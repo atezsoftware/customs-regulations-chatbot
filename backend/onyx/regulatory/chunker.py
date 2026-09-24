@@ -22,7 +22,7 @@ from onyx.regulatory.heading_path import parse_regulatory_article_heading
 # Bump whenever parser or structural chunk-boundary semantics change. Durable
 # jobs persist this identity so a process restart cannot silently reinterpret
 # an immutable input revision with different chunk-generation semantics.
-REGULATORY_CHUNKER_CODE_VERSION = "2"
+REGULATORY_CHUNKER_CODE_VERSION = "3"
 
 ATOMIC_CHUNK_VARIANT = "atomic"
 HIERARCHICAL_AGGREGATE_CHUNK_VARIANT = "hierarchical_aggregate"
@@ -111,12 +111,12 @@ _DOCUMENT_TITLE_TYPE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 
 _ARTICLE_RE = re.compile(
     r"^(?P<label>(?:gecici|geçici)\s+madde|(?:mukerrer|mükerrer)\s+madde|madde)"
-    r"(?:\s+|\s*[:.]\s*)(?P<num>\d+[a-z]?)\b\s*(?:[-–—:]\s*)?(?P<rest>.*)$",
+    r"(?:\s+|\s*[:.]\s*)(?P<num>\d+(?:/?[a-z])?)\b\s*(?:[-–—:]\s*)?(?P<rest>.*)$",
     flags=re.IGNORECASE,
 )
 _ARTICLE_EXPLICIT_SEPARATOR_RE = re.compile(
     r"^(?:geçici\s+madde|mükerrer\s+madde|madde)"
-    r"(?:\s+|\s*[:.]\s*)\d+[a-z]?\s*[-–—:]",
+    r"(?:\s+|\s*[:.]\s*)\d+(?:/?[a-z])?\s*[-–—:]",
     flags=re.IGNORECASE,
 )
 _ARTICLE_REFERENCE_CONTINUATION_RE = re.compile(
@@ -1722,7 +1722,7 @@ def _classify_block(block: SourceBlock) -> dict[str, Any]:
 def _article_rest_from_original(clean: str) -> str:
     match = re.match(
         r"^(?:GEÇİCİ\s+MADDE|Geçici\s+Madde|MÜKERRER\s+MADDE|Mükerrer\s+Madde|"
-        r"MADDE|Madde)(?:\s+|\s*[:.]\s*)\d+[A-Za-z]?\s*"
+        r"MADDE|Madde)(?:\s+|\s*[:.]\s*)\d+(?:/?[A-Za-z])?\s*"
         r"(?:[-–—:]\s*)?(.*)$",
         clean,
     )
@@ -2220,6 +2220,15 @@ def hierarchical_aggregate_root_label(
         titled = f"{label} - {title.strip()}"
         if existing_text.startswith(titled + "\n\n"):
             return titled
+    prefix, separator, body = existing_text.partition("\n\n")
+    if separator and prefix.startswith(label + " - "):
+        recorded_title = prefix[len(label) + 3 :]
+        lines = [_clean_inline_markdown(line).strip() for line in body.splitlines()]
+        if recorded_title and any(
+            _fold_text(left) == _fold_text(label) and right == recorded_title
+            for left, right in zip(lines, lines[1:])
+        ):
+            return prefix
     return label
 
 
@@ -2263,6 +2272,11 @@ def _finalize_hierarchical_aggregate(
         source_chunk_orders=source_chunk_orders,
         hierarchy_root_id=node.node_id,
         hierarchy_root_path=hierarchy_root_path,
+        article_title=(
+            node.label.partition(" - ")[2] or first_metadata.article_title
+            if node.node_type == "article"
+            else first_metadata.article_title
+        ),
         paragraph_no=(
             first_metadata.paragraph_no
             if node.node_type in {"paragraph", "numbered_section", "dotted_section"}

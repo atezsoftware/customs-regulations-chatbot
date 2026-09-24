@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 from typing import cast
 from uuid import uuid4
 
@@ -52,6 +53,126 @@ def test_baseline_retains_exact_source_and_vectors_without_encoder_receipt() -> 
     assert binding.context is None
     assert binding.dependency_ids == []
     assert binding.projection.model_dump()["evidence_kind"] == "observed-v1"
+
+
+def test_metadata_repair_uses_source_heading_without_changing_index_payload() -> None:
+    from onyx.regulatory.publication_baseline import validate_baseline_metadata_repair
+
+    inputs, evidence = baseline_case()
+    correct = inputs.canonical[0]
+    inputs = replace(
+        inputs,
+        canonical=[correct.model_copy(update={"heading_path": ["wrong ancestor"]})],
+    )
+    repaired = validate_baseline_metadata_repair(inputs, [correct])
+    binding = observed_baseline_binding(evidence, [correct])
+    assert repaired == {correct.id}
+    assert json.loads(binding.projection.source_json) == json.loads(
+        evidence.source_json
+    )
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("text", "new text"),
+        ("id", "new-id"),
+        ("position", 8),
+        ("projection_ordinal", 8),
+    ],
+)
+def test_baseline_metadata_repair_cannot_change_content_or_identity(
+    field: str, value: object
+) -> None:
+    from onyx.regulatory.publication_baseline import validate_baseline_metadata_repair
+
+    inputs, _ = baseline_case()
+    with pytest.raises(ValueError, match="metadata repair"):
+        validate_baseline_metadata_repair(
+            inputs, [inputs.canonical[0].model_copy(update={field: value})]
+        )
+
+
+def test_baseline_metadata_repair_cannot_rewrite_qualified_history() -> None:
+    from onyx.regulatory.publication_baseline import validate_baseline_metadata_repair
+
+    inputs, evidence = baseline_case()
+    inputs = replace(
+        inputs, bindings=[observed_baseline_binding(evidence, inputs.canonical)]
+    )
+    correct = inputs.canonical[0].model_copy(update={"heading_path": ["new heading"]})
+    with pytest.raises(ValueError, match="qualified history"):
+        validate_baseline_metadata_repair(inputs, [correct])
+
+
+def test_metadata_baseline_archives_old_revision_and_activates_corrected_revision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import MagicMock
+
+    from elasticsearch import Elasticsearch
+
+    from onyx.db.models import SearchSettings
+    from onyx.regulatory import publication_baseline as baseline
+    from tests.unit.onyx.regulatory.indexing_jobs.owned_publication_test_helpers import (
+        OwnedAuthority,
+    )
+
+    inputs, evidence = baseline_case()
+    correct = inputs.canonical[0]
+    original = correct.model_copy(update={"heading_path": ["incorrect ancestor"]})
+    settings = MagicMock(spec=SearchSettings)
+    settings.index_name = evidence.index.index_name
+    settings.status.is_current.return_value = True
+    inputs = replace(inputs, canonical=[original], settings=[settings])
+    client = MagicMock(spec=Elasticsearch)
+    client.indices = MagicMock()
+    client.indices.get.return_value = {
+        settings.index_name: {
+            "settings": {"index": {"uuid": evidence.index.index_uuid}}
+        }
+    }
+    adapter = MagicMock()
+    adapter.inventory_evidence.return_value = [evidence]
+    monkeypatch.setattr(baseline, "FencedPublicationIndex", lambda *_a: adapter)
+    monkeypatch.setattr(baseline, "PublicationStore", lambda *_a: MagicMock())
+    monkeypatch.setattr(baseline, "observed_index_snapshot", lambda *_a: evidence.index)
+    manifest = baseline.prepare_owned_baseline(
+        OwnedAuthority(inputs.file.id).owner, client, inputs, canonical_after=[correct]
+    )
+    assert manifest is not None and manifest.canonical_after == [correct]
+    assert manifest.canonical_before_sha256 == baseline.publication_digest(
+        [original.model_dump(mode="json")]
+    )
+    assert manifest.bindings[0].id not in manifest.canonical_revisions
+    assert json.loads(manifest.bindings[0].projection.source_json) == json.loads(
+        evidence.source_json
+    )
+
+
+def test_historical_baseline_retains_vector_with_open_ended_unchanged_parent() -> None:
+    from datetime import date
+
+    inputs, evidence = baseline_case()
+    parent = inputs.canonical[0].model_copy(
+        update={"id": "unchanged-parent", "projection_ordinal": 6}
+    )
+    aggregate = inputs.canonical[0].model_copy(
+        update={
+            "validity_end_date": date(2026, 9, 9),
+            "metadata": {
+                "chunk_variant": "hierarchical_aggregate",
+                "hierarchy_root_path": ["Legal"],
+                "source_regulatory_chunk_ids": [parent.id],
+            },
+        }
+    )
+    source = json.loads(evidence.source_json)
+    source["validity_end_date"] = 1788912000
+    evidence = evidence.model_copy(update={"source_json": json.dumps(source)})
+    binding = observed_baseline_binding(evidence, [parent, aggregate])
+    assert binding.dependency_ids == ["unchanged-parent"]
+    assert json.loads(binding.projection.source_json) == source
 
 
 @pytest.mark.parametrize(

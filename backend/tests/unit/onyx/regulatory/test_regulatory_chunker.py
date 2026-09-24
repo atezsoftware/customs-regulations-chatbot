@@ -877,6 +877,88 @@ b) Data 2.
     ]
 
 
+def test_slash_article_number_does_not_leak_its_paragraph_into_next_article() -> None:
+    doc = RegulatoryChunker(min_chunk_chars=0).chunk_text("""4458 SAYILI GÜMRÜK KANUNU
+
+ÜÇÜNCÜ KISIM
+
+İKİNCİ BÖLÜM
+
+**MADDE 35/C-** 1. Giriş gümrük idaresi özet beyan verilmesinden vazgeçebilir.
+
+2. Gümrük idarelerince düzenlenen beyannameler için aynı düzeyde risk yönetimi uygulanır.
+
+**MADDE 36- 1.** Türkiye Gümrük Bölgesine getirilen eşya gümrük gözetimine tabidir.
+
+2. Söz konusu eşya gümrük statüleri belirleninceye kadar gözetim altında kalır.
+""")
+    atomic = [c for c in doc.chunks if c.metadata.chunk_variant == "atomic"]
+    assert [c.metadata.article_no for c in atomic] == ["35/C", "35/C", "36", "36"]
+    for row in atomic[2:]:
+        assert row.metadata.heading_path[:4] == [
+            "4458 SAYILI GÜMRÜK KANUNU",
+            "ÜÇÜNCÜ KISIM",
+            "İKİNCİ BÖLÜM",
+            "MADDE 36",
+        ]
+        assert len(row.metadata.heading_path) == 5
+
+
+def test_repeated_article_intro_preserves_aggregate_root_title() -> None:
+    from onyx.regulatory.chunker import (
+        hierarchical_aggregate_root_label,
+        hierarchical_aggregate_text,
+    )
+
+    text = """ULUSLARARASI SÖZLEŞME
+
+**Madde 2**
+Madde 2 aşağıdaki gibi olmalıdır:
+
+**Madde 2**
+**Kimlik Kartlarıyla Seyahat**
+Madde 1 gereğince kimlik kartlarıyla seyahat yalnızca Akit Taraflar arasında mümkündür.
+"""
+    doc = RegulatoryChunker(min_chunk_chars=0).chunk_text(text)
+    aggregate = next(
+        c for c in doc.chunks if c.metadata.chunk_variant == "hierarchical_aggregate"
+    )
+    assert aggregate.metadata.article_title == "Kimlik Kartlarıyla Seyahat"
+    members = [doc.chunks[i].text for i in aggregate.metadata.source_chunk_orders]
+    assert (
+        hierarchical_aggregate_text(
+            hierarchical_aggregate_root_label(
+                aggregate.metadata.to_storage_dict(), aggregate.text
+            ),
+            members,
+        )
+        == aggregate.text
+    )
+
+
+def test_legacy_aggregate_prefix_requires_matching_article_title_in_body() -> None:
+    from onyx.regulatory.chunker import hierarchical_aggregate_root_label
+
+    metadata = {"hierarchy_root_path": ["MADDE 2"], "article_title": None}
+    body = "MADDE 2 - Kimlik Kartlarıyla Seyahat\n\n**Madde 2**\n**Kimlik Kartlarıyla Seyahat**\nMetin."
+    assert (
+        hierarchical_aggregate_root_label(metadata, body)
+        == "MADDE 2 - Kimlik Kartlarıyla Seyahat"
+    )
+    assert (
+        hierarchical_aggregate_root_label(
+            metadata, body.replace("**Madde 2**", "**Madde 3**")
+        )
+        == "MADDE 2"
+    )
+    assert (
+        hierarchical_aggregate_root_label(
+            metadata, body.replace("**Kimlik Kartlarıyla Seyahat**", "**Başka başlık**")
+        )
+        == "MADDE 2"
+    )
+
+
 def test_hierarchical_multipass_skips_subtree_over_character_budget() -> None:
     long_clause = "veri işleme koşulu " * 14
     text = f"""ULUSLARARASI SÖZLEŞME

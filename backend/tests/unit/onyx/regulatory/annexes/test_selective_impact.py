@@ -1,4 +1,5 @@
 from datetime import date
+from hashlib import sha256
 
 import pytest
 
@@ -11,6 +12,81 @@ from onyx.regulatory.amendments.annexes.selective_impact import (
     local_source_rows,
 )
 from tests.unit.onyx.regulatory.annexes.test_publication_timeline import draft, snapshot
+
+
+def test_recorded_source_identity_retains_root_member_after_position_shift() -> None:
+    from onyx.regulatory.amendments.annexes.selective_impact import (
+        recover_source_membership,
+    )
+
+    root = snapshot("root-current", None, None).model_copy(
+        update={"text": "Root", "position": 11, "heading_path": ["Root"]}
+    )
+    child = root.model_copy(
+        update={"id": "child-current", "text": "Child", "position": 12}
+    )
+    recorded = [
+        "rc_" + sha256(f"{root.user_file_id}:{order}:{body}".encode()).hexdigest()[:40]
+        for order, body in [(10, "Root"), (11, "Child")]
+    ]
+    aggregate = root.model_copy(
+        update={
+            "id": "aggregate",
+            "text": "Root\n\nChild",
+            "metadata": {
+                "chunk_variant": "hierarchical_aggregate",
+                "hierarchy_root_path": ["Root"],
+                "source_chunk_orders": [10, 11],
+                "source_regulatory_chunk_ids": recorded,
+            },
+        }
+    )
+    assert recover_source_membership([root, child, aggregate]) == {
+        "aggregate": ["root-current", "child-current"]
+    }
+    duplicate = root.model_copy(update={"id": "ambiguous-root", "position": 13})
+    duplicate_child = child.model_copy(update={"id": "ambiguous-child", "position": 14})
+    assert not recover_source_membership(
+        [root, child, duplicate, duplicate_child, aggregate]
+    )
+    # A repeated heading alone is not a second matching ordered source window.
+    assert recover_source_membership([root, child, duplicate, aggregate]) == {
+        "aggregate": ["root-current", "child-current"]
+    }
+
+
+@pytest.mark.parametrize(
+    "parent_start,parent_end,valid",
+    [
+        (None, None, True),
+        (date(2020, 1, 1), None, True),
+        (None, date(2027, 1, 1), True),
+        (date(2026, 1, 1), date(2026, 9, 9), True),
+        (date(2026, 1, 2), None, False),
+        (None, date(2026, 9, 8), False),
+    ],
+)
+def test_historical_aggregate_requires_parent_covering_entire_legal_window(
+    parent_start: date | None, parent_end: date | None, valid: bool
+) -> None:
+    from onyx.regulatory.amendments.annexes.selective_impact import (
+        aggregate_membership_is_valid,
+    )
+
+    parent = snapshot("Root text", parent_start, parent_end)
+    aggregate = parent.model_copy(
+        update={
+            "id": "historical-aggregate",
+            "validity_start_date": date(2026, 1, 1),
+            "validity_end_date": date(2026, 9, 9),
+            "metadata": {
+                "chunk_variant": "hierarchical_aggregate",
+                "hierarchy_root_path": ["Root"],
+                "source_regulatory_chunk_ids": [parent.id],
+            },
+        }
+    )
+    assert aggregate_membership_is_valid(aggregate, {parent.id: parent}) is valid
 
 
 def test_reverse_transitive_membership_deduplicates_shared_consumers() -> None:

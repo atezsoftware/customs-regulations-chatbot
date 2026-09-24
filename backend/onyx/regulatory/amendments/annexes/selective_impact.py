@@ -1,6 +1,7 @@
 """Deterministic dependency traversal over frozen canonical and context sources."""
 
 from collections import defaultdict, deque
+from uuid import UUID
 
 from onyx.regulatory.amendments.annexes.models import (
     AnnexCanonicalSnapshot,
@@ -160,6 +161,29 @@ def review_units(items: list[AnnexChangeItemDraft]) -> list[list[int]]:
     return sorted(groups.values(), key=lambda group: group[0])
 
 
+def source_window_covers(
+    source: AnnexCanonicalSnapshot, dependent: AnnexCanonicalSnapshot
+) -> bool:
+    """Unchanged sources can support a narrower historical derived window."""
+    start, end = dependent.validity_start_date, dependent.validity_end_date
+    if start is not None and end is not None and start >= end:
+        # Empty archived versions retain their original exact relationship.
+        return (
+            start == end
+            and source.validity_start_date == start
+            and source.validity_end_date == end
+        )
+    return (
+        source.validity_start_date is None
+        or start is not None
+        and source.validity_start_date <= start
+    ) and (
+        source.validity_end_date is None
+        or end is not None
+        and end <= source.validity_end_date
+    )
+
+
 def aggregate_membership_is_valid(
     aggregate: AnnexCanonicalSnapshot, rows: dict[str, AnnexCanonicalSnapshot]
 ) -> bool:
@@ -182,8 +206,7 @@ def aggregate_membership_is_valid(
     if any(
         row is None
         or row.user_file_id != aggregate.user_file_id
-        or row.validity_start_date != aggregate.validity_start_date
-        or row.validity_end_date != aggregate.validity_end_date
+        or not source_window_covers(row, aggregate)
         for row in selected
     ):
         return False
@@ -261,8 +284,7 @@ def recover_source_membership(
                 for row in rows
                 if row.id != aggregate.id
                 and row.user_file_id == aggregate.user_file_id
-                and row.validity_start_date == aggregate.validity_start_date
-                and row.validity_end_date == aggregate.validity_end_date
+                and source_window_covers(row, aggregate)
                 and row.metadata.get("chunk_variant") != "hierarchical_aggregate"
                 and not row.metadata.get("bound_to_regulatory_chunk_id")
                 and row.heading_path[: len(root)] in root_paths
@@ -271,12 +293,28 @@ def recover_source_membership(
         )
         orders = aggregate.metadata.get("source_chunk_orders")
         if isinstance(orders, list) and orders:
+            from onyx.db.regulatory_chunks import make_regulatory_chunk_id
+
+            recorded_ids = source_ids(aggregate)
+            identity_proven = len(recorded_ids) == len(orders)
             selected = []
-            for order in orders:
+            for offset, order in enumerate(orders):
+                if not isinstance(order, int) or isinstance(order, bool) or order < 0:
+                    break
                 matches = [
                     row
                     for row in candidates
-                    if row.metadata.get("chunk_order") == order
+                    if (
+                        (
+                            row.id == recorded_ids[offset]
+                            or make_regulatory_chunk_id(
+                                UUID(row.user_file_id), order, row.text
+                            )
+                            == recorded_ids[offset]
+                        )
+                        if identity_proven
+                        else row.metadata.get("chunk_order") == order
+                    )
                 ]
                 if len(matches) != 1:
                     break
@@ -290,6 +328,41 @@ def recover_source_membership(
                     == aggregate.text
                 ):
                     recovered[aggregate.id] = [row.id for row in selected]
+                    continue
+            # Repeated heading bodies need the entire recorded contiguous window.
+            if (
+                identity_proven
+                and all(
+                    isinstance(order, int)
+                    and not isinstance(order, bool)
+                    and order >= 0
+                    for order in orders
+                )
+                and orders == list(range(orders[0], orders[0] + len(orders)))
+            ):
+                windows = [
+                    candidates[start : start + len(orders)]
+                    for start in range(len(candidates) - len(orders) + 1)
+                    if all(
+                        row.id == identifier
+                        or make_regulatory_chunk_id(
+                            UUID(row.user_file_id), order, row.text
+                        )
+                        == identifier
+                        for row, identifier, order in zip(
+                            candidates[start : start + len(orders)],
+                            recorded_ids,
+                            orders,
+                        )
+                    )
+                    and hierarchical_aggregate_text(
+                        root_label,
+                        [row.text for row in candidates[start : start + len(orders)]],
+                    )
+                    == aggregate.text
+                ]
+                if len(windows) == 1:
+                    recovered[aggregate.id] = [row.id for row in windows[0]]
                     continue
         matches: list[list[str]] = []
         for start in range(len(candidates)):
@@ -362,8 +435,7 @@ def image_membership_is_valid(
     if (
         image.id == parent.id
         or image.user_file_id != parent.user_file_id
-        or image.validity_start_date != parent.validity_start_date
-        or image.validity_end_date != parent.validity_end_date
+        or not source_window_covers(parent, image)
         or parent.metadata.get("chunk_variant")
         in {"hierarchical_aggregate", "image_companion"}
         or parent.metadata.get("bound_to_regulatory_chunk_id") is not None

@@ -33,6 +33,7 @@ from onyx.regulatory.amendments.annexes.selective_impact import (
     image_membership_is_valid,
     recover_source_membership,
     source_ids,
+    source_window_covers,
 )
 from onyx.regulatory.writer_publication_models import WriterPublicationManifest
 from onyx.utils.text_processing import remove_invalid_unicode_chars
@@ -150,10 +151,7 @@ def observed_baseline_binding(
         if (
             dependency is None
             or dependency.user_file_id != row.user_file_id
-            or (
-                dependency.validity_start_date != row.validity_start_date
-                or dependency.validity_end_date != row.validity_end_date
-            )
+            or not source_window_covers(dependency, row)
         ):
             raise ValueError(
                 "baseline dependency identity or interval mismatch: " + row.id
@@ -192,14 +190,48 @@ def observed_baseline_binding(
     return binding
 
 
+def validate_baseline_metadata_repair(
+    inputs: "OwnedWriterInputs", after: list[AnnexCanonicalSnapshot]
+) -> set[str]:
+    """Only unqualified canonical metadata may change during baseline adoption."""
+    before = {row.id: row for row in inputs.canonical}
+    if len(after) != len(before) or {row.id for row in after} != set(before):
+        raise ValueError("baseline metadata repair changed canonical inventory")
+    changed: set[str] = set()
+    for row in after:
+        original = before[row.id]
+        if row.model_dump(exclude={"metadata", "heading_path"}) != original.model_dump(
+            exclude={"metadata", "heading_path"}
+        ):
+            raise ValueError(
+                "baseline metadata repair changed canonical content or identity"
+            )
+        if row != original:
+            changed.add(row.id)
+    qualified = {
+        str(json.loads(binding.projection.source_json)["regulatory_chunk_id"])
+        for binding in inputs.bindings
+    }
+    if changed & qualified:
+        raise ValueError("baseline metadata repair cannot rewrite qualified history")
+    return changed
+
+
 def prepare_owned_baseline(
     owner: FileOwnership,
     client: Elasticsearch,
     inputs: "OwnedWriterInputs",
     *,
     origin_proposal_id: int | None = None,
+    canonical_after: list[AnnexCanonicalSnapshot] | None = None,
 ) -> WriterPublicationManifest | None:
     """Prepare the whole active index inventory under the ordinary writer lease."""
+    changed = (
+        validate_baseline_metadata_repair(inputs, canonical_after)
+        if canonical_after is not None
+        else set()
+    )
+    canonical = canonical_after if canonical_after is not None else inputs.canonical
     authority = PublicationStore(owner.scope)
     indexes: list[PublicationIndexSnapshot] = []
     bindings: list[AnnexTemporalProjection] = []
@@ -228,7 +260,7 @@ def prepare_owned_baseline(
         authority.reserve_existing_ordinals(owner, existing)
         evidence = adapter.inventory_evidence(authority.reservations(owner))
         preflight = audit_baseline_inventory(
-            inputs.canonical,
+            canonical,
             list(evidence),
             previous,
             require_complete=settings.status.is_current(),
@@ -256,7 +288,7 @@ def prepare_owned_baseline(
         }
         required_ids = {
             row.id
-            for row in inputs.canonical
+            for row in canonical
             if row.source == "indexed" or row.status == "active"
         }
         if settings.status.is_current() and not required_ids <= observed_ids:
@@ -274,11 +306,11 @@ def prepare_owned_baseline(
                 raise ValueError(
                     "baseline protected source has lost its temporal binding"
                 )
-            binding = observed_baseline_binding(actual, inputs.canonical)
+            binding = observed_baseline_binding(actual, canonical)
             bindings.append(binding)
-            revisions[binding.id] = inputs.canonical_revisions[
-                str(json.loads(actual.source_json)["regulatory_chunk_id"])
-            ]
+            canonical_id = str(json.loads(actual.source_json)["regulatory_chunk_id"])
+            if canonical_id not in changed:
+                revisions[binding.id] = inputs.canonical_revisions[canonical_id]
             added = True
         # Keep actual accepted encoder authority for mixed files.
         qualified = next(
@@ -302,6 +334,7 @@ def prepare_owned_baseline(
         canonical_before_sha256=publication_digest(
             [row.model_dump(mode="json") for row in inputs.canonical]
         ),
+        canonical_after=canonical_after,
         indexes=indexes,
         bindings=bindings,
         previous_binding_ids=[
