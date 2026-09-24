@@ -58,7 +58,7 @@ jobs:
           if process.exists():
               print((process/'cmdline').read_bytes().replace(b'\x00',b' ').decode())
               print((process/'status').read_text())
-          for name in ('memory.current','memory.max','memory.events'):
+          for name in ('memory.current','memory.max','memory.events','memory.stat'):
               path=Path('/sys/fs/cgroup')/name
               if path.exists(): print(name,path.read_text())
           for name in ('worker.log','results.jsonl','phase.json','file-2.log','file-3.log','file-4.log'):
@@ -71,9 +71,11 @@ jobs:
           for process in Path('/proc').glob('[0-9]*'):
               try:
                   command=(process/'cmdline').read_bytes()
-                  if b'/tmp/dev-remaining78-20260924-resume2/' in command:
-                      print('TASK_PROCESS',process.name,command.replace(b'\x00',b' ').decode())
-                      print('\n'.join(line for line in (process/'status').read_text().splitlines() if line.startswith(('VmRSS:','VmHWM:','VmSwap:'))))
+                  status=(process/'status').read_text().splitlines()
+                  rss=next((int(line.split()[1]) for line in status if line.startswith('VmRSS:')),0)
+                  if rss > 100000 or b'/tmp/dev-remaining78-20260924-resume2/' in command:
+                      print('PROCESS_MEMORY',process.name,'rss_kib',rss,'name',(process/'comm').read_text().strip())
+                      print('\n'.join(line for line in status if line.startswith(('VmRSS:','VmHWM:','VmSwap:','RssAnon:','RssFile:'))))
               except (FileNotFoundError,PermissionError):
                   pass
           PY
