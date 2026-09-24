@@ -55,6 +55,39 @@ def test_recorded_source_identity_retains_root_member_after_position_shift() -> 
     }
 
 
+def test_historical_recovery_rejects_text_matching_contradictory_recorded_identity() -> (
+    None
+):
+    from onyx.regulatory.amendments.annexes.selective_impact import (
+        recover_source_membership,
+    )
+
+    parent = snapshot("candidate", None, None).model_copy(
+        update={"text": "Body", "heading_path": ["Root"]}
+    )
+    recorded = (
+        "rc_"
+        + sha256(
+            f"{parent.user_file_id}:5:Different original body".encode()
+        ).hexdigest()[:40]
+    )
+    aggregate = parent.model_copy(
+        update={
+            "id": "aggregate",
+            "text": "Root\n\nBody",
+            "validity_start_date": date(2020, 1, 1),
+            "validity_end_date": date(2021, 1, 1),
+            "metadata": {
+                "chunk_variant": "hierarchical_aggregate",
+                "hierarchy_root_path": ["Root"],
+                "source_chunk_orders": [5],
+                "source_regulatory_chunk_ids": [recorded],
+            },
+        }
+    )
+    assert recover_source_membership([parent, aggregate]) == {}
+
+
 @pytest.mark.parametrize(
     "parent_start,parent_end,valid",
     [

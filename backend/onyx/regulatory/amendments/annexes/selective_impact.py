@@ -296,6 +296,8 @@ def recover_source_membership(
             from onyx.db.regulatory_chunks import make_regulatory_chunk_id
 
             recorded_ids = source_ids(aggregate)
+            if recorded_ids and len(recorded_ids) != len(orders):
+                continue
             identity_proven = len(recorded_ids) == len(orders)
             selected = []
             for offset, order in enumerate(orders):
@@ -364,6 +366,9 @@ def recover_source_membership(
                 if len(windows) == 1:
                     recovered[aggregate.id] = [row.id for row in windows[0]]
                     continue
+            if recorded_ids:
+                # Exact text cannot overrule contradictory persisted identity.
+                continue
         matches: list[list[str]] = []
         for start in range(len(candidates)):
             texts: list[str] = []
