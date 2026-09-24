@@ -469,6 +469,106 @@ def test_matching_evidence_rejects_allowed_source_identity_changes(
         )
 
 
+@pytest.mark.parametrize(
+    "change,invalidates",
+    [
+        ("unrelated_lease", False),
+        ("candidate_lease", True),
+        ("unrelated_epoch", True),
+        ("unrelated_gate", True),
+    ],
+)
+def test_matching_distinguishes_writer_leases_from_published_source_changes(
+    checkpoint_session: Session, change: str, invalidates: bool
+) -> None:
+    from datetime import datetime, timedelta, timezone
+
+    from onyx.db.amendment_match_checkpoints import assert_match_evidence
+    from onyx.db.models import RegulatoryFilePublication
+    from tests.external_dependency_unit.regulatory.test_annex_baseline import (
+        _chunk,
+        _file,
+    )
+
+    session = checkpoint_session
+    docset = DocumentSet(name=str(uuid4()), description="lease", is_up_to_date=True)
+    session.add(docset)
+    session.flush()
+    files = [_file(session, docset), _file(session, docset)]
+    source = _chunk(session, files[0], 0, "source fixture")
+    publications = [
+        RegulatoryFilePublication(
+            user_file_id=file.id,
+            scope_key="fixture",
+            owner_id=uuid4(),
+            fencing_token=45,
+            lease_expires_at=datetime.now(timezone.utc) - timedelta(seconds=1),
+            epoch=23991,
+            gate_closed=index == 1,
+        )
+        for index, file in enumerate(files)
+    ]
+    session.add_all(publications)
+    batch = AmendmentBatch(
+        document_set_id=docset.id,
+        raw_text="test",
+        status="analyzing",
+        stage="processing",
+        lease_generation=1,
+        instruction_count=1,
+        user_file_ids=[str(file.id) for file in files],
+    )
+    session.add(batch)
+    session.flush()
+    candidate = CandidateChunk(
+        chunk_id=source.id,
+        user_file_id=str(source.user_file_id),
+        text=source.text,
+        metadata={**source.chunk_metadata, "heading_path": source.heading_path},
+    )
+    checkpoint = MatchedInstruction(
+        instruction_index=0,
+        instruction=AmendmentInstruction(instruction_text="Amend source"),
+        candidates=[candidate],
+        match=MatchResult(old_chunk_id=source.id, confidence=1, rationale="verified"),
+        evidence=capture_match_evidence(session, batch.user_file_ids, [candidate]),
+    )
+    assert persist_match_checkpoint(
+        session,
+        batch_id=batch.id,
+        lease_generation=1,
+        input_sha256="f" * 64,
+        checkpoint=checkpoint,
+    )
+    publication = publications[0 if change == "candidate_lease" else 1]
+    if change.endswith("lease"):
+        publication.fencing_token += 1
+        publication.owner_id = uuid4()
+        publication.lease_expires_at = datetime.now(timezone.utc) + timedelta(minutes=1)
+    elif change == "unrelated_epoch":
+        publication.epoch += 1
+    else:
+        publication.gate_closed = False
+    session.flush()
+    assert checkpoint.evidence is not None
+    if invalidates:
+        with pytest.raises(ValueError, match="evidence changed"):
+            assert_match_evidence(session, batch.user_file_ids, checkpoint.evidence)
+    else:
+        assert_match_evidence(session, batch.user_file_ids, checkpoint.evidence)
+        assert persist_match_checkpoint(
+            session,
+            batch_id=batch.id,
+            lease_generation=1,
+            input_sha256="f" * 64,
+            checkpoint=checkpoint,
+        )
+    restored = load_match_checkpoint(
+        session, batch_id=batch.id, instruction_index=0, input_sha256="f" * 64
+    )
+    assert (restored is None) == invalidates
+
+
 def test_resource_deferral_preserves_progress_fences_writer_and_bounds_retries(
     checkpoint_session: Session,
 ) -> None:

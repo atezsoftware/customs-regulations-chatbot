@@ -57,6 +57,8 @@ def _source_fingerprints(db_session: Session, chunk_ids: list[str]) -> dict[str,
 
 
 def match_scope_fingerprint(db_session: Session, file_ids: list[str]) -> str:
+    # Writer acquisition does not change visible sources. Epoch/gate changes do;
+    # candidate-specific fingerprints separately retain their writer fencing.
     roots = (
         select(RegulatoryChunk.user_file_id, RegulatoryChunk.heading_path)
         .where(
@@ -76,7 +78,6 @@ def match_scope_fingerprint(db_session: Session, file_ids: list[str]) -> str:
             roots.c.heading_path,
             RegulatoryFilePublication.scope_key,
             RegulatoryFilePublication.epoch,
-            RegulatoryFilePublication.fencing_token,
             RegulatoryFilePublication.gate_closed,
         ).cast(Text)
     )
