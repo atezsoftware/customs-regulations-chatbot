@@ -1,18 +1,10 @@
 [
   {
-    "file_id": "383f3765-b8e0-4574-aeca-49293021b91d",
-    "canonical_count": 86,
-    "action": "metadata"
-  },
-  {
-    "file_id": "64524aab-7f48-40ca-a3cd-d587a7d311ba",
-    "canonical_count": 7,
-    "action": "restored_index"
-  },
-  {
     "file_id": "12328001-2f21-407e-b230-7d50a8dbf28f",
     "canonical_count": 1285,
-    "action": "metadata"
+    "action": "metadata",
+    "reviewed_pending_id": "2dd4beaf-443b-4313-a8ac-abc08e504f6b",
+    "reviewed_pending_sha": "c60b2c39020f4d689386289e4d6c55c0b3c5a84613156b6f0cb81ab4d714c447"
   },
   {
     "file_id": "03ee3942-18bb-4e1a-b837-46d4c8eb9528",
@@ -27,16 +19,6 @@
   {
     "file_id": "bf99fba0-0e69-4e1f-8d2d-d4cef8c6d35b",
     "canonical_count": 132,
-    "action": "metadata"
-  },
-  {
-    "file_id": "84571ebf-7ff7-4cbf-af9e-4db3b0c83612",
-    "canonical_count": 201,
-    "action": "metadata"
-  },
-  {
-    "file_id": "926b0f56-322b-4cc8-81f5-62b5c4668bea",
-    "canonical_count": 379,
     "action": "metadata"
   },
   {

@@ -7,11 +7,13 @@ import hashlib
 import json
 import os
 import threading
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, cast
 from uuid import UUID, uuid4
 
+from backpressure import GuardedClient
 from elasticsearch import Elasticsearch
 from elasticsearch.helpers import scan
 from image_correction import FILE_ID as IMAGE_FILE_ID
@@ -31,6 +33,7 @@ from onyx.document_index.publication_models import (
     PublicationScope,
     publication_digest,
     publication_source,
+    publication_streaming_digest,
 )
 from onyx.file_store.file_store import get_default_file_store
 from onyx.key_value_store.factory import get_kv_store
@@ -54,13 +57,15 @@ from onyx.regulatory.restored_index_evidence import verified_restored_index_sour
 from onyx.regulatory.source_metadata_repair import repair_canonical_source_metadata
 from onyx.regulatory.writer_projection import prepare_owned_correction
 from onyx.regulatory.writer_publication import execute_writer_publication
+from onyx.utils.variable_functionality import set_is_ee_based_on_env_variable
 from shared_configs.contextvars import CURRENT_TENANT_ID_CONTEXTVAR
 
 DATABASE = "customs-regulations-dev"
 INDEX = "danswer_chunk_dev_gemini_embedding_2_1024"
 INDEX_UUID = "q8lSz7g2Rvq7739qGJz6jg"
 OLD_UUID = "umb9_zfJRgW_MYV9xqClsg"
-PREFIX = "regulatory_maintenance:remaining78-20260924:"
+PREFIX = "regulatory_maintenance:remaining78-20260924-resume1:"
+OLD_PREFIX = "regulatory_maintenance:remaining78-20260924:"
 
 
 def now() -> str:
@@ -106,7 +111,49 @@ def process_file(client: Elasticsearch, plan: dict[str, Any]) -> dict[str, Any]:
     file_id = UUID(plan["file_id"])
     before = baseline_audit_inputs("public", file_id)
     if before.pending_manifest or before.gate_closed:
-        raise ValueError("pending publication requires explicit recovery inspection")
+        if str(file_id) != "12328001-2f21-407e-b230-7d50a8dbf28f":
+            raise ValueError("unreviewed pending publication requires inspection")
+        from onyx.db.regulatory_writer_publication import pending_writer_manifest
+
+        scope = PublicationScope(
+            tenant_id="public",
+            environment=config.REGULATORY_ANNEX_ENVIRONMENT,
+            database_identity=config.ANNEX_DATABASE_IDENTITY,
+        )
+        authority = PublicationStore(scope)
+        owner = authority.acquire(file_id, owner_id=uuid4(), ttl=LEASE_TTL)
+        try:
+            with publication_heartbeat(owner):
+                frozen = pending_writer_manifest(owner)
+                if (
+                    frozen is None
+                    or str(frozen.id) != plan.get("reviewed_pending_id")
+                    or frozen.kind != "baseline"
+                    or frozen.canonical_after is None
+                ):
+                    raise ValueError("reviewed recovery manifest changed")
+                if (
+                    publication_streaming_digest(frozen.model_dump(mode="json"))
+                    != plan["reviewed_pending_sha"]
+                ):
+                    raise ValueError("reviewed frozen manifest checksum changed")
+                if protected_canonical(frozen.canonical_after) != protected_canonical(
+                    before.canonical
+                ):
+                    raise ValueError("recovery would change protected source")
+                execute_writer_publication(
+                    owner,
+                    cast(
+                        Elasticsearch,
+                        GuardedClient(client, lambda: authority.reservations(owner)),
+                    ),
+                )
+        finally:
+            authority.release(owner)
+        result = process_file(client, plan)
+        result["recovered_manifest_id"] = str(frozen.id)
+        return result
+
     settings = baseline_audit_settings("public", DATABASE)
     current = [item for item in settings if item.status.is_current()]
     if len(settings) != 1 or len(current) != 1 or current[0].index_name != INDEX:
@@ -146,6 +193,9 @@ def process_file(client: Elasticsearch, plan: dict[str, Any]) -> dict[str, Any]:
     authority = PublicationStore(scope)
     owner = authority.acquire(file_id, owner_id=uuid4(), ttl=LEASE_TTL)
     try:
+        client = cast(
+            Elasticsearch, GuardedClient(client, lambda: authority.reservations(owner))
+        )
         with publication_heartbeat(owner) as lost:
             inputs = load_owned_writer_inputs(owner)
             if inputs.canonical != before.canonical:
@@ -171,6 +221,8 @@ def process_file(client: Elasticsearch, plan: dict[str, Any]) -> dict[str, Any]:
                     changed_id=None,
                     target_settings_ids={current[0].id},
                 )
+                # Initial qualification uses bounded bulk with identical fencing/proofs.
+                manifest = manifest.model_copy(update={"kind": "baseline"})
                 if manifest.canonical_after != inputs.canonical:
                     raise ValueError(
                         "missing projection preparation changed canonical records"
@@ -395,10 +447,23 @@ def main() -> None:
     ids = [str(UUID(item["file_id"])) for item in plans]
     if not ids or len(set(ids)) != len(ids) or len(ids) > 78:
         raise ValueError("invalid explicit remaining-file selection")
+    set_is_ee_based_on_env_variable()
     os.nice(10)
     SqlEngine.init_engine(pool_size=3, max_overflow=0)
     CURRENT_TENANT_ID_CONTEXTVAR.set("public")
     baseline_audit_settings("public", DATABASE)
+    old_state = get_kv_store().load(OLD_PREFIX + "status", refresh_cache=True)
+    old_control = get_kv_store().load(OLD_PREFIX + "control", refresh_cache=True)
+    if (
+        not isinstance(old_state, dict)
+        or cast(dict[str, Any], old_state).get("state") != "stopped"
+    ):
+        raise ValueError("previous process has not reached its stopped boundary")
+    if (
+        not isinstance(old_control, dict)
+        or cast(dict[str, Any], old_control).get("requested_by") != "agent"
+    ):
+        raise ValueError("a user stop requires user-directed resumption")
     claim_regulatory_maintenance(
         tenant_id="public",
         key=PREFIX + "claim",
@@ -453,6 +518,9 @@ def main() -> None:
                     control = None
                 if (
                     (args.output.parent / "STOP").exists()
+                    or (
+                        args.output.parent.parent / "dev-remaining78-20260924" / "STOP"
+                    ).exists()
                     or isinstance(control, dict)
                     and cast(dict[str, Any], control).get("stop") is True
                 ):
@@ -470,13 +538,16 @@ def main() -> None:
                 )
                 report.flush()
                 try:
-                    record: dict[str, Any] = process_file(transport.publication_client(), item)
+                    record: dict[str, Any] = process_file(
+                        transport.publication_client(), item
+                    )
                 except Exception as error:
                     record = {
                         "file_id": item["file_id"],
                         "state": "failed",
                         "error_type": type(error).__name__,
                         "detail": str(error)[:1000],
+                        "traceback": traceback.format_exc(limit=12),
                     }
                 record["at"] = now()
                 report.write(json.dumps(record, ensure_ascii=False) + "\n")

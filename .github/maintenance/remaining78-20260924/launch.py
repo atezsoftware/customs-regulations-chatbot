@@ -12,6 +12,16 @@ if not os.environ.get("KUBERNETES_SERVICE_HOST"):
     raise SystemExit("Launch requires the existing DEV project container")
 if (directory / "STOP").exists():
     raise SystemExit("STOP is present; refusing launch")
+previous = directory.parent / "dev-remaining78-20260924"
+if (previous / "STOP").exists():
+    raise SystemExit("Original STOP is present; refusing reviewed resume")
+prior_pid = json.loads((previous / "launch.json").read_text())["pid"]
+command = Path("/proc") / str(prior_pid) / "cmdline"
+if (
+    command.exists()
+    and str(previous / "repair_server.py").encode() in command.read_bytes()
+):
+    raise SystemExit("Original worker still runs; refusing a second operator")
 with (directory / "launch.json").open("x") as receipt:
     with (directory / "worker.log").open("x") as log:
         process = subprocess.Popen(
@@ -30,12 +40,16 @@ with (directory / "launch.json").open("x") as receipt:
             stderr=subprocess.STDOUT,
             start_new_session=True,
         )
-    receipt.write(json.dumps({"pid": process.pid, "run": "remaining78-20260924"}))
+    receipt.write(
+        json.dumps({"pid": process.pid, "run": "remaining78-20260924-resume1"})
+    )
 time.sleep(3)
 if process.poll() is not None:
     raise SystemExit(
         "Worker exited during launch; inspect worker.log, do not redispatch"
     )
 print(
-    json.dumps({"state": "launched", "pid": process.pid, "run": "remaining78-20260924"})
+    json.dumps(
+        {"state": "launched", "pid": process.pid, "run": "remaining78-20260924-resume1"}
+    )
 )

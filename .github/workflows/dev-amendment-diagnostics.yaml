@@ -37,8 +37,8 @@ jobs:
           Path('/tmp/remaining78-target').write_text('\t'.join(selected[0]))
           PY
           IFS=$'\t' read -r pod container < /tmp/remaining78-target || [[ -n "$pod" && -n "$container" ]]
-          directory=/tmp/dev-remaining78-20260924
-          tar -C .github/maintenance/remaining78-20260924 -cf - repair_server.py image_correction.py file-plan.json launch.py \
+          directory=/tmp/dev-remaining78-20260924-resume1
+          tar -C .github/maintenance/remaining78-20260924 -cf - repair_server.py image_correction.py backpressure.py file-plan.json launch.py \
             | kubectl exec -i "$pod" -n customs-regulations-dev -c "$container" -- \
                 sh -ec 'umask 077; mkdir "$1"; tar -xf - -C "$1"' remaining78-copy "$directory"
           kubectl exec "$pod" -n customs-regulations-dev -c "$container" -- \
