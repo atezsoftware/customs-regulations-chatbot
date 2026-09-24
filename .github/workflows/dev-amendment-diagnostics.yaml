@@ -21,6 +21,28 @@ jobs:
         run: |
           set -euo pipefail
           aws eks update-kubeconfig --name atez-dev-cluster --region eu-central-1
+          kubectl get pods -n customs-regulations-dev -o json > /tmp/dev-project-pods.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          candidates=[]
+          for pod in json.loads(Path('/tmp/dev-project-pods.json').read_text())['items']:
+              for container in pod['spec']['containers']:
+                  if 'customs-regulations-backend-lite-dev:' not in container['image']:
+                      continue
+                  print('PROJECT_RESOURCES',json.dumps({'pod':pod['metadata']['name'],'container':container['name'],'resources':container.get('resources',{}),'image':container['image']}))
+                  if pod['status']['phase']=='Running' and not pod['metadata'].get('deletionTimestamp'):
+                      candidates.append(pod['metadata']['name']+'\t'+container['name'])
+          Path('/tmp/dev-project-backends').write_text('\n'.join(candidates)+'\n')
+          PY
+          if [[ '${{ inputs.operation }}' == 'inspect' ]]; then
+            while IFS=$'\t' read -r resource_pod resource_container; do
+              [[ -n "$resource_pod" ]] || continue
+              echo "PROJECT_MEMORY $resource_pod $resource_container"
+              kubectl exec "$resource_pod" -n customs-regulations-dev -c "$resource_container" -- \
+                python -c "from pathlib import Path; print({n:(Path('/sys/fs/cgroup')/n).read_text() for n in ('memory.current','memory.max','cpu.max')})"
+            done < /tmp/dev-project-backends
+          fi
           kubectl get pods -n customs-regulations-dev -l app=dev-customs-regulations-background -o json > /tmp/remaining78-pods.json
           python - <<'PY'
           import json
