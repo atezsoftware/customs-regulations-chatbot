@@ -1,6 +1,11 @@
 name: One-time DEV remaining 78 repair
 on:
   workflow_dispatch:
+    inputs:
+      operation:
+        type: choice
+        options: [inspect, launch]
+        default: inspect
 permissions:
   contents: read
 jobs:
@@ -11,7 +16,7 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
           persist-credentials: false
-      - name: Launch once inside the existing DEV project container
+      - name: Inspect or launch the existing DEV project repair
         shell: bash
         run: |
           set -euo pipefail
@@ -38,6 +43,27 @@ jobs:
           PY
           IFS=$'\t' read -r pod container < /tmp/remaining78-target || [[ -n "$pod" && -n "$container" ]]
           directory=/tmp/dev-remaining78-20260924-resume1
+          if [[ '${{ inputs.operation }}' != 'launch' ]]; then
+            kubectl exec -i "$pod" -n customs-regulations-dev -c "$container" -- python - <<'PY'
+          import json
+          from pathlib import Path
+          directory=Path('/tmp/dev-remaining78-20260924-resume1')
+          pid=json.loads((directory/'launch.json').read_text())['pid']
+          process=Path('/proc')/str(pid)
+          print('PROCESS_EXISTS',process.exists())
+          if process.exists():
+              print((process/'cmdline').read_bytes().replace(b'\x00',b' ').decode())
+              print((process/'status').read_text())
+          for name in ('memory.current','memory.max','memory.events'):
+              path=Path('/sys/fs/cgroup')/name
+              if path.exists(): print(name,path.read_text())
+          for name in ('worker.log','results.jsonl'):
+              path=directory/name
+              print(name, path.stat().st_size if path.exists() else 'absent')
+              if path.exists(): print('\n'.join(path.read_text()[-16000:].splitlines()[-50:]))
+          PY
+            exit 0
+          fi
           tar -C .github/maintenance/remaining78-20260924 -cf - repair_server.py image_correction.py backpressure.py file-plan.json launch.py \
             | kubectl exec -i "$pod" -n customs-regulations-dev -c "$container" -- \
                 sh -ec 'umask 077; mkdir "$1"; tar -xf - -C "$1"' remaining78-copy "$directory"
