@@ -11,6 +11,49 @@ from onyx.regulatory.amendments.memory_budget import (
 from onyx.regulatory.amendments.supervision import supervise
 
 
+@pytest.mark.parametrize(
+    "paid,licensed", [(True, False), (False, True), (False, False)]
+)
+def test_child_initializes_configured_secret_decryption(
+    monkeypatch: pytest.MonkeyPatch, paid: bool, licensed: bool
+) -> None:
+    from ee.onyx.utils import encryption as encrypted_storage
+    from onyx.db.engine.sql_engine import SqlEngine
+    from onyx.regulatory.amendments import job, supervision
+    from onyx.utils import variable_functionality as versioning
+    from onyx.utils.encryption import decrypt_bytes_to_string
+
+    monkeypatch.setattr(versioning, "global_version", versioning.OnyxVersion())
+    monkeypatch.setattr(versioning, "ENTERPRISE_EDITION_ENABLED", paid)
+    monkeypatch.setattr(versioning, "_LICENSE_ENFORCEMENT_ENABLED", licensed)
+    versioning.fetch_versioned_implementation.cache_clear()
+    key = "synthetic-test-key-for-child-only"
+    value = "synthetic-embedding-credential"
+    # Make raw UTF-8 decoding fail deterministically, as for encrypted DEV data.
+    monkeypatch.setattr(encrypted_storage, "urandom", lambda size: b"\xde" * size)
+    stored = (
+        encrypted_storage._encrypt_string(value, key=key)
+        if paid or licensed
+        else value.encode()
+    )
+    observed: list[str] = []
+
+    def run_batch(**_kwargs: object) -> None:
+        observed.append(decrypt_bytes_to_string(stored, key=key))
+
+    monkeypatch.setattr(supervision, "protect_parent_lifetime", lambda: None)
+    monkeypatch.setattr(SqlEngine, "reset_engine", lambda: None)
+    monkeypatch.setattr(SqlEngine, "set_app_name", lambda _name: None)
+    monkeypatch.setattr(SqlEngine, "init_engine", lambda **_kwargs: None)
+    monkeypatch.setattr(job, "run_amendment_batch", run_batch)
+    monkeypatch.setattr(sys, "argv", ["supervision", "161", "25", "public", "parallel"])
+    try:
+        supervision._child_main()
+        assert observed == [value]
+    finally:
+        versioning.fetch_versioned_implementation.cache_clear()
+
+
 def test_missing_telemetry_does_not_launch_a_child(tmp_path: Path) -> None:
     marker = tmp_path / "started"
     with pytest.raises(ResourcePressure):

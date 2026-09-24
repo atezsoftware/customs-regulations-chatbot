@@ -183,6 +183,11 @@ def protect_parent_lifetime() -> None:
 
 def _child_main() -> None:
     protect_parent_lifetime()
+    from onyx.utils.variable_functionality import set_is_ee_based_on_env_variable
+
+    # Spawned processes must select the same secret codec as the Celery entrypoint.
+    set_is_ee_based_on_env_variable()
+
     from functools import partial
 
     from onyx.db.engine.sql_engine import SqlEngine
