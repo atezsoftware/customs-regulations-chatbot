@@ -4,7 +4,7 @@ on:
     inputs:
       operation:
         type: choice
-        options: [inspect, launch, refresh_helpers, update_amendment_image]
+        options: [inspect, launch, refresh_helpers, update_amendment_image, inspect_amendment_runtime]
         default: inspect
 permissions:
   contents: read
@@ -75,8 +75,39 @@ jobs:
           print('VERIFIED_IMAGE', image, 'VERIFIED_RESOURCES', json.dumps(resources), flush=True)
           print(kubectl('exec', pod, '-c', container, '--', 'python', '-c', "from pathlib import Path; print({n:(Path('/sys/fs/cgroup')/n).read_text() for n in ('memory.current','memory.max','memory.events')})"), flush=True)
           PY
+      - name: Inspect current DEV amendment worker readiness
+        if: inputs.operation == 'inspect_amendment_runtime' && github.ref == 'refs/heads/develop'
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws eks update-kubeconfig --name atez-dev-cluster --region eu-central-1
+          python3 - <<'PY'
+          import json
+          import subprocess
+          ns = 'customs-regulations-dev'
+          container = 'dev-customs-regulations-background-container'
+          def run(*args):
+              return subprocess.run(['kubectl', '-n', ns, *args], text=True, capture_output=True, timeout=120)
+          result = run('get', 'pods', '-l', 'app=dev-customs-regulations-background', '-o', 'json')
+          result.check_returncode()
+          pods = [p for p in json.loads(result.stdout)['items'] if not p['metadata'].get('deletionTimestamp')]
+          assert len(pods) == 1
+          p = pods[0]
+          c = next(c for c in p['spec']['containers'] if c['name'] == container)
+          keys = ('REGULATORY_ANNEX_ENVIRONMENT', 'REGULATORY_ANNEX_WORKER_ENABLED', 'REDIS_DEPLOYMENT_DATABASES', 'POSTGRES_DB', 'POSTGRES_DATABASE')
+          print('POD', json.dumps({'name':p['metadata']['name'],'image':c['image'],'resources':c['resources'],'environment':{e['name']:e.get('value','<reference>') for e in c.get('env',[]) if e['name'] in keys},'status':p['status'].get('containerStatuses',[])}), flush=True)
+          pod = p['metadata']['name']
+          commands = [
+              ['supervisorctl','-c','/etc/supervisor/conf.d/supervisord.conf','status','celery_worker_regulatory_annex'],
+              ['sh','-ec',". /vault/secrets/config; exec python -c 'import os; print({k:os.environ.get(k) for k in (\"REGULATORY_ANNEX_ENVIRONMENT\",\"REGULATORY_ANNEX_WORKER_ENABLED\",\"REDIS_DEPLOYMENT_DATABASES\",\"POSTGRES_DB\",\"POSTGRES_DATABASE\")})'"],
+              ['sh','-ec','. /vault/secrets/config; exec python -m onyx.background.celery.regulatory_annex_readiness'],
+          ]
+          for command in commands:
+              result = run('exec',pod,'-c',container,'--',*command)
+              print('CHECK', command[0], 'EXIT', result.returncode, 'OUTPUT', result.stdout[-3000:], flush=True)
+          PY
       - name: Inspect or launch the existing DEV project repair
-        if: inputs.operation != 'update_amendment_image'
+        if: inputs.operation != 'update_amendment_image' && inputs.operation != 'inspect_amendment_runtime'
         shell: bash
         run: |
           set -euo pipefail
