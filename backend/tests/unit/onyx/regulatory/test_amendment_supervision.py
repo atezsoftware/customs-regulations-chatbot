@@ -1,4 +1,5 @@
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -9,6 +10,43 @@ from onyx.regulatory.amendments.memory_budget import (
     ResourcePressure,
 )
 from onyx.regulatory.amendments.supervision import supervise
+
+
+@pytest.mark.parametrize("current_mib", [2800, 3084])
+def test_serial_child_phases_use_actual_reserve(
+    monkeypatch: pytest.MonkeyPatch, current_mib: int
+) -> None:
+    from onyx.db.engine.sql_engine import SqlEngine
+    from onyx.regulatory.amendments import job, supervision
+    from onyx.utils import variable_functionality as versioning
+
+    completed: list[str] = []
+
+    def run_batch(*, before_work: Callable[[], None], **_kwargs: object) -> None:
+        for phase in ("segmentation", "drafting"):
+            before_work()
+            completed.append(phase)
+
+    monkeypatch.setattr(versioning, "set_is_ee_based_on_env_variable", lambda: None)
+    monkeypatch.setattr(supervision, "protect_parent_lifetime", lambda: None)
+    monkeypatch.setattr(
+        supervision,
+        "read_memory",
+        lambda: MemorySample(current_mib * 1024**2, 3584 * 1024**2),
+    )
+    monkeypatch.setattr(SqlEngine, "reset_engine", lambda: None)
+    monkeypatch.setattr(SqlEngine, "set_app_name", lambda _name: None)
+    monkeypatch.setattr(SqlEngine, "init_engine", lambda **_kwargs: None)
+    monkeypatch.setattr(job, "run_amendment_batch", run_batch)
+    monkeypatch.setattr(sys, "argv", ["supervision", "188", "1", "public", "parallel"])
+    if current_mib == 3084:
+        with pytest.raises(SystemExit) as error:
+            supervision._child_main()
+        assert error.value.code == 75
+        assert completed == []
+    else:
+        supervision._child_main()
+        assert completed == ["segmentation", "drafting"]
 
 
 @pytest.mark.parametrize(
@@ -85,6 +123,29 @@ def test_dev_baseline_can_launch_analysis_with_reserved_headroom(
         lock_path=tmp_path / "lock",
     )
     assert marker.exists()
+
+
+def test_serial_start_does_not_require_speculative_parallel_headroom(
+    tmp_path: Path,
+) -> None:
+    marker = tmp_path / "started"
+    supervise(
+        [sys.executable, "-c", f'open({str(marker)!r}, "w").close()'],
+        sample=lambda: MemorySample(2800 * 1024**2, 3584 * 1024**2),
+        lock_path=tmp_path / "lock",
+    )
+    assert marker.exists()
+
+
+def test_start_at_safety_reserve_never_launches_child(tmp_path: Path) -> None:
+    marker = tmp_path / "started"
+    with pytest.raises(ResourcePressure, match="memory_pressure"):
+        supervise(
+            [sys.executable, "-c", f'open({str(marker)!r}, "w").close()'],
+            sample=lambda: MemorySample(3084 * 1024**2, 3584 * 1024**2),
+            lock_path=tmp_path / "lock",
+        )
+    assert not marker.exists()
 
 
 def test_memory_spike_terminates_only_the_owned_child(tmp_path: Path) -> None:

@@ -94,9 +94,9 @@ def supervise(
             or not initial_probe.allowed
         ):
             raise RuntimeError("Amendment analysis ownership unavailable")
-        # Includes process import/setup cost; both measurements must allow it.
-        if not policy.admit(sample(), active=1):
-            raise ResourcePressure("insufficient_analysis_headroom")
+        # Start one supervised process; its measured usage controls expansion.
+        # Reserving estimated work twice here can prevent serial progress.
+        policy.check(sample())
         environment = dict(os.environ)
         environment["PYTHONPATH"] = os.pathsep.join(sys.path)
         environment["AMENDMENT_SUPERVISOR_PID"] = str(os.getpid())
@@ -246,10 +246,6 @@ def _child_main() -> None:
     def check_resources() -> None:
         policy.check(read_memory())
 
-    def before_work() -> None:
-        if not policy.admit(read_memory(), active=0):
-            raise ResourcePressure("insufficient_phase_headroom")
-
     try:
         run_amendment_batch(
             batch_id=int(batch_id),
@@ -258,7 +254,7 @@ def _child_main() -> None:
                 bounded_map, max_parallel=4 if mode == "parallel" else 1, report=report
             ),
             check_resources=check_resources,
-            before_work=before_work,
+            before_work=check_resources,
         )
     except ResourcePressure:
         raise SystemExit(RESOURCE_EXIT) from None

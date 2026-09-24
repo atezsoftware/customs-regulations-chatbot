@@ -92,6 +92,44 @@ def test_unknown_memory_never_starts_work() -> None:
     assert started == []
 
 
+def test_serial_progress_with_headroom_below_estimated_item_cost() -> None:
+    running = peak = 0
+    lock = Lock()
+
+    def work(value: int) -> int:
+        nonlocal running, peak
+        with lock:
+            running += 1
+            peak = max(peak, running)
+        sleep(0.02)
+        with lock:
+            running -= 1
+        return value
+
+    assert list(
+        bounded_map(
+            work,
+            range(4),
+            sample=lambda: MemorySample(2900 * MIB, 3584 * MIB),
+            max_parallel=4,
+        )
+    ) == [0, 1, 2, 3]
+    assert peak == 1
+
+
+def test_matching_at_safety_reserve_never_starts_work() -> None:
+    started: list[int] = []
+    with pytest.raises(ResourcePressure, match="memory_pressure"):
+        list(
+            bounded_map(
+                lambda n: started.append(n),
+                [1, 2],
+                sample=lambda: MemorySample(3084 * MIB, 3584 * MIB),
+            )
+        )
+    assert started == []
+
+
 def test_small_budget_stays_serial_without_dropping_work() -> None:
     seen: list[int] = []
     assert list(

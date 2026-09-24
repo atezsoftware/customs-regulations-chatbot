@@ -120,9 +120,10 @@ def bounded_map(
                     except StopIteration:
                         exhausted = True
                         break
-                if not policy.admit(sample(), active=len(pending)):
-                    if not pending:
-                        raise ResourcePressure("insufficient_instruction_headroom")
+                admission = policy.check(sample())
+                # Estimates limit concurrency, not the first serial operation.
+                # The enclosing process watchdog still enforces the reserve.
+                if pending and not policy.admit(admission, active=len(pending)):
                     break
                 item = queued.popleft()
                 if warmup_baseline is None:
