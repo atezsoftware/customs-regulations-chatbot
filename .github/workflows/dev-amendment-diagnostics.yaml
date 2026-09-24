@@ -61,10 +61,21 @@ jobs:
           for name in ('memory.current','memory.max','memory.events'):
               path=Path('/sys/fs/cgroup')/name
               if path.exists(): print(name,path.read_text())
-          for name in ('worker.log','results.jsonl'):
+          for name in ('worker.log','results.jsonl','phase.json','file-2.log','file-3.log','file-4.log'):
               path=directory/name
               print(name, path.stat().st_size if path.exists() else 'absent')
-              if path.exists(): print('\n'.join(path.read_text()[-16000:].splitlines()[-50:]))
+              if path.exists():
+                  with path.open('rb') as stream:
+                      stream.seek(max(0,path.stat().st_size-16000))
+                      print('\n'.join(stream.read().decode(errors='replace').splitlines()[-50:]))
+          for process in Path('/proc').glob('[0-9]*'):
+              try:
+                  command=(process/'cmdline').read_bytes()
+                  if b'/tmp/dev-remaining78-20260924-resume2/' in command:
+                      print('TASK_PROCESS',process.name,command.replace(b'\x00',b' ').decode())
+                      print('\n'.join(line for line in (process/'status').read_text().splitlines() if line.startswith(('VmRSS:','VmHWM:','VmSwap:'))))
+              except (FileNotFoundError,PermissionError):
+                  pass
           PY
             exit 0
           fi
