@@ -85,6 +85,7 @@ jobs:
           receipt=directory/'launch.json'
           pid=json.loads(receipt.read_text())['pid'] if receipt.exists() else 508
           process=Path('/proc')/str(pid)
+          print('HOST_MEMORY', '\n'.join(line for line in Path('/proc/meminfo').read_text().splitlines() if line.split(':')[0] in ('MemTotal','MemAvailable','SwapFree')))
           print('PROCESS_EXISTS',process.exists())
           if process.exists():
               print((process/'cmdline').read_bytes().replace(b'\x00',b' ').decode())
