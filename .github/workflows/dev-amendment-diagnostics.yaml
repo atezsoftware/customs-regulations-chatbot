@@ -4,7 +4,7 @@ on:
     inputs:
       operation:
         type: choice
-        options: [inspect, launch]
+        options: [inspect, launch, refresh_helpers]
         default: inspect
 permissions:
   contents: read
@@ -46,6 +46,15 @@ jobs:
           PY
           IFS=$'\t' read -r pod container < /tmp/remaining78-target || [[ -n "$pod" && -n "$container" ]]
           directory=/tmp/dev-remaining78-20260924-resume2
+          if [[ '${{ inputs.operation }}' == 'refresh_helpers' ]]; then
+            incoming="$directory/refresh-bounded-v1"
+            tar -C .github/maintenance/remaining78-20260924 -cf - repair_server.py backpressure.py bounded_inventory.py refresh_helpers.py \
+              | kubectl exec -i "$pod" -n customs-regulations-dev -c "$container" -- \
+                  sh -ec 'umask 077; mkdir "$1"; tar -xf - -C "$1"' remaining78-helper-copy "$incoming"
+            kubectl exec "$pod" -n customs-regulations-dev -c "$container" -- \
+              sh -ec '. /vault/secrets/config; cd /app/onyx/db; exec python "$1/refresh_helpers.py"' remaining78-helper-refresh "$incoming"
+            exit 0
+          fi
           if [[ '${{ inputs.operation }}' != 'launch' ]]; then
             kubectl exec -i "$pod" -n customs-regulations-dev -c "$container" -- python - <<'PY'
           import json
@@ -81,7 +90,7 @@ jobs:
           PY
             exit 0
           fi
-          tar -C .github/maintenance/remaining78-20260924 -cf - repair_server.py image_correction.py image_scope.py backpressure.py file-plan.json launch.py supervisor.py \
+          tar -C .github/maintenance/remaining78-20260924 -cf - repair_server.py image_correction.py image_scope.py backpressure.py bounded_inventory.py file-plan.json launch.py supervisor.py \
             | kubectl exec -i "$pod" -n customs-regulations-dev -c "$container" -- \
                 sh -ec 'umask 077; mkdir "$1"; tar -xf - -C "$1"' remaining78-copy "$directory"
           kubectl exec "$pod" -n customs-regulations-dev -c "$container" -- \

@@ -37,6 +37,11 @@ class GuardedClient:
     def options(self, **kwargs: Any) -> "GuardedClient":
         return GuardedClient(self.client.options(**kwargs), self.check_owner)
 
+    def search(self, **kwargs: Any) -> Any:
+        if kwargs.get("scroll"):
+            kwargs["size"] = min(kwargs.get("size", 16), 16)
+        return self.retry(self.client.search, **kwargs)
+
     def bulk(self, *, operations: list[Any], **kwargs: Any) -> dict[str, Any]:
         if len(operations) % 2:
             raise ValueError("maintenance bulk requires paired actions and payloads")
