@@ -599,15 +599,21 @@ def activate_temporal_projection(
                     raise ValueError("image companion target lineage leaves file scope")
                 ancestor = parent
             target = dated_dependency(target)
-            for key in (
+            asset_keys = (
                 "image_file_id",
                 "image_file_ids",
                 "source_asset_ids",
                 "annex_element_ids",
+            )
+            asset_metadata = target.chunk_metadata
+            if target.id == predecessor and not any(
+                asset_metadata.get(key) for key in asset_keys
             ):
-                if binding.representation_metadata.get(
-                    key
-                ) != target.chunk_metadata.get(key):
+                # Legacy companions own their image; the unchanged text parent
+                # need not carry a duplicate copy of that asset reference.
+                asset_metadata = canonical.chunk_metadata
+            for key in asset_keys:
+                if binding.representation_metadata.get(key) != asset_metadata.get(key):
                     raise ValueError("image companion source evidence mismatch")
     from onyx.regulatory.chunk_evidence import chunk_evidence
 

@@ -12,6 +12,97 @@ from tests.external_dependency_unit.regulatory.test_amendment_sources import (
 from tests.external_dependency_unit.regulatory.test_annex_baseline import _chunk, _file
 
 
+@pytest.mark.parametrize("case", ["own_asset", "changed_asset", "changed_parent"])
+def test_frozen_image_keeps_its_own_asset_for_unchanged_text_parent(
+    source_session: Session, case: str
+) -> None:
+    import json
+
+    from onyx.db.regulatory_context_projections import activate_temporal_projection
+    from onyx.document_index.publication_models import (
+        PublicationIndexSnapshot,
+        publication_digest,
+    )
+    from onyx.regulatory.amendments.annexes.context_dependencies import context_hash
+    from onyx.regulatory.amendments.annexes.models import AnnexTemporalProjection
+    from tests.external_dependency_unit.regulatory.test_publication_primitives import (
+        frozen_projection,
+    )
+
+    group = DocumentSet(name=str(uuid4()), description="", is_up_to_date=True)
+    source_session.add(group)
+    source_session.flush()
+    file = _file(source_session, group)
+    parent = _chunk(source_session, file, 0, "Text without embedded asset metadata")
+    companion = _chunk(
+        source_session,
+        file,
+        1,
+        "Image caption",
+        bound_to_regulatory_chunk_id=parent.id,
+        image_file_id="own-image",
+    )
+    target = parent
+    if case == "changed_parent":
+        target = _chunk(source_session, file, 2, "New text")
+        target.supersedes_chunk_id = parent.id
+        source_session.flush()
+    metadata = {**companion.chunk_metadata, "bound_to_regulatory_chunk_id": target.id}
+    if case == "changed_asset":
+        metadata["image_file_id"] = "invented-image"
+    identity = uuid4()
+    frozen = frozen_projection(file.id, 1, companion.text)
+    source = json.loads(frozen.source_json)
+    source.update(
+        regulatory_chunk_id=companion.id,
+        doc_summary="",
+        chunk_context="",
+        image_file_id=metadata["image_file_id"],
+        source_links=json.dumps({0: ""}),
+        validity_start_date=None,
+        validity_end_date=None,
+    )
+    binding = AnnexTemporalProjection(
+        id=identity,
+        index=PublicationIndexSnapshot(
+            index_name="fixture",
+            index_uuid=str(uuid4()),
+            search_settings_id=1,
+            model_provider="fixture",
+            model_name="fixture",
+            vector_dimension=3,
+            embedding_config_sha256=publication_digest({"model": "fixture"}),
+            multitenant=False,
+        ),
+        projection=frozen.model_copy(
+            update={
+                "context_projection_id": str(identity),
+                "source_json": json.dumps(source),
+            }
+        ),
+        canonical_base_sha256=context_hash(companion.text),
+        derived_role="image_companion",
+        dependency_ids=[target.id],
+        representation_text=companion.text,
+        representation_metadata=metadata,
+        reference_date=None,
+        effective_start=None,
+        effective_end=None,
+        semantic_position=1,
+    )
+    if case != "own_asset":
+        with pytest.raises(
+            ValueError, match="image companion source evidence mismatch"
+        ):
+            activate_temporal_projection(
+                source_session, user_file_id=file.id, binding=binding
+            )
+    else:
+        activate_temporal_projection(
+            source_session, user_file_id=file.id, binding=binding
+        )
+
+
 def test_context_only_history_retains_canonical_identity_and_validity(
     source_session: Session,
 ) -> None:

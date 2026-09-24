@@ -236,9 +236,11 @@ def current_protected_file_ids(file_ids: tuple[UUID, ...]) -> frozenset[UUID]:
 
 
 def resolve_public_query_index(
-    index_name: str, index_uuid: str
+    index_name: str, index_uuid: str, *, file_ids: tuple[UUID, ...]
 ) -> PublicationIndexSnapshot:
-    """Freeze activated positive receipts against actual runtime encoder facts."""
+    """Freeze returned files' activated receipts against runtime encoder facts."""
+    if not file_ids:
+        raise ValueError("qualified query requires a nonempty file scope")
     from onyx.db.engine.sql_engine import get_session_with_current_tenant
     from onyx.db.models import SearchSettings
     from onyx.document_index.encoder_authority import effective_runtime_authority
@@ -271,6 +273,7 @@ def resolve_public_query_index(
             .distinct()
             .where(
                 RegulatoryTemporalProjection.index_uuid == index_uuid,
+                RegulatoryTemporalProjection.user_file_id.in_(file_ids),
                 RegulatoryTemporalProjection.retired_at.is_(None),
             )
         )

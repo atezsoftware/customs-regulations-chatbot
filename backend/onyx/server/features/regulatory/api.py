@@ -255,7 +255,9 @@ def get_chunk_pdf(
                 "Chunk view requires a concrete active index.",
             )
         index = resolve_public_query_index(
-            settings.index_name, info[settings.index_name]["settings"]["index"]["uuid"]
+            settings.index_name,
+            info[settings.index_name]["settings"]["index"]["uuid"],
+            file_ids=(chunk.user_file_id,),
         )
         bindings = load_public_temporal_bindings(
             db_session,

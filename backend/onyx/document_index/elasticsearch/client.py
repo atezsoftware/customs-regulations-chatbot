@@ -1941,7 +1941,7 @@ class ElasticsearchIndexClient(ElasticsearchClient):
                 self._index_name
             ]["settings"]["index"]["uuid"]
             query_index = publication_index or resolve_public_query_index(
-                self._index_name, index_uuid
+                self._index_name, index_uuid, file_ids=tuple(qualified)
             )
             if (
                 query_index.index_name != self._index_name
