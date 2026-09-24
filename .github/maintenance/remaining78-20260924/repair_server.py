@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
+import gc
 import hashlib
 import json
 import os
@@ -16,8 +18,8 @@ from uuid import UUID, uuid4
 from backpressure import GuardedClient
 from elasticsearch import Elasticsearch
 from elasticsearch.helpers import scan
-from image_correction import FILE_ID as IMAGE_FILE_ID
-from image_correction import PARENTS, corrected_rows, prepare_image_correction
+from image_scope import FILE_ID as IMAGE_FILE_ID
+from image_scope import PARENTS
 from scripts.prepare_regulatory_publication_baselines import read_file_inventory
 
 from onyx.db.engine.sql_engine import SqlEngine
@@ -32,7 +34,7 @@ from onyx.document_index.elasticsearch.client import ElasticsearchClient
 from onyx.document_index.publication_models import (
     PublicationScope,
     publication_digest,
-    publication_source,
+    publication_list_digest,
     publication_streaming_digest,
 )
 from onyx.file_store.file_store import get_default_file_store
@@ -55,7 +57,6 @@ from onyx.regulatory.publication_baseline import (
 )
 from onyx.regulatory.restored_index_evidence import verified_restored_index_source
 from onyx.regulatory.source_metadata_repair import repair_canonical_source_metadata
-from onyx.regulatory.writer_projection import prepare_owned_correction
 from onyx.regulatory.writer_publication import execute_writer_publication
 from onyx.utils.variable_functionality import set_is_ee_based_on_env_variable
 from shared_configs.contextvars import CURRENT_TENANT_ID_CONTEXTVAR
@@ -64,12 +65,26 @@ DATABASE = "customs-regulations-dev"
 INDEX = "danswer_chunk_dev_gemini_embedding_2_1024"
 INDEX_UUID = "q8lSz7g2Rvq7739qGJz6jg"
 OLD_UUID = "umb9_zfJRgW_MYV9xqClsg"
-PREFIX = "regulatory_maintenance:remaining78-20260924-resume1:"
+PREFIX = "regulatory_maintenance:remaining78-20260924-resume2:"
 OLD_PREFIX = "regulatory_maintenance:remaining78-20260924:"
 
 
 def now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def release_memory() -> None:
+    gc.collect()
+    ctypes.CDLL(None).malloc_trim(0)
+
+
+def set_phase(file_id: UUID, phase: str) -> None:
+    target = Path(__file__).parent / "phase.json"
+    temporary = target.with_suffix(".tmp")
+    temporary.write_text(
+        json.dumps({"file_id": str(file_id), "phase": phase, "at": now()})
+    )
+    temporary.replace(target)
 
 
 def protected_canonical(rows: list[AnnexCanonicalSnapshot]) -> str:
@@ -83,12 +98,15 @@ def protected_canonical(rows: list[AnnexCanonicalSnapshot]) -> str:
 
 
 def source_fingerprint(hits: list[dict[str, Any]]) -> str:
-    sources = [
-        publication_source(json.dumps(hit["_source"]))
-        for hit in hits
+    return publication_list_digest(
+        {
+            key: value
+            for key, value in hit["_source"].items()
+            if not key.startswith("publication_")
+        }
+        for hit in sorted(hits, key=lambda item: item["_source"]["chunk_index"])
         if hit["_source"].get("regulatory_chunk_id") not in PARENTS
-    ]
-    return publication_digest(sorted(sources, key=lambda row: row["chunk_index"]))
+    )
 
 
 def inventory(client: Elasticsearch, file_id: UUID) -> list[dict[str, Any]]:
@@ -99,6 +117,7 @@ def inventory(client: Elasticsearch, file_id: UUID) -> list[dict[str, Any]]:
         scan(
             client,
             index=INDEX,
+            size=32,
             query={
                 "seq_no_primary_term": True,
                 "query": {"term": {"document_id": str(file_id)}},
@@ -109,9 +128,10 @@ def inventory(client: Elasticsearch, file_id: UUID) -> list[dict[str, Any]]:
 
 def process_file(client: Elasticsearch, plan: dict[str, Any]) -> dict[str, Any]:
     file_id = UUID(plan["file_id"])
+    set_phase(file_id, "inventory")
     before = baseline_audit_inputs("public", file_id)
     if before.pending_manifest or before.gate_closed:
-        if str(file_id) != "12328001-2f21-407e-b230-7d50a8dbf28f":
+        if not plan.get("reviewed_pending_id") or not plan.get("reviewed_pending_sha"):
             raise ValueError("unreviewed pending publication requires inspection")
         from onyx.db.regulatory_writer_publication import pending_writer_manifest
 
@@ -141,6 +161,7 @@ def process_file(client: Elasticsearch, plan: dict[str, Any]) -> dict[str, Any]:
                     before.canonical
                 ):
                     raise ValueError("recovery would change protected source")
+                set_phase(file_id, "frozen_publication_recovery")
                 execute_writer_publication(
                     owner,
                     cast(
@@ -150,8 +171,11 @@ def process_file(client: Elasticsearch, plan: dict[str, Any]) -> dict[str, Any]:
                 )
         finally:
             authority.release(owner)
+        recovered_id = str(frozen.id)
+        del frozen, before
+        release_memory()
         result = process_file(client, plan)
-        result["recovered_manifest_id"] = str(frozen.id)
+        result["recovered_manifest_id"] = recovered_id
         return result
 
     settings = baseline_audit_settings("public", DATABASE)
@@ -161,6 +185,8 @@ def process_file(client: Elasticsearch, plan: dict[str, Any]) -> dict[str, Any]:
     index = observed_index_snapshot(current[0], INDEX_UUID)
     initial_hits = inventory(client, file_id)
     before_hash = protected_canonical(before.canonical)
+    original_canonical = before.canonical
+    original_image_rows = {row.id: row for row in before.canonical if row.id in PARENTS}
     source_hash = source_fingerprint(initial_hits)
     if len(before.canonical) != plan["canonical_count"]:
         raise ValueError("canonical count differs from approved selection")
@@ -185,6 +211,13 @@ def process_file(client: Elasticsearch, plan: dict[str, Any]) -> dict[str, Any]:
                 "indexed_count": audit.indexed_count,
                 "new_indexed_count": 0,
             }
+    initial_inventory_sha = (
+        publication_digest(sorted(initial_hits, key=lambda hit: hit["_id"]))
+        if str(file_id) == IMAGE_FILE_ID
+        else None
+    )
+    del initial_hits
+    release_memory()
     scope = PublicationScope(
         tenant_id="public",
         environment=config.REGULATORY_ANNEX_ENVIRONMENT,
@@ -201,15 +234,20 @@ def process_file(client: Elasticsearch, plan: dict[str, Any]) -> dict[str, Any]:
             if inputs.canonical != before.canonical:
                 raise ValueError("canonical changed while acquiring ownership")
             fresh_hits = inventory(client, file_id)
-            if str(file_id) == IMAGE_FILE_ID and publication_digest(
-                sorted(initial_hits, key=lambda h: h["_id"])
-            ) != publication_digest(sorted(fresh_hits, key=lambda h: h["_id"])):
+            if str(
+                file_id
+            ) == IMAGE_FILE_ID and initial_inventory_sha != publication_digest(
+                sorted(fresh_hits, key=lambda h: h["_id"])
+            ):
                 raise ValueError("image evidence changed while acquiring ownership")
             if source_fingerprint(fresh_hits) != source_hash:
                 raise ValueError("index changed while acquiring ownership")
             manifest = None
             action = plan["action"]
             if action == "missing":
+                from onyx.regulatory.writer_projection import prepare_owned_correction
+
+                set_phase(file_id, "context_and_embedding")
                 if fresh_hits or inputs.bindings:
                     raise ValueError("missing-only repair refuses existing projections")
                 # Existing canonical units are authoritative: never parse the raw file.
@@ -228,6 +266,7 @@ def process_file(client: Elasticsearch, plan: dict[str, Any]) -> dict[str, Any]:
                         "missing projection preparation changed canonical records"
                     )
             elif action == "metadata":
+                set_phase(file_id, "source_metadata")
                 expected = {
                     hit["_source"]["regulatory_chunk_id"]: hit["_source"].get(
                         "heading_path"
@@ -264,6 +303,11 @@ def process_file(client: Elasticsearch, plan: dict[str, Any]) -> dict[str, Any]:
                             with store.read_file(asset, mode="rb") as image:
                                 assets[asset] = hashlib.sha256(image.read()).hexdigest()
                 if str(file_id) == IMAGE_FILE_ID:
+                    from image_correction import (
+                        corrected_rows,
+                        prepare_image_correction,
+                    )
+
                     if markdown is None:
                         raise ValueError("image correction requires original Markdown")
                     after = corrected_rows(inputs.canonical, markdown, assets, expected)
@@ -283,6 +327,8 @@ def process_file(client: Elasticsearch, plan: dict[str, Any]) -> dict[str, Any]:
                     kv.store(PREFIX + "image_backup", backup)
                     if kv.load(PREFIX + "image_backup", refresh_cache=True) != backup:
                         raise ValueError("two-image archive readback differs")
+                    fresh_hits.clear()
+                    release_memory()
                     manifest = prepare_image_correction(owner, client, inputs, after)
                 else:
                     after = repair_canonical_source_metadata(
@@ -291,6 +337,8 @@ def process_file(client: Elasticsearch, plan: dict[str, Any]) -> dict[str, Any]:
                         asset_sha256=assets,
                         indexed_headings=expected,
                     )
+                    fresh_hits.clear()
+                    release_memory()
                     manifest = prepare_owned_baseline(
                         owner, client, inputs, canonical_after=after
                     )
@@ -369,7 +417,13 @@ def process_file(client: Elasticsearch, plan: dict[str, Any]) -> dict[str, Any]:
                     )
                 if lost.is_set():
                     raise ValueError("ownership heartbeat lost before publication")
+                set_phase(file_id, "publication")
                 execute_writer_publication(owner, client, manifest)
+        del inputs, fresh_hits, before
+        if str(file_id) != IMAGE_FILE_ID:
+            manifest = None
+        release_memory()
+        set_phase(file_id, "verification")
         after_inputs = baseline_audit_inputs("public", file_id)
         after_hits = inventory(client, file_id)
         if str(file_id) == IMAGE_FILE_ID:
@@ -377,10 +431,9 @@ def process_file(client: Elasticsearch, plan: dict[str, Any]) -> dict[str, Any]:
                 raise ValueError(
                     "image correction differs from approved frozen manifest"
                 )
-            original_rows = {row.id: row for row in before.canonical}
             for row in after_inputs.canonical:
                 if row.id in PARENTS:
-                    old = original_rows[row.id]
+                    old = original_image_rows[row.id]
                     if row.model_dump(
                         exclude={"text", "heading_path", "metadata"}
                     ) != old.model_dump(exclude={"text", "heading_path", "metadata"}):
@@ -390,7 +443,7 @@ def process_file(client: Elasticsearch, plan: dict[str, Any]) -> dict[str, Any]:
                             raise ValueError("image asset identity changed")
         if protected_canonical(after_inputs.canonical) != before_hash:
             raise ValueError("canonical text, identities, ordering or dates changed")
-        if plan["action"] == "missing" and after_inputs.canonical != before.canonical:
+        if plan["action"] == "missing" and after_inputs.canonical != original_canonical:
             raise ValueError("missing projection repair changed canonical metadata")
         if (
             plan["action"] != "missing"
@@ -438,6 +491,7 @@ def main() -> None:
     parser.add_argument("--plan", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--file-index", type=int)
     args = parser.parse_args()
     if not args.apply or not os.environ.get("KUBERNETES_SERVICE_HOST"):
         parser.error("explicit --apply and the DEV project container are required")
@@ -452,6 +506,39 @@ def main() -> None:
     SqlEngine.init_engine(pool_size=3, max_overflow=0)
     CURRENT_TENANT_ID_CONTEXTVAR.set("public")
     baseline_audit_settings("public", DATABASE)
+    if args.file_index is not None:
+        item = plans[args.file_index]
+        state = get_kv_store().load(PREFIX + "status", refresh_cache=True)
+        if (
+            not isinstance(state, dict)
+            or cast(dict[str, Any], state).get("state") != "running"
+            or cast(dict[str, Any], state).get("current_file") != item["file_id"]
+        ):
+            raise ValueError("single-file child requires its matching live supervisor")
+        claim_regulatory_maintenance(
+            tenant_id="public",
+            key=PREFIX + item["file_id"] + ":claim",
+            expected_database=DATABASE,
+            selection_sha256=publication_digest(item),
+        )
+        with ElasticsearchClient() as transport:
+            try:
+                record = process_file(transport.publication_client(), item)
+            except Exception as error:
+                record = {
+                    "file_id": item["file_id"],
+                    "state": "failed",
+                    "at": now(),
+                    "error_type": type(error).__name__,
+                    "detail": str(error)[:1000],
+                    "traceback": traceback.format_exc(limit=12),
+                }
+        record["at"] = now()
+        with args.output.open("x") as output:
+            output.write(json.dumps(record, ensure_ascii=False))
+            output.flush()
+            os.fsync(output.fileno())
+        return
     old_state = get_kv_store().load(OLD_PREFIX + "status", refresh_cache=True)
     old_control = get_kv_store().load(OLD_PREFIX + "control", refresh_cache=True)
     if (

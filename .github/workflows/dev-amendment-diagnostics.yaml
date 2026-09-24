@@ -34,7 +34,7 @@ jobs:
                   continue
               ready={c['name'] for c in pod['status'].get('containerStatuses',[]) if c.get('ready')}
               for container in pod['spec']['containers']:
-                  if container['name'] not in ready or not container['image'].endswith(':a52892710a3166eb4e77f3528b2af9236f34f613'):
+                  if container['name'] not in ready or not container['image'].endswith(':7d5b7cb7851abbcf91331804784edf325dae1f35'):
                       continue
                   limits=container.get('resources',{}).get('limits',{})
                   if str(limits.get('cpu')) not in ('1','1000m') or limits.get('memory') not in ('4Gi','4096Mi'):
@@ -45,12 +45,12 @@ jobs:
           Path('/tmp/remaining78-target').write_text('\t'.join(selected[0]))
           PY
           IFS=$'\t' read -r pod container < /tmp/remaining78-target || [[ -n "$pod" && -n "$container" ]]
-          directory=/tmp/dev-remaining78-20260924-resume1
+          directory=/tmp/dev-remaining78-20260924-resume2
           if [[ '${{ inputs.operation }}' != 'launch' ]]; then
             kubectl exec -i "$pod" -n customs-regulations-dev -c "$container" -- python - <<'PY'
           import json
           from pathlib import Path
-          directory=Path('/tmp/dev-remaining78-20260924-resume1')
+          directory=Path('/tmp/dev-remaining78-20260924-resume2')
           receipt=directory/'launch.json'
           pid=json.loads(receipt.read_text())['pid'] if receipt.exists() else 508
           process=Path('/proc')/str(pid)
@@ -68,7 +68,7 @@ jobs:
           PY
             exit 0
           fi
-          tar -C .github/maintenance/remaining78-20260924 -cf - repair_server.py image_correction.py backpressure.py file-plan.json launch.py \
+          tar -C .github/maintenance/remaining78-20260924 -cf - repair_server.py image_correction.py image_scope.py backpressure.py file-plan.json launch.py supervisor.py \
             | kubectl exec -i "$pod" -n customs-regulations-dev -c "$container" -- \
                 sh -ec 'umask 077; mkdir "$1"; tar -xf - -C "$1"' remaining78-copy "$directory"
           kubectl exec "$pod" -n customs-regulations-dev -c "$container" -- \

@@ -15,24 +15,21 @@ if (directory / "STOP").exists():
 previous = directory.parent / "dev-remaining78-20260924"
 if (previous / "STOP").exists():
     raise SystemExit("Original STOP is present; refusing reviewed resume")
-prior_pid = json.loads((previous / "launch.json").read_text())["pid"]
-command = Path("/proc") / str(prior_pid) / "cmdline"
-if (
-    command.exists()
-    and str(previous / "repair_server.py").encode() in command.read_bytes()
-):
-    raise SystemExit("Original worker still runs; refusing a second operator")
+for command in Path("/proc").glob("[0-9]*/cmdline"):
+    try:
+        value = command.read_bytes()
+    except FileNotFoundError:
+        continue
+    if b"dev-remaining78-20260924" in value and any(
+        item in value for item in (b"/repair_server.py", b"/supervisor.py")
+    ):
+        raise SystemExit("Previous worker still runs; refusing a second operator")
 with (directory / "launch.json").open("x") as receipt:
     with (directory / "worker.log").open("x") as log:
         process = subprocess.Popen(
             [
                 sys.executable,
-                str(directory / "repair_server.py"),
-                "--apply",
-                "--plan",
-                str(directory / "file-plan.json"),
-                "--output",
-                str(directory / "results.jsonl"),
+                str(directory / "supervisor.py"),
             ],
             cwd="/app/onyx/db",
             stdin=subprocess.DEVNULL,
@@ -41,7 +38,7 @@ with (directory / "launch.json").open("x") as receipt:
             start_new_session=True,
         )
     receipt.write(
-        json.dumps({"pid": process.pid, "run": "remaining78-20260924-resume1"})
+        json.dumps({"pid": process.pid, "run": "remaining78-20260924-resume2"})
     )
 time.sleep(3)
 if process.poll() is not None:
@@ -50,6 +47,6 @@ if process.poll() is not None:
     )
 print(
     json.dumps(
-        {"state": "launched", "pid": process.pid, "run": "remaining78-20260924-resume1"}
+        {"state": "launched", "pid": process.pid, "run": "remaining78-20260924-resume2"}
     )
 )
