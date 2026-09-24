@@ -27,6 +27,9 @@ jobs:
           from pathlib import Path
           selected=[]
           for pod in json.loads(Path('/tmp/remaining78-pods.json').read_text())['items']:
+              print(json.dumps({'pod':pod['metadata']['name'],'uid':pod['metadata']['uid'],
+                  'created':pod['metadata']['creationTimestamp'],'phase':pod['status']['phase'],
+                  'containers':[{k:c.get(k) for k in ('name','image','restartCount','lastState','state')} for c in pod['status'].get('containerStatuses',[])]}))
               if pod['metadata'].get('deletionTimestamp') or pod['status']['phase']!='Running':
                   continue
               ready={c['name'] for c in pod['status'].get('containerStatuses',[]) if c.get('ready')}
@@ -48,7 +51,8 @@ jobs:
           import json
           from pathlib import Path
           directory=Path('/tmp/dev-remaining78-20260924-resume1')
-          pid=json.loads((directory/'launch.json').read_text())['pid']
+          receipt=directory/'launch.json'
+          pid=json.loads(receipt.read_text())['pid'] if receipt.exists() else 508
           process=Path('/proc')/str(pid)
           print('PROCESS_EXISTS',process.exists())
           if process.exists():
