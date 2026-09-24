@@ -1,45 +1,45 @@
-name: DEV amendment approval diagnostics
+name: One-time DEV remaining 78 repair
 on:
   workflow_dispatch:
-  push:
-    branches: [develop]
-    paths: [.github/workflows/dev-amendment-diagnostics.yaml]
 permissions:
   contents: read
 jobs:
-  inspect:
+  launch:
     runs-on: codebuild-customs-regulations-runner-${{ github.run_id }}-${{ github.run_attempt }}
     timeout-minutes: 5
     steps:
-      - name: Read DEV worker failure traces
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          persist-credentials: false
+      - name: Launch once inside the existing DEV project container
         shell: bash
         run: |
           set -euo pipefail
           aws eks update-kubeconfig --name atez-dev-cluster --region eu-central-1
-          kubectl get pods -n customs-regulations-dev -o json | jq '[.items[] | select(.metadata.name | test("customs-regulations-(api|background)")) | {name:.metadata.name,phase:.status.phase,terminating:.metadata.deletionTimestamp,containers:[.status.containerStatuses[]? | {name,ready,restartCount,state}],image:[.spec.containers[].image]}]'
-          pods=$(kubectl get pods -n customs-regulations-dev -l app=dev-customs-regulations-background -o json)
-          while IFS=$'\t' read -r pod container; do
-            kubectl exec "$pod" -n customs-regulations-dev -c "$container" -- python -c '
-          import json,re
+          kubectl get pods -n customs-regulations-dev -l app=dev-customs-regulations-background -o json > /tmp/remaining78-pods.json
+          python - <<'PY'
+          import json
           from pathlib import Path
-          lines=Path("/var/log/onyx/celery_worker_regulatory_benchmark.log").read_text(errors="replace").splitlines()[-20000:]
-          failures=[]
-          for i,line in enumerate(lines):
-              if not re.search(r"Amendment proposal \d+ approval failed",line):
+          selected=[]
+          for pod in json.loads(Path('/tmp/remaining78-pods.json').read_text())['items']:
+              if pod['metadata'].get('deletionTimestamp') or pod['status']['phase']!='Running':
                   continue
-              trace=[]
-              for part in lines[i+1:i+120]:
-                  if re.search(r"Amendment proposal \d+ approval failed",part):
-                      break
-                  if re.search(r"api.key|password|secret|authorization|bearer",part,re.I):
+              ready={c['name'] for c in pod['status'].get('containerStatuses',[]) if c.get('ready')}
+              for container in pod['spec']['containers']:
+                  if container['name'] not in ready or not container['image'].endswith(':a52892710a3166eb4e77f3528b2af9236f34f613'):
                       continue
-                  if re.match(r"\s*File \"",part) or re.match(r"^[\w.]+(?:Error|Exception|Lost|Conflict):",part):
-                      trace.append(part[:500])
-                  if trace and re.match(r"^[\w.]+(?:Error|Exception|Lost|Conflict):",part):
-                      break
-              failures.append({"event":line[:220],"trace":trace})
-          print(json.dumps(failures[-10:],ensure_ascii=False,indent=2))
-          timings=[line for line in lines if re.search(r"(?:amendment_context_impact|amendment_prepared|writer_publication_finished|amendment_approved) ",line)]
-          print(json.dumps({"publication_timings":timings[-30:]},ensure_ascii=False,indent=2))
-          '
-          done < <(jq -r '.items[] | select(.metadata.deletionTimestamp == null) | .metadata.name as $pod | .spec.containers[] | select(.image | contains("customs-regulations-backend-lite")) | [$pod,.name] | @tsv' <<<"$pods")
+                  limits=container.get('resources',{}).get('limits',{})
+                  if str(limits.get('cpu')) not in ('1','1000m') or limits.get('memory') not in ('4Gi','4096Mi'):
+                      raise SystemExit('Project resource limits differ; refusing launch')
+                  selected.append((pod['metadata']['name'],container['name']))
+          if len(selected)!=1:
+              raise SystemExit('Expected exactly one ready pinned DEV project container')
+          Path('/tmp/remaining78-target').write_text('\t'.join(selected[0]))
+          PY
+          IFS=$'\t' read -r pod container < /tmp/remaining78-target || [[ -n "$pod" && -n "$container" ]]
+          directory=/tmp/dev-remaining78-20260924
+          tar -C .github/maintenance/remaining78-20260924 -cf - repair_server.py image_correction.py file-plan.json launch.py \
+            | kubectl exec -i "$pod" -n customs-regulations-dev -c "$container" -- \
+                sh -ec 'umask 077; mkdir "$1"; tar -xf - -C "$1"' remaining78-copy "$directory"
+          kubectl exec "$pod" -n customs-regulations-dev -c "$container" -- \
+            sh -ec '. /vault/secrets/config; export PYTHONPATH=/app; cd /app/onyx/db; exec python "$1/launch.py"' remaining78-launch "$directory"
