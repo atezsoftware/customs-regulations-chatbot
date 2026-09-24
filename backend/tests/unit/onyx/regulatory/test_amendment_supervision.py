@@ -32,13 +32,25 @@ def test_success_releases_container_slot(tmp_path: Path) -> None:
         )
 
 
+def test_dev_baseline_can_launch_analysis_with_reserved_headroom(
+    tmp_path: Path,
+) -> None:
+    marker = tmp_path / "started"
+    supervise(
+        [sys.executable, "-c", f'open({str(marker)!r}, "w").close()'],
+        sample=lambda: MemorySample(2087477248, 3758096384),
+        lock_path=tmp_path / "lock",
+    )
+    assert marker.exists()
+
+
 def test_memory_spike_terminates_only_the_owned_child(tmp_path: Path) -> None:
     calls = 0
 
     def sample() -> MemorySample:
         nonlocal calls
         calls += 1
-        return MemorySample(10 if calls < 3 else 9000, 10000)
+        return MemorySample(10 if calls < 3 else 9900, 10000)
 
     with pytest.raises(ResourcePressure) as error:
         supervise(
@@ -99,7 +111,7 @@ def test_slow_ownership_query_cannot_block_memory_watchdog(tmp_path: Path) -> No
         return True
 
     def sample() -> MemorySample:
-        return MemorySample(9000 if probing.is_set() else 10, 10000)
+        return MemorySample(9900 if probing.is_set() else 10, 10000)
 
     with pytest.raises(ResourcePressure):
         supervise(

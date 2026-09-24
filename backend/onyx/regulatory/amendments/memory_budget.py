@@ -41,13 +41,13 @@ def read_memory(root: Path = Path("/sys/fs/cgroup")) -> MemorySample | None:
 
 @dataclass(frozen=True)
 class MemoryPolicy:
-    reserve_bytes: int = 512 * MIB
+    reserve_bytes: int = 500 * MIB
     item_bytes: int = 512 * MIB
 
     def check(self, reading: MemorySample | None) -> MemorySample:
         if reading is None:
             raise ResourcePressure("memory_telemetry_unavailable")
-        ceiling = reading.limit - max(self.reserve_bytes, reading.limit // 5)
+        ceiling = reading.limit - self.reserve_bytes
         if reading.current >= ceiling:
             raise ResourcePressure("memory_pressure")
         return reading
@@ -55,7 +55,7 @@ class MemoryPolicy:
     def admit(self, reading: MemorySample | None, *, active: int) -> bool:
         value = self.check(reading)
         # Account for growth of every in-flight call, not just the next one.
-        ceiling = value.limit - max(self.reserve_bytes, value.limit * 3 // 10)
+        ceiling = value.limit - self.reserve_bytes
         return value.current + (active + 1) * self.item_bytes <= ceiling
 
 

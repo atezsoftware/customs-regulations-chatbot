@@ -6,6 +6,7 @@ from time import sleep
 import pytest
 
 from onyx.regulatory.amendments.memory_budget import (
+    MIB,
     MemoryPolicy,
     MemorySample,
     ResourcePressure,
@@ -17,11 +18,25 @@ from onyx.regulatory.amendments.memory_budget import (
 def test_budget_reserves_future_growth_and_stops_before_limit() -> None:
     policy = MemoryPolicy(reserve_bytes=100, item_bytes=150)
     assert policy.admit(MemorySample(200, 1000), active=0)
-    assert not policy.admit(MemorySample(450, 1000), active=1)
+    assert policy.admit(MemorySample(700, 1000), active=0)
+    assert not policy.admit(MemorySample(700, 1000), active=1)
+    assert policy.check(MemorySample(899, 1000))
     with pytest.raises(ResourcePressure):
-        policy.check(MemorySample(810, 1000))
+        policy.check(MemorySample(900, 1000))
     with pytest.raises(ResourcePressure):
         policy.check(None)
+
+
+def test_dev_budget_uses_available_memory_but_retains_500_mib() -> None:
+    policy = MemoryPolicy()
+    # Observed DEV cgroup usage before the analysis process was launched.
+    assert policy.admit(MemorySample(2087477248, 3584 * MIB), active=1)
+    # After process setup, one instruction fits but two do not.
+    assert policy.admit(MemorySample(2500 * MIB, 3584 * MIB), active=0)
+    assert not policy.admit(MemorySample(2500 * MIB, 3584 * MIB), active=1)
+    assert policy.check(MemorySample(3084 * MIB - 1, 3584 * MIB))
+    with pytest.raises(ResourcePressure, match="memory_pressure"):
+        policy.check(MemorySample(3084 * MIB, 3584 * MIB))
 
 
 def test_cgroup_reader_rejects_unbounded_or_inconsistent_measurements(
@@ -83,7 +98,7 @@ def test_small_budget_stays_serial_without_dropping_work() -> None:
         bounded_map(
             lambda n: seen.append(n) or n,
             [1, 2, 3],
-            sample=lambda: MemorySample(450, 1000),
+            sample=lambda: MemorySample(700, 1000),
             policy=MemoryPolicy(reserve_bytes=100, item_bytes=150),
         )
     ) == [1, 2, 3]
