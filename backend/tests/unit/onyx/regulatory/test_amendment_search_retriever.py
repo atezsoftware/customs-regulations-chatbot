@@ -20,6 +20,78 @@ from onyx.tools.models import ToolResponse
 _FILE_ID = UUID("00000000-0000-0000-0000-000000000123")
 
 
+@pytest.mark.parametrize("failures", [1, 3])
+def test_transient_query_expansion_failure_retries_without_losing_candidates(
+    monkeypatch: pytest.MonkeyPatch, failures: int
+) -> None:
+    from litellm.exceptions import MidStreamFallbackError, RateLimitError
+
+    delays: list[float] = []
+    monkeypatch.setattr("time.sleep", delays.append)
+    rate_limit = RateLimitError("capacity", llm_provider="vertex_ai", model="test")
+    error = MidStreamFallbackError(
+        "capacity",
+        model="test",
+        llm_provider="vertex_ai",
+        original_exception=rate_limit,
+    )
+    tool = MagicMock()
+    tool.run.side_effect = [error] * failures + [
+        ToolResponse(
+            rich_response=SearchDocsResponse(
+                search_docs=[_search_doc(file_id=str(_FILE_ID), chunk_id="target")],
+                displayed_docs=[],
+                citation_mapping={},
+            ),
+            llm_facing_response="",
+        )
+    ]
+    target = CandidateChunk(
+        chunk_id="target",
+        user_file_id=str(_FILE_ID),
+        text="Canonical provision",
+        source_name="Gümrük Genel Tebliği (TIR İşlemleri)",
+    )
+    retriever = AmendmentSearchRetriever(
+        search_tool_factory=lambda: tool,
+        canonical_candidate_loader=lambda _: {"target": target},
+        allowed_user_file_ids=[_FILE_ID],
+    )
+    instruction = AmendmentInstruction(instruction_text="Change provision")
+    if failures == 3:
+        with pytest.raises(MidStreamFallbackError):
+            retriever._run_query(instruction, "target", skip_query_expansion=False)
+        assert len(delays) == 2
+        assert retriever.last_attention is None
+    else:
+        assert retriever._run_query(
+            instruction, "target", skip_query_expansion=False
+        ) == [target]
+        assert len(delays) == 1
+    assert all(5 <= delay <= 30 for delay in delays)
+
+
+def test_source_integrity_failure_is_not_retried(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    delays: list[float] = []
+    monkeypatch.setattr("time.sleep", delays.append)
+    tool = MagicMock()
+    tool.run.side_effect = ValueError("source changed")
+    retriever = AmendmentSearchRetriever(
+        search_tool_factory=lambda: tool,
+        canonical_candidate_loader=lambda _: {},
+        allowed_user_file_ids=[_FILE_ID],
+    )
+    with pytest.raises(ValueError, match="source changed"):
+        retriever._run_query(
+            AmendmentInstruction(instruction_text="Change provision"),
+            "target",
+            skip_query_expansion=False,
+        )
+    assert delays == []
+
+
 def test_appendix_target_runs_one_whole_appendix_structural_lookup() -> None:
     assert _structural_lookup_scopes(
         AmendmentStructuralTarget(appendix_label="EK-2")

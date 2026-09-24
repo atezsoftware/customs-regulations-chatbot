@@ -6,6 +6,12 @@ from difflib import SequenceMatcher
 from uuid import UUID
 
 from sqlalchemy.orm import Session
+from tenacity import (
+    retry,
+    retry_if_exception,
+    stop_after_attempt,
+    wait_exponential_jitter,
+)
 
 from onyx.chat.emitter import NullEmitter
 from onyx.configs.constants import MessageType
@@ -48,6 +54,7 @@ from onyx.regulatory.amendments.structural_target import (
     source_identity_matches,
 )
 from onyx.regulatory.amendments.target_scope import article_scope_candidates
+from onyx.regulatory.structured_llm import is_retryable_provider_error
 from onyx.server.query_and_chat.placement import Placement
 from onyx.tools.constants import REGULATORY_MAX_SEARCH_QUERY_CHARS, SEARCH_TOOL_ID
 from onyx.tools.models import ChatMinimalTextMessage, SearchToolOverrideKwargs
@@ -103,6 +110,16 @@ class AmendmentSearchRetriever:
             str(user_file_id) for user_file_id in allowed_user_file_ids
         }
 
+    @retry(
+        retry=retry_if_exception(is_retryable_provider_error),
+        stop=stop_after_attempt(3),
+        wait=wait_exponential_jitter(initial=5, max=30, jitter=5),
+        reraise=True,
+        before_sleep=lambda state: logger.warning(
+            "Retrying amendment search after transient provider failure; attempt=%s",
+            state.attempt_number,
+        ),
+    )
     def _run_query(
         self,
         instruction: AmendmentInstruction,
