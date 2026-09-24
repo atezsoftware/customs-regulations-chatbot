@@ -4,19 +4,79 @@ on:
     inputs:
       operation:
         type: choice
-        options: [inspect, launch, refresh_helpers]
+        options: [inspect, launch, refresh_helpers, update_amendment_image]
         default: inspect
 permissions:
   contents: read
 jobs:
   launch:
     runs-on: codebuild-customs-regulations-runner-${{ github.run_id }}-${{ github.run_attempt }}
-    timeout-minutes: 5
+    timeout-minutes: ${{ inputs.operation == 'update_amendment_image' && 15 || 5 }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
           persist-credentials: false
+      - name: Update DEV amendment image while preserving live resources
+        if: inputs.operation == 'update_amendment_image' && github.ref == 'refs/heads/develop'
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws eks update-kubeconfig --name atez-dev-cluster --region eu-central-1
+          python3 - <<'PY'
+          import json
+          import subprocess
+          import time
+
+          namespace = 'customs-regulations-dev'
+          deployment = 'dev-customs-regulations-background-deployment'
+          container = 'dev-customs-regulations-background-container'
+          repository = '255114580789.dkr.ecr.eu-central-1.amazonaws.com/customs-regulations-backend-lite-dev:'
+          image = repository + '6f686f078f0e83f3290e06b64d4439acd11ada3f'
+          previous_image = repository + '7d5b7cb7851abbcf91331804784edf325dae1f35'
+
+          def kubectl(*args):
+              return subprocess.run(['kubectl', '-n', namespace, *args], check=True, text=True, capture_output=True, timeout=660).stdout
+
+          before = json.loads(kubectl('get', 'deployment', deployment, '-o', 'json'))
+          containers = before['spec']['template']['spec']['containers']
+          matches = [(i, c) for i, c in enumerate(containers) if c['name'] == container]
+          assert len(matches) == 1, 'Expected one project container'
+          index, current = matches[0]
+          resources = current['resources']
+          assert resources['limits']['memory'] == '5Gi', 'Expected approved 5Gi limit'
+          assert resources['requests']['memory'] == '2560Mi', 'Expected live 2.5Gi request'
+          assert current['image'] in (previous_image, image), 'Unexpected live image; inspect before retry'
+          print('PRESERVED_RESOURCES', json.dumps(resources), flush=True)
+          if current['image'] != image:
+              path = f'/spec/template/spec/containers/{index}'
+              patch = [
+                  {'op': 'test', 'path': '/metadata/resourceVersion', 'value': before['metadata']['resourceVersion']},
+                  {'op': 'test', 'path': path + '/resources', 'value': resources},
+                  {'op': 'test', 'path': path + '/image', 'value': current['image']},
+                  {'op': 'replace', 'path': path + '/image', 'value': image},
+              ]
+              print(kubectl('patch', 'deployment', deployment, '--type=json', '-p', json.dumps(patch)), flush=True)
+          print(kubectl('rollout', 'status', 'deployment/' + deployment, '--timeout=600s'), flush=True)
+          after = json.loads(kubectl('get', 'deployment', deployment, '-o', 'json'))
+          updated = next(c for c in after['spec']['template']['spec']['containers'] if c['name'] == container)
+          assert updated['image'] == image and updated['resources'] == resources
+          pods = json.loads(kubectl('get', 'pods', '-l', 'app=dev-customs-regulations-background', '-o', 'json'))['items']
+          ready = [p for p in pods if not p['metadata'].get('deletionTimestamp') and any(c['name'] == container and c['image'] == image for c in p['spec']['containers']) and any(c['name'] == container and c.get('ready') for c in p['status'].get('containerStatuses', []))]
+          assert len(ready) == 1, 'Expected one ready updated worker'
+          pod = ready[0]['metadata']['name']
+          for attempt in range(30):
+              try:
+                  print(kubectl('exec', pod, '-c', container, '--', 'sh', '-ec', '. /vault/secrets/config; exec python -m onyx.background.celery.regulatory_annex_readiness'), flush=True)
+                  break
+              except subprocess.CalledProcessError:
+                  if attempt == 29:
+                      raise
+                  time.sleep(5)
+          print('VERIFIED_IMAGE', image, 'VERIFIED_RESOURCES', json.dumps(resources), flush=True)
+          print(kubectl('exec', pod, '-c', container, '--', 'python', '-c', "from pathlib import Path; print({n:(Path('/sys/fs/cgroup')/n).read_text() for n in ('memory.current','memory.max','memory.events')})"), flush=True)
+          PY
       - name: Inspect or launch the existing DEV project repair
+        if: inputs.operation != 'update_amendment_image'
         shell: bash
         run: |
           set -euo pipefail
