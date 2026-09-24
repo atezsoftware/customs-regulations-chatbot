@@ -53,7 +53,10 @@ from onyx.regulatory.amendments.structural_target import (
     source_identity_distinguishing_tokens,
     source_identity_matches,
 )
-from onyx.regulatory.amendments.target_scope import article_scope_candidates
+from onyx.regulatory.amendments.target_scope import (
+    addition_source_identity_is_compatible,
+    article_scope_candidates,
+)
 from onyx.regulatory.structured_llm import is_retryable_provider_error
 from onyx.server.query_and_chat.placement import Placement
 from onyx.tools.constants import REGULATORY_MAX_SEARCH_QUERY_CHARS, SEARCH_TOOL_ID
@@ -243,14 +246,11 @@ class AmendmentSearchRetriever:
             )
             return []
 
-        if (
-            source_files is not None
-            and len(set(source_files)) > 1
-            and (
-                explicitly_adds_top_level_provision(instruction.instruction_text)
-                or added_subordinate_unit_kind(instruction.instruction_text)
-            )
-        ):
+        adds_provision = bool(
+            explicitly_adds_top_level_provision(instruction.instruction_text)
+            or added_subordinate_unit_kind(instruction.instruction_text)
+        )
+        if source_files is not None and len(set(source_files)) > 1 and adds_provision:
             self.query_stats = []
             self.last_attention = (
                 "Multiple target source files or versions were verified. "
@@ -295,6 +295,10 @@ class AmendmentSearchRetriever:
             if candidate.user_file_id not in self._allowed_user_file_ids:
                 continue
             if source_files is not None and candidate.user_file_id not in source_files:
+                continue
+            if adds_provision and not addition_source_identity_is_compatible(
+                instruction, candidate
+            ):
                 continue
             existing_index = candidate_indexes.get(candidate.chunk_id)
             if existing_index is not None:

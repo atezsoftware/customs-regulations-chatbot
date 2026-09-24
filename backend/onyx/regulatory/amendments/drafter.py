@@ -216,6 +216,7 @@ def draft_combined_chunk(
             max_attempts=1,
             provider_max_attempts=3,
             deadline=time.monotonic() + 45,
+            validate_late_response=True,
         )
     return generate_structured(
         llm,
@@ -225,6 +226,7 @@ def draft_combined_chunk(
         response_model=DraftResult,
         timeout_override=60,
         deadline=time.monotonic() + 90,
+        validate_late_response=True,
     )
 
 
@@ -301,4 +303,5 @@ def draft_multi_chunk_scope(
         max_attempts=2,
         provider_max_attempts=1,
         deadline=time.monotonic() + 120,
+        validate_late_response=True,
     )

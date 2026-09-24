@@ -79,6 +79,80 @@ def test_new_top_level_article_does_not_require_existing_target_article() -> Non
     assert validated_addition_anchor(instruction, [anchor]) == anchor
 
 
+@pytest.mark.parametrize(
+    ("document_type", "document_number"),
+    [("teblig", "2019/1"), ("karar", "2020/9495")],
+)
+def test_addition_rejects_related_instrument_with_same_title_tokens(
+    document_type: str, document_number: str
+) -> None:
+    title = "Yatırımlara Proje Bazlı Devlet Yardımı Verilmesine İlişkin Karar"
+    instruction = AmendmentInstruction(
+        instruction_text=(
+            "MADDE 1- 2016/9495 sayılı Bakanlar Kurulu Kararı ile yürürlüğe "
+            f"konulan {title}ın 2 nci maddesinin birinci fıkrasına aşağıdaki "
+            "bent eklenmiştir. “m) 5411 sayılı Bankacılık Kanunu kapsamındaki bankalar,”"
+        ),
+        target_source=title,
+    )
+    parent = CandidateChunk(
+        chunk_id="parent",
+        user_file_id="decision",
+        text="(1) Tanımlar;",
+        source_name=title,
+        metadata={
+            "article_no": "2",
+            "paragraph_no": "1",
+            "document_type": "karar",
+            "document_number": "2016/9495",
+        },
+    )
+    related = replace(
+        parent,
+        chunk_id="related",
+        user_file_id="other",
+        source_name=title + "ın Uygulanmasına İlişkin Tebliğ",
+        metadata={
+            **parent.metadata,
+            "document_type": document_type,
+            "document_number": document_number,
+        },
+    )
+    assert validated_addition_anchor(instruction, [related, parent]) == parent
+    assert validated_addition_anchor(instruction, [related]) is None
+    assert (
+        validated_addition_anchor(
+            instruction, [parent, replace(parent, user_file_id="another-version")]
+        )
+        is None
+    )
+
+
+def test_added_clause_requires_its_named_parent_paragraph() -> None:
+    instruction = AmendmentInstruction(
+        instruction_text="3713 sayılı Kanunun 3 üncü maddesinin ikinci fıkrasına aşağıdaki bent eklenmiştir.",
+        target_source="3713 sayılı Terörle Mücadele Kanunu",
+    )
+    wrong = candidate("wrong-paragraph", "(1) İlk", article_no="3", paragraph_no="1")
+    parent = candidate("parent", "(2) İkinci", article_no="3", paragraph_no="2")
+    assert validated_addition_anchor(instruction, [wrong, parent]) == parent
+    assert validated_addition_anchor(instruction, [wrong]) is None
+
+
+@pytest.mark.parametrize("document_type", ["unknown", "", "karar"])
+def test_missing_legacy_identity_does_not_override_verified_source(
+    document_type: str,
+) -> None:
+    instruction = AmendmentInstruction(
+        instruction_text="2016/9495 sayılı Kararın 10 uncu maddesine aşağıdaki fıkra eklenmiştir.",
+        target_source="Yatırımlara Proje Bazlı Devlet Yardımı Verilmesine İlişkin Karar",
+    )
+    parent = candidate(
+        "parent", "(1) Mevcut", article_no="10", document_type=document_type
+    )
+    assert validated_addition_anchor(instruction, [parent]) == parent
+
+
 def test_matcher_keeps_late_old_wording_evidence() -> None:
     from onyx.regulatory.amendments.matcher import _bounded_candidate_text
 

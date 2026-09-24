@@ -46,6 +46,7 @@ def _generate(
     provider_max_attempts: int = 3,
     deadline: float | None = None,
     use_streaming: bool | None = None,
+    validate_late_response: bool = False,
 ) -> _TinyResult:
     with (
         patch(
@@ -67,6 +68,7 @@ def _generate(
             provider_max_attempts=provider_max_attempts,
             deadline=deadline,
             use_streaming=use_streaming,
+            validate_late_response=validate_late_response,
         )
 
 
@@ -408,6 +410,35 @@ def test_deadline_rejects_expired_and_late_success(
     llm.invoke.side_effect = late
     with pytest.raises(TimeoutError):
         _generate(llm, deadline=105.0)
+
+
+@pytest.mark.parametrize("content", ['{"value":"complete"}', '{"invalid":true}'])
+def test_late_response_policy_validates_but_never_starts_another_call(
+    monkeypatch: pytest.MonkeyPatch, content: str
+) -> None:
+    from onyx.regulatory import structured_llm as module
+
+    clock = [100.0]
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
+    llm = MagicMock()
+
+    def late(*_args: object, **_kwargs: object) -> ModelResponse:
+        clock[0] = 106.0
+        return _response(content)
+
+    llm.invoke.side_effect = late
+    if '"value"' in content:
+        assert (
+            _generate(llm, deadline=105.0, validate_late_response=True).value
+            == "complete"
+        )
+    else:
+        with pytest.raises(TimeoutError):
+            _generate(llm, deadline=105.0, validate_late_response=True)
+    assert llm.invoke.call_count == 1
+    with pytest.raises(TimeoutError):
+        _generate(llm, deadline=105.0, validate_late_response=True)
+    assert llm.invoke.call_count == 1
 
 
 def test_retry_after_date_and_bounded_cycle_use_existing_parser() -> None:

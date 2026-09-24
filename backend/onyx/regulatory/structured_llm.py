@@ -247,6 +247,7 @@ def generate_structured(
     provider_max_attempts: int = 3,
     deadline: float | None = None,
     use_streaming: bool | None = None,
+    validate_late_response: bool = False,
 ) -> ResponseModel:
     """Call the LLM and parse+validate its response as `response_model`.
 
@@ -254,6 +255,8 @@ def generate_structured(
     response isn't valid JSON matching the schema. Optional invocation limits
     are forwarded only when supplied. An optional absolute monotonic deadline
     bounds calls and retry waits across both provider and validation attempts.
+    With ``validate_late_response``, a call already completed may still be
+    validated after the deadline; no further provider call is permitted.
     """
     if deadline is not None and not math.isfinite(deadline):
         raise ValueError("deadline must be finite")
@@ -321,7 +324,11 @@ def generate_structured(
                 ) as span:
                     response = llm.invoke(messages, **invoke_options)
                     record_llm_response(span, response)
-                if deadline is not None and time.monotonic() >= deadline:
+                if (
+                    not validate_late_response
+                    and deadline is not None
+                    and time.monotonic() >= deadline
+                ):
                     raise TimeoutError("structured LLM deadline exhausted")
                 break
             except Exception as error:
@@ -375,7 +382,12 @@ def generate_structured(
         try:
             result = _validate_json_object(content, response_model)
             if deadline is not None and time.monotonic() >= deadline:
-                raise TimeoutError("structured LLM deadline exhausted")
+                if not validate_late_response:
+                    raise TimeoutError("structured LLM deadline exhausted")
+                logger.info(
+                    "generate_structured: retained validated late response for %s",
+                    response_model.__name__,
+                )
             return result
         except ValidationError as e:
             last_error = e

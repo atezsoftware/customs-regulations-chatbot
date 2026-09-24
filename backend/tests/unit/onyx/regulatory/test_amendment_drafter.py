@@ -19,6 +19,53 @@ from onyx.regulatory.amendments.models import (
 )
 
 
+def test_draft_validates_completed_response_after_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from contextlib import nullcontext
+
+    from onyx.llm.model_response import Choice, Message, ModelResponse
+    from onyx.regulatory import structured_llm
+
+    result = DraftResult(
+        new_chunk=ChunkFieldsDraft(text="(7) Mülga.", chunk_type="paragraph"),
+        dates=DateResolution(rationale="No date provided"),
+    )
+    llm = MagicMock()
+    clock = [100.0]
+    monkeypatch.setattr(structured_llm.time, "monotonic", lambda: clock[0])
+
+    def invoke(*_args: object, **_kwargs: object) -> ModelResponse:
+        clock[0] = 227.0
+        return ModelResponse(
+            id="draft",
+            created="2026-09-24T00:00:00Z",
+            choice=Choice(message=Message(content=result.model_dump_json())),
+        )
+
+    llm.invoke.side_effect = invoke
+    monkeypatch.setattr(
+        structured_llm, "llm_generation_span", lambda **_: nullcontext(MagicMock())
+    )
+    monkeypatch.setattr(structured_llm, "record_llm_response", lambda *_: None)
+    draft = drafter.draft_combined_chunk(
+        llm,
+        instructions=[
+            AmendmentInstruction(
+                instruction_text="MADDE 3- Aynı Kararın 5 inci maddesinin yedinci fıkrası yürürlükten kaldırılmıştır."
+            )
+        ],
+        old_chunk={
+            "text": "(7) Eski fıkra.",
+            "metadata": {"article_no": "5", "paragraph_no": "7"},
+        },
+        sibling_reference=None,
+        reference_date=None,
+    )
+    assert draft == result
+    assert llm.invoke.call_count == 1
+
+
 @pytest.mark.parametrize("value", ["yayımı tarihinde", "2026-02-30"])
 def test_model_date_schema_safely_drops_unresolved_or_invalid_dates(value: str) -> None:
     assert (

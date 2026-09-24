@@ -1,5 +1,7 @@
 """Resolve legacy source context without rewriting canonical chunk metadata."""
 
+import re
+import unicodedata
 from collections.abc import Sequence
 from dataclasses import replace
 
@@ -10,11 +12,54 @@ from onyx.regulatory.amendments.new_provision_policy import (
 )
 from onyx.regulatory.amendments.ranker import CandidateChunk
 from onyx.regulatory.amendments.structural_target import (
+    amendment_operation_text,
     parse_amendment_structural_target,
     source_identity_distinguishing_tokens,
     source_identity_matches,
 )
 from onyx.regulatory.article_scope import SourceFragment, article_scope_indices
+
+
+def _fold_identity(value: str) -> str:
+    return "".join(
+        character
+        for character in unicodedata.normalize(
+            "NFKD", value.casefold().replace("ı", "i")
+        )
+        if not unicodedata.combining(character)
+    )
+
+
+def addition_source_identity_is_compatible(
+    instruction: AmendmentInstruction, candidate: CandidateChunk
+) -> bool:
+    """Title overlap cannot override a contradictory instrument identity."""
+    title = _fold_identity(instruction.target_source or "").strip()
+    kind = re.search(r"\b(karar|kanun|teblig|yonetmelik)(?:i|u)?$", title)
+    candidate_kind = candidate.metadata.get("document_type")
+    known_kinds = {"karar", "kanun", "teblig", "yonetmelik"}
+    if kind and isinstance(candidate_kind, str):
+        normalized_kind = _fold_identity(candidate_kind).strip()
+        if normalized_kind in known_kinds and kind.group(1) != normalized_kind:
+            return False
+    # Only the command names the target: the inserted body may cite other acts.
+    numbers = set(re.findall(r"(?<![\d/])\d{4}/\d+(?![\d/])", title))
+    if not numbers and kind and kind.group(1) == "karar":
+        numbers = set(
+            re.findall(
+                r"(?<![\d/])(\d{4}/\d+)\s+sayili\b",
+                _fold_identity(amendment_operation_text(instruction.instruction_text)),
+            )
+        )
+    candidate_number = candidate.metadata.get("document_number")
+    if len(numbers) == 1 and isinstance(candidate_number, str) and candidate_number:
+        normalized_number = candidate_number.strip().replace("-", "/")
+        if (
+            re.fullmatch(r"\d{4}/\d+", normalized_number)
+            and normalized_number not in numbers
+        ):
+            return False
+    return True
 
 
 def article_scope_candidates(
@@ -61,6 +106,7 @@ def validated_addition_anchor(
                 )
             )
         )
+        and addition_source_identity_is_compatible(instruction, candidate)
     ]
     if len({candidate.user_file_id for candidate in identified}) != 1:
         return None
@@ -73,6 +119,12 @@ def validated_addition_anchor(
             if (candidate.resolved_article_no or candidate.metadata.get("article_no"))
             == target.article_no
         ]
+        if subordinate == "clause" and target.paragraph_no is not None:
+            identified = [
+                candidate
+                for candidate in identified
+                if candidate.metadata.get("paragraph_no") == target.paragraph_no
+            ]
     return next(
         (candidate for candidate in identified if candidate.structured_match),
         identified[0] if identified else None,

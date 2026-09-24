@@ -639,3 +639,40 @@ def test_new_unit_does_not_pick_one_of_multiple_verified_source_versions() -> No
     assert found == []
     assert "multiple" in (retriever.last_attention or "").lower()
     search.assert_not_called()
+
+
+@pytest.mark.parametrize("addition", [True, False])
+def test_related_instrument_is_excluded_only_from_addition_candidates(
+    monkeypatch: pytest.MonkeyPatch, addition: bool
+) -> None:
+    parent = CandidateChunk(
+        chunk_id="parent",
+        user_file_id=str(_FILE_ID),
+        text="(1) Tanımlar;",
+        metadata={"document_type": "karar", "document_number": "2016/9495"},
+    )
+    related = replace(
+        parent,
+        chunk_id="related",
+        metadata={"document_type": "teblig", "document_number": "2019/1"},
+    )
+    retriever = AmendmentSearchRetriever(
+        search_tool_factory=MagicMock(),
+        canonical_candidate_loader=lambda _: {},
+        allowed_user_file_ids=[_FILE_ID],
+    )
+    monkeypatch.setattr(
+        retriever, "_run_query", lambda *_args, **_kwargs: [related, parent]
+    )
+    instruction = AmendmentInstruction(
+        instruction_text=(
+            "Kararın 2 nci maddesine aşağıdaki fıkra eklenmiştir."
+            if addition
+            else "Kararın 2 nci maddesi değiştirilmiştir."
+        ),
+        target_source="Yatırımlara Proje Bazlı Devlet Yardımı Verilmesine İlişkin Karar",
+    )
+    found = retriever.search(instruction)
+    assert [item.chunk_id for item in found] == (
+        ["parent"] if addition else ["related", "parent"]
+    )
