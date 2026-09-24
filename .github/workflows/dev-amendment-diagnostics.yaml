@@ -1,11 +1,6 @@
 name: DEV amendment approval diagnostics
 on:
   workflow_dispatch:
-    inputs:
-      run_server_baseline:
-        type: boolean
-        default: false
-        description: Temporary single DEV corpus worker using the pinned remaining-file list
   push:
     branches: [develop]
     paths: [.github/workflows/dev-amendment-diagnostics.yaml]
@@ -17,7 +12,6 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Read DEV worker failure traces
-        if: ${{ !inputs.run_server_baseline }}
         shell: bash
         run: |
           set -euo pipefail
@@ -49,42 +43,3 @@ jobs:
           print(json.dumps({"publication_timings":timings[-30:]},ensure_ascii=False,indent=2))
           '
           done < <(jq -r '.items[] | select(.metadata.deletionTimestamp == null) | .metadata.name as $pod | .spec.containers[] | select(.image | contains("customs-regulations-backend-lite")) | [$pod,.name] | @tsv' <<<"$pods")
-      - name: Checkout approved one-time launcher
-        if: inputs.run_server_baseline
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-        with:
-          persist-credentials: false
-      - name: Start one server-side DEV corpus worker
-        if: inputs.run_server_baseline
-        shell: bash
-        run: |
-          set -euo pipefail
-          aws eks update-kubeconfig --name atez-dev-cluster --region eu-central-1
-          kubectl get pods -n customs-regulations-dev -l app=dev-customs-regulations-background -o json > /tmp/baseline-pods.json
-          python - <<'PY'
-          import json
-          from pathlib import Path
-          selected=[]
-          for pod in json.loads(Path('/tmp/baseline-pods.json').read_text())['items']:
-              if pod['metadata'].get('deletionTimestamp') or pod['status']['phase']!='Running':
-                  continue
-              ready={c['name'] for c in pod['status'].get('containerStatuses',[]) if c.get('ready')}
-              for container in pod['spec']['containers']:
-                  if container['name'] not in ready or not container['image'].endswith(':1b683deb0c7bdedc1af3a952e5b0616e33fd5175'):
-                      continue
-                  limits=container.get('resources',{}).get('limits',{})
-                  if str(limits.get('cpu')) not in ('1','1000m') or limits.get('memory') not in ('4Gi','4096Mi'):
-                      raise SystemExit('Unexpected project resource limits; no launch')
-                  selected.append((pod['metadata']['name'],container['name']))
-                  print(json.dumps({'project_pod':pod['metadata']['name'],'uid':pod['metadata']['uid'],'resources':container['resources'],'image':container['image']}))
-          if len(selected)!=1:
-              raise SystemExit('Expected one ready pinned DEV project container')
-          Path('/tmp/baseline-target').write_text('\t'.join(selected[0]))
-          PY
-          IFS=$'\t' read -r pod container < /tmp/baseline-target || [[ -n "$pod" && -n "$container" ]]
-          directory=/tmp/dev-baseline-20260923-89f9cd19
-          tar -C .github/maintenance/dev-baseline-20260923 -cf - server.py file-ids.json \
-            | kubectl exec -i "$pod" -n customs-regulations-dev -c "$container" -- \
-                sh -ec 'umask 077; mkdir "$1"; tar -xf - -C "$1"' baseline-copy "$directory"
-          kubectl exec "$pod" -n customs-regulations-dev -c "$container" -- \
-            sh -ec '. /vault/secrets/config; cd /app/onyx/db; exec python "$1/server.py"' baseline-launch "$directory"
