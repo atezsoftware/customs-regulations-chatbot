@@ -32,3 +32,23 @@ export interface RegulatoryChunkUpdate {
   validity_end_date?: string;
   clear_validity_end_date?: boolean;
 }
+export interface AmendmentRuntime {
+  batch_id: number;
+  status: string;
+  stage: string;
+  lease_generation: number;
+  scope: "worker_container";
+  raw_text_chars: number;
+  current_bytes: number | null;
+  limit_bytes: number | null;
+  peak_bytes: number | null;
+  reserve_bytes: number | null;
+  active: number | null;
+  peak_active: number | null;
+  max_parallel: number | null;
+  admission_limited: boolean | null;
+  dependency_limited: boolean | null;
+  calibrating: boolean | null;
+  memory_checked_at: string | null;
+  activity_checked_at: string | null;
+}

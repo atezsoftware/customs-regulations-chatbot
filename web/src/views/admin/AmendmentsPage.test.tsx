@@ -41,11 +41,13 @@ jest.mock("@/lib/hooks/useDocumentSets", () => ({
   useDocumentSets: () => ({ documentSets: mockDocumentSets }),
 }));
 
+jest.mock("@/sections/cards/AmendmentRuntimePanel", () => () => null);
+
 jest.mock("@/lib/regulatory/amendments", () => ({
   RegulatoryRequestError: class extends Error {
     constructor(
       message: string,
-      readonly status: number,
+      readonly status: number
     ) {
       super(message);
     }
@@ -216,7 +218,7 @@ test("keeps legacy source controls usable when grouped capabilities are absent",
   expect(screen.getByRole("button", { name: "PDF" })).toBeVisible();
   expect(screen.getByRole("button", { name: "Word (.docx)" })).toBeVisible();
   expect(
-    screen.queryByRole("button", { name: "Image" }),
+    screen.queryByRole("button", { name: "Image" })
   ).not.toBeInTheDocument();
 });
 
@@ -240,7 +242,7 @@ test("keeps legacy controls when grouped annex support is disabled", async () =>
   expect(await screen.findByRole("button", { name: "Text" })).toBeVisible();
   expect(screen.getByRole("button", { name: "Word (.docx)" })).toBeVisible();
   expect(
-    screen.queryByRole("button", { name: "Excel (.xlsx)" }),
+    screen.queryByRole("button", { name: "Excel (.xlsx)" })
   ).not.toBeInTheDocument();
 });
 
@@ -308,24 +310,24 @@ test("prepares an XLSX package asynchronously before enabling analysis", async (
   await screen.findByRole("option", { name: "Transit rules" });
   await user.keyboard("{Enter}");
   await user.click(
-    await screen.findByRole("button", { name: "Excel (.xlsx)" }),
+    await screen.findByRole("button", { name: "Excel (.xlsx)" })
   );
   const file = new File(["sheet"], "EK-1.xlsx", {
     type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
   });
   await user.upload(
     screen.getByLabelText("Amendment source Excel workbook"),
-    file,
+    file
   );
   await user.click(screen.getByRole("button", { name: "Prepare source" }));
 
   expect(mockedUploadAmendmentSourcePackage).toHaveBeenCalledWith(
     7,
     expect.any(String),
-    file,
+    file
   );
   await waitFor(() =>
-    expect(screen.getByDisplayValue("EK-1 spreadsheet text")).toBeVisible(),
+    expect(screen.getByDisplayValue("EK-1 spreadsheet text")).toBeVisible()
   );
   expect(screen.getByRole("button", { name: "Analyze" })).toBeEnabled();
 });
@@ -356,7 +358,7 @@ test("ignores a late package response after the source identity changes", async 
     () =>
       new Promise((resolve) => {
         resolvePackage = resolve;
-      }),
+      })
   );
   mockedGetAmendmentSourceText.mockResolvedValue({
     package_id: "package-late",
@@ -373,17 +375,17 @@ test("ignores a late package response after the source identity changes", async 
   await screen.findByRole("option", { name: "Transit rules" });
   await user.keyboard("{Enter}");
   await user.click(
-    await screen.findByRole("button", { name: "Excel (.xlsx)" }),
+    await screen.findByRole("button", { name: "Excel (.xlsx)" })
   );
   await user.upload(
     screen.getByLabelText("Amendment source Excel workbook"),
     new File(["sheet"], "EK-1.xlsx", {
       type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    }),
+    })
   );
   await user.click(screen.getByRole("button", { name: "Prepare source" }));
   await waitFor(() =>
-    expect(mockedGetAmendmentSourcePackage).toHaveBeenCalled(),
+    expect(mockedGetAmendmentSourcePackage).toHaveBeenCalled()
   );
   await user.click(screen.getByRole("button", { name: "PDF" }));
   await act(async () => {
@@ -396,7 +398,7 @@ test("ignores a late package response after the source identity changes", async 
 
   expect(mockedGetAmendmentSourceText).not.toHaveBeenCalled();
   expect(
-    screen.queryByDisplayValue("stale spreadsheet text"),
+    screen.queryByDisplayValue("stale spreadsheet text")
   ).not.toBeInTheDocument();
 });
 
@@ -425,7 +427,7 @@ test("ignores a late package creation after the selected source changes", async 
     () =>
       new Promise((resolve) => {
         resolveCreation = resolve;
-      }),
+      })
   );
   const user = setupUser();
   render(<AmendmentsPage />);
@@ -436,20 +438,20 @@ test("ignores a late package creation after the selected source changes", async 
   await screen.findByRole("option", { name: "Transit rules" });
   await user.keyboard("{Enter}");
   await user.click(
-    await screen.findByRole("button", { name: "Excel (.xlsx)" }),
+    await screen.findByRole("button", { name: "Excel (.xlsx)" })
   );
   await user.upload(
     screen.getByLabelText("Amendment source Excel workbook"),
     new File(["sheet"], "EK-1.xlsx", {
       type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    }),
+    })
   );
   await user.click(screen.getByRole("button", { name: "Prepare source" }));
   await user.click(screen.getByRole("button", { name: "PDF" }));
   await act(async () => resolveCreation(processingPackage));
 
   expect(
-    screen.queryByText("Source package processing"),
+    screen.queryByText("Source package processing")
   ).not.toBeInTheDocument();
   expect(mockedGetAmendmentSourcePackage).not.toHaveBeenCalled();
 });
@@ -499,17 +501,17 @@ test("recovers source package polling after a transient status failure", async (
   await screen.findByRole("option", { name: "Transit rules" });
   await user.keyboard("{Enter}");
   await user.click(
-    await screen.findByRole("button", { name: "Excel (.xlsx)" }),
+    await screen.findByRole("button", { name: "Excel (.xlsx)" })
   );
   await user.upload(
     screen.getByLabelText("Amendment source Excel workbook"),
     new File(["sheet"], "EK-1.xlsx", {
       type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    }),
+    })
   );
   await user.click(screen.getByRole("button", { name: "Prepare source" }));
   await waitFor(() =>
-    expect(mockedGetAmendmentSourcePackage).toHaveBeenCalledTimes(1),
+    expect(mockedGetAmendmentSourcePackage).toHaveBeenCalledTimes(1)
   );
   await act(async () => {
     await jest.advanceTimersByTimeAsync(3000);
@@ -517,7 +519,7 @@ test("recovers source package polling after a transient status failure", async (
 
   expect(mockedGetAmendmentSourcePackage).toHaveBeenCalledTimes(2);
   expect(
-    await screen.findByDisplayValue("Recovered frozen source text"),
+    await screen.findByDisplayValue("Recovered frozen source text")
   ).toBeVisible();
   jest.useRealTimers();
 });
@@ -545,7 +547,7 @@ test("stops source package polling after a terminal status error", async () => {
   };
   mockedUploadAmendmentSourcePackage.mockResolvedValue(processingPackage);
   mockedGetAmendmentSourcePackage.mockRejectedValue(
-    new RegulatoryRequestError("Source package not found", 404),
+    new RegulatoryRequestError("Source package not found", 404)
   );
   const user = setupUser({ advanceTimers: jest.advanceTimersByTime });
   render(<AmendmentsPage />);
@@ -556,22 +558,22 @@ test("stops source package polling after a terminal status error", async () => {
   await screen.findByRole("option", { name: "Transit rules" });
   await user.keyboard("{Enter}");
   await user.click(
-    await screen.findByRole("button", { name: "Excel (.xlsx)" }),
+    await screen.findByRole("button", { name: "Excel (.xlsx)" })
   );
   await user.upload(
     screen.getByLabelText("Amendment source Excel workbook"),
     new File(["sheet"], "EK-1.xlsx", {
       type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    }),
+    })
   );
   await user.click(screen.getByRole("button", { name: "Prepare source" }));
   await waitFor(() =>
-    expect(mockedGetAmendmentSourcePackage).toHaveBeenCalledTimes(1),
+    expect(mockedGetAmendmentSourcePackage).toHaveBeenCalledTimes(1)
   );
   expect(
     await screen.findByText(
-      "Source package status cannot be refreshed: Source package not found",
-    ),
+      "Source package status cannot be refreshed: Source package not found"
+    )
   ).toBeVisible();
 
   await act(async () => {
@@ -608,7 +610,7 @@ test("ignores a late source package retry after the source changes", async () =>
     () =>
       new Promise((resolve) => {
         resolveRetry = resolve;
-      }),
+      })
   );
   const user = setupUser();
   render(<AmendmentsPage />);
@@ -619,17 +621,17 @@ test("ignores a late source package retry after the source changes", async () =>
   await screen.findByRole("option", { name: "Transit rules" });
   await user.keyboard("{Enter}");
   await user.click(
-    await screen.findByRole("button", { name: "Excel (.xlsx)" }),
+    await screen.findByRole("button", { name: "Excel (.xlsx)" })
   );
   await user.upload(
     screen.getByLabelText("Amendment source Excel workbook"),
     new File(["sheet"], "EK-1.xlsx", {
       type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    }),
+    })
   );
   await user.click(screen.getByRole("button", { name: "Prepare source" }));
   await user.click(
-    await screen.findByRole("button", { name: "Retry source preparation" }),
+    await screen.findByRole("button", { name: "Retry source preparation" })
   );
   await user.click(screen.getByRole("button", { name: "PDF" }));
   await act(async () => {
@@ -637,7 +639,7 @@ test("ignores a late source package retry after the source changes", async () =>
   });
 
   expect(
-    screen.queryByText("Source package processing"),
+    screen.queryByText("Source package processing")
   ).not.toBeInTheDocument();
   expect(screen.getByRole("button", { name: "Prepare source" })).toBeDisabled();
 });
@@ -710,13 +712,13 @@ test("renders a grouped blocked review from the real analysis response shape", a
   await screen.findByRole("option", { name: "Transit rules" });
   await user.keyboard("{Enter}");
   await user.click(
-    await screen.findByRole("button", { name: "Batch #42 (analyzed)" }),
+    await screen.findByRole("button", { name: "Batch #42 (analyzed)" })
   );
 
   expect(await screen.findByText("Annex chunk changes")).toBeVisible();
   expect(screen.getByText("Source package missing")).toBeVisible();
   expect(
-    screen.queryByRole("button", { name: "Approve group" }),
+    screen.queryByRole("button", { name: "Approve group" })
   ).not.toBeInTheDocument();
 });
 
@@ -734,7 +736,7 @@ test("places extracted URL text in the editable amendment text area", async () =
   await user.click(screen.getByRole("button", { name: "URL" }));
   await user.type(
     screen.getByRole("textbox", { name: "Amendment source URL" }),
-    "https://example.gov/20260826-2.htm",
+    "https://example.gov/20260826-2.htm"
   );
   await user.click(screen.getByRole("button", { name: "Extract" }));
 
@@ -812,14 +814,14 @@ test.each(["URL", ...sourceUploadCases.map((source) => source.mode)] as const)(
     if (mode === "URL") {
       await user.type(
         screen.getByLabelText("Amendment source URL"),
-        "https://www.resmigazete.gov.tr/eskiler/2026/07/20260704-17.htm",
+        "https://www.resmigazete.gov.tr/eskiler/2026/07/20260704-17.htm"
       );
     } else {
       const source = sourceUploadCases.find((source) => source.mode === mode);
       if (!source) throw new Error("Missing source upload fixture");
       await user.upload(
         screen.getByLabelText(source.label),
-        new File(["source content"], source.filename, { type: source.mime }),
+        new File(["source content"], source.filename, { type: source.mime })
       );
     }
     await user.click(screen.getByRole("button", { name: "Prepare source" }));
@@ -833,13 +835,13 @@ test.each(["URL", ...sourceUploadCases.map((source) => source.mode)] as const)(
     expect(
       mode === "URL"
         ? mockedCreateAmendmentSourcePackage
-        : mockedUploadAmendmentSourcePackage,
+        : mockedUploadAmendmentSourcePackage
     ).toHaveBeenCalledTimes(1);
 
     if (mode === "URL") {
       await user.type(
         screen.getByLabelText("Amendment source URL"),
-        "?revision=2",
+        "?revision=2"
       );
     } else {
       const source = sourceUploadCases.find((source) => source.mode === mode);
@@ -848,16 +850,16 @@ test.each(["URL", ...sourceUploadCases.map((source) => source.mode)] as const)(
         screen.getByLabelText(source.label),
         new File(["another source"], `second-${source.filename}`, {
           type: source.mime,
-        }),
+        })
       );
     }
     expect(
-      screen.getByRole("button", { name: "Prepare source" }),
+      screen.getByRole("button", { name: "Prepare source" })
     ).toBeEnabled();
     expect(
-      screen.queryByText("Source package processing"),
+      screen.queryByText("Source package processing")
     ).not.toBeInTheDocument();
-  },
+  }
 );
 
 test.each(["URL", "PDF"] as const)(
@@ -889,7 +891,7 @@ test.each(["URL", "PDF"] as const)(
       () =>
         new Promise((resolve) => {
           resolvePreparation = resolve;
-        }),
+        })
     );
     mockedRetryAmendmentSourcePackage.mockResolvedValue(processingPackage);
     const user = setupUser();
@@ -904,12 +906,12 @@ test.each(["URL", "PDF"] as const)(
     if (mode === "URL") {
       await user.type(
         screen.getByLabelText("Amendment source URL"),
-        "https://www.resmigazete.gov.tr/eskiler/2026/07/20260704-17.htm",
+        "https://www.resmigazete.gov.tr/eskiler/2026/07/20260704-17.htm"
       );
     } else {
       await user.upload(
         screen.getByLabelText("Amendment source PDF"),
-        new File(["pdf"], "amendment.pdf", { type: "application/pdf" }),
+        new File(["pdf"], "amendment.pdf", { type: "application/pdf" })
       );
     }
     await user.click(screen.getByRole("button", { name: "Prepare source" }));
@@ -920,13 +922,13 @@ test.each(["URL", "PDF"] as const)(
         ...processingPackage,
         status: "failed",
         issues: [{ code: "source_preparation_timeout", retryable: true }],
-      }),
+      })
     );
 
     expect(
       await screen.findByText(
-        /timed out while reading the document or its attachments/i,
-      ),
+        /timed out while reading the document or its attachments/i
+      )
     ).toBeVisible();
     expect(screen.getByRole("button", { name: "Analyze" })).toBeDisabled();
     mockedGetAmendmentSourcePackage.mockResolvedValue({
@@ -942,30 +944,30 @@ test.each(["URL", "PDF"] as const)(
       original_text_sha256: "b".repeat(64),
     });
     await user.click(
-      screen.getByRole("button", { name: "Retry source preparation" }),
+      screen.getByRole("button", { name: "Retry source preparation" })
     );
 
     expect(mockedRetryAmendmentSourcePackage).toHaveBeenCalledWith(
       7,
-      processingPackage.id,
+      processingPackage.id
     );
     expect(
       mode === "PDF"
         ? mockedUploadAmendmentSourcePackage
-        : mockedCreateAmendmentSourcePackage,
+        : mockedCreateAmendmentSourcePackage
     ).toHaveBeenCalledTimes(1);
     const expectedText = "MADDE 1- Ek tablo güncellenmiştir.\n\nbu yeni hali";
     await waitFor(() =>
-      expect(screen.getByLabelText("Amendment text")).toHaveValue(expectedText),
+      expect(screen.getByLabelText("Amendment text")).toHaveValue(expectedText)
     );
     expect(screen.getByRole("button", { name: "Analyze" })).toBeEnabled();
     await user.click(screen.getByRole("button", { name: "Analyze" }));
     expect(mockedAnalyzeAmendment).toHaveBeenCalledWith(
       7,
       expectedText,
-      processingPackage.id,
+      processingPackage.id
     );
-  },
+  }
 );
 
 test("analyzes pasted text directly and still prepares a switched-to URL", async () => {
@@ -1003,7 +1005,7 @@ test("analyzes pasted text directly and still prepares a switched-to URL", async
   await user.keyboard("{Enter}");
   await user.type(
     screen.getByLabelText("Amendment text"),
-    "MADDE 1- Ek değişti.",
+    "MADDE 1- Ek değişti."
   );
 
   // Pasted text is already the amendment text; nothing has to be frozen first.
@@ -1013,14 +1015,14 @@ test("analyzes pasted text directly and still prepares a switched-to URL", async
   expect(mockedCreateAmendmentSourcePackage).not.toHaveBeenCalled();
   expect(mockedAnalyzeAmendment).toHaveBeenCalledWith(
     7,
-    "MADDE 1- Ek değişti.",
+    "MADDE 1- Ek değişti."
   );
 
   // A URL source still has to be downloaded and frozen before analysis.
   await user.click(screen.getByRole("button", { name: "URL" }));
   await user.type(
     screen.getByLabelText("Amendment source URL"),
-    "https://example.gov/update.htm",
+    "https://example.gov/update.htm"
   );
   expect(screen.getByRole("button", { name: "Prepare source" })).toBeEnabled();
   await user.click(screen.getByRole("button", { name: "Prepare source" }));
@@ -1072,7 +1074,7 @@ test("queues pasted text and polls durable progress", async () => {
   expect(mockedAnalyzeAmendment).toHaveBeenCalledWith(7, "MADDE 1");
   expect(mockedGetAmendmentAnalysis).toHaveBeenCalledWith(42);
   expect(
-    await screen.findByText("Matched 3 / 5 · Finalized 2 / 5"),
+    await screen.findByText("Matched 3 / 5 · Finalized 2 / 5")
   ).toBeVisible();
 });
 
@@ -1089,7 +1091,7 @@ test("queues PDF-extracted text through the same durable analysis", async () => 
   await user.click(screen.getByRole("button", { name: "PDF" }));
   await user.upload(
     screen.getByLabelText("Amendment source PDF"),
-    new File(["pdf"], "amendment.pdf", { type: "application/pdf" }),
+    new File(["pdf"], "amendment.pdf", { type: "application/pdf" })
   );
   await user.click(screen.getByRole("button", { name: "Extract" }));
   await user.click(screen.getByRole("button", { name: "Analyze" }));
@@ -1112,7 +1114,7 @@ test("queues DOCX-extracted text through the same durable analysis", async () =>
     screen.getByLabelText("Amendment source Word document"),
     new File(["docx"], "değişiklik.docx", {
       type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    }),
+    })
   );
   await user.click(screen.getByRole("button", { name: "Extract" }));
 
@@ -1120,7 +1122,7 @@ test("queues DOCX-extracted text through the same durable analysis", async () =>
   await user.click(screen.getByRole("button", { name: "Analyze" }));
   expect(mockedAnalyzeAmendment).toHaveBeenCalledWith(
     7,
-    "MADDE 3- Word metni.",
+    "MADDE 3- Word metni."
   );
 });
 
@@ -1139,7 +1141,7 @@ test("clears the selected file when switching between DOCX and PDF", async () =>
     screen.getByLabelText("Amendment source Word document"),
     new File(["docx"], "değişiklik.docx", {
       type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    }),
+    })
   );
   expect(screen.getByText("değişiklik.docx")).toBeVisible();
 
@@ -1198,13 +1200,13 @@ test("renders all grouped instructions on one proposal card", async () => {
   await screen.findByRole("option", { name: "Transit rules" });
   await user.keyboard("{Enter}");
   await user.click(
-    await screen.findByRole("button", { name: "Batch #42 (analyzed)" }),
+    await screen.findByRole("button", { name: "Batch #42 (analyzed)" })
   );
 
   expect(await screen.findByText("Replace Article 1.")).toBeVisible();
   expect(screen.getByText("Add the Article 1 exception.")).toBeVisible();
   expect(
-    screen.getAllByRole("article", { name: "Amendment proposal" }),
+    screen.getAllByRole("article", { name: "Amendment proposal" })
   ).toHaveLength(1);
 });
 
@@ -1282,7 +1284,7 @@ test("shows before and after field tables and approves edits without exposing JS
   await screen.findByRole("option", { name: "Transit rules" });
   await user.keyboard("{Enter}");
   await user.click(
-    await screen.findByRole("button", { name: "Batch #42 (analyzed)" }),
+    await screen.findByRole("button", { name: "Batch #42 (analyzed)" })
   );
 
   expect(await screen.findByText("Before")).toBeVisible();
@@ -1291,7 +1293,7 @@ test("shows before and after field tables and approves edits without exposing JS
   expect(screen.getAllByText("validity_end_date")).toHaveLength(2);
   expect(screen.queryByText("superseded_by_chunk_id")).not.toBeInTheDocument();
   expect(
-    screen.queryByRole("textbox", { name: "Proposed chunk JSON" }),
+    screen.queryByRole("textbox", { name: "Proposed chunk JSON" })
   ).not.toBeInTheDocument();
 
   const reviewedDraft = {
@@ -1307,19 +1309,19 @@ test("shows before and after field tables and approves edits without exposing JS
     screen.getByRole("textbox", { name: "After validity_start_date" }),
     {
       target: { value: reviewedDraft.effective_start_date },
-    },
+    }
   );
   fireEvent.change(
     screen.getByRole("textbox", { name: "After metadata article_no" }),
     {
       target: { value: "15/a" },
-    },
+    }
   );
   expect(
-    screen.getByRole("textbox", { name: "After user_file_id" }),
+    screen.getByRole("textbox", { name: "After user_file_id" })
   ).toHaveAttribute("readonly");
   expect(
-    screen.getByRole("textbox", { name: "After position" }),
+    screen.getByRole("textbox", { name: "After position" })
   ).toHaveAttribute("readonly");
   expect(screen.getAllByText("Generated on approval")).not.toHaveLength(0);
   expect(screen.getByText("amendment")).toBeVisible();
@@ -1328,7 +1330,7 @@ test("shows before and after field tables and approves edits without exposing JS
 
   expect(mockedApproveProposal).toHaveBeenCalledWith(19, reviewedDraft);
   expect(
-    await screen.findByText(/Approval is running in the background\./),
+    await screen.findByText(/Approval is running in the background\./)
   ).toBeVisible();
 });
 
@@ -1387,12 +1389,12 @@ test("shows a green success message after approval and indexing complete", async
   await screen.findByRole("option", { name: "Transit rules" });
   await user.keyboard("{Enter}");
   await user.click(
-    await screen.findByRole("button", { name: "Batch #42 (analyzed)" }),
+    await screen.findByRole("button", { name: "Batch #42 (analyzed)" })
   );
 
   const success = await screen.findByRole("status");
   expect(success).toHaveTextContent(
-    "Success — this proposal was approved and indexed.",
+    "Success — this proposal was approved and indexed."
   );
   expect(success).toHaveClass("bg-status-success-01");
 });
@@ -1449,14 +1451,14 @@ test("shows a terminal indexing error instead of an endless running state", asyn
   await screen.findByRole("option", { name: "Transit rules" });
   await user.keyboard("{Enter}");
   await user.click(
-    await screen.findByRole("button", { name: "Batch #42 (analyzed)" }),
+    await screen.findByRole("button", { name: "Batch #42 (analyzed)" })
   );
 
   expect(await screen.findByRole("alert")).toHaveTextContent(
-    "Indexing failed. The approval was not published.",
+    "Indexing failed. The approval was not published."
   );
   expect(
-    screen.queryByText(/Approval is running in the background\./),
+    screen.queryByText(/Approval is running in the background\./)
   ).not.toBeInTheDocument();
   const retryButton = screen.getByRole("button", { name: "Retry indexing" });
   expect(retryButton).toBeEnabled();
@@ -1517,12 +1519,12 @@ test("keeps an invalid date edit from being approved", async () => {
   await screen.findByRole("option", { name: "Transit rules" });
   await user.keyboard("{Enter}");
   await user.click(
-    await screen.findByRole("button", { name: "Batch #42 (analyzed)" }),
+    await screen.findByRole("button", { name: "Batch #42 (analyzed)" })
   );
 
   fireEvent.change(
     await screen.findByRole("textbox", { name: "After validity_start_date" }),
-    { target: { value: "not-a-date" } },
+    { target: { value: "not-a-date" } }
   );
 
   expect(screen.getByText("Chunk 1: Use a YYYY-MM-DD date.")).toBeVisible();
@@ -1600,16 +1602,16 @@ test.each(["queued", "paused"] as const)(
       await screen.findByText(
         status === "queued"
           ? /Waiting for available memory.*saved progress is preserved/i
-          : /Analysis paused to protect memory.*saved progress is preserved/i,
-      ),
+          : /Analysis paused to protect memory.*saved progress is preserved/i
+      )
     ).toBeVisible();
     expect(screen.queryByText(/Analysis failed:/)).not.toBeInTheDocument();
     expect(
-      screen.queryByText("Instructions requiring attention"),
+      screen.queryByText("Instructions requiring attention")
     ).not.toBeInTheDocument();
     if (status === "paused") {
       await user.click(screen.getByRole("button", { name: "Retry" }));
       expect(mockedRetryAmendmentBatch).toHaveBeenCalledWith(42);
     }
-  },
+  }
 );

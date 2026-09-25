@@ -5,8 +5,10 @@ import unicodedata
 from collections.abc import Sequence
 from typing import NamedTuple
 
+from onyx.regulatory.provision_identity import canonical_clause_label
+
 _FORWARD_ARTICLE_HEADING_RE = re.compile(
-    r"^(?:(?P<qualifier>gecici|geçici|mukerrer|mükerrer)\s+)?"
+    r"^(?:(?P<qualifier>ek|gecici|geçici|mukerrer|mükerrer)\s+)?"
     r"(?:madde|article|art\.?)"
     r"(?:\s+|\s*[:.]\s*)"
     r"(?P<number>\d+[a-z]?)\b",
@@ -18,7 +20,7 @@ _REVERSE_ARTICLE_HEADING_RE = re.compile(
 )
 _QUERY_FORWARD_ARTICLE_RE = re.compile(
     r"(?<![a-z0-9])"
-    r"(?:(?P<qualifier>gecici|mukerrer)\s+)?"
+    r"(?:(?P<qualifier>ek|gecici|mukerrer)\s+)?"
     r"(?:madde|md|article|art)\.?\s*:?[ \t]*"
     r"(?P<number>\d+[a-z]?)(?![a-z0-9]|\.\d)",
     flags=re.IGNORECASE,
@@ -27,7 +29,7 @@ _INFLECTED_ARTICLE_WORD = (
     r"(?:madde(?:de|den|nin|ye|yi)?|maddes(?:i|ı)(?:nde|nden|nin|ne|ni)?)"
 )
 _QUERY_REVERSE_ARTICLE_RE = re.compile(
-    r"(?<![a-z0-9])(?P<number>\d+[a-z]?)(?![a-z0-9]|\.\d)"
+    r"(?<![a-z0-9])(?:(?P<qualifier>ek|gecici|mukerrer)\s+)?(?P<number>\d+[a-z]?)(?![a-z0-9]|\.\d)"
     r"(?:"
     rf"\.\s*{_INFLECTED_ARTICLE_WORD}"
     rf"|\s*['’]?\s*(?:inci|nci|uncu|ıncı)\s+{_INFLECTED_ARTICLE_WORD}"
@@ -113,7 +115,7 @@ def _canonical_article_number(value: str) -> str:
     folded = " ".join(_fold(value).split()).upper()
     folded = folded.removeprefix("GEÇICI ").removeprefix("GECICI ")
     folded = folded.removeprefix("MÜKERRER ").removeprefix("MUKERRER ")
-    return folded
+    return folded.removeprefix("EK ")
 
 
 def extract_single_regulatory_provision_reference(
@@ -162,7 +164,7 @@ def extract_regulatory_provision_references(
                 match.start(),
                 RegulatoryProvisionReference(
                     article_no=_canonical_article_number(match.group("number")),
-                    qualifier=None,
+                    qualifier=match.group("qualifier"),
                 ),
             )
         )
@@ -354,6 +356,7 @@ def regulatory_provision_heading_phrases(
     qualifier = {
         "gecici": "GEÇİCİ ",
         "mukerrer": "MÜKERRER ",
+        "ek": "EK ",
     }.get(reference.qualifier or "", "")
     article_no = reference.article_no
     if qualifier:
@@ -434,6 +437,8 @@ def _canonical_article_heading_from_metadata(article_no: str) -> str | None:
         qualifier = "GEÇİCİ "
     elif folded_article_no.startswith("mukerrer "):
         qualifier = "MÜKERRER "
+    elif folded_article_no.startswith("ek "):
+        qualifier = "EK "
     return f"{qualifier}MADDE {target}"
 
 
@@ -449,7 +454,7 @@ def _terminal_heading_matches_unit_metadata(
         if match is None:
             return False
         marker = match.group("parenthesized") or match.group("plain") or ""
-        return _fold(marker) == _fold(clause_label)
+        return canonical_clause_label(marker) == canonical_clause_label(clause_label)
     if chunk_type == "paragraph" and paragraph_no is not None:
         match = _NUMBERED_UNIT_HEADING_RE.match(heading)
         if match is None:
@@ -559,10 +564,19 @@ def normalize_regulatory_heading_path(
         if article_no is None:
             return path
         target = _canonical_article_number(article_no)
+        target_heading = _canonical_article_heading_from_metadata(article_no)
+        target_identity = parse_regulatory_article_heading(target_heading or "")
         matching_indices: list[int] = []
         for index in article_indices:
             parsed_heading = parsed_headings[index]
-            if parsed_heading is not None and parsed_heading.article_no == target:
+            if (
+                parsed_heading is not None
+                and parsed_heading.article_no == target
+                and (
+                    target_identity is None
+                    or parsed_heading.qualifier == target_identity.qualifier
+                )
+            ):
                 matching_indices.append(index)
         if not matching_indices:
             return path

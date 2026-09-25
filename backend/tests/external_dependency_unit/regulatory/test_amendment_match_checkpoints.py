@@ -1,6 +1,7 @@
 """Transaction-isolated PostgreSQL recovery tests; never publish source changes."""
 
 from collections.abc import Generator
+from typing import cast
 from uuid import uuid4
 
 import pytest
@@ -22,7 +23,11 @@ from onyx.regulatory.amendments.ranker import CandidateChunk
 def test_runtime_measurements_cannot_be_overwritten_by_old_analysis(
     checkpoint_session: Session,
 ) -> None:
-    from onyx.db.amendment_resources import record_analysis_resources
+    from onyx.db.amendment_resources import (
+        load_runtime_header,
+        load_runtime_snapshot,
+        record_analysis_resources,
+    )
     from onyx.db.models import KVStore
 
     session = checkpoint_session
@@ -47,6 +52,11 @@ def test_runtime_measurements_cannot_be_overwritten_by_old_analysis(
         lease_generation=7,
         measurements={"current_bytes": 123, "active": 2, "peak_bytes": 200},
     )
+    header = load_runtime_header(session, batch.id)
+    assert header is not None
+    first = load_runtime_snapshot(session, header)
+    assert first.raw_text_chars == 4
+    assert first.activity_checked_at == first.memory_checked_at
     record_analysis_resources(
         session,
         batch_id=batch.id,
@@ -61,10 +71,25 @@ def test_runtime_measurements_cannot_be_overwritten_by_old_analysis(
     )
     row = session.get(KVStore, f"amendment_runtime:{batch.id}")
     assert row is not None
-    assert row.value["current_bytes"] == 123
-    assert row.value["active"] == 2
-    assert row.value["lease_generation"] == 7
-    assert row.value["peak_bytes"] == 200
+    assert isinstance(row.value, dict)
+    resources = cast(dict[str, object], row.value)
+    assert resources["current_bytes"] == 123
+    assert resources["active"] == 2
+    assert resources["lease_generation"] == 7
+    assert resources["peak_bytes"] == 200
+    latest = load_runtime_snapshot(session, header)
+    assert latest.active == 2 and latest.peak_bytes == 200
+    assert latest.activity_checked_at == first.activity_checked_at
+    assert latest.memory_checked_at is not None and first.memory_checked_at is not None
+    assert latest.memory_checked_at > first.memory_checked_at
+    from dataclasses import replace
+
+    assert (
+        load_runtime_snapshot(
+            session, replace(header, lease_generation=8)
+        ).current_bytes
+        is None
+    )
 
 
 @pytest.fixture
@@ -605,8 +630,8 @@ def test_resource_deferral_preserves_progress_fences_writer_and_bounds_retries(
     assert spec is not None and spec.loader is not None
     migration = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(migration)
-    migration.op = Operations(MigrationContext.configure(session.connection()))
-    migration.upgrade()
+    with Operations.context(MigrationContext.configure(session.connection())):
+        migration.upgrade()
     docset = DocumentSet(
         name=f"resources-{uuid4()}", description="resource test", is_up_to_date=True
     )
@@ -642,6 +667,7 @@ def test_resource_deferral_preserves_progress_fences_writer_and_bounds_retries(
     assert not owns_analysis(session, batch_id=batch.id, lease_generation=1)
     assert not parallel_analysis_allowed(session, batch.id)
     waiting_since = batch.heartbeat_at
+    assert waiting_since is not None
     assert (
         claim_stale_batches_for_recovery(
             session,
@@ -673,7 +699,8 @@ def test_resource_deferral_preserves_progress_fences_writer_and_bounds_retries(
     assert batch.status == "paused"
     assert batch.unmatched_instructions == []
 
-    migration.downgrade()
+    with Operations.context(MigrationContext.configure(session.connection())):
+        migration.downgrade()
     session.expire_all()
     session.refresh(batch)
     assert batch.status == "failed"

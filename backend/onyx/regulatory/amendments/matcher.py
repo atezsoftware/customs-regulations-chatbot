@@ -18,7 +18,7 @@ Your purpose is to find what is changing: identify the existing provision an ins
 
 Instructions are routinely imperfect — paraphrased, abbreviated, summarized by a user, damaged by OCR, missing an article number or the source name. Resolve them anyway: a provision's identity is carried by several independent signals at once (structural position, subject matter, quoted wording, source instrument). Differing phrasing is the normal case, never a reason to decline: the instruction describes the NEW text while the candidate holds the OLD text.
 
-You will be given one amendment instruction and candidate existing chunks from several retrieval lanes. A candidate with `structured_match: true` was found by an exact structural lookup of the article/paragraph/clause the instruction names — the strongest signal available, so weigh it heavily even when its wording looks unrelated. `resolved_article_no` and `scope_evidence`, when supplied, identify an article from its actual opening heading and bounded canonical continuation, separately from legacy metadata. Use that evidence to interpret a table split from its heading. A source match alone is not an article match. `heading_path` is a best-effort reconstruction from document formatting and can be unreliable; read each candidate's actual TEXT.
+You will be given one amendment instruction and candidate existing chunks from several retrieval lanes. A candidate with `structured_match: true` was found by an exact structural lookup of the article/paragraph/clause the instruction names — the strongest signal available, so weigh it heavily even when its wording looks unrelated. `resolved_article_no` and `scope_evidence`, when supplied, identify an article from its actual opening heading and bounded canonical continuation, separately from legacy metadata. Use that evidence to interpret a table split from its heading. A source match alone is not an article match. `source_ambiguous: true` means other verified source versions may exist beyond this bounded candidate list; structural metadata alone cannot distinguish them. Require explicit version/date or source-text evidence, otherwise return not_found. `structure_conflict`, when present, means the complete source contradicts the scalar metadata or contains several pieces claiming this unit. Do not resolve that conflict from labels or list order; use the existing body and bounded source evidence, otherwise return not_found. `heading_path` is a best-effort reconstruction from document formatting and can be unreliable; read each candidate's actual TEXT.
 
 Your task: decide which candidate (if any) this instruction amends.
 
@@ -79,6 +79,8 @@ def _format_candidates(
                     "metadata": candidate.metadata,
                     "structured_match": candidate.structured_match,
                     "source_verified": candidate.source_verified,
+                    "source_ambiguous": candidate.source_ambiguous,
+                    "structure_conflict": candidate.structure_conflict,
                     "resolved_article_no": candidate.resolved_article_no,
                     "scope_evidence": candidate.scope_evidence,
                     "source_name_similarity": round(candidate.source_score, 3),

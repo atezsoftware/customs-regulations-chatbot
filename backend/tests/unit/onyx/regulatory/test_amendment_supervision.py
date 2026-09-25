@@ -17,13 +17,16 @@ def test_child_pool_supports_nested_parallel_reads_and_releases_overflow(
 ) -> None:
     from concurrent.futures import ThreadPoolExecutor
     from contextlib import ExitStack
-    from threading import Barrier
+    from contextvars import copy_context
+    from functools import partial
+    from threading import Event, Lock
 
     from sqlalchemy import create_engine, text
     from sqlalchemy.engine import Engine
     from sqlalchemy.exc import TimeoutError as PoolTimeout
     from sqlalchemy.pool import QueuePool
 
+    from onyx.context.search.retrieval.concurrency import search_slot
     from onyx.db.engine.sql_engine import SqlEngine
     from onyx.regulatory.amendments import job, supervision
     from onyx.utils import variable_functionality as versioning
@@ -41,27 +44,50 @@ def test_child_pool_supports_nested_parallel_reads_and_releases_overflow(
             pool_timeout=0.1,
         )
 
-    def run_batch(**_kwargs: object) -> None:
+    def run_batch(**kwargs: object) -> None:
         assert engine is not None
+        runner = kwargs["instruction_runner"]
+        assert isinstance(runner, partial)
+        assert runner.keywords["max_parallel"] == 10
         analysis_engine = engine
-        # Four instructions can each fan out into five query lanes.
-        held = Barrier(20, timeout=2)
-        nested = Barrier(20, timeout=2)
+        full = Event()
+        release = Event()
+        lock = Lock()
+        active = peak = 0
 
         def read(_index: int) -> int:
-            try:
-                with analysis_engine.connect():
-                    held.wait()
-                    with analysis_engine.connect() as publication:
-                        nested.wait()
+            nonlocal active, peak
+            with search_slot():
+                with (
+                    analysis_engine.connect(),
+                    analysis_engine.connect() as publication,
+                ):
+                    with lock:
+                        active += 1
+                        peak = max(peak, active)
+                        if active == 12:
+                            full.set()
+                    try:
+                        assert release.wait(5)
                         return publication.execute(text("SELECT 1")).scalar_one()
-            except Exception:
-                held.abort()
-                nested.abort()
-                raise
+                    finally:
+                        with lock:
+                            active -= 1
 
-        with ThreadPoolExecutor(max_workers=20) as workers:
-            assert list(workers.map(read, range(20))) == [1] * 20
+        with ExitStack() as outer, ThreadPoolExecutor(max_workers=50) as workers:
+            for _ in range(10):
+                outer.enter_context(analysis_engine.connect())
+            futures = [
+                workers.submit(copy_context().run, read, index) for index in range(50)
+            ]
+            try:
+                assert full.wait(3)
+                assert isinstance(analysis_engine.pool, QueuePool)
+                assert analysis_engine.pool.checkedout() == 34
+            finally:
+                release.set()
+            assert [future.result(timeout=5) for future in futures] == [1] * 50
+        assert peak == 12
         pool = analysis_engine.pool
         assert isinstance(pool, QueuePool)
         assert pool.checkedout() == 0
@@ -74,6 +100,9 @@ def test_child_pool_supports_nested_parallel_reads_and_releases_overflow(
                 analysis_engine.connect()
         assert pool.checkedout() == 0
 
+    monkeypatch.setattr(
+        supervision, "read_memory", lambda: MemorySample(1024**3, 5 * 1024**3)
+    )
     monkeypatch.setattr(versioning, "set_is_ee_based_on_env_variable", lambda: None)
     monkeypatch.setattr(supervision, "protect_parent_lifetime", lambda: None)
     monkeypatch.setattr(SqlEngine, "reset_engine", lambda: None)

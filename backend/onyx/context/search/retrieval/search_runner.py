@@ -13,6 +13,7 @@ from onyx.context.search.models import (
     InferenceChunk,
     InferenceSection,
 )
+from onyx.context.search.retrieval.concurrency import search_slot
 from onyx.context.search.utils import get_query_embedding, inference_section_from_chunks
 from onyx.document_index.interfaces_new import DocumentIndex, DocumentSectionRequest
 from onyx.federated_connectors.federated_retrieval import (
@@ -218,6 +219,27 @@ def _keyword_search(
 
 
 def search_chunks(
+    query_request: ChunkIndexRequest,
+    user_id: UUID | None,
+    document_index: DocumentIndex,
+    db_session: Session | None = None,
+    embedding_model: EmbeddingModel | None = None,
+    prefetched_federated_retrieval_infos: list[FederatedRetrievalInfo] | None = None,
+) -> list[InferenceChunk]:
+    # Admission precedes observations and DB/provider work. The amendment
+    # caller supplies prefetched metadata, so waiting lanes hold no DB session.
+    with search_slot():
+        return _search_chunks(
+            query_request,
+            user_id,
+            document_index,
+            db_session,
+            embedding_model,
+            prefetched_federated_retrieval_infos,
+        )
+
+
+def _search_chunks(
     query_request: ChunkIndexRequest,
     user_id: UUID | None,
     document_index: DocumentIndex,

@@ -33,6 +33,33 @@ def explicit_replacement_body(instruction_text: str) -> str | None:
     return None
 
 
+def explicit_added_body(instruction_text: str) -> str | None:
+    from onyx.regulatory.amendments.new_provision_policy import (
+        added_subordinate_unit_kind,
+        explicitly_adds_top_level_provision,
+    )
+
+    if not (
+        added_subordinate_unit_kind(instruction_text)
+        or explicitly_adds_top_level_provision(instruction_text)
+    ):
+        return None
+    unquoted = re.sub(
+        r'“[^”]*”|"[^"]*"', lambda match: " " * len(match.group()), instruction_text
+    )
+    addition = re.search(
+        r"(?:eklenmiş|ilave\s+edilmiş)(?:tir)?\b", unquoted, re.IGNORECASE
+    )
+    if addition is None:
+        return None
+    remainder = instruction_text[addition.end() :].strip()
+    for opening, closing in (("“", "”"), ('"', '"')):
+        start, end = remainder.find(opening), remainder.rfind(closing)
+        if start >= 0 and end > start:
+            return remainder[start + len(opening) : end].strip()
+    return None
+
+
 def _comparison_text(value: str) -> str:
     normalized = unicodedata.normalize("NFKC", value)
     normalized = _MARKDOWN_RE.sub("", normalized)
@@ -57,7 +84,9 @@ def validate_explicit_replacement_texts(
 
     normalized_draft = _comparison_text(draft_text)
     for instruction_text in instruction_texts:
-        body = explicit_replacement_body(instruction_text)
+        body = explicit_replacement_body(instruction_text) or explicit_added_body(
+            instruction_text
+        )
         if body is None:
             continue
         if _comparison_text(body) not in normalized_draft:
@@ -122,13 +151,15 @@ def reconcile_existing_heading_path(
     plain_text = _MARKDOWN_RE.sub("", unicodedata.normalize("NFKC", amended_text))
     if chunk_type == "article" and article_no:
         qualifier_match = re.fullmatch(
-            r"(?P<qualifier>GEÇİCİ|GECICI|MÜKERRER|MUKERRER)\s+(?P<number>.+)",
+            r"(?P<qualifier>EK|GEÇİCİ|GECICI|MÜKERRER|MUKERRER)\s+(?P<number>.+)",
             article_no.strip(),
             flags=re.IGNORECASE,
         )
         if qualifier_match:
             canonical_qualifier = (
-                "GEÇİCİ"
+                "EK"
+                if qualifier_match.group("qualifier").upper() == "EK"
+                else "GEÇİCİ"
                 if qualifier_match.group("qualifier").upper().startswith(("GEÇ", "GEC"))
                 else "MÜKERRER"
             )

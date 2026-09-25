@@ -1908,6 +1908,11 @@ def get_regulatory_provision_heading_source(
                 file_id,
                 index=index,
                 as_of_date=as_of_date or datetime.date.today(),
+                canonical_chunk_ids=tuple(
+                    record.id
+                    for record in seed_records
+                    if record.user_file_id == file_id
+                ),
             ):
                 bindings[
                     json.loads(binding.projection.source_json)["regulatory_chunk_id"]
@@ -1954,52 +1959,68 @@ def get_regulatory_provision_heading_source(
             )
         ).all()
     )
-    candidates_by_file: dict[UUID, list[RegulatoryProvisionHeadingCandidate]] = {}
-    for record in heading_records:
-        candidate = RegulatoryProvisionHeadingCandidate(
-            regulatory_chunk_id=record.id,
-            user_file_id=record.user_file_id,
-            position=record.position,
-            heading_path=tuple(record.heading_path),
-            status=record.status,
-            validity_start_date=record.validity_start_date,
-            validity_end_date=record.validity_end_date,
-            article_title=(
-                str(record.chunk_metadata["article_title"])
-                if record.chunk_metadata.get("article_title") is not None
-                else None
-            ),
-        )
-        if record.user_file_id in qualified:
-            binding = bindings.get(record.id)
-            if binding is None:
-                continue
-            source = json.loads(binding.projection.source_json)
-            candidate = replace(
-                candidate,
-                position=binding.semantic_position,
-                heading_path=tuple(
-                    source.get("heading_path") or candidate.heading_path
-                ),
-                validity_start_date=binding.effective_start,
-                validity_end_date=binding.effective_end,
-                status=RegulatoryChunkStatus.ACTIVE.value,
-            )
-        # Recheck the pure visibility rule so mock-backed callers and future
-        # query refactors cannot accidentally broaden the outline.
-        if is_regulatory_navigation_candidate_visible(candidate, as_of_date=as_of_date):
-            candidates_by_file.setdefault(candidate.user_file_id, []).append(candidate)
-
     selected_source: (
-        tuple[
-            UUID,
-            tuple[int, ...],
-            tuple[RegulatoryProvisionHeadingCandidate, ...],
-        ]
+        tuple[UUID, tuple[int, ...], tuple[RegulatoryProvisionHeadingCandidate, ...]]
         | None
     ) = None
     for user_file_id, seed_positions in ranked_sources:
-        candidates = tuple(candidates_by_file.get(user_file_id, ()))
+        # Hydrate the next source only if a higher-ranked outline was unusable.
+        bindings = {}
+        if user_file_id in qualified:
+            index = (query_indexes or {}).get(user_file_id)
+            if index is None:
+                continue
+            bindings = {
+                json.loads(binding.projection.source_json)[
+                    "regulatory_chunk_id"
+                ]: binding
+                for binding in load_public_temporal_bindings(
+                    db_session,
+                    user_file_id,
+                    index=index,
+                    as_of_date=as_of_date or datetime.date.today(),
+                )
+            }
+        file_candidates: list[RegulatoryProvisionHeadingCandidate] = []
+        for record in heading_records:
+            if record.user_file_id != user_file_id:
+                continue
+            candidate = RegulatoryProvisionHeadingCandidate(
+                regulatory_chunk_id=record.id,
+                user_file_id=record.user_file_id,
+                position=record.position,
+                heading_path=tuple(record.heading_path),
+                status=record.status,
+                validity_start_date=record.validity_start_date,
+                validity_end_date=record.validity_end_date,
+                article_title=(
+                    str(record.chunk_metadata["article_title"])
+                    if record.chunk_metadata.get("article_title") is not None
+                    else None
+                ),
+            )
+            if record.user_file_id in qualified:
+                binding = bindings.get(record.id)
+                if binding is None:
+                    continue
+                source = json.loads(binding.projection.source_json)
+                candidate = replace(
+                    candidate,
+                    position=binding.semantic_position,
+                    heading_path=tuple(
+                        source.get("heading_path") or candidate.heading_path
+                    ),
+                    validity_start_date=binding.effective_start,
+                    validity_end_date=binding.effective_end,
+                    status=RegulatoryChunkStatus.ACTIVE.value,
+                )
+            # Recheck the pure visibility rule so mock-backed callers and future
+            # query refactors cannot accidentally broaden the outline.
+            if is_regulatory_navigation_candidate_visible(
+                candidate, as_of_date=as_of_date
+            ):
+                file_candidates.append(candidate)
+        candidates = tuple(file_candidates)
         if any(
             parse_regulatory_article_heading(heading.strip()) is not None
             for candidate in candidates
@@ -2055,6 +2076,9 @@ def _public_sibling_candidates(
             file_id,
             index=index,
             as_of_date=as_of_date or datetime.date.today(),
+            canonical_chunk_ids=tuple(
+                row.id for row in rows if row.user_file_id == file_id
+            ),
         ):
             source = json.loads(binding.projection.source_json)
             bindings[source["regulatory_chunk_id"]] = binding
@@ -2889,9 +2913,7 @@ def get_active_chunks_by_structural_reference(
             func.lower(func.trim(RegulatoryChunk.chunk_metadata["clause_label"].astext))
             == clause_label.casefold()
         )
-    elif paragraph_no is not None:
-        # A clause carries its own label and no paragraph number, so the two
-        # narrowings are alternatives rather than a conjunction.
+    if paragraph_no is not None:
         conditions.append(
             func.trim(RegulatoryChunk.chunk_metadata["paragraph_no"].astext)
             == paragraph_no

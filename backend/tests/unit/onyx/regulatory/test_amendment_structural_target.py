@@ -51,6 +51,23 @@ _ADD_ANNEX_ROW = (
 )
 
 
+def test_verified_canonical_root_can_identify_an_opaque_filename() -> None:
+    instruction = AmendmentInstruction(
+        instruction_text="MADDE 12- Aynı Tebliğin Ek-7’sinde yer alan liste değiştirilmiştir.",
+        target_source="Makina Güvenliği Tebliği (2031/4)",
+    )
+    candidate = CandidateChunk(
+        chunk_id="annex-member",
+        user_file_id="one-source",
+        source_name="doc-8f2.md",
+        text="9. Photo.",
+        metadata={"appendix_label": "EK 7"},
+        structured_match=True,
+        source_verified=True,
+    )
+    assert deterministic_structural_candidate(instruction, [candidate]) == candidate
+
+
 @pytest.mark.parametrize(
     ("ordinal", "expected"),
     [
@@ -179,6 +196,33 @@ def test_annex_row_addition_anchors_to_existing_canonical_scope() -> None:
     )
 
     assert deterministic_structural_candidate(instruction, [exact]) == exact
+
+
+def test_annex_representative_requires_one_source_version() -> None:
+    instruction = AmendmentInstruction(
+        instruction_text=_ADD_ANNEX_ROW, target_source="Makina Güvenliği Tebliği"
+    )
+    candidates = [
+        CandidateChunk(
+            chunk_id=f"part-{index}",
+            user_file_id=f"file-{index}",
+            text="Ek",
+            source_name="Makina Güvenliği Tebliği",
+            metadata={"appendix_label": "EK-2"},
+            structured_match=True,
+        )
+        for index in (1, 2)
+    ]
+    assert deterministic_structural_candidate(instruction, candidates) is None
+
+
+def test_annex_list_item_anchor_keeps_the_annex_namespace() -> None:
+    instruction = AmendmentInstruction(
+        instruction_text="MADDE 20- Aynı Tebliğin Ek-3’ünde yer alan listenin 6 ncı maddesinde yer alan “fotoğraflar” ibaresi değiştirilmiştir."
+    )
+    target = parse_amendment_structural_target(instruction)
+    assert target is not None and target.appendix_label == "EK-3"
+    assert canonical_structural_query_anchor(target) == "EK-3 madde 6"
 
 
 def test_query_anchor_uses_the_forward_designator_retrieval_indexes() -> None:

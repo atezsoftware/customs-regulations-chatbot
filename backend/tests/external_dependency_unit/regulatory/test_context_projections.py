@@ -359,6 +359,13 @@ def test_index_qualified_temporal_bindings_keep_two_configurations_and_source_hi
             as_of_date=date(2025, 1, 1),
             projection_ordinals=(first.projection.ordinal,),
         ) == [first]
+        assert load_public_temporal_bindings(
+            source_session,
+            file.id,
+            index=indices[0],
+            as_of_date=date(2025, 1, 1),
+            canonical_chunk_ids=(canonical.id,),
+        ) == [first]
         with pytest.raises(ValueError, match="payload changed"):
             load_public_temporal_bindings(
                 source_session,
@@ -385,6 +392,36 @@ def test_index_qualified_temporal_bindings_keep_two_configurations_and_source_hi
             as_of_date=when,
         )
         assert inventory == [expected]
+        assert (
+            load_public_temporal_bindings(
+                source_session,
+                file.id,
+                index=index,
+                as_of_date=when,
+                canonical_chunk_ids=(canonical.id,),
+            )
+            == inventory
+        )
+        assert (
+            load_public_temporal_bindings(
+                source_session,
+                file.id,
+                index=index,
+                as_of_date=when,
+                canonical_chunk_ids=("absent-identity",),
+            )
+            == []
+        )
+        assert (
+            load_public_temporal_bindings(
+                source_session,
+                file.id,
+                index=index,
+                as_of_date=when,
+                canonical_chunk_ids=(),
+            )
+            == []
+        )
         assert (
             load_public_temporal_bindings(
                 source_session,

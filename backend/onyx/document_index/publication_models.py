@@ -407,6 +407,27 @@ def _observed_source_facts(source_json: str) -> _ObservedSourceFacts:
     return _cached_observed_source(source_json)
 
 
+class SourceHeadingRepair(PublicationModel):
+    """Narrow source-backed correction; original vector/content receipt stays valid."""
+
+    canonical_chunk_id: str
+    original_heading_present: bool
+    original_heading_path: list[str] | None
+    corrected_heading_path: list[str]
+    source_sha256: str = Field(min_length=64, max_length=64)
+    canonical_before_sha256: str = Field(min_length=64, max_length=64)
+    canonical_after_sha256: str = Field(min_length=64, max_length=64)
+    parser_version: str
+    source_start: int = Field(ge=0)
+    source_end: int = Field(gt=0)
+
+    @model_validator(mode="after")
+    def validate_span(self) -> Self:
+        if self.source_end <= self.source_start:
+            raise ValueError("heading repair source interval is empty")
+        return self
+
+
 class ObservedPublicationProjection(PublicationModel):
     """Versioned same-index evidence; deliberately contains no encoder receipt.
 
@@ -423,6 +444,9 @@ class ObservedPublicationProjection(PublicationModel):
     observed_start: int | None
     observed_end: int | None
     observed_index: PublicationIndexSnapshot
+    heading_repair: SourceHeadingRepair | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
     @classmethod
     def observe(
@@ -451,7 +475,27 @@ class ObservedPublicationProjection(PublicationModel):
         # Cache only facts about the complete immutable string, never acceptance
         # of a caller's proof, index, ordinal or legal interval.
         current = _observed_source_facts(self.source_json)
-        if current.immutable_sha256 != self.observed_immutable_sha256:
+        immutable_sha256 = current.immutable_sha256
+        if self.heading_repair is not None:
+            source = json.loads(self.source_json)
+            repair = self.heading_repair
+            if (
+                source.get("regulatory_chunk_id") != repair.canonical_chunk_id
+                or source.get("heading_path") != repair.corrected_heading_path
+            ):
+                raise ValueError("source heading differs from its repair receipt")
+            if repair.original_heading_present:
+                source["heading_path"] = repair.original_heading_path
+            else:
+                source.pop("heading_path", None)
+            immutable_sha256 = publication_digest(
+                {
+                    key: value
+                    for key, value in source.items()
+                    if key not in OBSERVED_MUTABLE_SOURCE_FIELDS
+                }
+            )
+        if immutable_sha256 != self.observed_immutable_sha256:
             raise ValueError("observation changes existing content or vector")
         if current.ordinal != self.ordinal:
             raise ValueError("observed projection ordinal mismatch")

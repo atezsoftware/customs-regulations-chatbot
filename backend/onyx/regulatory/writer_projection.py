@@ -76,7 +76,21 @@ def prepare_owned_correction(
     identifier = uuid4()
     desired = {row.id: row for row in after}
     previous_canonical = {row.id: row for row in inputs.canonical}
-    changed_ids = {row.id for row in after if previous_canonical.get(row.id) != row}
+    from onyx.regulatory.position_rebase import (
+        monotonic_position_map,
+        position_only_changes,
+        rebase_binding_position,
+    )
+
+    position_map = monotonic_position_map(inputs.canonical, after)
+    rebased_ids = {
+        row.id
+        for row in inputs.canonical
+        if position_map.get(row.position, row.position) != row.position
+    }
+    changed_ids = {
+        row.id for row in after if previous_canonical.get(row.id) != row
+    } - position_only_changes(inputs.canonical, after)
     target = desired[changed_id] if changed_id is not None else None
     affected = [(date.min, date.max)]
     if target is not None:
@@ -364,7 +378,11 @@ def prepare_owned_correction(
                     if row.id not in changed_ids:
                         row.text = previous.representation_text
                         row.chunk_metadata = dict(previous.representation_metadata)
-                        row.position = previous.semantic_position
+                        row.position = (
+                            desired[row.id].position
+                            if row.id in rebased_ids
+                            else previous.semantic_position
+                        )
             rows = rebuild_context_aggregates(rows, changed_ids=sorted(changed_ids))
             active = effective_context_rows(rows, when)
             if not active:
@@ -528,6 +546,23 @@ def prepare_owned_correction(
                     bindings.append(previous)
                 else:
                     bindings.append(rebuilt)
+
+    for number, binding in enumerate(bindings):
+        canonical_id = json.loads(binding.projection.source_json)["regulatory_chunk_id"]
+        if canonical_id not in rebased_ids:
+            continue
+        rebased = rebase_binding_position(
+            binding,
+            previous_position=previous_canonical[canonical_id].position,
+            position=desired[canonical_id].position,
+        )
+        if rebased is not binding:
+            revision = revisions.pop(binding.id, None) or inputs.revisions.get(
+                binding.id
+            )
+            if revision is not None:
+                revisions[rebased.id] = revision
+            bindings[number] = rebased
 
     return WriterPublicationManifest(
         id=identifier,

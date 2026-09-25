@@ -79,6 +79,7 @@ def _run_grouping_job(
     interrupt_match_at: int | None = None,
     before_work: Callable[[], None] | None = None,
     instruction_runner: job.InstructionRunner | None = None,
+    on_draft: Callable[[list[int]], None] | None = None,
 ) -> SimpleNamespace:
     instructions = instructions_override or [
         AmendmentInstruction(
@@ -109,16 +110,17 @@ def _run_grouping_job(
     if processed_instruction_indices is not None:
         batch_values["processed_instruction_indices"] = processed_instruction_indices
     batch = SimpleNamespace(**batch_values)
-    session_depth = 0
+    from contextvars import ContextVar
+
+    session_depth = ContextVar("grouping_session_depth", default=0)
 
     @contextmanager
     def _session():
-        nonlocal session_depth
-        session_depth += 1
+        token = session_depth.set(session_depth.get() + 1)
         try:
             yield MagicMock()
         finally:
-            session_depth -= 1
+            session_depth.reset(token)
 
     events: list[tuple[str, object]] = []
     candidate_lists = [
@@ -146,7 +148,7 @@ def _run_grouping_job(
         capture_evidence: object = None,
     ) -> tuple[list[CandidateChunk], MatchResult]:
         del retriever, llm, amendment_context, trace, capture_evidence
-        assert session_depth == 0
+        assert session_depth.get() == 0
         instruction_index = index_by_text[instruction.instruction_text]
         events.append(("match", instruction_index))
         if instruction_index == interrupt_match_at:
@@ -159,7 +161,7 @@ def _run_grouping_job(
         match: MatchResult,
         **_kwargs: object,
     ) -> SimpleNamespace:
-        assert session_depth == 1
+        assert session_depth.get() == 1
         events.append(
             (
                 "load",
@@ -173,8 +175,10 @@ def _run_grouping_job(
         )
 
     def draft_group(*_args: object, **kwargs: Any) -> SimpleNamespace:
-        assert session_depth == 0
+        assert session_depth.get() == 0
         events.append(("draft", list(kwargs["instruction_indices"])))
+        if on_draft is not None:
+            on_draft(list(kwargs["instruction_indices"]))
         if draft_failures and kwargs["instruction_indices"][0] in draft_failures:
             raise draft_failures[kwargs["instruction_indices"][0]]
         if draft_error is not None:
@@ -243,6 +247,143 @@ def _run_grouping_job(
     )
 
 
+def test_draft_warmup_is_one_operation_not_an_entire_article(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from threading import Event
+
+    from onyx.regulatory.amendments.memory_budget import (
+        MemoryPolicy,
+        MemorySample,
+        bounded_map,
+    )
+
+    first_finished = Event()
+    sibling_running = Event()
+    independent_started = Event()
+
+    def on_draft(indices: list[int]) -> None:
+        if indices == [0]:
+            first_finished.set()
+        elif indices == [1]:
+            assert first_finished.is_set()
+            sibling_running.set()
+            assert independent_started.wait(3), (
+                "An entire article lane blocked the parallel warmup"
+            )
+        elif indices == [2]:
+            assert sibling_running.wait(3)
+            independent_started.set()
+
+    def runner(function, indices, **kwargs):
+        return bounded_map(
+            function,
+            indices,
+            max_parallel=2,
+            sample=lambda: MemorySample(100, 1000),
+            policy=MemoryPolicy(reserve_bytes=100, item_bytes=100),
+            **kwargs,
+        )
+
+    result = _run_grouping_job(
+        monkeypatch,
+        batch_id=18,
+        targets=[f"chunk-{i}" for i in range(3)],
+        instructions_override=[
+            AmendmentInstruction(
+                instruction_text=f"MADDE {i + 1}- Aynı Kanunun {article} inci maddesinin {paragraph} inci fıkrası değiştirilmiştir.",
+                target_source="2468 sayılı Kaynak Kanunu",
+            )
+            for i, (article, paragraph) in enumerate([(1, 1), (1, 2), (2, 1)])
+        ],
+        instruction_runner=runner,
+        on_draft=on_draft,
+    )
+    assert independent_started.is_set() and result.persist.call_count == 3
+
+
+def test_draft_jobs_overlap_refill_and_serialize_the_same_article(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from threading import Event
+
+    from onyx.regulatory.amendments.memory_budget import (
+        MemoryPolicy,
+        MemorySample,
+        bounded_map,
+    )
+
+    running = Event()
+    replacement_started = Event()
+    same_article_finished = Event()
+
+    def on_draft(indices: list[int]) -> None:
+        if indices == [1]:
+            running.set()
+            assert replacement_started.wait(5), (
+                "The freed slot did not refill while a peer was running"
+            )
+            running.clear()
+            same_article_finished.set()
+        elif indices == [2]:
+            assert running.wait(5), "Independent articles did not overlap"
+        elif indices == [3]:
+            assert same_article_finished.is_set(), (
+                "Same-article drafts ran concurrently"
+            )
+        elif indices == [4]:
+            assert running.is_set(), "Replacement waited for all peers"
+            replacement_started.set()
+
+    def runner(function, indices, **kwargs):
+        return bounded_map(
+            function,
+            indices,
+            max_parallel=2,
+            sample=lambda: MemorySample(100, 1000),
+            policy=MemoryPolicy(reserve_bytes=100, item_bytes=100),
+            **kwargs,
+        )
+
+    result = _run_grouping_job(
+        monkeypatch,
+        batch_id=17,
+        targets=[f"chunk-{i}" for i in range(5)],
+        instructions_override=[
+            AmendmentInstruction(
+                instruction_text=f"MADDE {i + 1}- Aynı Kanunun {article} inci maddesinin {paragraph} inci fıkrası değiştirilmiştir.",
+                target_source="2468 sayılı Kaynak Kanunu",
+            )
+            for i, (article, paragraph) in enumerate(
+                [(1, 1), (2, 1), (3, 1), (2, 2), (4, 1)]
+            )
+        ],
+        instruction_runner=runner,
+        on_draft=on_draft,
+    )
+    assert result.persist.call_count == 5
+
+
+def test_annex_inner_item_does_not_claim_the_containing_instrument_article_lane() -> (
+    None
+):
+    from onyx.regulatory.amendments.match_checkpoint import MatchedInstruction
+
+    instruction = AmendmentInstruction(
+        instruction_text="MADDE 12- Aynı Tebliğin Ek-7’sinde yer alan listenin 9 uncu maddesi değiştirilmiştir."
+    )
+    candidate = _candidate("annex-member")
+    checkpoint = MatchedInstruction(
+        instruction_index=0,
+        instruction=instruction,
+        candidates=[candidate],
+        match=MatchResult(
+            old_chunk_id=candidate.chunk_id, confidence=1.0, rationale="Exact annex"
+        ),
+    )
+    assert checkpoint.draft_lane_key() == (candidate.user_file_id, "appendix:ek7")
+
+
 def test_resumed_matches_do_not_count_as_memory_warmup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -255,10 +396,12 @@ def test_resumed_matches_do_not_count_as_memory_warmup(
             checkpoint_store=saved,
             interrupt_match_at=1,
         )
-    submitted: list[int] = []
+    submitted: list[list[int]] = []
 
-    def runner(function: Callable[[int], job.MatchOutcome], items: list[int]):
-        submitted.extend(items)
+    def runner(
+        function: Callable[[int], job.MatchOutcome], items: list[int], **_kwargs
+    ):
+        submitted.append(items)
         return map(function, items)
 
     result = _run_grouping_job(
@@ -268,7 +411,7 @@ def test_resumed_matches_do_not_count_as_memory_warmup(
         checkpoint_store=saved,
         instruction_runner=runner,
     )
-    assert submitted == [1, 2]
+    assert submitted == [[1, 2], [0, 1, 2]]
     assert ("match", 0) not in result.events
     assert ("draft", [0]) in result.events
 
@@ -465,6 +608,50 @@ def test_match_rejection_gets_only_one_recovery_and_rechecks_merged_candidates(
     assert match == expected_match
     assert retriever.search.call_count == 2
     assert confirm.call_count == 2
+
+
+def test_identical_recovery_evidence_is_not_sent_to_matcher_twice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate = CandidateChunk(chunk_id="same", user_file_id="file", text="unchanged")
+    retriever = MagicMock()
+    retriever.search.side_effect = [[candidate], [candidate]]
+    confirm = MagicMock(return_value=None)
+    monkeypatch.setattr(job, "confirm_instruction_match", confirm)
+    _, match = job.retrieve_and_confirm_instruction(
+        retriever=retriever,
+        llm=MagicMock(),
+        instruction=AmendmentInstruction(instruction_text="Change this provision"),
+    )
+    assert match is None
+    confirm.assert_called_once()
+
+
+def test_recovered_exact_structure_uses_the_same_verified_confirmation_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate = CandidateChunk(
+        chunk_id="found",
+        user_file_id="file",
+        text="(2) Old text",
+        source_name="Makina Güvenliği Tebliği",
+        structured_match=True,
+        metadata={"article_no": "4", "paragraph_no": "2"},
+    )
+    retriever = MagicMock()
+    retriever.search.side_effect = [[], [candidate]]
+    confirm = MagicMock(return_value=None)
+    monkeypatch.setattr(job, "confirm_instruction_match", confirm)
+    _, match = job.retrieve_and_confirm_instruction(
+        retriever=retriever,
+        llm=MagicMock(),
+        instruction=AmendmentInstruction(
+            instruction_text="MADDE 2- Aynı Tebliğin 4 üncü maddesinin ikinci fıkrası yürürlükten kaldırılmıştır.",
+            target_source="Makina Güvenliği Tebliği",
+        ),
+    )
+    assert match is not None and match.old_chunk_id == "found"
+    confirm.assert_not_called()
 
 
 def test_appendix_without_replacement_body_never_reaches_matcher(

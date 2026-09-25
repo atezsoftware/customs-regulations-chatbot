@@ -1,8 +1,7 @@
 """Legal article namespaces shared by amendment and chat lookup."""
 
 import re
-
-from onyx.regulatory.heading_path import extract_regulatory_provision_references
+import unicodedata
 
 QUALIFIED_ARTICLE_RE = re.compile(
     r"(?<!\w)(?P<kind>ek|geçici|gecici|mükerrer|mukerrer)\s+"
@@ -15,6 +14,8 @@ QUALIFIED_ARTICLE_RE = re.compile(
 
 def article_identity(reference: str) -> str | None:
     """Preserve the normal/additional/temporary/repeated article namespace."""
+    from onyx.regulatory.heading_path import extract_regulatory_provision_references
+
     references = extract_regulatory_provision_references(reference)
     if not references:
         return None
@@ -34,3 +35,9 @@ def article_identity(reference: str) -> str | None:
         )
         return f"{prefix} {number}"
     return number
+
+
+def canonical_clause_label(value: str) -> str:
+    """Normalize casing without merging distinct Turkish legal enumerators."""
+    normalized = unicodedata.normalize("NFC", value.strip())
+    return normalized.translate(str.maketrans({"İ": "i", "I": "ı"})).lower()

@@ -308,3 +308,62 @@ def test_mixed_index_authority_is_independent_of_binding_order(reverse: bool) ->
     assert result == qualified
     assert result.encoder_authority is not None
     assert observed().accepted_by(result)
+
+
+def test_heading_repair_receipt_cannot_change_observed_text_or_vectors() -> None:
+    from onyx.document_index.publication_models import SourceHeadingRepair
+
+    before = observed()
+    source = json.loads(before.source_json)
+    repair = SourceHeadingRepair(
+        canonical_chunk_id=source["regulatory_chunk_id"],
+        original_heading_path=source.get("heading_path"),
+        original_heading_present="heading_path" in source,
+        corrected_heading_path=["Kanun", "EK MADDE 8"],
+        source_sha256="a" * 64,
+        canonical_before_sha256="b" * 64,
+        canonical_after_sha256="c" * 64,
+        parser_version="4",
+        source_start=0,
+        source_end=30,
+    )
+    source["heading_path"] = repair.corrected_heading_path
+    payload = {
+        **before.model_dump(),
+        "source_json": json.dumps(source),
+        "heading_repair": repair,
+    }
+    after = ObservedPublicationProjection.model_validate(payload)
+    from onyx.document_index.elasticsearch.publication import FencedPublicationIndex
+
+    params = {}
+    FencedPublicationIndex._guard_observation(
+        params,
+        {
+            **source,
+            "publication_evidence": {
+                "kind": "observed-v1",
+                "observation": after.model_dump(mode="json", exclude={"source_json"}),
+            },
+        },
+    )
+    assert params["observation"].get("heading_path") == repair.original_heading_path
+    assert "heading_path" not in params["observation_mutable"]
+    assert after.observed_immutable_sha256 == before.observed_immutable_sha256
+    assert (
+        json.loads(after.source_json)["content_vector"]
+        == json.loads(before.source_json)["content_vector"]
+    )
+    for field, value in (
+        ("content_vector", [0.9, 0.2]),
+        ("content", "Changed legal text"),
+        ("heading_path", ["Wrong"]),
+    ):
+        with pytest.raises(ValueError):
+            ObservedPublicationProjection.model_validate(
+                {**payload, "source_json": json.dumps({**source, field: value})}
+            )
+    with pytest.raises(ValueError):
+        ObservedPublicationProjection.model_validate(
+            {**payload, "heading_repair": None}
+        )

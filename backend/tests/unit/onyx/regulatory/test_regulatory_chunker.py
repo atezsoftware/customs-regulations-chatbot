@@ -1008,3 +1008,56 @@ b) Dördüncü veri.
     assert all(len(chunk.metadata.source_chunk_orders) == 2 for chunk in aggregates)
     assert "MADDE 2" not in aggregates[0].text
     assert "MADDE 1" not in aggregates[1].text
+
+
+@pytest.mark.parametrize("number", [1, 8, 21])
+def test_additional_article_has_own_namespace_and_keeps_body(number: int) -> None:
+    body = f"""ÖRNEK KANUN
+
+MADDE 12 - (1) Normal hüküm.
+
+**EK MADDE {number}** - (1) İlave hüküm uygulanır.
+
+(2) İkinci fıkra uygulanır.
+
+EK-1
+
+Ek tablosunun açıklaması.
+"""
+    doc = RegulatoryChunker().chunk_text(body, source_file="kanun.md")
+    added = [
+        c
+        for c in doc.chunks
+        if "İlave hüküm" in c.text and c.metadata.chunk_variant == "atomic"
+    ]
+    assert len(added) == 1
+    assert added[0].metadata.article_no == f"EK {number}"
+    assert any(f"EK MADDE {number}" in h for h in added[0].metadata.heading_path)
+    assert added[0].metadata.appendix_label is None
+    second = next(
+        c
+        for c in doc.chunks
+        if "İkinci fıkra" in c.text and c.metadata.chunk_variant == "atomic"
+    )
+    assert second.metadata.article_no == f"EK {number}"
+    assert second.metadata.paragraph_no == "2"
+
+
+@pytest.mark.parametrize("label", ["g", "ğ", "c", "ç", "i", "ı", "Ğ", "Ç", "İ", "I"])
+def test_clause_identity_preserves_turkish_letters(label: str) -> None:
+    doc = RegulatoryChunker().chunk_text(
+        f"ÖRNEK KANUN\n\nMADDE 2 - (1) Tanımlar:\n\n{label}) Özel tanım uygulanır.",
+        source_file="kanun.md",
+    )
+    clause = next(c for c in doc.chunks if "Özel tanım" in c.text)
+    expected = label.translate(str.maketrans({"İ": "i", "I": "ı"})).lower()
+    assert clause.metadata.clause_label == expected
+    assert clause.metadata.paragraph_no == "1"
+
+
+def test_additional_article_cross_reference_does_not_open_article() -> None:
+    doc = RegulatoryChunker().chunk_text(
+        "ÖRNEK KANUN\n\nMADDE 2 - (1) Başvuru yapılır.\n\nEk madde 8 uyarınca işlem yapılır.",
+        source_file="kanun.md",
+    )
+    assert {c.metadata.article_no for c in doc.chunks if c.metadata.article_no} == {"2"}

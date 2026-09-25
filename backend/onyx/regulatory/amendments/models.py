@@ -20,6 +20,8 @@ from pydantic import (
     model_validator,
 )
 
+from onyx.regulatory.amendments.insertion_order import InsertionOrder
+
 
 def _normalize_iso_date(value: Any) -> Any:
     """Canonicalize unambiguous date strings returned by structured models."""
@@ -247,6 +249,9 @@ class ReviewedAmendmentChunkDraft(BaseModel):
 
     user_file_id: UUID
     position: int = Field(ge=0, strict=True)
+    insertion_order: InsertionOrder | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     text: str = Field(min_length=1)
     chunk_type: str | None = None
     heading_path: list[str] = Field(default_factory=list)

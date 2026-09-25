@@ -4,7 +4,7 @@ from datetime import date
 from typing import Literal, Self
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
 from onyx.document_index.publication_models import (
     PublicationIndexSnapshot,
@@ -104,6 +104,9 @@ class WriterPublicationManifest(BaseModel):
     previous_binding_ids: list[UUID]
     bindings: list[AnnexTemporalProjection]
     canonical_revisions: dict[UUID, UUID] = Field(default_factory=dict)
+    structure_repair: dict[str, JsonValue] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     views: list[PreparedContextView] = Field(default_factory=list)
     amendment_impacts: list[AmendmentImpactReport] = Field(
         default_factory=list, exclude_if=lambda value: not value
@@ -111,6 +114,22 @@ class WriterPublicationManifest(BaseModel):
 
     @model_validator(mode="after")
     def validate_inventory(self) -> Self:
+        if self.structure_repair is not None:
+            from onyx.regulatory.structure_metadata_repair import StructureRepairPlan
+
+            repair = StructureRepairPlan.model_validate(self.structure_repair)
+            desired = {row.id: row for row in self.canonical_after or []}
+            if (
+                self.kind != "metadata"
+                or not repair.changes
+                or any(
+                    desired.get(change.after.id) != change.after
+                    for change in repair.changes
+                )
+            ):
+                raise ValueError(
+                    "Structure repair source authority differs from its canonical transition"
+                )
         if (self.kind == "durable") != (
             self.durable_job_id is not None and self.durable_input_sha256 is not None
         ):

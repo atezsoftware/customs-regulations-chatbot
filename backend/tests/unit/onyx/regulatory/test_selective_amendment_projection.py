@@ -9,6 +9,7 @@ import pytest
 from onyx.db.enums import IndexModelStatus
 from onyx.db.models import SearchSettings
 from onyx.document_index.publication_models import (
+    FrozenPublicationProjection,
     IndexedProjectionEvidence,
     ObservedPublicationProjection,
 )
@@ -29,11 +30,12 @@ class ProjectionAuthority(OwnedAuthority):
 
 
 @pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("rebase", [False, True])
 @pytest.mark.parametrize(
     "changed_count,scheduled", [(1, False), (4, False), (11, False), (1, True)]
 )
 def test_amendment_retains_unrelated_bindings_and_only_embeds_successors(
-    changed_count: int, scheduled: bool, legacy: bool
+    changed_count: int, scheduled: bool, legacy: bool, rebase: bool
 ) -> None:
     file_id = uuid4()
     authority = ProjectionAuthority(file_id)
@@ -185,12 +187,21 @@ def test_amendment_retains_unrelated_bindings_and_only_embeds_successors(
             )
             for i, row in enumerate(changed)
         )
+        if rebase:
+            after = [
+                row.model_copy(update={"position": row.position + (row.position >= 5)})
+                for row in after
+            ]
         evidence = [
             IndexedProjectionEvidence(
                 index=b.index,
                 source_json=b.projection.source_json,
-                frozen_projection=None if legacy else b.projection,
-                observed_projection=b.projection if legacy else None,
+                frozen_projection=b.projection
+                if isinstance(b.projection, FrozenPublicationProjection)
+                else None,
+                observed_projection=b.projection
+                if isinstance(b.projection, ObservedPublicationProjection)
+                else None,
                 payload_sha256=None,
             )
             for b in original.bindings
@@ -214,9 +225,32 @@ def test_amendment_retains_unrelated_bindings_and_only_embeds_successors(
             if json.loads(b.projection.source_json)["regulatory_chunk_id"]
             not in changed_ids
         }
-        assert retained <= {b.id for b in result.bindings}
+        if rebase:
+            for prior in original.bindings:
+                identifier = json.loads(prior.projection.source_json)[
+                    "regulatory_chunk_id"
+                ]
+                if identifier in changed_ids:
+                    continue
+                current = next(
+                    b
+                    for b in result.bindings
+                    if b.projection.ordinal == prior.projection.ordinal
+                )
+                assert current.semantic_position == prior.semantic_position + (
+                    prior.semantic_position >= 5
+                )
+                assert current.projection.source_json == prior.projection.source_json
+                if current.id != prior.id:
+                    assert (
+                        result.canonical_revisions[current.id]
+                        == inputs.revisions[prior.id]
+                    )
+            assert len(result.bindings) == (59 if scheduled else 30) + changed_count
+        else:
+            assert retained <= {b.id for b in result.bindings}
         assert len(result.bindings) == (59 if scheduled else 30) + changed_count
-        assert len([b for b in result.bindings if b.id not in retained]) == (
+        assert rebase or len([b for b in result.bindings if b.id not in retained]) == (
             3 if scheduled else 2 * changed_count
         )
         assert encode.call_count == changed_count
@@ -252,6 +286,10 @@ def test_amendment_retains_unrelated_bindings_and_only_embeds_successors(
                 ]
             )
         else:
+            assert isinstance(historical.projection, FrozenPublicationProjection)
+            assert isinstance(
+                original.bindings[10].projection, FrozenPublicationProjection
+            )
             assert (
                 historical.projection.embedding_inputs
                 == original.bindings[10].projection.embedding_inputs

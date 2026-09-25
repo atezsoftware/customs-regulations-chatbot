@@ -457,3 +457,29 @@ def test_structural_path_match_uses_first_article_anchor() -> None:
         ["Bazel Sözleşmesi", "MADDE 5", "(1)"],
         reference,
     )
+
+
+@pytest.mark.parametrize(
+    "query", ["EK MADDE 8", "Kanunun ek 8 inci maddesi", "ek 8. maddesi"]
+)
+def test_additional_article_reference_retains_namespace(query: str) -> None:
+    assert extract_single_regulatory_provision_reference(
+        query
+    ) == RegulatoryProvisionReference("8", "ek")
+
+
+def test_additional_article_heading_and_annex_are_distinct() -> None:
+    heading = parse_regulatory_article_heading("EK MADDE 8 - İlave hükümler")
+    assert heading is not None
+    assert (heading.article_no, heading.qualifier) == ("8", "ek")
+    assert parse_regulatory_article_heading("EK-8") is None
+    assert regulatory_provision_heading_phrases(
+        RegulatoryProvisionReference("8", "ek")
+    ) == ("EK MADDE 8", "EK MADDE8")
+    assert normalize_regulatory_heading_path([], article_no="EK 8") == ["EK MADDE 8"]
+
+
+def test_heading_normalization_matches_article_namespace_not_only_number() -> None:
+    assert normalize_regulatory_heading_path(
+        ["Belge", "MADDE 8", "EK MADDE 8", "(1) İlave hüküm"], article_no="EK 8"
+    ) == ["Belge", "EK MADDE 8", "(1) İlave hüküm"]

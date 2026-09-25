@@ -4,7 +4,7 @@ import json
 from datetime import date
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from onyx.db.models import RegulatoryTemporalProjection, SearchSettings, UserFile
@@ -82,13 +82,15 @@ def load_file_temporal_bindings(
     refresh: bool = False,
     projection_ordinals: tuple[int, ...] | None = None,
     index_uuid: str | None = None,
+    canonical_chunk_ids: tuple[str, ...] | None = None,
+    as_of_date: date | None = None,
 ) -> list[AnnexTemporalProjection]:
     from onyx.db.regulatory_canonical_revisions import (
         validate_temporal_canonical_revisions,
     )
     from onyx.document_index.publication_models import publication_digest
 
-    if projection_ordinals == ():
+    if projection_ordinals == () or canonical_chunk_ids == ():
         return []
     query = (
         select(RegulatoryTemporalProjection)
@@ -104,6 +106,21 @@ def load_file_temporal_bindings(
         )
     if index_uuid is not None:
         query = query.where(RegulatoryTemporalProjection.index_uuid == index_uuid)
+    if canonical_chunk_ids is not None:
+        query = query.where(
+            RegulatoryTemporalProjection.canonical_chunk_id.in_(canonical_chunk_ids)
+        )
+    if as_of_date is not None:
+        query = query.where(
+            or_(
+                RegulatoryTemporalProjection.effective_start.is_(None),
+                RegulatoryTemporalProjection.effective_start <= as_of_date,
+            ),
+            or_(
+                RegulatoryTemporalProjection.effective_end.is_(None),
+                RegulatoryTemporalProjection.effective_end > as_of_date,
+            ),
+        )
     rows = list(session.scalars(query))
     for row in rows:
         if publication_digest(row.payload) != row.payload_sha256:
@@ -112,7 +129,11 @@ def load_file_temporal_bindings(
     bindings = [AnnexTemporalProjection.model_validate(row.payload) for row in rows]
     for row, binding in zip(rows, bindings):
         if (
-            row.projection_ordinal != binding.projection.ordinal
+            row.canonical_chunk_id
+            != json.loads(binding.projection.source_json)["regulatory_chunk_id"]
+            or row.effective_start != binding.effective_start
+            or row.effective_end != binding.effective_end
+            or row.projection_ordinal != binding.projection.ordinal
             or row.index_uuid != binding.index.index_uuid
             or str(row.user_file_id)
             != json.loads(binding.projection.source_json)["document_id"]

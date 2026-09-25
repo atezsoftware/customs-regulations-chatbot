@@ -75,6 +75,7 @@ from onyx.error_handling.exceptions import OnyxError
 from onyx.file_store.file_store import get_default_file_store
 from onyx.regulatory.amendments.annexes import config as annex_config
 from onyx.regulatory.amendments.annexes.sources import MAX_ASSET_BYTES
+from onyx.regulatory.amendments.runtime import AmendmentRuntime
 from onyx.regulatory.amendments.source_extraction import (
     AmendmentSourceExtractionError,
     fetch_and_extract_amendment_url,
@@ -671,6 +672,21 @@ def list_amendment_proposals(
         )
         for p in proposals
     ]
+
+
+@router.get("/amendments/batches/{batch_id}/runtime", tags=PUBLIC_API_TAGS)
+def get_amendment_runtime(
+    batch_id: int,
+    user: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
+    db_session: Session = Depends(get_session),
+) -> AmendmentRuntime:
+    from onyx.db.amendment_resources import load_runtime_header, load_runtime_snapshot
+
+    header = load_runtime_header(db_session, batch_id)
+    if header is None:
+        raise OnyxError(OnyxErrorCode.NOT_FOUND, "Amendment batch not found")
+    _get_editable_document_set(db_session, header.document_set_id, user)
+    return load_runtime_snapshot(db_session, header)
 
 
 @router.get(

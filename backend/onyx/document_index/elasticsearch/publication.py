@@ -73,6 +73,25 @@ if (ctx._source.publication_token == params.token) {
                 original.put(entry.getKey(), entry.getValue());
             }
         }
+        def receipt = ctx._source.publication_evidence;
+        if (receipt != null && receipt.kind == 'observed-v1' &&
+            receipt.observation.heading_repair != null) {
+            def prior = receipt.observation.heading_repair;
+            def repair = params.observation_heading_repair;
+            if (repair == null || prior.canonical_chunk_id != repair.canonical_chunk_id ||
+                receipt.observation.observed_immutable_sha256 != params.observation_immutable ||
+                prior.original_heading_present != repair.original_heading_present ||
+                (prior.original_heading_path == null ? repair.original_heading_path != null :
+                 !prior.original_heading_path.equals(repair.original_heading_path)) ||
+                !prior.corrected_heading_path.equals(original.get('heading_path'))) {
+                throw new IllegalArgumentException('observed heading repair authority changed');
+            }
+            if (prior.original_heading_present) {
+                original.put('heading_path', prior.original_heading_path);
+            } else {
+                original.remove('heading_path');
+            }
+        }
         if (!original.equals(params.observation) ||
             (ctx._source.publication_evidence != null &&
              ctx._source.publication_evidence.kind != 'observed-v1')) {
@@ -326,9 +345,22 @@ class FencedPublicationIndex:
                     "source_json": json.dumps(publication_source(json.dumps(source))),
                 }
             )
+            original = publication_source(observed.source_json)
+            repair = observed.heading_repair
+            if repair is not None:
+                if repair.original_heading_present:
+                    original["heading_path"] = cast(
+                        JsonValue, repair.original_heading_path
+                    )
+                else:
+                    original.pop("heading_path", None)
+            params["observation_heading_repair"] = (
+                repair.model_dump(mode="json") if repair else None
+            )
+            params["observation_immutable"] = observed.observed_immutable_sha256
             params["observation"] = {
                 key: value
-                for key, value in publication_source(observed.source_json).items()
+                for key, value in original.items()
                 if key not in OBSERVED_MUTABLE_SOURCE_FIELDS
             }
             params["observation_mutable"] = sorted(OBSERVED_MUTABLE_SOURCE_FIELDS)

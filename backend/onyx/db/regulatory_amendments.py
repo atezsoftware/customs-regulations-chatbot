@@ -234,6 +234,7 @@ def persist_proposal_checkpoint(
     instruction_texts = list(getattr(proposal, "instruction_texts", None) or [])
     if not instruction_texts:
         instruction_texts = [proposal.instruction_text]
+    already_applied = _proposal_is_already_applied(db_session, proposal)
     db_session.add(
         AmendmentProposal(
             batch_id=batch_id,
@@ -250,6 +251,11 @@ def persist_proposal_checkpoint(
             match_confidence=proposal.match_confidence,
             match_rationale=proposal.match_rationale,
             date_rationale=proposal.date_rationale,
+            status=(
+                AmendmentProposalStatus.ALREADY_APPLIED.value
+                if already_applied
+                else AmendmentProposalStatus.PENDING.value
+            ),
         )
     )
     covered_indices.update(instruction_indices)
@@ -257,6 +263,44 @@ def persist_proposal_checkpoint(
     batch.processed_instruction_count = len(covered_indices)
     batch.heartbeat_at = datetime.datetime.now(datetime.timezone.utc)
     db_session.commit()
+    return True
+
+
+def _proposal_is_already_applied(db_session: Session, proposal: ProposalDraft) -> bool:
+    from onyx.regulatory.amendments.outcomes import identical_applied_result
+
+    pairs = [
+        (change.old_chunk_id, change.old_chunk_snapshot, change.new_chunk_draft)
+        for change in proposal.chunk_changes
+    ] or [
+        (proposal.old_chunk_id, proposal.old_chunk_snapshot, proposal.new_chunk_draft)
+    ]
+    for identifier, snapshot, draft in pairs:
+        if identifier is None or not identical_applied_result(snapshot, draft):
+            return False
+        current = db_session.get(RegulatoryChunk, identifier, populate_existing=True)
+        if current is None or current.status != RegulatoryChunkStatus.ACTIVE.value:
+            return False
+        parent = (
+            db_session.get(
+                RegulatoryChunk, current.supersedes_chunk_id, populate_existing=True
+            )
+            if current.supersedes_chunk_id
+            else None
+        )
+        if (
+            parent is None
+            or parent.status != RegulatoryChunkStatus.SUPERSEDED.value
+            or parent.superseded_by_chunk_id != current.id
+            or parent.user_file_id != current.user_file_id
+            or parent.position != current.position
+            or parent.validity_end_date != current.validity_start_date
+        ):
+            return False
+        try:
+            _ensure_old_chunk_matches_review_snapshot(current, snapshot)
+        except ValueError:
+            return False
     return True
 
 
@@ -957,6 +1001,19 @@ def _validated_reviewed_chunk_draft(
         raise ValueError("Reviewed chunk draft cannot change user_file_id")
     if reviewed.position != stored.position:
         raise ValueError("Reviewed chunk draft cannot change position")
+    if reviewed.insertion_order != stored.insertion_order:
+        raise ValueError("Reviewed chunk draft cannot change its insertion authority")
+    if reviewed.insertion_order is not None:
+        order = reviewed.insertion_order
+        if old_chunk_snapshot.get("id") is not None or (
+            reviewed.position != order.position
+            or reviewed.metadata.get("article_no") != order.article_no
+            or reviewed.metadata.get("paragraph_no") != order.paragraph_no
+            or reviewed.metadata.get("clause_label") != order.clause_label
+        ):
+            raise ValueError(
+                "Reviewed insertion identity differs from its source authority"
+            )
     canonical_chunk_type = old_chunk_snapshot.get("chunk_type")
     if (
         canonical_chunk_type is not None
@@ -1127,6 +1184,23 @@ def _approve_multi_chunk_proposal(
     if publication_owner is None:
         raise ValueError("Multi-chunk approval requires publication ownership")
     changes = _stored_proposal_chunk_changes(proposal)
+    from onyx.db.regulatory_amendment_order import (
+        apply_insertion_order,
+        validate_insertion_order,
+    )
+    from onyx.regulatory.amendments.insertion_order import InsertionOrder
+
+    insertions = {
+        index: InsertionOrder.model_validate(
+            change["new_chunk_draft"]["insertion_order"]
+        )
+        for index, change in enumerate(changes)
+        if change["new_chunk_draft"].get("insertion_order") is not None
+    }
+    if len(insertions) > 1:
+        raise ValueError("Multiple insertions require one coordinated ordering review")
+    for order in insertions.values():
+        validate_insertion_order(db_session, publication_owner.user_file_id, order)
     target_ids = [
         str(change["old_chunk_id"])
         for change in changes
@@ -1134,6 +1208,26 @@ def _approve_multi_chunk_proposal(
     ]
     if len(set(target_ids)) != len(target_ids):
         raise ValueError("Multi-chunk proposal targets must be unique existing chunks")
+    consumed_snapshots: dict[str, dict[str, Any]] = {}
+    for change in changes:
+        if not any(
+            explicit_replacement_body(text)
+            for text in change.get("instruction_texts", [])
+        ):
+            continue
+        for snapshot in change.get("old_chunk_snapshot", {}).get(
+            "descendant_snapshots", []
+        ):
+            identifier = snapshot.get("id")
+            if (
+                not isinstance(identifier, str)
+                or identifier in target_ids
+                or identifier in consumed_snapshots
+            ):
+                raise ValueError(
+                    "Replacement descendants overlap another reviewed target"
+                )
+            consumed_snapshots[identifier] = snapshot
     heading_scope = proposal.old_chunk_snapshot.get("heading_change_scope")
     if len(target_ids) != len(changes) and heading_scope is None:
         raise ValueError(
@@ -1155,17 +1249,25 @@ def _approve_multi_chunk_proposal(
             raise ValueError(
                 "Article heading scope changed after review; reanalyze before approval"
             )
+    if consumed_snapshots and (
+        heading_scope is None
+        or not consumed_snapshots.keys() <= set(heading_scope["chunk_ids"])
+    ):
+        raise ValueError(
+            "Replacement descendants require a complete reviewed heading scope"
+        )
+    locked_ids = set(target_ids) | consumed_snapshots.keys()
     locked = list(
         db_session.scalars(
             select(RegulatoryChunk)
-            .where(RegulatoryChunk.id.in_(sorted(target_ids)))
+            .where(RegulatoryChunk.id.in_(sorted(locked_ids)))
             .order_by(RegulatoryChunk.id)
             .with_for_update()
             .execution_options(populate_existing=True)
         )
     )
     by_id = {chunk.id: chunk for chunk in locked}
-    if set(by_id) != set(target_ids):
+    if set(by_id) != locked_ids:
         raise ValueError("One or more reviewed chunks no longer exist")
 
     from onyx.db.regulatory_annexes import copy_annex_chunk_links
@@ -1177,6 +1279,7 @@ def _approve_multi_chunk_proposal(
     for index, change in enumerate(changes):
         old_chunk = by_id.get(str(change.get("old_chunk_id")))
         snapshot = dict(change.get("old_chunk_snapshot") or {})
+        replaced_descendants: list[RegulatoryChunk] = []
         if old_chunk is None and snapshot.get("id") is not None:
             raise ValueError("Reviewed multi-chunk target identity changed")
         if old_chunk is not None:
@@ -1190,11 +1293,43 @@ def _approve_multi_chunk_proposal(
                 raise ValueError("Derived aggregate chunks cannot be amended directly.")
             _ensure_old_chunk_matches_review_snapshot(old_chunk, snapshot)
             descendants = load_active_structural_descendants(db_session, old_chunk)
-            if descendants and not (
-                heading_scope is not None
-                and snapshot.get("heading_change", {}).get("article_no")
-                == heading_scope["article_no"]
-                and {row.id for row in descendants}.issubset(target_ids)
+            replacement = any(
+                explicit_replacement_body(text)
+                for text in change.get("instruction_texts", [])
+            )
+            if descendants and replacement and snapshot.get("descendant_snapshots"):
+                from onyx.regulatory.amendments.draft_integrity import (
+                    validate_complete_scope_replacement,
+                )
+
+                validate_complete_scope_replacement(change["instruction_texts"])
+                declared = {item["id"] for item in snapshot["descendant_snapshots"]}
+                if {row.id for row in descendants} != declared:
+                    raise ValueError("Replacement descendants changed after review")
+                for identifier in declared:
+                    descendant = by_id[identifier]
+                    _ensure_old_chunk_matches_review_snapshot(
+                        descendant, consumed_snapshots[identifier]
+                    )
+                    replaced_descendants.append(descendant)
+            elif heading_scope is not None:
+                from onyx.regulatory.amendments.compound_heading import (
+                    reject_compound_descendant_replacement,
+                )
+
+                reject_compound_descendant_replacement(
+                    list(change.get("instruction_texts") or []),
+                    has_descendants=bool(descendants),
+                )
+            if (
+                descendants
+                and not replaced_descendants
+                and not (
+                    heading_scope is not None
+                    and snapshot.get("heading_change", {}).get("article_no")
+                    == heading_scope["article_no"]
+                    and {row.id for row in descendants}.issubset(locked_ids)
+                )
             ):
                 raise ValueError(
                     "A multi-chunk target gained active descendants; reanalyze before approval."
@@ -1229,6 +1364,14 @@ def _approve_multi_chunk_proposal(
         ):
             raise ValueError(
                 "Replacement date must follow the existing chunk start date"
+            )
+        if any(
+            row.validity_start_date is not None
+            and row.validity_start_date >= start_date
+            for row in replaced_descendants
+        ):
+            raise ValueError(
+                "Replacement date must follow the existing descendant start date"
             )
 
         metadata = dict(draft.get("metadata") or {})
@@ -1281,10 +1424,25 @@ def _approve_multi_chunk_proposal(
             old_chunk.validity_end_date = start_date
             old_chunk.superseded_by_chunk_id = new_chunk.id
             db_session.add(old_chunk)
+        for descendant in replaced_descendants:
+            supersede_hierarchical_aggregates_referencing_chunk(
+                db_session,
+                user_file_id=user_file_id,
+                source_chunk_id=descendant.id,
+                superseded_at=start_date,
+            )
+            descendant.status = RegulatoryChunkStatus.SUPERSEDED.value
+            descendant.validity_end_date = start_date
+            descendant.superseded_by_chunk_id = new_chunk.id
+            db_session.add(descendant)
         change["new_chunk_draft"] = draft
         new_chunks.append(new_chunk)
         old_chunks.append(old_chunk)
 
+    for index, order in insertions.items():
+        apply_insertion_order(
+            db_session, publication_owner.user_file_id, order, new_chunks[index].id
+        )
     proposal.chunk_changes = changes
     proposal.new_chunk_draft = dict(changes[0]["new_chunk_draft"])
     proposal.status = AmendmentProposalStatus.APPROVING.value
@@ -1418,6 +1576,23 @@ def approve_amendment_proposal(
 
     validate_pdf_proposal_authority(db_session, proposal, draft)
     user_file_id = UUID(draft["user_file_id"])
+    from onyx.db.regulatory_amendment_order import (
+        apply_insertion_order,
+        validate_insertion_order,
+    )
+    from onyx.regulatory.amendments.insertion_order import InsertionOrder
+
+    insertion = (
+        InsertionOrder.model_validate(draft["insertion_order"])
+        if draft.get("insertion_order") is not None
+        else None
+    )
+    if insertion is not None:
+        if proposal.old_chunk_id is not None or publication_owner is None:
+            raise ValueError(
+                "Insertion requires file publication ownership and a new target"
+            )
+        validate_insertion_order(db_session, user_file_id, insertion)
     today = datetime.date.today()
     start_date_str = draft.get("effective_start_date")
     end_date_str = draft.get("effective_end_date")
@@ -1571,6 +1746,8 @@ def approve_amendment_proposal(
         descendant.superseded_by_chunk_id = new_chunk.id
         db_session.add(descendant)
 
+    if insertion is not None:
+        apply_insertion_order(db_session, user_file_id, insertion, new_chunk.id)
     proposal.new_chunk_draft = draft
     proposal.status = AmendmentProposalStatus.APPROVING.value
     proposal.applied_new_chunk_id = new_chunk.id

@@ -28,8 +28,10 @@ from onyx.regulatory.amendments.amendment_context import (
 )
 from onyx.regulatory.amendments.candidate_finder import find_candidates
 from onyx.regulatory.amendments.compound_heading import (
+    article_heading_title,
     attach_heading_changes,
     compound_heading_title,
+    is_article_heading_only,
 )
 from onyx.regulatory.amendments.draft_integrity import (
     DraftIntegrityError,
@@ -43,6 +45,7 @@ from onyx.regulatory.amendments.drafter import (
     draft_multi_chunk_scope,
     draft_new_chunk,
 )
+from onyx.regulatory.amendments.insertion_order import OrderMember
 from onyx.regulatory.amendments.matcher import confirm_match
 from onyx.regulatory.amendments.models import (
     AmendmentInstruction,
@@ -111,6 +114,7 @@ class InstructionDraftContext:
     target_evidence: str | None = None
     expected_new_article_no: str | None = None
     heading_change_snapshots: list[dict[str, Any]] = field(default_factory=list)
+    insertion_members: list["OrderMember"] | None = None
 
 
 def confirm_instruction_match(
@@ -158,6 +162,25 @@ def confirm_instruction_match(
             "Amendment matcher returned candidate id outside the supplied set: %s",
             match.old_chunk_id,
         )
+        return None
+    target = parse_amendment_structural_target(instruction)
+    selected = next(
+        (item for item in candidates if item.chunk_id == match.old_chunk_id), None
+    )
+    if (
+        selected is not None
+        and selected.structure_conflict
+        and target is not None
+        and target.appendix_label is None
+        and target.article_no is not None
+        and selected.resolved_article_no != target.article_no
+        and any(item.resolved_article_no == target.article_no for item in candidates)
+    ):
+        if decisions:
+            decisions[-1]["rationale"] = (
+                "The selected unit contradicts the verified source article boundary; "
+                "stored structural labels cannot override that evidence."
+            )
         return None
     if (
         match.old_chunk_id is None
@@ -260,9 +283,9 @@ def load_instruction_draft_context(
         and compound_heading_title(instruction.instruction_text) is None
     ):
         return None
-    if instruction is not None and compound_heading_title(instruction.instruction_text):
+    if instruction is not None and article_heading_title(instruction.instruction_text):
         target = parse_amendment_structural_target(instruction)
-        if target is None or target.article_no is None or old_chunk is not None:
+        if target is None or target.article_no is None:
             return None
         heading_rows = get_active_chunks_by_structural_reference(
             db_session,
@@ -276,9 +299,19 @@ def load_instruction_draft_context(
         if not heading_rows or len(heading_rows) > 256:
             return None
         heading_snapshots = [_chunk_to_review_dict(row.chunk) for row in heading_rows]
+    from onyx.db.regulatory_amendment_order import load_amendment_order
+
+    insertion_members = (
+        load_amendment_order(db_session, target_user_file_id)
+        if old_chunk is None
+        and instruction is not None
+        and added_subordinate_unit_kind(instruction.instruction_text)
+        else None
+    )
     return InstructionDraftContext(
         match=match,
         heading_change_snapshots=heading_snapshots,
+        insertion_members=insertion_members,
         old_chunk_snapshot=snapshot,
         target_user_file_id=target_user_file_id,
         target_position=target_position,
@@ -329,6 +362,90 @@ def draft_instruction_proposal(
     )
 
 
+def _added_unit_structure(
+    instruction: AmendmentInstruction,
+    text: str,
+    sibling_reference: dict[str, Any] | None,
+) -> tuple[dict[str, str], list[str]] | None:
+    """Use the supplied unit marker and verified parent, not model-made labels."""
+    from onyx.regulatory.provision_identity import canonical_clause_label
+
+    kind = added_subordinate_unit_kind(instruction.instruction_text)
+    target = parse_amendment_structural_target(instruction)
+    if (
+        kind is None
+        or target is None
+        or target.article_no is None
+        or not sibling_reference
+    ):
+        return None
+    marker = re.match(
+        r"^\s*\(?(\d+)\)\s*" if kind == "paragraph" else r"^\s*\(?([a-zçğıöşüİI])\)\s*",
+        text,
+        re.IGNORECASE,
+    )
+    after_paragraph = (
+        str(int(target.paragraph_no) + 1)
+        if kind == "paragraph"
+        and target.paragraph_no is not None
+        and target.paragraph_no.isdecimal()
+        and re.search(
+            r"f[ıi]kra(?:s[ıi]n)?dan\s+sonra\b",
+            amendment_operation_text(instruction.instruction_text),
+            re.IGNORECASE,
+        )
+        else None
+    )
+    if marker is None and after_paragraph is None:
+        return None
+    if (
+        marker is not None
+        and after_paragraph is not None
+        and marker.group(1) != after_paragraph
+    ):
+        raise DraftIntegrityError(
+            "New paragraph marker conflicts with its explicit insertion boundary"
+        )
+    parent_path = list(sibling_reference.get("heading_path") or [])
+    article_index = next(
+        (
+            index
+            for index, part in enumerate(parent_path)
+            if article_identity(part) == target.article_no
+        ),
+        None,
+    )
+    if article_index is None:
+        raise DraftIntegrityError("New provision parent heading could not be verified")
+    path = parent_path[: article_index + 1]
+    metadata = {"article_no": target.article_no}
+    if kind == "paragraph":
+        assert marker is not None or after_paragraph is not None
+        metadata["paragraph_no"] = marker.group(1) if marker else str(after_paragraph)
+    else:
+        assert marker is not None
+        metadata["clause_label"] = canonical_clause_label(marker.group(1))
+        if target.paragraph_no is not None:
+            metadata["paragraph_no"] = target.paragraph_no
+            paragraph_marker = re.compile(
+                rf"^\s*\({re.escape(target.paragraph_no)}\)(?:\s|$)"
+            )
+            path.append(
+                next(
+                    (
+                        part
+                        for part in parent_path[article_index + 1 :]
+                        if paragraph_marker.match(part)
+                    ),
+                    f"({target.paragraph_no})",
+                )
+            )
+    path.append(marker.group().strip() if marker else f"({after_paragraph})")
+    return metadata, reconcile_existing_heading_path(
+        path, amended_text=text, chunk_type=kind, **metadata
+    )
+
+
 def _build_proposal_draft(
     *,
     instruction_indices: list[int],
@@ -348,6 +465,7 @@ def _build_proposal_draft(
         **context.base_metadata,
         **draft.new_chunk.metadata_changes,
     }
+    added_structure_verified = False
     if context.old_chunk_snapshot:
         canonical_metadata = dict(context.old_chunk_snapshot.get("metadata") or {})
         for key in (
@@ -389,6 +507,16 @@ def _build_proposal_draft(
                 raise DraftIntegrityError(
                     f"New provision identity must remain {expected_article} in metadata and heading_path."
                 )
+        structure = _added_unit_structure(
+            instructions[0], draft.new_chunk.text, context.sibling_reference
+        )
+        if structure is not None:
+            added_structure_verified = True
+            unit_metadata, heading_path = structure
+            for key in ("paragraph_no", "clause_label", "subclause_label"):
+                merged_metadata.pop(key, None)
+            merged_metadata.update(unit_metadata)
+            chunk_type = added_subordinate_unit_kind(instructions[0].instruction_text)
 
     if context.old_chunk_snapshot:
         heading_path = reconcile_existing_heading_path(
@@ -432,6 +560,25 @@ def _build_proposal_draft(
         "effective_start_date": draft.dates.effective_start_date,
         "effective_end_date": draft.dates.effective_end_date,
     }
+    if context.insertion_members is not None and added_structure_verified:
+        from onyx.regulatory.amendments.insertion_order import plan_insertion
+
+        if not merged_metadata.get("article_no") or not (
+            merged_metadata.get("paragraph_no") or merged_metadata.get("clause_label")
+        ):
+            raise DraftIntegrityError(
+                "New subordinate unit requires an explicit parent and label"
+            )
+        order = plan_insertion(
+            context.insertion_members,
+            article_no=str(merged_metadata["article_no"]),
+            paragraph_no=str(merged_metadata["paragraph_no"])
+            if merged_metadata.get("paragraph_no") is not None
+            else None,
+            clause_label=merged_metadata.get("clause_label"),
+        )
+        new_chunk_draft["position"] = order.position
+        new_chunk_draft["insertion_order"] = order.model_dump(mode="json")
     combined_match_rationale = (
         matches[0].rationale
         if len(matches) == 1
@@ -467,6 +614,7 @@ def draft_instruction_group_proposal(
     context: InstructionDraftContext,
     pdf_source: PdfBatchSource | None = None,
     amendment_context: AmendmentContext | None = None,
+    apply_heading: bool = True,
 ) -> ProposalDraft:
     if not instructions or len(instruction_indices) != len(instructions):
         raise ValueError(
@@ -534,6 +682,12 @@ def draft_instruction_group_proposal(
         pdf_evidence=evidence,
         amendment_context=amendment_context,
     )
+    if all(is_article_heading_only(item.instruction_text) for item in instructions):
+        if not context.old_chunk_snapshot:
+            raise DraftIntegrityError(
+                "Heading replacement requires an existing article scope"
+            )
+        draft.new_chunk.text = context.old_chunk_snapshot["text"]
     proposal = _build_proposal_draft(
         instruction_indices=instruction_indices,
         instructions=instructions,
@@ -544,15 +698,18 @@ def draft_instruction_group_proposal(
     heading_titles = {
         title
         for item in instructions
-        if (title := compound_heading_title(item.instruction_text))
+        if (title := article_heading_title(item.instruction_text))
     }
-    if heading_titles:
-        if len(heading_titles) != 1 or not context.expected_new_article_no:
+    if heading_titles and apply_heading:
+        article_no = context.expected_new_article_no or context.base_metadata.get(
+            "article_no"
+        )
+        if len(heading_titles) != 1 or not isinstance(article_no, str):
             raise DraftIntegrityError("Combined heading change is ambiguous")
         proposal = attach_heading_changes(
             proposal,
             snapshots=context.heading_change_snapshots,
-            article_no=context.expected_new_article_no,
+            article_no=article_no,
             title=next(iter(heading_titles)),
         )
     if evidence is not None:
@@ -573,6 +730,94 @@ def draft_instruction_group_proposal(
             PDF_EVIDENCE_KEY: receipt.model_dump(mode="json"),
         }
     return proposal
+
+
+def draft_article_heading_group_proposal(
+    llm: LLM,
+    *,
+    items: list[tuple[int, AmendmentInstruction, MatchResult, InstructionDraftContext]],
+    reference_date: str | None,
+    amendment_context: AmendmentContext | None = None,
+    pdf_source: PdfBatchSource | None = None,
+) -> ProposalDraft:
+    """Draft each body once, then apply one heading operation to the complete scope."""
+    heading_items = [
+        item for item in items if article_heading_title(item[1].instruction_text)
+    ]
+    if not heading_items:
+        raise DraftIntegrityError("Article dependency group has no heading operation")
+    titles = {article_heading_title(item[1].instruction_text) for item in heading_items}
+    targets = [parse_amendment_structural_target(item[1]) for item in items]
+    articles = {target.article_no for target in targets if target is not None}
+    files = {item[3].target_user_file_id for item in items}
+    if len(titles) != 1 or len(articles) != 1 or None in articles or len(files) != 1:
+        raise DraftIntegrityError("Heading dependency source or article is ambiguous")
+    title = next(iter(titles))
+    article_no = next(iter(articles))
+    assert title is not None and article_no is not None
+    snapshots = heading_items[0][3].heading_change_snapshots
+    if not snapshots or any(
+        item[3].heading_change_snapshots != snapshots for item in heading_items
+    ):
+        raise DraftIntegrityError(
+            "Heading dependencies do not share one canonical revision"
+        )
+    groups: dict[
+        str | int,
+        list[tuple[int, AmendmentInstruction, MatchResult, InstructionDraftContext]],
+    ] = {}
+    for item in items:
+        groups.setdefault(item[2].old_chunk_id or item[0], []).append(item)
+    proposals = []
+    for group in groups.values():
+        proposals.append(
+            draft_instruction_group_proposal(
+                llm,
+                instruction_indices=[item[0] for item in group],
+                instructions=[item[1] for item in group],
+                matches=[item[2] for item in group],
+                context=group[0][3],
+                reference_date=reference_date,
+                amendment_context=amendment_context,
+                pdf_source=pdf_source,
+                apply_heading=False,
+            )
+        )
+    changes = []
+    for proposal in proposals:
+        changes.extend(
+            proposal.chunk_changes
+            or [
+                ProposalChunkChange(
+                    old_chunk_id=proposal.old_chunk_id,
+                    old_chunk_snapshot=proposal.old_chunk_snapshot,
+                    new_chunk_draft=proposal.new_chunk_draft,
+                    instruction_indices=proposal.instruction_indices,
+                    instruction_texts=proposal.instruction_texts,
+                    match_confidence=proposal.match_confidence,
+                    match_rationale=proposal.match_rationale,
+                    date_rationale=proposal.date_rationale,
+                )
+            ]
+        )
+    combined = proposals[0].model_copy(
+        update={
+            "instruction_indices": [item[0] for item in items],
+            "instruction_texts": [item[1].instruction_text for item in items],
+            "chunk_changes": changes,
+            "match_confidence": min(
+                (
+                    proposal.match_confidence
+                    for proposal in proposals
+                    if proposal.match_confidence is not None
+                ),
+                default=None,
+            ),
+        }
+    )
+    return attach_heading_changes(
+        combined, snapshots=snapshots, article_no=article_no, title=title
+    )
 
 
 def draft_multi_chunk_group_proposal(

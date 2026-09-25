@@ -58,6 +58,37 @@ def source_identity_matches(target_source: str | None, source_name: str) -> bool
     return distinguishing_tokens <= _source_identity_tokens(source_name)
 
 
+def _series_identities(value: str) -> set[tuple[int, int]]:
+    return {
+        (int(match[0]), int(match[1]))
+        for match in re.findall(
+            r"(?<!\d)((?:19|20)\d{2})\s*[/_-]\s*(\d{1,5})(?!\d|[/_-]\d)",
+            value,
+        )
+    }
+
+
+def source_file_identity_matches(target: str, name: str, root: str) -> bool:
+    """Verify a file's own title and reject conflicting instrument identifiers."""
+    number = named_law_number(target)
+    filename_number, root_number = named_law_number(name), named_law_number(root)
+    if filename_number and root_number and filename_number != root_number:
+        return False
+    if number is not None:
+        return (filename_number or root_number) == number
+    series = _series_identities(target)
+    name_series, root_series = _series_identities(name), _series_identities(root)
+    if name_series and root_series and name_series != root_series:
+        return False
+    if series and any(
+        identities and identities != series for identities in (name_series, root_series)
+    ):
+        return False
+    return source_identity_matches(target, name) or source_identity_matches(
+        target, root
+    )
+
+
 def named_law_number(source_name: str) -> str | None:
     """Identify a law title, not a law cited inside another document's name."""
     folded = unicodedata.normalize("NFKD", source_name.casefold().replace("ı", "i"))

@@ -1,6 +1,7 @@
 import datetime
 from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import MagicMock
 from uuid import UUID
 
@@ -2936,3 +2937,112 @@ def test_historical_navigation_uses_half_open_validity_window() -> None:
         successor,
         as_of_date=boundary,
     )
+
+
+def test_visibility_reads_only_requested_canonical_identities(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from onyx.db import regulatory_public_reads as reads
+    from onyx.db.models import RegulatoryChunk
+    from onyx.document_index.publication_models import PublicationIndexSnapshot
+
+    session = MagicMock()
+    session.scalars.return_value = [
+        RegulatoryChunk(
+            id=identifier,
+            user_file_id=file,
+            position=position,
+            projection_ordinal=100 + position,
+            text=identifier,
+            heading_path=[],
+            chunk_metadata={},
+            status="active",
+        )
+        for position, (identifier, file) in enumerate(
+            [("one", FILE_A), ("two", FILE_A), ("three", FILE_B)]
+        )
+    ]
+    monkeypatch.setattr(
+        reads, "qualified_file_ids", lambda *_: frozenset((FILE_A, FILE_B))
+    )
+    loader = MagicMock(return_value=[])
+    monkeypatch.setattr(reads, "load_public_temporal_bindings", loader)
+    index = MagicMock(spec=PublicationIndexSnapshot)
+    assert (
+        get_visible_regulatory_chunk_ids(
+            session,
+            ["one", "two", "three"],
+            as_of_date=datetime.date(2026, 1, 1),
+            query_indexes={FILE_A: index, FILE_B: index},
+        )
+        == set()
+    )
+    scopes = {
+        call.args[1]: set(call.kwargs["canonical_chunk_ids"])
+        for call in loader.call_args_list
+    }
+    assert scopes == {FILE_A: {"one", "two"}, FILE_B: {"three"}}
+
+
+def test_heading_navigation_does_not_hydrate_unselected_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import json
+
+    from onyx.db import regulatory_public_reads as reads
+
+    seeds = [
+        SimpleNamespace(id=f"{file}-{n}", user_file_id=file, position=n)
+        for file in (FILE_A, FILE_B)
+        for n in range(2)
+    ]
+    headings = [
+        _navigation_heading_record(file, 0, ("Source", "MADDE 8"))
+        for file in (FILE_A, FILE_B)
+    ]
+    session = MagicMock()
+    session.execute.side_effect = [
+        _navigation_query_result(seeds),
+        _navigation_query_result(headings),
+    ]
+    session.scalar.return_value = "Source"
+    monkeypatch.setattr(
+        reads, "qualified_file_ids", lambda *_: frozenset((FILE_A, FILE_B))
+    )
+    inventory_reads: list[UUID] = []
+
+    def load(_session: object, file: UUID, **kwargs: object) -> list[SimpleNamespace]:
+        ids = kwargs.get("canonical_chunk_ids")
+        if ids is None:
+            inventory_reads.append(file)
+            ids = [
+                record.id
+                for record in [*seeds, *headings]
+                if record.user_file_id == file
+            ]
+        return [
+            SimpleNamespace(
+                projection=SimpleNamespace(
+                    source_json=json.dumps(
+                        {
+                            "regulatory_chunk_id": identifier,
+                            "heading_path": ["Source", "MADDE 8"],
+                        }
+                    )
+                ),
+                semantic_position=position,
+                effective_start=None,
+                effective_end=None,
+            )
+            for position, identifier in enumerate(cast(list[str], ids))
+        ]
+
+    monkeypatch.setattr(reads, "load_public_temporal_bindings", load)
+    result = get_regulatory_provision_heading_source(
+        session,
+        [seed.id for seed in seeds],
+        as_of_date=None,
+        query_indexes={FILE_A: MagicMock(), FILE_B: MagicMock()},
+    )
+    assert result is not None and result.user_file_id == FILE_A
+    assert inventory_reads == [FILE_A]

@@ -214,19 +214,22 @@ def _child_main() -> None:
 
     from functools import partial
 
+    from onyx.context.search.retrieval.concurrency import limit_search_concurrency
     from onyx.db.amendment_resources import record_analysis_resources
     from onyx.db.engine.sql_engine import SqlEngine, get_session_with_current_tenant
     from onyx.regulatory.amendments.job import run_amendment_batch
-    from onyx.regulatory.amendments.memory_budget import bounded_map
+    from onyx.regulatory.amendments.memory_budget import (
+        MAX_ANALYSIS_PARALLELISM,
+        bounded_map,
+    )
     from shared_configs.contextvars import CURRENT_TENANT_ID_CONTEXTVAR
 
     batch_id, generation, tenant_id, mode = sys.argv[1:]
     token = CURRENT_TENANT_ID_CONTEXTVAR.set(tenant_id)
     SqlEngine.reset_engine()
     SqlEngine.set_app_name("amendment_analysis_child")
-    # Four matching tasks fan out into up to twenty search lanes with nested
-    # publication reads. Burst connections close on return; only this child
-    # receives the larger pool, leaving API and Celery defaults unchanged.
+    # Ten instructions share twelve inner search slots. Keep capacity for
+    # nested publication reads and checkpoints; burst connections close on return.
     SqlEngine.init_engine(pool_size=24, max_overflow=24, pool_pre_ping=True)
     policy = MemoryPolicy()
 
@@ -248,15 +251,18 @@ def _child_main() -> None:
         policy.check(read_memory())
 
     try:
-        run_amendment_batch(
-            batch_id=int(batch_id),
-            lease_generation=int(generation),
-            instruction_runner=partial(
-                bounded_map, max_parallel=4 if mode == "parallel" else 1, report=report
-            ),
-            check_resources=check_resources,
-            before_work=check_resources,
-        )
+        with limit_search_concurrency(12, check_resources=check_resources):
+            run_amendment_batch(
+                batch_id=int(batch_id),
+                lease_generation=int(generation),
+                instruction_runner=partial(
+                    bounded_map,
+                    max_parallel=MAX_ANALYSIS_PARALLELISM if mode == "parallel" else 1,
+                    report=report,
+                ),
+                check_resources=check_resources,
+                before_work=check_resources,
+            )
     except ResourcePressure:
         raise SystemExit(RESOURCE_EXIT) from None
     finally:

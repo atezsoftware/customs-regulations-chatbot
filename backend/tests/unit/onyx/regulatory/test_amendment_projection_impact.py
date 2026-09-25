@@ -1,4 +1,5 @@
 from datetime import date
+from typing import cast
 from uuid import uuid4
 
 import pytest
@@ -9,10 +10,42 @@ from onyx.regulatory.amendment_projection_impact import (
     merge_windows,
     validate_context_decisions,
 )
+from onyx.regulatory.amendments.annexes.models import AnnexTemporalProjection
 from tests.unit.onyx.regulatory.indexing_jobs.owned_publication_test_helpers import (
     canonical_row,
     writer_inputs,
 )
+
+
+def test_insertion_position_shift_does_not_reembed_the_rest_of_the_document() -> None:
+    file_id = uuid4()
+    before = writer_inputs(
+        file_id, [canonical_row(file_id, n, str(n)) for n in range(100)]
+    ).canonical
+    after = [
+        row.model_copy(update={"position": row.position + (row.position >= 5)})
+        for row in before
+    ]
+    after.append(
+        before[0].model_copy(
+            update={
+                "id": "added",
+                "position": 5,
+                "text": "New paragraph",
+                "validity_start_date": date(2031, 1, 1),
+            }
+        )
+    )
+    assert changed_windows(before, after) == {"added": [(date(2031, 1, 1), date.max)]}
+
+
+def test_actual_reordering_still_invalidates_context() -> None:
+    file_id = uuid4()
+    before = writer_inputs(
+        file_id, [canonical_row(file_id, n, str(n)) for n in range(2)]
+    ).canonical
+    after = [row.model_copy(update={"position": 1 - row.position}) for row in before]
+    assert set(changed_windows(before, after)) == {row.id for row in before}
 
 
 def test_replacement_affects_only_successor_lifetime() -> None:
@@ -344,7 +377,9 @@ def test_context_evidence_selects_actual_consumer_and_keeps_generic_summary(
         if fault == "repair_source_quote" and attempts == 2:
             feedback = data["validation_feedback"]
             assert "context 0" in feedback["error"]
-            assert feedback["previous_decisions"][0]["source_quote"] == "fee is 7 percent"
+            assert (
+                feedback["previous_decisions"][0]["source_quote"] == "fee is 7 percent"
+            )
         decisions = [
             ContextImpactDecision(
                 key=key,
@@ -377,7 +412,11 @@ def test_context_evidence_selects_actual_consumer_and_keeps_generic_summary(
         return cache[key]
 
     report = impact.analyze_amendment_impact(
-        before=before, after=after, bindings=bindings, llm=llm, audit_cache=resolve
+        before=before,
+        after=after,
+        bindings=bindings,
+        llm=llm,
+        audit_cache=resolve,
     )
     if fault not in {None, "transient", "repair_source_quote"}:
         assert report.unresolved
@@ -395,7 +434,11 @@ def test_context_evidence_selects_actual_consumer_and_keeps_generic_summary(
     if fault is None:
         prior_attempts = attempts
         replay = impact.analyze_amendment_impact(
-            before=before, after=after, bindings=bindings, llm=llm, audit_cache=resolve
+            before=before,
+            after=after,
+            bindings=bindings,
+            llm=llm,
+            audit_cache=resolve,
         )
         assert replay.affected_windows == report.affected_windows
         assert attempts == prior_attempts
@@ -513,14 +556,22 @@ def test_context_audit_handles_bounded_provider_output_and_resumes_completed_gro
     monkeypatch.setattr(impact, "generate_structured", audit)
     try:
         failed = impact.analyze_amendment_impact(
-            before=before, after=after, bindings=bindings, llm=llm, audit_cache=resolve
+            before=before,
+            after=after,
+            bindings=cast(list[AnnexTemporalProjection], bindings),
+            llm=llm,
+            audit_cache=resolve,
         )
         assert failed.unresolved and not failed.unchanged_ids
         assert cache  # Successful groups survive a different group's provider failure.
         successful_calls = calls[contexts[consumers[0].id]]
         blocked = False
         result = impact.analyze_amendment_impact(
-            before=before, after=after, bindings=bindings, llm=llm, audit_cache=resolve
+            before=before,
+            after=after,
+            bindings=cast(list[AnnexTemporalProjection], bindings),
+            llm=llm,
+            audit_cache=resolve,
         )
         assert not result.unresolved
         assert set(result.affected_windows) == {"old", "new", consumers[-1].id}

@@ -12,6 +12,9 @@ from onyx.regulatory.provision_identity import (
 from onyx.regulatory.provision_identity import (
     article_identity as article_identity,
 )
+from onyx.regulatory.provision_identity import (
+    canonical_clause_label,
+)
 from onyx.regulatory.source_identity import (
     named_law_number as named_law_number,
 )
@@ -152,7 +155,11 @@ def parse_amendment_structural_target(
     )
     target = AmendmentStructuralTarget(
         article_no=article_no,
-        clause_label=(clause_match.group("label").casefold() if clause_match else None),
+        clause_label=(
+            canonical_clause_label(clause_match.group("label"))
+            if clause_match
+            else None
+        ),
         appendix_label=(
             f"EK-{appendix_match.group('label').upper()}" if appendix_match else None
         ),
@@ -177,6 +184,12 @@ def canonical_structural_query_anchor(
 
     if target is None:
         return None
+    if target.appendix_label is not None:
+        return (
+            f"{target.appendix_label} madde {target.article_no}"
+            if target.article_no is not None
+            else target.appendix_label
+        )
     if target.article_no is not None:
         anchor = f"madde {target.article_no}"
         if target.paragraph_no is not None:
@@ -215,8 +228,13 @@ def deterministic_structural_candidate(
         candidate
         for candidate in candidates
         if bool(getattr(candidate, "structured_match", False))
-        and source_identity_matches(
-            instruction.target_source, str(getattr(candidate, "source_name", ""))
+        and not candidate.source_ambiguous
+        and not candidate.structure_conflict
+        and (
+            candidate.source_verified
+            or source_identity_matches(
+                instruction.target_source, str(getattr(candidate, "source_name", ""))
+            )
         )
     ]
     if target.appendix_label is not None:
@@ -225,7 +243,11 @@ def deterministic_structural_candidate(
             for candidate in exact
             if _candidate_matches_appendix(candidate, target.appendix_label)
         ]
-        return appendix[0] if appendix else None
+        return (
+            appendix[0]
+            if len({candidate.user_file_id for candidate in appendix}) == 1
+            else None
+        )
 
     def matches_named_unit(candidate: CandidateChunk) -> bool:
         metadata = candidate.metadata

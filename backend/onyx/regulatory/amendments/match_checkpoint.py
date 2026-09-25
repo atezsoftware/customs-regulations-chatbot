@@ -13,7 +13,7 @@ from onyx.regulatory.amendments.structural_target import (
     parse_amendment_structural_target,
 )
 
-MATCH_CONTRACT_VERSION = 2
+MATCH_CONTRACT_VERSION = 3
 
 
 class MatchEvidence(BaseModel):
@@ -49,6 +49,60 @@ class MatchedInstruction(BaseModel):
             ("existing", old_chunk_id)
             if old_chunk_id
             else ("new", self.instruction_index)
+        )
+
+    def draft_group_key(self, heading_articles: set[str]) -> tuple[str, str | int]:
+        """Join heading dependencies only inside a verified physical source."""
+        from onyx.regulatory.amendments.target_scope import validated_addition_anchor
+
+        target = parse_amendment_structural_target(self.instruction)
+        if (
+            target is None
+            or target.appendix_label
+            or target.article_no not in heading_articles
+        ):
+            return self.group_key
+        candidate = next(
+            (
+                item
+                for item in self.candidates
+                if item.chunk_id == self.match.old_chunk_id
+            ),
+            None,
+        )
+        if self.match.old_chunk_id is None:
+            candidate = validated_addition_anchor(self.instruction, self.candidates)
+        if candidate is None:
+            return self.group_key
+        return "article_heading", f"{candidate.user_file_id}:{target.article_no}"
+
+    def draft_lane_key(self) -> tuple[str, str]:
+        """Keep overlapping article/annex drafts in one serial lane."""
+        from onyx.regulatory.amendments.target_scope import validated_addition_anchor
+
+        candidate = next(
+            (
+                item
+                for item in self.candidates
+                if item.chunk_id == self.match.old_chunk_id
+            ),
+            None,
+        )
+        if self.match.old_chunk_id is None:
+            candidate = validated_addition_anchor(self.instruction, self.candidates)
+        if candidate is None:
+            return "unverified", "source"
+        target = parse_amendment_structural_target(self.instruction)
+        if target is None:
+            return candidate.user_file_id, "source"
+        if target.appendix_label:
+            return (
+                candidate.user_file_id,
+                f"appendix:{normalize_appendix_label(target.appendix_label)}",
+            )
+        return (
+            candidate.user_file_id,
+            f"article:{target.article_no}" if target.article_no else "source",
         )
 
 

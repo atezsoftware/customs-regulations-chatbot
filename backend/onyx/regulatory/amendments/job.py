@@ -1,10 +1,12 @@
 """Durable execution of one checkpointed amendment-analysis batch."""
 
-from collections.abc import Callable, Generator, Iterable
+from collections.abc import Callable, Generator, Hashable, Iterable
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import date
+from time import monotonic
 from traceback import extract_tb
+from typing import Protocol
 from uuid import UUID
 
 from sqlalchemy.orm import Session
@@ -44,6 +46,7 @@ from onyx.regulatory.amendments.new_provision_policy import (
 )
 from onyx.regulatory.amendments.pipeline import (
     confirm_instruction_match,
+    draft_article_heading_group_proposal,
     draft_instruction_group_proposal,
     draft_multi_chunk_group_proposal,
     load_instruction_draft_context,
@@ -89,6 +92,10 @@ def _merge_candidates(
                 structured_match=previous.structured_match
                 or candidate.structured_match,
                 source_verified=previous.source_verified or candidate.source_verified,
+                source_ambiguous=previous.source_ambiguous
+                or candidate.source_ambiguous,
+                structure_conflict=previous.structure_conflict
+                or candidate.structure_conflict,
                 resolved_article_no=candidate.resolved_article_no
                 or previous.resolved_article_no,
                 scope_evidence=candidate.scope_evidence or previous.scope_evidence,
@@ -170,9 +177,10 @@ def retrieve_and_confirm_instruction(
     if appendix_note is not None:
         trace.note = "This annex target needs its replacement body supplied."
         return candidates, None
-    if candidates:
+
+    def exact_match(items: list[CandidateChunk]) -> MatchResult | None:
         structural_candidate = (
-            deterministic_structural_candidate(instruction, candidates)
+            deterministic_structural_candidate(instruction, items)
             if not (
                 explicitly_adds_top_level_provision(instruction.instruction_text)
                 or added_subordinate_unit_kind(instruction.instruction_text)
@@ -180,8 +188,7 @@ def retrieve_and_confirm_instruction(
             else None
         )
         if structural_candidate is not None:
-            trace.confirmations += 1
-            return candidates, MatchResult(
+            return MatchResult(
                 old_chunk_id=structural_candidate.chunk_id,
                 confidence=1.0,
                 rationale=(
@@ -189,6 +196,13 @@ def retrieve_and_confirm_instruction(
                     "named amendment target."
                 ),
             )
+        return None
+
+    if candidates:
+        structural_match = exact_match(candidates)
+        if structural_match is not None:
+            trace.confirmations += 1
+            return candidates, structural_match
         trace.confirmations += 1
         match = confirm_instruction_match(
             llm,
@@ -206,7 +220,13 @@ def retrieve_and_confirm_instruction(
     trace.queries.extend(retriever.query_stats)
     if not recovered:
         return candidates, None
-    candidates = _merge_candidates(candidates, recovered)
+    merged = _merge_candidates(candidates, recovered)
+    if merged == candidates:
+        trace.note = (
+            "Recovery returned the same canonical evidence; no repeated model check."
+        )
+        return candidates, None
+    candidates = merged
     if capture_evidence is not None:
         capture_evidence(candidates)
     trace.candidates = len(candidates)
@@ -214,7 +234,7 @@ def retrieve_and_confirm_instruction(
         trace.note = "This annex target needs its replacement body supplied."
         return candidates, None
     trace.confirmations += 1
-    match = confirm_instruction_match(
+    match = exact_match(candidates) or confirm_instruction_match(
         llm,
         instruction=instruction,
         candidates=candidates,
@@ -227,9 +247,18 @@ def retrieve_and_confirm_instruction(
 
 MatchGroupKey = tuple[str, str | int]
 MatchOutcome = tuple[int, MatchGroupKey] | None
-InstructionRunner = Callable[
-    [Callable[[int], MatchOutcome], list[int]], Iterable[MatchOutcome]
-]
+
+
+class InstructionRunner(Protocol):
+    def __call__(
+        self,
+        function: Callable[[int], MatchOutcome],
+        items: list[int],
+        /,
+        *,
+        concurrency_key: Callable[[int], Hashable] | None = None,
+        work_class: Callable[[int], Hashable] | None = None,
+    ) -> Iterable[MatchOutcome]: ...
 
 
 def run_amendment_batch(
@@ -272,10 +301,11 @@ def run_amendment_batch(
         )
         if batch.segmented_instructions:
             instruction_payloads = list(batch.segmented_instructions)
-            reference_date = (
-                batch.reference_date.isoformat()
-                if hasattr(batch.reference_date, "isoformat")
-                else batch.reference_date
+            stored_date = batch.reference_date
+            reference_date: str | None = (
+                stored_date.isoformat()
+                if isinstance(stored_date, date)
+                else stored_date
             )
         else:
             instruction_payloads = []
@@ -323,7 +353,12 @@ def run_amendment_batch(
                 instructions=instruction_payloads,
             ):
                 raise RuntimeError(f"Amendment batch {batch_id} lost its lease")
-        reference_date = segmentation.reference_date
+        segmented_date = segmentation.reference_date
+        reference_date = (
+            segmented_date.isoformat()
+            if isinstance(segmented_date, date)
+            else segmented_date
+        )
         del segmentation
 
     instructions = propagate_target_sources(
@@ -400,6 +435,14 @@ def run_amendment_batch(
     )
     del raw_text, instruction_payloads
     groups: dict[tuple[str, str | int], list[int]] = {}
+    from onyx.regulatory.amendments.compound_heading import article_heading_title
+
+    heading_articles: set[str] = set()
+    for instruction in instructions:
+        if article_heading_title(instruction.instruction_text):
+            target = parse_amendment_structural_target(instruction)
+            if target is not None and target.article_no is not None:
+                heading_articles.add(target.article_no)
     pending_indices: list[int] = []
     # Only real retrieval work can calibrate the scheduler's memory budget.
     for instruction_index in range(len(instructions)):
@@ -423,7 +466,9 @@ def run_amendment_batch(
                 input_sha256=input_sha256,
             )
         if checkpoint is not None:
-            groups.setdefault(checkpoint.group_key, []).append(instruction_index)
+            groups.setdefault(checkpoint.draft_group_key(heading_articles), []).append(
+                instruction_index
+            )
             log("instruction_match_restored", index=instruction_index)
             del checkpoint
             continue
@@ -573,7 +618,7 @@ def run_amendment_batch(
                 )
             if not persisted:
                 raise RuntimeError(f"Amendment batch {batch_id} lost its lease")
-            outcome = instruction_index, checkpoint.group_key
+            outcome = instruction_index, checkpoint.draft_group_key(heading_articles)
             log("instruction_match_checkpointed", index=instruction_index)
             del checkpoint
 
@@ -589,7 +634,21 @@ def run_amendment_batch(
         # Only checkpoint references survive the next retrieval/model call.
         return outcome
 
-    outcomes = (instruction_runner or map)(match_one, pending_indices)
+    def instruction_work_class(index: int) -> str:
+        target = parse_amendment_structural_target(instructions[index])
+        if target is not None and target.appendix_label:
+            return "annex"
+        if article_heading_title(instructions[index].instruction_text):
+            return "heading"
+        return "provision" if target is not None else "general"
+
+    outcomes = (
+        instruction_runner(
+            match_one, pending_indices, work_class=instruction_work_class
+        )
+        if instruction_runner is not None
+        else map(match_one, pending_indices)
+    )
     for outcome in outcomes:
         if outcome is not None:
             index, group_key = outcome
@@ -601,9 +660,33 @@ def run_amendment_batch(
             raise RuntimeError(f"Amendment batch {batch_id} no longer exists")
         pdf_source = load_batch_pdf_source(db_session, batch)
     del batch
-    ordered_groups = sorted(groups.values(), key=lambda indices: min(indices))
+    draft_groups = []
+    for key, indices in groups.items():
+        if key[0] != "article_heading" or any(
+            article_heading_title(instructions[index].instruction_text)
+            for index in indices
+        ):
+            draft_groups.append(indices)
+            continue
+        # A heading in another file (or an unmatched heading) does not merge
+        # otherwise independent operations in this source.
+        separate: dict[MatchGroupKey, list[int]] = {}
+        for index in indices:
+            with _session() as db_session:
+                checkpoint = load_match_checkpoint(
+                    db_session,
+                    batch_id=batch_id,
+                    instruction_index=index,
+                    input_sha256=input_sha256,
+                )
+            if checkpoint is None:
+                raise RuntimeError("Amendment match source changed before grouping")
+            separate.setdefault(checkpoint.group_key, []).append(index)
+        draft_groups.extend(separate.values())
+    ordered_groups = sorted(draft_groups, key=lambda indices: min(indices))
 
     def draft_group(group: list[int]) -> None:
+        draft_started = monotonic()
         if before_work is not None:
             before_work()
         if check_resources is not None:
@@ -649,6 +732,11 @@ def run_amendment_batch(
         )
         appendix_candidate_ids = list(dict.fromkeys(appendix_candidate_ids))
         contexts = []
+        heading_group = any(
+            article_heading_title(item.instruction.instruction_text)
+            for item in ordered_group
+        )
+        heading_contexts = []
         with _session() as db_session:
             representative = next(
                 (
@@ -707,6 +795,21 @@ def run_amendment_batch(
                         contexts.append(context)
             elif representative_context is not None:
                 contexts.append(representative_context)
+            if heading_group:
+                for item in ordered_group:
+                    context = load_instruction_draft_context(
+                        db_session,
+                        candidates=group_candidates,
+                        match=item.match,
+                        instruction=item.instruction,
+                    )
+                    if context is None:
+                        heading_contexts = []
+                        break
+                    heading_contexts.append(
+                        (item.instruction_index, item.instruction, item.match, context)
+                    )
+                contexts = [item[3] for item in heading_contexts]
         log(
             "draft_group_started",
             indices=instruction_indices,
@@ -755,9 +858,20 @@ def run_amendment_batch(
             return
 
         try:
-            if len(contexts) > 1:
+            draft_llm = (
+                get_amendment_analysis_llm() if instruction_runner is not None else llm
+            )
+            if heading_group:
+                proposal = draft_article_heading_group_proposal(
+                    draft_llm,
+                    items=heading_contexts,
+                    reference_date=reference_date,
+                    amendment_context=amendment_context,
+                    pdf_source=pdf_source,
+                )
+            elif len(contexts) > 1:
                 proposal = draft_multi_chunk_group_proposal(
-                    llm,
+                    draft_llm,
                     instruction_indices=instruction_indices,
                     instructions=[item.instruction for item in ordered_group],
                     matches=[item.match for item in ordered_group],
@@ -767,7 +881,7 @@ def run_amendment_batch(
                 )
             else:
                 proposal = draft_instruction_group_proposal(
-                    llm,
+                    draft_llm,
                     instruction_indices=instruction_indices,
                     instructions=[item.instruction for item in ordered_group],
                     matches=[item.match for item in ordered_group],
@@ -835,6 +949,11 @@ def run_amendment_batch(
             )
         if not persisted:
             raise RuntimeError(f"Amendment batch {batch_id} lost its lease")
+        log(
+            "draft_group_checkpointed",
+            indices=instruction_indices,
+            elapsed_seconds=round(monotonic() - draft_started, 3),
+        )
         logger.info(
             "Amendment batch=%s processed instruction group=%s lease=%s candidates=%s",
             batch_id,
@@ -843,8 +962,52 @@ def run_amendment_batch(
             len(group_candidates),
         )
 
-    for group in ordered_groups:
-        draft_group(group)
+    if instruction_runner is None:
+        for group in ordered_groups:
+            draft_group(group)
+    else:
+        lane_groups: dict[tuple[str, str], list[list[int]]] = {}
+        for group in ordered_groups:
+            with _session() as db_session:
+                checkpoint = load_match_checkpoint(
+                    db_session,
+                    batch_id=batch_id,
+                    instruction_index=group[0],
+                    input_sha256=input_sha256,
+                )
+            if checkpoint is None:
+                raise RuntimeError("Amendment match source changed before scheduling")
+            lane_groups.setdefault(checkpoint.draft_lane_key(), []).append(group)
+        # An unqualified source scope may overlap any article in that file.
+        wildcard_files = {
+            file_id for file_id, provision in lane_groups if provision == "source"
+        }
+        lanes: dict[tuple[str, str], list[list[int]]] = {}
+        for key, members in lane_groups.items():
+            lane = (
+                ("unverified", "source")
+                if "unverified" in wildcard_files
+                else ((key[0], "source") if key[0] in wildcard_files else key)
+            )
+            lanes.setdefault(lane, []).extend(members)
+        work = sorted(
+            [(group, lane) for lane, members in lanes.items() for group in members],
+            key=lambda item: min(item[0]),
+        )
+
+        def draft_item(index: int) -> MatchOutcome:
+            draft_group(work[index][0])
+            return None
+
+        for _ in instruction_runner(
+            draft_item,
+            list(range(len(work))),
+            concurrency_key=lambda index: work[index][1],
+            work_class=lambda index: tuple(
+                sorted({instruction_work_class(item) for item in work[index][0]})
+            ),
+        ):
+            pass
     log("proposals_finished", groups=len(ordered_groups))
     if check_resources is not None:
         check_resources()

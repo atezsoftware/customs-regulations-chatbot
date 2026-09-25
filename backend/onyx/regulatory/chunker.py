@@ -18,11 +18,12 @@ from pathlib import Path
 from typing import Any, Literal
 
 from onyx.regulatory.heading_path import parse_regulatory_article_heading
+from onyx.regulatory.provision_identity import canonical_clause_label
 
 # Bump whenever parser or structural chunk-boundary semantics change. Durable
 # jobs persist this identity so a process restart cannot silently reinterpret
 # an immutable input revision with different chunk-generation semantics.
-REGULATORY_CHUNKER_CODE_VERSION = "3"
+REGULATORY_CHUNKER_CODE_VERSION = "4"
 
 ATOMIC_CHUNK_VARIANT = "atomic"
 HIERARCHICAL_AGGREGATE_CHUNK_VARIANT = "hierarchical_aggregate"
@@ -110,12 +111,12 @@ _DOCUMENT_TITLE_TYPE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 )
 
 _ARTICLE_RE = re.compile(
-    r"^(?P<label>(?:gecici|geçici)\s+madde|(?:mukerrer|mükerrer)\s+madde|madde)"
+    r"^(?P<label>(?:gecici|geçici)\s+madde|(?:mukerrer|mükerrer)\s+madde|ek\s+madde|madde)"
     r"(?:\s+|\s*[:.]\s*)(?P<num>\d+(?:/?[a-z])?)\b\s*(?:[-–—:]\s*)?(?P<rest>.*)$",
     flags=re.IGNORECASE,
 )
 _ARTICLE_EXPLICIT_SEPARATOR_RE = re.compile(
-    r"^(?:geçici\s+madde|mükerrer\s+madde|madde)"
+    r"^(?:geçici\s+madde|mükerrer\s+madde|ek\s+madde|madde)"
     r"(?:\s+|\s*[:.]\s*)\d+(?:/?[a-z])?\s*[-–—:]",
     flags=re.IGNORECASE,
 )
@@ -767,7 +768,11 @@ class RegulatoryChunker:
                         heading_path=parent_path,
                         article_no=current_article_no,
                         article_title=current_article_title,
-                        paragraph_no=unit_label if unit_kind == "paragraph" else None,
+                        paragraph_no=(
+                            unit_label
+                            if unit_kind == "paragraph"
+                            else _enclosing_paragraph_no(stack)
+                        ),
                         clause_label=unit_label if unit_kind == "clause" else None,
                         appendix_label=current_appendix,
                     )
@@ -859,7 +864,11 @@ class RegulatoryChunker:
                     heading_path=parent_path,
                     article_no=current_article_no,
                     article_title=current_article_title,
-                    paragraph_no=unit_label if unit_kind == "paragraph" else None,
+                    paragraph_no=(
+                        unit_label
+                        if unit_kind == "paragraph"
+                        else _enclosing_paragraph_no(stack)
+                    ),
                     clause_label=unit_label if unit_kind == "clause" else None,
                     appendix_label=current_appendix,
                 )
@@ -1623,6 +1632,15 @@ def _article_unit_level(stack: list[StructureNode], *, kind: str) -> int:
     return 4 if kind == "clause" else 3
 
 
+def _enclosing_paragraph_no(stack: list[StructureNode]) -> str | None:
+    for node in reversed(stack):
+        if node.node_type == "article":
+            break
+        if node.node_type in {"paragraph", "numbered_section"}:
+            return _paragraph_no(node.label)
+    return None
+
+
 def _current_article_level(stack: list[StructureNode]) -> int | None:
     for node in reversed(stack):
         if node.node_type == "article":
@@ -1660,6 +1678,9 @@ def _classify_block(block: SourceBlock) -> dict[str, Any]:
         elif "mukerrer" in label:
             article_heading = f"MÜKERRER MADDE {article_no}"
             article_no = f"MÜKERRER {article_no}"
+        elif label.startswith("ek "):
+            article_heading = f"EK MADDE {article_no}"
+            article_no = f"EK {article_no}"
         else:
             article_heading = f"MADDE {article_no}"
         return {
@@ -1676,6 +1697,8 @@ def _classify_block(block: SourceBlock) -> dict[str, Any]:
             article_no = f"GEÇİCİ {article_no}"
         elif "mukerrer" in label:
             article_no = f"MÜKERRER {article_no}"
+        elif label.startswith("ek "):
+            article_no = f"EK {article_no}"
         return {
             "kind": "article",
             "article_no": article_no,
@@ -1722,7 +1745,7 @@ def _classify_block(block: SourceBlock) -> dict[str, Any]:
 def _article_rest_from_original(clean: str) -> str:
     match = re.match(
         r"^(?:GEÇİCİ\s+MADDE|Geçici\s+Madde|MÜKERRER\s+MADDE|Mükerrer\s+Madde|"
-        r"MADDE|Madde)(?:\s+|\s*[:.]\s*)\d+(?:/?[A-Za-z])?\s*"
+        r"EK\s+MADDE|Ek\s+Madde|MADDE|Madde)(?:\s+|\s*[:.]\s*)\d+(?:/?[A-Za-z])?\s*"
         r"(?:[-–—:]\s*)?(.*)$",
         clean,
     )
@@ -2051,7 +2074,7 @@ def _article_unit(clean_text: str, raw_text: str) -> dict[str, str] | None:
 
     return {
         "kind": "clause",
-        "label": _fold_text(label),
+        "label": canonical_clause_label(label),
         "marker": marker,
         "body": clean_text[clause.end() :].strip(),
     }

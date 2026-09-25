@@ -20,6 +20,70 @@ from onyx.tools.models import ToolResponse
 _FILE_ID = UUID("00000000-0000-0000-0000-000000000123")
 
 
+def test_verified_addition_parent_avoids_unnecessary_semantic_search() -> None:
+    instruction = AmendmentInstruction(
+        instruction_text="MADDE 12- Aynı Tebliğin 8 inci maddesinin birinci fıkrasına aşağıdaki bent eklenmiştir. “m) Yeni tanım.”",
+        target_source="Makina Güvenliği Tebliği (2031/4)",
+    )
+    parent = CandidateChunk(
+        chunk_id="parent",
+        user_file_id=str(_FILE_ID),
+        text="(1) Tanımlar.",
+        source_name="Makina Güvenliği Tebliği (2031/4)",
+        metadata={"article_no": "8", "paragraph_no": "1"},
+        structured_match=True,
+    )
+    search = MagicMock(
+        side_effect=AssertionError("Verified parent should not need semantic search")
+    )
+    retriever = AmendmentSearchRetriever(
+        search_tool_factory=search,
+        canonical_candidate_loader=lambda _: {},
+        structural_candidate_loader=lambda _: [parent],
+        source_file_loader=lambda _: [str(_FILE_ID)],
+        allowed_user_file_ids=[_FILE_ID],
+    )
+    results = retriever.search(instruction)
+    assert (
+        len(results) == 1
+        and results[0].chunk_id == "parent"
+        and results[0].source_verified
+    )
+    search.assert_not_called()
+
+
+def test_partial_candidates_cannot_hide_ambiguity_between_source_versions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from onyx.regulatory.amendments.structural_target import (
+        deterministic_structural_candidate,
+    )
+
+    other = UUID("00000000-0000-0000-0000-000000000222")
+    instruction = AmendmentInstruction(
+        instruction_text="MADDE 12- Aynı Tebliğin 8 inci maddesinin birinci fıkrası değiştirilmiştir.",
+        target_source="Makina Güvenliği Tebliği",
+    )
+    candidate = CandidateChunk(
+        chunk_id="one-version",
+        user_file_id=str(_FILE_ID),
+        text="(1) Hüküm.",
+        source_name="Makina Güvenliği Tebliği",
+        metadata={"article_no": "8", "paragraph_no": "1"},
+        structured_match=True,
+    )
+    retriever = AmendmentSearchRetriever(
+        search_tool_factory=MagicMock(),
+        canonical_candidate_loader=lambda _: {},
+        structural_candidate_loader=lambda _: [candidate],
+        source_file_loader=lambda _: [str(_FILE_ID), str(other)],
+        allowed_user_file_ids=[_FILE_ID, other],
+    )
+    monkeypatch.setattr(retriever, "_run_query", lambda *_args, **_kwargs: [])
+    result = retriever.search(instruction)
+    assert result and deterministic_structural_candidate(instruction, result) is None
+
+
 @pytest.mark.parametrize("failures", [1, 3])
 def test_transient_query_expansion_failure_retries_without_losing_candidates(
     monkeypatch: pytest.MonkeyPatch, failures: int
@@ -98,6 +162,99 @@ def test_appendix_target_runs_one_whole_appendix_structural_lookup() -> None:
     ) == ((None, None),)
     assert _structural_lookup_scopes(AmendmentStructuralTarget(article_no="3")) == (
         (None, None),
+    )
+
+
+def test_verified_annex_target_does_not_pay_for_semantic_search() -> None:
+    instruction = AmendmentInstruction(
+        instruction_text="MADDE 20- Aynı Tebliğin Ek-3’ünde yer alan listenin 6 ncı maddesinde yer alan “fotoğraflar” ibaresi “en az üç adet fotoğraf” şeklinde değiştirilmiştir.",
+        target_source="Karayolu Dışında Kullanılan Hareketli Makinaların İthalat Denetimi Tebliği (2026/2)",
+        search_query="İthal ürün fotoğrafları",
+    )
+    target = CandidateChunk(
+        chunk_id="annex-item",
+        user_file_id=str(_FILE_ID),
+        text="6. İthal edilmek istenen ürüne ait en az üç adet fotoğraf.",
+        source_name=instruction.target_source or "",
+        metadata={"appendix_label": "EK3", "paragraph_no": "6"},
+        structured_match=True,
+    )
+    factory = MagicMock()
+    retriever = AmendmentSearchRetriever(
+        search_tool_factory=factory,
+        canonical_candidate_loader=lambda _: {},
+        structural_candidate_loader=lambda _: [target],
+        source_file_loader=lambda _: [str(_FILE_ID)],
+        allowed_user_file_ids=[_FILE_ID],
+    )
+    assert retriever.search(instruction) == [replace(target, source_verified=True)]
+    factory.assert_not_called()
+    assert retriever.query_stats[0]["strategy"] == "verified_structure"
+
+
+def test_recovery_can_change_to_named_structure_without_model_recovery_query() -> None:
+    tool = MagicMock()
+    tool.run.return_value = ToolResponse(
+        rich_response=SearchDocsResponse(
+            search_docs=[], displayed_docs=[], citation_mapping={}
+        ),
+        llm_facing_response="",
+    )
+    retriever = AmendmentSearchRetriever(
+        search_tool_factory=lambda: tool,
+        canonical_candidate_loader=lambda _: {},
+        allowed_user_file_ids=[_FILE_ID],
+    )
+    instruction = AmendmentInstruction(
+        instruction_text="MADDE 20- Aynı Tebliğin Ek-3’ünde yer alan listenin 6 ncı maddesinde yer alan “fotoğraflar” ibaresi değiştirilmiştir.",
+        target_source="Makina Güvenliği Tebliği (2026/2)",
+        search_query="fotoğraflar",
+    )
+    retriever.search(instruction, recovery=True)
+    tool.run.assert_called_once()
+    query = tool.run.call_args.kwargs["queries"][0]
+    assert "2026/2" in query and "EK-3" in query
+    assert query != instruction.search_query
+
+
+@pytest.mark.parametrize(
+    "filename,root,expected",
+    [
+        (
+            "2026-02_ugd_karayolu_disinda_kullanilan_hareketli_makinalarin_ithalat_denetimi_tebligi.md",
+            "",
+            True,
+        ),
+        ("2026-32_ugd_makinalarin_ithalat_denetimi_tebligi.md", "", False),
+        (
+            "belge.md",
+            "Karayolu Dışında Kullanılan Hareketli Makinaların İthalat Denetimi Tebliği (2026/2)",
+            True,
+        ),
+        (
+            "2026-32_ugd_karayolu_disinda_kullanilan_hareketli_makinalarin_ithalat_denetimi_tebligi.md",
+            "Karayolu Dışında Kullanılan Hareketli Makinaların İthalat Denetimi Tebliği (2026/2)",
+            False,
+        ),
+        (
+            "2025-02_ugd_karayolu_disinda_kullanilan_hareketli_makinalarin_ithalat_denetimi_tebligi.md",
+            "",
+            False,
+        ),
+    ],
+)
+def test_file_identity_checks_series_and_root_conflicts(
+    filename: str, root: str, expected: bool
+) -> None:
+    from onyx.regulatory.source_identity import source_file_identity_matches
+
+    assert (
+        source_file_identity_matches(
+            "Karayolu Dışında Kullanılan Hareketli Makinaların İthalat Denetimi Tebliği (2026/2)",
+            filename,
+            root,
+        )
+        is expected
     )
 
 

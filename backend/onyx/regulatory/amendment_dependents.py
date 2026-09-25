@@ -55,7 +55,14 @@ def rebuild_amendment_dependents(
             raise ValueError(f"aggregate source membership unavailable: {row.id}")
         if members:
             dependencies[row.id] = members
-    changed = {i for i in old if i not in dependencies and old[i] != desired[i]}
+    from onyx.regulatory.position_rebase import position_only_changes
+
+    position_only = position_only_changes(before, after)
+    changed = {
+        i
+        for i in old
+        if i not in dependencies and old[i] != desired[i] and i not in position_only
+    }
     affected = set(changed)
     while True:
         consumers = {i for i, ids in dependencies.items() if affected.intersection(ids)}
@@ -91,6 +98,9 @@ def rebuild_amendment_dependents(
         for identifier in ready:
             # Keep exact recovery evidence when dates stop permitting reconstruction.
             original = with_membership([old[identifier]])[0]
+            original = original.model_copy(
+                update={"position": desired[identifier].position}
+            )
             members = dependencies[identifier]
             if any(i not in old for i in members):
                 raise ValueError("derived source missing: " + identifier)

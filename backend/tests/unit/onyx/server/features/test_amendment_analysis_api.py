@@ -15,6 +15,25 @@ from onyx.server.features.regulatory.models import (
 )
 
 
+def test_runtime_authorizes_document_set_before_loading_measurements() -> None:
+    from onyx.db import amendment_resources
+
+    user = cast(User, SimpleNamespace(id=uuid4()))
+    header = SimpleNamespace(document_set_id=7)
+    with (
+        patch.object(amendment_resources, "load_runtime_header", return_value=header),
+        patch.object(amendment_resources, "load_runtime_snapshot") as load,
+        patch.object(
+            api,
+            "_get_editable_document_set",
+            side_effect=OnyxError(api.OnyxErrorCode.INSUFFICIENT_PERMISSIONS),
+        ),
+        pytest.raises(OnyxError),
+    ):
+        api.get_amendment_runtime(42, user=user, db_session=MagicMock())
+    load.assert_not_called()
+
+
 def test_analyze_queues_batch_without_invoking_llm() -> None:
     user_file_id = uuid4()
     document_set = SimpleNamespace(

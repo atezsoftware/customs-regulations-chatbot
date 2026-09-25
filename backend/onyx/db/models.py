@@ -6689,7 +6689,7 @@ class AmendmentProposal(Base):
         ),
         CheckConstraint(
             "status IN ('pending', 'approving', 'approval_failed', "
-            "'approved', 'rejected')",
+            "'approved', 'rejected', 'already_applied')",
             name="amendment_proposal_status_check",
         ),
     )

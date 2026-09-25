@@ -122,6 +122,9 @@ def merge_windows(windows: list[Window]) -> list[Window]:
 def changed_windows(
     before: list[AnnexCanonicalSnapshot], after: list[AnnexCanonicalSnapshot]
 ) -> dict[str, list[Window]]:
+    from onyx.regulatory.position_rebase import monotonic_position_map
+
+    position_map = monotonic_position_map(before, after)
     old, new = {r.id: r for r in before}, {r.id: r for r in after}
     result: dict[str, list[Window]] = {}
     for identifier in old.keys() | new.keys():
@@ -151,7 +154,9 @@ def changed_windows(
                 row.text,
                 row.heading_path,
                 row.metadata,
-                row.position,
+                position_map.get(row.position, row.position)
+                if row is left
+                else row.position,
                 row.chunk_type,
             )
 
@@ -260,7 +265,10 @@ def validate_context_decisions(
                     f"context {decision.key}: context impact must quote an actual changed "
                     "source verbatim; source_id and source_side must select one of "
                     + json.dumps(
-                        {side: list(rows) for side, rows in changes[decision.key].items()}
+                        {
+                            side: list(rows)
+                            for side, rows in changes[decision.key].items()
+                        }
                     )
                 )
     return {d.key for d in decisions if d.affected}

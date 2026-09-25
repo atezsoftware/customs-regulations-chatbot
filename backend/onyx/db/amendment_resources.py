@@ -1,13 +1,15 @@
 """Lease-fenced resource deferrals, separate from legal matching failures."""
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import cast
 
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
 from onyx.db.models import AmendmentBatch, KVStore
+from onyx.regulatory.amendments.runtime import AmendmentRuntime
 from onyx.utils.special_types import JSON_ro
 
 
@@ -44,6 +46,7 @@ def record_analysis_resources(
     if previous.get("lease_generation") != lease_generation:
         previous = {}
     previous_peak = previous.get("peak_bytes", 0)
+    checked_at = datetime.now(timezone.utc).isoformat()
     row.value = {
         **previous,
         **measurements,
@@ -52,9 +55,94 @@ def record_analysis_resources(
             measurements.get("peak_bytes", 0),
         ),
         "lease_generation": lease_generation,
-        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "checked_at": checked_at,
+        **(
+            {"memory_checked_at": checked_at} if "current_bytes" in measurements else {}
+        ),
+        **({"activity_checked_at": checked_at} if "active" in measurements else {}),
     }
     db_session.commit()
+
+
+@dataclass(frozen=True)
+class RuntimeHeader:
+    id: int
+    document_set_id: int
+    status: str
+    stage: str
+    lease_generation: int
+    raw_text_chars: int
+
+
+def load_runtime_header(db_session: Session, batch_id: int) -> RuntimeHeader | None:
+    row = db_session.execute(
+        select(
+            AmendmentBatch.id,
+            AmendmentBatch.document_set_id,
+            AmendmentBatch.status,
+            AmendmentBatch.stage,
+            AmendmentBatch.lease_generation,
+            func.char_length(AmendmentBatch.raw_text),
+        ).where(AmendmentBatch.id == batch_id)
+    ).one_or_none()
+    return RuntimeHeader(*row) if row is not None else None
+
+
+def load_runtime_snapshot(
+    db_session: Session, header: RuntimeHeader
+) -> AmendmentRuntime:
+    row = db_session.get(KVStore, f"amendment_runtime:{header.id}")
+    raw_value = row.value if row is not None else None
+    value: Mapping[str, object] = (
+        cast(Mapping[str, object], raw_value) if isinstance(raw_value, Mapping) else {}
+    )
+    if value.get("lease_generation") != header.lease_generation:
+        value = {}
+
+    def counter(key: str) -> int | None:
+        number = value.get(key)
+        return (
+            number
+            if isinstance(number, int) and not isinstance(number, bool) and number >= 0
+            else None
+        )
+
+    def timestamp(key: str) -> datetime | None:
+        candidate = value.get(key)
+        if isinstance(candidate, str):
+            try:
+                parsed = datetime.fromisoformat(candidate)
+                if parsed.tzinfo is not None:
+                    return parsed
+            except ValueError:
+                pass
+        return None
+
+    return AmendmentRuntime(
+        batch_id=header.id,
+        status=header.status,
+        stage=header.stage,
+        lease_generation=header.lease_generation,
+        raw_text_chars=header.raw_text_chars,
+        current_bytes=counter("current_bytes"),
+        limit_bytes=counter("limit_bytes"),
+        peak_bytes=counter("peak_bytes"),
+        reserve_bytes=counter("reserve_bytes"),
+        active=counter("active"),
+        peak_active=counter("peak_active"),
+        max_parallel=counter("max_parallel"),
+        memory_checked_at=timestamp("memory_checked_at"),
+        activity_checked_at=timestamp("activity_checked_at"),
+        admission_limited=bool(value["admission_limited"])
+        if value.get("admission_limited") in (0, 1)
+        else None,
+        dependency_limited=bool(value["dependency_limited"])
+        if value.get("dependency_limited") in (0, 1)
+        else None,
+        calibrating=bool(value["calibrating"])
+        if value.get("calibrating") in (0, 1)
+        else None,
+    )
 
 
 def owns_analysis(db_session: Session, *, batch_id: int, lease_generation: int) -> bool:

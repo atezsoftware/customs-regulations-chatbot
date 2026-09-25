@@ -15,6 +15,7 @@ import SvgHistory from "@opal/icons/history";
 import SvgChevronLeft from "@opal/icons/chevron-left";
 import SvgChevronRight from "@opal/icons/chevron-right";
 import { useDocumentSets } from "@/lib/hooks/useDocumentSets";
+import AmendmentRuntimePanel from "@/sections/cards/AmendmentRuntimePanel";
 import {
   type AmendmentSourcePackage,
   type AnnexCapabilities,
@@ -106,7 +107,7 @@ function sourceIdentity(
   mode: AmendmentSourceMode,
   url: string,
   file: File | null,
-  text = "",
+  text = ""
 ) {
   if (mode === "text") {
     const normalizedText = text.trim();
@@ -204,7 +205,7 @@ function cloneEditableValue(value: unknown): unknown {
       Object.entries(value).map(([key, child]) => [
         key,
         cloneEditableValue(child),
-      ]),
+      ])
     );
   }
   return value;
@@ -234,7 +235,7 @@ function ReadOnlyFieldValue({ value }: { value: unknown }) {
   }
   if (isRecord(value)) {
     const visibleEntries = Object.entries(value).filter(
-      ([, child]) => child !== null && child !== undefined,
+      ([, child]) => child !== null && child !== undefined
     );
     if (visibleEntries.length === 0) {
       return <span className="text-text-03">Empty</span>;
@@ -275,7 +276,7 @@ function FieldTable({
     ? chunkFieldOrder.filter(
         (key) =>
           alwaysVisibleFields.has(key) ||
-          (fields[key] !== null && fields[key] !== undefined),
+          (fields[key] !== null && fields[key] !== undefined)
       )
     : [];
 
@@ -358,7 +359,7 @@ interface MetadataLeaf {
 
 function metadataLeaves(
   value: Record<string, unknown>,
-  prefix: string[] = [],
+  prefix: string[] = []
 ): MetadataLeaf[] {
   return Object.entries(value).flatMap(([key, child]) => {
     const path = [...prefix, key];
@@ -373,7 +374,7 @@ function metadataLeaves(
 function updateNestedValue(
   root: Record<string, unknown>,
   path: string[],
-  value: unknown,
+  value: unknown
 ): Record<string, unknown> {
   const [head, ...tail] = path;
   if (head === undefined) return root;
@@ -429,7 +430,7 @@ function ProposalCard({
       match_rationale: proposal.match_rationale,
       date_rationale: proposal.date_rationale,
     }),
-    [proposal],
+    [proposal]
   );
   const proposalChanges = useMemo<AmendmentProposalChunkChange[]>(() => {
     const storedChanges = proposal.chunk_changes ?? [];
@@ -437,7 +438,7 @@ function ProposalCard({
   }, [fallbackChange, proposal.chunk_changes]);
   const [activeChangeIndex, setActiveChangeIndex] = useState(0);
   const [drafts, setDrafts] = useState<Record<string, unknown>[]>(() =>
-    proposalChanges.map((change) => cloneDraft(change.new_chunk_draft)),
+    proposalChanges.map((change) => cloneDraft(change.new_chunk_draft))
   );
   const draft = drafts[activeChangeIndex] ?? {};
   const activeChange = proposalChanges[activeChangeIndex] ?? fallbackChange;
@@ -451,7 +452,7 @@ function ProposalCard({
   useEffect(() => {
     if (proposal.status !== "pending") {
       setDrafts(
-        proposalChanges.map((change) => cloneDraft(change.new_chunk_draft)),
+        proposalChanges.map((change) => cloneDraft(change.new_chunk_draft))
       );
       setActiveChangeIndex(0);
     }
@@ -520,7 +521,7 @@ function ProposalCard({
     currentChunk.text = [
       currentChunk.text,
       ...descendantSnapshots.map((item: Record<string, unknown>) =>
-        String(item.text ?? ""),
+        String(item.text ?? "")
       ),
     ].join("\n\n");
   }
@@ -546,8 +547,8 @@ function ProposalCard({
   const updateDraftField = (key: string, value: unknown) => {
     setDrafts((current) =>
       current.map((item, index) =>
-        index === activeChangeIndex ? { ...item, [key]: value } : item,
-      ),
+        index === activeChangeIndex ? { ...item, [key]: value } : item
+      )
     );
   };
 
@@ -601,7 +602,7 @@ function ProposalCard({
                 event.target.value
                   .split("\n")
                   .map((heading) => heading.trim())
-                  .filter(Boolean),
+                  .filter(Boolean)
               )
             }
             variant={readOnly ? "readOnly" : "primary"}
@@ -630,14 +631,12 @@ function ProposalCard({
               "aria-label": `After metadata ${metadataKey}`,
               value: metadataInputValue(leaf.value),
               onChange: (
-                event: React.ChangeEvent<
-                  HTMLInputElement | HTMLTextAreaElement
-                >,
+                event: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>
               ) => {
                 const nextMetadata = updateNestedValue(
                   metadata,
                   leaf.path,
-                  metadataValueFromInput(leaf.value, event.target.value),
+                  metadataValueFromInput(leaf.value, event.target.value)
                 );
                 updateDraftField("metadata", nextMetadata);
               },
@@ -750,7 +749,7 @@ function ProposalCard({
             aria-label="Next changed chunk"
             onClick={() =>
               setActiveChangeIndex((current) =>
-                Math.min(proposalChanges.length - 1, current + 1),
+                Math.min(proposalChanges.length - 1, current + 1)
               )
             }
             disabled={activeChangeIndex === proposalChanges.length - 1}
@@ -803,6 +802,12 @@ function ProposalCard({
         </Text>
       )}
 
+      {proposal.status === "already_applied" && (
+        <Text font="main-ui-body" color="text-03" as="p">
+          This result already matches the applied source version, including its
+          text, structure and effective dates.
+        </Text>
+      )}
       {proposal.status === "approving" && (
         <div
           role="status"
@@ -909,7 +914,7 @@ export default function AmendmentsPage() {
   >(null);
   const sourceRequestTokenRef = useRef<string | null>(null);
   const sourceDraftRef = useRef<{ identity: string; text: string } | null>(
-    null,
+    null
   );
   const sourceFileInputRef = useRef<HTMLInputElement>(null);
   const [analyzing, setAnalyzing] = useState(false);
@@ -922,7 +927,7 @@ export default function AmendmentsPage() {
   const [annexReviews, setAnnexReviews] = useState<AnnexReview[]>([]);
   const [unmatched, setUnmatched] = useState<string[]>([]);
   const [analysisLog, setAnalysisLog] = useState<AmendmentAnalysisLogEntry[]>(
-    [],
+    []
   );
 
   const annexEnabled =
@@ -955,8 +960,8 @@ export default function AmendmentsPage() {
   const updateProposal = useCallback((updatedProposal: AmendmentProposal) => {
     setProposals((current) =>
       current.map((proposal) =>
-        proposal.id === updatedProposal.id ? updatedProposal : proposal,
-      ),
+        proposal.id === updatedProposal.id ? updatedProposal : proposal
+      )
     );
   }, []);
 
@@ -990,7 +995,7 @@ export default function AmendmentsPage() {
           const exists = current.some((batch) => batch.id === result.batch.id);
           return exists
             ? current.map((batch) =>
-                batch.id === result.batch.id ? result.batch : batch,
+                batch.id === result.batch.id ? result.batch : batch
               )
             : [result.batch, ...current];
         });
@@ -1009,7 +1014,7 @@ export default function AmendmentsPage() {
         if (!cancelled) {
           if (!pollErrorReported) {
             toast.error(
-              e instanceof Error ? e.message : "Could not refresh analysis.",
+              e instanceof Error ? e.message : "Could not refresh analysis."
             );
             pollErrorReported = true;
           }
@@ -1038,12 +1043,12 @@ export default function AmendmentsPage() {
         .filter(
           (review) =>
             ["approving", "preparing", "publishing"].includes(review.status) ||
-            ["queued", "running"].includes(review.preparation?.status ?? ""),
+            ["queued", "running"].includes(review.preparation?.status ?? "")
         )
         .map((review) => `${review.id}:${review.status}`)
         .sort()
         .join(","),
-    [annexReviews],
+    [annexReviews]
   );
 
   useEffect(() => {
@@ -1063,9 +1068,9 @@ export default function AmendmentsPage() {
           reviews.some(
             (review) =>
               ["approving", "preparing", "publishing"].includes(
-                review.status,
+                review.status
               ) ||
-              ["queued", "running"].includes(review.preparation?.status ?? ""),
+              ["queued", "running"].includes(review.preparation?.status ?? "")
           )
         ) {
           timeoutId = setTimeout(() => void pollReviews(), delayMs);
@@ -1086,12 +1091,12 @@ export default function AmendmentsPage() {
   const updateAnnexReview = useCallback((updatedReview: AnnexReview) => {
     setAnnexReviews((current) => {
       const others = current.filter(
-        (review) => review.logical_group_id !== updatedReview.logical_group_id,
+        (review) => review.logical_group_id !== updatedReview.logical_group_id
       );
       return [...others, updatedReview].sort(
         (left, right) =>
           (left.review_payload.instruction_indices[0] ?? 0) -
-          (right.review_payload.instruction_indices[0] ?? 0),
+          (right.review_payload.instruction_indices[0] ?? 0)
       );
     });
   }, []);
@@ -1103,7 +1108,7 @@ export default function AmendmentsPage() {
         .map((proposal) => proposal.id)
         .sort((left, right) => left - right)
         .join(","),
-    [proposals],
+    [proposals]
   );
 
   useEffect(() => {
@@ -1113,7 +1118,7 @@ export default function AmendmentsPage() {
     let timeoutId: ReturnType<typeof setTimeout> | null = null;
     let pollDelayMs = 1500;
     const trackedIds = new Set(
-      approvingProposalIdsKey.split(",").map((value) => Number(value)),
+      approvingProposalIdsKey.split(",").map((value) => Number(value))
     );
 
     const pollApprovals = async () => {
@@ -1123,12 +1128,12 @@ export default function AmendmentsPage() {
 
         const completedCount = refreshed.filter(
           (proposal) =>
-            trackedIds.has(proposal.id) && proposal.status === "approved",
+            trackedIds.has(proposal.id) && proposal.status === "approved"
         ).length;
         const failedCount = refreshed.filter(
           (proposal) =>
             trackedIds.has(proposal.id) &&
-            ["pending", "approval_failed"].includes(proposal.status),
+            ["pending", "approval_failed"].includes(proposal.status)
         ).length;
         setProposals(refreshed);
 
@@ -1136,7 +1141,7 @@ export default function AmendmentsPage() {
           toast.success(
             completedCount === 1
               ? "Proposal approved and indexed."
-              : `${completedCount} proposals approved and indexed.`,
+              : `${completedCount} proposals approved and indexed.`
           );
         }
         if (failedCount > 0) {
@@ -1145,17 +1150,17 @@ export default function AmendmentsPage() {
               ? refreshed.find(
                   (proposal) =>
                     trackedIds.has(proposal.id) &&
-                    ["pending", "approval_failed"].includes(proposal.status),
+                    ["pending", "approval_failed"].includes(proposal.status)
                 )?.approval_error ||
                   "Approval was interrupted. Open the proposal for details."
-              : `${failedCount} approvals were interrupted. Open the proposals for details.`,
+              : `${failedCount} approvals were interrupted. Open the proposals for details.`
           );
         }
 
         if (
           refreshed.some(
             (proposal) =>
-              trackedIds.has(proposal.id) && proposal.status === "approving",
+              trackedIds.has(proposal.id) && proposal.status === "approving"
           )
         ) {
           pollDelayMs = 1500;
@@ -1179,7 +1184,7 @@ export default function AmendmentsPage() {
     sourceMode,
     sourceUrl,
     sourceFile,
-    rawText,
+    rawText
   );
   // Pasted text is already the amendment text: there is nothing to download,
   // transcribe, or freeze before analysis can read it.
@@ -1224,7 +1229,7 @@ export default function AmendmentsPage() {
         if (sourcePackageStatus === "ready") {
           const sourceText = await getAmendmentSourceText(
             Number(selectedDocumentSetId),
-            sourcePackageId,
+            sourcePackageId
           );
           if (!isCurrentRequest()) return;
           setSourcePackagePollError(null);
@@ -1236,7 +1241,7 @@ export default function AmendmentsPage() {
                 draft?.identity === expectedIdentity ? draft.text : "",
               ]
                 .filter((text) => text.trim())
-                .join("\n\n"),
+                .join("\n\n")
             );
           }
           sourceDraftRef.current = null;
@@ -1246,7 +1251,7 @@ export default function AmendmentsPage() {
         }
         const refreshed = await getAmendmentSourcePackage(
           Number(selectedDocumentSetId),
-          sourcePackageId,
+          sourcePackageId
         );
         if (!isCurrentRequest()) return;
         pollErrorReported = false;
@@ -1262,7 +1267,7 @@ export default function AmendmentsPage() {
           toast.error(
             error instanceof Error
               ? error.message
-              : "Could not refresh source preparation.",
+              : "Could not refresh source preparation."
           );
           pollErrorReported = true;
         }
@@ -1315,7 +1320,7 @@ export default function AmendmentsPage() {
       toast.error(
         sourceMode === "url"
           ? "Enter an amendment source URL."
-          : "Choose a supported annex source file.",
+          : "Choose a supported annex source file."
       );
       return;
     }
@@ -1331,18 +1336,18 @@ export default function AmendmentsPage() {
             ? await createAmendmentSourcePackage(
                 Number(selectedDocumentSetId),
                 requestToken,
-                { url: sourceUrl.trim() },
+                { url: sourceUrl.trim() }
               )
             : await uploadAmendmentSourcePackage(
                 Number(selectedDocumentSetId),
                 requestToken,
-                sourceFile as File,
+                sourceFile as File
               );
         if (sourceRequestTokenRef.current !== requestToken) return;
         setSourcePackageIdentity(identity);
         setSourcePackage(prepared);
         toast.info(
-          "Source preparation started. Status will update automatically.",
+          "Source preparation started. Status will update automatically."
         );
         return;
       }
@@ -1356,12 +1361,12 @@ export default function AmendmentsPage() {
       setRawText(result.text);
       setExtractedSourceIdentity(identity);
       toast.success(
-        `Extracted text from ${result.display_name}. Review it before analysis.`,
+        `Extracted text from ${result.display_name}. Review it before analysis.`
       );
     } catch (e) {
       if (sourceRequestTokenRef.current === requestToken) {
         toast.error(
-          e instanceof Error ? e.message : "Source extraction failed.",
+          e instanceof Error ? e.message : "Source extraction failed."
         );
       }
     } finally {
@@ -1390,7 +1395,7 @@ export default function AmendmentsPage() {
           ? await analyzeAmendment(
               Number(selectedDocumentSetId),
               rawText,
-              sourcePackage?.id,
+              sourcePackage?.id
             )
           : await analyzeAmendment(Number(selectedDocumentSetId), rawText);
       toast.success("Analysis queued. Progress will update automatically.");
@@ -1432,7 +1437,7 @@ export default function AmendmentsPage() {
     try {
       const retried = await retryAmendmentSourcePackage(
         documentSetId,
-        packageId,
+        packageId
       );
       if (sourceRequestTokenRef.current !== requestToken) return;
       setSourcePackage(retried);
@@ -1440,7 +1445,7 @@ export default function AmendmentsPage() {
     } catch (error) {
       if (sourceRequestTokenRef.current === requestToken) {
         toast.error(
-          error instanceof Error ? error.message : "Source retry failed.",
+          error instanceof Error ? error.message : "Source retry failed."
         );
       }
     } finally {
@@ -1456,7 +1461,7 @@ export default function AmendmentsPage() {
     try {
       const batch = await retryAmendmentBatch(selectedBatchId);
       setBatches((current) =>
-        current.map((item) => (item.id === batch.id ? batch : item)),
+        current.map((item) => (item.id === batch.id ? batch : item))
       );
       setUnmatched([]);
       setAnalysisLog([]);
@@ -1471,7 +1476,7 @@ export default function AmendmentsPage() {
 
   const selectedBatch = useMemo(
     () => batches.find((b) => b.id === selectedBatchId) ?? null,
-    [batches, selectedBatchId],
+    [batches, selectedBatchId]
   );
 
   return (
@@ -1711,10 +1716,10 @@ export default function AmendmentsPage() {
                       </Text>
                     )}
                     {["partial", "blocked", "failed"].includes(
-                      sourcePackage.status,
+                      sourcePackage.status
                     ) &&
                       sourcePackage.issues.some(
-                        (issue) => issue.retryable !== false,
+                        (issue) => issue.retryable !== false
                       ) && (
                         <div className="flex justify-end">
                           <Button
@@ -1810,6 +1815,11 @@ export default function AmendmentsPage() {
 
               {selectedBatch && (
                 <div className="flex flex-col gap-3">
+                  <AmendmentRuntimePanel
+                    key={selectedBatch.id}
+                    batchId={selectedBatch.id}
+                    status={selectedBatch.status}
+                  />
                   {(selectedBatch.status === "queued" ||
                     selectedBatch.status === "analyzing") && (
                     <Text font="main-ui-body" color="text-05" as="p">
@@ -1870,7 +1880,7 @@ export default function AmendmentsPage() {
                             .filter(([, value]) => value !== null)
                             .map(
                               ([key, value]) =>
-                                `${key}=${JSON.stringify(value)}`,
+                                `${key}=${JSON.stringify(value)}`
                             )
                             .join(" ");
                           return (

@@ -12,12 +12,122 @@ from onyx.regulatory.amendments.new_provision_policy import (
 )
 from onyx.regulatory.amendments.ranker import CandidateChunk
 from onyx.regulatory.amendments.structural_target import (
+    AmendmentStructuralTarget,
     amendment_operation_text,
     parse_amendment_structural_target,
     source_identity_distinguishing_tokens,
     source_identity_matches,
 )
 from onyx.regulatory.article_scope import SourceFragment, article_scope_indices
+from onyx.regulatory.provision_identity import canonical_clause_label
+
+_UNIT_OPENING = re.compile(
+    r"^(?:(?:EK|GEÇİCİ|GECICI|MÜKERRER|MUKERRER)\s+)?MADDE\s+\d+[a-z]?\s*[-–—:.]\s*",
+    re.IGNORECASE,
+)
+_PARAGRAPH_OPENING = re.compile(r"^\((\d+)\)")
+_CLAUSE_OPENING = re.compile(r"^(?:\(([a-zçğıöşü])\)|([a-zçğıöşü])\))", re.IGNORECASE)
+
+
+def reconcile_structural_candidates(
+    candidates: Sequence[CandidateChunk],
+    ordered_rows: Sequence[CandidateChunk],
+    target: AmendmentStructuralTarget,
+) -> list[CandidateChunk]:
+    """Keep contradictory source evidence ahead of a bounded matching shortlist.
+
+    Parent context is evidence only; stored metadata is never repaired by a
+    retrieval. Exact lookup cannot hide legacy null parents or appended units.
+    """
+    if target.article_no is None or target.appendix_label is not None:
+        return list(candidates)
+    resolved = article_scope_candidates(ordered_rows, target.article_no)
+    by_id = {item.chunk_id: item for item in resolved}
+    units: dict[str, tuple[str | None, str | None]] = {}
+    paragraph: str | None = None
+    for item in resolved:
+        if item.metadata.get(
+            "chunk_variant"
+        ) == "hierarchical_aggregate" or item.metadata.get(
+            "bound_to_regulatory_chunk_id"
+        ):
+            continue
+        clean = re.sub(r"(?:\*\*|__|`|<[^>]+>)", "", item.text).strip()
+        clean = _UNIT_OPENING.sub("", clean)
+        paragraph_match = _PARAGRAPH_OPENING.match(clean)
+        if paragraph_match:
+            paragraph = paragraph_match.group(1)
+        clause_match = _CLAUSE_OPENING.match(clean)
+        clause = (
+            canonical_clause_label(clause_match.group(1) or clause_match.group(2))
+            if clause_match
+            else None
+        )
+        # A continuation without an opening still belongs to the same named
+        # unit when its metadata says so; it must not vanish from exact matching.
+        if clause is None and not paragraph_match:
+            stored_clause = item.metadata.get("clause_label")
+            clause = (
+                canonical_clause_label(stored_clause)
+                if isinstance(stored_clause, str)
+                else None
+            )
+        units[item.chunk_id] = (paragraph, clause)
+        by_id[item.chunk_id] = replace(
+            item,
+            scope_evidence=f"{item.scope_evidence}; paragraph {paragraph or 'unresolved'}; clause {clause or 'none'}",
+        )
+
+    def named(paragraph_no: object, clause_label: object) -> bool:
+        if target.paragraph_no is not None and paragraph_no != target.paragraph_no:
+            return False
+        if target.clause_label is not None:
+            return clause_label == target.clause_label
+        return clause_label is None
+
+    relevant: list[CandidateChunk] = []
+    conflict: str | None = None
+    for item in ordered_rows:
+        if item.metadata.get(
+            "chunk_variant"
+        ) == "hierarchical_aggregate" or item.metadata.get(
+            "bound_to_regulatory_chunk_id"
+        ):
+            continue
+        actual = units.get(item.chunk_id)
+        stored = (item.metadata.get("paragraph_no"), item.metadata.get("clause_label"))
+        actual_matches = actual is not None and named(*actual)
+        stored_matches = item.metadata.get("article_no") == target.article_no and named(
+            *stored
+        )
+        if not (actual_matches or stored_matches):
+            continue
+        relevant.append(by_id.get(item.chunk_id, item))
+        if actual is None or actual_matches != stored_matches:
+            conflict = "The named unit's stored metadata and bounded source structure disagree."
+    if len(relevant) > 1:
+        conflict = "Several canonical pieces claim the named unit; compare their bodies and source boundaries."
+    if not resolved and candidates:
+        conflict = "The article's complete source boundaries could not be verified."
+    result: dict[str, CandidateChunk] = {}
+    originals = {item.chunk_id: item for item in candidates}
+    # Actual source matches precede stale scalar matches and unrelated siblings.
+    relevant.sort(
+        key=lambda item: not (item.chunk_id in units and named(*units[item.chunk_id]))
+    )
+    for item in [*relevant, *candidates, *resolved]:
+        original = originals.get(item.chunk_id, item)
+        evidence = by_id.get(item.chunk_id, item)
+        result.setdefault(
+            item.chunk_id,
+            replace(
+                original,
+                resolved_article_no=evidence.resolved_article_no,
+                scope_evidence=evidence.scope_evidence,
+                structure_conflict=conflict or original.structure_conflict,
+            ),
+        )
+    return list(result.values())
 
 
 def _fold_identity(value: str) -> str:

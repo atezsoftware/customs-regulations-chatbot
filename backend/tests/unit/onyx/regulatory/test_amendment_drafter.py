@@ -488,6 +488,8 @@ def test_multichunk_conflicting_dates_stop_before_model(
 def test_verified_new_unit_identity_survives_generation(
     metadata_article: str, heading: str, valid: bool
 ) -> None:
+    from onyx.regulatory.amendments.insertion_order import OrderMember
+
     context = pipeline.InstructionDraftContext(
         match=MatchResult(
             old_chunk_id=None, confidence=1.0, rationale="verified parent"
@@ -501,6 +503,9 @@ def test_verified_new_unit_identity_survives_generation(
         },
         base_metadata={},
         base_heading_path=[],
+        insertion_members=[
+            OrderMember(id="parent", position=9, article_no="EK 3", paragraph_no="1")
+        ],
     )
     instruction = AmendmentInstruction(
         instruction_text="3713 sayılı Kanunun ek 3 üncü maddesine aşağıdaki fıkra eklenmiştir. “Yeni metin.”"
@@ -532,6 +537,91 @@ def test_verified_new_unit_identity_survives_generation(
                 context=context,
                 draft=draft,
             )
+
+
+def test_unnumbered_paragraph_after_an_explicit_third_paragraph_gets_fourth_identity() -> (
+    None
+):
+    instruction = AmendmentInstruction(
+        instruction_text="MADDE 4- 3713 sayılı Kanunun ek 3 üncü maddesine üçüncü fıkrasından sonra gelmek üzere aşağıdaki fıkra eklenmiştir. “Yeni hüküm.”"
+    )
+    result = pipeline._added_unit_structure(
+        instruction,
+        "Yeni hüküm.",
+        {"heading_path": ["Kanun", "EK MADDE 3", "(3) Mevcut hüküm"]},
+    )
+    assert result is not None
+    metadata, path = result
+    assert metadata == {"article_no": "EK 3", "paragraph_no": "4"}
+    assert path[-1].startswith("(4)")
+
+
+@pytest.mark.parametrize("label", ["m", "ğ", "ı"])
+def test_added_clause_uses_the_explicit_parent_and_body_identity(label: str) -> None:
+    context = pipeline.InstructionDraftContext(
+        match=MatchResult(old_chunk_id=None, confidence=1, rationale="verified parent"),
+        old_chunk_snapshot={},
+        target_user_file_id=UUID("00000000-0000-0000-0000-000000000123"),
+        target_position=10,
+        sibling_reference={
+            "metadata": {"article_no": "8", "paragraph_no": "2"},
+            "heading_path": [
+                "Kaynak",
+                "MADDE 8 - Tanımlar",
+                "(2) Tanımlar",
+                "a) Önceki",
+            ],
+        },
+        base_metadata={},
+        base_heading_path=[],
+        expected_new_article_no="8",
+    )
+    text = f"{label}) Yeni ve tam tanım."
+    instruction = AmendmentInstruction(
+        instruction_text=f"MADDE 4- Aynı Kanunun 8 inci maddesinin ikinci fıkrasına aşağıdaki bent eklenmiştir. “{text}”"
+    )
+    draft = DraftResult(
+        new_chunk=ChunkFieldsDraft(
+            text=text,
+            chunk_type="clause",
+            heading_path=["Kaynak", "MADDE 8", "a) Yanlış"],
+            metadata_changes={
+                "article_no": "8",
+                "paragraph_no": "1",
+                "clause_label": "a",
+            },
+        ),
+        dates=DateResolution(rationale="date"),
+    )
+    proposal = pipeline._build_proposal_draft(
+        instruction_indices=[0],
+        instructions=[instruction],
+        matches=[context.match],
+        context=context,
+        draft=draft,
+    )
+    result = proposal.new_chunk_draft
+    assert result["metadata"]["paragraph_no"] == "2"
+    assert result["metadata"]["clause_label"] == label
+    assert result["heading_path"][:3] == [
+        "Kaynak",
+        "MADDE 8 - Tanımlar",
+        "(2) Tanımlar",
+    ]
+    assert result["heading_path"][-1].startswith(f"{label}) ")
+    assert result["text"] == text
+
+
+def test_new_unit_cannot_omit_part_of_the_supplied_addition() -> None:
+    from onyx.regulatory.amendments.draft_integrity import (
+        validate_explicit_replacements,
+    )
+
+    instruction = AmendmentInstruction(
+        instruction_text="MADDE 4- Aynı Kanunun 8 inci maddesine aşağıdaki fıkra eklenmiştir. “(4) Başvuru yapılır ve onay beklenir.”"
+    )
+    with pytest.raises(DraftIntegrityError, match="body"):
+        validate_explicit_replacements([instruction], "(4) Başvuru yapılır.")
 
 
 @pytest.mark.parametrize("article_no", ["20", "GEÇİCİ 20"])
@@ -576,3 +666,75 @@ def test_new_temporary_article_preserves_expected_namespace(article_no: str) -> 
             draft=draft,
         )
         assert result.new_chunk_draft["metadata"]["article_no"] == article_no
+
+
+def test_added_body_ignores_addition_verb_inside_a_quoted_heading() -> None:
+    from onyx.regulatory.amendments.draft_integrity import explicit_added_body
+
+    instruction = "MADDE 1- Aynı Kanunun 8 inci maddesinin başlığı “Yeni kayıt eklenmiştir” şeklinde değiştirilmiş ve maddeye aşağıdaki fıkra eklenmiştir. “(4) Yeni kural.”"
+    assert explicit_added_body(instruction) == "(4) Yeni kural."
+
+
+def test_direct_article_clause_proposal_keeps_unnumbered_parent() -> None:
+    from uuid import uuid4
+
+    from onyx.regulatory.amendments.insertion_order import OrderMember
+    from onyx.regulatory.amendments.models import (
+        AmendmentInstruction,
+        ChunkFieldsDraft,
+        DateResolution,
+        DraftResult,
+        MatchResult,
+    )
+    from onyx.regulatory.amendments.pipeline import (
+        InstructionDraftContext,
+        _build_proposal_draft,
+    )
+
+    instruction = AmendmentInstruction(
+        instruction_text="MADDE 4- Aynı Kanunun 8 inci maddesine aşağıdaki bent eklenmiştir. “c) Yeni kural.”"
+    )
+    match = MatchResult(
+        old_chunk_id=None, outcome="new_provision", confidence=1, rationale="new clause"
+    )
+    context = InstructionDraftContext(
+        match=match,
+        old_chunk_snapshot={},
+        target_user_file_id=uuid4(),
+        target_position=99,
+        sibling_reference={
+            "text": "MADDE 8- Tanımlar:",
+            "metadata": {"article_no": "8"},
+            "heading_path": ["Kaynak", "MADDE 8"],
+        },
+        base_metadata={},
+        base_heading_path=[],
+        expected_new_article_no="8",
+        insertion_members=[
+            OrderMember(
+                id="parent", position=0, article_no="8", direct_clause_parent=True
+            ),
+            OrderMember(id="a", position=1, article_no="8", clause_label="a"),
+            OrderMember(id="b", position=2, article_no="8", clause_label="b"),
+        ],
+    )
+    result = _build_proposal_draft(
+        instruction_indices=[0],
+        instructions=[instruction],
+        matches=[match],
+        context=context,
+        draft=DraftResult(
+            new_chunk=ChunkFieldsDraft(
+                text="c) Yeni kural.",
+                chunk_type="clause",
+                heading_path=["Kaynak", "MADDE 8", "c) Yeni kural"],
+                metadata_changes={"article_no": "8", "clause_label": "c"},
+            ),
+            dates=DateResolution(
+                effective_start_date=None, effective_end_date=None, rationale="unknown"
+            ),
+        ),
+    )
+    assert result.new_chunk_draft["metadata"].get("paragraph_no") is None
+    assert result.new_chunk_draft["position"] == 3
+    assert result.new_chunk_draft["insertion_order"]["paragraph_no"] is None

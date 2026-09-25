@@ -48,15 +48,17 @@ from onyx.regulatory.amendments.new_provision_policy import (
 from onyx.regulatory.amendments.ranker import CandidateChunk
 from onyx.regulatory.amendments.structural_target import (
     AmendmentStructuralTarget,
-    named_law_number,
+    canonical_structural_query_anchor,
+    deterministic_structural_candidate,
     parse_amendment_structural_target,
     source_identity_distinguishing_tokens,
     source_identity_matches,
 )
 from onyx.regulatory.amendments.target_scope import (
     addition_source_identity_is_compatible,
-    article_scope_candidates,
+    reconcile_structural_candidates,
 )
+from onyx.regulatory.source_identity import source_file_identity_matches
 from onyx.regulatory.structured_llm import is_retryable_provider_error
 from onyx.server.query_and_chat.placement import Placement
 from onyx.tools.constants import REGULATORY_MAX_SEARCH_QUERY_CHARS, SEARCH_TOOL_ID
@@ -227,7 +229,15 @@ class AmendmentSearchRetriever:
         if recovery:
             query = _bounded_query(instruction.recovery_query or "")
             if not query or query.casefold() == initial_query.casefold():
-                return []
+                anchor = canonical_structural_query_anchor(
+                    parse_amendment_structural_target(instruction)
+                )
+                query = _bounded_query(
+                    f"{instruction.target_source or ''} {anchor or ''}"
+                )
+                if not query or query.casefold() == initial_query.casefold():
+                    self.query_stats = []
+                    return []
         else:
             query = initial_query
         if not query:
@@ -258,9 +268,6 @@ class AmendmentSearchRetriever:
             )
             return []
 
-        ranked = self._run_query(instruction, query, skip_query_expansion=recovery)
-        self.query_stats = [dict(self.last_query_stats)]
-
         # An amendment describes the text it introduces, not the text it
         # replaces, so the provision it names by article/paragraph/clause is
         # regularly unreachable by wording alone. Expansion still requires an
@@ -277,6 +284,55 @@ class AmendmentSearchRetriever:
             and structural_source_tokens
             else []
         )
+
+        if source_files is not None:
+            structural = [
+                replace(
+                    candidate,
+                    source_verified=True,
+                    source_ambiguous=len(set(source_files)) > 1,
+                )
+                for candidate in structural
+                if candidate.user_file_id in source_files
+                and candidate.user_file_id in self._allowed_user_file_ids
+            ]
+        # This is the same exact-target contract used by confirmation. Returning
+        # its proof early avoids query expansion, reranking and a second DB read.
+        if (
+            not recovery
+            and not adds_provision
+            and source_files is not None
+            and len(set(source_files)) == 1
+            and deterministic_structural_candidate(instruction, structural) is not None
+        ):
+            self.query_stats = [
+                {"strategy": "verified_structure", "kept": len(structural)}
+            ]
+            return structural
+
+        from onyx.regulatory.amendments.target_scope import validated_addition_anchor
+
+        if (
+            not recovery
+            and added_subordinate_unit_kind(instruction.instruction_text) is not None
+            and source_files is not None
+            and len(set(source_files)) == 1
+            and validated_addition_anchor(instruction, structural) is not None
+        ):
+            # Confirmation still classifies the operation. Drafting independently
+            # verifies the complete sibling inventory and insertion boundary.
+            self.query_stats = [
+                {"strategy": "verified_parent", "kept": len(structural)}
+            ]
+            return structural
+
+        ranked = self._run_query(instruction, query, skip_query_expansion=recovery)
+        self.query_stats = [
+            {
+                **self.last_query_stats,
+                "strategy": "semantic_recovery" if recovery else "semantic",
+            }
+        ]
 
         # The confirming model reads every candidate in full, so the merged list
         # stays bounded: a prompt it cannot read inside its deadline loses every
@@ -312,13 +368,19 @@ class AmendmentSearchRetriever:
                         or existing.resolved_article_no,
                         scope_evidence=candidate.scope_evidence
                         or existing.scope_evidence,
+                        structure_conflict=candidate.structure_conflict
+                        or existing.structure_conflict,
                         source_score=max(existing.source_score, candidate.source_score),
                         source_name=candidate.source_name or existing.source_name,
                         metadata={**existing.metadata, **candidate.metadata},
                     )
                 continue
             candidates.append(
-                replace(candidate, source_verified=True)
+                replace(
+                    candidate,
+                    source_verified=True,
+                    source_ambiguous=len(set(source_files)) > 1,
+                )
                 if source_files is not None
                 else candidate
             )
@@ -424,22 +486,14 @@ def build_amendment_search_retriever(
     source_chunks: dict[str, list[CandidateChunk]] = {}
 
     def source_file_loader(instruction: AmendmentInstruction) -> Sequence[str] | None:
-        number = named_law_number(instruction.target_source or "")
-        if number is None:
+        target = instruction.target_source or ""
+        if not source_identity_distinguishing_tokens(target):
             return None
-        files = []
-        for source in source_identities:
-            filename_number = named_law_number(source.name)
-            root_number = named_law_number(source.root_heading)
-            if (
-                filename_number is not None
-                and root_number is not None
-                and filename_number != root_number
-            ):
-                continue
-            if (filename_number or root_number) == number:
-                files.append(str(source.user_file_id))
-        return files
+        return [
+            str(source.user_file_id)
+            for source in source_identities
+            if source_file_identity_matches(target, source.name, source.root_heading)
+        ]
 
     def structural_candidate_loader(
         instruction: AmendmentInstruction,
@@ -489,7 +543,11 @@ def build_amendment_search_retriever(
                 for match in get_active_chunks_by_structural_reference(
                     structural_session,
                     user_file_ids=scoped_ids,
-                    article_no=target.article_no,
+                    # An annex's numbered list item is not an article in the
+                    # containing instrument. Its full annex is the draft scope.
+                    article_no=target.article_no
+                    if target.appendix_label is None
+                    else None,
                     clause_label=clause_label,
                     appendix_label=target.appendix_label,
                     source_name_hint=instruction.target_source,
@@ -509,7 +567,8 @@ def build_amendment_search_retriever(
                     candidates.append(
                         as_candidate(
                             match,
-                            exact=(clause_label, paragraph_no)
+                            exact=target.appendix_label is not None
+                            or (clause_label, paragraph_no)
                             == (target.clause_label, target.paragraph_no),
                         )
                     )
@@ -519,6 +578,7 @@ def build_amendment_search_retriever(
                 verified_files is not None
                 and len(verified_files) == 1
                 and target.article_no is not None
+                and target.appendix_label is None
             ):
                 file_id = verified_files[0]
                 if file_id not in source_chunks:
@@ -531,27 +591,7 @@ def build_amendment_search_retriever(
                         )
                     ]
                 rows = source_chunks[file_id]
-                resolved = article_scope_candidates(rows, target.article_no)
-                resolved_by_id = {
-                    candidate.chunk_id: candidate for candidate in resolved
-                }
-                candidates = [
-                    replace(
-                        candidate,
-                        resolved_article_no=target.article_no,
-                        scope_evidence=resolved_by_id[
-                            candidate.chunk_id
-                        ].scope_evidence,
-                    )
-                    if candidate.chunk_id in resolved_by_id
-                    else candidate
-                    for candidate in candidates
-                ]
-                candidates.extend(
-                    candidate
-                    for candidate in resolved
-                    if candidate.chunk_id not in seen_chunk_ids
-                )
+                candidates = reconcile_structural_candidates(candidates, rows, target)
                 if not candidates and explicitly_adds_top_level_provision(
                     instruction.instruction_text
                 ):
