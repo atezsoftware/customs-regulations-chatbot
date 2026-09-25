@@ -2966,7 +2966,7 @@ def test_visibility_reads_only_requested_canonical_identities(
         reads, "qualified_file_ids", lambda *_: frozenset((FILE_A, FILE_B))
     )
     loader = MagicMock(return_value=[])
-    monkeypatch.setattr(reads, "load_public_temporal_bindings", loader)
+    monkeypatch.setattr(reads, "iter_public_temporal_bindings", loader)
     index = MagicMock(spec=PublicationIndexSnapshot)
     assert (
         get_visible_regulatory_chunk_ids(
@@ -3023,14 +3023,16 @@ def test_heading_navigation_does_not_hydrate_unselected_source(
         return [
             SimpleNamespace(
                 projection=SimpleNamespace(
+                    ordinal=position,
                     source_json=json.dumps(
                         {
                             "regulatory_chunk_id": identifier,
                             "heading_path": ["Source", "MADDE 8"],
                         }
-                    )
+                    ),
                 ),
                 semantic_position=position,
+                representation_text=identifier,
                 effective_start=None,
                 effective_end=None,
             )
@@ -3038,6 +3040,7 @@ def test_heading_navigation_does_not_hydrate_unselected_source(
         ]
 
     monkeypatch.setattr(reads, "load_public_temporal_bindings", load)
+    monkeypatch.setattr(reads, "iter_public_temporal_bindings", load)
     result = get_regulatory_provision_heading_source(
         session,
         [seed.id for seed in seeds],

@@ -141,6 +141,18 @@ def validate_temporal_canonical_revisions(
             _validate_temporal_revision(row, revisions[row.canonical_revision_id])
 
 
+def validate_joined_temporal_canonical_revision(
+    row: RegulatoryTemporalProjection,
+    revision: RegulatoryCanonicalRevision | None,
+) -> None:
+    """Validate an outer-joined revision without performing another database read."""
+    if row.canonical_revision_id is None:
+        return
+    if revision is None or revision.id != row.canonical_revision_id:
+        raise ValueError("canonical revision does not exist")
+    _validate_temporal_revision(row, _validated_revision(revision))
+
+
 def _validate_temporal_revision(
     row: RegulatoryTemporalProjection, revision: CanonicalRevision
 ) -> None:

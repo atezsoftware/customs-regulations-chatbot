@@ -4,25 +4,35 @@ These reads never grant access: callers retain the existing file/document ACLs.
 """
 
 import json
-from collections.abc import Mapping
+from collections.abc import Generator, Mapping
 from datetime import date, timedelta
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session
 
 from onyx.db.models import (
+    RegulatoryCanonicalRevision,
     RegulatoryChunk,
     RegulatoryFilePublication,
     RegulatoryTemporalProjection,
     UserFile,
 )
-from onyx.db.regulatory_annex_publication import load_file_temporal_bindings
+from onyx.db.regulatory_annex_publication import (
+    load_file_temporal_bindings,
+    parse_temporal_binding,
+    validate_temporal_binding_payload,
+)
+from onyx.db.regulatory_canonical_revisions import (
+    validate_joined_temporal_canonical_revision,
+)
 from onyx.document_index.publication_models import (
     PublicationIndexSnapshot,
     accepts_publication_projection,
 )
 from onyx.regulatory.amendments.annexes.models import AnnexTemporalProjection
+
+_PUBLIC_TEMPORAL_READ_BATCH_SIZE = 256
 
 
 def protected_file_ids(session: Session, file_ids: tuple[UUID, ...]) -> frozenset[UUID]:
@@ -59,8 +69,6 @@ def load_public_temporal_bindings(
     canonical_chunk_ids: tuple[str, ...] | None = None,
 ) -> list[AnnexTemporalProjection]:
     """Use each immutable activated binding's positive receipt and actual physical index."""
-    from onyx.regulatory.contextual import validity_window_contains
-
     bindings = load_file_temporal_bindings(
         session,
         user_file_id,
@@ -90,26 +98,130 @@ def load_public_temporal_bindings(
     canonical = {row.id: row for row in session.scalars(canonical_query)}
     selected = []
     for binding in bindings:
-        if not binding.index.matches_temporal_index(index):
-            continue
         source = json.loads(binding.projection.source_json)
         row = canonical.get(source["regulatory_chunk_id"])
-        if (
-            row is None
-            or not validity_window_contains(
-                row.validity_start_date, row.validity_end_date, as_of_date
-            )
-            or not validity_window_contains(
-                binding.effective_start, binding.effective_end, as_of_date
-            )
+        if _public_temporal_binding_is_visible(
+            binding,
+            index=index,
+            as_of_date=as_of_date,
+            canonical_present=row is not None,
+            canonical_start=row.validity_start_date if row is not None else None,
+            canonical_end=row.validity_end_date if row is not None else None,
         ):
-            continue
-        if not accepts_publication_projection(index, binding.projection):
-            raise ValueError("temporal binding encoder receipt is not accepted")
-        selected.append(binding)
+            selected.append(binding)
     return sorted(
         selected, key=lambda item: (item.semantic_position, item.projection.ordinal)
     )
+
+
+def _public_temporal_binding_is_visible(
+    binding: AnnexTemporalProjection,
+    *,
+    index: PublicationIndexSnapshot,
+    as_of_date: date,
+    canonical_present: bool,
+    canonical_start: date | None,
+    canonical_end: date | None,
+) -> bool:
+    from onyx.regulatory.contextual import validity_window_contains
+
+    if not binding.index.matches_temporal_index(index):
+        return False
+    if (
+        not canonical_present
+        or not validity_window_contains(canonical_start, canonical_end, as_of_date)
+        or not validity_window_contains(
+            binding.effective_start, binding.effective_end, as_of_date
+        )
+    ):
+        return False
+    if not accepts_publication_projection(index, binding.projection):
+        raise ValueError("temporal binding encoder receipt is not accepted")
+    return True
+
+
+def iter_public_temporal_bindings(
+    session: Session,
+    user_file_id: UUID,
+    *,
+    index: PublicationIndexSnapshot,
+    as_of_date: date,
+    projection_ordinals: tuple[int, ...] | None = None,
+    canonical_chunk_ids: tuple[str, ...] | None = None,
+) -> Generator[AnnexTemporalProjection, None, None]:
+    """Stream one joined read; callers must not retain every full source.
+
+    The driver fetches bounded batches. ORM transitions can briefly retain two
+    batches. Callers needing semantic order must sort their compact results.
+    """
+    if projection_ordinals == () or canonical_chunk_ids == ():
+        return
+    query = (
+        select(
+            RegulatoryTemporalProjection,
+            RegulatoryCanonicalRevision,
+            RegulatoryChunk.id,
+            RegulatoryChunk.validity_start_date,
+            RegulatoryChunk.validity_end_date,
+        )
+        .select_from(RegulatoryTemporalProjection)
+        .outerjoin(
+            RegulatoryCanonicalRevision,
+            RegulatoryCanonicalRevision.id
+            == RegulatoryTemporalProjection.canonical_revision_id,
+        )
+        .outerjoin(
+            RegulatoryChunk,
+            and_(
+                RegulatoryChunk.id == RegulatoryTemporalProjection.canonical_chunk_id,
+                RegulatoryChunk.user_file_id == user_file_id,
+            ),
+        )
+        .where(
+            RegulatoryTemporalProjection.user_file_id == user_file_id,
+            RegulatoryTemporalProjection.index_uuid == index.index_uuid,
+            RegulatoryTemporalProjection.retired_at.is_(None),
+            or_(
+                RegulatoryTemporalProjection.effective_start.is_(None),
+                RegulatoryTemporalProjection.effective_start <= as_of_date,
+            ),
+            or_(
+                RegulatoryTemporalProjection.effective_end.is_(None),
+                RegulatoryTemporalProjection.effective_end > as_of_date,
+            ),
+        )
+        .order_by(RegulatoryTemporalProjection.projection_ordinal)
+        .execution_options(
+            populate_existing=True,
+            stream_results=True,
+            yield_per=_PUBLIC_TEMPORAL_READ_BATCH_SIZE,
+        )
+    )
+    if projection_ordinals is not None:
+        query = query.where(
+            RegulatoryTemporalProjection.projection_ordinal.in_(projection_ordinals)
+        )
+    if canonical_chunk_ids is not None:
+        query = query.where(
+            RegulatoryTemporalProjection.canonical_chunk_id.in_(canonical_chunk_ids)
+        )
+    result = session.execute(query)
+    try:
+        for row, revision, canonical_id, canonical_start, canonical_end in result:
+            validate_temporal_binding_payload(row)
+            validate_joined_temporal_canonical_revision(row, revision)
+            binding = parse_temporal_binding(row)
+            if _public_temporal_binding_is_visible(
+                binding,
+                index=index,
+                as_of_date=as_of_date,
+                canonical_present=canonical_id is not None,
+                canonical_start=canonical_start,
+                canonical_end=canonical_end,
+            ):
+                yield binding
+    finally:
+        result.close()
 
 
 def citation_chunk_as_of_date(

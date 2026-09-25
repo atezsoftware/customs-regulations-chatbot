@@ -88,7 +88,6 @@ def load_file_temporal_bindings(
     from onyx.db.regulatory_canonical_revisions import (
         validate_temporal_canonical_revisions,
     )
-    from onyx.document_index.publication_models import publication_digest
 
     if projection_ordinals == () or canonical_chunk_ids == ():
         return []
@@ -123,23 +122,33 @@ def load_file_temporal_bindings(
         )
     rows = list(session.scalars(query))
     for row in rows:
-        if publication_digest(row.payload) != row.payload_sha256:
-            raise ValueError("temporal binding payload changed")
+        validate_temporal_binding_payload(row)
     validate_temporal_canonical_revisions(session, rows)
-    bindings = [AnnexTemporalProjection.model_validate(row.payload) for row in rows]
-    for row, binding in zip(rows, bindings):
-        if (
-            row.canonical_chunk_id
-            != json.loads(binding.projection.source_json)["regulatory_chunk_id"]
-            or row.effective_start != binding.effective_start
-            or row.effective_end != binding.effective_end
-            or row.projection_ordinal != binding.projection.ordinal
-            or row.index_uuid != binding.index.index_uuid
-            or str(row.user_file_id)
-            != json.loads(binding.projection.source_json)["document_id"]
-        ):
-            raise ValueError("temporal binding lookup identity mismatch")
-    return bindings
+    return [parse_temporal_binding(row) for row in rows]
+
+
+def validate_temporal_binding_payload(row: RegulatoryTemporalProjection) -> None:
+    from onyx.document_index.publication_models import publication_digest
+
+    if publication_digest(row.payload) != row.payload_sha256:
+        raise ValueError("temporal binding payload changed")
+
+
+def parse_temporal_binding(
+    row: RegulatoryTemporalProjection,
+) -> AnnexTemporalProjection:
+    binding = AnnexTemporalProjection.model_validate(row.payload)
+    source = json.loads(binding.projection.source_json)
+    if (
+        row.canonical_chunk_id != source["regulatory_chunk_id"]
+        or row.effective_start != binding.effective_start
+        or row.effective_end != binding.effective_end
+        or row.projection_ordinal != binding.projection.ordinal
+        or row.index_uuid != binding.index.index_uuid
+        or str(row.user_file_id) != source["document_id"]
+    ):
+        raise ValueError("temporal binding lookup identity mismatch")
+    return binding
 
 
 def load_binding_context_sources(

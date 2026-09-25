@@ -115,6 +115,7 @@ class RegulatoryChunkSiblingCandidate:
     projection_ordinal: int | None = None
     source_json: str | None = None
     image_file_id: str | None = None
+    publication_source_sha256: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,6 +147,7 @@ class RegulatoryChunkProjection:
     structural_order: int | None = None
     source_json: str | None = None
     image_file_id: str | None = None
+    publication_source_sha256: str | None = None
 
     @property
     def structural_index(self) -> int:
@@ -640,6 +642,7 @@ def _project_candidates(
                 else projection_index,
                 structural_order=projection_index,
                 source_json=candidate.source_json,
+                publication_source_sha256=candidate.publication_source_sha256,
                 image_file_id=candidate.image_file_id,
                 position=candidate.position,
                 text=candidate.text,
@@ -1589,6 +1592,7 @@ def get_bounded_source_lexical_matches(
     )
 
     observation = observe_publication_read()
+    effective_date = as_of_date or datetime.date.today()
     all_rows = list(
         db_session.scalars(
             select(RegulatoryChunk)
@@ -1600,7 +1604,7 @@ def get_bounded_source_lexical_matches(
         _public_sibling_candidates(
             db_session,
             all_rows,
-            as_of_date=as_of_date,
+            as_of_date=effective_date,
             query_indexes=query_indexes,
             observation=observation,
         ),
@@ -1610,6 +1614,12 @@ def get_bounded_source_lexical_matches(
         excluded_chunk_ids=excluded_chunk_ids,
         max_matches=max_matches,
         max_total_chars=max_total_chars,
+    )
+    selected = _hydrate_selected_regulatory_sources(
+        db_session,
+        selected,
+        as_of_date=effective_date,
+        query_indexes=query_indexes,
     )
     return filter_publication_read(
         observation, selected, lambda row: str(row.user_file_id)
@@ -1861,6 +1871,7 @@ def get_regulatory_provision_heading_source(
     )
 
     observation = observe_publication_read()
+    effective_date = as_of_date or datetime.date.today()
     unique_seed_ids = list(dict.fromkeys(seed_chunk_ids))
     if not unique_seed_ids:
         return None
@@ -1907,7 +1918,7 @@ def get_regulatory_provision_heading_source(
                 db_session,
                 file_id,
                 index=index,
-                as_of_date=as_of_date or datetime.date.today(),
+                as_of_date=effective_date,
                 canonical_chunk_ids=tuple(
                     record.id
                     for record in seed_records
@@ -1965,22 +1976,17 @@ def get_regulatory_provision_heading_source(
     ) = None
     for user_file_id, seed_positions in ranked_sources:
         # Hydrate the next source only if a higher-ranked outline was unusable.
-        bindings = {}
+        outline_bindings: dict[str, _PublicProvisionRead] = {}
         if user_file_id in qualified:
             index = (query_indexes or {}).get(user_file_id)
             if index is None:
                 continue
-            bindings = {
-                json.loads(binding.projection.source_json)[
-                    "regulatory_chunk_id"
-                ]: binding
-                for binding in load_public_temporal_bindings(
-                    db_session,
-                    user_file_id,
-                    index=index,
-                    as_of_date=as_of_date or datetime.date.today(),
-                )
-            }
+            outline_bindings = _compact_public_bindings(
+                db_session,
+                user_file_id,
+                index=index,
+                as_of_date=effective_date,
+            )
         file_candidates: list[RegulatoryProvisionHeadingCandidate] = []
         for record in heading_records:
             if record.user_file_id != user_file_id:
@@ -2000,18 +2006,15 @@ def get_regulatory_provision_heading_source(
                 ),
             )
             if record.user_file_id in qualified:
-                binding = bindings.get(record.id)
-                if binding is None:
+                outline_binding = outline_bindings.get(record.id)
+                if outline_binding is None:
                     continue
-                source = json.loads(binding.projection.source_json)
                 candidate = replace(
                     candidate,
-                    position=binding.semantic_position,
-                    heading_path=tuple(
-                        source.get("heading_path") or candidate.heading_path
-                    ),
-                    validity_start_date=binding.effective_start,
-                    validity_end_date=binding.effective_end,
+                    position=outline_binding.semantic_position,
+                    heading_path=outline_binding.heading_path or candidate.heading_path,
+                    validity_start_date=outline_binding.effective_start,
+                    validity_end_date=outline_binding.effective_end,
                     status=RegulatoryChunkStatus.ACTIVE.value,
                 )
             # Recheck the pure visibility rule so mock-backed callers and future
@@ -2047,6 +2050,117 @@ def get_regulatory_provision_heading_source(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class _PublicProvisionRead:
+    canonical_chunk_id: str
+    semantic_position: int
+    projection_ordinal: int
+    representation_text: str
+    heading_path: tuple[str, ...]
+    image_file_id: str | None
+    effective_start: datetime.date | None
+    effective_end: datetime.date | None
+    source_sha256: str
+
+
+def _compact_public_bindings(
+    session: Session,
+    user_file_id: UUID,
+    *,
+    index: PublicationIndexSnapshot,
+    as_of_date: datetime.date,
+    canonical_chunk_ids: tuple[str, ...] | None = None,
+) -> dict[str, _PublicProvisionRead]:
+    from onyx.db.regulatory_public_reads import iter_public_temporal_bindings
+
+    compact: dict[str, _PublicProvisionRead] = {}
+    for binding in iter_public_temporal_bindings(
+        session,
+        user_file_id,
+        index=index,
+        as_of_date=as_of_date,
+        canonical_chunk_ids=canonical_chunk_ids,
+    ):
+        source = json.loads(binding.projection.source_json)
+        identifier = source["regulatory_chunk_id"]
+        previous = compact.get(identifier)
+        # Preserve the last binding in the original globally sorted inventory.
+        if previous is not None and (
+            previous.semantic_position,
+            previous.projection_ordinal,
+        ) > (binding.semantic_position, binding.projection.ordinal):
+            continue
+        compact[identifier] = _PublicProvisionRead(
+            canonical_chunk_id=identifier,
+            semantic_position=binding.semantic_position,
+            projection_ordinal=binding.projection.ordinal,
+            representation_text=binding.representation_text,
+            heading_path=tuple(source.get("heading_path") or ()),
+            image_file_id=source.get("image_file_id"),
+            effective_start=binding.effective_start,
+            effective_end=binding.effective_end,
+            source_sha256=hashlib.sha256(
+                binding.projection.source_json.encode()
+            ).hexdigest(),
+        )
+    return compact
+
+
+def _hydrate_selected_regulatory_sources(
+    session: Session,
+    selected: list[RegulatoryChunkProjection],
+    *,
+    as_of_date: datetime.date,
+    query_indexes: dict[UUID, PublicationIndexSnapshot] | None,
+) -> list[RegulatoryChunkProjection]:
+    from onyx.db.regulatory_public_reads import iter_public_temporal_bindings
+
+    published = {
+        (row.user_file_id, row.projection_index): row
+        for row in selected
+        if row.publication_source_sha256 is not None
+    }
+    if not published:
+        return selected
+    hydrated: dict[tuple[UUID, int], str] = {}
+    for file_id in dict.fromkeys(file for file, _ in published):
+        index = (query_indexes or {}).get(file_id)
+        if index is None:
+            raise ValueError("selected provision has no physical index authority")
+        for binding in iter_public_temporal_bindings(
+            session,
+            file_id,
+            index=index,
+            as_of_date=as_of_date,
+            projection_ordinals=tuple(
+                ordinal for file, ordinal in published if file == file_id
+            ),
+        ):
+            key = (file_id, binding.projection.ordinal)
+            row = published.get(key)
+            source_json = binding.projection.source_json
+            source = json.loads(source_json)
+            if row is None or (
+                source["regulatory_chunk_id"] != row.regulatory_chunk_id
+                or hashlib.sha256(source_json.encode()).hexdigest()
+                != row.publication_source_sha256
+                or binding.semantic_position != row.position
+                or binding.representation_text != row.text
+                or binding.effective_start != row.validity_start_date
+                or binding.effective_end != row.validity_end_date
+            ):
+                raise ValueError("selected provision changed during publication read")
+            hydrated[key] = source_json
+    if hydrated.keys() != published.keys():
+        raise ValueError("selected provision publication is no longer available")
+    return [
+        replace(row, source_json=hydrated[(row.user_file_id, row.projection_index)])
+        if row.publication_source_sha256 is not None
+        else row
+        for row in selected
+    ]
+
+
 def _public_sibling_candidates(
     session: Session,
     rows: list[RegulatoryChunk],
@@ -2055,33 +2169,28 @@ def _public_sibling_candidates(
     query_indexes: dict[UUID, PublicationIndexSnapshot] | None,
     observation: ReadObservation,
 ) -> list[RegulatoryChunkSiblingCandidate]:
-    import json
-    from dataclasses import replace
-
-    from onyx.db.regulatory_public_reads import (
-        load_public_temporal_bindings,
-        qualified_file_ids,
-    )
+    from onyx.db.regulatory_public_reads import qualified_file_ids
     from onyx.regulatory.publication_reads import filter_publication_read
 
     file_ids = tuple({row.user_file_id for row in rows})
     qualified = qualified_file_ids(session, file_ids)
-    bindings = {}
+    bindings: dict[str, _PublicProvisionRead] = {}
+    effective_date = as_of_date or datetime.date.today()
     for file_id in qualified:
         index = (query_indexes or {}).get(file_id)
         if index is None:
             continue
-        for binding in load_public_temporal_bindings(
-            session,
-            file_id,
-            index=index,
-            as_of_date=as_of_date or datetime.date.today(),
-            canonical_chunk_ids=tuple(
-                row.id for row in rows if row.user_file_id == file_id
-            ),
-        ):
-            source = json.loads(binding.projection.source_json)
-            bindings[source["regulatory_chunk_id"]] = binding
+        bindings.update(
+            _compact_public_bindings(
+                session,
+                file_id,
+                index=index,
+                as_of_date=effective_date,
+                canonical_chunk_ids=tuple(
+                    row.id for row in rows if row.user_file_id == file_id
+                ),
+            )
+        )
     candidates = []
     for row in rows:
         candidate = _regulatory_sibling_candidate(row)
@@ -2089,16 +2198,15 @@ def _public_sibling_candidates(
             binding = bindings.get(row.id)
             if binding is None:
                 continue
-            source = json.loads(binding.projection.source_json)
             candidate = replace(
                 candidate,
                 position=binding.semantic_position,
                 text=binding.representation_text,
                 status=RegulatoryChunkStatus.ACTIVE.value,
-                heading_path=tuple(source.get("heading_path") or row.heading_path),
-                projection_ordinal=binding.projection.ordinal,
-                source_json=binding.projection.source_json,
-                image_file_id=source.get("image_file_id"),
+                heading_path=binding.heading_path or tuple(row.heading_path),
+                projection_ordinal=binding.projection_ordinal,
+                publication_source_sha256=binding.source_sha256,
+                image_file_id=binding.image_file_id,
                 validity_start_date=binding.effective_start,
                 validity_end_date=binding.effective_end,
             )
@@ -2163,6 +2271,7 @@ def get_bounded_same_provision_siblings(
     )
 
     observation = observe_publication_read()
+    effective_date = as_of_date or datetime.date.today()
     unique_seed_ids = list(dict.fromkeys(seed_chunk_ids))
     if not unique_seed_ids:
         return []
@@ -2188,7 +2297,7 @@ def get_bounded_same_provision_siblings(
     candidates = _public_sibling_candidates(
         db_session,
         all_rows,
-        as_of_date=as_of_date,
+        as_of_date=effective_date,
         query_indexes=query_indexes,
         observation=observation,
     )
@@ -2199,6 +2308,12 @@ def get_bounded_same_provision_siblings(
         as_of_date=as_of_date,
         max_chunks_per_provision=max_chunks_per_provision,
         max_chars_per_provision=max_chars_per_provision,
+    )
+    selected = _hydrate_selected_regulatory_sources(
+        db_session,
+        selected,
+        as_of_date=effective_date,
+        query_indexes=query_indexes,
     )
     return filter_publication_read(
         observation, selected, lambda row: str(row.user_file_id)
@@ -2224,6 +2339,7 @@ def get_bounded_adjacent_provisions(
     )
 
     observation = observe_publication_read()
+    effective_date = as_of_date or datetime.date.today()
     unique_seed_ids = list(dict.fromkeys(seed_chunk_ids))
     if not unique_seed_ids:
         return []
@@ -2248,7 +2364,7 @@ def get_bounded_adjacent_provisions(
         _public_sibling_candidates(
             db_session,
             all_rows,
-            as_of_date=as_of_date,
+            as_of_date=effective_date,
             query_indexes=query_indexes,
             observation=observation,
         ),
@@ -2258,6 +2374,12 @@ def get_bounded_adjacent_provisions(
         max_provisions=max_provisions,
         max_chunks_per_provision=max_chunks_per_provision,
         max_total_chars=max_total_chars,
+    )
+    selected = _hydrate_selected_regulatory_sources(
+        db_session,
+        selected,
+        as_of_date=effective_date,
+        query_indexes=query_indexes,
     )
     return filter_publication_read(
         observation, selected, lambda row: str(row.user_file_id)
@@ -2330,6 +2452,7 @@ def get_bounded_referenced_provisions(
     )
 
     observation = observe_publication_read()
+    effective_date = as_of_date or datetime.date.today()
     unique_seed_ids = list(dict.fromkeys(seed_chunk_ids))
     if not unique_seed_ids or not references:
         return []
@@ -2354,7 +2477,7 @@ def get_bounded_referenced_provisions(
         _public_sibling_candidates(
             db_session,
             all_rows,
-            as_of_date=as_of_date,
+            as_of_date=effective_date,
             query_indexes=query_indexes,
             observation=observation,
         ),
@@ -2365,6 +2488,12 @@ def get_bounded_referenced_provisions(
         max_provisions=max_provisions,
         max_chunks_per_provision=max_chunks_per_provision,
         max_chars_per_provision=max_chars_per_provision,
+    )
+    selected = _hydrate_selected_regulatory_sources(
+        db_session,
+        selected,
+        as_of_date=effective_date,
+        query_indexes=query_indexes,
     )
     return filter_publication_read(
         observation, selected, lambda row: str(row.user_file_id)
