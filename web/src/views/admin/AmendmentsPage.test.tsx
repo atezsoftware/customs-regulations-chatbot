@@ -965,7 +965,8 @@ test.each(["URL", "PDF"] as const)(
     expect(mockedAnalyzeAmendment).toHaveBeenCalledWith(
       7,
       expectedText,
-      processingPackage.id
+      processingPackage.id,
+      "gemini-3.8-flash"
     );
   }
 );
@@ -1015,7 +1016,9 @@ test("analyzes pasted text directly and still prepares a switched-to URL", async
   expect(mockedCreateAmendmentSourcePackage).not.toHaveBeenCalled();
   expect(mockedAnalyzeAmendment).toHaveBeenCalledWith(
     7,
-    "MADDE 1- Ek değişti."
+    "MADDE 1- Ek değişti.",
+    undefined,
+    "gemini-3.8-flash"
   );
 
   // A URL source still has to be downloaded and frozen before analysis.
@@ -1071,11 +1074,36 @@ test("queues pasted text and polls durable progress", async () => {
   await user.type(screen.getByPlaceholderText(/Paste the official/), "MADDE 1");
   await user.click(screen.getByRole("button", { name: "Analyze" }));
 
-  expect(mockedAnalyzeAmendment).toHaveBeenCalledWith(7, "MADDE 1");
+  expect(mockedAnalyzeAmendment).toHaveBeenCalledWith(
+    7,
+    "MADDE 1",
+    undefined,
+    "gemini-3.8-flash"
+  );
   expect(mockedGetAmendmentAnalysis).toHaveBeenCalledWith(42);
   expect(
     await screen.findByText("Matched 3 / 5 · Finalized 2 / 5")
   ).toBeVisible();
+});
+
+test("submits the chosen Vertex analysis model", async () => {
+  const user = setupUser();
+  render(<AmendmentsPage />);
+  act(() => screen.getByRole("combobox").focus());
+  await user.keyboard("{ArrowDown}");
+  await screen.findByRole("option", { name: "Transit rules" });
+  await user.keyboard("{Enter}");
+  await user.type(screen.getByLabelText("Amendment text"), "MADDE 1");
+  await user.click(
+    screen.getByRole("button", { name: "Gemini 3.5 Flash Lite" })
+  );
+  await user.click(screen.getByRole("button", { name: "Analyze" }));
+  expect(mockedAnalyzeAmendment).toHaveBeenCalledWith(
+    7,
+    "MADDE 1",
+    undefined,
+    "gemini-3.5-flash-lite"
+  );
 });
 
 test("queues PDF-extracted text through the same durable analysis", async () => {
@@ -1096,7 +1124,12 @@ test("queues PDF-extracted text through the same durable analysis", async () => 
   await user.click(screen.getByRole("button", { name: "Extract" }));
   await user.click(screen.getByRole("button", { name: "Analyze" }));
 
-  expect(mockedAnalyzeAmendment).toHaveBeenCalledWith(7, "MADDE 2- PDF metni.");
+  expect(mockedAnalyzeAmendment).toHaveBeenCalledWith(
+    7,
+    "MADDE 2- PDF metni.",
+    undefined,
+    "gemini-3.8-flash"
+  );
 });
 
 test("queues DOCX-extracted text through the same durable analysis", async () => {
@@ -1122,7 +1155,9 @@ test("queues DOCX-extracted text through the same durable analysis", async () =>
   await user.click(screen.getByRole("button", { name: "Analyze" }));
   expect(mockedAnalyzeAmendment).toHaveBeenCalledWith(
     7,
-    "MADDE 3- Word metni."
+    "MADDE 3- Word metni.",
+    undefined,
+    "gemini-3.8-flash"
   );
 });
 

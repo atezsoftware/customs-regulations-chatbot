@@ -5,8 +5,11 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from onyx.regulatory.amendments.model_choice import AmendmentAnalysisModel
+
 
 class AmendmentRuntime(BaseModel):
+    analysis_model: AmendmentAnalysisModel = AmendmentAnalysisModel.FLASH
     batch_id: int
     status: str
     stage: str

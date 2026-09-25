@@ -599,12 +599,25 @@ def analyze_amendment_text(
         )
 
     # Commit before dispatch so every broker delivery points at a durable row.
+    from onyx.db.llm import fetch_vertex_model_configuration
+
+    if (
+        fetch_vertex_model_configuration(
+            db_session, analyze_request.analysis_model.value
+        )
+        is None
+    ):
+        raise OnyxError(
+            OnyxErrorCode.INVALID_INPUT,
+            "The selected analysis model must be enabled on the Gemini (Vertex AI) provider.",
+        )
     batch = create_batch(
         db_session,
         document_set_id=document_set.id,
         user_file_ids=user_file_ids,
         raw_text=analyze_request.raw_text,
         created_by=user.id,
+        analysis_model=analyze_request.analysis_model.value,
     )
     if analyze_request.source_package_id is not None:
         attach_source_package_to_batch(

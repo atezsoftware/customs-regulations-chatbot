@@ -91,6 +91,8 @@ def load_runtime_header(db_session: Session, batch_id: int) -> RuntimeHeader | N
 def load_runtime_snapshot(
     db_session: Session, header: RuntimeHeader
 ) -> AmendmentRuntime:
+    from onyx.db.amendment_analysis_settings import load_analysis_model
+
     row = db_session.get(KVStore, f"amendment_runtime:{header.id}")
     raw_value = row.value if row is not None else None
     value: Mapping[str, object] = (
@@ -119,6 +121,7 @@ def load_runtime_snapshot(
         return None
 
     return AmendmentRuntime(
+        analysis_model=load_analysis_model(db_session, header.id),
         batch_id=header.id,
         status=header.status,
         stage=header.stage,
@@ -206,7 +209,7 @@ def defer_analysis(
         row = KVStore(key=_key(batch_id), value={})
         db_session.add(row)
     row.value = {"stops": stops, "reason": reason}
-    # One automatic continuation, in serial mode. Never repeatedly kill/retry
+    # One automatic continuation with bounded concurrency. Never repeatedly kill/retry
     # a single oversized instruction; subsequent recovery requires review.
     batch.status = "paused" if stops >= 2 else "queued"
     batch.stage = "waiting_resources"

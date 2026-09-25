@@ -215,10 +215,13 @@ def _child_main() -> None:
     from functools import partial
 
     from onyx.context.search.retrieval.concurrency import limit_search_concurrency
+    from onyx.db.amendment_analysis_settings import get_batch_analysis_model
     from onyx.db.amendment_resources import record_analysis_resources
     from onyx.db.engine.sql_engine import SqlEngine, get_session_with_current_tenant
+    from onyx.regulatory.amendments.analysis_llm import use_analysis_model
     from onyx.regulatory.amendments.job import run_amendment_batch
     from onyx.regulatory.amendments.memory_budget import (
+        INITIAL_ANALYSIS_PARALLELISM,
         MAX_ANALYSIS_PARALLELISM,
         bounded_map,
     )
@@ -251,13 +254,19 @@ def _child_main() -> None:
         policy.check(read_memory())
 
     try:
-        with limit_search_concurrency(12, check_resources=check_resources):
+        selected_model = get_batch_analysis_model(int(batch_id))
+        with (
+            use_analysis_model(selected_model.value),
+            limit_search_concurrency(12, check_resources=check_resources),
+        ):
             run_amendment_batch(
                 batch_id=int(batch_id),
                 lease_generation=int(generation),
                 instruction_runner=partial(
                     bounded_map,
-                    max_parallel=MAX_ANALYSIS_PARALLELISM if mode == "parallel" else 1,
+                    max_parallel=MAX_ANALYSIS_PARALLELISM
+                    if mode == "parallel"
+                    else INITIAL_ANALYSIS_PARALLELISM,
                     report=report,
                 ),
                 check_resources=check_resources,
@@ -265,6 +274,23 @@ def _child_main() -> None:
             )
     except ResourcePressure:
         raise SystemExit(RESOURCE_EXIT) from None
+    except Exception as error:
+        from onyx.db.regulatory_amendments import record_analysis_child_failure
+        from onyx.utils.logger import setup_logger
+
+        try:
+            with get_session_with_current_tenant() as session:
+                record_analysis_child_failure(
+                    session,
+                    batch_id=int(batch_id),
+                    lease_generation=int(generation),
+                    failure=error,
+                )
+        except Exception:
+            setup_logger().exception(
+                "Amendment child failure receipt could not be stored"
+            )
+        raise
     finally:
         CURRENT_TENANT_ID_CONTEXTVAR.reset(token)
 

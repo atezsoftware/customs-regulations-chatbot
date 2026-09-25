@@ -17,6 +17,7 @@ import SvgChevronRight from "@opal/icons/chevron-right";
 import { useDocumentSets } from "@/lib/hooks/useDocumentSets";
 import AmendmentRuntimePanel from "@/sections/cards/AmendmentRuntimePanel";
 import {
+  type AmendmentAnalysisModel,
   type AmendmentSourcePackage,
   type AnnexCapabilities,
   type AnnexReview,
@@ -896,6 +897,8 @@ export default function AmendmentsPage() {
     string | null
   >(null);
   const [rawText, setRawText] = useState("");
+  const [analysisModel, setAnalysisModel] =
+    useState<AmendmentAnalysisModel>("gemini-3.8-flash");
   const [sourceMode, setSourceMode] = useState<AmendmentSourceMode>("text");
   const [sourceUrl, setSourceUrl] = useState("");
   const [sourceFile, setSourceFile] = useState<File | null>(null);
@@ -1390,14 +1393,12 @@ export default function AmendmentsPage() {
     setAnalyzing(true);
     try {
       if (!canAnalyze) return;
-      const result =
-        annexEnabled && sourceMode !== "text"
-          ? await analyzeAmendment(
-              Number(selectedDocumentSetId),
-              rawText,
-              sourcePackage?.id
-            )
-          : await analyzeAmendment(Number(selectedDocumentSetId), rawText);
+      const result = await analyzeAmendment(
+        Number(selectedDocumentSetId),
+        rawText,
+        annexEnabled && sourceMode !== "text" ? sourcePackage?.id : undefined,
+        analysisModel
+      );
       toast.success("Analysis queued. Progress will update automatically.");
       setRawText("");
       setBatches((current) => [
@@ -1417,6 +1418,7 @@ export default function AmendmentsPage() {
   }, [
     annexEnabled,
     canAnalyze,
+    analysisModel,
     rawText,
     selectedDocumentSetId,
     sourceMode,
@@ -1776,6 +1778,33 @@ export default function AmendmentsPage() {
                   maxRows={20}
                   placeholder="Paste the official amendment/update text here..."
                 />
+                <Text font="main-ui-action">Analysis model · Vertex AI</Text>
+                <div
+                  className="flex flex-wrap gap-2"
+                  role="group"
+                  aria-label="Analysis model"
+                >
+                  {(
+                    [
+                      ["gemini-3.8-flash", "Gemini 3.8 Flash"],
+                      ["gemini-3.5-flash-lite", "Gemini 3.5 Flash Lite"],
+                    ] as const
+                  ).map(([model, label]) => (
+                    <Button
+                      key={model}
+                      type="button"
+                      size="sm"
+                      prominence={
+                        analysisModel === model ? "primary" : "secondary"
+                      }
+                      aria-pressed={analysisModel === model}
+                      disabled={analyzing}
+                      onClick={() => setAnalysisModel(model)}
+                    >
+                      {label}
+                    </Button>
+                  ))}
+                </div>
                 <div className="flex justify-end">
                   <Button
                     onClick={() => void handleAnalyze()}

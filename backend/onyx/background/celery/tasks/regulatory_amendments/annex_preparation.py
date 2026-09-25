@@ -88,12 +88,14 @@ def recover_review_preparations(
 def prepare_annex_review(
     *, review_id: str, tenant_id: str, environment: str, database_identity: str
 ) -> None:
+    from onyx.db.amendment_analysis_settings import load_analysis_model
     from onyx.db.regulatory_annex_changes import (
         require_current_annex_review,
         revise_annex_review,
     )
-    from onyx.llm.factory import get_default_llm, get_default_llm_with_vision
+    from onyx.regulatory.amendments.analysis_llm import get_amendment_analysis_llm
     from onyx.regulatory.amendments.annexes.analysis import (
+        draft_batch_id,
         prepare_review_context,
         validate_live_review_runtime,
     )
@@ -156,6 +158,7 @@ def prepare_annex_review(
                     allow_preparation=True,
                 )
                 original = AnnexChangeDraft.model_validate(review.review_payload)
+                analysis_model = load_analysis_model(session, draft_batch_id(original))
             progress("evidence", 0, 0)
             if job.checkpoint is not None:
                 draft = AnnexChangeDraft.model_validate(job.checkpoint).model_copy(
@@ -165,6 +168,7 @@ def prepare_annex_review(
                 validate_live_review_runtime(draft)
                 draft = prepare_review_context(draft)
             else:
+                llm = get_amendment_analysis_llm(model=analysis_model)
                 draft = revalidate_annex_review(
                     draft=original,
                     corrections=[
@@ -172,8 +176,8 @@ def prepare_annex_review(
                         for item in job.corrections
                     ],
                     corrected_by=job.corrected_by,
-                    llm=get_default_llm(),
-                    vision_llm=get_default_llm_with_vision(),
+                    llm=llm,
+                    vision_llm=llm,
                 )
             progress("validating", 0, 0)
             with get_session_with_current_tenant() as session:

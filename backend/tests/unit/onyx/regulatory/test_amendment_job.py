@@ -528,6 +528,73 @@ def test_invalid_generated_draft_becomes_an_attention_item(
     )
 
 
+@pytest.mark.parametrize("parallel", [False, True])
+def test_insertion_identity_conflict_preserves_progress_and_finishes_other_groups(
+    monkeypatch: pytest.MonkeyPatch,
+    parallel: bool,
+) -> None:
+    from functools import partial
+    from threading import Event
+
+    from onyx.regulatory.amendments.insertion_order import OrderMember, plan_insertion
+    from onyx.regulatory.amendments.memory_budget import (
+        MemoryPolicy,
+        MemorySample,
+        bounded_map,
+    )
+
+    independent_started = Event()
+
+    def check_order(indices: list[int]) -> None:
+        if indices == [1]:
+            if parallel:
+                assert independent_started.wait(3)
+            plan_insertion(
+                [
+                    OrderMember(
+                        id="existing", position=9, article_no="7", paragraph_no="6"
+                    )
+                ],
+                article_no="7",
+                paragraph_no="6",
+                clause_label=None,
+            )
+        elif indices == [2]:
+            independent_started.set()
+
+    result = _run_grouping_job(
+        monkeypatch,
+        batch_id=31,
+        targets=["saved", "conflicting", "good"],
+        instructions_override=[
+            AmendmentInstruction(
+                instruction_text=f"MADDE {i + 1}- Aynı Kanunun {i + 6} ncı maddesinin birinci fıkrası değiştirilmiştir."
+            )
+            for i in range(3)
+        ],
+        processed_instruction_indices=[0],
+        processed_instruction_count=1,
+        on_draft=check_order,
+        instruction_runner=partial(
+            bounded_map,
+            max_parallel=2,
+            sample=lambda: MemorySample(100, 1000),
+            policy=MemoryPolicy(reserve_bytes=100, item_bytes=100),
+        )
+        if parallel
+        else None,
+    )
+    assert result.persist.call_count == 1
+    assert result.persist.call_args.kwargs["proposal"].instruction_indices == [2]
+    result.unmatched.assert_called_once()
+    assert result.unmatched.call_args.kwargs["instruction_index"] == 1
+    assert (
+        "Insertion identity already exists"
+        in result.unmatched.call_args.kwargs["instruction_text"]
+    )
+    cast(MagicMock, job.mark_batch_analyzed).assert_called_once()
+
+
 def test_unmatched_initial_search_gets_one_recovery_before_giving_up(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

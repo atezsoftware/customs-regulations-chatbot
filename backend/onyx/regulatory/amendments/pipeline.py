@@ -856,7 +856,9 @@ def draft_multi_chunk_group_proposal(
     )
     changed_ids = [change.old_chunk_id for change in result.changes]
     if any(chunk_id not in context_by_id for chunk_id in changed_ids):
-        raise ValueError("Multi-chunk draft escaped its frozen candidate scope")
+        raise DraftIntegrityError(
+            "Multi-chunk draft escaped its frozen candidate scope"
+        )
 
     covered_instruction_indexes: set[int] = set()
     changes: list[ProposalChunkChange] = []
@@ -864,7 +866,9 @@ def draft_multi_chunk_group_proposal(
     for change in result.changes:
         local_indexes = sorted(set(change.instruction_indexes))
         if any(index < 0 or index >= len(instructions) for index in local_indexes):
-            raise ValueError("Multi-chunk draft returned an invalid instruction index")
+            raise DraftIntegrityError(
+                "Multi-chunk draft returned an invalid instruction index"
+            )
         covered_instruction_indexes.update(local_indexes)
         local_instructions = [instructions[index] for index in local_indexes]
         local_global_indices = [instruction_indices[index] for index in local_indexes]
@@ -898,7 +902,7 @@ def draft_multi_chunk_group_proposal(
             )
         )
     if covered_instruction_indexes != set(range(len(instructions))):
-        raise ValueError("Multi-chunk draft did not apply every instruction")
+        raise DraftIntegrityError("Multi-chunk draft did not apply every instruction")
 
     primary = built_proposals[0]
     return ProposalDraft(

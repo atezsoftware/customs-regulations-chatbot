@@ -113,6 +113,71 @@ def checkpoint_session(
             transaction.rollback()
 
 
+def test_model_choice_survives_retry_and_child_error_is_not_overwritten(
+    checkpoint_session: Session,
+) -> None:
+    import json
+
+    from onyx.db.amendment_analysis_settings import load_analysis_model
+    from onyx.db.models import KVStore
+    from onyx.db.regulatory_amendments import (
+        claim_batch_for_analysis,
+        create_batch,
+        mark_batch_failed,
+        record_analysis_child_failure,
+        reset_failed_batch_for_retry,
+    )
+
+    session = checkpoint_session
+    docset = DocumentSet(
+        name=f"settings-{uuid4()}", description="isolated fixture", is_up_to_date=True
+    )
+    session.add(docset)
+    session.flush()
+    batch = create_batch(
+        session,
+        document_set_id=docset.id,
+        user_file_ids=[],
+        raw_text="test",
+        created_by=None,
+        analysis_model="gemini-3.5-flash-lite",
+    )
+    session.commit()
+    lease = claim_batch_for_analysis(session, batch_id=batch.id)
+    assert lease is not None
+    assert record_analysis_child_failure(
+        session,
+        batch_id=batch.id,
+        lease_generation=lease.generation,
+        failure=ValueError("private payload must not be stored"),
+    )
+    assert mark_batch_failed(
+        session,
+        batch_id=batch.id,
+        lease_generation=lease.generation,
+        error_message="Failed",
+        failure=RuntimeError("Child exited"),
+    )
+    receipt = session.get(
+        KVStore, f"regulatory_amendment_failure:{batch.id}:{lease.generation}"
+    )
+    assert receipt is not None
+    recorded = json.loads(json.dumps(receipt.value))
+    assert json.loads(recorded["detail"])["exceptions"][0]["type"] == "ValueError"
+    assert "private payload" not in json.dumps(receipt.value)
+    session.refresh(batch)
+    assert batch.analysis_log[-1]["step"] == "analysis_child_failed"
+    assert "private payload" not in json.dumps(batch.analysis_log)
+    assert reset_failed_batch_for_retry(session, batch_id=batch.id) is not None
+    assert load_analysis_model(session, batch.id).value == "gemini-3.5-flash-lite"
+    assert not record_analysis_child_failure(
+        session,
+        batch_id=batch.id,
+        lease_generation=lease.generation,
+        failure=TypeError(),
+    )
+
+
 def test_match_survives_session_restart_and_rejects_changed_source_or_inputs(
     checkpoint_session: Session,
 ) -> None:

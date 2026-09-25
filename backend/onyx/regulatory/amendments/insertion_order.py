@@ -11,6 +11,10 @@ from onyx.regulatory.provision_identity import article_identity, canonical_claus
 _ALPHABET = "abcçdefgğhıijklmnoöprsştuüvyz"
 
 
+class InsertionOrderError(ValueError):
+    """The source cannot prove a safe insertion without further review."""
+
+
 class OrderMember(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     id: str
@@ -52,7 +56,7 @@ def plan_insertion(
         and (clause_label is None or row.paragraph_no == paragraph_no)
     ]
     if not scope:
-        raise ValueError("Insertion parent could not be verified")
+        raise InsertionOrderError("Insertion parent could not be verified")
     if paragraph_no is None and (
         clause_label is None
         or sum(row.direct_clause_parent for row in scope) != 1
@@ -64,7 +68,7 @@ def plan_insertion(
             for row in ordered
         )
     ):
-        raise ValueError(
+        raise InsertionOrderError(
             "Direct clause parent could not be verified without a numbered paragraph"
         )
 
@@ -73,11 +77,11 @@ def plan_insertion(
             return -1
         if clause_label is None:
             if not value.isdecimal():
-                raise ValueError("Insertion paragraph identity is ambiguous")
+                raise InsertionOrderError("Insertion paragraph identity is ambiguous")
             return int(value)
         label = canonical_clause_label(value)
         if label is None or len(label) != 1 or label not in _ALPHABET:
-            raise ValueError("Insertion clause identity is ambiguous")
+            raise InsertionOrderError("Insertion clause identity is ambiguous")
         return _ALPHABET.index(label)
 
     target = rank(clause_label if clause_label is not None else paragraph_no)
@@ -86,11 +90,13 @@ def plan_insertion(
         for row in scope
     ]
     if target in ranks:
-        raise ValueError(
+        raise InsertionOrderError(
             "Insertion identity already exists; a reviewed renumbering is required"
         )
     if ranks != sorted(ranks):
-        raise ValueError("Insertion parent order conflicts with its source metadata")
+        raise InsertionOrderError(
+            "Insertion parent order conflicts with its source metadata"
+        )
     lower = [row for row, value in zip(scope, ranks) if value < target]
     upper = [row for row, value in zip(scope, ranks) if value > target]
     after = lower[-1] if lower else None
@@ -108,7 +114,7 @@ def plan_insertion(
     )
     position = before.position if before else scope[-1].position + 1
     if after is not None and after.position >= position:
-        raise ValueError("Insertion has overlapping source positions")
+        raise InsertionOrderError("Insertion has overlapping source positions")
     return InsertionOrder(
         baseline_sha256=publication_digest(
             [row.model_dump(mode="json") for row in ordered]

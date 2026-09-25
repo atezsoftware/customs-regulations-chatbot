@@ -18,6 +18,7 @@ from onyx.regulatory.amendments.annexes.models import (
     AnnexChangeDraft,
     AnnexElementCorrection,
 )
+from onyx.regulatory.amendments.model_choice import AmendmentAnalysisModel
 from onyx.regulatory.approval_execution_state import (
     ApprovalExecutionState,
     read_execution_state,
@@ -108,6 +109,7 @@ class UserFileRenameRequest(BaseModel):
 
 
 class AnalyzeAmendmentRequest(BaseModel):
+    analysis_model: AmendmentAnalysisModel = AmendmentAnalysisModel.FLASH
     source_package_id: UUID | None = None
     document_set_id: int
     raw_text: str = Field(min_length=1, max_length=MAX_AMENDMENT_SOURCE_TEXT_CHARS)

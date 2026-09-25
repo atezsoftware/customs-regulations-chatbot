@@ -12,8 +12,23 @@ from onyx.regulatory.amendments.memory_budget import (
 from onyx.regulatory.amendments.supervision import supervise
 
 
+@pytest.fixture(autouse=True)
+def analysis_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    from onyx.db import amendment_analysis_settings
+    from onyx.regulatory.amendments.model_choice import AmendmentAnalysisModel
+
+    monkeypatch.setattr(
+        amendment_analysis_settings,
+        "get_batch_analysis_model",
+        lambda _: AmendmentAnalysisModel.FLASH,
+    )
+
+
+@pytest.mark.parametrize("mode,expected_parallel", [("parallel", 10), ("serial", 4)])
 def test_child_pool_supports_nested_parallel_reads_and_releases_overflow(
     monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    expected_parallel: int,
 ) -> None:
     from concurrent.futures import ThreadPoolExecutor
     from contextlib import ExitStack
@@ -48,7 +63,7 @@ def test_child_pool_supports_nested_parallel_reads_and_releases_overflow(
         assert engine is not None
         runner = kwargs["instruction_runner"]
         assert isinstance(runner, partial)
-        assert runner.keywords["max_parallel"] == 10
+        assert runner.keywords["max_parallel"] == expected_parallel
         analysis_engine = engine
         full = Event()
         release = Event()
@@ -109,7 +124,7 @@ def test_child_pool_supports_nested_parallel_reads_and_releases_overflow(
     monkeypatch.setattr(SqlEngine, "set_app_name", lambda _name: None)
     monkeypatch.setattr(SqlEngine, "init_engine", initialize)
     monkeypatch.setattr(job, "run_amendment_batch", run_batch)
-    monkeypatch.setattr(sys, "argv", ["supervision", "189", "1", "public", "parallel"])
+    monkeypatch.setattr(sys, "argv", ["supervision", "189", "1", "public", mode])
     try:
         supervision._child_main()
     finally:

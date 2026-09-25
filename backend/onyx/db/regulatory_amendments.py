@@ -7,8 +7,9 @@ amendment-sourced row into `regulatory_chunk` — everything upstream
 """
 
 import datetime
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 from uuid import UUID
 
 from sqlalchemy import and_, case, func, or_, select, update
@@ -45,6 +46,7 @@ from onyx.regulatory.amendments.draft_integrity import (
 from onyx.regulatory.amendments.models import ProposalDraft, ReviewedAmendmentChunkDraft
 from onyx.regulatory.chunker import ATOMIC_CHUNK_VARIANT
 from onyx.utils.logger import setup_logger
+from onyx.utils.special_types import JSON_ro
 
 _MAX_ERROR_MESSAGE_LENGTH = 4000
 _AMENDMENT_PROJECTION_ORDINAL_BASE = 1_000_000_000
@@ -68,7 +70,12 @@ def create_batch(
     user_file_ids: list[UUID],
     raw_text: str,
     created_by: UUID | None,
+    analysis_model: str = "gemini-3.8-flash",
 ) -> AmendmentBatch:
+    from onyx.db.amendment_analysis_settings import store_analysis_model
+    from onyx.regulatory.amendments.model_choice import AmendmentAnalysisModel
+
+    selected = AmendmentAnalysisModel(analysis_model)
     batch = AmendmentBatch(
         document_set_id=document_set_id,
         user_file_ids=[str(user_file_id) for user_file_id in user_file_ids],
@@ -85,6 +92,7 @@ def create_batch(
     )
     db_session.add(batch)
     db_session.flush()
+    store_analysis_model(db_session, batch.id, selected)
     return batch
 
 
@@ -419,6 +427,54 @@ def mark_batch_analyzed(
     return True
 
 
+def record_analysis_child_failure(
+    db_session: Session, *, batch_id: int, lease_generation: int, failure: BaseException
+) -> bool:
+    from onyx.regulatory.failure_details import safe_failure_detail
+
+    owned = db_session.execute(
+        select(AmendmentBatch.id, AmendmentBatch.analysis_log)
+        .where(
+            AmendmentBatch.id == batch_id,
+            AmendmentBatch.status == AmendmentBatchStatus.ANALYZING.value,
+            AmendmentBatch.lease_generation == lease_generation,
+        )
+        .with_for_update()
+    ).one_or_none()
+    if owned is None:
+        db_session.rollback()
+        return False
+    key = f"regulatory_amendment_failure:{batch_id}:{lease_generation}"
+    row = db_session.get(KVStore, key)
+    if row is None:
+        row = KVStore(key=key, value={})
+        db_session.add(row)
+    detail = safe_failure_detail("source_review", failure)
+    row.value = {
+        "batch_id": batch_id,
+        "lease_generation": lease_generation,
+        "origin": "child",
+        "detail": detail,
+    }
+    db_session.execute(
+        update(AmendmentBatch)
+        .where(AmendmentBatch.id == batch_id)
+        .values(
+            analysis_log=[
+                *owned.analysis_log,
+                {
+                    "at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    "step": "analysis_child_failed",
+                    "lease_generation": lease_generation,
+                    "failure_detail": detail,
+                },
+            ][-AMENDMENT_LOG_LIMIT:]
+        )
+    )
+    db_session.commit()
+    return True
+
+
 def mark_batch_failed(
     db_session: Session,
     *,
@@ -442,20 +498,31 @@ def mark_batch_failed(
     if failure is not None:
         from onyx.regulatory.failure_details import safe_failure_detail
 
-        db_session.add(
-            KVStore(
-                key=f"regulatory_amendment_failure:{batch.id}:{lease_generation}",
-                value={
-                    "batch_id": batch.id,
-                    "lease_generation": lease_generation,
-                    "document_set_id": batch.document_set_id,
-                    "created_by": str(batch.created_by),
-                    "source_package_id": str(batch.source_package_id),
-                    "user_file_ids": list(batch.user_file_ids),
-                    "detail": safe_failure_detail("source_review", failure),
-                },
-            )
+        key = f"regulatory_amendment_failure:{batch.id}:{lease_generation}"
+        row = db_session.get(KVStore, key)
+        previous = (
+            cast(Mapping[str, JSON_ro], row.value)
+            if row is not None and isinstance(row.value, Mapping)
+            else {}
         )
+        if row is not None and previous.get("origin") == "child":
+            row.value = {
+                **previous,
+                "supervisor_detail": safe_failure_detail("source_review", failure),
+            }
+        else:
+            if row is None:
+                row = KVStore(key=key, value={})
+                db_session.add(row)
+            row.value = {
+                "batch_id": batch.id,
+                "lease_generation": lease_generation,
+                "document_set_id": batch.document_set_id,
+                "created_by": str(batch.created_by),
+                "source_package_id": str(batch.source_package_id),
+                "user_file_ids": list(batch.user_file_ids),
+                "detail": safe_failure_detail("source_review", failure),
+            }
     batch.heartbeat_at = completed_at
     batch.completed_at = completed_at
     db_session.commit()

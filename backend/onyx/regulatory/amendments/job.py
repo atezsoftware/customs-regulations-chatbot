@@ -34,6 +34,7 @@ from onyx.regulatory.amendments.amendment_context import (
 from onyx.regulatory.amendments.analysis_llm import get_amendment_analysis_llm
 from onyx.regulatory.amendments.draft_integrity import DraftIntegrityError
 from onyx.regulatory.amendments.drafter import AmendmentDateConflict
+from onyx.regulatory.amendments.insertion_order import InsertionOrderError
 from onyx.regulatory.amendments.match_checkpoint import (
     MatchedInstruction,
     MatchEvidence,
@@ -918,7 +919,11 @@ def run_amendment_batch(
                 if not persisted:
                     raise RuntimeError(f"Amendment batch {batch_id} lost its lease")
             return
-        except (DraftIntegrityError, AmendmentDateConflict) as error:
+        except (
+            DraftIntegrityError,
+            AmendmentDateConflict,
+            InsertionOrderError,
+        ) as error:
             log(
                 "draft_group_rejected",
                 indices=instruction_indices,

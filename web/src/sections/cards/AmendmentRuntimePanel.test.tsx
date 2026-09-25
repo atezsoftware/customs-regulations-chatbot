@@ -86,6 +86,36 @@ test("unavailable telemetry never shows zero consumption", () => {
   expect(screen.queryByText(/0.00 GiB/)).not.toBeInTheDocument();
 });
 
+test("retry keeps polling when SWR still holds the preceding failed attempt", () => {
+  jest.mocked(useSWR).mockReturnValue({
+    data: { ...sample, status: "failed" },
+    error: undefined,
+    isLoading: false,
+    isValidating: false,
+    mutate: jest.fn(),
+  });
+  render(<AmendmentRuntimePanel batchId={1} status="queued" />);
+  const refresh = jest.mocked(useSWR).mock.calls.at(-1)?.[2]?.refreshInterval;
+  if (typeof refresh !== "function")
+    throw new Error("Expected conditional polling");
+  expect(refresh({ ...sample, status: "failed" })).toBe(5000);
+});
+
+test("queued attempt explains that no worker has reported task activity yet", () => {
+  jest.mocked(useSWR).mockReturnValue({
+    data: { ...sample, status: "queued", active: null, max_parallel: null },
+    error: undefined,
+    isLoading: false,
+    isValidating: false,
+    mutate: jest.fn(),
+  });
+  render(<AmendmentRuntimePanel batchId={1} status="queued" />);
+  expect(screen.getByText(/Queued: waiting for a worker/)).toBeInTheDocument();
+  expect(
+    screen.queryByText(/Last task count: Unknown/)
+  ).not.toBeInTheDocument();
+});
+
 test("dependency waiting is not shown as a memory shortage", () => {
   jest.mocked(useSWR).mockReturnValue({
     data: {

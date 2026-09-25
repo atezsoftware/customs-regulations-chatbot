@@ -181,8 +181,10 @@ def test_combined_draft_prompt_contains_each_instruction_and_returns_one_proposa
     assert "period row" in (proposal.match_rationale or "")
 
 
+@pytest.mark.parametrize("invalid", [None, "outside_scope", "index", "coverage"])
 def test_multi_chunk_scope_becomes_one_atomic_editable_proposal(
     monkeypatch: pytest.MonkeyPatch,
+    invalid: str | None,
 ) -> None:
     instructions = [
         AmendmentInstruction(instruction_text="EK-2 sıra 3 adı değiştirilmiştir."),
@@ -235,6 +237,24 @@ def test_multi_chunk_scope_becomes_one_atomic_editable_proposal(
     monkeypatch.setattr(
         pipeline, "draft_multi_chunk_scope", MagicMock(return_value=generated)
     )
+
+    if invalid is not None:
+        if invalid == "outside_scope":
+            generated.changes[0].old_chunk_id = "other-source"
+        elif invalid == "index":
+            generated.changes[0].instruction_indexes = [2]
+        else:
+            generated.changes = generated.changes[:1]
+        with pytest.raises(DraftIntegrityError):
+            pipeline.draft_multi_chunk_group_proposal(
+                MagicMock(),
+                instruction_indices=[17, 18],
+                instructions=instructions,
+                matches=matches,
+                contexts=[context("first", 1), context("second", 2)],
+                reference_date="2026-09-20",
+            )
+        return
 
     proposal = pipeline.draft_multi_chunk_group_proposal(
         MagicMock(),

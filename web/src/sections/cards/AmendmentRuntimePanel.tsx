@@ -28,10 +28,7 @@ export default function AmendmentRuntimePanel({
     ["amendment-runtime", batchId],
     () => getAmendmentRuntime(batchId),
     {
-      refreshInterval: (latest) =>
-        running && (!latest || ["queued", "analyzing"].includes(latest.status))
-          ? 5000
-          : 0,
+      refreshInterval: () => (running ? 5000 : 0),
       keepPreviousData: false,
       revalidateOnFocus: running,
       shouldRetryOnError: running,
@@ -50,6 +47,11 @@ export default function AmendmentRuntimePanel({
         </Text>
       ) : (
         <>
+          {data.analysis_model && (
+            <Text font="secondary-body">
+              {`Analysis model: ${data.analysis_model === "gemini-3.5-flash-lite" ? "Gemini 3.5 Flash Lite" : "Gemini 3.8 Flash"} · Vertex AI`}
+            </Text>
+          )}
           <Text font="secondary-body">
             {`${memoryLabel}: ${gib(data.current_bytes)} / ${gib(data.limit_bytes)} · Peak: ${gib(data.peak_bytes)} · Reserve: ${gib(data.reserve_bytes)}`}
           </Text>
@@ -59,16 +61,18 @@ export default function AmendmentRuntimePanel({
             </Text>
           )}
           <Text font="secondary-body">
-            {`${running && activityFresh ? "Active tasks" : "Last task count"}: ${data.active ?? "Unknown"} · Observed concurrency limit: ${data.max_parallel ?? "Unknown"}`}
+            {status === "queued" && data.active === null
+              ? "Queued: waiting for a worker to report task activity."
+              : `${running && activityFresh ? "Active tasks" : "Last task count"}: ${data.active ?? "Unknown"} · Observed concurrency limit: ${data.max_parallel ?? "Unknown"}`}
           </Text>
-          {running && !activityFresh && (
+          {status === "analyzing" && !activityFresh && (
             <Text font="secondary-body" color="text-03">
               Task count is not current.
             </Text>
           )}
           {running && activityFresh && data.calibrating && (
             <Text font="secondary-body" color="text-03">
-              Measuring the first task before admitting more work.
+              Measuring the initial tasks before expanding concurrency.
             </Text>
           )}
           {running && activityFresh && data.admission_limited && (

@@ -89,6 +89,27 @@ def test_pdf_extracted_and_pasted_text_share_analysis_request_contract() -> None
     assert pasted_text.raw_text == "TEXT MADDE 1"
 
 
+def test_analysis_model_is_an_explicit_two_model_contract() -> None:
+    from pydantic import ValidationError
+
+    selected = AnalyzeAmendmentRequest.model_validate(
+        {
+            "document_set_id": 7,
+            "raw_text": "MADDE 1",
+            "analysis_model": "gemini-3.5-flash-lite",
+        }
+    )
+    assert selected.model_dump()["analysis_model"] == "gemini-3.5-flash-lite"
+    with pytest.raises(ValidationError):
+        AnalyzeAmendmentRequest.model_validate(
+            {
+                "document_set_id": 7,
+                "raw_text": "MADDE 1",
+                "analysis_model": "unapproved-model",
+            }
+        )
+
+
 def test_proposal_cannot_be_approved_before_batch_finishes() -> None:
     proposal = SimpleNamespace(batch_id=42)
     batch = SimpleNamespace(

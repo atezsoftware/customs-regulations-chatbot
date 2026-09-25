@@ -645,6 +645,7 @@ def draft_batch_id(draft: AnnexChangeDraft) -> int:
 
 def validate_live_review_runtime(draft: AnnexChangeDraft) -> None:
     from onyx.configs.app_configs import REGULATORY_BATCH_INDEXING_ENABLED
+    from onyx.db.amendment_analysis_settings import load_analysis_model
     from onyx.db.amendment_sources import (
         list_source_assets,
         require_ready_source_package,
@@ -671,6 +672,7 @@ def validate_live_review_runtime(draft: AnnexChangeDraft) -> None:
         batch = get_batch(session, draft_batch_id(draft))
         if batch is None:
             raise ValueError("batch missing")
+        analysis_model = load_analysis_model(session, batch.id)
         package = require_ready_source_package(
             session,
             package_id=draft.source_package_id,
@@ -697,10 +699,8 @@ def validate_live_review_runtime(draft: AnnexChangeDraft) -> None:
     ):
         raise ValueError("source graph changed")
     context_llm = resolve_review_context_llm(settings, snapshot)
-    vision_llm = get_amendment_analysis_llm()
-    actual["analysis_model"] = context_hash(
-        get_amendment_analysis_llm().config.model_dump(mode="json")
-    )
+    vision_llm = get_amendment_analysis_llm(model=analysis_model)
+    actual["analysis_model"] = context_hash(vision_llm.config.model_dump(mode="json"))
     actual["vision_model"] = (
         context_hash(vision_llm.config.model_dump(mode="json"))
         if vision_llm

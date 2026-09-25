@@ -46,6 +46,7 @@ describe("regulatory document set API contracts", () => {
         body: JSON.stringify({
           document_set_id: 17,
           raw_text: "Official update text",
+          analysis_model: "gemini-3.8-flash",
         }),
       }
     );

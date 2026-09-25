@@ -33,6 +33,7 @@ export interface RegulatoryChunkUpdate {
   clear_validity_end_date?: boolean;
 }
 export interface AmendmentRuntime {
+  analysis_model?: "gemini-3.8-flash" | "gemini-3.5-flash-lite";
   batch_id: number;
   status: string;
   stage: string;

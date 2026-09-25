@@ -1019,12 +1019,15 @@ def create_source_text_revision(
         for proposal in legacy_proposals
     ):
         raise ValueError("legacy publication state prevents source edits")
+    from onyx.db.amendment_analysis_settings import load_analysis_model
+
     revised = create_batch(
         session,
         document_set_id=batch.document_set_id,
         user_file_ids=[UUID(value) for value in batch.user_file_ids],
         raw_text=raw_text,
         created_by=created_by,
+        analysis_model=load_analysis_model(session, batch.id).value,
     )
     revised.source_parent_batch_id = batch.id
     revised.source_text_sha256 = hashlib.sha256(raw_text.encode()).hexdigest()

@@ -1,5 +1,9 @@
 import type { AmendmentRuntime } from "@/lib/regulatory/interfaces";
 
+export type AmendmentAnalysisModel =
+  | "gemini-3.8-flash"
+  | "gemini-3.5-flash-lite";
+
 export interface AmendmentBatch {
   source_package_id?: string | null;
   source_text_sha256?: string | null;
@@ -740,7 +744,8 @@ export function getAnnexEvidenceUrl(
 export async function analyzeAmendment(
   documentSetId: number,
   rawText: string,
-  sourcePackageId?: string
+  sourcePackageId?: string,
+  analysisModel: AmendmentAnalysisModel = "gemini-3.8-flash"
 ): Promise<AmendmentBatch> {
   const response = await fetch("/api/regulatory/amendments/analyze", {
     method: "POST",
@@ -748,6 +753,7 @@ export async function analyzeAmendment(
     body: JSON.stringify({
       document_set_id: documentSetId,
       raw_text: rawText,
+      analysis_model: analysisModel,
       ...(sourcePackageId ? { source_package_id: sourcePackageId } : {}),
     }),
   });
