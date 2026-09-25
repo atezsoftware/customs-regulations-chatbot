@@ -1,7 +1,8 @@
 """Limit amendment publication to changed legal intervals and actual consumers."""
 
+import hashlib
 import json
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Callable
 from datetime import date
 from time import monotonic
@@ -228,17 +229,46 @@ ContextAuditResolver = Callable[
 ]
 
 
+class ContextImpactCoverageError(ValueError):
+    """Incomplete key coverage is recoverable without weakening evidence checks."""
+
+    def __init__(
+        self, contexts: dict[str, str], decisions: list[ContextImpactDecision]
+    ) -> None:
+        counts = Counter(decision.key for decision in decisions)
+
+        def safe_key(key: str) -> str:
+            if key in contexts or key.isascii() and key.isdecimal() and len(key) <= 12:
+                return key
+            return "sha256:" + hashlib.sha256(key.encode()).hexdigest()[:12]
+
+        self.coverage = {
+            "expected_keys": list(contexts),
+            "missing_keys": sorted(set(contexts) - counts.keys()),
+            "duplicate_keys": sorted(
+                safe_key(key) for key, n in counts.items() if n > 1
+            )[:8],
+            "unexpected_keys": sorted(
+                safe_key(key) for key in counts.keys() - contexts.keys()
+            )[:8],
+        }
+        super().__init__(
+            "context impact audit must cover every supplied context exactly once: "
+            + json.dumps(self.coverage, sort_keys=True)
+        )
+
+
 def validate_context_decisions(
     contexts: dict[str, str],
     decisions: list[ContextImpactDecision],
     *,
     changes: dict[str, dict[str, dict[str, str]]] | None = None,
 ) -> set[str]:
-    if len(decisions) != len(contexts) or {d.key for d in decisions} != set(contexts):
-        raise ValueError(
-            "context impact audit must cover every supplied context exactly once"
-        )
+    counts = Counter(decision.key for decision in decisions)
     for decision in decisions:
+        # A known, unambiguous semantic failure must not be hidden by missing keys.
+        if decision.key not in contexts or counts[decision.key] != 1:
+            continue
         if decision.uncertain:
             raise ValueError("unresolved context impact: " + decision.reason)
         if not decision.reason.strip():
@@ -271,6 +301,8 @@ def validate_context_decisions(
                         }
                     )
                 )
+    if len(decisions) != len(contexts) or counts.keys() != contexts.keys():
+        raise ContextImpactCoverageError(contexts, decisions)
     return {d.key for d in decisions if d.affected}
 
 
@@ -401,31 +433,90 @@ def include_context_consumers(
         deadline = monotonic() + 180
         proofs = source_proofs(batch)
 
-        def generate_audit() -> ContextImpactResult:
-            feedback: dict[str, object] | None = None
-            for attempt in range(2):
-                response = generate_structured(
-                    llm,
-                    flow=LLMFlow.REGULATORY_CONTEXTUAL_BATCH,
-                    system_prompt=CONTEXT_IMPACT_AUDIT,
-                    user_prompt=json.dumps(
-                        {
-                            "contexts": {key: cases[key] for key in batch},
-                            "validation_feedback": feedback,
-                            "changes": {
+        def request(
+            selected: dict[str, str],
+            feedback: dict[str, object] | None,
+            *,
+            singleton_recovery: bool = False,
+        ) -> ContextImpactResult:
+            if monotonic() >= deadline:
+                raise TimeoutError("context impact audit deadline exhausted")
+            return generate_structured(
+                llm,
+                flow=LLMFlow.REGULATORY_CONTEXTUAL_BATCH,
+                system_prompt=CONTEXT_IMPACT_AUDIT,
+                user_prompt=json.dumps(
+                    {
+                        "contexts": {key: cases[key] for key in selected},
+                        "expected_keys": list(selected),
+                        "validation_feedback": feedback,
+                        "changes": {
+                            str(cases[key]["change_key"]): changes[
+                                str(cases[key]["change_key"])
+                            ]
+                            for key in selected
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                response_model=ContextImpactResult,
+                timeout_override=60,
+                deadline=deadline,
+                max_tokens=12000,
+                max_attempts=1 if singleton_recovery else 2,
+                provider_max_attempts=1 if singleton_recovery else 3,
+            )
+
+        def cached(
+            selected: dict[str, str], generate: Callable[[], ContextImpactResult]
+        ) -> ContextImpactResult:
+            # Preserve the existing valid-group checkpoint identity.
+            return (
+                audit_cache(
+                    context_hash(
+                        [
+                            {key: cases[key] for key in selected},
+                            {
                                 str(cases[key]["change_key"]): changes[
                                     str(cases[key]["change_key"])
                                 ]
-                                for key in batch
+                                for key in selected
                             },
-                        },
-                        ensure_ascii=False,
+                            contextual_model_fingerprint(llm),
+                            CONTEXT_IMPACT_AUDIT,
+                        ]
                     ),
-                    response_model=ContextImpactResult,
-                    timeout_override=60,
-                    deadline=deadline,
-                    max_tokens=12000,
+                    generate,
                 )
+                if audit_cache is not None
+                else generate()
+            )
+
+        def recover_singletons() -> ContextImpactResult:
+            decisions: list[ContextImpactDecision] = []
+            # At most eight extra provider calls, sequential under the parent deadline.
+            for key, context in batch.items():
+                singleton = {key: context}
+
+                def generate_one() -> ContextImpactResult:
+                    response = request(singleton, None, singleton_recovery=True)
+                    validate_context_decisions(
+                        singleton, response.decisions, changes=source_proofs(singleton)
+                    )
+                    return response
+
+                response = cached(singleton, generate_one)
+                validate_context_decisions(
+                    singleton, response.decisions, changes=source_proofs(singleton)
+                )
+                decisions.extend(response.decisions)
+            validate_context_decisions(batch, decisions, changes=proofs)
+            return ContextImpactResult(decisions=decisions)
+
+        def generate_audit() -> ContextImpactResult:
+            feedback: dict[str, object] | None = None
+            for attempt in range(2):
+                response = request(batch, feedback)
                 try:
                     validate_context_decisions(
                         batch, response.decisions, changes=proofs
@@ -433,35 +524,25 @@ def include_context_consumers(
                     return response
                 except ValueError as error:
                     if attempt == 1:
+                        if (
+                            isinstance(error, ContextImpactCoverageError)
+                            and len(batch) > 1
+                        ):
+                            return recover_singletons()
                         raise
-                    feedback = {
-                        "error": str(error),
-                        "previous_decisions": response.model_dump(mode="json")[
-                            "decisions"
-                        ],
-                    }
+                    feedback = (
+                        {"error": str(error), "coverage": error.coverage}
+                        if isinstance(error, ContextImpactCoverageError)
+                        else {
+                            "error": str(error),
+                            "previous_decisions": response.model_dump(mode="json")[
+                                "decisions"
+                            ],
+                        }
+                    )
             raise AssertionError("context audit attempts exhausted")
 
-        return (
-            audit_cache(
-                context_hash(
-                    [
-                        {key: cases[key] for key in batch},
-                        {
-                            str(cases[key]["change_key"]): changes[
-                                str(cases[key]["change_key"])
-                            ]
-                            for key in batch
-                        },
-                        contextual_model_fingerprint(llm),
-                        CONTEXT_IMPACT_AUDIT,
-                    ]
-                ),
-                generate_audit,
-            )
-            if audit_cache is not None
-            else generate_audit()
-        )
+        return cached(batch, generate_audit)
 
     # The shared helper preserves tenant/tracing context and joins every call on failure.
     responses = cast(
