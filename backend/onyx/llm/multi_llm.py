@@ -57,6 +57,7 @@ from onyx.llm.models import (
 from onyx.llm.request_context import get_llm_mock_response
 from onyx.llm.utils import build_litellm_passthrough_kwargs
 from onyx.llm.well_known_providers.constants import VERTEX_LOCATION_KWARG
+from onyx.tracing.answer_graph import graph_step
 from onyx.tracing.llm_utils import record_llm_request_params
 from onyx.utils.encryption import mask_env_value_for_logging, mask_string
 from onyx.utils.logger import setup_logger
@@ -990,18 +991,35 @@ class LitellmLLM(LLM):
                     }
                 )
                 try:
-                    response = _call_litellm(opts)
-                    if not stream:
-                        return response
-                    # Some providers defer the HTTP request until iteration.
-                    # Catch their parameter rejections before exposing a chunk;
-                    # never replay a stream once any chunk has been returned.
-                    chunks = iter(response)
-                    try:
-                        first_chunk = next(chunks)
-                    except StopIteration:
-                        return iter(())
-                    return chain((first_chunk,), chunks)
+                    with graph_step(
+                        "llm.provider_attempt",
+                        {
+                            "model": model,
+                            "provider": self._model_provider,
+                            "attempt": i + 1,
+                            "messages": messages,
+                            "tools": tools,
+                            "sent_kwargs": opts,
+                            "stream": stream,
+                        },
+                    ) as graph_call:
+                        response = _call_litellm(opts)
+                        if not stream:
+                            graph_call.output_value = response
+                            return response
+                        # Some providers defer the HTTP request until iteration.
+                        # A later stream error is recorded by the generation span.
+                        chunks = iter(response)
+                        try:
+                            first_chunk = next(chunks)
+                        except StopIteration:
+                            graph_call.output_value = {"stream": "empty"}
+                            return iter(())
+                        graph_call.output_value = {
+                            "first_chunk_received": True,
+                            "stream_output": "recorded_by_generation_span",
+                        }
+                        return chain((first_chunk,), chunks)
                 except BadRequestError as e:
                     if i == len(attempts) - 1:
                         raise

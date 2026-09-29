@@ -6,6 +6,7 @@ import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextvars import copy_context
 from functools import wraps
 from types import TracebackType
 from typing import Any, cast
@@ -1130,6 +1131,8 @@ class EmbeddingModel:
                 else LLMFlow.EMBED_QUERY
             )
             try:
+                from onyx.tracing.answer_graph import graph_step
+
                 with (
                     traced_llm_call(
                         flow=embed_flow,
@@ -1145,6 +1148,15 @@ class EmbeddingModel:
                         },
                     ),
                     track_embedding_in_progress(self.provider_type, text_type),
+                    graph_step(
+                        "embedding.batch",
+                        {
+                            "model": self.model_name,
+                            "text_type": text_type.value,
+                            "texts": text_batch,
+                            "batch_index": batch_idx,
+                        },
+                    ) as graph_call,
                 ):
                     # Route between direct API calls and model server calls.
                     if self.provider_type is not None:
@@ -1181,6 +1193,10 @@ class EmbeddingModel:
                         response = self._make_model_server_request(
                             embed_request, tenant_id=tenant_id, request_id=request_id
                         )
+                    graph_call.output_value = {
+                        "embeddings": response.embeddings,
+                        "batch_index": batch_idx,
+                    }
                 success = True
             finally:
                 processing_time = time.monotonic() - start_time
@@ -1216,13 +1232,15 @@ class EmbeddingModel:
                 # every lambda would point to the same values for idx and batch.
                 futures = [
                     executor.submit(
-                        lambda idx, batch: process_batch(
+                        lambda context, idx, batch: context.run(
+                            process_batch,
                             batch_idx=idx,
                             num_of_batches=num_of_batches,
                             text_batch=batch,
                             tenant_id=tenant_id,
                             request_id=request_id,
                         ),
+                        copy_context(),
                         idx,
                         batch,
                     )

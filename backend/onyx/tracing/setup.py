@@ -2,6 +2,7 @@
 provider config at runtime so config changes apply without a restart."""
 
 from onyx.configs.app_configs import USER_USAGE_TRACKING_ENABLED
+from onyx.tracing.answer_graph import AnswerGraphTracingProcessor
 from onyx.tracing.dynamic_processor import DynamicTracingProcessor
 from onyx.tracing.framework import add_trace_processor, set_trace_processors
 from onyx.utils.logger import setup_logger
@@ -11,18 +12,20 @@ logger = setup_logger()
 _initialized = False
 _dynamic_processor: DynamicTracingProcessor | None = None
 _user_usage_processor: object | None = None
+_answer_graph_processor: AnswerGraphTracingProcessor | None = None
 
 
 def setup_tracing() -> list[str]:
     """Register the dynamic tracing processor and do an initial config read.
     Idempotent; returns the provider names active at startup."""
-    global _initialized, _dynamic_processor
+    global _initialized, _dynamic_processor, _answer_graph_processor
     if _initialized:
         logger.debug("Tracing already initialized, skipping")
         return []
 
     _dynamic_processor = DynamicTracingProcessor()
-    set_trace_processors([_dynamic_processor])
+    _answer_graph_processor = AnswerGraphTracingProcessor()
+    set_trace_processors([_dynamic_processor, _answer_graph_processor])
     config = _dynamic_processor.reconcile(force=True)
 
     initialized_providers = config.active_provider_names() if config else []
@@ -61,6 +64,7 @@ def shutdown_tracing() -> None:
     """Flush buffered usage to the DB on shutdown. Call before disposing the DB
     engines (the drain thread writes through them) so queued records aren't lost."""
     global _initialized, _dynamic_processor, _user_usage_processor
+    global _answer_graph_processor
 
     from onyx.tracing.processors.user_usage_processor import UserUsageTracingProcessor
 
@@ -78,4 +82,5 @@ def shutdown_tracing() -> None:
     set_trace_processors([])
     _user_usage_processor = None
     _dynamic_processor = None
+    _answer_graph_processor = None
     _initialized = False

@@ -13,4 +13,7 @@ def test_chat_trace_metadata_uses_current_tenant() -> None:
         "tenant_id": "tenant",
         "chat_session_id": "session",
         "user_id": "user",
+        "user_message_id": None,
+        "assistant_message_id": None,
+        "model_name": None,
     }

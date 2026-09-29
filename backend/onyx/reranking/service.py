@@ -190,18 +190,34 @@ class RerankingService:
             )
 
         try:
+            from onyx.tracing.answer_graph import graph_step
+
             with self._trace_call(
                 flow=LLMFlow.RERANK,
                 model=config.model_name,
                 provider=provider.value,
             ):
-                scores = client.rerank(
-                    api_key=api_key,
-                    model=config.model_name,
-                    query=query,
-                    documents=payload.documents,
-                    top_n=len(payload.documents),
-                )
+                with graph_step(
+                    "rerank.provider_call",
+                    {
+                        "query": query,
+                        "documents": payload.documents,
+                        "model": config.model_name,
+                        "submitted_count": len(payload.documents),
+                        "unsent_count": len(payload.unsent_chunks),
+                    },
+                ) as rerank_step:
+                    scores = client.rerank(
+                        api_key=api_key,
+                        model=config.model_name,
+                        query=query,
+                        documents=payload.documents,
+                        top_n=len(payload.documents),
+                    )
+                    rerank_step.output_value = [
+                        {"index": score.index, "relevance_score": score.relevance_score}
+                        for score in scores
+                    ]
         except RerankTimeout:
             logger.warning("Rerank provider timed out model=%s", model)
             self._circuit_breaker.record_failure(circuit_key)
@@ -294,9 +310,30 @@ def rerank_chunks(
     chunks: Sequence[InferenceChunk],
     config: RerankerRuntimeConfig,
 ) -> RerankResult:
-    return _get_default_service().rerank_chunks(
-        query=query, chunks=chunks, config=config
-    )
+    from onyx.tracing.answer_graph import graph_step
+
+    with graph_step(
+        "rerank.decision",
+        {
+            "query": query,
+            "candidate_ids": [chunk.unique_id for chunk in chunks],
+            "model": config.model_name,
+            "enabled": config.enabled,
+        },
+    ) as decision:
+        result = _get_default_service().rerank_chunks(
+            query=query, chunks=chunks, config=config
+        )
+        decision.output_value = {
+            "ordered_ids": [chunk.unique_id for chunk in result.ordered_chunks],
+            "scores": [
+                {"document_id": document_id, "chunk_id": chunk_id, "score": score}
+                for (document_id, chunk_id), score in result.scores_by_chunk.items()
+            ],
+            "outcome": result.outcome.value,
+            "fallback_used": result.fallback_used,
+        }
+        return result
 
 
 def invalidate_reranker_circuit(tenant_id: str) -> None:

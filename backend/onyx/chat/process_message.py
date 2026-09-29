@@ -147,6 +147,7 @@ from onyx.tools.tool_constructor import (
     construct_tools,
 )
 from onyx.tools.tool_implementations.search.search_tool import SearchTool
+from onyx.tracing.answer_graph import record_final_answer_message
 from onyx.utils.logger import setup_logger
 from onyx.utils.telemetry import mt_cloud_telemetry
 from onyx.utils.timing import log_function_time
@@ -1434,6 +1435,7 @@ def _run_models(
                 llm=setup.llms[model_idx],
                 reserved_tokens=setup.reserved_token_count,
             )
+            record_final_answer_message(setup.reserved_messages[model_idx].id)
         except Exception:
             logger.exception(
                 "%s completion failed for model %d (%s)",
@@ -1553,6 +1555,8 @@ def _run_models(
                         user_identity=setup.user_identity,
                         chat_session_id=str(setup.chat_session.id),
                         all_injected_file_metadata=setup.all_injected_file_metadata,
+                        user_message_id=setup.user_message.id,
+                        assistant_message_id=setup.reserved_messages[model_idx].id,
                     )
                 else:
                     run_llm_loop(
@@ -1574,6 +1578,8 @@ def _run_models(
                         include_citations=setup.new_msg_req.include_citations,
                         all_injected_file_metadata=setup.all_injected_file_metadata,
                         inject_memories_in_prompt=user.use_memories,
+                        user_message_id=setup.user_message.id,
+                        assistant_message_id=setup.reserved_messages[model_idx].id,
                     )
 
                 model_succeeded[model_idx] = True
@@ -1612,6 +1618,7 @@ def _run_models(
                     msg.message = error_text
                     msg.error = error_text
                     save_db_session.commit()
+            record_final_answer_message(setup.reserved_messages[model_idx].id)
         except Exception:
             logger.exception(
                 "%s error save failed for model %d (%s)",
@@ -1635,6 +1642,7 @@ def _run_models(
                     setup.reserved_messages[model_idx].id, error.error
                 )
                 publication_invalidated[model_idx] = True
+                record_final_answer_message(setup.reserved_messages[model_idx].id)
             except Exception:
                 logger.exception("Failed to invalidate changed-source chat message")
         return error

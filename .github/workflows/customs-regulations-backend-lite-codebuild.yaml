@@ -171,6 +171,21 @@ jobs:
         run: |
           aws eks update-kubeconfig --name ${{ env.CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
 
+      - name: Verify DEV answer graph encryption key
+        if: env.env_x == 'dev'
+        run: |
+          set -euo pipefail
+          pod=$(kubectl get pods -n "${namespace}" -l app=dev-customs-regulations-api -o json |
+            jq -r '.items[] | select(.metadata.deletionTimestamp == null and .status.phase == "Running") | .metadata.name' | head -n 1)
+          [[ -n "$pod" ]]
+          container=$(kubectl get pod "$pod" -n "${namespace}" -o json | jq -r '.spec.containers[0].name')
+          kubectl exec "$pod" -n "${namespace}" -c "$container" -- sh -ec '
+            . /vault/secrets/config
+            key_bytes=$(printf %s "${ANSWER_GRAPH_ENCRYPTION_KEY:-${ENCRYPTION_KEY_SECRET:-}}" | wc -c)
+            test "$key_bytes" -ge 32
+          '
+          echo "DEV answer graph encryption key is available"
+
       - name: Render required DEV runtime configuration
         if: env.env_x == 'dev'
         run: |

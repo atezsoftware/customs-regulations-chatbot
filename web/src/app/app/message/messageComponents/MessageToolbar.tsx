@@ -32,6 +32,7 @@ import { useVoiceStatus } from "@/hooks/useVoiceStatus";
 import { findModelConfigId } from "@/lib/languageModels/options";
 import { getModelIcon } from "@/lib/languageModels";
 import { formatModelProvenanceLabel } from "@/lib/chat/modelProvenance";
+import AnswerGraphLink from "@/app/app/message/messageComponents/AnswerGraphLink";
 
 interface SouurcesTagWrapperProps {
   citations: StreamingCitation[];
@@ -271,6 +272,7 @@ export default function MessageToolbar({
               getHtmlContent={() => finalAnswerRef.current?.innerHTML || ""}
               data-testid="AgentMessage/copy-button"
             />
+            <AnswerGraphLink messageId={messageId} />
             <SelectButton
               icon={SvgThumbsUp}
               onClick={() => handleFeedbackClick("like")}

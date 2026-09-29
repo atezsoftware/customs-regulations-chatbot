@@ -68,7 +68,7 @@ ENV REGULATORY_ANNEX_WORKER_ENABLED="false"
 
 # Retry expired user-file work and refresh Auto model catalogs. Other global
 # tasks target queues this image does not consume.
-ENV BEAT_TASK_ALLOWLIST="check_for_user_file_processing,check_for_user_file_project_sync,check_for_user_file_delete,check_for_auto_llm_update"
+ENV BEAT_TASK_ALLOWLIST="check_for_user_file_processing,check_for_user_file_project_sync,check_for_user_file_delete,check_for_auto_llm_update,prune_answer_graphs"
 
 RUN groupadd -g 1001 onyx && \
     useradd -u 1001 -g onyx -m -s /bin/bash onyx && \

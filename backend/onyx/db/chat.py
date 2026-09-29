@@ -12,6 +12,7 @@ from onyx.configs.chat_configs import HARD_DELETE_CHATS
 from onyx.configs.constants import MessageType
 from onyx.context.search.models import InferenceSection, SavedSearchDoc
 from onyx.context.search.models import SearchDoc as ServerSearchDoc
+from onyx.db.answer_graph import delete_answer_graphs_for_session
 from onyx.db.models import (
     ChatMessage,
     ChatMessage__SearchDoc,
@@ -177,6 +178,7 @@ def delete_orphaned_search_docs(db_session: Session) -> None:
 def delete_messages_and_files_from_chat_session(
     chat_session_id: UUID, db_session: Session
 ) -> None:
+    delete_answer_graphs_for_session(db_session, chat_session_id)
     # Select messages older than cutoff_time with files
     messages_with_files = (
         db_session.execute(
@@ -328,6 +330,8 @@ def delete_all_chat_sessions_for_user(
             )
         )
     else:
+        for chat_session in chat_sessions:
+            delete_answer_graphs_for_session(db_session, chat_session.id)
         db_session.execute(
             update(ChatSession)
             .where(
@@ -362,6 +366,7 @@ def delete_chat_session(
         delete_messages_and_files_from_chat_session(chat_session_id, db_session)
         db_session.execute(delete(ChatSession).where(ChatSession.id == chat_session_id))
     else:
+        delete_answer_graphs_for_session(db_session, chat_session_id)
         chat_session = get_chat_session_by_id(
             chat_session_id=chat_session_id, user_id=user_id, db_session=db_session
         )

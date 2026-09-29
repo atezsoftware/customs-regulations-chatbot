@@ -3930,6 +3930,138 @@ class TracingProviderConfig(Base):
         )
 
 
+class AnswerGraphRun(Base):
+    """One durable execution graph for one reserved assistant message."""
+
+    __tablename__ = "answer_graph_run"
+    __table_args__ = (
+        Index("ix_answer_graph_run_session", "chat_session_id", "time_created"),
+    )
+
+    id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid4
+    )
+    tenant_id: Mapped[str] = mapped_column(String, nullable=False)
+    assistant_message_id: Mapped[int] = mapped_column(
+        ForeignKey("chat_message.id", ondelete="CASCADE"), unique=True, nullable=False
+    )
+    user_message_id: Mapped[int] = mapped_column(
+        ForeignKey("chat_message.id", ondelete="CASCADE"), nullable=False
+    )
+    chat_session_id: Mapped[UUID] = mapped_column(
+        ForeignKey("chat_session.id", ondelete="CASCADE"), nullable=False
+    )
+    trace_id: Mapped[str] = mapped_column(String, unique=True, nullable=False)
+    model_name: Mapped[str | None] = mapped_column(String, nullable=True)
+    status: Mapped[str] = mapped_column(String, nullable=False, default="RUNNING")
+    capture_status: Mapped[str] = mapped_column(
+        String, nullable=False, default="COMPLETE"
+    )
+    capture_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    final_answer_sha256: Mapped[str | None] = mapped_column(String, nullable=True)
+    time_created: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    time_finished: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
+class AnswerGraphNode(Base):
+    """A physical call or an explicitly instrumented local decision."""
+
+    __tablename__ = "answer_graph_node"
+    __table_args__ = (
+        PrimaryKeyConstraint("run_id", "node_id"),
+        Index("ix_answer_graph_node_run_started", "run_id", "started_at"),
+    )
+
+    run_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("answer_graph_run.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    node_id: Mapped[str] = mapped_column(String, nullable=False)
+    parent_node_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    kind: Mapped[str] = mapped_column(String, nullable=False)
+    operation: Mapped[str] = mapped_column(String, nullable=False)
+    status: Mapped[str] = mapped_column(String, nullable=False, default="RUNNING")
+    started_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    ended_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    attributes: Mapped[dict[str, Any]] = mapped_column(
+        postgresql.JSONB(), nullable=False, default=dict
+    )
+    has_input: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    has_output: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    has_reasoning: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    capture_status: Mapped[str] = mapped_column(
+        String, nullable=False, default="COMPLETE"
+    )
+
+
+class AnswerGraphPayload(Base):
+    """Encrypted payload isolated from graph-list metadata queries."""
+
+    __tablename__ = "answer_graph_payload"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["run_id", "node_id"],
+            ["answer_graph_node.run_id", "answer_graph_node.node_id"],
+            ondelete="CASCADE",
+        ),
+        PrimaryKeyConstraint("run_id", "node_id", "part"),
+    )
+
+    run_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), nullable=False)
+    node_id: Mapped[str] = mapped_column(String, nullable=False)
+    part: Mapped[str] = mapped_column(String, nullable=False)
+    ciphertext: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+
+
+class AnswerGraphEdge(Base):
+    """A recorded data dependency between two nodes of the same run."""
+
+    __tablename__ = "answer_graph_edge"
+    __table_args__ = (
+        UniqueConstraint("run_id", "from_node_id", "to_node_id", "kind"),
+        Index("ix_answer_graph_edge_run", "run_id"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    run_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("answer_graph_run.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    from_node_id: Mapped[str] = mapped_column(String, nullable=False)
+    to_node_id: Mapped[str] = mapped_column(String, nullable=False)
+    kind: Mapped[str] = mapped_column(String, nullable=False)
+
+
+class AnswerGraphAccessEvent(Base):
+    """Append-only admin access record; retained independently of the graph."""
+
+    __tablename__ = "answer_graph_access_event"
+    __table_args__ = (
+        Index("ix_answer_graph_access_event_run", "run_id", "time_created"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String, nullable=False)
+    run_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), nullable=False)
+    node_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    user_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), nullable=False)
+    action: Mapped[str] = mapped_column(String, nullable=False)
+    time_created: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
 class DocumentSet(Base):
     __tablename__ = "document_set"
 

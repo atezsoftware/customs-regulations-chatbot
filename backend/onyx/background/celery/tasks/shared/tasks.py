@@ -13,6 +13,7 @@ from onyx.access.access import get_access_for_document
 from onyx.background.celery.apps.app_base import task_logger
 from onyx.background.celery.tasks.shared.RetryDocumentIndex import RetryDocumentIndex
 from onyx.configs.constants import ONYX_CELERY_BEAT_HEARTBEAT_KEY, OnyxCeleryTask
+from onyx.db.answer_graph import prune_expired_answer_graphs
 from onyx.db.connector_credential_pair import get_connector_credential_pair
 from onyx.db.document import (
     delete_document_by_connector_credential_pair__no_commit,
@@ -39,6 +40,18 @@ from onyx.redis.redis_pool import get_redis_client
 from onyx.server.documents.models import ConnectorCredentialPairIdentifier
 
 DOCUMENT_BY_CC_PAIR_CLEANUP_MAX_RETRIES = 3
+
+
+@shared_task(name=OnyxCeleryTask.PRUNE_ANSWER_GRAPHS, ignore_result=True)
+def prune_answer_graphs(*, tenant_id: str) -> None:
+    from shared_configs.contextvars import CURRENT_TENANT_ID_CONTEXTVAR
+
+    token = CURRENT_TENANT_ID_CONTEXTVAR.set(tenant_id)
+    try:
+        with get_session_with_current_tenant() as db_session:
+            prune_expired_answer_graphs(db_session)
+    finally:
+        CURRENT_TENANT_ID_CONTEXTVAR.reset(token)
 
 
 # 5 seconds more than RetryDocumentIndex STOP_AFTER+MAX_WAIT

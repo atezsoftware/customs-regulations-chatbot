@@ -24,6 +24,9 @@ class ChatTraceMetadata(BaseModel):
     tenant_id: str = Field(default_factory=get_current_tenant_id)
     chat_session_id: str | None = None
     user_id: str | None = None
+    user_message_id: int | None = None
+    assistant_message_id: int | None = None
+    model_name: str | None = None
 
 
 def trace(

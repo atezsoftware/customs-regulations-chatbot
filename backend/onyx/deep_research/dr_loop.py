@@ -1412,6 +1412,8 @@ def run_deep_research_llm_loop(
     user_identity: LLMUserIdentity | None = None,
     chat_session_id: str | None = None,
     all_injected_file_metadata: dict[str, FileToolMetadata] | None = None,
+    user_message_id: int | None = None,
+    assistant_message_id: int | None = None,
 ) -> None:
     with trace(
         "run_deep_research_llm_loop",
@@ -1419,8 +1421,26 @@ def run_deep_research_llm_loop(
         metadata=ChatTraceMetadata(
             chat_session_id=chat_session_id,
             user_id=user_identity.user_id if user_identity else None,
+            user_message_id=user_message_id,
+            assistant_message_id=assistant_message_id,
+            model_name=llm.config.model_name,
         ).model_dump(),
     ):
+        from onyx.tracing.answer_graph import graph_step
+
+        with graph_step(
+            "chat.input",
+            {
+                "chat_history": simple_chat_history,
+                "custom_agent_prompt": custom_agent_prompt,
+                "user_message_id": user_message_id,
+            },
+        ) as input_step:
+            input_step.output_value = {
+                "assistant_message_id": assistant_message_id,
+                "model": llm.config.model_name,
+            }
+
         # Here for lazy load LiteLLM
         from onyx.llm.litellm_singleton.config import initialize_litellm
 

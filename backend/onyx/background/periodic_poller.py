@@ -64,6 +64,14 @@ def _run_cache_cleanup() -> None:
     cleanup_expired_cache_entries()
 
 
+def _run_answer_graph_cleanup() -> None:
+    from onyx.db.answer_graph import prune_expired_answer_graphs
+    from onyx.db.engine.sql_engine import get_session_with_current_tenant
+
+    with get_session_with_current_tenant() as db_session:
+        prune_expired_answer_graphs(db_session)
+
+
 def _run_scheduled_eval() -> None:
     from onyx.configs.app_configs import (
         BRAINTRUST_API_KEY,
@@ -119,6 +127,14 @@ def _build_periodic_tasks() -> list[_PeriodicTaskDef]:
     )
 
     tasks: list[_PeriodicTaskDef] = []
+    tasks.append(
+        _PeriodicTaskDef(
+            name="answer-graph-cleanup",
+            interval_seconds=3600,
+            lock_id=PERIODIC_TASK_LOCK_BASE + 3,
+            run_fn=_run_answer_graph_cleanup,
+        )
+    )
     if CACHE_BACKEND == CacheBackendType.POSTGRES:
         tasks.append(
             _PeriodicTaskDef(

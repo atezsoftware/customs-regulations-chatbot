@@ -604,6 +604,7 @@ CLOUD_BUILD_FENCE_LOOKUP_TABLE_INTERVAL_DEFAULT = 600
 
 class OnyxCeleryTask:
     DEFAULT = "celery"
+    PRUNE_ANSWER_GRAPHS = "prune_answer_graphs"
 
     CLOUD_BEAT_TASK_GENERATOR = f"{ONYX_CLOUD_CELERY_TASK_PREFIX}_generate_beat_tasks"
     CLOUD_MONITOR_ALEMBIC = f"{ONYX_CLOUD_CELERY_TASK_PREFIX}_monitor_alembic"

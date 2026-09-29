@@ -1849,14 +1849,24 @@ class ElasticsearchIndexClient(ElasticsearchClient):
         with ctx:
             try:
                 t0 = time.perf_counter()
-                raw_result = (
-                    self._search_hybrid_fusion(body)
-                    if "_onyx_hybrid_fusion" in body
-                    else self._client.search(
-                        index=self._index_name,
-                        **self._search_kwargs_from_body(body),
-                    )
-                )
+                if "_onyx_hybrid_fusion" in body:
+                    raw_result = self._search_hybrid_fusion(body)
+                else:
+                    from onyx.tracing.answer_graph import graph_step
+
+                    with graph_step(
+                        "search.vector" if "knn" in body else "search.bm25",
+                        {"index": self._index_name, "body": body},
+                    ) as query_step:
+                        raw_result = self._client.search(
+                            index=self._index_name,
+                            **self._search_kwargs_from_body(body),
+                        )
+                        query_step.output_value = (
+                            raw_result
+                            if isinstance(raw_result, dict)
+                            else dict(raw_result.body)
+                        )
                 result = (
                     raw_result
                     if isinstance(raw_result, dict)
@@ -2042,6 +2052,8 @@ class ElasticsearchIndexClient(ElasticsearchClient):
 
     def _search_hybrid_fusion(self, body: dict[str, Any]) -> dict[str, Any]:
         """Fuse independent query lanes without requiring the retriever API."""
+        from onyx.tracing.answer_graph import graph_step, link_graph_nodes
+
         specification = body["_onyx_hybrid_fusion"]
         subqueries: list[dict[str, Any]] = specification["subqueries"]
         weights: list[float] = specification["weights"]
@@ -2053,6 +2065,7 @@ class ElasticsearchIndexClient(ElasticsearchClient):
         merged_scores: Counter[str] = Counter()
         total_took = 0
         timed_out = False
+        subquery_node_ids: list[str | None] = []
 
         for subquery, weight in zip(subqueries, weights, strict=True):
             if "knn" in subquery:
@@ -2076,10 +2089,21 @@ class ElasticsearchIndexClient(ElasticsearchClient):
             if "explain" in body:
                 request_body["explain"] = body["explain"]
 
-            raw_response = self._client.search(
-                index=self._index_name,
-                **self._search_kwargs_from_body(request_body),
-            )
+            operation = "search.vector" if "knn" in subquery else "search.bm25"
+            with graph_step(
+                operation,
+                {"index": self._index_name, "body": request_body, "weight": weight},
+            ) as query_step:
+                raw_response = self._client.search(
+                    index=self._index_name,
+                    **self._search_kwargs_from_body(request_body),
+                )
+                query_step.output_value = (
+                    raw_response
+                    if isinstance(raw_response, dict)
+                    else dict(raw_response.body)
+                )
+            subquery_node_ids.append(query_step.node_id)
             response = (
                 raw_response
                 if isinstance(raw_response, dict)
@@ -2105,11 +2129,24 @@ class ElasticsearchIndexClient(ElasticsearchClient):
         ranked_hits = sorted(
             merged_hits.values(), key=lambda hit: float(hit["_score"]), reverse=True
         )[: int(body["size"])]
-        return {
+        fused_response = {
             "took": total_took,
             "timed_out": timed_out,
             "hits": {"hits": ranked_hits},
         }
+        with graph_step(
+            "search.fusion",
+            {
+                "subquery_node_ids": subquery_node_ids,
+                "weights": weights,
+                "normalizer": normalizer,
+                "rank_window_size": rank_window_size,
+            },
+        ) as fusion_step:
+            fusion_step.output_value = fused_response
+        for node_id in subquery_node_ids:
+            link_graph_nodes(node_id, fusion_step.node_id)
+        return fused_response
 
     @staticmethod
     def _normalize_hybrid_scores(scores: list[float], normalizer: str) -> list[float]:

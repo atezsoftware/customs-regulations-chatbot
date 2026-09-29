@@ -12,6 +12,7 @@ import AgentMessage, {
 import { ErrorBanner } from "@/app/app/message/Resubmit";
 import { cn } from "@opal/utils";
 import { markdown } from "@opal/utils";
+import AnswerGraphLink from "@/app/app/message/messageComponents/AnswerGraphLink";
 
 export interface MultiModelPanelProps {
   /** Provider name for icon lookup */
@@ -105,17 +106,23 @@ export default function MultiModelPanel({
         title={isHidden ? markdown(`~~${displayName}~~`) : displayName}
         rightChildren={
           readOnly ? (
-            isPreferred ? (
-              <div className="flex items-center px-2">
+            <div className="flex items-center gap-1 px-2">
+              {(!isPreferred || isHidden || errorMessage) && (
+                <AnswerGraphLink messageId={agentMessageProps.messageId} />
+              )}
+              {isPreferred && (
                 <span className="text-action-selection-05 shrink-0">
                   <Text font="secondary-body" color="inherit" nowrap>
                     Preferred Response
                   </Text>
                 </span>
-              </div>
-            ) : undefined
+              )}
+            </div>
           ) : (
             <div className="flex items-center gap-1 px-2">
+              {(!isPreferred || isHidden || errorMessage) && (
+                <AnswerGraphLink messageId={agentMessageProps.messageId} />
+              )}
               {isPreferred && (
                 <>
                   <span className="text-action-selection-05 shrink-0">

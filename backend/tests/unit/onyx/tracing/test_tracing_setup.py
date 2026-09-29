@@ -5,6 +5,7 @@ from unittest.mock import patch
 import pytest
 
 from onyx.tracing import setup as tracing_setup
+from onyx.tracing.answer_graph import AnswerGraphTracingProcessor
 from onyx.tracing.dynamic_processor import DynamicTracingProcessor
 from onyx.tracing.provider_config import (
     BraintrustConfig,
@@ -16,7 +17,7 @@ RESOLVE = "onyx.tracing.dynamic_processor.resolve_effective_tracing_config"
 BUILD = "onyx.tracing.dynamic_processor.build_delegates"
 
 
-def test_setup_tracing_registers_single_dynamic_processor() -> None:
+def test_setup_tracing_registers_dynamic_and_answer_graph_processors() -> None:
     tracing_setup._initialized = False
     with (
         patch.object(tracing_setup, "set_trace_processors") as mock_set,
@@ -29,8 +30,9 @@ def test_setup_tracing_registers_single_dynamic_processor() -> None:
 
         mock_set.assert_called_once()
         (processors,) = mock_set.call_args.args
-        assert len(processors) == 1
+        assert len(processors) == 2
         assert isinstance(processors[0], DynamicTracingProcessor)
+        assert isinstance(processors[1], AnswerGraphTracingProcessor)
         assert result == []
 
     tracing_setup._initialized = False

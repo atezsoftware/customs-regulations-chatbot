@@ -42,6 +42,17 @@ CLOUD_DOC_PERMISSION_SYNC_MULTIPLIER_DEFAULT = 1.0
 # tasks that run in either self-hosted on cloud
 beat_task_templates: list[dict] = [
     {
+        "name": "prune-answer-graphs",
+        "task": OnyxCeleryTask.PRUNE_ANSWER_GRAPHS,
+        "schedule": timedelta(hours=1),
+        "options": {
+            "priority": OnyxCeleryPriority.LOW,
+            "expires": BEAT_EXPIRES_DEFAULT,
+            "queue": OnyxCeleryQueues.CHECKPOINT_CLEANUP,
+            "skip_gated": False,
+        },
+    },
+    {
         "name": "recover-stale-regulatory-amendments",
         "task": OnyxCeleryTask.REGULATORY_AMENDMENT_RECOVER_STALE,
         "schedule": timedelta(minutes=1),
