@@ -108,7 +108,7 @@ function useGraphPages(runId: string | null, phase: string) {
           setNodes((previous) => {
             const byId = new Map(previous.map((node) => [node.node_id, node]));
             nodePage.nodes.forEach((node) => byId.set(node.node_id, node));
-            return [...byId.values()];
+            return Array.from(byId.values());
           });
           setNodeOffset(nodePage.next_offset);
         }
@@ -126,7 +126,7 @@ function useGraphPages(runId: string | null, phase: string) {
                 edge
               )
             );
-            return [...byId.values()];
+            return Array.from(byId.values());
           });
           setEdgeOffset(edgePage.next_offset);
         }
