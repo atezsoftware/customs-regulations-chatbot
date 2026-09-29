@@ -200,11 +200,14 @@ function graphLayout(nodes: Node[], edges: Edge[]) {
     rows.set(depth, row + 1);
   }
   let maxDepth = 0;
-  for (const depth of depths.values()) maxDepth = Math.max(maxDepth, depth);
+  depths.forEach((depth) => {
+    maxDepth = Math.max(maxDepth, depth);
+  });
   return {
     positions,
     width: 72 + (maxDepth + 1) * (NODE_WIDTH + 100),
-    height: 72 + Math.max(1, ...rows.values()) * (NODE_HEIGHT + 32),
+    height:
+      72 + Math.max(1, ...Array.from(rows.values())) * (NODE_HEIGHT + 32),
   };
 }
 
