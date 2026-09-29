@@ -104,3 +104,112 @@ def test_missing_paragraph_metadata_alone_cannot_prove_a_direct_parent() -> None
             paragraph_no=None,
             clause_label="b",
         )
+
+
+@pytest.mark.parametrize(
+    ("identity", "after", "before", "position"),
+    [
+        ("6/A", "p2", "next", 3),
+        ("GEÇİCİ 2", "temp1", "temp4", 5),
+        ("GEÇİCİ 3", "temp1", "temp4", 5),
+    ],
+)
+def test_new_articles_are_inserted_within_their_numbering_namespace(
+    identity: str, after: str, before: str, position: int
+) -> None:
+    rows = [
+        member("a6", 0, "6", None),
+        member("p1", 1, "6", "1"),
+        member("p2", 2, "6", "2"),
+        member("next", 3, "7", None),
+        member("temp1", 4, "GEÇİCİ 1", None),
+        member("temp4", 5, "GEÇİCİ 4", None),
+    ]
+    order = plan_insertion(
+        rows, article_no=identity, paragraph_no=None, clause_label=None
+    )
+    assert (order.after_chunk_id, order.before_chunk_id, order.position) == (
+        after,
+        before,
+        position,
+    )
+
+
+def test_new_article_duplicate_and_disordered_source_are_rejected() -> None:
+    with pytest.raises(ValueError, match="already exists"):
+        plan_insertion(
+            [member("existing", 0, "6/A", None)],
+            article_no="6/A",
+            paragraph_no=None,
+            clause_label=None,
+        )
+    with pytest.raises(ValueError, match="order"):
+        plan_insertion(
+            [member("a7", 0, "7", None), member("a6", 1, "6", None)],
+            article_no="6/A",
+            paragraph_no=None,
+            clause_label=None,
+        )
+
+
+def test_second_added_article_follows_first_without_replacing_it() -> None:
+    rows = [
+        member("a6", 0, "6", None),
+        member("a6a", 1, "6/A", None),
+        member("a7", 2, "7", None),
+    ]
+    order = plan_insertion(rows, article_no="6/B", paragraph_no=None, clause_label=None)
+    assert (order.after_chunk_id, order.before_chunk_id) == ("a6a", "a7")
+
+
+def test_first_temporary_article_precedes_document_annexes() -> None:
+    rows = [member("a7", 0, "7", None), OrderMember(id="annex", position=1)]
+    order = plan_insertion(
+        rows, article_no="GEÇİCİ 1", paragraph_no=None, clause_label=None
+    )
+    assert (order.after_chunk_id, order.before_chunk_id, order.position) == (
+        "a7",
+        "annex",
+        1,
+    )
+
+
+def test_explicit_article_neighbour_must_exist() -> None:
+    with pytest.raises(ValueError, match="neighbour"):
+        plan_insertion(
+            [member("a7", 0, "7", None)],
+            article_no="6/A",
+            paragraph_no=None,
+            clause_label=None,
+            after_article_no="6",
+        )
+
+
+def test_new_article_cannot_cross_unknown_source_rows() -> None:
+    rows = [
+        member("a6", 0, "6", None),
+        OrderMember(id="unrelated", position=1),
+        member("a7", 2, "7", None),
+    ]
+    with pytest.raises(ValueError, match="boundary"):
+        plan_insertion(rows, article_no="6/A", paragraph_no=None, clause_label=None)
+
+
+def test_explicit_neighbour_preserves_interleaved_legal_namespaces() -> None:
+    rows = [
+        member("a6", 0, "6", None),
+        member("temp1", 1, "GEÇİCİ 1", None),
+        member("a7", 2, "7", None),
+    ]
+    order = plan_insertion(
+        rows,
+        article_no="6/A",
+        paragraph_no=None,
+        clause_label=None,
+        after_article_no="6",
+    )
+    assert (order.after_chunk_id, order.before_chunk_id, order.position) == (
+        "a6",
+        "temp1",
+        1,
+    )

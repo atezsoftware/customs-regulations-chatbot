@@ -34,6 +34,7 @@ class InsertionOrder(BaseModel):
     article_no: str
     paragraph_no: str | None
     clause_label: str | None
+    after_article_no: str | None = None
     after_chunk_id: str | None
     before_chunk_id: str | None
     position: int = Field(ge=0)
@@ -45,8 +46,11 @@ def plan_insertion(
     article_no: str,
     paragraph_no: str | None,
     clause_label: str | None,
+    after_article_no: str | None = None,
 ) -> InsertionOrder:
     ordered = sorted(rows, key=lambda row: (row.position, row.id))
+    if paragraph_no is None and clause_label is None:
+        return _plan_article_insertion(ordered, article_no, after_article_no)
     scope = [
         row
         for row in ordered
@@ -125,6 +129,94 @@ def plan_insertion(
         after_chunk_id=after.id if after else None,
         before_chunk_id=before.id if before else None,
         position=position,
+    )
+
+
+def _plan_article_insertion(
+    ordered: list[OrderMember], article_no: str, after_article_no: str | None
+) -> InsertionOrder:
+    def identity(value: str) -> tuple[str, int, str]:
+        match = re.fullmatch(r"(?:(EK|GEÇİCİ|MÜKERRER) )?(\d+)(/?[A-Z])?", value)
+        if match is None:
+            raise InsertionOrderError("Insertion article identity is ambiguous")
+        return match[1] or "", int(match[2]), match[3] or ""
+
+    namespace, number, suffix = identity(article_no)
+    active = [row for row in ordered if row.active and not row.derived]
+    if after_article_no is not None and not any(
+        row.article_no == after_article_no for row in active
+    ):
+        raise InsertionOrderError("Explicit insertion neighbour could not be verified")
+    scoped = [
+        row
+        for row in active
+        if row.article_no is not None and identity(row.article_no)[0] == namespace
+    ]
+    ranks = [identity(row.article_no or "")[1:] for row in scoped]
+    target = (number, suffix)
+    if target in ranks:
+        raise InsertionOrderError("Insertion article identity already exists")
+    if ranks != sorted(ranks):
+        raise InsertionOrderError(
+            "Insertion article order conflicts with source metadata"
+        )
+    if not scoped:
+        if not namespace:
+            raise InsertionOrderError(
+                "Insertion article namespace has no verified anchor"
+            )
+        article_rows = [row for row in active if row.article_no is not None]
+        if not article_rows:
+            raise InsertionOrderError("Insertion source has no verified article anchor")
+        scoped = article_rows
+        ranks = []
+    lower = [row for row, rank in zip(scoped, ranks) if rank < target]
+    upper = [row for row, rank in zip(scoped, ranks) if rank > target]
+    after = lower[-1] if lower else scoped[-1] if not ranks else None
+    if after_article_no is not None:
+        anchor_namespace, anchor_number, anchor_suffix = identity(after_article_no)
+        if (
+            anchor_namespace != namespace
+            or (anchor_number, anchor_suffix) >= target
+            or after is None
+            or identity(after.article_no or "")[:2] != (anchor_namespace, anchor_number)
+        ):
+            raise InsertionOrderError(
+                "Insertion identity conflicts with its explicit neighbour"
+            )
+    before = (
+        upper[0]
+        if upper
+        else next((row for row in active if row.position > scoped[-1].position), None)
+    )
+    if after_article_no is not None and after is not None and before is not None:
+        immediate = next((row for row in active if row.position > after.position), None)
+        if immediate is not None and immediate.position < before.position:
+            if immediate.article_no is None:
+                raise InsertionOrderError("Insertion article boundary is unqualified")
+            # Honour the named neighbour without moving a temporary article past it.
+            before = immediate
+    if after and before and after.position >= before.position:
+        raise InsertionOrderError("Insertion has overlapping source positions")
+    if (
+        after
+        and before
+        and any(after.position < row.position < before.position for row in active)
+    ):
+        raise InsertionOrderError(
+            "Insertion article boundary contains unrelated source rows"
+        )
+    return InsertionOrder(
+        baseline_sha256=publication_digest(
+            [row.model_dump(mode="json") for row in ordered]
+        ),
+        article_no=article_no,
+        paragraph_no=None,
+        clause_label=None,
+        after_article_no=after_article_no,
+        after_chunk_id=after.id if after else None,
+        before_chunk_id=before.id if before else None,
+        position=before.position if before else scoped[-1].position + 1,
     )
 
 

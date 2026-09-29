@@ -2,7 +2,7 @@
 
 import re
 import unicodedata
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 
 from onyx.regulatory.amendments.models import AmendmentInstruction
 
@@ -64,6 +64,68 @@ def _comparison_text(value: str) -> str:
     normalized = unicodedata.normalize("NFKC", value)
     normalized = _MARKDOWN_RE.sub("", normalized)
     return " ".join(normalized.split()).casefold()
+
+
+def explicit_added_article_identity(instruction_text: str) -> str | None:
+    """Identify one supplied article, independently of its insertion neighbour."""
+    from onyx.regulatory.provision_identity import article_identity
+
+    body = explicit_added_body(instruction_text)
+    if body is None:
+        return None
+    headings = list(
+        re.finditer(
+            r"(?<!\w)(?:(?:geçici|gecici|ek|mükerrer|mukerrer)\s+)?"
+            r"madde\s+\d+(?:/?[a-z])?\s*[-–—]",
+            body,
+            re.IGNORECASE,
+        )
+    )
+    if len(headings) != 1:
+        return None
+    return article_identity(headings[0].group())
+
+
+def validate_added_article_draft(
+    instruction_texts: Sequence[str],
+    *,
+    metadata: Mapping[str, object],
+    heading_path: Sequence[str],
+    old_chunk_id: str | None,
+    insertion_order: Mapping[str, object] | None = None,
+) -> None:
+    """Reject stale drafts that confuse a new article with its neighbour."""
+    from onyx.regulatory.amendments.new_provision_policy import (
+        explicitly_adds_top_level_provision,
+    )
+    from onyx.regulatory.provision_identity import article_identity
+
+    for instruction_text in instruction_texts:
+        if not explicitly_adds_top_level_provision(instruction_text):
+            continue
+        expected = explicit_added_article_identity(instruction_text)
+        if expected is None:
+            raise DraftIntegrityError(
+                "New article requires one explicit supplied identity"
+            )
+        headings = [
+            value
+            for part in heading_path
+            if (value := article_identity(part)) is not None
+        ]
+        if (
+            old_chunk_id is not None
+            or metadata.get("article_no") != expected
+            or not headings
+            or headings[-1] != expected
+        ):
+            raise DraftIntegrityError(
+                f"New article identity must remain {expected}; reanalyze the proposal."
+            )
+        if insertion_order is None:
+            raise DraftIntegrityError(
+                "New article requires a reviewed insertion order; reanalyze the proposal."
+            )
 
 
 def validate_explicit_replacements(

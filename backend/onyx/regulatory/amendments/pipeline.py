@@ -35,6 +35,8 @@ from onyx.regulatory.amendments.compound_heading import (
 )
 from onyx.regulatory.amendments.draft_integrity import (
     DraftIntegrityError,
+    explicit_added_article_identity,
+    explicit_added_body,
     explicit_replacement_body,
     reconcile_existing_heading_path,
     reject_unsupported_descendant_replacement,
@@ -258,6 +260,17 @@ def load_instruction_draft_context(
             else None
         )
         expected_new_article_no = target.article_no if target is not None else None
+        if instruction is not None and explicitly_adds_top_level_provision(
+            instruction.instruction_text
+        ):
+            supplied_identity = explicit_added_article_identity(
+                instruction.instruction_text
+            )
+            if supplied_identity is not None:
+                expected_new_article_no = supplied_identity
+            elif explicit_added_body(instruction.instruction_text) is not None:
+                # Multiple or missing supplied identities cannot inherit a neighbour.
+                return None
         sibling_reference["expected_new_article_no"] = expected_new_article_no
         target_position = get_next_chunk_position(db_session, target_user_file_id)
 
@@ -305,7 +318,10 @@ def load_instruction_draft_context(
         load_amendment_order(db_session, target_user_file_id)
         if old_chunk is None
         and instruction is not None
-        and added_subordinate_unit_kind(instruction.instruction_text)
+        and (
+            added_subordinate_unit_kind(instruction.instruction_text)
+            or explicitly_adds_top_level_provision(instruction.instruction_text)
+        )
         else None
     )
     return InstructionDraftContext(
@@ -507,6 +523,10 @@ def _build_proposal_draft(
                 raise DraftIntegrityError(
                     f"New provision identity must remain {expected_article} in metadata and heading_path."
                 )
+        if explicitly_adds_top_level_provision(instructions[0].instruction_text):
+            chunk_type = "article"
+            for key in ("paragraph_no", "clause_label", "subclause_label"):
+                merged_metadata.pop(key, None)
         structure = _added_unit_structure(
             instructions[0], draft.new_chunk.text, context.sibling_reference
         )
@@ -560,11 +580,18 @@ def _build_proposal_draft(
         "effective_start_date": draft.dates.effective_start_date,
         "effective_end_date": draft.dates.effective_end_date,
     }
-    if context.insertion_members is not None and added_structure_verified:
+    if context.insertion_members is not None and (
+        added_structure_verified
+        or explicitly_adds_top_level_provision(instructions[0].instruction_text)
+    ):
         from onyx.regulatory.amendments.insertion_order import plan_insertion
 
-        if not merged_metadata.get("article_no") or not (
-            merged_metadata.get("paragraph_no") or merged_metadata.get("clause_label")
+        if not merged_metadata.get("article_no") or (
+            added_structure_verified
+            and not (
+                merged_metadata.get("paragraph_no")
+                or merged_metadata.get("clause_label")
+            )
         ):
             raise DraftIntegrityError(
                 "New subordinate unit requires an explicit parent and label"
@@ -576,6 +603,16 @@ def _build_proposal_draft(
             if merged_metadata.get("paragraph_no") is not None
             else None,
             clause_label=merged_metadata.get("clause_label"),
+            after_article_no=article_identity(
+                amendment_operation_text(instructions[0].instruction_text)
+            )
+            if not added_structure_verified
+            and re.search(
+                r"maddesinden\s+sonra\b",
+                amendment_operation_text(instructions[0].instruction_text),
+                re.IGNORECASE,
+            )
+            else None,
         )
         new_chunk_draft["position"] = order.position
         new_chunk_draft["insertion_order"] = order.model_dump(mode="json")

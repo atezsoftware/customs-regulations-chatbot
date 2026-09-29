@@ -41,6 +41,7 @@ from onyx.regulatory.amendments.draft_integrity import (
     explicit_replacement_body,
     reconcile_existing_heading_path,
     reject_unsupported_descendant_replacement_texts,
+    validate_added_article_draft,
     validate_explicit_replacement_texts,
 )
 from onyx.regulatory.amendments.models import ProposalDraft, ReviewedAmendmentChunkDraft
@@ -769,6 +770,13 @@ def queue_amendment_proposal_approval(
             list(stored_change.get("instruction_texts") or []),
             reviewed_draft["text"],
         )
+        validate_added_article_draft(
+            list(stored_change.get("instruction_texts") or []),
+            metadata=reviewed_draft["metadata"],
+            heading_path=reviewed_draft["heading_path"],
+            old_chunk_id=stored_change.get("old_chunk_id"),
+            insertion_order=reviewed_draft.get("insertion_order"),
+        )
         reviewed_changes.append({**stored_change, "new_chunk_draft": reviewed_draft})
     reviewed_draft = reviewed_changes[0]["new_chunk_draft"]
     from onyx.db.amendment_pdf_evidence import validate_pdf_proposal_authority
@@ -1409,6 +1417,13 @@ def _approve_multi_chunk_proposal(
         validate_explicit_replacement_texts(
             list(change.get("instruction_texts") or []), draft["text"]
         )
+        validate_added_article_draft(
+            list(change.get("instruction_texts") or []),
+            metadata=draft["metadata"],
+            heading_path=draft["heading_path"],
+            old_chunk_id=change.get("old_chunk_id"),
+            insertion_order=draft.get("insertion_order"),
+        )
         user_file_id = UUID(draft["user_file_id"])
         if user_file_id != publication_owner.user_file_id:
             raise ValueError("Atomic multi-chunk change escaped its source file")
@@ -1638,6 +1653,13 @@ def approve_amendment_proposal(
     validate_explicit_replacement_texts(
         _proposal_instruction_texts(proposal),
         draft["text"],
+    )
+    validate_added_article_draft(
+        _proposal_instruction_texts(proposal),
+        metadata=draft["metadata"],
+        heading_path=draft["heading_path"],
+        old_chunk_id=proposal.old_chunk_id,
+        insertion_order=draft.get("insertion_order"),
     )
     from onyx.db.amendment_pdf_evidence import validate_pdf_proposal_authority
 

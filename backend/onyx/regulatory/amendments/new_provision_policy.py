@@ -21,7 +21,7 @@ _TOP_LEVEL_ADDITION_PATTERNS = (
         re.IGNORECASE | re.DOTALL,
     ),
     re.compile(
-        rf"aşağıdaki\s+(?:yeni\s+)?(?:(?:geçici|gecici|ek|mükerrer|mukerrer)\s+)?madde\b.{{0,200}}?"
+        rf"aşağıdaki\s+(?:yeni\s+)?(?:(?:geçici|gecici|ek|mükerrer|mukerrer)\s+)?madde(?:ler)?\b.{{0,200}}?"
         rf"{_ADDITION_VERB}",
         re.IGNORECASE | re.DOTALL,
     ),

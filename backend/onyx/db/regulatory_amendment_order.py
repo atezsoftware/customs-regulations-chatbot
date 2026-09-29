@@ -85,6 +85,7 @@ def validate_insertion_order(
         article_no=order.article_no,
         paragraph_no=order.paragraph_no,
         clause_label=order.clause_label,
+        after_article_no=order.after_article_no,
     )
     if current != order:
         raise ValueError(

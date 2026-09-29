@@ -5,8 +5,8 @@ import unicodedata
 
 QUALIFIED_ARTICLE_RE = re.compile(
     r"(?<!\w)(?P<kind>ek|geçici|gecici|mükerrer|mukerrer)\s+"
-    r"(?:madde\s+(?P<forward>\d+[a-z]?)\b|"
-    r"(?P<reverse>\d+[a-z]?)\s*(?:[.'’]?\s*"
+    r"(?:madde\s+(?P<forward>\d+(?:/?[a-z])?)\b|"
+    r"(?P<reverse>\d+(?:/?[a-z])?)\s*(?:[.'’]?\s*"
     r"(?:inci|ıncı|uncu|üncü|nci|ncı|ncu|ncü))?\s+madd\w*)",
     re.IGNORECASE,
 )

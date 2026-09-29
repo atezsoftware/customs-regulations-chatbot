@@ -11,7 +11,7 @@ _FORWARD_ARTICLE_HEADING_RE = re.compile(
     r"^(?:(?P<qualifier>ek|gecici|geçici|mukerrer|mükerrer)\s+)?"
     r"(?:madde|article|art\.?)"
     r"(?:\s+|\s*[:.]\s*)"
-    r"(?P<number>\d+[a-z]?)\b",
+    r"(?P<number>\d+(?:/?[a-z])?)\b",
     flags=re.IGNORECASE,
 )
 _REVERSE_ARTICLE_HEADING_RE = re.compile(
@@ -22,14 +22,14 @@ _QUERY_FORWARD_ARTICLE_RE = re.compile(
     r"(?<![a-z0-9])"
     r"(?:(?P<qualifier>ek|gecici|mukerrer)\s+)?"
     r"(?:madde|md|article|art)\.?\s*:?[ \t]*"
-    r"(?P<number>\d+[a-z]?)(?![a-z0-9]|\.\d)",
+    r"(?P<number>\d+(?:/?[a-z])?)(?![a-z0-9/]|\.\d)",
     flags=re.IGNORECASE,
 )
 _INFLECTED_ARTICLE_WORD = (
     r"(?:madde(?:de|den|nin|ye|yi)?|maddes(?:i|ı)(?:nde|nden|nin|ne|ni)?)"
 )
 _QUERY_REVERSE_ARTICLE_RE = re.compile(
-    r"(?<![a-z0-9])(?:(?P<qualifier>ek|gecici|mukerrer)\s+)?(?P<number>\d+[a-z]?)(?![a-z0-9]|\.\d)"
+    r"(?<![a-z0-9/])(?:(?P<qualifier>ek|gecici|mukerrer)\s+)?(?P<number>\d+(?:/?[a-z])?)(?![a-z0-9/]|\.\d)"
     r"(?:"
     rf"\.\s*{_INFLECTED_ARTICLE_WORD}"
     rf"|\s*['’]?\s*(?:inci|nci|uncu|ıncı)\s+{_INFLECTED_ARTICLE_WORD}"
