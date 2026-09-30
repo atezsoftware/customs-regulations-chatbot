@@ -465,6 +465,9 @@ def test_heading_and_full_parent_replacement_retire_consumed_children(
     )
     session.add(proposal)
     session.flush()
+    for row in (parent, child, sibling):
+        row.position += 1
+    session.flush()
     authority = OwnedAuthority(file.id)
     monkeypatch.setattr(
         PublicationStore,
@@ -475,6 +478,7 @@ def test_heading_and_full_parent_replacement_retire_consumed_children(
         session, proposal, publication_owner=authority.owner
     )
     assert len(result.new_chunks) == 2
+    assert [row.position for row in result.new_chunks] == [1, 3]
     assert parent.status == child.status == sibling.status == "superseded"
     assert child.superseded_by_chunk_id == result.new_chunks[0].id
     assert child.validity_end_date == result.new_chunks[0].validity_start_date

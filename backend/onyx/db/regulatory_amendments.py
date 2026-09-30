@@ -1220,7 +1220,6 @@ def _ensure_old_chunk_matches_review_snapshot(
     supported_keys = {
         "id",
         "user_file_id",
-        "position",
         "text",
         "chunk_type",
         "heading_path",
@@ -1233,6 +1232,8 @@ def _ensure_old_chunk_matches_review_snapshot(
         "superseded_by_chunk_id",
         "created_at",
     }
+    # An earlier insertion can shift an unchanged provision. Approval uses the
+    # locked current position while still checking its identity and content.
     for key in snapshot.keys() & supported_keys:
         if snapshot[key] != _review_snapshot_value(chunk, key):
             raise ValueError(
@@ -1413,6 +1414,8 @@ def _approve_multi_chunk_proposal(
             change["new_chunk_draft"],
             old_chunk_snapshot=snapshot,
         )
+        if old_chunk is not None:
+            draft["position"] = old_chunk.position
         if index in insertions:
             draft["position"] = insertions[index].position
             draft["insertion_order"] = insertions[index].model_dump(mode="json")
@@ -1773,6 +1776,9 @@ def approve_amendment_proposal(
     new_chunk_metadata.setdefault("chunk_variant", ATOMIC_CHUNK_VARIANT)
     new_chunk_metadata.setdefault("source_chunk_orders", [])
     new_chunk_metadata.setdefault("source_regulatory_chunk_ids", [])
+
+    if old_chunk is not None:
+        draft["position"] = old_chunk.position
 
     new_chunk_id = make_regulatory_chunk_id(
         user_file_id,

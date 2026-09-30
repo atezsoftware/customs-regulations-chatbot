@@ -19,6 +19,8 @@ from onyx.db.regulatory_chunks import (
     get_current_chunks_by_ids,
     make_regulatory_chunk_id,
 )
+from onyx.db.regulatory_writer_publication import amendment_writer_target
+from shared_configs.configs import POSTGRES_DEFAULT_SCHEMA_STANDARD_VALUE
 from tests.external_dependency_unit.conftest import create_test_user
 
 
@@ -312,6 +314,7 @@ def test_approval_persists_same_text_version_and_retry_is_idempotent(
         )
         new_chunk_id = first_result.new_chunk.id
         db_session.commit()
+
         db_session.expire_all()
 
         persisted_old = db_session.get(RegulatoryChunk, old_chunk_id)
@@ -341,6 +344,135 @@ def test_approval_persists_same_text_version_and_retry_is_idempotent(
             .count()
             == 2
         )
+    finally:
+        db_session.rollback()
+        db_session.execute(
+            delete(AmendmentProposal).where(AmendmentProposal.batch_id == batch.id)
+        )
+        db_session.execute(delete(AmendmentBatch).where(AmendmentBatch.id == batch.id))
+        db_session.execute(
+            delete(RegulatoryChunk).where(RegulatoryChunk.user_file_id == user_file_id)
+        )
+        db_session.execute(delete(UserFile).where(UserFile.id == user_file_id))
+        db_session.execute(delete(DocumentSet).where(DocumentSet.id == document_set.id))
+        persisted_user = db_session.get(User, user.id)
+        if persisted_user is not None:
+            db_session.delete(persisted_user)
+        db_session.commit()
+
+
+def test_approval_rebases_position_after_earlier_insertion(
+    db_session: Session,
+    tenant_context: None,  # noqa: ARG001
+) -> None:
+    user = create_test_user(db_session, "amendment_position_shift")
+    document_set = DocumentSet(
+        name=f"amendment-position-shift-{uuid4().hex}",
+        description="Position shift approval regression test",
+        user_id=user.id,
+        is_public=False,
+        is_up_to_date=True,
+    )
+    user_file_id = uuid4()
+    user_file = UserFile(
+        id=user_file_id,
+        user_id=user.id,
+        file_id=f"amendment_position_shift_{uuid4().hex}",
+        name="amendment-position-shift.md",
+        file_type="text/markdown",
+        status=UserFileStatus.COMPLETED,
+    )
+    old = RegulatoryChunk(
+        id=f"rc_{uuid4().hex}",
+        user_file_id=user_file_id,
+        text="(1) Eski hüküm.",
+        position=10,
+        chunk_type="paragraph",
+        heading_path=["MADDE 4", "(1) Eski hüküm."],
+        chunk_metadata={"article_no": "4", "paragraph_no": "1"},
+        status="active",
+        source="indexed",
+        projection_ordinal=10,
+        validity_start_date=date(2020, 1, 1),
+    )
+    db_session.add_all([document_set, user_file, old])
+    db_session.flush()
+    batch = AmendmentBatch(
+        document_set_id=document_set.id,
+        raw_text="4 üncü maddenin birinci fıkrası değiştirilmiştir.",
+        user_file_ids=[str(user_file_id)],
+        segmented_instructions=[],
+        unmatched_instructions=[],
+        status="analyzed",
+        stage="finalizing",
+        instruction_count=1,
+        processed_instruction_count=1,
+        processed_instruction_indices=[0],
+    )
+    db_session.add(batch)
+    db_session.flush()
+    proposal = AmendmentProposal(
+        batch_id=batch.id,
+        instruction_index=0,
+        instruction_text=batch.raw_text,
+        instruction_indices=[0],
+        instruction_texts=[batch.raw_text],
+        old_chunk_id=old.id,
+        old_chunk_snapshot={
+            "id": old.id,
+            "user_file_id": str(user_file_id),
+            "position": 10,
+            "text": old.text,
+            "status": "active",
+            "metadata": dict(old.chunk_metadata),
+        },
+        new_chunk_draft={
+            "user_file_id": str(user_file_id),
+            "position": 10,
+            "text": "(1) Yeni hüküm.",
+            "chunk_type": "paragraph",
+            "heading_path": list(old.heading_path),
+            "metadata": dict(old.chunk_metadata),
+            "effective_start_date": "2026-09-03",
+        },
+        status="approving",
+    )
+    db_session.add(proposal)
+    db_session.commit()
+
+    try:
+        # An independently approved insertion shifted the target after review.
+        inserted = RegulatoryChunk(
+            id=f"rc_{uuid4().hex}",
+            user_file_id=user_file_id,
+            text="Yeni bent.",
+            position=10,
+            chunk_type="clause",
+            heading_path=["MADDE 3", "Yeni bent."],
+            chunk_metadata={"article_no": "3", "clause_label": "k"},
+            status="active",
+            source="amendment",
+            projection_ordinal=11,
+        )
+        old.position = 11
+        db_session.add(inserted)
+        db_session.commit()
+
+        planned = amendment_writer_target(
+            proposal.id, POSTGRES_DEFAULT_SCHEMA_STANDARD_VALUE
+        )
+        assert planned is not None
+        result = approve_amendment_proposal(db_session, proposal)
+        assert result.new_chunk.position == 11
+        assert planned == (user_file_id, [result.new_chunk.id])
+        assert result.new_chunk.id == make_regulatory_chunk_id(
+            user_file_id,
+            11,
+            "(1) Yeni hüküm.",
+            version_key=f"amendment:{proposal.id}",
+        )
+        assert proposal.new_chunk_draft["position"] == 11
+        assert old.status == "superseded"
     finally:
         db_session.rollback()
         db_session.execute(

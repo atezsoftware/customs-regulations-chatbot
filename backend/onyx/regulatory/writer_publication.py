@@ -946,8 +946,12 @@ def approve_owned_amendment(
     owner = authority.acquire(file_id, owner_id=uuid4(), ttl=LEASE_TTL)
     try:
         owner = recover_owned_writer_before_next(owner)
-        if amendment_writer_target(proposal_id, tenant_id) is None:
+        refreshed_target = amendment_writer_target(proposal_id, tenant_id)
+        if refreshed_target is None:
             return 0
+        if refreshed_target[0] != file_id:
+            raise ValueError("amendment publication file changed")
+        canonical_ids = refreshed_target[1]
         record_amendment_execution_stage(owner, proposal_id, "baseline")
         from onyx.regulatory.publication_baseline import ensure_owned_baseline
 

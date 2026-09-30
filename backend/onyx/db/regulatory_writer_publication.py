@@ -1084,6 +1084,17 @@ def amendment_writer_target(
         proposal = session.get(AmendmentProposal, proposal_id)
         if proposal is None or proposal.status != "approving":
             return None
+
+        def current_position(old_chunk_id: str | None, draft: dict[str, Any]) -> int:
+            if old_chunk_id is not None:
+                old_chunk = session.get(RegulatoryChunk, old_chunk_id)
+                if (
+                    old_chunk is not None
+                    and str(old_chunk.user_file_id) == draft["user_file_id"]
+                ):
+                    return old_chunk.position
+            return draft["position"]
+
         changes = list(getattr(proposal, "chunk_changes", None) or [])
         if len(changes) > 1:
             file_ids = {
@@ -1096,7 +1107,9 @@ def amendment_writer_target(
             canonical_ids = applied or [
                 make_regulatory_chunk_id(
                     file_id,
-                    change["new_chunk_draft"]["position"],
+                    current_position(
+                        change.get("old_chunk_id"), change["new_chunk_draft"]
+                    ),
                     change["new_chunk_draft"]["text"],
                     version_key=f"amendment:{proposal.id}:{index}",
                 )
@@ -1115,7 +1128,7 @@ def amendment_writer_target(
             proposal.applied_new_chunk_id
             or make_regulatory_chunk_id(
                 file_id,
-                draft["position"],
+                current_position(proposal.old_chunk_id, draft),
                 draft["text"],
                 version_key=f"amendment:{proposal.id}",
             )
