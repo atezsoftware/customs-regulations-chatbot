@@ -1,7 +1,7 @@
 # ATEZ Search v2 — etiket skorlamalı çalışma akışı ve prompt envanteri
 
 **İnceleme tarihi:** 30 Eylül 2026  
-**Kapsam:** `371c1a8e0f81d830e53cec9f784a20466c220c47` commit'indeki varsayılan asistanın `atez_search_v2` yolu ve açık istekle etkinleşen etiket skorlaması. Bu commit 30 Eylül 2026'da DEV'e deploy edildi; `/api/version` aynı SHA'yı, `/api/health` başarılı durumu bildirdi. Production varsayılanı değiştirilmedi. Aşağıdaki ortak sohbet akışı ve statik prompt metinleri checkout'tan, etiketli yürütüm ayrıntıları yeni koddan alınmıştır. Yönetici veritabanındaki canlı persona promptu bu kaynak metinlerden farklı olabilir.
+**Kapsam:** `58df7d504df77ead6fe632ff355f26f7160c4ba3` commit'indeki varsayılan asistanın `atez_search_v2` yolu ve açık istekle etkinleşen etiket skorlaması. Kod ağacı, ilk etiket skorlama sürümü `371c1a8e0f81d830e53cec9f784a20466c220c47` ile aynıdır. Bu sürüm 30 Eylül 2026'da DEV'e deploy edildi; `/api/version` aynı SHA'yı, `/api/health` başarılı durumu bildirdi. Production varsayılanı değiştirilmedi. Aşağıdaki ortak sohbet akışı ve statik prompt metinleri checkout'tan, etiketli yürütüm ayrıntıları yeni koddan alınmıştır. Yönetici veritabanındaki canlı persona promptu bu kaynak metinlerden farklı olabilir.
 
 ## Yönetici özeti
 
@@ -141,7 +141,7 @@ Ek A'da bu akışta çalışabilen statik şablonların mevcut çalışma ağac�
 
 ## İnceleme sınırı ve kritik gözlemler
 
-- DEV deploy kanıtı: [`customs-regulations-backend-lite-codebuild` run 36730695039](https://github.com/atezsoftware/customs-regulations-chatbot/actions/runs/36730695039) başarılı; `/api/version` commit `371c1a8e0f81d830e53cec9f784a20466c220c47` döndürdü. Production için varsayılan etiket etkinleştirmesi yapılmadı.
+- DEV deploy kanıtı: [`customs-regulations-backend-lite-codebuild` run 36749454943](https://github.com/atezsoftware/customs-regulations-chatbot/actions/runs/36749454943) başarılı; `/api/version` commit `58df7d504df77ead6fe632ff355f26f7160c4ba3`, `/api/health` HTTP 200 döndürdü. Rerank packet bağlamı için corpus boyutuna dayalı kısa yol yoktur; tam yapısal packet yolu korunur. Production için varsayılan etiket etkinleştirmesi yapılmadı.
 - Etiketli yolun nedensel katkısını her arama satırında `search.label_score_fusion` içindeki `baseline_score`, `label_score` ve `combined_score` ile; son cevap bağlamında `search.label_evidence_selection` içindeki `label_supported_visible_chunk_ids` ve `label_added_visible_chunk_ids` ile sınayın. Etiketli adayın görüldüğü halde seçilmemesi, reranker veya bağlam bütçesi etkisi olabilir; yalnız grafik sırasından cevap kalitesi sonucu çıkmaz.
 - A/B kalite kabulü için beş sorunun metni ve SHA-256'sı sabitlenmeli; her çiftte model, tarih, belge kümesi ve kullanıcı yetkisi aynı kalmalı. Atıflardaki tam hüküm, geçerlilik aralığı, istenen her alt sorunun kapanması ve yanıttaki iddia-kaynak bağlantısı insan tarafından incelenmeli. LLM planı deterministik garanti vermediğinden farklı plan satırları ayrıca kaydedilmeli.
 - Aşağıdaki prompt envanteri statik kod tanımlarını gösterir; tek başına canlı LLM trace'i değildir. Gerçek call sayısı, reranker türü ve maliyet planın boyutuna, model/konfigürasyona ve veri durumuna bağlıdır.
