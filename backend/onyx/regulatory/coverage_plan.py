@@ -13,7 +13,6 @@ from onyx.llm.models import ReasoningEffort
 from onyx.prompts.regulatory_coverage_plan import (
     REGULATORY_COVERAGE_GAP_AUDIT_SYSTEM_PROMPT,
     REGULATORY_COVERAGE_PLAN_SYSTEM_PROMPT,
-    REGULATORY_LABEL_HINT_INSTRUCTION,
     REGULATORY_REQUEST_INVENTORY_SYSTEM_PROMPT,
 )
 from onyx.regulatory.labeling.search_models import LabelQueryHint
@@ -719,7 +718,6 @@ def build_regulatory_coverage_plan(
     llm: LLM,
     *,
     user_request: str,
-    label_catalog: list[dict[str, str]] | None = None,
 ) -> RegulatoryCoveragePlan | None:
     """Create a request-only plan with a bounded request-derived fallback."""
 
@@ -766,8 +764,7 @@ def build_regulatory_coverage_plan(
         plan = generate_structured(
             llm,
             flow=LLMFlow.REGULATORY_COVERAGE_PLAN,
-            system_prompt=REGULATORY_COVERAGE_PLAN_SYSTEM_PROMPT
-            + (REGULATORY_LABEL_HINT_INSTRUCTION if label_catalog else ""),
+            system_prompt=REGULATORY_COVERAGE_PLAN_SYSTEM_PROMPT,
             user_prompt=json.dumps(
                 {
                     "user_request": bounded_request,
@@ -776,7 +773,6 @@ def build_regulatory_coverage_plan(
                     ],
                     "request_inventory": inventory.model_dump(),
                     "request_truncated": len(stripped_request) > len(bounded_request),
-                    **({"label_catalog": label_catalog} if label_catalog else {}),
                 },
                 ensure_ascii=False,
             ),

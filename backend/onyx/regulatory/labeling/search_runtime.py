@@ -14,7 +14,10 @@ from onyx.db.regulatory_label_search import (
     load_label_overlay,
     load_search_snapshot,
 )
-from onyx.regulatory.labeling.search_hints import explicit_subject_hint
+from onyx.regulatory.labeling.search_hints import (
+    explicit_subject_hint,
+    query_subject_hint,
+)
 from onyx.regulatory.labeling.search_models import (
     LabelFusionScore,
     LabelSearchHint,
@@ -92,10 +95,12 @@ def search_with_labels(
         return fallback.model_copy(update={"status": "snapshot_mismatch"})
     hint = validate_search_hint(raw_hint, snapshot)
     explicit = explicit_subject_hint(snapshot, query)
-    if explicit.label_ids:
-        hint = LabelSearchHint(
-            label_ids=tuple(dict.fromkeys((*explicit.label_ids, *hint.label_ids)))[:12]
-        )
+    vocabulary = query_subject_hint(snapshot, query)
+    hint = LabelSearchHint(
+        label_ids=tuple(
+            dict.fromkeys((*explicit.label_ids, *vocabulary.label_ids, *hint.label_ids))
+        )[:12]
+    )
     if not hint.label_ids:
         return fallback.model_copy(update={"status": "no_hint"})
     try:

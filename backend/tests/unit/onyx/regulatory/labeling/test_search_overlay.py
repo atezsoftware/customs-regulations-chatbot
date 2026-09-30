@@ -290,6 +290,14 @@ def test_explicit_subject_hint_survives_optional_planner_omission() -> None:
     assert explicit_subject_hint(state, "KDVXYZ adlı dosyada arama").label_ids == ()
 
 
+def test_subject_hint_uses_query_after_source_neutral_planning() -> None:
+    from onyx.regulatory.labeling.search_hints import query_subject_hint
+
+    state = snapshot()
+    assert "SUB.CUS.GUAR" in query_subject_hint(state, "teminat çözümü").label_ids
+    assert query_subject_hint(state, "hangi şartlar uygulanır").label_ids == ()
+
+
 @pytest.mark.parametrize(
     "scores, expected",
     [

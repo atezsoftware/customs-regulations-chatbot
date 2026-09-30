@@ -99,7 +99,6 @@ from onyx.regulatory.gap_recovery import (
     run_batched_gap_recovery,
     select_priority_recovery_issues,
 )
-from onyx.regulatory.labeling.search_hints import hint_for_query, planning_label_catalog
 from onyx.regulatory.navigation_recovery import (
     select_regulatory_navigation_recovery_leads,
 )
@@ -611,11 +610,6 @@ def _build_regulatory_coverage_tool_calls(
                 "coverage_item": coverage_item,
                 "evidence_target": evidence_target,
                 "source_anchors": source_anchors,
-                **(
-                    {"label_hint": hint_for_query(plan.coverage_items, query)}
-                    if any(item.label_hints for item in plan.coverage_items)
-                    else {}
-                ),
             },
             placement=Placement(turn_index=turn_index, tab_index=query_index),
         )
@@ -2995,20 +2989,9 @@ def run_llm_loop(
             # create or require a coverage plan.
             complex_regulatory_request = bool(regulatory_user_message.strip())
             regulatory_review_llm = build_regulatory_review_llm(llm)
-            label_snapshot = (
-                regulatory_search_tool.get_label_search_snapshot()
-                if regulatory_search_tool is not None
-                else None
-            )
-            label_catalog = (
-                planning_label_catalog(label_snapshot, regulatory_user_message)
-                if label_snapshot is not None
-                else None
-            )
             regulatory_coverage_plan = build_regulatory_coverage_plan(
                 regulatory_review_llm,
                 user_request=regulatory_user_message,
-                **({"label_catalog": label_catalog} if label_catalog else {}),
             )
             regulatory_coverage_reminder = format_regulatory_coverage_plan(
                 regulatory_coverage_plan

@@ -44,7 +44,7 @@ Etiketli deney açık bir istek sözleşmesidir: `atez_search_v2=true`, `atez_se
 ```mermaid
 flowchart LR
     Q["Planın odaklı sorgusu"] --> B["ES hibrit/lexical baseline adayları"]
-    Q --> H["Planner label hint + sorgudan açık konu eşlemesi"]
+    Q --> H["Plan sonrası sorgu-taksonomi konu eşlemesi"]
     H --> T["Bitmiş run ve taxonomy snapshot"]
     T --> D["Aynı filtreli ES label discovery"]
     B --> V["Kanonik kimlik, kaynak metni, context, tarih, tenant ve görünürlük doğrulaması"]
@@ -60,7 +60,7 @@ flowchart LR
 
 Etiket yolu şu sırada işler:
 
-1. Planner, mevcut ve geçerli etiket kataloğu varsa her `retrieval_query` için az sayıda `label_id` önerebilir. `REGULATORY_LABEL_HINT_INSTRUCTION` bu eşlemeyi sorguya bağlar; etiket yeni bir hukuki issue veya kaynak yetkisi oluşturmaz. Kod, açık konu terimlerinden sınırlı bir ek hint de çıkarabilir. Hiç geçerli hint yoksa etiket lane'i `no_hint` döner. [Prompt](../backend/onyx/prompts/regulatory_coverage_plan.py), [hint hazırlama](../backend/onyx/regulatory/labeling/search_hints.py), [runtime](../backend/onyx/regulatory/labeling/search_runtime.py).
+1. Envanter, kapsama planı ve boşluk denetimi iki kolda aynı prompt ve payload ile çalışır; planner etiket kataloğunu görmez. Plan tamamlandıktan sonra yalnız etiketli SearchTool kolu, odaklı sorgudaki açık konu adları ve taksonomi sözcük eşleşmelerinden en çok üç konu etiketi çıkarır. Etiket yeni bir hukuki issue veya kaynak yetkisi oluşturmaz. Geçerli eşleşme yoksa etiket lane'i `no_hint` döner. [Plan](../backend/onyx/regulatory/coverage_plan.py), [hint hazırlama](../backend/onyx/regulatory/labeling/search_hints.py), [runtime](../backend/onyx/regulatory/labeling/search_runtime.py).
 2. SearchTool normal ES adaylarını önce getirir. Açık run ID listesi için read-only PostgreSQL snapshot alınır; tenant, taxonomy ve bitmiş run uygunluğu kontrol edilir. Etiketli ek aday araması aynı kullanıcı, belge seti, tarih, yayın ve ACL filtreleriyle ES üzerinde yürür. Run veya DB kullanılamıyorsa normal adaylar korunur. [Snapshot doğrulaması](../backend/onyx/db/regulatory_label_search.py), [SearchTool](../backend/onyx/tools/tool_implementations/search/search_tool.py).
 3. Etiket eşleşmesi yalnız ID düzeyinde kabul edilmez. Kanonik chunk kaydı, etiketleme metin/context snapshot'ı, etkin sürüm ve tarih, kaynak metninin indeks sonucunda bulunması ve görünürlük yeniden doğrulanır. Uygun olmayan ek aday havuza girmez. Bu kontrol etiketin eski veya farklı metne yanlış skor vermesini önler. [Doğrulama](../backend/onyx/db/regulatory_label_search.py), [runtime](../backend/onyx/regulatory/labeling/search_runtime.py).
 4. En çok 48 adaylık havuzda en az %75 baseline sırası tutulur; keşfedilen etiketli ekler en çok %25 yer kaplar. Doğrulanmış etiket lane'i için `1/(60 + label_rank)`, baseline için `1/(60 + baseline_rank)` hesaplanır ve toplam skorla sıralanır. Bileşenler, sıralar ve birleşik skor graph'a yazılır. Bu eşit RRF ağırlığı doğrudan retrieval sıralamasını etkiler; etiketin tek başına hukuki kanıt olduğu anlamına gelmez. Sonraki reranker farklı sıraya karar verebilir; yakın skorların güvenli etiket terfisi en çok iki konumla sınırlıdır. [Skor hesabı](../backend/onyx/regulatory/labeling/search_ranking.py), [entegrasyon](../backend/onyx/regulatory/labeling/search_runtime.py), [rerank seçimi](../backend/onyx/tools/tool_implementations/search/search_tool.py).
@@ -81,7 +81,7 @@ Varsayılan persona için otomatik kaynak/zaman filtre çıkarma LLM'i devre dı
 | Adım | Girdi | Çıktı / amaç | Hata davranışı |
 | --- | --- | --- | --- |
 | Request inventory | `user_request`, `request_outline` JSON | Bağımsız cevaplanabilir yükümlülükler, `O1…` kimlikleri ve sorudan birebir kısa ankrajlar | Başarısızsa sözdizimsel outline ile devam eder |
-| Coverage plan | Soru, outline, inventory, kısaltma bilgisi; label açık ve geçerliyse `label_catalog` | Kaynaktan bağımsız retrieval kontratı; her delil boyutuna tek odaklı query | Tüm plan başarısızsa sınırlı sözdizimsel fallback |
+| Coverage plan | Soru, outline, inventory ve kısaltma bilgisi; iki kolda aynı | Kaynaktan bağımsız retrieval kontratı; her delil boyutuna tek odaklı query | Tüm plan başarısızsa sınırlı sözdizimsel fallback |
 | Gap audit | Soru, outline, inventory, taslak plan | Yalnızca isteğe dayalı eksik satırlar | Başarısızsa mevcut plan korunur |
 
 Sunucu sonrasında eksik açık segment ve obligation eşlemesini tamamlar, yalnızca doğrulanmış kullanıcı ifadelerini ankrajlara bağlar. Plan **hukuki delil veya gizli reasoning dökümü değil**, arama/sentez için danışma niteliğinde bir kapsama sözleşmesidir. Planın `coverage_items` içindeki `evidence_dimensions` alanları, tek tek araştırılması gereken önerme ve kapsamları temsil eder. [Kod ve JSON şekli](../backend/onyx/regulatory/coverage_plan.py), [şemalar](../backend/onyx/regulatory/coverage_plan.py).
@@ -91,16 +91,16 @@ Promptun dinamik kullanıcı mesajı, kodda `json.dumps(..., ensure_ascii=False)
 | LLM | JSON kullanıcı mesajındaki alanlar |
 | --- | --- |
 | Inventory | `user_request`, `request_outline` |
-| Coverage plan | `user_request`, `request_outline`, `request_inventory`, `request_truncated`, koşullu `label_catalog` |
+| Coverage plan | `user_request`, `request_outline`, `request_inventory`, `request_truncated` |
 | Gap audit | `user_request`, `request_outline`, `request_inventory`, `draft_plan` |
 
 Şema en fazla 20 coverage item ve item başına en fazla altı evidence dimension kabul eder. Prompt normalde sekiz item altında kalmayı ister; teknik üst sınır bunun üzerindedir. V2 başlangıçta her ayrı delil boyutuna bir hibrit arama ayırdığı için `max_parallel_search_calls=None` “sınırsız thread” demek değildir; plan/şema ve dedup ile sınırlı iş listesinin yürütülmesi demektir. Teorik ilk batch 20×6=120 delil satırına kadar büyüyebilir; gerçek sayı genellikle daha düşüktür ve en fazla sekiz SearchTool işçisi eşzamanlı çalışır. Bu, çok parçalı sorularda gecikme/yük açısından izlenmesi gereken noktadır. [Şema sınırları](../backend/onyx/regulatory/coverage_plan.py), [profil](../backend/onyx/regulatory/workflow_profile.py), [batch üretimi](../backend/onyx/chat/llm_loop.py).
 
-İsteğe bağlı label sözlüğü varsa planner system promptuna `REGULATORY_LABEL_HINT_INSTRUCTION` eklenir. Bu etiketler sorgu başına ipucudur; kaynak yetkisini, tarihini veya hukuki uygulanabilirliğini değiştiremez. Yeni etiketli v2 yolunda etkinleştirme ve bitmiş run UUID listesi **istek düzeyindedir** (`atez_search_v2_labels`, `atez_search_v2_label_run_ids`); varsayılan kapalıdır. [Planlama çağrısı](../backend/onyx/regulatory/coverage_plan.py), [istek modeli](../backend/onyx/server/query_and_chat/models.py), [label runtime](../backend/onyx/regulatory/labeling/search_runtime.py).
+Planner system promptu ve kullanıcı payload'u etiket bayrağından bağımsızdır. Etiket eşleşmesi yalnız plan sonrası odaklı sorgu üstünde çalışır; kaynak yetkisini, tarihi veya hukuki uygulanabilirliği değiştiremez. Etiketli v2 yolunda etkinleştirme ve bitmiş run UUID listesi **istek düzeyindedir** (`atez_search_v2_labels`, `atez_search_v2_label_run_ids`); varsayılan kapalıdır. [Planlama çağrısı](../backend/onyx/regulatory/coverage_plan.py), [istek modeli](../backend/onyx/server/query_and_chat/models.py), [label runtime](../backend/onyx/regulatory/labeling/search_runtime.py).
 
 ## 3. Plandan arama çağrılarına
 
-Sunucu her plan maddesinin bağımsız delil boyutunu eşleyen `retrieval_query` ile ilişkilendirir. Yapısal eşleşme bozuksa delil boyutunun kendisini fallback query olarak kullanır. İlk tur, her delil satırı için bir `hybrid` çağrı kurar; V2 `include_auxiliary_searches=False` ve `include_lexical_fallbacks=False` olduğundan bağlam atomu/branch/anchor ek turları ve `keyword` fallback'i başlangıçta yoktur. Birbirinin aynı normalize edilmiş sorgu ve mod çiftleri ayıklanır; farklı mod aynı query ile yine farklı denemedir. Her çağrı `coverage_item`, `evidence_target`, `source_anchors`, varsa `label_hint` provenance taşır. Bunların hiçbiri tek başına hukuki kanıt değildir. [Çağrı üretimi](../backend/onyx/chat/llm_loop.py), [profil](../backend/onyx/regulatory/workflow_profile.py).
+Sunucu her plan maddesinin bağımsız delil boyutunu eşleyen `retrieval_query` ile ilişkilendirir. Yapısal eşleşme bozuksa delil boyutunun kendisini fallback query olarak kullanır. İlk tur, her delil satırı için bir `hybrid` çağrı kurar; V2 `include_auxiliary_searches=False` ve `include_lexical_fallbacks=False` olduğundan bağlam atomu/branch/anchor ek turları ve `keyword` fallback'i başlangıçta yoktur. Birbirinin aynı normalize edilmiş sorgu ve mod çiftleri ayıklanır; farklı mod aynı query ile yine farklı denemedir. Her çağrı `coverage_item`, `evidence_target`, `source_anchors` provenance taşır. Etiketli kolda ipucu SearchTool içinde aynı sorgudan hesaplanır. Bunların hiçbiri tek başına hukuki kanıt değildir. [Çağrı üretimi](../backend/onyx/chat/llm_loop.py), [profil](../backend/onyx/regulatory/workflow_profile.py).
 
 İlk plan batch'i için modelden ayrıca “arama yapayım mı?” kararı alınmaz: `pending_regulatory_coverage_tool_calls` doğrudan tool call sonucuna dönüştürülür. İşçiler `run_tool_calls` ile en fazla sekizli paralel çalışır. Bir çağrının verdiği 10 LLM-görünür chunk sınırı, tüm batch'in toplam chunk sayısı değildir. V2, query embedding cache etkinse planın hibrit sorgularını batch olarak ısıtmaya çalışır; hata aramayı durdurmaz. [Döngü](../backend/onyx/chat/llm_loop.py), [cache priming](../backend/onyx/chat/llm_loop.py), [işçi limiti](../backend/onyx/regulatory/workflow_profile.py).
 
@@ -129,7 +129,7 @@ Ek A'da bu akışta çalışabilen statik şablonların mevcut çalışma ağac�
 | Prompt bileşeni | Çalışma koşulu |
 | --- | --- |
 | Request inventory, coverage plan, gap audit | Düzenleyici soru planlaması; planlama başarısızlığına göre sonraki aşamalar değişir |
-| Label hint instruction | Geçerli label katalog verisi varsa coverage plan system promptuna eklenir |
+| Label hint instruction | Kaynakta eski şablon olarak bulunur; adil karşılaştırma sürümünün aktif planner promptuna eklenmez |
 | Default system, grounding, regulatory analysis, internal search guidance, tool schema | Varsayılan prompt yapılandırmasına ve etkin araçlara göre ana yanıt modeli |
 | Coverage contract, coverage/citation reminder | Plan ve citation koşullarına göre dinamik kullanıcı reminder'ı |
 | Last-cycle citation reminder | Araçsız son sentezde koşullu |
@@ -258,7 +258,9 @@ Return an empty coverage_items list when the request is structurally covered. No
 than four items."""
 ~~~~
 
-### `REGULATORY_LABEL_HINT_INSTRUCTION`
+### `REGULATORY_LABEL_HINT_INSTRUCTION` (aktif değil)
+
+Bu kaynak sabiti korunmuştur; bu sürümde planlama çağrısına eklenmez.
 
 Kaynak: [`backend/onyx/prompts/regulatory_coverage_plan.py:92`](../backend/onyx/prompts/regulatory_coverage_plan.py#L92).
 

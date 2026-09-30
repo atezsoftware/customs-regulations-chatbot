@@ -80,3 +80,23 @@ def explicit_subject_hint(snapshot: LabelSearchSnapshot, query: str) -> LabelSea
         if name_match or acronym_match:
             matched.append(label.id)
     return LabelSearchHint(label_ids=tuple(matched[:12]))
+
+
+def query_subject_hint(snapshot: LabelSearchSnapshot, query: str) -> LabelSearchHint:
+    """Match a focused retrieval query to subject vocabulary after planning."""
+    from onyx.regulatory.labeling.search_ranking import resolve_label_facets
+
+    words = _words(query)
+    if not words:
+        return LabelSearchHint()
+    facets = resolve_label_facets(snapshot.taxonomy)
+    matches: list[tuple[int, int, str]] = []
+    for label in snapshot.taxonomy.labels:
+        if facets.get(label.id) != "subject":
+            continue
+        name_overlap = len(words & _words(label.name))
+        description_overlap = len(words & _words(label.description))
+        if name_overlap or description_overlap >= 2:
+            matches.append((name_overlap, description_overlap, label.id))
+    matches.sort(key=lambda item: (-item[0], -item[1], item[2]))
+    return LabelSearchHint(label_ids=tuple(label_id for _, _, label_id in matches[:3]))
