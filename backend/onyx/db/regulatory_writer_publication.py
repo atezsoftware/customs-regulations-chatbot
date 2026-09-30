@@ -3,7 +3,7 @@
 import json
 from collections.abc import Sequence
 from datetime import date, datetime, timezone
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 from sqlalchemy import select
@@ -44,6 +44,28 @@ from onyx.regulatory.amendments.annexes.models import (
     AnnexTemporalProjection,
     PreparedContextView,
 )
+
+
+def _retained_binding_payload_matches(
+    previous: dict[str, Any], binding: AnnexTemporalProjection
+) -> bool:
+    expected = binding.model_dump(mode="json")
+    previous_projection = previous.get("projection")
+    expected_projection = expected.get("projection")
+    if isinstance(previous_projection, dict) and isinstance(expected_projection, dict):
+        # Retain explicit nulls in older receipts without rewriting their payload.
+        for key in (
+            "heading_repair",
+            "canonical_restore_fields",
+            "allow_frozen_predecessor",
+        ):
+            if (
+                key in previous_projection
+                and previous_projection[key] is None
+                and key not in expected_projection
+            ):
+                expected_projection[key] = None
+    return previous == expected
 
 
 def canonical_scope_digest(session: Session, user_file_id: UUID) -> str:
@@ -413,7 +435,9 @@ def finalize_writer_publication(
         retained = {binding.id: binding for binding in manifest.bindings}
         for previous in active:
             if previous.id in retained:
-                if previous.payload != retained[previous.id].model_dump(mode="json"):
+                if not _retained_binding_payload_matches(
+                    previous.payload, retained[previous.id]
+                ):
                     raise ValueError("writer changed immutable retained binding")
             else:
                 previous.retired_at = datetime.now(timezone.utc)

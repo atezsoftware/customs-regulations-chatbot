@@ -571,10 +571,17 @@ def activate_publication(
 
             end = _as_date(source.get("validity_end_date"))
             if end != previous.effective_end:
+                from onyx.document_index.publication_models import (
+                    ObservedPublicationProjection,
+                )
+
+                projection = previous.projection
+                if isinstance(projection, ObservedPublicationProjection):
+                    projection = projection.for_ordinary_update()
                 updated = previous.model_copy(
                     update={
                         "effective_end": end,
-                        "projection": previous.projection.model_copy(
+                        "projection": projection.model_copy(
                             update={
                                 "source_json": json.dumps(
                                     {

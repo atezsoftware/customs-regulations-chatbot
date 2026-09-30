@@ -447,6 +447,13 @@ class ObservedPublicationProjection(PublicationModel):
     heading_repair: SourceHeadingRepair | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
+    # Read maintenance receipts; ordinary updates re-anchor the verified source.
+    canonical_restore_fields: tuple[str, ...] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    allow_frozen_predecessor: bool | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
     @classmethod
     def observe(
@@ -476,9 +483,65 @@ class ObservedPublicationProjection(PublicationModel):
         # of a caller's proof, index, ordinal or legal interval.
         current = _observed_source_facts(self.source_json)
         immutable_sha256 = current.immutable_sha256
-        if self.heading_repair is not None:
+        restored = frozenset(self.canonical_restore_fields or ())
+        if not restored.issubset(
+            {
+                "content",
+                "blurb",
+                "semantic_identifier",
+                "heading_path",
+                "provision_identifiers",
+                "decision_numbers",
+                "legal_dates",
+                "image_file_id",
+                "source_links",
+            }
+        ):
+            raise ValueError("unsupported canonical restore source field")
+        if restored:
+            # Maintenance excluded repaired fields from its historical digest.
+            # Accept only the exact completed source, not fresh repair authority.
             source = json.loads(self.source_json)
-            repair = self.heading_repair
+            original_interval = {
+                **source,
+                "validity_start_date": self.observed_start,
+                "validity_end_date": self.observed_end,
+            }
+            matches_completed = (
+                current.source_sha256 == self.observed_source_sha256
+                or publication_digest(original_interval) == self.observed_source_sha256
+            )
+            if not matches_completed and self.heading_repair is not None:
+                repair = self.heading_repair
+                if (
+                    source.get("regulatory_chunk_id") != repair.canonical_chunk_id
+                    or source.get("heading_path") != repair.corrected_heading_path
+                ):
+                    raise ValueError("source heading differs from its repair receipt")
+                # Earlier repair receipts anchored the pre-repair heading.
+                for candidate in (source.copy(), original_interval.copy()):
+                    if repair.original_heading_present:
+                        candidate["heading_path"] = repair.original_heading_path
+                    else:
+                        candidate.pop("heading_path", None)
+                    if publication_digest(candidate) == self.observed_source_sha256:
+                        matches_completed = True
+                        break
+            if not matches_completed:
+                raise ValueError("completed maintenance source changed")
+            immutable_sha256 = publication_digest(
+                {
+                    key: value
+                    for key, value in source.items()
+                    if key not in OBSERVED_MUTABLE_SOURCE_FIELDS and key not in restored
+                }
+            )
+        elif (
+            self.heading_repair is not None
+            and immutable_sha256 != self.observed_immutable_sha256
+        ):
+            source = json.loads(self.source_json)
+            repair = SourceHeadingRepair.model_validate(self.heading_repair)
             if (
                 source.get("regulatory_chunk_id") != repair.canonical_chunk_id
                 or source.get("heading_path") != repair.corrected_heading_path
@@ -513,6 +576,17 @@ class ObservedPublicationProjection(PublicationModel):
             ):
                 raise ValueError("observation cannot expand its legal interval")
         return self
+
+    def for_ordinary_update(self) -> "ObservedPublicationProjection":
+        """Freeze completed repair content before changing ordinary metadata/intervals."""
+        if not self.canonical_restore_fields and not self.allow_frozen_predecessor:
+            return self
+        verified = type(self).model_validate(self.model_dump())
+        return type(self).observe(
+            source_json=verified.source_json,
+            observed_index=verified.observed_index,
+            context_projection_id=verified.context_projection_id,
+        )
 
     def accepted_by(self, index: PublicationIndexSnapshot) -> bool:
         return self.observed_index.matches_temporal_index(index)

@@ -29,6 +29,7 @@ from onyx.document_index.publication_models import (
     PublicationProjection,
     PublicationVerification,
     RetainedPublicationProjection,
+    SourceHeadingRepair,
     publication_digest,
     publication_list_digest,
     publication_source,
@@ -74,7 +75,8 @@ if (ctx._source.publication_token == params.token) {
             }
         }
         def receipt = ctx._source.publication_evidence;
-        if (receipt != null && receipt.kind == 'observed-v1' &&
+        if (params.observation_heading_repair != null &&
+            receipt != null && receipt.kind == 'observed-v1' &&
             receipt.observation.heading_repair != null) {
             def prior = receipt.observation.heading_repair;
             def repair = params.observation_heading_repair;
@@ -347,7 +349,11 @@ class FencedPublicationIndex:
             )
             original = publication_source(observed.source_json)
             repair = observed.heading_repair
+            if observed.canonical_restore_fields or observed.allow_frozen_predecessor:
+                observed = observed.for_ordinary_update()
+                repair = None
             if repair is not None:
+                repair = SourceHeadingRepair.model_validate(repair)
                 if repair.original_heading_present:
                     original["heading_path"] = cast(
                         JsonValue, repair.original_heading_path

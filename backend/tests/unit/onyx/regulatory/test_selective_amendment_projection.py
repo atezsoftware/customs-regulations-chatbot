@@ -29,13 +29,15 @@ class ProjectionAuthority(OwnedAuthority):
         return object()
 
 
-@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize(
+    "legacy,repaired", [(False, False), (True, False), (True, True)]
+)
 @pytest.mark.parametrize("rebase", [False, True])
 @pytest.mark.parametrize(
     "changed_count,scheduled", [(1, False), (4, False), (11, False), (1, True)]
 )
 def test_amendment_retains_unrelated_bindings_and_only_embeds_successors(
-    changed_count: int, scheduled: bool, legacy: bool, rebase: bool
+    changed_count: int, scheduled: bool, legacy: bool, rebase: bool, repaired: bool
 ) -> None:
     file_id = uuid4()
     authority = ProjectionAuthority(file_id)
@@ -158,6 +160,37 @@ def test_amendment_retains_unrelated_bindings_and_only_embeds_successors(
                     ]
                 }
             )
+        if repaired:
+            from onyx.document_index.publication_models import (
+                OBSERVED_MUTABLE_SOURCE_FIELDS,
+                publication_digest,
+            )
+
+            repaired_bindings = []
+            for binding in original.bindings:
+                payload = binding.projection.model_dump()
+                source = json.loads(payload["source_json"])
+                payload.update(
+                    canonical_restore_fields=("heading_path",),
+                    observed_immutable_sha256=publication_digest(
+                        {
+                            key: value
+                            for key, value in source.items()
+                            if key not in OBSERVED_MUTABLE_SOURCE_FIELDS
+                            and key != "heading_path"
+                        }
+                    ),
+                )
+                repaired_bindings.append(
+                    binding.model_copy(
+                        update={
+                            "projection": ObservedPublicationProjection.model_validate(
+                                payload
+                            ),
+                        }
+                    )
+                )
+            original = original.model_copy(update={"bindings": repaired_bindings})
         inputs = replace(
             inputs,
             bindings=original.bindings,

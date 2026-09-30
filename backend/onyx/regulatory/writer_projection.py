@@ -302,7 +302,7 @@ def prepare_owned_correction(
                 if isinstance(previous.projection, ObservedPublicationProjection):
                     projection = ObservedPublicationProjection.model_validate(
                         {
-                            **previous.projection.model_dump(),
+                            **previous.projection.for_ordinary_update().model_dump(),
                             "ordinal": ordinal,
                             "context_projection_id": str(new_id),
                             "source_json": json.dumps(source),

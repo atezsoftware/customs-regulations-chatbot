@@ -13,7 +13,11 @@ from onyx.db.regulatory_writer_publication import (
     stage_writer_publication,
 )
 from onyx.document_index.elasticsearch.publication import FencedPublicationIndex
-from onyx.document_index.publication_models import FileOwnership, publication_digest
+from onyx.document_index.publication_models import (
+    FileOwnership,
+    ObservedPublicationProjection,
+    publication_digest,
+)
 from onyx.regulatory.amendments.annexes.publication_execution import (
     publication_heartbeat,
 )
@@ -73,7 +77,11 @@ def execute_writer_publication(
                 import json
 
                 projections = {
-                    ordinal: projection.model_copy(
+                    ordinal: (
+                        projection.for_ordinary_update()
+                        if isinstance(projection, ObservedPublicationProjection)
+                        else projection
+                    ).model_copy(
                         update={
                             "source_json": json.dumps(
                                 {**json.loads(projection.source_json), "hidden": True}
@@ -229,7 +237,7 @@ def prepare_owned_metadata(
         if isinstance(previous.projection, ObservedPublicationProjection):
             projection = ObservedPublicationProjection.model_validate(
                 {
-                    **previous.projection.model_dump(),
+                    **previous.projection.for_ordinary_update().model_dump(),
                     "context_projection_id": str(identifier),
                     "source_json": json.dumps(source),
                 }
