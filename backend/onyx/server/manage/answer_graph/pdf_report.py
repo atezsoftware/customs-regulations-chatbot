@@ -247,11 +247,17 @@ def build_answer_graph_pdf(
                         )
                         pdf.setFont("Helvetica", 7)
                         pdf.setFillColor(colors.HexColor("#475569"))
+                        summary = node.attributes.get("summary")
+                        detail = (
+                            summary
+                            if isinstance(summary, str) and summary
+                            else f"{node.started_at:%H:%M:%S} UTC"
+                        )
                         pdf.drawString(
                             x + 9,
                             top - 25,
                             _fitted(
-                                f"{node.kind}  |  {node.status}  |  {node.started_at:%H:%M:%S} UTC",
+                                f"{node.kind}  |  {node.status}  |  {detail}",
                                 card_width - 18,
                                 font_size=7,
                             ),

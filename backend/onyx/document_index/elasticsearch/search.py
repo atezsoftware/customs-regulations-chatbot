@@ -225,6 +225,7 @@ class DocumentQuery:
             as_of_date=index_filters.as_of_date,
             regulatory_source_hint=index_filters.regulatory_source_hint,
             regulatory_chunks_only=index_filters.regulatory_chunks_only,
+            regulatory_candidate_ids=index_filters.regulatory_candidate_ids,
             min_chunk_index=min_chunk_index,
             max_chunk_index=max_chunk_index,
             max_chunk_size=max_chunk_size,
@@ -412,6 +413,7 @@ class DocumentQuery:
             as_of_date=index_filters.as_of_date,
             regulatory_source_hint=index_filters.regulatory_source_hint,
             regulatory_chunks_only=index_filters.regulatory_chunks_only,
+            regulatory_candidate_ids=index_filters.regulatory_candidate_ids,
             min_chunk_index=None,
             max_chunk_index=None,
             attached_document_ids=index_filters.attached_document_ids,
@@ -506,6 +508,7 @@ class DocumentQuery:
             as_of_date=index_filters.as_of_date,
             regulatory_source_hint=index_filters.regulatory_source_hint,
             regulatory_chunks_only=index_filters.regulatory_chunks_only,
+            regulatory_candidate_ids=index_filters.regulatory_candidate_ids,
             min_chunk_index=None,
             max_chunk_index=None,
             attached_document_ids=index_filters.attached_document_ids,
@@ -639,6 +642,7 @@ class DocumentQuery:
             as_of_date=index_filters.as_of_date,
             regulatory_source_hint=index_filters.regulatory_source_hint,
             regulatory_chunks_only=index_filters.regulatory_chunks_only,
+            regulatory_candidate_ids=index_filters.regulatory_candidate_ids,
             min_chunk_index=None,
             max_chunk_index=None,
             attached_document_ids=index_filters.attached_document_ids,
@@ -708,6 +712,7 @@ class DocumentQuery:
             as_of_date=index_filters.as_of_date,
             regulatory_source_hint=index_filters.regulatory_source_hint,
             regulatory_chunks_only=index_filters.regulatory_chunks_only,
+            regulatory_candidate_ids=index_filters.regulatory_candidate_ids,
             min_chunk_index=None,
             max_chunk_index=None,
             attached_document_ids=index_filters.attached_document_ids,
@@ -1168,6 +1173,7 @@ class DocumentQuery:
         max_chunk_index: int | None,
         as_of_date: date | None = None,
         regulatory_chunks_only: bool = False,
+        regulatory_candidate_ids: list[str] | None = None,
         regulatory_source_hint: str | None = None,
         max_chunk_size: int | None = None,
         document_id: str | None = None,
@@ -1744,6 +1750,13 @@ class DocumentQuery:
                         ],
                     }
                 }
+            )
+
+        if regulatory_candidate_ids is not None:
+            filter_clauses.append(
+                {"terms": {REGULATORY_CHUNK_ID_FIELD_NAME: regulatory_candidate_ids}}
+                if regulatory_candidate_ids
+                else {"match_none": {}}
             )
 
         if regulatory_chunks_only:

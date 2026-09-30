@@ -376,6 +376,12 @@ def _latest_context_advisories(
         return {}
     rows = session.execute(
         select(RegulatoryIndexingItem)
+        .options(
+            load_only(
+                RegulatoryIndexingItem.regulatory_chunk_id,
+                RegulatoryIndexingItem.context,
+            )
+        )
         .where(
             RegulatoryIndexingItem.regulatory_chunk_id.in_(chunk_ids),
             RegulatoryIndexingItem.context.is_not(None),
@@ -2646,3 +2652,114 @@ def final_status(session: Session, lease: RunLease) -> str:
     if run.unresolved_derived_chunks:
         return "completed_with_errors"
     return "completed"
+
+
+def current_labeling_items_for_search(
+    session: Session,
+    *,
+    run: RegulatoryLabelingRun,
+    items: Sequence[RegulatoryLabelingItem],
+    deadline: float | None = None,
+) -> frozenset[str]:
+    """Recheck frozen context without changing results or their job lifecycle."""
+    groups: dict[tuple[UUID, int, int], list[RegulatoryLabelingItem]] = defaultdict(
+        list
+    )
+    for item in items:
+        if item.run_id != run.id or item.status != "completed":
+            continue
+        try:
+            lower, upper = _snapshot_context_window(item.source_snapshot)
+        except ValueError:
+            continue
+        groups[(item.user_file_id, lower, upper)].append(item)
+    valid: set[str] = set()
+    advisories = _latest_context_advisories(
+        session, [item.regulatory_chunk_id for item in items]
+    )
+    hashes = {key: context_hash(value) for key, value in advisories.items()}
+    for (file_id, lower, upper), file_items in groups.items():
+        if deadline is not None and monotonic() >= deadline:
+            break
+        try:
+            required_ids = {
+                identifier
+                for item in file_items
+                for identifier in _snapshot_string_list(
+                    item.source_snapshot, "context_member_ids"
+                )
+            }
+        except ValueError:
+            continue
+        rows, boundaries, complete = _current_file_context_candidates(
+            session,
+            document_set_id=run.document_set_id,
+            user_file_id=file_id,
+            lower=lower,
+            upper=upper,
+        )
+        frozen = {
+            item.regulatory_chunk_id: item
+            for item in session.scalars(
+                select(RegulatoryLabelingItem)
+                .options(
+                    load_only(
+                        RegulatoryLabelingItem.regulatory_chunk_id,
+                        RegulatoryLabelingItem.user_file_id,
+                        RegulatoryLabelingItem.text_snapshot,
+                        RegulatoryLabelingItem.source_snapshot,
+                    )
+                )
+                .where(
+                    RegulatoryLabelingItem.run_id == run.id,
+                    RegulatoryLabelingItem.regulatory_chunk_id.in_(required_ids),
+                )
+            )
+        }
+        current = {row.id: row for row in rows}
+        for item in file_items:
+            if (
+                item.context_sha256
+                and item.canonical_text_sha256 == context_hash(item.text_snapshot)
+                and _item_snapshot_is_current(
+                    item,
+                    snapshot_items=frozen,
+                    current_rows=current,
+                    current_file_rows={file_id: rows},
+                    current_boundary_ids={file_id: boundaries},
+                    current_windows_complete={file_id: complete},
+                    advisory_hashes=hashes,
+                )
+            ):
+                valid.add(item.regulatory_chunk_id)
+    return frozenset(valid)
+
+
+def current_derived_label_sources_for_search(
+    session: Session,
+    *,
+    run: RegulatoryLabelingRun,
+    target: RegulatoryDerivedLabelProjection,
+) -> tuple[str, ...]:
+    """Accept only fully resolved explicit lineage from unchanged derived text."""
+    if (
+        target.resolution != "lineage"
+        or _current_projection_target(session, run=run, target=target) is None
+    ):
+        return ()
+    try:
+        return tuple(
+            _expand_projection_dependencies(
+                session,
+                run=run,
+                dependency_ids=_explicit_projection_dependencies(target),
+                user_file_id=target.user_file_id,
+                item_cache={},
+                target_cache={},
+                seen=frozenset({target.regulatory_chunk_id}),
+                visited=set(),
+                depth=0,
+            )
+        )
+    except ValueError:
+        return ()

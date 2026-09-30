@@ -3,7 +3,7 @@ from enum import Enum
 from typing import Any
 from uuid import UUID
 
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, Field, model_validator
 
 from onyx.configs.constants import DocumentSource, MessageType, SessionType
 from onyx.context.search.models import BaseFilters, SavedSearchDoc, SearchDoc, Tag
@@ -121,6 +121,11 @@ class SendMessageRequest(BaseModel):
     # Independent, lower-latency profile. It shares the same indexed corpus,
     # authorization, citations, coverage plan, and validation contracts.
     atez_search_v2: bool = False
+    # Explicit experiment opt-in. The deployed default remains the baseline path.
+    atez_search_v2_labels: bool = False
+    atez_search_v2_label_run_ids: list[UUID] = Field(
+        default_factory=list, max_length=32
+    )
 
     # Headers to forward to MCP tool calls (e.g., user JWT token, user ID)
     # Example: {"Authorization": "Bearer <user_jwt>", "X-User-ID": "user123"}
@@ -158,6 +163,10 @@ class SendMessageRequest(BaseModel):
     def check_chat_session_id_or_info(self) -> "SendMessageRequest":
         if self.atez_search and self.atez_search_v2:
             raise ValueError("atez_search and atez_search_v2 are mutually exclusive")
+        if self.atez_search_v2_labels and not self.atez_search_v2:
+            raise ValueError("atez_search_v2_labels requires atez_search_v2")
+        if self.atez_search_v2_label_run_ids and not self.atez_search_v2_labels:
+            raise ValueError("atez_search_v2_label_run_ids requires labels")
         # If neither is provided, default to creating a new chat session using the
         # default ChatSessionCreationRequest values.
         if self.chat_session_id is None and self.chat_session_info is None:

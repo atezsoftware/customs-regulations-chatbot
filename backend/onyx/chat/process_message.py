@@ -714,6 +714,15 @@ def _global_regulatory_search_filters(setup: ChatTurnSetup) -> BaseFilters | Non
         "regulatory_chunks_only": regulatory_search_enabled
         and not _is_social_only_message(setup.new_msg_req.message),
         "regulatory_workflow_mode": "fast" if atez_search_v2 else "standard",
+        "regulatory_label_search_enabled": (
+            atez_search_v2
+            and getattr(setup.new_msg_req, "atez_search_v2_labels", False) is True
+        ),
+        "regulatory_label_run_ids": (
+            tuple(getattr(setup.new_msg_req, "atez_search_v2_label_run_ids", ()))
+            if atez_search_v2
+            else ()
+        ),
     }
     query_as_of_date = None
     if regulatory_search_enabled and (filters is None or filters.as_of_date is None):
@@ -854,6 +863,7 @@ def build_chat_turn(
             "deep_research": new_msg_req.deep_research,
             "atez_search": new_msg_req.atez_search,
             "atez_search_v2": new_msg_req.atez_search_v2,
+            "atez_search_v2_labels": new_msg_req.atez_search_v2_labels,
         },
     )
 

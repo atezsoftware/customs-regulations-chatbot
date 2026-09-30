@@ -45,3 +45,23 @@ def test_pdf_contains_every_ordered_operation_and_its_relations() -> None:
     assert "parent #1" in extracted
     assert "data from #1" in extracted
     assert "regulatory_coverage_plan_12" in extracted
+
+
+def test_pdf_shows_label_contribution_summary_without_payload() -> None:
+    node = AnswerGraphNode(
+        node_id="label",
+        parent_node_id=None,
+        kind="step",
+        operation="search.label_evidence_selection",
+        status="COMPLETE",
+        started_at=datetime(2026, 9, 30, tzinfo=timezone.utc),
+        attributes={"summary": "2 labeled visible; 1 added"},
+    )
+    run = AnswerGraphRun(assistant_message_id=42, status="COMPLETE")
+    document = build_answer_graph_pdf(run, [node], [])
+    extracted = "\n".join(
+        page.extract_text() for page in PdfReader(BytesIO(document)).pages
+    )
+
+    assert "search.label_evidence_selection" in extracted
+    assert "2 labeled visible; 1 added" in extracted
