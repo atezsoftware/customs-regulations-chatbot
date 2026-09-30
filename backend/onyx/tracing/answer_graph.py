@@ -226,11 +226,12 @@ def _span_contents(span: Span[Any]) -> tuple[Any, Any, Any, dict[str, Any], str]
             operation,
         )
     if isinstance(data, FunctionSpanData):
+        recorded_agent = (data.mcp_data or {}).get("answer_graph_agent")
         return (
             data.input,
             data.output,
             None,
-            {},
+            {"agent": recorded_agent} if isinstance(recorded_agent, str) else {},
             str(redact_graph_value(data.name))[:128],
         )
     exported = data.export()
@@ -373,6 +374,7 @@ class AnswerGraphStep:
         self._started_at: datetime.datetime | None = None
         self._parent_node_id: str | None = None
         self._step_token: Token[str | None] | None = None
+        self._agent_name: str | None = None
 
     def __enter__(self) -> AnswerGraphStep:
         self._run_id = _active_run()
@@ -382,6 +384,11 @@ class AnswerGraphStep:
         self._started_at = datetime.datetime.now(datetime.timezone.utc)
         parent = get_current_span()
         trace = get_current_trace()
+        if trace is not None and self.operation == "chat.input":
+            self._agent_name = {
+                "run_llm_loop": "Chat agent",
+                "run_deep_research_llm_loop": "Deep Research agent",
+            }.get(trace.name, trace.name)
         self._parent_node_id = (
             _ACTIVE_STEP.get()
             or (parent.span_id if parent else None)
@@ -429,7 +436,7 @@ class AnswerGraphStep:
                     started_at=self._started_at,
                     ended_at=datetime.datetime.now(datetime.timezone.utc),
                     status="FAILED" if exc_type else "COMPLETE",
-                    attributes={},
+                    attributes={"agent": self._agent_name} if self._agent_name else {},
                     input_ciphertext=input_ciphertext,
                     output_ciphertext=output_ciphertext,
                     reasoning_ciphertext=None,

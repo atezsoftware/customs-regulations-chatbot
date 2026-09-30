@@ -1392,6 +1392,9 @@ def run_research_agent_call(
     turn_index = research_agent_call.placement.turn_index
     tab_index = research_agent_call.placement.tab_index
     with function_span("research_agent") as span:
+        span.span_data.mcp_data = {
+            "answer_graph_agent": f"Research agent {tab_index + 1}"
+        }
         span.span_data.input = str(research_agent_call.tool_args)
         try:
             # Track start time for timeout-based forced report generation

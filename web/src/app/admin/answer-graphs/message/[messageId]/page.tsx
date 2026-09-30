@@ -4,6 +4,16 @@ import { use, useEffect, useMemo, useRef, useState } from "react";
 import useSWR from "swr";
 import { Button, InputTypeIn } from "@opal/components";
 import { useUser } from "@/providers/UserProvider";
+import {
+  buildGraphLayout,
+  buildGraphPresentation,
+  GRAPH_NODE_HEIGHT,
+  GRAPH_NODE_WIDTH,
+  graphOperationLabel,
+  type GraphEdge,
+  type GraphNode,
+  type GraphPhase,
+} from "./graphPresentation";
 
 type Run = {
   run_id: string | null;
@@ -12,25 +22,9 @@ type Run = {
   capture_error: string | null;
   model_name: string | null;
 };
-type Node = {
-  node_id: string;
-  parent_node_id: string | null;
-  kind: string;
-  operation: string;
-  status: string;
-  capture_status: string;
-  started_at: string;
-  ended_at: string | null;
-  attributes: Record<string, unknown>;
-  has_input: boolean;
-  has_output: boolean;
-  has_reasoning: boolean;
-  error: string | null;
-};
-type Edge = { from_node_id: string; to_node_id: string; kind: string };
 type Page<T> = T & { next_offset: number | null };
 type Detail = {
-  node: Node;
+  node: GraphNode;
   input: unknown;
   output: unknown;
   reasoning: unknown;
@@ -40,8 +34,14 @@ type Detail = {
 };
 
 const PAGE_SIZE = 200;
-const NODE_WIDTH = 220;
-const NODE_HEIGHT = 76;
+const PHASE_STYLES: Record<GraphPhase, string> = {
+  input: "border-slate-500 bg-slate-500/10",
+  planning: "border-violet-500 bg-violet-500/10",
+  retrieval: "border-cyan-500 bg-cyan-500/10",
+  model: "border-blue-500 bg-blue-500/10",
+  answer: "border-emerald-500 bg-emerald-500/10",
+  operation: "border-amber-500 bg-amber-500/10",
+};
 
 async function loadJson<T>(url: string): Promise<T> {
   const response = await fetch(url, { cache: "no-store" });
@@ -56,8 +56,8 @@ async function loadJson<T>(url: string): Promise<T> {
 }
 
 function useGraphPages(runId: string | null, phase: string) {
-  const [nodes, setNodes] = useState<Node[]>([]);
-  const [edges, setEdges] = useState<Edge[]>([]);
+  const [nodes, setNodes] = useState<GraphNode[]>([]);
+  const [edges, setEdges] = useState<GraphEdge[]>([]);
   const [nodeOffset, setNodeOffset] = useState<number | null>(0);
   const [edgeOffset, setEdgeOffset] = useState<number | null>(0);
   const [pageRequest, setPageRequest] = useState(0);
@@ -93,12 +93,12 @@ function useGraphPages(runId: string | null, phase: string) {
     Promise.all([
       nodeOffset === null
         ? Promise.resolve(null)
-        : loadJson<Page<{ nodes: Node[] }>>(
+        : loadJson<Page<{ nodes: GraphNode[] }>>(
             `${base}/nodes?offset=${nodeOffset}&limit=${PAGE_SIZE}`
           ),
       edgeOffset === null
         ? Promise.resolve(null)
-        : loadJson<Page<{ edges: Edge[] }>>(
+        : loadJson<Page<{ edges: GraphEdge[] }>>(
             `${base}/edges?offset=${edgeOffset}&limit=${PAGE_SIZE}`
           ),
     ])
@@ -156,61 +156,6 @@ function useGraphPages(runId: string | null, phase: string) {
   };
 }
 
-function graphLayout(nodes: Node[], edges: Edge[]) {
-  const byId = new Map(nodes.map((node) => [node.node_id, node]));
-  const parents = new Map<string, string[]>();
-  for (const node of nodes) {
-    if (node.parent_node_id && byId.has(node.parent_node_id))
-      parents.set(node.node_id, [node.parent_node_id]);
-  }
-  for (const edge of edges) {
-    if (!byId.has(edge.from_node_id) || !byId.has(edge.to_node_id)) continue;
-    parents.set(edge.to_node_id, [
-      ...(parents.get(edge.to_node_id) || []),
-      edge.from_node_id,
-    ]);
-  }
-  const depths = new Map<string, number>();
-  const visiting = new Set<string>();
-  const depthOf = (id: string): number => {
-    if (depths.has(id)) return depths.get(id)!;
-    if (visiting.has(id)) return 0;
-    visiting.add(id);
-    const depth = Math.min(
-      20,
-      Math.max(
-        0,
-        ...(parents.get(id) || []).map((parent) => depthOf(parent) + 1)
-      )
-    );
-    visiting.delete(id);
-    depths.set(id, depth);
-    return depth;
-  };
-  nodes.forEach((node) => depthOf(node.node_id));
-  const rows = new Map<number, number>();
-  const positions = new Map<string, { x: number; y: number }>();
-  for (const node of nodes) {
-    const depth = depths.get(node.node_id) || 0;
-    const row = rows.get(depth) || 0;
-    positions.set(node.node_id, {
-      x: 36 + depth * (NODE_WIDTH + 100),
-      y: 36 + row * (NODE_HEIGHT + 32),
-    });
-    rows.set(depth, row + 1);
-  }
-  let maxDepth = 0;
-  depths.forEach((depth) => {
-    maxDepth = Math.max(maxDepth, depth);
-  });
-  return {
-    positions,
-    width: 72 + (maxDepth + 1) * (NODE_WIDTH + 100),
-    height:
-      72 + Math.max(1, ...Array.from(rows.values())) * (NODE_HEIGHT + 32),
-  };
-}
-
 function Payload({
   label,
   value,
@@ -253,11 +198,13 @@ export default function AnswerGraphPage({
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [zoom, setZoom] = useState(1);
   const [search, setSearch] = useState("");
+  const [pdfLoading, setPdfLoading] = useState(false);
+  const [pdfError, setPdfError] = useState<string | null>(null);
   const graphContainerRef = useRef<HTMLDivElement>(null);
   const [viewport, setViewport] = useState({
     left: 0,
     top: 0,
-    width: 1200,
+    width: 1000,
     height: 800,
   });
   const graphUrl =
@@ -285,7 +232,26 @@ export default function AnswerGraphPage({
     detailUrl,
     loadJson
   );
-  const layout = useMemo(() => graphLayout(nodes, edges), [nodes, edges]);
+  const presented = useMemo(
+    () => buildGraphPresentation(nodes, edges),
+    [nodes, edges]
+  );
+  const layout = useMemo(
+    () => buildGraphLayout(presented, edges),
+    [presented, edges]
+  );
+  const positions = useMemo(
+    () => new Map(layout.nodes.map((item) => [item.node.node_id, item])),
+    [layout]
+  );
+  const presentedBySequence = useMemo(
+    () => new Map(presented.map((item) => [item.sequence, item])),
+    [presented]
+  );
+  const presentedById = useMemo(
+    () => new Map(presented.map((item) => [item.node.node_id, item])),
+    [presented]
+  );
   useEffect(() => {
     const element = graphContainerRef.current;
     if (!element) return;
@@ -301,42 +267,73 @@ export default function AnswerGraphPage({
     observer.observe(element);
     return () => observer.disconnect();
   }, [runId, zoom]);
-  const inViewport = (position: { x: number; y: number } | undefined) =>
-    position !== undefined &&
-    position.x + NODE_WIDTH >= viewport.left - 300 &&
-    position.x <= viewport.left + viewport.width + 300 &&
-    position.y + NODE_HEIGHT >= viewport.top - 300 &&
-    position.y <= viewport.top + viewport.height + 300;
-  const renderedNodes = nodes.filter((node) =>
-    inViewport(layout.positions.get(node.node_id))
+  const inViewport = (x: number, y: number) =>
+    x + GRAPH_NODE_WIDTH >= viewport.left - 300 &&
+    x <= viewport.left + viewport.width + 300 &&
+    y + GRAPH_NODE_HEIGHT >= viewport.top - 300 &&
+    y <= viewport.top + viewport.height + 300;
+  const renderedNodes = layout.nodes.filter((item) =>
+    inViewport(item.x, item.y)
+  );
+  const visibleEdges = layout.edges.filter(
+    (edge) =>
+      positions.has(edge.from_node_id) &&
+      positions.has(edge.to_node_id) &&
+      (inViewport(
+        positions.get(edge.from_node_id)!.x,
+        positions.get(edge.from_node_id)!.y
+      ) ||
+        inViewport(
+          positions.get(edge.to_node_id)!.x,
+          positions.get(edge.to_node_id)!.y
+        ))
   );
   const searchResults = search
-    ? nodes
-        .filter((node) =>
-          `${node.operation} ${node.kind} ${node.node_id}`
+    ? presented
+        .filter((item) =>
+          `${item.node.operation} ${item.node.kind} ${item.node.node_id} ${item.agent}`
             .toLowerCase()
             .includes(search.toLowerCase())
         )
         .slice(0, 50)
     : [];
-  const visibleEdges = useMemo(() => {
-    const result = [...edges];
-    const known = new Set(
-      result.map((edge) => `${edge.from_node_id}:${edge.to_node_id}`)
-    );
-    for (const node of nodes) {
-      if (
-        node.parent_node_id &&
-        !known.has(`${node.parent_node_id}:${node.node_id}`)
-      )
-        result.push({
-          from_node_id: node.parent_node_id,
-          to_node_id: node.node_id,
-          kind: "parent",
-        });
+  const selected = selectedId ? presentedById.get(selectedId) : null;
+  const jumpToSequence = (sequence: number) => {
+    const item = presentedBySequence.get(sequence);
+    if (!item) return;
+    setSelectedId(item.node.node_id);
+    const position = positions.get(item.node.node_id);
+    if (!position) return;
+    graphContainerRef.current?.scrollTo({
+      left: Math.max(0, (position.x - 80) * zoom),
+      top: Math.max(0, (position.y - 80) * zoom),
+      behavior: "smooth",
+    });
+  };
+  const downloadPdf = async () => {
+    if (!runId || pdfLoading) return;
+    setPdfLoading(true);
+    setPdfError(null);
+    try {
+      const response = await fetch(`/api/admin/answer-graphs/${runId}/pdf`, {
+        cache: "no-store",
+      });
+      if (!response.ok)
+        throw new Error(`PDF download failed (${response.status}).`);
+      const url = URL.createObjectURL(await response.blob());
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `answer-execution-${messageId}.pdf`;
+      link.click();
+      window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
+    } catch (failure) {
+      setPdfError(
+        failure instanceof Error ? failure.message : "Could not download PDF."
+      );
+    } finally {
+      setPdfLoading(false);
     }
-    return result;
-  }, [nodes, edges]);
+  };
 
   if (!user) return <p className="p-6">Loading account…</p>;
   if (!isAdmin) return <p className="p-6">Administrator access required.</p>;
@@ -345,18 +342,32 @@ export default function AnswerGraphPage({
     <main className="flex h-[calc(100vh-5rem)] min-h-[600px] flex-col p-5">
       <header className="mb-4 flex flex-wrap items-start justify-between gap-3">
         <div>
-          <h1 className="text-xl font-semibold">Answer execution graph</h1>
+          <h1 className="text-xl font-semibold">Answer execution</h1>
           <p className="text-sm opacity-70">Assistant message {messageId}</p>
           {run && (
             <p className="mt-1 text-sm">
               {run.status} · Capture {run.capture_status || "unknown"} ·{" "}
-              {run.model_name || "model unknown"} · {nodes.length} nodes
+              {run.model_name || "model unknown"} · {nodes.length} operations
               {nodeOffset !== null ? "+" : ""}
               {run.capture_error ? ` · ${run.capture_error}` : ""}
             </p>
           )}
         </div>
-        <div className="flex gap-2">
+        <div className="flex items-center gap-2">
+          {runId && (
+            <Button
+              size="sm"
+              prominence="secondary"
+              disabled={
+                pdfLoading ||
+                run?.status === "RUNNING" ||
+                run?.status === "FINALIZING"
+              }
+              onClick={downloadPdf}
+            >
+              {pdfLoading ? "Preparing PDF…" : "Download PDF"}
+            </Button>
+          )}
           <Button
             aria-label="Zoom out"
             size="sm"
@@ -382,6 +393,7 @@ export default function AnswerGraphPage({
         <p>This answer predates graph capture or its trace was unavailable.</p>
       )}
       {error && <p role="alert">{error}</p>}
+      {pdfError && <p role="alert">{pdfError}</p>}
       {runId && (
         <div className="flex min-h-0 flex-1 gap-4">
           <div
@@ -395,7 +407,8 @@ export default function AnswerGraphPage({
                 height: element.clientHeight / zoom,
               });
             }}
-            className="min-w-0 flex-1 overflow-auto rounded-lg border border-border-01 bg-background-neutral-01"
+            className="min-w-0 flex-1 overflow-auto rounded-xl border border-border-01 bg-background-neutral-01"
+            aria-label="Agent execution graph"
           >
             <div
               className="relative origin-top-left"
@@ -412,69 +425,139 @@ export default function AnswerGraphPage({
                   transform: `scale(${zoom})`,
                 }}
               >
+                {[...new Set(layout.nodes.map((item) => item.rank))].map(
+                  (rank) => (
+                    <span
+                      key={rank}
+                      className="absolute top-1 text-xs font-semibold uppercase tracking-wide opacity-65"
+                      style={{ left: 40 + rank * (GRAPH_NODE_WIDTH + 96) }}
+                    >
+                      Stage {rank + 1}
+                    </span>
+                  )
+                )}
+                {layout.lanes.map((lane) => (
+                  <div
+                    key={lane.agent}
+                    className="absolute left-4 rounded-xl border border-border-02 bg-background-neutral-02/50"
+                    style={{
+                      top: lane.y,
+                      width: layout.width - 32,
+                      height: lane.height,
+                    }}
+                  >
+                    <span className="absolute left-4 top-3 text-xs font-semibold uppercase tracking-wide opacity-70">
+                      {lane.agent}
+                    </span>
+                  </div>
+                ))}
                 <svg
                   aria-hidden="true"
                   className="pointer-events-none absolute inset-0"
                   width={layout.width}
                   height={layout.height}
                 >
+                  <defs>
+                    <marker
+                      id="graph-arrow"
+                      markerWidth="8"
+                      markerHeight="8"
+                      refX="7"
+                      refY="4"
+                      orient="auto"
+                    >
+                      <path d="M 0 0 L 8 4 L 0 8 z" fill="#94a3b8" />
+                    </marker>
+                    <marker
+                      id="graph-data-arrow"
+                      markerWidth="8"
+                      markerHeight="8"
+                      refX="7"
+                      refY="4"
+                      orient="auto"
+                    >
+                      <path d="M 0 0 L 8 4 L 0 8 z" fill="#3b82f6" />
+                    </marker>
+                  </defs>
                   {visibleEdges.map((edge, index) => {
-                    const source = layout.positions.get(edge.from_node_id);
-                    const target = layout.positions.get(edge.to_node_id);
-                    if (!source || !target) return null;
-                    if (!inViewport(source) && !inViewport(target)) return null;
-                    const x1 = source.x + NODE_WIDTH;
+                    const source = positions.get(edge.from_node_id)!;
+                    const target = positions.get(edge.to_node_id)!;
+                    const x1 = source.x + GRAPH_NODE_WIDTH;
                     const x2 = target.x;
-                    const y1 = source.y + NODE_HEIGHT / 2;
-                    const y2 = target.y + NODE_HEIGHT / 2;
+                    const y1 = source.y + GRAPH_NODE_HEIGHT / 2;
+                    const y2 = target.y + GRAPH_NODE_HEIGHT / 2;
                     return (
                       <path
                         key={`${edge.kind}:${edge.from_node_id}:${edge.to_node_id}:${index}`}
-                        d={`M ${x1} ${y1} C ${x1 + 48} ${y1}, ${x2 - 48} ${y2}, ${x2} ${y2}`}
+                        d={`M ${x1} ${y1} C ${x1 + 46} ${y1}, ${x2 - 46} ${y2}, ${x2 - 8} ${y2}`}
                         fill="none"
-                        stroke={edge.kind === "data" ? "#4f83d1" : "#a3a3a3"}
-                        strokeWidth={edge.kind === "data" ? 2 : 1}
+                        stroke={edge.kind === "data" ? "#3b82f6" : "#94a3b8"}
+                        strokeWidth={edge.kind === "data" ? 2.5 : 1.5}
                         strokeDasharray={
-                          edge.kind === "data" ? undefined : "4 4"
+                          edge.kind === "order"
+                            ? "3 5"
+                            : edge.kind === "parent"
+                              ? "6 4"
+                              : undefined
+                        }
+                        markerEnd={
+                          edge.kind === "order"
+                            ? undefined
+                            : edge.kind === "data"
+                              ? "url(#graph-data-arrow)"
+                              : "url(#graph-arrow)"
                         }
                       />
                     );
                   })}
                 </svg>
-                {renderedNodes.map((node) => {
-                  const position = layout.positions.get(node.node_id)!;
+                {renderedNodes.map((item) => {
+                  const node = item.node;
                   return (
-                    <div
+                    <article
                       key={node.node_id}
-                      className={`absolute overflow-hidden rounded-lg border bg-background-neutral-00 p-2 shadow-sm ${
-                        selectedId === node.node_id
-                          ? "border-blue-500"
-                          : "border-border-01"
-                      }`}
+                      className={`absolute flex flex-col rounded-xl border-l-4 p-3 shadow-sm ring-1 ring-border-01 ${PHASE_STYLES[item.phase]} ${selectedId === node.node_id ? "ring-2 ring-blue-500" : ""}`}
                       style={{
-                        left: position.x,
-                        top: position.y,
-                        width: NODE_WIDTH,
-                        height: NODE_HEIGHT,
+                        left: item.x,
+                        top: item.y,
+                        width: GRAPH_NODE_WIDTH,
+                        height: GRAPH_NODE_HEIGHT,
                       }}
                     >
-                      <Button
-                        size="sm"
-                        prominence="tertiary"
-                        width="full"
+                      <div className="flex items-center justify-between gap-2 text-xs">
+                        <span className="rounded bg-background-neutral-00 px-1.5 py-0.5 font-bold">
+                          #{item.sequence}
+                        </span>
+                        <span className="font-semibold uppercase opacity-70">
+                          {item.phase}
+                        </span>
+                      </div>
+                      <button
+                        type="button"
+                        className="mt-2 truncate text-left text-sm font-semibold hover:underline"
+                        title={node.operation}
                         onClick={() => setSelectedId(node.node_id)}
-                        aria-label={`${node.operation}, ${node.status}`}
+                        aria-label={`Step ${item.sequence}: ${node.operation}`}
                         aria-pressed={selectedId === node.node_id}
                       >
-                        {node.operation}
-                      </Button>
-                      <span className="block truncate text-xs opacity-70">
-                        {node.kind} · {node.status}
-                        {node.capture_status !== "COMPLETE"
-                          ? ` · ${node.capture_status}`
+                        {graphOperationLabel(node)}
+                      </button>
+                      <p
+                        className="mt-1 truncate text-xs opacity-70"
+                        title={item.agent}
+                      >
+                        {item.agent}
+                      </p>
+                      <p className="mt-auto truncate text-xs opacity-70">
+                        {node.status} ·{" "}
+                        {item.durationMs === null
+                          ? "running"
+                          : `${item.durationMs} ms`}
+                        {item.callNumber > 1
+                          ? ` · call ${item.callNumber}`
                           : ""}
-                      </span>
-                    </div>
+                      </p>
+                    </article>
                   );
                 })}
               </div>
@@ -497,23 +580,15 @@ export default function AnswerGraphPage({
             />
             {searchResults.length > 0 && (
               <ol className="mt-2 max-h-40 overflow-auto border-b border-border-01 pb-2">
-                {searchResults.map((node) => (
-                  <li key={node.node_id}>
+                {searchResults.map((item) => (
+                  <li key={item.node.node_id}>
                     <Button
                       size="sm"
                       prominence="tertiary"
                       width="full"
-                      onClick={() => {
-                        setSelectedId(node.node_id);
-                        const position = layout.positions.get(node.node_id);
-                        if (position && graphContainerRef.current)
-                          graphContainerRef.current.scrollTo({
-                            left: Math.max(0, (position.x - 80) * zoom),
-                            top: Math.max(0, (position.y - 80) * zoom),
-                          });
-                      }}
+                      onClick={() => jumpToSequence(item.sequence)}
                     >
-                      {`${node.operation} · ${node.status}`}
+                      {`#${item.sequence} ${item.node.operation} · ${item.agent}`}
                     </Button>
                   </li>
                 ))}
@@ -527,12 +602,36 @@ export default function AnswerGraphPage({
             {detailError && <p role="alert">{String(detailError.message)}</p>}
             {detail && detail.node.node_id === selectedId && (
               <>
-                <p className="mt-2 break-all text-sm">
+                <p className="mt-2 break-all text-sm font-semibold">
+                  {selected ? `#${selected.sequence} · ` : ""}
                   {detail.node.operation}
                 </p>
                 <p className="text-xs opacity-70">
                   {detail.node.started_at} · {detail.node.status}
                 </p>
+                {selected && (
+                  <div className="mt-3 rounded-lg border border-border-01 p-3 text-xs">
+                    <p>Agent: {selected.agent}</p>
+                    <p className="mt-1">Phase: {selected.phase}</p>
+                    {selected.parentSequence !== null && (
+                      <button
+                        type="button"
+                        className="mt-2 text-blue-500 hover:underline"
+                        onClick={() => jumpToSequence(selected.parentSequence!)}
+                      >
+                        Parent: step #{selected.parentSequence}
+                      </button>
+                    )}
+                    {selected.dataInputSequences.length > 0 && (
+                      <p className="mt-1">
+                        Data from:{" "}
+                        {selected.dataInputSequences
+                          .map((sequence) => `#${sequence}`)
+                          .join(", ")}
+                      </p>
+                    )}
+                  </div>
+                )}
                 {detail.node.error && (
                   <p className="mt-2 text-sm text-red-600">
                     {detail.node.error}
@@ -572,8 +671,14 @@ export default function AnswerGraphPage({
             </Button>
           )}
           <span>
-            {nodes.length} nodes · {edges.length} data links
+            {nodes.length} ordered operations · {edges.length} recorded data
+            links
           </span>
+          {nodes.length > 0 && (
+            <span className="ml-auto text-xs opacity-70">
+              Dashed: parent · Blue: recorded data · Dotted: same-agent order
+            </span>
+          )}
         </footer>
       )}
     </main>

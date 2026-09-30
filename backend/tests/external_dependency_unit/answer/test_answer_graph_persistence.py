@@ -1,9 +1,11 @@
 from datetime import datetime, timedelta, timezone
+from io import BytesIO
 from uuid import uuid4
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from pypdf import PdfReader
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
@@ -133,6 +135,16 @@ def test_persisted_answer_graph_follows_reserved_message(
             f"/admin/answer-graphs/{run.id}/nodes/{search_node.node_id}"
         )
         assert search_detail.json()["output"]["body"] == "a" * 70000
+        pdf_response = client.get(f"/admin/answer-graphs/{run.id}/pdf")
+        assert pdf_response.status_code == 200
+        assert pdf_response.headers["content-type"] == "application/pdf"
+        assert pdf_response.headers["cache-control"] == "private, no-store"
+        pdf_text = "\n".join(
+            page.extract_text()
+            for page in PdfReader(BytesIO(pdf_response.content)).pages
+        )
+        assert "search.bm25" in pdf_text
+        assert "data from" in pdf_text
         run.time_created = datetime.now(timezone.utc) - timedelta(days=31)
         db_session.commit()
         assert prune_expired_answer_graphs(db_session, batch_size=1) == (0, 3)

@@ -31,12 +31,15 @@ from onyx.server.manage.answer_graph.models import (
     AnswerGraphNodeView,
     AnswerGraphRunView,
 )
+from onyx.server.manage.answer_graph.pdf_report import build_answer_graph_pdf
 from onyx.tracing.answer_graph import load_graph_part
 from onyx.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
 
 admin_router = APIRouter(prefix="/admin/answer-graphs")
+_MAX_PDF_NODES = 2000
+_MAX_PDF_EDGES = 10000
 
 
 def _no_store(response: Response) -> None:
@@ -154,6 +157,38 @@ def get_graph_edges(
         ],
         next_offset=offset + limit if has_more else None,
     )
+
+
+@admin_router.get("/{run_id}/pdf")
+def download_graph_pdf(
+    run_id: UUID,
+    user: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
+    db_session: Session = Depends(get_session),
+) -> Response:
+    run = _visible_run(db_session, run_id)
+    if run.status in {"RUNNING", "FINALIZING"}:
+        raise OnyxError(OnyxErrorCode.CONFLICT, "Answer graph is still running")
+    nodes = list_answer_graph_nodes(
+        db_session, run_id, offset=0, limit=_MAX_PDF_NODES + 1
+    )
+    edges = list_answer_graph_edges(
+        db_session, run_id, offset=0, limit=_MAX_PDF_EDGES + 1
+    )
+    if len(nodes) > _MAX_PDF_NODES or len(edges) > _MAX_PDF_EDGES:
+        raise OnyxError(
+            OnyxErrorCode.PAYLOAD_TOO_LARGE, "Answer graph is too large for PDF"
+        )
+    document = build_answer_graph_pdf(run, nodes, edges)
+    record_answer_graph_access(
+        db_session, run_id=run_id, user_id=user.id, action="pdf_export"
+    )
+    response = Response(content=document, media_type="application/pdf")
+    _no_store(response)
+    response.headers["Content-Disposition"] = (
+        f'attachment; filename="answer-execution-{run.assistant_message_id}.pdf"'
+    )
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    return response
 
 
 def _part(
