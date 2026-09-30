@@ -694,6 +694,7 @@ def create_labeling_run(
     idempotency_key: UUID,
     retry_of_id: UUID | None = None,
     uses_current_labels: bool = False,
+    target_file_ids: Sequence[UUID] | None = None,
 ) -> tuple[RegulatoryLabelingRun, bool]:
     document_set = session.scalar(
         select(DocumentSet).where(DocumentSet.id == document_set_id).with_for_update()
@@ -716,6 +717,11 @@ def create_labeling_run(
             not same_taxonomy
             or existing.provider_binding.get("model_configuration_id")
             != model_configuration_id
+            or (
+                target_file_ids is not None
+                and existing.file_ids
+                != [str(file_id) for file_id in sorted(set(target_file_ids))]
+            )
         ):
             raise LabelingStateConflictError(
                 "The idempotency key was already used with different parameters"
@@ -726,13 +732,22 @@ def create_labeling_run(
             "A labeling run is already active for this document set"
         )
 
-    file_ids = list(
+    document_set_file_ids = list(
         session.scalars(
             select(DocumentSet__UserFile.user_file_id)
             .where(DocumentSet__UserFile.document_set_id == document_set_id)
             .order_by(DocumentSet__UserFile.user_file_id)
         ).all()
     )
+    if target_file_ids is not None:
+        requested_file_ids = set(target_file_ids)
+        if not requested_file_ids or not requested_file_ids.issubset(
+            document_set_file_ids
+        ):
+            raise ValueError("Labeling target files must belong to the document set")
+        file_ids = sorted(requested_file_ids)
+    else:
+        file_ids = document_set_file_ids
     atomic_expression = _atomic_sql_expression()
     frozen_rows = session.execute(
         select(RegulatoryChunk.id, atomic_expression.label("is_atomic"))

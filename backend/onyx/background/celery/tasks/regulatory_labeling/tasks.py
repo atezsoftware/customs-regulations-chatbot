@@ -12,12 +12,16 @@ from onyx.configs.constants import (
     OnyxCeleryQueues,
     OnyxCeleryTask,
 )
+from onyx.db import regulatory_label_refresh
 from onyx.db import regulatory_labeling as repository
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.regulatory.labeling.orchestrator import (
     LabelingStepOutcome,
     run_labeling_step,
 )
+from onyx.utils.logger import setup_logger
+
+logger = setup_logger()
 
 
 def _delivery_expiry(countdown_seconds: float) -> int:
@@ -125,3 +129,22 @@ def regulatory_labeling_recover_stale(self: Task, *, tenant_id: str) -> None:
             expected_generation=run.generation,
             tenant_id=tenant_id,
         )
+    if not regulatory_label_refresh.amendment_label_refresh_enabled():
+        return
+    with get_session_with_current_tenant() as session:
+        regulatory_label_refresh.reconcile_finished_refreshes(session)
+        session.commit()
+    for _ in range(8):
+        with get_session_with_current_tenant() as session:
+            run_id = regulatory_label_refresh.start_next_refresh(session)
+            session.commit()
+        if run_id is None:
+            continue
+        try:
+            enqueue_labeling_run(run_id=run_id, tenant_id=tenant_id)
+        except Exception:
+            logger.warning(
+                "Automatic amendment labeling delivery failed; recovery will retry",
+                extra={"run_id": str(run_id)},
+                exc_info=True,
+            )

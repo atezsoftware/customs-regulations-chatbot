@@ -6040,6 +6040,69 @@ class RegulatoryLabelingRun(Base):
     )
 
 
+class RegulatoryAmendmentLabelRefresh(Base):
+    """Durable file-scoped relabel request created by an approved publication."""
+
+    __tablename__ = "regulatory_amendment_label_refresh"
+
+    id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid4
+    )
+    proposal_id: Mapped[int] = mapped_column(
+        ForeignKey("amendment_proposal.id", ondelete="CASCADE"), nullable=False
+    )
+    document_set_id: Mapped[int] = mapped_column(
+        ForeignKey("document_set.id", ondelete="CASCADE"), nullable=False
+    )
+    user_file_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("user_file.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    new_chunk_ids: Mapped[list[str]] = mapped_column(PGJSONB, nullable=False)
+    run_id: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("regulatory_labeling_run.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="pending", server_default="pending"
+    )
+    attempt_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    next_retry_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    error: Mapped[str | None] = mapped_column(String(4000), nullable=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "proposal_id",
+            "document_set_id",
+            name="uq_regulatory_amendment_label_refresh_proposal_set",
+        ),
+        Index("ix_regulatory_amendment_label_refresh_due", "status", "next_retry_at"),
+        CheckConstraint(
+            "status IN ('pending', 'running', 'completed', 'failed')",
+            name="regulatory_amendment_label_refresh_status_check",
+        ),
+        CheckConstraint(
+            "attempt_count >= 0",
+            name="regulatory_amendment_label_refresh_attempt_check",
+        ),
+    )
+
+
 class RegulatoryLabelingShard(Base):
     """One bounded provider batch with an independently recoverable identity."""
 

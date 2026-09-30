@@ -1027,6 +1027,7 @@ def render_values(enabled: bool = False) -> None:
             "REGULATORY_ANNEX_ENVIRONMENT": "dev",
             "REGULATORY_ANNEX_UPDATES_ENABLED": str(enabled).lower(),
             "REGULATORY_LABELING_VERTEX_GCS_URI": staging_uri,
+            "REGULATORY_AMENDMENT_LABEL_REFRESH_ENABLED": "true",
         }
         for name, value in updates.items():
             matches = [entry for entry in parameters if entry["name"] == name]

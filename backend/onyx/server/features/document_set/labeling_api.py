@@ -7,6 +7,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from onyx.auth.permissions import require_permission
+from onyx.db import regulatory_label_refresh
 from onyx.db import regulatory_labeling as repository
 from onyx.db.document_set import get_document_set_by_id_for_user
 from onyx.db.engine.sql_engine import get_session
@@ -26,6 +27,7 @@ from onyx.regulatory.indexing_jobs.models import (
     IndexingGatewayHTTPError,
 )
 from onyx.regulatory.labeling.api_models import (
+    AmendmentLabelRefreshSnapshot,
     LabelingItemsPage,
     LabelingProviderSummary,
     LabelingRunCreate,
@@ -337,6 +339,43 @@ def list_labeling_runs(
         repository.run_snapshot(row)
         for row in repository.list_runs(db_session, document_set_id)
     ]
+
+
+@router.get("/amendment-refreshes")
+def list_amendment_label_refreshes(
+    document_set_id: int,
+    user: User = Depends(labeling_admin),
+    db_session: Session = Depends(get_session),
+) -> list[AmendmentLabelRefreshSnapshot]:
+    _check_access(db_session, document_set_id, user)
+    return [
+        regulatory_label_refresh.refresh_snapshot(row)
+        for row in regulatory_label_refresh.list_refreshes(
+            db_session, document_set_id=document_set_id
+        )
+    ]
+
+
+@router.post("/amendment-refreshes/{refresh_id}/retry")
+def retry_amendment_label_refresh(
+    document_set_id: int,
+    refresh_id: UUID,
+    user: User = Depends(labeling_admin),
+    db_session: Session = Depends(get_session),
+) -> AmendmentLabelRefreshSnapshot:
+    _check_access(db_session, document_set_id, user)
+    try:
+        row = regulatory_label_refresh.retry_failed_refresh(
+            db_session, document_set_id=document_set_id, refresh_id=refresh_id
+        )
+    except ValueError as error:
+        db_session.rollback()
+        raise OnyxError(OnyxErrorCode.CONFLICT, str(error)) from None
+    if row is None:
+        raise OnyxError(OnyxErrorCode.NOT_FOUND, "Label refresh not found")
+    result = regulatory_label_refresh.refresh_snapshot(row)
+    db_session.commit()
+    return result
 
 
 @router.get("/runs/{run_id}")

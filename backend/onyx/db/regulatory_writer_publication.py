@@ -517,11 +517,19 @@ def finalize_writer_publication(
             from onyx.db.regulatory_amendments import (
                 finalize_amendment_proposal_projection,
             )
+            from onyx.db.regulatory_label_refresh import (
+                record_published_amendment_refresh,
+            )
 
             if not finalize_amendment_proposal_projection(
                 session, proposal_id=manifest.amendment_proposal_id, succeeded=True
             ):
                 raise ValueError("owned amendment could not be finalized")
+            record_published_amendment_refresh(
+                session,
+                proposal_id=manifest.amendment_proposal_id,
+                user_file_id=owner.user_file_id,
+            )
         if manifest.kind == "durable":
             from onyx.db.regulatory_indexing_jobs import (
                 complete_regulatory_indexing_publication,

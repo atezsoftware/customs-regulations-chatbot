@@ -100,3 +100,16 @@ class LabelingItemSnapshot(BaseModel):
 class LabelingItemsPage(BaseModel):
     items: list[LabelingItemSnapshot]
     total: int
+
+
+class AmendmentLabelRefreshSnapshot(BaseModel):
+    id: str
+    proposal_id: int
+    file_id: str
+    new_chunk_ids: list[str]
+    run_id: str | None
+    status: str
+    attempt_count: int
+    next_retry_at: datetime.datetime | None
+    error: str | None
+    created_at: datetime.datetime
