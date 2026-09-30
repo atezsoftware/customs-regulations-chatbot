@@ -425,7 +425,7 @@ export default function AnswerGraphPage({
                   transform: `scale(${zoom})`,
                 }}
               >
-                {[...new Set(layout.nodes.map((item) => item.rank))].map(
+                {Array.from(new Set(layout.nodes.map((item) => item.rank))).map(
                   (rank) => (
                     <span
                       key={rank}

@@ -152,9 +152,9 @@ export function buildGraphPresentation(
       parentSequence: node.parent_node_id
         ? (sequenceById.get(node.parent_node_id) ?? null)
         : null,
-      dataInputSequences: [...new Set(dataInputs.get(node.node_id) ?? [])].sort(
-        (left, right) => left - right
-      ),
+      dataInputSequences: Array.from(
+        new Set(dataInputs.get(node.node_id) ?? [])
+      ).sort((left, right) => left - right),
       depth: resolveDepth(node, new Set()),
       agent: resolveOwner(node, new Set()),
       phase: graphPhase(node),
@@ -223,7 +223,7 @@ export function buildGraphLayout(
     );
     ranks.set(item.node.node_id, rank);
   }
-  const agents = [...new Set(presented.map((item) => item.agent))];
+  const agents = Array.from(new Set(presented.map((item) => item.agent)));
   const lanes: AgentLane[] = [];
   const positioned: PositionedNode[] = [];
   let laneY = 24;
@@ -240,7 +240,7 @@ export function buildGraphLayout(
     );
     const height = 56 + slots * (GRAPH_NODE_HEIGHT + 22);
     lanes.push({ agent, y: laneY, height });
-    for (const [rank, items] of byRank) {
+    byRank.forEach((items, rank) => {
       items.forEach((item, slot) => {
         positioned.push({
           ...item,
@@ -249,7 +249,7 @@ export function buildGraphLayout(
           y: laneY + 46 + slot * (GRAPH_NODE_HEIGHT + 22),
         });
       });
-    }
+    });
     laneY += height + 18;
   }
   const maxRank = Math.max(0, ...Array.from(ranks.values()));
