@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from tempfile import SpooledTemporaryFile
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query, Response
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from onyx.auth.permissions import require_permission
@@ -23,6 +26,10 @@ from onyx.db.enums import Permission
 from onyx.db.models import AnswerGraphNode, AnswerGraphRun, User
 from onyx.error_handling.error_codes import OnyxErrorCode
 from onyx.error_handling.exceptions import OnyxError
+from onyx.server.manage.answer_graph.markdown_report import (
+    MarkdownExportTooLarge,
+    write_answer_graph_markdown,
+)
 from onyx.server.manage.answer_graph.models import (
     AnswerGraphEdgePage,
     AnswerGraphEdgeView,
@@ -38,8 +45,8 @@ from onyx.utils.logger import setup_logger
 logger = setup_logger(__name__)
 
 admin_router = APIRouter(prefix="/admin/answer-graphs")
-_MAX_PDF_NODES = 2000
-_MAX_PDF_EDGES = 10000
+_MAX_EXPORT_NODES = 2000
+_MAX_EXPORT_EDGES = 10000
 
 
 def _no_store(response: Response) -> None:
@@ -169,12 +176,12 @@ def download_graph_pdf(
     if run.status in {"RUNNING", "FINALIZING"}:
         raise OnyxError(OnyxErrorCode.CONFLICT, "Answer graph is still running")
     nodes = list_answer_graph_nodes(
-        db_session, run_id, offset=0, limit=_MAX_PDF_NODES + 1
+        db_session, run_id, offset=0, limit=_MAX_EXPORT_NODES + 1
     )
     edges = list_answer_graph_edges(
-        db_session, run_id, offset=0, limit=_MAX_PDF_EDGES + 1
+        db_session, run_id, offset=0, limit=_MAX_EXPORT_EDGES + 1
     )
-    if len(nodes) > _MAX_PDF_NODES or len(edges) > _MAX_PDF_EDGES:
+    if len(nodes) > _MAX_EXPORT_NODES or len(edges) > _MAX_EXPORT_EDGES:
         raise OnyxError(
             OnyxErrorCode.PAYLOAD_TOO_LARGE, "Answer graph is too large for PDF"
         )
@@ -186,6 +193,69 @@ def download_graph_pdf(
     _no_store(response)
     response.headers["Content-Disposition"] = (
         f'attachment; filename="answer-execution-{run.assistant_message_id}.pdf"'
+    )
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    return response
+
+
+@admin_router.get("/{run_id}/markdown")
+def download_graph_markdown(
+    run_id: UUID,
+    user: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
+    db_session: Session = Depends(get_session),
+) -> Response:
+    run = _visible_run(db_session, run_id)
+    if run.status in {"RUNNING", "FINALIZING"}:
+        raise OnyxError(OnyxErrorCode.CONFLICT, "Answer graph is still running")
+    nodes = list_answer_graph_nodes(
+        db_session, run_id, offset=0, limit=_MAX_EXPORT_NODES + 1
+    )
+    edges = list_answer_graph_edges(
+        db_session, run_id, offset=0, limit=_MAX_EXPORT_EDGES + 1
+    )
+    if len(nodes) > _MAX_EXPORT_NODES or len(edges) > _MAX_EXPORT_EDGES:
+        raise OnyxError(
+            OnyxErrorCode.PAYLOAD_TOO_LARGE, "Answer graph is too large for export"
+        )
+
+    def load_parts(node: AnswerGraphNode) -> dict[str, tuple[object, str]]:
+        payloads = get_answer_graph_node_payloads(db_session, run_id, node.node_id)
+        return {
+            part: _part(
+                payloads.get(part),
+                run_id=run_id,
+                node_id=node.node_id,
+                part=part,
+                capture_status=node.capture_status,
+            )
+            for part in ("input", "output", "reasoning")
+        }
+
+    output = SpooledTemporaryFile(max_size=1024 * 1024, mode="w+b")
+    try:
+        write_answer_graph_markdown(run, nodes, edges, load_parts, output)
+        record_answer_graph_access(
+            db_session, run_id=run_id, user_id=user.id, action="markdown_export"
+        )
+    except MarkdownExportTooLarge as exc:
+        output.close()
+        raise OnyxError(OnyxErrorCode.PAYLOAD_TOO_LARGE, str(exc)) from exc
+    except Exception:
+        output.close()
+        raise
+    output.seek(0)
+
+    def chunks() -> Iterator[bytes]:
+        try:
+            while data := output.read(64 * 1024):
+                yield data
+        finally:
+            output.close()
+
+    response = StreamingResponse(chunks(), media_type="text/markdown; charset=utf-8")
+    _no_store(response)
+    response.headers["Content-Disposition"] = (
+        f'attachment; filename="answer-execution-{run.assistant_message_id}.md"'
     )
     response.headers["X-Content-Type-Options"] = "nosniff"
     return response

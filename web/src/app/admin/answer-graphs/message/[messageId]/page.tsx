@@ -198,8 +198,10 @@ export default function AnswerGraphPage({
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [zoom, setZoom] = useState(1);
   const [search, setSearch] = useState("");
-  const [pdfLoading, setPdfLoading] = useState(false);
-  const [pdfError, setPdfError] = useState<string | null>(null);
+  const [downloading, setDownloading] = useState<"pdf" | "markdown" | null>(
+    null
+  );
+  const [downloadError, setDownloadError] = useState<string | null>(null);
   const graphContainerRef = useRef<HTMLDivElement>(null);
   const [viewport, setViewport] = useState({
     left: 0,
@@ -310,28 +312,38 @@ export default function AnswerGraphPage({
       behavior: "smooth",
     });
   };
-  const downloadPdf = async () => {
-    if (!runId || pdfLoading) return;
-    setPdfLoading(true);
-    setPdfError(null);
+  const downloadExport = async (format: "pdf" | "markdown") => {
+    if (!runId || downloading) return;
+    setDownloading(format);
+    setDownloadError(null);
     try {
-      const response = await fetch(`/api/admin/answer-graphs/${runId}/pdf`, {
-        cache: "no-store",
-      });
-      if (!response.ok)
-        throw new Error(`PDF download failed (${response.status}).`);
+      const response = await fetch(
+        `/api/admin/answer-graphs/${runId}/${format}`,
+        { cache: "no-store" }
+      );
+      if (!response.ok) {
+        const failure = (await response.json().catch(() => null)) as {
+          detail?: string;
+        } | null;
+        throw new Error(
+          failure?.detail ||
+            `${format.toUpperCase()} download failed (${response.status}).`
+        );
+      }
       const url = URL.createObjectURL(await response.blob());
       const link = document.createElement("a");
       link.href = url;
-      link.download = `answer-execution-${messageId}.pdf`;
+      link.download = `answer-execution-${messageId}.${format === "markdown" ? "md" : "pdf"}`;
       link.click();
       window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
     } catch (failure) {
-      setPdfError(
-        failure instanceof Error ? failure.message : "Could not download PDF."
+      setDownloadError(
+        failure instanceof Error
+          ? failure.message
+          : "Could not download report."
       );
     } finally {
-      setPdfLoading(false);
+      setDownloading(null);
     }
   };
 
@@ -359,13 +371,29 @@ export default function AnswerGraphPage({
               size="sm"
               prominence="secondary"
               disabled={
-                pdfLoading ||
+                downloading !== null ||
                 run?.status === "RUNNING" ||
                 run?.status === "FINALIZING"
               }
-              onClick={downloadPdf}
+              onClick={() => downloadExport("pdf")}
             >
-              {pdfLoading ? "Preparing PDF…" : "Download PDF"}
+              {downloading === "pdf" ? "Preparing PDF…" : "Download PDF map"}
+            </Button>
+          )}
+          {runId && (
+            <Button
+              size="sm"
+              prominence="secondary"
+              disabled={
+                downloading !== null ||
+                run?.status === "RUNNING" ||
+                run?.status === "FINALIZING"
+              }
+              onClick={() => downloadExport("markdown")}
+            >
+              {downloading === "markdown"
+                ? "Preparing Markdown…"
+                : "Download detailed Markdown"}
             </Button>
           )}
           <Button
@@ -393,7 +421,7 @@ export default function AnswerGraphPage({
         <p>This answer predates graph capture or its trace was unavailable.</p>
       )}
       {error && <p role="alert">{error}</p>}
-      {pdfError && <p role="alert">{pdfError}</p>}
+      {downloadError && <p role="alert">{downloadError}</p>}
       {runId && (
         <div className="flex min-h-0 flex-1 gap-4">
           <div

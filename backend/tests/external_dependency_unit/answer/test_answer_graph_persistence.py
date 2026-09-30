@@ -73,7 +73,11 @@ def test_persisted_answer_graph_follows_reserved_message(
             ) as input_step:
                 input_step.output_value = {"ready": True}
             with graph_step("search.bm25", {"query": "rule"}) as search_step:
-                search_step.output_value = {"hits": [1, 2], "body": "a" * 70000}
+                search_step.output_value = {
+                    "hits": [1, 2],
+                    "chunks": [{"text": "Türkçe gümrük chunk içeriği"}],
+                    "body": "a" * 70000 + "END_OF_CAPTURED_OUTPUT",
+                }
         record_final_answer_message(assistant_message.id)
         db_session.expire_all()
         run = get_answer_graph_run_by_message(db_session, assistant_message.id)
@@ -134,7 +138,9 @@ def test_persisted_answer_graph_follows_reserved_message(
         search_detail = client.get(
             f"/admin/answer-graphs/{run.id}/nodes/{search_node.node_id}"
         )
-        assert search_detail.json()["output"]["body"] == "a" * 70000
+        assert search_detail.json()["output"]["body"] == (
+            "a" * 70000 + "END_OF_CAPTURED_OUTPUT"
+        )
         pdf_response = client.get(f"/admin/answer-graphs/{run.id}/pdf")
         assert pdf_response.status_code == 200
         assert pdf_response.headers["content-type"] == "application/pdf"
@@ -145,6 +151,15 @@ def test_persisted_answer_graph_follows_reserved_message(
         )
         assert "search.bm25" in pdf_text
         assert "data from" in pdf_text
+        markdown_response = client.get(f"/admin/answer-graphs/{run.id}/markdown")
+        assert markdown_response.status_code == 200
+        assert markdown_response.headers["content-type"].startswith("text/markdown")
+        assert markdown_response.headers["cache-control"] == "private, no-store"
+        assert "```mermaid\nflowchart LR" in markdown_response.text
+        assert "Türkçe gümrük chunk içeriği" in markdown_response.text
+        assert "END_OF_CAPTURED_OUTPUT" in markdown_response.text
+        assert "[REDACTED]" in markdown_response.text
+        assert "should-hide" not in markdown_response.text
         run.time_created = datetime.now(timezone.utc) - timedelta(days=31)
         db_session.commit()
         assert prune_expired_answer_graphs(db_session, batch_size=1) == (0, 3)
