@@ -37,7 +37,36 @@ class InsertionOrder(BaseModel):
     after_article_no: str | None = None
     after_chunk_id: str | None
     before_chunk_id: str | None
+    after_source_sha256: str | None = None
+    before_source_sha256: str | None = None
     position: int = Field(ge=0)
+
+
+def reconcile_insertion_order(
+    reviewed: InsertionOrder, current: InsertionOrder
+) -> InsertionOrder:
+    """Rebase an insertion only when its reviewed structural boundary survives."""
+    identity_fields = (
+        "article_no",
+        "paragraph_no",
+        "clause_label",
+        "after_article_no",
+        "after_chunk_id",
+        "before_chunk_id",
+    )
+    if any(
+        getattr(reviewed, field) != getattr(current, field) for field in identity_fields
+    ):
+        raise ValueError(
+            "Insertion source order changed after review; reanalyze before approval"
+        )
+    for field in ("after_source_sha256", "before_source_sha256"):
+        expected = getattr(reviewed, field)
+        if expected is not None and expected != getattr(current, field):
+            raise ValueError(
+                "Insertion source order changed after review; reanalyze before approval"
+            )
+    return current
 
 
 def plan_insertion(
@@ -128,6 +157,8 @@ def plan_insertion(
         clause_label=clause_label,
         after_chunk_id=after.id if after else None,
         before_chunk_id=before.id if before else None,
+        after_source_sha256=after.source_sha256 if after else None,
+        before_source_sha256=before.source_sha256 if before else None,
         position=position,
     )
 
@@ -216,6 +247,8 @@ def _plan_article_insertion(
         after_article_no=after_article_no,
         after_chunk_id=after.id if after else None,
         before_chunk_id=before.id if before else None,
+        after_source_sha256=after.source_sha256 if after else None,
+        before_source_sha256=before.source_sha256 if before else None,
         position=before.position if before else scoped[-1].position + 1,
     )
 

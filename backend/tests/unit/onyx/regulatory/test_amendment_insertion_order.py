@@ -1,6 +1,10 @@
 import pytest
 
-from onyx.regulatory.amendments.insertion_order import OrderMember, plan_insertion
+from onyx.regulatory.amendments.insertion_order import (
+    OrderMember,
+    plan_insertion,
+    reconcile_insertion_order,
+)
 
 
 def member(
@@ -70,6 +74,80 @@ def test_order_proof_detects_a_new_concurrent_sibling() -> None:
         clause_label="c",
     )
     assert first.baseline_sha256 != second.baseline_sha256
+
+
+def test_unrelated_change_does_not_invalidate_reviewed_insertion() -> None:
+    original = [
+        member("unrelated", 0, "7", "1"),
+        member("parent", 1, "8", "3").model_copy(
+            update={"source_sha256": "parent-source"}
+        ),
+        member("next", 2, "9", "1").model_copy(update={"source_sha256": "next-source"}),
+    ]
+    reviewed = plan_insertion(
+        original, article_no="8", paragraph_no="4", clause_label=None
+    )
+    current = plan_insertion(
+        [original[0].model_copy(update={"source_sha256": "changed"}), *original[1:]],
+        article_no="8",
+        paragraph_no="4",
+        clause_label=None,
+    )
+    assert reviewed.baseline_sha256 != current.baseline_sha256
+    assert reconcile_insertion_order(reviewed, current) == current
+    legacy = reviewed.model_copy(
+        update={"after_source_sha256": None, "before_source_sha256": None}
+    )
+    assert reconcile_insertion_order(legacy, current) == current
+
+
+def test_prior_insertion_rebases_position_but_keeps_reviewed_boundary() -> None:
+    original = [member("parent", 1, "8", "3"), member("next", 2, "9", "1")]
+    reviewed = plan_insertion(
+        original, article_no="8", paragraph_no="4", clause_label=None
+    )
+    current = plan_insertion(
+        [
+            member("earlier", 0, "7", "1"),
+            *[
+                row.model_copy(update={"position": row.position + 1})
+                for row in original
+            ],
+        ],
+        article_no="8",
+        paragraph_no="4",
+        clause_label=None,
+    )
+    assert current.position == reviewed.position + 1
+    assert reconcile_insertion_order(reviewed, current) == current
+
+
+def test_changed_reviewed_boundary_still_requires_new_review() -> None:
+    original = [
+        member("parent", 1, "8", "3").model_copy(
+            update={"source_sha256": "old-source"}
+        ),
+        member("next", 2, "9", "1"),
+    ]
+    reviewed = plan_insertion(
+        original, article_no="8", paragraph_no="4", clause_label=None
+    )
+    current = plan_insertion(
+        [original[0].model_copy(update={"source_sha256": "new-source"}), original[1]],
+        article_no="8",
+        paragraph_no="4",
+        clause_label=None,
+    )
+    with pytest.raises(ValueError, match="changed after review"):
+        reconcile_insertion_order(reviewed, current)
+    moved = plan_insertion(
+        [original[0], member("different", 2, "9", "1")],
+        article_no="8",
+        paragraph_no="4",
+        clause_label=None,
+    )
+    with pytest.raises(ValueError, match="changed after review"):
+        reconcile_insertion_order(reviewed, moved)
 
 
 def test_unknown_parent_is_not_placed_at_the_end_of_the_file() -> None:

@@ -1101,10 +1101,16 @@ def amendment_writer_target(
                     version_key=f"amendment:{proposal.id}:{index}",
                 )
                 for index, change in enumerate(changes)
+                if change["new_chunk_draft"].get("insertion_order") is None
             ]
             return file_id, canonical_ids
         draft = proposal.new_chunk_draft
         file_id = UUID(draft["user_file_id"])
+        if (
+            draft.get("insertion_order") is not None
+            and not proposal.applied_new_chunk_id
+        ):
+            return file_id, []
         return file_id, [
             proposal.applied_new_chunk_id
             or make_regulatory_chunk_id(

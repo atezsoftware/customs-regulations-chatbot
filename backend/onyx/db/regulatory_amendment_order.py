@@ -11,6 +11,7 @@ from onyx.regulatory.amendments.insertion_order import (
     OrderMember,
     is_direct_article_opening,
     plan_insertion,
+    reconcile_insertion_order,
 )
 
 
@@ -79,7 +80,7 @@ def load_amendment_order(session: Session, user_file_id: UUID) -> list[OrderMemb
 
 def validate_insertion_order(
     session: Session, user_file_id: UUID, order: InsertionOrder
-) -> None:
+) -> InsertionOrder:
     current = plan_insertion(
         load_amendment_order(session, user_file_id),
         article_no=order.article_no,
@@ -87,10 +88,7 @@ def validate_insertion_order(
         clause_label=order.clause_label,
         after_article_no=order.after_article_no,
     )
-    if current != order:
-        raise ValueError(
-            "Insertion source order changed after review; reanalyze before approval"
-        )
+    return reconcile_insertion_order(order, current)
 
 
 def apply_insertion_order(

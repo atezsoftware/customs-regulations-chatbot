@@ -1019,25 +1019,20 @@ def recover_stale_amendment_proposal_approvals(
             manifest.get("amendment_proposal_id"),
             manifest.get("baseline_origin_proposal_id"),
         )
-        if proposal.applied_new_chunk_id or retained_writer:
+        from onyx.regulatory.approval_execution_state import read_execution_state
+
+        state = read_execution_state(proposal.approval_error)
+        if proposal.applied_new_chunk_id or retained_writer or state is None:
             proposal.updated_at = recovered_at
             resume_ids.append(proposal.id)
             continue
         proposal.status = AmendmentProposalStatus.PENDING.value
         proposal.decided_by = None
         proposal.decided_at = None
-        from onyx.regulatory.approval_execution_state import (
-            ApprovalExecutionState,
-            read_execution_state,
-        )
-
-        state = read_execution_state(proposal.approval_error)
-        if state is None or state.state != "failed":
-            proposal.approval_error = (
-                (state or ApprovalExecutionState.running("baseline", attempt=1))
-                .failed(RuntimeError("worker interrupted"))
-                .model_dump_json()
-            )
+        if state.state != "failed":
+            proposal.approval_error = state.failed(
+                RuntimeError("worker interrupted")
+            ).model_dump_json()
         proposal.updated_at = recovered_at
     db_session.commit()
     return resume_ids
@@ -1274,8 +1269,12 @@ def _approve_multi_chunk_proposal(
     }
     if len(insertions) > 1:
         raise ValueError("Multiple insertions require one coordinated ordering review")
-    for order in insertions.values():
-        validate_insertion_order(db_session, publication_owner.user_file_id, order)
+    insertions = {
+        index: validate_insertion_order(
+            db_session, publication_owner.user_file_id, order
+        )
+        for index, order in insertions.items()
+    }
     target_ids = [
         str(change["old_chunk_id"])
         for change in changes
@@ -1414,6 +1413,9 @@ def _approve_multi_chunk_proposal(
             change["new_chunk_draft"],
             old_chunk_snapshot=snapshot,
         )
+        if index in insertions:
+            draft["position"] = insertions[index].position
+            draft["insertion_order"] = insertions[index].model_dump(mode="json")
         validate_explicit_replacement_texts(
             list(change.get("instruction_texts") or []), draft["text"]
         )
@@ -1681,7 +1683,9 @@ def approve_amendment_proposal(
             raise ValueError(
                 "Insertion requires file publication ownership and a new target"
             )
-        validate_insertion_order(db_session, user_file_id, insertion)
+        insertion = validate_insertion_order(db_session, user_file_id, insertion)
+        draft["position"] = insertion.position
+        draft["insertion_order"] = insertion.model_dump(mode="json")
     today = datetime.date.today()
     start_date_str = draft.get("effective_start_date")
     end_date_str = draft.get("effective_end_date")

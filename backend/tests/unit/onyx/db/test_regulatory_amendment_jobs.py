@@ -25,12 +25,13 @@ from onyx.db.regulatory_amendments import (
     reset_failed_batch_for_retry,
 )
 from onyx.regulatory.amendments.models import ProposalDraft
+from onyx.regulatory.approval_execution_state import ApprovalExecutionState
 
 NOW = datetime.datetime(2026, 8, 27, 12, 0, tzinfo=datetime.timezone.utc)
 
 
-def test_stale_approval_recovery_resets_legacy_and_resumes_applied() -> None:
-    legacy = SimpleNamespace(
+def test_stale_approval_recovery_requeues_delivery_and_resumes_applied() -> None:
+    queued = SimpleNamespace(
         id=70,
         new_chunk_draft={"user_file_id": str(uuid4())},
         approval_indexing_job_id=None,
@@ -53,11 +54,11 @@ def test_stale_approval_recovery_resets_legacy_and_resumes_applied() -> None:
         updated_at=NOW - datetime.timedelta(hours=2),
     )
     db_session = MagicMock()
-    db_session.scalars.return_value.all.return_value = [legacy, applied]
+    db_session.scalars.return_value.all.return_value = [queued, applied]
     from onyx.db.models import AmendmentProposal
 
     db_session.get.side_effect = lambda model, identifier, **_kw: (
-        {70: legacy, 71: applied}.get(identifier)
+        {70: queued, 71: applied}.get(identifier)
         if model is AmendmentProposal
         else None
     )
@@ -68,13 +69,45 @@ def test_stale_approval_recovery_resets_legacy_and_resumes_applied() -> None:
         recovered_at=NOW,
     )
 
-    assert resume_ids == [71]
-    assert legacy.status == AmendmentProposalStatus.PENDING.value
-    assert legacy.decided_by is None
+    assert resume_ids == [70, 71]
+    assert queued.status == AmendmentProposalStatus.APPROVING.value
+    assert queued.decided_by is not None
     assert applied.status == AmendmentProposalStatus.APPROVING.value
-    assert legacy.updated_at == NOW
+    assert queued.updated_at == NOW
     assert applied.updated_at == NOW
     db_session.commit.assert_called_once_with()
+
+
+def test_stale_started_approval_releases_review_after_worker_loss() -> None:
+    proposal = SimpleNamespace(
+        id=72,
+        new_chunk_draft={"user_file_id": str(uuid4())},
+        approval_indexing_job_id=None,
+        status=AmendmentProposalStatus.APPROVING.value,
+        applied_new_chunk_id=None,
+        decided_by=uuid4(),
+        decided_at=None,
+        approval_error=ApprovalExecutionState.running(
+            "baseline", attempt=1
+        ).model_dump_json(),
+        updated_at=NOW - datetime.timedelta(hours=2),
+    )
+    session = MagicMock()
+    session.scalars.return_value.all.return_value = [proposal]
+    from onyx.db.models import AmendmentProposal
+
+    session.get.side_effect = lambda model, _id, **_kw: (
+        proposal if model is AmendmentProposal else None
+    )
+
+    assert not recover_stale_amendment_proposal_approvals(
+        session,
+        stale_before=NOW - datetime.timedelta(minutes=10),
+        recovered_at=NOW,
+    )
+    assert proposal.status == AmendmentProposalStatus.PENDING.value
+    assert proposal.decided_by is None
+    assert '"code":"baseline_interrupted"' in proposal.approval_error
 
 
 def test_failed_projection_retry_reuses_applied_chunk() -> None:
