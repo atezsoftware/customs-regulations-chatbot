@@ -82,7 +82,10 @@ from onyx.db.federated import (
     list_federated_connector_oauth_tokens,
 )
 from onyx.db.models import SearchSettings, User
-from onyx.db.regulatory_chunks import get_visible_regulatory_chunk_ids
+from onyx.db.regulatory_chunks import (
+    count_regulatory_seed_file_chunks,
+    get_visible_regulatory_chunk_ids,
+)
 from onyx.db.reranking import get_reranker_configuration
 from onyx.db.search_settings import get_current_search_settings
 from onyx.db.slack_bot import fetch_slack_bots
@@ -195,6 +198,7 @@ _REGULATORY_PROVISION_OVERFETCH_FACTOR = 4
 _REGULATORY_PROVISION_MAX_CANDIDATES = 128
 _REGULATORY_PROVISION_FAMILY_SEED_LIMIT = 4
 _REGULATORY_RERANK_CANDIDATE_LIMIT = 48
+_REGULATORY_FAST_RERANK_PACKET_FILE_CHUNK_LIMIT = 6_000
 _REGULATORY_KEYWORD_QUERY_HYBRID_ALPHA = 0.0
 _REGULATORY_SEARCH_DESCRIPTION = (
     "Search administrator-indexed regulatory chunks for evidence. You decide "
@@ -2377,16 +2381,68 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
         rerank_packets = None
         rerank_input_chunks = fused_candidates
         if regulatory_chunks_only and effective_reranker_config.enabled:
-            with get_session_with_current_tenant() as rerank_packet_session:
-                rerank_packets = build_regulatory_rerank_packets(
-                    rerank_packet_session,
-                    fused_candidates,
-                    query=rerank_query,
-                    as_of_date=(
-                        effective_filters.as_of_date if effective_filters else None
+            fast_profile = bool(
+                self.user_selected_filters
+                and self.user_selected_filters.regulatory_workflow_mode == "fast"
+            )
+            source_chunk_count: int | None = None
+            use_packets = True
+            with graph_step(
+                "search.rerank_packet_context",
+                {
+                    "query": llm_queries[0],
+                    "fast_profile": fast_profile,
+                    "file_chunk_limit": (
+                        _REGULATORY_FAST_RERANK_PACKET_FILE_CHUNK_LIMIT
+                        if fast_profile
+                        else None
                     ),
+                },
+            ) as packet_step:
+                if fast_profile:
+                    try:
+                        with get_session_with_current_tenant() as count_session:
+                            source_chunk_count = count_regulatory_seed_file_chunks(
+                                count_session,
+                                [
+                                    chunk.regulatory_chunk_id
+                                    for chunk in fused_candidates
+                                    if chunk.regulatory_chunk_id is not None
+                                ],
+                            )
+                        use_packets = (
+                            source_chunk_count
+                            <= _REGULATORY_FAST_RERANK_PACKET_FILE_CHUNK_LIMIT
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Rerank packet size check failed; using atomic chunks"
+                        )
+                        use_packets = False
+                if use_packets:
+                    with get_session_with_current_tenant() as rerank_packet_session:
+                        rerank_packets = build_regulatory_rerank_packets(
+                            rerank_packet_session,
+                            fused_candidates,
+                            query=rerank_query,
+                            as_of_date=(
+                                effective_filters.as_of_date
+                                if effective_filters
+                                else None
+                            ),
+                        )
+                    rerank_input_chunks = [
+                        packet.candidate for packet in rerank_packets
+                    ]
+                packet_step.summary = (
+                    f"{'packets' if use_packets else 'atomic fallback'}; "
+                    f"{source_chunk_count if source_chunk_count is not None else 'unknown'} file chunks"
                 )
-            rerank_input_chunks = [packet.candidate for packet in rerank_packets]
+                packet_step.output_value = {
+                    "mode": "packets" if use_packets else "atomic_fallback",
+                    "source_chunk_count": source_chunk_count,
+                    "rerank_candidate_count": len(rerank_input_chunks),
+                }
         rerank_result = rerank_chunks(
             query=rerank_query,
             chunks=rerank_input_chunks,
