@@ -12,23 +12,6 @@ from tests.external_dependency_unit.regulatory.test_amendment_sources import (
 from tests.external_dependency_unit.regulatory.test_annex_baseline import _chunk, _file
 
 
-def test_rerank_source_count_deduplicates_seed_files(source_session: Session) -> None:
-    from onyx.db.regulatory_chunks import count_regulatory_seed_file_chunks
-
-    group = DocumentSet(name=str(uuid4()), description="", is_up_to_date=True)
-    source_session.add(group)
-    source_session.flush()
-    first_file = _file(source_session, group)
-    second_file = _file(source_session, group)
-    first = _chunk(source_session, first_file, 0, "first")
-    _chunk(source_session, first_file, 1, "second")
-    other = _chunk(source_session, second_file, 0, "other")
-
-    assert count_regulatory_seed_file_chunks(source_session, []) == 0
-    assert count_regulatory_seed_file_chunks(source_session, [first.id, first.id]) == 2
-    assert count_regulatory_seed_file_chunks(source_session, [first.id, other.id]) == 3
-
-
 @pytest.mark.parametrize("case", ["own_asset", "changed_asset", "changed_parent"])
 def test_frozen_image_keeps_its_own_asset_for_unchanged_text_parent(
     source_session: Session, case: str

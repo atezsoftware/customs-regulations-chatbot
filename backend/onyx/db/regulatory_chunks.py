@@ -2320,28 +2320,6 @@ def get_bounded_same_provision_siblings(
     )
 
 
-def count_regulatory_seed_file_chunks(
-    db_session: Session, seed_chunk_ids: Sequence[str]
-) -> int:
-    """Estimate the file-wide work required before building rerank packets."""
-    unique_ids = tuple(dict.fromkeys(seed_chunk_ids))
-    if not unique_ids:
-        return 0
-    file_ids = (
-        select(RegulatoryChunk.user_file_id)
-        .where(RegulatoryChunk.id.in_(unique_ids))
-        .distinct()
-    )
-    return int(
-        db_session.scalar(
-            select(func.count())
-            .select_from(RegulatoryChunk)
-            .where(RegulatoryChunk.user_file_id.in_(file_ids))
-        )
-        or 0
-    )
-
-
 def get_bounded_adjacent_provisions(
     db_session: Session,
     seed_chunk_ids: Sequence[str],
