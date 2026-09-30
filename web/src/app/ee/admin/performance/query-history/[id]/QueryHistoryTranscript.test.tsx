@@ -2,6 +2,12 @@ import { fireEvent, render, screen } from "@testing-library/react";
 import type { MessageSnapshot } from "../../usage/types";
 import QueryHistoryTranscript from "./QueryHistoryTranscript";
 
+let mockIsAdmin = false;
+
+jest.mock("@/providers/UserProvider", () => ({
+  useUser: () => ({ isAdmin: mockIsAdmin }),
+}));
+
 const messages: MessageSnapshot[] = [
   {
     id: 1,
@@ -37,6 +43,11 @@ const messages: MessageSnapshot[] = [
 ];
 
 describe("QueryHistoryTranscript", () => {
+  afterEach(() => {
+    mockIsAdmin = false;
+    jest.restoreAllMocks();
+  });
+
   it("renders a read-only conversation with chat-style user and assistant messages", () => {
     render(<QueryHistoryTranscript messages={messages} />);
 
@@ -117,5 +128,18 @@ describe("QueryHistoryTranscript", () => {
 
     expect(screen.getByText("Like")).toBeInTheDocument();
     expect(screen.getByText("Clear and helpful.")).toBeInTheDocument();
+  });
+
+  it("offers admins a graph link for each assistant answer", () => {
+    mockIsAdmin = true;
+    const open = jest.spyOn(window, "open").mockImplementation(() => null);
+    render(<QueryHistoryTranscript messages={messages} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Execution graph" }));
+    expect(open).toHaveBeenCalledWith(
+      "/admin/answer-graphs/message/2",
+      "_blank",
+      "noopener,noreferrer"
+    );
   });
 });

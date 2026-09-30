@@ -32,7 +32,7 @@ from onyx.document_index.publication_models import (
 )
 from onyx.regulatory.amendments.annexes.models import AnnexTemporalProjection
 
-_PUBLIC_TEMPORAL_READ_BATCH_SIZE = 256
+_PUBLIC_TEMPORAL_READ_BATCH_SIZE = 512
 
 
 def protected_file_ids(session: Session, file_ids: tuple[UUID, ...]) -> frozenset[UUID]:

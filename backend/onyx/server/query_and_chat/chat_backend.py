@@ -68,6 +68,7 @@ from onyx.db.llm import (
 )
 from onyx.db.models import ChatMessage, ChatSessionSharedStatus, Persona, User
 from onyx.db.persona import get_persona_by_id
+from onyx.db.tools import get_tools_by_ids
 from onyx.db.usage import UsageType, increment_usage
 from onyx.db.user_file import get_file_id_by_user_file_id
 from onyx.error_handling.error_codes import OnyxErrorCode
@@ -441,11 +442,22 @@ def get_chat_session(
     # Every assistant message might have a set of tool calls associated with it, these need to be replayed back for the frontend
     # Each list is the set of tool calls for the given assistant message.
     replay_packet_lists: list[list[Packet]] = []
+    tool_ids = {
+        tool_call.tool_id
+        for msg in session_messages
+        if msg.message_type == MessageType.ASSISTANT
+        for tool_call in msg.tool_calls
+    }
+    tools_by_id = {
+        tool.id: tool for tool in get_tools_by_ids(list(tool_ids), db_session)
+    }
     for msg in session_messages:
         if msg.message_type == MessageType.ASSISTANT:
             replay_packet_lists.append(
                 translate_assistant_message_to_packets(
-                    chat_message=msg, db_session=db_session
+                    chat_message=msg,
+                    db_session=db_session,
+                    tools_by_id=tools_by_id,
                 )
             )
             # msg_packet_list.append(Packet(ind=end_step_nr, obj=OverallStop()))
@@ -453,10 +465,11 @@ def get_chat_session(
     from onyx.db.regulatory_chat_reads import (
         finalize_message_publication_read,
         message_publication_available,
+        message_publication_read_needs_finalization,
     )
 
     for index, message in enumerate(session_messages):
-        if message.publication_read is not None:
+        if message_publication_read_needs_finalization(message):
             finalize_message_publication_read(message.id)
             if not message_publication_available(message):
                 chat_message_details[index] = (

@@ -14,7 +14,7 @@ from onyx.db.chat import (
     get_db_search_doc_by_id,
     translate_db_search_doc_to_saved_search_doc,
 )
-from onyx.db.models import ChatMessage
+from onyx.db.models import ChatMessage, Tool
 from onyx.db.tools import get_tool_by_id
 from onyx.deep_research.dr_mock_tools import (
     RESEARCH_AGENT_IN_CODE_ID,
@@ -536,6 +536,7 @@ def create_search_packets(
 def translate_assistant_message_to_packets(
     chat_message: ChatMessage,
     db_session: Session,
+    tools_by_id: dict[int, Tool] | None = None,
 ) -> list[Packet]:
     """
     Translates an assistant message and tool calls to packet format.
@@ -594,7 +595,9 @@ def translate_assistant_message_to_packets(
             for tool_call in tool_calls_in_turn:
                 # Here we do a try because some tools may get deleted before the session is reloaded.
                 try:
-                    tool = get_tool_by_id(tool_call.tool_id, db_session)
+                    tool = (tools_by_id or {}).get(tool_call.tool_id)
+                    if tool is None:
+                        tool = get_tool_by_id(tool_call.tool_id, db_session)
                     if tool.in_code_tool_id == RESEARCH_AGENT_IN_CODE_ID:
                         research_agent_count += 1
 
@@ -842,8 +845,11 @@ def translate_assistant_message_to_packets(
     citation_info_list: list[CitationInfo] = []
 
     if citations:
+        related_search_docs = {doc.id: doc for doc in chat_message.search_docs}
         for citation_num, search_doc_id in citations.items():
-            search_doc = get_db_search_doc_by_id(search_doc_id, db_session)
+            search_doc = related_search_docs.get(search_doc_id)
+            if search_doc is None:
+                search_doc = get_db_search_doc_by_id(search_doc_id, db_session)
             if search_doc:
                 citation_info_list.append(
                     CitationInfo(

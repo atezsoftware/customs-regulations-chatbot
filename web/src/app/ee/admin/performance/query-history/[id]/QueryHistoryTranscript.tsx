@@ -19,6 +19,7 @@ import {
 } from "@/refresh-components/Collapsible";
 import { FeedbackBadge } from "../FeedbackBadge";
 import type { MessageSnapshot } from "../../usage/types";
+import AnswerGraphLink from "@/app/app/message/messageComponents/AnswerGraphLink";
 import "@/app/app/message/custom-code-styles.css";
 
 interface QueryHistoryTranscriptProps {
@@ -244,6 +245,9 @@ function AssistantMessage({ message }: TranscriptMessageProps) {
       data-testid="query-history-assistant-message"
     >
       <AssistantMessageMarkdown content={message.message} />
+      <div className="flex justify-start">
+        <AnswerGraphLink messageId={message.id} />
+      </div>
       <ReferenceDocuments message={message} />
       {message.feedback_type && (
         <div className="flex flex-col items-start gap-1.5">

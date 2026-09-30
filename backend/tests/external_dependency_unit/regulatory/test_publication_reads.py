@@ -359,6 +359,7 @@ def test_saved_inflight_message_refuses_changed_sources_but_final_history_surviv
         finalize_message_publication_read,
         mark_message_publication_generated,
         message_publication_available,
+        message_publication_read_needs_finalization,
         stage_message_publication_read,
     )
     from onyx.regulatory.publication_reads import (
@@ -397,7 +398,17 @@ def test_saved_inflight_message_refuses_changed_sources_but_final_history_surviv
         assert not finalize_message_publication_read(complete_id)
         assert mark_message_publication_generated(complete_id)
         assert mark_message_publication_generated(pending_id)
+        with get_session_with_tenant(tenant_id="public") as session:
+            pending = session.get(ChatMessage, pending_id)
+            complete = session.get(ChatMessage, complete_id)
+            assert pending is not None and complete is not None
+            assert message_publication_read_needs_finalization(pending)
+            assert message_publication_read_needs_finalization(complete)
         assert finalize_message_publication_read(complete_id)
+        with get_session_with_tenant(tenant_id="public") as session:
+            complete = session.get(ChatMessage, complete_id)
+            assert complete is not None
+            assert not message_publication_read_needs_finalization(complete)
         authority.close_gate(owner)
         with get_session_with_tenant(tenant_id="public") as session:
             pending = session.get(ChatMessage, pending_id)

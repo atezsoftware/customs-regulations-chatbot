@@ -46,6 +46,14 @@ def finalize_message_publication_read(message_id: int) -> bool:
     return _advance_message_publication_read(message_id, finalize=True)
 
 
+def message_publication_read_needs_finalization(message: ChatMessage) -> bool:
+    """Avoid a locking DB round trip for reads that are already settled."""
+    if message.publication_read is None:
+        return False
+    state = MessagePublicationRead.model_validate(message.publication_read)
+    return state.generation_done and not state.finalized
+
+
 def _advance_message_publication_read(message_id: int, *, finalize: bool) -> bool:
     with get_session_with_current_tenant() as session:
         message = session.get(ChatMessage, message_id, with_for_update=True)
