@@ -120,6 +120,118 @@ def main() -> None:
                         default=str,
                     ),
                 )
+                if proposal["id"] == 470:
+                    for index, change in enumerate(proposal["chunk_changes"] or []):
+                        old = change.get("old_chunk_snapshot") or {}
+                        new = change.get("new_chunk_draft") or {}
+                        print(
+                            "CHANGE_470",
+                            json.dumps(
+                                {
+                                    "index": index,
+                                    "old_id": change.get("old_chunk_id"),
+                                    "old_file": old.get("user_file_id"),
+                                    "new_file": new.get("user_file_id"),
+                                    "old_position": old.get("position"),
+                                    "new_position": new.get("position"),
+                                    "old_sha256": hashlib.sha256(
+                                        str(old.get("text", "")).encode()
+                                    ).hexdigest(),
+                                    "new_sha256": hashlib.sha256(
+                                        str(new.get("text", "")).encode()
+                                    ).hexdigest(),
+                                    "heading": new.get("heading_path"),
+                                },
+                                ensure_ascii=False,
+                                default=str,
+                            ),
+                        )
+        manifest_row = connection.execute(
+            text(
+                "SELECT writer_manifest, writer_manifest_sha256 FROM "
+                "regulatory_file_publication WHERE user_file_id = "
+                "CAST(:file_id AS uuid)"
+            ),
+            {"file_id": "1e110f49-3814-4edd-9b08-f17b9f51eabe"},
+        ).one_or_none()
+        if manifest_row and manifest_row.writer_manifest:
+            from onyx.regulatory.writer_publication_models import WriterPublicationManifest
+            from onyx.document_index.publication_models import accepts_publication_projection
+            from onyx.regulatory.amendments.annexes.models import AnnexTemporalProjection
+
+            manifest = WriterPublicationManifest.model_validate(
+                manifest_row.writer_manifest
+            )
+            print(
+                "MANIFEST_460",
+                json.dumps(
+                    {
+                        "proposal_id": manifest.amendment_proposal_id,
+                        "sha256": manifest_row.writer_manifest_sha256,
+                        "bindings": len(manifest.bindings),
+                        "new_bindings": len(manifest.bindings)
+                        - len(manifest.previous_binding_ids),
+                        "indexes": [
+                            {
+                                "uuid": idx.index_uuid,
+                                "receipts": len(idx.encoder_receipts),
+                                "config_sha256": idx.embedding_config_sha256,
+                            }
+                            for idx in manifest.indexes
+                        ],
+                    },
+                ),
+            )
+            dependencies = sorted(
+                {
+                    identifier
+                    for binding in manifest.bindings
+                    if binding.derived_role == "hierarchical_aggregate"
+                    for identifier in binding.dependency_ids
+                }
+            )
+            if dependencies:
+                rows = connection.execute(
+                    text(
+                        "SELECT canonical_chunk_id, payload FROM "
+                        "regulatory_temporal_projection WHERE "
+                        "canonical_chunk_id = ANY(:ids) AND retired_at IS NULL"
+                    ),
+                    {"ids": dependencies},
+                )
+                failed = 0
+                for old_row in rows:
+                    prior = AnnexTemporalProjection.model_validate(old_row.payload)
+                    matching = [
+                        idx
+                        for idx in manifest.indexes
+                        if idx.index_uuid == prior.index.index_uuid
+                    ]
+                    for idx in matching:
+                        if not accepts_publication_projection(idx, prior.projection):
+                            failed += 1
+                            print(
+                                "RECEIPT_MISMATCH_460",
+                                json.dumps(
+                                    {
+                                        "dependency_id": old_row.canonical_chunk_id,
+                                        "index_uuid": idx.index_uuid,
+                                        "prior_type": type(prior.projection).__name__,
+                                        "prior_config_sha256": hashlib.sha256(
+                                            getattr(
+                                                prior.projection,
+                                                "embedding_config_json",
+                                                "",
+                                            ).encode()
+                                        ).hexdigest(),
+                                        "accepted_receipts": len(idx.encoder_receipts),
+                                    }
+                                ),
+                            )
+                            if failed >= 8:
+                                break
+                    if failed >= 8:
+                        break
     engine.dispose()
 
 
