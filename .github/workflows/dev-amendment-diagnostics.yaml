@@ -589,6 +589,7 @@ jobs:
           import json
           import os
           import re
+          from uuid import UUID
 
           # libpq makes every transaction read-only before any SQL is issued.
           os.environ["PGOPTIONS"] = (
@@ -613,8 +614,13 @@ jobs:
           start = datetime.datetime(2026, 10, 1, 8, 45, tzinfo=datetime.timezone.utc)
           end = datetime.datetime(2026, 10, 1, 9, 32, tzinfo=datetime.timezone.utc)
           oom = datetime.datetime(2026, 10, 1, 9, 25, 36, tzinfo=datetime.timezone.utc)
+          historical_run_id = UUID("67c509e2-8c19-47d4-9f94-7cec62a52319")
+          payload_operations = (
+              "search.vector", "search.bm25", "search.fusion", "internal_search"
+          )
           run_table = f'"{schema}"."answer_graph_run"'
           node_table = f'"{schema}"."answer_graph_node"'
+          payload_table = f'"{schema}"."answer_graph_payload"'
 
           def utc(value):
               return aware(value).astimezone(datetime.timezone.utc).isoformat() if value else None
@@ -672,6 +678,53 @@ jobs:
                           ).bindparams(bindparam("run_ids", expanding=True)), {
                               "run_ids": run_ids
                           }).mappings().all()
+                      if str(historical_run_id) not in {str(run_id) for run_id in run_ids}:
+                          raise RuntimeError("Known historical graph run missing from guarded window")
+                      payload_rows = connection.execute(text(
+                          "SELECT n.operation, count(*) AS payload_count, "
+                          "coalesce(sum(octet_length(p.ciphertext)), 0) AS ciphertext_bytes, "
+                          "coalesce(max(octet_length(p.ciphertext)), 0) AS max_ciphertext_bytes "
+                          f"FROM {run_table} AS r "
+                          f"JOIN {node_table} AS n ON n.run_id = r.id "
+                          f"JOIN {payload_table} AS p "
+                          "ON p.run_id = n.run_id AND p.node_id = n.node_id "
+                          "WHERE r.id = :historical_run_id AND r.tenant_id = :tenant "
+                          "AND r.time_created >= :start AND r.time_created < :end "
+                          "AND n.operation IN :operations AND p.part = 'output' "
+                          "GROUP BY n.operation"
+                      ).bindparams(bindparam("operations", expanding=True)), {
+                          **parameters,
+                          "historical_run_id": historical_run_id,
+                          "operations": payload_operations,
+                      }).mappings().all()
+              payload_summary = {
+                  operation: {
+                      "payload_count": 0,
+                      "ciphertext_bytes": 0,
+                      "max_ciphertext_bytes": 0,
+                  }
+                  for operation in payload_operations
+              }
+              for row in payload_rows:
+                  operation = row["operation"]
+                  if operation not in payload_summary:
+                      raise RuntimeError("Unexpected graph payload operation")
+                  payload_summary[operation] = {
+                      "payload_count": int(row["payload_count"]),
+                      "ciphertext_bytes": int(row["ciphertext_bytes"]),
+                      "max_ciphertext_bytes": int(row["max_ciphertext_bytes"]),
+                  }
+              payload_count = sum(item["payload_count"] for item in payload_summary.values())
+              payload_bytes = sum(item["ciphertext_bytes"] for item in payload_summary.values())
+              if (
+                  payload_count > 500
+                  or payload_bytes > 512 * 1024 * 1024
+                  or any(
+                      item["max_ciphertext_bytes"] > 16 * 1024 * 1024
+                      for item in payload_summary.values()
+                  )
+              ):
+                  raise RuntimeError("Historical graph output payload size cap exceeded")
               result = {
                   "window_start_utc": utc(start),
                   "window_end_utc": utc(end),
@@ -709,6 +762,7 @@ jobs:
                           row["ended_at"] is None or aware(row["ended_at"]) >= oom
                       ),
                   } for row in node_rows],
+                  "historical_run_output_payload_summary": payload_summary,
               }
               print("HISTORICAL_JSON=" + json.dumps(result, separators=(",", ":")))
           finally:
