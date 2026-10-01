@@ -767,13 +767,7 @@ def queue_amendment_proposal_approval(
             old_chunk_snapshot=stored_change.get("old_chunk_snapshot") or {},
         )
         old_snapshot = stored_change.get("old_chunk_snapshot") or {}
-        heading_only_dependent = (
-            index > 0
-            and len(stored_changes) > 1
-            and old_snapshot.get("heading_change") is not None
-            and old_snapshot.get("text") == stored_change["new_chunk_draft"].get("text")
-        )
-        if heading_only_dependent:
+        if _heading_only_dependent_change(stored_changes, index):
             if reviewed_draft["text"] != old_snapshot["text"]:
                 raise ValueError("Heading-only dependent chunk text cannot be changed")
         else:
@@ -801,6 +795,16 @@ def queue_amendment_proposal_approval(
     db_session.add(proposal)
     db_session.flush()
     return proposal
+
+
+def _heading_only_dependent_change(changes: list[dict[str, Any]], index: int) -> bool:
+    if index == 0 or len(changes) <= 1:
+        return False
+    change = changes[index]
+    old = change.get("old_chunk_snapshot") or {}
+    return old.get("heading_change") is not None and old.get("text") == change[
+        "new_chunk_draft"
+    ].get("text")
 
 
 def reset_amendment_proposal_approval(
@@ -1430,9 +1434,13 @@ def _approve_multi_chunk_proposal(
         if index in insertions:
             draft["position"] = insertions[index].position
             draft["insertion_order"] = insertions[index].model_dump(mode="json")
-        validate_explicit_replacement_texts(
-            list(change.get("instruction_texts") or []), draft["text"]
-        )
+        if _heading_only_dependent_change(changes, index):
+            if draft["text"] != snapshot["text"]:
+                raise ValueError("Heading-only dependent chunk text cannot be changed")
+        else:
+            validate_explicit_replacement_texts(
+                list(change.get("instruction_texts") or []), draft["text"]
+            )
         validate_added_article_draft(
             list(change.get("instruction_texts") or []),
             metadata=draft["metadata"],
