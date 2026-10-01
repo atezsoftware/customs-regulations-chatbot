@@ -80,6 +80,17 @@ def main() -> None:
                     default=str,
                 ),
             )
+            if batch["id"] == 299:
+                for event in batch["analysis_log"] or []:
+                    indices = event.get("indices") or []
+                    if 5 in indices or event.get("index") == 5:
+                        print("BATCH_299_INDEX_5", json.dumps(event, ensure_ascii=False, default=str))
+            if batch["id"] == 306:
+                print(
+                    "BATCH_306_SOURCE_MEMBER",
+                    "c7bed4e2-77a2-4609-bb52-3fdffcd15cb1"
+                    in batch["user_file_ids"],
+                )
             proposals = connection.execute(
                 text(
                     "SELECT id, instruction_index, instruction_text, status, "
@@ -373,6 +384,27 @@ def main() -> None:
             )
         for row in connection.execute(
             text(
+                "SELECT rc.id, rc.user_file_id, uf.name, rc.status, "
+                "rc.position, rc.text FROM regulatory_chunk rc JOIN user_file uf "
+                "ON uf.id=rc.user_file_id WHERE "
+                "rc.chunk_metadata->>'article_no' = '6/A' AND "
+                "(uf.name ILIKE '%dovizlerinin_turk_lirasina_donusum%' OR "
+                "uf.name ILIKE '%2023-5%') LIMIT 30"
+            )
+        ):
+            print(
+                "ARTICLE_6A_OTHER_FILE",
+                json.dumps(
+                    {"id": row.id, "file_id": str(row.user_file_id),
+                     "name": row.name, "status": row.status,
+                     "position": row.position,
+                     "text_sha256": hashlib.sha256(row.text.encode()).hexdigest(),
+                     "text_excerpt": row.text[:700]},
+                    ensure_ascii=False,
+                ),
+            )
+        for row in connection.execute(
+            text(
                 "SELECT id, name, status, chunk_count FROM user_file WHERE "
                 "name ILIKE '%2018%13%' OR name ILIKE '%gumruksuz%' OR "
                 "name ILIKE '%gümrüksüz%' LIMIT 100"
@@ -384,6 +416,26 @@ def main() -> None:
                     {"id": str(row.id), "name": row.name,
                      "status": row.status, "chunk_count": row.chunk_count},
                     ensure_ascii=False, default=str,
+                ),
+            )
+        for row in connection.execute(
+            text(
+                "SELECT id, position, status, chunk_metadata->>'article_no' "
+                "AS article_no, text, heading_path FROM regulatory_chunk WHERE "
+                "user_file_id=CAST(:file_id AS uuid) AND "
+                "(chunk_metadata->>'article_no' = '2' OR position < 6) "
+                "ORDER BY position LIMIT 20"
+            ),
+            {"file_id": "c7bed4e2-77a2-4609-bb52-3fdffcd15cb1"},
+        ):
+            print(
+                "FILE_306_ARTICLE_2",
+                json.dumps(
+                    {"id": row.id, "position": row.position,
+                     "status": row.status, "article_no": row.article_no,
+                     "text_excerpt": row.text[:500],
+                     "heading_path": row.heading_path[:3]},
+                    ensure_ascii=False,
                 ),
             )
     engine.dispose()

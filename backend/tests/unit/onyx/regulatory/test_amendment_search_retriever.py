@@ -258,6 +258,29 @@ def test_file_identity_checks_series_and_root_conflicts(
     )
 
 
+def test_circular_title_ignores_konulu_but_rejects_a_later_reference() -> None:
+    from onyx.regulatory.source_identity import source_file_identity_matches
+
+    target = (
+        "2018/13 sayılı Gümrüksüz Satış Mağazaları Yönetmeliğinin "
+        "Uygulanması konulu Genelge"
+    )
+    source = (
+        "Genelgeler/Gümrükler genel müdürlüğü/"
+        "genelge_2018-13_gumruksuz_satis_magazalari_"
+        "yonetmeliginin_uygulanmasi.md"
+    )
+    reference = (
+        "Genelgeler/Gümrükler genel müdürlüğü/"
+        "genelge_2025-12_gumruksuz_satis_magazalari_"
+        "yonetmeliginin_uygulanmasina_iliskin_2018-13_sayili_genelgede_"
+        "degisiklik.md"
+    )
+
+    assert source_file_identity_matches(target, source, "")
+    assert not source_file_identity_matches(target, reference, "")
+
+
 def _search_doc(*, file_id: str | None, chunk_id: str) -> SearchDoc:
     return SearchDoc(
         document_id="document-1",
