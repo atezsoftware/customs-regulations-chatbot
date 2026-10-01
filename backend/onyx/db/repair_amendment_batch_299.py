@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from onyx.db.amendment_match_checkpoints import load_match_checkpoint
+from onyx.db.amendment_match_checkpoints import capture_match_evidence
 from onyx.db.amendment_pdf_evidence import load_batch_pdf_source
 from onyx.db.engine.sql_engine import SqlEngine, get_session_with_current_tenant
 from onyx.db.models import AmendmentBatch, AmendmentMatchCheckpoint, AmendmentProposal
@@ -16,6 +16,10 @@ from onyx.regulatory.amendments.analysis_llm import get_amendment_analysis_llm
 from onyx.regulatory.amendments.draft_integrity import (
     validate_added_article_draft,
     validate_explicit_replacement_texts,
+)
+from onyx.regulatory.amendments.match_checkpoint import (
+    MatchedInstruction,
+    MatchEvidence,
 )
 from onyx.regulatory.amendments.pipeline import (
     draft_instruction_group_proposal,
@@ -42,6 +46,24 @@ def checked_batch(session: Session) -> AmendmentBatch:
     ):
         raise RuntimeError("Frozen instruction state changed")
     return batch
+
+
+def revalidated_match(
+    session: Session, batch: AmendmentBatch, row: AmendmentMatchCheckpoint
+) -> MatchedInstruction:
+    frozen = MatchedInstruction.model_validate(row.payload)
+    if (
+        frozen.instruction_index != INDEX
+        or frozen.evidence is None
+        or frozen.evidence.candidates != row.source_fingerprints
+    ):
+        raise RuntimeError("Frozen match identity or evidence is inconsistent")
+    current: MatchEvidence = capture_match_evidence(
+        session, batch.user_file_ids, frozen.candidates
+    )
+    if current.candidates != row.source_fingerprints:
+        raise RuntimeError("Frozen match candidate source changed")
+    return frozen.model_copy(update={"evidence": current})
 
 
 def main() -> None:
@@ -79,17 +101,9 @@ def main() -> None:
         row = session.get(AmendmentMatchCheckpoint, (BATCH_ID, INDEX))
         if row is None:
             raise RuntimeError("Frozen match checkpoint missing")
-        checkpoint = load_match_checkpoint(
-            session,
-            batch_id=BATCH_ID,
-            instruction_index=INDEX,
-            input_sha256=row.input_sha256,
-        )
-        if (
-            checkpoint is None
-            or checkpoint.instruction.instruction_text != instruction_text
-        ):
-            raise RuntimeError("Frozen match checkpoint or source fingerprints changed")
+        checkpoint = revalidated_match(session, batch, row)
+        if checkpoint.instruction.instruction_text != instruction_text:
+            raise RuntimeError("Frozen match instruction changed")
         if checkpoint.match.old_chunk_id is not None:
             raise RuntimeError("Instruction is no longer a new-article addition")
         context = load_instruction_draft_context(
@@ -157,15 +171,9 @@ def main() -> None:
         row = session.get(AmendmentMatchCheckpoint, (BATCH_ID, INDEX))
         if (
             row is None
-            or load_match_checkpoint(
-                session,
-                batch_id=BATCH_ID,
-                instruction_index=INDEX,
-                input_sha256=row.input_sha256,
-            )
-            is None
+            or revalidated_match(session, batch, row).evidence != checkpoint.evidence
         ):
-            raise RuntimeError("Frozen source evidence changed while drafting")
+            raise RuntimeError("Revalidated source evidence changed while drafting")
         attention = [
             item
             for item in batch.unmatched_instructions
