@@ -291,6 +291,67 @@ def main() -> None:
                     if failed >= 8:
                         break
                 print("RECEIPT_CHECK_460", json.dumps({"checked": checked, "failed": failed}))
+        targets = [
+            ("299_6A", "rc.user_file_id = CAST(:file_id AS uuid) AND "
+             "(rc.chunk_metadata->>'article_no' = '6/A' OR "
+             "rc.text ILIKE '%MADDE 6/A%')", {"file_id": "014fbc6a-2da2-4845-9df9-f4afc625587a"}),
+            ("302_CODE_0703", "(uf.name ILIKE '%İthalat Rejimi%' OR "
+             "uf.name ILIKE '%3350%') AND rc.text ILIKE '%0703.10.19.00.11%'", {}),
+            ("302_CODE_1206", "(uf.name ILIKE '%İthalat Rejimi%' OR "
+             "uf.name ILIKE '%3350%') AND rc.text ILIKE '%1206.00.91.00.19%'", {}),
+            ("306_TITLE", "uf.name ILIKE '%Gümrüksüz Satış Mağazaları%' OR "
+             "uf.name ILIKE '%2018/13%'", {}),
+        ]
+        for label, predicate, params in targets:
+            rows = connection.execute(
+                text(
+                    "SELECT rc.id, rc.user_file_id, uf.name, rc.status, "
+                    "rc.position, rc.chunk_type, rc.chunk_metadata->>'article_no' "
+                    "AS article_no, rc.text, rc.heading_path FROM regulatory_chunk rc "
+                    "JOIN user_file uf ON uf.id=rc.user_file_id WHERE "
+                    f"({predicate}) LIMIT 30"
+                ),
+                params,
+            )
+            for row in rows:
+                text_value = row.text
+                print(
+                    "SOURCE_MATCH",
+                    json.dumps(
+                        {
+                            "target": label,
+                            "id": row.id,
+                            "file_id": str(row.user_file_id),
+                            "file_name": row.name,
+                            "status": row.status,
+                            "position": row.position,
+                            "chunk_type": row.chunk_type,
+                            "article_no": row.article_no,
+                            "text_sha256": hashlib.sha256(text_value.encode()).hexdigest(),
+                            "text_excerpt": text_value[:700],
+                            "heading_path": row.heading_path[:2],
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
+        files = connection.execute(
+            text(
+                "SELECT id, name, status, chunk_count FROM user_file WHERE "
+                "name ILIKE '%İthalat Rejimi%' OR name ILIKE '%3350%' OR "
+                "name ILIKE '%Gümrüksüz Satış Mağazaları%' OR "
+                "name ILIKE '%2018/13%' LIMIT 100"
+            )
+        )
+        for row in files:
+            print(
+                "SOURCE_FILE",
+                json.dumps(
+                    {"id": str(row.id), "name": row.name,
+                     "status": row.status, "chunk_count": row.chunk_count},
+                    ensure_ascii=False,
+                    default=str,
+                ),
+            )
     engine.dispose()
 
 
