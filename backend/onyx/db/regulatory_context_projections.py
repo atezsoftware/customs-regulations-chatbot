@@ -465,6 +465,83 @@ def activate_temporal_projection(
                 binding.effective_start, binding.effective_end
             ),
         )
+
+        def continuous_qualified_dependency() -> "AnnexTemporalProjection | None":
+            """Accept adjacent, identical qualified versions across the parent window."""
+            from onyx.db.models import RegulatoryTemporalProjection
+
+            lower = binding.effective_start or datetime.date.min
+            upper = binding.effective_end or datetime.date.max
+            intervals = list(
+                session.scalars(
+                    select(RegulatoryTemporalProjection)
+                    .where(
+                        RegulatoryTemporalProjection.canonical_chunk_id == row.id,
+                        RegulatoryTemporalProjection.retired_at.is_(None),
+                        RegulatoryTemporalProjection.index_identity_sha256.in_(
+                            qualified_dependency_index.temporal_lookup_identities()
+                        ),
+                        or_(
+                            RegulatoryTemporalProjection.effective_end.is_(None),
+                            RegulatoryTemporalProjection.effective_end > lower,
+                        ),
+                        or_(
+                            RegulatoryTemporalProjection.effective_start.is_(None),
+                            RegulatoryTemporalProjection.effective_start < upper,
+                        ),
+                    )
+                    .order_by(
+                        RegulatoryTemporalProjection.effective_start.asc().nullsfirst()
+                    )
+                )
+            )
+            if not intervals:
+                return None
+            cursor = lower
+            common: AnnexTemporalProjection | None = None
+            for interval in intervals:
+                start = interval.effective_start or datetime.date.min
+                end = interval.effective_end or datetime.date.max
+                if (
+                    start > cursor
+                    or common is not None
+                    and start != cursor
+                    or end <= cursor
+                ):
+                    raise ValueError(
+                        "qualified dependency window does not cover parent"
+                    )
+                anchor = (
+                    end - datetime.timedelta(days=1)
+                    if cursor == datetime.date.min and end != datetime.date.max
+                    else cursor
+                    if cursor != datetime.date.min
+                    else datetime.date.today()
+                )
+                candidate = get_indexed_temporal_projection(
+                    session, row.id, index=qualified_dependency_index, as_of_date=anchor
+                )
+                if candidate is None or candidate.id != interval.id:
+                    raise ValueError(
+                        "qualified dependency window does not cover parent"
+                    )
+                if common is not None and (
+                    candidate.canonical_base_sha256 != common.canonical_base_sha256
+                    or candidate.derived_role != common.derived_role
+                    or candidate.dependency_ids != common.dependency_ids
+                    or candidate.representation_text != common.representation_text
+                    or candidate.representation_metadata
+                    != common.representation_metadata
+                ):
+                    raise ValueError(
+                        "qualified dependency changes within parent window"
+                    )
+                common = candidate
+                cursor = end
+                if cursor >= upper:
+                    return common
+            raise ValueError("qualified dependency window does not cover parent")
+
         if qualified is None:
             overlapping = select(RegulatoryTemporalProjection.id).where(
                 RegulatoryTemporalProjection.canonical_chunk_id == row.id,
@@ -504,7 +581,9 @@ def activate_temporal_projection(
                 or qualified.effective_end < binding.effective_end
             )
         ):
-            raise ValueError("qualified dependency window does not cover parent")
+            qualified = continuous_qualified_dependency()
+            if qualified is None:
+                raise ValueError("qualified dependency window does not cover parent")
         return RegulatoryChunk(
             id=row.id,
             user_file_id=row.user_file_id,

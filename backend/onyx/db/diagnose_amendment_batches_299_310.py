@@ -80,6 +80,33 @@ def main() -> None:
                     default=str,
                 ),
             )
+            if batch["id"] == 299:
+                from onyx.regulatory.amendments.draft_integrity import (
+                    explicit_added_article_identity,
+                    explicit_added_body,
+                )
+                from onyx.regulatory.amendments.new_provision_policy import (
+                    explicitly_adds_top_level_provision,
+                )
+                instruction = (batch["segmented_instructions"] or [])[5]
+                instruction_text = instruction.get("instruction_text", "")
+                print("BATCH_299_6A_PARSE", json.dumps({
+                    "length": len(instruction_text),
+                    "tail": instruction_text[-360:],
+                    "is_top_level": explicitly_adds_top_level_provision(instruction_text),
+                    "body_length": len(explicit_added_body(instruction_text) or ""),
+                    "identity": explicit_added_article_identity(instruction_text),
+                }, ensure_ascii=False))
+                for event in batch["analysis_log"] or []:
+                    indices = event.get("indices") or []
+                    if 5 in indices or event.get("index") == 5:
+                        print("BATCH_299_INDEX_5", json.dumps(event, ensure_ascii=False, default=str))
+            if batch["id"] == 306:
+                print(
+                    "BATCH_306_SOURCE_MEMBER",
+                    "c7bed4e2-77a2-4609-bb52-3fdffcd15cb1"
+                    in batch["user_file_ids"],
+                )
             proposals = connection.execute(
                 text(
                     "SELECT id, instruction_index, instruction_text, status, "
@@ -291,6 +318,212 @@ def main() -> None:
                     if failed >= 8:
                         break
                 print("RECEIPT_CHECK_460", json.dumps({"checked": checked, "failed": failed}))
+                dependency_windows = {}
+                active_rows = connection.execute(text(
+                    "SELECT canonical_chunk_id, index_identity_sha256, effective_start, "
+                    "effective_end FROM regulatory_temporal_projection WHERE "
+                    "canonical_chunk_id = ANY(:ids) AND retired_at IS NULL"
+                ), {"ids": dependencies})
+                for active_row in active_rows:
+                    dependency_windows.setdefault(active_row.canonical_chunk_id, []).append({
+                        "identity": active_row.index_identity_sha256,
+                        "start": active_row.effective_start,
+                        "end": active_row.effective_end,
+                        "origin": "active",
+                    })
+                for other in manifest.bindings:
+                    if other.id in previous_ids:
+                        continue
+                    identifier = json.loads(other.projection.source_json)["regulatory_chunk_id"]
+                    dependency_windows.setdefault(identifier, []).append({
+                        "identity": other.index.temporal_lookup_identity(),
+                        "start": other.effective_start,
+                        "end": other.effective_end,
+                        "origin": "pending",
+                    })
+                from onyx.regulatory.contextual import context_reference_date
+                window_issues = 0
+                for parent in manifest.bindings:
+                    if parent.id in previous_ids or parent.derived_role != "hierarchical_aggregate":
+                        continue
+                    identities = set(manifest_index_by_uuid[parent.index.index_uuid].temporal_lookup_identities())
+                    for identifier in parent.dependency_ids:
+                        windows = [w for w in dependency_windows.get(identifier, []) if w["identity"] in identities]
+                        reference_date = context_reference_date(parent.effective_start, parent.effective_end)
+                        selected = [w for w in windows if
+                            (w["start"] is None or w["start"] <= reference_date)
+                            and (w["end"] is None or w["end"] > reference_date)
+                        ]
+                        noncovering = [w for w in selected if not (
+                            (w["start"] is None or parent.effective_start is not None and w["start"] <= parent.effective_start)
+                            and (w["end"] is None or parent.effective_end is not None and w["end"] >= parent.effective_end)
+                        )]
+                        if noncovering:
+                            print("WINDOW_MISMATCH_460", json.dumps({
+                                "parent": parent.id.hex,
+                                "parent_start": str(parent.effective_start),
+                                "parent_end": str(parent.effective_end),
+                                "dependency": identifier,
+                                "reference_date": str(reference_date),
+                                "windows": [{**w, "start": str(w["start"]), "end": str(w["end"])} for w in selected[:5]],
+                            }))
+                            window_issues += 1
+                            if window_issues >= 12:
+                                break
+                    if window_issues >= 12:
+                        break
+                print("WINDOW_ISSUE_COUNT_460", window_issues)
+                for item in manifest.bindings:
+                    if item.id.hex == "52424e5d41714496ad1139db51f7c04b" or json.loads(item.projection.source_json)["regulatory_chunk_id"] in {
+                        "rc_fcafb699b8b49d81756158f82296b872938006c1",
+                        "rc_5c0be3e4b5e0759daa72ee6bbaa51a01cee727d4",
+                    }:
+                        print("WINDOW_MEMBER_460", json.dumps({
+                            "binding": item.id.hex,
+                            "canonical": json.loads(item.projection.source_json)["regulatory_chunk_id"],
+                            "role": item.derived_role,
+                            "start": str(item.effective_start),
+                            "end": str(item.effective_end),
+                            "retained": item.id in previous_ids,
+                            "text_hash": hashlib.sha256(item.representation_text.encode()).hexdigest(),
+                            "dependency_ids": item.dependency_ids[:8],
+                        }))
+        targets = [
+            ("299_6A", "rc.user_file_id = CAST(:file_id AS uuid) AND "
+             "(rc.chunk_metadata->>'article_no' = '6/A' OR "
+             "rc.text ILIKE '%MADDE 6/A%')", {"file_id": "014fbc6a-2da2-4845-9df9-f4afc625587a"}),
+            ("302_CODE_0703", "(uf.name ILIKE '%İthalat Rejimi%' OR "
+             "uf.name ILIKE '%3350%') AND rc.text ILIKE '%0703.10.19.00.11%'", {}),
+            ("302_CODE_1206", "(uf.name ILIKE '%İthalat Rejimi%' OR "
+             "uf.name ILIKE '%3350%') AND rc.text ILIKE '%1206.00.91.00.19%'", {}),
+            ("306_TITLE", "uf.name ILIKE '%Gümrüksüz Satış Mağazaları%' OR "
+             "uf.name ILIKE '%2018/13%'", {}),
+        ]
+        for label, predicate, params in targets:
+            rows = connection.execute(
+                text(
+                    "SELECT rc.id, rc.user_file_id, uf.name, rc.status, "
+                    "rc.position, rc.chunk_type, rc.chunk_metadata->>'article_no' "
+                    "AS article_no, rc.text, rc.heading_path FROM regulatory_chunk rc "
+                    "JOIN user_file uf ON uf.id=rc.user_file_id WHERE "
+                    f"({predicate}) LIMIT 30"
+                ),
+                params,
+            )
+            for row in rows:
+                text_value = row.text
+                print(
+                    "SOURCE_MATCH",
+                    json.dumps(
+                        {
+                            "target": label,
+                            "id": row.id,
+                            "file_id": str(row.user_file_id),
+                            "file_name": row.name,
+                            "status": row.status,
+                            "position": row.position,
+                            "chunk_type": row.chunk_type,
+                            "article_no": row.article_no,
+                            "text_sha256": hashlib.sha256(text_value.encode()).hexdigest(),
+                            "text_excerpt": text_value[:700],
+                            "heading_path": row.heading_path[:2],
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
+        files = connection.execute(
+            text(
+                "SELECT id, name, status, chunk_count FROM user_file WHERE "
+                "name ILIKE '%İthalat Rejimi%' OR name ILIKE '%3350%' OR "
+                "name ILIKE '%Gümrüksüz Satış Mağazaları%' OR "
+                "name ILIKE '%2018/13%' LIMIT 100"
+            )
+        )
+        for row in files:
+            print(
+                "SOURCE_FILE",
+                json.dumps(
+                    {"id": str(row.id), "name": row.name,
+                     "status": row.status, "chunk_count": row.chunk_count},
+                    ensure_ascii=False,
+                    default=str,
+                ),
+            )
+        for row in connection.execute(
+            text(
+                "SELECT id, position, status, chunk_metadata->>'article_no' "
+                "AS article_no, text, heading_path FROM regulatory_chunk WHERE "
+                "user_file_id=CAST(:file_id AS uuid) AND position BETWEEN 12 AND 25 "
+                "ORDER BY position, created_at"
+            ),
+            {"file_id": "014fbc6a-2da2-4845-9df9-f4afc625587a"},
+        ):
+            print(
+                "FILE_299_AROUND_6",
+                json.dumps(
+                    {"id": row.id, "position": row.position,
+                     "status": row.status, "article_no": row.article_no,
+                     "text_excerpt": row.text[:350],
+                     "heading_path": row.heading_path[:3]},
+                    ensure_ascii=False,
+                ),
+            )
+        for row in connection.execute(
+            text(
+                "SELECT rc.id, rc.user_file_id, uf.name, rc.status, "
+                "rc.position, rc.text FROM regulatory_chunk rc JOIN user_file uf "
+                "ON uf.id=rc.user_file_id WHERE "
+                "rc.chunk_metadata->>'article_no' = '6/A' AND "
+                "(uf.name ILIKE '%dovizlerinin_turk_lirasina_donusum%' OR "
+                "uf.name ILIKE '%2023-5%') LIMIT 30"
+            )
+        ):
+            print(
+                "ARTICLE_6A_OTHER_FILE",
+                json.dumps(
+                    {"id": row.id, "file_id": str(row.user_file_id),
+                     "name": row.name, "status": row.status,
+                     "position": row.position,
+                     "text_sha256": hashlib.sha256(row.text.encode()).hexdigest(),
+                     "text_excerpt": row.text[:700]},
+                    ensure_ascii=False,
+                ),
+            )
+        for row in connection.execute(
+            text(
+                "SELECT id, name, status, chunk_count FROM user_file WHERE "
+                "name ILIKE '%2018%13%' OR name ILIKE '%gumruksuz%' OR "
+                "name ILIKE '%gümrüksüz%' LIMIT 100"
+            )
+        ):
+            print(
+                "FILE_306_CANDIDATE",
+                json.dumps(
+                    {"id": str(row.id), "name": row.name,
+                     "status": row.status, "chunk_count": row.chunk_count},
+                    ensure_ascii=False, default=str,
+                ),
+            )
+        for row in connection.execute(
+            text(
+                "SELECT id, position, status, chunk_metadata->>'article_no' "
+                "AS article_no, text, heading_path FROM regulatory_chunk WHERE "
+                "user_file_id=CAST(:file_id AS uuid) AND "
+                "(chunk_metadata->>'article_no' = '2' OR position < 6) "
+                "ORDER BY position LIMIT 20"
+            ),
+            {"file_id": "c7bed4e2-77a2-4609-bb52-3fdffcd15cb1"},
+        ):
+            print(
+                "FILE_306_ARTICLE_2",
+                json.dumps(
+                    {"id": row.id, "position": row.position,
+                     "status": row.status, "article_no": row.article_no,
+                     "text_excerpt": row.text[:500],
+                     "heading_path": row.heading_path[:3]},
+                    ensure_ascii=False,
+                ),
+            )
     engine.dispose()
 
 

@@ -11,6 +11,7 @@ _SOURCE_GENERIC_TOKENS = frozenset(
         "karari",
         "kanun",
         "kanunu",
+        "konulu",
         "no",
         "sayili",
         "seri",
