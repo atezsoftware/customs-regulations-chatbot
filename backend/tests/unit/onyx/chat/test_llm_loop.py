@@ -2794,6 +2794,152 @@ def test_fast_source_gap_draft_is_withheld_retrieved_once_and_resynthesized(
     assert streamed_answer == state.get_answer_tokens()
 
 
+@pytest.mark.parametrize("repeated_tool_call", [False, True])
+def test_fast_final_synthesis_retries_unexpected_tool_call_once(
+    repeated_tool_call: bool,
+) -> None:
+    plan = RegulatoryCoveragePlan(
+        coverage_items=[
+            RegulatoryCoverageItem(
+                research_question="Madde 101 ve 102 metnini incele.",
+                evidence_dimensions=["Madde 101 ve 102"],
+                retrieval_queries=["Madde 101 102"],
+                completion_test="İki maddeyi kaynakla cevapla.",
+            )
+        ]
+    )
+    llm_step_calls: list[dict[str, Any]] = []
+    dispatched_batches: list[list[ToolCallKickoff]] = []
+
+    def fake_run_llm_step(**kwargs: Any) -> tuple[LlmStepResult, bool]:
+        llm_step_calls.append(kwargs)
+        if len(llm_step_calls) == 1 or repeated_tool_call:
+            return (
+                LlmStepResult(
+                    reasoning=None,
+                    answer=None,
+                    tool_calls=[
+                        _search_tool_call(
+                            f"unexpected-final-{len(llm_step_calls)}",
+                            query="Madde 101 102",
+                        )
+                    ],
+                    finish_reason="tool_calls",
+                ),
+                False,
+            )
+        answer = "Yanıt tamamlandı."
+        cast(ChatStateContainer, kwargs["state_container"]).set_answer_tokens(answer)
+        cast(Emitter, kwargs["emitter"]).emit(
+            Packet(placement=kwargs["placement"], obj=AgentResponseStart())
+        )
+        cast(Emitter, kwargs["emitter"]).emit(
+            Packet(
+                placement=kwargs["placement"],
+                obj=AgentResponseDelta(content=answer),
+            )
+        )
+        return (
+            LlmStepResult(
+                reasoning=None,
+                answer=answer,
+                tool_calls=None,
+                finish_reason="stop",
+            ),
+            False,
+        )
+
+    def fake_run_tool_calls(**kwargs: Any) -> ParallelToolCallResponse:
+        calls = list(kwargs["tool_calls"])
+        dispatched_batches.append(calls)
+        return ParallelToolCallResponse(
+            tool_responses=[
+                ToolResponse(
+                    rich_response=SearchDocsResponse(
+                        search_docs=[], citation_mapping={}
+                    ),
+                    llm_facing_response='{"results":[]}',
+                    tool_call=call,
+                )
+                for call in calls
+            ],
+            updated_citation_mapping={},
+        )
+
+    search_tool = Mock(spec=SearchTool)
+    search_tool.id = 1
+    search_tool.name = SearchTool.NAME
+    search_tool.user_selected_filters = BaseFilters(
+        regulatory_chunks_only=True,
+        regulatory_workflow_mode="fast",
+    )
+    search_tool.tool_definition.return_value = {
+        "type": "function",
+        "function": {
+            "name": SearchTool.NAME,
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }
+    persona = Mock(
+        id=1,
+        datetime_aware=False,
+        replace_base_system_prompt=False,
+        system_prompt=None,
+        task_prompt=None,
+    )
+    llm = Mock()
+    llm.config = LLMConfig(
+        model_provider="vertex_ai",
+        model_name="gemini-3.8-flash",
+        temperature=0.0,
+        max_input_tokens=100_000,
+    )
+    state = ChatStateContainer()
+    output_queue: queue.Queue[tuple[int, Packet | Exception | object]] = queue.Queue()
+
+    with (
+        patch("onyx.chat.llm_loop.run_llm_step", side_effect=fake_run_llm_step),
+        patch("onyx.chat.llm_loop.run_tool_calls", side_effect=fake_run_tool_calls),
+        patch("onyx.chat.llm_loop._prime_fast_regulatory_query_embeddings"),
+        patch("onyx.chat.llm_loop.build_regulatory_coverage_plan", return_value=plan),
+        patch("onyx.chat.llm_loop.get_default_base_system_prompt", return_value=""),
+        patch("onyx.chat.llm_loop.get_session_with_current_tenant"),
+        patch("onyx.llm.litellm_singleton.config.initialize_litellm"),
+    ):
+
+        def run() -> None:
+            run_llm_loop(
+                emitter=Emitter(merged_queue=output_queue),
+                state_container=state,
+                simple_chat_history=[
+                    create_message("Madde 101 ve 102'yi incele.", MessageType.USER)
+                ],
+                tools=[search_tool],
+                custom_agent_prompt=None,
+                context_files=create_context_files(),
+                persona=persona,
+                user_memory_context=None,
+                llm=llm,
+                token_counter=len,
+            )
+
+        if repeated_tool_call:
+            with pytest.raises(EmptyLLMResponseError) as error:
+                run()
+            assert error.value.error_code == "UNEXPECTED_FINAL_TOOL_CALL"
+            assert error.value.finish_reason == "tool_calls"
+        else:
+            run()
+            assert state.get_answer_tokens() == "Yanıt tamamlandı."
+
+    assert len(dispatched_batches) == 1
+    assert len(llm_step_calls) == 2
+    assert all(
+        call["tool_choice"] is ToolChoiceOptions.NONE and call["tool_definitions"] == []
+        for call in llm_step_calls
+    )
+
+
 def test_fast_coverage_embeddings_are_primed_in_one_batch() -> None:
     calls = [
         _search_tool_call(
