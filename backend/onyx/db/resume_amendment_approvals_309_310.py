@@ -223,6 +223,7 @@ def main(proposal_id: int) -> None:
                 article_no="4/A" if proposal_id == 437 else "6/B",
                 paragraph_no=None,
                 clause_label=None,
+                after_article_no=prior.get("after_article_no"),
             )
             expected_after = (
                 dependency.applied_new_chunk_id
