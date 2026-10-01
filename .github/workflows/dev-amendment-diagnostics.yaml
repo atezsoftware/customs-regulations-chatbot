@@ -7,7 +7,7 @@ on:
         type: choice
         required: true
         default: observe
-        options: [observe, inspect_request_logs]
+        options: [observe, inspect_request_logs, inspect_historical_graph_metadata]
       expected_image_sha:
         type: string
         required: true
@@ -558,5 +558,242 @@ jobs:
         with:
           name: dev-api-request-log-metadata-${{ github.run_id }}
           path: dev-api-request-log-metadata.jsonl
+          if-no-files-found: ignore
+          retention-days: 7
+
+  inspect_historical_graph_metadata:
+    if: inputs.operation == 'inspect_historical_graph_metadata'
+    runs-on: codebuild-customs-regulations-runner-${{ github.run_id }}-${{ github.run_attempt }}
+    timeout-minutes: 5
+    steps:
+      - name: Read bounded historical answer graph metadata from DEV
+        shell: bash
+        env:
+          EXPECTED_IMAGE_SHA: ${{ inputs.expected_image_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_IMAGE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          aws eks update-kubeconfig --name atez-dev-cluster --region eu-central-1
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+
+          namespace = "customs-regulations-dev"
+          deployment_name = "dev-customs-regulations-api-deployment"
+          expected_sha = os.environ["EXPECTED_IMAGE_SHA"]
+          output_path = Path("dev-api-historical-graph-metadata.json")
+          probe = r'''
+          import datetime
+          import json
+          import os
+          import re
+
+          # libpq makes every transaction read-only before any SQL is issued.
+          os.environ["PGOPTIONS"] = (
+              "-c default_transaction_read_only=on "
+              "-c statement_timeout=5000 -c lock_timeout=1000"
+          )
+
+          from sqlalchemy import bindparam, text
+          from shared_configs.configs import MULTI_TENANT, POSTGRES_DEFAULT_SCHEMA
+          from onyx.db.engine.sql_engine import SqlEngine
+
+          if MULTI_TENANT:
+              raise RuntimeError("Historical graph probe requires single-tenant DEV")
+          schema = POSTGRES_DEFAULT_SCHEMA
+          if not re.fullmatch(r"[A-Za-z0-9_-]{1,63}", schema):
+              raise RuntimeError("Unsafe database schema identifier")
+          configured_readonly_role = bool(
+              os.environ.get("DB_READONLY_USER")
+              and os.environ.get("DB_READONLY_PASSWORD")
+          )
+
+          start = datetime.datetime(2026, 10, 1, 8, 45, tzinfo=datetime.timezone.utc)
+          end = datetime.datetime(2026, 10, 1, 9, 32, tzinfo=datetime.timezone.utc)
+          oom = datetime.datetime(2026, 10, 1, 9, 25, 36, tzinfo=datetime.timezone.utc)
+          run_table = f'"{schema}"."answer_graph_run"'
+          node_table = f'"{schema}"."answer_graph_node"'
+
+          def utc(value):
+              return aware(value).astimezone(datetime.timezone.utc).isoformat() if value else None
+
+          def aware(value):
+              if value.tzinfo is None or value.utcoffset() is None:
+                  raise RuntimeError("Graph timestamp is missing timezone")
+              return value
+
+          def static_name(value):
+              if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9._-]{1,100}", value):
+                  return value
+              return "other"
+
+          try:
+              if configured_readonly_role:
+                  SqlEngine.init_readonly_engine(pool_size=1, max_overflow=0)
+                  engine = SqlEngine.get_readonly_engine()
+              else:
+                  SqlEngine.init_engine(pool_size=1, max_overflow=0)
+                  engine = SqlEngine.get_engine()
+              with engine.connect() as connection:
+                  with connection.begin():
+                      connection.execute(text("SET TRANSACTION READ ONLY"))
+                      connection.execute(text("SET LOCAL statement_timeout = '5s'"))
+                      connection.execute(text("SET LOCAL lock_timeout = '1s'"))
+                      where = "tenant_id = :tenant AND time_created >= :start AND time_created < :end"
+                      parameters = {"tenant": schema, "start": start, "end": end}
+                      run_count = connection.execute(text(
+                          f"SELECT count(*) FROM {run_table} WHERE {where}"
+                      ), parameters).scalar_one()
+                      if run_count > 500:
+                          raise RuntimeError("Historical graph run cap exceeded")
+                      run_rows = connection.execute(text(
+                          "SELECT id, trace_id, assistant_message_id, model_name, "
+                          "status, capture_status, time_created, time_finished "
+                          f"FROM {run_table} WHERE {where} "
+                          "ORDER BY time_created, id LIMIT 500"
+                      ), parameters).mappings().all()
+                      run_ids = [row["id"] for row in run_rows]
+                      node_count = 0
+                      node_rows = []
+                      if run_ids:
+                          node_count = connection.execute(text(
+                              f"SELECT count(*) FROM {node_table} WHERE run_id IN :run_ids"
+                          ).bindparams(bindparam("run_ids", expanding=True)), {
+                              "run_ids": run_ids
+                          }).scalar_one()
+                          if node_count > 10000:
+                              raise RuntimeError("Historical graph node cap exceeded")
+                          node_rows = connection.execute(text(
+                              "SELECT run_id, kind, operation, status, capture_status, "
+                              f"started_at, ended_at FROM {node_table} "
+                              "WHERE run_id IN :run_ids ORDER BY started_at, run_id LIMIT 10000"
+                          ).bindparams(bindparam("run_ids", expanding=True)), {
+                              "run_ids": run_ids
+                          }).mappings().all()
+              result = {
+                  "window_start_utc": utc(start),
+                  "window_end_utc": utc(end),
+                  "oom_time_utc": utc(oom),
+                  "database_role": "readonly" if configured_readonly_role else "transaction_readonly",
+                  "tenant_scope": "single_tenant_default_schema",
+                  "run_count": run_count,
+                  "node_count": node_count,
+                  "runs": [{
+                      "run_id": str(row["id"]),
+                      "trace_id": (
+                          row["trace_id"] if re.fullmatch(
+                              r"trace_[0-9a-f]{32}", row["trace_id"]
+                          ) else "other"
+                      ),
+                      "assistant_message_id": row["assistant_message_id"],
+                      "model_name": static_name(row["model_name"]),
+                      "status": static_name(row["status"]),
+                      "capture_status": static_name(row["capture_status"]),
+                      "started_at": utc(row["time_created"]),
+                      "finished_at": utc(row["time_finished"]),
+                      "overlaps_oom": aware(row["time_created"]) <= oom and (
+                          row["time_finished"] is None or aware(row["time_finished"]) >= oom
+                      ),
+                  } for row in run_rows],
+                  "nodes": [{
+                      "run_id": str(row["run_id"]),
+                      "kind": static_name(row["kind"]),
+                      "operation": static_name(row["operation"]),
+                      "status": static_name(row["status"]),
+                      "capture_status": static_name(row["capture_status"]),
+                      "started_at": utc(row["started_at"]),
+                      "ended_at": utc(row["ended_at"]),
+                      "overlaps_oom": aware(row["started_at"]) <= oom and (
+                          row["ended_at"] is None or aware(row["ended_at"]) >= oom
+                      ),
+                  } for row in node_rows],
+              }
+              print("HISTORICAL_JSON=" + json.dumps(result, separators=(",", ":")))
+          finally:
+              if configured_readonly_role:
+                  SqlEngine.reset_readonly_engine()
+              else:
+                  SqlEngine.reset_engine()
+          '''
+
+          def run(args, timeout=20, input_text=None):
+              return subprocess.run(
+                  args, input=input_text, capture_output=True, text=True,
+                  errors="replace", timeout=timeout
+              )
+
+          deployment_result = run([
+              "kubectl", "get", "deployment", deployment_name, "-n", namespace,
+              "-o", "json", "--request-timeout=5s",
+          ])
+          if deployment_result.returncode:
+              raise RuntimeError("Could not read DEV API deployment")
+          deployment = json.loads(deployment_result.stdout)
+          containers = deployment["spec"]["template"]["spec"]["containers"]
+          if (
+              deployment["spec"].get("replicas") != 2
+              or deployment["status"].get("readyReplicas") != 2
+              or sum(item["image"].endswith(":" + expected_sha) for item in containers) != 1
+          ):
+              raise RuntimeError("DEV API deployment image or replica guard failed")
+          pods_result = run([
+              "kubectl", "get", "pods", "-n", namespace,
+              "-l", "app=dev-customs-regulations-api", "-o", "json",
+              "--request-timeout=5s",
+          ])
+          if pods_result.returncode:
+              raise RuntimeError("Could not list DEV API pods")
+          pods = []
+          for pod in json.loads(pods_result.stdout)["items"]:
+              if pod["metadata"].get("deletionTimestamp") is not None:
+                  continue
+              matches = [
+                  item["name"] for item in pod["spec"]["containers"]
+                  if item["image"].endswith(":" + expected_sha)
+              ]
+              if len(matches) != 1:
+                  continue
+              status = next(
+                  (item for item in pod["status"].get("containerStatuses", [])
+                   if item["name"] == matches[0]), {}
+              )
+              if status.get("ready") is True:
+                  pods.append((pod["metadata"]["name"], matches[0]))
+          if len(pods) != 2:
+              raise RuntimeError("Expected exactly two Ready pinned DEV API pods")
+
+          pod_name, container_name = sorted(pods)[0]
+          probe_result = run([
+              "kubectl", "exec", "-i", pod_name, "-n", namespace,
+              "-c", container_name, "--", "sh", "-ec",
+              ". /vault/secrets/config; export PYTHONPATH=/app; "
+              "cd /app/onyx/db; exec python -",
+          ], timeout=90, input_text=probe)
+          if probe_result.returncode:
+              raise RuntimeError("Read-only historical graph probe failed")
+          marker = "HISTORICAL_JSON="
+          matching_lines = [
+              line[len(marker):] for line in probe_result.stdout.splitlines()
+              if line.startswith(marker)
+          ]
+          if len(matching_lines) != 1:
+              raise RuntimeError("Historical graph probe returned no unique metadata result")
+          result = json.loads(matching_lines[0])
+          output_path.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+          print(
+              "HISTORICAL_GRAPH_METADATA_READY "
+              f"runs={result['run_count']} nodes={result['node_count']}",
+              flush=True,
+          )
+          PY
+
+      - name: Preserve historical graph metadata only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dev-api-historical-graph-metadata-${{ github.run_id }}
+          path: dev-api-historical-graph-metadata.json
           if-no-files-found: ignore
           retention-days: 7
