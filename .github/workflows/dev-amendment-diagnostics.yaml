@@ -4,7 +4,7 @@ on:
     inputs:
       operation:
         type: choice
-        options: [inspect, approve_439, approve_441, approve_442, approve_443, approve_462, approve_465, approve_470, approve_481, approve_482, repair_299, retry_306]
+        options: [inspect, inspect_299_scopes, approve_439, approve_441, approve_442, approve_443, approve_462, approve_465, approve_470, approve_481, approve_482, repair_299, repair_299_scopes, retry_306]
         default: inspect
 permissions:
   contents: read
@@ -121,3 +121,14 @@ jobs:
           kubectl exec -i "$pod" -n customs-regulations-dev -c "$container" -- \
             sh -ec '. /vault/secrets/config; export PYTHONPATH=/app; exec python -' < \
             backend/onyx/db/retry_amendment_batch_306.py
+      - name: Repair reviewed batch 299 replacement scopes
+        if: inputs.operation == 'repair_299_scopes' || inputs.operation == 'inspect_299_scopes'
+        shell: bash
+        env:
+          OPERATION: ${{ inputs.operation }}
+        run: |
+          set -euo pipefail
+          IFS=$'\t' read -r pod container < /tmp/amendment-target
+          kubectl exec -i "$pod" -n customs-regulations-dev -c "$container" -- \
+            sh -ec '. /vault/secrets/config; export PYTHONPATH=/app; if [ "$1" = inspect_299_scopes ]; then export AMENDMENT_SCOPE_DRY_RUN=1; fi; exec python -' sh "$OPERATION" < \
+            backend/onyx/db/repair_amendment_batch_299_scopes.py
