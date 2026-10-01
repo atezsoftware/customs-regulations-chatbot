@@ -341,6 +341,7 @@ def main() -> None:
                         "end": other.effective_end,
                         "origin": "pending",
                     })
+                from onyx.regulatory.contextual import context_reference_date
                 window_issues = 0
                 for parent in manifest.bindings:
                     if parent.id in previous_ids or parent.derived_role != "hierarchical_aggregate":
@@ -348,18 +349,24 @@ def main() -> None:
                     identities = set(manifest_index_by_uuid[parent.index.index_uuid].temporal_lookup_identities())
                     for identifier in parent.dependency_ids:
                         windows = [w for w in dependency_windows.get(identifier, []) if w["identity"] in identities]
+                        reference_date = context_reference_date(parent.effective_start, parent.effective_end)
+                        selected = [w for w in windows if
+                            (w["start"] is None or w["start"] <= reference_date)
+                            and (w["end"] is None or w["end"] > reference_date)
+                        ]
                         covers = any(
                             (w["start"] is None or parent.effective_start is not None and w["start"] <= parent.effective_start)
                             and (w["end"] is None or parent.effective_end is not None and w["end"] >= parent.effective_end)
-                            for w in windows
+                            for w in selected
                         )
-                        if windows and not covers:
+                        if selected and not covers:
                             print("WINDOW_MISMATCH_460", json.dumps({
                                 "parent": parent.id.hex,
                                 "parent_start": str(parent.effective_start),
                                 "parent_end": str(parent.effective_end),
                                 "dependency": identifier,
-                                "windows": [{**w, "start": str(w["start"]), "end": str(w["end"])} for w in windows[:5]],
+                                "reference_date": str(reference_date),
+                                "windows": [{**w, "start": str(w["start"]), "end": str(w["end"])} for w in selected[:5]],
                             }))
                             window_issues += 1
                             if window_issues >= 12:
