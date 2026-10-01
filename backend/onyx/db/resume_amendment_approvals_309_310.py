@@ -17,6 +17,7 @@ from onyx.db.regulatory_amendments import (
 from shared_configs.contextvars import get_current_tenant_id
 
 EXPECTED: dict[int, tuple[int, str, int]] = {
+    439: (299, "758c3b4bdf345cec553958d194f302c566f7d559e2ef59e406c2abb986a34a48", 0),
     443: (299, "0cec6f3ed0cf25fdeed344032c924d7e4b842faa03f3465824d8d9cb2164b7ba", 0),
     442: (299, "1fe5608e7be48a77328be8bc26b79f1d439592d6b7b18ae47137bf02e57c82b4", 0),
     481: (299, "aee0fe3b82d815e238190a6f6ebc64be66cbfe244d9caf741c3a9569c1a2601c", 0),
@@ -106,6 +107,23 @@ def main(proposal_id: int) -> None:
                 or explicit_added_body(proposal.instruction_text) != draft.get("text")
             ):
                 raise RuntimeError("Reviewed temporary Article 2 identity changed")
+        if proposal_id == 439:
+            draft = proposal.new_chunk_draft
+            old_text = (proposal.old_chunk_snapshot or {}).get("text")
+            if (
+                proposal.instruction_index != 7
+                or proposal.old_chunk_id
+                != "rc_89c2cbd8f02fda473189ef601fc32bb7c49cc414"
+                or str(draft.get("user_file_id"))
+                != "014fbc6a-2da2-4845-9df9-f4afc625587a"
+                or (draft.get("metadata") or {}).get("article_no") != "GEÇİCİ 1"
+                or draft.get("effective_start_date") != "2026-08-01"
+                or not isinstance(old_text, str)
+                or old_text.count("31/7/2026") != 1
+                or old_text.replace("31/7/2026", "31/1/2027")
+                != draft.get("text")
+            ):
+                raise RuntimeError("Reviewed temporary Article 1 date change altered")
         if proposal.status != "pending":
             print(f"SKIP proposal={proposal_id} status={proposal.status}")
             return
@@ -123,6 +141,6 @@ def main(proposal_id: int) -> None:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2 or sys.argv[1] not in {"442", "443", "462", "465", "470", "481", "482"}:
+    if len(sys.argv) != 2 or sys.argv[1] not in {"439", "442", "443", "462", "465", "470", "481", "482"}:
         raise SystemExit("Specify exactly one approved DEV proposal ID")
     main(int(sys.argv[1]))
