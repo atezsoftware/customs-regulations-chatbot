@@ -1417,6 +1417,41 @@ def test_regulatory_luna_rerank_is_deferred_until_after_bootstrap() -> None:
     assert configured.enabled is True
 
 
+def test_fast_regulatory_rerank_uses_atomic_candidates_without_packet_lookup() -> None:
+    chunk = _real_regulatory_section(
+        "document", 1, heading_path=["Instrument", "Provision"]
+    ).center_chunk
+    configured = RerankerRuntimeConfig(
+        enabled=True,
+        provider_type=RerankerProvider.SILICONFLOW,
+        model_name="Qwen/Qwen3-Reranker-8B",
+        api_key=make_mock_sensitive_value("test-key"),
+        configuration_generation="test-generation",
+    )
+    rerank_mocks: list[MagicMock] = []
+    with patch(
+        f"{MODULE}.build_regulatory_rerank_packets",
+        side_effect=AssertionError("fast search must not scan rerank packet files"),
+    ) as packet_builder:
+        _run(
+            _make_tool(
+                BaseFilters(
+                    regulatory_chunks_only=True,
+                    regulatory_workflow_mode="fast",
+                ),
+                auto_detect_filters=False,
+            ),
+            connected_sources=[DocumentSource.USER_FILE],
+            fused_chunks=[chunk],
+            rerank_sink=rerank_mocks,
+            reranker_config=configured,
+        )
+
+    packet_builder.assert_not_called()
+    assert rerank_mocks[0].call_args.kwargs["chunks"] == [chunk]
+    assert rerank_mocks[0].call_args.kwargs["config"].enabled is True
+
+
 def test_regulatory_luna_rerank_is_enabled_for_followup_query() -> None:
     rerank_mocks: list[MagicMock] = []
     configured = RerankerRuntimeConfig(

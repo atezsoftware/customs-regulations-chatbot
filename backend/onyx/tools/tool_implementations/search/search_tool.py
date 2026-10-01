@@ -2377,16 +2377,40 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
         rerank_packets = None
         rerank_input_chunks = fused_candidates
         if regulatory_chunks_only and effective_reranker_config.enabled:
-            with get_session_with_current_tenant() as rerank_packet_session:
-                rerank_packets = build_regulatory_rerank_packets(
-                    rerank_packet_session,
-                    fused_candidates,
-                    query=rerank_query,
-                    as_of_date=(
-                        effective_filters.as_of_date if effective_filters else None
+            fast_regulatory_search = bool(
+                effective_filters
+                and effective_filters.regulatory_workflow_mode == "fast"
+            )
+            with graph_step(
+                "search.rerank_packet_preparation",
+                {
+                    "strategy": (
+                        "atomic_candidates"
+                        if fast_regulatory_search
+                        else "provision_packets"
                     ),
+                    "candidate_count": len(fused_candidates),
+                },
+            ) as packet_step:
+                if not fast_regulatory_search:
+                    with get_session_with_current_tenant() as rerank_packet_session:
+                        rerank_packets = build_regulatory_rerank_packets(
+                            rerank_packet_session,
+                            fused_candidates,
+                            query=rerank_query,
+                            as_of_date=(
+                                effective_filters.as_of_date
+                                if effective_filters
+                                else None
+                            ),
+                        )
+                    rerank_input_chunks = [
+                        packet.candidate for packet in rerank_packets
+                    ]
+                packet_step.summary = (
+                    f"{len(rerank_input_chunks)} candidates; "
+                    f"{'atomic' if fast_regulatory_search else 'provision packets'}"
                 )
-            rerank_input_chunks = [packet.candidate for packet in rerank_packets]
         rerank_result = rerank_chunks(
             query=rerank_query,
             chunks=rerank_input_chunks,
