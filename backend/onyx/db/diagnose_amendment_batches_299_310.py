@@ -318,6 +318,55 @@ def main() -> None:
                     if failed >= 8:
                         break
                 print("RECEIPT_CHECK_460", json.dumps({"checked": checked, "failed": failed}))
+                dependency_windows = {}
+                active_rows = connection.execute(text(
+                    "SELECT canonical_chunk_id, index_identity_sha256, effective_start, "
+                    "effective_end FROM regulatory_temporal_projection WHERE "
+                    "canonical_chunk_id = ANY(:ids) AND retired_at IS NULL"
+                ), {"ids": dependencies})
+                for active_row in active_rows:
+                    dependency_windows.setdefault(active_row.canonical_chunk_id, []).append({
+                        "identity": active_row.index_identity_sha256,
+                        "start": active_row.effective_start,
+                        "end": active_row.effective_end,
+                        "origin": "active",
+                    })
+                for other in manifest.bindings:
+                    if other.id in previous_ids:
+                        continue
+                    identifier = json.loads(other.projection.source_json)["regulatory_chunk_id"]
+                    dependency_windows.setdefault(identifier, []).append({
+                        "identity": other.index.temporal_lookup_identity(),
+                        "start": other.effective_start,
+                        "end": other.effective_end,
+                        "origin": "pending",
+                    })
+                window_issues = 0
+                for parent in manifest.bindings:
+                    if parent.id in previous_ids or parent.derived_role != "hierarchical_aggregate":
+                        continue
+                    identities = set(manifest_index_by_uuid[parent.index.index_uuid].temporal_lookup_identities())
+                    for identifier in parent.dependency_ids:
+                        windows = [w for w in dependency_windows.get(identifier, []) if w["identity"] in identities]
+                        covers = any(
+                            (w["start"] is None or parent.effective_start is not None and w["start"] <= parent.effective_start)
+                            and (w["end"] is None or parent.effective_end is not None and w["end"] >= parent.effective_end)
+                            for w in windows
+                        )
+                        if windows and not covers:
+                            print("WINDOW_MISMATCH_460", json.dumps({
+                                "parent": parent.id.hex,
+                                "parent_start": str(parent.effective_start),
+                                "parent_end": str(parent.effective_end),
+                                "dependency": identifier,
+                                "windows": [{**w, "start": str(w["start"]), "end": str(w["end"])} for w in windows[:5]],
+                            }))
+                            window_issues += 1
+                            if window_issues >= 12:
+                                break
+                    if window_issues >= 12:
+                        break
+                print("WINDOW_ISSUE_COUNT_460", window_issues)
         targets = [
             ("299_6A", "rc.user_file_id = CAST(:file_id AS uuid) AND "
              "(rc.chunk_metadata->>'article_no' = '6/A' OR "
