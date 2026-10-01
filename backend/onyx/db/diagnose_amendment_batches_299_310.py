@@ -352,6 +352,40 @@ def main() -> None:
                     default=str,
                 ),
             )
+        for row in connection.execute(
+            text(
+                "SELECT id, position, status, chunk_metadata->>'article_no' "
+                "AS article_no, text, heading_path FROM regulatory_chunk WHERE "
+                "user_file_id=CAST(:file_id AS uuid) AND position BETWEEN 12 AND 25 "
+                "ORDER BY position, created_at"
+            ),
+            {"file_id": "014fbc6a-2da2-4845-9df9-f4afc625587a"},
+        ):
+            print(
+                "FILE_299_AROUND_6",
+                json.dumps(
+                    {"id": row.id, "position": row.position,
+                     "status": row.status, "article_no": row.article_no,
+                     "text_excerpt": row.text[:350],
+                     "heading_path": row.heading_path[:3]},
+                    ensure_ascii=False,
+                ),
+            )
+        for row in connection.execute(
+            text(
+                "SELECT id, name, status, chunk_count FROM user_file WHERE "
+                "name ILIKE '%2018%13%' OR name ILIKE '%gumruksuz%' OR "
+                "name ILIKE '%gümrüksüz%' LIMIT 100"
+            )
+        ):
+            print(
+                "FILE_306_CANDIDATE",
+                json.dumps(
+                    {"id": str(row.id), "name": row.name,
+                     "status": row.status, "chunk_count": row.chunk_count},
+                    ensure_ascii=False, default=str,
+                ),
+            )
     engine.dispose()
 
 
