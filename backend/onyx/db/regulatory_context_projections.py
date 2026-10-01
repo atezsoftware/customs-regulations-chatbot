@@ -360,6 +360,7 @@ def activate_temporal_projection(
     user_file_id: UUID,
     binding: "AnnexTemporalProjection",
     canonical_revision_id: UUID | None = None,
+    dependency_index: "PublicationIndexSnapshot | None" = None,
 ) -> None:
     """Join an owned publication transaction; never alter another index's history."""
     import json
@@ -397,6 +398,13 @@ def activate_temporal_projection(
         or not accepts_publication_projection(binding.index, binding.projection)
     ):
         raise ValueError("temporal encoder/source identity mismatch")
+    qualified_dependency_index = dependency_index or binding.index
+    if not binding.index.matches_temporal_index(
+        qualified_dependency_index
+    ) or not accepts_publication_projection(
+        qualified_dependency_index, binding.projection
+    ):
+        raise ValueError("temporal dependency index cannot accept parent projection")
     canonical = session.get(RegulatoryChunk, source["regulatory_chunk_id"])
     retained_revision_id = canonical_revision_id
     if retained_revision_id is not None:
@@ -452,7 +460,7 @@ def activate_temporal_projection(
         qualified = get_indexed_temporal_projection(
             session,
             row.id,
-            index=binding.index,
+            index=qualified_dependency_index,
             as_of_date=context_reference_date(
                 binding.effective_start, binding.effective_end
             ),
@@ -462,7 +470,7 @@ def activate_temporal_projection(
                 RegulatoryTemporalProjection.canonical_chunk_id == row.id,
                 RegulatoryTemporalProjection.retired_at.is_(None),
                 RegulatoryTemporalProjection.index_identity_sha256.in_(
-                    binding.index.temporal_lookup_identities()
+                    qualified_dependency_index.temporal_lookup_identities()
                 ),
             )
             if binding.effective_start is not None:

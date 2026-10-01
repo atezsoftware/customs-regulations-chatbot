@@ -549,6 +549,93 @@ def test_reviewed_text_reconciles_inherited_type_and_heading_metadata() -> None:
     )
 
 
+def test_heading_only_dependents_do_not_need_the_primary_replacement_body() -> None:
+    instruction = (
+        "MADDE 4 başlığı değiştirilmiş ve birinci fıkrası aşağıdaki şekilde "
+        "değiştirilmiştir. “(1) Yeni hüküm.”"
+    )
+    file_id = "00000000-0000-0000-0000-000000000123"
+    heading_change = {"article_no": "4", "title": "Yeni başlık"}
+
+    def change(identifier: str, position: int, old_text: str, new_text: str) -> dict:
+        heading = ["MADDE 4 - Eski başlık", old_text]
+        old = {
+            "id": identifier,
+            "user_file_id": file_id,
+            "position": position,
+            "text": old_text,
+            "chunk_type": "paragraph",
+            "heading_path": heading,
+            "metadata": {"article_no": "4", "paragraph_no": str(position)},
+            "heading_change": heading_change,
+        }
+        draft = {
+            "user_file_id": file_id,
+            "position": position,
+            "text": new_text,
+            "chunk_type": "paragraph",
+            "heading_path": ["MADDE 4 - Yeni başlık", new_text],
+            "metadata": {
+                "article_no": "4",
+                "paragraph_no": str(position),
+                "article_title": "Yeni başlık",
+            },
+            "effective_start_date": None,
+            "effective_end_date": None,
+        }
+        return {
+            "old_chunk_id": identifier,
+            "old_chunk_snapshot": old,
+            "new_chunk_draft": draft,
+            "instruction_indices": [0],
+            "instruction_texts": [instruction],
+        }
+
+    changes = [
+        change("old-primary", 1, "(1) Eski hüküm.", "(1) Yeni hüküm."),
+        change("old-dependent", 2, "(2) Değişmeyen hüküm.", "(2) Değişmeyen hüküm."),
+    ]
+    proposal = SimpleNamespace(
+        id=470,
+        status="pending",
+        old_chunk_id="old-primary",
+        old_chunk_snapshot=changes[0]["old_chunk_snapshot"],
+        new_chunk_draft=changes[0]["new_chunk_draft"],
+        chunk_changes=changes,
+    )
+    session = MagicMock(spec=Session)
+    session.scalar.side_effect = [None, proposal, None, proposal]
+
+    queue_amendment_proposal_approval(
+        session,
+        cast(AmendmentProposal, proposal),
+        decided_by=None,
+        reviewed_new_chunk_draft=changes[0]["new_chunk_draft"],
+        reviewed_chunk_changes=changes,
+    )
+
+    assert proposal.status == "approving"
+    assert len(proposal.chunk_changes) == 2
+
+    proposal.status = "pending"
+    tampered = [dict(change) for change in changes]
+    tampered[1] = {
+        **tampered[1],
+        "new_chunk_draft": {
+            **tampered[1]["new_chunk_draft"],
+            "text": "(2) Yetkisiz değişiklik.",
+        },
+    }
+    with pytest.raises(ValueError, match="Heading-only dependent chunk text"):
+        queue_amendment_proposal_approval(
+            session,
+            cast(AmendmentProposal, proposal),
+            decided_by=None,
+            reviewed_new_chunk_draft=changes[0]["new_chunk_draft"],
+            reviewed_chunk_changes=tampered,
+        )
+
+
 def test_reviewed_text_cannot_drop_an_explicit_replacement_body() -> None:
     instruction_text = (
         "20 nci maddenin birinci fıkrası aşağıdaki şekilde değiştirilmiştir. "

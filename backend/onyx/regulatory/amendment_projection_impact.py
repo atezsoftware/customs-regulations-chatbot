@@ -258,6 +258,10 @@ class ContextImpactCoverageError(ValueError):
         )
 
 
+class ContextImpactSourceQuoteError(ValueError):
+    """An affected decision did not identify verbatim changed-source evidence."""
+
+
 def validate_context_decisions(
     contexts: dict[str, str],
     decisions: list[ContextImpactDecision],
@@ -291,7 +295,7 @@ def validate_context_decisions(
                 or not decision.source_quote.strip()
                 or decision.source_quote not in source
             ):
-                raise ValueError(
+                raise ContextImpactSourceQuoteError(
                     f"context {decision.key}: context impact must quote an actual changed "
                     "source verbatim; source_id and source_side must select one of "
                     + json.dumps(
@@ -524,9 +528,9 @@ def include_context_consumers(
                     return response
                 except ValueError as error:
                     if attempt == 1:
-                        if (
-                            isinstance(error, ContextImpactCoverageError)
-                            and len(batch) > 1
+                        if len(batch) > 1 and isinstance(
+                            error,
+                            (ContextImpactCoverageError, ContextImpactSourceQuoteError),
                         ):
                             return recover_singletons()
                         raise

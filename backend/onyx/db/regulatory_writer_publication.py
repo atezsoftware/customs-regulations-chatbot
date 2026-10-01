@@ -472,6 +472,7 @@ def finalize_writer_publication(
                 session, user_file_id=owner.user_file_id, view=view
             )
         existing_ids = {binding.id for binding in active}
+        dependency_indexes = {index.index_uuid: index for index in manifest.indexes}
         pending = [
             binding for binding in manifest.bindings if binding.id not in existing_ids
         ]
@@ -500,6 +501,7 @@ def finalize_writer_publication(
                     user_file_id=owner.user_file_id,
                     binding=binding,
                     canonical_revision_id=manifest.canonical_revisions.get(binding.id),
+                    dependency_index=dependency_indexes[binding.index.index_uuid],
                 )
                 pending.remove(binding)
         file = session.get(UserFile, owner.user_file_id)

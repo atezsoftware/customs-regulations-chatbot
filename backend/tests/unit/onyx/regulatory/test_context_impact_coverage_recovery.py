@@ -154,6 +154,35 @@ def test_persistent_batch_coverage_recovers_with_original_singleton_keys(
     )
 
 
+def test_invalid_batch_source_quote_retries_each_context_with_exact_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[dict[str, Any]] = []
+
+    def audit(*_args: object, **kwargs: object) -> impact.ContextImpactResult:
+        data = json.loads(str(kwargs["user_prompt"]))
+        requests.append(data)
+        response = decisions(list(data["contexts"]))
+        if len(data["contexts"]) > 1:
+            response.decisions[0] = response.decisions[0].model_copy(
+                update={"source_quote": "not in the changed source"}
+            )
+        return response
+
+    monkeypatch.setattr(impact, "generate_structured", audit)
+    result = run(inputs())
+
+    assert set(result) == {"old", "new", "consumer-0", "consumer-1", "consumer-2"}
+    assert [list(request["contexts"]) for request in requests] == [
+        ["0", "1", "2"],
+        ["0", "1", "2"],
+        ["0"],
+        ["1"],
+        ["2"],
+    ]
+    assert requests[2]["changes"] == requests[0]["changes"]
+
+
 @pytest.mark.parametrize(
     "fault", ["missing", "duplicate", "foreign", "source_quote", "uncertain"]
 )
@@ -213,9 +242,8 @@ def test_expired_parent_deadline_prevents_later_singleton_calls(
     assert calls == [["0", "1", "2"], ["0", "1", "2"], ["0"]]
 
 
-@pytest.mark.parametrize("fault", ["source_quote", "uncertain"])
-def test_incomplete_batch_with_semantic_error_does_not_trigger_coverage_fallback(
-    monkeypatch: pytest.MonkeyPatch, fault: str
+def test_incomplete_batch_with_uncertain_decision_does_not_retry_as_coverage(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[list[str]] = []
 
@@ -225,14 +253,12 @@ def test_incomplete_batch_with_semantic_error_does_not_trigger_coverage_fallback
         response = decisions(keys[:-1] if len(keys) > 1 else keys)
         if len(keys) > 1:
             response.decisions[0] = response.decisions[0].model_copy(
-                update={"source_quote": "fabricated"}
-                if fault == "source_quote"
-                else {"uncertain": True}
+                update={"uncertain": True}
             )
         return response
 
     monkeypatch.setattr(impact, "generate_structured", audit)
-    with pytest.raises(ValueError, match="changed source|unresolved context impact"):
+    with pytest.raises(ValueError, match="unresolved context impact"):
         run(inputs())
     assert calls == [["0", "1", "2"], ["0", "1", "2"]]
 

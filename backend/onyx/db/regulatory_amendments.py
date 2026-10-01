@@ -766,10 +766,21 @@ def queue_amendment_proposal_approval(
             effective_draft,
             old_chunk_snapshot=stored_change.get("old_chunk_snapshot") or {},
         )
-        validate_explicit_replacement_texts(
-            list(stored_change.get("instruction_texts") or []),
-            reviewed_draft["text"],
+        old_snapshot = stored_change.get("old_chunk_snapshot") or {}
+        heading_only_dependent = (
+            index > 0
+            and len(stored_changes) > 1
+            and old_snapshot.get("heading_change") is not None
+            and old_snapshot.get("text") == stored_change["new_chunk_draft"].get("text")
         )
+        if heading_only_dependent:
+            if reviewed_draft["text"] != old_snapshot["text"]:
+                raise ValueError("Heading-only dependent chunk text cannot be changed")
+        else:
+            validate_explicit_replacement_texts(
+                list(stored_change.get("instruction_texts") or []),
+                reviewed_draft["text"],
+            )
         validate_added_article_draft(
             list(stored_change.get("instruction_texts") or []),
             metadata=reviewed_draft["metadata"],
