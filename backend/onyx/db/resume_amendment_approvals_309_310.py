@@ -7,7 +7,7 @@ import sys
 from onyx.background.celery.tasks.regulatory_amendments.tasks import (
     enqueue_amendment_proposal_approval,
 )
-from onyx.db.engine.sql_engine import get_session_with_current_tenant
+from onyx.db.engine.sql_engine import SqlEngine, get_session_with_current_tenant
 from onyx.db.regulatory_amendments import (
     get_batch,
     get_proposal,
@@ -30,6 +30,7 @@ def main(proposal_id: int) -> None:
         raise RuntimeError("This replay is restricted to the DEV database")
     if annex_config.REGULATORY_ANNEX_ENVIRONMENT != "dev":
         raise RuntimeError("This replay is restricted to DEV publication")
+    SqlEngine.init_engine(pool_size=1, max_overflow=0)
     expected_batch, expected_hash, expected_changes = EXPECTED[proposal_id]
     with get_session_with_current_tenant() as session:
         proposal = get_proposal(session, proposal_id)
