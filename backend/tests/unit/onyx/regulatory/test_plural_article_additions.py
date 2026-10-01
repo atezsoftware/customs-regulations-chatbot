@@ -6,6 +6,8 @@ from onyx.db import regulatory_amendment_order
 from onyx.regulatory.amendments import pipeline
 from onyx.regulatory.amendments.draft_integrity import (
     DraftIntegrityError,
+    explicit_added_article_identity,
+    explicit_added_body,
     validate_added_article_draft,
 )
 from onyx.regulatory.amendments.insertion_order import OrderMember
@@ -21,6 +23,21 @@ from onyx.regulatory.amendments.new_provision_policy import (
 )
 from onyx.regulatory.amendments.ranker import CandidateChunk
 from onyx.regulatory.provision_identity import article_identity
+
+
+def test_unclosed_quoted_added_article_preserves_its_own_identity() -> None:
+    body = (
+        "Destek ödemesi işlemleri ile ilgili inceleme yapılması\n"
+        "MADDE 6/A- (1) Merkez Bankası bilgi ve belge talep edebilir.\n"
+        "(2) İnceleme süresince destek ödenmez."
+    )
+    instruction = (
+        "MADDE 5- Aynı Tebliğe 6 ncı maddesinden sonra gelmek üzere "
+        "aşağıdaki maddeler eklenmiştir.\n“" + body
+    )
+    assert explicitly_adds_top_level_provision(instruction)
+    assert explicit_added_body(instruction) == body
+    assert explicit_added_article_identity(instruction) == "6/A"
 
 
 @pytest.mark.parametrize(

@@ -57,6 +57,8 @@ def explicit_added_body(instruction_text: str) -> str | None:
         start, end = remainder.find(opening), remainder.rfind(closing)
         if start >= 0 and end > start:
             return remainder[start + len(opening) : end].strip()
+        if start >= 0 and end < 0:
+            return remainder[start + len(opening) :].strip()
     return None
 
 
