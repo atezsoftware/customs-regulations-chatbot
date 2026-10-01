@@ -4,7 +4,7 @@ import json
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timezone
 from threading import Barrier
-from typing import Any, cast
+from typing import Any, Callable, cast
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
@@ -1022,6 +1022,7 @@ def _run(
     expanded_keyword_queries: list[str] | None = None,
     fused_chunks: list[InferenceChunk] | None = None,
     rerank_result: RerankResult | None = None,
+    rerank_behavior: Callable[..., RerankResult] | None = None,
     selector_sink: list[MagicMock] | None = None,
     rerank_sink: list[MagicMock] | None = None,
     rrf_sink: list[MagicMock] | None = None,
@@ -1050,7 +1051,11 @@ def _run(
         outcome=RerankOutcome.DISABLED,
         fallback_used=True,
     )
-    rerank_mock = MagicMock(return_value=effective_rerank_result)
+    rerank_mock = (
+        MagicMock(side_effect=rerank_behavior)
+        if rerank_behavior is not None
+        else MagicMock(return_value=effective_rerank_result)
+    )
     rrf_mock = MagicMock(return_value=effective_fused_chunks)
     selector_mock = MagicMock(
         side_effect=lambda sections, **_kwargs: (list(sections), None)
@@ -1450,6 +1455,56 @@ def test_fast_regulatory_rerank_uses_atomic_candidates_without_packet_lookup() -
     packet_builder.assert_not_called()
     assert rerank_mocks[0].call_args.kwargs["chunks"] == [chunk]
     assert rerank_mocks[0].call_args.kwargs["config"].enabled is True
+
+
+def test_fast_regulatory_search_stages_large_candidate_pool() -> None:
+    from tests.unit.onyx.regulatory.labeling.test_search_overlay import chunk
+
+    candidates = [chunk(str(index)) for index in range(1, 101)]
+    configured = RerankerRuntimeConfig(
+        enabled=True,
+        provider_type=RerankerProvider.SILICONFLOW,
+        model_name="Qwen/Qwen3-Reranker-8B",
+        api_key=make_mock_sensitive_value("test-key"),
+        configuration_generation="test-generation",
+    )
+
+    def rank_batch(
+        *, query: str, chunks: list[InferenceChunk], config: RerankerRuntimeConfig
+    ) -> RerankResult:
+        assert query == "ticket"
+        assert config.enabled
+        return RerankResult(
+            ordered_chunks=chunks,
+            scores_by_chunk={},
+            submitted_count=len(chunks),
+            result_count=len(chunks),
+            outcome=RerankOutcome.SUCCESS,
+            fallback_used=False,
+        )
+
+    rerank_mocks: list[MagicMock] = []
+    _run(
+        _make_tool(
+            BaseFilters(
+                regulatory_chunks_only=True,
+                regulatory_workflow_mode="fast",
+            ),
+            auto_detect_filters=False,
+        ),
+        connected_sources=[DocumentSource.USER_FILE],
+        fused_chunks=candidates,
+        rerank_behavior=rank_batch,
+        rerank_sink=rerank_mocks,
+        reranker_config=configured,
+    )
+
+    assert [len(call.kwargs["chunks"]) for call in rerank_mocks[0].call_args_list] == [
+        32,
+        32,
+        32,
+        48,
+    ]
 
 
 def test_regulatory_luna_rerank_is_enabled_for_followup_query() -> None:
@@ -2186,14 +2241,14 @@ def test_hybrid_label_addition_reaches_reranker_with_full_baseline(
         label_hint={"label_ids": ["SUB.TAX.VAT"]},
     )
     submitted = reranks[0].call_args.kwargs["chunks"]
-    assert len(submitted) <= 48
+    assert len(submitted) == 96
     assert "101" in {row.regulatory_chunk_id for row in submitted}
     assert (
         len(
             {row.regulatory_chunk_id for row in submitted}
             & {str(i) for i in range(1, 101)}
         )
-        >= 36
+        >= 72
     )
 
 

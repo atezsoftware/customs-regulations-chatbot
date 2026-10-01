@@ -128,9 +128,16 @@ from onyx.regulatory.provision_retrieval import (
     expand_selected_regulatory_source_lexical_matches,
     regulatory_provision_navigation_payload,
 )
-from onyx.reranking.constants import uses_chat_completion_reranking
+from onyx.reranking.constants import (
+    MAX_CHAT_RERANK_CANDIDATES,
+    uses_chat_completion_reranking,
+)
 from onyx.reranking.diversity import apply_soft_diversity
 from onyx.reranking.service import rerank_chunks
+from onyx.reranking.staged import (
+    STAGED_FINAL_LIMIT,
+    rerank_regulatory_candidates_in_stages,
+)
 from onyx.secondary_llm_flows.document_filter import (
     select_chunks_for_relevance,
     select_sections_for_expansion,
@@ -195,6 +202,7 @@ _REGULATORY_PROVISION_OVERFETCH_FACTOR = 4
 _REGULATORY_PROVISION_MAX_CANDIDATES = 128
 _REGULATORY_PROVISION_FAMILY_SEED_LIMIT = 4
 _REGULATORY_RERANK_CANDIDATE_LIMIT = 48
+_FAST_REGULATORY_RERANK_CANDIDATE_LIMIT = 96
 _REGULATORY_KEYWORD_QUERY_HYBRID_ALPHA = 0.0
 _REGULATORY_SEARCH_DESCRIPTION = (
     "Search administrator-indexed regulatory chunks for evidence. You decide "
@@ -2085,6 +2093,19 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
             )
 
         effective_filters = _resolve_regulatory_as_of_date(effective_filters)
+        fast_regulatory_search = bool(
+            effective_filters
+            and effective_filters.regulatory_chunks_only
+            and effective_filters.regulatory_workflow_mode == "fast"
+        )
+        regulatory_rerank_candidate_limit = min(
+            override_kwargs.rerank_candidate_limit,
+            (
+                _FAST_REGULATORY_RERANK_CANDIDATE_LIMIT
+                if fast_regulatory_search
+                else _REGULATORY_RERANK_CANDIDATE_LIMIT
+            ),
+        )
 
         focused_regulatory_search = bool(
             effective_filters
@@ -2303,7 +2324,7 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
                 as_of_date=effective_filters.as_of_date or date.today(),
                 limit=min(
                     override_kwargs.rerank_candidate_limit,
-                    _REGULATORY_RERANK_CANDIDATE_LIMIT,
+                    regulatory_rerank_candidate_limit,
                 ),
                 retrieve=retrieve_label_ids,
                 discover=discover_label_sources,
@@ -2352,10 +2373,7 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
 
         fused_candidates = rerank_candidate_pool[
             : (
-                min(
-                    override_kwargs.rerank_candidate_limit,
-                    _REGULATORY_RERANK_CANDIDATE_LIMIT,
-                )
+                regulatory_rerank_candidate_limit
                 if regulatory_chunks_only
                 else override_kwargs.rerank_candidate_limit
             )
@@ -2377,10 +2395,6 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
         rerank_packets = None
         rerank_input_chunks = fused_candidates
         if regulatory_chunks_only and effective_reranker_config.enabled:
-            fast_regulatory_search = bool(
-                effective_filters
-                and effective_filters.regulatory_workflow_mode == "fast"
-            )
             with graph_step(
                 "search.rerank_packet_preparation",
                 {
@@ -2411,11 +2425,26 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
                     f"{len(rerank_input_chunks)} candidates; "
                     f"{'atomic' if fast_regulatory_search else 'provision packets'}"
                 )
-        rerank_result = rerank_chunks(
-            query=rerank_query,
-            chunks=rerank_input_chunks,
-            config=effective_reranker_config,
-        )
+        if fast_regulatory_search and effective_reranker_config.enabled:
+            rerank_result = rerank_regulatory_candidates_in_stages(
+                query=rerank_query,
+                chunks=rerank_input_chunks,
+                config=effective_reranker_config,
+                rerank=rerank_chunks,
+                final_limit=(
+                    MAX_CHAT_RERANK_CANDIDATES
+                    if uses_chat_completion_reranking(
+                        effective_reranker_config.model_name
+                    )
+                    else STAGED_FINAL_LIMIT
+                ),
+            )
+        else:
+            rerank_result = rerank_chunks(
+                query=rerank_query,
+                chunks=rerank_input_chunks,
+                config=effective_reranker_config,
+            )
         diverse_candidate_chunks = apply_soft_diversity(
             chunks=rerank_result.ordered_chunks,
             scores=rerank_result.scores_by_chunk,
