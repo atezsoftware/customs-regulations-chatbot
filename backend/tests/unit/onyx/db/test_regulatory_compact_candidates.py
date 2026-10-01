@@ -179,17 +179,27 @@ def test_sibling_read_releases_each_file_before_loading_the_next(
         for index, (identifier, file_id, article) in enumerate(identities)
     }
     session = MagicMock(spec=Session)
-    session.scalars.return_value.all.side_effect = [
-        [rows[identifier] for identifier, _, _ in identities],
-        [rows["a1"], rows["a2"]],
-        [rows["b1"]],
+    session.scalars.return_value.all.return_value = [
+        rows[identifier] for identifier, _, _ in identities
     ]
+    loaded_files: list[UUID] = []
+
+    def load_file(
+        _session: Session, file_ids: list[UUID]
+    ) -> list[chunks.RegulatoryChunkSiblingCandidate]:
+        assert len(file_ids) == 1
+        loaded_files.append(file_ids[0])
+        return [
+            candidate
+            for candidate in candidates.values()
+            if candidate.user_file_id == file_ids[0]
+        ]
+
+    monkeypatch.setattr(chunks, "_load_compact_sibling_candidates", load_file)
     monkeypatch.setattr(
         chunks,
         "_public_sibling_candidates",
-        lambda _session, file_rows, **_kwargs: [
-            candidates[row.id] for row in file_rows
-        ],
+        lambda _session, file_rows, **_kwargs: file_rows,
     )
     monkeypatch.setattr(
         chunks,
@@ -211,7 +221,8 @@ def test_sibling_read_releases_each_file_before_loading_the_next(
     )
 
     assert [row.regulatory_chunk_id for row in selected] == ["a1", "b1", "a2"]
-    assert session.scalars.call_count == 3
+    assert loaded_files == [FILE_ID, second_file_id]
+    assert session.scalars.call_count == 1
 
 
 def test_candidates_drop_vector_payload_but_keep_exact_publication_digest(
@@ -434,7 +445,22 @@ def test_hydration_rejects_changed_or_unavailable_publication(
 def _lexical_wrapper(
     inventory: SimpleNamespace,
 ) -> list[chunks.RegulatoryChunkProjection]:
-    inventory.session.scalars.return_value.all.return_value = inventory.rows
+    inventory.session.execute.return_value = [
+        (
+            row.id,
+            row.user_file_id,
+            row.position,
+            row.text,
+            row.status,
+            row.heading_path,
+            row.chunk_metadata,
+            row.chunk_type,
+            row.validity_start_date,
+            row.validity_end_date,
+            row.projection_ordinal,
+        )
+        for row in inventory.rows
+    ]
     return chunks.get_bounded_source_lexical_matches(
         inventory.session,
         user_file_id=FILE_ID,
@@ -449,6 +475,10 @@ def test_lexical_db_wrapper_returns_exact_selected_frozen_source(
 ) -> None:
     result = _lexical_wrapper(inventory)
 
+    statement = inventory.session.execute.call_args.args[0]
+    assert len(statement.selected_columns) == 11
+    assert statement.get_execution_options()["yield_per"] == 256
+    inventory.session.scalars.assert_not_called()
     assert [row.regulatory_chunk_id for row in result] == ["reference"]
     assert [_semantic_result(row) for row in result] == [
         _semantic_result(row) for row in _select("lexical", inventory.eager)

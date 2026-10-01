@@ -1635,13 +1635,7 @@ def get_bounded_source_lexical_matches(
 
     observation = observe_publication_read()
     effective_date = as_of_date or datetime.date.today()
-    all_rows = list(
-        db_session.scalars(
-            select(RegulatoryChunk)
-            .execution_options(populate_existing=True)
-            .where(RegulatoryChunk.user_file_id == user_file_id)
-        ).all()
-    )
+    all_rows = _load_compact_sibling_candidates(db_session, [user_file_id])
     selected = select_bounded_source_lexical_matches(
         _public_sibling_candidates(
             db_session,
@@ -2204,9 +2198,88 @@ def _hydrate_selected_regulatory_sources(
     ]
 
 
+def _load_compact_sibling_candidates(
+    session: Session,
+    user_file_ids: Sequence[UUID],
+) -> list[RegulatoryChunkSiblingCandidate]:
+    """Read source text and selection metadata without hydrating ORM rows."""
+
+    if not user_file_ids:
+        return []
+    statement = (
+        select(
+            RegulatoryChunk.id,
+            RegulatoryChunk.user_file_id,
+            RegulatoryChunk.position,
+            RegulatoryChunk.text,
+            RegulatoryChunk.status,
+            RegulatoryChunk.heading_path,
+            RegulatoryChunk.chunk_metadata,
+            RegulatoryChunk.chunk_type,
+            RegulatoryChunk.validity_start_date,
+            RegulatoryChunk.validity_end_date,
+            RegulatoryChunk.projection_ordinal,
+        )
+        .where(RegulatoryChunk.user_file_id.in_(user_file_ids))
+        .order_by(RegulatoryChunk.user_file_id, RegulatoryChunk.position)
+        .execution_options(yield_per=256)
+    )
+    candidates: list[RegulatoryChunkSiblingCandidate] = []
+    for (
+        chunk_id,
+        file_id,
+        position,
+        source_text,
+        status,
+        heading_path,
+        metadata,
+        chunk_type,
+        validity_start_date,
+        validity_end_date,
+        projection_ordinal,
+    ) in session.execute(statement):
+        metadata = metadata or {}
+        candidates.append(
+            RegulatoryChunkSiblingCandidate(
+                regulatory_chunk_id=chunk_id,
+                user_file_id=file_id,
+                position=position,
+                text=source_text,
+                status=status,
+                heading_path=tuple(heading_path),
+                article_no=(
+                    str(metadata["article_no"])
+                    if metadata.get("article_no") is not None
+                    else None
+                ),
+                article_title=(
+                    str(metadata["article_title"])
+                    if metadata.get("article_title") is not None
+                    else None
+                ),
+                chunk_type=chunk_type,
+                paragraph_no=(
+                    str(metadata["paragraph_no"])
+                    if metadata.get("paragraph_no") is not None
+                    else None
+                ),
+                clause_label=(
+                    str(metadata["clause_label"])
+                    if metadata.get("clause_label") is not None
+                    else None
+                ),
+                validity_start_date=validity_start_date,
+                validity_end_date=validity_end_date,
+                projection_ordinal=projection_ordinal,
+                image_file_id=metadata.get("image_file_id"),
+            )
+        )
+    return candidates
+
+
 def _public_sibling_candidates(
     session: Session,
-    rows: list[RegulatoryChunk],
+    rows: Sequence[RegulatoryChunk | RegulatoryChunkSiblingCandidate],
     *,
     as_of_date: datetime.date | None,
     query_indexes: dict[UUID, PublicationIndexSnapshot] | None,
@@ -2230,15 +2303,25 @@ def _public_sibling_candidates(
                 index=index,
                 as_of_date=effective_date,
                 canonical_chunk_ids=tuple(
-                    row.id for row in rows if row.user_file_id == file_id
+                    (
+                        row.regulatory_chunk_id
+                        if isinstance(row, RegulatoryChunkSiblingCandidate)
+                        else row.id
+                    )
+                    for row in rows
+                    if row.user_file_id == file_id
                 ),
             )
         )
     candidates = []
     for row in rows:
-        candidate = _regulatory_sibling_candidate(row)
+        candidate = (
+            row
+            if isinstance(row, RegulatoryChunkSiblingCandidate)
+            else _regulatory_sibling_candidate(row)
+        )
         if row.user_file_id in qualified:
-            binding = bindings.get(row.id)
+            binding = bindings.get(candidate.regulatory_chunk_id)
             if binding is None:
                 continue
             candidate = replace(
@@ -2246,7 +2329,7 @@ def _public_sibling_candidates(
                 position=binding.semantic_position,
                 text=binding.representation_text,
                 status=RegulatoryChunkStatus.ACTIVE.value,
-                heading_path=binding.heading_path or tuple(row.heading_path),
+                heading_path=binding.heading_path or candidate.heading_path,
                 projection_ordinal=binding.projection_ordinal,
                 publication_source_sha256=binding.source_sha256,
                 image_file_id=binding.image_file_id,
@@ -2345,13 +2428,7 @@ def get_bounded_same_provision_siblings(
             for seed_id in unique_seed_ids
             if file_by_seed_id.get(seed_id) == file_id
         ]
-        file_rows = list(
-            db_session.scalars(
-                select(RegulatoryChunk)
-                .execution_options(populate_existing=True)
-                .where(RegulatoryChunk.user_file_id == file_id)
-            ).all()
-        )
+        file_rows = _load_compact_sibling_candidates(db_session, [file_id])
         candidates = _public_sibling_candidates(
             db_session,
             file_rows,
@@ -2423,13 +2500,7 @@ def get_bounded_adjacent_provisions(
     user_file_ids = {row.user_file_id for row in seed_rows}
     if not user_file_ids:
         return []
-    all_rows = list(
-        db_session.scalars(
-            select(RegulatoryChunk)
-            .execution_options(populate_existing=True)
-            .where(RegulatoryChunk.user_file_id.in_(user_file_ids))
-        ).all()
-    )
+    all_rows = _load_compact_sibling_candidates(db_session, list(user_file_ids))
     selected = select_bounded_adjacent_provisions(
         _public_sibling_candidates(
             db_session,
@@ -2537,13 +2608,7 @@ def get_bounded_referenced_provisions(
     user_file_ids = {row.user_file_id for row in seed_rows}
     if not user_file_ids:
         return []
-    all_rows = list(
-        db_session.scalars(
-            select(RegulatoryChunk)
-            .execution_options(populate_existing=True)
-            .where(RegulatoryChunk.user_file_id.in_(user_file_ids))
-        ).all()
-    )
+    all_rows = _load_compact_sibling_candidates(db_session, list(user_file_ids))
     selected = select_bounded_referenced_provisions(
         _public_sibling_candidates(
             db_session,
