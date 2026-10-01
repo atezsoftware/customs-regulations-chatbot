@@ -354,12 +354,11 @@ def main() -> None:
                             (w["start"] is None or w["start"] <= reference_date)
                             and (w["end"] is None or w["end"] > reference_date)
                         ]
-                        covers = any(
+                        noncovering = [w for w in selected if not (
                             (w["start"] is None or parent.effective_start is not None and w["start"] <= parent.effective_start)
                             and (w["end"] is None or parent.effective_end is not None and w["end"] >= parent.effective_end)
-                            for w in selected
-                        )
-                        if selected and not covers:
+                        )]
+                        if noncovering:
                             print("WINDOW_MISMATCH_460", json.dumps({
                                 "parent": parent.id.hex,
                                 "parent_start": str(parent.effective_start),
