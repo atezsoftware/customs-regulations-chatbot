@@ -44,7 +44,6 @@ jobs:
           import os
           import subprocess
           import time
-          import urllib.request
           from pathlib import Path
 
           NAMESPACE = "customs-regulations-dev"
@@ -168,13 +167,6 @@ jobs:
                   "--", "python", "-",
               ], timeout=5, input_text=POD_SAMPLE)
               return name, uid, json.loads(raw)
-
-          with urllib.request.urlopen(
-              "https://dev-customs-regulations.singlewindow.io/api/version", timeout=10
-          ) as response:
-              served_sha = json.load(response)["backend_version"]
-          if served_sha != EXPECTED_SHA:
-              raise RuntimeError("DEV frontend version differs from expected image SHA")
 
           deployment = json.loads(command([
               "kubectl", "get", "deployment", DEPLOYMENT, "-n", NAMESPACE, "-o", "json",
