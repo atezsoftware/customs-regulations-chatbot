@@ -4,7 +4,7 @@ on:
     inputs:
       operation:
         type: choice
-        options: [inspect]
+        options: [inspect, approve_462, approve_465, approve_470]
         default: inspect
 permissions:
   contents: read
@@ -47,6 +47,7 @@ jobs:
             sh -ec '. /vault/secrets/config; export PYTHONPATH=/app; exec python -' < \
             backend/onyx/db/diagnose_amendment_batches_299_310.py
       - name: Filter amendment approval worker errors
+        if: inputs.operation == 'inspect'
         shell: bash
         run: |
           set -euo pipefail
@@ -79,3 +80,20 @@ jobs:
                           for excerpt in lines[index:index + 45]:
                               print(excerpt[:500])
           PY
+      - name: Resume one existing reviewed proposal
+        if: inputs.operation != 'inspect'
+        shell: bash
+        env:
+          OPERATION: ${{ inputs.operation }}
+        run: |
+          set -euo pipefail
+          case "$OPERATION" in
+            approve_462) proposal_id=462 ;;
+            approve_465) proposal_id=465 ;;
+            approve_470) proposal_id=470 ;;
+            *) exit 2 ;;
+          esac
+          IFS=$'\t' read -r pod container < /tmp/amendment-target
+          kubectl exec -i "$pod" -n customs-regulations-dev -c "$container" -- \
+            sh -ec '. /vault/secrets/config; export PYTHONPATH=/app; exec python - "$1"' sh "$proposal_id" < \
+            backend/onyx/db/resume_amendment_approvals_309_310.py
