@@ -40,7 +40,7 @@ jobs:
           ready.sort()
           pod,container,image=ready[0]
           print('TARGET',pod,container,image)
-          Path('/tmp/amendment-target').write_text(pod+'\t'+container)
+          Path('/tmp/amendment-target').write_text(pod+'\t'+container+'\n')
           PY
           IFS=$'\t' read -r pod container < /tmp/amendment-target
           kubectl exec -i "$pod" -n customs-regulations-dev -c "$container" -- \
