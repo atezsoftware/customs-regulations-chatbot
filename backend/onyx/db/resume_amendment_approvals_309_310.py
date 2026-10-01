@@ -3,6 +3,7 @@
 import hashlib
 import os
 import sys
+from uuid import UUID
 
 from onyx.background.celery.tasks.regulatory_amendments.tasks import (
     enqueue_amendment_proposal_approval,
@@ -17,6 +18,7 @@ from onyx.db.regulatory_amendments import (
 from shared_configs.contextvars import get_current_tenant_id
 
 EXPECTED: dict[int, tuple[int, str, int]] = {
+    441: (299, "23dfb8e916d111ea8ee6e4f5c8df11a3d8fb2e498039eb70633b51ecb30fb0fe", 0),
     439: (299, "758c3b4bdf345cec553958d194f302c566f7d559e2ef59e406c2abb986a34a48", 0),
     443: (299, "0cec6f3ed0cf25fdeed344032c924d7e4b842faa03f3465824d8d9cb2164b7ba", 0),
     442: (299, "1fe5608e7be48a77328be8bc26b79f1d439592d6b7b18ae47137bf02e57c82b4", 0),
@@ -124,9 +126,60 @@ def main(proposal_id: int) -> None:
                 != draft.get("text")
             ):
                 raise RuntimeError("Reviewed temporary Article 1 date change altered")
+        if proposal_id == 441:
+            from onyx.regulatory.amendments.draft_integrity import explicit_added_body
+
+            draft = proposal.new_chunk_draft
+            if (
+                proposal.instruction_index != 9
+                or proposal.old_chunk_id is not None
+                or str(draft.get("user_file_id"))
+                != "014fbc6a-2da2-4845-9df9-f4afc625587a"
+                or (draft.get("metadata") or {}).get("article_no") != "GEÇİCİ 3"
+                or draft.get("effective_start_date") != "2026-10-01"
+                or explicit_added_body(proposal.instruction_text) != draft.get("text")
+            ):
+                raise RuntimeError("Reviewed temporary Article 3 identity changed")
         if proposal.status != "pending":
             print(f"SKIP proposal={proposal_id} status={proposal.status}")
             return
+        if proposal_id == 441:
+            from onyx.db.regulatory_amendment_order import load_amendment_order
+            from onyx.regulatory.amendments.insertion_order import plan_insertion
+
+            prior = proposal.new_chunk_draft["insertion_order"]
+            first = get_proposal(session, 439)
+            second = get_proposal(session, 442)
+            if (
+                first is None
+                or second is None
+                or first.status != "approved"
+                or second.status != "approved"
+                or prior.get("after_chunk_id")
+                != "rc_89c2cbd8f02fda473189ef601fc32bb7c49cc414"
+                or prior.get("before_chunk_id")
+                != "rc_0f0090df74a75c1f9e35adbaf0df6d3593e6d6ca"
+            ):
+                raise RuntimeError("Temporary provision predecessor review changed")
+            current = plan_insertion(
+                load_amendment_order(
+                    session, UUID(proposal.new_chunk_draft["user_file_id"])
+                ),
+                article_no="GEÇİCİ 3",
+                paragraph_no=None,
+                clause_label=None,
+            )
+            if (
+                current.after_chunk_id != second.applied_new_chunk_id
+                or current.before_chunk_id
+                != "rc_0f0090df74a75c1f9e35adbaf0df6d3593e6d6ca"
+            ):
+                raise RuntimeError("Temporary provision insertion boundary changed")
+            proposal.new_chunk_draft = {
+                **proposal.new_chunk_draft,
+                "position": current.position,
+                "insertion_order": current.model_dump(mode="json"),
+            }
         queue_amendment_proposal_approval(session, proposal, decided_by=None)
         session.commit()
     try:
@@ -141,6 +194,6 @@ def main(proposal_id: int) -> None:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2 or sys.argv[1] not in {"439", "442", "443", "462", "465", "470", "481", "482"}:
+    if len(sys.argv) != 2 or sys.argv[1] not in {"439", "441", "442", "443", "462", "465", "470", "481", "482"}:
         raise SystemExit("Specify exactly one approved DEV proposal ID")
     main(int(sys.argv[1]))
