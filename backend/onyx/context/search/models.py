@@ -2,6 +2,7 @@ from collections.abc import Sequence
 from datetime import date, datetime, timezone
 from enum import Enum
 from typing import Any, Literal
+from uuid import UUID
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -124,6 +125,11 @@ class BaseFilters(BaseModel):
     regulatory_workflow_mode: Literal["standard", "fast"] = Field(
         default="standard", exclude=True
     )
+    regulatory_label_search_enabled: bool = Field(default=False, exclude=True)
+    regulatory_label_run_ids: tuple[UUID, ...] = Field(default=(), exclude=True)
+
+    # Optional internal narrowing for read-only label-assisted retrieval.
+    regulatory_candidate_ids: list[str] | None = Field(default=None, max_length=64)
 
     # Deprecated wire-compat alias for updated_at_range.start. Folded into
     # updated_at_range on validation and cleared; internal code must never read

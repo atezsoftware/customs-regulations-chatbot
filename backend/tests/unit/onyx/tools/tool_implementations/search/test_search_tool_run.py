@@ -6,6 +6,7 @@ from datetime import date, datetime, timezone
 from threading import Barrier
 from typing import Any, cast
 from unittest.mock import MagicMock, patch
+from uuid import uuid4
 
 import pytest
 
@@ -1014,6 +1015,7 @@ def _run(
     filter_queries: list[str] | None = None,
     response_sink: list[ToolResponse] | None = None,
     query: str = "ticket",
+    label_hint: dict[str, list[str]] | None = None,
     original_query: str | None = None,
     queries: list[str] | None = None,
     search_mode: str | None = "hybrid",
@@ -1115,6 +1117,8 @@ def _run(
             "coverage_item": "resolve the ticket",
             "evidence_target": "whether the ticket can be resolved",
         }
+        if label_hint is not None:
+            tool_kwargs["label_hint"] = label_hint
         if search_mode is not None:
             tool_kwargs["search_mode"] = search_mode
         response = tool.run(
@@ -2100,3 +2104,149 @@ def test_named_provision_does_not_force_exact_source_lane_in_normal_chat() -> No
     )
     exact = [lane for lane in lanes if getattr(lane, "exact_source_hint", None)]
     assert exact == []
+
+
+def test_hybrid_label_addition_reaches_reranker_with_full_baseline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from onyx.regulatory.labeling import search_runtime
+    from onyx.regulatory.labeling.search_models import LabelSearchOverlay
+    from tests.unit.onyx.regulatory.labeling.test_search_overlay import (
+        chunk,
+        evidence,
+        snapshot,
+    )
+
+    tool = _make_tool(
+        BaseFilters(
+            regulatory_chunks_only=True,
+            regulatory_workflow_mode="fast",
+            regulatory_label_search_enabled=True,
+        ),
+        auto_detect_filters=False,
+    )
+    baseline = [chunk(str(i)) for i in range(1, 101)]
+    extra = chunk("101")
+    monkeypatch.setattr(tool, "get_label_search_snapshot", snapshot)
+    monkeypatch.setattr(search_runtime, "get_current_tenant_id", lambda: "test")
+    monkeypatch.setattr(search_runtime, "label_read_session", MagicMock())
+    monkeypatch.setattr(
+        search_runtime,
+        "load_label_overlay",
+        MagicMock(
+            return_value=LabelSearchOverlay(
+                candidate_ids=("101",),
+                evidence_by_chunk={"101": (evidence("101", "SUB.TAX.VAT"),)},
+                source_texts={"101": extra.content},
+            )
+        ),
+    )
+    reranks: list[MagicMock] = []
+    _run(
+        tool,
+        connected_sources=[DocumentSource.USER_FILE],
+        fused_chunks=baseline,
+        pipeline_chunks=[extra],
+        rerank_sink=reranks,
+        label_hint={"label_ids": ["SUB.TAX.VAT"]},
+    )
+    submitted = reranks[0].call_args.kwargs["chunks"]
+    assert len(submitted) <= 48
+    assert "101" in {row.regulatory_chunk_id for row in submitted}
+    assert (
+        len(
+            {row.regulatory_chunk_id for row in submitted}
+            & {str(i) for i in range(1, 101)}
+        )
+        >= 36
+    )
+
+
+def test_label_snapshot_is_shared_only_with_parallel_forks() -> None:
+    from tests.unit.onyx.regulatory.labeling.test_search_overlay import snapshot
+
+    run_id = uuid4()
+    tool = _make_tool(
+        BaseFilters(
+            regulatory_chunks_only=True,
+            regulatory_workflow_mode="fast",
+            regulatory_label_search_enabled=True,
+            regulatory_label_run_ids=(run_id,),
+        )
+    )
+    with patch(
+        f"{MODULE}.search_snapshot_for_run_ids", side_effect=lambda _ids: snapshot()
+    ) as configured:
+        first = tool.get_label_search_snapshot()
+        assert tool.fork_for_parallel_call().get_label_search_snapshot() is first
+        assert configured.call_count == 1
+        assert (
+            tool.fork_for_independent_context().get_label_search_snapshot() is not first
+        )
+        assert configured.call_count == 2
+
+
+def test_label_snapshot_requires_explicit_runs() -> None:
+    tool = _make_tool(
+        BaseFilters(
+            regulatory_chunks_only=True,
+            regulatory_workflow_mode="fast",
+            regulatory_label_search_enabled=True,
+        )
+    )
+    with patch(f"{MODULE}.search_snapshot_for_run_ids") as load:
+        assert tool.get_label_search_snapshot() is None
+        load.assert_not_called()
+
+
+def test_verified_label_near_tie_survives_external_reranking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from onyx.regulatory.labeling.search_models import LabelSearchHint
+    from onyx.regulatory.labeling.search_runtime import LabelSearchResult
+    from tests.unit.onyx.regulatory.labeling.test_search_overlay import (
+        chunk,
+        evidence,
+        snapshot,
+    )
+
+    chunks = [chunk(str(i)) for i in range(1, 5)]
+    tool = _make_tool(
+        BaseFilters(
+            regulatory_chunks_only=True,
+            regulatory_workflow_mode="fast",
+            regulatory_label_search_enabled=True,
+        ),
+        auto_detect_filters=False,
+    )
+    monkeypatch.setattr(tool, "get_label_search_snapshot", snapshot)
+    label_result = LabelSearchResult(
+        candidates=chunks,
+        hint=LabelSearchHint(label_ids=("SUB.TAX.VAT",)),
+        evidence_by_chunk={"4": (evidence("4", "SUB.TAX.VAT"),)},
+    )
+    responses: list[ToolResponse] = []
+    with patch(f"{MODULE}.search_with_labels", return_value=label_result):
+        _run(
+            tool,
+            connected_sources=[DocumentSource.USER_FILE],
+            fused_chunks=chunks,
+            rerank_result=RerankResult(
+                ordered_chunks=chunks,
+                scores_by_chunk={
+                    ("file", i + 1): score
+                    for i, score in enumerate([0.95, 0.8, 0.79, 0.78])
+                },
+                submitted_count=4,
+                result_count=4,
+                outcome=RerankOutcome.SUCCESS,
+                fallback_used=False,
+            ),
+            max_llm_chunks=2,
+            response_sink=responses,
+        )
+    results = json.loads(responses[0].llm_facing_response)["results"]
+    assert [json.loads(row["metadata"])["regulatory_chunk_id"] for row in results] == [
+        "1",
+        "4",
+    ]

@@ -2,6 +2,7 @@ from datetime import date
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import MagicMock, Mock
+from uuid import uuid4
 
 import pytest
 
@@ -84,6 +85,29 @@ def test_atez_search_v2_uses_fast_regulatory_profile() -> None:
 
     assert effective_filters is not None
     assert effective_filters.regulatory_chunks_only is True
+    assert effective_filters.regulatory_workflow_mode == "fast"
+    assert effective_filters.regulatory_label_search_enabled is False
+
+
+def test_atez_search_v2_labels_require_explicit_request_opt_in() -> None:
+    run_id = uuid4()
+    setup = SimpleNamespace(
+        persona=SimpleNamespace(id=process_message.DEFAULT_PERSONA_ID),
+        new_msg_req=SendMessageRequest(
+            message="Antrepo rejiminin şartları nelerdir?",
+            atez_search_v2=True,
+            atez_search_v2_labels=True,
+            atez_search_v2_label_run_ids=[run_id],
+        ),
+    )
+
+    effective_filters = process_message._global_regulatory_search_filters(
+        cast(ChatTurnSetup, setup)
+    )
+
+    assert effective_filters is not None
+    assert effective_filters.regulatory_label_search_enabled is True
+    assert effective_filters.regulatory_label_run_ids == (run_id,)
     assert effective_filters.regulatory_workflow_mode == "fast"
 
 
@@ -236,6 +260,21 @@ def test_send_message_request_defaults_atez_search_to_false() -> None:
 
     assert request.atez_search is False
     assert request.atez_search_v2 is False
+    assert request.atez_search_v2_labels is False
+
+
+def test_send_message_request_rejects_labels_without_v2() -> None:
+    with pytest.raises(ValueError, match="requires atez_search_v2"):
+        SendMessageRequest(message="Merhaba", atez_search_v2_labels=True)
+
+
+def test_send_message_request_rejects_label_runs_without_opt_in() -> None:
+    with pytest.raises(ValueError, match="requires labels"):
+        SendMessageRequest(
+            message="Merhaba",
+            atez_search_v2=True,
+            atez_search_v2_label_run_ids=[uuid4()],
+        )
 
 
 def test_send_message_request_rejects_both_atez_versions() -> None:

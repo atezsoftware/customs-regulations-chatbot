@@ -15,6 +15,7 @@ from onyx.prompts.regulatory_coverage_plan import (
     REGULATORY_COVERAGE_PLAN_SYSTEM_PROMPT,
     REGULATORY_REQUEST_INVENTORY_SYSTEM_PROMPT,
 )
+from onyx.regulatory.labeling.search_models import LabelQueryHint
 from onyx.regulatory.structured_llm import generate_structured
 from onyx.tracing.flows import LLMFlow
 from onyx.utils.logger import setup_logger
@@ -65,6 +66,21 @@ class RegulatoryCoverageItem(BaseModel):
     retrieval_queries: list[str] = Field(
         default_factory=list, max_length=_MAX_RETRIEVAL_QUERIES_PER_ITEM
     )
+    label_hints: list[LabelQueryHint] = Field(default_factory=list, max_length=6)
+
+    @field_validator("label_hints", mode="before")
+    @classmethod
+    def parse_optional_label_hints(cls, value: object) -> list[LabelQueryHint]:
+        if not isinstance(value, list):
+            return []
+        hints: list[LabelQueryHint] = []
+        for entry in value[:6]:
+            try:
+                hints.append(LabelQueryHint.model_validate(entry))
+            except ValueError:
+                continue
+        return hints
+
     source_anchors: list[str] = Field(
         default_factory=list, max_length=_MAX_SOURCE_ANCHORS_PER_ITEM
     )

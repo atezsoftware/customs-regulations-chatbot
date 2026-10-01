@@ -152,6 +152,7 @@ def _build_index_filters(
         as_of_date=base_filters.as_of_date,
         regulatory_chunks_only=base_filters.regulatory_chunks_only,
         regulatory_source_hint=base_filters.regulatory_source_hint,
+        regulatory_candidate_ids=base_filters.regulatory_candidate_ids,
     )
 
     return final_filters

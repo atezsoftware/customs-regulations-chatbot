@@ -365,7 +365,13 @@ class AnswerGraphTracingProcessor(TracingProcessor):
 class AnswerGraphStep:
     """Record a decision or physical call without changing the existing trace tree."""
 
-    def __init__(self, operation: str, input_value: Any = None) -> None:
+    def __init__(
+        self,
+        operation: str,
+        input_value: Any = None,
+        *,
+        summary: str | None = None,
+    ) -> None:
         self.operation = operation
         self.input_value = input_value
         self.output_value: Any = None
@@ -375,6 +381,7 @@ class AnswerGraphStep:
         self._parent_node_id: str | None = None
         self._step_token: Token[str | None] | None = None
         self._agent_name: str | None = None
+        self.summary = summary
 
     def __enter__(self) -> AnswerGraphStep:
         self._run_id = _active_run()
@@ -436,7 +443,10 @@ class AnswerGraphStep:
                     started_at=self._started_at,
                     ended_at=datetime.datetime.now(datetime.timezone.utc),
                     status="FAILED" if exc_type else "COMPLETE",
-                    attributes={"agent": self._agent_name} if self._agent_name else {},
+                    attributes={
+                        **({"agent": self._agent_name} if self._agent_name else {}),
+                        **({"summary": self.summary[:160]} if self.summary else {}),
+                    },
                     input_ciphertext=input_ciphertext,
                     output_ciphertext=output_ciphertext,
                     reasoning_ciphertext=None,
@@ -466,8 +476,10 @@ class AnswerGraphStep:
                 _ACTIVE_STEP.reset(self._step_token)
 
 
-def graph_step(operation: str, input_value: Any = None) -> AnswerGraphStep:
-    return AnswerGraphStep(operation, input_value)
+def graph_step(
+    operation: str, input_value: Any = None, *, summary: str | None = None
+) -> AnswerGraphStep:
+    return AnswerGraphStep(operation, input_value, summary=summary)
 
 
 def link_graph_nodes(from_node_id: str | None, to_node_id: str | None) -> None:

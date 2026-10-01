@@ -105,6 +105,17 @@ from onyx.regulatory.heading_path import (
     parse_regulatory_article_heading,
     regulatory_heading_path_matches_reference,
 )
+from onyx.regulatory.labeling.evidence_completion import (
+    annotate_label_evidence,
+    complete_label_sources,
+)
+from onyx.regulatory.labeling.search_models import LabelSearchHint, LabelSearchSnapshot
+from onyx.regulatory.labeling.search_ranking import rank_near_tied_label_candidates
+from onyx.regulatory.labeling.search_runtime import (
+    LabelSearchResult,
+    search_snapshot_for_run_ids,
+    search_with_labels,
+)
 from onyx.regulatory.provision_retrieval import (
     RegulatoryProvisionNavigation,
     build_regulatory_provision_navigation,
@@ -160,6 +171,7 @@ from onyx.tools.tool_implementations.search.search_utils import (
 from onyx.tools.tool_implementations.utils import (
     convert_inference_sections_to_llm_string,
 )
+from onyx.tracing.answer_graph import graph_step
 from onyx.utils.logger import setup_logger
 from onyx.utils.threadpool_concurrency import run_functions_tuples_in_parallel
 from onyx.utils.timing import log_function_time
@@ -1193,6 +1205,8 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
         # query. When False, only user/persona-selected filters are applied.
         auto_detect_filters: bool = True,
         shared_time_filter_decision: _SharedDecision[TimeFilter | None] | None = None,
+        shared_label_snapshot: _SharedDecision[LabelSearchSnapshot | None]
+        | None = None,
         parallel_scope_decision: (
             _SharedDecision[list[DocumentSource] | None] | None
         ) = None,
@@ -1220,8 +1234,23 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
             shared_time_filter_decision or _SharedDecision()
         )
         self._parallel_scope_decision = parallel_scope_decision
+        self._shared_label_snapshot = shared_label_snapshot or _SharedDecision()
 
         self._id = tool_id
+
+    def get_label_search_snapshot(self) -> LabelSearchSnapshot | None:
+        if not (
+            self.user_selected_filters
+            and self.user_selected_filters.regulatory_chunks_only
+            and self.user_selected_filters.regulatory_workflow_mode == "fast"
+            and self.user_selected_filters.regulatory_label_search_enabled
+            and self.user_selected_filters.regulatory_label_run_ids
+        ):
+            return None
+        run_ids = self.user_selected_filters.regulatory_label_run_ids
+        return self._shared_label_snapshot.get_or_compute(
+            lambda: search_snapshot_for_run_ids(run_ids)
+        )
 
     def _fork_for_parallel_call(
         self,
@@ -1243,6 +1272,7 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
             enable_slack_search=self.enable_slack_search,
             auto_detect_filters=self.auto_detect_filters,
             shared_time_filter_decision=self._shared_time_filter_decision,
+            shared_label_snapshot=self._shared_label_snapshot,
             parallel_scope_decision=parallel_scope_decision,
         )
 
@@ -2182,6 +2212,144 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
                     source_anchors,
                 )
             ]
+        retrieve_label_ids = None
+        label_result = LabelSearchResult(candidates=rerank_candidate_pool)
+        requested_label_search = bool(
+            self.user_selected_filters
+            and self.user_selected_filters.regulatory_label_search_enabled
+        )
+        label_snapshot = self.get_label_search_snapshot()
+        if label_snapshot is None and requested_label_search:
+            label_result = label_result.model_copy(
+                update={"status": "snapshot_unavailable"}
+            )
+        elif label_snapshot is not None:
+            label_result = label_result.model_copy(update={"status": "ineligible"})
+        if (
+            label_snapshot is not None
+            and effective_filters is not None
+            and self.project_id_filter is None
+            and extract_single_regulatory_provision_reference(llm_queries[0]) is None
+        ):
+
+            def search_label_sources(
+                query: str,
+                identifiers: tuple[str, ...] | None,
+            ) -> list[InferenceChunk]:
+                scoped = (
+                    effective_filters.model_copy(
+                        update={"regulatory_candidate_ids": list(identifiers)}
+                    )
+                    if identifiers is not None
+                    else effective_filters
+                )
+                chunks = self._run_search_for_query(
+                    query,
+                    None,
+                    False,
+                    64,
+                    acl_filters,
+                    embedding_model,
+                    federated_retrieval_infos,
+                    scoped,
+                )
+                chunks = [
+                    chunk
+                    for chunk in chunks
+                    if chunk.regulatory_chunk_id
+                    and (
+                        identifiers is None or chunk.regulatory_chunk_id in identifiers
+                    )
+                ]
+                with get_session_with_current_tenant() as label_visibility_session:
+                    visible = get_visible_regulatory_chunk_ids(
+                        label_visibility_session,
+                        [
+                            chunk.regulatory_chunk_id
+                            for chunk in chunks
+                            if chunk.regulatory_chunk_id
+                        ],
+                        as_of_date=effective_filters.as_of_date,
+                        query_indexes={
+                            UUID(chunk.document_id): chunk.publication_index
+                            for chunk in chunks
+                            if chunk.publication_index is not None
+                        },
+                    )
+                return [
+                    chunk for chunk in chunks if chunk.regulatory_chunk_id in visible
+                ]
+
+            def retrieve_label_ids(
+                identifiers: tuple[str, ...],
+            ) -> list[InferenceChunk]:
+                return search_label_sources(llm_queries[0], identifiers)
+
+            def discover_label_sources(hint: LabelSearchHint) -> list[InferenceChunk]:
+                subjects = set(hint.candidate_label_ids(label_snapshot.taxonomy))
+                names = [
+                    label.name
+                    for label in label_snapshot.taxonomy.labels
+                    if label.id in subjects
+                ][:3]
+                query = llm_queries[0] + " " + " ".join(names)[:240]
+                return search_label_sources(query, None)
+
+            label_result = search_with_labels(
+                rerank_candidate_pool,
+                snapshot=label_snapshot,
+                raw_hint=llm_kwargs.get("label_hint"),
+                query=llm_queries[0],
+                as_of_date=effective_filters.as_of_date or date.today(),
+                limit=min(
+                    override_kwargs.rerank_candidate_limit,
+                    _REGULATORY_RERANK_CANDIDATE_LIMIT,
+                ),
+                retrieve=retrieve_label_ids,
+                discover=discover_label_sources,
+            )
+            rerank_candidate_pool = label_result.candidates
+
+        if regulatory_chunks_only:
+            with graph_step(
+                "search.label_lane_result",
+                {
+                    "query": llm_queries[0],
+                    "coverage_item": coverage_item,
+                    "evidence_target": evidence_target,
+                    "configured_mode": (
+                        label_snapshot.mode
+                        if label_snapshot is not None
+                        else "on_unavailable"
+                        if requested_label_search
+                        else "off"
+                    ),
+                    "snapshot_run_ids": (
+                        [str(run_id) for run_id in label_snapshot.run_ids]
+                        if label_snapshot is not None
+                        else []
+                    ),
+                    "taxonomy_hash": (
+                        label_snapshot.taxonomy.version_hash
+                        if label_snapshot is not None
+                        else None
+                    ),
+                    "requested_label_ids": label_result.hint.label_ids,
+                },
+            ) as label_step:
+                label_step.summary = (
+                    f"{label_result.status}; "
+                    f"{len(label_result.evidence_by_chunk)} verified"
+                )
+                label_step.output_value = {
+                    "status": label_result.status,
+                    "baseline_candidate_count": len(top_chunks),
+                    "verified_candidate_count": len(label_result.evidence_by_chunk),
+                    "fused_candidate_ids": [
+                        chunk.regulatory_chunk_id for chunk in rerank_candidate_pool
+                    ],
+                }
+
         fused_candidates = rerank_candidate_pool[
             : (
                 min(
@@ -2247,6 +2415,21 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
                     "ordered_chunks": atomic_ranked_chunks,
                     "scores_by_chunk": atomic_scores,
                 }
+            )
+        if rerank_result.used_external and label_result.hint.label_ids:
+            before_labels = [chunk.unique_id for chunk in diverse_candidate_chunks]
+            diverse_candidate_chunks = rank_near_tied_label_candidates(
+                diverse_candidate_chunks,
+                scores=rerank_result.scores_by_chunk,
+                evidence=label_result.evidence_by_chunk,
+                hint=label_result.hint,
+            )
+            logger.info(
+                "Label final rerank promoted=%d",
+                sum(
+                    before_labels.index(chunk.unique_id) > index
+                    for index, chunk in enumerate(diverse_candidate_chunks)
+                ),
             )
         chunks_for_selection = (
             diverse_candidate_chunks
@@ -2470,6 +2653,80 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
                     as_of_date=provision_as_of_date,
                     max_total_sections=max_selected_sections,
                 )
+        if (
+            label_result.evidence_by_chunk
+            and label_snapshot is not None
+            and retrieve_label_ids is not None
+        ):
+            selected_sections = complete_label_sources(
+                selected_sections,
+                label_result.evidence_by_chunk,
+                limit=max_selected_sections,
+                retrieve=retrieve_label_ids,
+            )
+            selected_sections = annotate_label_evidence(
+                selected_sections,
+                label_result.evidence_by_chunk,
+                label_snapshot.taxonomy.version_hash,
+            )
+        if regulatory_chunks_only:
+            with graph_step(
+                "search.label_evidence_selection",
+                {
+                    "status": label_result.status,
+                    "verified_label_ids": label_result.hint.label_ids,
+                    "baseline_candidate_ids": [
+                        chunk.regulatory_chunk_id for chunk in top_chunks
+                    ],
+                    "fused_candidate_ids": [
+                        chunk.regulatory_chunk_id for chunk in label_result.candidates
+                    ],
+                },
+            ) as selection_step:
+                baseline_chunk_ids = {chunk.regulatory_chunk_id for chunk in top_chunks}
+                visible_labeled_ids = [
+                    section.center_chunk.regulatory_chunk_id
+                    for section in selected_sections[:max_selected_sections]
+                    if section.center_chunk.regulatory_chunk_id
+                    in label_result.evidence_by_chunk
+                ]
+                selection_step.summary = (
+                    f"{len(visible_labeled_ids)} labeled visible; "
+                    f"{sum(chunk_id not in baseline_chunk_ids for chunk_id in visible_labeled_ids)} added"
+                )
+                selection_step.output_value = {
+                    "llm_visible_chunk_ids": [
+                        section.center_chunk.regulatory_chunk_id
+                        for section in selected_sections[:max_selected_sections]
+                    ],
+                    "label_supported_visible_chunk_ids": visible_labeled_ids,
+                    "label_added_visible_chunk_ids": [
+                        section.center_chunk.regulatory_chunk_id
+                        for section in selected_sections[:max_selected_sections]
+                        if section.center_chunk.regulatory_chunk_id
+                        in label_result.evidence_by_chunk
+                        and section.center_chunk.regulatory_chunk_id
+                        not in baseline_chunk_ids
+                    ],
+                    "selected_label_evidence": {
+                        section.center_chunk.regulatory_chunk_id: [
+                            {
+                                "label_id": entry.label_id,
+                                "source_chunk_id": entry.source_chunk_id,
+                                "run_id": str(entry.run_id),
+                            }
+                            for entry in label_result.evidence_by_chunk.get(
+                                section.center_chunk.regulatory_chunk_id or "", ()
+                            )
+                        ]
+                        for section in selected_sections[:max_selected_sections]
+                        if section.center_chunk.regulatory_chunk_id
+                        in label_result.evidence_by_chunk
+                    },
+                    "label_fusion_scores": [
+                        score.model_dump() for score in label_result.fusion_scores
+                    ],
+                }
         search_docs = convert_inference_sections_to_search_docs(
             _rich_response_sections(
                 returned_sections,
