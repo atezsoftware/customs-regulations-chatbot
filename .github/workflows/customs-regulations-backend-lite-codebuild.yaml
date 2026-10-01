@@ -38,7 +38,7 @@ on:
       - ".github/workflows/customs-regulations-web-codebuild.yaml"
 
 concurrency:
-  group: backend-lite-${{ github.ref == 'refs/heads/develop' && 'dev' || github.run_id }}
+  group: backend-lite-${{ github.event_name == 'workflow_dispatch' && inputs.environment || (github.ref == 'refs/heads/develop' && 'dev' || github.ref == 'refs/heads/test/v1' && 'test' || 'production') }}
   cancel-in-progress: false
 
 jobs:
