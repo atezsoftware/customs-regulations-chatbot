@@ -16,6 +16,42 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
           persist-credentials: false
+      - name: Read DEV API incident evidence
+        if: inputs.operation == 'inspect'
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws eks update-kubeconfig --name atez-dev-cluster --region eu-central-1
+          namespace=customs-regulations-dev
+          kubectl get pods -n "$namespace" -o json | python3 -c '
+          import json, re, sys
+          pods=json.load(sys.stdin)["items"]
+          for pod in pods:
+              name=pod["metadata"]["name"]
+              if not re.search(r"customs-regulations-(?:api|web)", name):
+                  continue
+              print("INCIDENT_POD",json.dumps({
+                  "name":name,
+                  "created":pod["metadata"].get("creationTimestamp"),
+                  "phase":pod["status"].get("phase"),
+                  "conditions":[{"type":c["type"],"status":c["status"],"lastTransitionTime":c.get("lastTransitionTime")} for c in pod["status"].get("conditions",[]) if c["type"] in ("Ready","ContainersReady")],
+                  "containers":[{"name":c["name"],"ready":c.get("ready"),"restartCount":c.get("restartCount"),"lastState":c.get("lastState"),"state":c.get("state")} for c in pod["status"].get("containerStatuses",[])]
+              },ensure_ascii=False))
+          '
+          kubectl get events -n "$namespace" -o json | python3 -c '
+          import json, re, sys
+          events=json.load(sys.stdin)["items"]
+          for event in events:
+              name=event.get("involvedObject",{}).get("name","")
+              if not re.search(r"customs-regulations-(?:api|web)",name):
+                  continue
+              print("INCIDENT_EVENT",json.dumps({"pod":name,"reason":event.get("reason"),"count":event.get("count"),"first":event.get("firstTimestamp"),"last":event.get("lastTimestamp"),"message":event.get("message","")[:300]},ensure_ascii=False))
+          '
+          while IFS=$'\t' read -r pod container; do
+            echo "INCIDENT_CGROUP $pod $container"
+            kubectl exec "$pod" -n "$namespace" -c "$container" -- \
+              cat /sys/fs/cgroup/memory.events
+          done < <(kubectl get pods -n "$namespace" -o json | jq -r '.items[] | select(.metadata.deletionTimestamp == null and (.metadata.name | test("customs-regulations-api"))) | .metadata.name as $pod | .spec.containers[] | select(.image | contains("customs-regulations-backend-lite")) | [$pod,.name] | @tsv')
       - name: Inspect or launch the existing DEV project repair
         shell: bash
         run: |
