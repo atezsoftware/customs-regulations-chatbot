@@ -288,7 +288,7 @@ jobs:
             ([.spec.template.spec.containers[] |
               select(.name == "dev-customs-regulations-api-container" and
                 .image == $image and
-                .resources.requests.memory == "1024Mi" and
+                .resources.requests.memory == "1Gi" and
                 .resources.limits.memory == "2560Mi")] | length) == 1
           ' <<<"$deployment_json" >/dev/null
           jq -e --arg image "$expected_image" '
@@ -298,11 +298,11 @@ jobs:
               ([.spec.containers[] |
                 select(.name == "dev-customs-regulations-api-container" and
                   .image == $image and
-                  .resources.requests.memory == "1024Mi" and
+                  .resources.requests.memory == "1Gi" and
                   .resources.limits.memory == "2560Mi")] | length) == 1 and
               any(.status.conditions[]?; .type == "Ready" and .status == "True"))
           ' <<<"$pods_json" >/dev/null
-          echo "Verified one Ready DEV API pod at $expected_image, 1024Mi request, 2560Mi limit"
+          echo "Verified one Ready DEV API pod at $expected_image, 1Gi request, 2560Mi limit"
           jq -c --arg name dev-customs-regulations-api-container '
             .items[] | select(.metadata.deletionTimestamp == null) |
             .metadata.name as $pod | .status.containerStatuses[]? |
@@ -338,7 +338,7 @@ jobs:
             .spec.replicas == 1 and
             ([.spec.template.spec.containers[] |
               select(.name == $name and .image == $image and
-                .resources.requests.memory == "1024Mi" and
+                .resources.requests.memory == "1Gi" and
                 .resources.limits.memory == "2560Mi")] | length) == 1
           ' <<<"$deployment_json" >/dev/null
           resource_version=$(jq -r '.metadata.resourceVersion' <<<"$deployment_json")
@@ -354,10 +354,9 @@ jobs:
               {op:"test", path:"/spec/replicas", value:1},
               {op:"test", path:($path + "/name"), value:$name},
               {op:"test", path:($path + "/image"), value:$image},
-              {op:"test", path:($path + "/resources/requests/memory"), value:"1024Mi"},
+              {op:"test", path:($path + "/resources/requests/memory"), value:"1Gi"},
               {op:"test", path:($path + "/resources/limits/memory"), value:"2560Mi"},
               {op:"replace", path:"/spec/replicas", value:2},
-              {op:"replace", path:($path + "/resources/requests/memory"), value:"1Gi"},
               {op:"replace", path:($path + "/resources/limits/memory"), value:"4Gi"}
             ]
           ')
@@ -396,7 +395,6 @@ jobs:
                   {op:"test", path:($path + "/resources/requests/memory"), value:"1Gi"},
                   {op:"test", path:($path + "/resources/limits/memory"), value:"4Gi"},
                   {op:"replace", path:"/spec/replicas", value:1},
-                  {op:"replace", path:($path + "/resources/requests/memory"), value:"1024Mi"},
                   {op:"replace", path:($path + "/resources/limits/memory"), value:"2560Mi"}
                 ]
               ')
@@ -411,7 +409,7 @@ jobs:
                     .spec.replicas == 1 and
                     ([.spec.template.spec.containers[] |
                       select(.name == $name and .image == $image and
-                        .resources.requests.memory == "1024Mi" and
+                        .resources.requests.memory == "1Gi" and
                         .resources.limits.memory == "2560Mi")] | length) == 1
                   ' >/dev/null; then
                   echo "API resource restore could not be verified" >&2
@@ -886,7 +884,7 @@ jobs:
         run: echo "Deployment successful"
 
       - name: Slack Notification
-        if: always()
+        if: always() && inputs.action != 'stabilize_api'
         uses: rtCamp/action-slack-notify@v2
         env:
           SLACK_CHANNEL: ops-customs-regulation-chatbot
