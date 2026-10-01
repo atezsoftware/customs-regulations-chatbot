@@ -7,6 +7,7 @@ amendment-sourced row into `regulatory_chunk` — everything upstream
 """
 
 import datetime
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
@@ -1099,16 +1100,40 @@ def _validated_reviewed_chunk_draft(
             raise ValueError(
                 "Reviewed insertion identity differs from its source authority"
             )
+    replacement_scope = old_chunk_snapshot.get("replacement_scope")
+    if replacement_scope is not None and (
+        not isinstance(replacement_scope, dict)
+        or replacement_scope.get("result_chunk_type") not in {"article", "paragraph"}
+        or not isinstance(replacement_scope.get("result_metadata"), dict)
+        or not isinstance(replacement_scope.get("result_heading_path"), list)
+    ):
+        raise ValueError("Invalid reviewed replacement scope")
+    scoped_type = (
+        replacement_scope["result_chunk_type"]
+        if isinstance(replacement_scope, dict)
+        else None
+    )
+    if scoped_type is not None and (
+        stored.chunk_type != scoped_type or reviewed.chunk_type != scoped_type
+    ):
+        raise ValueError("Reviewed replacement scope chunk type changed")
     canonical_chunk_type = old_chunk_snapshot.get("chunk_type")
     if (
-        canonical_chunk_type is not None
+        scoped_type is None
+        and canonical_chunk_type is not None
         and reviewed.chunk_type is not None
         and reviewed.chunk_type != canonical_chunk_type
     ):
         raise ValueError("Reviewed chunk draft cannot change chunk_type")
-    chunk_type = canonical_chunk_type or reviewed.chunk_type or stored.chunk_type
+    chunk_type = (
+        scoped_type or canonical_chunk_type or reviewed.chunk_type or stored.chunk_type
+    )
     metadata = dict(reviewed.metadata)
-    canonical_metadata = dict(old_chunk_snapshot.get("metadata") or {})
+    canonical_metadata = dict(
+        replacement_scope["result_metadata"]
+        if isinstance(replacement_scope, dict)
+        else old_chunk_snapshot.get("metadata") or {}
+    )
     if "metadata" in old_chunk_snapshot:
         for key in (
             "article_no",
@@ -1120,7 +1145,11 @@ def _validated_reviewed_chunk_draft(
                 metadata.pop(key, None)
             else:
                 metadata[key] = canonical_metadata[key]
-    canonical_heading_path = old_chunk_snapshot.get("heading_path")
+    canonical_heading_path = (
+        replacement_scope["result_heading_path"]
+        if isinstance(replacement_scope, dict)
+        else old_chunk_snapshot.get("heading_path")
+    )
     heading_path = reconcile_existing_heading_path(
         (
             canonical_heading_path
@@ -1255,6 +1284,106 @@ def _ensure_old_chunk_matches_review_snapshot(
                 f"Old chunk {chunk.id} changed after analysis; "
                 "refresh or reanalyze before approval."
             )
+
+
+def _lock_reviewed_replacement_scope(
+    db_session: Session,
+    proposal: AmendmentProposal,
+    old_chunk: RegulatoryChunk,
+    draft: dict[str, Any],
+    start_date: datetime.date,
+) -> list[RegulatoryChunk]:
+    scope = proposal.old_chunk_snapshot.get("replacement_scope")
+    if not isinstance(scope, dict):
+        raise ValueError("Reviewed replacement scope is missing")
+    kind = scope.get("kind")
+    article_no = scope.get("article_no")
+    snapshots = scope.get("member_snapshots")
+    if (
+        kind not in {"article", "clause_pair"}
+        or not isinstance(article_no, str)
+        or not isinstance(snapshots, list)
+        or len(snapshots) < 2
+        or any(not isinstance(item, dict) for item in snapshots)
+    ):
+        raise ValueError("Invalid reviewed replacement members")
+    result_metadata = scope.get("result_metadata")
+    if (
+        not isinstance(result_metadata, dict)
+        or result_metadata.get("article_no") != article_no
+        or result_metadata.get("clause_label") is not None
+        or result_metadata.get("subclause_label") is not None
+        or old_chunk.chunk_metadata.get("article_no") != article_no
+    ):
+        raise ValueError("Reviewed replacement article identity changed")
+    conditions = [
+        RegulatoryChunk.user_file_id == old_chunk.user_file_id,
+        RegulatoryChunk.status == RegulatoryChunkStatus.ACTIVE.value,
+        RegulatoryChunk.chunk_metadata["article_no"].astext == article_no,
+    ]
+    if kind == "article":
+        if (
+            scope.get("result_chunk_type") != "article"
+            or result_metadata.get("paragraph_no") is not None
+        ):
+            raise ValueError("Full article replacement identity changed")
+    else:
+        if (
+            scope.get("paragraph_no") != "1"
+            or scope.get("clause_labels") != ["a", "b"]
+            or article_no != "3"
+            or scope.get("result_chunk_type") != "paragraph"
+            or result_metadata.get("paragraph_no") != "1"
+        ):
+            raise ValueError("Clause replacement identity changed")
+        conditions.extend(
+            [
+                RegulatoryChunk.chunk_metadata["paragraph_no"].astext == "1",
+                RegulatoryChunk.chunk_metadata["clause_label"].astext.in_(["a", "b"]),
+            ]
+        )
+    rows = list(
+        db_session.scalars(
+            select(RegulatoryChunk)
+            .where(*conditions)
+            .order_by(RegulatoryChunk.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    )
+    rows = [row for row in rows if not is_hierarchical_aggregate_chunk(row)]
+    by_id = {row.id: row for row in rows}
+    reviewed = {str(item.get("id")): item for item in snapshots}
+    if (
+        len(reviewed) != len(snapshots)
+        or set(by_id) != set(reviewed)
+        or old_chunk.id not in by_id
+    ):
+        raise ValueError("Replacement source scope changed after review")
+    for row in rows:
+        _ensure_old_chunk_matches_review_snapshot(row, reviewed[row.id])
+        if (
+            row.validity_start_date is not None
+            and row.validity_start_date >= start_date
+        ):
+            raise ValueError("Replacement date must follow every source chunk")
+        if load_active_structural_descendants(db_session, row):
+            raise ValueError("Replacement source has unreviewed descendants")
+    body = explicit_replacement_body(proposal.instruction_text)
+    if kind == "clause_pair":
+        if body != draft["text"] or not body.startswith("a) ") or "\nb) " not in body:
+            raise ValueError("Reviewed clause replacement differs from source")
+    elif body is not None:
+        if body != draft["text"] or not body.startswith(f"MADDE {article_no}-"):
+            raise ValueError("Reviewed article replacement differs from source")
+    elif (
+        not re.search(
+            r"maddesi\s+yürürlükten\s+kaldırılmıştır", proposal.instruction_text, re.I
+        )
+        or draft["text"] != f"**MADDE {article_no}-** (Mülga)"
+    ):
+        raise ValueError("Reviewed article repeal differs from source")
+    return [row for row in rows if row.id != old_chunk.id]
 
 
 def _approve_multi_chunk_proposal(
@@ -1743,7 +1872,11 @@ def approve_amendment_proposal(
             getattr(proposal, "old_chunk_snapshot", None) or {},
         )
         instruction_texts = _proposal_instruction_texts(proposal)
-        if any(explicit_replacement_body(text) for text in instruction_texts):
+        if proposal.old_chunk_snapshot.get("replacement_scope") is not None:
+            replaced_descendants = _lock_reviewed_replacement_scope(
+                db_session, proposal, old_chunk, draft, start_date
+            )
+        elif any(explicit_replacement_body(text) for text in instruction_texts):
             from onyx.regulatory.amendments.draft_integrity import (
                 validate_complete_scope_replacement,
             )
@@ -1853,6 +1986,9 @@ def approve_amendment_proposal(
         db_session.add(old_chunk)
 
     for descendant in replaced_descendants:
+        copy_annex_chunk_links(
+            db_session, old_chunk_id=descendant.id, new_chunk_id=new_chunk.id
+        )
         supersede_hierarchical_aggregates_referencing_chunk(
             db_session,
             user_file_id=user_file_id,

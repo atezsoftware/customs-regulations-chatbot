@@ -229,6 +229,163 @@ def test_approval_rechecks_descendants_added_after_analysis(
         db_session.commit()
 
 
+def test_full_article_replacement_supersedes_only_reviewed_scope(
+    db_session: Session,
+    tenant_context: None,  # noqa: ARG001
+) -> None:
+    user = create_test_user(db_session, "amendment_article_scope")
+    document_set = DocumentSet(
+        name=f"amendment-article-scope-{uuid4().hex}",
+        description="Reviewed whole-article replacement",
+        user_id=user.id,
+        is_public=False,
+        is_up_to_date=True,
+    )
+    user_file_id = uuid4()
+    user_file = UserFile(
+        id=user_file_id,
+        user_id=user.id,
+        file_id=f"amendment_article_scope_{uuid4().hex}",
+        name="amendment-article-scope.md",
+        file_type="text/markdown",
+        status=UserFileStatus.COMPLETED,
+    )
+    first = RegulatoryChunk(
+        id=f"rc_{uuid4().hex}",
+        user_file_id=user_file_id,
+        text="MADDE 4- (1) Eski ilk fıkra.",
+        position=4,
+        chunk_type="paragraph",
+        heading_path=["MADDE 4", "(1) Eski ilk fıkra"],
+        chunk_metadata={"article_no": "4", "paragraph_no": "1"},
+        status="active",
+        source="indexed",
+        projection_ordinal=4,
+    )
+    second = RegulatoryChunk(
+        id=f"rc_{uuid4().hex}",
+        user_file_id=user_file_id,
+        text="(2) Eski ikinci fıkra.",
+        position=5,
+        chunk_type="paragraph",
+        heading_path=["MADDE 4", "(2) Eski ikinci fıkra"],
+        chunk_metadata={"article_no": "4", "paragraph_no": "2"},
+        status="active",
+        source="indexed",
+        projection_ordinal=5,
+    )
+    unreviewed = RegulatoryChunk(
+        id=f"rc_{uuid4().hex}",
+        user_file_id=user_file_id,
+        text="(3) Later source row.",
+        position=6,
+        chunk_type="paragraph",
+        heading_path=["MADDE 4", "(3) Later source row"],
+        chunk_metadata={"article_no": "4", "paragraph_no": "3"},
+        status="active",
+        source="indexed",
+        projection_ordinal=6,
+    )
+    body = "MADDE 4- (1) Yeni ilk fıkra.\n(2) Yeni ikinci fıkra."
+    instruction = f"4 üncü maddesi aşağıdaki şekilde değiştirilmiştir. “{body}”"
+    db_session.add_all([document_set, user_file, first, second, unreviewed])
+    db_session.flush()
+    batch = AmendmentBatch(
+        document_set_id=document_set.id,
+        raw_text=instruction,
+        user_file_ids=[str(user_file_id)],
+        segmented_instructions=[],
+        unmatched_instructions=[],
+        status="analyzed",
+        stage="finalizing",
+        instruction_count=1,
+        processed_instruction_count=1,
+        processed_instruction_indices=[0],
+    )
+    db_session.add(batch)
+    db_session.flush()
+    snapshots = [
+        {
+            "id": row.id,
+            "text": row.text,
+            "chunk_type": row.chunk_type,
+            "metadata": dict(row.chunk_metadata),
+            "status": row.status,
+        }
+        for row in (first, second)
+    ]
+    proposal = AmendmentProposal(
+        batch_id=batch.id,
+        instruction_index=0,
+        instruction_text=instruction,
+        instruction_indices=[0],
+        instruction_texts=[instruction],
+        old_chunk_id=first.id,
+        old_chunk_snapshot={
+            **snapshots[0],
+            "replacement_scope": {
+                "kind": "article",
+                "article_no": "4",
+                "member_snapshots": snapshots,
+                "result_chunk_type": "article",
+                "result_metadata": {"article_no": "4"},
+                "result_heading_path": ["MADDE 4"],
+            },
+        },
+        new_chunk_draft={
+            "user_file_id": str(user_file_id),
+            "position": 4,
+            "text": body,
+            "chunk_type": "article",
+            "heading_path": ["MADDE 4"],
+            "metadata": {"article_no": "4"},
+            "effective_start_date": "2026-10-01",
+        },
+        status="approving",
+    )
+    db_session.add(proposal)
+    db_session.commit()
+
+    try:
+        with pytest.raises(ValueError, match="scope changed after review"):
+            approve_amendment_proposal(db_session, proposal)
+        db_session.rollback()
+        db_session.get(RegulatoryChunk, unreviewed.id).status = "superseded"
+        db_session.commit()
+
+        proposal = db_session.get(AmendmentProposal, proposal.id)
+        assert proposal is not None
+        result = approve_amendment_proposal(db_session, proposal)
+        db_session.commit()
+        assert result.new_chunk.chunk_type == "article"
+        assert result.new_chunk.chunk_metadata.get("paragraph_no") is None
+        assert db_session.get(RegulatoryChunk, first.id).status == "superseded"
+        assert db_session.get(RegulatoryChunk, second.id).status == "superseded"
+        assert (
+            db_session.get(RegulatoryChunk, first.id).superseded_by_chunk_id
+            == result.new_chunk.id
+        )
+        assert (
+            db_session.get(RegulatoryChunk, second.id).superseded_by_chunk_id
+            == result.new_chunk.id
+        )
+    finally:
+        db_session.rollback()
+        db_session.execute(
+            delete(AmendmentProposal).where(AmendmentProposal.batch_id == batch.id)
+        )
+        db_session.execute(delete(AmendmentBatch).where(AmendmentBatch.id == batch.id))
+        db_session.execute(
+            delete(RegulatoryChunk).where(RegulatoryChunk.user_file_id == user_file_id)
+        )
+        db_session.execute(delete(UserFile).where(UserFile.id == user_file_id))
+        db_session.execute(delete(DocumentSet).where(DocumentSet.id == document_set.id))
+        persisted_user = db_session.get(User, user.id)
+        if persisted_user is not None:
+            db_session.delete(persisted_user)
+        db_session.commit()
+
+
 def test_approval_persists_same_text_version_and_retry_is_idempotent(
     db_session: Session,
     tenant_context: None,  # noqa: ARG001
