@@ -8,6 +8,7 @@ from pathlib import Path
 from dotenv import dotenv_values
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import URL
+from sqlalchemy.orm import Session
 
 
 def main() -> None:
@@ -81,6 +82,36 @@ def main() -> None:
                 ),
             )
             if batch["id"] == 299:
+                from onyx.db.amendment_match_checkpoints import (
+                    _source_fingerprints,
+                    match_scope_fingerprint,
+                )
+                from onyx.db.models import AmendmentMatchCheckpoint
+                from onyx.regulatory.amendments.match_checkpoint import MatchedInstruction
+
+                with Session(bind=connection) as orm_session:
+                    checkpoint_row = orm_session.get(AmendmentMatchCheckpoint, (299, 5))
+                    if checkpoint_row is not None:
+                        frozen = MatchedInstruction.model_validate(checkpoint_row.payload)
+                        actual = _source_fingerprints(
+                            orm_session, list(checkpoint_row.source_fingerprints)
+                        )
+                        changed = [
+                            chunk_id for chunk_id, digest in checkpoint_row.source_fingerprints.items()
+                            if actual.get(chunk_id) != digest
+                        ]
+                        scope_now = match_scope_fingerprint(
+                            orm_session, batch["user_file_ids"]
+                        )
+                        print("CHECKPOINT_299_5", json.dumps({
+                            "candidate_count": len(checkpoint_row.source_fingerprints),
+                            "changed_candidate_ids": changed,
+                            "scope_matches": frozen.evidence is not None
+                            and frozen.evidence.scope_sha256 == scope_now,
+                            "frozen_scope": frozen.evidence.scope_sha256 if frozen.evidence else None,
+                            "current_scope": scope_now,
+                            "frozen_match_old_chunk_id": frozen.match.old_chunk_id,
+                        }))
                 from onyx.regulatory.amendments.draft_integrity import (
                     explicit_added_article_identity,
                     explicit_added_body,
@@ -107,6 +138,26 @@ def main() -> None:
                     "c7bed4e2-77a2-4609-bb52-3fdffcd15cb1"
                     in batch["user_file_ids"],
                 )
+            if batch["id"] == 302 and batch["source_package_id"] is not None:
+                package = connection.execute(
+                    text(
+                        "SELECT id, status, input_spec, issues, asset_count FROM "
+                        "amendment_source_package WHERE id=:package_id"
+                    ),
+                    {"package_id": batch["source_package_id"]},
+                ).mappings().one_or_none()
+                assets = connection.execute(
+                    text(
+                        "SELECT id, mime_type, display_name, original_url, final_url, "
+                        "sha256, text_sha256 FROM regulatory_source_asset "
+                        "WHERE package_id=:package_id ORDER BY display_name"
+                    ),
+                    {"package_id": batch["source_package_id"]},
+                ).mappings().all()
+                print("BATCH_302_SOURCE_PACKAGE", json.dumps({
+                    "package": dict(package) if package else None,
+                    "assets": [dict(asset) for asset in assets],
+                }, ensure_ascii=False, default=str))
             proposals = connection.execute(
                 text(
                     "SELECT id, instruction_index, instruction_text, status, "
