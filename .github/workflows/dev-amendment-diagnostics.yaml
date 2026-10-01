@@ -7,7 +7,7 @@ on:
         type: choice
         required: true
         default: observe
-        options: [observe]
+        options: [observe, inspect_request_logs]
       expected_image_sha:
         type: string
         required: true
@@ -17,6 +17,15 @@ on:
         required: true
         default: "30"
         description: Observation duration, 1 to 30 minutes
+      request_ids:
+        type: string
+        required: false
+        description: Comma-separated X-Onyx-Request-ID values for inspect_request_logs only
+      since_minutes:
+        type: string
+        required: false
+        default: "90"
+        description: Log lookback for inspect_request_logs, 1 to 180 minutes
 
 permissions:
   contents: read
@@ -245,5 +254,226 @@ jobs:
         with:
           name: dev-api-memory-samples-${{ github.run_id }}
           path: dev-api-memory-samples.jsonl
+          if-no-files-found: ignore
+          retention-days: 7
+
+  inspect_request_logs:
+    if: inputs.operation == 'inspect_request_logs'
+    runs-on: codebuild-customs-regulations-runner-${{ github.run_id }}-${{ github.run_attempt }}
+    timeout-minutes: 8
+    steps:
+      - name: Extract request-scoped metadata from existing DEV API pod logs
+        shell: bash
+        env:
+          EXPECTED_IMAGE_SHA: ${{ inputs.expected_image_sha }}
+          REQUEST_IDS: ${{ inputs.request_ids }}
+          SINCE_MINUTES: ${{ inputs.since_minutes }}
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_IMAGE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$SINCE_MINUTES" =~ ^[1-9][0-9]{0,2}$ ]] && (( SINCE_MINUTES <= 180 ))
+          aws eks update-kubeconfig --name atez-dev-cluster --region eu-central-1
+          python3 - <<'PY'
+          import collections
+          import json
+          import os
+          import re
+          import subprocess
+          from pathlib import Path
+
+          namespace = "customs-regulations-dev"
+          deployment_name = "dev-customs-regulations-api-deployment"
+          selector = "app=dev-customs-regulations-api"
+          expected_sha = os.environ["EXPECTED_IMAGE_SHA"]
+          since_minutes = int(os.environ["SINCE_MINUTES"])
+          tokens = [part.strip() for part in os.environ["REQUEST_IDS"].split(",")]
+          if not 1 <= len(tokens) <= 8 or any(
+              not re.fullmatch(r"[A-Za-z0-9:_-]{8,80}", token) for token in tokens
+          ) or len(tokens) != len(set(tokens)):
+              raise ValueError("Provide 1 to 8 unique safe request IDs")
+          request_index = {token: index + 1 for index, token in enumerate(tokens)}
+          output_path = Path("dev-api-request-log-metadata.jsonl")
+          ansi = re.compile(r"\x1b\[[0-9;]*m")
+          kube_timestamp = re.compile(
+              r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})"
+          )
+          text_record = re.compile(
+              r"^(?P<level>CRITICAL|ERROR|WARNING|NOTICE|INFO|DEBUG):\s+"
+              r"\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}:\d{2}\s+[AP]M\s+"
+              r"(?P<logger>\S+)\s+\d+:\s+\[(?P<request_id>[A-Za-z0-9:_-]{8,80})\]\s+"
+              r"(?P<message>.*)$"
+          )
+
+          def run(args, timeout=20):
+              return subprocess.run(
+                  args, capture_output=True, text=True, errors="replace", timeout=timeout
+              )
+
+          def operation_for(logger, message):
+              value = (logger + " " + message).lower()
+              if "rerank" in value:
+                  return "rerank"
+              if "coverage_plan" in value or "coverage plan" in value:
+                  return "coverage_plan"
+              if any(term in value for term in ("search_tool", "internal_search", "elasticsearch", "search pipeline")):
+                  return "search"
+              if "tool_runner" in value or "tool execution" in value:
+                  return "tool_execution"
+              if any(term in value for term in ("llm_loop", "litellm", "gemini", "openrouter", "provider")):
+                  return "llm"
+              if any(term in value for term in ("sqlalchemy", "database", "db_pool", "postgres")):
+                  return "database"
+              if any(term in value for term in ("uvicorn", "process_message", "api_server")):
+                  return "api"
+              return "other"
+
+          def error_for(level, message):
+              value = message.lower()
+              if any(term in value for term in ("oomkilled", "out of memory", "memoryerror")):
+                  return "memory"
+              if any(term in value for term in ("queuepool", "pool timeout", "connection pool")):
+                  return "db_pool"
+              if "timeout" in value or "timed out" in value:
+                  return "timeout"
+              if any(term in value for term in ("connection reset", "connection refused", "connectionerror")):
+                  return "connection"
+              if "rate limit" in value or "429" in value:
+                  return "rate_limit"
+              if level in {"ERROR", "CRITICAL"}:
+                  return "other_error"
+              return "none"
+
+          def parse_line(line):
+              timestamp, separator, body = line.partition(" ")
+              if not separator or not kube_timestamp.fullmatch(timestamp):
+                  return None
+              body = ansi.sub("", body)
+              if body.startswith("{"):
+                  try:
+                      record = json.loads(body)
+                  except (json.JSONDecodeError, ValueError):
+                      return None
+                  if not isinstance(record, dict):
+                      return None
+                  request_id = record.get("request_id")
+                  level = record.get("level")
+                  logger = record.get("logger")
+                  message = record.get("message")
+                  if not all(isinstance(item, str) for item in (request_id, level, logger, message)):
+                      return None
+              else:
+                  match = text_record.match(body)
+                  if match is None:
+                      return None
+                  request_id = match.group("request_id")
+                  level = match.group("level")
+                  logger = match.group("logger")
+                  message = match.group("message")
+              if request_id not in request_index or level not in {
+                  "CRITICAL", "ERROR", "WARNING", "NOTICE", "INFO", "DEBUG"
+              }:
+                  return None
+              return {
+                  "time": timestamp,
+                  "request_index": request_index[request_id],
+                  "operation": operation_for(logger, message),
+                  "error_kind": error_for(level, message),
+              }
+
+          deployment_result = run([
+              "kubectl", "get", "deployment", deployment_name, "-n", namespace,
+              "-o", "json", "--request-timeout=5s",
+          ])
+          if deployment_result.returncode:
+              raise RuntimeError("Could not read DEV API deployment")
+          deployment = json.loads(deployment_result.stdout)
+          template = deployment["spec"]["template"]["spec"]["containers"]
+          if (
+              deployment["spec"].get("replicas") != 2
+              or sum(item["image"].endswith(":" + expected_sha) for item in template) != 1
+          ):
+              raise RuntimeError("DEV API deployment image or replica guard failed")
+          pods_result = run([
+              "kubectl", "get", "pods", "-n", namespace, "-l", selector,
+              "-o", "json", "--request-timeout=5s",
+          ])
+          if pods_result.returncode:
+              raise RuntimeError("Could not list DEV API pods")
+          pods = []
+          for pod in json.loads(pods_result.stdout)["items"]:
+              if pod["metadata"].get("deletionTimestamp") is not None:
+                  continue
+              matches = [
+                  item["name"] for item in pod["spec"]["containers"]
+                  if item["image"].endswith(":" + expected_sha)
+              ]
+              if len(matches) == 1:
+                  pods.append((pod["metadata"]["name"], matches[0]))
+          if not 1 <= len(pods) <= 4:
+              raise RuntimeError("No bounded set of expected-image DEV API pods")
+
+          print(f"LOG_INSPECT_READY pods={len(pods)} request_count={len(tokens)}", flush=True)
+          counts = collections.Counter()
+          available_streams = 0
+          emitted = 0
+          with output_path.open("w", encoding="utf-8") as output:
+              for pod_name, container_name in pods:
+                  for stream in ("current", "previous"):
+                      args = [
+                          "kubectl", "logs", pod_name, "-n", namespace, "-c", container_name,
+                          f"--since={since_minutes}m", "--timestamps", "--tail=10000",
+                          "--limit-bytes=8388608", "--request-timeout=20s",
+                      ]
+                      if stream == "previous":
+                          args.append("--previous")
+                      try:
+                          result = run(args, timeout=30)
+                      except subprocess.TimeoutExpired:
+                          counts[(pod_name, stream, "timeout")] += 1
+                          continue
+                      if result.returncode:
+                          counts[(pod_name, stream, "unavailable")] += 1
+                          continue
+                      available_streams += 1
+                      for line in result.stdout.splitlines():
+                          event = parse_line(line)
+                          if event is None:
+                              continue
+                          counts[(pod_name, stream, "matched")] += 1
+                          if emitted < 4000:
+                              event["pod"] = pod_name
+                              output.write(json.dumps(event, separators=(",", ":")) + "\n")
+                              emitted += 1
+              output.write(json.dumps({
+                  "kind": "summary", "pods": len(pods), "request_count": len(tokens),
+                  "available_streams": available_streams, "emitted": emitted,
+                  "unavailable_streams": sum(
+                      count for (pod, stream, kind), count in counts.items()
+                      if kind == "unavailable"
+                  ),
+                  "timed_out_streams": sum(
+                      count for (pod, stream, kind), count in counts.items()
+                      if kind == "timeout"
+                  ),
+                  "matched": sum(count for (pod, stream, kind), count in counts.items()
+                                 if kind == "matched"),
+                  "truncated": sum(count for (pod, stream, kind), count in counts.items()
+                                   if kind == "matched") > emitted,
+              }, separators=(",", ":")) + "\n")
+          print(
+              f"LOG_INSPECT_COMPLETE streams={available_streams} matched="
+              f"{sum(count for (pod, stream, kind), count in counts.items() if kind == 'matched')} "
+              f"emitted={emitted}", flush=True,
+          )
+          if available_streams == 0:
+              raise RuntimeError("No DEV API log stream could be read")
+          PY
+
+      - name: Preserve sanitized request log metadata
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dev-api-request-log-metadata-${{ github.run_id }}
+          path: dev-api-request-log-metadata.jsonl
           if-no-files-found: ignore
           retention-days: 7
