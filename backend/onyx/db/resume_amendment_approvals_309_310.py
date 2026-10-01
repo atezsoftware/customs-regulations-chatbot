@@ -18,6 +18,7 @@ from shared_configs.contextvars import get_current_tenant_id
 
 EXPECTED: dict[int, tuple[int, str, int]] = {
     443: (299, "0cec6f3ed0cf25fdeed344032c924d7e4b842faa03f3465824d8d9cb2164b7ba", 0),
+    442: (299, "1fe5608e7be48a77328be8bc26b79f1d439592d6b7b18ae47137bf02e57c82b4", 0),
     481: (299, "aee0fe3b82d815e238190a6f6ebc64be66cbfe244d9caf741c3a9569c1a2601c", 0),
     482: (306, "4a7c7ac54d7c2f2e98e3fc1098b607ea96b96bdc5826b8f8815e9d5c723aa444", 0),
     462: (309, "dcb40be9e4d2009764a65a9cdd6f44dc471562dc9ff2138cde056d81f1459be9", 0),
@@ -91,6 +92,20 @@ def main(proposal_id: int) -> None:
                 != draft.get("text")
             ):
                 raise RuntimeError("Reviewed Article 3 clause e identity changed")
+        if proposal_id == 442:
+            from onyx.regulatory.amendments.draft_integrity import explicit_added_body
+
+            draft = proposal.new_chunk_draft
+            if (
+                proposal.instruction_index != 8
+                or proposal.old_chunk_id is not None
+                or str(draft.get("user_file_id"))
+                != "014fbc6a-2da2-4845-9df9-f4afc625587a"
+                or (draft.get("metadata") or {}).get("article_no") != "GEÇİCİ 2"
+                or draft.get("effective_start_date") != "2026-10-01"
+                or explicit_added_body(proposal.instruction_text) != draft.get("text")
+            ):
+                raise RuntimeError("Reviewed temporary Article 2 identity changed")
         if proposal.status != "pending":
             print(f"SKIP proposal={proposal_id} status={proposal.status}")
             return
@@ -108,6 +123,6 @@ def main(proposal_id: int) -> None:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2 or sys.argv[1] not in {"443", "462", "465", "470", "481", "482"}:
+    if len(sys.argv) != 2 or sys.argv[1] not in {"442", "443", "462", "465", "470", "481", "482"}:
         raise SystemExit("Specify exactly one approved DEV proposal ID")
     main(int(sys.argv[1]))
