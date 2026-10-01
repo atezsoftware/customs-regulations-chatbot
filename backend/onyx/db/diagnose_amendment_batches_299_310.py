@@ -607,8 +607,7 @@ def main() -> None:
                 "SELECT id, position, status, chunk_metadata->>'article_no' "
                 "AS article_no, text, heading_path FROM regulatory_chunk WHERE "
                 "user_file_id=CAST(:file_id AS uuid) AND "
-                "(chunk_metadata->>'article_no' = '2' OR position < 6) "
-                "ORDER BY position LIMIT 20"
+                "status='active' ORDER BY position LIMIT 40"
             ),
             {"file_id": "c7bed4e2-77a2-4609-bb52-3fdffcd15cb1"},
         ):
@@ -617,7 +616,7 @@ def main() -> None:
                 json.dumps(
                     {"id": row.id, "position": row.position,
                      "status": row.status, "article_no": row.article_no,
-                     "text_excerpt": row.text[:500],
+                     "text_excerpt": row.text[:320],
                      "heading_path": row.heading_path[:3]},
                     ensure_ascii=False,
                 ),
