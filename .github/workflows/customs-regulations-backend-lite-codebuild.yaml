@@ -14,13 +14,14 @@ on:
           - test
           - production
       action:
-        description: 'Select the action'
+        description: 'Deploy, redeploy, or stabilize only the current DEV API image'
         required: false
         default: deploy
         type: choice
         options:
           - deploy
           - redeploy
+          - stabilize_api
       image_tag:
         description: 'Enter the image tag'
         required: false
@@ -84,6 +85,11 @@ jobs:
             exit 1
           fi
 
+          if [[ "$DISPATCH_ACTION" == "stabilize_api" && "$deployment_target" != "dev" ]]; then
+            echo "API capacity stabilization is available only for DEV." >&2
+            exit 1
+          fi
+
           case "$deployment_target" in
           dev)
             echo "SERVICE_NAME=customs-regulations-backend-lite-dev" >> $GITHUB_ENV
@@ -116,32 +122,33 @@ jobs:
           esac
 
           echo "GIT_COMMIT=$WORKFLOW_GIT_SHA" >> $GITHUB_ENV
+          echo "DEPLOY_ACTION=$DISPATCH_ACTION" >> $GITHUB_ENV
           echo "AWS_REGION=eu-central-1" >> $GITHUB_ENV
           echo "AWS_ECR=255114580789.dkr.ecr.eu-central-1.amazonaws.com" >> $GITHUB_ENV
-          if [[ "$DISPATCH_ACTION" == "redeploy" ]]; then
+          if [[ "$DISPATCH_ACTION" == "redeploy" || "$DISPATCH_ACTION" == "stabilize_api" ]]; then
             echo "IMAGE_TAG=$DISPATCH_IMAGE_TAG" >> $GITHUB_ENV
           else
             echo "IMAGE_TAG=$WORKFLOW_GIT_SHA" >> $GITHUB_ENV
           fi
 
-      - name: Validate Redeploy Image
-        if: inputs.action == 'redeploy'
+      - name: Validate existing image tag
+        if: inputs.action == 'redeploy' || inputs.action == 'stabilize_api'
         env:
-          REDEPLOY_IMAGE_TAG: ${{ inputs.image_tag }}
+          EXISTING_IMAGE_TAG: ${{ inputs.image_tag }}
         run: |
-          if [[ -z "${REDEPLOY_IMAGE_TAG//[[:space:]]/}" ]]; then
-            echo "Error: image_tag input is required for redeploy action." >&2
+          if [[ -z "${EXISTING_IMAGE_TAG//[[:space:]]/}" ]]; then
+            echo "Error: image_tag input is required for an existing-image action." >&2
             exit 1
           fi
-          echo "Using image tag for redeploy: $REDEPLOY_IMAGE_TAG"
+          echo "Using existing image tag: $EXISTING_IMAGE_TAG"
 
       - name: AWS ECR login
-        if: inputs.action != 'redeploy'
+        if: inputs.action != 'redeploy' && inputs.action != 'stabilize_api'
         run: |
           aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin ${{ env.AWS_ECR }}
 
       - name: Docker Build ve Tag
-        if: inputs.action != 'redeploy'
+        if: inputs.action != 'redeploy' && inputs.action != 'stabilize_api'
         run: |
           docker build backend \
             -t ${{ env.SERVICE_NAME }}:${{ env.GIT_COMMIT }} \
@@ -155,7 +162,7 @@ jobs:
           echo "IMAGE_TAG=${{ env.GIT_COMMIT }}" >> $GITHUB_ENV
 
       - name: Docker Push
-        if: inputs.action != 'redeploy'
+        if: inputs.action != 'redeploy' && inputs.action != 'stabilize_api'
         run: |
           docker push ${{ env.DOCKER_IMAGE_REPO }}:${{ env.GIT_COMMIT }}
           docker push ${{ env.DOCKER_IMAGE_REPO }}:latest
@@ -172,7 +179,7 @@ jobs:
           aws eks update-kubeconfig --name ${{ env.CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
 
       - name: Verify DEV answer graph encryption key
-        if: env.env_x == 'dev'
+        if: env.env_x == 'dev' && inputs.action != 'stabilize_api'
         run: |
           set -euo pipefail
           pod=$(kubectl get pods -n "${namespace}" -l app=dev-customs-regulations-api -o json |
@@ -187,7 +194,7 @@ jobs:
           echo "DEV answer graph encryption key is available"
 
       - name: Render required DEV runtime configuration
-        if: env.env_x == 'dev'
+        if: env.env_x == 'dev' && inputs.action != 'stabilize_api'
         run: |
           set -euo pipefail
           python3 -m venv /tmp/regulatory-runtime-values
@@ -260,6 +267,49 @@ jobs:
         with:
           version: v4.2.3
 
+      - name: Verify DEV API stabilization baseline
+        if: inputs.action == 'stabilize_api'
+        run: |
+          set -euo pipefail
+          [[ "$env_x" == "dev" && "$namespace" == "customs-regulations-dev" ]]
+          [[ "$IMAGE_TAG" == "7714a8a3e4efb90307913aacdda49fb3d86a273b" ]] || {
+            echo "This one-time stabilization requires the current DEV image SHA." >&2
+            exit 1
+          }
+          expected_image="${DOCKER_IMAGE_REPO}:${IMAGE_TAG}"
+          deployment_json=$(kubectl get deployment dev-customs-regulations-api-deployment \
+            --namespace "$namespace" -o json)
+          pods_json=$(kubectl get pods --namespace "$namespace" \
+            -l app=dev-customs-regulations-api -o json)
+          jq -e --arg image "$expected_image" '
+            .spec.replicas == 1 and
+            .status.readyReplicas == 1 and
+            ([.spec.template.spec.containers[] |
+              select(.name == "dev-customs-regulations-api-container" and
+                .image == $image and
+                .resources.requests.memory == "1024Mi" and
+                .resources.limits.memory == "2560Mi")] | length) == 1
+          ' <<<"$deployment_json" >/dev/null
+          jq -e --arg image "$expected_image" '
+            [.items[] | select(.metadata.deletionTimestamp == null)] as $pods |
+            ($pods | length) == 1 and
+            all($pods[];
+              ([.spec.containers[] |
+                select(.name == "dev-customs-regulations-api-container" and
+                  .image == $image and
+                  .resources.requests.memory == "1024Mi" and
+                  .resources.limits.memory == "2560Mi")] | length) == 1 and
+              any(.status.conditions[]?; .type == "Ready" and .status == "True"))
+          ' <<<"$pods_json" >/dev/null
+          history_json=$(helm history customs-regulations-api-dev --namespace "$namespace" -o json)
+          rollback_revision=$(jq -r '
+            [.[] | select(.status == "deployed")] |
+            sort_by(.revision | tonumber) | last | .revision // empty
+          ' <<<"$history_json")
+          [[ "$rollback_revision" =~ ^[0-9]+$ ]]
+          echo "STABILIZE_API_ROLLBACK_REVISION=$rollback_revision" >> "$GITHUB_ENV"
+          echo "Verified one Ready DEV API pod at $expected_image, 1024Mi request, 2560Mi limit"
+
       - name: Deploy api and background with Helm
         id: helm_deploy
         run: |
@@ -275,6 +325,14 @@ jobs:
 
             if [[ -n "$memory_limit" ]]; then
               memory_override+=(--set "app.mem_limits=$memory_limit")
+            fi
+            if [[ "$env_x" == "dev" && "$app_name" == "customs-regulations-api" ]]; then
+              memory_override+=(
+                --set app.replicas=2
+                --set app.mem_limits=4Gi
+                --set app.mem_requests=1Gi
+                --set app.strategy.rollingUpdate.maxSurge=1
+              )
             fi
 
             if ! kubectl get namespace "${namespace}" >/dev/null 2>&1; then
@@ -329,6 +387,43 @@ jobs:
             done
 
             kubectl get deployment "$deployment" --namespace "${namespace}" -o json | jq -e --arg tag "${IMAGE_TAG}" 'any(.spec.template.spec.containers[]?; (.image | endswith(":" + $tag)))' >/dev/null
+
+            if [[ "$env_x" == "dev" && "$app_name" == "customs-regulations-api" ]]; then
+              expected_image="${DOCKER_IMAGE_REPO}:${IMAGE_TAG}"
+              for attempt in {1..12}; do
+                deployment_json=$(kubectl get deployment "$deployment" --namespace "${namespace}" -o json)
+                pods_json=$(kubectl get pods --namespace "${namespace}" -l "$selector" -o json)
+                if jq -e --arg image "$expected_image" '
+                  .spec.replicas == 2 and
+                  .status.updatedReplicas == 2 and
+                  .status.readyReplicas == 2 and
+                  ([.spec.template.spec.containers[] |
+                    select(.name == "dev-customs-regulations-api-container" and
+                      .image == $image and
+                      .resources.requests.memory == "1Gi" and
+                      .resources.limits.memory == "4Gi")] | length) == 1
+                ' <<<"$deployment_json" >/dev/null &&
+                  jq -e --arg image "$expected_image" '
+                    [.items[] | select(.metadata.deletionTimestamp == null)] as $pods |
+                    ($pods | length) == 2 and
+                    all($pods[];
+                      ([.spec.containers[] |
+                        select(.name == "dev-customs-regulations-api-container" and
+                          .image == $image and
+                          .resources.requests.memory == "1Gi" and
+                          .resources.limits.memory == "4Gi")] | length) == 1 and
+                      any(.status.conditions[]?; .type == "Ready" and .status == "True"))
+                  ' <<<"$pods_json" >/dev/null; then
+                  echo "Two Ready DEV API pods use $expected_image with 1Gi request and 4Gi limit"
+                  break
+                fi
+                if [[ "$attempt" == 12 ]]; then
+                  echo "DEV API image, capacity, or Ready replica verification failed" >&2
+                  return 1
+                fi
+                sleep 5
+              done
+            fi
 
             if [[ "$wait_for_ready" == "true" ]]; then
               echo "Waiting for a Ready pod running image tag ${IMAGE_TAG} for ${app_name}"
@@ -515,15 +610,17 @@ jobs:
           }
 
           deploy_app "customs-regulations-api" "customs-regulations/customs-regulations-api-values.yaml" "true" ""
-          deploy_app "customs-regulations-background" "customs-regulations/customs-regulations-background-values.yaml" "true" ""
-          verify_benchmark_worker
-          verify_regulatory_indexing_worker
-          verify_regulatory_indexing_beat
-          capture_background_memory_evidence
+          if [[ "$DEPLOY_ACTION" != "stabilize_api" ]]; then
+            deploy_app "customs-regulations-background" "customs-regulations/customs-regulations-background-values.yaml" "true" ""
+            verify_benchmark_worker
+            verify_regulatory_indexing_worker
+            verify_regulatory_indexing_beat
+            capture_background_memory_evidence
+          fi
         continue-on-error: true
 
       - name: Verify DEV annex consumer and labeling configuration
-        if: env.env_x == 'dev' && steps.helm_deploy.outcome == 'success'
+        if: env.env_x == 'dev' && steps.helm_deploy.outcome == 'success' && inputs.action != 'stabilize_api'
         run: |
           set -euo pipefail
           for app_name in api background; do
@@ -546,7 +643,11 @@ jobs:
       - name: Check Deployment Status
         if: steps.helm_deploy.outcome == 'failure' || steps.helm_deploy.conclusion == 'failure'
         run: |
-          for app_name in customs-regulations-api customs-regulations-background; do
+          app_names=(customs-regulations-api customs-regulations-background)
+          if [[ "$DEPLOY_ACTION" == "stabilize_api" ]]; then
+            app_names=(customs-regulations-api)
+          fi
+          for app_name in "${app_names[@]}"; do
             echo "=== Diagnostics for ${app_name} ==="
             kubectl describe deployment ${{ env.env_x }}-${app_name}-deployment -n ${{ env.namespace }} || true
             kubectl get pods --namespace ${{ env.namespace }} -l app=${{ env.env_x }}-${app_name} -o wide || true
@@ -562,10 +663,23 @@ jobs:
         id: rollback_step
         if: steps.helm_deploy.outcome == 'failure' || steps.helm_deploy.conclusion == 'failure'
         run: |
-          for app_name in customs-regulations-api customs-regulations-background; do
+          app_names=(customs-regulations-api customs-regulations-background)
+          if [[ "$DEPLOY_ACTION" == "stabilize_api" ]]; then
+            app_names=(customs-regulations-api)
+          fi
+          for app_name in "${app_names[@]}"; do
             release="${app_name}-${{ env.env_x }}"
             if history_json=$(helm history "$release" --namespace ${{ env.namespace }} -o json 2>/dev/null); then
-              rollback_revision=$(jq -r '[.[] | select(.status == "deployed" or .status == "superseded")] | sort_by(.revision | tonumber) | last | .revision // empty' <<<"$history_json")
+              if [[ "$DEPLOY_ACTION" == "stabilize_api" ]]; then
+                rollback_revision="${STABILIZE_API_ROLLBACK_REVISION:-}"
+              else
+                rollback_revision=$(jq -r '
+                  (map(.revision | tonumber) | max) as $latest |
+                  [.[] | select((.revision | tonumber) < $latest) |
+                    select(.status == "deployed" or .status == "superseded")] |
+                  sort_by(.revision | tonumber) | last | .revision // empty
+                ' <<<"$history_json")
+              fi
               if [[ -n "$rollback_revision" ]]; then
                 echo "Rolling back $release to revision $rollback_revision"
                 helm rollback "$release" "$rollback_revision" \
@@ -574,6 +688,8 @@ jobs:
                   --wait=watcher \
                   --timeout 600s || true
                 echo "ROLLBACK_PERFORMED=true" >> $GITHUB_ENV
+              elif [[ "$DEPLOY_ACTION" == "stabilize_api" ]]; then
+                echo "No earlier API revision found; preserving the existing release for diagnosis" >&2
               else
                 helm uninstall "$release" --namespace ${{ env.namespace }} || true
                 echo "ROLLBACK_PERFORMED=cleanup" >> $GITHUB_ENV
