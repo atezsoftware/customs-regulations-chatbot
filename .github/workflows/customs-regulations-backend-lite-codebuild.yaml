@@ -276,6 +276,13 @@ jobs:
             if [[ -n "$memory_limit" ]]; then
               memory_override+=(--set "app.mem_limits=$memory_limit")
             fi
+            if [[ "$env_x" == "dev" && "$app_name" == "customs-regulations-api" ]]; then
+              memory_override+=(
+                --set app.mem_limits=4Gi
+                --set app.replicas=2
+                --set app.strategy.rollingUpdate.maxSurge=1
+              )
+            fi
 
             if ! kubectl get namespace "${namespace}" >/dev/null 2>&1; then
               echo "Namespace ${namespace} does not exist yet; skipping terminating pod cleanup for ${app_name}."
@@ -329,6 +336,12 @@ jobs:
             done
 
             kubectl get deployment "$deployment" --namespace "${namespace}" -o json | jq -e --arg tag "${IMAGE_TAG}" 'any(.spec.template.spec.containers[]?; (.image | endswith(":" + $tag)))' >/dev/null
+            if [[ "$env_x" == "dev" && "$app_name" == "customs-regulations-api" ]]; then
+              kubectl get deployment "$deployment" --namespace "${namespace}" -o json | jq -e '
+                .spec.replicas == 2 and .status.readyReplicas == 2 and
+                any(.spec.template.spec.containers[]?; .name == "dev-customs-regulations-api-container" and .resources.limits.memory == "4Gi")
+              ' >/dev/null
+            fi
 
             if [[ "$wait_for_ready" == "true" ]]; then
               echo "Waiting for a Ready pod running image tag ${IMAGE_TAG} for ${app_name}"
