@@ -152,6 +152,68 @@ def _compact_candidates(
     )
 
 
+def test_sibling_read_releases_each_file_before_loading_the_next(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    second_file_id = UUID("00000000-0000-0000-0000-000000000102")
+    identities = [
+        ("a1", FILE_ID, "1"),
+        ("b1", second_file_id, "1"),
+        ("a2", FILE_ID, "2"),
+    ]
+    rows = {
+        identifier: SimpleNamespace(id=identifier, user_file_id=file_id)
+        for identifier, file_id, _ in identities
+    }
+    candidates = {
+        identifier: chunks.RegulatoryChunkSiblingCandidate(
+            regulatory_chunk_id=identifier,
+            user_file_id=file_id,
+            position=index,
+            text=f"MADDE {article} Başvuru hükümleri.",
+            heading_path=(f"Kanun {file_id}", f"MADDE {article}"),
+            article_no=article,
+            chunk_type="article",
+            status="active",
+        )
+        for index, (identifier, file_id, article) in enumerate(identities)
+    }
+    session = MagicMock(spec=Session)
+    session.scalars.return_value.all.side_effect = [
+        [rows[identifier] for identifier, _, _ in identities],
+        [rows["a1"], rows["a2"]],
+        [rows["b1"]],
+    ]
+    monkeypatch.setattr(
+        chunks,
+        "_public_sibling_candidates",
+        lambda _session, file_rows, **_kwargs: [
+            candidates[row.id] for row in file_rows
+        ],
+    )
+    monkeypatch.setattr(
+        chunks,
+        "_hydrate_selected_regulatory_sources",
+        lambda _session, selected, **_kwargs: selected,
+    )
+    monkeypatch.setattr(publication_reads, "observe_publication_read", object)
+    monkeypatch.setattr(
+        publication_reads,
+        "filter_publication_read",
+        lambda _observation, selected, _document_id: selected,
+    )
+
+    selected = chunks.get_bounded_same_provision_siblings(
+        session,
+        ["a1", "b1", "a2"],
+        query="başvuru",
+        as_of_date=AS_OF,
+    )
+
+    assert [row.regulatory_chunk_id for row in selected] == ["a1", "b1", "a2"]
+    assert session.scalars.call_count == 3
+
+
 def test_candidates_drop_vector_payload_but_keep_exact_publication_digest(
     inventory: SimpleNamespace,
 ) -> None:

@@ -1,3 +1,8 @@
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -5,7 +10,7 @@ import pytest
 from onyx.chat.models import ChatMessageSimple, ToolCallSimple
 from onyx.configs.constants import MessageType
 from onyx.server.query_and_chat.placement import Placement
-from onyx.tools.models import ToolCallKickoff
+from onyx.tools.models import ToolCallKickoff, ToolResponse
 from onyx.tools.tool_runner import (
     DEFAULT_SEARCH_MAX_LLM_CHUNKS,
     PARALLEL_SEARCH_MIN_LLM_CHUNKS_PER_CALL,
@@ -14,6 +19,7 @@ from onyx.tools.tool_runner import (
     _max_llm_chunks_per_search_call,
     _merge_tool_calls,
     _parallel_search_filter_queries,
+    _safe_run_single_tool,
     _search_filter_message_history,
     _search_input_context,
     _should_skip_search_query_expansion,
@@ -113,6 +119,63 @@ def test_parallel_worker_limit_must_be_positive() -> None:
             next_citation_num=1,
             max_parallel_workers=0,
         )
+
+
+def test_fast_regulatory_search_memory_gate_bounds_parallel_requests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import onyx.tools.tool_runner as runner
+
+    active = 0
+    maximum_active = 0
+    lock = threading.Lock()
+    four_entered = threading.Event()
+    release = threading.Event()
+
+    class FakeSearchTool:
+        name = "internal_search"
+        user_selected_filters = SimpleNamespace(
+            regulatory_chunks_only=True,
+            regulatory_workflow_mode="fast",
+        )
+        emitter = MagicMock()
+
+        def run(self, **_kwargs: object) -> ToolResponse:
+            nonlocal active, maximum_active
+            with lock:
+                active += 1
+                maximum_active = max(maximum_active, active)
+                if active == 4:
+                    four_entered.set()
+            release.wait(5)
+            with lock:
+                active -= 1
+            return ToolResponse(rich_response=None, llm_facing_response="ok")
+
+    monkeypatch.setattr(runner, "SearchTool", FakeSearchTool)
+    monkeypatch.setattr(
+        runner,
+        "function_span",
+        lambda _name: nullcontext(SimpleNamespace(span_data=SimpleNamespace())),
+    )
+    tool = FakeSearchTool()
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [
+            executor.submit(
+                _safe_run_single_tool,
+                tool,
+                _make_tool_call("internal_search", {}, tool_call_id=str(index)),
+                None,
+            )
+            for index in range(8)
+        ]
+        try:
+            assert four_entered.wait(5)
+            time.sleep(0.02)
+            assert maximum_active == 4
+        finally:
+            release.set()
+        assert all(future.result().llm_facing_response == "ok" for future in futures)
 
 
 def test_model_written_internal_search_uses_only_focused_context() -> None:

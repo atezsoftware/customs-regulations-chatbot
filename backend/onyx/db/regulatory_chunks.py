@@ -11,10 +11,12 @@ import hashlib
 import json
 import math
 import re
+import threading
 import unicodedata
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, replace
-from typing import Any, Literal, cast
+from functools import wraps
+from typing import Any, Literal, ParamSpec, TypeVar, cast
 from uuid import UUID
 
 from sqlalchemy import delete, exists, func, or_, select
@@ -49,6 +51,22 @@ DEFAULT_REFERENCE_MAX_CHARS_PER_PROVISION = 4_000
 DEFAULT_ADJACENT_MAX_PROVISIONS = 2
 DEFAULT_ADJACENT_MAX_CHUNKS_PER_PROVISION = 2
 DEFAULT_ADJACENT_MAX_TOTAL_CHARS = 4_000
+
+_CONTEXT_READ_SLOTS = threading.BoundedSemaphore(2)
+_P = ParamSpec("_P")
+_T = TypeVar("_T")
+
+
+def _bounded_context_read(function: Callable[_P, _T]) -> Callable[_P, _T]:
+    """Bound concurrent full-file publication reads across chat requests."""
+
+    @wraps(function)
+    def run(*args: _P.args, **kwargs: _P.kwargs) -> _T:
+        with _CONTEXT_READ_SLOTS:
+            return function(*args, **kwargs)
+
+    return run
+
 
 _LEXICAL_TERM_RE = re.compile(r"[^\W_]+", flags=re.UNICODE)
 _NUMBERED_PEER_HEADING_RE = re.compile(
@@ -1313,6 +1331,33 @@ def select_bounded_same_provision_siblings(
     admitted only within the same parent heading scope. Other metadata-free rows
     must bridge two rows structurally compatible with the seed provision.
     """
+    groups = _select_bounded_same_provision_groups(
+        candidates,
+        seed_chunk_ids,
+        query=query,
+        as_of_date=as_of_date,
+        max_chunks_per_provision=max_chunks_per_provision,
+        max_chars_per_provision=max_chars_per_provision,
+    )
+    selected: list[RegulatoryChunkProjection] = []
+    selected_ids: set[str] = set()
+    for _, group_rows in groups:
+        for row in group_rows:
+            if row.regulatory_chunk_id not in selected_ids:
+                selected.append(row)
+                selected_ids.add(row.regulatory_chunk_id)
+    return selected
+
+
+def _select_bounded_same_provision_groups(
+    candidates: Iterable[RegulatoryChunkSiblingCandidate],
+    seed_chunk_ids: Sequence[str],
+    *,
+    query: str,
+    as_of_date: datetime.date | None,
+    max_chunks_per_provision: int,
+    max_chars_per_provision: int,
+) -> list[tuple[str, list[RegulatoryChunkProjection]]]:
     if max_chunks_per_provision <= 0:
         raise ValueError("max_chunks_per_provision must be positive")
     if max_chars_per_provision <= 0:
@@ -1331,8 +1376,7 @@ def select_bounded_same_provision_siblings(
         as_of_date,
     )
     query_terms = _lexical_terms(query)
-    selected: list[RegulatoryChunkProjection] = []
-    selected_ids: set[str] = set()
+    selected_groups: list[tuple[str, list[RegulatoryChunkProjection]]] = []
     for group in groups:
         group_rows = _select_group_within_budget(
             projected_by_file[group.user_file_id],
@@ -1342,11 +1386,8 @@ def select_bounded_same_provision_siblings(
             max_chunks=max_chunks_per_provision,
             max_chars=max_chars_per_provision,
         )
-        for row in group_rows:
-            if row.regulatory_chunk_id not in selected_ids:
-                selected.append(row)
-                selected_ids.add(row.regulatory_chunk_id)
-    return selected
+        selected_groups.append((group.seed_ids[0], group_rows))
+    return selected_groups
 
 
 def select_bounded_adjacent_provisions(
@@ -1573,6 +1614,7 @@ def select_bounded_source_lexical_matches(
     return selected
 
 
+@_bounded_context_read
 def get_bounded_source_lexical_matches(
     db_session: Session,
     *,
@@ -1849,6 +1891,7 @@ def is_regulatory_navigation_candidate_visible(
     return True
 
 
+@_bounded_context_read
 def get_regulatory_provision_heading_source(
     db_session: Session,
     seed_chunk_ids: Sequence[str],
@@ -2254,6 +2297,7 @@ def _regulatory_sibling_candidate(
     )
 
 
+@_bounded_context_read
 def get_bounded_same_provision_siblings(
     db_session: Session,
     seed_chunk_ids: Sequence[str],
@@ -2283,32 +2327,57 @@ def get_bounded_same_provision_siblings(
             .where(RegulatoryChunk.id.in_(unique_seed_ids))
         ).all()
     )
-    user_file_ids = {row.user_file_id for row in seed_rows}
-    if not user_file_ids:
+    file_by_seed_id = {row.id: row.user_file_id for row in seed_rows}
+    file_ids = list(
+        dict.fromkeys(
+            file_by_seed_id[seed_id]
+            for seed_id in unique_seed_ids
+            if seed_id in file_by_seed_id
+        )
+    )
+    if not file_ids:
         return []
-
-    all_rows = list(
-        db_session.scalars(
-            select(RegulatoryChunk)
-            .execution_options(populate_existing=True)
-            .where(RegulatoryChunk.user_file_id.in_(user_file_ids))
-        ).all()
-    )
-    candidates = _public_sibling_candidates(
-        db_session,
-        all_rows,
-        as_of_date=effective_date,
-        query_indexes=query_indexes,
-        observation=observation,
-    )
-    selected = select_bounded_same_provision_siblings(
-        candidates,
-        unique_seed_ids,
-        query=query,
-        as_of_date=as_of_date,
-        max_chunks_per_provision=max_chunks_per_provision,
-        max_chars_per_provision=max_chars_per_provision,
-    )
+    seed_order = {seed_id: index for index, seed_id in enumerate(unique_seed_ids)}
+    selected_groups: list[tuple[int, list[RegulatoryChunkProjection]]] = []
+    for file_id in file_ids:
+        file_seed_ids = [
+            seed_id
+            for seed_id in unique_seed_ids
+            if file_by_seed_id.get(seed_id) == file_id
+        ]
+        file_rows = list(
+            db_session.scalars(
+                select(RegulatoryChunk)
+                .execution_options(populate_existing=True)
+                .where(RegulatoryChunk.user_file_id == file_id)
+            ).all()
+        )
+        candidates = _public_sibling_candidates(
+            db_session,
+            file_rows,
+            as_of_date=effective_date,
+            query_indexes=query_indexes,
+            observation=observation,
+        )
+        selected_groups.extend(
+            (seed_order[first_seed_id], group_rows)
+            for first_seed_id, group_rows in _select_bounded_same_provision_groups(
+                candidates,
+                file_seed_ids,
+                query=query,
+                as_of_date=as_of_date,
+                max_chunks_per_provision=max_chunks_per_provision,
+                max_chars_per_provision=max_chars_per_provision,
+            )
+        )
+        del file_rows, candidates
+    selected: list[RegulatoryChunkProjection] = []
+    selected_ids: set[str] = set()
+    for _, group_rows in sorted(selected_groups, key=lambda item: item[0]):
+        for row in group_rows:
+            if row.regulatory_chunk_id not in selected_ids:
+                selected.append(row)
+                selected_ids.add(row.regulatory_chunk_id)
     selected = _hydrate_selected_regulatory_sources(
         db_session,
         selected,
@@ -2320,6 +2389,7 @@ def get_bounded_same_provision_siblings(
     )
 
 
+@_bounded_context_read
 def get_bounded_adjacent_provisions(
     db_session: Session,
     seed_chunk_ids: Sequence[str],
@@ -2432,6 +2502,7 @@ def get_visible_regulatory_chunk_ids(
     return {row.regulatory_chunk_id for row in candidates}
 
 
+@_bounded_context_read
 def get_bounded_referenced_provisions(
     db_session: Session,
     seed_chunk_ids: Sequence[str],

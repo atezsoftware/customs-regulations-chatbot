@@ -21,6 +21,7 @@ from onyx.chat.llm_loop import (
     _REGULATORY_MAX_PARALLEL_SEARCH_CALLS,
     SearchEvidenceLedgerEntry,
     _build_candidate_answer_evidence_chunks,
+    _build_explicit_provision_bootstrap_call,
     _build_fast_regulatory_absence_recovery_tool_calls,
     _build_regulatory_coverage_tool_calls,
     _build_regulatory_matrix_citation_issues,
@@ -92,6 +93,7 @@ from onyx.regulatory.evidence_matrix import (
     RegulatoryEvidenceMatrixRow,
     RegulatoryNavigationLead,
 )
+from onyx.regulatory.provision_lookup import ProvisionRequest
 from onyx.server.query_and_chat.placement import Placement
 from onyx.server.query_and_chat.streaming_models import (
     AgentResponseDelta,
@@ -100,6 +102,9 @@ from onyx.server.query_and_chat.streaming_models import (
     Packet,
 )
 from onyx.tools.models import ParallelToolCallResponse, ToolCallKickoff, ToolResponse
+from onyx.tools.tool_implementations.regulatory_provision.regulatory_provision_tool import (
+    RegulatoryProvisionTool,
+)
 from onyx.tools.tool_implementations.search.search_tool import SearchTool
 
 
@@ -2520,6 +2525,209 @@ def test_fast_coverage_profile_uses_plan_derived_search_count() -> None:
 
     assert len(calls) == 40
     assert all(call.tool_args["search_mode"] == "hybrid" for call in calls)
+
+
+def test_explicit_article_starts_with_one_structural_lookup() -> None:
+    plan = RegulatoryCoveragePlan(
+        coverage_items=[
+            RegulatoryCoverageItem(
+                research_question="Gümrük Kanunu madde 104 nasıl uygulanır?",
+                evidence_dimensions=[
+                    "Madde 104 kapsamı",
+                    "Madde 104 koşulları",
+                    "Madde 104 istisnaları",
+                    "Madde 104 sonucu",
+                ],
+                source_anchors=["Gümrük Kanunu"],
+                completion_test="Dört soruyu kaynakla cevapla.",
+            )
+        ]
+    )
+    request = "Gümrük Kanunu madde 104 kapsamı, koşulları, istisnaları ve sonucu nedir?"
+
+    call = _build_explicit_provision_bootstrap_call(
+        request, plan, provision_tool_available=True, turn_index=0
+    )
+
+    assert call is not None
+    assert call.tool_name == "get_regulatory_provision"
+    assert call.tool_args == {
+        "source": "Gümrük Kanunu",
+        "article_number": "104",
+        "article_kind": "regular",
+    }
+    assert ProvisionRequest.model_validate(call.tool_args).heading == "MADDE 104"
+
+
+@pytest.mark.parametrize(
+    "user_request,source_anchors",
+    [
+        ("Gümrük Kanunu madde 104 ve madde 105 nedir?", ["Gümrük Kanunu"]),
+        ("Gümrük Kanunu madde 104 nedir?", ["Gümrük Kanunu", "Başka Kanun"]),
+        ("Başka madde 104 nedir?", ["Gümrük Kanunu"]),
+    ],
+)
+def test_structural_bootstrap_keeps_ambiguous_requests_on_planned_search(
+    user_request: str, source_anchors: list[str]
+) -> None:
+    plan = RegulatoryCoveragePlan(
+        coverage_items=[
+            RegulatoryCoverageItem(
+                research_question=user_request,
+                evidence_dimensions=[user_request],
+                source_anchors=source_anchors,
+                completion_test="Kaynakla cevapla.",
+            )
+        ]
+    )
+    assert (
+        _build_explicit_provision_bootstrap_call(
+            user_request, plan, provision_tool_available=True, turn_index=0
+        )
+        is None
+    )
+
+
+def test_fast_article_request_uses_structural_lookup_before_optional_followup() -> None:
+    user_request = (
+        "Gümrük Kanunu madde 104 kapsamı, koşulları, istisnaları ve sonucu nedir?"
+    )
+    plan = RegulatoryCoveragePlan(
+        coverage_items=[
+            RegulatoryCoverageItem(
+                research_question=user_request,
+                evidence_dimensions=["kapsam", "koşullar", "istisnalar", "sonuç"],
+                source_anchors=["Gümrük Kanunu"],
+                completion_test="Dört sonucu destekle.",
+            )
+        ]
+    )
+    dispatched: list[list[ToolCallKickoff]] = []
+    decisions = 0
+
+    def fake_run_llm_step(**kwargs: Any) -> tuple[LlmStepResult, bool]:
+        nonlocal decisions
+        decisions += 1
+        if decisions == 1:
+            assert kwargs["tool_choice"] is ToolChoiceOptions.AUTO
+            assert any(
+                '"status": "partial"' in message.message
+                for message in kwargs["history"]
+            )
+            return (
+                LlmStepResult(
+                    reasoning=None,
+                    answer=None,
+                    tool_calls=[
+                        _search_tool_call("article-followup", query="Madde 104 istisna")
+                    ],
+                    raw_answer=None,
+                    finish_reason="tool_calls",
+                ),
+                False,
+            )
+        return (
+            LlmStepResult(
+                reasoning=None,
+                answer="İnceleme tamamlandı.",
+                tool_calls=None,
+                raw_answer="İnceleme tamamlandı.",
+                finish_reason="stop",
+            ),
+            False,
+        )
+
+    def fake_run_tool_calls(**kwargs: Any) -> ParallelToolCallResponse:
+        calls = list(kwargs["tool_calls"])
+        dispatched.append(calls)
+        return ParallelToolCallResponse(
+            tool_responses=[
+                ToolResponse(
+                    rich_response=SearchDocsResponse(
+                        search_docs=[], citation_mapping={}
+                    ),
+                    llm_facing_response=json.dumps(
+                        {
+                            "status": (
+                                "partial"
+                                if call.tool_name == RegulatoryProvisionTool.NAME
+                                else "searched"
+                            ),
+                            "results": [],
+                        }
+                    ),
+                    tool_call=call,
+                )
+                for call in calls
+            ],
+            updated_citation_mapping={},
+        )
+
+    search_tool = Mock(spec=SearchTool)
+    search_tool.id = 1
+    search_tool.name = SearchTool.NAME
+    search_tool.user_selected_filters = BaseFilters(
+        regulatory_chunks_only=True,
+        regulatory_workflow_mode="fast",
+    )
+    search_tool.tool_definition.return_value = {
+        "type": "function",
+        "function": {
+            "name": SearchTool.NAME,
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }
+    provision_tool = Mock(spec=RegulatoryProvisionTool)
+    provision_tool.id = 2
+    provision_tool.name = RegulatoryProvisionTool.NAME
+    provision_tool.tool_definition.return_value = {
+        "type": "function",
+        "function": {
+            "name": RegulatoryProvisionTool.NAME,
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }
+    persona = Mock(
+        id=1,
+        datetime_aware=False,
+        replace_base_system_prompt=False,
+        system_prompt=None,
+        task_prompt=None,
+    )
+    llm = Mock()
+    llm.config = LLMConfig(
+        model_provider="openai",
+        model_name="test-model",
+        temperature=0.0,
+        max_input_tokens=100_000,
+    )
+
+    with (
+        patch("onyx.chat.llm_loop.run_llm_step", side_effect=fake_run_llm_step),
+        patch("onyx.chat.llm_loop.run_tool_calls", side_effect=fake_run_tool_calls),
+        patch("onyx.chat.llm_loop.build_regulatory_coverage_plan", return_value=plan),
+        patch("onyx.chat.llm_loop.get_default_base_system_prompt", return_value=""),
+        patch("onyx.chat.llm_loop.get_session_with_current_tenant"),
+        patch("onyx.llm.litellm_singleton.config.initialize_litellm"),
+    ):
+        run_llm_loop(
+            emitter=Emitter(merged_queue=queue.Queue()),
+            state_container=ChatStateContainer(),
+            simple_chat_history=[create_message(user_request, MessageType.USER)],
+            tools=[search_tool, provision_tool],
+            custom_agent_prompt=None,
+            context_files=create_context_files(),
+            persona=persona,
+            user_memory_context=None,
+            llm=llm,
+            token_counter=len,
+        )
+
+    assert [call.tool_name for batch in dispatched for call in batch] == [
+        RegulatoryProvisionTool.NAME,
+        SearchTool.NAME,
+    ]
+    assert len(dispatched[0]) == 1
 
 
 def test_source_gap_detector_catches_the_observed_false_negative_draft() -> None:

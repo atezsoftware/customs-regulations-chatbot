@@ -1,5 +1,7 @@
+import threading
 import traceback
 from collections import defaultdict
+from contextlib import nullcontext
 from typing import Any
 
 import onyx.tracing.framework._error_tracing as _error_tracing
@@ -61,6 +63,7 @@ PARALLEL_SEARCH_MIN_LLM_CHUNKS_PER_CALL = 8
 
 # 10 minute timeout for tool execution to prevent indefinite hangs
 TOOL_EXECUTION_TIMEOUT_SECONDS = 10 * 60
+_FAST_REGULATORY_SEARCH_SLOTS = threading.BoundedSemaphore(4)
 
 # Mapping of tool name to the field that should be merged when multiple calls exist
 MERGEABLE_TOOL_FIELDS: dict[str, str] = {
@@ -148,11 +151,20 @@ def _safe_run_single_tool(
     with function_span(tool.name) as span_fn:
         span_fn.span_data.input = str(tool_call.tool_args)
         try:
-            tool_response = tool.run(
-                placement=tool_call.placement,
-                override_kwargs=override_kwargs,
-                **tool_call.tool_args,
+            memory_slot = (
+                _FAST_REGULATORY_SEARCH_SLOTS
+                if isinstance(tool, SearchTool)
+                and tool.user_selected_filters is not None
+                and tool.user_selected_filters.regulatory_chunks_only
+                and tool.user_selected_filters.regulatory_workflow_mode == "fast"
+                else nullcontext()
             )
+            with memory_slot:
+                tool_response = tool.run(
+                    placement=tool_call.placement,
+                    override_kwargs=override_kwargs,
+                    **tool_call.tool_args,
+                )
             span_fn.span_data.output = tool_response.llm_facing_response
         except ToolCallException as e:
             # ToolCallException is an expected error from tool execution

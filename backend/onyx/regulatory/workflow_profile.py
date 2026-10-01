@@ -38,7 +38,7 @@ FAST_REGULATORY_WORKFLOW = RegulatoryWorkflowProfile(
     # The validated plan determines total fan-out. Concurrency remains bounded
     # independently, so a complex scenario is not semantically truncated.
     max_parallel_search_calls=None,
-    max_concurrent_search_tools=8,
+    max_concurrent_search_tools=4,
     search_chunks_per_call=10,
     max_candidate_reviews=0,
     post_review_cycles=0,
