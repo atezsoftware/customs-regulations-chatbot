@@ -1444,6 +1444,46 @@ def test_regulatory_luna_rerank_is_enabled_for_followup_query() -> None:
     assert call["config"].enabled is True
 
 
+def test_fast_regulatory_rerank_skips_large_file_packet_scan() -> None:
+    rerank_mocks: list[MagicMock] = []
+    candidate = _real_regulatory_section(
+        "document", 1, heading_path=["Instrument", "Provision"]
+    ).center_chunk
+    configured = RerankerRuntimeConfig(
+        enabled=True,
+        provider_type=RerankerProvider.OPENROUTER,
+        model_name=OPENROUTER_LUNA_RERANK_MODEL,
+        api_key=make_mock_sensitive_value("test-key"),
+        configuration_generation="test-generation",
+    )
+
+    with (
+        patch(
+            f"{MODULE}.count_regulatory_seed_file_chunks",
+            return_value=2_001,
+        ) as count_chunks,
+        patch(f"{MODULE}.build_regulatory_rerank_packets") as packet_builder,
+    ):
+        _run(
+            _make_tool(
+                BaseFilters(
+                    regulatory_chunks_only=True,
+                    regulatory_workflow_mode="fast",
+                ),
+                auto_detect_filters=False,
+            ),
+            connected_sources=[DocumentSource.USER_FILE],
+            fused_chunks=[candidate],
+            rerank_sink=rerank_mocks,
+            reranker_config=configured,
+            placement_turn_index=1,
+        )
+
+    count_chunks.assert_called_once()
+    packet_builder.assert_not_called()
+    assert rerank_mocks[0].call_args.kwargs["chunks"] == [candidate]
+
+
 def test_regulatory_rerank_preserves_original_and_model_rewritten_queries() -> None:
     rerank_mocks: list[MagicMock] = []
 
