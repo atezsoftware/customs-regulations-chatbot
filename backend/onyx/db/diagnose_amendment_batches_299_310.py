@@ -154,6 +154,48 @@ def main() -> None:
                     for index, change in enumerate(proposal["chunk_changes"] or []):
                         old = change.get("old_chunk_snapshot") or {}
                         new = change.get("new_chunk_draft") or {}
+                        live = connection.execute(
+                            text(
+                                "SELECT id, user_file_id, text, chunk_type, heading_path, "
+                                "chunk_metadata, validity_start_date, validity_end_date, "
+                                "status, source, supersedes_chunk_id, "
+                                "superseded_by_chunk_id, created_at "
+                                "FROM regulatory_chunk WHERE id=:chunk_id"
+                            ),
+                            {"chunk_id": change.get("old_chunk_id")},
+                        ).mappings().one_or_none()
+                        if live is not None:
+                            aliases = {"metadata": "chunk_metadata"}
+                            mismatches = {}
+                            for key, expected in old.items():
+                                if key not in {
+                                    "id", "user_file_id", "text", "chunk_type",
+                                    "heading_path", "metadata", "validity_start_date",
+                                    "validity_end_date", "status", "source",
+                                    "supersedes_chunk_id", "superseded_by_chunk_id",
+                                    "created_at",
+                                }:
+                                    continue
+                                actual = live[aliases.get(key, key)]
+                                if key in {"user_file_id", "created_at", "validity_start_date", "validity_end_date"} and actual is not None:
+                                    actual = actual.isoformat() if key != "user_file_id" else str(actual)
+                                if expected != actual:
+                                    mismatches[key] = {
+                                        "expected": str(expected)[:300],
+                                        "actual": str(actual)[:300],
+                                    }
+                            print("CHANGE_470_LIVE", json.dumps({
+                                "index": index,
+                                "old_id": change.get("old_chunk_id"),
+                                "status": live["status"],
+                                "mismatches": mismatches,
+                            }, ensure_ascii=False))
+                        else:
+                            print("CHANGE_470_LIVE", json.dumps({
+                                "index": index,
+                                "old_id": change.get("old_chunk_id"),
+                                "missing": True,
+                            }))
                         try:
                             validate_explicit_replacement_texts(
                                 list(change.get("instruction_texts") or []),
