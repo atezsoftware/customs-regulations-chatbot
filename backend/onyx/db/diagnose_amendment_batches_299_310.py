@@ -208,6 +208,10 @@ def main() -> None:
             if dependencies:
                 binding_indexes = {}
                 previous_ids = set(manifest.previous_binding_ids)
+                manifest_index_by_uuid = {
+                    idx.index_uuid: idx for idx in manifest.indexes
+                }
+                rejected_by_current = []
                 for binding in manifest.bindings:
                     idx = binding.index
                     key = (
@@ -219,7 +223,21 @@ def main() -> None:
                         binding.derived_role,
                     )
                     binding_indexes[key] = binding_indexes.get(key, 0) + 1
+                    if (
+                        binding.id not in previous_ids
+                        and not accepts_publication_projection(
+                            manifest_index_by_uuid[idx.index_uuid],
+                            binding.projection,
+                        )
+                    ):
+                        rejected_by_current.append(binding.id.hex)
                 print("BINDING_INDEXES_460", json.dumps(list(binding_indexes.items())))
+                print(
+                    "REJECTED_BY_CURRENT_460",
+                    json.dumps(
+                        {"count": len(rejected_by_current), "sample": rejected_by_current[:8]}
+                    ),
+                )
                 rows = connection.execute(
                     text(
                         "SELECT canonical_chunk_id, payload FROM "
