@@ -81,6 +81,22 @@ def main() -> None:
                 ),
             )
             if batch["id"] == 299:
+                from onyx.regulatory.amendments.draft_integrity import (
+                    explicit_added_article_identity,
+                    explicit_added_body,
+                )
+                from onyx.regulatory.amendments.new_provision_policy import (
+                    explicitly_adds_top_level_provision,
+                )
+                instruction = (batch["segmented_instructions"] or [])[5]
+                instruction_text = instruction.get("instruction_text", "")
+                print("BATCH_299_6A_PARSE", json.dumps({
+                    "length": len(instruction_text),
+                    "tail": instruction_text[-360:],
+                    "is_top_level": explicitly_adds_top_level_provision(instruction_text),
+                    "body_length": len(explicit_added_body(instruction_text) or ""),
+                    "identity": explicit_added_article_identity(instruction_text),
+                }, ensure_ascii=False))
                 for event in batch["analysis_log"] or []:
                     indices = event.get("indices") or []
                     if 5 in indices or event.get("index") == 5:
