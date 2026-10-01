@@ -46,3 +46,36 @@ jobs:
           kubectl exec -i "$pod" -n customs-regulations-dev -c "$container" -- \
             sh -ec '. /vault/secrets/config; export PYTHONPATH=/app; exec python -' < \
             backend/onyx/db/diagnose_amendment_batches_299_310.py
+      - name: Filter amendment approval worker errors
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import re
+          import subprocess
+          from pathlib import Path
+
+          pods = json.loads(Path('/tmp/amendment-pods.json').read_text())['items']
+          needles = re.compile(r'Amendment proposal (460|462|465|470) approval failed|amendment_(prepared|approved) proposal_id=(460|462|465|470)')
+          for pod in pods:
+              name = pod['metadata']['name']
+              if pod['status']['phase'] != 'Running' or 'background' not in name:
+                  continue
+              for container in pod['spec']['containers']:
+                  result = subprocess.run(
+                      ['kubectl', 'logs', name, '-n', 'customs-regulations-dev',
+                       '-c', container['name'], '--since=36h', '--tail=30000'],
+                      capture_output=True, text=True, check=False,
+                  )
+                  if result.returncode:
+                      print('LOG_READ_FAILED', name, container['name'], result.returncode)
+                      continue
+                  lines = result.stdout.splitlines()
+                  print('LOG_SCAN', name, container['name'], len(lines))
+                  for index, line in enumerate(lines):
+                      if needles.search(line):
+                          print('LOG_MATCH', name, container['name'])
+                          for excerpt in lines[index:index + 45]:
+                              print(excerpt[:500])
+          PY
