@@ -191,6 +191,16 @@ def main() -> None:
                 }
             )
             if dependencies:
+                binding_indexes = {}
+                for binding in manifest.bindings:
+                    idx = binding.index
+                    key = (
+                        idx.index_uuid,
+                        idx.embedding_config_sha256,
+                        len(idx.encoder_receipts),
+                    )
+                    binding_indexes[key] = binding_indexes.get(key, 0) + 1
+                print("BINDING_INDEXES_460", json.dumps(list(binding_indexes.items())))
                 rows = connection.execute(
                     text(
                         "SELECT canonical_chunk_id, payload FROM "
@@ -200,14 +210,23 @@ def main() -> None:
                     {"ids": dependencies},
                 )
                 failed = 0
+                checked = 0
+                derived_by_dependency = {}
+                for binding in manifest.bindings:
+                    if binding.derived_role == "hierarchical_aggregate":
+                        for identifier in binding.dependency_ids:
+                            derived_by_dependency.setdefault(identifier, []).append(
+                                binding
+                            )
                 for old_row in rows:
                     prior = AnnexTemporalProjection.model_validate(old_row.payload)
-                    matching = [
-                        idx
-                        for idx in manifest.indexes
-                        if idx.index_uuid == prior.index.index_uuid
-                    ]
-                    for idx in matching:
+                    for parent in derived_by_dependency.get(
+                        old_row.canonical_chunk_id, []
+                    ):
+                        idx = parent.index
+                        if prior.index.index_uuid != idx.index_uuid:
+                            continue
+                        checked += 1
                         if not accepts_publication_projection(idx, prior.projection):
                             failed += 1
                             print(
@@ -225,6 +244,8 @@ def main() -> None:
                                             ).encode()
                                         ).hexdigest(),
                                         "accepted_receipts": len(idx.encoder_receipts),
+                                        "parent_id": parent.id.hex,
+                                        "parent_index_config_sha256": idx.embedding_config_sha256,
                                     }
                                 ),
                             )
@@ -232,6 +253,7 @@ def main() -> None:
                                 break
                     if failed >= 8:
                         break
+                print("RECEIPT_CHECK_460", json.dumps({"checked": checked, "failed": failed}))
     engine.dispose()
 
 
