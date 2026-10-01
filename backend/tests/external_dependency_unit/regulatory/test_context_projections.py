@@ -1,15 +1,146 @@
 from datetime import date, datetime, time, timezone
+from typing import Literal
 from uuid import UUID, uuid4
 
 import pytest
+from pydantic import JsonValue
 from sqlalchemy.orm import Session
 
-from onyx.db.models import DocumentSet
+from onyx.db.models import DocumentSet, RegulatoryChunk
 from onyx.db.regulatory_public_reads import load_public_temporal_bindings
 from tests.external_dependency_unit.regulatory.test_amendment_sources import (
     source_session as source_session,
 )
 from tests.external_dependency_unit.regulatory.test_annex_baseline import _chunk, _file
+
+
+@pytest.mark.parametrize("same_representation", [True, False])
+def test_adjacent_identical_dependency_versions_cover_derived_window(
+    source_session: Session, same_representation: bool
+) -> None:
+    import json
+
+    from onyx.db.regulatory_context_projections import activate_temporal_projection
+    from onyx.document_index.publication_models import (
+        PublicationIndexSnapshot,
+        publication_digest,
+    )
+    from onyx.regulatory.amendments.annexes.context_dependencies import context_hash
+    from onyx.regulatory.amendments.annexes.models import AnnexTemporalProjection
+    from tests.external_dependency_unit.regulatory.test_publication_primitives import (
+        frozen_projection,
+    )
+
+    group = DocumentSet(name=str(uuid4()), description="", is_up_to_date=True)
+    source_session.add(group)
+    source_session.flush()
+    file = _file(source_session, group)
+    parent = _chunk(source_session, file, 0, "Unchanged parent")
+    companion = _chunk(
+        source_session,
+        file,
+        1,
+        "Image caption",
+        bound_to_regulatory_chunk_id=parent.id,
+        image_file_id="asset",
+    )
+    index = PublicationIndexSnapshot(
+        index_name="fixture",
+        index_uuid=str(uuid4()),
+        search_settings_id=1,
+        model_provider="fixture",
+        model_name="fixture",
+        vector_dimension=3,
+        embedding_config_sha256=publication_digest({"model": "fixture"}),
+        multitenant=False,
+    )
+
+    def version(
+        row: RegulatoryChunk,
+        *,
+        ordinal: int,
+        start: date | None,
+        end: date | None,
+        role: Literal["canonical", "image_companion"],
+        metadata: dict[str, JsonValue],
+        dependencies: list[str],
+    ) -> AnnexTemporalProjection:
+        frozen = frozen_projection(file.id, ordinal, row.text)
+        identity = uuid4()
+        source = json.loads(frozen.source_json)
+        source.update(
+            regulatory_chunk_id=row.id,
+            doc_summary="",
+            chunk_context="",
+            image_file_id=metadata.get("image_file_id"),
+            source_links=json.dumps({0: ""}),
+            validity_start_date=(
+                int(datetime.combine(start, time.min, timezone.utc).timestamp())
+                if start
+                else None
+            ),
+            validity_end_date=(
+                int(datetime.combine(end, time.min, timezone.utc).timestamp())
+                if end
+                else None
+            ),
+        )
+        return AnnexTemporalProjection(
+            id=identity,
+            index=index,
+            projection=frozen.model_copy(
+                update={
+                    "context_projection_id": str(identity),
+                    "source_json": json.dumps(source),
+                }
+            ),
+            canonical_base_sha256=context_hash(row.text),
+            derived_role=role,
+            dependency_ids=dependencies,
+            representation_text=row.text,
+            representation_metadata=metadata,
+            reference_date=start,
+            effective_start=start,
+            effective_end=end,
+            semantic_position=ordinal,
+        )
+
+    boundary = date(2026, 8, 18)
+    for ordinal, start, end, metadata in (
+        (0, None, boundary, {}),
+        (2, boundary, None, {} if same_representation else {"changed": True}),
+    ):
+        activate_temporal_projection(
+            source_session,
+            user_file_id=file.id,
+            binding=version(
+                parent,
+                ordinal=ordinal,
+                start=start,
+                end=end,
+                role="canonical",
+                metadata=metadata,
+                dependencies=[],
+            ),
+        )
+    spanning = version(
+        companion,
+        ordinal=1,
+        start=None,
+        end=None,
+        role="image_companion",
+        metadata=dict(companion.chunk_metadata),
+        dependencies=[parent.id],
+    )
+    if same_representation:
+        activate_temporal_projection(
+            source_session, user_file_id=file.id, binding=spanning
+        )
+    else:
+        with pytest.raises(ValueError, match="qualified dependency changes"):
+            activate_temporal_projection(
+                source_session, user_file_id=file.id, binding=spanning
+            )
 
 
 @pytest.mark.parametrize("case", ["own_asset", "changed_asset", "changed_parent"])
