@@ -99,6 +99,9 @@ from onyx.regulatory.gap_recovery import (
     run_batched_gap_recovery,
     select_priority_recovery_issues,
 )
+from onyx.regulatory.heading_path import (
+    extract_single_regulatory_provision_reference,
+)
 from onyx.regulatory.navigation_recovery import (
     select_regulatory_navigation_recovery_leads,
 )
@@ -621,6 +624,51 @@ def _build_regulatory_coverage_tool_calls(
             source_anchors,
         ) in enumerate(calls)
     ]
+
+
+def _build_explicit_provision_bootstrap_call(
+    user_request: str,
+    plan: RegulatoryCoveragePlan | None,
+    *,
+    provision_tool_available: bool,
+    turn_index: int,
+) -> ToolCallKickoff | None:
+    """Start with one verified structural read for one explicitly named provision."""
+    if not provision_tool_available or plan is None or not plan.coverage_items:
+        return None
+    reference = extract_single_regulatory_provision_reference(user_request)
+    if reference is None or not re.fullmatch(r"\d{1,5}[A-Za-z]?", reference.article_no):
+        return None
+    anchors = {
+        " ".join(anchor.casefold().split()): anchor
+        for item in plan.coverage_items
+        for anchor in item.source_anchors
+    }
+    if len(anchors) != 1 or any(
+        len(item.source_anchors) != 1 for item in plan.coverage_items
+    ):
+        return None
+    source = next(iter(anchors.values()))
+    if source.casefold() not in user_request.casefold():
+        return None
+    article_kind = {
+        None: "regular",
+        "ek": "additional",
+        "gecici": "temporary",
+        "mukerrer": "repeated",
+    }.get(reference.qualifier)
+    if article_kind is None:
+        return None
+    return ToolCallKickoff(
+        tool_call_id=f"regulatory-provision-bootstrap-{turn_index}-0",
+        tool_name=RegulatoryProvisionTool.NAME,
+        tool_args={
+            "source": source,
+            "article_number": reference.article_no,
+            "article_kind": article_kind,
+        },
+        placement=Placement(turn_index=turn_index, tab_index=0),
+    )
 
 
 def _build_regulatory_navigation_recovery_tool_calls(
@@ -3009,6 +3057,17 @@ def run_llm_loop(
                     ),
                 )
             )
+            if regulatory_workflow_profile.mode == "fast":
+                provision_call = _build_explicit_provision_bootstrap_call(
+                    regulatory_user_message,
+                    regulatory_coverage_plan,
+                    provision_tool_available=any(
+                        isinstance(tool, RegulatoryProvisionTool) for tool in tools
+                    ),
+                    turn_index=0,
+                )
+                if provision_call is not None:
+                    pending_regulatory_coverage_tool_calls = [provision_call]
             regulatory_navigation_recovery_ready = (
                 not regulatory_workflow_profile.use_navigation_recovery
             )
@@ -4338,12 +4397,20 @@ def run_llm_loop(
                 simple_chat_history.extend(failure_messages)
                 continue
 
-            if any(
+            completed_plan_batch = any(
                 tool_call.tool_call_id.startswith("regulatory-coverage-0-")
                 for tool_call in tool_calls
-            ):
+            )
+            completed_provision_bootstrap = any(
+                tool_call.tool_call_id.startswith("regulatory-provision-bootstrap-0-")
+                for tool_call in tool_calls
+            )
+            if completed_plan_batch or completed_provision_bootstrap:
                 regulatory_bootstrap_searches_completed = True
-                if regulatory_workflow_profile.direct_synthesis_after_plan_search:
+                if (
+                    completed_plan_batch
+                    and regulatory_workflow_profile.direct_synthesis_after_plan_search
+                ):
                     regulatory_autonomous_research_completed = True
                     regulatory_research_complete_pending = True
             for tool_response in tool_responses:
