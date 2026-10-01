@@ -121,9 +121,20 @@ def main() -> None:
                     ),
                 )
                 if proposal["id"] == 470:
+                    from onyx.regulatory.amendments.draft_integrity import (
+                        validate_explicit_replacement_texts,
+                    )
                     for index, change in enumerate(proposal["chunk_changes"] or []):
                         old = change.get("old_chunk_snapshot") or {}
                         new = change.get("new_chunk_draft") or {}
+                        try:
+                            validate_explicit_replacement_texts(
+                                list(change.get("instruction_texts") or []),
+                                str(new.get("text", "")),
+                            )
+                            integrity = "pass"
+                        except ValueError as error:
+                            integrity = str(error)
                         print(
                             "CHANGE_470",
                             json.dumps(
@@ -141,6 +152,10 @@ def main() -> None:
                                         str(new.get("text", "")).encode()
                                     ).hexdigest(),
                                     "heading": new.get("heading_path"),
+                                    "replacement_integrity": integrity,
+                                    "instruction_text_count": len(
+                                        change.get("instruction_texts") or []
+                                    ),
                                 },
                                 ensure_ascii=False,
                                 default=str,
@@ -198,6 +213,7 @@ def main() -> None:
                         idx.index_uuid,
                         idx.embedding_config_sha256,
                         len(idx.encoder_receipts),
+                        type(binding.projection).__name__,
                     )
                     binding_indexes[key] = binding_indexes.get(key, 0) + 1
                 print("BINDING_INDEXES_460", json.dumps(list(binding_indexes.items())))
