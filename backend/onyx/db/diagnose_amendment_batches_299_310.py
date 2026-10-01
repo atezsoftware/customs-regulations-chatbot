@@ -373,6 +373,21 @@ def main() -> None:
                     if window_issues >= 12:
                         break
                 print("WINDOW_ISSUE_COUNT_460", window_issues)
+                for item in manifest.bindings:
+                    if item.id.hex == "52424e5d41714496ad1139db51f7c04b" or json.loads(item.projection.source_json)["regulatory_chunk_id"] in {
+                        "rc_fcafb699b8b49d81756158f82296b872938006c1",
+                        "rc_5c0be3e4b5e0759daa72ee6bbaa51a01cee727d4",
+                    }:
+                        print("WINDOW_MEMBER_460", json.dumps({
+                            "binding": item.id.hex,
+                            "canonical": json.loads(item.projection.source_json)["regulatory_chunk_id"],
+                            "role": item.derived_role,
+                            "start": str(item.effective_start),
+                            "end": str(item.effective_end),
+                            "retained": item.id in previous_ids,
+                            "text_hash": hashlib.sha256(item.representation_text.encode()).hexdigest(),
+                            "dependency_ids": item.dependency_ids[:8],
+                        }))
         targets = [
             ("299_6A", "rc.user_file_id = CAST(:file_id AS uuid) AND "
              "(rc.chunk_metadata->>'article_no' = '6/A' OR "
