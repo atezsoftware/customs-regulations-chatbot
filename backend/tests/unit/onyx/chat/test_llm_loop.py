@@ -21,8 +21,6 @@ from onyx.chat.llm_loop import (
     _REGULATORY_MAX_PARALLEL_SEARCH_CALLS,
     SearchEvidenceLedgerEntry,
     _build_candidate_answer_evidence_chunks,
-    _build_explicit_provision_bootstrap_call,
-    _build_fast_regulatory_absence_recovery_tool_calls,
     _build_regulatory_coverage_tool_calls,
     _build_regulatory_matrix_citation_issues,
     _build_regulatory_navigation_recovery_tool_calls,
@@ -93,7 +91,6 @@ from onyx.regulatory.evidence_matrix import (
     RegulatoryEvidenceMatrixRow,
     RegulatoryNavigationLead,
 )
-from onyx.regulatory.provision_lookup import ProvisionRequest
 from onyx.server.query_and_chat.placement import Placement
 from onyx.server.query_and_chat.streaming_models import (
     AgentResponseDelta,
@@ -2527,78 +2524,38 @@ def test_fast_coverage_profile_uses_plan_derived_search_count() -> None:
     assert all(call.tool_args["search_mode"] == "hybrid" for call in calls)
 
 
-def test_explicit_article_starts_with_one_structural_lookup() -> None:
-    plan = RegulatoryCoveragePlan(
-        coverage_items=[
-            RegulatoryCoverageItem(
-                research_question="Gümrük Kanunu madde 104 nasıl uygulanır?",
-                evidence_dimensions=[
-                    "Madde 104 kapsamı",
-                    "Madde 104 koşulları",
-                    "Madde 104 istisnaları",
-                    "Madde 104 sonucu",
-                ],
-                source_anchors=["Gümrük Kanunu"],
-                completion_test="Dört soruyu kaynakla cevapla.",
-            )
-        ]
-    )
-    request = "Gümrük Kanunu madde 104 kapsamı, koşulları, istisnaları ve sonucu nedir?"
-
-    call = _build_explicit_provision_bootstrap_call(
-        request, plan, provision_tool_available=True, turn_index=0
-    )
-
-    assert call is not None
-    assert call.tool_name == "get_regulatory_provision"
-    assert call.tool_args == {
-        "source": "Gümrük Kanunu",
-        "article_number": "104",
-        "article_kind": "regular",
-    }
-    assert ProvisionRequest.model_validate(call.tool_args).heading == "MADDE 104"
-
-
 @pytest.mark.parametrize(
-    "user_request,source_anchors",
+    ("user_request", "source", "article_numbers", "needs_followup"),
     [
-        ("Gümrük Kanunu madde 104 ve madde 105 nedir?", ["Gümrük Kanunu"]),
-        ("Gümrük Kanunu madde 104 nedir?", ["Gümrük Kanunu", "Başka Kanun"]),
-        ("Başka madde 104 nedir?", ["Gümrük Kanunu"]),
+        (
+            "Gümrük Kanunu madde 104 kapsamı, koşulları ve sonucu nedir?",
+            "Gümrük Kanunu",
+            ("104",),
+            True,
+        ),
+        (
+            "Gümrük Yönetmeliği md. 104, 105, 106 maddelerinin tam metni nedir?",
+            "Gümrük Yönetmeliği",
+            ("104", "105", "106"),
+            False,
+        ),
     ],
 )
-def test_structural_bootstrap_keeps_ambiguous_requests_on_planned_search(
-    user_request: str, source_anchors: list[str]
+def test_fast_research_model_chooses_structural_reads_and_followup(
+    user_request: str,
+    source: str,
+    article_numbers: tuple[str, ...],
+    needs_followup: bool,
 ) -> None:
     plan = RegulatoryCoveragePlan(
         coverage_items=[
             RegulatoryCoverageItem(
                 research_question=user_request,
-                evidence_dimensions=[user_request],
-                source_anchors=source_anchors,
-                completion_test="Kaynakla cevapla.",
-            )
-        ]
-    )
-    assert (
-        _build_explicit_provision_bootstrap_call(
-            user_request, plan, provision_tool_available=True, turn_index=0
-        )
-        is None
-    )
-
-
-def test_fast_article_request_uses_structural_lookup_before_optional_followup() -> None:
-    user_request = (
-        "Gümrük Kanunu madde 104 kapsamı, koşulları, istisnaları ve sonucu nedir?"
-    )
-    plan = RegulatoryCoveragePlan(
-        coverage_items=[
-            RegulatoryCoverageItem(
-                research_question=user_request,
-                evidence_dimensions=["kapsam", "koşullar", "istisnalar", "sonuç"],
-                source_anchors=["Gümrük Kanunu"],
-                completion_test="Dört sonucu destekle.",
+                evidence_dimensions=[
+                    f"Madde {number} tam metni" for number in article_numbers
+                ],
+                source_anchors=[source],
+                completion_test="İstenen maddeleri kaynakla cevapla.",
             )
         ]
     )
@@ -2610,6 +2567,29 @@ def test_fast_article_request_uses_structural_lookup_before_optional_followup() 
         decisions += 1
         if decisions == 1:
             assert kwargs["tool_choice"] is ToolChoiceOptions.AUTO
+            return (
+                LlmStepResult(
+                    reasoning=None,
+                    answer=None,
+                    tool_calls=[
+                        ToolCallKickoff(
+                            tool_call_id=f"article-{number}",
+                            tool_name=RegulatoryProvisionTool.NAME,
+                            tool_args={
+                                "source": source,
+                                "article_number": number,
+                                "article_kind": "regular",
+                            },
+                            placement=Placement(turn_index=0, tab_index=index),
+                        )
+                        for index, number in enumerate(article_numbers)
+                    ],
+                    raw_answer=None,
+                    finish_reason="tool_calls",
+                ),
+                False,
+            )
+        if decisions == 2 and needs_followup:
             assert any(
                 '"status": "partial"' in message.message
                 for message in kwargs["history"]
@@ -2650,6 +2630,9 @@ def test_fast_article_request_uses_structural_lookup_before_optional_followup() 
                         {
                             "status": (
                                 "partial"
+                                if call.tool_name == RegulatoryProvisionTool.NAME
+                                and needs_followup
+                                else "found"
                                 if call.tool_name == RegulatoryProvisionTool.NAME
                                 else "searched"
                             ),
@@ -2723,11 +2706,15 @@ def test_fast_article_request_uses_structural_lookup_before_optional_followup() 
             token_counter=len,
         )
 
-    assert [call.tool_name for batch in dispatched for call in batch] == [
-        RegulatoryProvisionTool.NAME,
-        SearchTool.NAME,
-    ]
-    assert len(dispatched[0]) == 1
+    assert [call.tool_name for call in dispatched[0]] == [
+        RegulatoryProvisionTool.NAME
+    ] * len(article_numbers)
+    assert [call.tool_args["article_number"] for call in dispatched[0]] == list(
+        article_numbers
+    )
+    assert [call.tool_name for batch in dispatched[1:] for call in batch] == (
+        [SearchTool.NAME] if needs_followup else []
+    )
 
 
 def test_source_gap_detector_catches_the_observed_false_negative_draft() -> None:
@@ -2792,43 +2779,8 @@ def test_source_gap_detector_ignores_unrelated_calculation_uncertainty() -> None
     )
 
 
-def test_fast_source_gap_recovery_uses_only_unattempted_deferred_plan_queries() -> None:
-    plan = RegulatoryCoveragePlan(
-        coverage_items=[
-            RegulatoryCoverageItem(
-                research_question="How may Turkey request collection assistance?",
-                evidence_dimensions=["Article 7(2)(a) and (b) exact conditions"],
-                retrieval_queries=["Ek IV Madde 7 2 a b"],
-                material_factual_branches=["Domestic collection remedies exhausted"],
-                request_anchor_groups=[["Madde 7", "2(a)", "2(b)"]],
-                source_anchors=["Common Transit Convention Annex IV"],
-                completion_test="Resolve every condition for collection assistance.",
-            )
-        ],
-        request_context_atoms=["Turkey could not collect from the Italian firm"],
-    )
-    attempted = {("article 7(2)(a) and (b) exact conditions", "hybrid")}
-
-    calls = _build_fast_regulatory_absence_recovery_tool_calls(
-        plan,
-        turn_index=3,
-        attempted_query_modes=attempted,
-    )
-    query_modes = {
-        (call.tool_args["queries"][0], call.tool_args["search_mode"]) for call in calls
-    }
-
-    assert ("Article 7(2)(a) and (b) exact conditions", "hybrid") not in query_modes
-    assert ("Ek IV Madde 7 2 a b", "keyword") in query_modes
-    assert ("Domestic collection remedies exhausted", "hybrid") in query_modes
-    assert ("Madde 7; 2(a); 2(b)", "hybrid") in query_modes
-    assert all(
-        call.tool_call_id.startswith("regulatory-absence-recovery-3-") for call in calls
-    )
-
-
 @pytest.mark.parametrize("recovery_batch_fails", [False, True])
-def test_fast_source_gap_draft_is_withheld_retrieved_once_and_resynthesized(
+def test_fast_source_gap_draft_allows_one_model_selected_retry_and_resynthesis(
     recovery_batch_fails: bool,
 ) -> None:
     plan = RegulatoryCoveragePlan(
@@ -2855,6 +2807,40 @@ def test_fast_source_gap_draft_is_withheld_retrieved_once_and_resynthesized(
     def fake_run_llm_step(**kwargs: Any) -> tuple[LlmStepResult, bool]:
         llm_step_histories.append(kwargs["history"])
         llm_step_tool_choices.append(kwargs["tool_choice"])
+        if len(llm_step_histories) == 1:
+            return (
+                LlmStepResult(
+                    reasoning=None,
+                    answer=None,
+                    tool_calls=[
+                        _search_tool_call(
+                            "initial-research",
+                            query="Article 7(2) exact conditions",
+                        )
+                    ],
+                    raw_answer=None,
+                    finish_reason="tool_calls",
+                ),
+                False,
+            )
+        if len(llm_step_histories) == 3:
+            assert kwargs["tool_choice"] is ToolChoiceOptions.AUTO
+            return (
+                LlmStepResult(
+                    reasoning=None,
+                    answer=None,
+                    tool_calls=[
+                        _search_tool_call(
+                            "model-recovery",
+                            query="Madde 7 2 a b",
+                            search_mode="keyword",
+                        )
+                    ],
+                    raw_answer=None,
+                    finish_reason="tool_calls",
+                ),
+                False,
+            )
         raw_answer = next(synthesis_steps)
         answer = raw_answer.replace("[1]", "[[1]](https://example.test/source)")
         cast(ChatStateContainer, kwargs["state_container"]).set_answer_tokens(answer)
@@ -2880,8 +2866,7 @@ def test_fast_source_gap_draft_is_withheld_retrieved_once_and_resynthesized(
         calls = list(kwargs["tool_calls"])
         dispatched_batches.append(calls)
         if recovery_batch_fails and any(
-            call.tool_call_id.startswith("regulatory-absence-recovery-")
-            for call in calls
+            call.tool_call_id == "model-recovery" for call in calls
         ):
             return ParallelToolCallResponse(
                 tool_responses=[],
@@ -2978,17 +2963,16 @@ def test_fast_source_gap_draft_is_withheld_retrieved_once_and_resynthesized(
         (call.tool_args["queries"][0], call.tool_args["search_mode"])
         for call in dispatched_batches[1]
     }
-    assert recovery_query_modes == {
-        ("Domestic remedies exhausted", "hybrid"),
-        ("Madde 7 2 a b", "keyword"),
-    }
-    assert len(llm_step_histories) == 2
+    assert recovery_query_modes == {("Madde 7 2 a b", "keyword")}
+    assert len(llm_step_histories) == 4
     assert llm_step_tool_choices == [
-        ToolChoiceOptions.NONE,
+        ToolChoiceOptions.AUTO,
+        ToolChoiceOptions.AUTO,
+        ToolChoiceOptions.AUTO,
         ToolChoiceOptions.NONE,
     ]
     assert "uygulanan aramalarda ulaşılamadı" in "\n".join(
-        message.message for message in llm_step_histories[1]
+        message.message for message in llm_step_histories[3]
     )
     assert state.get_answer_tokens() == (
         "Uygulanan aramalarda ilgili metne ulaşılamadı: "

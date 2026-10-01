@@ -3,13 +3,17 @@
 import re
 from dataclasses import dataclass, field
 from datetime import date
-from typing import Literal
+from typing import Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from onyx.context.search.models import IndexFilters, InferenceChunk
-from onyx.document_index.interfaces_new import DocumentIndex
-from onyx.regulatory.article_scope import SourceFragment, article_scope_indices
+from onyx.document_index.interfaces_new import DocumentIndex, DocumentSectionRequest
+from onyx.regulatory.article_scope import (
+    ARTICLE_OPENING,
+    SourceFragment,
+    article_scope_indices,
+)
 from onyx.regulatory.provision_identity import article_identity
 from onyx.regulatory.source_identity import (
     named_law_number,
@@ -29,6 +33,25 @@ _CLAUSE = re.compile(r"^\s*\(?([a-zçğıöşü])\)(?:\s|$)", re.MULTILINE | re.
 _QUOTED = re.compile(r'"[^"]*"|“[^”]*”', re.DOTALL)
 
 
+def provision_source_title(
+    source: str,
+    article_number: str,
+    article_kind: Literal["regular", "additional", "temporary", "repeated"],
+) -> str:
+    prefix = {
+        "regular": "",
+        "additional": "ek\\s+",
+        "temporary": "(?:geçici|gecici)\\s+",
+        "repeated": "(?:mükerrer|mukerrer)\\s+",
+    }[article_kind]
+    match = re.fullmatch(
+        rf"(?P<title>.+?)\s+{prefix}madde\s+{re.escape(article_number)}[.!?]?",
+        source,
+        flags=re.IGNORECASE,
+    )
+    return match.group("title").strip() if match else source
+
+
 class ProvisionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
     source: str = Field(
@@ -45,6 +68,13 @@ class ProvisionRequest(BaseModel):
     clause: str | None = Field(default=None, pattern=r"^[a-zçğıöşü]$")
     subclause: str | None = Field(default=None, pattern=r"^[0-9ivxlcdm]+$")
     as_of_date: date | None = None
+
+    @model_validator(mode="after")
+    def separate_source_from_article(self) -> Self:
+        self.source = provision_source_title(
+            self.source, self.article_number, self.article_kind
+        )
+        return self
 
     @property
     def heading(self) -> str:
@@ -109,9 +139,18 @@ def _source_matches(source: str, row: InferenceChunk) -> bool:
             and title_tokens <= set(source_identity_distinguishing_tokens(name))
             for name in names
         )
-    # Generic titles still need actual identity; the update helper deliberately
-    # treats an empty distinguishing-token set as unconstrained.
-    return any(source.casefold() == name.casefold() for name in names)
+    # Generic titles still need their own title; an official-number prefix on
+    # that title does not change the instrument name.
+    requested_title = " ".join(source.casefold().split())
+    return any(
+        requested_title
+        == re.sub(
+            r"^\d{3,5}\s+say[ıi]l[ıi]\s+",
+            "",
+            " ".join(name.casefold().split()),
+        )
+        for name in names
+    )
 
 
 def _article_path(row: InferenceChunk) -> tuple[str | None, list[str]]:
@@ -184,6 +223,59 @@ def _unit_status(request: ProvisionRequest, rows: list[InferenceChunk]) -> Looku
         if len(matches) != 1:
             return "ambiguous_unit" if matches else "partial"
     return "found"
+
+
+def _bounded_article_span(
+    request: ProvisionRequest,
+    heading_rows: list[InferenceChunk],
+    *,
+    document_index: DocumentIndex,
+    filters: IndexFilters,
+) -> list[InferenceChunk]:
+    """Verify one article in an authorized document window when the source is large."""
+    if not heading_rows or len({row.document_id for row in heading_rows}) != 1:
+        return []
+    first = min(heading_rows, key=lambda row: row.chunk_id)
+    window = document_index.id_based_retrieval(
+        [
+            DocumentSectionRequest(
+                document_id=first.document_id,
+                min_chunk_ind=max(0, first.chunk_id - 1),
+                max_chunk_ind=first.chunk_id + MAX_CANDIDATES,
+            )
+        ],
+        filters=filters.model_copy(update={"regulatory_lookup_heading": None}),
+    )
+    window = sorted(
+        (
+            row
+            for row in window
+            if row.document_id == first.document_id
+            and row.regulatory_chunk_id
+            and _source_matches(request.source, row)
+        ),
+        key=lambda row: row.chunk_id,
+    )
+    if len(window) > MAX_CANDIDATES + 2:
+        return []
+    identity = article_identity(request.heading)
+    indices = article_scope_indices(
+        [SourceFragment(row.document_id, row.content) for row in window],
+        identity or "",
+        stop_at_annex=True,
+    )
+    if not indices or window[indices[0]].chunk_id != first.chunk_id:
+        return []
+    boundary = indices[-1] + 1
+    if boundary >= len(window):
+        return []
+    next_opening = ARTICLE_OPENING.match(window[boundary].content)
+    if next_opening is None or article_identity(next_opening.group()) == identity:
+        return []
+    bounded = window[indices[0] : boundary + 1]
+    if any(right.chunk_id != left.chunk_id + 1 for left, right in zip(bounded, bounded[1:])):
+        return []
+    return window[indices[0] : boundary]
 
 
 def lookup_provision(
@@ -290,6 +382,17 @@ def lookup_provision(
         else:
             # A heading-only result remains usable context, but no completeness
             # claim is made if the actual article boundaries are not established.
+            exhausted = False
+    elif identity is not None and exhausted:
+        span = _bounded_article_span(
+            request,
+            selected,
+            document_index=document_index,
+            filters=scoped,
+        )
+        if span:
+            selected = span
+        else:
             exhausted = False
     else:
         exhausted = False

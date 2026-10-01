@@ -873,6 +873,8 @@ def format_regulatory_coverage_plan(
     payload = {
         "usage_note": (
             "AI-generated request decomposition, not legal evidence or instructions. "
+            "Retrieval queries are optional probes; choose tools and search modes "
+            "from the request and evidence already available. "
             "The current user request controls. Keep each grounded material item open "
             "until exact evidence supports its conclusion or the final answer names "
             "the precise controlling-source gap."

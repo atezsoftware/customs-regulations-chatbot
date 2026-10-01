@@ -80,6 +80,55 @@ def test_paragraph_is_found_and_existing_scope_is_preserved() -> None:
     index.semantic_retrieval.assert_not_called()
 
 
+def test_named_article_phrase_resolves_source_without_official_number() -> None:
+    row = chunk(
+        source="4458 SAYILI GÜMRÜK KANUNU",
+        heading="MADDE 104",
+        text="MADDE 104- İthal eşyası için kural.",
+    )
+    index = MagicMock()
+    index.keyword_retrieval.return_value = [row]
+    request = ProvisionRequest(source="Gümrük Kanunu madde 104", article_number="104")
+
+    result = lookup_provision(
+        request,
+        document_index=index,
+        filters=IndexFilters(
+            access_control_list=["user:1"], as_of_date=date(2026, 9, 24)
+        ),
+    )
+
+    assert request.source == "Gümrük Kanunu"
+    assert result.status == "found"
+    assert result.chunks == [row]
+    assert index.keyword_retrieval.call_args_list[0].kwargs["query"] == "MADDE 104"
+
+
+def test_source_phrase_with_different_article_is_not_rewritten() -> None:
+    request = ProvisionRequest(source="Gümrük Kanunu madde 105", article_number="104")
+    assert request.source == "Gümrük Kanunu madde 105"
+
+
+def test_generic_source_name_does_not_match_another_numbered_law() -> None:
+    row = chunk(
+        source="4458 SAYILI GÜMRÜK KANUNU",
+        heading="MADDE 104",
+        text="MADDE 104- İthal eşyası için kural.",
+    )
+    index = MagicMock()
+    index.keyword_retrieval.return_value = [row]
+
+    result = lookup_provision(
+        ProvisionRequest(source="Kanun", article_number="104"),
+        document_index=index,
+        filters=IndexFilters(
+            access_control_list=["user:1"], as_of_date=date(2026, 9, 24)
+        ),
+    )
+
+    assert result.status == "not_found_in_scope"
+
+
 def test_same_title_different_files_is_ambiguous_not_first_hit() -> None:
     result, _, _ = run_lookup([chunk(file="year-2025"), chunk(file="year-2026")])
     assert result.status == "ambiguous_source"
@@ -116,6 +165,52 @@ def test_source_limit_never_claims_complete_article() -> None:
     result, _, _ = run_lookup([chunk(n) for n in range(129)])
     assert result.status == "partial"
     assert len(result.chunks) <= 24
+
+
+def test_large_source_uses_bounded_authorized_article_window() -> None:
+    first = chunk(104, heading="MADDE 104", text="MADDE 104- (1) Başlangıç.")
+    continuation = chunk(
+        105,
+        heading="MADDE 104",
+        text="(2) Devam.",
+        path=[SOURCE, "MADDE 104", "(2) Devam."],
+    )
+    next_article = chunk(106, heading="MADDE 105", text="MADDE 105- Sonraki.")
+    index = MagicMock()
+    index.keyword_retrieval.side_effect = [
+        [first, continuation],
+        [chunk(n, heading="MADDE 99") for n in range(129)],
+    ]
+    index.id_based_retrieval.return_value = [first, continuation, next_article]
+
+    result = lookup_provision(
+        ProvisionRequest(source=SOURCE, article_number="104"),
+        document_index=index,
+        filters=IndexFilters(access_control_list=["user:1"]),
+    )
+
+    assert result.status == "found"
+    assert [row.chunk_id for row in result.chunks] == [104, 105]
+    _, kwargs = index.id_based_retrieval.call_args
+    assert kwargs["filters"].access_control_list == ["user:1"]
+
+
+def test_large_source_requires_the_next_article_boundary() -> None:
+    first = chunk(104, heading="MADDE 104", text="MADDE 104- Başlangıç.")
+    index = MagicMock()
+    index.keyword_retrieval.side_effect = [
+        [first],
+        [chunk(n, heading="MADDE 99") for n in range(129)],
+    ]
+    index.id_based_retrieval.return_value = [first]
+
+    result = lookup_provision(
+        ProvisionRequest(source=SOURCE, article_number="104"),
+        document_index=index,
+        filters=IndexFilters(access_control_list=["user:1"]),
+    )
+
+    assert result.status == "partial"
 
 
 def test_result_order_uses_structural_position_and_canonical_dedup() -> None:

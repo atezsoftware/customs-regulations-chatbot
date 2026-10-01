@@ -176,6 +176,7 @@ def test_atez_search_v2_does_not_guess_between_multiple_query_dates() -> None:
         "Teşekkür ederim.",
         "Hello, how are you?",
         "Tamam, anladım.",
+        "Nasılsın?",
     ],
 )
 def test_default_persona_keeps_social_messages_out_of_regulatory_research(

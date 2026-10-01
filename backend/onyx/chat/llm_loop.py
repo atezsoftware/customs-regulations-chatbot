@@ -99,9 +99,6 @@ from onyx.regulatory.gap_recovery import (
     run_batched_gap_recovery,
     select_priority_recovery_issues,
 )
-from onyx.regulatory.heading_path import (
-    extract_single_regulatory_provision_reference,
-)
 from onyx.regulatory.navigation_recovery import (
     select_regulatory_navigation_recovery_leads,
 )
@@ -149,6 +146,7 @@ from onyx.utils.logger import setup_logger
 logger = setup_logger()
 
 _REGULATORY_MAX_PARALLEL_SEARCH_CALLS = 32
+_FAST_REGULATORY_MAX_SEARCH_CALLS_PER_DECISION = 4
 _REGULATORY_MAX_CONCURRENT_SEARCH_TOOLS = 8
 _REGULATORY_SEARCH_LLM_CHUNKS_PER_CALL = 10
 _REGULATORY_BOOTSTRAP_COVERAGE_CYCLES = 1
@@ -158,7 +156,9 @@ _FAST_REGULATORY_ABSENCE_RECOVERY_REMINDER = (
     "# Source-gap recovery correction\n"
     "The previous draft claimed that requested legal text was unavailable. "
     "That draft was withheld and is not authoritative. Re-audit all exact "
-    "evidence below, including newly retrieved evidence and sibling provisions, "
+    "evidence below and decide whether one materially different focused retrieval "
+    "could resolve the open request. Choose the tool and query yourself if so. "
+    "Include any newly retrieved evidence and sibling provisions, "
     "before producing a complete replacement answer. A retrieval miss never "
     "proves that the database lacks the source. If the exact controlling text "
     "still cannot be established after these attempts, say only that it was not "
@@ -624,51 +624,6 @@ def _build_regulatory_coverage_tool_calls(
             source_anchors,
         ) in enumerate(calls)
     ]
-
-
-def _build_explicit_provision_bootstrap_call(
-    user_request: str,
-    plan: RegulatoryCoveragePlan | None,
-    *,
-    provision_tool_available: bool,
-    turn_index: int,
-) -> ToolCallKickoff | None:
-    """Start with one verified structural read for one explicitly named provision."""
-    if not provision_tool_available or plan is None or not plan.coverage_items:
-        return None
-    reference = extract_single_regulatory_provision_reference(user_request)
-    if reference is None or not re.fullmatch(r"\d{1,5}[A-Za-z]?", reference.article_no):
-        return None
-    anchors = {
-        " ".join(anchor.casefold().split()): anchor
-        for item in plan.coverage_items
-        for anchor in item.source_anchors
-    }
-    if len(anchors) != 1 or any(
-        len(item.source_anchors) != 1 for item in plan.coverage_items
-    ):
-        return None
-    source = next(iter(anchors.values()))
-    if source.casefold() not in user_request.casefold():
-        return None
-    article_kind = {
-        None: "regular",
-        "ek": "additional",
-        "gecici": "temporary",
-        "mukerrer": "repeated",
-    }.get(reference.qualifier)
-    if article_kind is None:
-        return None
-    return ToolCallKickoff(
-        tool_call_id=f"regulatory-provision-bootstrap-{turn_index}-0",
-        tool_name=RegulatoryProvisionTool.NAME,
-        tool_args={
-            "source": source,
-            "article_number": reference.article_no,
-            "article_kind": article_kind,
-        },
-        placement=Placement(turn_index=turn_index, tab_index=0),
-    )
 
 
 def _build_regulatory_navigation_recovery_tool_calls(
@@ -2020,42 +1975,6 @@ def _constrain_regulatory_tool_calls(
     return constrained
 
 
-def _build_fast_regulatory_absence_recovery_tool_calls(
-    plan: RegulatoryCoveragePlan | None,
-    *,
-    turn_index: int,
-    attempted_query_modes: set[tuple[str, str]],
-) -> list[ToolCallKickoff]:
-    """Build the one V2 recall pass from deferred, query-distinct plan probes."""
-
-    all_plan_calls = _build_regulatory_coverage_tool_calls(
-        plan,
-        turn_index=turn_index,
-        max_calls=None,
-        include_auxiliary_searches=True,
-        include_lexical_fallbacks=True,
-    )
-    deferred_calls = _constrain_regulatory_tool_calls(
-        all_plan_calls,
-        search_slots=None,
-        attempted_query_modes=attempted_query_modes,
-    )
-    return [
-        call.model_copy(
-            update={
-                "tool_call_id": (
-                    f"regulatory-absence-recovery-{turn_index}-{call_index}"
-                ),
-                "placement": Placement(
-                    turn_index=turn_index,
-                    tab_index=call_index,
-                ),
-            }
-        )
-        for call_index, call in enumerate(deferred_calls)
-    ]
-
-
 def _format_regulatory_tool_call_batch_feedback(
     *,
     requested_search_calls: int,
@@ -3044,30 +2963,20 @@ def run_llm_loop(
             regulatory_coverage_reminder = format_regulatory_coverage_plan(
                 regulatory_coverage_plan
             )
-            pending_regulatory_coverage_tool_calls = (
-                _build_regulatory_coverage_tool_calls(
-                    regulatory_coverage_plan,
-                    turn_index=0,
-                    max_calls=regulatory_workflow_profile.max_parallel_search_calls,
-                    include_auxiliary_searches=(
-                        regulatory_workflow_profile.include_auxiliary_searches
-                    ),
-                    include_lexical_fallbacks=(
-                        regulatory_workflow_profile.include_lexical_fallbacks
-                    ),
+            if regulatory_workflow_profile.mode != "fast":
+                pending_regulatory_coverage_tool_calls = (
+                    _build_regulatory_coverage_tool_calls(
+                        regulatory_coverage_plan,
+                        turn_index=0,
+                        max_calls=regulatory_workflow_profile.max_parallel_search_calls,
+                        include_auxiliary_searches=(
+                            regulatory_workflow_profile.include_auxiliary_searches
+                        ),
+                        include_lexical_fallbacks=(
+                            regulatory_workflow_profile.include_lexical_fallbacks
+                        ),
+                    )
                 )
-            )
-            if regulatory_workflow_profile.mode == "fast":
-                provision_call = _build_explicit_provision_bootstrap_call(
-                    regulatory_user_message,
-                    regulatory_coverage_plan,
-                    provision_tool_available=any(
-                        isinstance(tool, RegulatoryProvisionTool) for tool in tools
-                    ),
-                    turn_index=0,
-                )
-                if provision_call is not None:
-                    pending_regulatory_coverage_tool_calls = [provision_call]
             regulatory_navigation_recovery_ready = (
                 not regulatory_workflow_profile.use_navigation_recovery
             )
@@ -3809,6 +3718,12 @@ def run_llm_loop(
                 if effective_regulatory_search_call_budget is not None
                 else regulatory_workflow_profile.max_parallel_search_calls
             )
+            if regulatory_workflow_profile.mode == "fast":
+                search_slots = (
+                    min(search_slots, _FAST_REGULATORY_MAX_SEARCH_CALLS_PER_DECISION)
+                    if search_slots is not None
+                    else _FAST_REGULATORY_MAX_SEARCH_CALLS_PER_DECISION
+                )
             tool_calls = _constrain_regulatory_tool_calls(
                 raw_tool_calls,
                 search_slots=search_slots,
@@ -3880,13 +3795,6 @@ def run_llm_loop(
                     fast_absence_recovery_feedback = (
                         _FAST_REGULATORY_ABSENCE_RECOVERY_REMINDER
                     )
-                    pending_regulatory_coverage_tool_calls = (
-                        _build_fast_regulatory_absence_recovery_tool_calls(
-                            regulatory_coverage_plan,
-                            turn_index=llm_cycle_count + reasoning_cycles + 1,
-                            attempted_query_modes=regulatory_attempted_query_modes,
-                        )
-                    )
                     simple_chat_history.append(
                         ChatMessageSimple(
                             message=candidate_answer_for_review,
@@ -3894,18 +3802,10 @@ def run_llm_loop(
                             message_type=MessageType.ASSISTANT,
                         )
                     )
-                    if pending_regulatory_coverage_tool_calls:
-                        logger.info(
-                            "Fast regulatory source-gap draft withheld; scheduling "
-                            "%d deferred plan search(es)",
-                            len(pending_regulatory_coverage_tool_calls),
-                        )
-                    else:
-                        regulatory_research_complete_pending = True
-                        logger.info(
-                            "Fast regulatory source-gap draft withheld; no distinct "
-                            "plan search remained, scheduling evidence re-synthesis"
-                        )
+                    logger.info(
+                        "Fast regulatory source-gap draft withheld; requesting one "
+                        "model-selected evidence decision"
+                    )
                     continue
                 if (
                     candidate_answer_review_count
@@ -4379,14 +4279,7 @@ def run_llm_loop(
             tool_responses = parallel_tool_call_results.tool_responses
             citation_mapping = parallel_tool_call_results.updated_citation_mapping
 
-            absence_recovery_batch = any(
-                tool_call.tool_call_id.startswith("regulatory-absence-recovery-")
-                for tool_call in tool_calls
-            )
-            if absence_recovery_batch:
-                # The recovery attempt is consumed even when every backend call
-                # fails. The next cycle must be one tools-disabled replacement
-                # synthesis, never an unbounded autonomous retry loop.
+            if fast_absence_correction_pending and tool_calls:
                 regulatory_research_complete_pending = True
 
             # Failure case, give something reasonable to the LLM to try again
@@ -4536,7 +4429,7 @@ def run_llm_loop(
                             title,
                             content,
                         ) in llm_visible_results:
-                            if absence_recovery_batch:
+                            if fast_absence_correction_pending:
                                 # Exact excerpts retrieved specifically to repair a
                                 # withheld source-gap draft must survive any later
                                 # physical-context compaction verbatim.

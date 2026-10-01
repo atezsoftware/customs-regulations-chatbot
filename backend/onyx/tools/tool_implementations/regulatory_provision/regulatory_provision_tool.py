@@ -49,7 +49,9 @@ class RegulatoryProvisionTool(Tool[ProvisionToolOverrideKwargs]):
     DESCRIPTION = (
         "Optional structural lookup of an identified legal instrument and article, "
         "with optional paragraph, clause and effective date. Useful when the source "
-        "and provision are known; returns canonical citations and coverage status. "
+        "and provision are known; call once per requested article and pass the "
+        "source title separately from its article number. Returns canonical "
+        "citations and coverage status. "
         "Choose this or internal_search according to the evidence you need, in any order. "
         "Ambiguous, partial or missing results are not proof of absence; you may "
         "clarify the reference or use other internal_search modes. "

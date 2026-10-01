@@ -71,6 +71,7 @@ _SOURCE_DESIGNATOR_STEMS = (
     "tuzuk",
     "yonerge",
     "yonetmelik",
+    "yonetmelig",
 )
 _SOURCE_DESIGNATOR_EXACT = frozenset({"act", "code", "law"})
 _ANONYMOUS_SOURCE_TERMS = frozenset({"a", "an", "bu", "isbu", "the", "this"})

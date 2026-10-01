@@ -387,6 +387,7 @@ def test_extracts_bounded_source_hint_before_explicit_provision(
         ("Basel Convention illegal traffic", "Basel Convention"),
         ("Madde 9 Basel Sözleşmesi geri alma", "Basel Sözleşmesi"),
         ("Gümrük Kanunu Madde 184 borç", "Gümrük Kanunu"),
+        ("Gümrük Yönetmeliği md. 104 kapsamı", "Gümrük Yönetmeliği"),
         (
             "Kurtarılan yükün gönderimi Basel Sözleşmesi bakımından mümkün mü",
             "Basel Sözleşmesi",
