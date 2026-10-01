@@ -80,6 +80,11 @@ jobs:
           for node in json.load(sys.stdin)["items"]:
               print("INCIDENT_NODE",{"name":node["metadata"]["name"],"allocatable_memory":node["status"]["allocatable"].get("memory"),"capacity_memory":node["status"]["capacity"].get("memory")})
           '
+          api_pod=$(kubectl get pods -n "$namespace" -l app=dev-customs-regulations-api -o json | jq -r '.items[] | select(.metadata.deletionTimestamp == null) | select(any(.status.conditions[]?; .type == "Ready" and .status == "True")) | .metadata.name' | head -n 1)
+          if [[ -n "$api_pod" ]]; then
+            kubectl exec "$api_pod" -n "$namespace" -c dev-customs-regulations-api-container -- \
+              sh -ec '. /vault/secrets/config; cd /app; python -c '\''from onyx.db.engine.sql_engine import get_session_with_current_tenant; from onyx.db.reranking import get_reranker_configuration; exec("with get_session_with_current_tenant() as session:\n c = get_reranker_configuration(session)\n print({\"enabled\": c.enabled, \"provider\": str(c.provider_type), \"model\": c.model_name})")'\'''
+          fi
       - name: Stabilize DEV API capacity
         if: inputs.operation == 'stabilize_api'
         shell: bash
@@ -101,7 +106,7 @@ jobs:
           kubectl rollout status deployment "$deployment" -n "$namespace" --timeout=300s
           kubectl get deployment "$deployment" -n "$namespace" -o json | jq '{name:.metadata.name,replicas:.spec.replicas,ready:.status.readyReplicas,available:.status.availableReplicas,containers:[.spec.template.spec.containers[] | {name,image,resources}]}'
       - name: Inspect or launch the existing DEV project repair
-        if: inputs.operation != 'stabilize_api'
+        if: inputs.operation == 'launch' || inputs.operation == 'refresh_helpers'
         shell: bash
         run: |
           set -euo pipefail
