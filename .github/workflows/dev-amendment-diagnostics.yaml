@@ -1,120 +1,48 @@
-name: One-time DEV remaining 78 repair
+name: DEV amendment approval diagnostics
 on:
   workflow_dispatch:
     inputs:
       operation:
         type: choice
-        options: [inspect, launch, refresh_helpers]
+        options: [inspect]
         default: inspect
 permissions:
   contents: read
 jobs:
-  launch:
+  inspect:
     runs-on: codebuild-customs-regulations-runner-${{ github.run_id }}-${{ github.run_attempt }}
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
           persist-credentials: false
-      - name: Inspect or launch the existing DEV project repair
+      - name: Read only batch inventory
         shell: bash
         run: |
           set -euo pipefail
           aws eks update-kubeconfig --name atez-dev-cluster --region eu-central-1
-          kubectl get pods -n customs-regulations-dev -o json > /tmp/dev-project-pods.json
+          kubectl get pods -n customs-regulations-dev -o json > /tmp/amendment-pods.json
           python - <<'PY'
           import json
           from pathlib import Path
-          candidates=[]
-          for pod in json.loads(Path('/tmp/dev-project-pods.json').read_text())['items']:
-              for container in pod['spec']['containers']:
-                  if 'customs-regulations-backend-lite-dev:' not in container['image']:
-                      continue
-                  print('PROJECT_RESOURCES',json.dumps({'pod':pod['metadata']['name'],'container':container['name'],'resources':container.get('resources',{}),'image':container['image']}))
-                  if pod['status']['phase']=='Running' and not pod['metadata'].get('deletionTimestamp'):
-                      candidates.append(pod['metadata']['name']+'\t'+container['name'])
-          Path('/tmp/dev-project-backends').write_text('\n'.join(candidates)+'\n')
-          PY
-          if [[ '${{ inputs.operation }}' == 'inspect' ]]; then
-            while IFS=$'\t' read -r resource_pod resource_container; do
-              [[ -n "$resource_pod" ]] || continue
-              echo "PROJECT_MEMORY $resource_pod $resource_container"
-              kubectl exec "$resource_pod" -n customs-regulations-dev -c "$resource_container" -- \
-                python -c "from pathlib import Path; print({n:(Path('/sys/fs/cgroup')/n).read_text() for n in ('memory.current','memory.max','cpu.max')})"
-            done < /tmp/dev-project-backends
-          fi
-          kubectl get pods -n customs-regulations-dev -l app=dev-customs-regulations-background -o json > /tmp/remaining78-pods.json
-          python - <<'PY'
-          import json
-          from pathlib import Path
-          selected=[]
-          for pod in json.loads(Path('/tmp/remaining78-pods.json').read_text())['items']:
-              print(json.dumps({'pod':pod['metadata']['name'],'uid':pod['metadata']['uid'],
-                  'created':pod['metadata']['creationTimestamp'],'phase':pod['status']['phase'],
-                  'containers':[{k:c.get(k) for k in ('name','image','restartCount','lastState','state')} for c in pod['status'].get('containerStatuses',[])]}))
-              if pod['metadata'].get('deletionTimestamp') or pod['status']['phase']!='Running':
+          pods=json.loads(Path('/tmp/amendment-pods.json').read_text())['items']
+          ready=[]
+          for pod in pods:
+              if pod['status']['phase']!='Running' or pod['metadata'].get('deletionTimestamp'):
                   continue
-              ready={c['name'] for c in pod['status'].get('containerStatuses',[]) if c.get('ready')}
+              statuses={item['name']:item for item in pod['status'].get('containerStatuses',[])}
               for container in pod['spec']['containers']:
-                  if container['name'] not in ready or not container['image'].endswith(':7d5b7cb7851abbcf91331804784edf325dae1f35'):
-                      continue
-                  limits=container.get('resources',{}).get('limits',{})
-                  if str(limits.get('cpu')) not in ('1','1000m') or limits.get('memory') not in ('4Gi','4096Mi'):
-                      raise SystemExit('Project resource limits differ; refusing launch')
-                  selected.append((pod['metadata']['name'],container['name']))
-          if len(selected)!=1:
-              raise SystemExit('Expected exactly one ready pinned DEV project container')
-          Path('/tmp/remaining78-target').write_text('\t'.join(selected[0]))
+                  image=container['image']
+                  if 'customs-regulations-backend-lite-dev:' in image and statuses.get(container['name'],{}).get('ready'):
+                      ready.append((pod['metadata']['name'],container['name'],image))
+          if not ready:
+              raise SystemExit('No ready DEV backend container')
+          ready.sort()
+          pod,container,image=ready[0]
+          print('TARGET',pod,container,image)
+          Path('/tmp/amendment-target').write_text(pod+'\t'+container)
           PY
-          IFS=$'\t' read -r pod container < /tmp/remaining78-target || [[ -n "$pod" && -n "$container" ]]
-          directory=/tmp/dev-remaining78-20260924-resume2
-          if [[ '${{ inputs.operation }}' == 'refresh_helpers' ]]; then
-            incoming="$directory/refresh-bounded-v1"
-            tar -C .github/maintenance/remaining78-20260924 -cf - repair_server.py backpressure.py bounded_inventory.py refresh_helpers.py \
-              | kubectl exec -i "$pod" -n customs-regulations-dev -c "$container" -- \
-                  sh -ec 'umask 077; mkdir "$1"; tar -xf - -C "$1"' remaining78-helper-copy "$incoming"
-            kubectl exec "$pod" -n customs-regulations-dev -c "$container" -- \
-              sh -ec '. /vault/secrets/config; cd /app/onyx/db; exec python "$1/refresh_helpers.py"' remaining78-helper-refresh "$incoming"
-            exit 0
-          fi
-          if [[ '${{ inputs.operation }}' != 'launch' ]]; then
-            kubectl exec -i "$pod" -n customs-regulations-dev -c "$container" -- python - <<'PY'
-          import json
-          from pathlib import Path
-          directory=Path('/tmp/dev-remaining78-20260924-resume2')
-          receipt=directory/'launch.json'
-          pid=json.loads(receipt.read_text())['pid'] if receipt.exists() else 508
-          process=Path('/proc')/str(pid)
-          print('HOST_MEMORY', '\n'.join(line for line in Path('/proc/meminfo').read_text().splitlines() if line.split(':')[0] in ('MemTotal','MemAvailable','SwapFree')))
-          print('PROCESS_EXISTS',process.exists())
-          if process.exists():
-              print((process/'cmdline').read_bytes().replace(b'\x00',b' ').decode())
-              print((process/'status').read_text())
-          for name in ('memory.current','memory.max','memory.events','memory.stat'):
-              path=Path('/sys/fs/cgroup')/name
-              if path.exists(): print(name,path.read_text())
-          for name in ('worker.log','results.jsonl','phase.json','file-2.log','file-3.log','file-4.log'):
-              path=directory/name
-              print(name, path.stat().st_size if path.exists() else 'absent')
-              if path.exists():
-                  with path.open('rb') as stream:
-                      stream.seek(max(0,path.stat().st_size-16000))
-                      print('\n'.join(stream.read().decode(errors='replace').splitlines()[-50:]))
-          for process in Path('/proc').glob('[0-9]*'):
-              try:
-                  command=(process/'cmdline').read_bytes()
-                  status=(process/'status').read_text().splitlines()
-                  rss=next((int(line.split()[1]) for line in status if line.startswith('VmRSS:')),0)
-                  if rss > 100000 or b'/tmp/dev-remaining78-20260924-resume2/' in command:
-                      print('PROCESS_MEMORY',process.name,'rss_kib',rss,'name',(process/'comm').read_text().strip())
-                      print('\n'.join(line for line in status if line.startswith(('VmRSS:','VmHWM:','VmSwap:','RssAnon:','RssFile:'))))
-              except (FileNotFoundError,PermissionError):
-                  pass
-          PY
-            exit 0
-          fi
-          tar -C .github/maintenance/remaining78-20260924 -cf - repair_server.py image_correction.py image_scope.py backpressure.py bounded_inventory.py file-plan.json launch.py supervisor.py \
-            | kubectl exec -i "$pod" -n customs-regulations-dev -c "$container" -- \
-                sh -ec 'umask 077; mkdir "$1"; tar -xf - -C "$1"' remaining78-copy "$directory"
-          kubectl exec "$pod" -n customs-regulations-dev -c "$container" -- \
-            sh -ec '. /vault/secrets/config; export PYTHONPATH=/app; cd /app/onyx/db; exec python "$1/launch.py"' remaining78-launch "$directory"
+          IFS=$'\t' read -r pod container < /tmp/amendment-target
+          kubectl exec -i "$pod" -n customs-regulations-dev -c "$container" -- \
+            sh -ec '. /vault/secrets/config; export PYTHONPATH=/app; exec python -' < \
+            backend/onyx/db/diagnose_amendment_batches_299_310.py
