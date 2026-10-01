@@ -477,6 +477,37 @@ jobs:
           echo "DEV API image, resources, or Ready replicas did not match" >&2
           exit 1
 
+      - name: Diagnose DEV API stabilization failure
+        if: failure() && inputs.action == 'stabilize_api' && env.env_x == 'dev'
+        run: |
+          set +e
+          container_name=dev-customs-regulations-api-container
+          deployment_json=$(kubectl get deployment dev-customs-regulations-api-deployment \
+            --namespace "$namespace" -o json)
+          if [[ "$?" -eq 0 ]]; then
+            jq -c --arg name "$container_name" '
+              {replicas:.spec.replicas, readyReplicas:(.status.readyReplicas // 0),
+                updatedReplicas:(.status.updatedReplicas // 0),
+                apiContainer:([.spec.template.spec.containers[]? |
+                  select(.name == $name) |
+                  {image, requests:.resources.requests, limits:.resources.limits}] | .[0] // null)}
+            ' <<<"$deployment_json"
+          fi
+          pods_json=$(kubectl get pods --namespace "$namespace" \
+            -l app=dev-customs-regulations-api -o json)
+          if [[ "$?" -eq 0 ]]; then
+            jq -c --arg name "$container_name" '
+              [.items[] | select(.metadata.deletionTimestamp == null) |
+                {pod:.metadata.name, phase:.status.phase,
+                  ready:any(.status.conditions[]?; .type == "Ready" and .status == "True"),
+                  apiContainer:([.status.containerStatuses[]? |
+                    select(.name == $name) |
+                    {restartCount, lastReason:(.lastState.terminated.reason // null)}] |
+                    .[0] // null)}]
+            ' <<<"$pods_json"
+          fi
+          exit 0
+
       - name: Deploy api and background with Helm
         if: inputs.action != 'stabilize_api'
         id: helm_deploy
