@@ -4,7 +4,7 @@ on:
     inputs:
       operation:
         type: choice
-        options: [inspect, approve_462, approve_465, approve_470, approve_481, repair_299, retry_306]
+        options: [inspect, approve_462, approve_465, approve_470, approve_481, approve_482, repair_299, retry_306]
         default: inspect
 permissions:
   contents: read
@@ -92,6 +92,7 @@ jobs:
             approve_465) proposal_id=465 ;;
             approve_470) proposal_id=470 ;;
             approve_481) proposal_id=481 ;;
+            approve_482) proposal_id=482 ;;
             *) exit 2 ;;
           esac
           IFS=$'\t' read -r pod container < /tmp/amendment-target
