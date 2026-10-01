@@ -2106,6 +2106,14 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
                 else _REGULATORY_RERANK_CANDIDATE_LIMIT
             ),
         )
+        per_lane_num_hits = (
+            max(
+                override_kwargs.per_lane_num_hits,
+                regulatory_rerank_candidate_limit,
+            )
+            if fast_regulatory_search
+            else override_kwargs.per_lane_num_hits
+        )
 
         focused_regulatory_search = bool(
             effective_filters
@@ -2157,7 +2165,7 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
                         lane.query,
                         lane.hybrid_alpha,
                         lane.high_term_coverage,
-                        override_kwargs.per_lane_num_hits,
+                        per_lane_num_hits,
                         acl_filters,
                         embedding_model,
                         federated_retrieval_infos,
@@ -2179,7 +2187,7 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
                         slack_bot_token,
                         slack_entities,
                         search_settings,
-                        override_kwargs.per_lane_num_hits,
+                        per_lane_num_hits,
                     ),
                 )
             )
@@ -2194,7 +2202,7 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
                 all_search_results[0] = _interleave_ranked_chunk_results(
                     all_search_results[0],
                     slack_results,
-                    override_kwargs.per_lane_num_hits,
+                    per_lane_num_hits,
                 )
 
         top_chunks = weighted_reciprocal_rank_fusion(

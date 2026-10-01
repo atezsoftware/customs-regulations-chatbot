@@ -1507,6 +1507,42 @@ def test_fast_regulatory_search_stages_large_candidate_pool() -> None:
     ]
 
 
+def test_fast_regulatory_search_fetches_enough_candidates_for_staged_rerank() -> None:
+    from tests.unit.onyx.regulatory.labeling.test_search_overlay import chunk
+
+    pipeline_chunks = [chunk(str(index)) for index in range(1, 101)]
+    fast_rrf: list[MagicMock] = []
+    standard_rrf: list[MagicMock] = []
+    _run(
+        _make_tool(
+            BaseFilters(
+                regulatory_chunks_only=True,
+                regulatory_workflow_mode="fast",
+            ),
+            auto_detect_filters=False,
+        ),
+        connected_sources=[DocumentSource.USER_FILE],
+        pipeline_chunks=pipeline_chunks,
+        rrf_sink=fast_rrf,
+    )
+    _run(
+        _make_tool(
+            BaseFilters(regulatory_chunks_only=True),
+            auto_detect_filters=False,
+        ),
+        connected_sources=[DocumentSource.USER_FILE],
+        pipeline_chunks=pipeline_chunks,
+        rrf_sink=standard_rrf,
+    )
+
+    assert [len(lane) for lane in fast_rrf[0].call_args.kwargs["ranked_results"]] == [
+        96
+    ]
+    assert [
+        len(lane) for lane in standard_rrf[0].call_args.kwargs["ranked_results"]
+    ] == [50]
+
+
 def test_regulatory_luna_rerank_is_enabled_for_followup_query() -> None:
     rerank_mocks: list[MagicMock] = []
     configured = RerankerRuntimeConfig(
