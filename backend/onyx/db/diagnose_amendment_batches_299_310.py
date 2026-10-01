@@ -247,11 +247,12 @@ def main() -> None:
                         default=str,
                     ),
                 )
-                if proposal["id"] == 481:
+                if proposal["id"] in {481, 482}:
                     print(
-                        "PROPOSAL_481_REVIEW",
+                        "PROPOSAL_DETAIL_REVIEW",
                         json.dumps(
                             {
+                                "proposal_id": proposal["id"],
                                 "instruction_text": proposal["instruction_text"],
                                 "draft_text": draft.get("text"),
                                 "draft_metadata": draft.get("metadata"),
@@ -265,6 +266,23 @@ def main() -> None:
                             default=str,
                         ),
                     )
+                    if proposal["id"] == 482:
+                        old = (
+                            connection.execute(
+                                text(
+                                    "SELECT id, user_file_id, text, heading_path, "
+                                    "chunk_metadata, status, position FROM regulatory_chunk "
+                                    "WHERE id=:chunk_id"
+                                ),
+                                {"chunk_id": proposal["old_chunk_id"]},
+                            )
+                            .mappings()
+                            .one()
+                        )
+                        print(
+                            "PROPOSAL_482_OLD",
+                            json.dumps(dict(old), ensure_ascii=False, default=str),
+                        )
                 if proposal["id"] == 470:
                     from onyx.regulatory.amendments.draft_integrity import (
                         validate_explicit_replacement_texts,
@@ -810,6 +828,26 @@ def main() -> None:
         for row in candidate_files:
             print(
                 "SOURCE_302_ANNEX_CANDIDATE",
+                json.dumps(
+                    {
+                        "id": str(row.id),
+                        "name": row.name,
+                        "status": row.status,
+                        "chunk_count": row.chunk_count,
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+        list_files = connection.execute(
+            text(
+                "SELECT id, name, status, chunk_count FROM user_file WHERE "
+                "name ILIKE '%sayılı liste%' OR name ILIKE '%sayili liste%' "
+                "ORDER BY name LIMIT 100"
+            )
+        )
+        for row in list_files:
+            print(
+                "SOURCE_302_LIST_FILE",
                 json.dumps(
                     {
                         "id": str(row.id),
