@@ -4,7 +4,7 @@ on:
     inputs:
       operation:
         type: choice
-        options: [inspect, inspect_299_scopes, approve_439, approve_441, approve_442, approve_443, approve_462, approve_465, approve_470, approve_481, approve_482, repair_299, repair_299_scopes, retry_306]
+        options: [inspect, inspect_299_scopes, approve_435, approve_436, approve_437, approve_438, approve_439, approve_440, approve_441, approve_442, approve_443, approve_462, approve_465, approve_470, approve_481, approve_482, repair_299, repair_299_scopes, retry_306]
         default: inspect
 permissions:
   contents: read
@@ -88,7 +88,12 @@ jobs:
         run: |
           set -euo pipefail
           case "$OPERATION" in
+            approve_435) proposal_id=435 ;;
+            approve_436) proposal_id=436 ;;
+            approve_437) proposal_id=437 ;;
+            approve_438) proposal_id=438 ;;
             approve_439) proposal_id=439 ;;
+            approve_440) proposal_id=440 ;;
             approve_441) proposal_id=441 ;;
             approve_442) proposal_id=442 ;;
             approve_443) proposal_id=443 ;;
