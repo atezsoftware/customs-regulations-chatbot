@@ -7,7 +7,7 @@ on:
         type: choice
         required: true
         default: observe
-        options: [observe, inspect_request_logs, inspect_historical_graph_metadata]
+        options: [observe, inspect_request_logs, inspect_historical_graph_metadata, inspect_historical_oom_logs]
       expected_image_sha:
         type: string
         required: true
@@ -797,3 +797,356 @@ jobs:
           path: dev-api-historical-graph-metadata.json
           if-no-files-found: ignore
           retention-days: 7
+
+  inspect_historical_oom_logs:
+    if: inputs.operation == 'inspect_historical_oom_logs'
+    runs-on: codebuild-customs-regulations-runner-${{ github.run_id }}-${{ github.run_attempt }}
+    timeout-minutes: 5
+    steps:
+      - name: Inspect fixed historical DEV API OOM logs without printing log content
+        shell: bash
+        env:
+          EXPECTED_IMAGE_SHA: ${{ inputs.expected_image_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_IMAGE_SHA" == "f576a260800d5285a262b9b198e2b81e4133e462" ]]
+          python3 - <<'PY'
+          import collections
+          import json
+          import re
+          import subprocess
+          import time
+          from datetime import datetime, timezone
+
+          REGION = "eu-central-1"
+          GROUP = "/aws/containerinsights/atez-dev-cluster/application"
+          NAMESPACE = "customs-regulations-dev"
+          POD = "dev-customs-regulations-api-deployment-7bd7c785ff-nvc8x"
+          CONTAINER = "dev-customs-regulations-api-container"
+          TARGET_TRACE_ID = "trace_cce21cee4c8446b58fdedb9e1a9949ff"
+          START_MS = 1790845948000  # 2026-10-01 09:12:28 UTC; old container start.
+          END_MS = 1790846737000  # Exclusive; one second after the 09:25:36 UTC OOM.
+          MAX_PAGES = 3
+          PAGE_LIMIT = 1000
+          FIRST_RECORDS = 100
+          LAST_RECORDS = 500
+          DEADLINE_SECONDS = 90
+          FILTER = (
+              '{ $.kubernetes.namespace_name = "' + NAMESPACE
+              + '" && $.kubernetes.pod_name = "' + POD
+              + '" && $.kubernetes.container_name = "' + CONTAINER + '" }'
+          )
+          BASE = [
+              "aws", "--region", REGION, "--output", "json",
+              "--no-cli-pager", "--no-paginate", "--cli-connect-timeout", "5",
+              "--cli-read-timeout", "15", "logs",
+          ]
+          ANSI = re.compile(r"\x1b\[[0-9;]*m")
+          TRACE_ID = re.compile(r"(?:trace_)?[0-9a-fA-F-]{16,64}")
+          REQUEST_ID = re.compile(r"[A-Za-z0-9:_-]{8,80}")
+          TEXT_LOG = re.compile(
+              r"^(?:[A-Z]+:\s+)?(?P<level>CRITICAL|ERROR|WARNING|NOTICE|INFO|DEBUG):?\s+"
+              r"\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}:\d{2}\s+[AP]M\s+"
+              r"(?P<logger>[A-Za-z_][A-Za-z0-9_]{0,63}\.py)\s+\d+:\s+"
+              r"(?:\[(?P<request_id>[A-Za-z0-9:_-]{8,80})\]\s+)?(?P<message>.*)$"
+          )
+          SEARCH_SECONDS = re.compile(
+              r"Search tool - Total execution time:\s*([0-9]{1,6}(?:\.[0-9]{1,3})?) seconds",
+              re.IGNORECASE,
+          )
+          RETURNED_CHUNKS = re.compile(r"returned\s+([0-9]{1,6})\s+chunks\b", re.IGNORECASE)
+          RETAINED_CANDIDATES = re.compile(
+              r"retained\s+([0-9]{1,6})/([0-9]{1,6})\s+candidates\b", re.IGNORECASE
+          )
+          SELECTED_AVAILABLE = re.compile(
+              r"selected=([0-9]{1,6})\s+available=([0-9]{1,6})\b", re.IGNORECASE
+          )
+
+          class Refusal(Exception):
+              def __init__(self, status):
+                  self.status = status
+
+          def emit(status, *, pages=0, source_events=0, parseable_events=0,
+                   classified_events=0,
+                   source_complete=False, source_truncated=False, records=None,
+                   category_counts=None, target_trace_matches=0):
+              selected = records or []
+              report = {
+                  "operation": "historical_dev_api_oom_cloudwatch_metadata",
+                  "scope": {
+                      "namespace": NAMESPACE,
+                      "pod": POD,
+                      "container": CONTAINER,
+                      "start_utc": datetime.fromtimestamp(
+                          START_MS / 1000, timezone.utc
+                      ).isoformat(),
+                      "end_utc_exclusive": datetime.fromtimestamp(
+                          END_MS / 1000, timezone.utc
+                      ).isoformat(),
+                  },
+                  "status": status,
+                  "source_complete": source_complete,
+                  "source_truncated": source_truncated,
+                  "records_complete": source_complete and classified_events == len(selected),
+                  "records_truncated": classified_events > len(selected),
+                  "pages_read": pages,
+                  "page_limit": PAGE_LIMIT,
+                  "max_pages": MAX_PAGES,
+                  "source_events": source_events,
+                  "parseable_events": parseable_events,
+                  "classified_events": classified_events,
+                  "target_trace_id": TARGET_TRACE_ID,
+                  "target_trace_matches": target_trace_matches,
+                  "category_counts": category_counts or {},
+                  "records": selected,
+              }
+              print(json.dumps(report, ensure_ascii=True, separators=(",", ":")), flush=True)
+
+          def aws_json(args, max_bytes):
+              try:
+                  result = subprocess.run(
+                      [*BASE, *args], capture_output=True, timeout=20
+                  )
+              except FileNotFoundError:
+                  raise Refusal("aws_unavailable") from None
+              except subprocess.TimeoutExpired:
+                  raise Refusal("aws_timeout") from None
+              if result.returncode:
+                  stderr = result.stderr[:4096]
+                  if b"AccessDenied" in stderr or b"UnauthorizedOperation" in stderr:
+                      raise Refusal("access_denied")
+                  raise Refusal("aws_query_failed")
+              if len(result.stdout) > max_bytes:
+                  raise Refusal("response_too_large")
+              try:
+                  value = json.loads(result.stdout)
+              except (UnicodeDecodeError, ValueError):
+                  raise Refusal("invalid_response") from None
+              if not isinstance(value, dict):
+                  raise Refusal("invalid_response")
+              return value
+
+          def parse_log(raw):
+              # Only an actual logger envelope may supply an ID; user/source text may not.
+              line = ANSI.sub("", raw[:8192])
+              if line.startswith("{"):
+                  try:
+                      record = json.loads(line)
+                  except ValueError:
+                      return None
+                  if not isinstance(record, dict):
+                      return None
+                  logger = record.get("logger")
+                  level = record.get("level")
+                  message = record.get("message")
+                  request_id = record.get("request_id")
+                  trace_id = record.get("trace_id")
+                  if not all(isinstance(value, str) for value in (logger, level, message)):
+                      return None
+                  logger = logger.rsplit("/", 1)[-1]
+                  if not logger.endswith(".py"):
+                      logger = logger.rsplit(".", 1)[-1] + ".py"
+              else:
+                  match = TEXT_LOG.match(line)
+                  if match is None:
+                      return None
+                  logger = match.group("logger")
+                  level = match.group("level")
+                  message = match.group("message")
+                  request_id = match.group("request_id")
+                  trace_id = None
+              if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}\.py", logger):
+                  return None
+              if level not in {"CRITICAL", "ERROR", "WARNING", "NOTICE", "INFO", "DEBUG"}:
+                  return None
+              return logger, level, message, request_id, trace_id
+
+          def classify(parsed):
+              # Read bounded logger metadata; never return message or its substrings.
+              logger, level, message, request_id, trace_id = parsed
+              line = message[:4096]
+              target_trace_match = trace_id == TARGET_TRACE_ID or TARGET_TRACE_ID in line
+              if logger == "search_tool.py" and "Search tool - Total execution time:" in line:
+                  category, stage = "search_complete", "search"
+              elif logger == "search_tool.py" and "Internal search - exact provision" in line:
+                  category, stage = "provision_candidates", "search"
+              elif logger == "search_tool.py" and "Internal search - source scope:" in line:
+                  category, stage = "source_scope", "search"
+              elif logger == "search_tool.py" and "Internal search - time window" in line:
+                  category, stage = "time_scope", "search"
+              elif logger == "search_tool.py" and "Search tool - no results found" in line:
+                  category, stage = "search_empty", "search"
+              elif logger == "llm_loop.py" and "Regulatory source-outline recovery" in line:
+                  category, stage = "navigation_recovery", "search"
+              elif logger == "llm_loop.py" and "Regulatory candidate review" in line:
+                  category, stage = "candidate_review", "answer"
+              elif logger in {"service.py", "openrouter.py", "search_tool.py"} and re.search(
+                  r"\brerank(?:er|ing)?\b", line, re.IGNORECASE
+              ):
+                  category, stage = "rerank_marker", "rerank"
+              elif logger == "coverage_plan.py" and re.search(
+                  r"\b(?:coverage plan|request inventory|gap audit)\b", line, re.IGNORECASE
+              ):
+                  category, stage = "planning_marker", "planning"
+              elif level in {"ERROR", "CRITICAL"} and re.search(
+                  r"\b(?:MemoryError|OutOfMemoryError|QueuePool limit)\b", line
+              ):
+                  category, stage = "resource_error", "unknown"
+              elif level in {"ERROR", "CRITICAL"} and re.search(
+                  r"\b(?:TimeoutError|SearchToolTimeout)\b", line
+              ):
+                  category, stage = "timeout_error", "unknown"
+              elif level in {"ERROR", "CRITICAL"}:
+                  category, stage = "error_marker", "unknown"
+              elif target_trace_match:
+                  category, stage = "target_trace_marker", "unknown"
+              else:
+                  return None
+              record = {"category": category, "stage": stage}
+              if target_trace_match:
+                  record["target_trace_match"] = True
+                  record["trace_id"] = TARGET_TRACE_ID
+              if not target_trace_match and isinstance(trace_id, str) and TRACE_ID.fullmatch(trace_id):
+                  record["trace_id"] = trace_id
+              if isinstance(request_id, str) and REQUEST_ID.fullmatch(request_id):
+                  record["request_id"] = request_id
+              duration_match = SEARCH_SECONDS.search(line)
+              if duration_match and category == "search_complete":
+                  record["duration_seconds"] = float(duration_match.group(1))
+              count_match = RETURNED_CHUNKS.search(line)
+              if count_match and stage == "search":
+                  record["chunk_count"] = int(count_match.group(1))
+              retained_match = RETAINED_CANDIDATES.search(line)
+              if retained_match and category == "provision_candidates":
+                  record["candidate_count"] = int(retained_match.group(1))
+                  record["candidate_total"] = int(retained_match.group(2))
+              selected_match = SELECTED_AVAILABLE.search(line)
+              if selected_match and category == "navigation_recovery":
+                  record["selected_count"] = int(selected_match.group(1))
+                  record["available_count"] = int(selected_match.group(2))
+              return record
+
+          try:
+              groups = aws_json([
+                  "describe-log-groups", "--log-group-name-prefix", GROUP,
+                  "--limit", "50",
+              ], 1_000_000)
+              if groups.get("nextToken") or not isinstance(groups.get("logGroups"), list):
+                  raise Refusal("group_inventory_incomplete")
+              if not any(
+                  isinstance(group, dict) and group.get("logGroupName") == GROUP
+                  for group in groups["logGroups"]
+              ):
+                  raise Refusal("group_absent")
+
+              first = []
+              last = collections.deque(maxlen=LAST_RECORDS)
+              categories = collections.Counter()
+              seen_event_ids = set()
+              seen_tokens = set()
+              token = None
+              source_events = 0
+              parseable_events = 0
+              classified_events = 0
+              target_trace_matches = 0
+              pages = 0
+              source_complete = False
+              deadline = time.monotonic() + DEADLINE_SECONDS
+              for pages in range(1, MAX_PAGES + 1):
+                  if time.monotonic() >= deadline:
+                      raise Refusal("query_deadline")
+                  args = [
+                      "filter-log-events", "--log-group-name", GROUP,
+                      "--start-time", str(START_MS), "--end-time", str(END_MS),
+                      "--filter-pattern", FILTER, "--limit", str(PAGE_LIMIT),
+                  ]
+                  if token is not None:
+                      args.extend(["--next-token", token])
+                  page = aws_json(args, 4_000_000)
+                  events = page.get("events")
+                  if not isinstance(events, list) or len(events) > PAGE_LIMIT:
+                      raise Refusal("invalid_response")
+                  for event in events:
+                      if not isinstance(event, dict):
+                          raise Refusal("invalid_response")
+                      event_id = event.get("eventId")
+                      timestamp = event.get("timestamp")
+                      if (
+                          not isinstance(event_id, str) or not event_id
+                          or type(timestamp) is not int
+                          or not START_MS <= timestamp < END_MS
+                      ):
+                          raise Refusal("invalid_response")
+                      if event_id in seen_event_ids:
+                          continue
+                      seen_event_ids.add(event_id)
+                      try:
+                          body = json.loads(event["message"])
+                      except (KeyError, TypeError, ValueError):
+                          raise Refusal("invalid_response") from None
+                      if not isinstance(body, dict):
+                          raise Refusal("invalid_response")
+                      kubernetes = body.get("kubernetes")
+                      if not isinstance(kubernetes, dict) or any([
+                          kubernetes.get("namespace_name") != NAMESPACE,
+                          kubernetes.get("pod_name") != POD,
+                          kubernetes.get("container_name") != CONTAINER,
+                      ]):
+                          raise Refusal("scope_mismatch")
+                      message = body.get("log")
+                      if not isinstance(message, str):
+                          raise Refusal("invalid_response")
+                      source_events += 1
+                      parsed = parse_log(message)
+                      if parsed is None:
+                          continue
+                      parseable_events += 1
+                      record = classify(parsed)
+                      if record is None:
+                          continue
+                      record["timestamp_utc"] = datetime.fromtimestamp(
+                          timestamp / 1000, timezone.utc
+                      ).isoformat()
+                      classified_events += 1
+                      if record.get("target_trace_match"):
+                          target_trace_matches += 1
+                      categories[record["category"]] += 1
+                      if len(first) < FIRST_RECORDS:
+                          first.append(record)
+                      else:
+                          last.append(record)
+                  next_token = page.get("nextToken")
+                  if next_token is None:
+                      source_complete = True
+                      break
+                  if (
+                      not isinstance(next_token, str) or not next_token
+                      or len(next_token) > 2048 or next_token == token
+                      or next_token in seen_tokens
+                  ):
+                      raise Refusal("pagination_invalid")
+                  seen_tokens.add(next_token)
+                  token = next_token
+
+              records = first + list(last)
+              emit(
+                  "complete" if source_complete else "truncated",
+                  pages=pages,
+                  source_events=source_events,
+                  parseable_events=parseable_events,
+                  classified_events=classified_events,
+                  source_complete=source_complete,
+                  source_truncated=not source_complete,
+                  records=records,
+                  category_counts=dict(sorted(categories.items())),
+                  target_trace_matches=target_trace_matches,
+              )
+              if not source_complete:
+                  raise SystemExit(2)
+          except Refusal as error:
+              emit(error.status)
+              raise SystemExit(1) from None
+          except Exception:
+              emit("unexpected_failure")
+              raise SystemExit(1) from None
+          PY
