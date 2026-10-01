@@ -267,6 +267,9 @@ def _bounded_article_span(
     )
     if len(window) > MAX_CANDIDATES + 2:
         return []
+    window_ids = {row.regulatory_chunk_id for row in window}
+    if any(row.regulatory_chunk_id not in window_ids for row in heading_rows):
+        return []
     identity = article_identity(request.heading)
     indices = article_scope_indices(
         [SourceFragment(row.document_id, row.content) for row in window],

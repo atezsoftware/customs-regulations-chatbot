@@ -248,6 +248,26 @@ def test_large_source_requires_the_next_article_boundary() -> None:
     assert result.status == "partial"
 
 
+def test_large_source_does_not_drop_an_outside_article_fragment() -> None:
+    first = chunk(104, heading="MADDE 104", text="MADDE 104- Başlangıç.")
+    later = chunk(500, heading="MADDE 104", text="Sonradan eklenen hüküm.")
+    next_article = chunk(105, heading="MADDE 105", text="MADDE 105- Sonraki.")
+    index = MagicMock()
+    index.keyword_retrieval.side_effect = [
+        [first, later],
+        [chunk(n, heading="MADDE 99") for n in range(129)],
+    ]
+    index.id_based_retrieval.return_value = [first, next_article]
+
+    result = lookup_provision(
+        ProvisionRequest(source=SOURCE, article_number="104"),
+        document_index=index,
+        filters=IndexFilters(access_control_list=["user:1"]),
+    )
+
+    assert result.status == "partial"
+
+
 def test_result_order_uses_structural_position_and_canonical_dedup() -> None:
     a = chunk(1, text="MADDE 1- (1) Başlangıç.")
     b = chunk(2, text="(2) Devam.", path=[SOURCE, "MADDE 1", "(2) Devam."])
