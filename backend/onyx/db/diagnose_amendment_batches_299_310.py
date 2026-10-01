@@ -473,6 +473,33 @@ def main() -> None:
                         ensure_ascii=False,
                     ),
                 )
+        for code in (
+            "0703.10.19.00.11",
+            "1206.00.91.00.19",
+            "1206.00.99.00.19",
+        ):
+            rows = connection.execute(
+                text(
+                    "SELECT rc.id, rc.user_file_id, uf.name, rc.status, "
+                    "rc.position, rc.text FROM regulatory_chunk rc "
+                    "JOIN user_file uf ON uf.id=rc.user_file_id "
+                    "WHERE rc.text LIKE :needle LIMIT 20"
+                ),
+                {"needle": f"%{code}%"},
+            )
+            matches = list(rows)
+            print("GTIP_CORPUS_COUNT_LOWER_BOUND", code, len(matches))
+            for row in matches:
+                at = row.text.find(code)
+                print("GTIP_CORPUS_MATCH", json.dumps({
+                    "code": code,
+                    "chunk_id": row.id,
+                    "file_id": str(row.user_file_id),
+                    "file_name": row.name,
+                    "status": row.status,
+                    "position": row.position,
+                    "text_near_code": row.text[max(0, at - 100):at + 220],
+                }, ensure_ascii=False))
         files = connection.execute(
             text(
                 "SELECT id, name, status, chunk_count FROM user_file WHERE "
