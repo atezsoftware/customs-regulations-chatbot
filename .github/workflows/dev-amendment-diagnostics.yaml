@@ -7,7 +7,7 @@ on:
         type: choice
         required: true
         default: observe
-        options: [observe, inspect_request_logs, inspect_historical_graph_metadata, inspect_historical_oom_logs]
+        options: [observe, inspect_request_logs, inspect_historical_graph_metadata, inspect_historical_oom_logs, inspect_historical_memory_metadata]
       expected_image_sha:
         type: string
         required: true
@@ -1148,5 +1148,577 @@ jobs:
               raise SystemExit(1) from None
           except Exception:
               emit("unexpected_failure")
+              raise SystemExit(1) from None
+          PY
+
+  inspect_historical_memory_metadata:
+    if: inputs.operation == 'inspect_historical_memory_metadata'
+    runs-on: codebuild-customs-regulations-runner-${{ github.run_id }}-${{ github.run_attempt }}
+    timeout-minutes: 5
+    steps:
+      - name: Inspect historical DEV pod memory metrics without printing log content
+        shell: bash
+        env:
+          EXPECTED_IMAGE_SHA: ${{ inputs.expected_image_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_IMAGE_SHA" == "f576a260800d5285a262b9b198e2b81e4133e462" ]]
+          python3 - <<'PY'
+          import collections
+          import json
+          import math
+          import re
+          import subprocess
+          import time
+          from datetime import datetime, timezone
+
+          REGION = "eu-central-1"
+          CLUSTER = "atez-dev-cluster"
+          PREFIX = "/aws/containerinsights/atez-dev-cluster/"
+          PERFORMANCE_GROUP = PREFIX + "performance"
+          NAMESPACE = "customs-regulations-dev"
+          POD = "dev-customs-regulations-api-deployment-7bd7c785ff-nvc8x"
+          CONTAINER = "dev-customs-regulations-api-container"
+          START_MS = 1790845948000  # 2026-10-01 09:12:28 UTC; old container start.
+          END_MS = 1790846737000  # Exclusive; one second after the OOM.
+          MAX_GROUP_PAGES = 3
+          GROUP_PAGE_LIMIT = 50
+          MAX_EVENT_PAGES = 3
+          EVENT_PAGE_LIMIT = 1000
+          FIRST_SAMPLES = 100
+          LAST_SAMPLES = 100
+          DEADLINE_SECONDS = 120
+          FILTER = (
+              '{ $.kubernetes.namespace_name = "' + NAMESPACE
+              + '" && $.kubernetes.pod_name = "' + POD + '" }'
+          )
+          BASE = [
+              "aws", "--region", REGION, "--output", "json",
+              "--no-cli-pager", "--no-paginate", "--cli-connect-timeout", "5",
+              "--cli-read-timeout", "15", "logs",
+          ]
+          METRIC_FIELDS = {
+              "Pod": (
+                  "pod_memory_usage", "pod_memory_working_set", "pod_memory_rss",
+                  "pod_memory_cache", "pod_memory_max_usage", "pod_memory_limit",
+                  "pod_memory_failcnt",
+              ),
+              "Container": (
+                  "container_memory_usage", "container_memory_working_set",
+                  "container_memory_rss", "container_memory_cache",
+                  "container_memory_max_usage", "container_memory_limit",
+                  "container_memory_failcnt",
+              ),
+          }
+          METRIC_NAMES = (
+              "pod_memory_working_set",
+              "container_memory_failures_total",
+              "pod_container_status_terminated_reason_oom_killed",
+          )
+
+          class Refusal(Exception):
+              def __init__(self, status):
+                  self.status = status
+
+          def utc(ms):
+              return datetime.fromtimestamp(ms / 1000, timezone.utc).isoformat()
+
+          def emit(status, **data):
+              report = {
+                  "operation": "historical_dev_api_oom_containerinsights_memory",
+                  "status": status,
+                  "scope": {
+                      "cluster": CLUSTER,
+                      "namespace": NAMESPACE,
+                      "pod": POD,
+                      "container": CONTAINER,
+                      "start_utc": utc(START_MS),
+                      "end_utc_exclusive": utc(END_MS),
+                  },
+                  "group_prefix": PREFIX,
+                  "performance_group": PERFORMANCE_GROUP,
+                  "group_names": data.pop("group_names", []),
+                  "group_inventory_complete": data.pop("group_inventory_complete", False),
+                  "group_inventory_truncated": data.pop("group_inventory_truncated", False),
+                  "source_complete": data.pop("source_complete", False),
+                  "source_truncated": data.pop("source_truncated", False),
+                  "event_pages_read": data.pop("event_pages_read", 0),
+                  "event_page_limit": EVENT_PAGE_LIMIT,
+                  "max_event_pages": MAX_EVENT_PAGES,
+                  "source_events": data.pop("source_events", 0),
+                  "target_container_samples": data.pop("target_container_samples", 0),
+                  "pod_samples": data.pop("pod_samples", 0),
+                  "sample_records_complete": data.pop("sample_records_complete", False),
+                  "sample_records_truncated": data.pop("sample_records_truncated", False),
+                  "observed_summary": data.pop("observed_summary", {}),
+                  "samples": data.pop("samples", []),
+                  "metric_inventory_complete": data.pop("metric_inventory_complete", False),
+                  "exact_metric_definitions": data.pop("exact_metric_definitions", []),
+                  "metric_data_complete": data.pop("metric_data_complete", False),
+                  "metric_data_truncated": data.pop("metric_data_truncated", False),
+                  "metric_series": data.pop("metric_series", []),
+              }
+              print(json.dumps(report, ensure_ascii=True, separators=(",", ":")), flush=True)
+
+          def aws_json(args, max_bytes):
+              try:
+                  result = subprocess.run([*BASE, *args], capture_output=True, timeout=25)
+              except FileNotFoundError:
+                  raise Refusal("aws_unavailable") from None
+              except subprocess.TimeoutExpired:
+                  raise Refusal("aws_timeout") from None
+              if result.returncode:
+                  stderr = result.stderr[:4096]
+                  if b"AccessDenied" in stderr or b"UnauthorizedOperation" in stderr:
+                      raise Refusal("access_denied")
+                  raise Refusal("aws_query_failed")
+              if len(result.stdout) > max_bytes:
+                  raise Refusal("response_too_large")
+              try:
+                  value = json.loads(result.stdout)
+              except (UnicodeDecodeError, ValueError):
+                  raise Refusal("invalid_response") from None
+              if not isinstance(value, dict):
+                  raise Refusal("invalid_response")
+              return value
+
+          def cloudwatch_json(args, max_bytes):
+              try:
+                  result = subprocess.run(
+                      [*BASE[:-1], "cloudwatch", *args], capture_output=True, timeout=25
+                  )
+              except FileNotFoundError:
+                  raise Refusal("aws_unavailable") from None
+              except subprocess.TimeoutExpired:
+                  raise Refusal("aws_timeout") from None
+              if result.returncode:
+                  stderr = result.stderr[:4096]
+                  if b"AccessDenied" in stderr or b"UnauthorizedOperation" in stderr:
+                      raise Refusal("access_denied")
+                  raise Refusal("aws_metric_query_failed")
+              if len(result.stdout) > max_bytes:
+                  raise Refusal("response_too_large")
+              try:
+                  value = json.loads(result.stdout)
+              except (UnicodeDecodeError, ValueError):
+                  raise Refusal("invalid_response") from None
+              if not isinstance(value, dict):
+                  raise Refusal("invalid_response")
+              return value
+
+          def valid_token(token, previous, seen):
+              if (
+                  not isinstance(token, str) or not token
+                  or len(token) > 2048 or token == previous or token in seen
+              ):
+                  raise Refusal("pagination_invalid")
+              seen.add(token)
+              return token
+
+          def numeric_fields(body, kind):
+              metrics = {}
+              for field in METRIC_FIELDS[kind]:
+                  if field not in body:
+                      continue
+                  value = body[field]
+                  if type(value) is not int or not 0 <= value <= 2**63 - 1:
+                      raise Refusal("invalid_numeric_metric")
+                  metrics[field] = value
+              if not any(field.endswith(("_usage", "_working_set")) for field in metrics):
+                  return None
+              return metrics
+
+          def summarize(samples):
+              result = {}
+              for kind in ("Container", "Pod"):
+                  selected = [sample for sample in samples if sample["type"] == kind]
+                  if not selected:
+                      continue
+                  selected.sort(key=lambda sample: sample["sample_timestamp_ms"])
+                  fields = METRIC_FIELDS[kind]
+                  metrics = {}
+                  for field in fields:
+                      present = [sample for sample in selected if field in sample["metrics"]]
+                      if not present:
+                          continue
+                      max_sample = max(present, key=lambda sample: sample["metrics"][field])
+                      metrics[field] = {
+                          "observed_max": max_sample["metrics"][field],
+                          "observed_max_at_utc": utc(max_sample["sample_timestamp_ms"]),
+                          "first": present[0]["metrics"][field],
+                          "last": present[-1]["metrics"][field],
+                      }
+                  gaps = [
+                      (later["sample_timestamp_ms"] - earlier["sample_timestamp_ms"]) / 1000
+                      for earlier, later in zip(selected, selected[1:])
+                  ]
+                  result[kind.lower()] = {
+                      "sample_count": len(selected),
+                      "first_at_utc": utc(selected[0]["sample_timestamp_ms"]),
+                      "last_at_utc": utc(selected[-1]["sample_timestamp_ms"]),
+                      "seconds_from_last_sample_to_oom": round(
+                          (END_MS - 1000 - selected[-1]["sample_timestamp_ms"]) / 1000, 3
+                      ),
+                      "max_sample_gap_seconds": max(gaps) if gaps else None,
+                      "metrics": metrics,
+                  }
+              return result
+
+          def exact_metric_definitions():
+              definitions = []
+              for metric_name in METRIC_NAMES:
+                  response = cloudwatch_json([
+                      "list-metrics", "--namespace", "ContainerInsights",
+                      "--metric-name", metric_name, "--dimensions",
+                      "Name=FullPodName,Value=" + POD,
+                  ], 1_000_000)
+                  metrics = response.get("Metrics")
+                  if not isinstance(metrics, list) or len(metrics) > 500:
+                      raise Refusal("invalid_response")
+                  if response.get("NextToken") is not None:
+                      raise Refusal("metric_inventory_truncated")
+                  for metric in metrics:
+                      if (
+                          not isinstance(metric, dict)
+                          or metric.get("Namespace") != "ContainerInsights"
+                          or metric.get("MetricName") != metric_name
+                      ):
+                          raise Refusal("invalid_response")
+                      dimensions = metric.get("Dimensions")
+                      if not isinstance(dimensions, list) or len(dimensions) > 10:
+                          raise Refusal("invalid_response")
+                      dimension_map = {}
+                      for dimension in dimensions:
+                          if not isinstance(dimension, dict):
+                              raise Refusal("invalid_response")
+                          name = dimension.get("Name")
+                          value = dimension.get("Value")
+                          if (
+                              not isinstance(name, str) or not isinstance(value, str)
+                              or name in dimension_map
+                          ):
+                              raise Refusal("invalid_response")
+                          dimension_map[name] = value
+                      if any((
+                          dimension_map.get("ClusterName") != CLUSTER,
+                          dimension_map.get("Namespace") != NAMESPACE,
+                          dimension_map.get("FullPodName") != POD,
+                      )):
+                          continue
+                      if metric_name != "pod_memory_working_set" and (
+                          dimension_map.get("ContainerName") != CONTAINER
+                      ):
+                          continue
+                      if not set(dimension_map).issubset({
+                          "ClusterName", "Namespace", "PodName", "FullPodName",
+                          "ContainerName",
+                      }):
+                          continue
+                      definitions.append({
+                          "metric_name": metric_name,
+                          "dimensions": dimensions,
+                          "dimension_names": sorted(dimension_map),
+                          "scope_level": (
+                              "pod" if metric_name == "pod_memory_working_set"
+                              else "container"
+                          ),
+                      })
+              selected = []
+              for metric_name in METRIC_NAMES:
+                  candidates = [
+                      definition for definition in definitions
+                      if definition["metric_name"] == metric_name
+                  ]
+                  if candidates:
+                      selected.append(max(candidates, key=lambda item: len(item["dimensions"])))
+              return selected
+
+          def metric_data(definitions):
+              if not definitions:
+                  return [], True
+              queries = []
+              names_by_id = {}
+              for index, definition in enumerate(definitions, 1):
+                  query_id = "m" + str(index)
+                  names_by_id[query_id] = definition["metric_name"]
+                  queries.append({
+                      "Id": query_id,
+                      "MetricStat": {
+                          "Metric": {
+                              "Namespace": "ContainerInsights",
+                              "MetricName": definition["metric_name"],
+                              "Dimensions": definition["dimensions"],
+                          },
+                          "Period": 60,
+                          "Stat": "Maximum",
+                      },
+                      "ReturnData": True,
+                  })
+              response = cloudwatch_json([
+                  "get-metric-data", "--start-time", utc(START_MS),
+                  "--end-time", utc(END_MS), "--scan-by", "TimestampAscending",
+                  "--max-datapoints", "200", "--metric-data-queries",
+                  json.dumps(queries, separators=(",", ":")),
+              ], 1_000_000)
+              results = response.get("MetricDataResults")
+              if not isinstance(results, list) or len(results) > len(queries):
+                  raise Refusal("invalid_response")
+              complete = response.get("NextToken") is None
+              series = []
+              seen_ids = set()
+              for result in results:
+                  if not isinstance(result, dict):
+                      raise Refusal("invalid_response")
+                  query_id = result.get("Id")
+                  if query_id not in names_by_id or query_id in seen_ids:
+                      raise Refusal("invalid_response")
+                  seen_ids.add(query_id)
+                  if result.get("StatusCode") != "Complete":
+                      complete = False
+                  timestamps = result.get("Timestamps")
+                  values = result.get("Values")
+                  if (
+                      not isinstance(timestamps, list) or not isinstance(values, list)
+                      or len(timestamps) != len(values) or len(values) > 200
+                  ):
+                      raise Refusal("invalid_response")
+                  points = []
+                  for stamp, value in zip(timestamps, values):
+                      if not isinstance(stamp, str) or type(value) not in (int, float):
+                          raise Refusal("invalid_response")
+                      try:
+                          parsed = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+                      except ValueError:
+                          raise Refusal("invalid_response") from None
+                      if parsed.tzinfo is None:
+                          raise Refusal("invalid_response")
+                      timestamp_ms = int(parsed.timestamp() * 1000)
+                      # CloudWatch rounds minute periods; boundary buckets can include
+                      # a previous or replacement container in this same pod.
+                      if not START_MS - 60_000 <= timestamp_ms < END_MS + 60_000:
+                          raise Refusal("invalid_response")
+                      if not math.isfinite(value) or not 0 <= value <= 2**63 - 1:
+                          raise Refusal("invalid_response")
+                      points.append({"timestamp_utc": utc(timestamp_ms), "value": value})
+                  points.sort(key=lambda point: point["timestamp_utc"])
+                  series.append({
+                      "metric_name": names_by_id[query_id],
+                      "period_seconds": 60,
+                      "stat": "Maximum",
+                      "boundary_buckets_can_mix_container_incarnations": True,
+                      "points": points,
+                  })
+              if seen_ids != set(names_by_id):
+                  complete = False
+              return series, complete
+
+          group_names = []
+          group_complete = False
+          try:
+              deadline = time.monotonic() + DEADLINE_SECONDS
+              token = None
+              seen_tokens = set()
+              for _ in range(MAX_GROUP_PAGES):
+                  if time.monotonic() >= deadline:
+                      raise Refusal("query_deadline")
+                  args = [
+                      "describe-log-groups", "--log-group-name-prefix", PREFIX,
+                      "--limit", str(GROUP_PAGE_LIMIT),
+                  ]
+                  if token is not None:
+                      args.extend(["--next-token", token])
+                  page = aws_json(args, 1_000_000)
+                  groups = page.get("logGroups")
+                  if not isinstance(groups, list) or len(groups) > GROUP_PAGE_LIMIT:
+                      raise Refusal("invalid_response")
+                  for group in groups:
+                      if not isinstance(group, dict):
+                          raise Refusal("invalid_response")
+                      name = group.get("logGroupName")
+                      if (
+                          not isinstance(name, str) or not name.startswith(PREFIX)
+                          or len(name) > 512 or not re.fullmatch(r"[A-Za-z0-9_./#-]+", name)
+                      ):
+                          raise Refusal("invalid_response")
+                      group_names.append(name)
+                  next_token = page.get("nextToken")
+                  if next_token is None:
+                      group_complete = True
+                      break
+                  token = valid_token(next_token, token, seen_tokens)
+              group_names = sorted(set(group_names))
+              if PERFORMANCE_GROUP not in group_names:
+                  if not group_complete:
+                      emit(
+                          "group_inventory_truncated",
+                          group_names=group_names,
+                          group_inventory_complete=False,
+                          group_inventory_truncated=True,
+                      )
+                      raise SystemExit(2)
+                  definitions = exact_metric_definitions()
+                  series, metric_complete = metric_data(definitions)
+                  metric_has_points = any(item["points"] for item in series)
+                  emit(
+                      (
+                          "metrics_complete" if definitions and metric_complete and metric_has_points
+                          else "exact_metric_unavailable" if not definitions
+                          else "metrics_no_points" if metric_complete
+                          else "metric_data_truncated"
+                      ),
+                      group_names=group_names,
+                      group_inventory_complete=True,
+                      metric_inventory_complete=True,
+                      exact_metric_definitions=[
+                          {
+                              "metric_name": definition["metric_name"],
+                              "scope_level": definition["scope_level"],
+                              "dimension_names": definition["dimension_names"],
+                          }
+                          for definition in definitions
+                      ],
+                      metric_data_complete=metric_complete,
+                      metric_data_truncated=not metric_complete,
+                      metric_series=series,
+                  )
+                  raise SystemExit(
+                      0 if definitions and metric_complete and metric_has_points else 2
+                  )
+
+              token = None
+              seen_tokens = set()
+              seen_event_ids = set()
+              samples = []
+              source_events = 0
+              event_pages = 0
+              source_complete = False
+              for event_pages in range(1, MAX_EVENT_PAGES + 1):
+                  if time.monotonic() >= deadline:
+                      raise Refusal("query_deadline")
+                  args = [
+                      "filter-log-events", "--log-group-name", PERFORMANCE_GROUP,
+                      "--start-time", str(START_MS), "--end-time", str(END_MS),
+                      "--filter-pattern", FILTER, "--limit", str(EVENT_PAGE_LIMIT),
+                  ]
+                  if token is not None:
+                      args.extend(["--next-token", token])
+                  page = aws_json(args, 4_000_000)
+                  events = page.get("events")
+                  if not isinstance(events, list) or len(events) > EVENT_PAGE_LIMIT:
+                      raise Refusal("invalid_response")
+                  for event in events:
+                      if not isinstance(event, dict):
+                          raise Refusal("invalid_response")
+                      event_id = event.get("eventId")
+                      event_ms = event.get("timestamp")
+                      if (
+                          not isinstance(event_id, str) or not event_id
+                          or type(event_ms) is not int or not START_MS <= event_ms < END_MS
+                      ):
+                          raise Refusal("invalid_response")
+                      if event_id in seen_event_ids:
+                          continue
+                      seen_event_ids.add(event_id)
+                      try:
+                          body = json.loads(event["message"])
+                      except (KeyError, TypeError, ValueError):
+                          raise Refusal("invalid_response") from None
+                      if not isinstance(body, dict):
+                          raise Refusal("invalid_response")
+                      kube = body.get("kubernetes")
+                      if not isinstance(kube, dict) or any((
+                          body.get("ClusterName") != CLUSTER,
+                          kube.get("namespace_name") != NAMESPACE,
+                          kube.get("pod_name") != POD,
+                      )):
+                          raise Refusal("scope_mismatch")
+                      source_events += 1
+                      kind = body.get("Type")
+                      if kind not in METRIC_FIELDS:
+                          continue
+                      if kind == "Container" and kube.get("container_name") != CONTAINER:
+                          continue
+                      raw_sample_ms = body.get("Timestamp")
+                      if isinstance(raw_sample_ms, str) and raw_sample_ms.isdecimal():
+                          sample_ms = int(raw_sample_ms)
+                      elif type(raw_sample_ms) is int:
+                          sample_ms = raw_sample_ms
+                      elif isinstance(raw_sample_ms, str):
+                          try:
+                              parsed = datetime.fromisoformat(
+                                  raw_sample_ms.replace("Z", "+00:00")
+                              )
+                          except ValueError:
+                              raise Refusal("invalid_sample_timestamp") from None
+                          if parsed.tzinfo is None:
+                              raise Refusal("invalid_sample_timestamp")
+                          sample_ms = int(parsed.astimezone(timezone.utc).timestamp() * 1000)
+                      else:
+                          raise Refusal("invalid_sample_timestamp")
+                      if not START_MS <= sample_ms < END_MS:
+                          raise Refusal("sample_outside_window")
+                      metrics = numeric_fields(body, kind)
+                      if metrics is None:
+                          continue
+                      samples.append({
+                          "type": kind,
+                          "sample_timestamp_ms": sample_ms,
+                          "event_timestamp_ms": event_ms,
+                          "metrics": metrics,
+                      })
+                  next_token = page.get("nextToken")
+                  if next_token is None:
+                      source_complete = True
+                      break
+                  token = valid_token(next_token, token, seen_tokens)
+
+              samples.sort(key=lambda sample: (sample["sample_timestamp_ms"], sample["type"]))
+              selected = samples[:FIRST_SAMPLES]
+              if len(samples) > FIRST_SAMPLES:
+                  selected += samples[-LAST_SAMPLES:]
+              selected = [
+                  {
+                      "type": sample["type"],
+                      "sample_timestamp_utc": utc(sample["sample_timestamp_ms"]),
+                      "event_timestamp_utc": utc(sample["event_timestamp_ms"]),
+                      "metrics": sample["metrics"],
+                  }
+                  for sample in selected
+              ]
+              emit(
+                  "complete" if source_complete else "truncated",
+                  group_names=group_names,
+                  group_inventory_complete=group_complete,
+                  group_inventory_truncated=not group_complete,
+                  source_complete=source_complete,
+                  source_truncated=not source_complete,
+                  event_pages_read=event_pages,
+                  source_events=source_events,
+                  target_container_samples=sum(
+                      sample["type"] == "Container" for sample in samples
+                  ),
+                  pod_samples=sum(sample["type"] == "Pod" for sample in samples),
+                  sample_records_complete=source_complete and len(samples) == len(selected),
+                  sample_records_truncated=len(samples) > len(selected),
+                  observed_summary=summarize(samples),
+                  samples=selected,
+              )
+              if not source_complete:
+                  raise SystemExit(2)
+          except Refusal as error:
+              emit(
+                  error.status,
+                  group_names=group_names,
+                  group_inventory_complete=group_complete,
+                  group_inventory_truncated=not group_complete,
+              )
+              raise SystemExit(1) from None
+          except Exception:
+              emit(
+                  "unexpected_failure",
+                  group_names=group_names,
+                  group_inventory_complete=group_complete,
+                  group_inventory_truncated=not group_complete,
+              )
               raise SystemExit(1) from None
           PY
