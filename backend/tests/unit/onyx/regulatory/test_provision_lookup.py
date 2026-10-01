@@ -129,6 +129,41 @@ def test_generic_source_name_does_not_match_another_numbered_law() -> None:
     assert result.status == "not_found_in_scope"
 
 
+def test_generic_turkish_title_matches_uppercase_heading_without_crossing_source() -> (
+    None
+):
+    regulation = chunk(
+        source="GÜMRÜK YÖNETMELİĞİ",
+        heading="MADDE 104",
+        text="MADDE 104- (1) Kaynak hüküm.",
+    )
+    index = MagicMock()
+    index.keyword_retrieval.return_value = [regulation]
+
+    result = lookup_provision(
+        ProvisionRequest(source="Gümrük Yönetmeliği", article_number="104"),
+        document_index=index,
+        filters=IndexFilters(access_control_list=["user:1"]),
+    )
+
+    assert result.status == "found"
+    assert result.chunks == [regulation]
+
+    index.keyword_retrieval.return_value = [
+        chunk(
+            source="GÜMRÜK KANUNU",
+            heading="MADDE 104",
+            text="MADDE 104- Başka kaynak.",
+        )
+    ]
+    other = lookup_provision(
+        ProvisionRequest(source="Gümrük Yönetmeliği", article_number="104"),
+        document_index=index,
+        filters=IndexFilters(access_control_list=["user:1"]),
+    )
+    assert other.status == "not_found_in_scope"
+
+
 def test_same_title_different_files_is_ambiguous_not_first_hit() -> None:
     result, _, _ = run_lookup([chunk(file="year-2025"), chunk(file="year-2026")])
     assert result.status == "ambiguous_source"

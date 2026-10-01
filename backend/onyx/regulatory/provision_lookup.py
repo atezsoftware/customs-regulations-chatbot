@@ -1,6 +1,7 @@
 """Bounded structural reads from the authorized, published search index."""
 
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import date
 from typing import Literal, Self
@@ -139,15 +140,23 @@ def _source_matches(source: str, row: InferenceChunk) -> bool:
             and title_tokens <= set(source_identity_distinguishing_tokens(name))
             for name in names
         )
+
     # Generic titles still need their own title; an official-number prefix on
     # that title does not change the instrument name.
-    requested_title = " ".join(source.casefold().split())
+    def title_identity(value: str) -> str:
+        folded = unicodedata.normalize("NFKD", value.casefold().replace("ı", "i"))
+        plain = "".join(
+            character for character in folded if not unicodedata.combining(character)
+        )
+        return " ".join(re.findall(r"[a-z0-9]+", plain))
+
+    requested_title = title_identity(source)
     return any(
         requested_title
         == re.sub(
-            r"^\d{3,5}\s+say[ıi]l[ıi]\s+",
+            r"^\d{3,5}\s+sayili\s+",
             "",
-            " ".join(name.casefold().split()),
+            title_identity(name),
         )
         for name in names
     )
@@ -273,7 +282,9 @@ def _bounded_article_span(
     if next_opening is None or article_identity(next_opening.group()) == identity:
         return []
     bounded = window[indices[0] : boundary + 1]
-    if any(right.chunk_id != left.chunk_id + 1 for left, right in zip(bounded, bounded[1:])):
+    if any(
+        right.chunk_id != left.chunk_id + 1 for left, right in zip(bounded, bounded[1:])
+    ):
         return []
     return window[indices[0] : boundary]
 
