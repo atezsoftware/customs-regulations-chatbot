@@ -207,13 +207,16 @@ def main() -> None:
             )
             if dependencies:
                 binding_indexes = {}
+                previous_ids = set(manifest.previous_binding_ids)
                 for binding in manifest.bindings:
                     idx = binding.index
                     key = (
+                        "retained" if binding.id in previous_ids else "new",
                         idx.index_uuid,
                         idx.embedding_config_sha256,
                         len(idx.encoder_receipts),
                         type(binding.projection).__name__,
+                        binding.derived_role,
                     )
                     binding_indexes[key] = binding_indexes.get(key, 0) + 1
                 print("BINDING_INDEXES_460", json.dumps(list(binding_indexes.items())))
