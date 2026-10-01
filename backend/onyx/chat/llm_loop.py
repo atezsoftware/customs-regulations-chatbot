@@ -24,6 +24,7 @@ from onyx.chat.citation_utils import (
 from onyx.chat.emitter import BufferedEmitter, Emitter
 from onyx.chat.empty_response import (
     REFUSAL_FINISH_REASONS,
+    EmptyLLMResponseError,
     build_empty_llm_response_error,
 )
 from onyx.chat.llm_step import (
@@ -151,6 +152,7 @@ _REGULATORY_SEARCH_LLM_CHUNKS_PER_CALL = 10
 _REGULATORY_BOOTSTRAP_COVERAGE_CYCLES = 1
 _REGULATORY_AUTONOMOUS_RESEARCH_CYCLES = 1
 _MAX_EMPTY_FINAL_RESPONSE_RETRIES = 1
+_MAX_DISABLED_TOOL_RESPONSE_RETRIES = 1
 _FAST_REGULATORY_ABSENCE_RECOVERY_REMINDER = (
     "# Source-gap recovery correction\n"
     "The previous draft claimed that requested legal text was unavailable. "
@@ -2945,6 +2947,7 @@ def run_llm_loop(
         fast_absence_correction_pending = False
         fast_absence_recovery_feedback: str | None = None
         empty_final_response_retries = 0
+        disabled_tool_response_retries = 0
         complex_regulatory_request = False
         regulatory_user_message = ""
         regulatory_earlier_user_context: tuple[str, ...] = ()
@@ -3089,6 +3092,7 @@ def run_llm_loop(
                 + _REGULATORY_PROJECTED_STOP_SYNTHESIS_CYCLES
                 + _REGULATORY_BOOTSTRAP_COVERAGE_CYCLES
                 + _REGULATORY_AUTONOMOUS_RESEARCH_CYCLES
+                + _MAX_DISABLED_TOOL_RESPONSE_RETRIES
             )
             if complex_regulatory_request
             else 0
@@ -3671,6 +3675,45 @@ def run_llm_loop(
             )
             if attempted:
                 fallback_extraction_attempted = True
+
+            if (
+                complex_regulatory_request
+                and tool_choice is ToolChoiceOptions.NONE
+                and llm_step_result.tool_calls
+            ):
+                logger.warning(
+                    "Regulatory final synthesis returned %d tool call(s) with "
+                    "tools disabled; provider=%s model=%s finish_reason=%s cycle=%d",
+                    len(llm_step_result.tool_calls),
+                    llm.config.model_provider,
+                    llm.config.model_name,
+                    llm_step_result.finish_reason,
+                    llm_cycle_count,
+                )
+                if (
+                    disabled_tool_response_retries < _MAX_DISABLED_TOOL_RESPONSE_RETRIES
+                    and llm_cycle_count < maximum_cycle_count - 1
+                ):
+                    disabled_tool_response_retries += 1
+                    regulatory_tool_feedback = (
+                        "The previous response attempted an unavailable tool. "
+                        "No tools are available. Answer using the evidence already "
+                        "provided, or state the precise source gap."
+                    )
+                    continue
+                raise EmptyLLMResponseError(
+                    provider=llm.config.model_provider,
+                    model=llm.config.model_name,
+                    tool_choice=tool_choice,
+                    client_error_msg=(
+                        "The selected model attempted a tool call during final "
+                        "synthesis even though tools were disabled, and did not "
+                        "produce a usable final answer."
+                    ),
+                    error_code="UNEXPECTED_FINAL_TOOL_CALL",
+                    is_retryable=True,
+                    finish_reason=llm_step_result.finish_reason,
+                )
 
             if autonomous_regulatory_research_turn:
                 regulatory_autonomous_research_completed = True
