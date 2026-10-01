@@ -4,7 +4,7 @@ on:
     inputs:
       operation:
         type: choice
-        options: [inspect, approve_462, approve_465, approve_470, repair_299]
+        options: [inspect, approve_462, approve_465, approve_470, repair_299, retry_306]
         default: inspect
 permissions:
   contents: read
@@ -106,3 +106,12 @@ jobs:
           kubectl exec -i "$pod" -n customs-regulations-dev -c "$container" -- \
             sh -ec '. /vault/secrets/config; export PYTHONPATH=/app; exec python -' < \
             backend/onyx/db/repair_amendment_batch_299.py
+      - name: Retry only batch 306's unmatched instruction
+        if: inputs.operation == 'retry_306'
+        shell: bash
+        run: |
+          set -euo pipefail
+          IFS=$'\t' read -r pod container < /tmp/amendment-target
+          kubectl exec -i "$pod" -n customs-regulations-dev -c "$container" -- \
+            sh -ec '. /vault/secrets/config; export PYTHONPATH=/app; exec python -' < \
+            backend/onyx/db/retry_amendment_batch_306.py
