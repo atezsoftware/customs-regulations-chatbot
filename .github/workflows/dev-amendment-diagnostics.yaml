@@ -51,7 +51,35 @@ jobs:
             echo "INCIDENT_CGROUP $pod $container"
             kubectl exec "$pod" -n "$namespace" -c "$container" -- \
               cat /sys/fs/cgroup/memory.events
+            kubectl logs "$pod" -n "$namespace" -c "$container" --previous --timestamps --tail=5000 > /tmp/dev-api-previous.log 2>/dev/null || true
+            python3 -c '
+          import collections,re
+          from pathlib import Path
+          lines=Path("/tmp/dev-api-previous.log").read_text(errors="replace").splitlines()
+          counts=collections.Counter()
+          samples=[]
+          for line in lines:
+              timestamp=line.split(" ",1)[0]
+              for label,pattern in (("final_answer_error",r"did not return a final answer"),("memory_error",r"MemoryError|Cannot allocate memory"),("request_error",r"Error from gemini|There was an error with the response"),("http_5xx",r"HTTP/1\\.1. 5[0-9][0-9]")):
+                  if re.search(pattern,line,re.I):
+                      counts[label]+=1
+                      samples.append({"time":timestamp,"kind":label})
+          print("INCIDENT_PREVIOUS_LOG",{"line_count":len(lines),"signals":dict(counts),"latest_signals":samples[-30:]})
+          '
           done < <(kubectl get pods -n "$namespace" -o json | jq -r '.items[] | select(.metadata.deletionTimestamp == null and (.metadata.name | test("customs-regulations-api"))) | .metadata.name as $pod | .spec.containers[] | select(.image | contains("customs-regulations-backend-lite")) | [$pod,.name] | @tsv')
+          kubectl get deployment -n "$namespace" -o json | python3 -c '
+          import json,sys
+          for deployment in json.load(sys.stdin)["items"]:
+              name=deployment["metadata"]["name"]
+              if "customs-regulations-api" not in name:
+                  continue
+              print("INCIDENT_DEPLOYMENT",{"name":name,"replicas":deployment["spec"].get("replicas"),"ready":deployment["status"].get("readyReplicas",0),"available":deployment["status"].get("availableReplicas",0)})
+          '
+          kubectl get nodes -o json | python3 -c '
+          import json,sys
+          for node in json.load(sys.stdin)["items"]:
+              print("INCIDENT_NODE",{"name":node["metadata"]["name"],"allocatable_memory":node["status"]["allocatable"].get("memory"),"capacity_memory":node["status"]["capacity"].get("memory")})
+          '
       - name: Inspect or launch the existing DEV project repair
         shell: bash
         run: |
