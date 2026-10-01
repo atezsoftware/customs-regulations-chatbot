@@ -309,17 +309,42 @@ jobs:
                   args, capture_output=True, text=True, errors="replace", timeout=timeout
               )
 
-          def operation_for(logger, message):
-              value = (logger + " " + message).lower()
+          def logger_basename(logger):
+              # A logger's module/file name is metadata; discard any other shape.
+              name = logger.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+              if not name.endswith(".py"):
+                  name = name.rsplit(".", 1)[-1] + ".py"
+              if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}\.py", name):
+                  return name
+              return "other"
+
+          def operation_for(logger_name, message):
+              value = (logger_name + " " + message).lower()
+              if logger_name == "answer_graph.py":
+                  return "answer_graph"
+              if logger_name == "coverage_plan.py":
+                  return "coverage_plan"
               if "rerank" in value:
                   return "rerank"
+              if logger_name == "llm_loop.py" and message.lower().startswith(
+                  "fast regulatory embedding batch prime failed"
+              ):
+                  return "search"
+              if logger_name in {"multi_llm.py", "litellm_singleton.py", "openrouter.py"}:
+                  return "provider"
+              if logger_name in {"search_runner.py", "search_tool.py", "search_utils.py"}:
+                  return "search"
+              if logger_name == "utils.py" and "llm" in message.lower():
+                  return "provider"
               if "coverage_plan" in value or "coverage plan" in value:
                   return "coverage_plan"
               if any(term in value for term in ("search_tool", "internal_search", "elasticsearch", "search pipeline")):
                   return "search"
               if "tool_runner" in value or "tool execution" in value:
                   return "tool_execution"
-              if any(term in value for term in ("llm_loop", "litellm", "gemini", "openrouter", "provider")):
+              if any(term in value for term in ("litellm", "gemini", "openrouter", "provider")):
+                  return "provider"
+              if "llm_loop" in value:
                   return "llm"
               if any(term in value for term in ("sqlalchemy", "database", "db_pool", "postgres")):
                   return "database"
@@ -341,6 +366,61 @@ jobs:
                   return "rate_limit"
               if level in {"ERROR", "CRITICAL"}:
                   return "other_error"
+              return "none"
+
+          def signature_for(logger_name, level, message):
+              value = message.lower()
+              if logger_name == "coverage_plan.py":
+                  if value.startswith("regulatory request inventory failed"):
+                      return "planning_inventory_fallback"
+                  if value.startswith("regulatory coverage audit failed"):
+                      return "planning_audit_fallback"
+                  if value.startswith("regulatory coverage planning failed; no"):
+                      return "planning_no_fallback"
+                  if value.startswith("regulatory coverage planning failed; using"):
+                      return "planning_syntax_fallback"
+              if logger_name == "llm_loop.py":
+                  if value.startswith("fast regulatory embedding batch prime failed"):
+                      return "embedding_prime_fallback"
+                  if value.startswith("batched regulatory citation-gap search failed"):
+                      return "citation_gap_search_failed"
+              if logger_name == "search_runner.py":
+                  if value.startswith("regulatory hybrid retrieval could not embed"):
+                      return "embedding_lexical_fallback"
+                  if value.startswith("regulatory embedding circuit is open"):
+                      return "embedding_circuit_open"
+                  if value.startswith("regulatory hybrid retrieval found index/query"):
+                      return "vector_dimension_lexical_fallback"
+              if logger_name == "search_tool.py":
+                  if value.startswith("could not add internal_search receipt"):
+                      return "search_receipt_warning"
+                  if value.startswith("slack federated search error"):
+                      return "search_backend_error"
+              if logger_name == "answer_graph.py" and value.startswith("could not"):
+                  if "final answer graph" in value or "finalization" in value:
+                      return "graph_finalization_error"
+                  if "data link" in value:
+                      return "graph_link_error"
+                  if "step" in value:
+                      return "graph_step_error"
+                  if "node" in value:
+                      return "graph_node_error"
+                  if "capture" in value:
+                      return "graph_capture_error"
+              if logger_name == "service.py" and value.startswith("rerank provider"):
+                  return "rerank_provider_error"
+              if logger_name == "utils.py" and value.startswith("failed to call llm"):
+                  return "provider_call_error"
+              if level in {"ERROR", "CRITICAL"}:
+                  if logger_name == "coverage_plan.py":
+                      return "planning_error"
+                  if logger_name == "answer_graph.py":
+                      return "graph_error"
+                  if logger_name in {"search_runner.py", "search_tool.py", "search_utils.py"}:
+                      return "search_error"
+                  if logger_name in {"multi_llm.py", "litellm_singleton.py", "openrouter.py"}:
+                      return "provider_error"
+                  return "unclassified_error"
               return "none"
 
           def parse_line(line):
@@ -373,11 +453,14 @@ jobs:
                   "CRITICAL", "ERROR", "WARNING", "NOTICE", "INFO", "DEBUG"
               }:
                   return None
+              safe_logger = logger_basename(logger)
               return {
                   "time": timestamp,
                   "request_index": request_index[request_id],
-                  "operation": operation_for(logger, message),
+                  "logger_basename": safe_logger,
+                  "operation": operation_for(safe_logger, message),
                   "error_kind": error_for(level, message),
+                  "error_signature": signature_for(safe_logger, level, message),
               }
 
           deployment_result = run([
