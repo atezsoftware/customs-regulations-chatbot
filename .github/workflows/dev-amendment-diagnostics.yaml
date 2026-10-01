@@ -4,7 +4,7 @@ on:
     inputs:
       operation:
         type: choice
-        options: [inspect, launch, refresh_helpers]
+        options: [inspect, stabilize_api, launch, refresh_helpers]
         default: inspect
 permissions:
   contents: read
@@ -80,7 +80,28 @@ jobs:
           for node in json.load(sys.stdin)["items"]:
               print("INCIDENT_NODE",{"name":node["metadata"]["name"],"allocatable_memory":node["status"]["allocatable"].get("memory"),"capacity_memory":node["status"]["capacity"].get("memory")})
           '
+      - name: Stabilize DEV API capacity
+        if: inputs.operation == 'stabilize_api'
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws eks update-kubeconfig --name atez-dev-cluster --region eu-central-1
+          namespace=customs-regulations-dev
+          deployment=dev-customs-regulations-api-deployment
+          container=dev-customs-regulations-api-container
+          current=$(kubectl get deployment "$deployment" -n "$namespace" -o json)
+          jq -e --arg image '255114580789.dkr.ecr.eu-central-1.amazonaws.com/customs-regulations-backend-lite-dev:f576a260800d5285a262b9b198e2b81e4133e462' --arg container "$container" '
+            .spec.replicas == 1 and
+            any(.spec.template.spec.containers[]; .name == $container and .image == $image and .resources.limits.memory == "2560Mi" and .resources.requests.memory == "1Gi")
+          ' <<< "$current" >/dev/null
+          kubectl scale deployment "$deployment" -n "$namespace" --replicas=2
+          kubectl rollout status deployment "$deployment" -n "$namespace" --timeout=300s
+          kubectl set resources deployment "$deployment" -n "$namespace" -c "$container" \
+            --limits=cpu=1,memory=4Gi --requests=cpu=100m,memory=1Gi
+          kubectl rollout status deployment "$deployment" -n "$namespace" --timeout=300s
+          kubectl get deployment "$deployment" -n "$namespace" -o json | jq '{name:.metadata.name,replicas:.spec.replicas,ready:.status.readyReplicas,available:.status.availableReplicas,containers:[.spec.template.spec.containers[] | {name,image,resources}]}'
       - name: Inspect or launch the existing DEV project repair
+        if: inputs.operation != 'stabilize_api'
         shell: bash
         run: |
           set -euo pipefail
