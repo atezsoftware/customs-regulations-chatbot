@@ -500,6 +500,35 @@ def main() -> None:
                     "position": row.position,
                     "text_near_code": row.text[max(0, at - 100):at + 220],
                 }, ensure_ascii=False))
+        target_302 = "e10c4816-c679-453c-ae02-dfc16e071c88"
+        rows = list(connection.execute(
+            text(
+                "SELECT position, status, text FROM regulatory_chunk "
+                "WHERE user_file_id=CAST(:file_id AS uuid) ORDER BY position"
+            ),
+            {"file_id": target_302},
+        ))
+        print("SOURCE_302_CHUNK_SUMMARY", json.dumps({
+            "file_id": target_302,
+            "count": len(rows),
+            "contains_7_fasil": [row.position for row in rows if "7. FASIL" in row.text],
+            "contains_12_fasil": [row.position for row in rows if "12. FASIL" in row.text],
+            "contains_list_one": [row.position for row in rows if "I SAYILI" in row.text.upper() or "I sayılı" in row.text],
+            "contains_target_codes": [row.position for row in rows if any(code in row.text for code in (
+                "0703.10.19.00.11", "1206.00.91.00.19", "1206.00.99.00.19"))],
+            "last_chunks": [{"position": row.position, "excerpt": row.text[:240]}
+                            for row in rows[-6:]],
+        }, ensure_ascii=False))
+        candidate_files = connection.execute(text(
+            "SELECT id, name, status, chunk_count FROM user_file WHERE "
+            "name ILIKE '%ithalat%rejim%liste%' OR "
+            "name ILIKE '%ithalat%rejim%ek%' ORDER BY name LIMIT 40"
+        ))
+        for row in candidate_files:
+            print("SOURCE_302_ANNEX_CANDIDATE", json.dumps({
+                "id": str(row.id), "name": row.name,
+                "status": row.status, "chunk_count": row.chunk_count,
+            }, ensure_ascii=False))
         files = connection.execute(
             text(
                 "SELECT id, name, status, chunk_count FROM user_file WHERE "
