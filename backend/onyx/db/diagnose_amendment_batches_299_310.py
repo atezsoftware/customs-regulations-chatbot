@@ -12,16 +12,19 @@ from sqlalchemy.orm import Session
 
 
 def main() -> None:
-    local_values = dotenv_values(
-        Path("deployment/docker_compose/.env.remote-db.local")
-    )
+    local_values = dotenv_values(Path("deployment/docker_compose/.env.remote-db.local"))
     values = {
         "DB": os.environ.get("POSTGRES_DB") or local_values.get("REMOTE_POSTGRES_DB"),
-        "USER": os.environ.get("POSTGRES_USER") or local_values.get("REMOTE_POSTGRES_USER"),
-        "PASSWORD": os.environ.get("POSTGRES_PASSWORD") or local_values.get("REMOTE_POSTGRES_PASSWORD"),
-        "HOST": os.environ.get("POSTGRES_HOST") or local_values.get("REMOTE_POSTGRES_HOST"),
-        "PORT": os.environ.get("POSTGRES_PORT") or local_values.get("REMOTE_POSTGRES_PORT"),
-        "SSLMODE": os.environ.get("POSTGRES_SSLMODE") or local_values.get("REMOTE_POSTGRES_SSLMODE"),
+        "USER": os.environ.get("POSTGRES_USER")
+        or local_values.get("REMOTE_POSTGRES_USER"),
+        "PASSWORD": os.environ.get("POSTGRES_PASSWORD")
+        or local_values.get("REMOTE_POSTGRES_PASSWORD"),
+        "HOST": os.environ.get("POSTGRES_HOST")
+        or local_values.get("REMOTE_POSTGRES_HOST"),
+        "PORT": os.environ.get("POSTGRES_PORT")
+        or local_values.get("REMOTE_POSTGRES_PORT"),
+        "SSLMODE": os.environ.get("POSTGRES_SSLMODE")
+        or local_values.get("REMOTE_POSTGRES_SSLMODE"),
     }
     if values["DB"] != "customs-regulations-dev":
         raise RuntimeError("Expected explicit DEV database")
@@ -38,11 +41,7 @@ def main() -> None:
             "connect_timeout": 5,
             "options": "-c default_transaction_read_only=on -c search_path=public "
             "-c statement_timeout=30000 -c application_name=amendment_299_310_audit",
-            **(
-                {"sslmode": values["SSLMODE"]}
-                if values["SSLMODE"]
-                else {}
-            ),
+            **({"sslmode": values["SSLMODE"]} if values["SSLMODE"] else {}),
         },
         pool_size=1,
         max_overflow=0,
@@ -73,7 +72,9 @@ def main() -> None:
                         "segmented_count": len(batch["segmented_instructions"] or []),
                         "log_tail": (batch["analysis_log"] or [])[-4:],
                         "file_count": len(batch["user_file_ids"] or []),
-                        "raw_sha256": hashlib.sha256(batch["raw_text"].encode()).hexdigest(),
+                        "raw_sha256": hashlib.sha256(
+                            batch["raw_text"].encode()
+                        ).hexdigest(),
                         "source_package_id": str(batch["source_package_id"]),
                         "updated_at": str(batch["updated_at"]),
                     },
@@ -87,31 +88,45 @@ def main() -> None:
                     match_scope_fingerprint,
                 )
                 from onyx.db.models import AmendmentMatchCheckpoint
-                from onyx.regulatory.amendments.match_checkpoint import MatchedInstruction
+                from onyx.regulatory.amendments.match_checkpoint import (
+                    MatchedInstruction,
+                )
 
                 with Session(bind=connection) as orm_session:
                     checkpoint_row = orm_session.get(AmendmentMatchCheckpoint, (299, 5))
                     if checkpoint_row is not None:
-                        frozen = MatchedInstruction.model_validate(checkpoint_row.payload)
+                        frozen = MatchedInstruction.model_validate(
+                            checkpoint_row.payload
+                        )
                         actual = _source_fingerprints(
                             orm_session, list(checkpoint_row.source_fingerprints)
                         )
                         changed = [
-                            chunk_id for chunk_id, digest in checkpoint_row.source_fingerprints.items()
+                            chunk_id
+                            for chunk_id, digest in checkpoint_row.source_fingerprints.items()
                             if actual.get(chunk_id) != digest
                         ]
                         scope_now = match_scope_fingerprint(
                             orm_session, batch["user_file_ids"]
                         )
-                        print("CHECKPOINT_299_5", json.dumps({
-                            "candidate_count": len(checkpoint_row.source_fingerprints),
-                            "changed_candidate_ids": changed,
-                            "scope_matches": frozen.evidence is not None
-                            and frozen.evidence.scope_sha256 == scope_now,
-                            "frozen_scope": frozen.evidence.scope_sha256 if frozen.evidence else None,
-                            "current_scope": scope_now,
-                            "frozen_match_old_chunk_id": frozen.match.old_chunk_id,
-                        }))
+                        print(
+                            "CHECKPOINT_299_5",
+                            json.dumps(
+                                {
+                                    "candidate_count": len(
+                                        checkpoint_row.source_fingerprints
+                                    ),
+                                    "changed_candidate_ids": changed,
+                                    "scope_matches": frozen.evidence is not None
+                                    and frozen.evidence.scope_sha256 == scope_now,
+                                    "frozen_scope": frozen.evidence.scope_sha256
+                                    if frozen.evidence
+                                    else None,
+                                    "current_scope": scope_now,
+                                    "frozen_match_old_chunk_id": frozen.match.old_chunk_id,
+                                }
+                            ),
+                        )
                 from onyx.regulatory.amendments.draft_integrity import (
                     explicit_added_article_identity,
                     explicit_added_body,
@@ -119,45 +134,75 @@ def main() -> None:
                 from onyx.regulatory.amendments.new_provision_policy import (
                     explicitly_adds_top_level_provision,
                 )
+
                 instruction = (batch["segmented_instructions"] or [])[5]
                 instruction_text = instruction.get("instruction_text", "")
-                print("BATCH_299_6A_PARSE", json.dumps({
-                    "length": len(instruction_text),
-                    "tail": instruction_text[-360:],
-                    "is_top_level": explicitly_adds_top_level_provision(instruction_text),
-                    "body_length": len(explicit_added_body(instruction_text) or ""),
-                    "identity": explicit_added_article_identity(instruction_text),
-                }, ensure_ascii=False))
+                print(
+                    "BATCH_299_6A_PARSE",
+                    json.dumps(
+                        {
+                            "length": len(instruction_text),
+                            "tail": instruction_text[-360:],
+                            "is_top_level": explicitly_adds_top_level_provision(
+                                instruction_text
+                            ),
+                            "body_length": len(
+                                explicit_added_body(instruction_text) or ""
+                            ),
+                            "identity": explicit_added_article_identity(
+                                instruction_text
+                            ),
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
                 for event in batch["analysis_log"] or []:
                     indices = event.get("indices") or []
                     if 5 in indices or event.get("index") == 5:
-                        print("BATCH_299_INDEX_5", json.dumps(event, ensure_ascii=False, default=str))
+                        print(
+                            "BATCH_299_INDEX_5",
+                            json.dumps(event, ensure_ascii=False, default=str),
+                        )
             if batch["id"] == 306:
                 print(
                     "BATCH_306_SOURCE_MEMBER",
-                    "c7bed4e2-77a2-4609-bb52-3fdffcd15cb1"
-                    in batch["user_file_ids"],
+                    "c7bed4e2-77a2-4609-bb52-3fdffcd15cb1" in batch["user_file_ids"],
                 )
             if batch["id"] == 302 and batch["source_package_id"] is not None:
-                package = connection.execute(
-                    text(
-                        "SELECT id, status, input_spec, issues, asset_count FROM "
-                        "amendment_source_package WHERE id=:package_id"
+                package = (
+                    connection.execute(
+                        text(
+                            "SELECT id, status, input_spec, issues, asset_count FROM "
+                            "amendment_source_package WHERE id=:package_id"
+                        ),
+                        {"package_id": batch["source_package_id"]},
+                    )
+                    .mappings()
+                    .one_or_none()
+                )
+                assets = (
+                    connection.execute(
+                        text(
+                            "SELECT id, mime_type, display_name, original_url, final_url, "
+                            "sha256, text_sha256 FROM regulatory_source_asset "
+                            "WHERE package_id=:package_id ORDER BY display_name"
+                        ),
+                        {"package_id": batch["source_package_id"]},
+                    )
+                    .mappings()
+                    .all()
+                )
+                print(
+                    "BATCH_302_SOURCE_PACKAGE",
+                    json.dumps(
+                        {
+                            "package": dict(package) if package else None,
+                            "assets": [dict(asset) for asset in assets],
+                        },
+                        ensure_ascii=False,
+                        default=str,
                     ),
-                    {"package_id": batch["source_package_id"]},
-                ).mappings().one_or_none()
-                assets = connection.execute(
-                    text(
-                        "SELECT id, mime_type, display_name, original_url, final_url, "
-                        "sha256, text_sha256 FROM regulatory_source_asset "
-                        "WHERE package_id=:package_id ORDER BY display_name"
-                    ),
-                    {"package_id": batch["source_package_id"]},
-                ).mappings().all()
-                print("BATCH_302_SOURCE_PACKAGE", json.dumps({
-                    "package": dict(package) if package else None,
-                    "assets": [dict(asset) for asset in assets],
-                }, ensure_ascii=False, default=str))
+                )
             proposals = connection.execute(
                 text(
                     "SELECT id, instruction_index, instruction_text, status, "
@@ -183,13 +228,17 @@ def main() -> None:
                             "old_chunk_id": proposal["old_chunk_id"],
                             "applied_new_chunk_id": proposal["applied_new_chunk_id"],
                             "applied_new_chunk_ids": proposal["applied_new_chunk_ids"],
-                            "indexing_job_id": str(proposal["approval_indexing_job_id"]),
+                            "indexing_job_id": str(
+                                proposal["approval_indexing_job_id"]
+                            ),
                             "approval_error": proposal["approval_error"],
                             "file_id": draft.get("user_file_id"),
                             "draft_text_sha256": hashlib.sha256(
                                 str(draft.get("text", "")).encode()
                             ).hexdigest(),
-                            "draft_article": (draft.get("metadata") or {}).get("article_no"),
+                            "draft_article": (draft.get("metadata") or {}).get(
+                                "article_no"
+                            ),
                             "insertion_order": draft.get("insertion_order"),
                             "chunk_change_count": len(proposal["chunk_changes"] or []),
                             "updated_at": str(proposal["updated_at"]),
@@ -198,55 +247,110 @@ def main() -> None:
                         default=str,
                     ),
                 )
+                if proposal["id"] == 481:
+                    print(
+                        "PROPOSAL_481_REVIEW",
+                        json.dumps(
+                            {
+                                "instruction_text": proposal["instruction_text"],
+                                "draft_text": draft.get("text"),
+                                "draft_metadata": draft.get("metadata"),
+                                "heading_path": draft.get("heading_path"),
+                                "insertion_order": draft.get("insertion_order"),
+                                "validity_start_date": draft.get("validity_start_date"),
+                                "validity_end_date": draft.get("validity_end_date"),
+                                "source": draft.get("source"),
+                            },
+                            ensure_ascii=False,
+                            default=str,
+                        ),
+                    )
                 if proposal["id"] == 470:
                     from onyx.regulatory.amendments.draft_integrity import (
                         validate_explicit_replacement_texts,
                     )
+
                     for index, change in enumerate(proposal["chunk_changes"] or []):
                         old = change.get("old_chunk_snapshot") or {}
                         new = change.get("new_chunk_draft") or {}
-                        live = connection.execute(
-                            text(
-                                "SELECT id, user_file_id, text, chunk_type, heading_path, "
-                                "chunk_metadata, validity_start_date, validity_end_date, "
-                                "status, source, supersedes_chunk_id, "
-                                "superseded_by_chunk_id, created_at "
-                                "FROM regulatory_chunk WHERE id=:chunk_id"
-                            ),
-                            {"chunk_id": change.get("old_chunk_id")},
-                        ).mappings().one_or_none()
+                        live = (
+                            connection.execute(
+                                text(
+                                    "SELECT id, user_file_id, text, chunk_type, heading_path, "
+                                    "chunk_metadata, validity_start_date, validity_end_date, "
+                                    "status, source, supersedes_chunk_id, "
+                                    "superseded_by_chunk_id, created_at "
+                                    "FROM regulatory_chunk WHERE id=:chunk_id"
+                                ),
+                                {"chunk_id": change.get("old_chunk_id")},
+                            )
+                            .mappings()
+                            .one_or_none()
+                        )
                         if live is not None:
                             aliases = {"metadata": "chunk_metadata"}
                             mismatches = {}
                             for key, expected in old.items():
                                 if key not in {
-                                    "id", "user_file_id", "text", "chunk_type",
-                                    "heading_path", "metadata", "validity_start_date",
-                                    "validity_end_date", "status", "source",
-                                    "supersedes_chunk_id", "superseded_by_chunk_id",
+                                    "id",
+                                    "user_file_id",
+                                    "text",
+                                    "chunk_type",
+                                    "heading_path",
+                                    "metadata",
+                                    "validity_start_date",
+                                    "validity_end_date",
+                                    "status",
+                                    "source",
+                                    "supersedes_chunk_id",
+                                    "superseded_by_chunk_id",
                                     "created_at",
                                 }:
                                     continue
                                 actual = live[aliases.get(key, key)]
-                                if key in {"user_file_id", "created_at", "validity_start_date", "validity_end_date"} and actual is not None:
-                                    actual = actual.isoformat() if key != "user_file_id" else str(actual)
+                                if (
+                                    key
+                                    in {
+                                        "user_file_id",
+                                        "created_at",
+                                        "validity_start_date",
+                                        "validity_end_date",
+                                    }
+                                    and actual is not None
+                                ):
+                                    actual = (
+                                        actual.isoformat()
+                                        if key != "user_file_id"
+                                        else str(actual)
+                                    )
                                 if expected != actual:
                                     mismatches[key] = {
                                         "expected": str(expected)[:300],
                                         "actual": str(actual)[:300],
                                     }
-                            print("CHANGE_470_LIVE", json.dumps({
-                                "index": index,
-                                "old_id": change.get("old_chunk_id"),
-                                "status": live["status"],
-                                "mismatches": mismatches,
-                            }, ensure_ascii=False))
+                            print(
+                                "CHANGE_470_LIVE",
+                                json.dumps(
+                                    {
+                                        "index": index,
+                                        "old_id": change.get("old_chunk_id"),
+                                        "status": live["status"],
+                                        "mismatches": mismatches,
+                                    },
+                                    ensure_ascii=False,
+                                ),
+                            )
                         else:
-                            print("CHANGE_470_LIVE", json.dumps({
-                                "index": index,
-                                "old_id": change.get("old_chunk_id"),
-                                "missing": True,
-                            }))
+                            print(
+                                "CHANGE_470_LIVE",
+                                json.dumps(
+                                    {
+                                        "index": index,
+                                        "old_id": change.get("old_chunk_id"),
+                                        "missing": True,
+                                    }
+                                ),
+                            )
                         try:
                             validate_explicit_replacement_texts(
                                 list(change.get("instruction_texts") or []),
@@ -290,9 +394,15 @@ def main() -> None:
             {"file_id": "1e110f49-3814-4edd-9b08-f17b9f51eabe"},
         ).one_or_none()
         if manifest_row and manifest_row.writer_manifest:
-            from onyx.regulatory.writer_publication_models import WriterPublicationManifest
-            from onyx.document_index.publication_models import accepts_publication_projection
-            from onyx.regulatory.amendments.annexes.models import AnnexTemporalProjection
+            from onyx.document_index.publication_models import (
+                accepts_publication_projection,
+            )
+            from onyx.regulatory.amendments.annexes.models import (
+                AnnexTemporalProjection,
+            )
+            from onyx.regulatory.writer_publication_models import (
+                WriterPublicationManifest,
+            )
 
             manifest = WriterPublicationManifest.model_validate(
                 manifest_row.writer_manifest
@@ -355,7 +465,10 @@ def main() -> None:
                 print(
                     "REJECTED_BY_CURRENT_460",
                     json.dumps(
-                        {"count": len(rejected_by_current), "sample": rejected_by_current[:8]}
+                        {
+                            "count": len(rejected_by_current),
+                            "sample": rejected_by_current[:8],
+                        }
                     ),
                 )
                 rows = connection.execute(
@@ -410,56 +523,110 @@ def main() -> None:
                                 break
                     if failed >= 8:
                         break
-                print("RECEIPT_CHECK_460", json.dumps({"checked": checked, "failed": failed}))
+                print(
+                    "RECEIPT_CHECK_460",
+                    json.dumps({"checked": checked, "failed": failed}),
+                )
                 dependency_windows = {}
-                active_rows = connection.execute(text(
-                    "SELECT canonical_chunk_id, index_identity_sha256, effective_start, "
-                    "effective_end FROM regulatory_temporal_projection WHERE "
-                    "canonical_chunk_id = ANY(:ids) AND retired_at IS NULL"
-                ), {"ids": dependencies})
+                active_rows = connection.execute(
+                    text(
+                        "SELECT canonical_chunk_id, index_identity_sha256, effective_start, "
+                        "effective_end FROM regulatory_temporal_projection WHERE "
+                        "canonical_chunk_id = ANY(:ids) AND retired_at IS NULL"
+                    ),
+                    {"ids": dependencies},
+                )
                 for active_row in active_rows:
-                    dependency_windows.setdefault(active_row.canonical_chunk_id, []).append({
-                        "identity": active_row.index_identity_sha256,
-                        "start": active_row.effective_start,
-                        "end": active_row.effective_end,
-                        "origin": "active",
-                    })
+                    dependency_windows.setdefault(
+                        active_row.canonical_chunk_id, []
+                    ).append(
+                        {
+                            "identity": active_row.index_identity_sha256,
+                            "start": active_row.effective_start,
+                            "end": active_row.effective_end,
+                            "origin": "active",
+                        }
+                    )
                 for other in manifest.bindings:
                     if other.id in previous_ids:
                         continue
-                    identifier = json.loads(other.projection.source_json)["regulatory_chunk_id"]
-                    dependency_windows.setdefault(identifier, []).append({
-                        "identity": other.index.temporal_lookup_identity(),
-                        "start": other.effective_start,
-                        "end": other.effective_end,
-                        "origin": "pending",
-                    })
+                    identifier = json.loads(other.projection.source_json)[
+                        "regulatory_chunk_id"
+                    ]
+                    dependency_windows.setdefault(identifier, []).append(
+                        {
+                            "identity": other.index.temporal_lookup_identity(),
+                            "start": other.effective_start,
+                            "end": other.effective_end,
+                            "origin": "pending",
+                        }
+                    )
                 from onyx.regulatory.contextual import context_reference_date
+
                 window_issues = 0
                 for parent in manifest.bindings:
-                    if parent.id in previous_ids or parent.derived_role != "hierarchical_aggregate":
+                    if (
+                        parent.id in previous_ids
+                        or parent.derived_role != "hierarchical_aggregate"
+                    ):
                         continue
-                    identities = set(manifest_index_by_uuid[parent.index.index_uuid].temporal_lookup_identities())
+                    identities = set(
+                        manifest_index_by_uuid[
+                            parent.index.index_uuid
+                        ].temporal_lookup_identities()
+                    )
                     for identifier in parent.dependency_ids:
-                        windows = [w for w in dependency_windows.get(identifier, []) if w["identity"] in identities]
-                        reference_date = context_reference_date(parent.effective_start, parent.effective_end)
-                        selected = [w for w in windows if
-                            (w["start"] is None or w["start"] <= reference_date)
+                        windows = [
+                            w
+                            for w in dependency_windows.get(identifier, [])
+                            if w["identity"] in identities
+                        ]
+                        reference_date = context_reference_date(
+                            parent.effective_start, parent.effective_end
+                        )
+                        selected = [
+                            w
+                            for w in windows
+                            if (w["start"] is None or w["start"] <= reference_date)
                             and (w["end"] is None or w["end"] > reference_date)
                         ]
-                        noncovering = [w for w in selected if not (
-                            (w["start"] is None or parent.effective_start is not None and w["start"] <= parent.effective_start)
-                            and (w["end"] is None or parent.effective_end is not None and w["end"] >= parent.effective_end)
-                        )]
+                        noncovering = [
+                            w
+                            for w in selected
+                            if not (
+                                (
+                                    w["start"] is None
+                                    or parent.effective_start is not None
+                                    and w["start"] <= parent.effective_start
+                                )
+                                and (
+                                    w["end"] is None
+                                    or parent.effective_end is not None
+                                    and w["end"] >= parent.effective_end
+                                )
+                            )
+                        ]
                         if noncovering:
-                            print("WINDOW_MISMATCH_460", json.dumps({
-                                "parent": parent.id.hex,
-                                "parent_start": str(parent.effective_start),
-                                "parent_end": str(parent.effective_end),
-                                "dependency": identifier,
-                                "reference_date": str(reference_date),
-                                "windows": [{**w, "start": str(w["start"]), "end": str(w["end"])} for w in selected[:5]],
-                            }))
+                            print(
+                                "WINDOW_MISMATCH_460",
+                                json.dumps(
+                                    {
+                                        "parent": parent.id.hex,
+                                        "parent_start": str(parent.effective_start),
+                                        "parent_end": str(parent.effective_end),
+                                        "dependency": identifier,
+                                        "reference_date": str(reference_date),
+                                        "windows": [
+                                            {
+                                                **w,
+                                                "start": str(w["start"]),
+                                                "end": str(w["end"]),
+                                            }
+                                            for w in selected[:5]
+                                        ],
+                                    }
+                                ),
+                            )
                             window_issues += 1
                             if window_issues >= 12:
                                 break
@@ -467,39 +634,66 @@ def main() -> None:
                         break
                 print("WINDOW_ISSUE_COUNT_460", window_issues)
                 for item in manifest.bindings:
-                    if item.id.hex == "52424e5d41714496ad1139db51f7c04b" or json.loads(item.projection.source_json)["regulatory_chunk_id"] in {
+                    if item.id.hex == "52424e5d41714496ad1139db51f7c04b" or json.loads(
+                        item.projection.source_json
+                    )["regulatory_chunk_id"] in {
                         "rc_fcafb699b8b49d81756158f82296b872938006c1",
                         "rc_5c0be3e4b5e0759daa72ee6bbaa51a01cee727d4",
                     }:
-                        print("WINDOW_MEMBER_460", json.dumps({
-                            "binding": item.id.hex,
-                            "canonical": json.loads(item.projection.source_json)["regulatory_chunk_id"],
-                            "role": item.derived_role,
-                            "start": str(item.effective_start),
-                            "end": str(item.effective_end),
-                            "retained": item.id in previous_ids,
-                            "text_hash": hashlib.sha256(item.representation_text.encode()).hexdigest(),
-                            "dependency_ids": item.dependency_ids[:8],
-                        }))
+                        print(
+                            "WINDOW_MEMBER_460",
+                            json.dumps(
+                                {
+                                    "binding": item.id.hex,
+                                    "canonical": json.loads(
+                                        item.projection.source_json
+                                    )["regulatory_chunk_id"],
+                                    "role": item.derived_role,
+                                    "start": str(item.effective_start),
+                                    "end": str(item.effective_end),
+                                    "retained": item.id in previous_ids,
+                                    "text_hash": hashlib.sha256(
+                                        item.representation_text.encode()
+                                    ).hexdigest(),
+                                    "dependency_ids": item.dependency_ids[:8],
+                                }
+                            ),
+                        )
         targets = [
-            ("299_6A", "rc.user_file_id = CAST(:file_id AS uuid) AND "
-             "(rc.chunk_metadata->>'article_no' = '6/A' OR "
-             "rc.text ILIKE '%MADDE 6/A%')", {"file_id": "014fbc6a-2da2-4845-9df9-f4afc625587a"}),
-            ("302_CODE_0703", "(uf.name ILIKE '%İthalat Rejimi%' OR "
-             "uf.name ILIKE '%3350%') AND rc.text ILIKE '%0703.10.19.00.11%'", {}),
-            ("302_CODE_1206", "(uf.name ILIKE '%İthalat Rejimi%' OR "
-             "uf.name ILIKE '%3350%') AND rc.text ILIKE '%1206.00.91.00.19%'", {}),
-            ("306_TITLE", "uf.name ILIKE '%Gümrüksüz Satış Mağazaları%' OR "
-             "uf.name ILIKE '%2018/13%'", {}),
+            (
+                "299_6A",
+                "rc.user_file_id = CAST(:file_id AS uuid) AND "
+                "(rc.chunk_metadata->>'article_no' = '6/A' OR "
+                "rc.text ILIKE '%MADDE 6/A%')",
+                {"file_id": "014fbc6a-2da2-4845-9df9-f4afc625587a"},
+            ),
+            (
+                "302_CODE_0703",
+                "(uf.name ILIKE '%İthalat Rejimi%' OR "
+                "uf.name ILIKE '%3350%') AND rc.text ILIKE '%0703.10.19.00.11%'",
+                {},
+            ),
+            (
+                "302_CODE_1206",
+                "(uf.name ILIKE '%İthalat Rejimi%' OR "
+                "uf.name ILIKE '%3350%') AND rc.text ILIKE '%1206.00.91.00.19%'",
+                {},
+            ),
+            (
+                "306_TITLE",
+                "uf.name ILIKE '%Gümrüksüz Satış Mağazaları%' OR "
+                "uf.name ILIKE '%2018/13%'",
+                {},
+            ),
         ]
         for label, predicate, params in targets:
             rows = connection.execute(
                 text(
-                    "SELECT rc.id, rc.user_file_id, uf.name, rc.status, "
+                    "SELECT rc.id, rc.user_file_id, uf.name, rc.status, "  # noqa: S608
                     "rc.position, rc.chunk_type, rc.chunk_metadata->>'article_no' "
                     "AS article_no, rc.text, rc.heading_path FROM regulatory_chunk rc "
                     "JOIN user_file uf ON uf.id=rc.user_file_id WHERE "
-                    f"({predicate}) LIMIT 30"
+                    f"({predicate}) LIMIT 30"  # noqa: S608 - fixed diagnostic predicates
                 ),
                 params,
             )
@@ -517,7 +711,9 @@ def main() -> None:
                             "position": row.position,
                             "chunk_type": row.chunk_type,
                             "article_no": row.article_no,
-                            "text_sha256": hashlib.sha256(text_value.encode()).hexdigest(),
+                            "text_sha256": hashlib.sha256(
+                                text_value.encode()
+                            ).hexdigest(),
                             "text_excerpt": text_value[:700],
                             "heading_path": row.heading_path[:2],
                         },
@@ -542,44 +738,88 @@ def main() -> None:
             print("GTIP_CORPUS_COUNT_LOWER_BOUND", code, len(matches))
             for row in matches:
                 at = row.text.find(code)
-                print("GTIP_CORPUS_MATCH", json.dumps({
-                    "code": code,
-                    "chunk_id": row.id,
-                    "file_id": str(row.user_file_id),
-                    "file_name": row.name,
-                    "status": row.status,
-                    "position": row.position,
-                    "text_near_code": row.text[max(0, at - 100):at + 220],
-                }, ensure_ascii=False))
+                print(
+                    "GTIP_CORPUS_MATCH",
+                    json.dumps(
+                        {
+                            "code": code,
+                            "chunk_id": row.id,
+                            "file_id": str(row.user_file_id),
+                            "file_name": row.name,
+                            "status": row.status,
+                            "position": row.position,
+                            "text_near_code": row.text[max(0, at - 100) : at + 220],
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
         target_302 = "e10c4816-c679-453c-ae02-dfc16e071c88"
-        rows = list(connection.execute(
-            text(
-                "SELECT position, status, text FROM regulatory_chunk "
-                "WHERE user_file_id=CAST(:file_id AS uuid) ORDER BY position"
+        rows = list(
+            connection.execute(
+                text(
+                    "SELECT position, status, text FROM regulatory_chunk "
+                    "WHERE user_file_id=CAST(:file_id AS uuid) ORDER BY position"
+                ),
+                {"file_id": target_302},
+            )
+        )
+        print(
+            "SOURCE_302_CHUNK_SUMMARY",
+            json.dumps(
+                {
+                    "file_id": target_302,
+                    "count": len(rows),
+                    "contains_7_fasil": [
+                        row.position for row in rows if "7. FASIL" in row.text
+                    ],
+                    "contains_12_fasil": [
+                        row.position for row in rows if "12. FASIL" in row.text
+                    ],
+                    "contains_list_one": [
+                        row.position
+                        for row in rows
+                        if "I SAYILI" in row.text.upper() or "I sayılı" in row.text
+                    ],
+                    "contains_target_codes": [
+                        row.position
+                        for row in rows
+                        if any(
+                            code in row.text
+                            for code in (
+                                "0703.10.19.00.11",
+                                "1206.00.91.00.19",
+                                "1206.00.99.00.19",
+                            )
+                        )
+                    ],
+                    "last_chunks": [
+                        {"position": row.position, "excerpt": row.text[:240]}
+                        for row in rows[-6:]
+                    ],
+                },
+                ensure_ascii=False,
             ),
-            {"file_id": target_302},
-        ))
-        print("SOURCE_302_CHUNK_SUMMARY", json.dumps({
-            "file_id": target_302,
-            "count": len(rows),
-            "contains_7_fasil": [row.position for row in rows if "7. FASIL" in row.text],
-            "contains_12_fasil": [row.position for row in rows if "12. FASIL" in row.text],
-            "contains_list_one": [row.position for row in rows if "I SAYILI" in row.text.upper() or "I sayılı" in row.text],
-            "contains_target_codes": [row.position for row in rows if any(code in row.text for code in (
-                "0703.10.19.00.11", "1206.00.91.00.19", "1206.00.99.00.19"))],
-            "last_chunks": [{"position": row.position, "excerpt": row.text[:240]}
-                            for row in rows[-6:]],
-        }, ensure_ascii=False))
-        candidate_files = connection.execute(text(
-            "SELECT id, name, status, chunk_count FROM user_file WHERE "
-            "name ILIKE '%ithalat%rejim%liste%' OR "
-            "name ILIKE '%ithalat%rejim%ek%' ORDER BY name LIMIT 40"
-        ))
+        )
+        candidate_files = connection.execute(
+            text(
+                "SELECT id, name, status, chunk_count FROM user_file WHERE "
+                "name ILIKE '%ithalat%rejim%liste%' OR "
+                "name ILIKE '%ithalat%rejim%ek%' ORDER BY name LIMIT 40"
+            )
+        )
         for row in candidate_files:
-            print("SOURCE_302_ANNEX_CANDIDATE", json.dumps({
-                "id": str(row.id), "name": row.name,
-                "status": row.status, "chunk_count": row.chunk_count,
-            }, ensure_ascii=False))
+            print(
+                "SOURCE_302_ANNEX_CANDIDATE",
+                json.dumps(
+                    {
+                        "id": str(row.id),
+                        "name": row.name,
+                        "status": row.status,
+                        "chunk_count": row.chunk_count,
+                    },
+                    ensure_ascii=False,
+                ),
+            )
         files = connection.execute(
             text(
                 "SELECT id, name, status, chunk_count FROM user_file WHERE "
@@ -592,8 +832,12 @@ def main() -> None:
             print(
                 "SOURCE_FILE",
                 json.dumps(
-                    {"id": str(row.id), "name": row.name,
-                     "status": row.status, "chunk_count": row.chunk_count},
+                    {
+                        "id": str(row.id),
+                        "name": row.name,
+                        "status": row.status,
+                        "chunk_count": row.chunk_count,
+                    },
                     ensure_ascii=False,
                     default=str,
                 ),
@@ -610,10 +854,14 @@ def main() -> None:
             print(
                 "FILE_299_AROUND_6",
                 json.dumps(
-                    {"id": row.id, "position": row.position,
-                     "status": row.status, "article_no": row.article_no,
-                     "text_excerpt": row.text[:350],
-                     "heading_path": row.heading_path[:3]},
+                    {
+                        "id": row.id,
+                        "position": row.position,
+                        "status": row.status,
+                        "article_no": row.article_no,
+                        "text_excerpt": row.text[:350],
+                        "heading_path": row.heading_path[:3],
+                    },
                     ensure_ascii=False,
                 ),
             )
@@ -630,11 +878,15 @@ def main() -> None:
             print(
                 "ARTICLE_6A_OTHER_FILE",
                 json.dumps(
-                    {"id": row.id, "file_id": str(row.user_file_id),
-                     "name": row.name, "status": row.status,
-                     "position": row.position,
-                     "text_sha256": hashlib.sha256(row.text.encode()).hexdigest(),
-                     "text_excerpt": row.text[:700]},
+                    {
+                        "id": row.id,
+                        "file_id": str(row.user_file_id),
+                        "name": row.name,
+                        "status": row.status,
+                        "position": row.position,
+                        "text_sha256": hashlib.sha256(row.text.encode()).hexdigest(),
+                        "text_excerpt": row.text[:700],
+                    },
                     ensure_ascii=False,
                 ),
             )
@@ -648,9 +900,14 @@ def main() -> None:
             print(
                 "FILE_306_CANDIDATE",
                 json.dumps(
-                    {"id": str(row.id), "name": row.name,
-                     "status": row.status, "chunk_count": row.chunk_count},
-                    ensure_ascii=False, default=str,
+                    {
+                        "id": str(row.id),
+                        "name": row.name,
+                        "status": row.status,
+                        "chunk_count": row.chunk_count,
+                    },
+                    ensure_ascii=False,
+                    default=str,
                 ),
             )
         for row in connection.execute(
@@ -665,10 +922,14 @@ def main() -> None:
             print(
                 "FILE_306_ARTICLE_2",
                 json.dumps(
-                    {"id": row.id, "position": row.position,
-                     "status": row.status, "article_no": row.article_no,
-                     "text_excerpt": row.text[:320],
-                     "heading_path": row.heading_path[:3]},
+                    {
+                        "id": row.id,
+                        "position": row.position,
+                        "status": row.status,
+                        "article_no": row.article_no,
+                        "text_excerpt": row.text[:320],
+                        "heading_path": row.heading_path[:3],
+                    },
                     ensure_ascii=False,
                 ),
             )
