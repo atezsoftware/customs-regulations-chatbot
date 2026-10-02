@@ -148,6 +148,7 @@ def iter_public_temporal_bindings(
     as_of_date: date,
     projection_ordinals: tuple[int, ...] | None = None,
     canonical_chunk_ids: tuple[str, ...] | None = None,
+    expected_payload_sha256: Mapping[int, str] | None = None,
 ) -> Generator[AnnexTemporalProjection, None, None]:
     """Stream one joined read; callers must not retain every full source.
 
@@ -208,6 +209,11 @@ def iter_public_temporal_bindings(
     result = session.execute(query)
     try:
         for row, revision, canonical_id, canonical_start, canonical_end in result:
+            if expected_payload_sha256 is not None and (
+                expected_payload_sha256.get(row.projection_ordinal)
+                != row.payload_sha256
+            ):
+                raise ValueError("selected ASv3 planning binding changed")
             validate_temporal_binding_payload(row)
             validate_joined_temporal_canonical_revision(row, revision)
             binding = parse_temporal_binding(row)

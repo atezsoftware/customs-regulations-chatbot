@@ -3,6 +3,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -10,6 +11,7 @@ import pytest
 from onyx.chat.models import ChatMessageSimple, ToolCallSimple
 from onyx.configs.constants import MessageType
 from onyx.server.query_and_chat.placement import Placement
+from onyx.tools.interface import Tool
 from onyx.tools.models import ToolCallKickoff, ToolResponse
 from onyx.tools.tool_runner import (
     DEFAULT_SEARCH_MAX_LLM_CHUNKS,
@@ -105,6 +107,40 @@ def test_parallel_worker_limit_queues_all_tool_calls() -> None:
     assert len(functions_with_args) == len(calls)
     assert run_parallel.call_args.kwargs["max_workers"] == 2
     assert tool.emit_start.call_count == len(calls)
+    assert run_parallel.call_args.kwargs["timeout"] == 600
+
+
+def test_harness_owned_single_invocation_keeps_result_without_nested_executor() -> None:
+    tool = MagicMock()
+    tool.name = "test_tool"
+    owning_thread = threading.get_ident()
+
+    def complete(**_kwargs: object) -> ToolResponse:
+        assert threading.get_ident() == owning_thread
+        return ToolResponse(
+            rich_response=None, llm_facing_response="complete source receipt"
+        )
+
+    tool.run.side_effect = complete
+    with patch(
+        "onyx.tools.tool_runner.run_functions_tuples_in_parallel",
+        side_effect=AssertionError(
+            "An owning harness must not discard a started tool's result"
+        ),
+    ):
+        result = run_tool_calls(
+            tool_calls=[_make_tool_call("test_tool", {})],
+            tools=[tool],
+            message_history=[],
+            user_memory_context=None,
+            user_info=None,
+            citation_mapping={},
+            next_citation_num=1,
+            tool_execution_timeout_seconds=None,
+        )
+    assert len(result.tool_responses) == 1
+    assert result.tool_responses[0].llm_facing_response == "complete source receipt"
+    assert result.tool_responses[0].tool_call is not None
 
 
 def test_parallel_worker_limit_must_be_positive() -> None:
@@ -163,7 +199,7 @@ def test_fast_regulatory_search_memory_gate_bounds_parallel_requests(
         futures = [
             executor.submit(
                 _safe_run_single_tool,
-                tool,
+                cast(Tool, tool),
                 _make_tool_call("internal_search", {}, tool_call_id=str(index)),
                 None,
             )

@@ -770,6 +770,16 @@ def build_regulatory_rerank_packets(
     if not seed_ids:
         return _singleton_rerank_packets(deduplicated)
 
+    from onyx.db.asv3_candidate_inventory import current_asv3_source_inventory_scope
+
+    if current_asv3_source_inventory_scope() is not None:
+        return _build_asv3_initial_rerank_packets(
+            db_session,
+            deduplicated,
+            as_of_date=as_of_date or datetime.date.today(),
+            max_chars=max_chars_per_provision,
+        )
+
     try:
         projections = get_bounded_same_provision_siblings(
             db_session,
@@ -781,6 +791,10 @@ def build_regulatory_rerank_packets(
             max_chars_per_provision=max_chars_per_provision,
         )
     except Exception:
+        from onyx.db.asv3_candidate_inventory import current_asv3_source_inventory_scope
+
+        if current_asv3_source_inventory_scope() is not None:
+            raise
         logger.exception(
             "Regulatory rerank packet metadata lookup failed; using singletons"
         )
@@ -896,6 +910,80 @@ def build_regulatory_rerank_packets(
                 candidate=candidate,
                 members=members,
                 primary_member=primary_member,
+            )
+        )
+    return packets
+
+
+def _build_asv3_initial_rerank_packets(
+    session: Session,
+    seeds: Sequence[InferenceChunk],
+    *,
+    as_of_date: datetime.date,
+    max_chars: int,
+) -> list[RegulatoryRerankPacket]:
+    from onyx.db.asv3_initial_context import get_asv3_initial_rerank_context
+
+    indexes = _query_indexes(seeds)
+    groups = get_asv3_initial_rerank_context(
+        session,
+        [
+            seed.regulatory_chunk_id
+            for seed in seeds
+            if seed.regulatory_chunk_id and UUID(seed.document_id) in indexes
+        ],
+        indexes=indexes,
+        as_of_date=as_of_date,
+    )
+    packets = []
+    for seed in seeds:
+        projections = groups.get(seed.regulatory_chunk_id or "", ())
+        members = [
+            _chunk_from_projection(
+                projection,
+                seed,
+                relevance_explanation="Verified local navigation context",
+            )
+            for projection in projections
+        ]
+        primary = next(
+            (
+                member
+                for member in members
+                if _chunk_identity(member) == _chunk_identity(seed)
+            ),
+            seed.model_copy(),
+        )
+        if not members:
+            members = [primary]
+        # Each retrieved seed owns a candidate; no shared-family limit may erase it.
+        ordered = [primary, *(member for member in members if member is not primary)]
+        bounded = [primary]
+        chars = len(_packet_document((primary,)))
+        for member in ordered[1:]:
+            size = len(_packet_document((member,))) + 2
+            if chars + size <= max_chars:
+                bounded.append(member)
+                chars += size
+        for member in bounded:
+            member.metadata = {
+                **member.metadata,
+                "asv3_context_kind": "bounded_initial_neighborhood",
+                "asv3_operative_unit_complete": "false",
+                "asv3_navigation_position_authority": "current_canonical_lead",
+            }
+        content = _packet_document(bounded)[:max_chars]
+        candidate = primary.model_copy(
+            update={
+                "content": content,
+                "blurb": content[:_SIBLING_BLURB_CHARS],
+                "match_highlights": [],
+                "relevance_explanation": "Bounded initial context; wider provision reading requires explicit expansion",
+            }
+        )
+        packets.append(
+            RegulatoryRerankPacket(
+                candidate=candidate, primary_member=primary, members=tuple(bounded)
             )
         )
     return packets

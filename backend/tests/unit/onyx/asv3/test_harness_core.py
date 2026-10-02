@@ -1078,3 +1078,36 @@ def test_restore_pending_metadata_marks_interrupted_without_reexecution_or_budge
     assert restored.turns == []
     restored.run()
     assert invoked == []
+
+
+def test_harness_persists_stop_reason_and_guard_gap_without_model_audit() -> None:
+    gap = ToolOutcome(
+        status=OutcomeStatus.PARTIAL,
+        summary="Original continuation missing",
+        data={"gaps": ["uncited operative exception"]},
+    )
+    checkpoints: list[dict[str, JsonValue]] = []
+    harness = Harness(
+        request="question",
+        context=RunContext(),
+        registry=CapabilityRegistry(),
+        decide=lambda _view: Decision(answer="Unsupported conclusion"),
+        draft_guard=lambda _draft: gap,
+        checkpoint=checkpoints.append,
+    )
+    result = harness.run()
+    assert result.status == OutcomeStatus.PARTIAL
+    assert result.stop_reason == "repeated_publication_gap"
+    assert result.publication_gap == gap
+    assert checkpoints[-1]["stop_reason"] == result.stop_reason
+    assert checkpoints[-1]["publication_gap"] == gap.model_dump(mode="json")
+    restored = Harness(
+        request="question",
+        context=RunContext(run_id=harness.context.run_id),
+        registry=CapabilityRegistry(),
+        decide=lambda _view: Decision(answer="New draft"),
+    )
+    restored.restore(checkpoints[-1])
+    assert restored.publication_gap == gap
+    assert restored.stop_reason == result.stop_reason
+    assert "publication_gap" not in restored.view().model_dump()

@@ -20,6 +20,7 @@ from onyx.chat.emitter import NullEmitter
 from onyx.chat.models import ChatMessageSimple
 from onyx.configs.constants import MessageType
 from onyx.context.search.models import SearchDocsResponse
+from onyx.db.asv3_candidate_inventory import asv3_source_inventory_scope
 from onyx.db.asv3_corpus import bind_pc_corpus_scope
 from onyx.db.memory import UserMemoryContext
 from onyx.llm.interfaces import LLM, LLMConfig, LLMUserIdentity
@@ -149,7 +150,7 @@ def build_search_adapter(
     inject_memories_in_prompt: bool = True,
     user_identity: LLMUserIdentity | None = None,
 ) -> Callable[[dict[str, JsonValue], RunContext], ToolOutcome]:
-    def search(args: dict[str, JsonValue], context: RunContext) -> ToolOutcome:
+    def search_in_scope(args: dict[str, JsonValue], context: RunContext) -> ToolOutcome:
         context.check_active()
         if tool is None:
             return ToolOutcome(
@@ -204,6 +205,7 @@ def build_search_adapter(
             citation_mapping={},
             next_citation_num=1,
             inject_memories_in_prompt=inject_memories_in_prompt,
+            tool_execution_timeout_seconds=None,
         )
         context.check_active()
         if len(batch.tool_responses) != 1:
@@ -248,8 +250,7 @@ def build_search_adapter(
                 unmapped_results += 1
                 continue
             mapped_docs.append(doc)
-        # Hydrate one local structural plan per source, keeping real atomic IDs.
-        hydrated_results = broker.hydrate_search_results(mapped_docs, context)
+        hydrated_results = broker.hydrate_search_centers(mapped_docs, context)
         incomplete_closures = 0
         unhydrated_centers: list[JsonValue] = []
         for doc in mapped_docs:
@@ -275,7 +276,7 @@ def build_search_adapter(
                     evidence.append(item)
         status = (
             OutcomeStatus.PARTIAL
-            if evidence and (unmapped_results or incomplete_closures)
+            if evidence and unmapped_results
             else OutcomeStatus.FOUND
             if evidence
             else OutcomeStatus.UNAVAILABLE
@@ -284,12 +285,13 @@ def build_search_adapter(
         )
         return ToolOutcome(
             status=status,
-            summary="Original text from the scoped search pipeline; navigation is not evidence",
+            summary="Exact retrieved original text. Local context is bounded, not a complete provision; choose further reading when the claim needs it.",
             data={
                 "source_count": len(evidence),
                 "retrieved_result_count": len(results),
                 "unmapped_result_count": unmapped_results,
                 "incomplete_closure_count": incomplete_closures,
+                "context_policy": "harness_controlled",
                 "unhydrated_centers": unhydrated_centers,
                 "query": query,
                 "mode": mode,
@@ -302,5 +304,20 @@ def build_search_adapter(
             },
             evidence=evidence,
         )
+
+    def search(args: dict[str, JsonValue], context: RunContext) -> ToolOutcome:
+        scope_key = json.dumps(
+            {
+                "run_id": context.run_id,
+                "user_id": str(broker.user.id),
+                "scope": context.scope,
+                "filters": broker.filters.model_dump(mode="json"),
+            },
+            sort_keys=True,
+        )
+        with asv3_source_inventory_scope(
+            scope_key=scope_key, check_active=context.check_active
+        ):
+            return search_in_scope(args, context)
 
     return search

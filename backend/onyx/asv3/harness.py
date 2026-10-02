@@ -24,6 +24,7 @@ from onyx.asv3.models import (
 )
 from onyx.asv3.progress import ProgressReporter
 from onyx.asv3.registry import CapabilityRegistry
+from onyx.asv3.working_memory import WorkingMemory
 from onyx.llm.models import ToolMessage
 from onyx.tracing.answer_graph import graph_step
 
@@ -72,11 +73,15 @@ class Harness:
         self.receipts: list[ToolReceipt] = []
         self.turns: list[ResearchTurn] = []
         self.last_draft: str | None = None
+        self.stop_reason: str | None = None
+        self.publication_gap: ToolOutcome | None = None
         self._blocked_attempts: dict[str, int] = {}
         self._seen_calls: set[str] = set()
         self._seen_failures: set[str] = set()
         self._committed_calls: set[str] = set()
         self._pending_calls: dict[str, dict[str, JsonValue]] = {}
+        self.working_memory = WorkingMemory(self.context.scope)
+        self.context.services["working_memory"] = self.working_memory
         self.context.services["registry"] = registry
         self.context.services["evidence"] = self.evidence
 
@@ -120,6 +125,11 @@ class Harness:
             "pending_calls_omitted": max(0, len(self._pending_calls) - 128),
             "turns": [turn.model_dump(mode="json") for turn in self.turns],
             "last_draft": self.last_draft,
+            "stop_reason": self.stop_reason,
+            "publication_gap": self.publication_gap.model_dump(mode="json")
+            if self.publication_gap
+            else None,
+            "working_memory": self.working_memory.export(),
         }
 
     def restore(self, snapshot: dict[str, JsonValue]) -> None:
@@ -152,6 +162,10 @@ class Harness:
         self._trim_turns()
         draft = snapshot.get("last_draft")
         self.last_draft = draft if isinstance(draft, str) else None
+        reason = snapshot.get("stop_reason")
+        self.stop_reason = reason if isinstance(reason, str) else None
+        gap = snapshot.get("publication_gap")
+        self.publication_gap = ToolOutcome.model_validate(gap) if gap else None
         evidence = snapshot.get("evidence")
         if not isinstance(evidence, dict):
             raise ValueError("Checkpoint evidence is missing")
@@ -160,6 +174,12 @@ class Harness:
         if isinstance(budget, dict):
             self.context.budget.restore({**budget, "artifact_bytes": 0})
         self._committed_calls = {receipt.call.call_id for receipt in self.receipts}
+        working = snapshot.get("working_memory")
+        if isinstance(working, dict):
+            self.working_memory.restore(working)
+        else:
+            for receipt in self.receipts:
+                self.working_memory.observe(receipt)
         self._seen_calls.update(self._committed_calls)
         self._pending_calls.clear()
         pending = array("pending_calls")
@@ -329,6 +349,7 @@ class Harness:
         self.context.check_active()
         if self.on_receipt:
             self.on_receipt(receipt)
+        self.working_memory.observe(receipt)
         receipt.outcome = receipt.outcome.model_copy(update={"evidence": []})
         self.receipts.append(receipt)
         self._seen_calls.add(receipt.call.call_id)
@@ -421,6 +442,7 @@ class Harness:
             executor.shutdown(wait=False, cancel_futures=True)
 
     def run(self) -> HarnessResult:
+        self.stop_reason = None
         if self.progress:
             self.progress.report("started")
         status = OutcomeStatus.PARTIAL
@@ -466,6 +488,7 @@ class Harness:
                     if blocked is None and self.draft_guard:
                         blocked = self.draft_guard(decision.answer)
                     if blocked is not None:
+                        self.publication_gap = blocked
                         receipt = ToolReceipt(
                             call=CapabilityCall(name="finalization_status"),
                             outcome=blocked,
@@ -490,13 +513,19 @@ class Harness:
                         )
                         if self._blocked_attempts[fingerprint] >= 3:
                             status = OutcomeStatus.PARTIAL
+                            self.stop_reason = "repeated_publication_gap"
                             break
                         continue
                     answer = decision.answer
                     status = OutcomeStatus.FOUND
+                    self.publication_gap = None
+                    self.stop_reason = (
+                        "verified_draft" if self.draft_guard else "answer_ready"
+                    )
                     break
                 self._save()
         except RunStopped as error:
+            self.stop_reason = str(error)
             status = (
                 OutcomeStatus.CANCELLED
                 if "cancel" in str(error).lower()
@@ -526,4 +555,6 @@ class Harness:
             receipts=self.receipts,
             questions=self.questions,
             facts=self.facts,
+            stop_reason=self.stop_reason,
+            publication_gap=self.publication_gap,
         )

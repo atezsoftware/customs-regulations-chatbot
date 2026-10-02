@@ -475,17 +475,37 @@ def test_real_search_results_are_canonically_hydrated_once_without_payload_text_
     )
     with (
         search_boundaries(chunks),
+        ExitStack() as expansion_checks,
         patch.object(
             broker,
-            "hydrate_search_results",
+            "hydrate_search_centers",
             return_value={(source_id, n): originals for n in (1, 2)},
         ) as hydrate,
     ):
+        expansions = [
+            expansion_checks.enter_context(
+                patch(
+                    f"{MODULE}.{name}",
+                    side_effect=AssertionError(
+                        "Initial retrieval must not expand the source implicitly"
+                    ),
+                )
+            )
+            for name in (
+                "build_regulatory_provision_navigation",
+                "expand_selected_regulatory_references",
+                "_expand_backfilled_regulatory_sections",
+                "expand_selected_regulatory_source_lexical_matches",
+                "expand_selected_regulatory_adjacent_provisions",
+                "expand_selected_regulatory_navigation_leads",
+            )
+        ]
         outcome = adapter(
             {"query": "named repair mechanism", "mode": "keyword"}, RunContext()
         )
     assert outcome.status == OutcomeStatus.FOUND
     assert hydrate.call_count == 1
+    assert all(expansion.call_count == 0 for expansion in expansions)
     assert [item.identity for item in outcome.evidence] == [
         item.identity for item in originals
     ]

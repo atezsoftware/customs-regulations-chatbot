@@ -162,14 +162,53 @@ def build_core_specs(
             data=evidence.inspect(number),
         )
 
-    def state(_args: dict[str, JsonValue], _context: RunContext) -> ToolOutcome:
+    def state(args: dict[str, JsonValue], context: RunContext) -> ToolOutcome:
+        from onyx.asv3.working_memory import WorkingMemory
+
         snapshot = state_provider()
-        # Original texts remain available through read_evidence rather than repeated snapshots.
-        snapshot.pop("evidence", None)
+        result = {
+            key: value
+            for key, value in snapshot.items()
+            if key
+            in {
+                "run_id",
+                "questions",
+                "facts",
+                "budget",
+                "pending_calls",
+                "pending_call_count",
+            }
+        }
+        memory = context.services.get("working_memory")
+        locator_ids = args.get("locator_ids")
+        if isinstance(memory, WorkingMemory):
+            result["working_locators"] = memory.view(
+                offset=int(str(args.get("locator_offset", 0))),
+                locator_ids=[str(value) for value in locator_ids]
+                if isinstance(locator_ids, list)
+                else None,
+            )
         receipts = snapshot.get("receipts")
         if isinstance(receipts, list):
             references: list[JsonValue] = []
-            for receipt in receipts[-20:]:
+            requested = args.get("receipt_ids")
+            if isinstance(requested, list):
+                receipts = [
+                    receipt
+                    for receipt in receipts
+                    if isinstance(receipt, dict)
+                    and isinstance(call := receipt.get("call"), dict)
+                    and call.get("call_id") in requested
+                ]
+            else:
+                offset = args.get("receipt_offset")
+                if isinstance(offset, int):
+                    result["receipt_count"] = len(receipts)
+                    result["next_receipt_offset"] = min(len(receipts), offset + 20)
+                    receipts = receipts[offset : offset + 20]
+                else:
+                    receipts = receipts[-20:]
+            for receipt in receipts:
                 if not isinstance(receipt, dict):
                     continue
                 call, outcome = receipt.get("call"), receipt.get("outcome")
@@ -178,6 +217,8 @@ def build_core_specs(
                 references.append(
                     {
                         "name": call.get("name"),
+                        "receipt_id": call.get("call_id"),
+                        "arguments": call.get("arguments"),
                         "status": outcome.get("status"),
                         "summary": str(outcome.get("summary", ""))[:300],
                         "evidence_numbers": receipt.get("evidence_ids", []),
@@ -186,11 +227,11 @@ def build_core_specs(
                 )
             from onyx.asv3.artifacts import compact_json
 
-            snapshot["receipts"] = compact_json(references, max_chars=9000)
+            result["receipts"] = compact_json(references, max_chars=9000)
         return ToolOutcome(
             status=OutcomeStatus.FOUND,
             summary="Research state and shared budget",
-            data=snapshot,
+            data=result,
         )
 
     integer: dict[str, JsonValue] = {"type": "integer", "minimum": 1}
@@ -233,10 +274,23 @@ def build_core_specs(
         ),
         ToolSpec(
             name="read_research_state",
-            description="Inspect the current questions, facts, checkpoint identity and shared budget.",
+            description="Reopen exact retained locator or receipt IDs, or page locators. Inspect current questions/facts/budget without replaying audit history. Locator leads are not legal evidence.",
             parameters={
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "locator_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "maxItems": 100,
+                    },
+                    "locator_offset": {"type": "integer", "minimum": 0},
+                    "receipt_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "maxItems": 20,
+                    },
+                    "receipt_offset": {"type": "integer", "minimum": 0},
+                },
                 "additionalProperties": False,
             },
             handler=state,

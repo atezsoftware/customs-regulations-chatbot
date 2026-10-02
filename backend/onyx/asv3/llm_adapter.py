@@ -433,6 +433,16 @@ class ResearchModel:
                 "wait_researcher",
                 "report_progress",
             }
+            working = payload.get("working_locators")
+            locators = working.get("locators") if isinstance(working, dict) else None
+            if isinstance(locators, list):
+                needed.update(
+                    str(item["name"])
+                    for item in locators
+                    if isinstance(item, dict)
+                    and item.get("kind") == "capability"
+                    and isinstance(item.get("name"), str)
+                )
             receipts = payload.get("receipts")
             if isinstance(receipts, list):
                 for receipt in receipts[-4:]:
@@ -751,10 +761,18 @@ class ResearchModel:
         )
 
     def decide(self, view: HarnessView) -> Decision:
+        from onyx.asv3.working_memory import WorkingMemory
+
         self.context.check_research_active()
         payload = view.model_dump(mode="json")
         payload.pop("tools", None)
         payload.pop("turns", None)
+        assistant_instructions = self.context.services.get("assistant_instructions")
+        if not self.context.depth and isinstance(assistant_instructions, str):
+            payload["assistant_instructions"] = assistant_instructions
+        working_memory = self.context.services.get("working_memory")
+        if isinstance(working_memory, WorkingMemory):
+            payload["working_locators"] = working_memory.view()
         latest_ids = {
             result.tool_call_id for turn in view.turns[-1:] for result in turn.results
         }

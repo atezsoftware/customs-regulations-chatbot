@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -71,6 +72,7 @@ from onyx.server.query_and_chat.streaming_models import (
 )
 from onyx.tools.interface import Tool
 from onyx.tools.tool_implementations.search.search_tool import SearchTool
+from onyx.tracing.answer_graph import graph_step
 from onyx.tracing.flows import LLMFlow
 from onyx.tracing.framework.create import ChatTraceMetadata, ensure_trace
 
@@ -111,7 +113,9 @@ condition, time limit or alternative is being checked. Never mention tool names,
 functions, file paths, SQL, code, model internals or reasoning. Do not assert unverified
 findings or pretend a particular document has already been read. 'final' means preparing
 the answer, 'completed' means answer ready, 'failed' means the research remains incomplete.
-'interrupted' describes an unexpected interruption, 'resume' offers to continue research,
+'failed' and 'interrupted' must state that research could not be completed, without
+inventing a technical cause, timeout, provider failure or any diagnosis not in this input.
+'resume' offers to continue research,
 and 'native_citation' labels an excerpt extracted from an original file (derived evidence).
 """
 )
@@ -178,6 +182,8 @@ def run_asv3_loop(
         timeout_seconds=float("inf"),
         cancelled=lambda: not is_connected(chat_session_id, cache),
     )
+    if custom_agent_prompt:
+        context.services["assistant_instructions"] = custom_agent_prompt
     scope = IndexFilters(
         **(filters.model_dump() if filters else {}), access_control_list=[]
     )
@@ -276,6 +282,12 @@ def run_asv3_loop(
     final_published = False
     latest_review: VerificationResult | None = None
     publication_status = OutcomeStatus.PARTIAL
+    publication_stop_reason: str | None = None
+    final_publication_gap: ToolOutcome | None = None
+    approved_draft: str | None = None
+    approved_review: VerificationResult | None = None
+    approved_call_id: str | None = None
+    approved_questions: list[str] = []
 
     def emit_progress(event: ProgressEvent) -> None:
         phase, status = event.phase, event.status
@@ -359,6 +371,17 @@ def run_asv3_loop(
                 if latest_review
                 else None,
                 publication_status=publication_status.value,
+                publication_stop_reason=publication_stop_reason,
+                final_publication_gap=final_publication_gap.model_dump(mode="json")
+                if final_publication_gap
+                else None,
+                draft_approval={
+                    "text_hash": hashlib.sha256(approved_draft.encode()).hexdigest(),
+                    "verification_call_id": approved_call_id,
+                    "questions": approved_questions,
+                }
+                if approved_draft is not None
+                else None,
                 scenario=scenarios.snapshot(),
                 question_message_id=user_message_id,
             )
@@ -528,6 +551,11 @@ def run_asv3_loop(
         return latest_review
 
     def draft_guard(draft: str) -> ToolOutcome | None:
+        nonlocal approved_draft, approved_review, approved_call_id, approved_questions
+        approved_draft = None
+        approved_review = None
+        approved_call_id = None
+        approved_questions = []
         if profile.requires_sources and not ledger.citation_mapping():
             return ToolOutcome(
                 status=OutcomeStatus.PARTIAL,
@@ -539,14 +567,20 @@ def run_asv3_loop(
             )
         review = review_answer(draft, research=True)
         assert harness is not None
-        return publication_gap(
+        questions = harness.view().questions
+        call_id = model.last_call_id
+        gap = publication_gap(
             draft,
             review,
-            harness.view().questions,
+            questions,
             ledger,
             require_sources=profile.requires_sources,
-            verification_call_id=model.last_call_id,
+            verification_call_id=call_id,
         )
+        if gap is None:
+            approved_draft, approved_review, approved_call_id = draft, review, call_id
+            approved_questions = list(questions)
+        return gap
 
     harness = Harness(
         request=question,
@@ -638,43 +672,88 @@ def run_asv3_loop(
                 ensure_ascii=False,
             )
         progress.report("final")
-        evidence = _evidence_record(
-            ledger,
-            draft,
-            max_chars=max(8000, min(180000, (llm.config.max_input_tokens - 18000) * 2)),
+        if complete:
+            if (
+                approved_draft != draft
+                or approved_review is None
+                or approved_call_id is None
+                or approved_questions != harness.view().questions
+            ):
+                raise ValueError(
+                    "Verified draft approval does not match the final answer"
+                )
+            final, final_review = draft, approved_review
+            # The verifier saw this exact text and its complete original evidence.
+            final_gap = publication_gap(
+                final,
+                final_review,
+                approved_questions,
+                ledger,
+                require_sources=profile.requires_sources,
+                verification_call_id=approved_call_id,
+            )
+        else:
+            evidence = _evidence_record(
+                ledger,
+                draft,
+                max_chars=max(
+                    8000, min(180000, (llm.config.max_input_tokens - 18000) * 2)
+                ),
+            )
+            final = model.invoke_text(
+                FINAL_PROMPT,
+                json.dumps(
+                    {
+                        "language": context.language,
+                        "question": question,
+                        "scenario": scenarios.snapshot(),
+                        "draft": draft,
+                        "review": latest_review.model_dump(mode="json")
+                        if latest_review
+                        else None,
+                        "evidence": evidence,
+                        "research_status": result.status.value,
+                        "assistant_instructions": custom_agent_prompt or "",
+                    },
+                    ensure_ascii=False,
+                ),
+                LLMFlow.ASV3_FINAL,
+                max_tokens=9000,
+            )
+            checkpoint(harness.snapshot())
+            # Review the actual published wording, not just the coordinator's draft.
+            final_review = review_answer(final, research=False)
+            final_gap = publication_gap(
+                final,
+                final_review,
+                harness.view().questions,
+                ledger,
+                require_sources=profile.requires_sources,
+                allow_explicit_gaps=not complete,
+                verification_call_id=model.last_call_id,
+            )
+        final_publication_gap = final_gap
+        publication_stop_reason = (
+            "publication_guard_rejected"
+            if final_gap is not None
+            else "verified_draft_ready"
+            if complete
+            else result.stop_reason or "incomplete_research"
         )
-        final = model.invoke_text(
-            FINAL_PROMPT,
-            json.dumps(
-                {
-                    "language": context.language,
-                    "question": question,
-                    "scenario": scenarios.snapshot(),
-                    "draft": draft,
-                    "review": latest_review.model_dump(mode="json")
-                    if latest_review
-                    else None,
-                    "evidence": evidence,
-                    "research_status": result.status.value,
-                    "assistant_instructions": custom_agent_prompt or "",
-                },
-                ensure_ascii=False,
-            ),
-            LLMFlow.ASV3_FINAL,
-            max_tokens=9000,
-        )
+        # Retain the exact rejection before any safe limitation notice replaces it.
+        with graph_step("asv3.publication_guard") as step:
+            step.output_value = {
+                "stop_reason": result.stop_reason,
+                "publication_stop_reason": publication_stop_reason,
+                "publication_gap": final_gap.model_dump(mode="json")
+                if final_gap
+                else None,
+                "verification_call_id": approved_call_id
+                if complete
+                else model.last_call_id,
+                "answer_hash": hashlib.sha256(final.encode()).hexdigest(),
+            }
         checkpoint(harness.snapshot())
-        # Review the actual published wording, not just the coordinator's draft.
-        final_review = review_answer(final, research=False)
-        final_gap = publication_gap(
-            final,
-            final_review,
-            harness.view().questions,
-            ledger,
-            require_sources=profile.requires_sources,
-            allow_explicit_gaps=not complete,
-            verification_call_id=model.last_call_id,
-        )
         if final_gap is not None:
             # A source-free limitation notice is safe even when synthesis failed.
             # Reviewer explanations are not substituted for unsupported legal rules.
@@ -733,20 +812,32 @@ def run_asv3_loop(
         state_container.set_citation_mapping(processor.citation_to_doc)
         state_container.set_answer_tokens("".join(answer_parts))
         final_published = True
+        if complete:
+            publication_stop_reason = "verified_draft_published"
         progress.report(
             "completed" if complete else "failed",
             status="completed" if complete else "failed",
         )
         checkpoint(harness.snapshot())
         emitter.emit(Packet(placement=Placement(turn_index=0), obj=SectionEnd()))
-    except RunStopped:
+    except RunStopped as error:
+        logger.info("ASv3 stopped before publication: %s", str(error))
         if context.is_cancelled():
             progress.report("cancelled", status="cancelled")
         else:
             progress.report("failed", status="failed")
         # Stop preserves the already durable record; no late write or answer is accepted.
         raise
-    except Exception:
+    except Exception as error:
+        publication_stop_reason = f"runtime_error:{type(error).__name__}"
+        publication_status = OutcomeStatus.PARTIAL
+        if harness is not None and not context.is_cancelled():
+            try:
+                checkpoint(harness.snapshot())
+            except RunStopped:
+                pass
+            except Exception:
+                logger.exception("Could not persist ASv3 terminal diagnostics")
         progress.report("failed", status="failed")
         logger.exception("ASv3 run failed")
         raise

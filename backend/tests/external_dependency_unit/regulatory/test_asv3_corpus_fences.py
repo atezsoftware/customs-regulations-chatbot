@@ -62,6 +62,64 @@ def pc_corpus(db_session: Session) -> Generator[DocumentSet, None, None]:
 
 
 @pytest.mark.usefixtures("tenant_context")
+def test_source_resolution_matches_turkish_query_to_ascii_canonical_filename(
+    db_session: Session, pc_corpus: DocumentSet
+) -> None:
+    owner = create_test_user(db_session, "asv3_source_names")
+    pc_corpus.user_id = owner.id
+    sources = [
+        UserFile(
+            id=uuid4(),
+            user_id=owner.id,
+            file_id=uuid4().hex,
+            name=name,
+            file_type="text/plain",
+        )
+        for name in (
+            "Kanunlar/4458_gumruk_kanunu.md",
+            "Genelgeler/Gümrükler genel müdürlüğü/genelge_gumruk_kanunu_uygulamasi.md",
+            "Genelgeler/Gümrükler genel müdürlüğü/genelge_kabahatler_kanunu.md",
+            "Kanunlar/gumruk_kanunu_outside_pc.md",
+            "literal/source_100%_special.md",
+        )
+    ]
+    db_session.add_all(sources)
+    db_session.flush()
+    db_session.add_all(
+        DocumentSet__UserFile(document_set_id=pc_corpus.id, user_file_id=source.id)
+        for source in [*sources[:3], sources[4]]
+    )
+    db_session.commit()
+    try:
+        filters = resolve_pc_corpus_scope(
+            db_session,
+            user=owner,
+            filters=IndexFilters(access_control_list=[]),
+        )
+        matches, more = find_sources(
+            db_session, user=owner, filters=filters, query="Gümrük Kanunu"
+        )
+        assert [source.id for source in matches] == [row.id for row in sources[:3]]
+        assert not more
+        page, more = find_sources(
+            db_session, user=owner, filters=filters, query="GUMRUK KANUNU", limit=1
+        )
+        assert page[0].id == sources[0].id and more
+        literal, _ = find_sources(
+            db_session, user=owner, filters=filters, query="100%_special"
+        )
+        assert [source.id for source in literal] == [sources[4].id]
+    finally:
+        db_session.rollback()
+        for source in sources:
+            db_session.delete(source)
+        pc_corpus.user_id = None
+        db_session.commit()
+        db_session.delete(owner)
+        db_session.commit()
+
+
+@pytest.mark.usefixtures("tenant_context")
 def test_actual_owner_date_and_text_revalidation_fences(
     db_session: Session, pc_corpus: DocumentSet
 ) -> None:
@@ -129,6 +187,21 @@ def test_actual_owner_date_and_text_revalidation_fences(
             )
         broker = CorpusBroker(owner, filters)
         retained = evidence_for_chunk(authorized, rows[0])
+        assert retained.search_doc is not None
+        retrieved = broker.hydrate_search_centers([retained.search_doc], RunContext())
+        originals = retrieved[(str(source.id), old.projection_ordinal)]
+        assert len(originals) == 1 and originals[0].text == old.text
+        assert originals[0].chunk_id == old.id
+        assert originals[0].metadata["article_closure_complete"] is False
+        wrong_ordinal = retained.search_doc.model_copy(
+            update={"chunk_ind": current.projection_ordinal}
+        )
+        assert (
+            broker.hydrate_search_centers([wrong_ordinal], RunContext())[
+                (str(source.id), current.projection_ordinal)
+            ]
+            == []
+        )
         broker.revalidate_evidence([retained], RunContext())
         old.text = "Changed retained text"
         db_session.commit()

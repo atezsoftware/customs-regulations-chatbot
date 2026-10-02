@@ -20,9 +20,13 @@ class ScenarioState:
 
     def record(self, questions: list[str], facts: list[str]) -> dict[str, JsonValue]:
         with self._lock:
+            previous = (list(self._questions), list(self._facts))
             self._questions = list(dict.fromkeys(self._questions + questions))
             self._facts = list(dict.fromkeys(self._facts + facts))
-            return self.snapshot()
+            return {
+                **self.snapshot(),
+                "research_changed": previous != (self._questions, self._facts),
+            }
 
     def snapshot(self) -> dict[str, JsonValue]:
         with self._lock:
@@ -109,7 +113,9 @@ def build_supplemental_specs() -> list[ToolSpec]:
         )
         return ToolOutcome(
             status=OutcomeStatus.FOUND,
-            summary="Questions and facts retained",
+            summary="Questions and facts retained"
+            if snapshot["research_changed"]
+            else "Questions and facts already retained; no scenario change",
             data=snapshot,
         )
 

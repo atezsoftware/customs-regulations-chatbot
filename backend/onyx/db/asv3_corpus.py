@@ -7,7 +7,7 @@ from datetime import date
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import Integer, cast, func, or_, select
+from sqlalchemy import Integer, and_, case, cast, func, or_, select
 from sqlalchemy.orm import Session
 
 from onyx.access.access import get_access_for_user_files, get_acl_for_user
@@ -301,9 +301,59 @@ def read_search_source_closures(
     if qualified and index is None:
         raise CorpusScopeUnavailable("Source requires a verified query index snapshot.")
 
+    from onyx.db.asv3_candidate_inventory import (
+        current_asv3_source_inventory_scope,
+        iter_verified_asv3_inventory_members,
+        read_asv3_candidate_inventory,
+    )
+
+    planning_inventory = None
+    if qualified and current_asv3_source_inventory_scope() is not None:
+        assert index is not None
+        planning_inventory = read_asv3_candidate_inventory(
+            session,
+            source_id=source_id,
+            index=index,
+            as_of_date=effective_date,
+            observation=observation,
+        )
+
     def outline() -> Generator[RegulatoryChunkSiblingCandidate, None, None]:
         if qualified:
             assert index is not None
+            if planning_inventory is not None:
+                for row in planning_inventory:
+                    check_active()
+                    if row.derived_role != "canonical":
+                        continue
+                    metadata = row.closure_metadata
+                    yield RegulatoryChunkSiblingCandidate(
+                        regulatory_chunk_id=row.canonical_chunk_id,
+                        user_file_id=source_id,
+                        position=row.semantic_position,
+                        text="",
+                        status="active",
+                        heading_path=row.heading_path,
+                        article_no=str(metadata["article_no"])
+                        if metadata.get("article_no") is not None
+                        else None,
+                        article_title=str(metadata["article_title"])
+                        if metadata.get("article_title") is not None
+                        else None,
+                        chunk_type=metadata["chunk_type"]
+                        if isinstance(metadata.get("chunk_type"), str)
+                        else None,
+                        paragraph_no=str(metadata["paragraph_no"])
+                        if metadata.get("paragraph_no") is not None
+                        else None,
+                        clause_label=str(metadata["clause_label"])
+                        if metadata.get("clause_label") is not None
+                        else None,
+                        validity_start_date=row.effective_start,
+                        validity_end_date=row.effective_end,
+                        projection_ordinal=row.ordinal,
+                    )
+                return
             bindings = iter_public_temporal_bindings(
                 session, source_id, index=index, as_of_date=effective_date
             )
@@ -464,13 +514,28 @@ def read_search_source_closures(
             return
         if qualified:
             assert index is not None
-            bindings = iter_public_temporal_bindings(
-                session,
-                source_id,
-                index=index,
-                as_of_date=effective_date,
-                canonical_chunk_ids=identifiers,
-            )
+            if planning_inventory is not None:
+                requested_ids = set(identifiers)
+                bindings = iter_verified_asv3_inventory_members(
+                    session,
+                    rows=tuple(
+                        row
+                        for row in planning_inventory
+                        if row.canonical_chunk_id in requested_ids
+                        and row.derived_role == "canonical"
+                    ),
+                    index=index,
+                    as_of_date=effective_date,
+                    observation=observation,
+                )
+            else:
+                bindings = iter_public_temporal_bindings(
+                    session,
+                    source_id,
+                    index=index,
+                    as_of_date=effective_date,
+                    canonical_chunk_ids=identifiers,
+                )
             try:
                 for binding in bindings:
                     check_active()
@@ -786,16 +851,40 @@ def find_sources(
     statement = _source_statement(filters)
     if source_ids is not None:
         statement = statement.where(UserFile.id.in_(source_ids))
-    if query:
-        for term in query.split()[:12]:
+    # Corpus filenames commonly transliterate Turkish letters and use underscores.
+    translation = str.maketrans("ÇĞİÖŞÜÂÎÛçğıöşüâîû", "CGIOSUAIUcgiosuaiu")
+    normalized_query = query.translate(translation).lower().strip()
+    normalized_name = func.lower(
+        func.translate(UserFile.name, "ÇĞİÖŞÜÂÎÛçğıöşüâîû", "CGIOSUAIUcgiosuaiu")
+    )
+    order = []
+    if normalized_query:
+        escaped_terms = [
+            term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            for term in normalized_query.split()[:12]
+        ]
+        for term in escaped_terms:
             statement = statement.where(
-                UserFile.name.ilike(
-                    "%" + term.replace("%", "\\%").replace("_", "\\_") + "%",
-                    escape="\\",
-                )
+                normalized_name.ilike("%" + term + "%", escape="\\")
             )
+        basename = func.regexp_replace(normalized_name, "^.*/", "")
+        order = [
+            case(
+                (
+                    and_(
+                        *(
+                            basename.ilike("%" + term + "%", escape="\\")
+                            for term in escaped_terms
+                        )
+                    ),
+                    0,
+                ),
+                else_=1,
+            ),
+            func.length(basename),
+        ]
     records = session.execute(
-        statement.order_by(UserFile.id).offset(offset).limit(limit + 1)
+        statement.order_by(*order, UserFile.id).offset(offset).limit(limit + 1)
     ).all()
     access = get_access_for_user_files([str(row.id) for row in records], session)
     user_acl = get_acl_for_user(user, session)

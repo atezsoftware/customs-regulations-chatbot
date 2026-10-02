@@ -433,6 +433,7 @@ def run_tool_calls(
     # (but still pass it to the memory tool for persistence)
     inject_memories_in_prompt: bool = True,
     search_llm_chunks_per_call_cap: int | None = None,
+    tool_execution_timeout_seconds: float | None = TOOL_EXECUTION_TIMEOUT_SECONDS,
 ) -> ParallelToolCallResponse:
     """Run (optionally merged) tool calls in parallel and update citation mappings.
 
@@ -669,16 +670,23 @@ def run_tool_calls(
         for tool, tool_call, override_kwargs in tool_run_params
     ]
 
-    tool_run_results: list[ToolResponse | None] = run_functions_tuples_in_parallel(
-        functions_with_args,
-        allow_failures=True,  # Continue even if some tools fail
-        max_workers=(
-            max_parallel_workers
-            if max_parallel_workers is not None
-            else max_concurrent_tools
-        ),
-        timeout=TOOL_EXECUTION_TIMEOUT_SECONDS,
-    )
+    # An owning harness already runs its isolated tool in a cancellable task.
+    # Do not start a second executor that can discard an otherwise valid result.
+    if tool_execution_timeout_seconds is None and len(tool_run_params) == 1:
+        tool_run_results: list[ToolResponse | None] = [
+            _safe_run_single_tool(*tool_run_params[0])
+        ]
+    else:
+        tool_run_results = run_functions_tuples_in_parallel(
+            functions_with_args,
+            allow_failures=True,
+            max_workers=(
+                max_parallel_workers
+                if max_parallel_workers is not None
+                else max_concurrent_tools
+            ),
+            timeout=tool_execution_timeout_seconds,
+        )
 
     # Process results and update citation_mapping
     for result in tool_run_results:

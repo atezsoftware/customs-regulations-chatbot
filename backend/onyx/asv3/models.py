@@ -280,6 +280,8 @@ class HarnessResult(BaseModel):
     receipts: list[ToolReceipt]
     questions: list[str]
     facts: list[str]
+    stop_reason: str | None = None
+    publication_gap: ToolOutcome | None = None
 
 
 class HarnessView(BaseModel):

@@ -16,12 +16,14 @@ import unicodedata
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, replace
 from functools import wraps
+from time import perf_counter
 from typing import Any, Literal, ParamSpec, TypeVar, cast
 from uuid import UUID
 
 from sqlalchemy import delete, exists, func, or_, select
 from sqlalchemy.orm import Session
 
+from onyx.db.asv3_candidate_inventory import ASv3CandidateInventoryRow
 from onyx.db.enums import RegulatoryChunkSource, RegulatoryChunkStatus
 from onyx.db.models import RegulatoryAnnexElementChunk, RegulatoryChunk, UserFile
 from onyx.document_index.publication_models import (
@@ -62,6 +64,29 @@ def _bounded_context_read(function: Callable[_P, _T]) -> Callable[_P, _T]:
 
     @wraps(function)
     def run(*args: _P.args, **kwargs: _P.kwargs) -> _T:
+        from onyx.db.asv3_candidate_inventory import current_asv3_source_inventory_scope
+        from onyx.tracing.answer_graph import graph_step
+
+        scope = current_asv3_source_inventory_scope()
+        if scope is not None:
+            scope.check_active()
+            with graph_step(
+                "asv3.provision_selection",
+                {
+                    "operation": str(
+                        getattr(function, "__name__", "regulatory_context_read")
+                    )
+                },
+            ) as step:
+                started = perf_counter()
+                with _CONTEXT_READ_SLOTS:
+                    waited = perf_counter() - started
+                    scope.check_active()
+                    value = function(*args, **kwargs)
+                step.output_value = {"semaphore_wait_seconds": waited}
+                if isinstance(value, (list, tuple, set)):
+                    step.output_value["selected_count"] = len(value)
+                return value
         with _CONTEXT_READ_SLOTS:
             return function(*args, **kwargs)
 
@@ -134,6 +159,7 @@ class RegulatoryChunkSiblingCandidate:
     source_json: str | None = None
     image_file_id: str | None = None
     publication_source_sha256: str | None = None
+    planning_inventory: ASv3CandidateInventoryRow | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,6 +192,7 @@ class RegulatoryChunkProjection:
     source_json: str | None = None
     image_file_id: str | None = None
     publication_source_sha256: str | None = None
+    planning_inventory: ASv3CandidateInventoryRow | None = None
 
     @property
     def structural_index(self) -> int:
@@ -661,6 +688,7 @@ def _project_candidates(
                 structural_order=projection_index,
                 source_json=candidate.source_json,
                 publication_source_sha256=candidate.publication_source_sha256,
+                planning_inventory=candidate.planning_inventory,
                 image_file_id=candidate.image_file_id,
                 position=candidate.position,
                 text=candidate.text,
@@ -1635,7 +1663,13 @@ def get_bounded_source_lexical_matches(
 
     observation = observe_publication_read()
     effective_date = as_of_date or datetime.date.today()
-    all_rows = _load_compact_sibling_candidates(db_session, [user_file_id])
+    all_rows = _load_compact_sibling_candidates(
+        db_session,
+        [user_file_id],
+        as_of_date=effective_date,
+        query_indexes=query_indexes,
+        observation=observation,
+    )
     selected = select_bounded_source_lexical_matches(
         _public_sibling_candidates(
             db_session,
@@ -1898,6 +1932,7 @@ def get_regulatory_provision_heading_source(
     Only ids, positions, paths, validity metadata, and the document title are
     loaded. Legal text is deliberately excluded from this navigation query.
     """
+    from onyx.db.asv3_candidate_inventory import current_asv3_source_inventory_scope
     from onyx.db.regulatory_public_reads import (
         load_public_temporal_bindings,
         qualified_file_ids,
@@ -1951,6 +1986,21 @@ def get_regulatory_provision_heading_source(
     for file_id in qualified:
         index = (query_indexes or {}).get(file_id)
         if index is not None:
+            if current_asv3_source_inventory_scope() is not None:
+                bindings.update(
+                    _compact_public_bindings(
+                        db_session,
+                        file_id,
+                        index=index,
+                        as_of_date=effective_date,
+                        canonical_chunk_ids=tuple(
+                            record.id
+                            for record in seed_records
+                            if record.user_file_id == file_id
+                        ),
+                    )
+                )
+                continue
             for binding in load_public_temporal_bindings(
                 db_session,
                 file_id,
@@ -1991,7 +2041,13 @@ def get_regulatory_provision_heading_source(
                 RegulatoryChunk.user_file_id,
                 RegulatoryChunk.position,
                 RegulatoryChunk.heading_path,
-                RegulatoryChunk.chunk_metadata,
+                (
+                    func.jsonb_build_object(
+                        "article_title", RegulatoryChunk.chunk_metadata["article_title"]
+                    ).label("chunk_metadata")
+                    if current_asv3_source_inventory_scope() is not None
+                    else RegulatoryChunk.chunk_metadata
+                ),
                 RegulatoryChunk.status,
                 RegulatoryChunk.validity_start_date,
                 RegulatoryChunk.validity_end_date,
@@ -2097,7 +2153,8 @@ class _PublicProvisionRead:
     image_file_id: str | None
     effective_start: datetime.date | None
     effective_end: datetime.date | None
-    source_sha256: str
+    source_sha256: str | None
+    planning_inventory: ASv3CandidateInventoryRow | None = None
 
 
 def _compact_public_bindings(
@@ -2108,9 +2165,45 @@ def _compact_public_bindings(
     as_of_date: datetime.date,
     canonical_chunk_ids: tuple[str, ...] | None = None,
 ) -> dict[str, _PublicProvisionRead]:
+    from onyx.db.asv3_candidate_inventory import (
+        current_asv3_source_inventory_scope,
+        read_asv3_candidate_inventory,
+    )
     from onyx.db.regulatory_public_reads import iter_public_temporal_bindings
+    from onyx.regulatory.publication_reads import observe_publication_read
 
     compact: dict[str, _PublicProvisionRead] = {}
+    if current_asv3_source_inventory_scope() is not None:
+        allowed = set(canonical_chunk_ids) if canonical_chunk_ids is not None else None
+        for row in read_asv3_candidate_inventory(
+            session,
+            source_id=user_file_id,
+            index=index,
+            as_of_date=as_of_date,
+            observation=observe_publication_read(),
+            canonical_chunk_ids=canonical_chunk_ids,
+        ):
+            if allowed is not None and row.canonical_chunk_id not in allowed:
+                continue
+            previous = compact.get(row.canonical_chunk_id)
+            if previous is not None and (
+                previous.semantic_position,
+                previous.projection_ordinal,
+            ) > (row.semantic_position, row.ordinal):
+                continue
+            compact[row.canonical_chunk_id] = _PublicProvisionRead(
+                row.canonical_chunk_id,
+                row.semantic_position,
+                row.ordinal,
+                row.text,
+                row.heading_path,
+                row.image_file_id,
+                row.effective_start,
+                row.effective_end,
+                None,
+                row,
+            )
+        return compact
     for binding in iter_public_temporal_bindings(
         session,
         user_file_id,
@@ -2156,6 +2249,7 @@ def _hydrate_selected_regulatory_sources(
         (row.user_file_id, row.projection_index): row
         for row in selected
         if row.publication_source_sha256 is not None
+        or row.planning_inventory is not None
     }
     if not published:
         return selected
@@ -2164,23 +2258,46 @@ def _hydrate_selected_regulatory_sources(
         index = (query_indexes or {}).get(file_id)
         if index is None:
             raise ValueError("selected provision has no physical index authority")
-        for binding in iter_public_temporal_bindings(
-            session,
-            file_id,
-            index=index,
-            as_of_date=as_of_date,
-            projection_ordinals=tuple(
-                ordinal for file, ordinal in published if file == file_id
-            ),
-        ):
+        planned = tuple(
+            row.planning_inventory
+            for row in published.values()
+            if row.user_file_id == file_id and row.planning_inventory is not None
+        )
+        if planned:
+            from onyx.db.asv3_candidate_inventory import (
+                iter_verified_asv3_inventory_members,
+            )
+            from onyx.regulatory.publication_reads import observe_publication_read
+
+            bindings = iter_verified_asv3_inventory_members(
+                session,
+                rows=planned,
+                index=index,
+                as_of_date=as_of_date,
+                observation=observe_publication_read(),
+            )
+        else:
+            bindings = iter_public_temporal_bindings(
+                session,
+                file_id,
+                index=index,
+                as_of_date=as_of_date,
+                projection_ordinals=tuple(
+                    ordinal for file, ordinal in published if file == file_id
+                ),
+            )
+        for binding in bindings:
             key = (file_id, binding.projection.ordinal)
             row = published.get(key)
             source_json = binding.projection.source_json
             source = json.loads(source_json)
             if row is None or (
                 source["regulatory_chunk_id"] != row.regulatory_chunk_id
-                or hashlib.sha256(source_json.encode()).hexdigest()
-                != row.publication_source_sha256
+                or (
+                    row.publication_source_sha256 is not None
+                    and hashlib.sha256(source_json.encode()).hexdigest()
+                    != row.publication_source_sha256
+                )
                 or binding.semantic_position != row.position
                 or binding.representation_text != row.text
                 or binding.effective_start != row.validity_start_date
@@ -2191,14 +2308,96 @@ def _hydrate_selected_regulatory_sources(
     if hydrated.keys() != published.keys():
         raise ValueError("selected provision publication is no longer available")
     return [
-        replace(row, source_json=hydrated[(row.user_file_id, row.projection_index)])
+        replace(
+            row,
+            source_json=hydrated[(row.user_file_id, row.projection_index)],
+            planning_inventory=None,
+            publication_source_sha256=(
+                row.publication_source_sha256
+                or hashlib.sha256(
+                    hydrated[(row.user_file_id, row.projection_index)].encode()
+                ).hexdigest()
+            ),
+        )
         if row.publication_source_sha256 is not None
+        or row.planning_inventory is not None
         else row
         for row in selected
     ]
 
 
 def _load_compact_sibling_candidates(
+    session: Session,
+    user_file_ids: Sequence[UUID],
+    *,
+    as_of_date: datetime.date | None = None,
+    query_indexes: dict[UUID, PublicationIndexSnapshot] | None = None,
+    observation: ReadObservation | None = None,
+) -> list[RegulatoryChunkSiblingCandidate]:
+    from onyx.db.asv3_candidate_inventory import current_asv3_source_inventory_scope
+    from onyx.db.regulatory_public_reads import qualified_file_ids
+
+    if not user_file_ids:
+        return []
+    if current_asv3_source_inventory_scope() is None or observation is None:
+        return _load_legacy_compact_sibling_candidates(session, user_file_ids)
+    qualified = qualified_file_ids(session, tuple(user_file_ids))
+    candidates = _load_legacy_compact_sibling_candidates(
+        session,
+        [source_id for source_id in user_file_ids if source_id not in qualified],
+    )
+    for source_id in user_file_ids:
+        if source_id not in qualified:
+            continue
+        index = (query_indexes or {}).get(source_id)
+        if index is None:
+            continue
+        bindings = _compact_public_bindings(
+            session,
+            source_id,
+            index=index,
+            as_of_date=as_of_date or datetime.date.today(),
+        )
+        for binding in bindings.values():
+            inventory = binding.planning_inventory
+            if inventory is None:
+                raise ValueError(
+                    "ASv3 source selection requires its uncitable inventory"
+                )
+            metadata = inventory.canonical_metadata
+            candidates.append(
+                RegulatoryChunkSiblingCandidate(
+                    regulatory_chunk_id=inventory.canonical_chunk_id,
+                    user_file_id=source_id,
+                    position=binding.semantic_position,
+                    text=binding.representation_text,
+                    status=RegulatoryChunkStatus.ACTIVE.value,
+                    heading_path=binding.heading_path
+                    or tuple(metadata.get("heading_path") or ()),
+                    article_no=str(metadata["article_no"])
+                    if metadata.get("article_no") is not None
+                    else None,
+                    article_title=str(metadata["article_title"])
+                    if metadata.get("article_title") is not None
+                    else None,
+                    chunk_type=metadata.get("chunk_type"),
+                    paragraph_no=str(metadata["paragraph_no"])
+                    if metadata.get("paragraph_no") is not None
+                    else None,
+                    clause_label=str(metadata["clause_label"])
+                    if metadata.get("clause_label") is not None
+                    else None,
+                    validity_start_date=binding.effective_start,
+                    validity_end_date=binding.effective_end,
+                    projection_ordinal=binding.projection_ordinal,
+                    image_file_id=binding.image_file_id,
+                    planning_inventory=inventory,
+                )
+            )
+    return candidates
+
+
+def _load_legacy_compact_sibling_candidates(
     session: Session,
     user_file_ids: Sequence[UUID],
 ) -> list[RegulatoryChunkSiblingCandidate]:
@@ -2323,6 +2522,7 @@ def _public_sibling_candidates(
                 heading_path=binding.heading_path or candidate.heading_path,
                 projection_ordinal=binding.projection_ordinal,
                 publication_source_sha256=binding.source_sha256,
+                planning_inventory=binding.planning_inventory,
                 image_file_id=binding.image_file_id,
                 validity_start_date=binding.effective_start,
                 validity_end_date=binding.effective_end,
@@ -2419,7 +2619,13 @@ def get_bounded_same_provision_siblings(
             for seed_id in unique_seed_ids
             if file_by_seed_id.get(seed_id) == file_id
         ]
-        file_rows = _load_compact_sibling_candidates(db_session, [file_id])
+        file_rows = _load_compact_sibling_candidates(
+            db_session,
+            [file_id],
+            as_of_date=effective_date,
+            query_indexes=query_indexes,
+            observation=observation,
+        )
         candidates = _public_sibling_candidates(
             db_session,
             file_rows,
@@ -2491,7 +2697,13 @@ def get_bounded_adjacent_provisions(
     user_file_ids = {row.user_file_id for row in seed_rows}
     if not user_file_ids:
         return []
-    all_rows = _load_compact_sibling_candidates(db_session, list(user_file_ids))
+    all_rows = _load_compact_sibling_candidates(
+        db_session,
+        list(user_file_ids),
+        as_of_date=effective_date,
+        query_indexes=query_indexes,
+        observation=observation,
+    )
     selected = select_bounded_adjacent_provisions(
         _public_sibling_candidates(
             db_session,
@@ -2599,7 +2811,13 @@ def get_bounded_referenced_provisions(
     user_file_ids = {row.user_file_id for row in seed_rows}
     if not user_file_ids:
         return []
-    all_rows = _load_compact_sibling_candidates(db_session, list(user_file_ids))
+    all_rows = _load_compact_sibling_candidates(
+        db_session,
+        list(user_file_ids),
+        as_of_date=effective_date,
+        query_indexes=query_indexes,
+        observation=observation,
+    )
     selected = select_bounded_referenced_provisions(
         _public_sibling_candidates(
             db_session,

@@ -1,5 +1,6 @@
 """Exercise the production harness and citation path with only external boundaries faked."""
 
+import hashlib
 import json
 import threading
 from datetime import date
@@ -364,7 +365,7 @@ def test_resume_reuses_saved_question_language_without_reclassifying(
         supported_review([1, 2]),
     ]
     runtime.run_asv3_loop(**kwargs, resume_message_id=2)
-    assert llm.invoke.call_count == 4
+    assert llm.invoke.call_count == 2
     assert all(
         packet.obj.language == "tr"
         for packet in packets(queue)
@@ -411,10 +412,31 @@ def test_runtime_parallel_sources_full_original_review_and_final_citations(
         temperature=0,
         max_input_tokens=100000,
     )
+    kwargs["custom_agent_prompt"] = "Her soruya ayrı ve kısa uygulama sonucu ver."
     runtime.run_asv3_loop(**kwargs)
+    assert llm.invoke.call_count == 4
+    for call in llm.invoke.call_args_list[1:3]:
+        assert (
+            request_data(call.kwargs)["assistant_instructions"]
+            == kwargs["custom_agent_prompt"]
+        )
+    from onyx.prompts.asv3.research import FINAL_PROMPT
+
+    assert all(
+        call.kwargs["prompt"][0].content != FINAL_PROMPT
+        for call in llm.invoke.call_args_list
+    )
+    assert checkpoints[-1]["stop_reason"] == "verified_draft"
+    assert checkpoints[-1]["publication_stop_reason"] == "verified_draft_published"
+    assert checkpoints[-1]["final_publication_gap"] is None
+    approval = checkpoints[-1]["draft_approval"]
+    assert approval["verification_call_id"]
+    approved_text = request_data(llm.invoke.call_args_list[-1].kwargs)["claim"]
+    assert approval["text_hash"] == hashlib.sha256(approved_text.encode()).hexdigest()
+    assert checkpoints[-1]["last_draft"] == approved_text
     assert broker.peak == 2
     assert {item.chunk_id for item in broker.revalidated} == {"chunk-0", "chunk-1"}
-    for call in llm.invoke.call_args_list[-2:]:
+    for call in llm.invoke.call_args_list[-1:]:
         data = json.loads(call.kwargs["prompt"][1].content)
         evidence = json.loads(data["evidence"])
         assert {item["text"] for item in evidence} == {
@@ -469,13 +491,26 @@ def test_runtime_parallel_sources_full_original_review_and_final_citations(
     assert llm.config.model_provider == provider and llm.config.model_name == model_name
 
 
+def incomplete_script(llm: MagicMock) -> list[ModelResponse | Exception]:
+    script = list(llm.invoke.side_effect)
+    return [
+        *script[:2],
+        *[
+            item
+            for _ in range(3)
+            for item in (script[2], unsafe_review("Missing condition"))
+        ],
+        *script[4:],
+    ]
+
+
 def test_failed_final_verification_preserves_successful_final_original_delivery_without_publication(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from onyx.tracing.flows import LLMFlow
 
     kwargs, broker, llm, checkpoints, queue = setup_run(monkeypatch)
-    script = list(llm.invoke.side_effect)
+    script = incomplete_script(llm)
     script[-1] = RuntimeError("Final verifier failed after successful synthesis")
     llm.invoke.side_effect = script
     with pytest.raises(RuntimeError, match="Final verifier failed"):
@@ -540,7 +575,8 @@ def test_final_evidence_keeps_uncited_same_source_exception_without_unrelated_so
 def test_runtime_drops_unrecorded_citation_and_publishes_only_localized_gap(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    kwargs, _broker, _llm, checkpoints, queue = setup_run(monkeypatch, "Kaynak [999].")
+    kwargs, _broker, llm, checkpoints, queue = setup_run(monkeypatch, "Kaynak [999].")
+    llm.invoke.side_effect = incomplete_script(llm)
     runtime.run_asv3_loop(**kwargs)
     output = packets(queue)
     assert not any(isinstance(packet.obj, CitationInfo) for packet in output)
@@ -564,7 +600,7 @@ def test_runtime_supported_draft_does_not_authorize_unsafe_final_wording(
 ) -> None:
     unsafe_final = "Her bedelsiz yeni makine vergiden muaftır [1]."
     kwargs, _broker, llm, checkpoints, queue = setup_run(monkeypatch, unsafe_final)
-    script = list(llm.invoke.side_effect)
+    script = incomplete_script(llm)
     script[-1] = unsafe_review(unsafe_final)
     llm.invoke.side_effect = script
     runtime.run_asv3_loop(**kwargs)
@@ -792,7 +828,7 @@ def test_runtime_review_gap_drives_new_source_before_supported_publication(
     llm.invoke.side_effect = invoke
     runtime.run_asv3_loop(**kwargs)
     assert recovery_observed
-    assert llm.invoke.call_count == 9
+    assert llm.invoke.call_count == 7
     assert checkpoints[-1]["publication_status"] == "found"
     assert checkpoints[-1]["evidence"]["included"] == [1, 2]
     assert len(kwargs["state_container"].citation_to_doc) == 2
@@ -907,3 +943,62 @@ def test_runtime_researchers_keep_scenario_facts_isolated_and_selected_llm(
         for packet in packets(queue)
     )
     assert llm.config.model_name == selected_name
+
+
+def test_incomplete_supported_review_retains_exact_publication_rejection_diagnostics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kwargs, _broker, llm, checkpoints, queue = setup_run(monkeypatch)
+    script = incomplete_script(llm)
+    review = supported_review([1, 2])
+    content = review.choice.message.content
+    assert isinstance(content, str)
+    parsed = json.loads(content)
+    # Supported/safe flags alone cannot override missing question coverage.
+    parsed["question_results"][0]["question_id"] = "unrelated-question"
+    script[-1] = response(json.dumps(parsed))
+    llm.invoke.side_effect = script
+    runtime.run_asv3_loop(**kwargs)
+    saved = checkpoints[-1]
+    assert saved["stop_reason"] == "repeated_publication_gap"
+    assert saved["publication_gap"]["data"]["review"]["missing_conditions"]
+    assert saved["publication_review"]["status"] == "supported"
+    assert saved["publication_review"]["safe_to_publish"] is True
+    assert saved["publication_stop_reason"] == "publication_guard_rejected"
+    assert saved["final_publication_gap"]["data"]["gaps"]
+    assert saved["publication_status"] == "partial"
+    assert saved["draft_approval"] is None
+    assert not any(isinstance(packet.obj, CitationInfo) for packet in packets(queue))
+    from onyx.prompts.asv3.research import FINAL_PROMPT
+
+    assert any(
+        call.kwargs["prompt"][0].content == FINAL_PROMPT
+        for call in llm.invoke.call_args_list
+    )
+
+
+def test_verified_draft_publication_still_revalidates_acl_and_rejects_late_cancel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kwargs, broker, llm, checkpoints, queue = setup_run(monkeypatch)
+    writes_before_cancel = 0
+
+    def revoke_during_revalidation(
+        _items: list[EvidenceItem], context: RunContext
+    ) -> None:
+        nonlocal writes_before_cancel
+        writes_before_cancel = len(checkpoints)
+        broker.cancelled.set()
+        context.check_active()
+
+    monkeypatch.setattr(broker, "revalidate_evidence", revoke_during_revalidation)
+    with pytest.raises(RunStopped):
+        runtime.run_asv3_loop(**kwargs)
+    assert llm.invoke.call_count == 4
+    assert checkpoints[-1]["draft_approval"]["verification_call_id"]
+    assert len(checkpoints) == writes_before_cancel
+    assert kwargs["state_container"].answer_tokens is None
+    assert not any(
+        isinstance(packet.obj, (AgentResponseStart, AgentResponseDelta, CitationInfo))
+        for packet in packets(queue)
+    )

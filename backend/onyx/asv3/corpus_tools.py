@@ -23,6 +23,7 @@ from onyx.asv3.models import (
 )
 from onyx.configs.constants import DocumentSource
 from onyx.context.search.models import IndexFilters, SearchDoc
+from onyx.db.asv3_candidate_inventory import current_asv3_source_inventory_scope
 from onyx.db.asv3_corpus import (
     CorpusChunk,
     CorpusScopeUnavailable,
@@ -446,6 +447,104 @@ class CorpusBroker:
         return self.hydrate_search_results([doc], context).get(
             (doc.document_id, doc.chunk_ind), []
         )
+
+    def hydrate_search_centers(
+        self, docs: list[SearchDoc], context: RunContext
+    ) -> dict[tuple[str, int], list[EvidenceItem]]:
+        """Read exact search originals; further context is a research decision."""
+        grouped: dict[str, list[SearchDoc]] = {}
+        for doc in docs:
+            if not isinstance(doc.metadata.get("regulatory_chunk_id"), str):
+                raise CorpusScopeUnavailable(
+                    "Retrieved section has no canonical center identity."
+                )
+            grouped.setdefault(doc.document_id, []).append(doc)
+        hydrated: dict[tuple[str, int], list[EvidenceItem]] = {}
+        for source_id, centers in grouped.items():
+            context.check_active()
+            center_ids = tuple(
+                dict.fromkeys(
+                    str(doc.metadata["regulatory_chunk_id"]) for doc in centers
+                )
+            )
+            with graph_step(
+                "asv3.canonical_hydration.centers",
+                {"source_id": source_id, "center_ids": center_ids},
+                summary="Read exact retrieved originals without implicit expansion",
+            ) as step:
+                with get_session_with_current_tenant() as session:
+                    source = require_source(
+                        session,
+                        user=self.user,
+                        filters=self.filters,
+                        source_id=UUID(source_id),
+                    )
+                    scope = current_asv3_source_inventory_scope()
+                    captured_index = None
+                    if scope is not None:
+                        with scope.lock:
+                            captured_index = scope.query_indexes.get(source.id)
+                    with self._index_lock:
+                        if captured_index is not None:
+                            previous = self.query_indexes.get(source.id)
+                            if (
+                                previous is not None
+                                and not previous.matches_temporal_index(captured_index)
+                            ):
+                                raise CorpusScopeUnavailable(
+                                    "Retrieved source index differs from captured authority."
+                                )
+                            self.query_indexes[source.id] = captured_index
+                        if source.id not in self.query_indexes:
+                            snapshot = resolve_source_query_index(session, source.id)
+                            if snapshot is not None:
+                                self.query_indexes[source.id] = snapshot
+                    originals = iter_source_chunks_by_ids(
+                        session,
+                        user=self.user,
+                        filters=self.filters,
+                        source_id=source.id,
+                        chunk_ids=center_ids,
+                        index=self.query_indexes.get(source.id),
+                        check_active=context.check_active,
+                    )
+                    by_id: dict[str, CorpusChunk] = {}
+                    try:
+                        for chunk in originals:
+                            if chunk.id in by_id:
+                                raise CorpusScopeUnavailable(
+                                    "Retrieved original has ambiguous canonical bindings."
+                                )
+                            by_id[chunk.id] = chunk
+                    finally:
+                        originals.close()
+                context.check_active()
+                for doc in centers:
+                    center_id = str(doc.metadata["regulatory_chunk_id"])
+                    chunk = by_id.get(center_id)
+                    if chunk is None or chunk.projection_ordinal != doc.chunk_ind:
+                        hydrated[(doc.document_id, doc.chunk_ind)] = []
+                        continue
+                    item = evidence_for_chunk(source, chunk)
+                    item.metadata.update(
+                        retrieval_method="established_search_exact_original",
+                        article_closure_complete=False,
+                        section_context="not_inferred",
+                        additional_context="harness_controlled",
+                        follow_context_tool="read_provision",
+                        retrieved_projection_ordinal=doc.chunk_ind,
+                        retrieved_center=True,
+                    )
+                    hydrated[(doc.document_id, doc.chunk_ind)] = [item]
+                step.output_value = {
+                    "requested_center_count": len(center_ids),
+                    "hydrated_chunk_count": len(by_id),
+                    "hydrated_characters": sum(
+                        len(chunk.text) for chunk in by_id.values()
+                    ),
+                    "context_expanded": False,
+                }
+        return hydrated
 
     def hydrate_search_results(
         self, docs: list[SearchDoc], context: RunContext

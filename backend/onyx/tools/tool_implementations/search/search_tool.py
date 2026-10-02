@@ -70,6 +70,7 @@ from onyx.context.search.utils import (
     inference_section_from_single_chunk,
     populate_file_ids_on_sections,
 )
+from onyx.db.asv3_candidate_inventory import current_asv3_source_inventory_scope
 from onyx.db.connector import (
     check_connectors_exist,
     check_federated_connectors_exist,
@@ -2668,58 +2669,63 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
                         ranked_regulatory_sections,
                         visible_chunk_ids,
                     )
-                regulatory_navigation = build_regulatory_provision_navigation(
-                    provision_session,
-                    navigation_seed_sections,
-                    query=llm_queries[0],
-                    as_of_date=provision_as_of_date,
-                )
-                selected_sections = expand_selected_regulatory_references(
-                    provision_session,
-                    selected_sections,
-                    reference_sections=navigation_seed_sections,
-                    query=llm_queries[0],
-                    as_of_date=provision_as_of_date,
-                    max_total_sections=_regulatory_reference_expansion_limit(
-                        len(selected_sections), max_selected_sections
-                    ),
-                )
-                selected_sections = _expand_backfilled_regulatory_sections(
-                    provision_session,
-                    selected_sections,
-                    ranked_sections=ranked_regulatory_sections or [],
-                    # evidence_target is reporting-only; retrieval remains driven
-                    # exclusively by the model-written query.
-                    query=llm_queries[0],
-                    as_of_date=provision_as_of_date,
-                    max_total_sections=(max_selected_sections),
-                    structural_seed_sections=navigation_seed_sections,
-                )
-                selected_sections = expand_selected_regulatory_source_lexical_matches(
-                    provision_session,
-                    selected_sections,
-                    navigation=regulatory_navigation,
-                    query=llm_queries[0],
-                    as_of_date=provision_as_of_date,
-                    max_total_sections=max_selected_sections,
-                )
-                if source_anchors:
-                    selected_sections = expand_selected_regulatory_adjacent_provisions(
+                if current_asv3_source_inventory_scope() is None:
+                    regulatory_navigation = build_regulatory_provision_navigation(
+                        provision_session,
+                        navigation_seed_sections,
+                        query=llm_queries[0],
+                        as_of_date=provision_as_of_date,
+                    )
+                    selected_sections = expand_selected_regulatory_references(
                         provision_session,
                         selected_sections,
-                        seed_sections=selected_sections,
+                        reference_sections=navigation_seed_sections,
+                        query=llm_queries[0],
+                        as_of_date=provision_as_of_date,
+                        max_total_sections=_regulatory_reference_expansion_limit(
+                            len(selected_sections), max_selected_sections
+                        ),
+                    )
+                    selected_sections = _expand_backfilled_regulatory_sections(
+                        provision_session,
+                        selected_sections,
+                        ranked_sections=ranked_regulatory_sections or [],
+                        # evidence_target is reporting-only; retrieval remains driven
+                        # exclusively by the model-written query.
+                        query=llm_queries[0],
+                        as_of_date=provision_as_of_date,
+                        max_total_sections=(max_selected_sections),
+                        structural_seed_sections=navigation_seed_sections,
+                    )
+                    selected_sections = (
+                        expand_selected_regulatory_source_lexical_matches(
+                            provision_session,
+                            selected_sections,
+                            navigation=regulatory_navigation,
+                            query=llm_queries[0],
+                            as_of_date=provision_as_of_date,
+                            max_total_sections=max_selected_sections,
+                        )
+                    )
+                    if source_anchors:
+                        selected_sections = (
+                            expand_selected_regulatory_adjacent_provisions(
+                                provision_session,
+                                selected_sections,
+                                seed_sections=selected_sections,
+                                query=llm_queries[0],
+                                as_of_date=provision_as_of_date,
+                                max_total_sections=max_selected_sections,
+                            )
+                        )
+                    selected_sections = expand_selected_regulatory_navigation_leads(
+                        provision_session,
+                        selected_sections,
+                        navigation=regulatory_navigation,
                         query=llm_queries[0],
                         as_of_date=provision_as_of_date,
                         max_total_sections=max_selected_sections,
                     )
-                selected_sections = expand_selected_regulatory_navigation_leads(
-                    provision_session,
-                    selected_sections,
-                    navigation=regulatory_navigation,
-                    query=llm_queries[0],
-                    as_of_date=provision_as_of_date,
-                    max_total_sections=max_selected_sections,
-                )
         if (
             label_result.evidence_by_chunk
             and label_snapshot is not None
