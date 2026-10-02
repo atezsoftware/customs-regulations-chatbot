@@ -12,7 +12,7 @@ from sqlalchemy import delete, event
 from sqlalchemy.orm import Session
 
 from onyx.context.search.models import IndexFilters
-from onyx.db import asv3_corpus, asv3_initial_context, regulatory_public_reads
+from onyx.db import asv3_corpus, regulatory_public_reads
 from onyx.db.asv3_candidate_inventory import (
     asv3_source_inventory_scope,
     iter_verified_asv3_inventory_members,
@@ -36,6 +36,7 @@ from onyx.document_index.publication_models import (
     PublicationIndexSnapshot,
     publication_digest,
 )
+from onyx.regulatory import provision_retrieval
 from onyx.regulatory.provision_retrieval import build_regulatory_rerank_packets
 from onyx.regulatory.publication_reads import observe_publication_read
 from tests.external_dependency_unit.conftest import create_test_user
@@ -279,6 +280,7 @@ def test_inventory_preserves_explicit_expansion_and_bounds_initial_packets(
 
 @pytest.mark.usefixtures("tenant_context")
 @pytest.mark.parametrize("inventory_source", [48, 2500], indirect=True)
+@pytest.mark.parametrize("all_siblings", [False, True])
 def test_initial_packets_select_all_frozen_parent_siblings_without_source_inventory(
     db_session: Session,
     inventory_source: tuple[
@@ -286,9 +288,11 @@ def test_initial_packets_select_all_frozen_parent_siblings_without_source_invent
     ],
     monkeypatch: pytest.MonkeyPatch,
     record_property: Any,
+    all_siblings: bool,
 ) -> None:
     source, index, rows = inventory_source
-    for row in rows[:20]:
+    selected = rows if all_siblings else rows[:20]
+    for row in selected:
         payload = dict(row.payload)
         original = json.loads(payload["projection"]["source_json"])
         original["heading_path"] = [
@@ -312,26 +316,41 @@ def test_initial_packets_select_all_frozen_parent_siblings_without_source_invent
     seeds = [
         _chunk(
             row.projection_ordinal, row.canonical_chunk_id, document_id=str(source.id)
-        ).model_copy(update={"publication_index": index})
+        ).model_copy(
+            update={"publication_index": index, "score": float(row.projection_ordinal)}
+        )
         for row in rows[:20]
     ]
-    requested_ids: list[tuple[str, ...]] = []
-    original_reader = asv3_initial_context.iter_public_temporal_bindings
+    converted_ids: list[str] = []
+    original_converter = provision_retrieval._asv3_parent_scoring_chunk
 
-    def selected_reader(*args: Any, **kwargs: Any) -> Any:
-        ids = kwargs["canonical_chunk_ids"]
-        assert ids is not None
-        requested_ids.append(ids)
-        return original_reader(*args, **kwargs)
+    def convert(*args: Any, **kwargs: Any) -> Any:
+        converted_ids.append(args[0].regulatory_chunk_id)
+        return original_converter(*args, **kwargs)
 
-    monkeypatch.setattr(
-        asv3_initial_context, "iter_public_temporal_bindings", selected_reader
-    )
+    monkeypatch.setattr(provision_retrieval, "_asv3_parent_scoring_chunk", convert)
+    statements: list[str] = []
+
+    def capture(
+        _connection: object,
+        _cursor: object,
+        statement: str,
+        _parameters: object,
+        _context: object,
+        _executemany: bool,
+    ) -> None:
+        statements.append(statement)
+
     with asv3_source_inventory_scope(scope_key="bounded-initial-packets") as scope:
         started = perf_counter()
-        packets = build_regulatory_rerank_packets(
-            db_session, seeds, query="paragraph", as_of_date=date(2026, 10, 2)
-        )
+        connection = db_session.connection()
+        event.listen(connection, "before_cursor_execute", capture)
+        try:
+            packets = build_regulatory_rerank_packets(
+                db_session, seeds, query="paragraph", as_of_date=date(2026, 10, 2)
+            )
+        finally:
+            event.remove(connection, "before_cursor_execute", capture)
         record_property("initial_packet_seconds", perf_counter() - started)
         record_property("source_rows", len(rows))
         assert not scope.entries
@@ -339,17 +358,28 @@ def test_initial_packets_select_all_frozen_parent_siblings_without_source_invent
     assert [packet.primary_member.regulatory_chunk_id for packet in packets] == [
         seed.regulatory_chunk_id for seed in seeds
     ]
-    assert all(len(packet.members) == 20 for packet in packets)
+    assert all(len(packet.members) == len(selected) for packet in packets)
     assert [member.regulatory_chunk_id for member in packets[0].members] == [
-        row.canonical_chunk_id for row in rows[:20]
+        row.canonical_chunk_id for row in selected
     ]
     assert all(
         (member.heading_path or [])[:3] == ["Law", "Ek 1", "MADDE 3"]
         for packet in packets
         for member in packet.members
     )
-    assert len(requested_ids) == 1
-    assert len(requested_ids[0]) == 20 < len(rows)
+    assert set(converted_ids) == {row.canonical_chunk_id for row in selected}
+    assert len(converted_ids) == len(selected)
+    assert not any("regulatory_canonical_revision" in sql for sql in statements)
+    assert all(
+        "regulatory_temporal_projection.payload," not in sql.split("FROM", 1)[0]
+        for sql in statements
+    )
+    assert all(
+        packet.primary_member.score == seed.score
+        for packet, seed in zip(packets, seeds)
+    )
+    packets[0].primary_member.metadata["private_test_value"] = "first packet"
+    assert "private_test_value" not in packets[1].members[0].metadata
     assert all(
         member.content.startswith("Original operative paragraph")
         for packet in packets
@@ -360,10 +390,26 @@ def test_initial_packets_select_all_frozen_parent_siblings_without_source_invent
         for packet in packets
         for member in packet.members
     )
+    assert all(
+        member.metadata["asv3_evidence_stage"] == "uncitable_parent_candidate"
+        for packet in packets
+        for member in packet.members
+    )
+    originals = list(
+        regulatory_public_reads.iter_public_temporal_bindings(
+            db_session,
+            source.id,
+            index=index,
+            as_of_date=date(2026, 10, 2),
+            canonical_chunk_ids=(rows[0].canonical_chunk_id,),
+        )
+    )
+    assert len(originals) == 1
+    assert originals[0].representation_text == packets[0].primary_member.content
 
 
 @pytest.mark.usefixtures("tenant_context")
-@pytest.mark.parametrize("corruption", ["payload", "retired", "wrong_index", "expired"])
+@pytest.mark.parametrize("corruption", ["retired", "wrong_index", "expired"])
 def test_initial_packet_selected_seed_fails_closed(
     db_session: Session,
     inventory_source: tuple[
@@ -396,6 +442,86 @@ def test_initial_packet_selected_seed_fails_closed(
         build_regulatory_rerank_packets(
             db_session, [seed], query="paragraph", as_of_date=date(2026, 10, 2)
         )
+
+
+@pytest.mark.usefixtures("tenant_context")
+@pytest.mark.parametrize("corruption", ["payload", "revision_authority"])
+def test_parent_scoring_lead_cannot_bypass_original_validation(
+    db_session: Session,
+    pc_corpus: DocumentSet,
+    inventory_source: tuple[
+        UserFile, PublicationIndexSnapshot, list[RegulatoryTemporalProjection]
+    ],
+    corruption: str,
+) -> None:
+    source, index, rows = inventory_source
+    owner = db_session.get_one(User, source.user_id)
+    previous_owner = pc_corpus.user_id
+    pc_corpus.user_id = owner.id
+    link = DocumentSet__UserFile(document_set_id=pc_corpus.id, user_file_id=source.id)
+    db_session.add(link)
+    db_session.commit()
+    try:
+        filters = resolve_pc_corpus_scope(
+            db_session,
+            user=owner,
+            filters=IndexFilters(access_control_list=[], as_of_date=date(2026, 10, 2)),
+        )
+        seed = _chunk(
+            0, rows[0].canonical_chunk_id, document_id=str(source.id)
+        ).model_copy(update={"publication_index": index})
+        assert seed.regulatory_chunk_id is not None
+        with asv3_source_inventory_scope(scope_key="owned-parent-candidates"):
+            packets = build_regulatory_rerank_packets(
+                db_session, [seed], query="paragraph", as_of_date=filters.as_of_date
+            )
+        assert (
+            packets[0].primary_member.metadata["asv3_evidence_stage"]
+            == "uncitable_parent_candidate"
+        )
+        assert (
+            len(
+                list(
+                    asv3_corpus.iter_source_chunks_by_ids(
+                        db_session,
+                        user=owner,
+                        filters=filters,
+                        source_id=source.id,
+                        chunk_ids=(seed.regulatory_chunk_id,),
+                        index=index,
+                        check_active=lambda: None,
+                    )
+                )
+            )
+            == 1
+        )
+        row = rows[0]
+        if corruption == "payload":
+            row.payload = {
+                **row.payload,
+                "representation_text": "unverified operative text",
+            }
+        else:
+            row.payload = {**row.payload, "canonical_base_sha256": "0" * 64}
+            row.payload_sha256 = publication_digest(row.payload)
+        db_session.commit()
+        with pytest.raises(ValueError):
+            list(
+                asv3_corpus.iter_source_chunks_by_ids(
+                    db_session,
+                    user=owner,
+                    filters=filters,
+                    source_id=source.id,
+                    chunk_ids=(seed.regulatory_chunk_id,),
+                    index=index,
+                    check_active=lambda: None,
+                )
+            )
+    finally:
+        db_session.rollback()
+        db_session.delete(link)
+        pc_corpus.user_id = previous_owner
+        db_session.commit()
 
 
 @pytest.mark.usefixtures("tenant_context")

@@ -7,7 +7,19 @@ from datetime import date
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import Integer, Text, and_, case, cast, func, or_, select
+from sqlalchemy import (
+    JSON,
+    Integer,
+    Text,
+    and_,
+    case,
+    cast,
+    column,
+    func,
+    or_,
+    select,
+    true,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Session
 
@@ -702,10 +714,20 @@ def source_sibling_ids(
             RegulatoryTemporalProjection.payload["semantic_position"].astext, Integer
         )
         ordinal = RegulatoryTemporalProjection.projection_ordinal
-        headings = cast(
-            RegulatoryTemporalProjection.payload["projection"]["source_json"].astext,
-            JSONB,
-        )["heading_path"]
+        parent_fields = (
+            func.json_to_record(
+                cast(
+                    RegulatoryTemporalProjection.payload["projection"][
+                        "source_json"
+                    ].astext,
+                    JSON,
+                )
+            )
+            .table_valued(column("heading_path", JSON))
+            .render_derived(with_types=True)
+            .lateral("parent_fields")
+        )
+        headings = cast(parent_fields.c.heading_path, JSONB)
         statement = (
             select(identifier)
             .join(
@@ -715,6 +737,7 @@ def source_sibling_ids(
                     RegulatoryChunk.user_file_id == source_id,
                 ),
             )
+            .join(parent_fields, true())
             .where(
                 RegulatoryTemporalProjection.user_file_id == source_id,
                 RegulatoryTemporalProjection.index_uuid == index.index_uuid,

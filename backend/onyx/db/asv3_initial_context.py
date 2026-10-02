@@ -1,22 +1,18 @@
-"""Same-parent navigation with freshly verified, independently citable originals."""
+"""Uncitable parent-family candidates; finalists need the public original reader."""
 
-import hashlib
 import json
 from collections.abc import Sequence
 from datetime import date
 from time import perf_counter
 from uuid import UUID
 
-from sqlalchemy import and_, cast, func, or_, select
+from sqlalchemy import JSON, Integer, Text, and_, cast, column, func, or_, select, true
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Session
 
 from onyx.db.asv3_candidate_inventory import current_asv3_source_inventory_scope
 from onyx.db.models import RegulatoryChunk, RegulatoryTemporalProjection
-from onyx.db.regulatory_chunks import (
-    RegulatoryChunkProjection,
-)
-from onyx.db.regulatory_public_reads import iter_public_temporal_bindings
+from onyx.db.regulatory_chunks import RegulatoryChunkProjection
 from onyx.document_index.publication_models import PublicationIndexSnapshot
 from onyx.regulatory.publication_reads import (
     observe_publication_read,
@@ -32,11 +28,12 @@ def get_asv3_initial_rerank_context(
     indexes: dict[UUID, PublicationIndexSnapshot],
     as_of_date: date,
 ) -> dict[str, tuple[RegulatoryChunkProjection, ...]]:
-    """Use frozen parent metadata, never infer whole-provision completeness.
+    """Select ALL frozen immediate-parent siblings as scoring/navigation leads.
 
-    Every sibling in the same immediate heading parent is selected from frozen
-    metadata. Only that family's originals are hydrated and verified. No full-source
-    inventory or positional window is used; wider reading remains a harness decision.
+    Read only compact fields, not full revision/vector payloads. This stage grants
+    neither citations nor legal completeness. ASv3 hydrates selected search centers
+    through its ACL/date/index/immutable-publication-fenced original reader before
+    adding them to the evidence ledger.
     """
     scope = current_asv3_source_inventory_scope()
     if scope is None:
@@ -53,23 +50,50 @@ def get_asv3_initial_rerank_context(
     unique_ids = tuple(dict.fromkeys(seed_ids))
     if not unique_ids:
         return {}
+    if not indexes:
+        raise ValueError("ASv3 parent selection requires pinned physical indexes")
     observation = observe_publication_read()
-    projection = RegulatoryTemporalProjection
-    canonical = RegulatoryChunk
-    headings = cast(projection.payload["projection"]["source_json"].astext, JSONB)[
-        "heading_path"
-    ]
-    pinned_index = or_(
-        *[
-            and_(
-                projection.user_file_id == file_id,
-                projection.index_uuid == index.index_uuid,
-            )
-            for file_id, index in indexes.items()
-        ]
+    require_publication_files(observation, tuple(indexes))
+    projection, canonical = RegulatoryTemporalProjection, RegulatoryChunk
+    # JSON extraction avoids constructing a binary JSON tree for every vector.
+    source_fields = (
+        func.json_to_record(
+            cast(projection.payload["projection"]["source_json"].astext, JSON)
+        )
+        .table_valued(column("heading_path", JSON))
+        .render_derived(with_types=True)
+        .lateral("parent_fields")
     )
-    # Materialize only parent locators once per binding, not once per seed join.
-    # Frozen source_json may be large; no source body or vector is selected here.
+    headings = cast(source_fields.c.heading_path, JSONB)
+    qualified = (
+        or_(
+            *[
+                and_(
+                    projection.user_file_id == file_id,
+                    projection.index_uuid == index.index_uuid,
+                )
+                for file_id, index in indexes.items()
+            ]
+        ),
+        projection.retired_at.is_(None),
+        or_(
+            projection.effective_start.is_(None),
+            projection.effective_start <= as_of_date,
+        ),
+        or_(projection.effective_end.is_(None), projection.effective_end > as_of_date),
+        or_(
+            canonical.validity_start_date.is_(None),
+            canonical.validity_start_date <= as_of_date,
+        ),
+        or_(
+            canonical.validity_end_date.is_(None),
+            canonical.validity_end_date > as_of_date,
+        ),
+    )
+    canonical_join = and_(
+        canonical.id == projection.canonical_chunk_id,
+        canonical.user_file_id == projection.user_file_id,
+    )
     locators = (
         select(
             projection.id.label("binding_id"),
@@ -80,151 +104,194 @@ def get_asv3_initial_rerank_context(
             headings.op("-", return_type=JSONB)(-1).label("parent"),
             (func.jsonb_array_length(headings) > 0).label("parent_known"),
         )
-        .join(
-            canonical,
-            and_(
-                canonical.id == projection.canonical_chunk_id,
-                canonical.user_file_id == projection.user_file_id,
-            ),
-        )
-        .where(
-            pinned_index,
-            projection.retired_at.is_(None),
-            or_(
-                projection.effective_start.is_(None),
-                projection.effective_start <= as_of_date,
-            ),
-            or_(
-                projection.effective_end.is_(None),
-                projection.effective_end > as_of_date,
-            ),
-            or_(
-                canonical.validity_start_date.is_(None),
-                canonical.validity_start_date <= as_of_date,
-            ),
-            or_(
-                canonical.validity_end_date.is_(None),
-                canonical.validity_end_date > as_of_date,
-            ),
-        )
+        .join(canonical, canonical_join)
+        .join(source_fields, true())
+        .where(*qualified)
         .cte("asv3_parent_locators")
         .prefix_with("MATERIALIZED")
     )
-    seeds, members = (
-        locators.alias("asv3_parent_seed"),
-        locators.alias("asv3_parent_sibling"),
-    )
+    seeds, siblings = locators.alias("parent_seed"), locators.alias("parent_sibling")
     query = (
-        select(seeds.c.chunk_id, seeds.c.file_id, members.c.chunk_id)
+        select(seeds.c.chunk_id, siblings.c.binding_id)
         .select_from(seeds)
         .join(
-            members,
+            siblings,
             and_(
-                members.c.file_id == seeds.c.file_id,
-                members.c.index_uuid == seeds.c.index_uuid,
+                siblings.c.file_id == seeds.c.file_id,
+                siblings.c.index_uuid == seeds.c.index_uuid,
                 or_(
                     and_(
                         seeds.c.parent_known,
-                        members.c.parent_known,
-                        members.c.parent == seeds.c.parent,
+                        siblings.c.parent_known,
+                        siblings.c.parent == seeds.c.parent,
                     ),
-                    members.c.binding_id == seeds.c.binding_id,
+                    siblings.c.binding_id == seeds.c.binding_id,
                 ),
             ),
         )
         .where(seeds.c.chunk_id.in_(unique_ids))
-        .order_by(seeds.c.chunk_id, members.c.ordinal, members.c.chunk_id)
-        .execution_options(yield_per=128)
+        .order_by(seeds.c.chunk_id, siblings.c.ordinal, siblings.c.chunk_id)
+        .execution_options(stream_results=True, yield_per=128)
     )
     with graph_step(
         "asv3.initial_packet_context",
         {
             "seed_count": len(unique_ids),
             "context_policy": "all_immediate_parent_siblings",
+            "citable": False,
             "complete_operative_unit": False,
         },
     ) as span:
-        leads: dict[str, list[str]] = {}
-        files: dict[str, UUID] = {}
+        leads: dict[str, list[UUID]] = {}
         started = perf_counter()
-        for seed_id, file_id, member_id in session.execute(query):
-            files[seed_id] = file_id
-            leads.setdefault(seed_id, []).append(member_id)
+        result = session.execute(query)
+        try:
+            for seed_id, binding_id in result:
+                scope.check_active()
+                leads.setdefault(seed_id, []).append(binding_id)
+        finally:
+            result.close()
         lead_seconds = perf_counter() - started
-        require_publication_files(observation, tuple(set(files.values())))
-        selected: dict[str, RegulatoryChunkProjection] = {}
-        validated_bindings = 0
-        original_bytes = 0
-        started = perf_counter()
-        for file_id in dict.fromkeys(files.values()):
-            scope.check_active()
-            members = tuple(
-                dict.fromkeys(
-                    member
-                    for seed, ids in leads.items()
-                    if files[seed] == file_id
-                    for member in ids
-                )
+        if set(leads) != set(unique_ids):
+            raise ValueError("ASv3 initial context lost a selected seed")
+        selected_ids = tuple(
+            dict.fromkeys(member for ids in leads.values() for member in ids)
+        )
+        binding_fields = (
+            func.jsonb_to_record(projection.payload)
+            .table_valued(
+                column("semantic_position", Integer),
+                column("representation_text", Text),
+                column("index", JSONB),
+                column("projection", JSONB),
             )
-            for binding in iter_public_temporal_bindings(
-                session,
-                file_id,
-                index=indexes[file_id],
-                as_of_date=as_of_date,
-                canonical_chunk_ids=members,
-            ):
-                validated_bindings += 1
-                source_json = binding.projection.source_json
-                original_bytes += len(source_json.encode())
-                source = json.loads(source_json)
-                chunk_id = source["regulatory_chunk_id"]
-                if source["document_id"] != str(file_id) or chunk_id not in members:
-                    raise ValueError("ASv3 initial context source identity mismatch")
-                previous = selected.get(chunk_id)
-                if previous is not None and (
-                    previous.position,
-                    previous.projection_index,
-                ) > (binding.semantic_position, binding.projection.ordinal):
-                    continue
-                selected[chunk_id] = RegulatoryChunkProjection(
-                    regulatory_chunk_id=chunk_id,
-                    user_file_id=file_id,
-                    projection_index=binding.projection.ordinal,
-                    position=binding.semantic_position,
-                    text=binding.representation_text,
-                    heading_path=tuple(source.get("heading_path") or ()),
-                    article_no=source.get("article_no"),
-                    status="approved",
-                    validity_start_date=binding.effective_start,
-                    validity_end_date=binding.effective_end,
-                    source_json=source_json,
-                    image_file_id=source.get("image_file_id"),
-                    publication_source_sha256=hashlib.sha256(
-                        source_json.encode()
-                    ).hexdigest(),
+            .render_derived(with_types=True)
+            .lateral("scoring_binding")
+        )
+        projection_fields = (
+            func.jsonb_to_record(binding_fields.c.projection)
+            .table_valued(
+                column("source_json", Text),
+                column("embedding_config_json", Text),
+                column("observed_index", JSONB),
+            )
+            .render_derived(with_types=True)
+            .lateral("scoring_projection")
+        )
+        scoring_fields = (
+            func.json_to_record(cast(projection_fields.c.source_json, JSON))
+            .table_valued(
+                column("regulatory_chunk_id", Text),
+                column("document_id", Text),
+                column("heading_path", JSON),
+                column("image_file_id", Text),
+                column("article_no", Text),
+            )
+            .render_derived(with_types=True)
+            .lateral("scoring_source")
+        )
+        scoring_query = (
+            select(
+                projection.id,
+                projection.canonical_chunk_id,
+                projection.user_file_id,
+                projection.projection_ordinal,
+                projection.effective_start,
+                projection.effective_end,
+                binding_fields.c.semantic_position,
+                binding_fields.c.representation_text,
+                binding_fields.c.index.label("binding_index"),
+                projection_fields.c.embedding_config_json,
+                projection_fields.c.observed_index,
+                scoring_fields.c.regulatory_chunk_id,
+                scoring_fields.c.document_id,
+                scoring_fields.c.heading_path,
+                scoring_fields.c.image_file_id,
+                scoring_fields.c.article_no,
+            )
+            .join(canonical, canonical_join)
+            .join(binding_fields, true())
+            .join(projection_fields, true())
+            .join(scoring_fields, true())
+            .where(*qualified, projection.id.in_(selected_ids))
+            .execution_options(stream_results=True, yield_per=128)
+        )
+        candidates: dict[UUID, RegulatoryChunkProjection] = {}
+        snapshots: dict[str, PublicationIndexSnapshot] = {}
+        accepted_receipts: set[tuple[UUID, str]] = set()
+        started = perf_counter()
+        result = session.execute(scoring_query)
+        try:
+            for row in result:
+                scope.check_active()
+                index = indexes[row.user_file_id]
+                key = json.dumps(row.binding_index, sort_keys=True)
+                if key not in snapshots:
+                    snapshots[key] = PublicationIndexSnapshot.model_validate(
+                        row.binding_index
+                    )
+                if not snapshots[key].matches_temporal_index(index):
+                    raise ValueError("ASv3 planning binding differs from pinned index")
+                receipt = row.embedding_config_json
+                receipt_key = (
+                    row.user_file_id,
+                    receipt or json.dumps(row.observed_index, sort_keys=True),
                 )
-        validation_seconds = perf_counter() - started
-        result: dict[str, tuple[RegulatoryChunkProjection, ...]] = {}
+                if receipt_key not in accepted_receipts:
+                    if receipt is not None:
+                        if not index.accepts_encoder_configuration(json.loads(receipt)):
+                            raise ValueError(
+                                "temporal binding encoder receipt is not accepted"
+                            )
+                    elif not PublicationIndexSnapshot.model_validate(
+                        row.observed_index
+                    ).matches_temporal_index(index):
+                        raise ValueError("temporal observation index is not accepted")
+                    accepted_receipts.add(receipt_key)
+                if (
+                    row.regulatory_chunk_id != row.canonical_chunk_id
+                    or row.document_id != str(row.user_file_id)
+                ):
+                    raise ValueError("ASv3 planning source identity mismatch")
+                candidates[row.id] = RegulatoryChunkProjection(
+                    regulatory_chunk_id=row.canonical_chunk_id,
+                    user_file_id=row.user_file_id,
+                    projection_index=row.projection_ordinal,
+                    position=row.semantic_position,
+                    text=row.representation_text,
+                    heading_path=tuple(row.heading_path or ()),
+                    article_no=row.article_no,
+                    status="planning",
+                    validity_start_date=row.effective_start,
+                    validity_end_date=row.effective_end,
+                    image_file_id=row.image_file_id,
+                )
+        finally:
+            result.close()
+        selected_seconds = perf_counter() - started
+        groups: dict[str, tuple[RegulatoryChunkProjection, ...]] = {}
         for seed_id, ids in leads.items():
-            seed = selected.get(seed_id)
-            if seed is None:
-                raise ValueError("ASv3 initial packet seed is no longer available")
-            members = []
-            for member_id in dict.fromkeys(ids):
-                member = selected.get(member_id)
-                if member is None:
-                    continue
-                if member.regulatory_chunk_id != seed.regulatory_chunk_id and (
+            family = [
+                candidates[binding_id] for binding_id in ids if binding_id in candidates
+            ]
+            seed = next(
+                (member for member in family if member.regulatory_chunk_id == seed_id),
+                None,
+            )
+            if seed is None or len(family) != len(ids):
+                raise ValueError("ASv3 parent selection changed during scoring read")
+            if any(
+                member.regulatory_chunk_id != seed_id
+                and (
                     not seed.heading_path
                     or member.heading_path[:-1] != seed.heading_path[:-1]
-                ):
-                    raise ValueError(
-                        "ASv3 sibling metadata differs from its verified parent"
-                    )
-                members.append(member)
-            result[seed_id] = tuple(
+                )
+                for member in family
+            ):
+                raise ValueError("ASv3 sibling metadata differs from selected parent")
+            groups[seed_id] = tuple(
                 sorted(
-                    members,
+                    family,
                     key=lambda item: (
                         item.position,
                         item.projection_index,
@@ -232,17 +299,18 @@ def get_asv3_initial_rerank_context(
                     ),
                 )
             )
-        if set(leads) != set(unique_ids):
-            raise ValueError("ASv3 initial context lost a selected seed")
-        require_publication_files(observation, tuple(set(files.values())))
-        scope.check_active()
+        require_publication_files(observation, tuple(indexes))
         span.output_value = {
-            "seed_count": len(result),
+            "seed_count": len(groups),
             "lead_rows": sum(map(len, leads.values())),
-            "validated_bindings": validated_bindings,
+            "selected_bindings": len(candidates),
+            "validated_bindings": 0,
             "source_wide_inventory": False,
             "lead_query_seconds": lead_seconds,
-            "selected_validation_seconds": validation_seconds,
-            "selected_source_json_bytes": original_bytes,
+            "selected_scoring_seconds": selected_seconds,
+            "selected_text_chars": sum(len(item.text) for item in candidates.values()),
+            "selected_source_json_bytes": 0,
+            "citable": False,
+            "original_validation": "selected_finalists_before_evidence_delivery",
         }
-        return result
+        return groups

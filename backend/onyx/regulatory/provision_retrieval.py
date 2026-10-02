@@ -776,6 +776,7 @@ def build_regulatory_rerank_packets(
         return _build_asv3_initial_rerank_packets(
             db_session,
             deduplicated,
+            query=query,
             as_of_date=as_of_date or datetime.date.today(),
             max_chars=max_chars_per_provision,
         )
@@ -919,6 +920,7 @@ def _build_asv3_initial_rerank_packets(
     session: Session,
     seeds: Sequence[InferenceChunk],
     *,
+    query: str,
     as_of_date: datetime.date,
     max_chars: int,
 ) -> list[RegulatoryRerankPacket]:
@@ -935,17 +937,59 @@ def _build_asv3_initial_rerank_packets(
         indexes=indexes,
         as_of_date=as_of_date,
     )
+    from onyx.regulatory.publication_reads import require_publication_files
+
+    observations = {
+        seed.publication_observation.model_dump_json(): seed.publication_observation
+        for seed in seeds
+        if seed.publication_observation is not None
+    }
+    files_by_observation = {
+        key: tuple(
+            dict.fromkeys(
+                UUID(seed.document_id)
+                for seed in seeds
+                if seed.publication_observation is not None
+                and seed.publication_observation.model_dump_json() == key
+            )
+        )
+        for key in observations
+    }
+    for key, observation in observations.items():
+        require_publication_files(observation, files_by_observation[key])
+    # Share uncitable scoring leads, with private packet metadata and scores.
+    # Selected originals are verified later by the ASv3 corpus broker.
+    candidates: dict[tuple[UUID, str, int], InferenceChunk] = {}
+    query_terms = set(_LEXICAL_TERM_RE.findall(_fold_heading(query)))
+    overlap: dict[tuple[str, str | int], float] = {}
+    rendered: dict[tuple[str, str | int], str] = {}
     packets = []
     for seed in seeds:
         projections = groups.get(seed.regulatory_chunk_id or "", ())
-        members = [
-            _chunk_from_projection(
-                projection,
-                seed,
-                relevance_explanation="Verified immediate-parent sibling context",
+        members = []
+        for projection in projections:
+            identity = (
+                projection.user_file_id,
+                projection.regulatory_chunk_id,
+                projection.projection_index,
             )
-            for projection in projections
-        ]
+            if identity not in candidates:
+                candidates[identity] = _asv3_parent_scoring_chunk(projection, seed)
+                candidate = candidates[identity]
+                chunk_identity = _chunk_identity(candidate)
+                rendered[chunk_identity] = _packet_document((candidate,))
+                overlap[chunk_identity] = _focused_query_overlap_score(
+                    query_terms, candidate.content
+                )
+            members.append(
+                candidates[identity].model_copy(
+                    update={
+                        "score": seed.score,
+                        "publication_observation": seed.publication_observation,
+                        "metadata": dict(candidates[identity].metadata),
+                    }
+                )
+            )
         primary = next(
             (
                 member
@@ -957,11 +1001,22 @@ def _build_asv3_initial_rerank_packets(
         if not members:
             members = [primary]
         # Each retrieved seed owns a candidate; no shared-family limit may erase it.
-        ordered = [primary, *(member for member in members if member is not primary)]
+        ordered = [
+            primary,
+            *sorted(
+                (member for member in members if member is not primary),
+                key=lambda member: (
+                    -overlap.get(_chunk_identity(member), 0),
+                    member.chunk_id,
+                ),
+            ),
+        ]
         bounded = [primary]
-        chars = len(_packet_document((primary,)))
+        chars = len(
+            rendered.get(_chunk_identity(primary)) or _packet_document((primary,))
+        )
         for member in ordered[1:]:
-            size = len(_packet_document((member,))) + 2
+            size = len(rendered[_chunk_identity(member)]) + 2
             if chars + size <= max_chars:
                 bounded.append(member)
                 chars += size
@@ -973,7 +1028,8 @@ def _build_asv3_initial_rerank_packets(
                 "asv3_selected_sibling_count": str(len(members)),
                 "asv3_rerank_excerpt_truncated": str(excerpt_truncated).lower(),
                 "asv3_operative_unit_complete": "false",
-                "asv3_navigation_position_authority": "verified_frozen_parent",
+                "asv3_navigation_position_authority": "frozen_parent_lead",
+                "asv3_evidence_stage": "uncitable_parent_candidate",
             }
         content = _packet_document(bounded)[:max_chars]
         candidate = primary.model_copy(
@@ -989,7 +1045,45 @@ def _build_asv3_initial_rerank_packets(
                 candidate=candidate, primary_member=primary, members=tuple(members)
             )
         )
+    for key, observation in observations.items():
+        require_publication_files(observation, files_by_observation[key])
     return packets
+
+
+def _asv3_parent_scoring_chunk(
+    projection: RegulatoryChunkProjection, template: InferenceChunk
+) -> InferenceChunk:
+    if projection.status != "planning" or projection.source_json is not None:
+        raise ValueError("ASv3 scoring context requires uncitable compact leads")
+    heading_path = list(projection.heading_path)
+    identifier = _document_semantic_identifier(template)
+    return template.model_copy(
+        update={
+            "document_id": str(projection.user_file_id),
+            "chunk_id": projection.projection_index,
+            "structural_position": projection.position,
+            "regulatory_chunk_id": projection.regulatory_chunk_id,
+            "heading_path": heading_path,
+            "content": projection.text,
+            "blurb": projection.text[:_SIBLING_BLURB_CHARS],
+            "doc_summary": "",
+            "chunk_context": "",
+            "source_links": None,
+            "image_file_id": projection.image_file_id,
+            "validity_start_date": projection.validity_start_date,
+            "validity_end_date": projection.validity_end_date,
+            "semantic_identifier": f"{identifier} — {' > '.join(heading_path)}"
+            if heading_path
+            else identifier,
+            "is_relevant": None,
+            "match_highlights": [],
+            "relevance_explanation": "Uncitable same-parent scoring lead; verify selected original before evidence delivery",
+            "metadata": {
+                "regulatory_chunk_id": projection.regulatory_chunk_id,
+                "asv3_evidence_stage": "uncitable_parent_candidate",
+            },
+        }
+    )
 
 
 def expand_ranked_regulatory_rerank_packets(
