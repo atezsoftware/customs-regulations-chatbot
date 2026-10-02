@@ -478,6 +478,17 @@ class ResearchModel:
                     "definitions_omitted": omitted,
                     "reopen": "discover_tools",
                 }
+        available = payload.get("available_evidence")
+        if not research and isinstance(available, list) and available:
+            # Navigation leads may yield space; required original law must not.
+            payload["available_evidence"] = []
+            payload["available_evidence_omitted"] = {
+                "count": len(available),
+                "notice": "Navigation inventory omitted for capacity; this is not proof that governing evidence is absent.",
+            }
+            fitted = prompt(json.dumps(payload, ensure_ascii=False))
+            if self._input_cost(fitted, selected) <= ceiling:
+                return fitted, selected, output
         # Verification/final synthesis preserves all cited operative text. Only
         # uncited supplemental evidence may be removed to fit the selected model.
         evidence = payload.get("evidence")

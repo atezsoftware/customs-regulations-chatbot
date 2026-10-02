@@ -36,8 +36,10 @@ class ScenarioState:
 _SKILLS: dict[str, str] = {
     "legal_conditions": (
         "Read the complete operative paragraph and its exceptions. Preserve AND/OR relations, "
-        "negative facts and alternatives. Separate inspection/document convenience from substantive "
-        "tax relief. Tie every conclusion to the original evidence and explicit scenario facts. "
+        "negative facts and alternatives. Separate procedural convenience from substantive relief. "
+        "Read the applicable governing higher norm and its authorized special or implementing rules; "
+        "a lower-level reference is not the original statutory text. Check decisive scenario facts "
+        "for special rules. Tie every conclusion and operative detail to original evidence. "
         "A source title or article navigation entry is only a lead, never an operative rule."
     ),
     "source_recovery": (
@@ -176,7 +178,7 @@ def build_supplemental_specs() -> list[ToolSpec]:
             summary="Research guidance; not legal evidence",
             data={
                 "name": name,
-                "version": "1",
+                "version": "2",
                 "text": text,
                 "sha256": hashlib.sha256(text.encode()).hexdigest(),
                 "legal_authority": False,

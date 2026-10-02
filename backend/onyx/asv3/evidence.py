@@ -122,6 +122,7 @@ class EvidenceLedger:
             output: list[dict[str, JsonValue]] = []
             selected: list[EvidenceItem] = []
             for number, item in ordered:
+                metadata = model_evidence_metadata(item.metadata)
                 entry: dict[str, JsonValue] = {
                     "citation": number,
                     "source_id": item.source_id,
@@ -131,6 +132,10 @@ class EvidenceLedger:
                     "text": "",
                     "truncated": bool(item.text),
                 }
+                for key in ("document_type", "title", "article_no", "paragraph_no"):
+                    value = metadata.get(key)
+                    if isinstance(value, str):
+                        entry[key] = value[:240]
                 trial = output + [entry]
                 if len(json.dumps(trial, ensure_ascii=False)) > max_chars:
                     break

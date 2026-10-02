@@ -500,12 +500,12 @@ def test_harness_reports_actual_parallel_actions_without_changing_decisions() ->
         == baseline.context.budget.snapshot()["tools"]
         == 3
     )
-    assert [receipt.call for receipt in narrated.receipts] == [
-        receipt.call for receipt in baseline.receipts
-    ]
-    assert [receipt.outcome for receipt in narrated.receipts] == [
-        receipt.outcome for receipt in baseline.receipts
-    ]
+    assert {receipt.call.call_id: receipt.call for receipt in narrated.receipts} == {
+        receipt.call.call_id: receipt.call for receipt in baseline.receipts
+    }
+    assert {receipt.call.call_id: receipt.outcome for receipt in narrated.receipts} == {
+        receipt.call.call_id: receipt.outcome for receipt in baseline.receipts
+    }
     events = reporter.snapshot()
     for call_id, phase in [("first", "tools"), ("second", "tools"), ("third", "final")]:
         lifecycle = [event for event in events if event.task_id == f"action:{call_id}"]

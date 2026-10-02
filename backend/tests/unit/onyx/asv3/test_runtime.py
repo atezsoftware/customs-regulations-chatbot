@@ -3,6 +3,7 @@
 import hashlib
 import json
 import threading
+from dataclasses import replace
 from datetime import date
 from queue import Queue
 from typing import Any
@@ -654,6 +655,127 @@ def test_final_evidence_keeps_uncited_same_source_exception_without_unrelated_so
     assert [record["citation"] for record in supplied] == [1, 2]
     assert supplied[1]["text"] == "Decisive exception and additional condition."
     assert all(record["truncated"] is False for record in supplied)
+
+
+def test_runtime_recovers_uncited_governing_source_without_losing_special_procedure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kwargs, broker, llm, checkpoints, _queue = setup_run(monkeypatch)
+    kwargs["simple_chat_history"][
+        0
+    ].message = (
+        "Bir işletmenin faaliyete başlamasının koşulları ve izin işlemleri nelerdir?"
+    )
+    for source, kind, text in zip(
+        broker.sources,
+        ("genelge", "kanun"),
+        (
+            "Yetkili özel usul: elektronik bildirim kabul edilir.",
+            "Kanuni koşul: izin gerekir.",
+        ),
+    ):
+        key = str(source.id)
+        broker.chunks[key] = replace(
+            broker.chunks[key],
+            text=text + (" Özgün hüküm devamı." * 200),
+            metadata={
+                **broker.chunks[key].metadata,
+                "document_type": kind,
+                "title": f"Faaliyete başlama {kind}",
+            },
+        )
+    scripts = list(llm.invoke.side_effect)
+    citations: dict[str, int] = {}
+
+    def first_draft(**arguments: Any) -> ModelResponse:
+        data = request_data(arguments)
+        citations.update(
+            {item["document_type"]: item["citation"] for item in data["evidence"]}
+        )
+        return response(f"Elektronik bildirim kabul edilir [{citations['genelge']}].")
+
+    def first_review(**arguments: Any) -> ModelResponse:
+        data = request_data(arguments)
+        originals = json.loads(data["evidence"])
+        assert [item["citation"] for item in originals] == [citations["genelge"]]
+        navigation = data["available_evidence"]
+        assert {item["document_type"] for item in navigation} == {"kanun", "genelge"}
+        assert any(item["citation"] == citations["kanun"] for item in navigation)
+        assert len(json.dumps(navigation, ensure_ascii=False)) <= 6000
+        return response(
+            json.dumps(
+                {
+                    "status": "incomplete",
+                    "explanation": "Kanuni dayanağın özgün hükmü ve atfı eksik.",
+                    "required_conditions": [],
+                    "missing_conditions": ["kanuni dayanağın özgün hükmü ve atfı"],
+                    "evidence_numbers": [citations["genelge"]],
+                    "safe_to_publish": False,
+                    "unsupported_claims": [],
+                    "question_results": [
+                        {
+                            "question_id": "q0",
+                            "status": "incomplete",
+                            "evidence_numbers": [citations["genelge"]],
+                            "missing_conditions": ["kanuni dayanak"],
+                        }
+                    ],
+                }
+            )
+        )
+
+    def reopen(**arguments: Any) -> ModelResponse:
+        assert "kanuni dayanak" in str(request_data(arguments))
+        return response(calls=[("read_evidence", {"citation": citations["kanun"]})])
+
+    final = ""
+
+    def corrected_draft(**_arguments: Any) -> ModelResponse:
+        nonlocal final
+        final = (
+            f"İzin gerekir [{citations['kanun']}]. "
+            f"Yetkili özel usulde elektronik bildirim kabul edilir [{citations['genelge']}]."
+        )
+        return response(final)
+
+    def corrected_review(**arguments: Any) -> ModelResponse:
+        data = request_data(arguments)
+        originals = json.loads(data["evidence"])
+        assert {item["citation"] for item in originals} == set(citations.values())
+        for item in originals:
+            stored = next(
+                chunk
+                for chunk in broker.chunks.values()
+                if chunk.id == item["chunk_id"]
+            )
+            assert item["text"] == stored.text and item["truncated"] is False
+        return supported_review(sorted(citations.values()))
+
+    stages = iter(
+        [
+            scripts[0],
+            scripts[1],
+            first_draft,
+            first_review,
+            reopen,
+            corrected_draft,
+            corrected_review,
+        ]
+    )
+
+    def invoke(**arguments: Any) -> ModelResponse:
+        stage = next(stages)
+        return stage(**arguments) if callable(stage) else stage
+
+    llm.invoke.side_effect = invoke
+    runtime.run_asv3_loop(**kwargs)
+    assert llm.invoke.call_count == 7
+    assert checkpoints[-1]["publication_status"] == "found"
+    assert checkpoints[-1]["publication_stop_reason"] == "verified_draft_published"
+    assert checkpoints[-1]["last_draft"] == final
+    answer = kwargs["state_container"].answer_tokens
+    assert "İzin gerekir" in answer and "elektronik bildirim" in answer
+    assert len(kwargs["state_container"].citation_to_doc) == 2
 
 
 def test_runtime_drops_unrecorded_citation_and_publishes_only_localized_gap(

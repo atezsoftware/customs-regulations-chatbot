@@ -60,6 +60,7 @@ from onyx.llm.models import ReasoningEffort
 from onyx.prompts.asv3.research import (
     FINAL_PROMPT,
     LANGUAGE_PROMPT,
+    PROMPT_VERSION,
     VERIFICATION_PROMPT,
 )
 from onyx.server.query_and_chat.placement import Placement
@@ -363,6 +364,7 @@ def run_asv3_loop(
             checkpoint_sequence += 1
             snapshot.update(
                 sequence=checkpoint_sequence,
+                prompt_version=PROMPT_VERSION,
                 scope=context.scope,
                 progress=list(emitted),
                 progress_state=progress.export(),
@@ -426,6 +428,7 @@ def run_asv3_loop(
                         "scenario": question,
                         "claim": claim,
                         "evidence": _evidence_record(ledger, anchors),
+                        "available_evidence": ledger.summaries(max_chars=6000),
                     },
                     ensure_ascii=False,
                 ),
@@ -552,6 +555,7 @@ def run_asv3_loop(
                     if preservation_reference
                     else None,
                     "evidence": evidence,
+                    "available_evidence": ledger.summaries(max_chars=6000),
                     "require_sources": profile.requires_sources,
                     "pending_tasks": model.pending_tasks(),
                 },

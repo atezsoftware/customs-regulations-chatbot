@@ -95,6 +95,8 @@ def test_evidence_metadata_excludes_vectors_and_raw_content_at_creation_and_rest
             "publication_revision": "rev-7",
             "query_index_uuid": "index-identity",
             "heading_path": ["Kanun", "Madde 143"],
+            "document_type": "kanun",
+            "title": "General operative statute",
             "document_date": "2020-01-01",
             "source_links": {"0": "https://example.test/article-143"},
         },
@@ -124,9 +126,15 @@ def test_evidence_metadata_excludes_vectors_and_raw_content_at_creation_and_rest
     assert retained["metadata"]["source_sha256"] == "original-hash"
     supplied = json.loads(ledger.serialize_records([1], required=[1]))[0]
     assert supplied["metadata"]["heading_path"] == ["Kanun", "Madde 143"]
+    assert supplied["metadata"]["document_type"] == "kanun"
+    assert supplied["metadata"]["title"] == "General operative statute"
     assert supplied["metadata"]["publication_revision"] == "rev-7"
     assert supplied["metadata"]["query_index_uuid"] == "index-identity"
     assert "canonical_metadata" not in supplied["metadata"]
+    navigation = ledger.summaries(max_chars=6000)
+    assert navigation[0]["document_type"] == "kanun"
+    assert navigation[0]["title"] == "General operative statute"
+    assert len(json.dumps(navigation, ensure_ascii=False)) <= 6000
     stored = ledger.get(1)
     assert stored is not None and "canonical_metadata" in stored.metadata
     # Legacy checkpoint metadata is sanitized without changing canonical identity.

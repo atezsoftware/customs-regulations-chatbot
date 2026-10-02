@@ -125,7 +125,7 @@ def model_evidence_metadata(metadata: Mapping[str, object]) -> dict[str, JsonVal
         if isinstance(nested, dict):
             merged = {**nested, **merged}
     keys = frozenset(
-        "article_no paragraph_no clause_label read_as_of_date version_unknown derived "
+        "document_type title article_no paragraph_no clause_label read_as_of_date version_unknown derived "
         "external untrusted legal_authority source_sha256 locator extraction_method "
         "extraction publication_revision publication_revision_id revision_id index_uuid "
         "query_index_uuid index_name query_index_name version revision document_date "

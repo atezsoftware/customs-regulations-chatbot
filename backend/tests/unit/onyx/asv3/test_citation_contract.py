@@ -259,3 +259,59 @@ def test_token_pressure_keeps_originals_for_details_omitted_from_the_rewritten_a
         1,
         2,
     }
+
+
+def test_navigation_inventory_is_not_delivery_or_proof_of_uncited_originals() -> None:
+    ledger, context = original_ledger()
+    model, _llm = selected_model(context)
+    model.invoke_text(
+        "Check governing evidence; navigation is not original proof",
+        json.dumps(
+            {
+                "claim": "An implementation result [1].",
+                "scenario": "facts",
+                "evidence": _evidence_record(ledger, "Implementation [1]."),
+                "available_evidence": ledger.summaries(max_chars=6000),
+            }
+        ),
+        LLMFlow.ASV3_VERIFICATION,
+        max_tokens=1000,
+    )
+    assert model.last_call_id is not None
+    assert ledger.completely_delivered(model.last_call_id) == {1}
+    gap = publication_gap(
+        "An implementation result [1].",
+        supported([1, 2]),
+        ["What governs the result?"],
+        ledger,
+        verification_call_id=model.last_call_id,
+    )
+    assert gap is not None
+    assert "not completely delivered" in str(gap.data["gaps"])
+
+
+def test_token_pressure_removes_navigation_before_required_originals() -> None:
+    ledger, context = original_ledger()
+    model, llm = selected_model(context)
+    originals = ledger.serialize_records([1, 2], required=[1, 2])
+    model.invoke_text(
+        "Verify complete cited originals",
+        json.dumps(
+            {
+                "claim": "Governing rule [1]; special procedure [2].",
+                "scenario": "facts",
+                "evidence": originals,
+                "available_evidence": [
+                    {"citation": 3, "text": "NAVIGATION ONLY " * 10000}
+                ],
+            }
+        ),
+        LLMFlow.ASV3_VERIFICATION,
+        max_tokens=1000,
+    )
+    payload = json.loads(llm.invoke.call_args.kwargs["prompt"][1].content)
+    assert payload["available_evidence"] == []
+    assert payload["available_evidence_omitted"]["count"] == 1
+    assert json.loads(payload["evidence"]) == json.loads(originals)
+    assert model.last_call_id is not None
+    assert ledger.completely_delivered(model.last_call_id) == {1, 2}
