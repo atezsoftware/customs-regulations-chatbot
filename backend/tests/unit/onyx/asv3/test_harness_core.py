@@ -416,6 +416,227 @@ def test_progress_narration_and_resume_keep_language_sequence() -> None:
     assert resumed.snapshot()[0] == first
 
 
+def test_harness_reports_actual_parallel_actions_without_changing_decisions() -> None:
+    def exercise(
+        with_progress: bool,
+    ) -> tuple[Harness, ProgressReporter, int, list[str]]:
+        reporter = ProgressReporter("lifecycle", "tr")
+        barrier = threading.Barrier(2)
+        invoked: list[str] = []
+        calls = [
+            CapabilityCall(
+                name="search_corpus",
+                call_id="first",
+                arguments={"private": "/tmp/private-case"},
+            ),
+            CapabilityCall(
+                name="read_source",
+                call_id="second",
+                arguments={"private": "unpublished claim"},
+            ),
+            CapabilityCall(
+                name="verify_claim",
+                call_id="third",
+                arguments={"private": "internal validation"},
+            ),
+        ]
+
+        def handler(_args: dict[str, JsonValue], _context: RunContext) -> ToolOutcome:
+            if threading.current_thread().name.startswith("asv3-tool"):
+                # Only source calls are dispatched together in this decision.
+                if len(invoked) < 2:
+                    barrier.wait(2)
+            invoked.append("executed")
+            return ToolOutcome(
+                status=OutcomeStatus.FOUND,
+                summary="Original result",
+                data={"unchanged": True},
+            )
+
+        specs = [
+            ToolSpec(
+                name=call.name,
+                description="research",
+                parameters={"type": "object"},
+                handler=handler,
+            )
+            for call in calls
+        ]
+        decisions = 0
+
+        def decide(view: HarnessView) -> Decision:
+            nonlocal decisions
+            decisions += 1
+            if decisions == 1:
+                return Decision(calls=calls[:2])
+            if decisions == 2:
+                assert len(view.receipts) == 2
+                assert all(
+                    receipt.outcome.data == {"unchanged": True}
+                    for receipt in view.receipts
+                )
+                return Decision(calls=calls[2:])
+            assert len(view.receipts) == 3
+            return Decision(answer="Yanıt hazır")
+
+        harness = Harness(
+            request="Soruyu incele",
+            context=RunContext(run_id="lifecycle", language="tr"),
+            registry=CapabilityRegistry(specs),
+            decide=decide,
+            progress=reporter if with_progress else None,
+            report_terminal=False,
+        )
+        result = harness.run()
+        assert result.answer == "Yanıt hazır"
+        return harness, reporter, decisions, invoked
+
+    baseline, _, baseline_decisions, baseline_invoked = exercise(False)
+    narrated, reporter, decisions, invoked = exercise(True)
+    assert decisions == baseline_decisions == 3
+    assert invoked == baseline_invoked == ["executed"] * 3
+    assert (
+        narrated.context.budget.snapshot()["tools"]
+        == baseline.context.budget.snapshot()["tools"]
+        == 3
+    )
+    assert [receipt.call for receipt in narrated.receipts] == [
+        receipt.call for receipt in baseline.receipts
+    ]
+    assert [receipt.outcome for receipt in narrated.receipts] == [
+        receipt.outcome for receipt in baseline.receipts
+    ]
+    events = reporter.snapshot()
+    for call_id, phase in [("first", "tools"), ("second", "tools"), ("third", "final")]:
+        lifecycle = [event for event in events if event.task_id == f"action:{call_id}"]
+        assert [(event.phase, event.status) for event in lifecycle] == [
+            (phase, "running"),
+            (phase, "completed"),
+        ]
+        assert lifecycle[0].sequence < lifecycle[1].sequence
+    assert any(
+        event.phase == "final" and event.task_id is None and event.status == "running"
+        for event in events
+    )
+    assert not any(
+        event.status == "completed" and event.task_id is None for event in events
+    )
+    public_text = " ".join(event.title + " " + event.message for event in events)
+    assert all(event.language == "tr" for event in events)
+    for private in [
+        "search_corpus",
+        "read_source",
+        "verify_claim",
+        "/tmp/private-case",
+        "unpublished claim",
+        "internal validation",
+        "Original result",
+    ]:
+        assert private not in public_text
+
+
+def test_harness_progress_skips_lightweight_actions_and_preserves_narration() -> None:
+    reporter = ProgressReporter(
+        "lightweight",
+        "fr",
+        translate=lambda _phase, _language: ("Recherche", "Je consulte les sources."),
+    )
+    names = [
+        "report_progress",
+        "record_scenario",
+        "discover_tools",
+        "read_research_state",
+        "list_researchers",
+        "wait_researcher",
+        "spawn_researcher",
+        "send_update",
+        "followup_researcher",
+        "cancel_researcher",
+    ]
+
+    def handler(_args: dict[str, JsonValue], _context: RunContext) -> ToolOutcome:
+        return ToolOutcome(status=OutcomeStatus.FOUND, summary="done")
+
+    registry = CapabilityRegistry(
+        [
+            ToolSpec(
+                name=name,
+                description="lightweight",
+                parameters={"type": "object"},
+                handler=handler,
+            )
+            for name in names
+        ]
+    )
+    harness = Harness(
+        request="Question",
+        context=RunContext(run_id="lightweight", language="fr"),
+        registry=registry,
+        decide=lambda _view: Decision(answer="done"),
+        progress=reporter,
+    )
+    original = reporter.report(
+        "research",
+        title="Vérification de la garantie",
+        message="Je distingue la réparation du remplacement.",
+    )
+    harness._dispatch([CapabilityCall(name=name) for name in names])
+    assert reporter.snapshot() == [original]
+
+
+@pytest.mark.parametrize(
+    "outcome,expected",
+    [
+        (OutcomeStatus.ERROR, "failed"),
+        (OutcomeStatus.TRUNCATED, "failed"),
+        (OutcomeStatus.CANCELLED, "cancelled"),
+        (OutcomeStatus.NOT_FOUND, "completed"),
+    ],
+)
+def test_harness_action_terminal_does_not_close_whole_run(
+    outcome: OutcomeStatus, expected: str
+) -> None:
+    reporter = ProgressReporter(
+        "action",
+        "fr",
+        translate=lambda phase, _language: (
+            "Vérification" if phase == "final" else "Recherche",
+            "Je contrôle les conditions.",
+        ),
+    )
+    registry = CapabilityRegistry(
+        [
+            ToolSpec(
+                name="verify_claim",
+                description="verify",
+                parameters={"type": "object"},
+                handler=lambda _args, _context: ToolOutcome(
+                    status=outcome, summary="private result"
+                ),
+            )
+        ]
+    )
+    harness = Harness(
+        request="Question",
+        context=RunContext(run_id="action", language="fr"),
+        registry=registry,
+        decide=lambda _view: Decision(answer="done"),
+        progress=reporter,
+    )
+    call = CapabilityCall(name="verify_claim")
+    harness._dispatch([call])
+    events = reporter.snapshot()
+    assert [(event.status, event.task_id) for event in events] == [
+        ("running", None),
+        ("running", f"action:{call.call_id}"),
+        (expected, f"action:{call.call_id}"),
+    ]
+    assert all(
+        event.title == "Vérification" and event.language == "fr" for event in events
+    )
+    assert harness._progress_calls == set()
+
+
 def test_worker_checkpoint_marks_unfinished_tasks_interrupted() -> None:
     def runner(task: str, _context: RunContext, _updates: object) -> ToolOutcome:
         return ToolOutcome(status=OutcomeStatus.FOUND, summary=task)

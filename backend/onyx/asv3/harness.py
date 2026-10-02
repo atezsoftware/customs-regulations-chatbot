@@ -80,6 +80,7 @@ class Harness:
         self._seen_failures: set[str] = set()
         self._committed_calls: set[str] = set()
         self._pending_calls: dict[str, dict[str, JsonValue]] = {}
+        self._progress_calls: set[str] = set()
         self.working_memory = WorkingMemory(self.context.scope)
         self.context.services["working_memory"] = self.working_memory
         self.context.services["registry"] = registry
@@ -288,10 +289,32 @@ class Harness:
         ):
             self.turns.pop(0)
 
+    @staticmethod
+    def _tool_progress_phase(call: CapabilityCall) -> str | None:
+        if call.name in {
+            "record_scenario",
+            "report_progress",
+            "discover_tools",
+            "read_research_state",
+            "spawn_researcher",
+            "followup_researcher",
+            "send_update",
+            "list_researchers",
+            "wait_researcher",
+            "cancel_researcher",
+        }:
+            return None
+        return "final" if call.name == "verify_claim" else "tools"
+
     def _execute(self, call: CapabilityCall, context: RunContext) -> ToolReceipt:
         start = time.monotonic()
         try:
             context.check_research_active()
+            phase = self._tool_progress_phase(call)
+            if self.progress and phase:
+                self._progress_calls.add(call.call_id)
+                self.progress.report(phase)
+                self.progress.report(phase, task_id=f"action:{call.call_id}")
             with graph_step(
                 "asv3.tool", {"name": call.name, "arguments": call.arguments}
             ) as step:
@@ -355,6 +378,29 @@ class Harness:
         self._seen_calls.add(receipt.call.call_id)
         self._committed_calls.add(receipt.call.call_id)
         self._pending_calls.pop(receipt.call.call_id, None)
+        if self.progress and receipt.call.call_id in self._progress_calls:
+            phase = self._tool_progress_phase(receipt.call)
+            if phase:
+                status = (
+                    "cancelled"
+                    if receipt.outcome.status == OutcomeStatus.CANCELLED
+                    else "failed"
+                    if receipt.outcome.status
+                    in {
+                        OutcomeStatus.TRUNCATED,
+                        OutcomeStatus.INVALID,
+                        OutcomeStatus.ERROR,
+                        OutcomeStatus.DENIED,
+                        OutcomeStatus.UNAVAILABLE,
+                    }
+                    else "completed"
+                )
+                self.progress.report(
+                    phase,
+                    status=status,
+                    task_id=f"action:{receipt.call.call_id}",
+                )
+            self._progress_calls.discard(receipt.call.call_id)
         self._save()
 
     def _dispatch(self, calls: list[CapabilityCall]) -> list[ToolReceipt]:
@@ -462,8 +508,6 @@ class Harness:
                         decision.calls
                     ):
                         raise ValueError("Decision contains duplicate call IDs")
-                    if self.progress:
-                        self.progress.report("tools")
                     results: list[ToolMessage] = []
                     for receipt in self._dispatch(decision.calls):
                         self.context.check_active()

@@ -5,7 +5,6 @@ from __future__ import annotations
 import copy
 import json
 import random
-import re
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -15,6 +14,7 @@ import jsonschema
 from pydantic import BaseModel, Field, JsonValue, model_validator
 
 from onyx.asv3.artifacts import ArtifactStore, compact_json
+from onyx.asv3.citation_numbers import extract_citation_numbers
 from onyx.asv3.models import (
     CapabilityCall,
     Decision,
@@ -488,10 +488,15 @@ class ResearchModel:
                 records = None
             if isinstance(records, list):
                 cited = {
-                    int(n)
+                    number
                     for key in ("claim", "draft")
-                    for n in re.findall(r"\[(\d+)\]", str(payload.get(key, "")))
+                    for number in extract_citation_numbers(str(payload.get(key, "")))
                 }
+                reference = payload.get("preservation_reference")
+                if isinstance(reference, dict):
+                    cited.update(
+                        extract_citation_numbers(str(reference.get("draft", "")))
+                    )
                 if cited:
                     payload["evidence"] = json.dumps(
                         [

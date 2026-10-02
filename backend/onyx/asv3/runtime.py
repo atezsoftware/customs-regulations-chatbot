@@ -6,7 +6,6 @@ import hashlib
 import json
 import logging
 import os
-import re
 import threading
 import time
 from collections.abc import Callable
@@ -16,6 +15,7 @@ from uuid import UUID
 
 from pydantic import JsonValue
 
+from onyx.asv3.citation_numbers import extract_citation_numbers
 from onyx.asv3.corpus_tools import CorpusBroker, build_corpus_specs
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.external_tools import build_external_specs
@@ -38,6 +38,7 @@ from onyx.asv3.progress import ProgressEvent, ProgressReporter
 from onyx.asv3.publication import publication_gap, question_inventory
 from onyx.asv3.registry import CapabilityRegistry, build_core_specs
 from onyx.asv3.sandbox import build_sandbox_specs
+from onyx.asv3.scenario import initial_questions
 from onyx.asv3.search_adapter import build_search_adapter
 from onyx.asv3.source_tools import build_source_specs
 from onyx.asv3.supplemental_tools import ScenarioState, build_supplemental_specs
@@ -124,7 +125,7 @@ and 'native_citation' labels an excerpt extracted from an original file (derived
 def _evidence_record(
     ledger: EvidenceLedger, draft: str, max_chars: int = 180000
 ) -> str:
-    numbers = list(dict.fromkeys(int(n) for n in re.findall(r"\[(\d+)\]", draft)))
+    numbers = list(extract_citation_numbers(draft))
     required = tuple(n for n in numbers if ledger.get(n) is not None)
     if numbers:
         source_ids = {
@@ -272,7 +273,7 @@ def run_asv3_loop(
         user_identity=user_identity,
     )
     scenarios = ScenarioState()
-    scenarios.record([question], [])
+    scenarios.record(initial_questions(question), [])
     context.services["scenario_state"] = scenarios
     emitted: list[dict[str, JsonValue]] = []
     checkpoint_lock = threading.RLock()
@@ -516,14 +517,20 @@ def run_asv3_loop(
         task.model_dump(mode="json") for task in workers.list()
     ]
 
-    def review_answer(draft: str, *, research: bool) -> VerificationResult:
+    def review_answer(
+        draft: str,
+        *,
+        research: bool,
+        preservation_reference: str | None = None,
+        previous_review: VerificationResult | None = None,
+    ) -> VerificationResult:
         nonlocal latest_review
         if harness is None:
             raise RuntimeError("Research state is not ready for verification")
         view = harness.view()
         evidence = _evidence_record(
             ledger,
-            draft,
+            draft + ("\n" + preservation_reference if preservation_reference else ""),
             max_chars=max(8000, min(180000, (llm.config.max_input_tokens - 18000) * 2)),
         )
         if research:
@@ -536,6 +543,14 @@ def run_asv3_loop(
                     "scenario": question,
                     "questions": question_inventory(view.questions),
                     "claim": draft,
+                    "preservation_reference": {
+                        "draft": preservation_reference,
+                        "previous_review": previous_review.model_dump(mode="json")
+                        if previous_review
+                        else None,
+                    }
+                    if preservation_reference
+                    else None,
                     "evidence": evidence,
                     "require_sources": profile.requires_sources,
                     "pending_tasks": model.pending_tasks(),
@@ -657,7 +672,7 @@ def run_asv3_loop(
             checkpoint_sequence = sequence
         result = harness.run()
         context.check_active()
-        draft = result.answer or ""
+        draft = result.answer or harness.last_draft or ""
         complete = result.status == OutcomeStatus.FOUND
         if not draft:
             draft = json.dumps(
@@ -693,6 +708,7 @@ def run_asv3_loop(
                 verification_call_id=approved_call_id,
             )
         else:
+            previous_review = latest_review
             evidence = _evidence_record(
                 ledger,
                 draft,
@@ -722,7 +738,14 @@ def run_asv3_loop(
             )
             checkpoint(harness.snapshot())
             # Review the actual published wording, not just the coordinator's draft.
-            final_review = review_answer(final, research=False)
+            final_review = review_answer(
+                final,
+                research=False,
+                preservation_reference=draft
+                if result.answer or harness.last_draft
+                else None,
+                previous_review=previous_review,
+            )
             final_gap = publication_gap(
                 final,
                 final_review,
@@ -764,13 +787,13 @@ def run_asv3_loop(
         publication_status = OutcomeStatus.FOUND if complete else OutcomeStatus.PARTIAL
         # Unknown citation IDs never reach the UI as plausible evidence links.
         allowed = ledger.citation_mapping()
-        unknown = {int(n) for n in re.findall(r"\[(\d+)\]", final)} - allowed.keys()
+        unknown = set(extract_citation_numbers(final)) - allowed.keys()
         if unknown:
             raise ValueError("ASv3 final answer contains unrecorded citation targets")
         revalidate([item for n in allowed if (item := ledger.get(n)) is not None])
         state_container.add_search_docs(list(allowed.values()))
         state_container.set_pre_answer_processing_time(time.monotonic() - start)
-        ledger.include(int(n) for n in re.findall(r"\[(\d+)\]", final))
+        ledger.include(extract_citation_numbers(final))
         checkpoint(harness.snapshot())
         processor = DynamicCitationProcessor(
             citation_mode=CitationMode.HYPERLINK

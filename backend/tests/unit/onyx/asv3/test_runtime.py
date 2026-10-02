@@ -457,7 +457,9 @@ def test_runtime_parallel_sources_full_original_review_and_final_citations(
     completed = [
         i
         for i, packet in enumerate(output)
-        if isinstance(packet.obj, ASv3Progress) and packet.obj.status == "completed"
+        if isinstance(packet.obj, ASv3Progress)
+        and packet.obj.status == "completed"
+        and packet.obj.task_id is None
     ]
     assert len(completed) == 1
     assert completed[0] > max(
@@ -502,6 +504,88 @@ def incomplete_script(llm: MagicMock) -> list[ModelResponse | Exception]:
         ],
         *script[4:],
     ]
+
+
+def test_numbered_questions_are_verified_separately_and_approved_details_are_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from onyx.prompts.asv3.research import FINAL_PROMPT
+
+    kwargs, _broker, llm, checkpoints, _queue = setup_run(monkeypatch)
+    request = (
+        "The goods are unused and permission is absent.\n\n"
+        "1. What is the result and its prerequisites?\n"
+        "2. Does replacement change the result?\n"
+        "3. Which documents and subsequent steps are required?"
+    )
+    kwargs["simple_chat_history"][0].message = request
+    draft = (
+        "Prerequisites and the actual outcome [1].\n"
+        "Replacement alternative [2].\n"
+        "Application, documents and later settlement [1, 2]."
+    )
+    script = list(llm.invoke.side_effect)
+    llm.invoke.side_effect = [
+        *script[:2],
+        response(draft),
+        supported_review([1, 2], question_count=3),
+    ]
+    runtime.run_asv3_loop(**kwargs)
+    assert llm.invoke.call_count == 4
+    assert checkpoints[-1]["last_draft"] == draft
+    assert checkpoints[-1]["publication_status"] == "found"
+    review_data = request_data(llm.invoke.call_args.kwargs)
+    assert review_data["scenario"] == request
+    assert [item["question_id"] for item in review_data["questions"]] == [
+        "q0",
+        "q1",
+        "q2",
+    ]
+    assert [item["question"] for item in review_data["questions"]] == [
+        "What is the result and its prerequisites?",
+        "Does replacement change the result?",
+        "Which documents and subsequent steps are required?",
+    ]
+    assert all(
+        call.kwargs["prompt"][0].content != FINAL_PROMPT
+        for call in llm.invoke.call_args_list
+    )
+
+
+def test_partial_rewrite_verifier_receives_draft_details_and_their_originals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from onyx.prompts.asv3.research import FINAL_PROMPT
+
+    kwargs, _broker, llm, _checkpoints, _queue = setup_run(
+        monkeypatch, final="Only the headline remains [1]."
+    )
+    script = incomplete_script(llm)
+    draft = "Outcome [1]; application documents and later settlement [2]."
+    for index in (2, 4, 6):
+        script[index] = response(draft)
+    script[-1] = unsafe_review("Missing the supported settlement detail")
+    llm.invoke.side_effect = script
+    runtime.run_asv3_loop(**kwargs)
+    final_review = request_data(llm.invoke.call_args.kwargs)
+    assert final_review["claim"] == "Only the headline remains [1]."
+    reference = final_review["preservation_reference"]
+    assert reference["draft"] == draft
+    previous_review = script[7]
+    assert isinstance(previous_review, ModelResponse)
+    assert isinstance(previous_review.choice.message.content, str)
+    assert reference["previous_review"] == json.loads(
+        previous_review.choice.message.content
+    )
+    synthesis = next(
+        request_data(call.kwargs)
+        for call in llm.invoke.call_args_list
+        if call.kwargs["prompt"][0].content == FINAL_PROMPT
+    )
+    assert synthesis["draft"] == draft
+    evidence = json.loads(final_review["evidence"])
+    assert {item["citation"] for item in evidence} == {1, 2}
+    assert all(item["truncated"] is False for item in evidence)
 
 
 def test_failed_final_verification_preserves_successful_final_original_delivery_without_publication(
@@ -612,7 +696,11 @@ def test_runtime_supported_draft_does_not_authorize_unsafe_final_wording(
     )
     assert not any(
         isinstance(packet.obj, CitationInfo)
-        or (isinstance(packet.obj, ASv3Progress) and packet.obj.status == "completed")
+        or (
+            isinstance(packet.obj, ASv3Progress)
+            and packet.obj.status == "completed"
+            and packet.obj.task_id is None
+        )
         or (
             isinstance(packet.obj, AgentResponseDelta)
             and "vergiden muaftır" in packet.obj.content

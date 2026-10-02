@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-import re
-
 from pydantic import JsonValue
 
+from onyx.asv3.citation_numbers import extract_citation_numbers
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.llm_adapter import VerificationResult
 from onyx.asv3.models import OutcomeStatus, ToolOutcome
@@ -29,7 +28,7 @@ def publication_gap(
     verification_call_id: str | None = None,
 ) -> ToolOutcome | None:
     reasons: list[str] = []
-    cited = {int(number) for number in re.findall(r"\[(\d+)\]", answer)}
+    cited = set(extract_citation_numbers(answer))
     allowed = ledger.citation_mapping()
     if cited - allowed.keys():
         reasons.append("The draft contains unknown or non-citable source numbers.")
