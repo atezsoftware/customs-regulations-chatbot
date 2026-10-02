@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from pydantic import JsonValue
 
+from onyx.asv3.authority import unresolved_authority_gap
 from onyx.asv3.citation_numbers import extract_citation_numbers
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.llm_adapter import VerificationResult
 from onyx.asv3.models import OutcomeStatus, ToolOutcome
+from onyx.asv3.quotations import normalized, unmatched_quoted_terms
 
 
 def question_inventory(questions: list[str]) -> list[dict[str, JsonValue]]:
@@ -26,9 +28,44 @@ def publication_gap(
     require_sources: bool = True,
     allow_explicit_gaps: bool = False,
     verification_call_id: str | None = None,
+    require_direct_authority: bool = False,
+    scenario: str = "",
+    require_quotation_checks: bool = False,
 ) -> ToolOutcome | None:
     reasons: list[str] = []
     cited = set(extract_citation_numbers(answer))
+    authority_gap = (
+        unresolved_authority_gap(answer, ledger)
+        if require_sources and require_direct_authority
+        else None
+    )
+    if authority_gap is not None:
+        reasons.append(str(authority_gap["gaps"]))
+    quote_gaps: list[dict[str, JsonValue]] = []
+    if require_sources and require_quotation_checks:
+        checks = {check.term_id: check for check in review.quotation_checks}
+        for term in unmatched_quoted_terms(answer, scenario, ledger):
+            check = checks.get(str(term["term_id"]))
+            # An unmatched literal cannot become supported just by being labelled so.
+            if check is None or check.kind in {"literal", "unsupported"}:
+                quote_gaps.append(term)
+                continue
+            evidence = (
+                ledger.get(check.evidence_number) if check.evidence_number else None
+            )
+            numbers = term["evidence_numbers"]
+            if (
+                evidence is None
+                or not isinstance(numbers, list)
+                or check.evidence_number not in numbers
+                or not check.source_quote.strip()
+                or normalized(check.source_quote) not in normalized(evidence.text)
+            ):
+                quote_gaps.append(term)
+        if quote_gaps:
+            reasons.append(
+                "Quoted wording has no literal inline-source match or validated translation/application witness."
+            )
     allowed = ledger.citation_mapping()
     if cited - allowed.keys():
         reasons.append("The draft contains unknown or non-citable source numbers.")
@@ -99,6 +136,8 @@ def publication_gap(
         summary="Evidence-backed finalization is incomplete; choose a useful next action or report the exact gap.",
         data={
             "gaps": reasons,
+            **({"missing": authority_gap["missing"]} if authority_gap else {}),
+            **({"unmatched_quoted_terms": quote_gaps} if quote_gaps else {}),
             "review": review.model_dump(mode="json"),
             "instruction": "A found source may need delivery or complete reading, not another search. Choose methods yourself. Do not substitute general legal knowledge.",
         },

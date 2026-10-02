@@ -11,6 +11,7 @@ from collections.abc import Mapping
 
 from pydantic import JsonValue
 
+from onyx.asv3.authority import statute_references
 from onyx.asv3.models import ToolReceipt
 
 
@@ -20,7 +21,7 @@ def encoded(value: object) -> str:
 
 class WorkingMemory:
     _FIELDS = frozenset(
-        "locator_id kind status receipt_id tool source_id name chunk_id citation text_hash information_need origin_chunk_id article qualifier position heading_path validity_start validity_end projection_ordinal source_name has_more next_offset next_position evidence_next_position scan_truncated evidence_truncated subunit_verified absence_proven paragraph clause operation query query_hash pattern pattern_hash mode read_as_of_date article_closure_complete context".split()
+        "locator_id kind status receipt_id tool source_id name chunk_id citation text_hash information_need origin_chunk_id origin_source_id instrument_number reference_text article qualifier position heading_path validity_start validity_end projection_ordinal source_name has_more next_offset next_position evidence_next_position scan_truncated evidence_truncated subunit_verified absence_proven paragraph clause operation query query_hash pattern pattern_hash mode read_as_of_date article_closure_complete context".split()
     )
 
     def __init__(self, scope: Mapping[str, JsonValue]) -> None:
@@ -49,6 +50,8 @@ class WorkingMemory:
                 "qualifier",
                 "information_need",
                 "origin_chunk_id",
+                "origin_source_id",
+                "instrument_number",
                 "query",
                 "query_hash",
                 "pattern",
@@ -105,6 +108,37 @@ class WorkingMemory:
                     + hashlib.sha256(need.encode()).hexdigest()
                 }
             changed = False
+            reference_origins: list[tuple[str, str | None, str | None]] = [
+                (item.text, item.source_id, item.chunk_id)
+                for item in receipt.outcome.evidence
+            ]
+            if isinstance(data.get("text"), str):
+                source_id, chunk_id = data.get("source_id"), data.get("chunk_id")
+                reference_origins.append(
+                    (
+                        str(data["text"]),
+                        source_id if isinstance(source_id, str) else None,
+                        chunk_id if isinstance(chunk_id, str) else None,
+                    )
+                )
+            for text, origin_source, origin_chunk in reference_origins:
+                for reference in statute_references(text):
+                    changed = (
+                        self._put(
+                            "reference",
+                            {
+                                **purpose,
+                                "origin_source_id": origin_source,
+                                "origin_chunk_id": origin_chunk,
+                                "instrument_number": reference.number,
+                                "article": reference.article,
+                                "reference_text": reference.reference_text,
+                                "context": "reference_lead_not_original_governing_evidence",
+                            },
+                            receipt,
+                        )
+                        or changed
+                    )
             for field, kind in (
                 ("sources", "source"),
                 ("headings", "chunk"),

@@ -15,6 +15,7 @@ from uuid import UUID
 
 from pydantic import JsonValue
 
+from onyx.asv3.authority import authority_obligations, unresolved_authority_gap
 from onyx.asv3.citation_numbers import extract_citation_numbers
 from onyx.asv3.corpus_tools import CorpusBroker, build_corpus_specs
 from onyx.asv3.evidence import EvidenceLedger
@@ -36,6 +37,7 @@ from onyx.asv3.models import (
 )
 from onyx.asv3.progress import ProgressEvent, ProgressReporter
 from onyx.asv3.publication import publication_gap, question_inventory
+from onyx.asv3.quotations import unmatched_quoted_terms
 from onyx.asv3.registry import CapabilityRegistry, build_core_specs
 from onyx.asv3.sandbox import build_sandbox_specs
 from onyx.asv3.scenario import initial_questions
@@ -556,6 +558,10 @@ def run_asv3_loop(
                     else None,
                     "evidence": evidence,
                     "available_evidence": ledger.summaries(max_chars=6000),
+                    "authority_obligations": authority_obligations(draft, ledger),
+                    "unmatched_quoted_terms": unmatched_quoted_terms(
+                        draft, question, ledger
+                    ),
                     "require_sources": profile.requires_sources,
                     "pending_tasks": model.pending_tasks(),
                 },
@@ -584,6 +590,17 @@ def run_asv3_loop(
                     "available_tasks": model.pending_tasks(),
                 },
             )
+        missing_authority = (
+            unresolved_authority_gap(draft, ledger)
+            if profile.requires_sources
+            else None
+        )
+        if missing_authority is not None:
+            return ToolOutcome(
+                status=OutcomeStatus.PARTIAL,
+                summary="An explicitly used statutory basis still needs its original provision.",
+                data=missing_authority,
+            )
         review = review_answer(draft, research=True)
         assert harness is not None
         questions = harness.view().questions
@@ -595,6 +612,9 @@ def run_asv3_loop(
             ledger,
             require_sources=profile.requires_sources,
             verification_call_id=call_id,
+            require_direct_authority=True,
+            scenario=question,
+            require_quotation_checks=True,
         )
         if gap is None:
             approved_draft, approved_review, approved_call_id = draft, review, call_id
@@ -710,6 +730,9 @@ def run_asv3_loop(
                 ledger,
                 require_sources=profile.requires_sources,
                 verification_call_id=approved_call_id,
+                require_direct_authority=True,
+                scenario=question,
+                require_quotation_checks=True,
             )
         else:
             previous_review = latest_review
@@ -758,6 +781,9 @@ def run_asv3_loop(
                 require_sources=profile.requires_sources,
                 allow_explicit_gaps=not complete,
                 verification_call_id=model.last_call_id,
+                require_direct_authority=final_review.status == "supported",
+                scenario=question,
+                require_quotation_checks=True,
             )
         final_publication_gap = final_gap
         publication_stop_reason = (

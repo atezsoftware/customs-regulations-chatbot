@@ -107,6 +107,14 @@ class LanguageProfile(BaseModel):
         return self
 
 
+class QuotationVerification(BaseModel):
+    term_id: str
+    kind: Literal["literal", "translation", "application", "unsupported"]
+    evidence_number: Annotated[int, Field(strict=True, ge=1)] | None
+    source_quote: str
+    explanation: Annotated[str, Field(min_length=1)]
+
+
 class VerificationResult(BaseModel):
     status: Literal["supported", "contradicted", "incomplete", "uncertain"]
     explanation: Annotated[str, Field(min_length=1)]
@@ -116,6 +124,7 @@ class VerificationResult(BaseModel):
     question_results: list["QuestionVerification"] = Field(default_factory=list)
     safe_to_publish: bool = Field(default=False, strict=True)
     unsupported_claims: list[str] = Field(default_factory=list)
+    quotation_checks: list[QuotationVerification] = Field(default_factory=list)
 
 
 class QuestionVerification(BaseModel):
@@ -813,7 +822,14 @@ class ResearchModel:
                             "data": {
                                 key: value
                                 for key, value in receipt.outcome.data.items()
-                                if key in {"gaps", "review", "missing", "instruction"}
+                                if key
+                                in {
+                                    "gaps",
+                                    "review",
+                                    "missing",
+                                    "instruction",
+                                    "unmatched_quoted_terms",
+                                }
                             }
                         }
                         if receipt.call.name == "finalization_status"

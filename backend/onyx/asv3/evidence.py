@@ -106,6 +106,27 @@ class EvidenceLedger:
                 used += cost
         return json.dumps(records, ensure_ascii=False)
 
+    def authority_metadata(self) -> list[dict[str, JsonValue]]:
+        """Inspect retained identities without copying original text or serialized receipts."""
+        with self._lock:
+            records: list[dict[str, JsonValue]] = []
+            for number, item in self._items.items():
+                metadata = model_evidence_metadata(item.metadata)
+                headings = metadata.get("heading_path")
+                records.append(
+                    {
+                        "citation": number,
+                        "citable": item.search_doc is not None,
+                        "document_type": metadata.get("document_type"),
+                        "title": metadata.get("title"),
+                        "article_no": metadata.get("article_no"),
+                        "heading_path": headings[:1]
+                        if isinstance(headings, list)
+                        else [],
+                    }
+                )
+            return records
+
     def summaries(self, *, max_chars: int = 32000) -> list[dict[str, JsonValue]]:
         with self._lock:
             # A global top-relevance prefix can erase a later question. Round-robin

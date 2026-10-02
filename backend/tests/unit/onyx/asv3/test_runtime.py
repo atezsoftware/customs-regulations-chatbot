@@ -575,9 +575,11 @@ def test_partial_rewrite_verifier_receives_draft_details_and_their_originals(
     previous_review = script[7]
     assert isinstance(previous_review, ModelResponse)
     assert isinstance(previous_review.choice.message.content, str)
-    assert reference["previous_review"] == json.loads(
+    assert reference[
+        "previous_review"
+    ] == runtime.VerificationResult.model_validate_json(
         previous_review.choice.message.content
-    )
+    ).model_dump(mode="json")
     synthesis = next(
         request_data(call.kwargs)
         for call in llm.invoke.call_args_list
@@ -776,6 +778,85 @@ def test_runtime_recovers_uncited_governing_source_without_losing_special_proced
     answer = kwargs["state_container"].answer_tokens
     assert "İzin gerekir" in answer and "elektronik bildirim" in answer
     assert len(kwargs["state_container"].citation_to_doc) == 2
+
+
+def test_runtime_follows_named_statutory_basis_before_accepting_a_supported_draft(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kwargs, broker, llm, checkpoints, _queue = setup_run(monkeypatch)
+    for source, kind, title, article, text in zip(
+        broker.sources,
+        ("genelge", "kanun"),
+        ("Uygulama Genelgesi", "8917 sayılı Faaliyet Kanunu"),
+        ("3", "27"),
+        (
+            "8917 sayılı Faaliyet Kanunu’nun 27 nci maddesi uyarınca izin gerekir.",
+            "İzin gerekir. Elektronik bildirim kabul edilebilir.",
+        ),
+    ):
+        key = str(source.id)
+        broker.chunks[key] = replace(
+            broker.chunks[key],
+            text=text,
+            metadata={
+                "document_type": kind,
+                "title": title,
+                "article_no": article,
+                "heading_path": [title],
+            },
+        )
+    scripts = list(llm.invoke.side_effect)
+    numbers: dict[str, int] = {}
+
+    def initial_draft(**arguments: Any) -> ModelResponse:
+        data = request_data(arguments)
+        numbers.update(
+            {row["document_type"]: row["citation"] for row in data["evidence"]}
+        )
+        return response(
+            f"8917 sayılı Faaliyet Kanunu’nun 27 nci maddesi uyarınca izin gerekir [{numbers['genelge']}]."
+        )
+
+    def follow_missing(**arguments: Any) -> ModelResponse:
+        data = request_data(arguments)
+        assert "unresolved_original" in json.dumps(data)
+        assert "8917" in json.dumps(data)
+        return response(calls=[("read_evidence", {"citation": numbers["kanun"]})])
+
+    final = ""
+
+    def complete_draft(**_arguments: Any) -> ModelResponse:
+        nonlocal final
+        final = f"8917 sayılı Faaliyet Kanunu’nun 27 nci maddesi uyarınca izin gerekir [{numbers['kanun']}]."
+        return response(final)
+
+    def review(**arguments: Any) -> ModelResponse:
+        data = request_data(arguments)
+        assert data["claim"] == final
+        assert data["authority_obligations"][0]["status"] == "original_cited"
+        assert data["authority_obligations"][0]["cited_original_evidence"] == [
+            numbers["kanun"]
+        ]
+        return supported_review([numbers["kanun"]])
+
+    stages = iter(
+        [scripts[0], scripts[1], initial_draft, follow_missing, complete_draft, review]
+    )
+
+    def invoke(**arguments: Any) -> ModelResponse:
+        stage = next(stages)
+        return stage(**arguments) if callable(stage) else stage
+
+    llm.invoke.side_effect = invoke
+    runtime.run_asv3_loop(**kwargs)
+    assert llm.invoke.call_count == 6
+    assert checkpoints[-1]["publication_stop_reason"] == "verified_draft_published"
+    assert checkpoints[-1]["last_draft"] == final
+    assert "8917" in kwargs["state_container"].answer_tokens
+    assert any(
+        receipt["call"]["name"] == "finalization_status"
+        for receipt in checkpoints[-1]["receipts"]
+    )
 
 
 def test_runtime_drops_unrecorded_citation_and_publishes_only_localized_gap(
