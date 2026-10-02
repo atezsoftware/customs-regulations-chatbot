@@ -15,6 +15,7 @@ from uuid import UUID
 
 from pydantic import JsonValue
 
+from onyx.asv3.assertions import assertion_inventory
 from onyx.asv3.authority import authority_obligations, unresolved_authority_gap
 from onyx.asv3.citation_numbers import extract_citation_numbers
 from onyx.asv3.corpus_tools import CorpusBroker, build_corpus_specs
@@ -552,6 +553,7 @@ def run_asv3_loop(
         if harness is None:
             raise RuntimeError("Research state is not ready for verification")
         view = harness.view()
+        assertion_units = assertion_inventory(draft)
         evidence = _evidence_record(
             ledger,
             draft + ("\n" + preservation_reference if preservation_reference else ""),
@@ -568,6 +570,7 @@ def run_asv3_loop(
                     "scenario": question,
                     "questions": question_inventory(view.questions),
                     "claim": draft,
+                    "assertion_units": assertion_units,
                     "preservation_reference": {
                         "draft": preservation_reference,
                         "previous_review": previous_review.model_dump(mode="json")
@@ -589,7 +592,7 @@ def run_asv3_loop(
                 ensure_ascii=False,
             ),
             LLMFlow.ASV3_VERIFICATION,
-            max_tokens=4000,
+            max_tokens=max(5000, min(14000, 3500 + 180 * len(assertion_units))),
             consume_budget=not research,
         )
         latest_review = VerificationResult.model_validate(parse_json_object(text))
@@ -660,6 +663,7 @@ def run_asv3_loop(
             require_direct_authority=True,
             scenario=question,
             require_quotation_checks=True,
+            require_assertion_checks=True,
             research_state=research_state,
         )
         if gap is None:
@@ -787,6 +791,7 @@ def run_asv3_loop(
                 require_direct_authority=True,
                 scenario=question,
                 require_quotation_checks=True,
+                require_assertion_checks=True,
                 research_state=research_state,
             )
         else:
@@ -842,6 +847,7 @@ def run_asv3_loop(
                 require_direct_authority=final_review.status == "supported",
                 scenario=question,
                 require_quotation_checks=True,
+                require_assertion_checks=True,
                 research_state=research_state,
             )
         if (
@@ -876,6 +882,7 @@ def run_asv3_loop(
                     require_direct_authority=True,
                     scenario=question,
                     require_quotation_checks=True,
+                    require_assertion_checks=True,
                     research_state=research_state,
                 )
             else:
@@ -928,6 +935,7 @@ def run_asv3_loop(
                         require_direct_authority=final_review.status == "supported",
                         scenario=question,
                         require_quotation_checks=True,
+                        require_assertion_checks=True,
                         research_state=research_state,
                     )
                 complete = False
@@ -945,6 +953,7 @@ def run_asv3_loop(
                     require_direct_authority=True,
                     scenario=question,
                     require_quotation_checks=True,
+                    require_assertion_checks=True,
                     research_state=research_state,
                 )
                 is None

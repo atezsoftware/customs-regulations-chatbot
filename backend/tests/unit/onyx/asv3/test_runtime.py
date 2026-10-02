@@ -13,6 +13,7 @@ from uuid import uuid4
 import pytest
 
 from onyx.asv3 import runtime
+from onyx.asv3.assertions import assertion_inventory
 from onyx.asv3.models import (
     EvidenceItem,
     OutcomeStatus,
@@ -71,7 +72,13 @@ def response(
     )
 
 
-def supported_review(numbers: list[int], question_count: int = 1) -> ModelResponse:
+def supported_review(
+    numbers: list[int],
+    question_count: int = 1,
+    *,
+    draft: str = "Tamir [1], değiştirme [2].",
+    quotes: dict[int, str] | None = None,
+) -> ModelResponse:
     return response(
         json.dumps(
             {
@@ -82,6 +89,24 @@ def supported_review(numbers: list[int], question_count: int = 1) -> ModelRespon
                 "evidence_numbers": numbers,
                 "safe_to_publish": True,
                 "unsupported_claims": [],
+                "assertion_results": [
+                    {
+                        "unit_id": unit["unit_id"],
+                        "status": "supported",
+                        "witnesses": [
+                            {
+                                "citation": number,
+                                "source_quote": (quotes or {}).get(
+                                    number, "Tamir şartları."
+                                ),
+                            }
+                            for number in unit["evidence_numbers"]
+                        ],
+                        "missing_conditions": [],
+                        "explanation": "Scripted source assessment for runtime contracts.",
+                    }
+                    for unit in assertion_inventory(draft)
+                ],
                 "question_results": [
                     {
                         "question_id": f"q{index}",
@@ -271,7 +296,7 @@ def setup_run(
         response("Tamir [1], değiştirme [2]."),
         supported_review([1, 2]),
         response(final),
-        supported_review([1, 2]),
+        supported_review([1, 2], draft=final),
     ]
     cache = MagicMock(spec=CacheBackend)
     cache.exists.side_effect = lambda _key: broker.cancelled.is_set()
@@ -364,7 +389,7 @@ def test_resume_reuses_saved_question_language_without_reclassifying(
         response("Tamir [1], değiştirme [2]."),
         supported_review([1, 2]),
         response("Tamir sonucu [1]; değiştirme sonucu [2]."),
-        supported_review([1, 2]),
+        supported_review([1, 2], draft="Tamir sonucu [1]; değiştirme sonucu [2]."),
     ]
     runtime.run_asv3_loop(**kwargs, resume_message_id=2)
     assert llm.invoke.call_count == 2
@@ -397,6 +422,9 @@ def test_runtime_parallel_sources_full_original_review_and_final_citations(
         current = invocation
         invocation += 1
         scheduled = next(scripted)
+        if current == 3:
+            data = request_data(arguments)
+            return supported_review([1, 2], draft=data["claim"])
         if current not in (2, 4):
             return scheduled
         evidence = request_data(arguments)["evidence"]
@@ -542,7 +570,7 @@ def test_numbered_questions_are_verified_separately_and_approved_details_are_unc
     llm.invoke.side_effect = [
         *script[:2],
         response(draft),
-        supported_review([1, 2], question_count=3),
+        supported_review([1, 2], question_count=3, draft=draft),
     ]
     runtime.run_asv3_loop(**kwargs)
     assert llm.invoke.call_count == 4
@@ -808,7 +836,11 @@ def test_runtime_recovers_uncited_governing_source_without_losing_special_proced
                 if chunk.id == item["chunk_id"]
             )
             assert item["text"] == stored.text and item["truncated"] is False
-        return supported_review(sorted(citations.values()))
+        return supported_review(
+            sorted(citations.values()),
+            draft=data["claim"],
+            quotes={item["citation"]: item["text"][:160] for item in originals},
+        )
 
     stages = iter(
         [
@@ -895,7 +927,11 @@ def test_runtime_follows_named_statutory_basis_before_accepting_a_supported_draf
         assert data["authority_obligations"][0]["cited_original_evidence"] == [
             numbers["kanun"]
         ]
-        return supported_review([numbers["kanun"]])
+        return supported_review(
+            [numbers["kanun"]],
+            draft=final,
+            quotes={numbers["kanun"]: "İzin gerekir."},
+        )
 
     stages = iter(
         [scripts[0], scripts[1], initial_draft, follow_missing, complete_draft, review]
@@ -1151,9 +1187,11 @@ def test_runtime_review_gap_drives_new_source_before_supported_publication(
             response(json.dumps(incomplete)),
             None,
             response("Tamir şartları [1]; yeni makinenin farklı şartları [2]."),
-            supported_review([1, 2]),
+            supported_review(
+                [1, 2], draft="Tamir şartları [1]; yeni makinenin farklı şartları [2]."
+            ),
             response("Tamir sonucu [1]; yeni makine sonucu [2]."),
-            supported_review([1, 2]),
+            supported_review([1, 2], draft="Tamir sonucu [1]; yeni makine sonucu [2]."),
         ]
     )
     recovery_observed = False
@@ -1264,7 +1302,7 @@ def test_finalization_waits_for_admitted_worker_originals_after_shared_decision_
             return response("Tamir şartı özgün hükme göre uygulanır [1].")
         if isinstance(instruction, str) and instruction.startswith(VERIFICATION_PROMPT):
             assert json.loads(data["evidence"])[0]["text"].endswith("ORIGINAL_TAIL_0")
-            return supported_review([1])
+            return supported_review([1], draft=data["claim"])
         assert isinstance(profile, ModelResponse)
         return profile
 
@@ -1453,7 +1491,7 @@ def test_rejected_final_candidate_can_reopen_research_and_publish_exact_repaired
         *script,
         response(calls=[("read_evidence", {"citation": 2})]),
         response(corrected),
-        supported_review([1, 2]),
+        supported_review([1, 2], draft=corrected),
     ]
     runtime.run_asv3_loop(**kwargs)
     saved = checkpoints[-1]
@@ -1470,3 +1508,86 @@ def test_rejected_final_candidate_can_reopen_research_and_publish_exact_repaired
     )
     assert request_data(repair_call.kwargs)["publication_gap"]
     assert llm.config.model_name == "scripted"
+
+
+def test_local_assertion_failure_repairs_only_rejected_outcome_despite_broad_approval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kwargs, broker, llm, checkpoints, _queue = setup_run(monkeypatch)
+    originals = ["Koşullu tamire izin verilir.", "Başvuru sonucu idareye bildirilir."]
+    for source, text in zip(broker.sources, originals):
+        broker.chunks[str(source.id)] = replace(
+            broker.chunks[str(source.id)], text=text
+        )
+    numbers: dict[str, int] = {}
+    draft = corrected = ""
+    repair_seen = False
+
+    def initial_draft(**arguments: Any) -> ModelResponse:
+        nonlocal draft, corrected
+        numbers.update(
+            {
+                item["chunk_id"]: item["citation"]
+                for item in request_data(arguments)["evidence"]
+            }
+        )
+        draft = f"Koşullu tamire izin verilir [{numbers['chunk-0']}].\n\nBaşvuru sonucunun bildirilmesi tüm şartları kaldırır [{numbers['chunk-1']}]."
+        corrected = f"Koşullu tamire izin verilir [{numbers['chunk-0']}].\n\nBaşvuru sonucu idareye bildirilir [{numbers['chunk-1']}]."
+        return response(draft)
+
+    def first_review(**_arguments: Any) -> ModelResponse:
+        review = supported_review(
+            list(numbers.values()),
+            draft=draft,
+            quotes={numbers["chunk-0"]: originals[0], numbers["chunk-1"]: originals[1]},
+        )
+        assert isinstance(review.choice.message.content, str)
+        data = json.loads(review.choice.message.content)
+        data["assertion_results"][1].update(
+            status="unsupported",
+            missing_conditions=["Bildirim tüm şartları kaldırmaz."],
+            explanation="Özgün kaynak yalnız bildirim öngörür.",
+        )
+        return response(json.dumps(data))
+
+    def repair(**arguments: Any) -> ModelResponse:
+        nonlocal repair_seen
+        payload = request_data(arguments)
+        assert payload["draft_to_repair"] == draft
+        gaps = payload["publication_gap"]["assertion_gaps"]
+        assert len(gaps) == 1 and gaps[0]["text"].endswith(
+            f"kaldırır [{numbers['chunk-1']}]."
+        )
+        repair_seen = True
+        return response(corrected)
+
+    def corrected_review(**_arguments: Any) -> ModelResponse:
+        return supported_review(
+            list(numbers.values()),
+            draft=corrected,
+            quotes={numbers["chunk-0"]: originals[0], numbers["chunk-1"]: originals[1]},
+        )
+
+    stages = iter(
+        [
+            *list(llm.invoke.side_effect)[:2],
+            initial_draft,
+            first_review,
+            repair,
+            corrected_review,
+        ]
+    )
+
+    def invoke(**arguments: Any) -> ModelResponse:
+        scheduled = next(stages)
+        return scheduled(**arguments) if callable(scheduled) else scheduled
+
+    llm.invoke.side_effect = invoke
+    runtime.run_asv3_loop(**kwargs)
+    assert repair_seen
+    assert checkpoints[-1]["publication_status"] == "found"
+    assert checkpoints[-1]["last_draft"] == corrected
+    assert kwargs["state_container"].answer_tokens.startswith(
+        "Koşullu tamire izin verilir"
+    )
+    assert "tüm şartları kaldırır" not in kwargs["state_container"].answer_tokens

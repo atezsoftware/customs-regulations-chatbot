@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pydantic import JsonValue
 
+from onyx.asv3.assertions import assertion_inventory
 from onyx.asv3.authority import unresolved_authority_gap
 from onyx.asv3.citation_numbers import extract_citation_numbers
 from onyx.asv3.evidence import EvidenceLedger
@@ -33,9 +34,51 @@ def publication_gap(
     scenario: str = "",
     require_quotation_checks: bool = False,
     research_state: ResearchState | None = None,
+    require_assertion_checks: bool = False,
 ) -> ToolOutcome | None:
     reasons: list[str] = []
     cited = set(extract_citation_numbers(answer))
+    assertion_gaps: list[dict[str, JsonValue]] = []
+    if require_sources and require_assertion_checks:
+        units = assertion_inventory(answer)
+        checks = {item.unit_id: item for item in review.assertion_results}
+        if len(checks) != len(review.assertion_results) or set(checks) != {
+            str(unit["unit_id"]) for unit in units
+        }:
+            reasons.append(
+                "Every cited answer block needs its own current original-source assessment; a general approval is insufficient."
+            )
+        for unit in units:
+            check = checks.get(str(unit["unit_id"]))
+            numbers = unit["evidence_numbers"]
+            valid = (
+                check is not None
+                and check.status == "supported"
+                and not check.missing_conditions
+            )
+            if check is not None:
+                witnessed = {w.citation for w in check.witnesses}
+                valid = valid and witnessed == set(numbers)
+                for witness in check.witnesses:
+                    original = ledger.get(witness.citation)
+                    valid = (
+                        valid
+                        and original is not None
+                        and bool(witness.source_quote.strip())
+                        and normalized(witness.source_quote)
+                        in normalized(original.text)
+                    )
+            if not valid:
+                assertion_gaps.append(
+                    {
+                        **unit,
+                        "assessment": check.model_dump(mode="json") if check else None,
+                    }
+                )
+        if assertion_gaps:
+            reasons.append(
+                "Cited assertions need support for all stated conditions and outcomes from their own inline originals."
+            )
     authority_gap = (
         unresolved_authority_gap(answer, ledger)
         if require_sources and require_direct_authority
@@ -185,6 +228,7 @@ def publication_gap(
             "gaps": reasons,
             **({"missing": authority_gap["missing"]} if authority_gap else {}),
             **({"unmatched_quoted_terms": quote_gaps} if quote_gaps else {}),
+            **({"assertion_gaps": assertion_gaps} if assertion_gaps else {}),
             "review": review.model_dump(mode="json"),
             "instruction": "A found source may need delivery or complete reading, not another search. Choose methods yourself. Do not substitute general legal knowledge.",
         },

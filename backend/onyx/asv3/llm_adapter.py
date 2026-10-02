@@ -14,6 +14,7 @@ import jsonschema
 from pydantic import BaseModel, Field, JsonValue, model_validator
 
 from onyx.asv3.artifacts import ArtifactStore, compact_json
+from onyx.asv3.assertions import AssertionVerification
 from onyx.asv3.citation_numbers import extract_citation_numbers
 from onyx.asv3.models import (
     CapabilityCall,
@@ -127,6 +128,7 @@ class VerificationResult(BaseModel):
     quotation_checks: list[QuotationVerification] = Field(default_factory=list)
     need_results: list["NeedVerification"] = Field(default_factory=list)
     omitted_supported_details: list[str] = Field(default_factory=list)
+    assertion_results: list[AssertionVerification] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def consistent_publication_assessment(self) -> VerificationResult:
