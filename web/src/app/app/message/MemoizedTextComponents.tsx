@@ -239,10 +239,10 @@ export const MemoizedLink = memo(
         <span
           data-citation-copy-text={value?.toString()}
           data-citation-copy-href={
-            href ||
-            document?.link ||
             citation?.preview_url ||
             document?.citation_preview_url ||
+            href ||
+            document?.link ||
             ""
           }
         >

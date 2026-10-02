@@ -17,7 +17,9 @@ it("copies inline source numbers and links without chip folder labels", () => {
     )
   );
   expect(copied?.text).toBe("First rule [1].\nLater settlement [2].");
-  expect(copied?.html).toContain('<a href="/api/asv3/citation/2/1">[1]</a>');
+  expect(copied?.html).toContain(
+    '<a href="http://localhost/api/asv3/citation/2/1">[1]</a>'
+  );
   expect(copied?.html).not.toContain("GLOBAL");
   expect(copied?.html).not.toContain("Long/folder");
 });
@@ -68,7 +70,7 @@ it("copies selected prose with source numbers even when the native event targets
     expect(event.defaultPrevented).toBe(true);
     expect(copied.get("text/plain")).toBe("Operative rule [7].");
     expect(copied.get("text/html")).toContain(
-      '<a href="/api/asv3/citation/2/7">[7]</a>'
+      '<a href="http://localhost/api/asv3/citation/2/7">[7]</a>'
     );
     expect(copied.get("text/html")).not.toContain("GLOBAL");
   } finally {

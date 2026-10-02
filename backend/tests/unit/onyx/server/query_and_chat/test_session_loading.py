@@ -2,6 +2,7 @@ from types import SimpleNamespace
 from typing import cast
 from unittest.mock import MagicMock, patch
 
+import pytest
 from pydantic import JsonValue
 from sqlalchemy.orm import Session
 
@@ -58,6 +59,58 @@ def test_reloaded_citation_packet_preserves_exact_source_identity() -> None:
             source_type=DocumentSource.USER_FILE,
         )
     ]
+
+
+@pytest.mark.parametrize("asv3", [True, False])
+def test_reloaded_canonical_preview_is_scoped_to_saved_asv3_runs(asv3: bool) -> None:
+    from onyx.db.asv3_runs import ASV3_CHECKPOINT_TOOL_ID
+
+    saved_search_doc = cast(
+        SearchDoc,
+        SimpleNamespace(
+            id=77,
+            document_id="corpus-original",
+            chunk_ind=46,
+            semantic_id="Source · Article 46",
+            source_type=DocumentSource.FILE,
+            doc_metadata={"regulatory_chunk_id": "rc-original"},
+        ),
+    )
+    checkpoint_tool = SimpleNamespace(
+        tool_id=ASV3_CHECKPOINT_TOOL_ID, tool_call_response="", turn_number=0
+    )
+    chat_message = cast(
+        ChatMessage,
+        SimpleNamespace(
+            id=101,
+            publication_read=None,
+            message_type=MessageType.ASSISTANT,
+            tool_calls=[checkpoint_tool] if asv3 else [],
+            citations={2: 77},
+            search_docs=[],
+            reasoning_tokens=None,
+            message="Answer [[2]]()",
+        ),
+    )
+    with (
+        patch(
+            "onyx.server.query_and_chat.session_loading.create_asv3_progress_packets",
+            return_value=[],
+        ),
+        patch(
+            "onyx.server.query_and_chat.session_loading.get_db_search_doc_by_id",
+            return_value=saved_search_doc,
+        ),
+    ):
+        packets = translate_assistant_message_to_packets(
+            chat_message, cast(Session, MagicMock())
+        )
+    citations = [
+        packet.obj for packet in packets if isinstance(packet.obj, CitationInfo)
+    ]
+    assert len(citations) == 1
+    assert citations[0].chunk_ind == 46
+    assert citations[0].preview_url == ("/api/asv3/citation/101/2" if asv3 else None)
 
 
 def test_reloaded_provision_tool_retains_its_label_and_query() -> None:

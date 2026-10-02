@@ -941,6 +941,10 @@ def translate_assistant_message_to_packets(
 
     citations = chat_message.citations
     citation_info_list: list[CitationInfo] = []
+    asv3_run = any(
+        tool_call.tool_id == ASV3_CHECKPOINT_TOOL_ID
+        for tool_call in (chat_message.tool_calls or [])
+    )
 
     if citations:
         related_search_docs = {doc.id: doc for doc in chat_message.search_docs}
@@ -960,6 +964,12 @@ def translate_assistant_message_to_packets(
                             f"/api/asv3/citation/{chat_message.id}/{citation_num}"
                             if (getattr(search_doc, "doc_metadata", None) or {}).get(
                                 "asv3_native_locator"
+                            )
+                            or (
+                                asv3_run
+                                and (
+                                    getattr(search_doc, "doc_metadata", None) or {}
+                                ).get("regulatory_chunk_id")
                             )
                             else None
                         ),

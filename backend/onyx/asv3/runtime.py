@@ -592,7 +592,17 @@ def run_asv3_loop(
                 ensure_ascii=False,
             ),
             LLMFlow.ASV3_VERIFICATION,
-            max_tokens=max(5000, min(14000, 3500 + 180 * len(assertion_units))),
+            max_tokens=max(
+                6000,
+                min(
+                    16000,
+                    3000
+                    + 220 * len(assertion_units)
+                    + 130
+                    * sum(len(unit["evidence_numbers"]) for unit in assertion_units)
+                    + 250 * len(view.questions),
+                ),
+            ),
             consume_budget=not research,
         )
         latest_review = VerificationResult.model_validate(parse_json_object(text))
@@ -1019,12 +1029,11 @@ def run_asv3_loop(
                 context.check_active()
                 if isinstance(part, CitationInfo):
                     doc = allowed.get(part.citation_number)
-                    if doc and isinstance(
-                        doc.metadata.get("asv3_citation_preview_url"), str
+                    if doc and (
+                        doc.metadata.get("regulatory_chunk_id")
+                        or doc.metadata.get("asv3_native_locator")
                     ):
-                        part.preview_url = str(
-                            doc.metadata["asv3_citation_preview_url"]
-                        )
+                        part.preview_url = f"/api/asv3/citation/{assistant_message_id}/{part.citation_number}"
                     state_container.add_emitted_citation(part.citation_number)
                     emitter.emit(Packet(placement=Placement(turn_index=0), obj=part))
                 else:

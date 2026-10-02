@@ -1,4 +1,4 @@
-"""Owned saved-run previews for verified original-file evidence."""
+"""Owned saved-run previews for verified corpus originals."""
 
 from fastapi import APIRouter, Depends
 from pydantic import JsonValue
@@ -22,7 +22,7 @@ from onyx.server.documents.models import ChunkInfo
 router = APIRouter(prefix="/asv3")
 
 
-def native_item_from_checkpoint(
+def saved_item_from_checkpoint(
     checkpoint: dict[str, JsonValue], number: int
 ) -> tuple[EvidenceItem, IndexFilters]:
     scope = checkpoint.get("scope")
@@ -45,16 +45,30 @@ def native_item_from_checkpoint(
     if record is None:
         raise ValueError("Citation not found")
     item = EvidenceItem.model_validate(record.get("item"))
-    if (
-        item.chunk_id is not None
-        or not item.metadata.get("derived")
-        or not item.metadata.get("source_sha256")
-        or item.search_doc is None
-        or item.search_doc.chunk_ind != -number
-        or item.search_doc.document_id != item.source_id
+    if item.search_doc is None or item.search_doc.document_id != item.source_id:
+        raise ValueError("Citation source identity differs from saved evidence")
+    if item.chunk_id is None:
+        if (
+            not item.metadata.get("derived")
+            or not item.metadata.get("source_sha256")
+            or item.search_doc.chunk_ind != -number
+        ):
+            raise ValueError("Citation is not verified native evidence")
+    elif (
+        item.search_doc.chunk_ind < 0
+        or item.search_doc.metadata.get("regulatory_chunk_id") != item.chunk_id
     ):
-        raise ValueError("Citation is not verified native evidence")
+        raise ValueError("Citation canonical identity differs from saved evidence")
     return item, IndexFilters.model_validate(scope)
+
+
+def native_item_from_checkpoint(
+    checkpoint: dict[str, JsonValue], number: int
+) -> tuple[EvidenceItem, IndexFilters]:
+    item, filters = saved_item_from_checkpoint(checkpoint, number)
+    if item.chunk_id is not None:
+        raise ValueError("Citation is not verified native evidence")
+    return item, filters
 
 
 @router.get("/citation/{assistant_message_id}/{citation_num}")
@@ -70,7 +84,7 @@ def get_native_citation(
         )
         if checkpoint is None:
             raise ValueError("Citation checkpoint not found")
-        item, filters = native_item_from_checkpoint(checkpoint, citation_num)
+        item, filters = saved_item_from_checkpoint(checkpoint, citation_num)
         context = RunContext(scope=filters.model_dump(mode="json"), timeout_seconds=30)
         CorpusBroker(user, filters).revalidate_evidence([item], context)
     except (PermissionError, ValueError, CorpusScopeUnavailable) as error:

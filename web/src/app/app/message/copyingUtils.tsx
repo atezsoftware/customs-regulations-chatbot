@@ -24,7 +24,10 @@ export function selectionCitationClipboard(
     const replacement = document.createElement("a");
     replacement.textContent = label;
     if (/^https?:\/\//i.test(target) || /^\/(?!\/)/.test(target)) {
-      replacement.setAttribute("href", target);
+      replacement.setAttribute(
+        "href",
+        new URL(target, window.location.origin).href
+      );
     }
     citation.replaceWith(replacement);
   }

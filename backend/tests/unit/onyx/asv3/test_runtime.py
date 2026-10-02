@@ -89,6 +89,8 @@ def supported_review(
                 "evidence_numbers": numbers,
                 "safe_to_publish": True,
                 "unsupported_claims": [],
+                "need_results": [],
+                "quotation_checks": [],
                 "assertion_results": [
                     {
                         "unit_id": unit["unit_id"],
@@ -143,6 +145,9 @@ def unsafe_review(claim: str, question_count: int = 1) -> ModelResponse:
                 "evidence_numbers": [],
                 "safe_to_publish": False,
                 "unsupported_claims": [claim],
+                "need_results": [],
+                "quotation_checks": [],
+                "assertion_results": [],
                 "question_results": [
                     {
                         "question_id": f"q{index}",
@@ -474,6 +479,11 @@ def test_runtime_parallel_sources_full_original_review_and_final_citations(
         }
         assert not any(item["truncated"] for item in evidence)
     output = packets(queue)
+    for packet in output:
+        if isinstance(packet.obj, CitationInfo):
+            assert packet.obj.preview_url == (
+                f"/api/asv3/citation/{kwargs['assistant_message_id']}/{packet.obj.citation_number}"
+            )
     narration = [
         packet.obj for packet in output if isinstance(packet.obj, ASv3Progress)
     ]
@@ -794,6 +804,9 @@ def test_runtime_recovers_uncited_governing_source_without_losing_special_proced
                 {
                     "status": "incomplete",
                     "explanation": "Kanuni dayanağın özgün hükmü ve atfı eksik.",
+                    "need_results": [],
+                    "quotation_checks": [],
+                    "assertion_results": [],
                     "required_conditions": [],
                     "missing_conditions": ["kanuni dayanağın özgün hükmü ve atfı"],
                     "evidence_numbers": [citations["genelge"]],

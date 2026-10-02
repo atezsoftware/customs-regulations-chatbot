@@ -711,6 +711,65 @@ def test_safe_review_with_unsupported_assertions_requires_consistent_repair() ->
     assert llm.invoke.call_count == 2
 
 
+def test_publication_review_requires_explicit_assessment_arrays_in_provider_schema() -> (
+    None
+):
+    from onyx.asv3.llm_adapter import PublicationVerificationResult
+
+    llm = scripted_model()
+    complete = {
+        **verification_profile(),
+        "question_results": [
+            {
+                "question_id": "q0",
+                "status": "supported",
+                "evidence_numbers": [1],
+                "missing_conditions": [],
+            }
+        ],
+        "assertion_results": [
+            {
+                "unit_id": "au0-original",
+                "status": "supported",
+                "witnesses": [{"citation": 1, "source_quote": "Original rule."}],
+                "missing_conditions": [],
+                "explanation": "Original supports this rule.",
+            }
+        ],
+        "need_results": [],
+        "quotation_checks": [],
+    }
+    llm.invoke.side_effect = [
+        text_response(verification_profile()),
+        text_response(complete),
+    ]
+    payload = {
+        "claim": "Rule [1].",
+        "questions": [{"question_id": "q0", "question": "Which rule?"}],
+        "assertion_units": [
+            {"unit_id": "au0-original", "text": "Rule [1].", "evidence_numbers": [1]}
+        ],
+        "evidence": "Original rule.",
+    }
+    result = ResearchModel(llm, RunContext()).invoke_text(
+        "Review originals", json.dumps(payload), LLMFlow.ASV3_VERIFICATION
+    )
+    assert PublicationVerificationResult.model_validate_json(result).assertion_results
+    native = llm.invoke.call_args_list[0].kwargs["structured_response_format"][
+        "json_schema"
+    ]["schema"]
+    assert {
+        "question_results",
+        "need_results",
+        "assertion_results",
+        "quotation_checks",
+    } <= set(native["required"])
+    assert llm.invoke.call_count == 2
+    repair_prompt = llm.invoke.call_args_list[1].kwargs["prompt"]
+    assert "au0-original" in str(repair_prompt)
+    assert "Original rule." in str(repair_prompt)
+
+
 def test_verification_uses_typed_provider_schema_and_repairs_incomplete_json() -> None:
     from onyx.asv3.llm_adapter import VerificationResult
 

@@ -153,6 +153,50 @@ class NeedVerification(BaseModel):
     missing_conditions: list[str]
 
 
+class PublicationVerificationResult(VerificationResult):
+    question_results: list[QuestionVerification] = Field(...)
+    need_results: list[NeedVerification] = Field(...)
+    assertion_results: list[AssertionVerification] = Field(...)
+    quotation_checks: list[QuotationVerification] = Field(...)
+
+
+def publication_review_inventory(data: str) -> dict[str, set[str]] | None:
+    try:
+        payload = parse_json_object(data)
+    except ValueError:
+        return None
+    units = payload.get("assertion_units")
+    if not isinstance(units, list):
+        return None
+    state = payload.get("research_state")
+    needs = state.get("needs", []) if isinstance(state, dict) else []
+
+    def identities(rows: JsonValue, key: str) -> set[str]:
+        return (
+            {str(row[key]) for row in rows if isinstance(row, dict) and key in row}
+            if isinstance(rows, list)
+            else set()
+        )
+
+    return {
+        "assertion_results": identities(units, "unit_id"),
+        "question_results": identities(payload.get("questions", []), "question_id"),
+        "need_results": identities(
+            [
+                row
+                for row in needs
+                if isinstance(row, dict) and row.get("status") != "out_of_scope"
+            ]
+            if isinstance(needs, list)
+            else [],
+            "need_id",
+        ),
+        "quotation_checks": identities(
+            payload.get("unmatched_quoted_terms", []), "term_id"
+        ),
+    }
+
+
 def structured_model(flow: LLMFlow) -> type[BaseModel] | None:
     if flow == LLMFlow.ASV3_LANGUAGE:
         return LanguageProfile
@@ -604,6 +648,7 @@ class ResearchModel:
         max_tokens: int,
         research: bool,
         structured: bool = True,
+        response_model: type[BaseModel] | None = None,
     ) -> ModelResponse:
         check = (
             self.context.check_research_active
@@ -621,6 +666,7 @@ class ResearchModel:
                     max_tokens=max_tokens,
                     research=research,
                     structured=structured,
+                    response_model=response_model,
                 )
             except Exception as error:
                 if attempt == 2 or not is_retryable_provider_error(error):
@@ -650,8 +696,11 @@ class ResearchModel:
         max_tokens: int,
         research: bool,
         structured: bool = True,
+        response_model: type[BaseModel] | None = None,
     ) -> ModelResponse:
-        response_model = structured_model(flow) if structured else None
+        response_model = (
+            (response_model or structured_model(flow)) if structured else None
+        )
         from onyx.asv3.evidence import EvidenceLedger
 
         ledger = self.context.services.get("evidence")
@@ -748,6 +797,20 @@ class ResearchModel:
     ) -> str:
         self.context.check_active()
         response_model = structured_model(flow)
+        review_inventory = (
+            publication_review_inventory(data)
+            if flow == LLMFlow.ASV3_VERIFICATION
+            else None
+        )
+        if review_inventory is not None:
+            response_model = PublicationVerificationResult
+            instruction += (
+                "\nReturn an assessment for each supplied ID in these fields; an empty list "
+                "cannot approve nonempty work. Exact required IDs:\n"
+                + json.dumps(
+                    {field: sorted(ids) for field, ids in review_inventory.items()}
+                )
+            )
         if response_model is not None:
             instruction += (
                 "\nReturn a JSON object conforming to this complete schema:\n"
@@ -757,7 +820,12 @@ class ResearchModel:
             self.context.budget.consume("decisions")
         prompt, tools, output = self._fit(instruction, data, [], max_tokens=max_tokens)
         response = self._invoke(
-            prompt, tools, flow, max_tokens=output, research=not consume_budget
+            prompt,
+            tools,
+            flow,
+            max_tokens=output,
+            research=not consume_budget,
+            response_model=response_model,
         )
 
         def valid(result: ModelResponse) -> str:
@@ -775,7 +843,10 @@ class ResearchModel:
             if not text.strip():
                 raise ValueError("ASv3 model returned an empty response")
             if response_model is not None:
-                return normalize_structured_response(text, response_model)
+                normalized_response = normalize_structured_response(
+                    text, response_model
+                )
+                return normalized_response
             return text
 
         try:
@@ -804,6 +875,7 @@ class ResearchModel:
                     max_tokens=output,
                     research=not consume_budget,
                     structured=False,
+                    response_model=response_model,
                 )
             )
 

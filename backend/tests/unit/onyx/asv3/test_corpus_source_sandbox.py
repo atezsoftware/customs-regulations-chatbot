@@ -15,7 +15,7 @@ from uuid import uuid4
 import pytest
 from pydantic import JsonValue
 
-from onyx.asv3.corpus_tools import CorpusBroker, build_corpus_specs
+from onyx.asv3.corpus_tools import CorpusBroker, build_corpus_specs, evidence_for_chunk
 from onyx.asv3.models import (
     CapabilityCall,
     OutcomeStatus,
@@ -37,7 +37,10 @@ from onyx.db.asv3_corpus import (
     original_source_record,
 )
 from onyx.db.models import User
-from onyx.server.asv3_citations import native_item_from_checkpoint
+from onyx.server.asv3_citations import (
+    native_item_from_checkpoint,
+    saved_item_from_checkpoint,
+)
 from onyx.tools.tool_implementations.python.code_interpreter_client import (
     BashExecResponse,
     CreateSessionResponse,
@@ -234,6 +237,36 @@ def test_native_revalidation_rejects_original_hash_change(
     )
     with pytest.raises(CorpusScopeUnavailable, match="changed"):
         broker.revalidate_evidence([item], RunContext())
+
+
+@pytest.mark.parametrize("corrupt", [None, "source", "chunk", "ordinal"])
+def test_saved_canonical_preview_requires_exact_source_chunk_and_ordinal_identity(
+    broker: MemoryBroker, corrupt: str | None
+) -> None:
+    item = evidence_for_chunk(broker.item, broker.items[0])
+    assert item.search_doc is not None
+    if corrupt == "source":
+        item.search_doc.document_id = "another-source"
+    elif corrupt == "chunk":
+        item.search_doc.metadata["regulatory_chunk_id"] = "another-chunk"
+    elif corrupt == "ordinal":
+        item.search_doc.chunk_ind = -3
+    checkpoint: dict[str, JsonValue] = {
+        "scope": broker.filters.model_dump(mode="json"),
+        "evidence": {
+            "version": 1,
+            "records": [{"citation": 3, "item": item.model_dump(mode="json")}],
+        },
+    }
+    if corrupt:
+        with pytest.raises(ValueError, match="identity"):
+            saved_item_from_checkpoint(checkpoint, 3)
+    else:
+        loaded, _ = saved_item_from_checkpoint(checkpoint, 3)
+        assert loaded.identity == item.identity
+        assert loaded.text == broker.items[0].text
+        with pytest.raises(ValueError, match="native"):
+            native_item_from_checkpoint(checkpoint, 3)
 
 
 @pytest.fixture
