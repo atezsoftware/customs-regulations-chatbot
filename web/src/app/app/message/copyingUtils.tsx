@@ -17,7 +17,7 @@ export function selectionCitationClipboard(
     "[data-citation-copy-text]"
   );
   if (!citations.length) return null;
-  for (const citation of citations) {
+  for (const citation of Array.from(citations)) {
     const label = citation.dataset.citationCopyText ?? "";
     if (!/^\[(?:D|Q)?\d+\]$/.test(label)) continue;
     const target = citation.dataset.citationCopyHref ?? "";
