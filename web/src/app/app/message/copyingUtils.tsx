@@ -43,9 +43,13 @@ export function selectionCitationClipboard(
 }
 
 export function handleCopy(
-  event: React.ClipboardEvent,
-  markdownRef: React.RefObject<HTMLDivElement>
+  event: Pick<
+    ClipboardEvent,
+    "clipboardData" | "preventDefault" | "defaultPrevented"
+  >,
+  markdownRef: React.RefObject<HTMLDivElement | null>
 ) {
+  if (event.defaultPrevented || !event.clipboardData) return;
   // Check if we have a selection
   const selection = window.getSelection();
   if (!selection?.rangeCount) return;
@@ -72,6 +76,21 @@ export function handleCopy(
       event.clipboardData.setData("text/plain", selection.toString());
     }
   }
+}
+
+export function registerMarkdownCopyHandler(
+  markdownRef: React.RefObject<HTMLDivElement | null>
+): () => void {
+  // Native copy may target the focused input/body rather than the selected prose.
+  const listener = (event: ClipboardEvent) => handleCopy(event, markdownRef);
+  document.addEventListener("copy", listener);
+  return () => document.removeEventListener("copy", listener);
+}
+
+export function citationClipboardHtml(html: string): string {
+  const template = document.createElement("template");
+  template.innerHTML = html;
+  return selectionCitationClipboard(template.content)?.html ?? html;
 }
 
 // Convert markdown tables to TSV format for spreadsheet compatibility

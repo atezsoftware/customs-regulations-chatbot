@@ -11,7 +11,10 @@ import { Packet, StopReason } from "@/app/app/services/streamingModels";
 import CustomToolAuthCard from "@/app/app/message/messageComponents/CustomToolAuthCard";
 import { FullChatState } from "@/app/app/message/messageComponents/interfaces";
 import { FeedbackType } from "@/app/app/interfaces";
-import { handleCopy } from "@/app/app/message/copyingUtils";
+import {
+  handleCopy,
+  registerMarkdownCopyHandler,
+} from "@/app/app/message/copyingUtils";
 import { useAuthErrors } from "@/app/app/message/messageComponents/hooks/useAuthErrors";
 import { useMessageSwitching } from "@/app/app/message/messageComponents/hooks/useMessageSwitching";
 import { RendererComponent } from "@/app/app/message/messageComponents/renderMessageComponent";
@@ -121,6 +124,7 @@ const AgentMessage = React.memo(function AgentMessage({
   const isASv3 = Boolean(asv3) || asv3Progress.runId !== null;
   const markdownRef = useRef<HTMLDivElement>(null);
   const finalAnswerRef = useRef<HTMLDivElement>(null);
+  useEffect(() => registerMarkdownCopyHandler(markdownRef), []);
 
   // Process streaming packets: returns data and callbacks
   // Hook handles all state internally, exposes clean API

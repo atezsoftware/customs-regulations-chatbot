@@ -10,7 +10,10 @@ import {
   useDocumentSidebarVisible,
   useSelectedNodeForDocDisplay,
 } from "@/app/app/stores/useChatSessionStore";
-import { convertMarkdownTablesToTsv } from "@/app/app/message/copyingUtils";
+import {
+  convertMarkdownTablesToTsv,
+  citationClipboardHtml,
+} from "@/app/app/message/copyingUtils";
 import { getTextContent } from "@/app/app/services/packetUtils";
 import { removeThinkingTokens } from "@/app/app/services/thinkingTokens";
 import MessageSwitcher from "@/app/app/message/MessageSwitcher";
@@ -269,7 +272,9 @@ export default function MessageToolbar({
                   removeThinkingTokens(getTextContent(rawPackets)) as string
                 )
               }
-              getHtmlContent={() => finalAnswerRef.current?.innerHTML || ""}
+              getHtmlContent={() =>
+                citationClipboardHtml(finalAnswerRef.current?.innerHTML || "")
+              }
               data-testid="AgentMessage/copy-button"
             />
             <AnswerGraphLink messageId={messageId} />
