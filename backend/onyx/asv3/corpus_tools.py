@@ -813,7 +813,7 @@ def build_corpus_specs(broker: CorpusBroker) -> list[ToolSpec]:
                 {
                     "source_id": SOURCE_FIELD,
                     "pattern": {"type": "string", "minLength": 1, "maxLength": 512},
-                    "mode": {"enum": ["literal", "regex"]},
+                    "mode": {"type": "string", "enum": ["literal", "regex"]},
                 },
                 ["source_id", "pattern"],
             ),
@@ -824,7 +824,7 @@ def build_corpus_specs(broker: CorpusBroker) -> list[ToolSpec]:
             description="Read scoped inventory or source headings; never arbitrary SQL.",
             parameters=schema(
                 {
-                    "operation": {"enum": ["inventory", "headings"]},
+                    "operation": {"type": "string", "enum": ["inventory", "headings"]},
                     "query": {"type": "string"},
                     "source_id": SOURCE_FIELD,
                     "offset": {"type": "integer", "minimum": 0},
@@ -874,7 +874,10 @@ def build_corpus_specs(broker: CorpusBroker) -> list[ToolSpec]:
             parameters=schema(
                 {
                     "query": {"type": "string"},
-                    "mode": {"enum": ["hybrid", "keyword", "full_text"]},
+                    "mode": {
+                        "type": "string",
+                        "enum": ["hybrid", "keyword", "full_text"],
+                    },
                 },
                 ["query"],
             ),

@@ -1410,9 +1410,6 @@ sandboxPushPolicy:
   allowTelepresenceAmbassador: false
 
 configMap:
-  # ASv3 exact names of request-provided read-only MCP/custom tools; external
-  # reads still require application consent and explicit user intent.
-  ASV3_EXTERNAL_READ_TOOLS: ""
   # WARNING: do NOT copy hostname keys from a docker-compose .env into this
   # block. The compose stack uses underscored service names (e.g. `api_server`,
   # `cache`, `inference_model_server`) which are invalid in K8s DNS labels and

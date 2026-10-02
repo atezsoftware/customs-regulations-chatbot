@@ -1,6 +1,9 @@
+import copy
 import threading
 from typing import Any
 from unittest.mock import MagicMock
+
+from pydantic import JsonValue
 
 from onyx.asv3.llm_adapter import ResearchModel
 from onyx.asv3.models import RunContext, SharedBudget
@@ -91,6 +94,56 @@ def tool_response(arguments: str, name: str = "read_evidence") -> ModelResponse:
             )
         ),
     )
+
+
+def test_vertex_tool_normalization_does_not_mutate_decision_validation_schema() -> None:
+    from litellm.llms.vertex_ai.common_utils import _build_vertex_schema
+
+    from onyx.asv3.models import HarnessView
+
+    llm = scripted_model()
+    tools: list[dict[str, JsonValue]] = [
+        {
+            "type": "function",
+            "function": {
+                "name": "search_corpus",
+                "description": "search",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "mode": {"type": "string", "enum": ["keyword", "hybrid"]},
+                    },
+                    "required": ["query"],
+                    "$defs": {"unused": {"type": "string"}},
+                    "additionalProperties": False,
+                },
+            },
+        }
+    ]
+    original = copy.deepcopy(tools)
+
+    def invoke(**kwargs: Any) -> ModelResponse:
+        supplied = kwargs["tools"][0]["function"]["parameters"]
+        normalized = _build_vertex_schema(supplied)
+        assert normalized["properties"]["mode"]["type"] == "string"
+        assert "$defs" not in supplied
+        return tool_response('{"query":"royalti","mode":"keyword"}', "search_corpus")
+
+    llm.invoke.side_effect = invoke
+    decision = ResearchModel(llm, RunContext()).decide(
+        HarnessView(
+            request="Royalti koşullarını araştır",
+            questions=[],
+            facts=[],
+            receipts=[],
+            evidence=[],
+            tools=tools,
+        )
+    )
+    assert decision.calls[0].arguments["mode"] == "keyword"
+    assert llm.invoke.call_count == 1
+    assert tools == original
 
 
 def original_state() -> tuple[RunContext, Any, list[dict[str, Any]]]:

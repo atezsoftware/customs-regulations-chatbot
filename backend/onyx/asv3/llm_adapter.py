@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import re
 import time
@@ -341,7 +342,8 @@ class ResearchModel:
         ):
             response = self.llm.invoke(
                 prompt=prompt,
-                tools=tools or None,
+                # Provider normalization must not rewrite canonical validation schemas.
+                tools=copy.deepcopy(tools) if tools else None,
                 tool_choice=ToolChoiceOptions.AUTO if tools else ToolChoiceOptions.NONE,
                 max_tokens=max_tokens,
                 timeout_override=max(

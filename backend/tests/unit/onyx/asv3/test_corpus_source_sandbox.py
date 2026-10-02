@@ -25,6 +25,7 @@ from onyx.asv3.models import (
 from onyx.asv3.registry import CapabilityRegistry
 from onyx.asv3.sandbox import build_sandbox_specs, calculate, compose, run_code
 from onyx.asv3.source_tools import build_source_specs, original_evidence, selected_pdf
+from onyx.asv3.supplemental_tools import build_supplemental_specs
 from onyx.context.search.models import IndexFilters
 from onyx.db.asv3_corpus import (
     CorpusChunk,
@@ -85,6 +86,58 @@ class MemoryBroker(CorpusBroker):
         source = self.source(source_id, context)
         rows = [row for row in self.items if row.position >= start]
         return source, rows[:limit], self.partial or len(rows) > limit
+
+
+def test_all_owned_tool_fields_have_provider_compatible_explicit_types(
+    broker: MemoryBroker,
+) -> None:
+    from litellm.llms.vertex_ai.common_utils import _build_vertex_schema
+
+    from onyx.asv3.evidence import EvidenceLedger
+    from onyx.asv3.registry import build_core_specs
+    from onyx.asv3.workers import WorkerPool
+
+    def inspect(node: JsonValue) -> None:
+        assert isinstance(node, dict)
+        assert "type" in node or any(
+            key in node for key in ("anyOf", "oneOf", "allOf", "$ref")
+        )
+        if "enum" in node:
+            assert node["type"] == "string"
+        properties = node.get("properties", {})
+        assert isinstance(properties, dict)
+        for child in properties.values():
+            inspect(child)
+        if "items" in node:
+            inspect(node["items"])
+
+    specs = (
+        build_corpus_specs(broker)
+        + build_source_specs(broker)
+        + build_sandbox_specs(broker)
+        + build_supplemental_specs()
+    )
+    registry = CapabilityRegistry(specs)
+    pool = WorkerPool(
+        RunContext(),
+        lambda _task, _context, _updates: ToolOutcome(
+            status=OutcomeStatus.FOUND, summary="done"
+        ),
+    )
+    try:
+        specs += pool.tool_specs() + build_core_specs(
+            registry, EvidenceLedger(), lambda: {}
+        )
+        for spec in specs:
+            inspect(spec.parameters)
+            function = spec.definition()["function"]
+            assert isinstance(function, dict)
+            parameters = function["parameters"]
+            assert isinstance(parameters, dict)
+            normalized = _build_vertex_schema(parameters)
+            inspect(normalized)
+    finally:
+        pool.close()
 
 
 def test_native_citation_uses_owned_saved_evidence_without_fake_chunk(

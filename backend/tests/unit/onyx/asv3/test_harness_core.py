@@ -64,6 +64,42 @@ def test_dispatch_validates_schema_and_corpus_boundary_before_execution() -> Non
     assert context.budget.snapshot()["tools"] == 0
 
 
+def test_vertex_normalization_of_tool_definition_cannot_corrupt_registry() -> None:
+    from litellm.llms.vertex_ai.common_utils import add_object_type
+
+    parameters: dict[str, JsonValue] = {
+        "type": "object",
+        "properties": {"mode": {"enum": ["keyword", "hybrid"]}},
+    }
+    registry = CapabilityRegistry(
+        [
+            ToolSpec(
+                name="read",
+                description="read",
+                parameters=parameters,
+                handler=lambda _args, _context: ToolOutcome(
+                    status=OutcomeStatus.FOUND, summary="ok"
+                ),
+            )
+        ]
+    )
+    definition = registry.definitions(RunContext())[0]
+    function = definition["function"]
+    assert isinstance(function, dict)
+    emitted = function["parameters"]
+    assert isinstance(emitted, dict)
+    add_object_type(emitted)
+    assert emitted != parameters
+    result = registry.dispatch(
+        CapabilityCall(name="read", arguments={"mode": "keyword"}), RunContext()
+    )
+    assert result.status == OutcomeStatus.FOUND
+    assert cast(
+        dict[str, JsonValue],
+        cast(dict[str, JsonValue], parameters["properties"])["mode"],
+    ) == {"enum": ["keyword", "hybrid"]}
+
+
 def test_harness_queues_excess_calls_and_propagates_context_and_citations() -> None:
     inherited = contextvars.ContextVar("test_asv3_scope", default="missing")
     token = inherited.set("tenant-A")

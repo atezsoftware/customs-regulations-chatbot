@@ -469,6 +469,7 @@ def build_sandbox_specs(broker: CorpusBroker) -> list[ToolSpec]:
             parameters=schema(
                 {
                     "operation": {
+                        "type": "string",
                         "enum": [
                             "add",
                             "multiply",
@@ -478,7 +479,7 @@ def build_sandbox_specs(broker: CorpusBroker) -> list[ToolSpec]:
                             "calendar_days",
                             "business_days",
                             "following_month_day",
-                        ]
+                        ],
                     },
                     "values": {
                         "type": "array",

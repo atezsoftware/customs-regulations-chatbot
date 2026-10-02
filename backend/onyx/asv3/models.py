@@ -86,12 +86,14 @@ class ToolSpec(BaseModel):
     orchestrates: bool = False
 
     def definition(self) -> dict[str, JsonValue]:
+        import copy
+
         return {
             "type": "function",
             "function": {
                 "name": self.name,
                 "description": self.description,
-                "parameters": self.parameters,
+                "parameters": copy.deepcopy(self.parameters),
             },
         }
 
