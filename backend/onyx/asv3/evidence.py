@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import threading
 from typing import Iterable
 
@@ -108,18 +109,45 @@ class EvidenceLedger:
 
     def authority_metadata(self) -> list[dict[str, JsonValue]]:
         """Inspect retained identities without copying original text or serialized receipts."""
+        from onyx.regulatory.heading_path import parse_regulatory_article_heading
+
         with self._lock:
             records: list[dict[str, JsonValue]] = []
             for number, item in self._items.items():
                 metadata = model_evidence_metadata(item.metadata)
                 headings = metadata.get("heading_path")
+                article = metadata.get("article_no")
+                qualifier = None
+                if isinstance(headings, list):
+                    for heading in reversed(headings):
+                        parsed = parse_regulatory_article_heading(str(heading))
+                        if parsed:
+                            article, qualifier = parsed.article_no, parsed.qualifier
+                            break
+                paragraph = metadata.get("paragraph_no")
+                if (
+                    paragraph is None
+                    and metadata.get("clause_label")
+                    and isinstance(headings, list)
+                ):
+                    # Atomic clauses can carry their enclosing paragraph only in the path.
+                    for heading in reversed(headings[:-1]):
+                        match = re.match(
+                            r"^\s*(?:\((\d{1,4})\)|(\d{1,4})\.)\s", str(heading)
+                        )
+                        if match:
+                            paragraph = match[1] or match[2]
+                            break
                 records.append(
                     {
                         "citation": number,
                         "citable": item.search_doc is not None,
                         "document_type": metadata.get("document_type"),
                         "title": metadata.get("title"),
-                        "article_no": metadata.get("article_no"),
+                        "article_no": article,
+                        "article_qualifier": qualifier,
+                        "paragraph_no": paragraph,
+                        "clause_label": metadata.get("clause_label"),
                         "heading_path": headings[:1]
                         if isinstance(headings, list)
                         else [],

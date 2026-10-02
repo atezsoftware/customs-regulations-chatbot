@@ -18,6 +18,7 @@ from onyx.asv3.models import (
     OutcomeStatus,
     RunContext,
     RunStopped,
+    SharedBudget,
     ToolOutcome,
     ToolSpec,
 )
@@ -498,11 +499,10 @@ def incomplete_script(llm: MagicMock) -> list[ModelResponse | Exception]:
     script = list(llm.invoke.side_effect)
     return [
         *script[:2],
-        *[
-            item
-            for _ in range(3)
-            for item in (script[2], unsafe_review("Missing condition"))
-        ],
+        script[2],
+        unsafe_review("Missing condition"),
+        script[2],
+        script[2],
         *script[4:],
     ]
 
@@ -563,7 +563,7 @@ def test_partial_rewrite_verifier_receives_draft_details_and_their_originals(
     )
     script = incomplete_script(llm)
     draft = "Outcome [1]; application documents and later settlement [2]."
-    for index in (2, 4, 6):
+    for index in (2, 4, 5):
         script[index] = response(draft)
     script[-1] = unsafe_review("Missing the supported settlement detail")
     llm.invoke.side_effect = script
@@ -572,7 +572,7 @@ def test_partial_rewrite_verifier_receives_draft_details_and_their_originals(
     assert final_review["claim"] == "Only the headline remains [1]."
     reference = final_review["preservation_reference"]
     assert reference["draft"] == draft
-    previous_review = script[7]
+    previous_review = script[3]
     assert isinstance(previous_review, ModelResponse)
     assert isinstance(previous_review.choice.message.content, str)
     assert reference[
@@ -804,6 +804,7 @@ def test_runtime_follows_named_statutory_basis_before_accepting_a_supported_draf
                 "article_no": article,
                 "heading_path": [title],
             },
+            heading_path=(title, f"MADDE {article}"),
         )
     scripts = list(llm.invoke.side_effect)
     numbers: dict[str, int] = {}
@@ -1104,12 +1105,9 @@ def test_runtime_review_gap_drives_new_source_before_supported_publication(
             return next_response
         assert arguments["prompt"][0].content == COORDINATOR_PROMPT
         data = request_data(arguments)
-        gap = next(
-            item
-            for item in reversed(data["receipts"])
-            if item["call"]["name"] == "finalization_status"
-        )
-        assert missing in gap["outcome"]["data"]["review"]["missing_conditions"]
+        gap = data["publication_gap"]
+        assert missing in gap["review"]["missing_conditions"]
+        assert data["draft_to_repair"]
         assert [item["citation"] for item in data["evidence"]] == [1]
         recovery_observed = True
         return response(
@@ -1132,6 +1130,90 @@ def test_runtime_review_gap_drives_new_source_before_supported_publication(
     assert [
         packet.obj.status for packet in output if isinstance(packet.obj, ASv3Progress)
     ][-1] == "completed"
+
+
+def test_finalization_waits_for_admitted_worker_originals_after_shared_decision_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from onyx.asv3.workers import WorkerPool
+    from onyx.prompts.asv3.research import (
+        COORDINATOR_PROMPT,
+        FINAL_PROMPT,
+        RESEARCHER_PROMPT,
+        VERIFICATION_PROMPT,
+    )
+
+    kwargs, broker, llm, checkpoints, _queue = setup_run(monkeypatch)
+    profile = (
+        llm.invoke.side_effect[0] if isinstance(llm.invoke.side_effect, list) else None
+    )
+    # MagicMock stores iterable side effects as an iterator.
+    if profile is None:
+        profile = next(llm.invoke.side_effect)
+    broker.barrier = threading.Barrier(1)
+    broker.block = True
+    final_observed = False
+    selected = str(broker.sources[0].id)
+
+    class TightRunContext(RunContext):
+        def __init__(self, **arguments: Any) -> None:
+            super().__init__(
+                budget=SharedBudget(
+                    max_decisions=15,
+                    final_decision_reserve=12,
+                    coordinator_decision_reserve=0,
+                ),
+                **arguments,
+            )
+
+    monkeypatch.setattr(runtime, "RunContext", TightRunContext)
+    original_settle = WorkerPool.settle
+
+    def settle(pool: WorkerPool) -> None:
+        assert broker.entered.is_set()
+        broker.release.set()
+        original_settle(pool)
+
+    monkeypatch.setattr(WorkerPool, "settle", settle)
+
+    def save(**arguments: Any) -> None:
+        snapshot = arguments["snapshot"]
+        if any(
+            item["call"]["name"] == "spawn_researcher" for item in snapshot["receipts"]
+        ):
+            assert broker.entered.wait(3)
+        checkpoints.append(snapshot)
+
+    monkeypatch.setattr(runtime, "save_asv3_checkpoint", save)
+
+    def invoke(**arguments: Any) -> ModelResponse:
+        nonlocal final_observed
+        instruction = arguments["prompt"][0].content
+        data = request_data(arguments)
+        if instruction == COORDINATOR_PROMPT:
+            return response(
+                calls=[("spawn_researcher", {"task": "independent condition"})]
+            )
+        if instruction == RESEARCHER_PROMPT:
+            return response(calls=[("read_source_range", {"source_id": selected})])
+        if instruction == FINAL_PROMPT:
+            originals = json.loads(data["evidence"])
+            assert len(originals) == 1
+            assert originals[0]["text"].endswith("ORIGINAL_TAIL_0")
+            final_observed = True
+            return response("Tamir şartı özgün hükme göre uygulanır [1].")
+        if isinstance(instruction, str) and instruction.startswith(VERIFICATION_PROMPT):
+            assert json.loads(data["evidence"])[0]["text"].endswith("ORIGINAL_TAIL_0")
+            return supported_review([1])
+        assert isinstance(profile, ModelResponse)
+        return profile
+
+    llm.invoke.side_effect = invoke
+    runtime.run_asv3_loop(**kwargs)
+    assert final_observed
+    assert kwargs["state_container"].answer_tokens.startswith("Tamir şartı")
+    assert checkpoints[-1]["evidence"]["included"] == [1]
+    assert checkpoints[-1]["publication_stop_reason"] != "publication_guard_rejected"
 
 
 def test_runtime_researchers_keep_scenario_facts_isolated_and_selected_llm(

@@ -291,6 +291,19 @@ class WorkerPool:
         for executor in self._executors.values():
             executor.shutdown(wait=False, cancel_futures=True)
 
+    def settle(self) -> None:
+        """Collect admitted results without consuming coordinator decisions."""
+        with self._changed:
+            while any(
+                task.status in (TaskStatus.RUNNING, TaskStatus.QUEUED)
+                for task in self._tasks.values()
+            ):
+                self.context.check_active()
+                remaining = self.context.research_deadline - time.monotonic()
+                if remaining <= 0:
+                    return
+                self._changed.wait(min(remaining, 0.1))
+
     def tool_specs(self) -> builtins.list[ToolSpec]:
         def outcome(items: builtins.list[TaskSnapshot]) -> ToolOutcome:
             evidence = [

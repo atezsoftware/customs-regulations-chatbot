@@ -22,7 +22,7 @@ from onyx.asv3.models import (
     ToolOutcome,
     ToolReceipt,
 )
-from onyx.asv3.progress import ProgressReporter
+from onyx.asv3.progress import ProgressReporter, action_narration, public_action_id
 from onyx.asv3.registry import CapabilityRegistry
 from onyx.asv3.working_memory import WorkingMemory
 from onyx.llm.models import ToolMessage
@@ -81,6 +81,7 @@ class Harness:
         self._committed_calls: set[str] = set()
         self._pending_calls: dict[str, dict[str, JsonValue]] = {}
         self._progress_calls: set[str] = set()
+        self._completed_reads: dict[str, ToolReceipt] = {}
         self.working_memory = WorkingMemory(self.context.scope)
         self.context.services["working_memory"] = self.working_memory
         self.context.services["registry"] = registry
@@ -280,6 +281,12 @@ class Harness:
             evidence=self.evidence.summaries(max_chars=self.max_context_chars // 2),
             tools=self.registry.definitions(self.context),
             turns=list(self.turns),
+            draft_to_repair=self.last_draft if self.publication_gap else None,
+            publication_gap=(
+                {"summary": self.publication_gap.summary, **self.publication_gap.data}
+                if self.publication_gap
+                else None
+            ),
         )
 
     def _trim_turns(self) -> None:
@@ -313,8 +320,15 @@ class Harness:
             phase = self._tool_progress_phase(call)
             if self.progress and phase:
                 self._progress_calls.add(call.call_id)
-                self.progress.report(phase)
-                self.progress.report(phase, task_id=f"action:{call.call_id}")
+                narration = action_narration(call.arguments, context)
+                title, message = narration if narration else (None, None)
+                self.progress.report(phase, title=title, message=message)
+                self.progress.report(
+                    phase,
+                    task_id=public_action_id(call.call_id),
+                    title=title,
+                    message=message,
+                )
             with graph_step(
                 "asv3.tool", {"name": call.name, "arguments": call.arguments}
             ) as step:
@@ -378,6 +392,13 @@ class Harness:
         self._seen_calls.add(receipt.call.call_id)
         self._committed_calls.add(receipt.call.call_id)
         self._pending_calls.pop(receipt.call.call_id, None)
+        if receipt.outcome.status == OutcomeStatus.FOUND and receipt.call.name in {
+            "read_evidence",
+            "read_chunk",
+            "read_provision",
+            "read_source_range",
+        }:
+            self._completed_reads[self._read_signature(receipt.call)] = receipt
         if self.progress and receipt.call.call_id in self._progress_calls:
             phase = self._tool_progress_phase(receipt.call)
             if phase:
@@ -398,10 +419,34 @@ class Harness:
                 self.progress.report(
                     phase,
                     status=status,
-                    task_id=f"action:{receipt.call.call_id}",
+                    task_id=public_action_id(receipt.call.call_id),
+                    title=(
+                        narration[0]
+                        if (
+                            narration := action_narration(
+                                receipt.call.arguments, self.context
+                            )
+                        )
+                        else None
+                    ),
+                    message=narration[1] if narration else None,
                 )
             self._progress_calls.discard(receipt.call.call_id)
         self._save()
+
+    @staticmethod
+    def _read_signature(call: CapabilityCall) -> str:
+        return json.dumps(
+            {
+                "name": call.name,
+                "arguments": {
+                    key: value
+                    for key, value in call.arguments.items()
+                    if key != "_public_update"
+                },
+            },
+            sort_keys=True,
+        )
 
     def _dispatch(self, calls: list[CapabilityCall]) -> list[ToolReceipt]:
         executor = ThreadPoolExecutor(
@@ -421,6 +466,26 @@ class Harness:
                         outcome=ToolOutcome(
                             status=OutcomeStatus.INVALID,
                             summary="Repeated failed call: change the arguments or method",
+                        ),
+                    )
+                    continue
+                cached = self._completed_reads.get(self._read_signature(call))
+                if cached is not None:
+                    ready[call.call_id] = ToolReceipt(
+                        call=call,
+                        elapsed_seconds=0,
+                        outcome=cached.outcome.model_copy(
+                            update={
+                                "evidence": [
+                                    item
+                                    for number in cached.evidence_ids
+                                    if (item := self.evidence.get(number)) is not None
+                                ],
+                                "data": {
+                                    **cached.outcome.data,
+                                    "reused_recorded_read": True,
+                                },
+                            }
                         ),
                     )
                     continue
@@ -487,6 +552,40 @@ class Harness:
                     future.cancel()
             executor.shutdown(wait=False, cancel_futures=True)
 
+    def _model_tool_result(self, receipt: ToolReceipt) -> ToolMessage:
+        outcome = receipt.outcome.model_dump(mode="json")
+        # A compact audit receipt is not the original passage requested by the model.
+        if receipt.call.name == "read_evidence":
+            data = outcome.get("data")
+            number = receipt.call.arguments.get("citation")
+            if (
+                isinstance(data, dict)
+                and isinstance(number, int)
+                and data.get("citation") == number
+            ):
+                item = self.evidence.get(number)
+                if item is not None and data.get("text_hash") == item.text_hash:
+                    start = int(cast(int, receipt.call.arguments.get("start_char", 0)))
+                    count = int(
+                        cast(int, receipt.call.arguments.get("num_chars", 16000))
+                    )
+                    data["text"] = item.text[start : start + count]
+        return ToolMessage(
+            tool_call_id=receipt.call.call_id,
+            content=json.dumps(
+                {
+                    "outcome": outcome,
+                    "evidence_ids": receipt.evidence_ids,
+                    "original_evidence": json.loads(
+                        self.evidence.serialize_records(
+                            receipt.evidence_ids, max_chars=20000
+                        )
+                    ),
+                },
+                ensure_ascii=False,
+            ),
+        )
+
     def run(self) -> HarnessResult:
         self.stop_reason = None
         if self.progress:
@@ -496,7 +595,12 @@ class Harness:
         try:
             while True:
                 self.context.check_research_active()
-                self.context.budget.consume_research_decision()
+                budget = self.context.budget
+                if budget.snapshot()["tools"] >= budget.limits["tools"]:
+                    raise RunStopped(
+                        "Shared tools budget exhausted; recorded originals retained for finalization"
+                    )
+                self.context.consume_research_decision()
                 decision = self.decide(self.view())
                 self.context.check_active()
                 self.questions = list(
@@ -511,12 +615,7 @@ class Harness:
                     results: list[ToolMessage] = []
                     for receipt in self._dispatch(decision.calls):
                         self.context.check_active()
-                        results.append(
-                            ToolMessage(
-                                tool_call_id=receipt.call.call_id,
-                                content=receipt.model_dump_json(),
-                            )
-                        )
+                        results.append(self._model_tool_result(receipt))
                     if decision.assistant_message is not None:
                         self.turns.append(
                             ResearchTurn(

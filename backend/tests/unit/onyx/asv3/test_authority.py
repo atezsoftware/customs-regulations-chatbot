@@ -86,8 +86,43 @@ def test_explicit_subunit_reference_is_a_locator_not_invented_rule() -> None:
         "7251 sayılı Kanunun (45/2-ç) maddesi uyarınca özel usul uygulanır."
     )
     assert [(ref.number, ref.article) for ref in refs] == [("7251", "45")]
+    assert [(ref.paragraph, ref.clause) for ref in refs] == [("2", "ç")]
     assert statute_references("Bedel 7251 TL, süre 45 gün.") == ()
     assert statute_references("2024/17 sayılı Genelge.") == ()
+
+
+def test_wrong_paragraph_or_clause_cannot_close_explicit_original_need() -> None:
+    ledger, context = EvidenceLedger(), RunContext()
+    answer = "8917 sayılı Faaliyet Kanunu m. 27/1-ç gereğince izin gerekir [1]."
+    wrong = source("kanun", "8917 sayılı Faaliyet Kanunu", "27", "Başka hüküm.")
+    wrong.metadata["paragraph_no"] = "2"
+    wrong.metadata["clause_label"] = "ç"
+    ledger.add([wrong], context)
+    assert unresolved_authority_gap(answer, ledger) is not None
+    another = source("kanun", "8917 sayılı Faaliyet Kanunu", "27", "Farklı bent.")
+    another.metadata["paragraph_no"] = "1"
+    another.metadata["clause_label"] = "c"
+    ledger.add([another], context)
+    assert unresolved_authority_gap(answer.replace("[1]", "[2]"), ledger) is not None
+    correct = source("kanun", "8917 sayılı Faaliyet Kanunu", "27", "İzin gerekir.")
+    correct.metadata["clause_label"] = "ç"
+    correct.metadata["heading_path"] = [
+        "8917 sayılı Faaliyet Kanunu",
+        "Madde 27",
+        "1. Başvuru",
+        "ç) İzin",
+    ]
+    ledger.add([correct], context)
+    assert unresolved_authority_gap(answer.replace("[1]", "[3]"), ledger) is None
+
+
+def test_temporary_article_is_not_the_ordinary_article() -> None:
+    ledger, context = EvidenceLedger(), RunContext()
+    ledger.add(
+        [source("kanun", "8917 sayılı Faaliyet Kanunu", "27", "Normal hüküm")], context
+    )
+    answer = "8917 sayılı Faaliyet Kanununun geçici 27 nci maddesi uygulanır [1]."
+    assert unresolved_authority_gap(answer, ledger) is not None
 
 
 def test_read_reference_is_durable_without_becoming_target_source_or_legal_evidence() -> (

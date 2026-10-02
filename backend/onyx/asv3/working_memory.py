@@ -132,6 +132,9 @@ class WorkingMemory:
                                 "origin_chunk_id": origin_chunk,
                                 "instrument_number": reference.number,
                                 "article": reference.article,
+                                "paragraph": reference.paragraph,
+                                "clause": reference.clause,
+                                "qualifier": reference.qualifier,
                                 "reference_text": reference.reference_text,
                                 "context": "reference_lead_not_original_governing_evidence",
                             },
@@ -386,14 +389,19 @@ class WorkingMemory:
                 )
             selected: list[JsonValue] = []
             for index, item in enumerate(ordered[offset:], start=offset):
+                # Reopen by locator_id; opaque provider signatures belong in the audit.
+                projected = dict(item)
+                receipt_id = projected.get("receipt_id")
+                if isinstance(receipt_id, str) and len(receipt_id) > 256:
+                    projected.pop("receipt_id")
                 trial = {
                     **result,
-                    "locators": [*selected, item],
+                    "locators": [*selected, projected],
                     "next_offset": index + 1,
                     "omitted_locators": len(ordered) - len(selected) - 1,
                 }
                 if len(json.dumps(trial, ensure_ascii=False).encode()) > max_bytes:
                     break
-                selected.append(item)
+                selected.append(projected)
                 result = trial
             return copy.deepcopy(result)

@@ -14,6 +14,60 @@ from onyx.llm.model_response import Choice, Message, ModelResponse
 from onyx.tracing.flows import LLMFlow
 
 
+def test_repair_context_preserves_exact_draft_and_only_latest_gap() -> None:
+    from onyx.asv3.models import (
+        CapabilityCall,
+        HarnessView,
+        OutcomeStatus,
+        ToolOutcome,
+        ToolReceipt,
+    )
+
+    llm = scripted_model()
+    llm.invoke.return_value = ModelResponse(
+        id="repair",
+        created="0",
+        choice=Choice(message=Message(content="Repaired wording")),
+    )
+    model = ResearchModel(llm, RunContext())
+    draft = "İzin gerekir [1]. Sonrasında kayıtlar karşılaştırılır [2]."
+    gap: dict[str, JsonValue] = {
+        "missing": ["b bendi"],
+        "instruction": "Read the operative clause",
+    }
+    stale = ToolReceipt(
+        call=CapabilityCall(name="finalization_status"),
+        outcome=ToolOutcome(
+            status=OutcomeStatus.PARTIAL,
+            summary="STALE_DIAGNOSIS",
+            data={"gaps": ["outdated requirement"]},
+        ),
+        elapsed_seconds=0,
+    )
+    model.decide(
+        HarnessView(
+            request="Şartlar nedir?",
+            questions=["Şartlar nedir?"],
+            facts=[],
+            receipts=[stale],
+            evidence=[],
+            tools=[],
+            draft_to_repair=draft,
+            publication_gap=gap,
+        )
+    )
+    content = llm.invoke.call_args.kwargs["prompt"][-1].content
+    assert isinstance(content, list)
+    payload = json.loads(content[0].text)
+    assert payload["draft_to_repair"] == draft
+    assert payload["publication_gap"] == gap
+    assert payload["receipts"] == []
+    assert "STALE_DIAGNOSIS" not in json.dumps(payload)
+    compacted = model._compact_payload(payload, 8)
+    assert compacted["draft_to_repair"] == draft and compacted["publication_gap"] == gap
+    assert llm.invoke.call_count == 1
+
+
 def test_real_adapter_limits_shared_provider_calls_across_worker_contexts() -> None:
     llm = MagicMock(spec=LLM)
     llm.config = LLMConfig(
@@ -631,6 +685,29 @@ def test_repeated_incomplete_language_profile_fails_closed_after_single_repair()
     assert llm.invoke.call_count == 2
     assert context.corpus_only is True
     assert context.budget.snapshot()["decisions"] == 2
+
+
+def test_safe_review_with_unsupported_assertions_requires_consistent_repair() -> None:
+    from onyx.asv3.llm_adapter import VerificationResult
+
+    llm = scripted_model()
+    contradictory = verification_profile()
+    contradictory["safe_to_publish"] = True
+    contradictory["unsupported_claims"] = ["The governing source has not been obtained"]
+    corrected = verification_profile()
+    corrected["safe_to_publish"] = True
+    corrected["status"] = "incomplete"
+    corrected["missing_conditions"] = ["The governing source has not been obtained"]
+    llm.invoke.side_effect = [text_response(contradictory), text_response(corrected)]
+    result = ResearchModel(llm, RunContext()).invoke_text(
+        "Verify only original evidence",
+        '{"claim":"The source gap is explicit","evidence":"original"}',
+        LLMFlow.ASV3_VERIFICATION,
+    )
+    review = VerificationResult.model_validate_json(result)
+    assert review.safe_to_publish is True and review.unsupported_claims == []
+    assert review.missing_conditions == corrected["missing_conditions"]
+    assert llm.invoke.call_count == 2
 
 
 def test_verification_uses_typed_provider_schema_and_repairs_incomplete_json() -> None:

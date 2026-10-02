@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import re
 import threading
+import unicodedata
 from collections.abc import Callable
 from typing import cast
 
@@ -21,12 +22,25 @@ class ScenarioState:
     def record(self, questions: list[str], facts: list[str]) -> dict[str, JsonValue]:
         with self._lock:
             previous = (list(self._questions), list(self._facts))
-            self._questions = list(dict.fromkeys(self._questions + questions))
+            seen = {self._question_key(item) for item in self._questions}
+            for question in questions:
+                key = self._question_key(question)
+                if key not in seen:
+                    self._questions.append(question)
+                    seen.add(key)
             self._facts = list(dict.fromkeys(self._facts + facts))
             return {
                 **self.snapshot(),
                 "research_changed": previous != (self._questions, self._facts),
             }
+
+    @staticmethod
+    def _question_key(question: str) -> str:
+        normalized = unicodedata.normalize("NFKC", question).translate(
+            str.maketrans({"‘": "'", "’": "'", "“": "'", "”": "'", '"': "'"})
+        )
+        # Typography may vary; conditions, numbers and wording must remain distinct.
+        return " ".join(normalized.split())
 
     def snapshot(self) -> dict[str, JsonValue]:
         with self._lock:

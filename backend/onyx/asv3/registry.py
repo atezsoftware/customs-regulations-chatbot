@@ -33,11 +33,32 @@ class CapabilityRegistry:
         self._specs[spec.name] = spec
 
     def definitions(self, context: RunContext) -> list[dict[str, JsonValue]]:
-        return [
-            spec.definition()
-            for spec in self._specs.values()
-            if not (context.corpus_only and spec.external)
-        ]
+        definitions: list[dict[str, JsonValue]] = []
+        for spec in self._specs.values():
+            if context.corpus_only and spec.external:
+                continue
+            definition = spec.definition()
+            if not spec.orchestrates and spec.name not in {
+                "report_progress",
+                "record_scenario",
+                "discover_tools",
+                "read_research_state",
+            }:
+                function = definition["function"]
+                assert isinstance(function, dict)
+                parameters = function["parameters"]
+                assert isinstance(parameters, dict)
+                properties = parameters.setdefault("properties", {})
+                assert isinstance(properties, dict)
+                properties["_public_update"] = {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 2,
+                    "maxItems": 2,
+                    "description": "Optional short title and natural action description in the question language; no tool names or paths.",
+                }
+            definitions.append(definition)
+        return definitions
 
     def get(self, name: str) -> ToolSpec | None:
         return self._specs.get(name)
@@ -56,9 +77,12 @@ class CapabilityRegistry:
                     summary="External access is disabled for this run",
                 )
             try:
-                jsonschema.Draft202012Validator(spec.parameters).validate(
-                    call.arguments
-                )
+                arguments = {
+                    key: value
+                    for key, value in call.arguments.items()
+                    if key != "_public_update"
+                }
+                jsonschema.Draft202012Validator(spec.parameters).validate(arguments)
             except jsonschema.ValidationError as error:
                 return ToolOutcome(
                     status=OutcomeStatus.INVALID,
@@ -73,11 +97,11 @@ class CapabilityRegistry:
                     acquired = context.budget.tool_slots.acquire(timeout=0.05)
             try:
                 if spec.parallel_safe:
-                    outcome = spec.handler(call.arguments, context)
+                    outcome = spec.handler(arguments, context)
                 else:
                     with self._serial:
                         context.check_active()
-                        outcome = spec.handler(call.arguments, context)
+                        outcome = spec.handler(arguments, context)
             finally:
                 if acquired:
                     context.budget.tool_slots.release()

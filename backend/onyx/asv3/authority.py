@@ -26,7 +26,14 @@ _STATUTE = re.compile(
     r"[^\n.;:]{0,100}?\bkanun[a-z]*\b"
     r"|\b(?:law|act|statute)\s+(?:no\.?\s*)?(?P<english_number>\d{2,7})\b"
 )
-_COMPACT_ARTICLE = re.compile(r"\(?\b(\d{1,4})(?:/\d+(?:-[a-z])?)\)?\s*madd")
+_COMPACT_ARTICLE = re.compile(
+    r"\(?\b(?P<article>\d{1,4})\s*/\s*(?P<paragraph>\d+)"
+    r"(?:\s*[-(]\s*(?P<clause>[a-zçğıöşü])\)?)?\)?\s*madd"
+)
+_SHORTHAND_ARTICLE = re.compile(
+    r"\b(?:(?P<qualifier>geçici|gecici|mükerrer|mukerrer|ek)\s+)?m\.?\s*(?P<article>\d{1,4})(?!\d)"
+    r"(?:\s*/\s*(?P<paragraph>\d+)(?:\s*[-(]\s*(?P<clause>[a-zçğıöşü])\)?)?)?"
+)
 
 
 @dataclass(frozen=True)
@@ -34,25 +41,51 @@ class StatuteReference:
     number: str
     article: str | None
     reference_text: str
+    paragraph: str | None = None
+    clause: str | None = None
+    qualifier: str | None = None
 
 
 def statute_references(text: str) -> tuple[StatuteReference, ...]:
-    normalized = folded(text.replace("**", "").replace("__", ""))
-    found: dict[tuple[str, str | None], StatuteReference] = {}
-    for match in _STATUTE.finditer(normalized):
+    # Keep Turkish clause letters distinct while normalizing instrument wording.
+    normalized = "".join(
+        char if char in "çğıöşü" else folded(char)
+        for char in text.replace("**", "").replace("__", "").casefold()
+    ).replace("ı", "i")
+    identity_text = folded(normalized)
+    found: dict[
+        tuple[str, str | None, str | None, str | None, str | None], StatuteReference
+    ] = {}
+    for match in _STATUTE.finditer(identity_text):
         tail = normalized[match.end() : match.end() + 180]
         # Do not attach a later sentence's article to this instrument.
         tail = re.split(r"[;\n]|\.(?=\s+[A-ZÇĞİÖŞÜa-zçğıöşü])", tail, 1)[0]
         explicit = extract_regulatory_provision_references(tail)
         compact = _COMPACT_ARTICLE.search(tail)
+        shorthand = _SHORTHAND_ARTICLE.search(tail)
+        subunit = compact or shorthand
         article = (
-            compact[1] if compact else explicit[0].article_no if explicit else None
+            subunit["article"]
+            if subunit
+            else explicit[0].article_no
+            if explicit
+            else None
         )
+        paragraph = subunit["paragraph"] if subunit else None
+        clause = subunit["clause"] if subunit else None
+        qualifier = explicit[0].qualifier if explicit else None
+        if shorthand and shorthand["qualifier"]:
+            qualifier = folded(shorthand["qualifier"])
         number = match["number"] or match["english_number"]
         found.setdefault(
-            (number, article),
+            (number, article, paragraph, clause, qualifier),
             StatuteReference(
-                number, article, normalized[match.start() : match.end() + 100][:240]
+                number,
+                article,
+                normalized[match.start() : match.end() + 100][:240],
+                paragraph,
+                clause,
+                qualifier,
             ),
         )
     return tuple(found.values())
@@ -85,11 +118,26 @@ def authority_obligations(
                 and str(metadata.get("article_no")) != reference.article
             ):
                 continue
+            if reference.qualifier != metadata.get("article_qualifier"):
+                continue
+            if (
+                reference.paragraph is not None
+                and str(metadata.get("paragraph_no")) != reference.paragraph
+            ):
+                continue
+            if (
+                reference.clause is not None
+                and str(metadata.get("clause_label")) != reference.clause
+            ):
+                continue
             matching.append(number)
         obligations.append(
             {
                 "instrument_number": reference.number,
                 "article": reference.article,
+                "paragraph": reference.paragraph,
+                "clause": reference.clause,
+                "qualifier": reference.qualifier,
                 "reference_text": reference.reference_text,
                 "matching_original_evidence": matching,
                 "cited_original_evidence": sorted(cited.intersection(matching)),

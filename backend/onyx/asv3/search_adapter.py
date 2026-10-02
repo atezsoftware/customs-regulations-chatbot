@@ -82,7 +82,7 @@ class ScopedSearchLLM(LLM):
         for attempt in range(3):
             try:
                 with model_slot(self.context, research=True):
-                    self.context.budget.consume_research_decision()
+                    self.context.consume_research_decision()
                     result = self.selected.invoke(
                         prompt=prompt,
                         tools=tools,
@@ -117,7 +117,7 @@ class ScopedSearchLLM(LLM):
             emitted = False
             try:
                 with model_slot(self.context, research=True):
-                    self.context.budget.consume_research_decision()
+                    self.context.consume_research_decision()
                     for part in self.selected.stream(
                         prompt=prompt,
                         tools=tools,

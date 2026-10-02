@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import hashlib
 import threading
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 from uuid import uuid4
 
 from pydantic import BaseModel, JsonValue
+
+if TYPE_CHECKING:
+    from onyx.asv3.models import RunContext
 
 
 class ProgressEvent(BaseModel):
@@ -20,6 +24,29 @@ class ProgressEvent(BaseModel):
     parent_task_id: str | None = None
     active_workers: int = 0
     completed_workers: int = 0
+    public_narration: bool = False
+
+
+def public_action_id(call_id: str) -> str:
+    """Provider call IDs may contain private, large opaque signatures."""
+    return "action:" + hashlib.sha256(call_id.encode()).hexdigest()[:24]
+
+
+def action_narration(
+    arguments: dict[str, JsonValue], context: "RunContext"
+) -> tuple[str, str] | None:
+    from onyx.asv3.supplemental_tools import public_narration_valid
+
+    update = arguments.get("_public_update")
+    if (
+        not isinstance(update, list)
+        or len(update) != 2
+        or not all(isinstance(item, str) for item in update)
+    ):
+        return None
+    title, message = update
+    assert isinstance(title, str) and isinstance(message, str)
+    return (title, message) if public_narration_valid(title, message, context) else None
 
 
 _MESSAGES: dict[str, dict[str, tuple[str, str]]] = {
@@ -116,6 +143,7 @@ class ProgressReporter:
                 parent_task_id=parent_task_id,
                 active_workers=active_workers,
                 completed_workers=completed_workers,
+                public_narration=title is not None and message is not None,
             )
             self._events.append(event)
             if len(self._events) > 200:

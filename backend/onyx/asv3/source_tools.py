@@ -85,7 +85,7 @@ def extract_source_vision(
 ) -> AnnexExtraction:
     if broker.vision_llm is None:
         raise CorpusScopeUnavailable("No source vision model is configured.")
-    context.budget.consume_research_decision()
+    context.consume_research_decision()
     with (
         model_slot(context, research=True),
         llm_generation_span(broker.vision_llm, LLMFlow.ASV3_SOURCE_VISION),

@@ -12,6 +12,61 @@ import {
 } from "@/lib/asv3/progress";
 import type { ASv3Progress } from "@/app/app/services/streamingModels";
 
+it("shows sequential source actions as distinct informative history, without fake parallel tabs or duplicate headers", () => {
+  const first: ASv3Progress = {
+    type: "asv3_progress",
+    run_id: "r",
+    event_id: "header-1",
+    sequence: 1,
+    language: "tr",
+    phase: "tools",
+    status: "running",
+    title: "Ayniyet şartlarını inceliyorum",
+    message:
+      "İlgili genelgede yeşil hat için öngörülen istisnayı kontrol ediyorum.",
+  };
+  let state = applyASv3Progress(createASv3ProgressState(), first);
+  state = applyASv3Progress(state, {
+    ...first,
+    event_id: "action-1",
+    sequence: 2,
+    task_id: "action:hashed-first",
+    status: "completed",
+  });
+  state = applyASv3Progress(state, {
+    ...first,
+    event_id: "header-2",
+    sequence: 3,
+    title: "Teminat koşullarını inceliyorum",
+    message:
+      "Kanuni şartı ve teslimden sonra tamamlanacak işlemleri karşılaştırıyorum.",
+  });
+  state = applyASv3Progress(state, {
+    ...state.header!,
+    event_id: "action-2",
+    sequence: 4,
+    task_id: "action:hashed-second",
+  });
+  const { rerender } = render(
+    <ASv3ProgressPanel state={state} stopped={false} />
+  );
+  fireEvent.click(
+    screen.getByRole("button", { name: "Teminat koşullarını inceliyorum" })
+  );
+  expect(screen.queryByRole("tab")).not.toBeInTheDocument();
+  expect(screen.getAllByTestId("asv3-past-step")).toHaveLength(2);
+  expect(
+    screen.getAllByRole("button", { name: "Ayniyet şartlarını inceliyorum" })
+  ).toHaveLength(1);
+  fireEvent.click(
+    screen.getByRole("button", { name: "Ayniyet şartlarını inceliyorum" })
+  );
+  expect(screen.getByText(/genelgede yeşil hat/)).toBeInTheDocument();
+  expect(screen.getByTestId("asv3-task-loading")).toBeInTheDocument();
+  rerender(<ASv3ProgressPanel state={state} stopped />);
+  expect(screen.queryByTestId("asv3-task-loading")).not.toBeInTheDocument();
+});
+
 function parallelState() {
   let state = createASv3ProgressState();
   const events: ASv3Progress[] = [

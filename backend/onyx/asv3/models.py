@@ -292,6 +292,8 @@ class HarnessView(BaseModel):
     evidence: list[dict[str, JsonValue]]
     tools: list[dict[str, JsonValue]]
     turns: list[ResearchTurn] = Field(default_factory=list)
+    draft_to_repair: str | None = None
+    publication_gap: dict[str, JsonValue] | None = None
 
 
 class RunStopped(RuntimeError):
@@ -309,6 +311,7 @@ class SharedBudget:
         max_inflight_sources: int = 2,
         max_artifact_bytes: int = 4_000_000,
         final_decision_reserve: int = 12,
+        coordinator_decision_reserve: int = 6,
     ) -> None:
         import threading
 
@@ -317,6 +320,10 @@ class SharedBudget:
         self.model_slots = threading.BoundedSemaphore(max_inflight_models)
         self.source_slots = threading.BoundedSemaphore(max_inflight_sources)
         self.final_decision_reserve = min(final_decision_reserve, max_decisions)
+        self.coordinator_decision_reserve = min(
+            coordinator_decision_reserve,
+            max(0, max_decisions - self.final_decision_reserve - 1),
+        )
         self.limits = {
             "tools": max_tools,
             "decisions": max_decisions,
@@ -337,12 +344,12 @@ class SharedBudget:
                 raise ValueError("Invalid resource budget release")
             self.used[kind] -= amount
 
-    def consume_research_decision(self) -> None:
+    def consume_research_decision(self, *, researcher: bool = False) -> None:
         with self._lock:
-            if (
-                self.used["decisions"]
-                >= self.limits["decisions"] - self.final_decision_reserve
-            ):
+            research_limit = self.limits["decisions"] - self.final_decision_reserve
+            if researcher:
+                research_limit -= self.coordinator_decision_reserve
+            if self.used["decisions"] >= research_limit:
                 raise RunStopped(
                     "Research decision budget exhausted; finalization reserve retained"
                 )
@@ -426,6 +433,9 @@ class RunContext:
         self.check_active()
         if time.monotonic() >= self.research_deadline:
             raise RunStopped("Research deadline exceeded; finalization time retained")
+
+    def consume_research_decision(self) -> None:
+        self.budget.consume_research_decision(researcher=self.depth > 0)
 
     def cancel(self) -> None:
         self._stop.set()

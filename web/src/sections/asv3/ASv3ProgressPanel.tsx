@@ -70,9 +70,10 @@ interface ASv3PastStepProps {
   step: ASv3Progress;
   first: boolean;
   last: boolean;
+  active: boolean;
 }
 
-function ASv3PastStep({ step, first, last }: ASv3PastStepProps) {
+function ASv3PastStep({ step, first, last, active }: ASv3PastStepProps) {
   const detailsId = useId();
   const [expanded, setExpanded] = useState(false);
   const Icon =
@@ -94,6 +95,7 @@ function ASv3PastStep({ step, first, last }: ASv3PastStepProps) {
               prominence="tertiary"
               size="md"
               width="full"
+              icon={() => <TaskStatusIcon task={step} active={active} />}
               rightIcon={expanded ? SvgFold : SvgExpand}
               aria-expanded={expanded}
               aria-controls={detailsId}
@@ -213,7 +215,11 @@ export default function ASv3ProgressPanel({
   const [expanded, setExpanded] = useState(false);
   if (!state.header && !pending) return null;
   const active = !state.terminal && !stopped;
-  const tasks = Array.from(state.tasks.values());
+  const allTasks = Array.from(state.tasks.values());
+  const actions = allTasks.filter((task) =>
+    task.task_id?.startsWith("action:")
+  );
+  const tasks = allTasks.filter((task) => !task.task_id?.startsWith("action:"));
   const ids = new Set(tasks.map((task) => task.task_id));
   const roots = tasks.filter(
     (task) =>
@@ -223,9 +229,18 @@ export default function ASv3ProgressPanel({
   );
   const rootTasks = roots.length > 0 ? roots : tasks;
   const header = state.header;
-  const pastSteps = state.history.filter(
-    (step) => step.event_id !== header?.event_id
+  const history = state.history.filter(
+    (step) =>
+      !actions.some(
+        (action) =>
+          action.title === step.title &&
+          action.message === step.message &&
+          action.phase === step.phase
+      )
   );
+  const pastSteps = [...history, ...actions]
+    .filter((step) => step.event_id !== header?.event_id)
+    .sort((left, right) => left.sequence - right.sequence);
   const title = header?.title ?? "ASv3";
   return (
     <section
@@ -294,6 +309,7 @@ export default function ASv3ProgressPanel({
                 step={step}
                 first={index === 0}
                 last={index === pastSteps.length - 1 && tasks.length === 0}
+                active={active}
               />
             ))}
             {tasks.length > 0 && (

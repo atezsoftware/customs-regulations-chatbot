@@ -126,6 +126,14 @@ class VerificationResult(BaseModel):
     unsupported_claims: list[str] = Field(default_factory=list)
     quotation_checks: list[QuotationVerification] = Field(default_factory=list)
 
+    @model_validator(mode="after")
+    def consistent_publication_assessment(self) -> VerificationResult:
+        if self.safe_to_publish and self.unsupported_claims:
+            raise ValueError(
+                "safe_to_publish=true conflicts with unsupported_claims. List actual unsupported assertions there; explicitly disclosed evidence gaps belong in missing_conditions. Reassess the supplied answer and originals."
+            )
+        return self
+
 
 class QuestionVerification(BaseModel):
     question_id: str
@@ -573,7 +581,7 @@ class ResearchModel:
                         "Provider retry would exceed the remaining run deadline"
                     ) from error
                 if research:
-                    self.context.budget.consume_research_decision()
+                    self.context.consume_research_decision()
                 else:
                     self.context.budget.consume("decisions")
                 retry_at = time.monotonic() + delay
@@ -613,7 +621,9 @@ class ResearchModel:
                         payload = parse_json_object(text)
                     except ValueError:
                         continue
-                    evidence = payload.get("evidence", [])
+                    evidence = payload.get(
+                        "original_evidence", payload.get("evidence", [])
+                    )
                     if isinstance(evidence, str):
                         try:
                             evidence = json.loads(evidence)
@@ -712,7 +722,7 @@ class ResearchModel:
             if consume_budget:
                 self.context.budget.consume("decisions")
             else:
-                self.context.budget.consume_research_decision()
+                self.context.consume_research_decision()
             correction = json.dumps(
                 {
                     "format_repair": str(error)[:300],
@@ -807,13 +817,13 @@ class ResearchModel:
             if (
                 receipt.outcome.status.value
                 in {"unavailable", "invalid", "error", "denied", "truncated"}
-                or receipt.call.name == "finalization_status"
             )
             and receipt.call.call_id not in latest_ids
+            and receipt.call.name != "finalization_status"
         ]
         payload["receipts"] = [
             {
-                "call": receipt.call.model_dump(mode="json"),
+                "call": receipt.call.model_dump(mode="json", exclude={"call_id"}),
                 "outcome": {
                     "status": receipt.outcome.status.value,
                     "summary": receipt.outcome.summary[:1000],
@@ -903,7 +913,7 @@ class ResearchModel:
         try:
             decision = self._decision(response, tools)
         except ValueError as error:
-            self.context.budget.consume_research_decision()
+            self.context.consume_research_decision()
             payload["format_repair"] = {
                 "error": str(error)[:300],
                 "previous_output": response.model_dump_json()[:3000],

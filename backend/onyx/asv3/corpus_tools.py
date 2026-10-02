@@ -2,6 +2,7 @@
 
 import difflib
 import json
+import re
 import time
 from collections.abc import Callable, Iterator
 from datetime import date
@@ -45,6 +46,7 @@ from onyx.llm.interfaces import LLM
 from onyx.regulatory.heading_path import (
     RegulatoryProvisionReference,
     extract_regulatory_provision_references,
+    parse_regulatory_article_heading,
 )
 from onyx.tools.constants import REGULATORY_MAX_SEARCH_QUERY_CHARS
 from onyx.tracing.answer_graph import graph_step
@@ -718,9 +720,11 @@ def bounded_evidence(
 
 
 def article_identity(chunk: CorpusChunk) -> tuple[str, str | None] | None:
-    references = extract_regulatory_provision_references(" ".join(chunk.heading_path))
-    if references:
-        return references[-1].article_no, references[-1].qualifier
+    # Clause headings can refer to other laws; only structural headings own a chunk.
+    for heading in reversed(chunk.heading_path):
+        parsed = parse_regulatory_article_heading(heading)
+        if parsed is not None:
+            return parsed.article_no, parsed.qualifier
     article = chunk.metadata.get("article_no")
     if isinstance(article, str):
         references = extract_regulatory_provision_references("MADDE " + article)
@@ -826,23 +830,34 @@ def build_corpus_specs(broker: CorpusBroker) -> list[ToolSpec]:
                 summary="Use one article identity including GEÇİCİ/MÜKERRER when applicable.",
             )
         target = requested[0].article_no, requested[0].qualifier
-        stream = broker.iter_chunks(str(args["source_id"]), context)
+        start = int(cast(int, args.get("start", 0)))
+        stream = broker.iter_chunks(str(args["source_id"]), context, start=start)
         selection = EvidenceSelection(stream.source)
         identity = None
         paragraph = args.get("paragraph")
         clause = args.get("clause")
         subunit_verified = False
+        reached = False
         for chunk in stream:
             own = article_identity(chunk)
+            if reached and own is not None and own != target:
+                stream.truncated = False
+                stream.next_position = chunk.position
+                break
             if own is not None:
                 identity = own
             if identity == target:
+                reached = True
                 selection.add(chunk)
+                inherited_paragraph = chunk.metadata.get("paragraph_no")
+                if inherited_paragraph is None:
+                    for heading in reversed(chunk.heading_path):
+                        marker = re.match(r"^\s*(?:\((\d+)\)|(\d+)\.)\s", heading)
+                        if marker:
+                            inherited_paragraph = marker[1] or marker[2]
+                            break
                 subunit_verified = subunit_verified or (
-                    (
-                        paragraph is None
-                        or str(chunk.metadata.get("paragraph_no")) == str(paragraph)
-                    )
+                    (paragraph is None or str(inherited_paragraph) == str(paragraph))
                     and (
                         clause is None
                         or str(chunk.metadata.get("clause_label")) == str(clause)
@@ -1160,11 +1175,12 @@ def build_corpus_specs(broker: CorpusBroker) -> list[ToolSpec]:
         ),
         ToolSpec(
             name="read_provision",
-            description="Read an identified article including continuation and prerequisite context. Source ID is mandatory; GEÇİCİ/MÜKERRER identities remain distinct.",
+            description="Read an identified article including its clauses and prerequisite context, stopping at its structural boundary. Source ID is mandatory; GEÇİCİ/MÜKERRER identities remain distinct. For an already located article, start at its known heading/first position; use evidence_next_position to continue a clipped article.",
             parameters=schema(
                 {
                     "source_id": SOURCE_FIELD,
                     "article": {"type": "string"},
+                    "start": {"type": "integer", "minimum": 0},
                     "paragraph": {"type": "string"},
                     "clause": {"type": "string"},
                 },

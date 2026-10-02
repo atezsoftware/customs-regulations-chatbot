@@ -28,6 +28,19 @@ from onyx.llm.model_response import (
 from onyx.llm.models import AssistantMessage, TextContentPart, ToolMessage
 
 
+def test_opaque_provider_ids_do_not_crowd_out_usable_source_locators() -> None:
+    memory = WorkingMemory({})
+    opaque_id = "call__thought__" + "signature" * 3000
+    memory.observe(receipt(opaque_id))
+    visible = memory.view(max_bytes=2000)
+    rows = visible["locators"]
+    assert isinstance(rows, list) and rows
+    assert "law-id-exact" in json.dumps(visible)
+    assert opaque_id not in json.dumps(visible)
+    exported = memory.export()
+    assert opaque_id in json.dumps(exported)
+
+
 def receipt(
     call_id: str,
     *,

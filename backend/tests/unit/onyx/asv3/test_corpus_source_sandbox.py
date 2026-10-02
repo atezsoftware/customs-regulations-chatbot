@@ -277,6 +277,88 @@ def test_provision_keeps_qualifier_continuation_and_exact_citation(
     assert all(item.source_id == str(broker.item.id) for item in result.evidence)
 
 
+def test_provision_keeps_cross_referencing_clause_and_stops_at_boundary() -> None:
+    identifier = uuid4()
+    rows = [
+        CorpusChunk(
+            "intro",
+            identifier,
+            "Başvuru şartları",
+            0,
+            0,
+            ("MADDE 27", "1. Başvuru şartları"),
+            {"article_no": "27", "paragraph_no": "1"},
+            None,
+            None,
+            "active",
+        ),
+        CorpusChunk(
+            "clause",
+            identifier,
+            "ç) 9923 sayılı Kanunun 99 uncu maddesine göre izin gerekir.",
+            1,
+            1,
+            (
+                "MADDE 27",
+                "1. Başvuru şartları",
+                "ç) 9923 sayılı Kanunun 99 uncu maddesine göre izin gerekir.",
+            ),
+            {"article_no": "27", "clause_label": "ç"},
+            None,
+            None,
+            "active",
+        ),
+        CorpusChunk(
+            "next",
+            identifier,
+            "Sonraki madde",
+            2,
+            2,
+            ("MADDE 28",),
+            {"article_no": "28"},
+            None,
+            None,
+            "active",
+        ),
+        *[
+            CorpusChunk(
+                f"later-{n}",
+                identifier,
+                "İlgisiz hüküm",
+                n,
+                n,
+                ("MADDE 99",),
+                {"article_no": "99"},
+                None,
+                None,
+                "active",
+            )
+            for n in range(3, 200)
+        ],
+    ]
+    broker = MemoryBroker(rows)
+    from onyx.asv3.corpus_tools import article_identity
+
+    assert article_identity(rows[1]) == ("27", None)
+    result = CapabilityRegistry(build_corpus_specs(broker)).dispatch(
+        CapabilityCall(
+            name="read_provision",
+            arguments={
+                "source_id": str(identifier),
+                "article": "27",
+                "paragraph": "1",
+                "clause": "ç",
+            },
+        ),
+        RunContext(),
+    )
+    assert result.status == OutcomeStatus.FOUND
+    assert result.data["subunit_verified"] is True
+    assert result.data["scan_truncated"] is False
+    assert result.data["next_position"] == 2
+    assert [item.chunk_id for item in result.evidence] == ["intro", "clause"]
+
+
 def test_partial_scan_is_never_proof_of_missing_article(broker: MemoryBroker) -> None:
     broker.partial = True
     result = CapabilityRegistry(build_corpus_specs(broker)).dispatch(

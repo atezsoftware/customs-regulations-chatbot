@@ -23,10 +23,183 @@ from onyx.asv3.models import (
     ToolOutcome,
     ToolSpec,
 )
-from onyx.asv3.progress import ProgressReporter
+from onyx.asv3.progress import ProgressReporter, public_action_id
 from onyx.asv3.registry import CapabilityRegistry, build_core_specs
 from onyx.asv3.workers import WorkerPool
 from onyx.llm.models import AssistantMessage, FunctionCall, ToolCall
+
+
+def test_original_action_text_is_delivered_and_identical_read_reuses_global_evidence() -> (
+    None
+):
+    context = RunContext()
+    ledger = EvidenceLedger()
+    invoked: list[str] = []
+
+    def read(_args: dict[str, JsonValue], _context: RunContext) -> ToolOutcome:
+        invoked.append("read")
+        return ToolOutcome(
+            status=OutcomeStatus.FOUND,
+            summary="recorded",
+            evidence=[
+                EvidenceItem(
+                    source_id="law",
+                    chunk_id="unit",
+                    text="The operative condition and its exception.",
+                )
+            ],
+        )
+
+    registry = CapabilityRegistry(
+        [
+            ToolSpec(
+                name="read_provision",
+                description="Read original",
+                parameters={"type": "object"},
+                handler=read,
+            )
+        ]
+    )
+    step = 0
+
+    def decide(view: HarnessView) -> Decision:
+        nonlocal step
+        if step == 1:
+            body = json.loads(view.turns[-1].results[0].content)
+            assert (
+                body["original_evidence"][0]["text"]
+                == "The operative condition and its exception."
+            )
+            assert body["original_evidence"][0]["citation"] == 1
+            assert body["original_evidence"][0]["truncated"] is False
+        if step == 2:
+            assert view.receipts[-1].outcome.data["reused_recorded_read"] is True
+            assert view.receipts[-1].evidence_ids == [1]
+            return Decision(answer="The condition applies [1].")
+        step += 1
+        call = CapabilityCall(
+            name="read_provision", arguments={"article": "27"}, call_id=f"native-{step}"
+        )
+        return Decision(
+            calls=[call],
+            assistant_message=AssistantMessage(
+                content=None,
+                tool_calls=[
+                    ToolCall(
+                        id=call.call_id,
+                        function=FunctionCall(
+                            name=call.name, arguments=json.dumps(call.arguments)
+                        ),
+                    )
+                ],
+            ),
+        )
+
+    result = Harness(
+        request="Read a condition",
+        context=context,
+        registry=registry,
+        evidence=ledger,
+        decide=decide,
+    ).run()
+    assert result.status == OutcomeStatus.FOUND
+    assert invoked == ["read"]
+    assert context.budget.snapshot()["tools"] == 1
+
+
+def test_exhausted_tools_end_research_before_repeated_empty_action_rounds() -> None:
+    context = RunContext(budget=SharedBudget(max_tools=1))
+    registry = CapabilityRegistry(
+        [
+            ToolSpec(
+                name="read",
+                description="read",
+                parameters={"type": "object"},
+                handler=lambda _args, _context: ToolOutcome(
+                    status=OutcomeStatus.FOUND, summary="read"
+                ),
+            )
+        ]
+    )
+    decisions: list[bool] = []
+
+    def decide(_view: HarnessView) -> Decision:
+        decisions.append(True)
+        return Decision(calls=[CapabilityCall(name="read")])
+
+    result = Harness(
+        request="read", context=context, registry=registry, decide=decide
+    ).run()
+    assert result.status == OutcomeStatus.TRUNCATED
+    assert len(decisions) == 1
+    assert result.stop_reason and "recorded originals retained" in result.stop_reason
+
+
+def test_requested_original_passage_survives_compact_audit_receipt() -> None:
+    context, ledger, registry = RunContext(), EvidenceLedger(), CapabilityRegistry()
+    text = "Operative text. " * 600 + "ESSENTIAL_FINAL_CONDITION"
+    ledger.add([EvidenceItem(source_id="law", text=text)], context)
+    for spec in build_core_specs(registry, ledger, lambda: {}):
+        registry.register(spec)
+    called = False
+
+    def decide(view: HarnessView) -> Decision:
+        nonlocal called
+        if called:
+            native_result = json.loads(view.turns[-1].results[0].content)
+            assert native_result["outcome"]["data"]["text"] == text
+            assert native_result["outcome"]["status"] == "found"
+            assert len(view.receipts[-1].outcome.data["text"]) < len(text)
+            return Decision(answer="Apply the final condition [1].")
+        called = True
+        return Decision(
+            calls=[
+                CapabilityCall(
+                    name="read_evidence",
+                    arguments={"citation": 1},
+                    call_id="original-read",
+                )
+            ],
+            assistant_message=AssistantMessage(
+                content=None,
+                tool_calls=[
+                    ToolCall(
+                        id="original-read",
+                        function=FunctionCall(
+                            name="read_evidence", arguments='{"citation":1}'
+                        ),
+                    )
+                ],
+            ),
+        )
+
+    result = Harness(
+        request="Read the complete original",
+        context=context,
+        registry=registry,
+        evidence=ledger,
+        decide=decide,
+    ).run()
+    assert result.status == OutcomeStatus.FOUND
+
+
+def test_worker_decisions_cannot_spend_coordinator_or_publication_reserve() -> None:
+    budget = SharedBudget(
+        max_decisions=14, final_decision_reserve=4, coordinator_decision_reserve=3
+    )
+    child = RunContext(budget=budget, depth=1)
+    for _ in range(7):
+        child.consume_research_decision()
+    with pytest.raises(RunStopped):
+        child.consume_research_decision()
+    root = RunContext(budget=budget)
+    for _ in range(3):
+        root.consume_research_decision()
+    with pytest.raises(RunStopped):
+        root.consume_research_decision()
+    for _ in range(4):
+        budget.consume("decisions")
+    assert budget.snapshot()["decisions"] == 14
 
 
 def test_dispatch_validates_schema_and_corpus_boundary_before_execution() -> None:
@@ -508,7 +681,9 @@ def test_harness_reports_actual_parallel_actions_without_changing_decisions() ->
     }
     events = reporter.snapshot()
     for call_id, phase in [("first", "tools"), ("second", "tools"), ("third", "final")]:
-        lifecycle = [event for event in events if event.task_id == f"action:{call_id}"]
+        lifecycle = [
+            event for event in events if event.task_id == public_action_id(call_id)
+        ]
         assert [(event.phase, event.status) for event in lifecycle] == [
             (phase, "running"),
             (phase, "completed"),
@@ -628,8 +803,8 @@ def test_harness_action_terminal_does_not_close_whole_run(
     events = reporter.snapshot()
     assert [(event.status, event.task_id) for event in events] == [
         ("running", None),
-        ("running", f"action:{call.call_id}"),
-        (expected, f"action:{call.call_id}"),
+        ("running", public_action_id(call.call_id)),
+        (expected, public_action_id(call.call_id)),
     ]
     assert all(
         event.title == "Vérification" and event.language == "fr" for event in events
@@ -707,6 +882,11 @@ def test_finalization_guard_returns_open_research_to_model() -> None:
         decisions += 1
         if decisions == 2:
             assert view.receipts[-1].outcome.status == OutcomeStatus.PARTIAL
+            assert view.draft_to_repair == "draft"
+            assert view.publication_gap is not None
+        else:
+            assert view.draft_to_repair is None
+            assert view.publication_gap is None
         return Decision(answer="draft")
 
     def guard() -> ToolOutcome | None:
@@ -1331,4 +1511,5 @@ def test_harness_persists_stop_reason_and_guard_gap_without_model_audit() -> Non
     restored.restore(checkpoints[-1])
     assert restored.publication_gap == gap
     assert restored.stop_reason == result.stop_reason
-    assert "publication_gap" not in restored.view().model_dump()
+    assert restored.view().draft_to_repair == "Unsupported conclusion"
+    assert restored.view().publication_gap == {"summary": gap.summary, **gap.data}

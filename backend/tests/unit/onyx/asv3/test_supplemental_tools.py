@@ -39,6 +39,75 @@ def test_scenario_recording_retains_counterfactuals_in_coordinator_view() -> Non
     assert harness.view().facts == ["standard exchange permission absent"]
 
 
+def test_question_typography_does_not_duplicate_but_changed_amount_does() -> None:
+    state = ScenarioState()
+    original = "Firma “başka işlem gerekmez” diyebilir mi? 100.000 TL’nin tamamı mı?"
+    state.record([original], [])
+    state.record(
+        ["Firma 'başka işlem gerekmez' diyebilir mi? 100.000 TL'nin tamamı mı?"], []
+    )
+    state.record([original.replace("100.000", "500.000")], [])
+    assert state.snapshot()["questions"] == [
+        original,
+        original.replace("100.000", "500.000"),
+    ]
+
+
+def test_same_action_narration_is_public_only_and_provider_ids_stay_private() -> None:
+    from onyx.asv3.progress import public_action_id
+
+    received: list[dict[str, JsonValue]] = []
+    reporter = ProgressReporter("run", "tr")
+    context = RunContext(run_id="run", language="tr")
+    registry = CapabilityRegistry(
+        [
+            ToolSpec(
+                name="read_source",
+                description="read",
+                parameters={
+                    "type": "object",
+                    "properties": {"source": {"type": "string"}},
+                    "required": ["source"],
+                    "additionalProperties": False,
+                },
+                handler=lambda args, _ctx: (
+                    received.append(args)
+                    or ToolOutcome(status=OutcomeStatus.FOUND, summary="Original read")
+                ),
+            )
+        ]
+    )
+    harness = Harness(
+        request="İzin gerekir mi?",
+        context=context,
+        registry=registry,
+        decide=lambda _view: Decision(answer="done"),
+        progress=reporter,
+    )
+    pair = [
+        "İzin koşullarını inceliyorum",
+        "Başvuru hükmünün şartlarını ve istisnalarını kontrol ediyorum.",
+    ]
+    opaque_id = "call__thought__" + "private-signature" * 1000
+    call = CapabilityCall(
+        name="read_source",
+        call_id=opaque_id,
+        arguments={"source": "law", "_public_update": pair},
+    )
+    harness._dispatch([call])
+    assert received == [{"source": "law"}]
+    assert harness.receipts[0].call.call_id == opaque_id
+    lifecycle = [event for event in reporter.snapshot() if event.task_id]
+    assert [event.status for event in lifecycle] == ["running", "completed"]
+    assert all(
+        event.task_id == public_action_id(opaque_id)
+        and event.title == pair[0]
+        and event.message == pair[1]
+        for event in lifecycle
+    )
+    assert opaque_id not in reporter.export().__str__()
+
+
 def test_public_narration_rejects_toolnames_but_accepts_case_findings() -> None:
     reporter = ProgressReporter("run", "tr")
     context = RunContext(services={"progress": reporter})

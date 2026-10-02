@@ -289,6 +289,9 @@ def run_asv3_loop(
     publication_stop_reason: str | None = None
     final_publication_gap: ToolOutcome | None = None
     approved_draft: str | None = None
+    guard_cache: dict[
+        str, tuple[ToolOutcome | None, VerificationResult, str | None, list[str]]
+    ] = {}
     approved_review: VerificationResult | None = None
     approved_call_id: str | None = None
     approved_questions: list[str] = []
@@ -307,7 +310,8 @@ def run_asv3_loop(
                 phase=phase,
                 status=status,
                 title=event.title
-                if phase == "research"
+                if event.public_narration
+                or phase == "research"
                 or (
                     phase == "worker"
                     and event.task_id
@@ -319,7 +323,8 @@ def run_asv3_loop(
                 )
                 else words[0],
                 message=event.message
-                if phase == "research"
+                if event.public_narration
+                or phase == "research"
                 or (
                     phase == "worker"
                     and event.task_id
@@ -420,7 +425,7 @@ def run_asv3_loop(
             reasoning_effort=reasoning_effort,
             token_counter=token_counter,
         )
-        child.budget.consume_research_decision()
+        child.consume_research_decision()
         report = parse_json_object(
             verifier.invoke_text(
                 VERIFICATION_PROMPT,
@@ -539,7 +544,7 @@ def run_asv3_loop(
             max_chars=max(8000, min(180000, (llm.config.max_input_tokens - 18000) * 2)),
         )
         if research:
-            context.budget.consume_research_decision()
+            context.consume_research_decision()
         text = model.invoke_text(
             VERIFICATION_PROMPT,
             json.dumps(
@@ -601,9 +606,27 @@ def run_asv3_loop(
                 summary="An explicitly used statutory basis still needs its original provision.",
                 data=missing_authority,
             )
-        review = review_answer(draft, research=True)
         assert harness is not None
         questions = harness.view().questions
+        fingerprint = hashlib.sha256(
+            json.dumps(
+                [draft, questions, scenarios.snapshot(), ledger.authority_metadata()],
+                ensure_ascii=False,
+                sort_keys=True,
+            ).encode()
+        ).hexdigest()
+        cached = guard_cache.get(fingerprint)
+        if cached is not None:
+            gap, review, call_id, _ = cached
+            if gap is None:
+                approved_draft, approved_review, approved_call_id = (
+                    draft,
+                    review,
+                    call_id,
+                )
+                approved_questions = list(questions)
+            return gap
+        review = review_answer(draft, research=True)
         call_id = model.last_call_id
         gap = publication_gap(
             draft,
@@ -619,6 +642,9 @@ def run_asv3_loop(
         if gap is None:
             approved_draft, approved_review, approved_call_id = draft, review, call_id
             approved_questions = list(questions)
+        guard_cache[fingerprint] = (gap, review, call_id, list(questions))
+        if len(guard_cache) > 8:
+            guard_cache.pop(next(iter(guard_cache)))
         return gap
 
     harness = Harness(
@@ -696,6 +722,12 @@ def run_asv3_loop(
             checkpoint_sequence = sequence
         result = harness.run()
         context.check_active()
+        # Finish admitted research before constructing the immutable synthesis input.
+        # A shared decision stop is not evidence that in-flight source reads finished.
+        if result.status != OutcomeStatus.FOUND:
+            workers.settle()
+        workers.close()
+        checkpoint(harness.snapshot())
         draft = result.answer or harness.last_draft or ""
         complete = result.status == OutcomeStatus.FOUND
         if not draft:
