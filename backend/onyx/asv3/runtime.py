@@ -171,13 +171,29 @@ def run_asv3_loop(
         history=history,
         token_counter=token_counter,
     )
-    profile = LanguageProfile.model_validate(
-        parse_json_object(
-            model.invoke_text(
-                _LANGUAGE_INSTRUCTION, question, LLMFlow.ASV3_LANGUAGE, max_tokens=1800
+    previous: dict[str, JsonValue] | None = None
+    if resume_message_id is not None:
+        previous = load_asv3_checkpoint(message_id=resume_message_id, user_id=user.id)
+        if (
+            previous is None
+            or previous.get("scope") != context.scope
+            or previous.get("request") != question
+        ):
+            raise ValueError(
+                "ASv3 resume requires the same authorized scope and question"
+            )
+        profile = LanguageProfile.model_validate(previous.get("public_profile"))
+    else:
+        profile = LanguageProfile.model_validate(
+            parse_json_object(
+                model.invoke_text(
+                    _LANGUAGE_INSTRUCTION,
+                    question,
+                    LLMFlow.ASV3_LANGUAGE,
+                    max_tokens=1800,
+                )
             )
         )
-    )
     required_phases = {
         "started",
         "tools",
@@ -429,18 +445,7 @@ def run_asv3_loop(
                     canonical.append(item)
             broker.revalidate_evidence(canonical, context)
 
-        if resume_message_id is not None:
-            previous = load_asv3_checkpoint(
-                message_id=resume_message_id, user_id=user.id
-            )
-            if (
-                previous is None
-                or previous.get("scope") != context.scope
-                or previous.get("request") != question
-            ):
-                raise ValueError(
-                    "ASv3 resume requires the same authorized scope and question"
-                )
+        if previous is not None:
             context.run_id = str(previous["run_id"])
             previous["language"] = context.language
             harness.restore(previous)

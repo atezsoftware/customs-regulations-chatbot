@@ -257,6 +257,29 @@ def test_runtime_external_capabilities_require_both_permission_and_user_intent(
     assert ("external_read_public_source" in names) is (consent and intent)
 
 
+def test_resume_reuses_saved_question_language_without_reclassifying(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kwargs, _broker, llm, checkpoints, queue = setup_run(monkeypatch)
+    runtime.run_asv3_loop(**kwargs)
+    previous = checkpoints[-1]
+    packets(queue)
+    monkeypatch.setattr(runtime, "load_asv3_checkpoint", lambda **_kwargs: previous)
+    llm.reset_mock()
+    llm.invoke.side_effect = [
+        response("Tamir [1], değiştirme [2]."),
+        response('{"status":"supported"}'),
+        response("Tamir sonucu [1]; değiştirme sonucu [2]."),
+    ]
+    runtime.run_asv3_loop(**kwargs, resume_message_id=2)
+    assert llm.invoke.call_count == 3
+    assert all(
+        packet.obj.language == "tr"
+        for packet in packets(queue)
+        if isinstance(packet.obj, ASv3Progress)
+    )
+
+
 @pytest.mark.parametrize(
     "provider,model_name",
     [

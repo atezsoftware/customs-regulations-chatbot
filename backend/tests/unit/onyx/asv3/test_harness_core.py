@@ -1,6 +1,7 @@
 import contextvars
 import json
 import threading
+import time
 from typing import cast
 
 import pytest
@@ -149,6 +150,113 @@ def test_harness_queues_excess_calls_and_propagates_context_and_citations() -> N
         [4],
         [5],
     ]
+
+
+def test_research_deadline_preserves_reserve_and_completed_sibling_evidence() -> None:
+    release, late_finished, early_finished = (
+        threading.Event(),
+        threading.Event(),
+        threading.Event(),
+    )
+
+    def handler(args: dict[str, JsonValue], _context: RunContext) -> ToolOutcome:
+        if args["slow"]:
+            assert release.wait(2)
+            late_finished.set()
+        else:
+            early_finished.set()
+        return ToolOutcome(
+            status=OutcomeStatus.FOUND,
+            summary="source",
+            evidence=[
+                EvidenceItem(
+                    source_id="late" if args["slow"] else "early", text="Original text"
+                )
+            ],
+        )
+
+    registry = CapabilityRegistry(
+        [
+            ToolSpec(
+                name="read",
+                description="read",
+                parameters={
+                    "type": "object",
+                    "properties": {"slow": {"type": "boolean"}},
+                    "required": ["slow"],
+                },
+                handler=handler,
+            )
+        ]
+    )
+    context = RunContext(timeout_seconds=0.8, research_reserve_seconds=0.6)
+    ledger = EvidenceLedger()
+
+    def decide(_view: HarnessView) -> Decision:
+        return Decision(
+            calls=[
+                CapabilityCall(name="read", arguments={"slow": True}, call_id="slow"),
+                CapabilityCall(name="read", arguments={"slow": False}, call_id="fast"),
+            ]
+        )
+
+    try:
+        result = Harness(
+            request="deadline reserve",
+            context=context,
+            registry=registry,
+            decide=decide,
+            evidence=ledger,
+        ).run()
+        assert early_finished.is_set()
+        assert result.status == OutcomeStatus.TRUNCATED
+        assert context.deadline - time.monotonic() > 0.45
+        assert [receipt.outcome.status for receipt in result.receipts] == [
+            OutcomeStatus.TRUNCATED,
+            OutcomeStatus.FOUND,
+        ]
+        assert result.receipts[1].evidence_ids == [1]
+        assert cast(EvidenceItem, ledger.get(1)).source_id == "early"
+    finally:
+        release.set()
+    assert late_finished.wait(2)
+    assert ledger.get(2) is None
+
+
+def test_execute_revokes_payload_completed_after_research_deadline() -> None:
+    context = RunContext(timeout_seconds=1, research_reserve_seconds=0.9)
+    invoked: list[bool] = []
+
+    def handler(_args: dict[str, JsonValue], _context: RunContext) -> ToolOutcome:
+        invoked.append(True)
+        time.sleep(0.15)
+        return ToolOutcome(
+            status=OutcomeStatus.FOUND,
+            summary="late",
+            evidence=[EvidenceItem(source_id="late", text="Must not be accepted")],
+        )
+
+    registry = CapabilityRegistry(
+        [
+            ToolSpec(
+                name="read",
+                description="read",
+                parameters={"type": "object"},
+                handler=handler,
+            )
+        ]
+    )
+    harness = Harness(
+        request="late result",
+        context=context,
+        registry=registry,
+        decide=lambda _view: Decision(answer="done"),
+    )
+    receipt = harness._execute(CapabilityCall(name="read"), context)
+    assert invoked == [True]
+    assert receipt.outcome.status == OutcomeStatus.TRUNCATED
+    assert receipt.outcome.evidence == []
+    assert receipt.outcome.artifacts == []
 
 
 def test_cancel_rejects_late_worker_output_and_preserves_sibling() -> None:

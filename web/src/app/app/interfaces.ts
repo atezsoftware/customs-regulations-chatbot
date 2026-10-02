@@ -157,6 +157,7 @@ export interface SearchSession {
 
 export interface Message {
   is_generating?: boolean;
+  asv3?: boolean;
   messageId?: number;
   nodeId: number; // Unique identifier for tree structure (can be negative for temp messages)
   message: string;

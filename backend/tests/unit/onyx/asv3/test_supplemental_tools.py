@@ -7,6 +7,7 @@ from onyx.asv3.models import (
     OutcomeStatus,
     RunContext,
     ToolOutcome,
+    ToolSpec,
 )
 from onyx.asv3.progress import ProgressReporter
 from onyx.asv3.registry import CapabilityRegistry
@@ -96,3 +97,31 @@ def test_claim_verification_calls_injected_verifier_and_skill_is_not_evidence() 
     assert skill.data["legal_authority"] is False
     assert len(str(skill.data["sha256"])) == 64
     assert skill.evidence == []
+
+
+def test_public_narration_checks_dynamically_registered_capability_names() -> None:
+    reporter = ProgressReporter("run", "en")
+    registry = CapabilityRegistry(build_supplemental_specs())
+    registry.register(
+        ToolSpec(
+            name="read_source_range",
+            description="Read original range",
+            parameters={"type": "object", "properties": {}},
+            handler=lambda _args, _ctx: ToolOutcome(
+                status=OutcomeStatus.FOUND, summary="Read"
+            ),
+        )
+    )
+    context = RunContext(services={"progress": reporter, "registry": registry})
+    result = registry.dispatch(
+        CapabilityCall(
+            name="report_progress",
+            arguments={
+                "title": "Research",
+                "message": "Calling read_source_range now.",
+            },
+        ),
+        context,
+    )
+    assert result.status == OutcomeStatus.INVALID
+    assert reporter.snapshot() == []

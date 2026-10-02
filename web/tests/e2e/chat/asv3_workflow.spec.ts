@@ -143,6 +143,12 @@ for (const scenario of [
         requests.push(
           route.request().postDataJSON() as Record<string, unknown>
         );
+        await expect(chatPage.page.getByTestId("asv3-progress")).toHaveText(
+          "ASv3"
+        );
+        await expect(
+          chatPage.page.getByText("Thinking...", { exact: true })
+        ).toHaveCount(0);
         await route.fulfill({
           status: 200,
           contentType: "text/plain",

@@ -313,6 +313,7 @@ const ChatUI = React.memo(
                   className={cn("w-full self-center", msgWidth)}
                 >
                   <AgentMessage
+                    asv3={message.asv3}
                     fullWidthChat={fullWidthChat}
                     rawPackets={message.packets}
                     packetCount={message.packetCount}

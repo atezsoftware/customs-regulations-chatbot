@@ -585,6 +585,22 @@ def create_asv3_progress_packets(
     if not isinstance(run_id, str) or not isinstance(language, str):
         return packets
     sequence = max((event.sequence for event in progress_events), default=0) + 1
+    evidence = checkpoint.get("evidence")
+    records = evidence.get("records", []) if isinstance(evidence, dict) else []
+    has_citable_external = False
+    if isinstance(records, list):
+        for record in records:
+            item = record.get("item") if isinstance(record, dict) else None
+            if not isinstance(item, dict):
+                continue
+            metadata = item.get("metadata")
+            if (
+                isinstance(metadata, dict)
+                and metadata.get("external")
+                and item.get("search_doc") is not None
+            ):
+                has_citable_external = True
+                break
     packets.append(
         Packet(
             placement=Placement(turn_index=turn_index),
@@ -597,7 +613,7 @@ def create_asv3_progress_packets(
                 status="failed",
                 title=cast(str, notice[0]),
                 message=cast(str, notice[1]),
-                resume_label=resume[0],
+                resume_label=None if has_citable_external else resume[0],
             ),
         )
     )

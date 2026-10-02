@@ -59,6 +59,7 @@ export interface AgentMessageProps {
   disableTTS?: boolean;
   /** When on, drop the message's reading-width padding so it sits flush with the chat edge. */
   fullWidthChat?: boolean;
+  asv3?: boolean;
 }
 
 // TODO: Consider more robust comparisons:
@@ -91,6 +92,7 @@ function arePropsEqual(
       next.llmManager?.isLoadingProviders &&
     prev.processingDurationSeconds === next.processingDurationSeconds &&
     prev.hideFooter === next.hideFooter &&
+    prev.asv3 === next.asv3 &&
     prev.fullWidthChat === next.fullWidthChat
     // Skip: chatState.regenerate, chatState.setPresentingDocument,
     //       most of llmManager, onMessageSelection (function/object props)
@@ -113,9 +115,10 @@ const AgentMessage = React.memo(function AgentMessage({
   hideFooter,
   disableTTS,
   fullWidthChat,
+  asv3,
 }: AgentMessageProps) {
   const asv3Progress = useASv3Progress(rawPackets, nodeId);
-  const isASv3 = asv3Progress.runId !== null;
+  const isASv3 = Boolean(asv3) || asv3Progress.runId !== null;
   const markdownRef = useRef<HTMLDivElement>(null);
   const finalAnswerRef = useRef<HTMLDivElement>(null);
 
@@ -309,6 +312,7 @@ const AgentMessage = React.memo(function AgentMessage({
 
       {isASv3 ? (
         <ASv3ProgressPanel
+          pending={Boolean(asv3) && !asv3Progress.header}
           state={asv3Progress}
           stopped={stopPacketSeen}
           onResume={

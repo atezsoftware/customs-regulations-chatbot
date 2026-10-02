@@ -8,6 +8,7 @@ interface ASv3ProgressPanelProps {
   state: ASv3ProgressState;
   stopped: boolean;
   onResume?: () => void;
+  pending?: boolean;
 }
 
 /** Public task updates arrive already localized to the question language. */
@@ -15,7 +16,29 @@ export default function ASv3ProgressPanel({
   state,
   stopped,
   onResume,
+  pending = false,
 }: ASv3ProgressPanelProps) {
+  if (!state.header && pending)
+    return (
+      <section
+        aria-label="ASv3"
+        aria-live="polite"
+        aria-busy={!stopped}
+        data-testid="asv3-progress"
+        className="flex items-center gap-2 rounded-08 border border-border-02 bg-background-neutral-01 p-3"
+      >
+        <Text font="secondary-action" color="text-03">
+          ASv3
+        </Text>
+        <span
+          aria-hidden="true"
+          className={cn(
+            "h-1.5 w-1.5 rounded-full bg-background-neutral-04",
+            !stopped && "animate-pulse"
+          )}
+        />
+      </section>
+    );
   if (!state.header) return null;
   const tasks = Array.from(state.tasks.values());
   return (

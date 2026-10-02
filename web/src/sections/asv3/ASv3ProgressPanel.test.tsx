@@ -6,6 +6,35 @@ import {
 } from "@/lib/asv3/progress";
 import type { ASv3Progress } from "@/app/app/services/streamingModels";
 
+it("shows a language-neutral pending state until the localized update arrives", () => {
+  const empty = createASv3ProgressState();
+  const { rerender } = render(
+    <ASv3ProgressPanel state={empty} stopped={false} pending />
+  );
+  expect(screen.getByRole("region", { name: "ASv3" })).toHaveTextContent(
+    /^ASv3$/
+  );
+  expect(screen.queryByText(/Thinking/)).not.toBeInTheDocument();
+  const localized = applyASv3Progress(empty, {
+    type: "asv3_progress",
+    run_id: "r",
+    event_id: "e",
+    sequence: 1,
+    language: "tr",
+    phase: "started",
+    status: "running",
+    title: "Garanti koşullarını inceliyorum",
+  });
+  rerender(<ASv3ProgressPanel state={localized} stopped={false} pending />);
+  expect(
+    screen.getByText("Garanti koşullarını inceliyorum")
+  ).toBeInTheDocument();
+  expect(screen.getByRole("region", { name: "ASv3" })).toHaveAttribute(
+    "lang",
+    "tr"
+  );
+});
+
 it.each([
   ["tr", "Kaynaklar paralel inceleniyor", "Süre koşulu araştırılıyor"],
   ["en", "Reviewing sources in parallel", "Checking the deadline"],

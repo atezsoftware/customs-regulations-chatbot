@@ -2,6 +2,7 @@ from types import SimpleNamespace
 from typing import cast
 from unittest.mock import MagicMock, patch
 
+from pydantic import JsonValue
 from sqlalchemy.orm import Session
 
 from onyx.configs.constants import DocumentSource, MessageType
@@ -267,6 +268,37 @@ def test_idle_incomplete_asv3_replay_gets_localized_resume_only_from_saved_profi
     assert notice.sequence == 8
     assert notice.resume_label == "Araştırmaya devam et"
     assert notice.language == "tr"
+
+    checkpoint = json.loads(payload)
+    external_item: dict[str, JsonValue] = {
+        "metadata": {"external": True},
+        "search_doc": {"document_id": "web-1"},
+    }
+    checkpoint["evidence"] = {
+        "records": [
+            {
+                "item": external_item,
+            }
+        ]
+    }
+    external = create_asv3_progress_packets(json.dumps(checkpoint), interrupted=True)
+    external_notice = external[-1].obj
+    assert isinstance(external_notice, ASv3Progress)
+    assert external_notice.phase == "interrupted"
+    assert external_notice.resume_label is None
+
+    external_item["search_doc"] = None
+    noncitable = create_asv3_progress_packets(json.dumps(checkpoint), interrupted=True)
+    assert isinstance(noncitable[-1].obj, ASv3Progress)
+    assert noncitable[-1].obj.resume_label == "Araştırmaya devam et"
+
+    checkpoint["evidence"]["records"][0]["item"] = {
+        "metadata": {},
+        "search_doc": {"document_id": "canonical-1"},
+    }
+    canonical = create_asv3_progress_packets(json.dumps(checkpoint), interrupted=True)
+    assert isinstance(canonical[-1].obj, ASv3Progress)
+    assert canonical[-1].obj.resume_label == "Araştırmaya devam et"
 
 
 def test_actual_terminal_asv3_replay_never_becomes_resumable() -> None:

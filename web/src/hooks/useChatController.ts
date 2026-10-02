@@ -666,6 +666,7 @@ export default function useChatController({
       }
 
       if (!isMultiModel) {
+        initialAgentNode.asv3 = atezSearchV3;
         // Freeze provenance on the answer itself; changing the input selector
         // later must not relabel historical assistant messages.
         initialAgentNode.overridden_model = finalLLM.modelName;

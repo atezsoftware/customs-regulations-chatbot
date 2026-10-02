@@ -86,7 +86,25 @@ def build_supplemental_specs() -> list[ToolSpec]:
 
     def progress(args: dict[str, JsonValue], context: RunContext) -> ToolOutcome:
         title, message = str(args["title"]), str(args["message"])
-        if _INTERNAL_NARRATION.search(title + " " + message):
+        from onyx.asv3.registry import CapabilityRegistry
+
+        registry = context.services.get("registry")
+        names = (
+            [
+                str(function["name"])
+                for definition in registry.definitions(context)
+                if isinstance(function := definition.get("function"), dict)
+                and isinstance(function.get("name"), str)
+                and "_" in str(function["name"])
+            ]
+            if isinstance(registry, CapabilityRegistry)
+            else []
+        )
+        text = title + " " + message
+        if _INTERNAL_NARRATION.search(text) or any(
+            re.search(r"\b" + re.escape(name) + r"\b", text, re.IGNORECASE)
+            for name in names
+        ):
             return ToolOutcome(
                 status=OutcomeStatus.INVALID,
                 summary="Use conversational public narration about the question; omit tool names, URLs, paths and code",

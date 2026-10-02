@@ -199,7 +199,18 @@ class Harness:
 
     def _execute(self, call: CapabilityCall, context: RunContext) -> ToolReceipt:
         start = time.monotonic()
-        outcome = self.registry.dispatch(call, context)
+        try:
+            context.check_research_active()
+            outcome = self.registry.dispatch(call, context)
+            # The handler may not support cancellation; its late payload is still revoked.
+            context.check_research_active()
+        except RunStopped as error:
+            outcome = ToolOutcome(
+                status=OutcomeStatus.CANCELLED
+                if context.is_cancelled()
+                else OutcomeStatus.TRUNCATED,
+                summary=str(error),
+            )
         return ToolReceipt(
             call=call, outcome=outcome, elapsed_seconds=time.monotonic() - start
         )
@@ -235,13 +246,36 @@ class Harness:
                     executor.submit(captured.run, self._execute, call, child),
                 )
                 futures.append((call, child, future))
-            for call, child, future in futures:
-                while not future.done():
-                    self.context.check_active()
-                    time.sleep(0.02)
-                receipt = future.result()
+            pending = {
+                call.call_id: (call, child, future) for call, child, future in futures
+            }
+            while pending:
                 self.context.check_active()
-                ready[call.call_id] = receipt
+                # A slow first call cannot hide an already completed sibling's evidence.
+                for call_id, (_, _, future) in list(pending.items()):
+                    if future.done():
+                        ready[call_id] = future.result()
+                        del pending[call_id]
+                if not pending:
+                    break
+                try:
+                    self.context.check_research_active()
+                except RunStopped as error:
+                    for call_id, (call, child, future) in pending.items():
+                        child.cancel()
+                        future.cancel()
+                        ready[call_id] = ToolReceipt(
+                            call=call,
+                            elapsed_seconds=0,
+                            outcome=ToolOutcome(
+                                status=OutcomeStatus.TRUNCATED,
+                                summary=str(error),
+                            ),
+                        )
+                    break
+                time.sleep(
+                    min(0.02, max(0, self.context.research_deadline - time.monotonic()))
+                )
             return [ready[call.call_id] for call in calls]
         finally:
             for _, child, future in futures:
