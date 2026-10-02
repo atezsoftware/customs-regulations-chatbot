@@ -178,7 +178,9 @@ def setup_run(
             ]
         ),
         response("Tamir [1], değiştirme [2]."),
-        response('{"supported": true, "gaps": []}'),
+        response(
+            '{"status":"supported","explanation":"Koşullar sağlandı.","required_conditions":[],"missing_conditions":[],"evidence_numbers":[1,2]}'
+        ),
         response(final),
     ]
     cache = MagicMock(spec=CacheBackend)
@@ -268,7 +270,9 @@ def test_resume_reuses_saved_question_language_without_reclassifying(
     llm.reset_mock()
     llm.invoke.side_effect = [
         response("Tamir [1], değiştirme [2]."),
-        response('{"status":"supported"}'),
+        response(
+            '{"status":"supported","explanation":"Koşullar sağlandı.","required_conditions":[],"missing_conditions":[],"evidence_numbers":[1,2]}'
+        ),
         response("Tamir sonucu [1]; değiştirme sonucu [2]."),
     ]
     runtime.run_asv3_loop(**kwargs, resume_message_id=2)
@@ -470,8 +474,10 @@ def test_runtime_researchers_keep_scenario_facts_isolated_and_selected_llm(
                     )
                 child_facts[task] = data["facts"]
                 return response(task + " tamamlandı.")
-            if instruction == VERIFICATION_PROMPT:
-                return response('{"supported": true, "gaps": []}')
+            if instruction.startswith(VERIFICATION_PROMPT):
+                return response(
+                    '{"status":"incomplete","explanation":"Kaynak araştırması tamamlanmadı.","required_conditions":[],"missing_conditions":[],"evidence_numbers":[]}'
+                )
             if instruction == FINAL_PROMPT:
                 final_scenario.update(data["scenario"])
                 return response("Araştırma tamamlandı.")

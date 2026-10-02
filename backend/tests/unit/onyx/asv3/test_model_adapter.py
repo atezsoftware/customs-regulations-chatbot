@@ -1,8 +1,10 @@
 import copy
+import json
 import threading
 from typing import Any
 from unittest.mock import MagicMock
 
+import pytest
 from pydantic import JsonValue
 
 from onyx.asv3.llm_adapter import ResearchModel
@@ -75,6 +77,37 @@ def scripted_model(limit: int = 100000) -> MagicMock:
         max_input_tokens=limit,
     )
     return llm
+
+
+def complete_language_profile() -> dict[str, Any]:
+    from onyx.asv3.llm_adapter import REQUIRED_NOTIFICATION_PHASES
+
+    return {
+        "language": "tr",
+        "external_requested": False,
+        "notifications": {
+            phase: ["Araştırma", "Royalti koşullarını inceliyorum."]
+            for phase in REQUIRED_NOTIFICATION_PHASES
+        },
+    }
+
+
+def text_response(profile: dict[str, Any]) -> ModelResponse:
+    return ModelResponse(
+        id="language",
+        created="0",
+        choice=Choice(message=Message(content=json.dumps(profile, ensure_ascii=False))),
+    )
+
+
+def verification_profile() -> dict[str, Any]:
+    return {
+        "status": "supported",
+        "explanation": "Özgün hüküm destekliyor.",
+        "required_conditions": [],
+        "missing_conditions": [],
+        "evidence_numbers": [1],
+    }
 
 
 def tool_response(arguments: str, name: str = "read_evidence") -> ModelResponse:
@@ -242,13 +275,7 @@ def test_language_json_repair_uses_original_request_and_same_selected_model() ->
         ModelResponse(
             id="bad", created="0", choice=Choice(message=Message(content="```{broken"))
         ),
-        ModelResponse(
-            id="valid",
-            created="0",
-            choice=Choice(
-                message=Message(content='{"language":"tr","notifications":{}}')
-            ),
-        ),
+        text_response(complete_language_profile()),
     ]
     context = RunContext()
     model = ResearchModel(llm, context)
@@ -261,6 +288,120 @@ def test_language_json_repair_uses_original_request_and_same_selected_model() ->
     assert llm.invoke.call_count == 2
     assert context.budget.snapshot()["decisions"] == 2
     assert llm.invoke.call_args.kwargs["prompt"][1].content == "Yanıt Türkçe olsun"
+
+
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "missing_phase",
+        "missing_native",
+        "single_value",
+        "blank_message",
+        "string_consent",
+    ],
+)
+def test_valid_json_incomplete_language_profile_is_repaired_once(defect: str) -> None:
+    from onyx.asv3.llm_adapter import LanguageProfile
+
+    incomplete = complete_language_profile()
+    if defect == "missing_phase":
+        del incomplete["notifications"]["tools"]
+    elif defect == "missing_native":
+        del incomplete["notifications"]["native_citation"]
+    elif defect == "single_value":
+        incomplete["notifications"]["started"] = ["Araştırma"]
+    elif defect == "blank_message":
+        incomplete["notifications"]["final"] = ["Araştırma", "  "]
+    else:
+        incomplete["external_requested"] = "true"
+    llm = scripted_model()
+    llm.invoke.side_effect = [
+        text_response(incomplete),
+        text_response(complete_language_profile()),
+    ]
+    result = ResearchModel(llm, RunContext()).invoke_text(
+        "Identify response language",
+        "Royalti hakkında Türkçe yanıtla",
+        LLMFlow.ASV3_LANGUAGE,
+    )
+    profile = LanguageProfile.model_validate_json(result)
+    assert profile.language == "tr" and profile.external_requested is False
+    assert llm.invoke.call_count == 2
+    assert llm.config.model_name == "selected-model"
+    for call in llm.invoke.call_args_list:
+        response_format = call.kwargs["structured_response_format"]
+        assert response_format["type"] == "json_schema"
+        schema = response_format["json_schema"]["schema"]
+        notification_schema = schema["properties"]["notifications"]
+        assert set(notification_schema["required"]) == set(profile.notifications)
+        assert notification_schema["properties"]["native_citation"]["type"] == "array"
+        assert notification_schema["additionalProperties"] is False
+        system = call.kwargs["prompt"][0].content
+        assert isinstance(system, str)
+        assert '"required": ["started", "tools"' in system
+        assert '"native_citation"' in system and '"maxItems": 2' in system
+
+
+def test_repeated_incomplete_language_profile_fails_closed_after_single_repair() -> (
+    None
+):
+    profile = complete_language_profile()
+    del profile["notifications"]["cancelled"]
+    llm = scripted_model()
+    llm.invoke.side_effect = [text_response(profile), text_response(profile)]
+    context = RunContext()
+    with pytest.raises(ValueError, match="cancelled"):
+        ResearchModel(llm, context).invoke_text(
+            "Identify language", "Türkçe yanıtla", LLMFlow.ASV3_LANGUAGE
+        )
+    assert llm.invoke.call_count == 2
+    assert context.corpus_only is True
+    assert context.budget.snapshot()["decisions"] == 2
+
+
+def test_verification_uses_typed_provider_schema_and_repairs_incomplete_json() -> None:
+    from onyx.asv3.llm_adapter import VerificationResult
+
+    llm = scripted_model()
+    llm.invoke.side_effect = [
+        text_response({"status": "supported"}),
+        text_response(verification_profile()),
+    ]
+    result = ResearchModel(llm, RunContext()).invoke_text(
+        "Verify the claim",
+        '{"claim":"Royalti [1]","evidence":"original"}',
+        LLMFlow.ASV3_VERIFICATION,
+    )
+    assert VerificationResult.model_validate_json(result).evidence_numbers == [1]
+    assert llm.invoke.call_count == 2
+    for call in llm.invoke.call_args_list:
+        response_format = call.kwargs["structured_response_format"]
+        schema = response_format["json_schema"]["schema"]
+        assert schema["properties"]["status"]["enum"] == [
+            "supported",
+            "contradicted",
+            "incomplete",
+            "uncertain",
+        ]
+        assert set(schema["required"]) == set(verification_profile())
+        assert (
+            call.kwargs["prompt"][1].content
+            == '{"claim":"Royalti [1]","evidence":"original"}'
+        )
+
+
+def test_final_answer_remains_free_text_without_structured_schema() -> None:
+    llm = scripted_model()
+    llm.invoke.return_value = ModelResponse(
+        id="final", created="0", choice=Choice(message=Message(content="Yanıt [1]."))
+    )
+    assert (
+        ResearchModel(llm, RunContext()).invoke_text(
+            "Write answer", "question", LLMFlow.ASV3_FINAL
+        )
+        == "Yanıt [1]."
+    )
+    assert llm.invoke.call_args.kwargs["structured_response_format"] is None
 
 
 def test_strict_json_rejects_duplicate_keys_nonfinite_values_and_bad_fences() -> None:
@@ -387,11 +528,7 @@ def test_final_review_removes_only_uncited_supplemental_context() -> None:
     import json
 
     llm = scripted_model(12000)
-    llm.invoke.return_value = ModelResponse(
-        id="valid",
-        created="0",
-        choice=Choice(message=Message(content='{"status":"supported"}')),
-    )
+    llm.invoke.return_value = text_response(verification_profile())
     model = ResearchModel(llm, RunContext())
     original = "Complete operative paragraph with all exceptions."
     model.invoke_text(
@@ -457,11 +594,7 @@ def test_selected_tokenizer_preserves_nonascii_cited_law_that_fits_actual_limit(
 
     encoding = tiktoken.get_encoding("cl100k_base")
     llm = scripted_model(12000)
-    llm.invoke.return_value = ModelResponse(
-        id="valid",
-        created="0",
-        choice=Choice(message=Message(content='{"status":"supported"}')),
-    )
+    llm.invoke.return_value = text_response(verification_profile())
     model = ResearchModel(
         llm, RunContext(), token_counter=lambda text: len(encoding.encode(text))
     )

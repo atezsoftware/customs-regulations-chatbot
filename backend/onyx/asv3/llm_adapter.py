@@ -8,9 +8,10 @@ import re
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from typing import Annotated, Literal
 
 import jsonschema
-from pydantic import BaseModel, Field, JsonValue
+from pydantic import BaseModel, Field, JsonValue, model_validator
 
 from onyx.asv3.artifacts import ArtifactStore, compact_json
 from onyx.asv3.models import (
@@ -34,14 +35,74 @@ from onyx.llm.models import (
     UserMessage,
 )
 from onyx.prompts.asv3.research import COORDINATOR_PROMPT, RESEARCHER_PROMPT
+from onyx.regulatory.structured_llm import _portable_structured_output_schema
 from onyx.tracing.flows import LLMFlow
 from onyx.tracing.llm_utils import llm_generation_span, record_llm_response
+
+REQUIRED_NOTIFICATION_PHASES = (
+    "started",
+    "tools",
+    "worker",
+    "final",
+    "completed",
+    "failed",
+    "cancelled",
+    "interrupted",
+    "resume",
+    "native_citation",
+)
 
 
 class LanguageProfile(BaseModel):
     language: str = Field(pattern=r"^[a-zA-Z]{2,3}(?:-[a-zA-Z0-9]{2,8})*$")
-    external_requested: bool = False
-    notifications: dict[str, list[str]]
+    external_requested: bool = Field(default=False, strict=True)
+    notifications: dict[str, list[str]] = Field(
+        json_schema_extra={
+            "type": "object",
+            "properties": {
+                phase: {
+                    "type": "array",
+                    "items": {"type": "string", "minLength": 1},
+                    "minItems": 2,
+                    "maxItems": 2,
+                }
+                for phase in REQUIRED_NOTIFICATION_PHASES
+            },
+            "required": list(REQUIRED_NOTIFICATION_PHASES),
+            "additionalProperties": False,
+        }
+    )
+
+    @model_validator(mode="after")
+    def validate_notifications(self) -> LanguageProfile:
+        missing = set(REQUIRED_NOTIFICATION_PHASES) - self.notifications.keys()
+        extra = self.notifications.keys() - set(REQUIRED_NOTIFICATION_PHASES)
+        if missing or extra:
+            raise ValueError(
+                f"Notification phases missing={sorted(missing)}, unexpected={sorted(extra)}"
+            )
+        for phase, pair in self.notifications.items():
+            if len(pair) != 2 or any(not text.strip() for text in pair):
+                raise ValueError(
+                    f"Notification {phase} requires exactly two nonblank strings"
+                )
+        return self
+
+
+class VerificationResult(BaseModel):
+    status: Literal["supported", "contradicted", "incomplete", "uncertain"]
+    explanation: Annotated[str, Field(min_length=1)]
+    required_conditions: list[str]
+    missing_conditions: list[str]
+    evidence_numbers: list[Annotated[int, Field(strict=True, ge=1)]]
+
+
+def structured_model(flow: LLMFlow) -> type[BaseModel] | None:
+    if flow == LLMFlow.ASV3_LANGUAGE:
+        return LanguageProfile
+    if flow == LLMFlow.ASV3_VERIFICATION:
+        return VerificationResult
+    return None
 
 
 def parse_json_object(text: str) -> dict[str, JsonValue]:
@@ -336,6 +397,7 @@ class ResearchModel:
         max_tokens: int,
         research: bool,
     ) -> ModelResponse:
+        response_model = structured_model(flow)
         with (
             model_slot(self.context, research=research),
             llm_generation_span(self.llm, flow, prompt, tools or None) as span,
@@ -345,6 +407,20 @@ class ResearchModel:
                 # Provider normalization must not rewrite canonical validation schemas.
                 tools=copy.deepcopy(tools) if tools else None,
                 tool_choice=ToolChoiceOptions.AUTO if tools else ToolChoiceOptions.NONE,
+                structured_response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": response_model.__name__,
+                        "schema": copy.deepcopy(
+                            _portable_structured_output_schema(
+                                response_model.model_json_schema()
+                            )
+                        ),
+                        "strict": False,
+                    },
+                }
+                if response_model is not None
+                else None,
                 max_tokens=max_tokens,
                 timeout_override=max(
                     1,
@@ -377,22 +453,26 @@ class ResearchModel:
         consume_budget: bool = True,
     ) -> str:
         self.context.check_active()
+        response_model = structured_model(flow)
+        if response_model is not None:
+            instruction += (
+                "\nReturn a JSON object conforming to this complete schema:\n"
+                + json.dumps(response_model.model_json_schema(), ensure_ascii=False)
+            )
         if consume_budget:
             self.context.budget.consume("decisions")
         prompt, tools, output = self._fit(instruction, data, [], max_tokens=max_tokens)
         response = self._invoke(
             prompt, tools, flow, max_tokens=output, research=not consume_budget
         )
-        structured = flow in (LLMFlow.ASV3_LANGUAGE, LLMFlow.ASV3_VERIFICATION)
 
         def valid(result: ModelResponse) -> str:
             text = result.choice.message.content or ""
             if not text.strip():
                 raise ValueError("ASv3 model returned an empty response")
-            if structured:
+            if response_model is not None:
                 parsed = parse_json_object(text)
-                if flow == LLMFlow.ASV3_LANGUAGE:
-                    LanguageProfile.model_validate(parsed)
+                response_model.model_validate(parsed)
             return text
 
         try:

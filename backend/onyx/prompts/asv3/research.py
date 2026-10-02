@@ -80,7 +80,9 @@ language throughout. Give a direct, readable answer, with citations beside suppo
 
 LANGUAGE_PROMPT = """Identify the requested response language from the user's QUESTION,
 not from quoted legal sources or IDE file paths. Explicit requested answer language wins.
-Return only JSON: {"language":"BCP-47 code", "external_requested":false}.
+Return only one JSON object matching the supplied complete schema: language is a
+BCP-47 code, external_requested is a boolean, and notifications contains all requested
+localized title/message pairs. Do not add prose outside the JSON object.
 external_requested is true only for an explicit request to use outside/web sources;
 it does not grant permission, which is decided separately by the application.
 """
