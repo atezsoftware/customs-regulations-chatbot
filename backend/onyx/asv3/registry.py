@@ -38,18 +38,29 @@ class CapabilityRegistry:
             if context.corpus_only and spec.external:
                 continue
             definition = spec.definition()
+            function = definition["function"]
+            assert isinstance(function, dict)
+            parameters = function["parameters"]
+            assert isinstance(parameters, dict)
+            properties = parameters.setdefault("properties", {})
+            assert isinstance(properties, dict)
+            if spec.name not in {
+                "update_research",
+                "inspect_research",
+                "record_scenario",
+                "report_progress",
+            }:
+                properties["_need_id"] = {
+                    "type": "string",
+                    "maxLength": 64,
+                    "description": "Optional existing research need ID binding this action's originals to the stable user questions.",
+                }
             if not spec.orchestrates and spec.name not in {
                 "report_progress",
                 "record_scenario",
                 "discover_tools",
                 "read_research_state",
             }:
-                function = definition["function"]
-                assert isinstance(function, dict)
-                parameters = function["parameters"]
-                assert isinstance(parameters, dict)
-                properties = parameters.setdefault("properties", {})
-                assert isinstance(properties, dict)
                 properties["_public_update"] = {
                     "type": "array",
                     "items": {"type": "string"},
@@ -80,7 +91,7 @@ class CapabilityRegistry:
                 arguments = {
                     key: value
                     for key, value in call.arguments.items()
-                    if key != "_public_update"
+                    if key not in {"_public_update", "_need_id"}
                 }
                 jsonschema.Draft202012Validator(spec.parameters).validate(arguments)
             except jsonschema.ValidationError as error:

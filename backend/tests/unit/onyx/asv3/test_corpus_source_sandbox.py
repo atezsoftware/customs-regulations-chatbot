@@ -1,5 +1,6 @@
 """Behavioral recovery, scope and execution tests for the research source tools."""
 
+from collections.abc import Generator
 from contextlib import nullcontext
 from contextvars import ContextVar
 from datetime import date
@@ -55,6 +56,42 @@ class MemoryBroker(CorpusBroker):
         self.search_adapter = None
         self.file_store = None
         self.vision_llm = None
+
+    def chunk_siblings(
+        self, seed: CorpusChunk, context: RunContext
+    ) -> tuple[CorpusSource, tuple[str, ...]]:
+        parent = seed.heading_path[:-1]
+        rows = sorted(
+            (
+                row
+                for row in self.items
+                if (
+                    bool(row.heading_path) and row.heading_path[:-1] == parent
+                    if seed.heading_path
+                    else row.id == seed.id
+                )
+            ),
+            key=lambda row: (row.position, row.projection_ordinal or 0, row.id),
+        )
+        return self.source(str(seed.source_id), context), tuple(row.id for row in rows)
+
+    def sibling_page(
+        self, source: CorpusSource, ids: tuple[str, ...], context: RunContext
+    ) -> Generator[CorpusChunk, None, None]:
+        self.source(str(source.id), context)
+        for row in sorted(
+            self.items,
+            key=lambda row: (row.position, row.projection_ordinal or 0, row.id),
+        ):
+            if row.id in ids:
+                yield row
+
+    def provision_start(
+        self, source_id: str, article: str, qualifier: str | None, context: RunContext
+    ) -> int | None:
+        del article, qualifier
+        self.source(source_id, context)
+        return None
 
     def source(self, source_id: str, context: RunContext) -> CorpusSource:
         context.check_active()
@@ -381,6 +418,7 @@ def test_exact_locator_retains_chunk_identity_when_semantic_positions_repeat(
 
     broker.items[1] = replace(broker.items[1], position=0)
     broker.query_indexes = {}
+    broker.user = User()
     broker._index_lock = RLock()
     monkeypatch.setattr(
         corpus_tools,
@@ -389,7 +427,11 @@ def test_exact_locator_retains_chunk_identity_when_semantic_positions_repeat(
     )
     monkeypatch.setattr(corpus_tools, "resolve_source_query_index", lambda *_args: None)
     monkeypatch.setattr(
-        corpus_tools, "source_chunk_position", lambda *_args, **_kwargs: 0
+        corpus_tools,
+        "iter_source_chunks_by_ids",
+        lambda *_args, **kwargs: iter(
+            row for row in broker.items if row.id in kwargs["chunk_ids"]
+        ),
     )
     _, chunk = CorpusBroker.chunk(
         broker, str(broker.item.id), "temporary-head", RunContext()
@@ -813,3 +855,65 @@ def test_query_snapshot_uses_only_requested_source_receipts(
     resolve.assert_called_once_with(
         "configured-index", "physical-index", file_ids=(source_id,)
     )
+
+
+def test_parent_context_selects_all_siblings_and_excludes_descendants(
+    broker: MemoryBroker,
+) -> None:
+    from dataclasses import replace
+
+    rows = [
+        replace(
+            broker.items[0],
+            id=str(n),
+            position=n * 100,
+            projection_ordinal=n,
+            heading_path=("MADDE 27", f"Clause {n}"),
+        )
+        for n in range(9)
+    ]
+    rows[3] = replace(rows[3], position=200, projection_ordinal=3)
+    rows.append(
+        replace(rows[-1], id="other-parent", heading_path=("MADDE 28", "Clause 1"))
+    )
+    rows.append(
+        replace(
+            rows[-1], id="descendant", heading_path=("MADDE 27", "Clause 1", "Detail")
+        )
+    )
+    broker.items = rows
+    result = CapabilityRegistry(build_corpus_specs(broker)).dispatch(
+        CapabilityCall(
+            name="read_chunk_context",
+            arguments={"source_id": str(broker.item.id), "chunk_id": "2"},
+        ),
+        RunContext(),
+    )
+    assert [item.chunk_id for item in result.evidence] == [str(n) for n in range(9)]
+    assert result.status == OutcomeStatus.FOUND
+    assert result.data["sibling_count"] == 9
+    assert result.data["has_more"] is False
+    assert result.data["article_closure_complete"] is False
+    first = CapabilityRegistry(build_corpus_specs(broker)).dispatch(
+        CapabilityCall(
+            name="read_chunk_context",
+            arguments={"source_id": str(broker.item.id), "chunk_id": "2", "limit": 4},
+        ),
+        RunContext(),
+    )
+    second = CapabilityRegistry(build_corpus_specs(broker)).dispatch(
+        CapabilityCall(
+            name="read_chunk_context",
+            arguments={
+                "source_id": str(broker.item.id),
+                "chunk_id": "2",
+                "offset": first.data["next_offset"],
+            },
+        ),
+        RunContext(),
+    )
+    assert first.data["sibling_count"] == second.data["sibling_count"] == 9
+    assert first.status == OutcomeStatus.PARTIAL
+    assert [item.chunk_id for item in first.evidence + second.evidence] == [
+        str(n) for n in range(9)
+    ]

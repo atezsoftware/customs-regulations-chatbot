@@ -24,6 +24,7 @@ from onyx.asv3.models import (
 )
 from onyx.asv3.progress import ProgressReporter, action_narration, public_action_id
 from onyx.asv3.registry import CapabilityRegistry
+from onyx.asv3.research_state import EvidenceWorkingSet, ResearchState
 from onyx.asv3.working_memory import WorkingMemory
 from onyx.llm.models import ToolMessage
 from onyx.tracing.answer_graph import graph_step
@@ -82,6 +83,7 @@ class Harness:
         self._pending_calls: dict[str, dict[str, JsonValue]] = {}
         self._progress_calls: set[str] = set()
         self._completed_reads: dict[str, ToolReceipt] = {}
+        self.evidence_working_set = EvidenceWorkingSet()
         self.working_memory = WorkingMemory(self.context.scope)
         self.context.services["working_memory"] = self.working_memory
         self.context.services["registry"] = registry
@@ -132,6 +134,12 @@ class Harness:
             if self.publication_gap
             else None,
             "working_memory": self.working_memory.export(),
+            "evidence_working_set": self.evidence_working_set.export(),
+            "research_state": state.export()
+            if isinstance(
+                state := self.context.services.get("research_state"), ResearchState
+            )
+            else {},
         }
 
     def restore(self, snapshot: dict[str, JsonValue]) -> None:
@@ -172,6 +180,17 @@ class Harness:
         if not isinstance(evidence, dict):
             raise ValueError("Checkpoint evidence is missing")
         self.evidence.restore(evidence, self.context)
+        research = self.context.services.get("research_state")
+        saved_research = snapshot.get("research_state")
+        if (
+            isinstance(research, ResearchState)
+            and isinstance(saved_research, dict)
+            and saved_research
+        ):
+            research.restore(saved_research, self.evidence)
+        ranges = snapshot.get("evidence_working_set")
+        if isinstance(ranges, list):
+            self.evidence_working_set.restore(ranges, self.evidence)
         budget = snapshot.get("budget")
         if isinstance(budget, dict):
             self.context.budget.restore({**budget, "artifact_bytes": 0})
@@ -245,6 +264,18 @@ class Harness:
                 self.facts = list(
                     dict.fromkeys(self.facts + [str(item) for item in facts])
                 )
+        state = self.context.services.get("research_state")
+        if isinstance(state, ResearchState):
+            self.questions = list(state.questions)
+        focus = self.context.services.get("task_need_ids")
+        preferred = (
+            state.preferred_citations(
+                [str(n) for n in focus] if isinstance(focus, list) else None
+            )
+            if isinstance(state, ResearchState)
+            else []
+        )
+        originals = self.evidence_working_set.view(self.evidence, preferred=preferred)
         # Receipts retain structured IDs/status while evidence is separately addressable.
         receipts: list[ToolReceipt] = []
         remaining = self.max_context_chars // 3
@@ -278,8 +309,13 @@ class Harness:
             questions=list(self.questions),
             facts=list(self.facts),
             receipts=list(reversed(receipts)),
-            evidence=self.evidence.summaries(max_chars=self.max_context_chars // 2),
+            evidence=self.evidence.summaries(
+                max_chars=min(6000, self.max_context_chars // 2)
+            ),
             tools=self.registry.definitions(self.context),
+            research_state=state.view() if isinstance(state, ResearchState) else {},
+            original_evidence=cast(list[dict[str, JsonValue]], originals["records"]),
+            original_evidence_omitted=cast(list[JsonValue], originals["omitted"]),
             turns=list(self.turns),
             draft_to_repair=self.last_draft if self.publication_gap else None,
             publication_gap=(
@@ -300,6 +336,8 @@ class Harness:
     def _tool_progress_phase(call: CapabilityCall) -> str | None:
         if call.name in {
             "record_scenario",
+            "update_research",
+            "inspect_research",
             "report_progress",
             "discover_tools",
             "read_research_state",
@@ -322,10 +360,14 @@ class Harness:
                 self._progress_calls.add(call.call_id)
                 narration = action_narration(call.arguments, context)
                 title, message = narration if narration else (None, None)
-                self.progress.report(phase, title=title, message=message)
+                if self.context.depth == 0:
+                    self.progress.report(phase, title=title, message=message)
                 self.progress.report(
                     phase,
                     task_id=public_action_id(call.call_id),
+                    parent_task_id=context.services.get("task_id")
+                    if isinstance(context.services.get("task_id"), str)
+                    else None,
                     title=title,
                     message=message,
                 )
@@ -364,7 +406,49 @@ class Harness:
         if receipt.call.call_id in self._committed_calls:
             return
         self.context.check_active()
+        state = self.context.services.get("research_state")
+        need = receipt.call.arguments.get("_need_id")
+        focus = self.context.services.get("task_need_ids")
+        need_ids = (
+            [need]
+            if isinstance(need, str)
+            else [str(n) for n in focus]
+            if isinstance(focus, list)
+            else []
+        )
+        if isinstance(state, ResearchState):
+            for item in receipt.outcome.evidence:
+                item.question_ids = list(
+                    dict.fromkeys(
+                        [
+                            *item.question_ids,
+                            *(q for n in need_ids for q in state.question_ids(n)),
+                        ]
+                    )
+                )
         receipt.evidence_ids = self.evidence.add(receipt.outcome.evidence, self.context)
+        if receipt.call.name == "read_evidence":
+            number = receipt.call.arguments.get("citation")
+            item = self.evidence.get(number) if type(number) is int else None
+            if (
+                item is not None
+                and receipt.outcome.data.get("text_hash") == item.text_hash
+            ):
+                receipt.evidence_ids = [cast(int, number)]
+                start = int(str(receipt.call.arguments.get("start_char", 0)))
+                end = min(
+                    len(item.text),
+                    start + int(str(receipt.call.arguments.get("num_chars", 16000))),
+                )
+                self.evidence_working_set.remember(cast(int, number), start, end)
+        else:
+            for number in receipt.evidence_ids:
+                item = self.evidence.get(number)
+                if item is not None:
+                    self.evidence_working_set.remember(number, 0, len(item.text))
+        if isinstance(state, ResearchState):
+            for need_id in need_ids:
+                state.attach(need_id, receipt.evidence_ids)
         if receipt.outcome.status in (
             OutcomeStatus.UNAVAILABLE,
             OutcomeStatus.INVALID,
@@ -392,12 +476,18 @@ class Harness:
         self._seen_calls.add(receipt.call.call_id)
         self._committed_calls.add(receipt.call.call_id)
         self._pending_calls.pop(receipt.call.call_id, None)
-        if receipt.outcome.status == OutcomeStatus.FOUND and receipt.call.name in {
-            "read_evidence",
-            "read_chunk",
-            "read_provision",
-            "read_source_range",
-        }:
+        if (
+            receipt.evidence_ids
+            and receipt.outcome.status in {OutcomeStatus.FOUND, OutcomeStatus.PARTIAL}
+            and receipt.call.name
+            in {
+                "read_evidence",
+                "read_chunk",
+                "read_chunk_context",
+                "read_provision",
+                "read_source_range",
+            }
+        ):
             self._completed_reads[self._read_signature(receipt.call)] = receipt
         if self.progress and receipt.call.call_id in self._progress_calls:
             phase = self._tool_progress_phase(receipt.call)
@@ -420,6 +510,9 @@ class Harness:
                     phase,
                     status=status,
                     task_id=public_action_id(receipt.call.call_id),
+                    parent_task_id=self.context.services.get("task_id")
+                    if isinstance(self.context.services.get("task_id"), str)
+                    else None,
                     title=(
                         narration[0]
                         if (
@@ -434,21 +527,47 @@ class Harness:
             self._progress_calls.discard(receipt.call.call_id)
         self._save()
 
-    @staticmethod
-    def _read_signature(call: CapabilityCall) -> str:
+    def _read_signature(self, call: CapabilityCall) -> str:
+        arguments = {
+            key: value
+            for key, value in call.arguments.items()
+            if key not in {"_public_update", "_need_id"}
+        }
+        number = arguments.get("citation")
+        if (
+            call.name == "read_evidence"
+            and isinstance(number, int)
+            and not isinstance(number, bool)
+        ):
+            item = self.evidence.get(number)
+            if item is not None:
+                start = int(str(arguments.get("start_char", 0)))
+                arguments = {
+                    "citation": number,
+                    "text_hash": item.text_hash,
+                    "start_char": start,
+                    "end_char": min(
+                        len(item.text),
+                        start + int(str(arguments.get("num_chars", 16000))),
+                    ),
+                }
         return json.dumps(
             {
                 "name": call.name,
-                "arguments": {
-                    key: value
-                    for key, value in call.arguments.items()
-                    if key != "_public_update"
-                },
+                "arguments": arguments,
             },
             sort_keys=True,
         )
 
     def _dispatch(self, calls: list[CapabilityCall]) -> list[ToolReceipt]:
+        # Local mutations establish bindings before dependent I/O in the same decision.
+        mutations = [call for call in calls if call.name == "update_research"]
+        if mutations and len(mutations) != len(calls):
+            receipts = self._dispatch(mutations) + self._dispatch(
+                [call for call in calls if call.name != "update_research"]
+            )
+            by_id = {receipt.call.call_id: receipt for receipt in receipts}
+            return [by_id[call.call_id] for call in calls]
         executor = ThreadPoolExecutor(
             max_workers=self.max_workers, thread_name_prefix="asv3-tool"
         )
@@ -570,17 +689,30 @@ class Harness:
                         cast(int, receipt.call.arguments.get("num_chars", 16000))
                     )
                     data["text"] = item.text[start : start + count]
+        originals = json.loads(
+            self.evidence.serialize_records(receipt.evidence_ids, max_chars=20000)
+        )
+        data = outcome.get("data")
+        if receipt.call.name == "read_evidence" and isinstance(data, dict):
+            # Respect the requested range; a short peek is not delivery of the full block.
+            originals = [
+                {
+                    **data,
+                    "end_char": int(str(data.get("start_char", 0)))
+                    + len(str(data.get("text", ""))),
+                    "truncated": receipt.outcome.status != OutcomeStatus.FOUND,
+                }
+            ]
+            outcome["data"] = {
+                key: value for key, value in data.items() if key != "text"
+            }
         return ToolMessage(
             tool_call_id=receipt.call.call_id,
             content=json.dumps(
                 {
                     "outcome": outcome,
                     "evidence_ids": receipt.evidence_ids,
-                    "original_evidence": json.loads(
-                        self.evidence.serialize_records(
-                            receipt.evidence_ids, max_chars=20000
-                        )
-                    ),
+                    "original_evidence": originals,
                 },
                 ensure_ascii=False,
             ),
@@ -588,7 +720,11 @@ class Harness:
 
     def run(self) -> HarnessResult:
         self.stop_reason = None
-        if self.progress:
+        if (
+            self.progress
+            and self.context.depth == 0
+            and self.context.services.get("final_repair") is not True
+        ):
             self.progress.report("started")
         status = OutcomeStatus.PARTIAL
         answer: str | None = None
@@ -596,15 +732,25 @@ class Harness:
             while True:
                 self.context.check_research_active()
                 budget = self.context.budget
-                if budget.snapshot()["tools"] >= budget.limits["tools"]:
+                limit = budget.limits["tools"]
+                if (
+                    self.context.services.get("research_state")
+                    and self.context.services.get("final_repair") is not True
+                    and limit >= 16
+                ):
+                    limit -= 8
+                if budget.snapshot()["tools"] >= limit:
                     raise RunStopped(
                         "Shared tools budget exhausted; recorded originals retained for finalization"
                     )
                 self.context.consume_research_decision()
                 decision = self.decide(self.view())
                 self.context.check_active()
-                self.questions = list(
-                    dict.fromkeys(self.questions + decision.questions)
+                research_state = self.context.services.get("research_state")
+                self.questions = (
+                    list(research_state.questions)
+                    if isinstance(research_state, ResearchState)
+                    else list(dict.fromkeys(self.questions + decision.questions))
                 )
                 self.facts = list(dict.fromkeys(self.facts + decision.facts))
                 if decision.calls:
@@ -624,6 +770,16 @@ class Harness:
                         )
                         self._trim_turns()
                     self._save()
+                    if all(
+                        call.name in {"wait_researcher", "list_researchers"}
+                        for call in decision.calls
+                    ) and any(
+                        call.name == "wait_researcher" for call in decision.calls
+                    ):
+                        wait = self.context.services.get("wait_for_task_change")
+                        if callable(wait):
+                            selected = decision.calls[-1].arguments.get("task_id")
+                            wait(selected if isinstance(selected, str) else None)
                     continue
                 if decision.answer is not None and decision.answer.strip():
                     self.last_draft = decision.answer

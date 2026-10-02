@@ -4,7 +4,7 @@ import difflib
 import json
 import re
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator, Iterator
 from datetime import date
 from hashlib import sha256
 from itertools import islice
@@ -35,8 +35,9 @@ from onyx.db.asv3_corpus import (
     read_source_chunks,
     require_source,
     resolve_source_query_index,
-    source_chunk_position,
     source_diagnostic,
+    source_provision_position,
+    source_sibling_ids,
 )
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.db.models import User
@@ -280,17 +281,69 @@ class CorpusBroker:
                     snapshot = resolve_source_query_index(session, source.id)
                     if snapshot is not None:
                         self.query_indexes[source.id] = snapshot
-            position = source_chunk_position(
-                session,
-                source_id=source.id,
-                chunk_id=chunk_id,
-                index=self.query_indexes.get(source.id),
-                as_of=self.filters.as_of_date,
+            chunks = list(
+                iter_source_chunks_by_ids(
+                    session,
+                    user=self.user,
+                    filters=self.filters,
+                    source_id=source.id,
+                    chunk_ids=(chunk_id,),
+                    index=self.query_indexes.get(source.id),
+                    check_active=context.check_active,
+                )
             )
-        if position is None:
-            return source, None
-        source, chunks, _ = self.page(source_id, context, start=position, limit=100)
         return source, next((chunk for chunk in chunks if chunk.id == chunk_id), None)
+
+    def chunk_siblings(
+        self, seed: CorpusChunk, context: RunContext
+    ) -> tuple[CorpusSource, tuple[str, ...]]:
+        source = self.source(str(seed.source_id), context)
+        with get_session_with_current_tenant() as session:
+            ids = source_sibling_ids(
+                session,
+                user=self.user,
+                filters=self.filters,
+                seed=seed,
+                index=self.query_indexes.get(source.id),
+            )
+        return source, ids
+
+    def sibling_page(
+        self,
+        source: CorpusSource,
+        ids: tuple[str, ...],
+        context: RunContext,
+    ) -> Generator[CorpusChunk, None, None]:
+        with get_session_with_current_tenant() as session:
+            yield from iter_source_chunks_by_ids(
+                session,
+                user=self.user,
+                filters=self.filters,
+                source_id=source.id,
+                chunk_ids=ids,
+                index=self.query_indexes.get(source.id),
+                check_active=context.check_active,
+            )
+
+    def provision_start(
+        self, source_id: str, article: str, qualifier: str | None, context: RunContext
+    ) -> int | None:
+        source = self.source(source_id, context)
+        with get_session_with_current_tenant() as session:
+            with self._index_lock:
+                if source.id not in self.query_indexes:
+                    snapshot = resolve_source_query_index(session, source.id)
+                    if snapshot is not None:
+                        self.query_indexes[source.id] = snapshot
+            return source_provision_position(
+                session,
+                user=self.user,
+                filters=self.filters,
+                source_id=source.id,
+                article=article,
+                qualifier=qualifier,
+                index=self.query_indexes.get(source.id),
+            )
 
     def revalidate_evidence(
         self, items: list[EvidenceItem], context: RunContext
@@ -822,6 +875,77 @@ def build_corpus_specs(broker: CorpusBroker) -> list[ToolSpec]:
             evidence=evidence,
         )
 
+    def read_chunk(args: dict[str, JsonValue], context: RunContext) -> ToolOutcome:
+        source, chunk = broker.chunk(
+            str(args["source_id"]), str(args["chunk_id"]), context
+        )
+        return ToolOutcome(
+            status=OutcomeStatus.FOUND if chunk else OutcomeStatus.NOT_FOUND,
+            summary="Exact authorized canonical chunk; surrounding conditions may require context.",
+            evidence=[evidence_for_chunk(source, chunk)] if chunk else [],
+        )
+
+    def chunk_context(args: dict[str, JsonValue], context: RunContext) -> ToolOutcome:
+        source, seed = broker.chunk(
+            str(args["source_id"]), str(args["chunk_id"]), context
+        )
+        if seed is None:
+            return ToolOutcome(
+                status=OutcomeStatus.NOT_FOUND,
+                summary="The anchor is not visible in this source snapshot.",
+            )
+        source, ids = broker.chunk_siblings(seed, context)
+        offset = int(str(args.get("offset", 0)))
+        limit = int(str(args.get("limit", 100)))
+        selected_ids = ids[offset : offset + limit]
+        selection = EvidenceSelection(source)
+        stream = broker.sibling_page(source, selected_ids, context)
+        try:
+            for chunk in stream:
+                selection.add(chunk)
+                if selection.clipped:
+                    break
+        finally:
+            stream.close()
+        delivered_ids = {item.chunk_id for item in selection.items}
+        # Advance only over delivered originals. Co-positioned chunks remain reachable.
+        consumed = 0
+        for chunk_id in selected_ids:
+            if chunk_id not in delivered_ids:
+                break
+            consumed += 1
+        next_offset = offset + consumed
+        has_more = next_offset < len(ids)
+        return ToolOutcome(
+            status=OutcomeStatus.PARTIAL
+            if has_more
+            else OutcomeStatus.FOUND
+            if selection.items
+            else OutcomeStatus.NOT_FOUND,
+            summary="All immediate-parent sibling IDs selected. Originals are delivered in pages; continue at next_offset when has_more. A sibling family is not proof of whole-article coverage.",
+            data={
+                "seed_chunk_id": seed.id,
+                "parent_heading": list(seed.heading_path[:-1]),
+                "parent_known": bool(seed.heading_path),
+                "sibling_count": len(ids),
+                "offset": offset,
+                "next_offset": next_offset,
+                "has_more": has_more,
+                "evidence_truncated": selection.clipped,
+                "article_closure_complete": False,
+                "sibling_selection_complete": bool(seed.heading_path),
+                "selected_chunk_ids": list(selected_ids),
+                "delivered_chunk_ids": [item.chunk_id for item in selection.items],
+                "oversized_chunk_id": selected_ids[consumed]
+                if selection.clipped and consumed < len(selected_ids)
+                else None,
+                "oversized_chunk_instruction": "Read the exact chunk using read_chunk, then continue at the next sibling offset."
+                if selection.clipped and consumed == 0
+                else None,
+            },
+            evidence=selection.items,
+        )
+
     def provision(args: dict[str, JsonValue], context: RunContext) -> ToolOutcome:
         requested = article_references(str(args["article"]))
         if len(requested) != 1:
@@ -831,6 +955,15 @@ def build_corpus_specs(broker: CorpusBroker) -> list[ToolSpec]:
             )
         target = requested[0].article_no, requested[0].qualifier
         start = int(cast(int, args.get("start", 0)))
+        if "start" not in args:
+            lookup = getattr(broker, "provision_start", None)
+            anchor = (
+                lookup(str(args["source_id"]), target[0], target[1], context)
+                if callable(lookup)
+                else None
+            )
+            if anchor is not None:
+                start = anchor
         stream = broker.iter_chunks(str(args["source_id"]), context, start=start)
         selection = EvidenceSelection(stream.source)
         identity = None
@@ -1172,6 +1305,29 @@ def build_corpus_specs(broker: CorpusBroker) -> list[ToolSpec]:
                 ["source_id"],
             ),
             handler=guarded(read_range),
+        ),
+        ToolSpec(
+            name="read_chunk",
+            description="Read one exact canonical chunk using an already discovered source/chunk anchor.",
+            parameters=schema(
+                {"source_id": SOURCE_FIELD, "chunk_id": {"type": "string"}},
+                ["source_id", "chunk_id"],
+            ),
+            handler=guarded(read_chunk),
+        ),
+        ToolSpec(
+            name="read_chunk_context",
+            description="Select every chunk with the exact same immediate heading parent as the anchor. Read their originals in pages, following next_offset while has_more. No before/after window or sibling-count cutoff. Wider parent or referenced-source reading remains your research decision.",
+            parameters=schema(
+                {
+                    "source_id": SOURCE_FIELD,
+                    "chunk_id": {"type": "string"},
+                    "offset": {"type": "integer", "minimum": 0},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                },
+                ["source_id", "chunk_id"],
+            ),
+            handler=guarded(chunk_context),
         ),
         ToolSpec(
             name="read_provision",

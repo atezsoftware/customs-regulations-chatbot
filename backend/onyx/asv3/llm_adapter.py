@@ -125,6 +125,8 @@ class VerificationResult(BaseModel):
     safe_to_publish: bool = Field(default=False, strict=True)
     unsupported_claims: list[str] = Field(default_factory=list)
     quotation_checks: list[QuotationVerification] = Field(default_factory=list)
+    need_results: list["NeedVerification"] = Field(default_factory=list)
+    omitted_supported_details: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def consistent_publication_assessment(self) -> VerificationResult:
@@ -137,6 +139,13 @@ class VerificationResult(BaseModel):
 
 class QuestionVerification(BaseModel):
     question_id: str
+    status: Literal["supported", "contradicted", "incomplete", "uncertain"]
+    evidence_numbers: list[Annotated[int, Field(strict=True, ge=1)]]
+    missing_conditions: list[str]
+
+
+class NeedVerification(BaseModel):
+    need_id: str
     status: Literal["supported", "contradicted", "incomplete", "uncertain"]
     evidence_numbers: list[Annotated[int, Field(strict=True, ge=1)]]
     missing_conditions: list[str]
@@ -304,6 +313,31 @@ class ResearchModel:
             "stage": stage,
             "notice": "Context excerpts are shortened, not absent. Reopen original evidence by global number; use read_research_state for tool receipts and list_researchers for task state.",
         }
+        originals = compacted.get("original_evidence")
+        if isinstance(originals, list):
+            retained: list[JsonValue] = []
+            previous_omissions = compacted.get("original_evidence_omitted")
+            omitted: list[JsonValue] = (
+                list(previous_omissions) if isinstance(previous_omissions, list) else []
+            )
+            allowance = max(2000, 32000 // (stage + 1))
+            for record in originals:
+                if not isinstance(record, dict):
+                    continue
+                cost = len(json.dumps(record, ensure_ascii=False))
+                if cost <= allowance:
+                    retained.append(record)
+                    allowance -= cost
+                else:
+                    omitted.append(
+                        {
+                            key: record[key]
+                            for key in ("citation", "start_char", "end_char")
+                            if key in record
+                        }
+                    )
+            compacted["original_evidence"] = retained
+            compacted["original_evidence_omitted"] = omitted
         evidence = compacted.get("evidence")
         if isinstance(evidence, list):
             items = []
@@ -357,7 +391,14 @@ class ResearchModel:
             compacted["research_tasks"] = [
                 {
                     key: item[key]
-                    for key in ("task_id", "status", "task", "parent_task_id")
+                    for key in (
+                        "task_id",
+                        "status",
+                        "task",
+                        "parent_task_id",
+                        "need_ids",
+                        "outcome",
+                    )
                     if key in item
                 }
                 for item in tasks
@@ -449,6 +490,8 @@ class ResearchModel:
                 "read_research_state",
                 "wait_researcher",
                 "report_progress",
+                "update_research",
+                "inspect_research",
             }
             working = payload.get("working_locators")
             locators = working.get("locators") if isinstance(working, dict) else None
@@ -558,6 +601,7 @@ class ResearchModel:
         *,
         max_tokens: int,
         research: bool,
+        structured: bool = True,
     ) -> ModelResponse:
         check = (
             self.context.check_research_active
@@ -569,7 +613,12 @@ class ResearchModel:
             check()
             try:
                 return self._invoke_once(
-                    prompt, tools, flow, max_tokens=max_tokens, research=research
+                    prompt,
+                    tools,
+                    flow,
+                    max_tokens=max_tokens,
+                    research=research,
+                    structured=structured,
                 )
             except Exception as error:
                 if attempt == 2 or not is_retryable_provider_error(error):
@@ -598,8 +647,9 @@ class ResearchModel:
         *,
         max_tokens: int,
         research: bool,
+        structured: bool = True,
     ) -> ModelResponse:
-        response_model = structured_model(flow)
+        response_model = structured_model(flow) if structured else None
         from onyx.asv3.evidence import EvidenceLedger
 
         ledger = self.context.services.get("evidence")
@@ -621,8 +671,8 @@ class ResearchModel:
                         payload = parse_json_object(text)
                     except ValueError:
                         continue
-                    evidence = payload.get(
-                        "original_evidence", payload.get("evidence", [])
+                    evidence = payload.get("original_evidence") or payload.get(
+                        "evidence", []
                     )
                     if isinstance(evidence, str):
                         try:
@@ -709,7 +759,17 @@ class ResearchModel:
         )
 
         def valid(result: ModelResponse) -> str:
+            if result.choice.finish_reason in {"length", "max_tokens"}:
+                raise ValueError("ASv3 output was truncated before completion")
             text = result.choice.message.content or ""
+            calls = result.choice.message.tool_calls or []
+            if response_model is not None and calls:
+                if len(calls) != 1 or calls[0].function.name not in {
+                    "json_tool_call",
+                    response_model.__name__,
+                }:
+                    raise ValueError("Unexpected structured-response tool envelope")
+                text = calls[0].function.arguments or ""
             if not text.strip():
                 raise ValueError("ASv3 model returned an empty response")
             if response_model is not None:
@@ -736,7 +796,12 @@ class ResearchModel:
             )
             return valid(
                 self._invoke(
-                    prompt, tools, flow, max_tokens=output, research=not consume_budget
+                    prompt,
+                    tools,
+                    flow,
+                    max_tokens=output,
+                    research=not consume_budget,
+                    structured=False,
                 )
             )
 
@@ -853,10 +918,18 @@ class ResearchModel:
         payload.update(
             language=self.context.language,
             conversation=self.history,
+            task_need_ids=self.context.services.get("task_need_ids", []),
             research_tasks=[
                 {
                     key: task[key]
-                    for key in ("task_id", "status", "task", "parent_task_id")
+                    for key in (
+                        "task_id",
+                        "status",
+                        "task",
+                        "parent_task_id",
+                        "need_ids",
+                        "outcome",
+                    )
                     if key in task
                 }
                 for task in self.pending_tasks()

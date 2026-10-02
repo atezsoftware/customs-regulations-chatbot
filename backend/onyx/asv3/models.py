@@ -60,7 +60,9 @@ _EVIDENCE_FIELDS = frozenset(
     "projection_payload_sha256 binding_sha256 effective_date supersession_id "
     "provision_identifiers decision_numbers validity_start_date validity_end_date "
     "context_projection_id chunk_index source_type search_settings_id committed_epoch "
-    "original_heading_present original_heading_path ordinal".split()
+    "original_heading_present original_heading_path ordinal asv3_context_kind "
+    "asv3_selected_sibling_count asv3_rerank_excerpt_truncated "
+    "asv3_operative_unit_complete asv3_navigation_position_authority".split()
 )
 _LOCATOR_FIELDS = frozenset(
     "page pages sheet cell row column path original_box normalized_box original_width "
@@ -131,7 +133,9 @@ def model_evidence_metadata(metadata: Mapping[str, object]) -> dict[str, JsonVal
         "query_index_uuid index_name query_index_name version revision document_date "
         "legal_dates decision_numbers provision_identifiers target_article_no "
         "target_paragraph_no target_clause_label publication_payload_sha256 payload_sha256 "
-        "article_closure_complete article_closure_remaining_count".split()
+        "article_closure_complete article_closure_remaining_count asv3_context_kind "
+        "asv3_selected_sibling_count asv3_rerank_excerpt_truncated "
+        "asv3_operative_unit_complete".split()
     )
     result = {key: value for key, value in merged.items() if key in keys}
     for canonical_key, aliases in {
@@ -268,6 +272,7 @@ class TaskSnapshot(BaseModel):
     task: str
     status: TaskStatus
     parent_task_id: str | None = None
+    need_ids: list[str] = Field(default_factory=list)
     public_title: str | None = None
     public_message: str | None = None
     updates: list[str] = Field(default_factory=list)
@@ -294,6 +299,9 @@ class HarnessView(BaseModel):
     turns: list[ResearchTurn] = Field(default_factory=list)
     draft_to_repair: str | None = None
     publication_gap: dict[str, JsonValue] | None = None
+    research_state: dict[str, JsonValue] = Field(default_factory=dict)
+    original_evidence: list[dict[str, JsonValue]] = Field(default_factory=list)
+    original_evidence_omitted: list[JsonValue] = Field(default_factory=list)
 
 
 class RunStopped(RuntimeError):
@@ -352,6 +360,17 @@ class SharedBudget:
             if self.used["decisions"] >= research_limit:
                 raise RunStopped(
                     "Research decision budget exhausted; finalization reserve retained"
+                )
+            self.used["decisions"] += 1
+
+    def consume_repair_decision(self) -> None:
+        """Targeted recovery can use the reserve while keeping publication capacity."""
+        with self._lock:
+            if self.used["decisions"] >= self.limits["decisions"] - min(
+                4, self.final_decision_reserve
+            ):
+                raise RunStopped(
+                    "Targeted repair capacity used; publication reserve retained"
                 )
             self.used["decisions"] += 1
 
@@ -435,7 +454,10 @@ class RunContext:
             raise RunStopped("Research deadline exceeded; finalization time retained")
 
     def consume_research_decision(self) -> None:
-        self.budget.consume_research_decision(researcher=self.depth > 0)
+        if self.services.get("final_repair") is True and not self.depth:
+            self.budget.consume_repair_decision()
+        else:
+            self.budget.consume_research_decision(researcher=self.depth > 0)
 
     def cancel(self) -> None:
         self._stop.set()

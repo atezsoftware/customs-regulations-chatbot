@@ -656,7 +656,8 @@ def test_valid_json_incomplete_language_profile_is_repaired_once(defect: str) ->
     assert profile.language == "tr" and profile.external_requested is False
     assert llm.invoke.call_count == 2
     assert llm.config.model_name == "selected-model"
-    for call in llm.invoke.call_args_list:
+    assert llm.invoke.call_args_list[1].kwargs["structured_response_format"] is None
+    for call in llm.invoke.call_args_list[:1]:
         response_format = call.kwargs["structured_response_format"]
         assert response_format["type"] == "json_schema"
         schema = response_format["json_schema"]["schema"]
@@ -725,7 +726,8 @@ def test_verification_uses_typed_provider_schema_and_repairs_incomplete_json() -
     )
     assert VerificationResult.model_validate_json(result).evidence_numbers == [1]
     assert llm.invoke.call_count == 2
-    for call in llm.invoke.call_args_list:
+    assert llm.invoke.call_args_list[1].kwargs["structured_response_format"] is None
+    for call in llm.invoke.call_args_list[:1]:
         response_format = call.kwargs["structured_response_format"]
         schema = response_format["json_schema"]["schema"]
         assert schema["properties"]["status"]["enum"] == [
@@ -1147,3 +1149,47 @@ def test_invalid_token_counter_fails_before_provider_and_unsupported_falls_back(
 
     model = ResearchModel(llm, RunContext(), token_counter=unsupported)
     assert model._tokens("Ücretsiz") == len("Ücretsiz".encode("utf-8"))
+
+
+def test_structured_native_tool_envelope_is_validated_as_provider_output() -> None:
+    from onyx.llm.model_response import ChatCompletionMessageToolCall, FunctionCall
+
+    llm = scripted_model()
+    llm.invoke.return_value = ModelResponse(
+        id="native-json",
+        created="0",
+        choice=Choice(
+            message=Message(
+                content=None,
+                tool_calls=[
+                    ChatCompletionMessageToolCall(
+                        id="json-result",
+                        function=FunctionCall(
+                            name="json_tool_call",
+                            arguments=json.dumps(verification_profile()),
+                        ),
+                    )
+                ],
+            )
+        ),
+    )
+    text = ResearchModel(llm, RunContext()).invoke_text(
+        "Verify", "{}", LLMFlow.ASV3_VERIFICATION
+    )
+    assert json.loads(text)["evidence_numbers"] == [1]
+    assert llm.invoke.call_count == 1
+
+
+def test_broken_structured_envelope_retries_plain_json_with_same_provider() -> None:
+    llm = scripted_model()
+    llm.invoke.side_effect = [
+        text_response({"$FUNCTION_NAME": "json_tool_call"}),
+        text_response(verification_profile()),
+    ]
+    text = ResearchModel(llm, RunContext()).invoke_text(
+        "Verify", "{}", LLMFlow.ASV3_VERIFICATION
+    )
+    assert json.loads(text)["status"] == verification_profile()["status"]
+    assert llm.invoke.call_args_list[0].kwargs["structured_response_format"] is not None
+    assert llm.invoke.call_args_list[1].kwargs["structured_response_format"] is None
+    assert llm.config.model_name == "selected-model"

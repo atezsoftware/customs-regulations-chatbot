@@ -10,6 +10,38 @@ import rehypeKatex from "rehype-katex";
 import rehypeSanitize from "rehype-sanitize";
 import rehypeStringify from "rehype-stringify";
 
+export function selectionCitationClipboard(
+  fragment: DocumentFragment
+): { html: string; text: string } | null {
+  const citations = fragment.querySelectorAll<HTMLElement>(
+    "[data-citation-copy-text]"
+  );
+  if (!citations.length) return null;
+  for (const citation of citations) {
+    const label = citation.dataset.citationCopyText ?? "";
+    if (!/^\[(?:D|Q)?\d+\]$/.test(label)) continue;
+    const target = citation.dataset.citationCopyHref ?? "";
+    const replacement = document.createElement("a");
+    replacement.textContent = label;
+    if (/^https?:\/\//i.test(target) || /^\/(?!\/)/.test(target)) {
+      replacement.setAttribute("href", target);
+    }
+    citation.replaceWith(replacement);
+  }
+  const container = document.createElement("div");
+  container.appendChild(fragment);
+  function plainText(node: Node): string {
+    if (node.nodeType === Node.TEXT_NODE) return node.textContent ?? "";
+    if (node instanceof HTMLElement && node.tagName === "BR") return "\n";
+    const text = Array.from(node.childNodes).map(plainText).join("");
+    return node instanceof HTMLElement &&
+      /^(P|DIV|LI|H[1-6]|TR|PRE)$/.test(node.tagName)
+      ? text + "\n"
+      : text;
+  }
+  return { html: container.innerHTML, text: plainText(container).trimEnd() };
+}
+
 export function handleCopy(
   event: React.ClipboardEvent,
   markdownRef: React.RefObject<HTMLDivElement>
@@ -29,12 +61,16 @@ export function handleCopy(
 
     // Clone selection to get the HTML
     const fragment = range.cloneContents();
-    const tempDiv = document.createElement("div");
-    tempDiv.appendChild(fragment);
-
-    // Create clipboard data with both HTML and plain text
-    event.clipboardData.setData("text/html", tempDiv.innerHTML);
-    event.clipboardData.setData("text/plain", selection.toString());
+    const citationContent = selectionCitationClipboard(fragment);
+    if (citationContent) {
+      event.clipboardData.setData("text/html", citationContent.html);
+      event.clipboardData.setData("text/plain", citationContent.text);
+    } else {
+      const tempDiv = document.createElement("div");
+      tempDiv.appendChild(fragment);
+      event.clipboardData.setData("text/html", tempDiv.innerHTML);
+      event.clipboardData.setData("text/plain", selection.toString());
+    }
   }
 }
 

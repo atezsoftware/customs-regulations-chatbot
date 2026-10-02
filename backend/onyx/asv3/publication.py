@@ -10,6 +10,7 @@ from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.llm_adapter import VerificationResult
 from onyx.asv3.models import OutcomeStatus, ToolOutcome
 from onyx.asv3.quotations import normalized, unmatched_quoted_terms
+from onyx.asv3.research_state import ResearchState
 
 
 def question_inventory(questions: list[str]) -> list[dict[str, JsonValue]]:
@@ -31,6 +32,7 @@ def publication_gap(
     require_direct_authority: bool = False,
     scenario: str = "",
     require_quotation_checks: bool = False,
+    research_state: ResearchState | None = None,
 ) -> ToolOutcome | None:
     reasons: list[str] = []
     cited = set(extract_citation_numbers(answer))
@@ -71,7 +73,9 @@ def publication_gap(
         reasons.append("The draft contains unknown or non-citable source numbers.")
     if require_sources and verification_call_id is not None:
         missing_delivery = (
-            cited | set(review.evidence_numbers)
+            cited
+            | set(review.evidence_numbers)
+            | {n for need in review.need_results for n in need.evidence_numbers}
         ) - ledger.completely_delivered(verification_call_id)
         if missing_delivery:
             reasons.append(
@@ -100,6 +104,46 @@ def publication_gap(
         reasons.append(
             "The answer still contains unsupported conclusions or is unsafe to publish."
         )
+    if review.omitted_supported_details:
+        reasons.append(
+            "Useful original-supported details were lost: "
+            + str(review.omitted_supported_details)
+        )
+    if research_state is not None:
+        state = research_state.export()
+        needs = state.get("needs", [])
+        material = (
+            {
+                str(row["need_id"])
+                for row in needs
+                if isinstance(row, dict)
+                and row.get("material")
+                and row.get("status") != "out_of_scope"
+            }
+            if isinstance(needs, list)
+            else set()
+        )
+        actual_needs = [item.need_id for item in review.need_results]
+        if material != set(actual_needs) or len(actual_needs) != len(material):
+            reasons.append(
+                "Review must assess every material research need against its completion test, independently of which norms the answer names."
+            )
+        for item in review.need_results:
+            if item.status == "supported":
+                if (
+                    item.missing_conditions
+                    or (require_sources and not item.evidence_numbers)
+                    or set(item.evidence_numbers) - cited
+                ):
+                    reasons.append(
+                        f"Incomplete original support for research need: {item.need_id}."
+                    )
+            elif (
+                not allow_explicit_gaps
+                or item.status == "contradicted"
+                or not item.missing_conditions
+            ):
+                reasons.append(f"Unresolved material research need: {item.need_id}.")
     if not allow_explicit_gaps and (
         review.status != "supported" or review.missing_conditions
     ):
@@ -127,7 +171,10 @@ def publication_gap(
             reasons.append(
                 f"The cited answer does not carry support for information need: {result.question_id}."
             )
-    if set(review.evidence_numbers) - allowed.keys():
+    if (
+        set(review.evidence_numbers)
+        | {n for need in review.need_results for n in need.evidence_numbers}
+    ) - allowed.keys():
         reasons.append("Verifier used an unknown or non-citable source.")
     if not reasons:
         return None

@@ -14,10 +14,13 @@ from onyx.asv3.progress import ProgressReporter
 
 
 class ScenarioState:
-    def __init__(self) -> None:
+    def __init__(
+        self, questions: list[str] | None = None, *, frozen: bool = False
+    ) -> None:
         self._lock = threading.RLock()
-        self._questions: list[str] = []
+        self._questions: list[str] = list(questions or [])
         self._facts: list[str] = []
+        self.frozen = frozen
 
     def record(self, questions: list[str], facts: list[str]) -> dict[str, JsonValue]:
         with self._lock:
@@ -25,13 +28,17 @@ class ScenarioState:
             seen = {self._question_key(item) for item in self._questions}
             for question in questions:
                 key = self._question_key(question)
-                if key not in seen:
+                if key not in seen and not self.frozen:
                     self._questions.append(question)
                     seen.add(key)
             self._facts = list(dict.fromkeys(self._facts + facts))
             return {
                 **self.snapshot(),
                 "research_changed": previous != (self._questions, self._facts),
+                "questions_frozen": self.frozen,
+                "instruction": "Original question IDs are stable. Record derived information needs with update_research; do not append paraphrased user questions."
+                if self.frozen
+                else "",
             }
 
     @staticmethod

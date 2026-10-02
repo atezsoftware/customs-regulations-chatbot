@@ -276,7 +276,16 @@ class WorkingMemory:
                                 or changed
                             )
             strategy = hashlib.sha256(
-                encoded([receipt.call.name, args]).encode()
+                encoded(
+                    [
+                        receipt.call.name,
+                        {
+                            key: value
+                            for key, value in args.items()
+                            if key not in {"_public_update", "_need_id"}
+                        },
+                    ]
+                ).encode()
             ).hexdigest()
             substantive = receipt.call.name not in {
                 "record_scenario",
@@ -284,6 +293,12 @@ class WorkingMemory:
                 "read_research_state",
                 "wait_researcher",
                 "inspect_evidence_path",
+                "read_evidence",
+                "read_chunk",
+                "read_provision",
+                "read_source_range",
+                "update_research",
+                "inspect_research",
             }
             new_strategy = substantive and strategy not in self._strategies
             self._strategies.add(strategy)

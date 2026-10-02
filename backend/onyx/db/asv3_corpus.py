@@ -7,7 +7,8 @@ from datetime import date
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import Integer, and_, case, cast, func, or_, select
+from sqlalchemy import Integer, Text, and_, case, cast, func, or_, select
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Session
 
 from onyx.access.access import get_access_for_user_files, get_acl_for_user
@@ -674,6 +675,197 @@ def source_chunk_position(
             RegulatoryChunk.user_file_id == source_id, RegulatoryChunk.id == chunk_id
         )
     )
+
+
+def source_sibling_ids(
+    session: Session,
+    *,
+    user: User,
+    filters: IndexFilters,
+    seed: CorpusChunk,
+    index: PublicationIndexSnapshot | None,
+) -> tuple[str, ...]:
+    """Select all immediate-parent siblings from metadata, without loading text."""
+    source_id = seed.source_id
+    require_source(session, user=user, filters=filters, source_id=source_id)
+    observation = observe_publication_read()
+    as_of = filters.as_of_date or date.today()
+    parent = seed.heading_path[:-1]
+    qualified = source_id in qualified_file_ids(session, (source_id,))
+    if qualified:
+        if index is None:
+            raise CorpusScopeUnavailable(
+                "Local context requires a verified query index snapshot."
+            )
+        identifier = RegulatoryTemporalProjection.canonical_chunk_id
+        position = cast(
+            RegulatoryTemporalProjection.payload["semantic_position"].astext, Integer
+        )
+        ordinal = RegulatoryTemporalProjection.projection_ordinal
+        headings = cast(
+            RegulatoryTemporalProjection.payload["projection"]["source_json"].astext,
+            JSONB,
+        )["heading_path"]
+        statement = (
+            select(identifier)
+            .join(
+                RegulatoryChunk,
+                and_(
+                    RegulatoryChunk.id == identifier,
+                    RegulatoryChunk.user_file_id == source_id,
+                ),
+            )
+            .where(
+                RegulatoryTemporalProjection.user_file_id == source_id,
+                RegulatoryTemporalProjection.index_uuid == index.index_uuid,
+                RegulatoryTemporalProjection.retired_at.is_(None),
+                RegulatoryTemporalProjection.payload["derived_role"].astext
+                == "canonical",
+                or_(
+                    RegulatoryChunk.validity_start_date.is_(None),
+                    RegulatoryChunk.validity_start_date <= as_of,
+                ),
+                or_(
+                    RegulatoryChunk.validity_end_date.is_(None),
+                    RegulatoryChunk.validity_end_date > as_of,
+                ),
+                or_(
+                    RegulatoryTemporalProjection.effective_start.is_(None),
+                    RegulatoryTemporalProjection.effective_start <= as_of,
+                ),
+                or_(
+                    RegulatoryTemporalProjection.effective_end.is_(None),
+                    RegulatoryTemporalProjection.effective_end > as_of,
+                ),
+            )
+        )
+        parent_expression = headings.op("-", return_type=JSONB)(-1)
+    else:
+        identifier, position, ordinal = (
+            RegulatoryChunk.id,
+            RegulatoryChunk.position,
+            RegulatoryChunk.projection_ordinal,
+        )
+        statement = select(identifier).where(
+            RegulatoryChunk.user_file_id == source_id,
+            RegulatoryChunk.chunk_type.is_distinct_from("hierarchical_aggregate"),
+        )
+        if filters.as_of_date is None:
+            statement = statement.where(RegulatoryChunk.status == "active")
+        else:
+            statement = statement.where(
+                or_(
+                    RegulatoryChunk.validity_start_date.is_(None),
+                    RegulatoryChunk.validity_start_date <= as_of,
+                ),
+                or_(
+                    RegulatoryChunk.validity_end_date.is_(None),
+                    RegulatoryChunk.validity_end_date > as_of,
+                ),
+            )
+        headings = RegulatoryChunk.heading_path
+        parent_expression = headings.op("-", return_type=JSONB)(-1)
+    # An unknown heading is not evidence of a shared parent.
+    parent_filter = (
+        and_(func.jsonb_array_length(headings) > 0, parent_expression == list(parent))
+        if seed.heading_path
+        else identifier == seed.id
+    )
+    ids = tuple(
+        session.scalars(
+            statement.where(parent_filter).order_by(
+                position, func.coalesce(ordinal, 0), identifier
+            )
+        )
+    )
+    require_source(session, user=user, filters=filters, source_id=source_id)
+    require_publication_files(observation, (source_id,))
+    return tuple(dict.fromkeys(ids))
+
+
+def source_provision_position(
+    session: Session,
+    *,
+    user: User,
+    filters: IndexFilters,
+    source_id: UUID,
+    article: str,
+    qualifier: str | None,
+    index: PublicationIndexSnapshot | None,
+) -> int | None:
+    """Locate an article from fenced structural metadata without hydrating a source."""
+    from onyx.regulatory.heading_path import parse_regulatory_article_heading
+
+    if not article.isdecimal() or len(article) > 4:
+        return None
+    require_source(session, user=user, filters=filters, source_id=source_id)
+    observation = observe_publication_read()
+    as_of = filters.as_of_date or date.today()
+    if source_id in qualified_file_ids(session, (source_id,)):
+        if index is None:
+            raise CorpusScopeUnavailable(
+                "Provision locator requires a verified index snapshot."
+            )
+        headings = cast(
+            RegulatoryTemporalProjection.payload["projection"]["source_json"].astext,
+            JSONB,
+        )["heading_path"]
+        position = cast(
+            RegulatoryTemporalProjection.payload["semantic_position"].astext, Integer
+        )
+        statement = select(position, headings).where(
+            RegulatoryTemporalProjection.user_file_id == source_id,
+            RegulatoryTemporalProjection.index_uuid == index.index_uuid,
+            RegulatoryTemporalProjection.retired_at.is_(None),
+            RegulatoryTemporalProjection.payload["derived_role"].astext == "canonical",
+            or_(
+                RegulatoryTemporalProjection.effective_start.is_(None),
+                RegulatoryTemporalProjection.effective_start <= as_of,
+            ),
+            or_(
+                RegulatoryTemporalProjection.effective_end.is_(None),
+                RegulatoryTemporalProjection.effective_end > as_of,
+            ),
+        )
+    else:
+        headings, position = RegulatoryChunk.heading_path, RegulatoryChunk.position
+        statement = select(position, headings).where(
+            RegulatoryChunk.user_file_id == source_id,
+            RegulatoryChunk.chunk_type.is_distinct_from("hierarchical_aggregate"),
+        )
+        if filters.as_of_date is None:
+            statement = statement.where(RegulatoryChunk.status == "active")
+        else:
+            statement = statement.where(
+                or_(
+                    RegulatoryChunk.validity_start_date.is_(None),
+                    RegulatoryChunk.validity_start_date <= as_of,
+                ),
+                or_(
+                    RegulatoryChunk.validity_end_date.is_(None),
+                    RegulatoryChunk.validity_end_date > as_of,
+                ),
+            )
+    # SQL only narrows candidates; exact own-heading identity is checked below.
+    pattern = rf"(madde[[:space:]]+{article}([^0-9]|$)|{article}[[:space:].]+madde)"
+    rows = session.execute(
+        statement.where(cast(headings, Text).op("~*")(pattern))
+        .order_by(position)
+        .limit(64)
+    )
+    result = None
+    for row in rows:
+        for heading in reversed(row[1] or []):
+            own = parse_regulatory_article_heading(str(heading))
+            if own:
+                if (own.article_no, own.qualifier) == (article, qualifier):
+                    result = int(row[0])
+                break
+        if result is not None:
+            break
+    require_source(session, user=user, filters=filters, source_id=source_id)
+    require_publication_files(observation, (source_id,))
+    return result
 
 
 def _bounded_temporal_bindings(

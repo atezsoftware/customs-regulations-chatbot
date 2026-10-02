@@ -236,14 +236,19 @@ export const MemoizedLink = memo(
         : question?.question || "Question";
 
       return (
-        <SourceTag
-          variant="inlineCitation"
-          displayName={displayName}
-          sources={[sourceInfo]}
-          onSourceClick={handleSourceClick}
-          showDetailsCard
-          className="mr-0.5"
-        />
+        <span
+          data-citation-copy-text={value?.toString()}
+          data-citation-copy-href={href || document?.link || ""}
+        >
+          <SourceTag
+            variant="inlineCitation"
+            displayName={displayName}
+            sources={[sourceInfo]}
+            onSourceClick={handleSourceClick}
+            showDetailsCard
+            className="mr-0.5"
+          />
+        </span>
       );
     }
 

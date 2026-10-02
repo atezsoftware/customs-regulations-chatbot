@@ -39,6 +39,7 @@ from onyx.asv3.progress import ProgressEvent, ProgressReporter
 from onyx.asv3.publication import publication_gap, question_inventory
 from onyx.asv3.quotations import unmatched_quoted_terms
 from onyx.asv3.registry import CapabilityRegistry, build_core_specs
+from onyx.asv3.research_state import ResearchState, build_research_specs
 from onyx.asv3.sandbox import build_sandbox_specs
 from onyx.asv3.scenario import initial_questions
 from onyx.asv3.search_adapter import build_search_adapter
@@ -126,11 +127,17 @@ and 'native_citation' labels an excerpt extracted from an original file (derived
 
 
 def _evidence_record(
-    ledger: EvidenceLedger, draft: str, max_chars: int = 180000
+    ledger: EvidenceLedger,
+    draft: str,
+    max_chars: int = 180000,
+    *,
+    preferred_numbers: list[int] | None = None,
 ) -> str:
     numbers = list(extract_citation_numbers(draft))
     required = tuple(n for n in numbers if ledger.get(n) is not None)
-    if numbers:
+    if preferred_numbers:
+        numbers = list(dict.fromkeys([*required, *preferred_numbers]))
+    elif numbers:
         source_ids = {
             item.source_id for n in required if (item := ledger.get(n)) is not None
         }
@@ -275,9 +282,12 @@ def run_asv3_loop(
         inject_memories_in_prompt=inject_memories_in_prompt,
         user_identity=user_identity,
     )
-    scenarios = ScenarioState()
-    scenarios.record(initial_questions(question), [])
+    if previous is not None:
+        context.run_id = str(previous["run_id"])
+    scenarios = ScenarioState(initial_questions(question), frozen=True)
     context.services["scenario_state"] = scenarios
+    research_state = ResearchState(initial_questions(question), context)
+    context.services["research_state"] = research_state
     emitted: list[dict[str, JsonValue]] = []
     checkpoint_lock = threading.RLock()
     checkpoint_sequence = 0
@@ -457,8 +467,7 @@ def run_asv3_loop(
     def researcher(
         task: str, child: RunContext, updates: Callable[[], list[str]]
     ) -> ToolOutcome:
-        local_scenario = ScenarioState()
-        local_scenario.record([task], [])
+        local_scenario = ScenarioState([task], frozen=True)
         child.services["scenario_state"] = local_scenario
         child.services["search_message_history"] = [
             ChatMessageSimple(
@@ -488,6 +497,8 @@ def run_asv3_loop(
             decide=researcher_model.decide,
             evidence=ledger,
             on_receipt=record,
+            progress=progress,
+            report_terminal=False,
             max_workers=2,
         ).run()
         return ToolOutcome(
@@ -519,6 +530,7 @@ def run_asv3_loop(
         + build_sandbox_specs(broker)
         + workers.tool_specs()
         + build_supplemental_specs()
+        + build_research_specs(research_state, ledger)
         + external_specs
     )
     for spec in registry_specs:
@@ -526,6 +538,8 @@ def run_asv3_loop(
     model.pending_tasks = lambda: [
         task.model_dump(mode="json") for task in workers.list()
     ]
+
+    context.services["wait_for_task_change"] = workers.wait_for_change
 
     def review_answer(
         draft: str,
@@ -542,6 +556,7 @@ def run_asv3_loop(
             ledger,
             draft + ("\n" + preservation_reference if preservation_reference else ""),
             max_chars=max(8000, min(180000, (llm.config.max_input_tokens - 18000) * 2)),
+            preferred_numbers=research_state.preferred_citations(),
         )
         if research:
             context.consume_research_decision()
@@ -564,6 +579,7 @@ def run_asv3_loop(
                     "evidence": evidence,
                     "available_evidence": ledger.summaries(max_chars=6000),
                     "authority_obligations": authority_obligations(draft, ledger),
+                    "research_state": research_state.view(max_chars=24000),
                     "unmatched_quoted_terms": unmatched_quoted_terms(
                         draft, question, ledger
                     ),
@@ -610,7 +626,13 @@ def run_asv3_loop(
         questions = harness.view().questions
         fingerprint = hashlib.sha256(
             json.dumps(
-                [draft, questions, scenarios.snapshot(), ledger.authority_metadata()],
+                [
+                    draft,
+                    questions,
+                    scenarios.snapshot(),
+                    ledger.authority_metadata(),
+                    research_state.export(),
+                ],
                 ensure_ascii=False,
                 sort_keys=True,
             ).encode()
@@ -638,6 +660,7 @@ def run_asv3_loop(
             require_direct_authority=True,
             scenario=question,
             require_quotation_checks=True,
+            research_state=research_state,
         )
         if gap is None:
             approved_draft, approved_review, approved_call_id = draft, review, call_id
@@ -726,7 +749,6 @@ def run_asv3_loop(
         # A shared decision stop is not evidence that in-flight source reads finished.
         if result.status != OutcomeStatus.FOUND:
             workers.settle()
-        workers.close()
         checkpoint(harness.snapshot())
         draft = result.answer or harness.last_draft or ""
         complete = result.status == OutcomeStatus.FOUND
@@ -765,6 +787,7 @@ def run_asv3_loop(
                 require_direct_authority=True,
                 scenario=question,
                 require_quotation_checks=True,
+                research_state=research_state,
             )
         else:
             previous_review = latest_review
@@ -774,6 +797,7 @@ def run_asv3_loop(
                 max_chars=max(
                     8000, min(180000, (llm.config.max_input_tokens - 18000) * 2)
                 ),
+                preferred_numbers=research_state.preferred_citations(),
             )
             final = model.invoke_text(
                 FINAL_PROMPT,
@@ -788,6 +812,7 @@ def run_asv3_loop(
                         else None,
                         "evidence": evidence,
                         "research_status": result.status.value,
+                        "research_state": research_state.view(max_chars=24000),
                         "assistant_instructions": custom_agent_prompt or "",
                     },
                     ensure_ascii=False,
@@ -795,6 +820,7 @@ def run_asv3_loop(
                 LLMFlow.ASV3_FINAL,
                 max_tokens=9000,
             )
+            harness.last_draft = final
             checkpoint(harness.snapshot())
             # Review the actual published wording, not just the coordinator's draft.
             final_review = review_answer(
@@ -816,7 +842,95 @@ def run_asv3_loop(
                 require_direct_authority=final_review.status == "supported",
                 scenario=question,
                 require_quotation_checks=True,
+                research_state=research_state,
             )
+        if (
+            final_gap is not None
+            and context.budget.snapshot()["decisions"]
+            < context.budget.limits["decisions"] - 4
+        ):
+            # The final review feeds the same research loop, with its exact candidate.
+            harness.last_draft = final
+            harness.publication_gap = final_gap
+            checkpoint(harness.snapshot())
+            context.services["final_repair"] = True
+            try:
+                repaired = harness.run()
+            finally:
+                context.services.pop("final_repair", None)
+            workers.settle()
+            if (
+                repaired.status == OutcomeStatus.FOUND
+                and approved_draft == repaired.answer
+                and approved_review is not None
+            ):
+                final, final_review = approved_draft, approved_review
+                complete = True
+                final_gap = publication_gap(
+                    final,
+                    final_review,
+                    harness.view().questions,
+                    ledger,
+                    require_sources=profile.requires_sources,
+                    verification_call_id=approved_call_id,
+                    require_direct_authority=True,
+                    scenario=question,
+                    require_quotation_checks=True,
+                    research_state=research_state,
+                )
+            else:
+                # Keep the repaired candidate and only publish supported portions.
+                draft = harness.last_draft or final
+                if (
+                    context.budget.snapshot()["decisions"]
+                    <= context.budget.limits["decisions"] - 4
+                ):
+                    final = model.invoke_text(
+                        FINAL_PROMPT,
+                        json.dumps(
+                            {
+                                "language": context.language,
+                                "question": question,
+                                "scenario": scenarios.snapshot(),
+                                "draft": draft,
+                                "review": latest_review.model_dump(mode="json")
+                                if latest_review
+                                else None,
+                                "research_state": research_state.view(max_chars=24000),
+                                "evidence": _evidence_record(
+                                    ledger,
+                                    draft,
+                                    preferred_numbers=research_state.preferred_citations(),
+                                ),
+                                "research_status": "incomplete",
+                                "assistant_instructions": custom_agent_prompt or "",
+                            },
+                            ensure_ascii=False,
+                        ),
+                        LLMFlow.ASV3_FINAL,
+                        max_tokens=9000,
+                    )
+                    harness.last_draft = final
+                    final_review = review_answer(
+                        final,
+                        research=False,
+                        preservation_reference=draft,
+                        previous_review=latest_review,
+                    )
+                    final_gap = publication_gap(
+                        final,
+                        final_review,
+                        harness.view().questions,
+                        ledger,
+                        require_sources=profile.requires_sources,
+                        allow_explicit_gaps=True,
+                        verification_call_id=model.last_call_id,
+                        require_direct_authority=final_review.status == "supported",
+                        scenario=question,
+                        require_quotation_checks=True,
+                        research_state=research_state,
+                    )
+                complete = False
         final_publication_gap = final_gap
         publication_stop_reason = (
             "publication_guard_rejected"

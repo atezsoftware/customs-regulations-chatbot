@@ -279,7 +279,7 @@ def test_inventory_preserves_explicit_expansion_and_bounds_initial_packets(
 
 @pytest.mark.usefixtures("tenant_context")
 @pytest.mark.parametrize("inventory_source", [48, 2500], indirect=True)
-def test_initial_packets_preserve_all_seeds_and_read_only_bounded_originals(
+def test_initial_packets_select_all_frozen_parent_siblings_without_source_inventory(
     db_session: Session,
     inventory_source: tuple[
         UserFile, PublicationIndexSnapshot, list[RegulatoryTemporalProjection]
@@ -339,9 +339,9 @@ def test_initial_packets_preserve_all_seeds_and_read_only_bounded_originals(
     assert [packet.primary_member.regulatory_chunk_id for packet in packets] == [
         seed.regulatory_chunk_id for seed in seeds
     ]
-    assert all(len(packet.members) <= 5 for packet in packets)
+    assert all(len(packet.members) == 20 for packet in packets)
     assert [member.regulatory_chunk_id for member in packets[0].members] == [
-        row.canonical_chunk_id for row in rows[:3]
+        row.canonical_chunk_id for row in rows[:20]
     ]
     assert all(
         (member.heading_path or [])[:3] == ["Law", "Ek 1", "MADDE 3"]
@@ -349,7 +349,7 @@ def test_initial_packets_preserve_all_seeds_and_read_only_bounded_originals(
         for member in packet.members
     )
     assert len(requested_ids) == 1
-    assert len(requested_ids[0]) == 22 < len(rows)
+    assert len(requested_ids[0]) == 20 < len(rows)
     assert all(
         member.content.startswith("Original operative paragraph")
         for packet in packets

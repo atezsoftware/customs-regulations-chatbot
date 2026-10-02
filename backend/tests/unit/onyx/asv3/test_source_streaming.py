@@ -44,6 +44,13 @@ class LazyBroker(CorpusBroker):
         self.max_live_chunks = 0
         self.pages: list[tuple[str, int, date | None]] = []
 
+    def provision_start(
+        self, source_id: str, article: str, qualifier: str | None, context: RunContext
+    ) -> int | None:
+        del article, qualifier
+        self.source(source_id, context)
+        return None
+
     def source(self, source_id: str, context: RunContext) -> CorpusSource:
         context.check_active()
         if source_id not in self.items:

@@ -22,6 +22,7 @@ from onyx.asv3.models import (
     ToolSpec,
 )
 from onyx.asv3.progress import ProgressReporter
+from onyx.asv3.research_state import ResearchState
 
 ResearchRunner = Callable[
     [str, RunContext, Callable[[], builtins.list[str]]], ToolOutcome
@@ -65,6 +66,7 @@ class WorkerPool:
         request_context: RunContext | None = None,
         public_title: str | None = None,
         public_message: str | None = None,
+        need_ids: builtins.list[str] | None = None,
     ) -> str:
         delegation = request_context or self.context
         delegation.check_active()
@@ -79,7 +81,23 @@ class WorkerPool:
                 raise ValueError(
                     "Task narration must use natural question-language labels without internal details"
                 )
+        needs = list(dict.fromkeys(need_ids or []))
+        state = delegation.services.get("research_state")
+        if needs and (
+            not isinstance(state, ResearchState)
+            or any(not state.has_need(n) for n in needs)
+        ):
+            raise ValueError(
+                "Delegated needs must exist in the request-bound research state"
+            )
         with self._lock:
+            for snapshot in self._tasks.values():
+                if (
+                    snapshot.status in (TaskStatus.QUEUED, TaskStatus.RUNNING)
+                    and needs
+                    and set(needs) == set(snapshot.need_ids)
+                ):
+                    return snapshot.task_id
             if self._closed or len(self._tasks) >= self.max_tasks:
                 raise RunStopped("Research task capacity exhausted")
             if delegation.depth >= delegation.max_depth:
@@ -88,12 +106,14 @@ class WorkerPool:
             child = delegation.child()
             child.services["task_id"] = task_id
             child.services["parent_task_id"] = parent_task_id
+            child.services["task_need_ids"] = needs
             self._contexts[task_id] = child
             self._tasks[task_id] = TaskSnapshot(
                 task_id=task_id,
                 task=task,
                 parent_task_id=parent_task_id,
                 status=TaskStatus.QUEUED,
+                need_ids=needs,
                 public_title=public_title,
                 public_message=public_message,
             )
@@ -213,6 +233,7 @@ class WorkerPool:
                 request_context=request_context,
                 public_title=snapshot.public_title,
                 public_message=snapshot.public_message,
+                need_ids=snapshot.need_ids,
             )
 
     def cancel(self, task_id: str) -> None:
@@ -282,6 +303,29 @@ class WorkerPool:
                     return [self._task_view(task) for task in tasks]
                 self._changed.wait(min(remaining, 0.05))
 
+    def wait_for_change(self, task_id: str | None = None) -> None:
+        """Await a chosen task without repeated empty coordinator decisions."""
+        state = self.context.services.get("research_state")
+        revision = state.revision if isinstance(state, ResearchState) else None
+        with self._changed:
+            selected = [self._tasks[task_id]] if task_id else list(self._tasks.values())
+            pending = {
+                task.task_id
+                for task in selected
+                if task.status in (TaskStatus.RUNNING, TaskStatus.QUEUED)
+            }
+            while pending:
+                self.context.check_research_active()
+                if any(
+                    self._tasks[key].status
+                    not in (TaskStatus.RUNNING, TaskStatus.QUEUED)
+                    for key in pending
+                ):
+                    return
+                if isinstance(state, ResearchState) and state.revision != revision:
+                    return
+                self._changed.wait(0.25)
+
     def close(self) -> None:
         with self._lock:
             self._closed = True
@@ -318,6 +362,7 @@ class WorkerPool:
 
         def spawn(args: dict[str, JsonValue], context: RunContext) -> ToolOutcome:
             parent = context.services.get("task_id")
+            raw_needs = args.get("need_ids")
             task_id = self.spawn(
                 str(args["task"]),
                 request_context=context,
@@ -328,10 +373,13 @@ class WorkerPool:
                 public_message=str(args["public_message"])
                 if args.get("public_message")
                 else None,
+                need_ids=[str(item) for item in raw_needs]
+                if isinstance(raw_needs, list)
+                else None,
             )
             return ToolOutcome(
                 status=OutcomeStatus.FOUND,
-                summary="Researcher queued",
+                summary="Researcher queued or existing assigned need reused",
                 data={"task_id": task_id},
             )
 
@@ -385,6 +433,11 @@ class WorkerPool:
                 parameters=schema(
                     {
                         "task": message,
+                        "need_ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "maxItems": 20,
+                        },
                         "public_title": {
                             "type": "string",
                             "minLength": 1,

@@ -495,6 +495,19 @@ def test_runtime_parallel_sources_full_original_review_and_final_citations(
     assert llm.config.model_provider == provider and llm.config.model_name == model_name
 
 
+def reserve_final_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Exercise rejection when the run has no post-publication repair allocation."""
+
+    class FinalOnlyContext(RunContext):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(
+                budget=SharedBudget(max_decisions=11, final_decision_reserve=4),
+                **kwargs,
+            )
+
+    monkeypatch.setattr(runtime, "RunContext", FinalOnlyContext)
+
+
 def incomplete_script(llm: MagicMock) -> list[ModelResponse | Exception]:
     script = list(llm.invoke.side_effect)
     return [
@@ -556,6 +569,7 @@ def test_numbered_questions_are_verified_separately_and_approved_details_are_unc
 def test_partial_rewrite_verifier_receives_draft_details_and_their_originals(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    reserve_final_only(monkeypatch)
     from onyx.prompts.asv3.research import FINAL_PROMPT
 
     kwargs, _broker, llm, _checkpoints, _queue = setup_run(
@@ -863,6 +877,7 @@ def test_runtime_follows_named_statutory_basis_before_accepting_a_supported_draf
 def test_runtime_drops_unrecorded_citation_and_publishes_only_localized_gap(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    reserve_final_only(monkeypatch)
     kwargs, _broker, llm, checkpoints, queue = setup_run(monkeypatch, "Kaynak [999].")
     llm.invoke.side_effect = incomplete_script(llm)
     runtime.run_asv3_loop(**kwargs)
@@ -886,6 +901,7 @@ def test_runtime_drops_unrecorded_citation_and_publishes_only_localized_gap(
 def test_runtime_supported_draft_does_not_authorize_unsafe_final_wording(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    reserve_final_only(monkeypatch)
     unsafe_final = "Her bedelsiz yeni makine vergiden muaftır [1]."
     kwargs, _broker, llm, checkpoints, queue = setup_run(monkeypatch, unsafe_final)
     script = incomplete_script(llm)
@@ -958,6 +974,7 @@ def test_runtime_cancel_discards_late_source_results_and_durable_writes(
 def test_runtime_incident_2888_zero_evidence_never_publishes_legal_memory(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    reserve_final_only(monkeypatch)
     kwargs, broker, llm, checkpoints, queue = setup_run(monkeypatch)
     language_response = list(llm.invoke.side_effect)[0]
     failures = {
@@ -1321,6 +1338,7 @@ def test_runtime_researchers_keep_scenario_facts_isolated_and_selected_llm(
 def test_incomplete_supported_review_retains_exact_publication_rejection_diagnostics(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    reserve_final_only(monkeypatch)
     kwargs, _broker, llm, checkpoints, queue = setup_run(monkeypatch)
     script = incomplete_script(llm)
     review = supported_review([1, 2])
@@ -1375,3 +1393,37 @@ def test_verified_draft_publication_still_revalidates_acl_and_rejects_late_cance
         isinstance(packet.obj, (AgentResponseStart, AgentResponseDelta, CitationInfo))
         for packet in packets(queue)
     )
+
+
+def test_rejected_final_candidate_can_reopen_research_and_publish_exact_repaired_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kwargs, _broker, llm, checkpoints, queue = setup_run(
+        monkeypatch, final="Only first rule [1]."
+    )
+    script = incomplete_script(llm)
+    script[-1] = unsafe_review("The second rule and later procedure were omitted")
+    corrected = (
+        "First rule and its conditions [1]. Second rule and later procedure [2]."
+    )
+    llm.invoke.side_effect = [
+        *script,
+        response(calls=[("read_evidence", {"citation": 2})]),
+        response(corrected),
+        supported_review([1, 2]),
+    ]
+    runtime.run_asv3_loop(**kwargs)
+    saved = checkpoints[-1]
+    assert saved["publication_status"] == "found"
+    assert saved["last_draft"] == corrected
+    assert saved["publication_stop_reason"] == "verified_draft_published"
+    assert saved["final_publication_gap"] is None
+    assert kwargs["state_container"].answer_tokens.startswith("First rule")
+    assert any(isinstance(packet.obj, CitationInfo) for packet in packets(queue))
+    repair_call = next(
+        call
+        for call in llm.invoke.call_args_list
+        if request_data(call.kwargs).get("draft_to_repair") == "Only first rule [1]."
+    )
+    assert request_data(repair_call.kwargs)["publication_gap"]
+    assert llm.config.model_name == "scripted"

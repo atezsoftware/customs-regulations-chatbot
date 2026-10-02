@@ -403,3 +403,118 @@ def test_pc_membership_is_not_bypassed_by_sets_attachments_or_changed_identity(
         db_session.delete(owner)
         db_session.delete(stranger)
         db_session.commit()
+
+
+@pytest.mark.usefixtures("tenant_context")
+def test_structural_locator_and_all_parent_siblings_use_actual_fenced_sql(
+    db_session: Session, pc_corpus: DocumentSet
+) -> None:
+    from onyx.db.asv3_corpus import source_provision_position, source_sibling_ids
+
+    owner = create_test_user(db_session, "asv3_bounded_context")
+    stranger = create_test_user(db_session, "asv3_bounded_context_stranger")
+    pc_corpus.user_id = owner.id
+    source = UserFile(
+        id=uuid4(),
+        user_id=owner.id,
+        file_id=uuid4().hex,
+        name="Metadata source",
+        file_type="text/plain",
+    )
+    db_session.add(source)
+    db_session.flush()
+    db_session.add(
+        DocumentSet__UserFile(document_set_id=pc_corpus.id, user_file_id=source.id)
+    )
+    rows = [
+        RegulatoryChunk(
+            id=uuid4().hex,
+            user_file_id=source.id,
+            text=f"Operative condition {n}",
+            position=4000 + n * 100,
+            projection_ordinal=n,
+            heading_path=["MADDE 27", f"Clause {n}"],
+            status="active",
+        )
+        for n in range(9)
+    ]
+    rows[3].position = rows[2].position
+    excluded = RegulatoryChunk(
+        id=uuid4().hex,
+        user_file_id=source.id,
+        text="Different article",
+        position=4199,
+        projection_ordinal=10,
+        heading_path=["MADDE 28", "Clause 1"],
+        status="active",
+    )
+    old = RegulatoryChunk(
+        id=uuid4().hex,
+        user_file_id=source.id,
+        text="Expired condition",
+        position=4200,
+        projection_ordinal=11,
+        heading_path=["MADDE 27", "Clause 1"],
+        status="superseded",
+        validity_end_date=date(2025, 1, 1),
+    )
+    descendant = RegulatoryChunk(
+        id=uuid4().hex,
+        user_file_id=source.id,
+        text="Deeper detail",
+        position=4201,
+        projection_ordinal=12,
+        heading_path=["MADDE 27", "Clause 1", "Detail"],
+        status="active",
+    )
+    db_session.add_all([*rows, excluded, old, descendant])
+    db_session.commit()
+    try:
+        filters = resolve_pc_corpus_scope(
+            db_session, user=owner, filters=IndexFilters(access_control_list=[])
+        )
+        assert (
+            source_provision_position(
+                db_session,
+                user=owner,
+                filters=filters,
+                source_id=source.id,
+                article="27",
+                qualifier=None,
+                index=None,
+            )
+            == 4000
+        )
+        _, visible, _ = read_source_chunks(
+            db_session,
+            user=owner,
+            filters=filters,
+            source_id=source.id,
+            start=4200,
+            limit=10,
+        )
+        seed = next(row for row in visible if row.id == rows[2].id)
+        neighbors = source_sibling_ids(
+            db_session,
+            user=owner,
+            filters=filters,
+            seed=seed,
+            index=None,
+        )
+        assert neighbors == tuple(row.id for row in rows)
+        with pytest.raises(PermissionError):
+            source_sibling_ids(
+                db_session,
+                user=stranger,
+                filters=filters,
+                seed=seed,
+                index=None,
+            )
+    finally:
+        db_session.rollback()
+        db_session.delete(source)
+        pc_corpus.user_id = None
+        db_session.commit()
+        db_session.delete(owner)
+        db_session.delete(stranger)
+        db_session.commit()

@@ -147,7 +147,8 @@ def test_requested_original_passage_survives_compact_audit_receipt() -> None:
         nonlocal called
         if called:
             native_result = json.loads(view.turns[-1].results[0].content)
-            assert native_result["outcome"]["data"]["text"] == text
+            assert native_result["original_evidence"][0]["text"] == text
+            assert "text" not in native_result["outcome"]["data"]
             assert native_result["outcome"]["status"] == "found"
             assert len(view.receipts[-1].outcome.data["text"]) < len(text)
             return Decision(answer="Apply the final condition [1].")

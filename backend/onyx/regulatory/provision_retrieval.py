@@ -942,7 +942,7 @@ def _build_asv3_initial_rerank_packets(
             _chunk_from_projection(
                 projection,
                 seed,
-                relevance_explanation="Verified local navigation context",
+                relevance_explanation="Verified immediate-parent sibling context",
             )
             for projection in projections
         ]
@@ -965,12 +965,15 @@ def _build_asv3_initial_rerank_packets(
             if chars + size <= max_chars:
                 bounded.append(member)
                 chars += size
-        for member in bounded:
+        excerpt_truncated = len(bounded) < len(members) or chars > max_chars
+        for member in members:
             member.metadata = {
                 **member.metadata,
-                "asv3_context_kind": "bounded_initial_neighborhood",
+                "asv3_context_kind": "all_immediate_parent_siblings",
+                "asv3_selected_sibling_count": str(len(members)),
+                "asv3_rerank_excerpt_truncated": str(excerpt_truncated).lower(),
                 "asv3_operative_unit_complete": "false",
-                "asv3_navigation_position_authority": "current_canonical_lead",
+                "asv3_navigation_position_authority": "verified_frozen_parent",
             }
         content = _packet_document(bounded)[:max_chars]
         candidate = primary.model_copy(
@@ -978,12 +981,12 @@ def _build_asv3_initial_rerank_packets(
                 "content": content,
                 "blurb": content[:_SIBLING_BLURB_CHARS],
                 "match_highlights": [],
-                "relevance_explanation": "Bounded initial context; wider provision reading requires explicit expansion",
+                "relevance_explanation": "All immediate-parent siblings retained; scoring text is a bounded excerpt",
             }
         )
         packets.append(
             RegulatoryRerankPacket(
-                candidate=candidate, primary_member=primary, members=tuple(bounded)
+                candidate=candidate, primary_member=primary, members=tuple(members)
             )
         )
     return packets

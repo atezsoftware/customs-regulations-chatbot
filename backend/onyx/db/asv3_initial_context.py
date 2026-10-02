@@ -1,4 +1,4 @@
-"""Bounded navigation leads with freshly verified, independently citable originals."""
+"""Same-parent navigation with freshly verified, independently citable originals."""
 
 import hashlib
 import json
@@ -7,15 +7,14 @@ from datetime import date
 from time import perf_counter
 from uuid import UUID
 
-from sqlalchemy import and_, or_, select, true, union_all
-from sqlalchemy.orm import Session, aliased
+from sqlalchemy import and_, cast, func, or_, select
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.orm import Session
 
 from onyx.db.asv3_candidate_inventory import current_asv3_source_inventory_scope
-from onyx.db.models import RegulatoryChunk
+from onyx.db.models import RegulatoryChunk, RegulatoryTemporalProjection
 from onyx.db.regulatory_chunks import (
     RegulatoryChunkProjection,
-    _fold_text,
-    _last_explicit_article_anchor,
 )
 from onyx.db.regulatory_public_reads import iter_public_temporal_bindings
 from onyx.document_index.publication_models import PublicationIndexSnapshot
@@ -33,11 +32,11 @@ def get_asv3_initial_rerank_context(
     indexes: dict[UUID, PublicationIndexSnapshot],
     as_of_date: date,
 ) -> dict[str, tuple[RegulatoryChunkProjection, ...]]:
-    """Use current positions only as leads, never as historical completeness proof.
+    """Use frozen parent metadata, never infer whole-provision completeness.
 
-    At most two neighboring canonical rows on either side are inspected per seed.
-    Immutable selected bindings decide dates, index identity, text and parent scope.
-    Wider operative-unit reading remains a separate harness action.
+    Every sibling in the same immediate heading parent is selected from frozen
+    metadata. Only that family's originals are hydrated and verified. No full-source
+    inventory or positional window is used; wider reading remains a harness decision.
     """
     scope = current_asv3_source_inventory_scope()
     if scope is None:
@@ -55,66 +54,93 @@ def get_asv3_initial_rerank_context(
     if not unique_ids:
         return {}
     observation = observe_publication_read()
-    seeds = aliased(RegulatoryChunk, name="asv3_context_seed")
-    neighbor = aliased(RegulatoryChunk, name="asv3_context_neighbor")
-    seed_filter = and_(seeds.id.in_(unique_ids), seeds.user_file_id.in_(indexes))
-    visible_neighbor = and_(
-        neighbor.user_file_id == seeds.user_file_id,
-        or_(
-            neighbor.validity_start_date.is_(None),
-            neighbor.validity_start_date <= as_of_date,
-        ),
-        or_(
-            neighbor.validity_end_date.is_(None),
-            neighbor.validity_end_date > as_of_date,
-        ),
+    projection = RegulatoryTemporalProjection
+    canonical = RegulatoryChunk
+    headings = cast(projection.payload["projection"]["source_json"].astext, JSONB)[
+        "heading_path"
+    ]
+    pinned_index = or_(
+        *[
+            and_(
+                projection.user_file_id == file_id,
+                projection.index_uuid == index.index_uuid,
+            )
+            for file_id, index in indexes.items()
+        ]
     )
-    before = (
-        select(neighbor.id.label("id"))
-        .where(
-            visible_neighbor,
-            or_(
-                neighbor.position < seeds.position,
-                and_(neighbor.position == seeds.position, neighbor.id < seeds.id),
-            ),
-        )
-        .order_by(neighbor.position.desc(), neighbor.id.desc())
-        .limit(2)
-        .correlate(seeds)
-        .lateral("asv3_context_before")
-    )
-    after = (
-        select(neighbor.id.label("id"))
-        .where(
-            visible_neighbor,
-            or_(
-                neighbor.position > seeds.position,
-                and_(neighbor.position == seeds.position, neighbor.id > seeds.id),
-            ),
-        )
-        .order_by(neighbor.position, neighbor.id)
-        .limit(2)
-        .correlate(seeds)
-        .lateral("asv3_context_after")
-    )
-    query = union_all(
+    # Materialize only parent locators once per binding, not once per seed join.
+    # Frozen source_json may be large; no source body or vector is selected here.
+    locators = (
         select(
-            seeds.id.label("seed_id"), seeds.user_file_id, seeds.id.label("member_id")
-        ).where(seed_filter),
-        select(seeds.id, seeds.user_file_id, before.c.id)
+            projection.id.label("binding_id"),
+            projection.canonical_chunk_id.label("chunk_id"),
+            projection.user_file_id.label("file_id"),
+            projection.index_uuid.label("index_uuid"),
+            projection.projection_ordinal.label("ordinal"),
+            headings.op("-", return_type=JSONB)(-1).label("parent"),
+            (func.jsonb_array_length(headings) > 0).label("parent_known"),
+        )
+        .join(
+            canonical,
+            and_(
+                canonical.id == projection.canonical_chunk_id,
+                canonical.user_file_id == projection.user_file_id,
+            ),
+        )
+        .where(
+            pinned_index,
+            projection.retired_at.is_(None),
+            or_(
+                projection.effective_start.is_(None),
+                projection.effective_start <= as_of_date,
+            ),
+            or_(
+                projection.effective_end.is_(None),
+                projection.effective_end > as_of_date,
+            ),
+            or_(
+                canonical.validity_start_date.is_(None),
+                canonical.validity_start_date <= as_of_date,
+            ),
+            or_(
+                canonical.validity_end_date.is_(None),
+                canonical.validity_end_date > as_of_date,
+            ),
+        )
+        .cte("asv3_parent_locators")
+        .prefix_with("MATERIALIZED")
+    )
+    seeds, members = (
+        locators.alias("asv3_parent_seed"),
+        locators.alias("asv3_parent_sibling"),
+    )
+    query = (
+        select(seeds.c.chunk_id, seeds.c.file_id, members.c.chunk_id)
         .select_from(seeds)
-        .join(before, true())
-        .where(seed_filter),
-        select(seeds.id, seeds.user_file_id, after.c.id)
-        .select_from(seeds)
-        .join(after, true())
-        .where(seed_filter),
+        .join(
+            members,
+            and_(
+                members.c.file_id == seeds.c.file_id,
+                members.c.index_uuid == seeds.c.index_uuid,
+                or_(
+                    and_(
+                        seeds.c.parent_known,
+                        members.c.parent_known,
+                        members.c.parent == seeds.c.parent,
+                    ),
+                    members.c.binding_id == seeds.c.binding_id,
+                ),
+            ),
+        )
+        .where(seeds.c.chunk_id.in_(unique_ids))
+        .order_by(seeds.c.chunk_id, members.c.ordinal, members.c.chunk_id)
+        .execution_options(yield_per=128)
     )
     with graph_step(
         "asv3.initial_packet_context",
         {
             "seed_count": len(unique_ids),
-            "neighbors_per_side": 2,
+            "context_policy": "all_immediate_parent_siblings",
             "complete_operative_unit": False,
         },
     ) as span:
@@ -183,34 +209,18 @@ def get_asv3_initial_rerank_context(
             seed = selected.get(seed_id)
             if seed is None:
                 raise ValueError("ASv3 initial packet seed is no longer available")
-            seed_parent = _last_explicit_article_anchor(seed.heading_path)
-            seed_parent_key = (
-                seed_parent.key
-                if seed_parent is not None
-                else tuple(_fold_text(part) for part in seed.heading_path[:-1])
-                if len(seed.heading_path) >= 2
-                else None
-            )
             members = []
             for member_id in dict.fromkeys(ids):
                 member = selected.get(member_id)
                 if member is None:
                     continue
-                member_parent = _last_explicit_article_anchor(member.heading_path)
-                member_parent_key = (
-                    member_parent.key
-                    if member_parent is not None
-                    else tuple(_fold_text(part) for part in member.heading_path[:-1])
-                    if len(member.heading_path) >= 2
-                    else None
-                )
-                if (
-                    seed_parent_key is not None
-                    and member_parent_key is not None
-                    and seed_parent_key != member_parent_key
+                if member.regulatory_chunk_id != seed.regulatory_chunk_id and (
+                    not seed.heading_path
+                    or member.heading_path[:-1] != seed.heading_path[:-1]
                 ):
-                    continue
-                # Missing parent identity is a local lead, not an asserted same-article match.
+                    raise ValueError(
+                        "ASv3 sibling metadata differs from its verified parent"
+                    )
                 members.append(member)
             result[seed_id] = tuple(
                 sorted(
