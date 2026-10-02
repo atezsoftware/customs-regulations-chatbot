@@ -304,12 +304,12 @@ class EvidenceWorkingSet:
         ordered = list(
             dict.fromkeys(
                 [
+                    *ranges,
                     *(
                         (n, 0, len(item.text))
                         for n in preferred
                         if (item := ledger.get(n)) is not None
                     ),
-                    *ranges,
                 ]
             )
         )

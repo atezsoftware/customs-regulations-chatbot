@@ -931,6 +931,24 @@ def run_asv3_loop(
                         research_state=research_state,
                     )
                 complete = False
+        # Research allocation and publication completeness are separate outcomes.
+        # A reviewed finalization can satisfy every obligation after research stops.
+        if final_gap is None and not complete and final_review.status == "supported":
+            complete = (
+                publication_gap(
+                    final,
+                    final_review,
+                    harness.view().questions,
+                    ledger,
+                    require_sources=profile.requires_sources,
+                    verification_call_id=model.last_call_id,
+                    require_direct_authority=True,
+                    scenario=question,
+                    require_quotation_checks=True,
+                    research_state=research_state,
+                )
+                is None
+            )
         final_publication_gap = final_gap
         publication_stop_reason = (
             "publication_guard_rejected"

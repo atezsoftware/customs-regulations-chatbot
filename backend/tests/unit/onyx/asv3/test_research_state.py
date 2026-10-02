@@ -209,6 +209,42 @@ def test_intervening_tools_do_not_erase_originals_or_change_questions() -> None:
     assert restored.view().original_evidence == harness.view().original_evidence
 
 
+def test_selected_original_range_survives_a_large_attached_candidate_prefix() -> None:
+    context = RunContext(scope={"source": "owned"})
+    ledger = EvidenceLedger()
+    ledger.add(
+        [
+            EvidenceItem(
+                source_id="original",
+                chunk_id=str(index),
+                text=f"Original {index}. " + "Operative text. " * 60,
+            )
+            for index in range(50)
+        ],
+        context,
+    )
+    working = EvidenceWorkingSet()
+    for number in range(1, 51):
+        item = ledger.get(number)
+        assert item is not None
+        working.remember(number, 0, len(item.text))
+    selected = ledger.get(41)
+    assert selected is not None
+    working.remember(41, 0, len(selected.text))
+    # The first need may have dozens of attached candidates. It must not evict
+    # the exact original the model just selected from a different need.
+    preferred = list(range(1, 41))
+    current = working.view(ledger, preferred=preferred, max_chars=2500)
+    records = current["records"]
+    assert isinstance(records, list) and isinstance(records[0], dict)
+    assert records[0]["citation"] == 41
+    assert records[0]["text"] == selected.text
+    assert current["omitted"]
+    restored = EvidenceWorkingSet()
+    restored.restore(working.export(), ledger)
+    assert restored.view(ledger, preferred=preferred, max_chars=2500) == current
+
+
 def test_need_verification_cannot_be_bypassed_by_omitting_the_norm_name() -> None:
     _, ledger, state = state_pair()
     state.update(

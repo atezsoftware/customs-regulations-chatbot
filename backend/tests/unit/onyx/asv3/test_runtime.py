@@ -605,6 +605,49 @@ def test_partial_rewrite_verifier_receives_draft_details_and_their_originals(
     assert all(item["truncated"] is False for item in evidence)
 
 
+def test_supported_finalization_after_research_stop_reports_answer_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reserve_final_only(monkeypatch)
+    kwargs, _broker, llm, checkpoints, queue = setup_run(monkeypatch)
+    llm.invoke.side_effect = incomplete_script(llm)
+    runtime.run_asv3_loop(**kwargs)
+    saved = checkpoints[-1]
+    assert saved["publication_review"]["status"] == "supported"
+    assert saved["final_publication_gap"] is None
+    assert saved["publication_status"] == "found"
+    assert saved["publication_stop_reason"] == "verified_draft_published"
+    assert saved["stop_reason"] != "verified_draft"
+    assert kwargs["state_container"].answer_tokens
+    statuses = [
+        packet.obj.status
+        for packet in packets(queue)
+        if isinstance(packet.obj, ASv3Progress)
+    ]
+    assert statuses[-1] == "completed"
+    assert "failed" not in statuses
+
+
+def test_explicit_unresolved_question_does_not_become_complete_after_finalization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reserve_final_only(monkeypatch)
+    kwargs, _broker, llm, checkpoints, _queue = setup_run(monkeypatch)
+    script = incomplete_script(llm)
+    review = script[-1]
+    assert isinstance(review, ModelResponse)
+    assert isinstance(review.choice.message.content, str)
+    partial = json.loads(review.choice.message.content)
+    partial["question_results"][0].update(
+        status="incomplete", missing_conditions=["Missing the applicable exception"]
+    )
+    script[-1] = response(json.dumps(partial))
+    llm.invoke.side_effect = script
+    runtime.run_asv3_loop(**kwargs)
+    assert checkpoints[-1]["publication_status"] == "partial"
+    assert checkpoints[-1]["publication_stop_reason"] != "verified_draft_published"
+
+
 def test_failed_final_verification_preserves_successful_final_original_delivery_without_publication(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
