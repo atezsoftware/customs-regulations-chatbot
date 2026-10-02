@@ -2214,7 +2214,11 @@ def _load_compact_sibling_candidates(
             RegulatoryChunk.text,
             RegulatoryChunk.status,
             RegulatoryChunk.heading_path,
-            RegulatoryChunk.chunk_metadata,
+            RegulatoryChunk.chunk_metadata["article_no"].label("article_no"),
+            RegulatoryChunk.chunk_metadata["article_title"].label("article_title"),
+            RegulatoryChunk.chunk_metadata["paragraph_no"].label("paragraph_no"),
+            RegulatoryChunk.chunk_metadata["clause_label"].label("clause_label"),
+            RegulatoryChunk.chunk_metadata["image_file_id"].label("image_file_id"),
             RegulatoryChunk.chunk_type,
             RegulatoryChunk.validity_start_date,
             RegulatoryChunk.validity_end_date,
@@ -2232,13 +2236,16 @@ def _load_compact_sibling_candidates(
         source_text,
         status,
         heading_path,
-        metadata,
+        article_no,
+        article_title,
+        paragraph_no,
+        clause_label,
+        image_file_id,
         chunk_type,
         validity_start_date,
         validity_end_date,
         projection_ordinal,
     ) in session.execute(statement):
-        metadata = metadata or {}
         candidates.append(
             RegulatoryChunkSiblingCandidate(
                 regulatory_chunk_id=chunk_id,
@@ -2247,31 +2254,15 @@ def _load_compact_sibling_candidates(
                 text=source_text,
                 status=status,
                 heading_path=tuple(heading_path),
-                article_no=(
-                    str(metadata["article_no"])
-                    if metadata.get("article_no") is not None
-                    else None
-                ),
-                article_title=(
-                    str(metadata["article_title"])
-                    if metadata.get("article_title") is not None
-                    else None
-                ),
+                article_no=str(article_no) if article_no is not None else None,
+                article_title=str(article_title) if article_title is not None else None,
                 chunk_type=chunk_type,
-                paragraph_no=(
-                    str(metadata["paragraph_no"])
-                    if metadata.get("paragraph_no") is not None
-                    else None
-                ),
-                clause_label=(
-                    str(metadata["clause_label"])
-                    if metadata.get("clause_label") is not None
-                    else None
-                ),
+                paragraph_no=str(paragraph_no) if paragraph_no is not None else None,
+                clause_label=str(clause_label) if clause_label is not None else None,
                 validity_start_date=validity_start_date,
                 validity_end_date=validity_end_date,
                 projection_ordinal=projection_ordinal,
-                image_file_id=metadata.get("image_file_id"),
+                image_file_id=image_file_id,
             )
         )
     return candidates

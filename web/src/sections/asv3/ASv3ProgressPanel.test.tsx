@@ -1,4 +1,10 @@
-import { fireEvent, render, screen, within } from "@tests/setup/test-utils";
+import {
+  fireEvent,
+  render,
+  screen,
+  setupUser,
+  within,
+} from "@tests/setup/test-utils";
 import ASv3ProgressPanel from "@/sections/asv3/ASv3ProgressPanel";
 import {
   applyASv3Progress,
@@ -64,6 +70,9 @@ function completedState() {
 it("keeps sibling activity independent and changes the natural task content through Onyx tabs", () => {
   const state = parallelState();
   render(<ASv3ProgressPanel state={state} stopped={false} />);
+  fireEvent.click(
+    screen.getByRole("button", { name: "Garanti koşullarını inceliyorum" })
+  );
   expect(screen.getAllByRole("tab")).toHaveLength(2);
   expect(
     within(screen.getByRole("tab", { name: "Ücretsiz tamir" })).queryByTestId(
@@ -89,7 +98,7 @@ it("keeps sibling activity independent and changes the natural task content thro
   ).not.toBeInTheDocument();
 });
 
-it("collapses at answer arrival and terminal replay without restarting activity", () => {
+it("starts collapsed during research, answer arrival and terminal replay without restarting activity", () => {
   const { rerender, unmount } = render(
     <ASv3ProgressPanel state={parallelState()} stopped={false} />
   );
@@ -106,7 +115,7 @@ it("collapses at answer arrival and terminal replay without restarting activity"
     screen.getByRole("button", { name: "Araştırma tamamlandı" })
   ).toHaveAttribute("aria-expanded", "false");
   expect(
-    screen.getByText("Araştırma tamamlandı").closest(".shimmer-text")
+    screen.getByText("Araştırma tamamlandı").closest(".asv3-title-running")
   ).toBeNull();
   fireEvent.click(screen.getByRole("button", { name: "Araştırma tamamlandı" }));
   expect(screen.getAllByRole("tab")).toHaveLength(2);
@@ -127,7 +136,6 @@ it("respects manual expansion across final and does not reactivate a stopped sib
   const toggle = screen.getByRole("button", {
     name: "Garanti koşullarını inceliyorum",
   });
-  fireEvent.click(toggle);
   fireEvent.click(toggle);
   rerender(
     <ASv3ProgressPanel state={parallelState()} stopped hasDisplayContent />
@@ -158,6 +166,9 @@ it("groups a nested researcher beneath its selected parent without exposing IDs"
     message: "Geri verme başvurusunun süresi kontrol ediliyor.",
   });
   render(<ASv3ProgressPanel state={state} stopped={false} />);
+  fireEvent.click(
+    screen.getByRole("button", { name: "Garanti koşullarını inceliyorum" })
+  );
   expect(
     screen.queryByRole("tab", { name: "İlk ithalat vergileri" })
   ).not.toBeInTheDocument();
@@ -231,6 +242,7 @@ it.each([
       <ASv3ProgressPanel state={state} stopped={false} />
     );
     expect(screen.getByText(title)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: title }));
     expect(screen.getByText(taskTitle)).toBeInTheDocument();
     expect(screen.getByRole("region", { name: "ASv3" })).toHaveAttribute(
       "lang",
@@ -274,6 +286,14 @@ it("shows contextual public updates without tool names or private task identifie
     screen.getByText("Garanti kapsamındaki iki ihtimali inceliyorum")
   ).toBeInTheDocument();
   expect(
+    screen.queryByText(/Gümrük Kanunu'ndaki bedelsiz tamir şartlarını/)
+  ).not.toBeInTheDocument();
+  fireEvent.click(
+    screen.getByRole("button", {
+      name: "Garanti kapsamındaki iki ihtimali inceliyorum",
+    })
+  );
+  expect(
     screen.getByText(/Gümrük Kanunu'ndaki bedelsiz tamir şartlarını/)
   ).toBeInTheDocument();
   for (const privateText of [
@@ -311,5 +331,91 @@ it("offers only a backend-localized explicit interrupted-run resume action", () 
     phase: "research",
   });
   rerender(<ASv3ProgressPanel state={failed} stopped onResume={onResume} />);
-  expect(screen.queryByRole("button")).not.toBeInTheDocument();
+  expect(
+    screen.queryByRole("button", { name: "Araştırmaya devam et" })
+  ).not.toBeInTheDocument();
+});
+
+it("opens the current description and real past steps with keyboard even with zero researchers", async () => {
+  const user = setupUser();
+  let state = applyASv3Progress(createASv3ProgressState(), {
+    type: "asv3_progress",
+    run_id: "r",
+    event_id: "initial",
+    sequence: 1,
+    language: "tr",
+    phase: "started",
+    status: "running",
+    title: "Geri gelen makinelerin koşullarını inceliyorum",
+    message:
+      "Ayniyet ve ihracatta alınan iadenin durumunu ayrı ayrı kontrol ediyorum.",
+  });
+  state = applyASv3Progress(state, {
+    ...state.header!,
+    event_id: "reading",
+    sequence: 2,
+    phase: "research",
+    title: "Geri geliş belgelerini inceliyorum",
+    message:
+      "Yeşil hat kolaylığının teslim ve teminat koşullarını nasıl etkilediğini kontrol ediyorum.",
+  });
+  render(<ASv3ProgressPanel state={state} stopped={false} />);
+  const toggle = screen.getByRole("button", {
+    name: "Geri geliş belgelerini inceliyorum",
+  });
+  expect(toggle).toHaveAttribute("aria-expanded", "false");
+  expect(screen.queryByText(/Yeşil hat kolaylığının/)).not.toBeInTheDocument();
+  expect(screen.queryByRole("tab")).not.toBeInTheDocument();
+  await user.tab();
+  expect(toggle).toHaveFocus();
+  await user.keyboard("{Enter}");
+  expect(toggle).toHaveAttribute("aria-expanded", "true");
+  expect(screen.getByText(/Yeşil hat kolaylığının/)).toBeInTheDocument();
+  const earlier = screen.getByRole("button", {
+    name: "Geri gelen makinelerin koşullarını inceliyorum",
+  });
+  expect(screen.queryByText(/Ayniyet ve ihracatta/)).not.toBeInTheDocument();
+  await user.tab();
+  expect(earlier).toHaveFocus();
+  await user.keyboard(" ");
+  expect(earlier).toHaveAttribute("aria-expanded", "true");
+  expect(screen.getByText(/Ayniyet ve ihracatta/)).toBeInTheDocument();
+  await user.click(toggle);
+  expect(screen.queryByText(/Ayniyet ve ihracatta/)).not.toBeInTheDocument();
+  expect(screen.queryByText(/Yeşil hat kolaylığının/)).not.toBeInTheDocument();
+  expect(screen.queryByRole("tab")).not.toBeInTheDocument();
+});
+
+it("retains actual step history on terminal replay while leaving all animation inactive", () => {
+  const initial: ASv3Progress = {
+    type: "asv3_progress",
+    run_id: "r",
+    event_id: "initial",
+    sequence: 1,
+    language: "en",
+    phase: "research",
+    status: "running",
+    title: "Checking the guarantee conditions",
+    message: "Reviewing the original repair provision.",
+  };
+  let state = applyASv3Progress(createASv3ProgressState(), initial);
+  state = applyASv3Progress(state, {
+    ...initial,
+    event_id: "final",
+    sequence: 2,
+    status: "completed",
+    title: "The review is complete",
+    message: "The answer is ready.",
+  });
+  render(<ASv3ProgressPanel state={state} stopped />);
+  const toggle = screen.getByRole("button", { name: "The review is complete" });
+  expect(toggle).toHaveAttribute("aria-expanded", "false");
+  expect(toggle.closest(".asv3-title-running")).toBeNull();
+  expect(screen.queryByText("The answer is ready.")).not.toBeInTheDocument();
+  fireEvent.click(toggle);
+  expect(screen.getByText("The answer is ready.")).toBeInTheDocument();
+  expect(
+    screen.getByRole("button", { name: "Checking the guarantee conditions" })
+  ).toBeInTheDocument();
+  expect(screen.queryByTestId("asv3-task-loading")).not.toBeInTheDocument();
 });

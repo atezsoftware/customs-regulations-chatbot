@@ -2,6 +2,7 @@ import {
   applyASv3Progress,
   createASv3ProgressState,
   collectASv3Progress,
+  MAX_ASV3_COORDINATOR_STEPS,
 } from "@/lib/asv3/progress";
 import type { ASv3Progress, Packet } from "@/app/app/services/streamingModels";
 
@@ -43,6 +44,75 @@ it("keeps a parallel sibling active when a different task or placement finishes"
   expect(state.tasks.get("a")?.status).toBe("completed");
   expect(state.tasks.get("b")?.status).toBe("running");
   expect(state.terminal).toBe(false);
+});
+
+it("coalesces adjacent public updates and keeps only the latest 32 real coordinator changes", () => {
+  let state = createASv3ProgressState();
+  state = applyASv3Progress(
+    state,
+    event(1, {
+      title: "Koşulları inceliyorum",
+      message: "Asıl metni okuyorum.",
+    })
+  );
+  state = applyASv3Progress(
+    state,
+    event(2, {
+      phase: "tools",
+      title: "Koşulları inceliyorum",
+      message: "Asıl metni okuyorum.",
+    })
+  );
+  expect(state.history).toHaveLength(1);
+  expect(state.history[0]?.sequence).toBe(2);
+  state = applyASv3Progress(
+    state,
+    event(3, { task_id: "actual-worker", title: "Teminat koşulu" })
+  );
+  expect(state.history).toHaveLength(1);
+  expect(state.tasks.get("actual-worker")?.title).toBe("Teminat koşulu");
+  for (let index = 4; index <= 43; index++) {
+    state = applyASv3Progress(
+      state,
+      event(index, {
+        title: `İncelenen koşul ${index}`,
+        message: `Kaynak açıklaması ${index}`,
+      })
+    );
+  }
+  expect(state.history).toHaveLength(MAX_ASV3_COORDINATOR_STEPS);
+  expect(state.history[0]?.sequence).toBe(12);
+  expect(state.history.at(-1)?.sequence).toBe(43);
+  expect(state.header?.sequence).toBe(43);
+});
+
+it("replays only real packet history and keeps terminal history closed to late results", () => {
+  const packets: Packet[] = [
+    {
+      placement: { turn_index: 0 },
+      obj: event(1, { title: "Şartlar inceleniyor" }),
+    },
+    {
+      placement: { turn_index: 1 },
+      obj: event(2, { title: "Belgeler inceleniyor" }),
+    },
+    {
+      placement: { turn_index: 2 },
+      obj: event(3, { status: "completed", title: "Yanıt hazır" }),
+    },
+    {
+      placement: { turn_index: 3 },
+      obj: event(4, { title: "Geç gelen güncelleme" }),
+    },
+  ];
+  const state = collectASv3Progress(packets);
+  expect(state.history.map((step) => step.title)).toEqual([
+    "Şartlar inceleniyor",
+    "Belgeler inceleniyor",
+    "Yanıt hazır",
+  ]);
+  expect(state.terminal).toBe(true);
+  expect(state.tasks.size).toBe(0);
 });
 
 it("ignores duplicate, stale task, foreign run and post-terminal results", () => {

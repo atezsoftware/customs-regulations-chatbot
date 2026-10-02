@@ -1,5 +1,7 @@
 """Read-only, ACL and publication fenced corpus access for ASv3."""
 
+import json
+from collections.abc import Callable, Generator
 from dataclasses import dataclass
 from datetime import date
 from typing import Any
@@ -28,6 +30,7 @@ from onyx.db.models import (
     UserFile,
 )
 from onyx.db.regulatory_public_reads import (
+    iter_public_temporal_bindings,
     qualified_file_ids,
     resolve_public_query_index,
 )
@@ -134,6 +137,435 @@ class CorpusChunk:
     validity_start: date | None
     validity_end: date | None
     status: str
+
+
+@dataclass(frozen=True)
+class CorpusClosureRead:
+    source: CorpusSource
+    chunks: list[CorpusChunk]
+    members: dict[str, tuple[str, ...]]
+    complete: dict[str, bool]
+    continuation: dict[str, tuple[str, ...]]
+    outline_rows: int
+    outline_truncated: bool
+
+
+def _binding_chunk(
+    source_id: UUID, binding: AnnexTemporalProjection, as_of: date
+) -> CorpusChunk:
+    payload = json.loads(binding.projection.source_json)
+    return CorpusChunk(
+        payload["regulatory_chunk_id"],
+        source_id,
+        binding.representation_text,
+        binding.semantic_position,
+        binding.projection.ordinal,
+        tuple(payload.get("heading_path") or ()),
+        {
+            **payload,
+            **binding.representation_metadata,
+            "read_as_of_date": as_of.isoformat(),
+        },
+        binding.effective_start,
+        binding.effective_end,
+        "active",
+    )
+
+
+def iter_source_chunks_by_ids(
+    session: Session,
+    *,
+    user: User,
+    filters: IndexFilters,
+    source_id: UUID,
+    chunk_ids: tuple[str, ...],
+    index: PublicationIndexSnapshot | None,
+    check_active: Callable[[], None],
+) -> Generator[CorpusChunk, None, None]:
+    """Stream exact retained originals under the same live source/snapshot fences."""
+    if not chunk_ids:
+        return
+    check_active()
+    require_source(session, user=user, filters=filters, source_id=source_id)
+    observation = observe_publication_read()
+    effective_date = filters.as_of_date or date.today()
+    qualified = source_id in qualified_file_ids(session, (source_id,))
+    if qualified:
+        if index is None:
+            raise CorpusScopeUnavailable(
+                "Source requires a verified query index snapshot."
+            )
+        bindings = iter_public_temporal_bindings(
+            session,
+            source_id,
+            index=index,
+            as_of_date=effective_date,
+            canonical_chunk_ids=tuple(dict.fromkeys(chunk_ids)),
+        )
+        try:
+            for binding in bindings:
+                check_active()
+                if binding.derived_role != "canonical":
+                    continue
+                chunk = _binding_chunk(source_id, binding, effective_date)
+                if filter_publication_read(
+                    observation, [chunk], lambda value: str(value.source_id)
+                ):
+                    yield chunk
+        finally:
+            bindings.close()
+    else:
+        statement = select(RegulatoryChunk).where(
+            RegulatoryChunk.user_file_id == source_id,
+            RegulatoryChunk.id.in_(chunk_ids),
+            RegulatoryChunk.chunk_type.is_distinct_from("hierarchical_aggregate"),
+        )
+        if filters.as_of_date is None:
+            statement = statement.where(RegulatoryChunk.status == "active")
+        else:
+            statement = statement.where(
+                or_(
+                    RegulatoryChunk.validity_start_date.is_(None),
+                    RegulatoryChunk.validity_start_date <= effective_date,
+                ),
+                or_(
+                    RegulatoryChunk.validity_end_date.is_(None),
+                    RegulatoryChunk.validity_end_date > effective_date,
+                ),
+            )
+        rows = session.scalars(
+            statement.order_by(
+                RegulatoryChunk.position, RegulatoryChunk.id
+            ).execution_options(yield_per=16, populate_existing=True)
+        )
+        try:
+            for row in rows:
+                check_active()
+                chunk = CorpusChunk(
+                    row.id,
+                    source_id,
+                    row.text,
+                    row.position,
+                    row.projection_ordinal,
+                    tuple(row.heading_path or ()),
+                    {
+                        **(row.chunk_metadata or {}),
+                        "read_as_of_date": filters.as_of_date.isoformat()
+                        if filters.as_of_date
+                        else None,
+                    },
+                    row.validity_start_date,
+                    row.validity_end_date,
+                    row.status,
+                )
+                if filter_publication_read(
+                    observation, [chunk], lambda value: str(value.source_id)
+                ):
+                    yield chunk
+        finally:
+            rows.close()
+    check_active()
+    require_source(session, user=user, filters=filters, source_id=source_id)
+    require_publication_files(observation, (source_id,))
+
+
+def read_search_source_closures(
+    session: Session,
+    *,
+    user: User,
+    filters: IndexFilters,
+    source_id: UUID,
+    center_ids: tuple[str, ...],
+    index: PublicationIndexSnapshot | None,
+    check_active: Callable[[], None],
+    max_outline_rows: int = 20000,
+    max_outline_bytes: int = 4 * 1024 * 1024,
+    max_chars: int = 64000,
+) -> CorpusClosureRead:
+    """Plan local closures once from structure, then hydrate only their exact members."""
+    from onyx.db.regulatory_chunks import (
+        RegulatoryChunkSiblingCandidate,
+        _candidate_article_no,
+        _has_overlapping_visible_positions,
+        _project_candidates,
+        _provision_span_for_seed,
+    )
+
+    if min(max_outline_rows, max_outline_bytes, max_chars) < 1:
+        raise ValueError("Closure read budgets must be positive.")
+    check_active()
+    source = require_source(session, user=user, filters=filters, source_id=source_id)
+    observation = observe_publication_read()
+    qualified = source_id in qualified_file_ids(session, (source_id,))
+    effective_date = filters.as_of_date or date.today()
+    if qualified and index is None:
+        raise CorpusScopeUnavailable("Source requires a verified query index snapshot.")
+
+    def outline() -> Generator[RegulatoryChunkSiblingCandidate, None, None]:
+        if qualified:
+            assert index is not None
+            bindings = iter_public_temporal_bindings(
+                session, source_id, index=index, as_of_date=effective_date
+            )
+            try:
+                for binding in bindings:
+                    check_active()
+                    if binding.derived_role != "canonical":
+                        continue
+                    payload = json.loads(binding.projection.source_json)
+                    metadata = {**payload, **binding.representation_metadata}
+                    yield RegulatoryChunkSiblingCandidate(
+                        regulatory_chunk_id=payload["regulatory_chunk_id"],
+                        user_file_id=source_id,
+                        position=binding.semantic_position,
+                        text="",
+                        status="active",
+                        heading_path=tuple(payload.get("heading_path") or ()),
+                        article_no=str(metadata["article_no"])
+                        if metadata.get("article_no") is not None
+                        else None,
+                        article_title=str(metadata["article_title"])
+                        if metadata.get("article_title") is not None
+                        else None,
+                        chunk_type=str(metadata["chunk_type"])
+                        if isinstance(metadata.get("chunk_type"), str)
+                        else None,
+                        paragraph_no=str(metadata["paragraph_no"])
+                        if metadata.get("paragraph_no") is not None
+                        else None,
+                        clause_label=str(metadata["clause_label"])
+                        if metadata.get("clause_label") is not None
+                        else None,
+                        validity_start_date=binding.effective_start,
+                        validity_end_date=binding.effective_end,
+                        projection_ordinal=binding.projection.ordinal,
+                    )
+                    # Frozen text/payload is never retained by the outline.
+                    del payload, metadata
+            finally:
+                bindings.close()
+            return
+        statement = select(
+            RegulatoryChunk.id,
+            RegulatoryChunk.position,
+            RegulatoryChunk.heading_path,
+            RegulatoryChunk.chunk_metadata,
+            RegulatoryChunk.chunk_type,
+            RegulatoryChunk.status,
+            RegulatoryChunk.validity_start_date,
+            RegulatoryChunk.validity_end_date,
+            RegulatoryChunk.projection_ordinal,
+        ).where(
+            RegulatoryChunk.user_file_id == source_id,
+            RegulatoryChunk.chunk_type.is_distinct_from("hierarchical_aggregate"),
+        )
+        if filters.as_of_date is None:
+            statement = statement.where(RegulatoryChunk.status == "active")
+        else:
+            statement = statement.where(
+                or_(
+                    RegulatoryChunk.validity_start_date.is_(None),
+                    RegulatoryChunk.validity_start_date <= effective_date,
+                ),
+                or_(
+                    RegulatoryChunk.validity_end_date.is_(None),
+                    RegulatoryChunk.validity_end_date > effective_date,
+                ),
+            )
+        rows = session.execute(
+            statement.order_by(
+                RegulatoryChunk.position, RegulatoryChunk.id
+            ).execution_options(yield_per=128)
+        )
+        try:
+            for row in rows:
+                check_active()
+                metadata = row.chunk_metadata or {}
+                yield RegulatoryChunkSiblingCandidate(
+                    regulatory_chunk_id=row.id,
+                    user_file_id=source_id,
+                    position=row.position,
+                    text="",
+                    status=row.status,
+                    heading_path=tuple(row.heading_path or ()),
+                    article_no=str(metadata["article_no"])
+                    if metadata.get("article_no") is not None
+                    else None,
+                    article_title=str(metadata["article_title"])
+                    if metadata.get("article_title") is not None
+                    else None,
+                    chunk_type=row.chunk_type,
+                    paragraph_no=str(metadata["paragraph_no"])
+                    if metadata.get("paragraph_no") is not None
+                    else None,
+                    clause_label=str(metadata["clause_label"])
+                    if metadata.get("clause_label") is not None
+                    else None,
+                    validity_start_date=row.validity_start_date,
+                    validity_end_date=row.validity_end_date,
+                    projection_ordinal=row.projection_ordinal,
+                )
+        finally:
+            rows.close()
+
+    candidates = []
+    outline_bytes = 0
+    truncated = False
+    stream = outline()
+    try:
+        for candidate in stream:
+            size = len(repr(candidate).encode("utf-8"))
+            if (
+                len(candidates) >= max_outline_rows
+                or outline_bytes + size > max_outline_bytes
+            ):
+                truncated = True
+                break
+            candidates.append(candidate)
+            outline_bytes += size
+    finally:
+        stream.close()
+    by_file, by_id = _project_candidates(candidates, as_of_date=filters.as_of_date)
+    rows = by_file.get(source_id, [])
+    members: dict[str, tuple[str, ...]] = {}
+    proven: dict[str, bool] = {}
+    for center in dict.fromkeys(center_ids):
+        seed = by_id.get(center)
+        if seed is None or truncated:
+            members[center], proven[center] = (center,), False
+            continue
+        span = _provision_span_for_seed(
+            rows, seed.structural_index, as_of_date=filters.as_of_date
+        )
+        selected_positions = {rows[i].position for i in span}
+        overlap_indices = {
+            i for i, row in enumerate(rows) if row.position in selected_positions
+        }
+        if _has_overlapping_visible_positions(
+            rows, overlap_indices, as_of_date=filters.as_of_date
+        ):
+            raise CorpusScopeUnavailable(
+                "Retrieved provision has overlapping visible versions."
+            )
+        members[center] = tuple(rows[i].regulatory_chunk_id for i in sorted(span))
+        # Unidentified outer rows cannot be asserted to be complete continuation.
+        uncertain_edge = any(
+            0 <= edge < len(rows) and _candidate_article_no(rows[edge]) is None
+            for edge in (min(span) - 1, max(span) + 1)
+        )
+        proven[center] = _candidate_article_no(seed) is not None and not uncertain_edge
+    outline_rows = len(candidates)
+    del candidates, by_file, by_id, rows
+    requested = set(center_ids)
+    requested.update(identifier for group in members.values() for identifier in group)
+
+    def hydrate(identifiers: tuple[str, ...]) -> Generator[CorpusChunk, None, None]:
+        if not identifiers:
+            return
+        if qualified:
+            assert index is not None
+            bindings = iter_public_temporal_bindings(
+                session,
+                source_id,
+                index=index,
+                as_of_date=effective_date,
+                canonical_chunk_ids=identifiers,
+            )
+            try:
+                for binding in bindings:
+                    check_active()
+                    if binding.derived_role == "canonical":
+                        yield _binding_chunk(source_id, binding, effective_date)
+            finally:
+                bindings.close()
+            return
+        statement = select(RegulatoryChunk).where(
+            RegulatoryChunk.user_file_id == source_id,
+            RegulatoryChunk.id.in_(identifiers),
+            RegulatoryChunk.chunk_type.is_distinct_from("hierarchical_aggregate"),
+        )
+        if filters.as_of_date is None:
+            statement = statement.where(RegulatoryChunk.status == "active")
+        else:
+            statement = statement.where(
+                or_(
+                    RegulatoryChunk.validity_start_date.is_(None),
+                    RegulatoryChunk.validity_start_date <= effective_date,
+                ),
+                or_(
+                    RegulatoryChunk.validity_end_date.is_(None),
+                    RegulatoryChunk.validity_end_date > effective_date,
+                ),
+            )
+        result = session.scalars(
+            statement.order_by(
+                RegulatoryChunk.position, RegulatoryChunk.id
+            ).execution_options(yield_per=16)
+        )
+        try:
+            for row in result:
+                check_active()
+                yield CorpusChunk(
+                    row.id,
+                    source_id,
+                    row.text,
+                    row.position,
+                    row.projection_ordinal,
+                    tuple(row.heading_path or ()),
+                    {
+                        **(row.chunk_metadata or {}),
+                        "read_as_of_date": filters.as_of_date.isoformat()
+                        if filters.as_of_date
+                        else None,
+                    },
+                    row.validity_start_date,
+                    row.validity_end_date,
+                    row.status,
+                )
+        finally:
+            result.close()
+
+    chunks: list[CorpusChunk] = []
+    characters = 0
+    hydrated_ids: set[str] = set()
+    for identifiers in (
+        tuple(dict.fromkeys(center_ids)),
+        tuple(requested - set(center_ids)),
+    ):
+        texts = hydrate(identifiers)
+        try:
+            for chunk in texts:
+                if chunk.id in hydrated_ids:
+                    raise CorpusScopeUnavailable(
+                        "Retrieved canonical center has ambiguous visible bindings."
+                    )
+                if characters + len(chunk.text) > max_chars:
+                    break
+                chunks.append(chunk)
+                hydrated_ids.add(chunk.id)
+                characters += len(chunk.text)
+        finally:
+            texts.close()
+    check_active()
+    chunks = filter_publication_read(
+        observation, chunks, lambda row: str(row.source_id)
+    )
+    require_source(session, user=user, filters=filters, source_id=source_id)
+    require_publication_files(observation, (source_id,))
+    present = {chunk.id for chunk in chunks}
+    continuation = {
+        center: tuple(identifier for identifier in group if identifier not in present)
+        for center, group in members.items()
+    }
+    return CorpusClosureRead(
+        source,
+        chunks,
+        members,
+        {center: proven[center] and not continuation[center] for center in members},
+        continuation,
+        outline_rows,
+        truncated,
+    )
 
 
 def source_chunk_position(

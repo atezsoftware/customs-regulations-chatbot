@@ -10,6 +10,7 @@ from pydantic import JsonValue
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.harness import Harness
 from onyx.asv3.models import (
+    Artifact,
     CapabilityCall,
     Decision,
     EvidenceItem,
@@ -25,6 +26,7 @@ from onyx.asv3.models import (
 from onyx.asv3.progress import ProgressReporter
 from onyx.asv3.registry import CapabilityRegistry, build_core_specs
 from onyx.asv3.workers import WorkerPool
+from onyx.llm.models import AssistantMessage, FunctionCall, ToolCall
 
 
 def test_dispatch_validates_schema_and_corpus_boundary_before_execution() -> None:
@@ -179,13 +181,15 @@ def test_harness_queues_excess_calls_and_propagates_context_and_citations() -> N
     assert result.status == OutcomeStatus.FOUND
     assert sorted(invoked) == list(range(5))
     assert peak == 2
-    assert [receipt.evidence_ids for receipt in result.receipts] == [
-        [1],
-        [2],
-        [3],
-        [4],
-        [5],
-    ]
+    assert sorted(
+        n for receipt in result.receipts for n in receipt.evidence_ids
+    ) == list(range(1, 6))
+    for receipt in result.receipts:
+        assert len(receipt.evidence_ids) == 1
+        item = ledger.get(receipt.evidence_ids[0])
+        assert item is not None and item.chunk_id == str(
+            receipt.call.arguments["number"]
+        )
 
 
 def test_research_deadline_preserves_reserve_and_completed_sibling_evidence() -> None:
@@ -229,30 +233,47 @@ def test_research_deadline_preserves_reserve_and_completed_sibling_evidence() ->
     ledger = EvidenceLedger()
 
     def decide(_view: HarnessView) -> Decision:
+        calls = [
+            CapabilityCall(name="read", arguments={"slow": True}, call_id="slow"),
+            CapabilityCall(name="read", arguments={"slow": False}, call_id="fast"),
+        ]
         return Decision(
-            calls=[
-                CapabilityCall(name="read", arguments={"slow": True}, call_id="slow"),
-                CapabilityCall(name="read", arguments={"slow": False}, call_id="fast"),
-            ]
+            calls=calls,
+            assistant_message=AssistantMessage(
+                content=None,
+                tool_calls=[
+                    ToolCall(
+                        id=call.call_id,
+                        function=FunctionCall(
+                            name=call.name, arguments=json.dumps(call.arguments)
+                        ),
+                    )
+                    for call in calls
+                ],
+            ),
         )
 
+    harness = Harness(
+        request="deadline reserve",
+        context=context,
+        registry=registry,
+        decide=decide,
+        evidence=ledger,
+    )
     try:
-        result = Harness(
-            request="deadline reserve",
-            context=context,
-            registry=registry,
-            decide=decide,
-            evidence=ledger,
-        ).run()
+        result = harness.run()
         assert early_finished.is_set()
         assert result.status == OutcomeStatus.TRUNCATED
         assert context.deadline - time.monotonic() > 0.45
-        assert [receipt.outcome.status for receipt in result.receipts] == [
-            OutcomeStatus.TRUNCATED,
-            OutcomeStatus.FOUND,
-        ]
-        assert result.receipts[1].evidence_ids == [1]
+        receipts = {receipt.call.call_id: receipt for receipt in result.receipts}
+        assert receipts["slow"].outcome.status == OutcomeStatus.TRUNCATED
+        assert receipts["fast"].outcome.status == OutcomeStatus.FOUND
+        assert receipts["fast"].evidence_ids == [1]
         assert cast(EvidenceItem, ledger.get(1)).source_id == "early"
+        assert [message.tool_call_id for message in harness.turns[0].results] == [
+            "slow",
+            "fast",
+        ]
     finally:
         release.set()
     assert late_finished.wait(2)
@@ -630,6 +651,45 @@ def test_worker_checkpoints_reference_shared_originals_without_full_ledger() -> 
         pool.close()
 
 
+def test_four_independent_researchers_run_concurrently_with_shared_budget() -> None:
+    context = RunContext(scope={"document_set": "PC"})
+    ready = threading.Barrier(5)
+    release = threading.Event()
+    contexts: list[RunContext] = []
+    lock = threading.Lock()
+
+    def runner(task: str, child: RunContext, _updates: object) -> ToolOutcome:
+        with lock:
+            contexts.append(child)
+        if task != "queued":
+            ready.wait(3)
+            assert release.wait(3)
+        return ToolOutcome(status=OutcomeStatus.FOUND, summary=task)
+
+    pool = WorkerPool(context, runner)
+    try:
+        tasks = [pool.spawn(f"independent {n}") for n in range(4)]
+        ready.wait(3)
+        queued = pool.spawn("queued")
+        snapshots = {task.task_id: task for task in pool.list()}
+        assert all(snapshots[task].status == TaskStatus.RUNNING for task in tasks)
+        assert snapshots[queued].status == TaskStatus.QUEUED
+        assert len(contexts) == 4
+        assert len({id(child) for child in contexts}) == 4
+        assert all(child.budget is context.budget for child in contexts)
+        contexts[0].scope["private"] = "first"
+        assert all("private" not in child.scope for child in contexts[1:])
+        assert "private" not in context.scope
+        release.set()
+        assert all(
+            pool.wait(task, 3)[0].status == TaskStatus.COMPLETED
+            for task in [*tasks, queued]
+        )
+    finally:
+        release.set()
+        pool.close()
+
+
 def test_saturated_parent_workers_can_delegate_and_wait_without_deadlock() -> None:
     context = RunContext()
     parents_ready = threading.Barrier(3)
@@ -772,3 +832,249 @@ def test_artifact_resident_eviction_preserves_locators_and_can_reopen() -> None:
     reopened = store.get("0")
     assert reopened is not None and reopened.metadata["base64"] == "A" * 100
     assert context.budget.snapshot()["artifact_bytes"] == 100
+
+
+def test_fast_sibling_is_durable_while_slow_tool_blocks_and_native_pair_order_is_preserved() -> (
+    None
+):
+    slow_entered, release, fast_checkpoint = (threading.Event() for _ in range(3))
+    snapshots: list[dict[str, JsonValue]] = []
+    callbacks: list[str] = []
+    errors: list[BaseException] = []
+    calls = [
+        CapabilityCall(name="read", arguments={"slow": value}, call_id=name)
+        for name, value in [("slow", True), ("fast", False)]
+    ]
+
+    def handler(args: dict[str, JsonValue], _child: RunContext) -> ToolOutcome:
+        if args["slow"]:
+            slow_entered.set()
+            assert release.wait(5)
+        return ToolOutcome(
+            status=OutcomeStatus.FOUND,
+            summary="original source",
+            evidence=[
+                EvidenceItem(
+                    source_id="law",
+                    chunk_id="critical",
+                    text="Original controlling text",
+                )
+            ],
+            artifacts=[
+                Artifact(
+                    artifact_id="shared-artifact",
+                    name="source locator",
+                    metadata={"content": "original"},
+                )
+            ],
+        )
+
+    def checkpoint(snapshot: dict[str, JsonValue]) -> None:
+        snapshots.append(json.loads(json.dumps(snapshot)))
+        receipts = snapshot["receipts"]
+        assert isinstance(receipts, list)
+        if any(
+            isinstance(item, dict)
+            and cast(dict[str, JsonValue], item["call"])["call_id"] == "fast"
+            for item in receipts
+        ):
+            fast_checkpoint.set()
+
+    step = 0
+
+    def decide(_view: HarnessView) -> Decision:
+        nonlocal step
+        step += 1
+        if step > 1:
+            return Decision(answer="Sources received")
+        return Decision(
+            calls=calls,
+            assistant_message=AssistantMessage(
+                content=None,
+                tool_calls=[
+                    ToolCall(
+                        id=call.call_id,
+                        function=FunctionCall(
+                            name=call.name, arguments=json.dumps(call.arguments)
+                        ),
+                    )
+                    for call in calls
+                ],
+            ),
+        )
+
+    harness = Harness(
+        request="critical sibling",
+        context=RunContext(timeout_seconds=10),
+        registry=CapabilityRegistry(
+            [
+                ToolSpec(
+                    name="read",
+                    description="read",
+                    parameters={"type": "object"},
+                    handler=handler,
+                )
+            ]
+        ),
+        decide=decide,
+        checkpoint=checkpoint,
+        on_receipt=lambda receipt: callbacks.append(receipt.call.call_id),
+    )
+
+    def run() -> None:
+        try:
+            harness.run()
+        except BaseException as error:
+            errors.append(error)
+
+    runner = threading.Thread(target=run)
+    runner.start()
+    try:
+        assert slow_entered.wait(3)
+        assert fast_checkpoint.wait(3)
+        assert runner.is_alive()
+        current = snapshots[-1]
+        assert current["pending_call_count"] == 1
+        assert (
+            current["turns"] == []
+        )  # A partial batch creates no orphan native messages.
+        evidence = current["evidence"]
+        assert (
+            isinstance(evidence, dict)
+            and len(cast(list[JsonValue], evidence["records"])) == 1
+        )
+        assert callbacks == ["fast"]
+        assert harness.context.budget.snapshot()["evidence_bytes"] == len(
+            "Original controlling text"
+        )
+        assert harness.context.budget.snapshot()["artifact_bytes"] == len("original")
+    finally:
+        release.set()
+        runner.join(3)
+    assert not runner.is_alive() and errors == []
+    assert callbacks == ["fast", "slow"]
+    assert len(harness.receipts) == 2
+    assert [receipt.evidence_ids for receipt in harness.receipts] == [[1], [1]]
+    assert harness.context.budget.snapshot()["evidence_bytes"] == len(
+        "Original controlling text"
+    )
+    assert harness.context.budget.snapshot()["artifact_bytes"] == len("original")
+    assert [result.tool_call_id for result in harness.turns[0].results] == [
+        "slow",
+        "fast",
+    ]
+    assert snapshots[0]["pending_call_count"] == 2
+    assert snapshots[-1]["pending_calls"] == []
+
+
+def test_cancelled_batch_keeps_fast_checkpoint_and_rejects_all_late_writes() -> None:
+    release, fast_checkpoint, late_finished = (threading.Event() for _ in range(3))
+    snapshots: list[dict[str, JsonValue]] = []
+    callbacks: list[str] = []
+
+    def handler(args: dict[str, JsonValue], _child: RunContext) -> ToolOutcome:
+        slow = bool(args["slow"])
+        if slow:
+            assert release.wait(5)
+            late_finished.set()
+        return ToolOutcome(
+            status=OutcomeStatus.FOUND,
+            summary="source",
+            evidence=[
+                EvidenceItem(source_id="late" if slow else "fast", text="original")
+            ],
+        )
+
+    def checkpoint(snapshot: dict[str, JsonValue]) -> None:
+        snapshots.append(snapshot)
+        if snapshot["receipts"]:
+            fast_checkpoint.set()
+
+    context = RunContext(timeout_seconds=10)
+    harness = Harness(
+        request="cancel in batch",
+        context=context,
+        registry=CapabilityRegistry(
+            [
+                ToolSpec(
+                    name="read",
+                    description="read",
+                    parameters={"type": "object"},
+                    handler=handler,
+                )
+            ]
+        ),
+        decide=lambda _view: Decision(
+            calls=[
+                CapabilityCall(name="read", arguments={"slow": n == 0}, call_id=str(n))
+                for n in range(2)
+            ]
+        ),
+        checkpoint=checkpoint,
+        on_receipt=lambda receipt: callbacks.append(receipt.call.call_id),
+    )
+    runner = threading.Thread(target=harness.run)
+    runner.start()
+    try:
+        assert fast_checkpoint.wait(3)
+        saved = len(snapshots)
+        context.cancel()
+        runner.join(3)
+        assert not runner.is_alive()
+        release.set()
+        assert late_finished.wait(3)
+        assert len(snapshots) == saved
+        assert callbacks == ["1"]
+        assert harness.evidence.get(1) is not None and harness.evidence.get(2) is None
+        assert len(harness.receipts) == 1 and harness.turns == []
+    finally:
+        release.set()
+        runner.join(3)
+
+
+def test_restore_pending_metadata_marks_interrupted_without_reexecution_or_budget_charge() -> (
+    None
+):
+    context = RunContext(run_id="interrupted")
+    source = Harness(
+        request="restore",
+        context=context,
+        registry=CapabilityRegistry(),
+        decide=lambda _view: Decision(answer="done"),
+    )
+    snapshot = source.snapshot()
+    snapshot["pending_calls"] = [
+        {"call_id": "pending", "name": "read", "arguments": {"source_id": "law"}}
+    ]
+    snapshot["pending_call_count"] = 1
+    invoked: list[bool] = []
+
+    def handler(_args: dict[str, JsonValue], _context: RunContext) -> ToolOutcome:
+        invoked.append(True)
+        return ToolOutcome(status=OutcomeStatus.FOUND, summary="must be explicit")
+
+    restored = Harness(
+        request="restore",
+        context=RunContext(run_id="interrupted"),
+        registry=CapabilityRegistry(
+            [
+                ToolSpec(
+                    name="read",
+                    description="read",
+                    parameters={"type": "object"},
+                    handler=handler,
+                )
+            ]
+        ),
+        decide=lambda _view: Decision(answer="done"),
+    )
+    restored.restore(snapshot)
+    receipt = restored.receipts[0]
+    assert receipt.call.call_id == "pending"
+    assert receipt.outcome.status == OutcomeStatus.CANCELLED
+    assert receipt.outcome.data["interrupted"] is True
+    assert restored.context.budget.snapshot()["tools"] == 0
+    assert restored.snapshot()["pending_calls"] == []
+    assert restored.turns == []
+    restored.run()
+    assert invoked == []

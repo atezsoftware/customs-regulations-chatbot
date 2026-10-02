@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Mapping
 from enum import StrEnum
 from typing import Callable
 from uuid import uuid4
@@ -33,6 +34,132 @@ class Artifact(BaseModel):
     metadata: dict[str, JsonValue] = Field(default_factory=dict)
 
 
+_EVIDENCE_FIELDS = frozenset(
+    "source_id file_id document_id regulatory_chunk_id canonical_chunk_id chunk_id "
+    "canonical_identity original_document_id source_sha256 text_hash payload_sha256 "
+    "publication_id publication_revision publication_revision_id revision revision_id "
+    "publication_version index_name index_uuid query_index_name query_index_uuid "
+    "version version_unknown status validity_start validity_end effective_start "
+    "effective_end read_as_of_date as_of_date regulatory_validity_start_date "
+    "regulatory_validity_end_date position semantic_position projection_ordinal "
+    "heading_path regulatory_heading_path article_no article_title paragraph_no "
+    "clause_label chunk_type derived_role canonical_role extraction extraction_method "
+    "derived external untrusted legal_authority external_tool_name external_tool_id "
+    "truncated retrieval_method section_context additional_context "
+    "article_closure_complete article_closure_continuation article_closure_remaining_count "
+    "source_outline_truncated follow_context_tool retrieved_projection_ordinal "
+    "retrieved_center asv3_native_locator asv3_citation_preview_url semantic_key "
+    "source_regulatory_chunk_ids replaced_regulatory_chunk_ids regulation_id "
+    "regulation_name regulation_number regulation_type title name source_name "
+    "target_id target_article_no target_paragraph_no target_clause_label "
+    "regulatory_document_id source_canonical_document_id canonical_document_id "
+    "canonical_source_id supersedes_id superseded_by_id representation_id "
+    "representation_sha256 binding_id tenant_id document_set_id document_sets "
+    "document_type document_date legal_dates chunk_variant semantic_identifier "
+    "source_document_id source_publication_id publication_payload_sha256 "
+    "projection_payload_sha256 binding_sha256 effective_date supersession_id "
+    "provision_identifiers decision_numbers validity_start_date validity_end_date "
+    "context_projection_id chunk_index source_type search_settings_id committed_epoch "
+    "original_heading_present original_heading_path ordinal".split()
+)
+_LOCATOR_FIELDS = frozenset(
+    "page pages sheet cell row column path original_box normalized_box original_width "
+    "original_height coordinate_system start_char end_char start_offset end_offset "
+    "start_page end_page line start_line end_line table table_index row_start row_end "
+    "column_start column_end start_position end_position".split()
+)
+
+
+def compact_evidence_metadata(metadata: Mapping[str, object]) -> dict[str, JsonValue]:
+    """Retain citation/provenance locators; index vectors and raw payloads stay outside research."""
+
+    def selected(value: object) -> JsonValue:
+        if isinstance(value, dict):
+            return compact_evidence_metadata(
+                {name: part for name, part in value.items() if isinstance(name, str)}
+            )
+        if isinstance(value, (list, tuple)):
+            return [
+                selected(item)
+                for item in value
+                if isinstance(item, (str, int, float, bool)) or item is None
+            ]
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        return None
+
+    result: dict[str, JsonValue] = {}
+    for key, value in metadata.items():
+        if key in _EVIDENCE_FIELDS:
+            result[key] = selected(value)
+        elif key == "canonical_metadata" and isinstance(value, dict):
+            result[key] = selected(value)
+        elif key in {"index", "publication", "provenance", "target"} and isinstance(
+            value, dict
+        ):
+            result[key] = selected(value)
+        elif key == "locator" and isinstance(value, dict):
+            result[key] = {
+                name: selected(part)
+                for name, part in value.items()
+                if isinstance(name, str) and name in _LOCATOR_FIELDS
+            }
+        elif key == "source_links" and isinstance(value, dict):
+            result[key] = {
+                name: link
+                for name, link in value.items()
+                if isinstance(name, str) and name == "0" and isinstance(link, str)
+            }
+        elif key == "source_links" and isinstance(value, str):
+            result[key] = value
+    return result
+
+
+def model_evidence_metadata(metadata: Mapping[str, object]) -> dict[str, JsonValue]:
+    """Model locators are a projection; complete compact provenance stays in the ledger."""
+    compact = compact_evidence_metadata(metadata)
+    canonical = compact.get("canonical_metadata")
+    merged = {**(canonical if isinstance(canonical, dict) else {}), **compact}
+    for key in ("publication", "index", "provenance"):
+        nested = merged.get(key)
+        if isinstance(nested, dict):
+            merged = {**nested, **merged}
+    keys = frozenset(
+        "article_no paragraph_no clause_label read_as_of_date version_unknown derived "
+        "external untrusted legal_authority source_sha256 locator extraction_method "
+        "extraction publication_revision publication_revision_id revision_id index_uuid "
+        "query_index_uuid index_name query_index_name version revision document_date "
+        "legal_dates decision_numbers provision_identifiers target_article_no "
+        "target_paragraph_no target_clause_label publication_payload_sha256 payload_sha256 "
+        "article_closure_complete article_closure_remaining_count".split()
+    )
+    result = {key: value for key, value in merged.items() if key in keys}
+    for canonical_key, aliases in {
+        "heading_path": (
+            "heading_path",
+            "regulatory_heading_path",
+            "original_heading_path",
+        ),
+        "validity_start": (
+            "validity_start",
+            "regulatory_validity_start_date",
+            "validity_start_date",
+            "effective_start",
+        ),
+        "validity_end": (
+            "validity_end",
+            "regulatory_validity_end_date",
+            "validity_end_date",
+            "effective_end",
+        ),
+    }.items():
+        for alias in aliases:
+            if alias in merged and merged[alias] is not None:
+                result[canonical_key] = merged[alias]
+                break
+    return result
+
+
 class EvidenceItem(BaseModel):
     source_id: str
     text: str
@@ -48,6 +175,14 @@ class EvidenceItem(BaseModel):
         if self.text_hash and self.text_hash != digest:
             raise ValueError("Evidence text does not match its hash")
         self.text_hash = digest
+        self.metadata = compact_evidence_metadata(self.metadata)
+        if self.search_doc is not None:
+            citation_metadata = compact_evidence_metadata(
+                dict(self.search_doc.metadata)
+            )
+            self.search_doc = self.search_doc.model_copy(
+                update={"metadata": citation_metadata}
+            )
         return self
 
     @property

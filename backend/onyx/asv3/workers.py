@@ -34,7 +34,7 @@ class WorkerPool:
         context: RunContext,
         runner: ResearchRunner,
         *,
-        max_workers: int = 3,
+        max_workers: int = 4,
         max_nested_workers: int = 2,
         max_tasks: int = 12,
         progress: ProgressReporter | None = None,

@@ -75,6 +75,8 @@ class Harness:
         self._blocked_attempts: dict[str, int] = {}
         self._seen_calls: set[str] = set()
         self._seen_failures: set[str] = set()
+        self._committed_calls: set[str] = set()
+        self._pending_calls: dict[str, dict[str, JsonValue]] = {}
         self.context.services["registry"] = registry
         self.context.services["evidence"] = self.evidence
 
@@ -113,6 +115,9 @@ class Harness:
             "evidence": self.evidence.export(),
             "seen_calls": sorted(self._seen_calls),
             "seen_failures": sorted(self._seen_failures),
+            "pending_calls": list(self._pending_calls.values())[:128],
+            "pending_call_count": len(self._pending_calls),
+            "pending_calls_omitted": max(0, len(self._pending_calls) - 128),
             "turns": [turn.model_dump(mode="json") for turn in self.turns],
             "last_draft": self.last_draft,
         }
@@ -154,9 +159,53 @@ class Harness:
         budget = snapshot.get("budget")
         if isinstance(budget, dict):
             self.context.budget.restore({**budget, "artifact_bytes": 0})
+        self._committed_calls = {receipt.call.call_id for receipt in self.receipts}
+        self._seen_calls.update(self._committed_calls)
+        self._pending_calls.clear()
+        pending = array("pending_calls")
+        if len(pending) > 128:
+            raise ValueError("Pending tool metadata exceeds its checkpoint bound")
+        for item in pending:
+            if not isinstance(item, dict):
+                raise ValueError("Invalid pending tool metadata")
+            call = CapabilityCall.model_validate(item)
+            if call.call_id in self._committed_calls:
+                continue
+            self.receipts.append(
+                ToolReceipt(
+                    call=call,
+                    elapsed_seconds=0,
+                    outcome=ToolOutcome(
+                        status=OutcomeStatus.CANCELLED,
+                        summary="Interrupted tool call was not automatically resumed; choose the next research action explicitly",
+                        data={"interrupted": True, "pending_metadata_only": True},
+                    ),
+                )
+            )
+            self._seen_calls.add(call.call_id)
+            self._committed_calls.add(call.call_id)
+        omitted = snapshot.get("pending_calls_omitted", 0)
+        if isinstance(omitted, bool) or not isinstance(omitted, int) or omitted < 0:
+            raise ValueError("Invalid omitted pending tool count")
+        if omitted:
+            self.receipts.append(
+                ToolReceipt(
+                    call=CapabilityCall(name="interrupted_batch"),
+                    elapsed_seconds=0,
+                    outcome=ToolOutcome(
+                        status=OutcomeStatus.CANCELLED,
+                        summary="Additional unfinished tool metadata was bounded; no tool was automatically resumed",
+                        data={"interrupted": True, "omitted_pending_calls": omitted},
+                    ),
+                )
+            )
 
     def _save(self) -> None:
-        if self.checkpoint:
+        if (
+            self.checkpoint
+            and not self.context.is_cancelled()
+            and time.monotonic() < self.context.deadline
+        ):
             self.checkpoint(self.snapshot())
 
     def view(self) -> HarnessView:
@@ -254,6 +303,39 @@ class Harness:
             call=call, outcome=outcome, elapsed_seconds=time.monotonic() - start
         )
 
+    def _commit_receipt(self, receipt: ToolReceipt) -> None:
+        if receipt.call.call_id in self._committed_calls:
+            return
+        self.context.check_active()
+        receipt.evidence_ids = self.evidence.add(receipt.outcome.evidence, self.context)
+        if receipt.outcome.status in (
+            OutcomeStatus.UNAVAILABLE,
+            OutcomeStatus.INVALID,
+            OutcomeStatus.ERROR,
+            OutcomeStatus.DENIED,
+        ):
+            self._seen_failures.add(
+                json.dumps(
+                    {"name": receipt.call.name, "arguments": receipt.call.arguments},
+                    sort_keys=True,
+                )
+            )
+        receipt.outcome.artifacts = self.artifacts.add(
+            receipt.outcome.artifacts, self.context
+        )
+        compacted = compact_json(receipt.outcome.data)
+        assert isinstance(compacted, dict)
+        receipt.outcome.data = compacted
+        self.context.check_active()
+        if self.on_receipt:
+            self.on_receipt(receipt)
+        receipt.outcome = receipt.outcome.model_copy(update={"evidence": []})
+        self.receipts.append(receipt)
+        self._seen_calls.add(receipt.call.call_id)
+        self._committed_calls.add(receipt.call.call_id)
+        self._pending_calls.pop(receipt.call.call_id, None)
+        self._save()
+
     def _dispatch(self, calls: list[CapabilityCall]) -> list[ToolReceipt]:
         executor = ThreadPoolExecutor(
             max_workers=self.max_workers, thread_name_prefix="asv3-tool"
@@ -276,6 +358,19 @@ class Harness:
                     )
                     continue
                 self._seen_calls.add(call.call_id)
+                arguments = compact_json(call.arguments, max_chars=1500)
+                assert isinstance(arguments, dict)
+                self._pending_calls[call.call_id] = {
+                    "call_id": call.call_id,
+                    "name": call.name,
+                    "arguments": arguments,
+                }
+            # Persist locators before execution; an interrupted batch is never replayed.
+            self._save()
+            for call in calls:
+                if call.call_id in ready:
+                    self._commit_receipt(ready[call.call_id])
+                    continue
                 child = self.context.child()
                 # Tools are not delegated researchers; keep their delegation depth unchanged.
                 child.depth = self.context.depth
@@ -294,6 +389,7 @@ class Harness:
                 for call_id, (_, _, future) in list(pending.items()):
                     if future.done():
                         ready[call_id] = future.result()
+                        self._commit_receipt(ready[call_id])
                         del pending[call_id]
                 if not pending:
                     break
@@ -311,6 +407,7 @@ class Harness:
                                 summary=str(error),
                             ),
                         )
+                        self._commit_receipt(ready[call_id])
                     break
                 time.sleep(
                     min(0.02, max(0, self.context.research_deadline - time.monotonic()))
@@ -348,37 +445,6 @@ class Harness:
                     results: list[ToolMessage] = []
                     for receipt in self._dispatch(decision.calls):
                         self.context.check_active()
-                        receipt.evidence_ids = self.evidence.add(
-                            receipt.outcome.evidence, self.context
-                        )
-                        if receipt.outcome.status in (
-                            OutcomeStatus.UNAVAILABLE,
-                            OutcomeStatus.INVALID,
-                            OutcomeStatus.ERROR,
-                            OutcomeStatus.DENIED,
-                        ):
-                            self._seen_failures.add(
-                                json.dumps(
-                                    {
-                                        "name": receipt.call.name,
-                                        "arguments": receipt.call.arguments,
-                                    },
-                                    sort_keys=True,
-                                )
-                            )
-                        receipt.outcome.artifacts = self.artifacts.add(
-                            receipt.outcome.artifacts, self.context
-                        )
-                        compacted = compact_json(receipt.outcome.data)
-                        assert isinstance(compacted, dict)
-                        receipt.outcome.data = compacted
-                        if self.on_receipt:
-                            self.on_receipt(receipt)
-                        # The immutable originals live in the ledger, rather than every receipt.
-                        receipt.outcome = receipt.outcome.model_copy(
-                            update={"evidence": []}
-                        )
-                        self.receipts.append(receipt)
                         results.append(
                             ToolMessage(
                                 tool_call_id=receipt.call.call_id,

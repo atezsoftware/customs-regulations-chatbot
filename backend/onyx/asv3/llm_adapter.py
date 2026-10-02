@@ -22,6 +22,7 @@ from onyx.asv3.models import (
     ResearchTurn,
     RunContext,
     RunStopped,
+    model_evidence_metadata,
 )
 from onyx.configs.chat_configs import (
     LLM_FIRST_CHUNK_RETRY_BASE_DELAY_S,
@@ -365,6 +366,44 @@ class ResearchModel:
             payload = parse_json_object(data)
         except ValueError:
             payload = None
+        if payload is not None:
+            evidence = payload.get("evidence")
+            encoded_evidence = isinstance(evidence, str)
+            if encoded_evidence:
+                assert isinstance(evidence, str)
+                try:
+                    evidence = json.loads(evidence)
+                except ValueError:
+                    evidence = None
+            if isinstance(evidence, list):
+                records = []
+                for record in evidence:
+                    if isinstance(record, dict):
+                        record = dict(record)
+                        metadata = record.get("metadata")
+                        if isinstance(metadata, dict):
+                            record["metadata"] = model_evidence_metadata(metadata)
+                    records.append(record)
+                payload["evidence"] = (
+                    json.dumps(records, ensure_ascii=False)
+                    if encoded_evidence
+                    else records
+                )
+            if not research:
+                for key in (
+                    "receipts",
+                    "turns",
+                    "updates",
+                    "research_tasks",
+                    "budget",
+                    "audit_history",
+                    "tool_history",
+                ):
+                    payload.pop(key, None)
+            data = json.dumps(payload, ensure_ascii=False)
+        # The ledger/checkpoint retains the audit. Provider continuity needs only
+        # the most recent complete pair with its original provider call IDs.
+        turns = list(turns[-1:]) if research and turns else []
 
         def prompt(text: str) -> list[ChatCompletionMessage]:
             result: list[ChatCompletionMessage] = [SystemMessage(content=instruction)]
@@ -377,7 +416,6 @@ class ResearchModel:
 
         initial = prompt(data)
         # Remove complete old call/result pairs; never leave orphan provider calls.
-        turns = list(turns or [])
         while turns and self._input_cost(initial, selected) > ceiling:
             turns.pop(0)
             initial = prompt(data)
@@ -580,16 +618,16 @@ class ResearchModel:
                 max_tokens=max_tokens,
                 timeout_override=max(
                     1,
-                    min(
-                        120,
-                        int(
+                    int(
+                        min(
+                            120,
                             (
                                 self.context.research_deadline
                                 if research
                                 else self.context.deadline
                             )
-                            - time.monotonic()
-                        ),
+                            - time.monotonic(),
+                        )
                     ),
                 ),
                 reasoning_effort=self.reasoning_effort,
@@ -717,11 +755,52 @@ class ResearchModel:
         payload = view.model_dump(mode="json")
         payload.pop("tools", None)
         payload.pop("turns", None)
+        latest_ids = {
+            result.tool_call_id for turn in view.turns[-1:] for result in turn.results
+        }
+        failed = [
+            receipt
+            for receipt in view.receipts
+            if (
+                receipt.outcome.status.value
+                in {"unavailable", "invalid", "error", "denied", "truncated"}
+                or receipt.call.name == "finalization_status"
+            )
+            and receipt.call.call_id not in latest_ids
+        ]
+        payload["receipts"] = [
+            {
+                "call": receipt.call.model_dump(mode="json"),
+                "outcome": {
+                    "status": receipt.outcome.status.value,
+                    "summary": receipt.outcome.summary[:1000],
+                    **(
+                        {
+                            "data": {
+                                key: value
+                                for key, value in receipt.outcome.data.items()
+                                if key in {"gaps", "review", "missing", "instruction"}
+                            }
+                        }
+                        if receipt.call.name == "finalization_status"
+                        else {}
+                    ),
+                },
+                "evidence_ids": list(receipt.evidence_ids),
+            }
+            for receipt in failed[-3:]
+        ]
         payload.update(
             language=self.context.language,
             conversation=self.history,
-            updates=self.updates(),
-            research_tasks=self.pending_tasks(),
+            research_tasks=[
+                {
+                    key: task[key]
+                    for key in ("task_id", "status", "task", "parent_task_id")
+                    if key in task
+                }
+                for task in self.pending_tasks()
+            ],
         )
         instruction = RESEARCHER_PROMPT if self.context.depth else COORDINATOR_PROMPT
         artifacts = [

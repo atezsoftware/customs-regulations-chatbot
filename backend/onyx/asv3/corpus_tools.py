@@ -2,8 +2,10 @@
 
 import difflib
 import json
+import time
 from collections.abc import Callable, Iterator
 from datetime import date
+from hashlib import sha256
 from itertools import islice
 from threading import RLock
 from typing import cast
@@ -17,6 +19,7 @@ from onyx.asv3.models import (
     RunContext,
     ToolOutcome,
     ToolSpec,
+    compact_evidence_metadata,
 )
 from onyx.configs.constants import DocumentSource
 from onyx.context.search.models import IndexFilters, SearchDoc
@@ -25,6 +28,8 @@ from onyx.db.asv3_corpus import (
     CorpusScopeUnavailable,
     CorpusSource,
     find_sources,
+    iter_source_chunks_by_ids,
+    read_search_source_closures,
     read_source_chunks,
     require_source,
     resolve_source_query_index,
@@ -41,6 +46,7 @@ from onyx.regulatory.heading_path import (
     extract_regulatory_provision_references,
 )
 from onyx.tools.constants import REGULATORY_MAX_SEARCH_QUERY_CHARS
+from onyx.tracing.answer_graph import graph_step
 
 MAX_SCAN_CHUNKS = 2000
 MAX_RESPONSE_CHARS = 64_000
@@ -287,57 +293,108 @@ class CorpusBroker:
         self, items: list[EvidenceItem], context: RunContext
     ) -> None:
         """Recheck authorization and immutable text before resume/final delivery."""
+        canonical: dict[tuple[str, date | None], list[EvidenceItem]] = {}
+        native: list[EvidenceItem] = []
         for item in items:
             context.check_active()
-            source = self.source(item.source_id, context)
             if item.chunk_id is not None:
+                requested = item.metadata.get("read_as_of_date")
+                as_of = (
+                    date.fromisoformat(str(requested))
+                    if requested
+                    else self.filters.as_of_date
+                )
+                if (
+                    self.filters.as_of_date is not None
+                    and as_of != self.filters.as_of_date
+                ):
+                    raise PermissionError(
+                        "The retained evidence date differs from the captured run scope."
+                    )
+                canonical.setdefault((item.source_id, as_of), []).append(item)
+            elif item.metadata.get("source_sha256"):
+                native.append(item)
+            else:
+                raise CorpusScopeUnavailable("Evidence has no immutable source proof.")
+        for (source_id, as_of), group in canonical.items():
+            scoped = self.filters.model_copy(update={"as_of_date": as_of})
+            retained: dict[str, list[EvidenceItem]] = {}
+            for item in group:
+                assert item.chunk_id is not None
+                retained.setdefault(item.chunk_id, []).append(item)
+            with graph_step(
+                "asv3.canonical_revalidation.source",
+                {
+                    "source_id": source_id,
+                    "as_of_date": str(as_of or "current"),
+                    "retained_chunk_count": len(retained),
+                },
+            ) as step:
                 with get_session_with_current_tenant() as session:
+                    source = require_source(
+                        session,
+                        user=self.user,
+                        filters=scoped,
+                        source_id=UUID(source_id),
+                    )
                     with self._index_lock:
                         if source.id not in self.query_indexes:
                             snapshot = resolve_source_query_index(session, source.id)
                             if snapshot is not None:
                                 self.query_indexes[source.id] = snapshot
-                    position = source_chunk_position(
+                    originals = iter_source_chunks_by_ids(
                         session,
+                        user=self.user,
+                        filters=scoped,
                         source_id=source.id,
-                        chunk_id=item.chunk_id,
+                        chunk_ids=tuple(retained),
                         index=self.query_indexes.get(source.id),
-                        as_of=date.fromisoformat(str(item.metadata["read_as_of_date"]))
-                        if item.metadata.get("read_as_of_date")
-                        else self.filters.as_of_date,
+                        check_active=context.check_active,
                     )
-                if position is None:
-                    raise CorpusScopeUnavailable(
-                        "Retained evidence chunk no longer exists in its source."
-                    )
-                requested = item.metadata.get("read_as_of_date")
-                as_of = date.fromisoformat(str(requested)) if requested else None
-                _, chunks, _ = self.page(
-                    item.source_id, context, start=position, limit=100, as_of=as_of
-                )
-                current = next(
-                    (chunk for chunk in chunks if chunk.id == item.chunk_id), None
-                )
-                if current is None or current.text != item.text:
-                    raise CorpusScopeUnavailable(
-                        "Evidence changed or is outside the captured legal snapshot."
-                    )
-            elif item.metadata.get("source_sha256"):
-                from hashlib import sha256
-
-                from onyx.asv3.source_tools import read_verified_original, source_slot
-
-                with source_slot(context, research=False):
-                    content, _, _ = read_verified_original(
-                        self, item.source_id, context
-                    )
-                    if sha256(content).hexdigest() != item.metadata["source_sha256"]:
+                    seen: set[str] = set()
+                    try:
+                        for current in originals:
+                            if current.id in seen or current.id not in retained:
+                                raise CorpusScopeUnavailable(
+                                    "Retained evidence has ambiguous canonical bindings."
+                                )
+                            digest = sha256(current.text.encode("utf-8")).hexdigest()
+                            for item in retained[current.id]:
+                                if (
+                                    current.text != item.text
+                                    or digest != item.text_hash
+                                ):
+                                    raise CorpusScopeUnavailable(
+                                        "Evidence changed or is outside the captured legal snapshot."
+                                    )
+                                if (
+                                    item.search_doc is not None
+                                    and current.projection_ordinal
+                                    != item.search_doc.chunk_ind
+                                ):
+                                    raise CorpusScopeUnavailable(
+                                        "Retained citation ordinal changed in its source snapshot."
+                                    )
+                            seen.add(current.id)
+                    finally:
+                        originals.close()
+                    if seen != retained.keys():
                         raise CorpusScopeUnavailable(
-                            "Original source changed after extraction."
+                            "Retained evidence chunk no longer exists in its source."
                         )
-                    del content
-            else:
-                raise CorpusScopeUnavailable("Evidence has no immutable source proof.")
+                step.output_value = {"verified_chunk_count": len(seen)}
+        for item in native:
+            from onyx.asv3.source_tools import read_verified_original, source_slot
+
+            context.check_active()
+            self.source(item.source_id, context)
+            with source_slot(context, research=False):
+                content, _, _ = read_verified_original(self, item.source_id, context)
+                if sha256(content).hexdigest() != item.metadata["source_sha256"]:
+                    raise CorpusScopeUnavailable(
+                        "Original source changed after extraction."
+                    )
+                del content
 
     def attach_native_citation(
         self, item: EvidenceItem, number: int, message_id: int, context: RunContext
@@ -386,72 +443,119 @@ class CorpusBroker:
     def hydrate_search_evidence(
         self, doc: SearchDoc, context: RunContext
     ) -> list[EvidenceItem]:
-        """Hydrate an actual retrieved center; never invent section membership."""
-        source = self.source(doc.document_id, context)
-        chunk_id = doc.metadata.get("regulatory_chunk_id")
-        if not isinstance(chunk_id, str):
-            raise CorpusScopeUnavailable(
-                "Retrieved section has no canonical center identity."
+        return self.hydrate_search_results([doc], context).get(
+            (doc.document_id, doc.chunk_ind), []
+        )
+
+    def hydrate_search_results(
+        self, docs: list[SearchDoc], context: RunContext
+    ) -> dict[tuple[str, int], list[EvidenceItem]]:
+        """Share one bounded structural plan per source within this search call."""
+        grouped: dict[str, list[SearchDoc]] = {}
+        for doc in docs:
+            if not isinstance(doc.metadata.get("regulatory_chunk_id"), str):
+                raise CorpusScopeUnavailable(
+                    "Retrieved section has no canonical center identity."
+                )
+            grouped.setdefault(doc.document_id, []).append(doc)
+        hydrated: dict[tuple[str, int], list[EvidenceItem]] = {}
+        for source_id, centers in grouped.items():
+            context.check_active()
+            started = time.monotonic()
+            center_ids = tuple(
+                dict.fromkeys(
+                    str(doc.metadata["regulatory_chunk_id"]) for doc in centers
+                )
             )
-        with get_session_with_current_tenant() as session:
-            with self._index_lock:
-                if source.id not in self.query_indexes:
-                    snapshot = resolve_source_query_index(session, source.id)
-                    if snapshot is not None:
-                        self.query_indexes[source.id] = snapshot
-            position = source_chunk_position(
-                session,
-                source_id=source.id,
-                chunk_id=chunk_id,
-                index=self.query_indexes.get(source.id),
-                as_of=self.filters.as_of_date,
-            )
-        if position is None:
-            raise CorpusScopeUnavailable(
-                "Retrieved center is not in the captured source snapshot."
-            )
-        _, chunks, _ = self.page(str(source.id), context, start=position, limit=100)
-        center = next((chunk for chunk in chunks if chunk.id == chunk_id), None)
-        del chunks
-        if center is None:
-            raise CorpusScopeUnavailable(
-                "Retrieved center cannot be independently hydrated."
-            )
-        identity = article_identity(center)
-        closure, incomplete = [center], False
-        if identity is not None:
-            stream = self.iter_chunks(str(source.id), context)
-            selection = EvidenceSelection(source)
-            current_identity = None
-            for chunk in stream:
-                own = article_identity(chunk)
-                if own is not None:
-                    current_identity = own
-                if current_identity == identity:
-                    selection.add(chunk)
-            incomplete = stream.truncated
-            items, clipped = selection.items, selection.clipped
-        else:
-            items, clipped = bounded_evidence(source, closure)
-        if not any(item.chunk_id == center.id for item in items):
-            items.insert(0, evidence_for_chunk(source, center))
-        for item in items:
-            item.metadata.update(
+            with graph_step(
+                "asv3.canonical_hydration.source",
                 {
-                    "retrieval_method": "established_search_canonical_hydration",
-                    "section_context": "not_inferred",
-                    "additional_context": "canonical_article_closure"
-                    if identity
-                    else "center_only",
-                    "article_closure_complete": not incomplete and not clipped
-                    if identity
-                    else False,
-                    "follow_context_tool": "read_provision",
-                    "retrieved_projection_ordinal": doc.chunk_ind,
-                    "retrieved_center": item.chunk_id == center.id,
+                    "source_id": source_id,
+                    "center_ids": center_ids,
+                    "as_of_date": str(self.filters.as_of_date or "current"),
+                },
+                summary="Read original local provision closures",
+            ) as step:
+                with get_session_with_current_tenant() as session:
+                    source = require_source(
+                        session,
+                        user=self.user,
+                        filters=self.filters,
+                        source_id=UUID(source_id),
+                    )
+                    with self._index_lock:
+                        if source.id not in self.query_indexes:
+                            snapshot = resolve_source_query_index(session, source.id)
+                            if snapshot is not None:
+                                self.query_indexes[source.id] = snapshot
+                    result = read_search_source_closures(
+                        session,
+                        user=self.user,
+                        filters=self.filters,
+                        source_id=source.id,
+                        center_ids=center_ids,
+                        index=self.query_indexes.get(source.id),
+                        check_active=context.check_active,
+                        max_chars=MAX_RESPONSE_CHARS * len(center_ids),
+                    )
+                by_id = {chunk.id: chunk for chunk in result.chunks}
+                originals = {
+                    chunk.id: evidence_for_chunk(result.source, chunk)
+                    for chunk in result.chunks
                 }
-            )
-        return items
+                for doc in centers:
+                    center_id = str(doc.metadata["regulatory_chunk_id"])
+                    if center_id not in by_id:
+                        hydrated[(doc.document_id, doc.chunk_ind)] = []
+                        continue
+                    items = []
+                    for member in result.members[center_id]:
+                        chunk = by_id.get(member)
+                        if chunk is None:
+                            continue
+                        item = originals[member].model_copy(
+                            update={
+                                "metadata": {
+                                    **originals[member].metadata,
+                                    "retrieval_method": "established_search_canonical_hydration",
+                                    "section_context": "not_inferred",
+                                    "additional_context": "canonical_local_provision_closure",
+                                    "article_closure_complete": result.complete[
+                                        center_id
+                                    ],
+                                    "article_closure_continuation": list(
+                                        result.continuation[center_id][:100]
+                                    ),
+                                    "article_closure_remaining_count": len(
+                                        result.continuation[center_id]
+                                    ),
+                                    "source_outline_truncated": result.outline_truncated,
+                                    "follow_context_tool": "read_provision",
+                                    "retrieved_projection_ordinal": doc.chunk_ind,
+                                    "retrieved_center": member == center_id,
+                                }
+                            }
+                        )
+                        items.append(item)
+                    hydrated[(doc.document_id, doc.chunk_ind)] = items
+                step.output_value = {
+                    "elapsed_seconds": time.monotonic() - started,
+                    "outline_rows": result.outline_rows,
+                    "outline_truncated": result.outline_truncated,
+                    "hydrated_chunk_count": len(result.chunks),
+                    "hydrated_characters": sum(
+                        len(chunk.text) for chunk in result.chunks
+                    ),
+                    "centers": [
+                        {
+                            "center_id": center,
+                            "complete": result.complete[center],
+                            "remaining_count": len(result.continuation[center]),
+                        }
+                        for center in center_ids
+                    ],
+                }
+        return hydrated
 
 
 def evidence_for_chunk(source: CorpusSource, chunk: CorpusChunk) -> EvidenceItem:
@@ -495,7 +599,7 @@ def evidence_for_chunk(source: CorpusSource, chunk: CorpusChunk) -> EvidenceItem
             if chunk.validity_end
             else None,
             "version_unknown": chunk.validity_start is None,
-            "canonical_metadata": json_value(chunk.metadata),
+            "canonical_metadata": compact_evidence_metadata(chunk.metadata),
             "read_as_of_date": cast(JsonValue, chunk.metadata.get("read_as_of_date")),
         },
     )

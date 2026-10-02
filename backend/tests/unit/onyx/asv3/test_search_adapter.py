@@ -476,14 +476,16 @@ def test_real_search_results_are_canonically_hydrated_once_without_payload_text_
     with (
         search_boundaries(chunks),
         patch.object(
-            broker, "hydrate_search_evidence", return_value=originals
+            broker,
+            "hydrate_search_results",
+            return_value={(source_id, n): originals for n in (1, 2)},
         ) as hydrate,
     ):
         outcome = adapter(
             {"query": "named repair mechanism", "mode": "keyword"}, RunContext()
         )
     assert outcome.status == OutcomeStatus.FOUND
-    assert hydrate.call_count == 2
+    assert hydrate.call_count == 1
     assert [item.identity for item in outcome.evidence] == [
         item.identity for item in originals
     ]

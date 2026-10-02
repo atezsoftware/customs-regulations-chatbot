@@ -7,6 +7,7 @@ import {
 export interface ASv3ProgressState {
   runId: string | null;
   header: ASv3Progress | null;
+  history: ASv3Progress[];
   tasks: Map<string, ASv3Progress>;
   seenEvents: Set<string>;
   latestSequences: Map<string, number>;
@@ -19,10 +20,13 @@ const TERMINAL_STATUSES = new Set<ASv3Progress["status"]>([
   "cancelled",
 ]);
 
+export const MAX_ASV3_COORDINATOR_STEPS = 32;
+
 export function createASv3ProgressState(): ASv3ProgressState {
   return {
     runId: null,
     header: null,
+    history: [],
     tasks: new Map(),
     seenEvents: new Set(),
     latestSequences: new Map(),
@@ -54,6 +58,18 @@ export function applyASv3Progress(
   const tasks = new Map(state.tasks);
   if (event.task_id) tasks.set(event.task_id, event);
   const terminal = !event.task_id && TERMINAL_STATUSES.has(event.status);
+  let history = state.history;
+  if (!event.task_id) {
+    const previous = history[history.length - 1];
+    const samePublicUpdate =
+      previous?.title === event.title &&
+      (previous.message ?? "") === (event.message ?? "") &&
+      previous.status === event.status &&
+      previous.language === event.language;
+    history = samePublicUpdate
+      ? [...history.slice(0, -1), event]
+      : [...history.slice(-(MAX_ASV3_COORDINATOR_STEPS - 1)), event];
+  }
   if (terminal) {
     // Closing the run revokes work that has not produced a terminal task event.
     for (const [id, task] of Array.from(tasks)) {
@@ -65,6 +81,7 @@ export function applyASv3Progress(
   return {
     runId: state.runId ?? event.run_id,
     header: !event.task_id || !state.header ? event : state.header,
+    history,
     tasks,
     seenEvents: new Set([
       ...Array.from(state.seenEvents).slice(-255),

@@ -7,7 +7,12 @@ from typing import Iterable
 
 from pydantic import JsonValue
 
-from onyx.asv3.models import EvidenceItem, RunContext
+from onyx.asv3.models import (
+    EvidenceItem,
+    RunContext,
+    RunStopped,
+    model_evidence_metadata,
+)
 from onyx.context.search.models import SearchDoc
 
 
@@ -25,6 +30,7 @@ class EvidenceLedger:
         with self._lock:
             context.check_active()
             for item in items:
+                item = EvidenceItem.model_validate(item.model_dump(mode="python"))
                 existing = self._identities.get(item.identity)
                 if existing is not None:
                     recorded = self._items[existing]
@@ -56,6 +62,49 @@ class EvidenceLedger:
                 for number, item in self._items.items()
                 if item.search_doc is not None
             }
+
+    def serialize_records(
+        self,
+        numbers: Iterable[int],
+        *,
+        required: Iterable[int] = (),
+        max_chars: int = 180000,
+    ) -> str:
+        """Fit full serialized originals, including provenance, without clipping required rules."""
+        required_numbers = list(dict.fromkeys(required))
+        required_set = set(required_numbers)
+        ordered = list(dict.fromkeys([*required_numbers, *numbers]))
+        records: list[dict[str, JsonValue]] = []
+        used = 2
+        with self._lock:
+            for number in ordered:
+                item = self._items.get(number)
+                if item is None:
+                    if number in required_set:
+                        raise ValueError("Required evidence is not recorded")
+                    continue
+                record: dict[str, JsonValue] = {
+                    "citation": number,
+                    "source_id": item.source_id,
+                    "chunk_id": item.chunk_id,
+                    "text_hash": item.text_hash,
+                    "text": item.text,
+                    "truncated": False,
+                    "citable": item.search_doc is not None,
+                    "metadata": model_evidence_metadata(item.metadata),
+                }
+                cost = len(json.dumps(record, ensure_ascii=False)) + (
+                    2 if records else 0
+                )
+                if used + cost > max_chars:
+                    if number in required_set:
+                        raise RunStopped(
+                            "Complete cited evidence and provenance exceed the serialized evidence limit"
+                        )
+                    continue
+                records.append(record)
+                used += cost
+        return json.dumps(records, ensure_ascii=False)
 
     def summaries(self, *, max_chars: int = 32000) -> list[dict[str, JsonValue]]:
         with self._lock:

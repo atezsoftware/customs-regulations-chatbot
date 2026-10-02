@@ -386,6 +386,25 @@ def test_runtime_parallel_sources_full_original_review_and_final_citations(
     model_name: str,
 ) -> None:
     kwargs, broker, llm, checkpoints, queue = setup_run(monkeypatch)
+    scripted = iter(list(llm.invoke.side_effect))
+    invocation = 0
+
+    def answer_from_supplied_evidence(**arguments: Any) -> ModelResponse:
+        nonlocal invocation
+        current = invocation
+        invocation += 1
+        scheduled = next(scripted)
+        if current not in (2, 4):
+            return scheduled
+        evidence = request_data(arguments)["evidence"]
+        if isinstance(evidence, str):
+            evidence = json.loads(evidence)
+        numbers = {item["chunk_id"]: item["citation"] for item in evidence}
+        return response(
+            f"Tamir sonucu [{numbers['chunk-0']}]; değiştirme sonucu [{numbers['chunk-1']}]."
+        )
+
+    llm.invoke.side_effect = answer_from_supplied_evidence
     llm.config = LLMConfig(
         model_provider=provider,
         model_name=model_name,
@@ -425,11 +444,97 @@ def test_runtime_parallel_sources_full_original_review_and_final_citations(
         if isinstance(packet.obj, (AgentResponseDelta, CitationInfo))
     )
     state = kwargs["state_container"]
-    assert "[[1]](https://example.test/law-0)" in state.answer_tokens
-    assert "[[2]](https://example.test/law-1)" in state.answer_tokens
+    assert {doc.link for doc in state.citation_to_doc.values()} == {
+        "https://example.test/law-0",
+        "https://example.test/law-1",
+    }
+    for number, doc in state.citation_to_doc.items():
+        assert f"[[{number}]]({doc.link})" in state.answer_tokens
+        expected_claim = (
+            "Tamir sonucu" if doc.link.endswith("law-0") else "değiştirme sonucu"
+        )
+        assert f"{expected_claim} [[{number}]]({doc.link})" in state.answer_tokens
     assert len(state.citation_to_doc) == 2
     assert checkpoints[-1]["evidence"]["included"] == [1, 2]
+    turn = checkpoints[-1]["turns"][0]
+    calls = turn["assistant"]["tool_calls"]
+    assert [result["tool_call_id"] for result in turn["results"]] == [
+        call["id"] for call in calls
+    ]
+    assert [call["function"]["name"] for call in calls] == [
+        "read_source_range",
+        "read_source_range",
+        "report_progress",
+    ]
     assert llm.config.model_provider == provider and llm.config.model_name == model_name
+
+
+def test_failed_final_verification_preserves_successful_final_original_delivery_without_publication(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from onyx.tracing.flows import LLMFlow
+
+    kwargs, broker, llm, checkpoints, queue = setup_run(monkeypatch)
+    script = list(llm.invoke.side_effect)
+    script[-1] = RuntimeError("Final verifier failed after successful synthesis")
+    llm.invoke.side_effect = script
+    with pytest.raises(RuntimeError, match="Final verifier failed"):
+        runtime.run_asv3_loop(**kwargs)
+    saved = checkpoints[-1]
+    assert saved["publication_status"] == "partial"
+    final_deliveries = [
+        delivery
+        for delivery in saved["evidence"]["deliveries"]
+        if delivery["flow"] == LLMFlow.ASV3_FINAL.value
+    ]
+    assert len(final_deliveries) == 1
+    records = final_deliveries[0]["records"]
+    assert {record["chunk_id"] for record in records} == {
+        chunk.id for chunk in broker.chunks.values()
+    }
+    assert all(record["complete"] for record in records)
+    originals = {
+        record["citation"]: record["item"] for record in saved["evidence"]["records"]
+    }
+    assert all(
+        record["text_hash"] == originals[record["citation"]]["text_hash"]
+        for record in records
+    )
+    assert not kwargs["state_container"].answer_tokens
+    assert not any(
+        isinstance(packet.obj, (AgentResponseDelta, CitationInfo))
+        for packet in packets(queue)
+    )
+
+
+def test_final_evidence_keeps_uncited_same_source_exception_without_unrelated_sources() -> (
+    None
+):
+    from onyx.asv3.evidence import EvidenceLedger
+
+    ledger = EvidenceLedger()
+    ledger.add(
+        [
+            EvidenceItem(
+                source_id="law",
+                chunk_id="rule",
+                text="Full rule and its first condition.",
+            ),
+            EvidenceItem(
+                source_id="law",
+                chunk_id="exception",
+                text="Decisive exception and additional condition.",
+            ),
+            EvidenceItem(
+                source_id="unrelated", chunk_id="other", text="Unrelated source."
+            ),
+        ],
+        RunContext(),
+    )
+    supplied = json.loads(runtime._evidence_record(ledger, "Apply the rule [1]."))
+    assert [record["citation"] for record in supplied] == [1, 2]
+    assert supplied[1]["text"] == "Decisive exception and additional condition."
+    assert all(record["truncated"] is False for record in supplied)
 
 
 def test_runtime_drops_unrecorded_citation_and_publishes_only_localized_gap(

@@ -47,8 +47,10 @@ class ScopedSearchLLM(LLM):
     def config(self) -> LLMConfig:
         return self.selected.config
 
-    def timeout(self, requested: int | None) -> int:
+    def timeout(self, requested: int | None) -> int | None:
         self.context.check_research_active()
+        if self.context.research_deadline == float("inf"):
+            return requested
         remaining = max(1, int(self.context.research_deadline - time.monotonic()))
         return remaining if requested is None else max(1, min(requested, remaining))
 
@@ -223,6 +225,7 @@ def build_search_adapter(
         seen_evidence: set[tuple[str, str | None, str]] = set()
         unmapped_results = 0
         docs = {(doc.document_id, doc.chunk_ind): doc for doc in rich.search_docs}
+        mapped_docs = []
         for result in results:
             if not isinstance(result, dict):
                 unmapped_results += 1
@@ -244,18 +247,35 @@ def build_search_adapter(
             if doc is None:
                 unmapped_results += 1
                 continue
-            # A retrieved section may contain siblings. Bind each real canonical row,
-            # never the combined section text to its center's identity.
-            hydrated = broker.hydrate_search_evidence(doc, context)
+            mapped_docs.append(doc)
+        # Hydrate one local structural plan per source, keeping real atomic IDs.
+        hydrated_results = broker.hydrate_search_results(mapped_docs, context)
+        incomplete_closures = 0
+        unhydrated_centers: list[JsonValue] = []
+        for doc in mapped_docs:
+            hydrated = hydrated_results.get((doc.document_id, doc.chunk_ind), [])
             if not hydrated:
                 unmapped_results += 1
+                unhydrated_centers.append(
+                    {
+                        "source_id": doc.document_id,
+                        "canonical_chunk_id": doc.metadata.get("regulatory_chunk_id"),
+                        "projection_ordinal": doc.chunk_ind,
+                        "instruction": "The center was not delivered as original evidence. Read its authorized source directly or report the exact gap; do not infer absence.",
+                    }
+                )
+            elif any(
+                item.metadata.get("article_closure_complete") is False
+                for item in hydrated
+            ):
+                incomplete_closures += 1
             for item in hydrated:
                 if item.identity not in seen_evidence:
                     seen_evidence.add(item.identity)
                     evidence.append(item)
         status = (
             OutcomeStatus.PARTIAL
-            if evidence and unmapped_results
+            if evidence and (unmapped_results or incomplete_closures)
             else OutcomeStatus.FOUND
             if evidence
             else OutcomeStatus.UNAVAILABLE
@@ -269,6 +289,8 @@ def build_search_adapter(
                 "source_count": len(evidence),
                 "retrieved_result_count": len(results),
                 "unmapped_result_count": unmapped_results,
+                "incomplete_closure_count": incomplete_closures,
+                "unhydrated_centers": unhydrated_centers,
                 "query": query,
                 "mode": mode,
                 "original_question": original_query,

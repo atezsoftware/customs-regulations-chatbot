@@ -79,6 +79,193 @@ def scripted_model(limit: int = 100000) -> MagicMock:
     return llm
 
 
+def test_evidence_metadata_excludes_vectors_and_raw_content_at_creation_and_restore() -> (
+    None
+):
+    from onyx.asv3.evidence import EvidenceLedger
+    from onyx.asv3.models import EvidenceItem
+
+    metadata: dict[str, JsonValue] = {
+        "canonical_metadata": {
+            "title_vector": [0.25] * 1024,
+            "content_vector": [0.75] * 1024,
+            "content": "DUPLICATED_RAW_DOCUMENT",
+            "doc_summary": "INDEX_SUMMARY",
+            "regulatory_chunk_id": "article-143",
+            "publication_revision": "rev-7",
+            "query_index_uuid": "index-identity",
+            "heading_path": ["Kanun", "Madde 143"],
+            "document_date": "2020-01-01",
+            "source_links": {"0": "https://example.test/article-143"},
+        },
+        "read_as_of_date": "2026-10-02",
+        "validity_start": "2020-01-01",
+        "source_sha256": "original-hash",
+        "locator": {"page": 3, "row": 2, "normalized_box": [0.1, 0.2, 0.3, 0.4]},
+    }
+    item = EvidenceItem(
+        source_id="law",
+        chunk_id="article-143",
+        text="Complete operative conditions.",
+        metadata=metadata,
+    )
+    ledger = EvidenceLedger()
+    ledger.add([item], RunContext())
+    checkpoint = json.loads(json.dumps(ledger.export()))
+    encoded = json.dumps(checkpoint)
+    assert "vector" not in encoded and "DUPLICATED_RAW_DOCUMENT" not in encoded
+    retained = checkpoint["records"][0]["item"]
+    assert retained["metadata"]["canonical_metadata"]["publication_revision"] == "rev-7"
+    assert retained["metadata"]["canonical_metadata"]["heading_path"] == [
+        "Kanun",
+        "Madde 143",
+    ]
+    assert retained["metadata"]["locator"]["normalized_box"] == [0.1, 0.2, 0.3, 0.4]
+    assert retained["metadata"]["source_sha256"] == "original-hash"
+    supplied = json.loads(ledger.serialize_records([1], required=[1]))[0]
+    assert supplied["metadata"]["heading_path"] == ["Kanun", "Madde 143"]
+    assert supplied["metadata"]["publication_revision"] == "rev-7"
+    assert supplied["metadata"]["query_index_uuid"] == "index-identity"
+    assert "canonical_metadata" not in supplied["metadata"]
+    stored = ledger.get(1)
+    assert stored is not None and "canonical_metadata" in stored.metadata
+    # Legacy checkpoint metadata is sanitized without changing canonical identity.
+    retained["metadata"] = metadata
+    restored = EvidenceLedger()
+    restored.restore(checkpoint, RunContext())
+    restored_item = restored.get(1)
+    assert restored_item is not None and restored_item.identity == item.identity
+    assert "vector" not in json.dumps(restored.export())
+    retained["text"] = "Changed original"
+    with pytest.raises(ValueError, match="hash"):
+        EvidenceLedger().restore(checkpoint, RunContext())
+
+
+def test_serialized_evidence_limit_counts_provenance_and_escaping_without_clipping_rules() -> (
+    None
+):
+    from onyx.asv3.evidence import EvidenceLedger
+    from onyx.asv3.models import EvidenceItem, RunStopped
+
+    ledger = EvidenceLedger()
+    item = EvidenceItem(
+        source_id="law",
+        chunk_id="143",
+        text='"\\' * 100,
+        metadata={"publication_revision": "r" * 1000, "heading_path": ["Madde 143"]},
+    )
+    ledger.add([item], RunContext())
+    full = ledger.serialize_records([1], required=[1])
+    assert json.loads(full)[0]["text"] == item.text
+    assert len(item.text) < len(full) - 1
+    with pytest.raises(RunStopped, match="serialized evidence limit"):
+        ledger.serialize_records([1], required=[1], max_chars=len(full) - 1)
+    assert ledger.serialize_records([1], max_chars=len(full) - 1) == "[]"
+    assert ledger.serialize_records([1], required=[1], max_chars=len(full)) == full
+    model = ResearchModel(scripted_model(limit=800), RunContext(), token_counter=len)
+    with pytest.raises(RunStopped, match="Complete cited evidence"):
+        model._fit(
+            "Verify",
+            json.dumps({"draft": "Rule [1]", "evidence": full}),
+            [],
+            max_tokens=100,
+        )
+
+
+def test_model_receives_latest_complete_pair_and_sanitized_originals_without_audit_history() -> (
+    None
+):
+    from onyx.asv3.models import ResearchTurn
+    from onyx.llm.models import AssistantMessage, FunctionCall, ToolCall, ToolMessage
+
+    turns = [
+        ResearchTurn(
+            assistant=AssistantMessage(
+                content=None,
+                tool_calls=[
+                    ToolCall(
+                        id=f"call-{n}",
+                        function=FunctionCall(
+                            name="read_evidence", arguments='{"citation":1}'
+                        ),
+                    )
+                ],
+            ),
+            results=[
+                ToolMessage(tool_call_id=f"call-{n}", content=f"HISTORICAL_PAYLOAD_{n}")
+            ],
+        )
+        for n in range(3)
+    ]
+    model = ResearchModel(scripted_model(), RunContext())
+    prompt, _, _ = model._fit(
+        "Research",
+        json.dumps({"request": "Complete scenario", "evidence": []}),
+        [],
+        max_tokens=1000,
+        research=True,
+        turns=turns,
+    )
+    assert prompt[1] == turns[-1].assistant and prompt[2] == turns[-1].results[0]
+    assert len(prompt) == 4 and len(turns) == 3
+    encoded = json.dumps([message.model_dump(mode="json") for message in prompt])
+    assert "HISTORICAL_PAYLOAD_2" in encoded and "HISTORICAL_PAYLOAD_0" not in encoded
+    data = {
+        "request": "Complete scenario",
+        "draft": "Condition [1]",
+        "evidence": json.dumps(
+            [
+                {
+                    "citation": 1,
+                    "text": "ALL_OPERATIVE_CONDITIONS",
+                    "metadata": {
+                        "title_vector": [0.25] * 1024,
+                        "publication_revision": "rev-7",
+                    },
+                }
+            ]
+        ),
+        "receipts": [{"audit": "OLD_AUDIT"}],
+        "updates": ["OLD_AUDIT"],
+    }
+    prompt, _, _ = model._fit(
+        "Verify", json.dumps(data), [], max_tokens=1000, turns=turns
+    )
+    encoded = json.dumps([message.model_dump(mode="json") for message in prompt])
+    assert (
+        "vector" not in encoded
+        and "OLD_AUDIT" not in encoded
+        and "HISTORICAL_PAYLOAD" not in encoded
+    )
+    assert "ALL_OPERATIVE_CONDITIONS" in encoded and "rev-7" in encoded
+
+
+def test_unlimited_run_keeps_finite_selected_provider_timeout_and_finite_deadline_checks() -> (
+    None
+):
+    from onyx.asv3.models import RunStopped
+
+    llm = scripted_model()
+    llm.invoke.return_value = ModelResponse(
+        id="result",
+        created="0",
+        choice=Choice(message=Message(content="Complete answer")),
+    )
+    assert (
+        ResearchModel(llm, RunContext(timeout_seconds=float("inf"))).invoke_text(
+            "Answer", "Scenario", LLMFlow.ASV3_FINAL
+        )
+        == "Complete answer"
+    )
+    assert llm.invoke.call_args.kwargs["timeout_override"] == 120
+    expired = RunContext(timeout_seconds=-1)
+    with pytest.raises(RunStopped):
+        ResearchModel(llm, expired).invoke_text(
+            "Answer", "Scenario", LLMFlow.ASV3_FINAL
+        )
+    assert llm.invoke.call_count == 1
+
+
 def complete_language_profile() -> dict[str, Any]:
     from onyx.asv3.llm_adapter import REQUIRED_NOTIFICATION_PHASES
 
@@ -463,10 +650,10 @@ def test_verification_uses_typed_provider_schema_and_repairs_incomplete_json() -
             "uncertain",
         ]
         assert set(schema["required"]) == set(verification_profile())
-        assert (
-            call.kwargs["prompt"][1].content
-            == '{"claim":"Royalti [1]","evidence":"original"}'
-        )
+        assert json.loads(call.kwargs["prompt"][1].content) == {
+            "claim": "Royalti [1]",
+            "evidence": "original",
+        }
 
 
 def test_final_answer_remains_free_text_without_structured_schema() -> None:

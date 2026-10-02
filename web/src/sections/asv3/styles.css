@@ -2,8 +2,37 @@
   overflow-x: auto;
 }
 
+.asv3-header-toggle button > div,
+.asv3-step-toggle button > div {
+  width: 100%;
+  min-width: 0;
+}
+
+.asv3-header-toggle button > div > span,
+.asv3-step-toggle button > div > span {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-align: left;
+  text-overflow: ellipsis;
+}
+
+.asv3-title-running button > div > span {
+  animation: shimmer 1s ease-out infinite;
+  background-size: 300% 100%;
+  background-image: linear-gradient(
+    90deg,
+    var(--shimmer-base) 35%,
+    var(--shimmer-highlight) 50%,
+    var(--shimmer-base) 65%
+  );
+  background-clip: text;
+  -webkit-background-clip: text;
+  color: transparent;
+}
+
 @media (prefers-reduced-motion: reduce) {
-  .asv3-timeline .shimmer-text {
+  .asv3-title-running button > div > span {
     animation: none;
     background: none;
     color: var(--text-03);

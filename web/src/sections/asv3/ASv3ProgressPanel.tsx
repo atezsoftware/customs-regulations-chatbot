@@ -5,6 +5,7 @@ import { Button, Tabs, Text } from "@opal/components";
 import {
   SvgBranch,
   SvgCheckCircle,
+  SvgCircle,
   SvgExpand,
   SvgFold,
   SvgLoader,
@@ -20,6 +21,7 @@ import { TimelineRoot } from "@/app/app/message/messageComponents/timeline/primi
 import { TimelineHeaderRow } from "@/app/app/message/messageComponents/timeline/primitives/TimelineHeaderRow";
 import { TimelineRow } from "@/app/app/message/messageComponents/timeline/primitives/TimelineRow";
 import { TimelineSurface } from "@/app/app/message/messageComponents/timeline/primitives/TimelineSurface";
+import { StepContainer as OnyxStepContainer } from "@/app/app/message/messageComponents/timeline/StepContainer";
 import "@/sections/asv3/styles.css";
 
 interface ASv3ProgressPanelProps {
@@ -43,7 +45,9 @@ function TaskStatusIcon({ task, active }: TaskStatusIconProps) {
     ? SvgLoader
     : task.status === "completed"
       ? SvgCheckCircle
-      : SvgXOctagon;
+      : task.status === "failed" || task.status === "cancelled"
+        ? SvgXOctagon
+        : SvgCircle;
   return (
     <span
       aria-hidden="true"
@@ -59,6 +63,59 @@ function TaskStatusIcon({ task, active }: TaskStatusIconProps) {
         )}
       />
     </span>
+  );
+}
+
+interface ASv3PastStepProps {
+  step: ASv3Progress;
+  first: boolean;
+  last: boolean;
+}
+
+function ASv3PastStep({ step, first, last }: ASv3PastStepProps) {
+  const detailsId = useId();
+  const [expanded, setExpanded] = useState(false);
+  const Icon =
+    step.status === "completed"
+      ? SvgCheckCircle
+      : step.status === "failed" || step.status === "cancelled"
+        ? SvgXOctagon
+        : SvgCircle;
+  return (
+    <div data-testid="asv3-past-step">
+      <OnyxStepContainer
+        stepIcon={Icon}
+        isFirstStep={first}
+        isLastStep={last}
+        collapsible={false}
+        header={
+          <div className="asv3-step-toggle min-w-0">
+            <Button
+              prominence="tertiary"
+              size="md"
+              width="full"
+              rightIcon={expanded ? SvgFold : SvgExpand}
+              aria-expanded={expanded}
+              aria-controls={detailsId}
+              onClick={() => setExpanded(!expanded)}
+              title={step.title}
+            >
+              {step.title}
+            </Button>
+          </div>
+        }
+      >
+        {expanded && (
+          <div id={detailsId} className="px-2 pb-2">
+            {step.message && (
+              <Text as="p" font="secondary-body" color="text-03">
+                {step.message}
+              </Text>
+            )}
+          </div>
+        )}
+      </OnyxStepContainer>
+    </div>
   );
 }
 
@@ -151,10 +208,9 @@ export default function ASv3ProgressPanel({
   onResume,
   pending = false,
   agent,
-  hasDisplayContent = false,
 }: ASv3ProgressPanelProps) {
   const detailsId = useId();
-  const [manualExpanded, setManualExpanded] = useState<boolean | null>(null);
+  const [expanded, setExpanded] = useState(false);
   if (!state.header && !pending) return null;
   const active = !state.terminal && !stopped;
   const tasks = Array.from(state.tasks.values());
@@ -166,8 +222,10 @@ export default function ASv3ProgressPanel({
       task.parent_task_id === task.task_id
   );
   const rootTasks = roots.length > 0 ? roots : tasks;
-  const expanded = manualExpanded ?? (active && !hasDisplayContent);
   const header = state.header;
+  const pastSteps = state.history.filter(
+    (step) => step.event_id !== header?.event_id
+  );
   const title = header?.title ?? "ASv3";
   return (
     <section
@@ -188,51 +246,28 @@ export default function ASv3ProgressPanel({
             )
           }
         >
-          <div className="flex h-full min-w-0 items-center justify-between rounded-12 p-1 transition-colors hover:bg-background-tint-00">
-            <div
-              data-testid="asv3-progress-title"
-              className={cn(
-                "min-w-0 px-(--timeline-header-text-padding-x) py-(--timeline-header-text-padding-y)",
-                active && "shimmer-text"
-              )}
-            >
-              <Text
-                as="p"
-                font="main-ui-action"
-                color={active ? "inherit" : "text-03"}
-                maxLines={1}
-                title={title}
-              >
-                {title}
-              </Text>
-            </div>
-            {tasks.length > 0 && (
-              <Button
-                prominence="tertiary"
-                size="sm"
-                icon={expanded ? SvgFold : SvgExpand}
-                aria-label={title}
-                aria-expanded={expanded}
-                aria-controls={detailsId}
-                onClick={() => setManualExpanded(!expanded)}
-              />
+          <div
+            data-testid="asv3-progress-title"
+            className={cn(
+              "asv3-header-toggle flex h-full min-w-0 items-center p-1",
+              active && "asv3-title-running"
             )}
+          >
+            <Button
+              prominence="tertiary"
+              size="md"
+              width="full"
+              rightIcon={expanded ? SvgFold : SvgExpand}
+              aria-expanded={expanded}
+              aria-controls={detailsId}
+              onClick={() => setExpanded(!expanded)}
+              title={title}
+            >
+              {title}
+            </Button>
           </div>
         </TimelineHeaderRow>
-        {header?.message && (
-          <TimelineRow
-            railVariant="spacer"
-            showIcon={false}
-            isLast={!expanded || tasks.length === 0}
-          >
-            <div className="px-3 pb-2">
-              <Text as="p" font="secondary-body" color="text-03">
-                {header.message}
-              </Text>
-            </div>
-          </TimelineRow>
-        )}
-        {expanded && tasks.length > 0 && (
+        {expanded && (
           <div
             id={detailsId}
             className={cn(
@@ -240,7 +275,34 @@ export default function ASv3ProgressPanel({
                 "motion-safe:animate-in motion-safe:fade-in motion-safe:slide-in-from-top-2 motion-safe:duration-300"
             )}
           >
-            <ASv3TaskGroup tasks={rootTasks} allTasks={tasks} active={active} />
+            {header?.message && (
+              <TimelineRow
+                railVariant="spacer"
+                showIcon={false}
+                isLast={pastSteps.length === 0 && tasks.length === 0}
+              >
+                <div className="px-3 pb-2">
+                  <Text as="p" font="secondary-body" color="text-03">
+                    {header.message}
+                  </Text>
+                </div>
+              </TimelineRow>
+            )}
+            {pastSteps.map((step, index) => (
+              <ASv3PastStep
+                key={step.event_id}
+                step={step}
+                first={index === 0}
+                last={index === pastSteps.length - 1 && tasks.length === 0}
+              />
+            ))}
+            {tasks.length > 0 && (
+              <ASv3TaskGroup
+                tasks={rootTasks}
+                allTasks={tasks}
+                active={active}
+              />
+            )}
           </div>
         )}
         {onResume &&

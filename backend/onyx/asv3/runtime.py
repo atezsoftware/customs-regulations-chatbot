@@ -121,36 +121,22 @@ def _evidence_record(
     ledger: EvidenceLedger, draft: str, max_chars: int = 180000
 ) -> str:
     numbers = list(dict.fromkeys(int(n) for n in re.findall(r"\[(\d+)\]", draft)))
-    # Full original cited provisions precede additional context, never silent clipping.
-    numbers += [
-        n
-        for item in ledger.summaries()
-        if isinstance(n := item["citation"], int) and n not in numbers
-    ]
-    records: list[dict[str, JsonValue]] = []
-    used = 0
-    for number in numbers:
-        item = ledger.get(number)
-        if item is None:
-            continue
-        available = max(0, max_chars - used)
-        text = item.text[:available]
-        records.append(
-            {
-                "citation": number,
-                "source_id": item.source_id,
-                "chunk_id": item.chunk_id,
-                "text_hash": item.text_hash,
-                "text": text,
-                "truncated": len(text) != len(item.text),
-                "citable": item.search_doc is not None,
-                "metadata": item.metadata,
-            }
+    required = tuple(n for n in numbers if ledger.get(n) is not None)
+    if numbers:
+        source_ids = {
+            item.source_id for n in required if (item := ledger.get(n)) is not None
+        }
+        numbers.extend(
+            n
+            for item in ledger.summaries()
+            if isinstance(n := item["citation"], int)
+            and item["source_id"] in source_ids
         )
-        used += len(text)
-        if used >= max_chars:
-            break
-    return json.dumps(records, ensure_ascii=False)
+    else:
+        numbers = [
+            n for item in ledger.summaries() if isinstance(n := item["citation"], int)
+        ]
+    return ledger.serialize_records(numbers, required=required, max_chars=max_chars)
 
 
 @_trace_asv3
@@ -189,8 +175,7 @@ def run_asv3_loop(
         "",
     )
     context = RunContext(
-        timeout_seconds=900,
-        research_reserve_seconds=180,
+        timeout_seconds=float("inf"),
         cancelled=lambda: not is_connected(chat_session_id, cache),
     )
     scope = IndexFilters(
@@ -539,6 +524,7 @@ def run_asv3_loop(
             consume_budget=not research,
         )
         latest_review = VerificationResult.model_validate(parse_json_object(text))
+        checkpoint(harness.snapshot())
         return latest_review
 
     def draft_guard(draft: str) -> ToolOutcome | None:
@@ -677,6 +663,7 @@ def run_asv3_loop(
             LLMFlow.ASV3_FINAL,
             max_tokens=9000,
         )
+        checkpoint(harness.snapshot())
         # Review the actual published wording, not just the coordinator's draft.
         final_review = review_answer(final, research=False)
         final_gap = publication_gap(
