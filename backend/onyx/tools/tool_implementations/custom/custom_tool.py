@@ -191,9 +191,18 @@ class CustomTool(Tool[None]):
         url = self._method_spec.build_url(self._base_url, path_params, query_params)
         method = self._method_spec.method
 
-        response = requests.request(
-            method, url, json=request_body, headers=self.headers
-        )
+        if self.invocation_timeout_seconds is None:
+            response = requests.request(
+                method, url, json=request_body, headers=self.headers
+            )
+        else:
+            response = requests.request(
+                method,
+                url,
+                json=request_body,
+                headers=self.headers,
+                timeout=self.invocation_timeout_seconds,
+            )
         content_type = response.headers.get("Content-Type", "")
 
         # Detect HTTP errors — only 401/403 are flagged as auth errors

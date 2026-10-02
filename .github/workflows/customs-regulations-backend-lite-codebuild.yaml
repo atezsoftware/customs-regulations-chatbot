@@ -276,6 +276,14 @@ jobs:
             if [[ -n "$memory_limit" ]]; then
               memory_override+=(--set "app.mem_limits=$memory_limit")
             fi
+            if [[ "$env_x" == "dev" && "$app_name" == "customs-regulations-api" ]]; then
+              memory_override+=(
+                --set app.replicas=2
+                --set app.mem_limits=4Gi
+                --set app.mem_requests=1Gi
+                --set app.strategy.rollingUpdate.maxSurge=1
+              )
+            fi
 
             if ! kubectl get namespace "${namespace}" >/dev/null 2>&1; then
               echo "Namespace ${namespace} does not exist yet; skipping terminating pod cleanup for ${app_name}."
@@ -329,6 +337,43 @@ jobs:
             done
 
             kubectl get deployment "$deployment" --namespace "${namespace}" -o json | jq -e --arg tag "${IMAGE_TAG}" 'any(.spec.template.spec.containers[]?; (.image | endswith(":" + $tag)))' >/dev/null
+
+            if [[ "$env_x" == "dev" && "$app_name" == "customs-regulations-api" ]]; then
+              expected_image="${DOCKER_IMAGE_REPO}:${IMAGE_TAG}"
+              for attempt in {1..12}; do
+                deployment_json=$(kubectl get deployment "$deployment" --namespace "${namespace}" -o json)
+                pods_json=$(kubectl get pods --namespace "${namespace}" -l "$selector" -o json)
+                if jq -e --arg image "$expected_image" '
+                  .spec.replicas == 2 and
+                  .status.updatedReplicas == 2 and
+                  .status.readyReplicas == 2 and
+                  ([.spec.template.spec.containers[] |
+                    select(.name == "dev-customs-regulations-api-container" and
+                      .image == $image and
+                      .resources.requests.memory == "1Gi" and
+                      .resources.limits.memory == "4Gi")] | length) == 1
+                ' <<<"$deployment_json" >/dev/null &&
+                  jq -e --arg image "$expected_image" '
+                    [.items[] | select(.metadata.deletionTimestamp == null)] as $pods |
+                    ($pods | length) == 2 and
+                    all($pods[];
+                      ([.spec.containers[] |
+                        select(.name == "dev-customs-regulations-api-container" and
+                          .image == $image and
+                          .resources.requests.memory == "1Gi" and
+                          .resources.limits.memory == "4Gi")] | length) == 1 and
+                      any(.status.conditions[]?; .type == "Ready" and .status == "True"))
+                  ' <<<"$pods_json" >/dev/null; then
+                  echo "Two Ready DEV API pods use $expected_image with 1Gi request and 4Gi limit"
+                  break
+                fi
+                if [[ "$attempt" == 12 ]]; then
+                  echo "DEV API image, capacity, or Ready replica verification failed" >&2
+                  return 1
+                fi
+                sleep 5
+              done
+            fi
 
             if [[ "$wait_for_ready" == "true" ]]; then
               echo "Waiting for a Ready pod running image tag ${IMAGE_TAG} for ${app_name}"

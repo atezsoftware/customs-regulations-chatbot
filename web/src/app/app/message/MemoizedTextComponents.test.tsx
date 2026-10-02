@@ -157,3 +157,137 @@ describe("inline document citations", () => {
     });
   });
 });
+
+it("preserves the source-specific native preview target on a citation chip", () => {
+  const updatePresentingDocument = jest.fn();
+  render(
+    <MemoizedLink
+      document={{
+        ...citedDocument,
+        document_id: "original-pdf",
+        chunk_ind: -2,
+        semantic_identifier:
+          "Garanti şartları.pdf · sayfa 4 (özgün belgeden çıkarılan metin)",
+      }}
+      citation={{
+        citation_num: 2,
+        document_id: "original-pdf",
+        chunk_ind: -2,
+        semantic_identifier:
+          "Garanti şartları.pdf · sayfa 4 (özgün belgeden çıkarılan metin)",
+        source_type: ValidSources.UserFile,
+        preview_url: "/api/asv3/citation/101/2",
+      }}
+      updatePresentingDocument={updatePresentingDocument}
+    >
+      [2]
+    </MemoizedLink>
+  );
+  fireEvent.click(screen.getByRole("button"));
+  expect(updatePresentingDocument).toHaveBeenCalledWith(
+    expect.objectContaining({
+      preview_type: "citation",
+      document_id: "original-pdf",
+      citation_chunk_ind: -2,
+      citation_preview_url: "/api/asv3/citation/101/2",
+    })
+  );
+});
+
+it("opens ephemeral internet citations at the original public page without a synthetic chunk preview", () => {
+  const updatePresentingDocument = jest.fn();
+  const openSpy = jest.spyOn(window, "open").mockImplementation(() => null);
+  render(
+    <MemoizedLink
+      document={{
+        ...citedDocument,
+        source_type: ValidSources.Web,
+        is_internet: true,
+        link: "https://official.example/legal/source",
+        chunk_ind: 0,
+      }}
+      citation={{
+        citation_num: 3,
+        document_id: citedDocument.document_id,
+        chunk_ind: 0,
+        source_type: ValidSources.Web,
+      }}
+      updatePresentingDocument={updatePresentingDocument}
+    >
+      [3]
+    </MemoizedLink>
+  );
+  fireEvent.click(screen.getByRole("button"));
+  expect(openSpy).toHaveBeenCalledWith(
+    "https://official.example/legal/source",
+    "_blank",
+    "noopener,noreferrer"
+  );
+  expect(updatePresentingDocument).not.toHaveBeenCalled();
+  openSpy.mockRestore();
+});
+
+it.each(["javascript:alert(1)", "file:///private/source", "/api/private/file"])(
+  "rejects unsafe ephemeral internet target %s",
+  (link) => {
+    const updatePresentingDocument = jest.fn();
+    const openSpy = jest.spyOn(window, "open").mockImplementation(() => null);
+    render(
+      <MemoizedLink
+        document={{
+          ...citedDocument,
+          source_type: ValidSources.Web,
+          is_internet: true,
+          link,
+          chunk_ind: 0,
+        }}
+        citation={{
+          citation_num: 3,
+          document_id: citedDocument.document_id,
+          chunk_ind: 0,
+          source_type: ValidSources.Web,
+        }}
+        updatePresentingDocument={updatePresentingDocument}
+      >
+        [3]
+      </MemoizedLink>
+    );
+    fireEvent.click(screen.getByRole("button"));
+    expect(openSpy).not.toHaveBeenCalled();
+    expect(updatePresentingDocument).not.toHaveBeenCalled();
+    openSpy.mockRestore();
+  }
+);
+
+it("keeps indexed web sources on their exact canonical chunk", () => {
+  const updatePresentingDocument = jest.fn();
+  const openSpy = jest.spyOn(window, "open").mockImplementation(() => null);
+  render(
+    <MemoizedLink
+      document={{
+        ...citedDocument,
+        source_type: ValidSources.Web,
+        is_internet: false,
+        link: "https://official.example/legal/source",
+      }}
+      citation={{
+        citation_num: 3,
+        document_id: citedDocument.document_id,
+        chunk_ind: 46,
+        source_type: ValidSources.Web,
+      }}
+      updatePresentingDocument={updatePresentingDocument}
+    >
+      [3]
+    </MemoizedLink>
+  );
+  fireEvent.click(screen.getByRole("button"));
+  expect(openSpy).not.toHaveBeenCalled();
+  expect(updatePresentingDocument).toHaveBeenCalledWith(
+    expect.objectContaining({
+      preview_type: "citation",
+      citation_chunk_ind: 46,
+    })
+  );
+  openSpy.mockRestore();
+});

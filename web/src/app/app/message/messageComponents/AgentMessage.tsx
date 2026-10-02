@@ -26,12 +26,15 @@ import { useVoiceMode } from "@/providers/VoiceModeProvider";
 import { getTextContent } from "@/app/app/services/packetUtils";
 import { removeThinkingTokens } from "@/app/app/services/thinkingTokens";
 import { cn } from "@opal/utils";
+import ASv3ProgressPanel from "@/sections/asv3/ASv3ProgressPanel";
+import { useASv3Progress } from "@/lib/asv3/hooks";
 
 // Type for the regeneration factory function passed from ChatUI
 export type RegenerationFactory = (regenerationRequest: {
   messageId: number;
   parentMessage: Message;
   forceSearch?: boolean;
+  asv3ResumeMessageId?: number;
 }) => (modelOverride: LlmDescriptor) => Promise<void>;
 
 export interface AgentMessageProps {
@@ -111,6 +114,8 @@ const AgentMessage = React.memo(function AgentMessage({
   disableTTS,
   fullWidthChat,
 }: AgentMessageProps) {
+  const asv3Progress = useASv3Progress(rawPackets, nodeId);
+  const isASv3 = asv3Progress.runId !== null;
   const markdownRef = useRef<HTMLDivElement>(null);
   const finalAnswerRef = useRef<HTMLDivElement>(null);
 
@@ -133,12 +138,17 @@ const AgentMessage = React.memo(function AgentMessage({
     onRenderComplete,
     finalAnswerComing,
     toolProcessingDuration,
-  } = usePacketProcessor(rawPackets, nodeId);
+  } = usePacketProcessor(rawPackets, nodeId, isASv3);
 
-  // Apply pacing delays between different tool types for smoother visual transitions
+  const visibleToolTurns = useMemo(
+    () => (isASv3 ? [] : toolTurnGroups),
+    [isASv3, toolTurnGroups]
+  );
+
+  // ASv3 uses operational progress directly; only generic timelines need pacing.
   const { pacedTurnGroups, pacedDisplayGroups, pacedFinalAnswerComing } =
     usePacedTurnGroups(
-      toolTurnGroups,
+      visibleToolTurns,
       displayGroups,
       stopPacketSeen,
       nodeId,
@@ -297,18 +307,36 @@ const AgentMessage = React.memo(function AgentMessage({
     >
       {/* Row 1: Two-column layout for tool steps */}
 
-      <AgentTimeline
-        turnGroups={pacedTurnGroups}
-        chatState={effectiveChatState}
-        stopPacketSeen={stopPacketSeen}
-        stopReason={stopReason}
-        hasDisplayContent={pacedDisplayGroups.length > 0}
-        processingDurationSeconds={processingDurationSeconds}
-        isGeneratingImage={isGeneratingImage}
-        generatedImageCount={generatedImageCount}
-        finalAnswerComing={pacedFinalAnswerComing}
-        toolProcessingDuration={toolProcessingDuration}
-      />
+      {isASv3 ? (
+        <ASv3ProgressPanel
+          state={asv3Progress}
+          stopped={stopPacketSeen}
+          onResume={
+            messageId && parentMessage && onRegenerate && llmManager
+              ? () => {
+                  void onRegenerate({
+                    messageId,
+                    parentMessage,
+                    asv3ResumeMessageId: messageId,
+                  })(llmManager.currentLlm);
+                }
+              : undefined
+          }
+        />
+      ) : (
+        <AgentTimeline
+          turnGroups={pacedTurnGroups}
+          chatState={effectiveChatState}
+          stopPacketSeen={stopPacketSeen}
+          stopReason={stopReason}
+          hasDisplayContent={pacedDisplayGroups.length > 0}
+          processingDurationSeconds={processingDurationSeconds}
+          isGeneratingImage={isGeneratingImage}
+          generatedImageCount={generatedImageCount}
+          finalAnswerComing={pacedFinalAnswerComing}
+          toolProcessingDuration={toolProcessingDuration}
+        />
+      )}
 
       {/* Row 2: Display content + MessageToolbar */}
       <div
@@ -340,7 +368,9 @@ const AgentMessage = React.memo(function AgentMessage({
                 packets={displayGroup.packets}
                 chatState={effectiveChatState}
                 messageNodeId={nodeId}
-                hasTimelineThinking={pacedTurnGroups.length > 0 || hasSteps}
+                hasTimelineThinking={
+                  isASv3 || pacedTurnGroups.length > 0 || hasSteps
+                }
                 onComplete={() => {
                   // Only mark complete on the last display group
                   // Hook handles the finalAnswerComing check internally
@@ -365,7 +395,8 @@ const AgentMessage = React.memo(function AgentMessage({
         )}
         {/* Show stopped message when user cancelled and no display content */}
         {pacedDisplayGroups.length === 0 &&
-          stopReason === StopReason.USER_CANCELLED && (
+          stopReason === StopReason.USER_CANCELLED &&
+          !isASv3 && (
             <Text as="p" secondaryBody text04>
               User has stopped generation
             </Text>

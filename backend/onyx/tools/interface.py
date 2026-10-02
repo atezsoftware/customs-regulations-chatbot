@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import abc
-from typing import Any, Generic, TypeVar
+import copy
+from typing import Any, Generic, Self, TypeVar
 
 from sqlalchemy.orm import Session
 
@@ -16,6 +17,16 @@ class Tool(abc.ABC, Generic[TOverride]):
     def __init__(self, emitter: Emitter | None = None):
         """Initialize tool with optional emitter. Emitter can be set later via set_emitter()."""
         self._emitter = emitter
+        self.invocation_timeout_seconds: float | None = None
+
+    def fork_for_independent_context(self, *, emitter: Emitter | None = None) -> Self:
+        """Isolate per-call mutable configuration while retaining authorized clients."""
+        fork = copy.copy(self)
+        for name, value in vars(self).items():
+            if isinstance(value, (dict, list, set)):
+                setattr(fork, name, copy.deepcopy(value))
+        fork._emitter = self._emitter if emitter is None else emitter
+        return fork
 
     @property
     def emitter(self) -> Emitter:

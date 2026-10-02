@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import zlib
 from typing import Any, Literal, cast
 
 from pydantic import ValidationError
@@ -10,6 +11,7 @@ from onyx.chat.citation_utils import extract_citation_order_from_text
 from onyx.coding_agent.mock_tools import CODING_AGENT_QUERY_KEY, CODING_AGENT_REPO_KEY
 from onyx.configs.constants import MessageType
 from onyx.context.search.models import SavedSearchDoc, SearchDoc
+from onyx.db.asv3_runs import ASV3_CHECKPOINT_TOOL_ID, decode_asv3_checkpoint
 from onyx.db.chat import (
     get_db_search_doc_by_id,
     translate_db_search_doc_to_saved_search_doc,
@@ -24,6 +26,7 @@ from onyx.server.query_and_chat.placement import Placement
 from onyx.server.query_and_chat.streaming_models import (
     AgentResponseDelta,
     AgentResponseStart,
+    ASv3Progress,
     CitationInfo,
     CodingAgentFinal,
     CodingAgentStart,
@@ -533,10 +536,80 @@ def create_search_packets(
     return packets
 
 
+def create_asv3_progress_packets(
+    payload: str, turn_index: int = 0, *, interrupted: bool = False
+) -> list[Packet]:
+    """Replay typed public updates; idle incomplete runs receive a localized resume action."""
+    packets: list[Packet] = []
+    try:
+        checkpoint = decode_asv3_checkpoint(payload)
+        events = checkpoint.get("progress", [])
+        if not isinstance(events, list):
+            raise ValueError("Invalid ASv3 progress checkpoint")
+    except (ValueError, TypeError, AttributeError, zlib.error):
+        logger.warning("Invalid ASv3 checkpoint progress; preserving answer replay")
+        return packets
+    progress_events: list[ASv3Progress] = []
+    for event in events:
+        try:
+            progress = ASv3Progress.model_validate(event)
+        except ValidationError:
+            logger.warning("Invalid ASv3 public progress event skipped")
+            continue
+        progress_events.append(progress)
+        packets.append(Packet(placement=Placement(turn_index=turn_index), obj=progress))
+    terminal = any(
+        event.task_id is None and event.status in {"completed", "failed", "cancelled"}
+        for event in progress_events
+    )
+    if not interrupted or terminal:
+        return packets
+    profile = checkpoint.get("public_profile")
+    if not isinstance(profile, dict):
+        return packets
+    notifications = profile.get("notifications")
+    if not isinstance(notifications, dict):
+        return packets
+    notice, resume = notifications.get("interrupted"), notifications.get("resume")
+    if (
+        not isinstance(notice, list)
+        or len(notice) != 2
+        or not all(isinstance(text, str) and text.strip() for text in notice)
+        or not isinstance(resume, list)
+        or not resume
+        or not isinstance(resume[0], str)
+        or not resume[0].strip()
+    ):
+        return packets
+    run_id, language = checkpoint.get("run_id"), profile.get("language")
+    if not isinstance(run_id, str) or not isinstance(language, str):
+        return packets
+    sequence = max((event.sequence for event in progress_events), default=0) + 1
+    packets.append(
+        Packet(
+            placement=Placement(turn_index=turn_index),
+            obj=ASv3Progress(
+                run_id=run_id,
+                event_id=f"{run_id}:interrupted:{sequence}",
+                sequence=sequence,
+                language=language,
+                phase="interrupted",
+                status="failed",
+                title=cast(str, notice[0]),
+                message=cast(str, notice[1]),
+                resume_label=resume[0],
+            ),
+        )
+    )
+    return packets
+
+
 def translate_assistant_message_to_packets(
     chat_message: ChatMessage,
     db_session: Session,
     tools_by_id: dict[int, Tool] | None = None,
+    *,
+    asv3_interrupted: bool = False,
 ) -> list[Packet]:
     """
     Translates an assistant message and tool calls to packet format.
@@ -556,6 +629,15 @@ def translate_assistant_message_to_packets(
         # Group tool calls by turn_number
         tool_calls_by_turn: dict[int, list] = {}
         for tool_call in chat_message.tool_calls:
+            if tool_call.tool_id == ASV3_CHECKPOINT_TOOL_ID:
+                packet_list.extend(
+                    create_asv3_progress_packets(
+                        tool_call.tool_call_response or "",
+                        interrupted=asv3_interrupted
+                        and not bool((chat_message.message or "").strip()),
+                    )
+                )
+                continue
             turn_num = tool_call.turn_number
             if turn_num not in tool_calls_by_turn:
                 tool_calls_by_turn[turn_num] = []
@@ -858,6 +940,13 @@ def translate_assistant_message_to_packets(
                         chunk_ind=search_doc.chunk_ind,
                         semantic_identifier=search_doc.semantic_id,
                         source_type=search_doc.source_type,
+                        preview_url=(
+                            f"/api/asv3/citation/{chat_message.id}/{citation_num}"
+                            if (getattr(search_doc, "doc_metadata", None) or {}).get(
+                                "asv3_native_locator"
+                            )
+                            else None
+                        ),
                     )
                 )
 

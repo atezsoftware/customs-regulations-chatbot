@@ -18,7 +18,11 @@ import {
   questionToSourceInfo,
   getDisplayNameForSource,
 } from "@/refresh-components/buttons/source-tag/sourceTagUtils";
-import { openCitation, openDocument } from "@/lib/search/utils";
+import {
+  openCitation,
+  openDocument,
+  openExternalCitation,
+} from "@/lib/search/utils";
 import { ensureHrefProtocol } from "@/lib/utils";
 
 interface DocumentCardProps {
@@ -199,11 +203,19 @@ export const MemoizedLink = memo(
     const handleSourceClick = useCallback(() => {
       if (document && citation && updatePresentingDocument) {
         const citedDocument = document as OnyxDocument;
-        openCitation(
-          citation,
-          getDisplayNameForSource(citedDocument),
-          updatePresentingDocument
-        );
+        if (
+          citedDocument.source_type === ValidSources.Web &&
+          citedDocument.is_internet &&
+          !citation.preview_url
+        ) {
+          openExternalCitation(citedDocument.link);
+        } else {
+          openCitation(
+            citation,
+            getDisplayNameForSource(citedDocument),
+            updatePresentingDocument
+          );
+        }
       } else if (document && updatePresentingDocument) {
         openDocument(document as OnyxDocument, updatePresentingDocument);
       } else if (question && openQuestion) {

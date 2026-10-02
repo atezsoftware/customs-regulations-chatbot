@@ -41,11 +41,15 @@ export interface ChatUIProps {
     deepResearch: boolean;
     atezSearch?: boolean;
     atezSearchV2?: boolean;
+    atezSearchV3?: boolean;
+    asv3ResumeMessageId?: number;
+    asv3AllowExternal?: boolean;
     modelOverride?: LlmDescriptor;
     regenerationRequest?: {
       messageId: number;
       parentMessage: Message;
       forceSearch?: boolean;
+      asv3ResumeMessageId?: number;
     };
     forceSearch?: boolean;
     selectedModels?: SelectedModel[];
@@ -53,6 +57,7 @@ export interface ChatUIProps {
   deepResearchEnabled: boolean;
   atezSearchEnabled?: boolean;
   atezSearchV2Enabled?: boolean;
+  atezSearchV3Enabled?: boolean;
   currentMessageFiles: any[];
 
   onResubmit: () => void;
@@ -81,6 +86,7 @@ const ChatUI = React.memo(
     deepResearchEnabled,
     atezSearchEnabled = false,
     atezSearchV2Enabled = false,
+    atezSearchV3Enabled = false,
     currentMessageFiles,
     onResubmit,
     anchorNodeId,
@@ -110,12 +116,14 @@ const ChatUI = React.memo(
     const deepResearchEnabledRef = useRef(deepResearchEnabled);
     const atezSearchEnabledRef = useRef(atezSearchEnabled);
     const atezSearchV2EnabledRef = useRef(atezSearchV2Enabled);
+    const atezSearchV3EnabledRef = useRef(atezSearchV3Enabled);
     const currentMessageFilesRef = useRef(currentMessageFiles);
     const selectedModelsRef = useRef(selectedModels);
     onSubmitRef.current = onSubmit;
     deepResearchEnabledRef.current = deepResearchEnabled;
     atezSearchEnabledRef.current = atezSearchEnabled;
     atezSearchV2EnabledRef.current = atezSearchV2Enabled;
+    atezSearchV3EnabledRef.current = atezSearchV3Enabled;
     currentMessageFilesRef.current = currentMessageFiles;
     selectedModelsRef.current = selectedModels;
 
@@ -124,14 +132,25 @@ const ChatUI = React.memo(
         messageId: number;
         parentMessage: Message;
         forceSearch?: boolean;
+        asv3ResumeMessageId?: number;
       }) => {
         return async function (modelOverride: LlmDescriptor) {
           return await onSubmitRef.current({
             message: regenerationRequest.parentMessage.message,
             currentMessageFiles: currentMessageFilesRef.current,
-            deepResearch: deepResearchEnabledRef.current,
-            atezSearch: atezSearchEnabledRef.current,
-            atezSearchV2: atezSearchV2EnabledRef.current,
+            deepResearch: regenerationRequest.asv3ResumeMessageId
+              ? false
+              : deepResearchEnabledRef.current,
+            atezSearch: regenerationRequest.asv3ResumeMessageId
+              ? false
+              : atezSearchEnabledRef.current,
+            atezSearchV2: regenerationRequest.asv3ResumeMessageId
+              ? false
+              : atezSearchV2EnabledRef.current,
+            atezSearchV3:
+              Boolean(regenerationRequest.asv3ResumeMessageId) ||
+              atezSearchV3EnabledRef.current,
+            asv3ResumeMessageId: regenerationRequest.asv3ResumeMessageId,
             modelOverride,
             messageIdToResend: regenerationRequest.parentMessage.messageId,
             regenerationRequest,
@@ -152,6 +171,8 @@ const ChatUI = React.memo(
           deepResearch: deepResearchEnabledRef.current,
           atezSearch: atezSearchEnabledRef.current,
           atezSearchV2: atezSearchV2EnabledRef.current,
+          atezSearchV3:
+            atezSearchV3EnabledRef.current && !(models && models.length >= 2),
           selectedModels: models && models.length >= 2 ? models : undefined,
         });
       },

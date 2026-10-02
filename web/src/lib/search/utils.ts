@@ -44,6 +44,17 @@ export const openDocument = (
   }
 };
 
+/** Public internet evidence points to its original page, outside the canonical chunk index. */
+export function openExternalCitation(link: string): void {
+  try {
+    const url = new URL(link);
+    if (url.protocol !== "https:" && url.protocol !== "http:") return;
+    window.open(url.href, "_blank", "noopener,noreferrer");
+  } catch {
+    // A malformed external target never becomes a synthetic indexed chunk.
+  }
+}
+
 export const openCitation = (
   citation: StreamingCitation,
   semanticIdentifier: string,
@@ -55,6 +66,9 @@ export const openCitation = (
     document_id: citation.document_id,
     semantic_identifier: semanticIdentifier,
     citation_chunk_ind: citation.chunk_ind,
+    ...(citation.preview_url
+      ? { citation_preview_url: citation.preview_url }
+      : {}),
   };
   updatePresentingDocument(citationTarget);
 };

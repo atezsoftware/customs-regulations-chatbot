@@ -430,8 +430,10 @@ def get_chat_session(
     ]
 
     current_run: CurrentRunInfo | None = None
+    processing_state_checked = False
     try:
         run_id = get_processing_run_id(session_id, get_cache_backend())
+        processing_state_checked = True
         if run_id is not None:
             current_run = CurrentRunInfo(run_id=run_id)
     except Exception:
@@ -446,7 +448,7 @@ def get_chat_session(
         tool_call.tool_id
         for msg in session_messages
         if msg.message_type == MessageType.ASSISTANT
-        for tool_call in msg.tool_calls
+        for tool_call in msg.tool_calls or []
     }
     tools_by_id = {
         tool.id: tool for tool in get_tools_by_ids(list(tool_ids), db_session)
@@ -458,6 +460,7 @@ def get_chat_session(
                     chat_message=msg,
                     db_session=db_session,
                     tools_by_id=tools_by_id,
+                    asv3_interrupted=processing_state_checked and current_run is None,
                 )
             )
             # msg_packet_list.append(Packet(ind=end_step_nr, obj=OverallStop()))

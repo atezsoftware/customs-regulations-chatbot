@@ -90,14 +90,35 @@ export default function PreviewModal({
       setFileName(originalFileName);
 
       if (isCitationChunk) {
-        if (presentingDocument.citation_chunk_ind === undefined) {
-          throw new Error("Citation packet did not include a chunk index");
+        let citationUrl: string;
+        if (presentingDocument.citation_preview_url) {
+          // Native targets are derived by the server from an owned saved message.
+          if (
+            !/^\/api\/asv3\/citation\/[1-9]\d*\/[1-9]\d*$/.test(
+              presentingDocument.citation_preview_url
+            )
+          ) {
+            throw new Error(
+              "Citation packet contains an invalid source preview endpoint"
+            );
+          }
+          citationUrl = presentingDocument.citation_preview_url;
+        } else {
+          if (
+            presentingDocument.citation_chunk_ind === undefined ||
+            presentingDocument.citation_chunk_ind < 0
+          ) {
+            throw new Error(
+              "Citation packet did not include a canonical chunk target"
+            );
+          }
+          const params = new URLSearchParams({
+            document_id: presentingDocument.document_id,
+            chunk_id: String(presentingDocument.citation_chunk_ind),
+          });
+          citationUrl = `/api/document/chunk-info?${params}`;
         }
-        const params = new URLSearchParams({
-          document_id: presentingDocument.document_id,
-          chunk_id: String(presentingDocument.citation_chunk_ind),
-        });
-        const response = await fetch(`/api/document/chunk-info?${params}`);
+        const response = await fetch(citationUrl);
         if (!response.ok) {
           throw new Error(
             `Chunk request failed with status ${response.status}`

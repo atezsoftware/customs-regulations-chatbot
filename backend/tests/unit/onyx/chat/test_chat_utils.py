@@ -361,3 +361,29 @@ class TestConvertChatHistory:
         assert last_user.image_files is not None
         assert len(last_user.image_files) == 1
         assert last_user.image_files[0].file_id == "project_image"
+
+
+def test_asv3_checkpoint_is_not_a_tool_call_in_future_model_history() -> None:
+    from onyx.db.asv3_runs import ASV3_CHECKPOINT_TOOL_ID
+
+    checkpoint = SimpleNamespace(tool_id=ASV3_CHECKPOINT_TOOL_ID)
+    assistant = cast(
+        ChatMessage,
+        SimpleNamespace(
+            message_type=MessageType.ASSISTANT,
+            tool_calls=[checkpoint],
+            message="Grounded final answer",
+            token_count=4,
+        ),
+    )
+    result = convert_chat_history(
+        chat_history=[assistant],
+        files=[],
+        context_image_files=[],
+        additional_context=None,
+        token_counter=len,
+        tool_id_to_name_map={},
+    )
+    assert len(result.simple_messages) == 1
+    assert result.simple_messages[0].message == "Grounded final answer"
+    assert not result.simple_messages[0].tool_calls

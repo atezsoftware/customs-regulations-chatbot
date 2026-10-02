@@ -51,6 +51,7 @@ class StreamingType(Enum):
     DEEP_RESEARCH_PLAN_START = "deep_research_plan_start"
     DEEP_RESEARCH_PLAN_DELTA = "deep_research_plan_delta"
     RESEARCH_AGENT_START = "research_agent_start"
+    ASV3_PROGRESS = "asv3_progress"
     INTERMEDIATE_REPORT_START = "intermediate_report_start"
     INTERMEDIATE_REPORT_DELTA = "intermediate_report_delta"
     INTERMEDIATE_REPORT_CITED_DOCS = "intermediate_report_cited_docs"
@@ -154,6 +155,8 @@ class CitationInfo(BaseObj):
     semantic_identifier: str | None = None
     # Makes a citation packet self-contained for rendering after a session reload.
     source_type: DocumentSource | None = None
+    # Owned-message endpoint for original-file locations outside the canonical index.
+    preview_url: str | None = None
 
 
 class ToolCallDebug(BaseObj):
@@ -374,6 +377,25 @@ class DeepResearchPlanDelta(BaseObj):
     content: str
 
 
+class ASv3Progress(BaseObj):
+    """Public operational updates, separate from private model reasoning."""
+
+    type: Literal["asv3_progress"] = StreamingType.ASV3_PROGRESS.value
+    run_id: str
+    event_id: str
+    sequence: int = Field(ge=0)
+    language: str
+    phase: str
+    status: Literal["queued", "running", "completed", "failed", "cancelled"]
+    title: str
+    message: str | None = None
+    task_id: str | None = None
+    parent_task_id: str | None = None
+    active_tasks: int | None = Field(default=None, ge=0)
+    completed_tasks: int | None = Field(default=None, ge=0)
+    resume_label: str | None = None
+
+
 class ResearchAgentStart(BaseObj):
     type: Literal["research_agent_start"] = StreamingType.RESEARCH_AGENT_START.value
     research_task: str
@@ -479,6 +501,8 @@ PacketObj = Union[
     CitationInfo,
     ToolCallDebug,
     ToolCallArgumentDelta,
+    # ASv3 public progress
+    ASv3Progress,
     # Deep Research Packets
     DeepResearchPlanStart,
     DeepResearchPlanDelta,

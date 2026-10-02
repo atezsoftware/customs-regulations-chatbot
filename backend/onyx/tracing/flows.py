@@ -17,6 +17,12 @@ class LLMFlow(StrEnum):
     # Chat / agent
     CHAT_RESPONSE = "chat_response"
     CHAT_HISTORY_SUMMARIZATION = "chat_history_summarization"
+    ASV3_COORDINATOR = "asv3_coordinator"
+    ASV3_RESEARCHER = "asv3_researcher"
+    ASV3_VERIFICATION = "asv3_verification"
+    ASV3_FINAL = "asv3_final"
+    ASV3_LANGUAGE = "asv3_language"
+    ASV3_SOURCE_VISION = "asv3_source_vision"
 
     # Secondary LLM flows
     SEMANTIC_QUERY_REPHRASE = "semantic_query_rephrase"

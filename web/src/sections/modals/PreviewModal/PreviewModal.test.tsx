@@ -191,3 +191,60 @@ describe("PreviewModal citation chunk mode", () => {
     expect(screen.queryByText("Download File")).not.toBeInTheDocument();
   });
 });
+
+it("opens native-derived citations at their owned-message endpoint", async () => {
+  const fetchMock = jest
+    .spyOn(global, "fetch")
+    .mockResolvedValue(
+      new Response(
+        JSON.stringify({ content: "Original source page 4 excerpt" })
+      )
+    );
+  render(
+    <PreviewModal
+      presentingDocument={{
+        preview_type: "citation",
+        document_id: "original-pdf",
+        semantic_identifier: "Original PDF · Page 4",
+        citation_chunk_ind: -2,
+        citation_preview_url: "/api/asv3/citation/101/2",
+      }}
+      onClose={jest.fn()}
+    />
+  );
+  expect(
+    await screen.findByText("Original source page 4 excerpt")
+  ).toBeInTheDocument();
+  expect(fetchMock).toHaveBeenCalledWith("/api/asv3/citation/101/2");
+  expect(mockedFetchChatFile).not.toHaveBeenCalled();
+});
+
+it.each([
+  "https://external.invalid/source",
+  "/api/asv3/citation/101/2?extra=true",
+  "/api/asv3/citation/0/2",
+])(
+  "rejects untrusted native citation route %s",
+  async (citation_preview_url) => {
+    const fetchMock = jest.spyOn(global, "fetch");
+    render(
+      <PreviewModal
+        presentingDocument={{
+          preview_type: "citation",
+          document_id: "original-pdf",
+          semantic_identifier: "Original PDF",
+          citation_chunk_ind: -2,
+          citation_preview_url,
+        }}
+        onClose={jest.fn()}
+      />
+    );
+    expect(
+      await screen.findByText(
+        "The cited chunk is unavailable or you no longer have access to it."
+      )
+    ).toBeInTheDocument();
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(mockedFetchChatFile).not.toHaveBeenCalled();
+  }
+);

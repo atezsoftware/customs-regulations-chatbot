@@ -164,6 +164,9 @@ export interface SendMessageParams {
   deepResearch?: boolean;
   atezSearch?: boolean;
   atezSearchV2?: boolean;
+  atezSearchV3?: boolean;
+  asv3ResumeMessageId?: number;
+  asv3AllowExternal?: boolean;
   enabledToolIds?: number[];
   // Single forced tool ID (new API uses singular, not array)
   forcedToolId?: number | null;
@@ -191,6 +194,9 @@ export async function* sendMessage({
   deepResearch,
   atezSearch,
   atezSearchV2,
+  atezSearchV3,
+  asv3ResumeMessageId,
+  asv3AllowExternal,
   enabledToolIds,
   forcedToolId,
   modelProvider,
@@ -211,6 +217,9 @@ export async function* sendMessage({
     deep_research: deepResearch ?? false,
     atez_search: atezSearch ?? false,
     atez_search_v2: atezSearchV2 ?? false,
+    atez_search_v3: atezSearchV3 ?? false,
+    asv3_resume_message_id: asv3ResumeMessageId,
+    asv3_allow_external: Boolean(atezSearchV3 && asv3AllowExternal),
     allowed_tool_ids: enabledToolIds,
     forced_tool_id: forcedToolId ?? null,
     llm_override:

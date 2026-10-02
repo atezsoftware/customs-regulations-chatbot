@@ -88,10 +88,12 @@ export interface AppInputBarProps {
   deepResearchEnabled: boolean;
   atezSearchEnabled?: boolean;
   atezSearchV2Enabled?: boolean;
+  atezSearchV3Enabled?: boolean;
   setPresentingDocument?: (document: MinimalOnyxDocument) => void;
   toggleDeepResearch: () => void;
   toggleAtezSearch?: () => void;
   toggleAtezSearchV2?: () => void;
+  toggleAtezSearchV3?: () => void;
   isMultiModelActive?: boolean;
   disabled: boolean;
   awaitingPreferredSelection?: boolean;
@@ -118,9 +120,11 @@ const AppInputBar = React.memo(
     deepResearchEnabled,
     atezSearchEnabled = false,
     atezSearchV2Enabled = false,
+    atezSearchV3Enabled = false,
     toggleDeepResearch,
     toggleAtezSearch,
     toggleAtezSearchV2,
+    toggleAtezSearchV3,
     isMultiModelActive,
     setPresentingDocument,
     disabled,
@@ -731,6 +735,23 @@ const AppInputBar = React.memo(
                     }
                   >
                     Atez Search V2
+                  </SelectButton>
+                )}
+                {showAtezSearch && toggleAtezSearchV3 && (
+                  <SelectButton
+                    disabled={disabled || isMultiModelActive}
+                    variant="select-light"
+                    icon={SvgSearch}
+                    onClick={toggleAtezSearchV3}
+                    state={atezSearchV3Enabled ? "selected" : "empty"}
+                    foldable={false}
+                    tooltip={
+                      isMultiModelActive
+                        ? "ASv3 runs with one model. Remove extra models to use it."
+                        : "Adaptive regulatory research"
+                    }
+                  >
+                    ASv3
                   </SelectButton>
                 )}
                 {showDeepResearch && (

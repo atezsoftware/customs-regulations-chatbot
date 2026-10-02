@@ -27,6 +27,7 @@ export default function useDeepResearchToggle({
   const [deepResearchEnabled, setDeepResearchEnabled] = useState(false);
   const [atezSearchEnabled, setAtezSearchEnabled] = useState(false);
   const [atezSearchV2Enabled, setAtezSearchV2Enabled] = useState(false);
+  const [atezSearchV3Enabled, setAtezSearchV3Enabled] = useState(false);
   const previousChatSessionId = useRef<string | null>(chatSessionId);
 
   // Reset when switching chat sessions, but preserve when going from null to a new session
@@ -39,6 +40,7 @@ export default function useDeepResearchToggle({
       setDeepResearchEnabled(false);
       setAtezSearchEnabled(false);
       setAtezSearchV2Enabled(false);
+      setAtezSearchV3Enabled(false);
     }
   }, [chatSessionId]);
 
@@ -47,16 +49,23 @@ export default function useDeepResearchToggle({
     setDeepResearchEnabled(false);
     setAtezSearchEnabled(false);
     setAtezSearchV2Enabled(false);
+    setAtezSearchV3Enabled(false);
   }, [agentId]);
 
   const toggleDeepResearch = useCallback(() => {
-    setDeepResearchEnabled((enabled) => !enabled);
+    setDeepResearchEnabled((enabled) => {
+      if (!enabled) setAtezSearchV3Enabled(false);
+      return !enabled;
+    });
   }, []);
 
   const toggleAtezSearch = useCallback(() => {
     setAtezSearchEnabled((enabled) => {
       const next = !enabled;
-      if (next) setAtezSearchV2Enabled(false);
+      if (next) {
+        setAtezSearchV2Enabled(false);
+        setAtezSearchV3Enabled(false);
+      }
       return next;
     });
   }, []);
@@ -64,8 +73,22 @@ export default function useDeepResearchToggle({
   const toggleAtezSearchV2 = useCallback(() => {
     setAtezSearchV2Enabled((enabled) => {
       const next = !enabled;
-      if (next) setAtezSearchEnabled(false);
+      if (next) {
+        setAtezSearchEnabled(false);
+        setAtezSearchV3Enabled(false);
+      }
       return next;
+    });
+  }, []);
+
+  const toggleAtezSearchV3 = useCallback(() => {
+    setAtezSearchV3Enabled((enabled) => {
+      if (!enabled) {
+        setAtezSearchEnabled(false);
+        setAtezSearchV2Enabled(false);
+        setDeepResearchEnabled(false);
+      }
+      return !enabled;
     });
   }, []);
 
@@ -76,5 +99,7 @@ export default function useDeepResearchToggle({
     toggleAtezSearch,
     atezSearchV2Enabled,
     toggleAtezSearchV2,
+    atezSearchV3Enabled,
+    toggleAtezSearchV3,
   };
 }

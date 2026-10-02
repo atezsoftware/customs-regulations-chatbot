@@ -229,6 +229,7 @@ function handleCitationPacket(state: ProcessorState, packet: Packet): void {
       chunk_ind: citationInfo.chunk_ind,
       semantic_identifier: citationInfo.semantic_identifier,
       source_type: citationInfo.source_type,
+      preview_url: citationInfo.preview_url,
     });
   }
 }
@@ -333,7 +334,7 @@ function addPacketToGroup(
 // ============================================================================
 
 function processPacket(state: ProcessorState, packet: Packet): void {
-  if (!packet) return;
+  if (!packet || packet.obj.type === PacketType.ASV3_PROGRESS) return;
 
   // Handle TopLevelBranching packets - these tell us how many parallel branches to expect
   if (packet.obj.type === PacketType.TOP_LEVEL_BRANCHING) {

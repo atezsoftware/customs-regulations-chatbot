@@ -57,6 +57,10 @@ export class InputBar {
     this.tileMeta = page.locator(".rich-input-tile-meta");
   }
 
+  async selectASv3(): Promise<void> {
+    await this.page.getByRole("button", { name: "ASv3", exact: true }).click();
+  }
+
   // ---------------------------------------------------------------------------
   // Text input
   // ---------------------------------------------------------------------------

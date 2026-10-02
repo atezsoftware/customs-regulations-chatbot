@@ -79,6 +79,53 @@ export class ChatPage {
     await this.page.screenshot({ path: screenshotPath, fullPage: true });
   }
 
+  async expectASv3Progress(
+    language: string,
+    title: string,
+    tasks: string[]
+  ): Promise<void> {
+    const panel = this.page.getByRole("region", { name: "ASv3" }).last();
+    await expect(panel).toHaveAttribute("lang", language);
+    await expect(panel).toContainText(title);
+    await expect(panel.getByTestId("asv3-task")).toHaveCount(tasks.length);
+    for (const task of tasks) await expect(panel).toContainText(task);
+    await expect(panel).not.toContainText("read_provision");
+    await expect(panel).not.toContainText("spawn_researcher");
+    await expect(panel).not.toContainText("Research Task");
+  }
+
+  async expectASv3TaskStatus(taskId: string, status: string): Promise<void> {
+    await expect(
+      this.page.locator(`[data-testid="asv3-task"][data-task-id="${taskId}"]`)
+    ).toHaveAttribute("data-status", status);
+  }
+
+  async expectASv3CitationTarget(
+    answer: string,
+    documentId: string,
+    chunkInd: number,
+    previewUrl?: string
+  ): Promise<void> {
+    const message = this.aiMessages.filter({ hasText: answer }).last();
+    const source = message
+      .locator("p")
+      .filter({ hasText: answer })
+      .getByRole("button");
+    await expect(source).toHaveCount(1);
+    const response = this.page.waitForResponse((response) => {
+      const url = new URL(response.url());
+      if (previewUrl) return url.pathname === previewUrl;
+      return (
+        url.pathname === "/api/document/chunk-info" &&
+        url.searchParams.get("document_id") === documentId &&
+        url.searchParams.get("chunk_id") === String(chunkInd)
+      );
+    });
+    await source.click();
+    expect((await response).ok()).toBe(true);
+    await expect(this.page.getByRole("dialog")).toContainText(answer);
+  }
+
   async scrollTo(position: "top" | "bottom"): Promise<void> {
     await this.scrollContainer.evaluate(async (el, pos) => {
       el.scrollTo({ top: pos === "top" ? 0 : el.scrollHeight });

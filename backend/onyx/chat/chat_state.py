@@ -60,6 +60,15 @@ class ChatStateContainer:
         self._all_search_docs: dict[SearchDocKey, SearchDoc] = {}
         # Track which citation numbers were actually emitted during streaming
         self._emitted_citations: set[int] = set()
+        self._stop_notice: str | None = None
+
+    def set_stop_notice(self, notice: str) -> None:
+        with self._lock:
+            self._stop_notice = notice
+
+    def get_stop_notice(self) -> str | None:
+        with self._lock:
+            return self._stop_notice
 
     def add_tool_call(self, tool_call: ToolCallInfo) -> None:
         """Add a tool call to the accumulated state."""

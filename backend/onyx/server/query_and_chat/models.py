@@ -126,6 +126,10 @@ class SendMessageRequest(BaseModel):
     atez_search_v2_label_run_ids: list[UUID] = Field(
         default_factory=list, max_length=32
     )
+    # ASv3 owns an independent adaptive research harness.
+    atez_search_v3: bool = False
+    asv3_allow_external: bool = False
+    asv3_resume_message_id: int | None = None
 
     # Headers to forward to MCP tool calls (e.g., user JWT token, user ID)
     # Example: {"Authorization": "Bearer <user_jwt>", "X-User-ID": "user123"}
@@ -167,6 +171,18 @@ class SendMessageRequest(BaseModel):
             raise ValueError("atez_search_v2_labels requires atez_search_v2")
         if self.atez_search_v2_label_run_ids and not self.atez_search_v2_labels:
             raise ValueError("atez_search_v2_label_run_ids requires labels")
+        if sum((self.atez_search, self.atez_search_v2, self.atez_search_v3)) > 1:
+            raise ValueError("ATEZ Search workflows are mutually exclusive")
+        if self.atez_search_v3 and self.deep_research:
+            raise ValueError("ASv3 and Deep Research are mutually exclusive")
+        if self.atez_search_v3 and self.llm_overrides and len(self.llm_overrides) > 1:
+            raise ValueError("ASv3 uses one coordinator model per request")
+        if self.asv3_resume_message_id is not None and not self.atez_search_v3:
+            raise ValueError("An ASv3 checkpoint requires the ASv3 workflow")
+        if self.asv3_allow_external and not self.atez_search_v3:
+            raise ValueError(
+                "ASv3 external source permission requires the ASv3 workflow"
+            )
         # If neither is provided, default to creating a new chat session using the
         # default ChatSessionCreationRequest values.
         if self.chat_session_id is None and self.chat_session_info is None:

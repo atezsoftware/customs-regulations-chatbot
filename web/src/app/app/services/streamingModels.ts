@@ -60,6 +60,7 @@ export enum PacketType {
   DEEP_RESEARCH_PLAN_START = "deep_research_plan_start",
   DEEP_RESEARCH_PLAN_DELTA = "deep_research_plan_delta",
   RESEARCH_AGENT_START = "research_agent_start",
+  ASV3_PROGRESS = "asv3_progress",
   INTERMEDIATE_REPORT_START = "intermediate_report_start",
   INTERMEDIATE_REPORT_DELTA = "intermediate_report_delta",
   INTERMEDIATE_REPORT_CITED_DOCS = "intermediate_report_cited_docs",
@@ -287,6 +288,7 @@ export interface StreamingCitation {
   chunk_ind?: number;
   semantic_identifier?: string;
   source_type?: ValidSources;
+  preview_url?: string | null;
 }
 
 export interface CitationStart extends BaseObj {
@@ -301,6 +303,7 @@ export interface CitationInfo extends BaseObj {
   chunk_ind?: number;
   semantic_identifier?: string;
   source_type?: ValidSources;
+  preview_url?: string | null;
 }
 
 // Deep Research Plan Packets
@@ -311,6 +314,23 @@ export interface DeepResearchPlanStart extends BaseObj {
 export interface DeepResearchPlanDelta extends BaseObj {
   type: "deep_research_plan_delta";
   content: string;
+}
+
+export interface ASv3Progress extends BaseObj {
+  type: "asv3_progress";
+  run_id: string;
+  event_id: string;
+  sequence: number;
+  language: string;
+  phase: string;
+  status: "queued" | "running" | "completed" | "failed" | "cancelled";
+  title: string;
+  message?: string | null;
+  task_id?: string | null;
+  parent_task_id?: string | null;
+  active_tasks?: number | null;
+  completed_tasks?: number | null;
+  resume_label?: string | null;
 }
 
 export interface ResearchAgentStart extends BaseObj {
@@ -477,6 +497,7 @@ export type ObjTypes =
   | CitationObj
   | DeepResearchPlanObj
   | ResearchAgentObj
+  | ASv3Progress
   | CodingAgentObj
   | PacketErrorObj
   | CitationObj;

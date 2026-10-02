@@ -61,10 +61,12 @@ export interface UsePacketProcessorResult {
  */
 export function usePacketProcessor(
   rawPackets: Packet[],
-  nodeId: number
+  nodeId: number,
+  resetOnPacketReplacement = false
 ): UsePacketProcessorResult {
   // Processor in ref: incremental, synchronous, no double render
   const stateRef = useRef<ProcessorState>(createInitialState(nodeId));
+  const packetBufferRef = useRef(rawPackets);
 
   // Only TRUE UI state: "has renderer finished?"
   const [renderComplete, setRenderComplete] = useState(false);
@@ -72,8 +74,14 @@ export function usePacketProcessor(
   // Optional override to force showing answer
   const [forceShowAnswer, setForceShowAnswer] = useState(false);
 
+  // ASv3 presentation compaction replaces the buffer without removing citations.
+  const bufferReplaced = packetBufferRef.current !== rawPackets;
+  packetBufferRef.current = rawPackets;
   // Reset on nodeId change
-  if (stateRef.current.nodeId !== nodeId) {
+  if (
+    stateRef.current.nodeId !== nodeId ||
+    (resetOnPacketReplacement && bufferReplaced)
+  ) {
     stateRef.current = createInitialState(nodeId);
     setRenderComplete(false);
     setForceShowAnswer(false);

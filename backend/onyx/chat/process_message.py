@@ -708,7 +708,11 @@ def _global_regulatory_search_filters(setup: ChatTurnSetup) -> BaseFilters | Non
         return filters
 
     atez_search_v2 = getattr(setup.new_msg_req, "atez_search_v2", False) is True
-    regulatory_search_enabled = setup.new_msg_req.atez_search or atez_search_v2
+    regulatory_search_enabled = (
+        setup.new_msg_req.atez_search
+        or atez_search_v2
+        or setup.new_msg_req.atez_search_v3
+    )
     updates: dict[str, object] = {
         "source_type": [DocumentSource.USER_FILE],
         "regulatory_chunks_only": regulatory_search_enabled
@@ -864,6 +868,7 @@ def build_chat_turn(
             "atez_search": new_msg_req.atez_search,
             "atez_search_v2": new_msg_req.atez_search_v2,
             "atez_search_v2_labels": new_msg_req.atez_search_v2_labels,
+            "atez_search_v3": new_msg_req.atez_search_v3,
         },
     )
 
@@ -1550,7 +1555,37 @@ def _run_models(
                 # Per-thread copy: run_llm_loop mutates simple_chat_history in-place.
                 # Deep Research receives the same internal-only, global regulatory
                 # SearchTool as the standard loop.
-                if n_models == 1 and setup.new_msg_req.deep_research:
+                if setup.new_msg_req.atez_search_v3:
+                    from onyx.asv3.runtime import run_asv3_loop
+
+                    if setup.persona.id != DEFAULT_PERSONA_ID:
+                        raise ValueError("ASv3 requires the default assistant")
+                    if setup.search_params.project_id_filter is not None:
+                        raise ValueError("ASv3 is unavailable inside a project")
+                    run_asv3_loop(
+                        emitter=model_emitter,
+                        state_container=sc,
+                        simple_chat_history=list(setup.simple_chat_history),
+                        tools=model_tools,
+                        llm=model_llm,
+                        token_counter=get_llm_token_counter(model_llm),
+                        user=user,
+                        filters=_global_regulatory_search_filters(setup),
+                        document_set_names_override=_benchmark_document_set_names_override(
+                            setup
+                        ),
+                        user_identity=setup.user_identity,
+                        chat_session_id=setup.chat_session.id,
+                        user_message_id=setup.user_message.id,
+                        assistant_message_id=setup.reserved_messages[model_idx].id,
+                        reasoning_effort=setup.reasoning_effort,
+                        include_citations=setup.new_msg_req.include_citations,
+                        cache=setup.cache,
+                        resume_message_id=setup.new_msg_req.asv3_resume_message_id,
+                        custom_agent_prompt=setup.custom_agent_prompt,
+                        allow_external=setup.new_msg_req.asv3_allow_external,
+                    )
+                elif n_models == 1 and setup.new_msg_req.deep_research:
                     _validate_deep_research_scope(setup.persona, model_tools)
                     run_deep_research_llm_loop(
                         emitter=model_emitter,
@@ -2218,7 +2253,12 @@ def llm_loop_completion_handle(
         final_answer = answer_tokens
     else:
         logger.debug("Chat session %s stopped by user", chat_session_id)
-        if answer_tokens:
+        stop_notice = state_container.get_stop_notice()
+        if stop_notice:
+            final_answer = (
+                (answer_tokens + "\n\n") if answer_tokens else ""
+            ) + stop_notice
+        elif answer_tokens:
             final_answer = (
                 answer_tokens + " ... \n\nGeneration was stopped by the user."
             )

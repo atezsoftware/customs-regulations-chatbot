@@ -131,3 +131,114 @@ it("fails loudly when the selected session model cannot be persisted", async () 
     )
   ).rejects.toThrow("Failed to persist selected chat model: 400");
 });
+
+it("serializes ASv3 as an independent opt-in workflow", async () => {
+  // POST /api/chat/send-chat-message: capture body before starting a stream.
+  global.fetch = jest.fn().mockResolvedValue({
+    ok: false,
+    status: 400,
+    json: async () => ({ detail: "stop after payload capture" }),
+  });
+  await expect(
+    sendMessage({
+      message: "Muafiyet şartları nelerdir?",
+      parentMessageId: null,
+      chatSessionId: "session-1",
+      filters: null,
+      atezSearchV3: true,
+    }).next()
+  ).rejects.toThrow("stop after payload capture");
+  const request = jest.mocked(global.fetch).mock.calls[0]![1];
+  const payload = JSON.parse(String(request?.body));
+  expect(payload.atez_search_v3).toBe(true);
+  expect(payload.atez_search).toBe(false);
+  expect(payload.atez_search_v2).toBe(false);
+  expect(payload.deep_research).toBe(false);
+});
+
+it("carries the explicit checkpoint owner when resuming ASv3", async () => {
+  global.fetch = jest.fn().mockResolvedValue({
+    ok: false,
+    status: 400,
+    json: async () => ({ detail: "capture" }),
+  });
+  await expect(
+    sendMessage({
+      message: "Original question",
+      parentMessageId: 88,
+      chatSessionId: "session-1",
+      filters: null,
+      atezSearchV3: true,
+      asv3ResumeMessageId: 101,
+    }).next()
+  ).rejects.toThrow("capture");
+  const payload = JSON.parse(
+    String(jest.mocked(global.fetch).mock.calls[0]![1]?.body)
+  );
+  expect(payload.asv3_resume_message_id).toBe(101);
+  expect(payload.message).toBe("Original question");
+  expect(payload.atez_search_v3).toBe(true);
+});
+
+it.each([
+  [true, undefined, false],
+  [true, false, false],
+  [true, true, true],
+  [false, true, false],
+])(
+  "limits external permission to an explicitly authorized ASv3 request (%s, %s)",
+  async (atezSearchV3, asv3AllowExternal, expected) => {
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: false,
+      status: 400,
+      json: async () => ({ detail: "capture" }),
+    });
+    await expect(
+      sendMessage({
+        message: "Question",
+        parentMessageId: null,
+        chatSessionId: "session-1",
+        filters: null,
+        atezSearchV3,
+        asv3AllowExternal,
+      }).next()
+    ).rejects.toThrow("capture");
+    const payload = JSON.parse(
+      String(jest.mocked(global.fetch).mock.calls[0]![1]?.body)
+    );
+    expect(payload.asv3_allow_external).toBe(expected);
+  }
+);
+
+it.each([undefined, 101])(
+  "preserves the selected named Vertex model in ASv3 send/resume (%s)",
+  async (asv3ResumeMessageId) => {
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: false,
+      status: 400,
+      json: async () => ({ detail: "capture" }),
+    });
+    await expect(
+      sendMessage({
+        message: "Question",
+        parentMessageId: 88,
+        chatSessionId: "session-1",
+        filters: null,
+        atezSearchV3: true,
+        asv3ResumeMessageId,
+        modelProvider: "Vertex Gemini",
+        modelProviderType: "vertex_ai",
+        modelVersion: "gemini-3.8-pro",
+      }).next()
+    ).rejects.toThrow("capture");
+    const payload = JSON.parse(
+      String(jest.mocked(global.fetch).mock.calls[0]![1]?.body)
+    );
+    expect(payload.llm_override).toEqual({
+      model_provider: "Vertex Gemini",
+      model_provider_type: "vertex_ai",
+      model_version: "gemini-3.8-pro",
+    });
+    expect(payload.asv3_resume_message_id).toBe(asv3ResumeMessageId);
+  }
+);

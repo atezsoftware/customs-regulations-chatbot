@@ -69,6 +69,8 @@ import {
   useCurrentChatState,
   useCurrentMessageHistory,
 } from "@/app/app/stores/useChatSessionStore";
+import { explicitASv3ExternalConsent } from "@/lib/asv3/consent";
+import { compactASv3ProgressPackets } from "@/lib/asv3/retention";
 import { Packet, MessageStart } from "@/app/app/services/streamingModels";
 import { SelectedModel } from "@/sections/model-selector/MultiModelSelector";
 import { useAgentPreferences } from "@/lib/agents/hooks";
@@ -88,6 +90,9 @@ export interface OnSubmitProps {
   deepResearch: boolean;
   atezSearch?: boolean;
   atezSearchV2?: boolean;
+  atezSearchV3?: boolean;
+  asv3ResumeMessageId?: number;
+  asv3AllowExternal?: boolean;
 
   // optional params
   messageIdToResend?: number;
@@ -376,6 +381,9 @@ export default function useChatController({
       deepResearch,
       atezSearch = false,
       atezSearchV2 = false,
+      atezSearchV3 = false,
+      asv3ResumeMessageId,
+      asv3AllowExternal,
       messageIdToResend,
       queryOverride,
       forceSearch,
@@ -959,6 +967,16 @@ export default function useChatController({
           deepResearch,
           atezSearch,
           atezSearchV2,
+          atezSearchV3,
+          asv3ResumeMessageId,
+          asv3AllowExternal:
+            asv3AllowExternal ??
+            explicitASv3ExternalConsent(
+              atezSearchV3,
+              forcedToolIds,
+              liveAgent?.tools ?? [],
+              disabledToolIds ?? []
+            ),
           enabledToolIds:
             disabledToolIds && liveAgent
               ? liveAgent.tools
@@ -1219,6 +1237,9 @@ export default function useChatController({
               } else {
                 // Single-model
                 packets.push(typedPacket);
+                if (atezSearchV3 && typedPacket.obj.type === "asv3_progress") {
+                  packets = compactASv3ProgressPackets(packets);
+                }
                 packetsVersion++;
                 singleModelDirty = true;
 

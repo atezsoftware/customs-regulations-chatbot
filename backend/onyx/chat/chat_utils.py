@@ -23,6 +23,7 @@ from onyx.configs.constants import (
 )
 from onyx.context.search.models import SearchDoc
 from onyx.context.search.utils import sandbox_filename_for_document
+from onyx.db.asv3_runs import ASV3_CHECKPOINT_TOOL_ID
 from onyx.db.chat import (
     create_chat_session,
     get_chat_messages_by_session,
@@ -905,6 +906,8 @@ def convert_chat_history(
                 # Group tool calls by turn number
                 tool_calls_by_turn: dict[int, list] = {}
                 for tool_call in chat_message.tool_calls:
+                    if tool_call.tool_id == ASV3_CHECKPOINT_TOOL_ID:
+                        continue
                     if tool_call.turn_number not in tool_calls_by_turn:
                         tool_calls_by_turn[tool_call.turn_number] = []
                     tool_calls_by_turn[tool_call.turn_number].append(tool_call)

@@ -182,6 +182,7 @@ export function getCitations(packets: Packet[]): StreamingCitation[] {
           chunk_ind: citationInfo.chunk_ind,
           semantic_identifier: citationInfo.semantic_identifier,
           source_type: citationInfo.source_type,
+          preview_url: citationInfo.preview_url,
         });
       }
     }
