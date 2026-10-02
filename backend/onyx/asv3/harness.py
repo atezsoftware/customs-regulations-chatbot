@@ -16,6 +16,7 @@ from onyx.asv3.models import (
     HarnessResult,
     HarnessView,
     OutcomeStatus,
+    ResearchTurn,
     RunContext,
     RunStopped,
     ToolOutcome,
@@ -23,6 +24,8 @@ from onyx.asv3.models import (
 )
 from onyx.asv3.progress import ProgressReporter
 from onyx.asv3.registry import CapabilityRegistry
+from onyx.llm.models import ToolMessage
+from onyx.tracing.answer_graph import graph_step
 
 DecisionMaker = Callable[[HarnessView], Decision]
 CheckpointWriter = Callable[[dict[str, JsonValue]], None]
@@ -43,6 +46,7 @@ class Harness:
         max_workers: int = 4,
         max_context_chars: int = 60000,
         finalize_guard: Callable[[], ToolOutcome | None] | None = None,
+        draft_guard: Callable[[str], ToolOutcome | None] | None = None,
         report_terminal: bool = True,
     ) -> None:
         self.request = request
@@ -56,6 +60,7 @@ class Harness:
         self.max_workers = max_workers
         self.max_context_chars = max_context_chars
         self.finalize_guard = finalize_guard
+        self.draft_guard = draft_guard
         self.report_terminal = report_terminal
         artifacts = self.context.services.get("artifacts")
         self.artifacts = (
@@ -65,6 +70,9 @@ class Harness:
         self.questions: list[str] = []
         self.facts: list[str] = []
         self.receipts: list[ToolReceipt] = []
+        self.turns: list[ResearchTurn] = []
+        self.last_draft: str | None = None
+        self._blocked_attempts: dict[str, int] = {}
         self._seen_calls: set[str] = set()
         self._seen_failures: set[str] = set()
         self.context.services["registry"] = registry
@@ -105,6 +113,8 @@ class Harness:
             "evidence": self.evidence.export(),
             "seen_calls": sorted(self._seen_calls),
             "seen_failures": sorted(self._seen_failures),
+            "turns": [turn.model_dump(mode="json") for turn in self.turns],
+            "last_draft": self.last_draft,
         }
 
     def restore(self, snapshot: dict[str, JsonValue]) -> None:
@@ -133,6 +143,10 @@ class Harness:
         ]
         self._seen_calls = {str(item) for item in array("seen_calls")}
         self._seen_failures = {str(item) for item in array("seen_failures")}
+        self.turns = [ResearchTurn.model_validate(item) for item in array("turns")]
+        self._trim_turns()
+        draft = snapshot.get("last_draft")
+        self.last_draft = draft if isinstance(draft, str) else None
         evidence = snapshot.get("evidence")
         if not isinstance(evidence, dict):
             raise ValueError("Checkpoint evidence is missing")
@@ -195,13 +209,38 @@ class Harness:
             receipts=list(reversed(receipts)),
             evidence=self.evidence.summaries(max_chars=self.max_context_chars // 2),
             tools=self.registry.definitions(self.context),
+            turns=list(self.turns),
         )
+
+    def _trim_turns(self) -> None:
+        while self.turns and (
+            len(self.turns) > 6
+            or sum(len(turn.model_dump_json()) for turn in self.turns) > 120000
+        ):
+            self.turns.pop(0)
 
     def _execute(self, call: CapabilityCall, context: RunContext) -> ToolReceipt:
         start = time.monotonic()
         try:
             context.check_research_active()
-            outcome = self.registry.dispatch(call, context)
+            with graph_step(
+                "asv3.tool", {"name": call.name, "arguments": call.arguments}
+            ) as step:
+                outcome = self.registry.dispatch(call, context)
+                step.output_value = {
+                    "status": outcome.status.value,
+                    "summary": outcome.summary,
+                    "data": compact_json(outcome.data),
+                    "sources": [
+                        {
+                            "source_id": item.source_id,
+                            "chunk_id": item.chunk_id,
+                            "text_hash": item.text_hash,
+                            "chars": len(item.text),
+                        }
+                        for item in outcome.evidence
+                    ],
+                }
             # The handler may not support cancellation; its late payload is still revoked.
             context.check_research_active()
         except RunStopped as error:
@@ -306,6 +345,7 @@ class Harness:
                         raise ValueError("Decision contains duplicate call IDs")
                     if self.progress:
                         self.progress.report("tools")
+                    results: list[ToolMessage] = []
                     for receipt in self._dispatch(decision.calls):
                         self.context.check_active()
                         receipt.evidence_ids = self.evidence.add(
@@ -339,10 +379,26 @@ class Harness:
                             update={"evidence": []}
                         )
                         self.receipts.append(receipt)
+                        results.append(
+                            ToolMessage(
+                                tool_call_id=receipt.call.call_id,
+                                content=receipt.model_dump_json(),
+                            )
+                        )
+                    if decision.assistant_message is not None:
+                        self.turns.append(
+                            ResearchTurn(
+                                assistant=decision.assistant_message, results=results
+                            )
+                        )
+                        self._trim_turns()
                     self._save()
                     continue
                 if decision.answer is not None and decision.answer.strip():
+                    self.last_draft = decision.answer
                     blocked = self.finalize_guard() if self.finalize_guard else None
+                    if blocked is None and self.draft_guard:
+                        blocked = self.draft_guard(decision.answer)
                     if blocked is not None:
                         receipt = ToolReceipt(
                             call=CapabilityCall(name="finalization_status"),
@@ -353,6 +409,22 @@ class Harness:
                         if self.on_receipt:
                             self.on_receipt(receipt)
                         self._save()
+                        fingerprint = json.dumps(
+                            {
+                                "evidence": [
+                                    (item["citation"], item["text_hash"])
+                                    for item in self.evidence.summaries()
+                                ],
+                                "gap": blocked.model_dump(mode="json"),
+                            },
+                            sort_keys=True,
+                        )
+                        self._blocked_attempts[fingerprint] = (
+                            self._blocked_attempts.get(fingerprint, 0) + 1
+                        )
+                        if self._blocked_attempts[fingerprint] >= 3:
+                            status = OutcomeStatus.PARTIAL
+                            break
                         continue
                     answer = decision.answer
                     status = OutcomeStatus.FOUND

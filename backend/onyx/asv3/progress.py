@@ -17,6 +17,7 @@ class ProgressEvent(BaseModel):
     title: str
     message: str
     task_id: str | None = None
+    parent_task_id: str | None = None
     active_workers: int = 0
     completed_workers: int = 0
 
@@ -84,6 +85,7 @@ class ProgressReporter:
         *,
         status: str = "running",
         task_id: str | None = None,
+        parent_task_id: str | None = None,
         active_workers: int = 0,
         completed_workers: int = 0,
         title: str | None = None,
@@ -111,10 +113,22 @@ class ProgressReporter:
                 title=(title or fallback_title)[:240],
                 message=(message or fallback_message)[:1600],
                 task_id=task_id,
+                parent_task_id=parent_task_id,
                 active_workers=active_workers,
                 completed_workers=completed_workers,
             )
             self._events.append(event)
+            if len(self._events) > 200:
+                latest = {item.task_id or "coordinator": item for item in self._events}
+                retained = {
+                    item.event_id: item
+                    for item in [
+                        self._events[0],
+                        *latest.values(),
+                        *self._events[-100:],
+                    ]
+                }
+                self._events = sorted(retained.values(), key=lambda item: item.sequence)
         # Callbacks may acquire checkpoint locks and export this reporter again.
         self._emit(event)
         return event

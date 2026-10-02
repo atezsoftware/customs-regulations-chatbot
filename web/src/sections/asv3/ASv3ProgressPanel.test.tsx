@@ -1,10 +1,178 @@
-import { fireEvent, render, screen } from "@tests/setup/test-utils";
+import { fireEvent, render, screen, within } from "@tests/setup/test-utils";
 import ASv3ProgressPanel from "@/sections/asv3/ASv3ProgressPanel";
 import {
   applyASv3Progress,
   createASv3ProgressState,
 } from "@/lib/asv3/progress";
 import type { ASv3Progress } from "@/app/app/services/streamingModels";
+
+function parallelState() {
+  let state = createASv3ProgressState();
+  const events: ASv3Progress[] = [
+    {
+      type: "asv3_progress",
+      run_id: "r",
+      event_id: "1",
+      sequence: 1,
+      language: "tr",
+      phase: "research",
+      status: "running",
+      title: "Garanti koşullarını inceliyorum",
+    },
+    {
+      type: "asv3_progress",
+      run_id: "r",
+      event_id: "2",
+      sequence: 2,
+      language: "tr",
+      phase: "worker",
+      status: "completed",
+      task_id: "repair",
+      title: "Ücretsiz tamir",
+      message: "Aynı makinenin geri geliş şartları incelendi.",
+    },
+    {
+      type: "asv3_progress",
+      run_id: "r",
+      event_id: "3",
+      sequence: 3,
+      language: "tr",
+      phase: "worker",
+      status: "running",
+      task_id: "replacement",
+      title: "Yeni makine",
+      message: "Farklı seri numaralı eşyanın ithalat koşulları inceleniyor.",
+    },
+  ];
+  for (const event of events) state = applyASv3Progress(state, event);
+  return state;
+}
+
+function completedState() {
+  return applyASv3Progress(parallelState(), {
+    type: "asv3_progress",
+    run_id: "r",
+    event_id: "done",
+    sequence: 9,
+    language: "tr",
+    phase: "completed",
+    status: "completed",
+    title: "Araştırma tamamlandı",
+  });
+}
+
+it("keeps sibling activity independent and changes the natural task content through Onyx tabs", () => {
+  const state = parallelState();
+  render(<ASv3ProgressPanel state={state} stopped={false} />);
+  expect(screen.getAllByRole("tab")).toHaveLength(2);
+  expect(
+    within(screen.getByRole("tab", { name: "Ücretsiz tamir" })).queryByTestId(
+      "asv3-task-loading"
+    )
+  ).not.toBeInTheDocument();
+  expect(
+    within(screen.getByRole("tab", { name: "Yeni makine" })).getByTestId(
+      "asv3-task-loading"
+    )
+  ).toBeInTheDocument();
+  fireEvent.mouseDown(screen.getByRole("tab", { name: "Yeni makine" }), {
+    button: 0,
+    ctrlKey: false,
+  });
+  expect(
+    screen.getByText(
+      "Farklı seri numaralı eşyanın ithalat koşulları inceleniyor."
+    )
+  ).toBeInTheDocument();
+  expect(
+    screen.queryByText("Aynı makinenin geri geliş şartları incelendi.")
+  ).not.toBeInTheDocument();
+});
+
+it("collapses at answer arrival and terminal replay without restarting activity", () => {
+  const { rerender, unmount } = render(
+    <ASv3ProgressPanel state={parallelState()} stopped={false} />
+  );
+  rerender(
+    <ASv3ProgressPanel
+      state={parallelState()}
+      stopped={false}
+      hasDisplayContent
+    />
+  );
+  expect(screen.queryByRole("tab")).not.toBeInTheDocument();
+  rerender(<ASv3ProgressPanel state={completedState()} stopped />);
+  expect(
+    screen.getByRole("button", { name: "Araştırma tamamlandı" })
+  ).toHaveAttribute("aria-expanded", "false");
+  expect(
+    screen.getByText("Araştırma tamamlandı").closest(".shimmer-text")
+  ).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "Araştırma tamamlandı" }));
+  expect(screen.getAllByRole("tab")).toHaveLength(2);
+  expect(screen.queryByTestId("asv3-task-loading")).not.toBeInTheDocument();
+  unmount();
+  render(<ASv3ProgressPanel state={completedState()} stopped />);
+  expect(screen.queryByRole("tab")).not.toBeInTheDocument();
+  expect(screen.getByRole("region", { name: "ASv3" })).toHaveAttribute(
+    "aria-busy",
+    "false"
+  );
+});
+
+it("respects manual expansion across final and does not reactivate a stopped sibling", () => {
+  const { rerender } = render(
+    <ASv3ProgressPanel state={parallelState()} stopped={false} />
+  );
+  const toggle = screen.getByRole("button", {
+    name: "Garanti koşullarını inceliyorum",
+  });
+  fireEvent.click(toggle);
+  fireEvent.click(toggle);
+  rerender(
+    <ASv3ProgressPanel state={parallelState()} stopped hasDisplayContent />
+  );
+  expect(screen.getAllByRole("tab")).toHaveLength(2);
+  expect(screen.queryByTestId("asv3-task-loading")).not.toBeInTheDocument();
+  rerender(
+    <ASv3ProgressPanel state={completedState()} stopped hasDisplayContent />
+  );
+  expect(screen.getAllByRole("tab")).toHaveLength(2);
+  expect(
+    screen.getByRole("button", { name: "Araştırma tamamlandı" })
+  ).toHaveAttribute("aria-expanded", "true");
+});
+
+it("groups a nested researcher beneath its selected parent without exposing IDs", () => {
+  const state = applyASv3Progress(parallelState(), {
+    type: "asv3_progress",
+    run_id: "r",
+    event_id: "nested",
+    sequence: 4,
+    language: "tr",
+    phase: "worker",
+    status: "running",
+    task_id: "old-tax",
+    parent_task_id: "replacement",
+    title: "İlk ithalat vergileri",
+    message: "Geri verme başvurusunun süresi kontrol ediliyor.",
+  });
+  render(<ASv3ProgressPanel state={state} stopped={false} />);
+  expect(
+    screen.queryByRole("tab", { name: "İlk ithalat vergileri" })
+  ).not.toBeInTheDocument();
+  fireEvent.mouseDown(screen.getByRole("tab", { name: "Yeni makine" }), {
+    button: 0,
+    ctrlKey: false,
+  });
+  expect(
+    screen.getByRole("tab", { name: "İlk ithalat vergileri" })
+  ).toBeInTheDocument();
+  expect(
+    screen.getByText("Geri verme başvurusunun süresi kontrol ediliyor.")
+  ).toBeInTheDocument();
+  expect(screen.queryByText("old-tax")).not.toBeInTheDocument();
+});
 
 it("shows a language-neutral pending state until the localized update arrives", () => {
   const empty = createASv3ProgressState();

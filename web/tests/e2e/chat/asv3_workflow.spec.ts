@@ -34,6 +34,9 @@ for (const scenario of [
   test(`ASv3 selection, localized parallel updates and citation target (${scenario.language})`, async ({
     chatPage,
   }) => {
+    await chatPage.page.emulateMedia({
+      reducedMotion: scenario.native ? "reduce" : "no-preference",
+    });
     const doc = {
       document_id: scenario.native ? "original-policy-pdf" : "asv3-test-law",
       chunk_ind: scenario.native ? -1 : 7,
@@ -143,12 +146,7 @@ for (const scenario of [
         requests.push(
           route.request().postDataJSON() as Record<string, unknown>
         );
-        await expect(chatPage.page.getByTestId("asv3-progress")).toHaveText(
-          "ASv3"
-        );
-        await expect(
-          chatPage.page.getByText("Thinking...", { exact: true })
-        ).toHaveCount(0);
+        await chatPage.expectASv3Pending(scenario.native);
         await route.fulfill({
           status: 200,
           contentType: "text/plain",
@@ -178,6 +176,7 @@ for (const scenario of [
     await chatPage.inputBar.fill(scenario.question);
     await chatPage.inputBar.send();
     await chatPage.expectHumanMessage(scenario.question);
+    await chatPage.expandASv3Progress(scenario.done);
     await chatPage.expectASv3Progress(
       scenario.language,
       scenario.done,
@@ -185,6 +184,10 @@ for (const scenario of [
     );
     await chatPage.expectASv3TaskStatus("repair", "completed");
     await chatPage.expectASv3TaskStatus("replacement", "completed");
+    await chatPage.expectASv3TerminalPresentation();
+    await chatPage.captureASv3Progress(
+      `/tmp/asv3-timeline-${scenario.language}.png`
+    );
     expect(requests).toHaveLength(1);
     expect(requests[0]).toMatchObject({
       atez_search_v3: true,

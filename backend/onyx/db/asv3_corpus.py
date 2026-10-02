@@ -9,8 +9,13 @@ from sqlalchemy import Integer, cast, func, or_, select
 from sqlalchemy.orm import Session
 
 from onyx.access.access import get_access_for_user_files, get_acl_for_user
+from onyx.configs.constants import DocumentSource
 from onyx.context.search.models import IndexFilters
-from onyx.db.document_set import filter_document_set_names_by_user_access
+from onyx.db.document_set import (
+    filter_document_set_names_by_user_access,
+    get_document_set_by_id_for_user,
+)
+from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.db.models import (
     DocumentSet,
     DocumentSet__UserFile,
@@ -37,6 +42,77 @@ from onyx.regulatory.publication_reads import (
 
 class CorpusScopeUnavailable(ValueError):
     """A requested fence cannot safely be evaluated by the corpus broker."""
+
+
+PC_CORPUS_NAME = "PC Külliyatı"
+
+
+def resolve_pc_corpus_scope(
+    session: Session, *, user: User, filters: IndexFilters
+) -> IndexFilters:
+    """Resolve and pin the active tenant's mandatory set without relaxing caller fences."""
+    from shared_configs.contextvars import get_current_tenant_id
+
+    tenant_id = get_current_tenant_id()
+    if filters.tenant_id is not None and filters.tenant_id != tenant_id:
+        raise PermissionError(
+            "Tenant filter differs from the active authorized tenant."
+        )
+    if filters.source_type and any(
+        value != DocumentSource.USER_FILE for value in filters.source_type
+    ):
+        raise CorpusScopeUnavailable(
+            "ASv3 PC corpus requires the USER_FILE source type."
+        )
+    forced = filters.forced_document_set
+    if forced and PC_CORPUS_NAME not in forced:
+        raise CorpusScopeUnavailable(
+            "Requested document sets do not include the mandatory PC corpus."
+        )
+    candidates = list(
+        session.scalars(
+            select(DocumentSet)
+            .where(
+                DocumentSet.name == PC_CORPUS_NAME, DocumentSet.is_deleting.is_(False)
+            )
+            .limit(2)
+        )
+    )
+    if len(candidates) != 1:
+        raise CorpusScopeUnavailable(
+            "Mandatory PC corpus is missing or ambiguous in the current tenant."
+        )
+    corpus = candidates[0]
+    if (
+        filters.asv3_document_set_id is not None
+        and filters.asv3_document_set_id != corpus.id
+    ):
+        raise PermissionError("Pinned PC corpus identity changed.")
+    allowed = get_document_set_by_id_for_user(
+        session, corpus.id, user, get_editable=False
+    )
+    if allowed is None or allowed.name != PC_CORPUS_NAME:
+        raise PermissionError("Mandatory PC corpus is outside the authorized scope.")
+    scoped = filters.model_copy(
+        deep=True,
+        update={
+            "tenant_id": tenant_id,
+            "asv3_document_set_id": corpus.id,
+            "source_type": [DocumentSource.USER_FILE],
+            "forced_document_set": [PC_CORPUS_NAME],
+        },
+    )
+    requested = set(scoped.document_set or []) | {PC_CORPUS_NAME}
+    if requested - filter_document_set_names_by_user_access(
+        session, list(requested), user
+    ):
+        raise PermissionError("Document set is outside the authorized scope.")
+    return scoped
+
+
+def bind_pc_corpus_scope(*, user: User, filters: IndexFilters) -> IndexFilters:
+    with get_session_with_current_tenant() as session:
+        return resolve_pc_corpus_scope(session, user=user, filters=filters)
 
 
 @dataclass(frozen=True)
@@ -191,9 +267,18 @@ def _validate_filters(session: Session, user: User, filters: IndexFilters) -> No
     if filters.hierarchy_node_ids:
         raise CorpusScopeUnavailable("Hierarchy scopes require indexed search.")
     if filters.source_type and any(
-        value.value != "file" for value in filters.source_type
+        value != DocumentSource.USER_FILE for value in filters.source_type
     ):
         raise CorpusScopeUnavailable("This broker reads regulatory user files only.")
+    if filters.asv3_document_set_id is None or filters.forced_document_set != [
+        PC_CORPUS_NAME
+    ]:
+        raise CorpusScopeUnavailable("Mandatory PC corpus scope has not been bound.")
+    pinned = get_document_set_by_id_for_user(
+        session, filters.asv3_document_set_id, user, get_editable=False
+    )
+    if pinned is None or pinned.name != PC_CORPUS_NAME:
+        raise PermissionError("Pinned PC corpus is missing, changed or inaccessible.")
     requested = set(filters.document_set or []) | set(filters.forced_document_set or [])
     allowed = filter_document_set_names_by_user_access(session, list(requested), user)
     if requested - allowed:
@@ -205,6 +290,15 @@ def _source_statement(filters: IndexFilters) -> Any:
     set_membership = select(DocumentSet__UserFile.user_file_id).join(
         DocumentSet, DocumentSet.id == DocumentSet__UserFile.document_set_id
     )
+    if filters.asv3_document_set_id is not None:
+        statement = statement.where(
+            UserFile.id.in_(
+                set_membership.where(
+                    DocumentSet.id == filters.asv3_document_set_id,
+                    DocumentSet.is_deleting.is_(False),
+                )
+            )
+        )
     knowledge = []
     if filters.document_set:
         knowledge.append(

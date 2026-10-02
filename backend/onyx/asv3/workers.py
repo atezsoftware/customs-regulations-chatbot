@@ -63,11 +63,22 @@ class WorkerPool:
         *,
         parent_task_id: str | None = None,
         request_context: RunContext | None = None,
+        public_title: str | None = None,
+        public_message: str | None = None,
     ) -> str:
         delegation = request_context or self.context
         delegation.check_active()
         if not task.strip() or len(task) > 4000:
             raise ValueError("Research task must contain 1–4000 characters")
+        if (public_title is None) != (public_message is None):
+            raise ValueError("Public task narration needs both title and message")
+        if public_title is not None and public_message is not None:
+            from onyx.asv3.supplemental_tools import public_narration_valid
+
+            if not public_narration_valid(public_title, public_message, delegation):
+                raise ValueError(
+                    "Task narration must use natural question-language labels without internal details"
+                )
         with self._lock:
             if self._closed or len(self._tasks) >= self.max_tasks:
                 raise RunStopped("Research task capacity exhausted")
@@ -75,12 +86,16 @@ class WorkerPool:
                 raise RunStopped("Research delegation depth exhausted")
             task_id = str(uuid4())
             child = delegation.child()
+            child.services["task_id"] = task_id
+            child.services["parent_task_id"] = parent_task_id
             self._contexts[task_id] = child
             self._tasks[task_id] = TaskSnapshot(
                 task_id=task_id,
                 task=task,
                 parent_task_id=parent_task_id,
                 status=TaskStatus.QUEUED,
+                public_title=public_title,
+                public_message=public_message,
             )
             captured = contextvars.copy_context()
             self._futures[task_id] = cast(
@@ -152,7 +167,8 @@ class WorkerPool:
         if self.progress is None:
             return
         with self._lock:
-            status = self._tasks[task_id].status.value
+            snapshot = self._tasks[task_id]
+            status = snapshot.status.value
             active = sum(
                 task.status in (TaskStatus.RUNNING, TaskStatus.QUEUED)
                 for task in self._tasks.values()
@@ -164,6 +180,9 @@ class WorkerPool:
             "worker",
             status=status,
             task_id=task_id,
+            parent_task_id=snapshot.parent_task_id,
+            title=snapshot.public_title,
+            message=snapshot.public_message,
             active_workers=active,
             completed_workers=completed,
         )
@@ -192,6 +211,8 @@ class WorkerPool:
                 snapshot.task + "\nFollow-up: " + message,
                 parent_task_id=task_id,
                 request_context=request_context,
+                public_title=snapshot.public_title,
+                public_message=snapshot.public_message,
             )
 
     def cancel(self, task_id: str) -> None:
@@ -283,7 +304,18 @@ class WorkerPool:
             )
 
         def spawn(args: dict[str, JsonValue], context: RunContext) -> ToolOutcome:
-            task_id = self.spawn(str(args["task"]), request_context=context)
+            parent = context.services.get("task_id")
+            task_id = self.spawn(
+                str(args["task"]),
+                request_context=context,
+                parent_task_id=parent if isinstance(parent, str) else None,
+                public_title=str(args["public_title"])
+                if args.get("public_title")
+                else None,
+                public_message=str(args["public_message"])
+                if args.get("public_message")
+                else None,
+            )
             return ToolOutcome(
                 status=OutcomeStatus.FOUND,
                 summary="Researcher queued",
@@ -337,7 +369,22 @@ class WorkerPool:
             ToolSpec(
                 name="spawn_researcher",
                 description="Delegate one independent information need. The researcher chooses its own tools.",
-                parameters=schema({"task": message}, ["task"]),
+                parameters=schema(
+                    {
+                        "task": message,
+                        "public_title": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 240,
+                        },
+                        "public_message": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 1600,
+                        },
+                    },
+                    ["task"],
+                ),
                 orchestrates=True,
                 handler=spawn,
             ),

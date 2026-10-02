@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import random
 import re
 import time
 from collections.abc import Callable, Iterator
@@ -18,12 +19,19 @@ from onyx.asv3.models import (
     CapabilityCall,
     Decision,
     HarnessView,
+    ResearchTurn,
     RunContext,
     RunStopped,
+)
+from onyx.configs.chat_configs import (
+    LLM_FIRST_CHUNK_RETRY_BASE_DELAY_S,
+    LLM_FIRST_CHUNK_RETRY_JITTER_RATIO,
+    LLM_FIRST_CHUNK_RETRY_MAX_DELAY_S,
 )
 from onyx.llm.interfaces import LLM, LLMUserIdentity
 from onyx.llm.model_response import ModelResponse
 from onyx.llm.models import (
+    AssistantMessage,
     ChatCompletionMessage,
     ContentPart,
     ImageContentPart,
@@ -31,11 +39,19 @@ from onyx.llm.models import (
     ReasoningEffort,
     SystemMessage,
     TextContentPart,
+    ToolCall,
     ToolChoiceOptions,
     UserMessage,
 )
+from onyx.llm.models import (
+    FunctionCall as NativeFunctionCall,
+)
 from onyx.prompts.asv3.research import COORDINATOR_PROMPT, RESEARCHER_PROMPT
-from onyx.regulatory.structured_llm import _portable_structured_output_schema
+from onyx.regulatory.structured_llm import (
+    _portable_structured_output_schema,
+    _retry_after_seconds,
+    is_retryable_provider_error,
+)
 from onyx.tracing.flows import LLMFlow
 from onyx.tracing.llm_utils import llm_generation_span, record_llm_response
 
@@ -56,6 +72,7 @@ REQUIRED_NOTIFICATION_PHASES = (
 class LanguageProfile(BaseModel):
     language: str = Field(pattern=r"^[a-zA-Z]{2,3}(?:-[a-zA-Z0-9]{2,8})*$")
     external_requested: bool = Field(default=False, strict=True)
+    requires_sources: bool = Field(default=True, strict=True)
     notifications: dict[str, list[str]] = Field(
         json_schema_extra={
             "type": "object",
@@ -95,6 +112,16 @@ class VerificationResult(BaseModel):
     required_conditions: list[str]
     missing_conditions: list[str]
     evidence_numbers: list[Annotated[int, Field(strict=True, ge=1)]]
+    question_results: list["QuestionVerification"] = Field(default_factory=list)
+    safe_to_publish: bool = Field(default=False, strict=True)
+    unsupported_claims: list[str] = Field(default_factory=list)
+
+
+class QuestionVerification(BaseModel):
+    question_id: str
+    status: Literal["supported", "contradicted", "incomplete", "uncertain"]
+    evidence_numbers: list[Annotated[int, Field(strict=True, ge=1)]]
+    missing_conditions: list[str]
 
 
 def structured_model(flow: LLMFlow) -> type[BaseModel] | None:
@@ -105,13 +132,7 @@ def structured_model(flow: LLMFlow) -> type[BaseModel] | None:
     return None
 
 
-def parse_json_object(text: str) -> dict[str, JsonValue]:
-    value = text.strip()
-    if value.startswith("```"):
-        if "\n" not in value or not value.endswith("```"):
-            raise ValueError("Malformed JSON code fence")
-        value = value.split("\n", 1)[1].rsplit("```", 1)[0]
-
+def strict_json_decoder() -> json.JSONDecoder:
     def object_pairs(pairs: list[tuple[str, JsonValue]]) -> dict[str, JsonValue]:
         result: dict[str, JsonValue] = {}
         for key, item in pairs:
@@ -123,12 +144,59 @@ def parse_json_object(text: str) -> dict[str, JsonValue]:
     def invalid_constant(_value: str) -> JsonValue:
         raise ValueError("Non-finite JSON number")
 
-    data = json.loads(
-        value, object_pairs_hook=object_pairs, parse_constant=invalid_constant
+    return json.JSONDecoder(
+        object_pairs_hook=object_pairs, parse_constant=invalid_constant
     )
+
+
+def provider_retry_delay(error: Exception, attempt: int) -> float:
+    delay = _retry_after_seconds(error)
+    if delay is not None:
+        return delay
+    scheduled = min(
+        LLM_FIRST_CHUNK_RETRY_MAX_DELAY_S,
+        LLM_FIRST_CHUNK_RETRY_BASE_DELAY_S * (2**attempt),
+    )
+    jitter = scheduled * LLM_FIRST_CHUNK_RETRY_JITTER_RATIO
+    return random.uniform(max(0, scheduled - jitter), scheduled + jitter)
+
+
+def parse_json_object(text: str) -> dict[str, JsonValue]:
+    value = text.strip()
+    if value.startswith("```"):
+        if "\n" not in value or not value.endswith("```"):
+            raise ValueError("Malformed JSON code fence")
+        value = value.split("\n", 1)[1].rsplit("```", 1)[0]
+    data = strict_json_decoder().decode(value)
     if not isinstance(data, dict):
         raise ValueError("Expected a JSON object")
     return data
+
+
+def normalize_structured_response(text: str, response_model: type[BaseModel]) -> str:
+    decoder = strict_json_decoder()
+    candidates: list[BaseModel] = []
+    validation_error: ValueError | None = None
+    offset = 0
+    if text.strip().startswith("["):
+        raise ValueError("Expected a JSON object, not an array")
+    while (start := text.find("{", offset)) >= 0:
+        # Never salvage an inner object from malformed, duplicate, or nonfinite JSON.
+        value, end = decoder.raw_decode(text, start)
+        offset = end
+        if isinstance(value, dict):
+            try:
+                candidates.append(response_model.model_validate(value))
+            except ValueError as error:
+                validation_error = error
+                continue
+    if not candidates and validation_error is not None:
+        raise validation_error
+    if len(candidates) != 1:
+        raise ValueError(
+            "Structured response requires exactly one schema-valid JSON object"
+        )
+    return candidates[0].model_dump_json()
 
 
 @contextmanager
@@ -164,6 +232,7 @@ class ResearchModel:
         self.updates = updates or (lambda: [])
         self.pending_tasks = pending_tasks or (lambda: [])
         self.token_counter = token_counter
+        self.last_call_id: str | None = None
 
     def _tokens(self, text: str) -> int:
         if self.token_counter is None:
@@ -183,6 +252,12 @@ class ResearchModel:
     ) -> int:
         total = 128 + len(prompt) * 16 + len(tools) * 16
         for message in prompt:
+            if isinstance(message, AssistantMessage) and message.tool_calls:
+                total += self._tokens(
+                    json.dumps(
+                        [call.model_dump(mode="json") for call in message.tool_calls]
+                    )
+                )
             content = message.content
             if isinstance(content, str):
                 total += self._tokens(content)
@@ -282,6 +357,7 @@ class ResearchModel:
         max_tokens: int,
         research: bool = False,
         repair: str | None = None,
+        turns: list[ResearchTurn] | None = None,
     ) -> tuple[list[ChatCompletionMessage], list[dict[str, JsonValue]], int]:
         ceiling, output = self._limits(max_tokens)
         selected = tools
@@ -291,15 +367,20 @@ class ResearchModel:
             payload = None
 
         def prompt(text: str) -> list[ChatCompletionMessage]:
-            result: list[ChatCompletionMessage] = [
-                SystemMessage(content=instruction),
-                UserMessage(content=text),
-            ]
+            result: list[ChatCompletionMessage] = [SystemMessage(content=instruction)]
+            for turn in turns or []:
+                result.extend([turn.assistant, *turn.results])
+            result.append(UserMessage(content=text))
             if repair:
                 result.append(UserMessage(content=repair))
             return result
 
         initial = prompt(data)
+        # Remove complete old call/result pairs; never leave orphan provider calls.
+        turns = list(turns or [])
+        while turns and self._input_cost(initial, selected) > ceiling:
+            turns.pop(0)
+            initial = prompt(data)
         if self._input_cost(initial, selected) <= ceiling:
             return initial, selected, output
         if payload is None:
@@ -397,7 +478,82 @@ class ResearchModel:
         max_tokens: int,
         research: bool,
     ) -> ModelResponse:
+        check = (
+            self.context.check_research_active
+            if research
+            else self.context.check_active
+        )
+        deadline = self.context.research_deadline if research else self.context.deadline
+        for attempt in range(3):
+            check()
+            try:
+                return self._invoke_once(
+                    prompt, tools, flow, max_tokens=max_tokens, research=research
+                )
+            except Exception as error:
+                if attempt == 2 or not is_retryable_provider_error(error):
+                    raise
+                check()
+                delay = provider_retry_delay(error, attempt)
+                if delay >= deadline - time.monotonic():
+                    raise RunStopped(
+                        "Provider retry would exceed the remaining run deadline"
+                    ) from error
+                if research:
+                    self.context.budget.consume_research_decision()
+                else:
+                    self.context.budget.consume("decisions")
+                retry_at = time.monotonic() + delay
+                while time.monotonic() < retry_at:
+                    check()
+                    time.sleep(min(0.05, max(0, retry_at - time.monotonic())))
+        raise AssertionError("Provider retry loop did not terminate")
+
+    def _invoke_once(
+        self,
+        prompt: list[ChatCompletionMessage],
+        tools: list[dict[str, JsonValue]],
+        flow: LLMFlow,
+        *,
+        max_tokens: int,
+        research: bool,
+    ) -> ModelResponse:
         response_model = structured_model(flow)
+        from onyx.asv3.evidence import EvidenceLedger
+
+        ledger = self.context.services.get("evidence")
+        records: list[dict[str, JsonValue]] = []
+        if isinstance(ledger, EvidenceLedger):
+            for message in prompt:
+                content = message.content
+                texts = (
+                    [content]
+                    if isinstance(content, str)
+                    else [
+                        part.text
+                        for part in content or []
+                        if isinstance(part, TextContentPart)
+                    ]
+                )
+                for text in texts:
+                    try:
+                        payload = parse_json_object(text)
+                    except ValueError:
+                        continue
+                    evidence = payload.get("evidence", [])
+                    if isinstance(evidence, str):
+                        try:
+                            evidence = json.loads(evidence)
+                        except ValueError:
+                            continue
+                    if isinstance(evidence, list):
+                        records.extend(
+                            item for item in evidence if isinstance(item, dict)
+                        )
+                    outcome = payload.get("outcome")
+                    data = outcome.get("data") if isinstance(outcome, dict) else None
+                    if isinstance(data, dict):
+                        records.append(data)
         with (
             model_slot(self.context, research=research),
             llm_generation_span(self.llm, flow, prompt, tools or None) as span,
@@ -440,6 +596,9 @@ class ResearchModel:
                 user_identity=self.user_identity,
             )
             record_llm_response(span, response)
+            self.last_call_id = span.span_id
+            if isinstance(ledger, EvidenceLedger):
+                ledger.record_delivery(span.span_id, flow.value, records)
         self.context.check_active()
         return response
 
@@ -471,8 +630,7 @@ class ResearchModel:
             if not text.strip():
                 raise ValueError("ASv3 model returned an empty response")
             if response_model is not None:
-                parsed = parse_json_object(text)
-                response_model.model_validate(parsed)
+                return normalize_structured_response(text, response_model)
             return text
 
         try:
@@ -536,12 +694,29 @@ class ResearchModel:
         answer = response.choice.message.content
         if not calls and not (answer or "").strip():
             raise ValueError("ASv3 model produced neither actions nor an answer")
-        return Decision(calls=calls, answer=answer)
+        return Decision(
+            calls=calls,
+            answer=answer,
+            assistant_message=AssistantMessage(
+                content=answer,
+                tool_calls=[
+                    ToolCall(
+                        id=call.id,
+                        function=NativeFunctionCall.model_validate(
+                            call.function.model_dump()
+                        ),
+                    )
+                    for call in response.choice.message.tool_calls or []
+                ]
+                or None,
+            ),
+        )
 
     def decide(self, view: HarnessView) -> Decision:
         self.context.check_research_active()
         payload = view.model_dump(mode="json")
         payload.pop("tools", None)
+        payload.pop("turns", None)
         payload.update(
             language=self.context.language,
             conversation=self.history,
@@ -565,8 +740,9 @@ class ResearchModel:
             view.tools,
             max_tokens=6000,
             research=True,
+            turns=view.turns,
         )
-        content = prompt[1].content
+        content = prompt[-1].content
         assert isinstance(content, str)
         parts: list[ContentPart] = [TextContentPart(text=content)]
         store = self.context.services.get("artifacts")
@@ -586,11 +762,11 @@ class ResearchModel:
                             detail="high",
                         )
                     )
-                    trial = [prompt[0], UserMessage(content=[*parts, image])]
+                    trial = [*prompt[:-1], UserMessage(content=[*parts, image])]
                     ceiling, _ = self._limits(output)
                     if self._input_cost(trial, tools) <= ceiling:
                         parts.append(image)
-        prompt[1] = UserMessage(content=parts)
+        prompt[-1] = UserMessage(content=parts)
         flow = (
             LLMFlow.ASV3_RESEARCHER if self.context.depth else LLMFlow.ASV3_COORDINATOR
         )
@@ -610,6 +786,7 @@ class ResearchModel:
                 tools,
                 max_tokens=6000,
                 research=True,
+                turns=view.turns,
             )
             decision = self._decision(
                 self._invoke(prompt, tools, flow, max_tokens=output, research=True),
@@ -639,14 +816,4 @@ class ResearchModel:
                     continue
                 if repaired.get(valid.call_id) != valid:
                     raise ValueError("Schema repair altered an already valid action")
-        if not decision.calls and any(
-            task.get("status") in ("queued", "running") for task in self.pending_tasks()
-        ):
-            return Decision(
-                calls=[
-                    CapabilityCall(
-                        name="wait_researcher", arguments={"timeout_seconds": 5}
-                    )
-                ]
-            )
         return decision

@@ -1528,7 +1528,13 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
                 high_term_coverage=high_term_coverage,
                 # For projects, the search scope is the project and has no other limits
                 user_selected_filters=(
-                    effective_filters if self.project_id_filter is None else None
+                    effective_filters
+                    if self.project_id_filter is None
+                    or (
+                        isinstance(effective_filters, IndexFilters)
+                        and effective_filters.asv3_document_set_id is not None
+                    )
+                    else None
                 ),
                 bypass_acl=self.bypass_acl,
                 limit=candidate_limit,

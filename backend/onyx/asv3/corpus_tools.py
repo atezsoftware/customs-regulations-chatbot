@@ -2,7 +2,7 @@
 
 import difflib
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from datetime import date
 from itertools import islice
 from threading import RLock
@@ -40,6 +40,7 @@ from onyx.regulatory.heading_path import (
     RegulatoryProvisionReference,
     extract_regulatory_provision_references,
 )
+from onyx.tools.constants import REGULATORY_MAX_SEARCH_QUERY_CHARS
 
 MAX_SCAN_CHUNKS = 2000
 MAX_RESPONSE_CHARS = 64_000
@@ -66,6 +67,79 @@ SOURCE_FIELD: dict[str, JsonValue] = {
     "format": "uuid",
     "description": "Canonical authorized source_id returned by resolve_source.",
 }
+
+
+class ChunkScan:
+    """Paged source traversal retaining only the current page and continuation."""
+
+    def __init__(
+        self,
+        broker: "CorpusBroker",
+        source_id: str,
+        context: RunContext,
+        *,
+        start: int = 0,
+        as_of: date | None = None,
+        historical_inventory: bool = False,
+    ) -> None:
+        self.broker = broker
+        self.source_id = source_id
+        self.context = context
+        self.source = broker.source(source_id, context)
+        self.next_position = start
+        self.truncated = True
+        self.as_of = as_of
+        self.historical_inventory = historical_inventory
+        self.scanned_chunks = 0
+        self.scanned_bytes = 0
+
+    def __iter__(self) -> Iterator[CorpusChunk]:
+        while self.scanned_chunks < MAX_SCAN_CHUNKS:
+            self.source, page, more = self.broker.page(
+                self.source_id,
+                self.context,
+                start=self.next_position,
+                limit=min(100, MAX_SCAN_CHUNKS - self.scanned_chunks),
+                as_of=self.as_of,
+                historical_inventory=self.historical_inventory,
+            )
+            for chunk in page:
+                self.context.check_active()
+                size = len(chunk.text.encode("utf-8"))
+                if self.scanned_bytes + size > MAX_SCAN_BYTES:
+                    self.next_position = chunk.position
+                    return
+                self.scanned_bytes += size
+                self.scanned_chunks += 1
+                self.next_position = chunk.position + 1
+                yield chunk
+            if not more:
+                self.truncated = False
+                return
+            if not page:
+                return
+            # Discard this page before fetching the next one.
+            del page
+
+
+class EvidenceSelection:
+    """Retain complete selected chunks within the existing response text budget."""
+
+    def __init__(self, source: CorpusSource) -> None:
+        self.source = source
+        self.items: list[EvidenceItem] = []
+        self.characters = 0
+        self.clipped = False
+        self.next_position: int | None = None
+
+    def add(self, chunk: CorpusChunk) -> None:
+        if self.clipped or self.characters + len(chunk.text) > MAX_RESPONSE_CHARS:
+            if not self.clipped:
+                self.next_position = chunk.position
+            self.clipped = True
+            return
+        self.items.append(evidence_for_chunk(self.source, chunk))
+        self.characters += len(chunk.text)
 
 
 class CorpusBroker:
@@ -162,29 +236,52 @@ class CorpusBroker:
         as_of: date | None = None,
         historical_inventory: bool = False,
     ) -> tuple[CorpusSource, list[CorpusChunk], bool]:
-        chunks: list[CorpusChunk] = []
-        byte_count = 0
-        start = 0
-        more = False
+        stream = self.iter_chunks(
+            source_id, context, as_of=as_of, historical_inventory=historical_inventory
+        )
+        chunks = list(stream)
+        return stream.source, chunks, stream.truncated
+
+    def iter_chunks(
+        self,
+        source_id: str,
+        context: RunContext,
+        *,
+        start: int = 0,
+        as_of: date | None = None,
+        historical_inventory: bool = False,
+    ) -> ChunkScan:
+        return ChunkScan(
+            self,
+            source_id,
+            context,
+            start=start,
+            as_of=as_of,
+            historical_inventory=historical_inventory,
+        )
+
+    def chunk(
+        self, source_id: str, chunk_id: str, context: RunContext
+    ) -> tuple[CorpusSource, CorpusChunk | None]:
+        """Resolve an exact canonical locator before hydrating its text."""
         source = self.source(source_id, context)
-        for _ in range(MAX_SCAN_CHUNKS // 100):
-            source, page, more = self.page(
-                source_id,
-                context,
-                start=start,
-                limit=100,
-                as_of=as_of,
-                historical_inventory=historical_inventory,
+        with get_session_with_current_tenant() as session:
+            with self._index_lock:
+                if source.id not in self.query_indexes:
+                    snapshot = resolve_source_query_index(session, source.id)
+                    if snapshot is not None:
+                        self.query_indexes[source.id] = snapshot
+            position = source_chunk_position(
+                session,
+                source_id=source.id,
+                chunk_id=chunk_id,
+                index=self.query_indexes.get(source.id),
+                as_of=self.filters.as_of_date,
             )
-            for chunk in page:
-                byte_count += len(chunk.text.encode("utf-8"))
-                if byte_count > MAX_SCAN_BYTES:
-                    return source, chunks, True
-                chunks.append(chunk)
-            if not more or not page:
-                return source, chunks, more
-            start = page[-1].position + 1
-        return source, chunks, more
+        if position is None:
+            return source, None
+        source, chunks, _ = self.page(source_id, context, start=position, limit=100)
+        return source, next((chunk for chunk in chunks if chunk.id == chunk_id), None)
 
     def revalidate_evidence(
         self, items: list[EvidenceItem], context: RunContext
@@ -228,13 +325,17 @@ class CorpusBroker:
             elif item.metadata.get("source_sha256"):
                 from hashlib import sha256
 
-                from onyx.asv3.source_tools import read_verified_original
+                from onyx.asv3.source_tools import read_verified_original, source_slot
 
-                content, _, _ = read_verified_original(self, item.source_id, context)
-                if sha256(content).hexdigest() != item.metadata["source_sha256"]:
-                    raise CorpusScopeUnavailable(
-                        "Original source changed after extraction."
+                with source_slot(context, research=False):
+                    content, _, _ = read_verified_original(
+                        self, item.source_id, context
                     )
+                    if sha256(content).hexdigest() != item.metadata["source_sha256"]:
+                        raise CorpusScopeUnavailable(
+                            "Original source changed after extraction."
+                        )
+                    del content
             else:
                 raise CorpusScopeUnavailable("Evidence has no immutable source proof.")
 
@@ -311,6 +412,7 @@ class CorpusBroker:
             )
         _, chunks, _ = self.page(str(source.id), context, start=position, limit=100)
         center = next((chunk for chunk in chunks if chunk.id == chunk_id), None)
+        del chunks
         if center is None:
             raise CorpusScopeUnavailable(
                 "Retrieved center cannot be independently hydrated."
@@ -318,18 +420,19 @@ class CorpusBroker:
         identity = article_identity(center)
         closure, incomplete = [center], False
         if identity is not None:
-            _, all_chunks, incomplete = self.scan(str(source.id), context)
-            closure = []
+            stream = self.iter_chunks(str(source.id), context)
+            selection = EvidenceSelection(source)
             current_identity = None
-            for chunk in all_chunks:
+            for chunk in stream:
                 own = article_identity(chunk)
                 if own is not None:
                     current_identity = own
                 if current_identity == identity:
-                    closure.append(chunk)
-            if not any(chunk.id == center.id for chunk in closure):
-                closure.insert(0, center)
-        items, clipped = bounded_evidence(source, closure)
+                    selection.add(chunk)
+            incomplete = stream.truncated
+            items, clipped = selection.items, selection.clipped
+        else:
+            items, clipped = bounded_evidence(source, closure)
         if not any(item.chunk_id == center.id for item in items):
             items.insert(0, evidence_for_chunk(source, center))
         for item in items:
@@ -520,28 +623,30 @@ def build_corpus_specs(broker: CorpusBroker) -> list[ToolSpec]:
                 summary="Use one article identity including GEÇİCİ/MÜKERRER when applicable.",
             )
         target = requested[0].article_no, requested[0].qualifier
-        source, chunks, more = broker.scan(str(args["source_id"]), context)
-        selected = []
+        stream = broker.iter_chunks(str(args["source_id"]), context)
+        selection = EvidenceSelection(stream.source)
         identity = None
-        for chunk in chunks:
+        paragraph = args.get("paragraph")
+        clause = args.get("clause")
+        subunit_verified = False
+        for chunk in stream:
             own = article_identity(chunk)
             if own is not None:
                 identity = own
             if identity == target:
-                selected.append(chunk)
-        evidence, clipped = bounded_evidence(source, selected)
-        paragraph = args.get("paragraph")
-        clause = args.get("clause")
-        subunit_verified = any(
-            (
-                paragraph is None
-                or str(chunk.metadata.get("paragraph_no")) == str(paragraph)
-            )
-            and (
-                clause is None or str(chunk.metadata.get("clause_label")) == str(clause)
-            )
-            for chunk in selected
-        )
+                selection.add(chunk)
+                subunit_verified = subunit_verified or (
+                    (
+                        paragraph is None
+                        or str(chunk.metadata.get("paragraph_no")) == str(paragraph)
+                    )
+                    and (
+                        clause is None
+                        or str(chunk.metadata.get("clause_label")) == str(clause)
+                    )
+                )
+        evidence, clipped = selection.items, selection.clipped
+        more = stream.truncated
         partial = (
             more or clipped or bool((paragraph or clause) and not subunit_verified)
         )
@@ -557,25 +662,31 @@ def build_corpus_specs(broker: CorpusBroker) -> list[ToolSpec]:
                 "subunit_verified": subunit_verified,
                 "scan_truncated": more,
                 "evidence_truncated": clipped,
+                "next_position": stream.next_position,
+                "evidence_next_position": selection.next_position,
                 "absence_proven": False,
             },
             evidence=evidence,
         )
 
     def text_search(args: dict[str, JsonValue], context: RunContext) -> ToolOutcome:
-        source, chunks, more = broker.scan(str(args["source_id"]), context)
         pattern = str(args["pattern"])
         if not pattern or len(pattern) > 512:
             raise ValueError("Pattern must contain 1..512 characters.")
         mode = str(args.get("mode", "literal"))
         matches: list[JsonValue] = []
-        selected = []
+        stream = broker.iter_chunks(
+            str(args["source_id"]), context, start=int(cast(int, args.get("start", 0)))
+        )
+        selection = EvidenceSelection(stream.source)
+        match_chunks = 0
+        match_overflow = False
         compiled = None
         if mode == "regex":
             import regex
 
             compiled = regex.compile(pattern, flags=regex.IGNORECASE)
-        for chunk in chunks:
+        for chunk in stream:
             context.check_active()
             if mode == "regex" and compiled is not None:
                 try:
@@ -604,8 +715,9 @@ def build_corpus_specs(broker: CorpusBroker) -> list[ToolSpec]:
                     )
                 ]
             if spans:
-                more = more or len(spans) > 20
-                selected.append(chunk)
+                match_overflow = match_overflow or len(spans) > 20
+                match_chunks += 1
+                selection.add(chunk)
                 matches.extend(
                     {
                         "chunk_id": chunk.id,
@@ -615,10 +727,11 @@ def build_corpus_specs(broker: CorpusBroker) -> list[ToolSpec]:
                     }
                     for start, end in spans[:20]
                 )
-            if len(selected) >= 30:
-                more = True
+            if match_chunks >= 30:
+                match_overflow = True
                 break
-        evidence, clipped = bounded_evidence(source, selected)
+        evidence, clipped = selection.items, selection.clipped
+        more = stream.truncated or match_overflow or len(matches) > 200
         return ToolOutcome(
             status=OutcomeStatus.PARTIAL
             if more or clipped
@@ -629,6 +742,9 @@ def build_corpus_specs(broker: CorpusBroker) -> list[ToolSpec]:
             data={
                 "matches": matches[:200],
                 "scan_truncated": more,
+                "next_position": stream.next_position,
+                "evidence_truncated": clipped,
+                "evidence_next_position": selection.next_position,
                 "absence_proven": False,
             },
             evidence=evidence,
@@ -637,7 +753,9 @@ def build_corpus_specs(broker: CorpusBroker) -> list[ToolSpec]:
     def query(args: dict[str, JsonValue], context: RunContext) -> ToolOutcome:
         if args.get("operation", "inventory") == "inventory":
             return resolve(args, context)
-        source, chunks, more = broker.scan(str(args["source_id"]), context)
+        stream = broker.iter_chunks(
+            str(args["source_id"]), context, start=int(cast(int, args.get("start", 0)))
+        )
         headings = [
             {
                 "position": chunk.position,
@@ -653,12 +771,17 @@ def build_corpus_specs(broker: CorpusBroker) -> list[ToolSpec]:
                 if chunk.validity_end
                 else None,
             }
-            for chunk in chunks
+            for chunk in stream
         ]
         return ToolOutcome(
-            status=OutcomeStatus.PARTIAL if more else OutcomeStatus.FOUND,
+            status=OutcomeStatus.PARTIAL if stream.truncated else OutcomeStatus.FOUND,
             summary="Scoped structural inventory; unknown validity remains unknown.",
-            data={"source_name": source.name, "headings": headings, "has_more": more},
+            data={
+                "source_name": stream.source.name,
+                "headings": headings,
+                "has_more": stream.truncated,
+                "next_position": stream.next_position,
+            },
         )
 
     def diagnose(args: dict[str, JsonValue], context: RunContext) -> ToolOutcome:
@@ -677,12 +800,11 @@ def build_corpus_specs(broker: CorpusBroker) -> list[ToolSpec]:
         )
 
     def reference(args: dict[str, JsonValue], context: RunContext) -> ToolOutcome:
-        source, chunks, more = broker.scan(str(args["source_id"]), context)
         identifier = str(args["chunk_id"])
-        chunk = next((item for item in chunks if item.id == identifier), None)
+        source, chunk = broker.chunk(str(args["source_id"]), identifier, context)
         if chunk is None:
             return ToolOutcome(
-                status=OutcomeStatus.PARTIAL if more else OutcomeStatus.NOT_FOUND,
+                status=OutcomeStatus.NOT_FOUND,
                 summary="Reference origin is not in the visible source snapshot.",
             )
         refs = extract_regulatory_provision_references(chunk.text)
@@ -719,12 +841,44 @@ def build_corpus_specs(broker: CorpusBroker) -> list[ToolSpec]:
             date.fromisoformat(str(args["old_date"])),
             date.fromisoformat(str(args["new_date"])),
         )
-        source, old, old_more = broker.scan(
-            str(args["source_id"]), context, as_of=old_date
+        requested = (
+            article_references(str(args["article"])) if args.get("article") else ()
         )
-        _, new, new_more = broker.scan(str(args["source_id"]), context, as_of=new_date)
-        left, left_clipped = bounded_evidence(source, old)
-        right, right_clipped = bounded_evidence(source, new)
+        if args.get("article") and len(requested) != 1:
+            raise ValueError("Compare one exact article identity.")
+        target = (
+            (requested[0].article_no, requested[0].qualifier) if requested else None
+        )
+        start = int(cast(int, args.get("start", 0)))
+        end = cast(int | None, args.get("end"))
+        if end is not None and end <= start:
+            raise ValueError("The exclusive range end must follow start.")
+        if target is not None and (start or end is not None):
+            raise ValueError("Choose either an article or a position range.")
+
+        def collect(as_of: date) -> tuple[EvidenceSelection, ChunkScan, bool]:
+            stream = broker.iter_chunks(
+                str(args["source_id"]), context, start=start, as_of=as_of
+            )
+            selection = EvidenceSelection(stream.source)
+            identity = None
+            unknown = False
+            for chunk in stream:
+                if end is not None and chunk.position >= end:
+                    stream.truncated = False
+                    stream.next_position = end
+                    break
+                own = article_identity(chunk)
+                if own is not None:
+                    identity = own
+                if target is None or identity == target:
+                    selection.add(chunk)
+                    unknown = unknown or chunk.validity_start is None
+            return selection, stream, unknown
+
+        old, old_scan, old_unknown = collect(old_date)
+        new, new_scan, new_unknown = collect(new_date)
+        left, right = old.items, new.items
         diff = "\n".join(
             difflib.unified_diff(
                 "\n".join(item.text for item in left).splitlines(),
@@ -733,12 +887,12 @@ def build_corpus_specs(broker: CorpusBroker) -> list[ToolSpec]:
                 tofile=str(new_date),
             )
         )
-        unknown = any(item.validity_start is None for item in old + new)
+        unknown = old_unknown or new_unknown
         partial = (
-            old_more
-            or new_more
-            or left_clipped
-            or right_clipped
+            old_scan.truncated
+            or new_scan.truncated
+            or old.clipped
+            or new.clipped
             or len(diff) > MAX_RESPONSE_CHARS
         )
         return ToolOutcome(
@@ -753,6 +907,15 @@ def build_corpus_specs(broker: CorpusBroker) -> list[ToolSpec]:
                 "old_date": str(old_date),
                 "new_date": str(new_date),
                 "version_unknown": unknown,
+                "old_next_position": old.next_position
+                if old.clipped
+                else old_scan.next_position,
+                "new_next_position": new.next_position
+                if new.clipped
+                else new_scan.next_position,
+                "article": args.get("article"),
+                "start": start,
+                "end": end,
             },
             evidence=left + right,
         )
@@ -814,6 +977,7 @@ def build_corpus_specs(broker: CorpusBroker) -> list[ToolSpec]:
                     "source_id": SOURCE_FIELD,
                     "pattern": {"type": "string", "minLength": 1, "maxLength": 512},
                     "mode": {"type": "string", "enum": ["literal", "regex"]},
+                    "start": {"type": "integer", "minimum": 0},
                 },
                 ["source_id", "pattern"],
             ),
@@ -825,6 +989,7 @@ def build_corpus_specs(broker: CorpusBroker) -> list[ToolSpec]:
             parameters=schema(
                 {
                     "operation": {"type": "string", "enum": ["inventory", "headings"]},
+                    "start": {"type": "integer", "minimum": 0},
                     "query": {"type": "string"},
                     "source_id": SOURCE_FIELD,
                     "offset": {"type": "integer", "minimum": 0},
@@ -863,6 +1028,9 @@ def build_corpus_specs(broker: CorpusBroker) -> list[ToolSpec]:
                     "source_id": SOURCE_FIELD,
                     "old_date": {"type": "string", "format": "date"},
                     "new_date": {"type": "string", "format": "date"},
+                    "article": {"type": "string"},
+                    "start": {"type": "integer", "minimum": 0},
+                    "end": {"type": "integer", "minimum": 1},
                 },
                 ["source_id", "old_date", "new_date"],
             ),
@@ -870,16 +1038,26 @@ def build_corpus_specs(broker: CorpusBroker) -> list[ToolSpec]:
         ),
         ToolSpec(
             name="search_corpus",
-            description="Use existing scoped index search; choose hybrid/keyword/full_text according to evidence need.",
+            description="Search the authorized PC corpus with the established retrieval, label and citation pipeline. Choose hybrid for semantic plus lexical retrieval, keyword for BM25 lexical ranking, or full_text for high analyzed-term coverage (not a literal substring guarantee). Source anchors and evidence targets are model-written navigation hints, not evidence.",
             parameters=schema(
                 {
-                    "query": {"type": "string"},
+                    "query": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": REGULATORY_MAX_SEARCH_QUERY_CHARS,
+                    },
                     "mode": {
                         "type": "string",
                         "enum": ["hybrid", "keyword", "full_text"],
                     },
+                    "coverage_item": {"type": "string", "minLength": 1},
+                    "evidence_target": {"type": "string", "minLength": 1},
+                    "source_anchors": {
+                        "type": "array",
+                        "items": {"type": "string", "minLength": 1},
+                    },
                 },
-                ["query"],
+                ["query", "mode"],
             ),
             handler=guarded(search),
         ),

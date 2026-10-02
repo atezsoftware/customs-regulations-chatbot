@@ -85,11 +85,90 @@ def complete_language_profile() -> dict[str, Any]:
     return {
         "language": "tr",
         "external_requested": False,
+        "requires_sources": True,
         "notifications": {
             phase: ["Araştırma", "Royalti koşullarını inceliyorum."]
             for phase in REQUIRED_NOTIFICATION_PHASES
         },
     }
+
+
+def test_actual_model_input_records_full_and_partial_deliveries_without_copying_files() -> (
+    None
+):
+    from onyx.asv3.models import HarnessView
+
+    context, ledger, tools = original_state()
+    llm = scripted_model()
+    llm.invoke.return_value = ModelResponse(
+        id="decision", created="0", choice=Choice(message=Message(content="Draft [1]"))
+    )
+    model = ResearchModel(llm, context)
+    original = ledger.get(1)
+    assert original is not None
+    view = HarnessView(
+        request="Read the operative rule",
+        questions=[],
+        facts=[],
+        receipts=[],
+        evidence=[{"citation": 1, "text": original.text[:12], "truncated": True}],
+        tools=tools,
+    )
+    model.decide(view)
+    first = ledger.inspect(1)["deliveries"]
+    assert isinstance(first, list) and len(first) == 1
+    record = first[0]["records"][0]
+    assert record["complete"] is False and record["end_char"] == 12
+    assert "text" not in record and record["text_hash"] == original.text_hash
+    model.invoke_text(
+        "Use supplied evidence",
+        json.dumps({"evidence": json.dumps([{"citation": 1, "text": original.text}])}),
+        LLMFlow.ASV3_FINAL,
+    )
+    delivered = ledger.inspect(1)["deliveries"]
+    assert (
+        isinstance(delivered, list) and delivered[-1]["records"][0]["complete"] is True
+    )
+    assert ledger.export()["records"][0]["item"]["text"] == original.text
+
+
+def test_provider_receives_paired_assistant_tool_history_and_current_state() -> None:
+    from onyx.asv3.harness import Harness
+    from onyx.asv3.registry import CapabilityRegistry, build_core_specs
+    from onyx.llm.models import AssistantMessage, ToolMessage
+
+    context, ledger, _ = original_state()
+    llm = scripted_model()
+    llm.invoke.side_effect = [
+        tool_response('{"citation":1}'),
+        ModelResponse(
+            id="draft",
+            created="0",
+            choice=Choice(message=Message(content="Supported draft [1]")),
+        ),
+    ]
+    registry = CapabilityRegistry()
+    for spec in build_core_specs(registry, ledger, lambda: {}):
+        registry.register(spec)
+    harness = Harness(
+        request="Read original",
+        context=context,
+        registry=registry,
+        evidence=ledger,
+        decide=ResearchModel(llm, context).decide,
+    )
+    result = harness.run()
+    assert result.answer == "Supported draft [1]"
+    prompt = llm.invoke.call_args_list[-1].kwargs["prompt"]
+    assistant = next(
+        message for message in prompt if isinstance(message, AssistantMessage)
+    )
+    tool = next(message for message in prompt if isinstance(message, ToolMessage))
+    assert assistant.tool_calls[0].id == tool.tool_call_id == "call-1"
+    assert "The original complete operative text." in tool.content
+    turns = harness.snapshot()["turns"]
+    assert isinstance(turns, list) and len(turns) == 1
+    assert ledger.inspect(1)["deliveries"]
 
 
 def text_response(profile: dict[str, Any]) -> ModelResponse:
@@ -402,6 +481,159 @@ def test_final_answer_remains_free_text_without_structured_schema() -> None:
         == "Yanıt [1]."
     )
     assert llm.invoke.call_args.kwargs["structured_response_format"] is None
+
+
+def test_wrapped_unique_structured_object_is_normalized_without_repair() -> None:
+    from onyx.asv3.llm_adapter import LanguageProfile
+
+    llm = scripted_model()
+    profile = complete_language_profile()
+    llm.invoke.return_value = ModelResponse(
+        id="wrapped",
+        created="0",
+        choice=Choice(
+            message=Message(
+                content="İstenen çıktı:\n"
+                + json.dumps(profile, ensure_ascii=False)
+                + "\nBu dilde devam edeceğim."
+            )
+        ),
+    )
+    result = ResearchModel(llm, RunContext()).invoke_text(
+        "Language", "Türkçe yanıtla", LLMFlow.ASV3_LANGUAGE
+    )
+    assert LanguageProfile.model_validate_json(result).external_requested is False
+    assert json.loads(result) == profile
+    assert llm.invoke.call_count == 1
+
+
+@pytest.mark.parametrize("defect", ["duplicate", "nonfinite", "malformed", "ambiguous"])
+def test_wrapped_structured_objects_preserve_strict_rejection(defect: str) -> None:
+    from onyx.asv3.llm_adapter import LanguageProfile, normalize_structured_response
+
+    raw = json.dumps(complete_language_profile())
+    if defect == "duplicate":
+        raw = raw.replace(
+            '"external_requested": false',
+            '"external_requested": false, "external_requested": true',
+        )
+    elif defect == "nonfinite":
+        raw = raw.replace('"external_requested": false', '"external_requested": NaN')
+    elif defect == "malformed":
+        raw = '{"broken": ' + raw
+    else:
+        raw += "\n" + raw
+    with pytest.raises(ValueError):
+        normalize_structured_response("Çıktı:\n" + raw, LanguageProfile)
+
+
+@pytest.mark.parametrize("error_kind", ["rate_limit", "timeout", "server"])
+def test_transient_provider_retry_preserves_model_schema_and_shared_budget(
+    error_kind: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from litellm.exceptions import InternalServerError, RateLimitError
+
+    from onyx.asv3 import llm_adapter
+    from onyx.llm.multi_llm import LLMTimeoutError
+
+    monkeypatch.setattr(llm_adapter, "LLM_FIRST_CHUNK_RETRY_BASE_DELAY_S", 0)
+    monkeypatch.setattr(llm_adapter, "LLM_FIRST_CHUNK_RETRY_MAX_DELAY_S", 0)
+    error = (
+        RateLimitError(
+            "limited",
+            llm_provider="vertex_ai",
+            model="selected-model",
+            headers={"Retry-After": "0"},
+        )
+        if error_kind == "rate_limit"
+        else LLMTimeoutError("timeout")
+        if error_kind == "timeout"
+        else InternalServerError(
+            "unavailable", llm_provider="vertex_ai", model="selected-model"
+        )
+    )
+    llm = scripted_model()
+    llm.invoke.side_effect = [error, text_response(complete_language_profile())]
+    context = RunContext()
+    result = ResearchModel(llm, context).invoke_text(
+        "Language", "Türkçe yanıtla", LLMFlow.ASV3_LANGUAGE
+    )
+    assert json.loads(result)["language"] == "tr"
+    assert llm.invoke.call_count == 2
+    assert context.budget.snapshot()["decisions"] == 2
+    assert llm.config.model_name == "selected-model"
+    assert (
+        llm.invoke.call_args_list[0].kwargs["structured_response_format"]
+        == llm.invoke.call_args_list[1].kwargs["structured_response_format"]
+    )
+
+
+def test_provider_retries_stop_after_three_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from onyx.asv3 import llm_adapter
+    from onyx.llm.multi_llm import LLMTimeoutError
+
+    monkeypatch.setattr(llm_adapter, "LLM_FIRST_CHUNK_RETRY_BASE_DELAY_S", 0)
+    monkeypatch.setattr(llm_adapter, "LLM_FIRST_CHUNK_RETRY_MAX_DELAY_S", 0)
+    llm = scripted_model()
+    llm.invoke.side_effect = LLMTimeoutError("timeout")
+    context = RunContext()
+    with pytest.raises(LLMTimeoutError):
+        ResearchModel(llm, context).invoke_text("Final", "question", LLMFlow.ASV3_FINAL)
+    assert llm.invoke.call_count == 3
+    assert context.budget.snapshot()["decisions"] == 3
+
+
+@pytest.mark.parametrize("kind", ["cancel", "deadline", "budget"])
+def test_retry_wait_checks_cancellation_deadline_and_budget(kind: str) -> None:
+    from litellm.exceptions import RateLimitError
+
+    from onyx.asv3.models import RunStopped
+
+    context = RunContext(
+        timeout_seconds=0.1 if kind == "deadline" else 2,
+        budget=SharedBudget(max_decisions=1, final_decision_reserve=0)
+        if kind == "budget"
+        else None,
+    )
+    error = RateLimitError(
+        "limited",
+        llm_provider="vertex_ai",
+        model="selected-model",
+        headers={"Retry-After": "0.2"},
+    )
+    llm = scripted_model()
+    llm.invoke.side_effect = error
+    timer = threading.Timer(0.02, context.cancel)
+    if kind == "cancel":
+        timer.start()
+    try:
+        with pytest.raises(RunStopped):
+            ResearchModel(llm, context).invoke_text(
+                "Final", "question", LLMFlow.ASV3_FINAL
+            )
+    finally:
+        timer.cancel()
+    assert llm.invoke.call_count == 1
+
+
+@pytest.mark.parametrize("kind", ["authentication", "unsupported"])
+def test_nonretryable_provider_failure_is_attempted_once(kind: str) -> None:
+    from litellm.exceptions import AuthenticationError
+
+    llm = scripted_model()
+    error = (
+        AuthenticationError("denied", llm_provider="vertex_ai", model="selected-model")
+        if kind == "authentication"
+        else ValueError("Unsupported request")
+    )
+    llm.invoke.side_effect = error
+    with pytest.raises(type(error)):
+        ResearchModel(llm, RunContext()).invoke_text(
+            "Final", "question", LLMFlow.ASV3_FINAL
+        )
+    assert llm.invoke.call_count == 1
 
 
 def test_strict_json_rejects_duplicate_keys_nonfinite_values_and_bad_fences() -> None:

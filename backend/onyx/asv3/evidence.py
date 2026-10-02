@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
 from typing import Iterable
@@ -17,6 +18,7 @@ class EvidenceLedger:
         self._items: dict[int, EvidenceItem] = {}
         self._identities: dict[tuple[str, str | None, str], int] = {}
         self._included: set[int] = set()
+        self._deliveries: list[dict[str, JsonValue]] = []
 
     def add(self, items: Iterable[EvidenceItem], context: RunContext) -> list[int]:
         result: list[int] = []
@@ -104,6 +106,7 @@ class EvidenceLedger:
                     for number, item in self._items.items()
                 ],
                 "included": sorted(self._included),
+                "deliveries": list(self._deliveries),
             }
 
     def restore(self, payload: dict[str, JsonValue], context: RunContext) -> None:
@@ -140,6 +143,64 @@ class EvidenceLedger:
         with self._lock:
             context.check_active()
             self._items, self._identities, self._included = items, identities, included
+            raw_deliveries = payload.get("deliveries", [])
+            if not isinstance(raw_deliveries, list) or len(raw_deliveries) > 200:
+                raise ValueError("Invalid evidence delivery checkpoint")
+            self._deliveries = []
+            for delivery in raw_deliveries:
+                if not isinstance(delivery, dict) or not isinstance(
+                    delivery.get("records"), list
+                ):
+                    raise ValueError("Invalid evidence delivery record")
+                for record in delivery["records"]:
+                    if (
+                        not isinstance(record, dict)
+                        or record.get("citation") not in self._items
+                    ):
+                        raise ValueError("Unknown delivered evidence")
+                    number = record["citation"]
+                    assert isinstance(number, int)
+                    if record.get("text_hash") != self._items[number].text_hash:
+                        raise ValueError("Changed delivered evidence identity")
+                self._deliveries.append(delivery)
+
+    def record_delivery(
+        self, call_id: str, flow: str, records: Iterable[dict[str, JsonValue]]
+    ) -> None:
+        """Record actual serialized source passages, not assumed model understanding."""
+        with self._lock:
+            delivered: list[JsonValue] = []
+            for record in records:
+                number, text = record.get("citation"), record.get("text")
+                if not isinstance(number, int) or not isinstance(text, str):
+                    continue
+                item = self._items.get(number)
+                if item is None or not text:
+                    continue
+                offset = record.get("start_char", 0)
+                if not isinstance(offset, int) or offset < 0:
+                    continue
+                if item.text[offset : offset + len(text)] != text:
+                    continue
+                delivered.append(
+                    {
+                        "citation": number,
+                        "source_id": item.source_id,
+                        "chunk_id": item.chunk_id,
+                        "text_hash": item.text_hash,
+                        "start_char": offset,
+                        "end_char": offset + len(text),
+                        "passage_hash": hashlib.sha256(
+                            text.encode("utf-8")
+                        ).hexdigest(),
+                        "complete": offset == 0 and text == item.text,
+                    }
+                )
+            if delivered:
+                self._deliveries.append(
+                    {"call_id": call_id, "flow": flow, "records": delivered}
+                )
+                self._deliveries = self._deliveries[-200:]
 
     def include(self, numbers: Iterable[int]) -> None:
         with self._lock:
@@ -148,12 +209,44 @@ class EvidenceLedger:
                 raise ValueError("Cannot include unknown evidence")
             self._included.update(numbers)
 
+    def completely_delivered(self, call_id: str) -> set[int]:
+        with self._lock:
+            numbers: set[int] = set()
+            for delivery in self._deliveries:
+                records = delivery.get("records")
+                if delivery.get("call_id") != call_id or not isinstance(records, list):
+                    continue
+                for record in records:
+                    number = (
+                        record.get("citation") if isinstance(record, dict) else None
+                    )
+                    if (
+                        isinstance(record, dict)
+                        and record.get("complete") is True
+                        and isinstance(number, int)
+                    ):
+                        numbers.add(number)
+            return numbers
+
     def inspect(self, number: int) -> dict[str, JsonValue]:
         with self._lock:
             item = self._items.get(number)
+            deliveries: list[JsonValue] = []
+            for delivery in self._deliveries:
+                records = delivery.get("records")
+                if not isinstance(records, list):
+                    continue
+                matching = [
+                    record
+                    for record in records
+                    if isinstance(record, dict) and record.get("citation") == number
+                ]
+                if matching:
+                    deliveries.append({**delivery, "records": matching})
             return {
                 "recorded": item is not None,
                 "included": number in self._included,
                 "citation": number,
                 "source_id": item.source_id if item else None,
+                "deliveries": deliveries,
             }

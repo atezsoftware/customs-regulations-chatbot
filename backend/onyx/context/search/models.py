@@ -186,6 +186,8 @@ class IndexFilters(BaseFilters, UserFileFilters, AssistantKnowledgeFilters):
     # `document_set` (a user/persona OR-scope). Set only on the Search UI path
     # (from FORCED_DOCUMENT_SET_NAMES); None = no restriction.
     forced_document_set: list[str] | None = None
+    # ASv3 pins the tenant-local mandatory corpus identity; other workflows omit it.
+    asv3_document_set_id: int | None = Field(default=None, ge=1)
 
 
 class BasicChunkRequest(BaseModel):

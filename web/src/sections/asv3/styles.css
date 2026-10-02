@@ -1,0 +1,18 @@
+.asv3-timeline .opal-tabs-list[data-variant="pill"] {
+  overflow-x: auto;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .asv3-timeline .shimmer-text {
+    animation: none;
+    background: none;
+    color: var(--text-03);
+  }
+
+  .asv3-timeline *,
+  .asv3-timeline *::before,
+  .asv3-timeline *::after {
+    animation: none !important;
+    transition: none !important;
+  }
+}

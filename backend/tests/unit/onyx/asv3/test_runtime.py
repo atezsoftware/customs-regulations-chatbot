@@ -23,8 +23,8 @@ from onyx.cache.interface import CacheBackend
 from onyx.chat.chat_state import ChatStateContainer
 from onyx.chat.emitter import Emitter
 from onyx.chat.models import ChatMessageSimple
-from onyx.configs.constants import MessageType
-from onyx.context.search.models import BaseFilters
+from onyx.configs.constants import DocumentSource, MessageType
+from onyx.context.search.models import BaseFilters, IndexFilters
 from onyx.db.asv3_corpus import CorpusChunk, CorpusSource
 from onyx.db.models import User
 from onyx.llm.interfaces import LLM, LLMConfig
@@ -35,7 +35,7 @@ from onyx.llm.model_response import (
     Message,
     ModelResponse,
 )
-from onyx.llm.models import ReasoningEffort
+from onyx.llm.models import ReasoningEffort, UserMessage
 from onyx.server.query_and_chat.streaming_models import (
     AgentResponseDelta,
     AgentResponseStart,
@@ -68,6 +68,67 @@ def response(
     )
 
 
+def supported_review(numbers: list[int], question_count: int = 1) -> ModelResponse:
+    return response(
+        json.dumps(
+            {
+                "status": "supported",
+                "explanation": "Her sorunun koşulları özgün kaynaklarla doğrulandı.",
+                "required_conditions": [],
+                "missing_conditions": [],
+                "evidence_numbers": numbers,
+                "safe_to_publish": True,
+                "unsupported_claims": [],
+                "question_results": [
+                    {
+                        "question_id": f"q{index}",
+                        "status": "supported",
+                        "evidence_numbers": numbers,
+                        "missing_conditions": [],
+                    }
+                    for index in range(question_count)
+                ],
+            }
+        )
+    )
+
+
+def request_data(arguments: dict[str, Any]) -> dict[str, Any]:
+    message = next(
+        item for item in reversed(arguments["prompt"]) if isinstance(item, UserMessage)
+    )
+    content = message.content
+    if isinstance(content, list):
+        content = content[0].text
+    assert isinstance(content, str)
+    return json.loads(content) if content.startswith("{") else {}
+
+
+def unsafe_review(claim: str, question_count: int = 1) -> ModelResponse:
+    return response(
+        json.dumps(
+            {
+                "status": "incomplete",
+                "explanation": "Hukuki sonuç özgün kaynakla doğrulanmadı.",
+                "required_conditions": [],
+                "missing_conditions": ["özgün kaynak"],
+                "evidence_numbers": [],
+                "safe_to_publish": False,
+                "unsupported_claims": [claim],
+                "question_results": [
+                    {
+                        "question_id": f"q{index}",
+                        "status": "incomplete",
+                        "evidence_numbers": [],
+                        "missing_conditions": ["özgün kaynak"],
+                    }
+                    for index in range(question_count)
+                ],
+            }
+        )
+    )
+
+
 class CorpusBoundary:
     def __init__(self) -> None:
         self.sources = [
@@ -97,6 +158,7 @@ class CorpusBoundary:
         self.lock = threading.Lock()
         self.revalidated: list[EvidenceItem] = []
         self.search_adapter: Any = None
+        self.scope: IndexFilters | None = None
 
     def page(
         self, source_id: str, _context: RunContext, **_kwargs: Any
@@ -127,7 +189,29 @@ def setup_run(
     final: str = "Tamir sonucu [1]; değiştirme sonucu [2].",
 ) -> tuple[dict[str, Any], CorpusBoundary, MagicMock, list[dict[str, Any]], Queue[Any]]:
     broker = CorpusBoundary()
-    monkeypatch.setattr(runtime, "CorpusBroker", lambda *_args, **_kwargs: broker)
+
+    def bind_scope(*, user: User, filters: IndexFilters) -> IndexFilters:
+        assert user.id is not None
+        assert filters.source_type == [DocumentSource.USER_FILE]
+        return filters.model_copy(
+            deep=True,
+            update={
+                "tenant_id": "test-tenant",
+                "asv3_document_set_id": 91,
+                "forced_document_set": ["PC Külliyatı"],
+            },
+        )
+
+    def create_broker(
+        _user: User, scope: IndexFilters, **_kwargs: Any
+    ) -> CorpusBoundary:
+        broker.scope = scope
+        return broker
+
+    # Only the DB binding boundary is faked; its real tenant/ACL behavior has
+    # separate DB acceptance tests. The runtime receives the real request shape.
+    monkeypatch.setattr(runtime, "bind_pc_corpus_scope", bind_scope)
+    monkeypatch.setattr(runtime, "CorpusBroker", create_broker)
     checkpoints: list[dict[str, Any]] = []
     monkeypatch.setattr(
         runtime,
@@ -160,6 +244,10 @@ def setup_run(
             "interrupted",
         )
     }
+    notifications["failed"] = [
+        "Kaynak doğrulaması tamamlanamadı",
+        "Bu sorudaki hukuki sonuçları mevcut kaynaklarla doğrulayamadım.",
+    ]
     llm.invoke.side_effect = [
         response(json.dumps({"language": "tr", "notifications": notifications})),
         response(
@@ -178,10 +266,9 @@ def setup_run(
             ]
         ),
         response("Tamir [1], değiştirme [2]."),
-        response(
-            '{"status":"supported","explanation":"Koşullar sağlandı.","required_conditions":[],"missing_conditions":[],"evidence_numbers":[1,2]}'
-        ),
+        supported_review([1, 2]),
         response(final),
+        supported_review([1, 2]),
     ]
     cache = MagicMock(spec=CacheBackend)
     cache.exists.side_effect = lambda _key: broker.cancelled.is_set()
@@ -203,7 +290,9 @@ def setup_run(
         llm=llm,
         token_counter=len,
         user=user,
-        filters=BaseFilters(regulatory_chunks_only=True),
+        filters=BaseFilters(
+            regulatory_chunks_only=True, source_type=[DocumentSource.USER_FILE]
+        ),
         document_set_names_override=None,
         user_identity=None,
         chat_session_id=uuid4(),
@@ -270,13 +359,12 @@ def test_resume_reuses_saved_question_language_without_reclassifying(
     llm.reset_mock()
     llm.invoke.side_effect = [
         response("Tamir [1], değiştirme [2]."),
-        response(
-            '{"status":"supported","explanation":"Koşullar sağlandı.","required_conditions":[],"missing_conditions":[],"evidence_numbers":[1,2]}'
-        ),
+        supported_review([1, 2]),
         response("Tamir sonucu [1]; değiştirme sonucu [2]."),
+        supported_review([1, 2]),
     ]
     runtime.run_asv3_loop(**kwargs, resume_message_id=2)
-    assert llm.invoke.call_count == 3
+    assert llm.invoke.call_count == 4
     assert all(
         packet.obj.language == "tr"
         for packet in packets(queue)
@@ -344,21 +432,52 @@ def test_runtime_parallel_sources_full_original_review_and_final_citations(
     assert llm.config.model_provider == provider and llm.config.model_name == model_name
 
 
-def test_runtime_rejects_unrecorded_citation_before_any_answer(
+def test_runtime_drops_unrecorded_citation_and_publishes_only_localized_gap(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    kwargs, _broker, _llm, _checkpoints, queue = setup_run(monkeypatch, "Kaynak [999].")
-    with pytest.raises(ValueError, match="unrecorded citation"):
-        runtime.run_asv3_loop(**kwargs)
+    kwargs, _broker, _llm, checkpoints, queue = setup_run(monkeypatch, "Kaynak [999].")
+    runtime.run_asv3_loop(**kwargs)
     output = packets(queue)
-    assert not any(
-        isinstance(packet.obj, (AgentResponseStart, AgentResponseDelta))
+    assert not any(isinstance(packet.obj, CitationInfo) for packet in output)
+    assert all(
+        "999" not in packet.obj.content
         for packet in output
+        if isinstance(packet.obj, AgentResponseDelta)
     )
     assert [
         packet.obj.status for packet in output if isinstance(packet.obj, ASv3Progress)
     ][-1] == "failed"
-    assert kwargs["state_container"].answer_tokens is None
+    assert (
+        kwargs["state_container"].answer_tokens
+        == "Bu sorudaki hukuki sonuçları mevcut kaynaklarla doğrulayamadım."
+    )
+    assert checkpoints[-1]["publication_status"] == "partial"
+
+
+def test_runtime_supported_draft_does_not_authorize_unsafe_final_wording(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unsafe_final = "Her bedelsiz yeni makine vergiden muaftır [1]."
+    kwargs, _broker, llm, checkpoints, queue = setup_run(monkeypatch, unsafe_final)
+    script = list(llm.invoke.side_effect)
+    script[-1] = unsafe_review(unsafe_final)
+    llm.invoke.side_effect = script
+    runtime.run_asv3_loop(**kwargs)
+    assert request_data(llm.invoke.call_args_list[-1].kwargs)["claim"] == unsafe_final
+    assert checkpoints[-1]["publication_review"]["unsupported_claims"] == [unsafe_final]
+    assert checkpoints[-1]["publication_status"] == "partial"
+    assert kwargs["state_container"].answer_tokens == (
+        "Bu sorudaki hukuki sonuçları mevcut kaynaklarla doğrulayamadım."
+    )
+    assert not any(
+        isinstance(packet.obj, CitationInfo)
+        or (isinstance(packet.obj, ASv3Progress) and packet.obj.status == "completed")
+        or (
+            isinstance(packet.obj, AgentResponseDelta)
+            and "vergiden muaftır" in packet.obj.content
+        )
+        for packet in packets(queue)
+    )
 
 
 def test_runtime_cancel_discards_late_source_results_and_durable_writes(
@@ -381,6 +500,7 @@ def test_runtime_cancel_discards_late_source_results_and_durable_writes(
         writes_before_cancel = len(checkpoints)
         broker.cancelled.set()
         thread.join(3)
+
         assert not thread.is_alive()
         assert len(errors) == 1 and isinstance(errors[0], RunStopped)
         broker.release.set()
@@ -402,6 +522,186 @@ def test_runtime_cancel_discards_late_source_results_and_durable_writes(
         thread.join(3)
 
 
+def test_runtime_incident_2888_zero_evidence_never_publishes_legal_memory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kwargs, broker, llm, checkpoints, queue = setup_run(monkeypatch)
+    language_response = list(llm.invoke.side_effect)[0]
+    failures = {
+        "resolve_source": ToolOutcome(
+            status=OutcomeStatus.UNAVAILABLE,
+            summary="This broker reads regulatory user files only.",
+        ),
+        "query_corpus": ToolOutcome(
+            status=OutcomeStatus.UNAVAILABLE,
+            summary="This broker reads regulatory user files only.",
+        ),
+        "search_corpus": ToolOutcome(
+            status=OutcomeStatus.INVALID,
+            summary="History cannot be empty for query rephrasing",
+        ),
+        "run_research_code": ToolOutcome(
+            status=OutcomeStatus.UNAVAILABLE,
+            summary="Isolated code execution is disabled by deployment policy.",
+        ),
+    }
+
+    def replace_boundary(spec: ToolSpec) -> ToolSpec:
+        failure = failures.get(spec.name)
+        if failure is None:
+            return spec
+        return spec.model_copy(
+            update={"handler": lambda _args, _ctx: failure.model_copy(deep=True)}
+        )
+
+    corpus_factory = runtime.build_corpus_specs
+    sandbox_factory = runtime.build_sandbox_specs
+    monkeypatch.setattr(
+        runtime,
+        "build_corpus_specs",
+        lambda boundary: [replace_boundary(spec) for spec in corpus_factory(boundary)],
+    )
+    monkeypatch.setattr(
+        runtime,
+        "build_sandbox_specs",
+        lambda boundary: [replace_boundary(spec) for spec in sandbox_factory(boundary)],
+    )
+    unsupported = "Yeni makine garanti kapsamında olsa da vergiye tabidir."
+    llm.invoke.side_effect = [
+        language_response,
+        response(
+            calls=[
+                (
+                    "record_scenario",
+                    {
+                        "questions": [
+                            "Ücretsiz tamir?",
+                            "Yeni makine?",
+                            "Bedelli tamir?",
+                        ],
+                        "facts": ["Standart değişim izni yok."],
+                    },
+                ),
+                ("resolve_source", {"query": "Hariçte işleme"}),
+                ("query_corpus", {"operation": "inventory"}),
+                ("search_corpus", {"query": "garanti tamir", "mode": "keyword"}),
+                ("run_research_code", {"code": "print('source inventory')"}),
+            ]
+        ),
+        response(unsupported),
+        response(unsupported),
+        response(unsupported),
+        response(unsupported),
+        unsafe_review(unsupported, question_count=4),
+    ]
+    runtime.run_asv3_loop(**kwargs)
+    final_checkpoint = checkpoints[-1]
+    receipts = final_checkpoint["receipts"]
+    assert [item["call"]["name"] for item in receipts[:5]] == [
+        "record_scenario",
+        *failures,
+    ]
+    assert [item["outcome"]["status"] for item in receipts[:5]] == [
+        "found",
+        "unavailable",
+        "unavailable",
+        "invalid",
+        "unavailable",
+    ]
+    assert sum(item["call"]["name"] == "finalization_status" for item in receipts) == 3
+    assert final_checkpoint["evidence"]["records"] == []
+    assert final_checkpoint["publication_status"] == "partial"
+    assert final_checkpoint["publication_review"]["safe_to_publish"] is False
+    assert llm.invoke.call_count == 7
+    assert broker.scope is not None
+    assert broker.scope.source_type == [DocumentSource.USER_FILE]
+    assert broker.scope.asv3_document_set_id == 91
+    assert (
+        kwargs["state_container"].answer_tokens
+        == "Bu sorudaki hukuki sonuçları mevcut kaynaklarla doğrulayamadım."
+    )
+    output = packets(queue)
+    assert not any(isinstance(packet.obj, CitationInfo) for packet in output)
+    assert not any(
+        isinstance(packet.obj, ASv3Progress) and packet.obj.status == "completed"
+        for packet in output
+    )
+    assert all(
+        unsupported not in packet.obj.content
+        for packet in output
+        if isinstance(packet.obj, AgentResponseDelta)
+    )
+
+
+def test_runtime_review_gap_drives_new_source_before_supported_publication(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from onyx.prompts.asv3.research import COORDINATOR_PROMPT
+
+    kwargs, broker, llm, checkpoints, queue = setup_run(monkeypatch)
+    broker.barrier = threading.Barrier(1)
+    initial_profile = list(llm.invoke.side_effect)[0]
+    missing = "Yeni makinenin ayrı serbest dolaşıma giriş koşulları"
+    review_text = unsafe_review("Yeni makine de muaftır [1].").choice.message.content
+    assert review_text is not None
+    incomplete = json.loads(review_text)
+    incomplete["evidence_numbers"] = [1]
+    incomplete["missing_conditions"] = [missing]
+    incomplete["question_results"][0]["missing_conditions"] = [missing]
+    script = iter(
+        [
+            initial_profile,
+            response(
+                calls=[("read_source_range", {"source_id": str(broker.sources[0].id)})]
+            ),
+            response("Tamir ve yeni makine de muaftır [1]."),
+            response(json.dumps(incomplete)),
+            None,
+            response("Tamir şartları [1]; yeni makinenin farklı şartları [2]."),
+            supported_review([1, 2]),
+            response("Tamir sonucu [1]; yeni makine sonucu [2]."),
+            supported_review([1, 2]),
+        ]
+    )
+    recovery_observed = False
+
+    def invoke(**arguments: Any) -> ModelResponse:
+        nonlocal recovery_observed
+        next_response = next(script)
+        if next_response is not None:
+            return next_response
+        assert arguments["prompt"][0].content == COORDINATOR_PROMPT
+        data = request_data(arguments)
+        gap = next(
+            item
+            for item in reversed(data["receipts"])
+            if item["call"]["name"] == "finalization_status"
+        )
+        assert missing in gap["outcome"]["data"]["review"]["missing_conditions"]
+        assert [item["citation"] for item in data["evidence"]] == [1]
+        recovery_observed = True
+        return response(
+            calls=[("read_source_range", {"source_id": str(broker.sources[1].id)})]
+        )
+
+    llm.invoke.side_effect = invoke
+    runtime.run_asv3_loop(**kwargs)
+    assert recovery_observed
+    assert llm.invoke.call_count == 9
+    assert checkpoints[-1]["publication_status"] == "found"
+    assert checkpoints[-1]["evidence"]["included"] == [1, 2]
+    assert len(kwargs["state_container"].citation_to_doc) == 2
+    output = packets(queue)
+    assert all(
+        "de muaftır" not in packet.obj.content
+        for packet in output
+        if isinstance(packet.obj, AgentResponseDelta)
+    )
+    assert [
+        packet.obj.status for packet in output if isinstance(packet.obj, ASv3Progress)
+    ][-1] == "completed"
+
+
 def test_runtime_researchers_keep_scenario_facts_isolated_and_selected_llm(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -412,7 +712,7 @@ def test_runtime_researchers_keep_scenario_facts_isolated_and_selected_llm(
         VERIFICATION_PROMPT,
     )
 
-    kwargs, _broker, llm, _checkpoints, _queue = setup_run(
+    kwargs, _broker, llm, checkpoints, queue = setup_run(
         monkeypatch, "Araştırma tamamlandı."
     )
     lock = threading.Lock()
@@ -439,10 +739,8 @@ def test_runtime_researchers_keep_scenario_facts_isolated_and_selected_llm(
     def invoke(**arguments: Any) -> ModelResponse:
         nonlocal coordinator_started
         prompt = arguments["prompt"]
-        instruction, content = prompt[0].content, prompt[1].content
-        if isinstance(content, list):
-            content = content[0].text
-        data = json.loads(content) if content.startswith("{") else {}
+        instruction = prompt[0].content
+        data = request_data(arguments)
         with lock:
             if instruction == COORDINATOR_PROMPT:
                 if not coordinator_started:
@@ -456,6 +754,13 @@ def test_runtime_researchers_keep_scenario_facts_isolated_and_selected_llm(
                             ("spawn_researcher", {"task": "branch-A"}),
                             ("spawn_researcher", {"task": "branch-B"}),
                         ]
+                    )
+                if any(
+                    task["status"] in ("queued", "running")
+                    for task in data["research_tasks"]
+                ):
+                    return response(
+                        calls=[("wait_researcher", {"timeout_seconds": 0.05})]
                     )
                 return response("Bağımsız çalışmalar değerlendirildi.")
             if instruction == RESEARCHER_PROMPT:
@@ -475,9 +780,7 @@ def test_runtime_researchers_keep_scenario_facts_isolated_and_selected_llm(
                 child_facts[task] = data["facts"]
                 return response(task + " tamamlandı.")
             if instruction.startswith(VERIFICATION_PROMPT):
-                return response(
-                    '{"status":"incomplete","explanation":"Kaynak araştırması tamamlanmadı.","required_conditions":[],"missing_conditions":[],"evidence_numbers":[]}'
-                )
+                return unsafe_review(data["claim"], len(data["questions"]))
             if instruction == FINAL_PROMPT:
                 final_scenario.update(data["scenario"])
                 return response("Araştırma tamamlandı.")
@@ -490,5 +793,12 @@ def test_runtime_researchers_keep_scenario_facts_isolated_and_selected_llm(
     runtime.run_asv3_loop(**kwargs)
     assert child_facts == {"branch-A": ["branch-A fact"], "branch-B": ["branch-B fact"]}
     assert final_scenario["facts"] == ["parent fact"]
-    assert kwargs["state_container"].answer_tokens == "Araştırma tamamlandı."
+    assert kwargs["state_container"].answer_tokens == notifications["failed"][1]
+    assert checkpoints[-1]["publication_status"] == "partial"
+    assert not any(
+        isinstance(packet.obj, ASv3Progress)
+        and packet.obj.status == "completed"
+        and packet.obj.task_id is None
+        for packet in packets(queue)
+    )
     assert llm.config.model_name == selected_name

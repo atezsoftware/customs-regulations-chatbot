@@ -8,6 +8,7 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
 from onyx.context.search.models import SearchDoc
+from onyx.llm.models import AssistantMessage, ToolMessage
 
 
 class OutcomeStatus(StrEnum):
@@ -73,6 +74,19 @@ class Decision(BaseModel):
     answer: str | None = None
     questions: list[str] = Field(default_factory=list)
     facts: list[str] = Field(default_factory=list)
+    assistant_message: AssistantMessage | None = None
+
+
+class ResearchTurn(BaseModel):
+    assistant: AssistantMessage
+    results: list[ToolMessage]
+
+    @model_validator(mode="after")
+    def match_results(self) -> ResearchTurn:
+        calls = self.assistant.tool_calls or []
+        if [call.id for call in calls] != [item.tool_call_id for item in self.results]:
+            raise ValueError("Research turn tool results do not match assistant calls")
+        return self
 
 
 class ToolSpec(BaseModel):
@@ -119,6 +133,8 @@ class TaskSnapshot(BaseModel):
     task: str
     status: TaskStatus
     parent_task_id: str | None = None
+    public_title: str | None = None
+    public_message: str | None = None
     updates: list[str] = Field(default_factory=list)
     outcome: ToolOutcome | None = None
 
@@ -138,6 +154,7 @@ class HarnessView(BaseModel):
     receipts: list[ToolReceipt]
     evidence: list[dict[str, JsonValue]]
     tools: list[dict[str, JsonValue]]
+    turns: list[ResearchTurn] = Field(default_factory=list)
 
 
 class RunStopped(RuntimeError):
@@ -148,18 +165,20 @@ class SharedBudget:
     def __init__(
         self,
         max_tools: int = 64,
-        max_decisions: int = 32,
+        max_decisions: int = 41,
         max_evidence_bytes: int = 2_000_000,
         max_inflight_tools: int = 4,
         max_inflight_models: int = 4,
+        max_inflight_sources: int = 2,
         max_artifact_bytes: int = 4_000_000,
-        final_decision_reserve: int = 3,
+        final_decision_reserve: int = 12,
     ) -> None:
         import threading
 
         self._lock = threading.Lock()
         self.tool_slots = threading.BoundedSemaphore(max_inflight_tools)
         self.model_slots = threading.BoundedSemaphore(max_inflight_models)
+        self.source_slots = threading.BoundedSemaphore(max_inflight_sources)
         self.final_decision_reserve = min(final_decision_reserve, max_decisions)
         self.limits = {
             "tools": max_tools,

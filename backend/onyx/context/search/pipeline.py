@@ -3,6 +3,7 @@ from datetime import datetime
 
 from sqlalchemy.orm import Session
 
+from onyx.configs.constants import DocumentSource
 from onyx.context.search.forced_document_set import get_forced_document_set_names
 from onyx.context.search.models import (
     BaseFilters,
@@ -134,6 +135,31 @@ def _build_index_filters(
         if force_configured_document_set_scope
         else None
     )
+    asv3_document_set_id = (
+        base_filters.asv3_document_set_id
+        if isinstance(base_filters, IndexFilters)
+        else None
+    )
+    if asv3_document_set_id is not None and isinstance(base_filters, IndexFilters):
+        if (
+            bypass_acl
+            or not base_filters.regulatory_chunks_only
+            or base_filters.source_type != [DocumentSource.USER_FILE]
+            or base_filters.forced_document_set != ["PC Külliyatı"]
+        ):
+            raise OnyxError(
+                OnyxErrorCode.INVALID_INPUT,
+                "ASv3 requires its authorized PC corpus scope on every index lane.",
+            )
+        if (
+            forced_document_set is not None
+            and "PC Külliyatı" not in forced_document_set
+        ):
+            raise OnyxError(
+                OnyxErrorCode.INVALID_INPUT,
+                "Configured document scope excludes the authorized ASv3 corpus.",
+            )
+        forced_document_set = ["PC Külliyatı"]
 
     final_filters = IndexFilters(
         project_id_filter=project_id_filter,
@@ -149,6 +175,7 @@ def _build_index_filters(
         attached_document_ids=attached_document_ids,
         hierarchy_node_ids=hierarchy_node_ids,
         forced_document_set=forced_document_set,
+        asv3_document_set_id=asv3_document_set_id,
         as_of_date=base_filters.as_of_date,
         regulatory_chunks_only=base_filters.regulatory_chunks_only,
         regulatory_source_hint=base_filters.regulatory_source_hint,

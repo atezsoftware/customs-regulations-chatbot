@@ -1584,6 +1584,8 @@ def _run_models(
                         resume_message_id=setup.new_msg_req.asv3_resume_message_id,
                         custom_agent_prompt=setup.custom_agent_prompt,
                         allow_external=setup.new_msg_req.asv3_allow_external,
+                        user_memory_context=setup.user_memory_context,
+                        inject_memories_in_prompt=user.use_memories,
                     )
                 elif n_models == 1 and setup.new_msg_req.deep_research:
                     _validate_deep_research_scope(setup.persona, model_tools)

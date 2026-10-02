@@ -1,5 +1,6 @@
 """Exercise actual PostgreSQL owner/date fences and retained-evidence validation."""
 
+from collections.abc import Generator
 from datetime import date
 from hashlib import sha256
 from io import BytesIO
@@ -7,30 +8,66 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from onyx.asv3.corpus_tools import CorpusBroker, evidence_for_chunk
 from onyx.asv3.models import RunContext
 from onyx.asv3.source_tools import original_evidence
-from onyx.configs.constants import FileOrigin, MessageType
+from onyx.configs.constants import DocumentSource, FileOrigin, MessageType
 from onyx.context.search.models import IndexFilters
 from onyx.db.asv3_corpus import (
+    PC_CORPUS_NAME,
     CorpusScopeUnavailable,
+    find_sources,
     read_source_chunks,
     require_source,
+    resolve_pc_corpus_scope,
 )
 from onyx.db.asv3_runs import save_asv3_checkpoint
-from onyx.db.models import ChatMessage, ChatSession, RegulatoryChunk, UserFile
+from onyx.db.models import (
+    ChatMessage,
+    ChatSession,
+    DocumentSet,
+    DocumentSet__UserFile,
+    RegulatoryChunk,
+    UserFile,
+)
 from onyx.error_handling.exceptions import OnyxError
 from onyx.file_store.file_store import get_default_file_store
 from onyx.server import asv3_citations
 from tests.external_dependency_unit.conftest import create_test_user
 
 
+@pytest.fixture
+def pc_corpus(db_session: Session) -> Generator[DocumentSet, None, None]:
+    if (
+        db_session.scalar(
+            select(DocumentSet.id).where(DocumentSet.name == PC_CORPUS_NAME)
+        )
+        is not None
+    ):
+        raise RuntimeError(
+            "PC scope tests require an isolated validation DB without a pre-existing PC corpus"
+        )
+    corpus = DocumentSet(name=PC_CORPUS_NAME, is_public=False)
+    db_session.add(corpus)
+    db_session.commit()
+    try:
+        yield corpus
+    finally:
+        db_session.rollback()
+        db_session.delete(corpus)
+        db_session.commit()
+
+
 @pytest.mark.usefixtures("tenant_context")
-def test_actual_owner_date_and_text_revalidation_fences(db_session: Session) -> None:
+def test_actual_owner_date_and_text_revalidation_fences(
+    db_session: Session, pc_corpus: DocumentSet
+) -> None:
     owner = create_test_user(db_session, "asv3_corpus_owner")
     stranger = create_test_user(db_session, "asv3_corpus_stranger")
+    pc_corpus.user_id = owner.id
     source = UserFile(
         id=uuid4(),
         user_id=owner.id,
@@ -40,6 +77,9 @@ def test_actual_owner_date_and_text_revalidation_fences(db_session: Session) -> 
     )
     db_session.add(source)
     db_session.flush()
+    db_session.add(
+        DocumentSet__UserFile(document_set_id=pc_corpus.id, user_file_id=source.id)
+    )
     old = RegulatoryChunk(
         id=uuid4().hex,
         user_file_id=source.id,
@@ -62,10 +102,16 @@ def test_actual_owner_date_and_text_revalidation_fences(db_session: Session) -> 
     )
     db_session.add_all([old, current])
     db_session.commit()
-    filters = IndexFilters(
-        access_control_list=[],
-        attached_document_ids=[str(source.id)],
-        as_of_date=date(2025, 12, 31),
+    filters = resolve_pc_corpus_scope(
+        db_session,
+        user=owner,
+        filters=IndexFilters(
+            access_control_list=[],
+            source_type=[DocumentSource.USER_FILE],
+            regulatory_chunks_only=True,
+            attached_document_ids=[str(source.id)],
+            as_of_date=date(2025, 12, 31),
+        ),
     )
     try:
         authorized, rows, more = read_source_chunks(
@@ -89,12 +135,14 @@ def test_actual_owner_date_and_text_revalidation_fences(db_session: Session) -> 
         with pytest.raises(CorpusScopeUnavailable, match="changed"):
             broker.revalidate_evidence([retained], RunContext())
         source.user_id = stranger.id
+        pc_corpus.user_id = stranger.id
         db_session.commit()
         with pytest.raises(PermissionError):
             broker.revalidate_evidence([retained], RunContext())
     finally:
         db_session.rollback()
         db_session.delete(source)
+        pc_corpus.user_id = None
         db_session.commit()
         db_session.delete(owner)
         db_session.delete(stranger)
@@ -103,10 +151,11 @@ def test_actual_owner_date_and_text_revalidation_fences(db_session: Session) -> 
 
 @pytest.mark.usefixtures("tenant_context")
 def test_native_preview_revalidates_saved_owner_and_original_bytes(
-    db_session: Session, monkeypatch: pytest.MonkeyPatch
+    db_session: Session, monkeypatch: pytest.MonkeyPatch, pc_corpus: DocumentSet
 ) -> None:
     owner = create_test_user(db_session, "asv3_native_owner")
     stranger = create_test_user(db_session, "asv3_native_stranger")
+    pc_corpus.user_id = owner.id
     store = get_default_file_store()
     raw = b"Header\nOriginal native row\n"
     file_id = store.save_file(
@@ -122,6 +171,9 @@ def test_native_preview_revalidates_saved_owner_and_original_bytes(
     chat = ChatSession(id=uuid4(), user_id=owner.id)
     db_session.add_all([source, chat])
     db_session.flush()
+    db_session.add(
+        DocumentSet__UserFile(document_set_id=pc_corpus.id, user_file_id=source.id)
+    )
     message = ChatMessage(
         chat_session_id=chat.id,
         message="",
@@ -131,8 +183,14 @@ def test_native_preview_revalidates_saved_owner_and_original_bytes(
     db_session.add(message)
     db_session.commit()
     try:
-        filters = IndexFilters(
-            access_control_list=[], attached_document_ids=[str(source.id)]
+        filters = resolve_pc_corpus_scope(
+            db_session,
+            user=owner,
+            filters=IndexFilters(
+                access_control_list=[],
+                source_type=[DocumentSource.USER_FILE],
+                attached_document_ids=[str(source.id)],
+            ),
         )
         broker = CorpusBroker(owner, filters)
         native = original_evidence(
@@ -184,8 +242,91 @@ def test_native_preview_revalidates_saved_owner_and_original_bytes(
         db_session.rollback()
         db_session.delete(chat)
         db_session.delete(source)
+        pc_corpus.user_id = None
         db_session.commit()
         store.delete_file(file_id)
+        db_session.delete(owner)
+        db_session.delete(stranger)
+        db_session.commit()
+
+
+@pytest.mark.usefixtures("tenant_context")
+def test_pc_membership_is_not_bypassed_by_sets_attachments_or_changed_identity(
+    db_session: Session, pc_corpus: DocumentSet
+) -> None:
+    owner = create_test_user(db_session, "asv3_pc_owner")
+    stranger = create_test_user(db_session, "asv3_pc_stranger")
+    pc_corpus.user_id = owner.id
+    other = DocumentSet(name="ASv3 other " + uuid4().hex, is_public=True)
+    inside = UserFile(
+        id=uuid4(),
+        user_id=owner.id,
+        file_id=uuid4().hex,
+        name="inside",
+        file_type="text/plain",
+    )
+    outside = UserFile(
+        id=uuid4(),
+        user_id=owner.id,
+        file_id=uuid4().hex,
+        name="outside",
+        file_type="text/plain",
+    )
+    inaccessible = UserFile(
+        id=uuid4(),
+        user_id=stranger.id,
+        file_id=uuid4().hex,
+        name="private",
+        file_type="text/plain",
+    )
+    db_session.add_all([other, inside, outside, inaccessible])
+    db_session.flush()
+    db_session.add_all(
+        [
+            DocumentSet__UserFile(document_set_id=pc_corpus.id, user_file_id=inside.id),
+            DocumentSet__UserFile(document_set_id=other.id, user_file_id=outside.id),
+        ]
+    )
+    db_session.commit()
+    try:
+        base = IndexFilters(
+            access_control_list=[],
+            source_type=[DocumentSource.USER_FILE],
+            regulatory_chunks_only=True,
+        )
+        scoped = resolve_pc_corpus_scope(db_session, user=owner, filters=base)
+        assert scoped.asv3_document_set_id == pc_corpus.id
+        sources, _ = find_sources(db_session, user=owner, filters=scoped)
+        assert {row.id for row in sources} == {inside.id}
+        attached = resolve_pc_corpus_scope(
+            db_session,
+            user=owner,
+            filters=base.model_copy(
+                update={"attached_document_ids": [str(outside.id)]}
+            ),
+        )
+        assert find_sources(db_session, user=owner, filters=attached)[0] == []
+        disjoint = resolve_pc_corpus_scope(
+            db_session,
+            user=owner,
+            filters=base.model_copy(update={"document_set": [other.name]}),
+        )
+        assert find_sources(db_session, user=owner, filters=disjoint)[0] == []
+        for identifier in (outside.id, inaccessible.id):
+            with pytest.raises(PermissionError):
+                require_source(
+                    db_session, user=owner, filters=scoped, source_id=identifier
+                )
+        pc_corpus.name = "Renamed " + uuid4().hex
+        db_session.commit()
+        with pytest.raises(PermissionError, match="Pinned PC"):
+            find_sources(db_session, user=owner, filters=scoped)
+    finally:
+        db_session.rollback()
+        for item in (inside, outside, inaccessible, other):
+            db_session.delete(item)
+        pc_corpus.user_id = None
+        db_session.commit()
         db_session.delete(owner)
         db_session.delete(stranger)
         db_session.commit()

@@ -166,7 +166,27 @@ def build_core_specs(
         snapshot = state_provider()
         # Original texts remain available through read_evidence rather than repeated snapshots.
         snapshot.pop("evidence", None)
-        snapshot.pop("receipts", None)
+        receipts = snapshot.get("receipts")
+        if isinstance(receipts, list):
+            references: list[JsonValue] = []
+            for receipt in receipts[-20:]:
+                if not isinstance(receipt, dict):
+                    continue
+                call, outcome = receipt.get("call"), receipt.get("outcome")
+                if not isinstance(call, dict) or not isinstance(outcome, dict):
+                    continue
+                references.append(
+                    {
+                        "name": call.get("name"),
+                        "status": outcome.get("status"),
+                        "summary": str(outcome.get("summary", ""))[:300],
+                        "evidence_numbers": receipt.get("evidence_ids", []),
+                        "data": outcome.get("data", {}),
+                    }
+                )
+            from onyx.asv3.artifacts import compact_json
+
+            snapshot["receipts"] = compact_json(references, max_chars=9000)
         return ToolOutcome(
             status=OutcomeStatus.FOUND,
             summary="Research state and shared budget",

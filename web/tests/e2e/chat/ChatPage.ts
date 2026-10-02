@@ -79,6 +79,46 @@ export class ChatPage {
     await this.page.screenshot({ path: screenshotPath, fullPage: true });
   }
 
+  async expandASv3Progress(title: string): Promise<void> {
+    const panel = this.page.getByRole("region", { name: "ASv3" }).last();
+    const toggle = panel.getByRole("button", { name: title, exact: true });
+    await expect(toggle).toHaveAttribute("aria-expanded", "false");
+    await toggle.click();
+    await expect(toggle).toHaveAttribute("aria-expanded", "true");
+  }
+
+  async expectASv3Pending(reducedMotion: boolean): Promise<void> {
+    const panel = this.page.getByRole("region", { name: "ASv3" }).last();
+    await expect(panel).toHaveText("ASv3");
+    await expect(
+      this.page.getByText("Thinking...", { exact: true })
+    ).toHaveCount(0);
+    if (reducedMotion) {
+      const title = panel.getByTestId("asv3-progress-title");
+      await expect(title).toHaveCSS("animation-name", "none");
+      await expect(title.getByText("ASv3", { exact: true })).not.toHaveCSS(
+        "color",
+        "rgba(0, 0, 0, 0)"
+      );
+    }
+  }
+
+  async expectASv3TerminalPresentation(): Promise<void> {
+    const panel = this.page.getByRole("region", { name: "ASv3" }).last();
+    await expect(panel).toHaveAttribute("aria-busy", "false");
+    await expect(panel.getByTestId("asv3-task-loading")).toHaveCount(0);
+    await expect(panel.getByTestId("asv3-progress-title")).toHaveCSS(
+      "animation-name",
+      "none"
+    );
+  }
+
+  async captureASv3Progress(path: string): Promise<void> {
+    const panel = this.page.getByRole("region", { name: "ASv3" }).last();
+    await expect(panel).toBeVisible();
+    await panel.screenshot({ path });
+  }
+
   async expectASv3Progress(
     language: string,
     title: string,

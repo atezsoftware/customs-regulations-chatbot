@@ -5,6 +5,7 @@ from contextvars import ContextVar
 from datetime import date
 from decimal import Decimal
 from io import BytesIO
+from threading import RLock
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import MagicMock
@@ -71,6 +72,13 @@ class MemoryBroker(CorpusBroker):
     ) -> tuple[CorpusSource, list[CorpusChunk], bool]:
         del as_of, historical_inventory
         return self.source(source_id, context), self.items, self.partial
+
+    def chunk(
+        self, source_id: str, chunk_id: str, context: RunContext
+    ) -> tuple[CorpusSource, CorpusChunk | None]:
+        return self.source(source_id, context), next(
+            (chunk for chunk in self.items if chunk.id == chunk_id), None
+        )
 
     def page(
         self,
@@ -282,6 +290,31 @@ def test_partial_scan_is_never_proof_of_missing_article(broker: MemoryBroker) ->
     assert result.data["absence_proven"] is False
 
 
+def test_exact_locator_retains_chunk_identity_when_semantic_positions_repeat(
+    broker: MemoryBroker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from dataclasses import replace
+
+    from onyx.asv3 import corpus_tools
+
+    broker.items[1] = replace(broker.items[1], position=0)
+    broker.query_indexes = {}
+    broker._index_lock = RLock()
+    monkeypatch.setattr(
+        corpus_tools,
+        "get_session_with_current_tenant",
+        lambda: nullcontext(MagicMock()),
+    )
+    monkeypatch.setattr(corpus_tools, "resolve_source_query_index", lambda *_args: None)
+    monkeypatch.setattr(
+        corpus_tools, "source_chunk_position", lambda *_args, **_kwargs: 0
+    )
+    _, chunk = CorpusBroker.chunk(
+        broker, str(broker.item.id), "temporary-head", RunContext()
+    )
+    assert chunk is not None and chunk.id == "temporary-head"
+
+
 def test_source_tools_cannot_escape_captured_owner_scope(broker: MemoryBroker) -> None:
     result = CapabilityRegistry(build_corpus_specs(broker)).dispatch(
         CapabilityCall(name="read_source_range", arguments={"source_id": str(uuid4())}),
@@ -348,6 +381,18 @@ def test_corpus_sources_acl_is_applied_after_metadata_candidates(
     ]
     monkeypatch.setattr(
         asv3_corpus,
+        "get_document_set_by_id_for_user",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            id=73, name=asv3_corpus.PC_CORPUS_NAME
+        ),
+    )
+    monkeypatch.setattr(
+        asv3_corpus,
+        "filter_document_set_names_by_user_access",
+        lambda _session, names, _user: set(names),
+    )
+    monkeypatch.setattr(
+        asv3_corpus,
         "get_access_for_user_files",
         lambda *_args: {
             str(allowed): SimpleNamespace(to_acl=lambda: {"user:x"}),
@@ -364,7 +409,11 @@ def test_corpus_sources_acl_is_applied_after_metadata_candidates(
     result, _ = find_sources(
         session,
         user=cast(User, SimpleNamespace()),
-        filters=IndexFilters(access_control_list=[]),
+        filters=IndexFilters(
+            access_control_list=[],
+            forced_document_set=[asv3_corpus.PC_CORPUS_NAME],
+            asv3_document_set_id=73,
+        ),
     )
     assert [row.id for row in result] == [allowed]
 

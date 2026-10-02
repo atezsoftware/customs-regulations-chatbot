@@ -9,6 +9,8 @@ import re
 import threading
 import time
 from collections.abc import Callable
+from functools import wraps
+from typing import ParamSpec, cast
 from uuid import UUID
 
 from pydantic import JsonValue
@@ -17,7 +19,12 @@ from onyx.asv3.corpus_tools import CorpusBroker, build_corpus_specs
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.external_tools import build_external_specs
 from onyx.asv3.harness import Harness
-from onyx.asv3.llm_adapter import LanguageProfile, ResearchModel, parse_json_object
+from onyx.asv3.llm_adapter import (
+    LanguageProfile,
+    ResearchModel,
+    VerificationResult,
+    parse_json_object,
+)
 from onyx.asv3.models import (
     EvidenceItem,
     OutcomeStatus,
@@ -27,6 +34,7 @@ from onyx.asv3.models import (
     ToolReceipt,
 )
 from onyx.asv3.progress import ProgressEvent, ProgressReporter
+from onyx.asv3.publication import publication_gap, question_inventory
 from onyx.asv3.registry import CapabilityRegistry, build_core_specs
 from onyx.asv3.sandbox import build_sandbox_specs
 from onyx.asv3.search_adapter import build_search_adapter
@@ -41,7 +49,9 @@ from onyx.chat.models import ChatMessageSimple
 from onyx.chat.stop_signal_checker import is_connected
 from onyx.configs.constants import MessageType
 from onyx.context.search.models import BaseFilters, IndexFilters
+from onyx.db.asv3_corpus import bind_pc_corpus_scope
 from onyx.db.asv3_runs import load_asv3_checkpoint, save_asv3_checkpoint
+from onyx.db.memory import UserMemoryContext
 from onyx.db.models import User
 from onyx.llm.interfaces import LLM, LLMUserIdentity
 from onyx.llm.models import ReasoningEffort
@@ -62,8 +72,34 @@ from onyx.server.query_and_chat.streaming_models import (
 from onyx.tools.interface import Tool
 from onyx.tools.tool_implementations.search.search_tool import SearchTool
 from onyx.tracing.flows import LLMFlow
+from onyx.tracing.framework.create import ChatTraceMetadata, ensure_trace
 
 logger = logging.getLogger(__name__)
+P = ParamSpec("P")
+
+
+def _trace_asv3(function: Callable[P, None]) -> Callable[P, None]:
+    @wraps(function)
+    def wrapped(*args: P.args, **kwargs: P.kwargs) -> None:
+        llm = cast(LLM, kwargs["llm"])
+        identity = cast(LLMUserIdentity | None, kwargs.get("user_identity"))
+        with ensure_trace(
+            "run_asv3_loop",
+            group_id=str(kwargs["chat_session_id"]),
+            metadata=ChatTraceMetadata(
+                chat_session_id=str(kwargs["chat_session_id"]),
+                user_id=identity.user_id
+                if identity
+                else str(cast(User, kwargs["user"]).id),
+                user_message_id=cast(int, kwargs["user_message_id"]),
+                assistant_message_id=cast(int, kwargs["assistant_message_id"]),
+                model_name=llm.config.model_name,
+            ).model_dump(),
+        ):
+            function(*args, **kwargs)
+
+    return wrapped
+
 
 _LANGUAGE_INSTRUCTION = (
     LANGUAGE_PROMPT
@@ -104,6 +140,7 @@ def _evidence_record(
                 "citation": number,
                 "source_id": item.source_id,
                 "chunk_id": item.chunk_id,
+                "text_hash": item.text_hash,
                 "text": text,
                 "truncated": len(text) != len(item.text),
                 "citable": item.search_doc is not None,
@@ -116,6 +153,7 @@ def _evidence_record(
     return json.dumps(records, ensure_ascii=False)
 
 
+@_trace_asv3
 def run_asv3_loop(
     *,
     emitter: Emitter,
@@ -137,6 +175,9 @@ def run_asv3_loop(
     resume_message_id: int | None = None,
     custom_agent_prompt: str | None = None,
     allow_external: bool = False,
+    user_memory_context: UserMemoryContext | None = None,
+    user_info: str | None = None,
+    inject_memories_in_prompt: bool = True,
 ) -> None:
     start = time.monotonic()
     question = next(
@@ -157,6 +198,7 @@ def run_asv3_loop(
     )
     if document_set_names_override:
         scope.forced_document_set = document_set_names_override
+    scope = bind_pc_corpus_scope(user=user, filters=scope)
     context.scope = scope.model_dump(mode="json")
     history = "\n".join(
         f"{message.message_type.value}: {message.message}"
@@ -215,10 +257,29 @@ def run_asv3_loop(
     # Both application consent and explicit user intent are required.
     context.corpus_only = not (allow_external and profile.external_requested)
     ledger = EvidenceLedger()
+    context.services["evidence"] = ledger
     registry = CapabilityRegistry()
     search = next((tool for tool in tools if isinstance(tool, SearchTool)), None)
     broker = CorpusBroker(user, scope, vision_llm=llm)
-    broker.search_adapter = build_search_adapter(search, question, broker)
+
+    def search_history(child: RunContext) -> list[ChatMessageSimple]:
+        private = child.services.get("search_message_history")
+        if isinstance(private, list) and all(
+            isinstance(item, ChatMessageSimple) for item in private
+        ):
+            return cast(list[ChatMessageSimple], private)
+        return list(simple_chat_history)
+
+    broker.search_adapter = build_search_adapter(
+        search,
+        question,
+        broker,
+        message_history=search_history,
+        user_memory_context=user_memory_context,
+        user_info=user_info,
+        inject_memories_in_prompt=inject_memories_in_prompt,
+        user_identity=user_identity,
+    )
     scenarios = ScenarioState()
     scenarios.record([question], [])
     context.services["scenario_state"] = scenarios
@@ -228,6 +289,8 @@ def run_asv3_loop(
     harness: Harness | None = None
     workers: WorkerPool | None = None
     final_published = False
+    latest_review: VerificationResult | None = None
+    publication_status = OutcomeStatus.PARTIAL
 
     def emit_progress(event: ProgressEvent) -> None:
         phase, status = event.phase, event.status
@@ -242,9 +305,32 @@ def run_asv3_loop(
                 language=event.language,
                 phase=phase,
                 status=status,
-                title=event.title if phase == "research" else words[0],
-                message=event.message if phase == "research" else words[1],
+                title=event.title
+                if phase == "research"
+                or (
+                    phase == "worker"
+                    and event.task_id
+                    and workers
+                    and any(
+                        task.task_id == event.task_id and task.public_title
+                        for task in workers.list()
+                    )
+                )
+                else words[0],
+                message=event.message
+                if phase == "research"
+                or (
+                    phase == "worker"
+                    and event.task_id
+                    and workers
+                    and any(
+                        task.task_id == event.task_id and task.public_message
+                        for task in workers.list()
+                    )
+                )
+                else words[1],
                 task_id=event.task_id,
+                parent_task_id=event.parent_task_id,
                 active_tasks=event.active_workers,
                 completed_tasks=event.completed_workers,
             )
@@ -284,6 +370,10 @@ def run_asv3_loop(
                 progress_state=progress.export(),
                 public_profile=profile.model_dump(mode="json"),
                 workers=workers.export() if workers else {},
+                publication_review=latest_review.model_dump(mode="json")
+                if latest_review
+                else None,
+                publication_status=publication_status.value,
                 scenario=scenarios.snapshot(),
                 question_message_id=user_message_id,
             )
@@ -336,7 +426,9 @@ def run_asv3_loop(
             )
         )
         return ToolOutcome(
-            status=OutcomeStatus.FOUND,
+            status=OutcomeStatus.FOUND
+            if report.get("status") == "supported"
+            else OutcomeStatus.PARTIAL,
             summary="Claim checked against original evidence",
             data=report,
         )
@@ -349,6 +441,18 @@ def run_asv3_loop(
         local_scenario = ScenarioState()
         local_scenario.record([task], [])
         child.services["scenario_state"] = local_scenario
+        child.services["search_message_history"] = [
+            ChatMessageSimple(
+                message=question,
+                token_count=token_counter(question),
+                message_type=MessageType.USER,
+            ),
+            ChatMessageSimple(
+                message=task,
+                token_count=token_counter(task),
+                message_type=MessageType.USER,
+            ),
+        ]
         researcher_model = ResearchModel(
             llm,
             child,
@@ -403,6 +507,61 @@ def run_asv3_loop(
     model.pending_tasks = lambda: [
         task.model_dump(mode="json") for task in workers.list()
     ]
+
+    def review_answer(draft: str, *, research: bool) -> VerificationResult:
+        nonlocal latest_review
+        if harness is None:
+            raise RuntimeError("Research state is not ready for verification")
+        view = harness.view()
+        evidence = _evidence_record(
+            ledger,
+            draft,
+            max_chars=max(8000, min(180000, (llm.config.max_input_tokens - 18000) * 2)),
+        )
+        if research:
+            context.budget.consume_research_decision()
+        text = model.invoke_text(
+            VERIFICATION_PROMPT,
+            json.dumps(
+                {
+                    "language": context.language,
+                    "scenario": question,
+                    "questions": question_inventory(view.questions),
+                    "claim": draft,
+                    "evidence": evidence,
+                    "require_sources": profile.requires_sources,
+                    "pending_tasks": model.pending_tasks(),
+                },
+                ensure_ascii=False,
+            ),
+            LLMFlow.ASV3_VERIFICATION,
+            max_tokens=4000,
+            consume_budget=not research,
+        )
+        latest_review = VerificationResult.model_validate(parse_json_object(text))
+        return latest_review
+
+    def draft_guard(draft: str) -> ToolOutcome | None:
+        if profile.requires_sources and not ledger.citation_mapping():
+            return ToolOutcome(
+                status=OutcomeStatus.PARTIAL,
+                summary="No original citable evidence is recorded. Source access failures do not justify legal conclusions from memory.",
+                data={
+                    "missing": "original legal evidence",
+                    "available_tasks": model.pending_tasks(),
+                },
+            )
+        review = review_answer(draft, research=True)
+        assert harness is not None
+        return publication_gap(
+            draft,
+            review,
+            harness.view().questions,
+            ledger,
+            require_sources=profile.requires_sources,
+            verification_call_id=model.last_call_id,
+        )
+
     harness = Harness(
         request=question,
         context=context,
@@ -413,6 +572,7 @@ def run_asv3_loop(
         on_receipt=record,
         checkpoint=checkpoint,
         report_terminal=False,
+        draft_guard=draft_guard,
     )
     for spec in build_core_specs(
         registry,
@@ -478,12 +638,16 @@ def run_asv3_loop(
         result = harness.run()
         context.check_active()
         draft = result.answer or ""
+        complete = result.status == OutcomeStatus.FOUND
         if not draft:
             draft = json.dumps(
                 {
                     "status": result.status.value,
                     "scenario": scenarios.snapshot(),
                     "warning": "Research is incomplete. State the exact unresolved questions.",
+                    "last_review": latest_review.model_dump(mode="json")
+                    if latest_review
+                    else None,
                 },
                 ensure_ascii=False,
             )
@@ -493,20 +657,6 @@ def run_asv3_loop(
             draft,
             max_chars=max(8000, min(180000, (llm.config.max_input_tokens - 18000) * 2)),
         )
-        review = model.invoke_text(
-            VERIFICATION_PROMPT,
-            json.dumps(
-                {
-                    "language": context.language,
-                    "scenario": question,
-                    "claim": draft,
-                    "evidence": evidence,
-                },
-                ensure_ascii=False,
-            ),
-            LLMFlow.ASV3_VERIFICATION,
-            max_tokens=3000,
-        )
         final = model.invoke_text(
             FINAL_PROMPT,
             json.dumps(
@@ -515,7 +665,9 @@ def run_asv3_loop(
                     "question": question,
                     "scenario": scenarios.snapshot(),
                     "draft": draft,
-                    "review": review,
+                    "review": latest_review.model_dump(mode="json")
+                    if latest_review
+                    else None,
                     "evidence": evidence,
                     "research_status": result.status.value,
                     "assistant_instructions": custom_agent_prompt or "",
@@ -525,6 +677,25 @@ def run_asv3_loop(
             LLMFlow.ASV3_FINAL,
             max_tokens=9000,
         )
+        # Review the actual published wording, not just the coordinator's draft.
+        final_review = review_answer(final, research=False)
+        final_gap = publication_gap(
+            final,
+            final_review,
+            harness.view().questions,
+            ledger,
+            require_sources=profile.requires_sources,
+            allow_explicit_gaps=not complete,
+            verification_call_id=model.last_call_id,
+        )
+        if final_gap is not None:
+            # A source-free limitation notice is safe even when synthesis failed.
+            # Reviewer explanations are not substituted for unsupported legal rules.
+            final = profile.notifications["failed"][1]
+            complete = False
+        elif final_review.status != "supported":
+            complete = False
+        publication_status = OutcomeStatus.FOUND if complete else OutcomeStatus.PARTIAL
         # Unknown citation IDs never reach the UI as plausible evidence links.
         allowed = ledger.citation_mapping()
         unknown = {int(n) for n in re.findall(r"\[(\d+)\]", final)} - allowed.keys()
@@ -575,7 +746,10 @@ def run_asv3_loop(
         state_container.set_citation_mapping(processor.citation_to_doc)
         state_container.set_answer_tokens("".join(answer_parts))
         final_published = True
-        progress.report("completed", status="completed")
+        progress.report(
+            "completed" if complete else "failed",
+            status="completed" if complete else "failed",
+        )
         checkpoint(harness.snapshot())
         emitter.emit(Packet(placement=Placement(turn_index=0), obj=SectionEnd()))
     except RunStopped:

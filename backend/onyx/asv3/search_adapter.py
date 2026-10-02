@@ -1,21 +1,151 @@
 """Isolate the established search pipeline and retain its original source text."""
 
 import json
-from collections.abc import Callable
+import time
+from collections.abc import Callable, Iterator
+from uuid import uuid4
 
 from pydantic import JsonValue
 
 from onyx.asv3.corpus_tools import CorpusBroker
-from onyx.asv3.models import EvidenceItem, OutcomeStatus, RunContext, ToolOutcome
+from onyx.asv3.llm_adapter import model_slot, provider_retry_delay
+from onyx.asv3.models import (
+    EvidenceItem,
+    OutcomeStatus,
+    RunContext,
+    RunStopped,
+    ToolOutcome,
+)
 from onyx.chat.emitter import NullEmitter
+from onyx.chat.models import ChatMessageSimple
+from onyx.configs.constants import MessageType
 from onyx.context.search.models import SearchDocsResponse
+from onyx.db.asv3_corpus import bind_pc_corpus_scope
+from onyx.db.memory import UserMemoryContext
+from onyx.llm.interfaces import LLM, LLMConfig, LLMUserIdentity
+from onyx.llm.model_response import ModelResponse, ModelResponseStream
+from onyx.llm.models import LanguageModelInput, ReasoningEffort, ToolChoiceOptions
+from onyx.regulatory.structured_llm import is_retryable_provider_error
 from onyx.server.query_and_chat.placement import Placement
-from onyx.tools.models import SearchToolOverrideKwargs
+from onyx.tools.constants import REGULATORY_MAX_SEARCH_QUERY_CHARS
+from onyx.tools.models import ToolCallKickoff
 from onyx.tools.tool_implementations.search.search_tool import SearchTool
+from onyx.tools.tool_runner import run_tool_calls
+
+
+class ScopedSearchLLM(LLM):
+    """Retain the selected model while accounting for secondary search generations."""
+
+    def __init__(
+        self, selected: LLM, context: RunContext, user_identity: LLMUserIdentity | None
+    ) -> None:
+        self.selected = selected
+        self.context = context
+        self.user_identity = user_identity
+
+    @property
+    def config(self) -> LLMConfig:
+        return self.selected.config
+
+    def timeout(self, requested: int | None) -> int:
+        self.context.check_research_active()
+        remaining = max(1, int(self.context.research_deadline - time.monotonic()))
+        return remaining if requested is None else max(1, min(requested, remaining))
+
+    def wait_to_retry(self, error: Exception, attempt: int) -> None:
+        self.context.check_research_active()
+        delay = provider_retry_delay(error, attempt)
+        if delay >= self.context.research_deadline - time.monotonic():
+            raise RunStopped(
+                "Provider retry exceeds the remaining search deadline"
+            ) from error
+        retry_at = time.monotonic() + delay
+        while time.monotonic() < retry_at:
+            self.context.check_research_active()
+            time.sleep(min(0.05, max(0, retry_at - time.monotonic())))
+
+    def invoke(
+        self,
+        prompt: LanguageModelInput,
+        tools: list[dict] | None = None,
+        tool_choice: ToolChoiceOptions | None = None,
+        structured_response_format: dict | None = None,
+        timeout_override: int | None = None,
+        max_tokens: int | None = None,
+        reasoning_effort: ReasoningEffort = ReasoningEffort.AUTO,
+        user_identity: LLMUserIdentity | None = None,
+        use_streaming: bool = True,
+    ) -> ModelResponse:
+        for attempt in range(3):
+            try:
+                with model_slot(self.context, research=True):
+                    self.context.budget.consume_research_decision()
+                    result = self.selected.invoke(
+                        prompt=prompt,
+                        tools=tools,
+                        tool_choice=tool_choice,
+                        structured_response_format=structured_response_format,
+                        timeout_override=self.timeout(timeout_override),
+                        max_tokens=max_tokens,
+                        reasoning_effort=reasoning_effort,
+                        user_identity=user_identity or self.user_identity,
+                        use_streaming=use_streaming,
+                    )
+                    self.context.check_research_active()
+                    return result
+            except Exception as error:
+                if attempt == 2 or not is_retryable_provider_error(error):
+                    raise
+                self.wait_to_retry(error, attempt)
+        raise AssertionError("Selected-provider retry loop did not terminate")
+
+    def stream(
+        self,
+        prompt: LanguageModelInput,
+        tools: list[dict] | None = None,
+        tool_choice: ToolChoiceOptions | None = None,
+        structured_response_format: dict | None = None,
+        timeout_override: int | None = None,
+        max_tokens: int | None = None,
+        reasoning_effort: ReasoningEffort = ReasoningEffort.AUTO,
+        user_identity: LLMUserIdentity | None = None,
+    ) -> Iterator[ModelResponseStream]:
+        for attempt in range(3):
+            emitted = False
+            try:
+                with model_slot(self.context, research=True):
+                    self.context.budget.consume_research_decision()
+                    for part in self.selected.stream(
+                        prompt=prompt,
+                        tools=tools,
+                        tool_choice=tool_choice,
+                        structured_response_format=structured_response_format,
+                        timeout_override=self.timeout(timeout_override),
+                        max_tokens=max_tokens,
+                        reasoning_effort=reasoning_effort,
+                        user_identity=user_identity or self.user_identity,
+                    ):
+                        self.context.check_research_active()
+                        emitted = True
+                        yield part
+                    self.context.check_research_active()
+                    return
+            except Exception as error:
+                if emitted or attempt == 2 or not is_retryable_provider_error(error):
+                    raise
+                self.wait_to_retry(error, attempt)
 
 
 def build_search_adapter(
-    tool: SearchTool | None, original_query: str, broker: CorpusBroker
+    tool: SearchTool | None,
+    original_query: str,
+    broker: CorpusBroker,
+    *,
+    message_history: Callable[[RunContext], list[ChatMessageSimple]],
+    user_memory_context: UserMemoryContext | None = None,
+    user_info: str | None = None,
+    inject_memories_in_prompt: bool = True,
+    user_identity: LLMUserIdentity | None = None,
 ) -> Callable[[dict[str, JsonValue], RunContext], ToolOutcome]:
     def search(args: dict[str, JsonValue], context: RunContext) -> ToolOutcome:
         context.check_active()
@@ -24,28 +154,78 @@ def build_search_adapter(
                 status=OutcomeStatus.UNAVAILABLE,
                 summary="Internal search is not configured",
             )
+        query, mode = args.get("query"), args.get("mode")
+        if (
+            not isinstance(query, str)
+            or not query.strip()
+            or len(query) > REGULATORY_MAX_SEARCH_QUERY_CHARS
+            or mode not in ("hybrid", "keyword", "full_text")
+        ):
+            return ToolOutcome(
+                status=OutcomeStatus.INVALID,
+                summary="Search requires a bounded non-empty query and an explicit hybrid, keyword or full_text mode",
+            )
+        history = message_history(context)
+        if not any(message.message_type == MessageType.USER for message in history):
+            return ToolOutcome(
+                status=OutcomeStatus.INVALID,
+                summary="Search requires the actual conversation or researcher user/task history",
+            )
         isolated = tool.fork_for_independent_context(emitter=NullEmitter())
-        response = isolated.run(
-            placement=Placement(turn_index=0),
-            override_kwargs=SearchToolOverrideKwargs(
-                starting_citation_num=1, original_query=original_query
-            ),
-            queries=[str(args["query"])],
-            search_mode=str(args.get("mode", "hybrid")),
+        # Every index lane must use the same captured authorization as direct reads.
+        isolated.user_selected_filters = bind_pc_corpus_scope(
+            user=broker.user, filters=broker.filters.model_copy(deep=True)
+        )
+        isolated.llm = ScopedSearchLLM(tool.llm, context, user_identity)
+        tool_args: dict[str, JsonValue] = {"queries": [query], "search_mode": mode}
+        for field in (
+            "coverage_item",
+            "evidence_target",
+            "source_anchors",
+            "label_hint",
+        ):
+            if field in args:
+                tool_args[field] = args[field]
+        batch = run_tool_calls(
+            tool_calls=[
+                ToolCallKickoff(
+                    tool_call_id=str(uuid4()),
+                    tool_name=SearchTool.NAME,
+                    tool_args=tool_args,
+                    placement=Placement(turn_index=len(history)),
+                )
+            ],
+            tools=[isolated],
+            message_history=history,
+            user_memory_context=user_memory_context,
+            user_info=user_info,
+            citation_mapping={},
+            next_citation_num=1,
+            inject_memories_in_prompt=inject_memories_in_prompt,
         )
         context.check_active()
+        if len(batch.tool_responses) != 1:
+            return ToolOutcome(
+                status=OutcomeStatus.UNAVAILABLE,
+                summary="The scoped search invocation returned no tool response; this is not proof of corpus absence",
+            )
+        response = batch.tool_responses[0]
         rich = response.rich_response
         if not isinstance(rich, SearchDocsResponse):
             return ToolOutcome(
                 status=OutcomeStatus.UNAVAILABLE,
-                summary="Search returned no source mapping",
+                summary="Search did not return a usable source mapping; this is not proof of corpus absence",
+                data={"search_response": response.llm_facing_response},
             )
         payload = json.loads(response.llm_facing_response)
         results = payload.get("results", []) if isinstance(payload, dict) else []
         evidence: list[EvidenceItem] = []
+        seen_evidence: set[tuple[str, str | None, str]] = set()
+        unmapped_results = 0
         docs = {(doc.document_id, doc.chunk_ind): doc for doc in rich.search_docs}
         for result in results:
             if not isinstance(result, dict):
+                unmapped_results += 1
                 continue
             number, text = result.get("document"), result.get("content")
             if (
@@ -53,21 +233,51 @@ def build_search_adapter(
                 or not isinstance(text, str)
                 or not text.strip()
             ):
+                unmapped_results += 1
                 continue
             doc_id = rich.citation_mapping.get(number)
             chunk = rich.citation_chunk_mapping.get(number)
             if doc_id is None or chunk is None:
+                unmapped_results += 1
                 continue
             doc = docs.get((doc_id, chunk))
             if doc is None:
+                unmapped_results += 1
                 continue
             # A retrieved section may contain siblings. Bind each real canonical row,
             # never the combined section text to its center's identity.
-            evidence.extend(broker.hydrate_search_evidence(doc, context))
+            hydrated = broker.hydrate_search_evidence(doc, context)
+            if not hydrated:
+                unmapped_results += 1
+            for item in hydrated:
+                if item.identity not in seen_evidence:
+                    seen_evidence.add(item.identity)
+                    evidence.append(item)
+        status = (
+            OutcomeStatus.PARTIAL
+            if evidence and unmapped_results
+            else OutcomeStatus.FOUND
+            if evidence
+            else OutcomeStatus.UNAVAILABLE
+            if results
+            else OutcomeStatus.NOT_FOUND
+        )
         return ToolOutcome(
-            status=OutcomeStatus.FOUND if evidence else OutcomeStatus.NOT_FOUND,
+            status=status,
             summary="Original text from the scoped search pipeline; navigation is not evidence",
-            data={"source_count": len(evidence), "query": str(args["query"])},
+            data={
+                "source_count": len(evidence),
+                "retrieved_result_count": len(results),
+                "unmapped_result_count": unmapped_results,
+                "query": query,
+                "mode": mode,
+                "original_question": original_query,
+                "search_receipt": {
+                    key: value for key, value in payload.items() if key != "results"
+                }
+                if isinstance(payload, dict)
+                else {},
+            },
             evidence=evidence,
         )
 

@@ -8,6 +8,8 @@ Frontend’de ASv3 seçimi `atez_search_v3: true` gönderir. ATEZ Search, v2 ve 
 
 Koordinatör kullanıcı tarafından seçilen modelle çalışır. Araştırmacılar, iddia doğrulayıcısı, dil profili ve final üretimi aynı seçilmiş LLM nesnesini kullanır; ASv3 içinde sabit bir sağlayıcı/model seçimi bulunmaz. Paralel araştırmacı oluşturmak, farklı sağlayıcılara otomatik geçiş anlamına gelmez. Modelin araç çağrısı, bağlam ve gerektiğinde görsel giriş yetenekleri ayrıca uygun olmalıdır.
 
+Her çalışmanın iç kaynak kapsamı, tenant içindeki yetkili ve etkin **PC Külliyatı** document set kimliğine bağlanır. Sayısal kimlik ortamlar arasında sabit değildir. İndeks, kanonik DB okuma, asıl dosya, araştırmacı, citation ve devam aynı zorunlu üyeliği korur; kullanıcı filtreleri kapsamı daraltabilir. Set eksik/erişilemezse tüm dosyalara dönüş yapılmaz. Erişim veya set kimliği değişirse yeniden doğrulama gerekir.
+
 Frontend normal gönderme, düzenleme, yeniden üretme ve devam isteklerinde mevcut model seçimi akışını kullanır. ASv3 bayrağı yanıtın ilk boş yer tutucusuna da yazılır: ilk yerelleştirilmiş paket gelene kadar yalnızca nötr `ASv3` ve bekleme göstergesi görünür.
 
 ## Araştırmanın yürütülmesi
@@ -15,6 +17,10 @@ Frontend normal gönderme, düzenleme, yeniden üretme ve devam isteklerinde mev
 Koordinatör soruları, belirleyici olguları, olumsuz koşulları ve alternatif senaryoları kaydeder; ihtiyaca uygun araçları seçer. Bilinen kaynak ve madde doğrudan okunabilir. Kaynak kimliği belirsizse önce çözülür; gerektiğinde kaynak içi metin araması, mevcut indeks araması, atıf takibi ve asıl dosya incelemesi kullanılır. Tek bir başarısız arama, hükmün külliyatta bulunmadığını kanıtlamaz.
 
 Bağımsız ihtiyaçlar araştırmacılara dağıtılabilir veya bağımlılıkları açık bir araç programıyla paralel yürütülebilir. Araştırmacılar aynı erişim kapsamını, kanıt defterini ve ortak bütçeyi paylaşır. Sonuçlar kaynak metniyle doğrulanır; araştırmacının özeti tek başına birincil hukuki kanıt sayılmaz. Finalden önce eksikler, kaynak koşulları, süreler ve atıflar ayrıca denetlenir. Bütçe veya servis sınırında ulaşılamayan hususlar kesin sonuç gibi sunulmamalıdır.
+
+Zorunlu araç sırası, arama modu veya araştırmacı sayısı yoktur. Model yöntemleri gerçek ihtiyaç ve sonuçlara göre seçer. `search_corpus`, V2'nin gerçek çağrı yoluyla geçmiş, filtreler, izinli bellek ve sorgu hedeflerini taşır. BM25/keyword, full_text ve hybrid ayrı sözleşmelerini korur; ayrı semantic modu mevcut bu arayüzde sunulmaz. Arama içindeki yardımcı LLM çağrıları da seçili model ve ortak kapasite/bütçe altında çalışır.
+
+Gerçek assistant tool-call ve eşleşen tool-result çiftleri sınırlı yakın geçmişte tutulur. Kaynak doğrulaması her kayıtlı soru ve alternatifi kontrol eder; eksik/çelişkili taslak gerçek geri bildirimle araştırmaya döner. Yayınlanacak son metin ayrıca doğrulanır. Sıfır özgün kaynakla kesin hukuki sonuç ve eksik araştırmaya başarılı tamamlanma bildirimi verilmez. LLM doğrulaması bağımsız hukuki doğruluk garantisi değildir.
 
 ## Sabit araç kataloğu: 29 araç
 
@@ -24,7 +30,7 @@ Araç şemalarının gerçek kaynağı `registry.py`, `corpus_tools.py`, `source
 | --- | --- |
 | `discover_tools` | İsteğe bağlı `names`; çalışma için yetkili araçların şemalarını verir. Servisin sağlıklı olduğunu kanıtlamaz. |
 | `read_evidence` | Global `citation`, isteğe bağlı karakter aralığı; kaydedilmiş özgün kanıt metnini okur. |
-| `inspect_evidence_path` | `citation`; gözlenen kayıt ve final dahil edilme bilgilerini verir, görülmeyen aşamaları uydurmaz. |
+| `inspect_evidence_path` | `citation`; kayıt, gerçek model çağrısına gönderilen pasajın hash/konum/tamlık makbuzu ve final dahil edilmesini gösterir. Modelin pasajı doğru yorumladığını tek başına kanıtlamaz. |
 | `read_research_state` | Girdi gerekmez; senaryo, araştırmacılar ve ortak bütçenin durumunu verir. Özgün metinler her durumda tekrar taşınmaz. |
 | `resolve_source` | `query`, isteğe bağlı sayfalama; yetkili kanonik kaynak adaylarını bulur, birden fazla adayı belirsiz bırakır. |
 | `read_source_range` | `source_id`, isteğe bağlı `start`, `limit`; sıralı kanonik parçaları okur ve devam konumunu bildirir. |
@@ -33,8 +39,8 @@ Araç şemalarının gerçek kaynağı `registry.py`, `corpus_tools.py`, `source
 | `query_corpus` | `operation: inventory/headings` ve kapsam/sayfalama alanları; envanter veya başlık okur, serbest SQL çalıştırmaz. |
 | `follow_reference` | Görülebilir başlangıç `source_id`, `chunk_id`; isteğe bağlı hedef kaynak/madde ve derinlik; açık mevzuat atfını takip eder. |
 | `diagnose_source` | `source_id`; gözlenen kaynak, DB ve yayın metadata’sını inceler. Servis hatasını metin yokluğu saymaz. |
-| `compare_versions` | `source_id`, `old_date`, `new_date`; açık tarihli kaynak görünümlerini karşılaştırır. Bilinmeyen geçerlilik sınırları bilinmiyor olarak kalır. |
-| `search_corpus` | `query`, isteğe bağlı `mode: hybrid/keyword/full_text`; mevcut kapsamlı SearchTool indeks adaptörünü kullanır. |
+| `compare_versions` | `source_id`, `old_date`, `new_date`; isteğe bağlı madde/konum kapsamıyla açık tarihli kaynak bloklarını karşılaştırır. Bilinmeyen geçerlilik sınırları bilinmiyor olarak kalır. |
+| `search_corpus` | `query` ve zorunlu `mode: hybrid/keyword/full_text`; isteğe bağlı bilgi ihtiyacı, kanıt hedefi ve kaynak dayanaklarını mevcut SearchTool indeks adaptörüne aktarır. |
 | `open_source_file` | `source_id`, isteğe bağlı metin aralığı; erişimi ve sürümü uygun asıl dosyanın baytlarını doğrular, metin veya manifest verir. |
 | `inspect_source_page` | `source_id`, birden başlayan `page`, isteğe bağlı `vision`; doğrulanmış PDF/görsel sayfasını ve mevcut native metni inceler. Görsel yorumlama model yeteneğine bağlıdır. |
 | `extract_table` | `source_id`, gerektiğinde `page`, `sheet`, `start_row`, `limit`; CSV/XLSX/HTML veya PDF sayfasından konum bilgili tablo çıkarır, çıkarım belirsizliğini korur. |
@@ -45,7 +51,7 @@ Araç şemalarının gerçek kaynağı `registry.py`, `corpus_tools.py`, `source
 | `calculate` | `operation` ve tutar/tarih girdileri; Decimal hesapları, dağıtım ve süre hesabı yapar. İş günü hesabı açık tatil takvimi ister; hukuki süre kuralını kendisi üretmez. |
 | `compose_tool_calls` | `steps`, isteğe bağlı `max_parallel`; bağımlılıklar, `$ref` yolları ve koşullarla en fazla 20 adımlı program yürütür. Her iç çağrı aynı kayıt ve kapsam kontrolünden geçer. |
 | `run_research_code` | `code`, isteğe bağlı `language: python/bash`, `source_ids`, `timeout_ms`; yapılandırılmış izole serviste kod çalıştırır. En fazla beş yetkili kanonik kaynak manifesti aktarılır; uygulama host’unda komut çalıştırmaz. |
-| `spawn_researcher` | `task`; bağımsız bilgi ihtiyacını araştırmacıya devreder. Araştırmacı kendi araçlarını seçer. |
+| `spawn_researcher` | `task`, isteğe bağlı doğal `public_title`/`public_message`; bağımsız ihtiyacı araştırmacıya devreder. Araştırmacı kendi araçlarını seçer; teknik talimatlar kullanıcı başlığına taşınmaz. |
 | `send_update` | `task_id`, `message`; yeni görev açmadan araştırmacıya ek bilgi iletir. |
 | `followup_researcher` | `task_id`, `message`; çalışan araştırmacıyı yönlendirir veya bitmiş görev için bağlı devam başlatır. |
 | `list_researchers` | Girdi gerekmez; görev durumlarını ve tamamlanmış sonuçları verir. |
@@ -76,9 +82,11 @@ Checkpoint, mevcut ToolCall logunda `-3001` ayırıcı kimliğiyle, tenant ve me
 
 ## Bellek ve izolasyon
 
-Ortak bütçe varsayılan olarak 64 araç çağrısı, 32 model kararı, 2.000.000 bayt kanıt ve 4.000.000 bayt artifact ile sınırlıdır; eşzamanlı araç ve model slotları ayrı ayrı dört adettir. Orkestrasyon araçları slot tutmaz; iç araştırma çağrıları kendi kontrollerinden geçer. Final için üç karar ayrılır. Runtime çalışma süresi 900 saniye, araştırmadan sonra final için ayrılan süre 180 saniyedir. Bunlar mevcut kod varsayılanlarıdır, her isteğin bu sınırları tüketmesi beklenmez.
+Ortak bütçe varsayılan olarak 64 araç çağrısı, 41 model çağrısı/kararı, 2.000.000 bayt kanıt ve 4.000.000 bayt artifact ile sınırlıdır; eşzamanlı araç ve model slotları ayrı ayrı dört adettir. Orkestrasyon araçları slot tutmaz; iç araştırma çağrıları kendi kontrollerinden geçer. Final metni ve onun gerçek kaynak doğrulaması için on iki çağrı ayrılır; iki aşamanın biçim düzeltmesi ve geçici sağlayıcı tekrarlarına yer bırakılır. İlk 29 kararın araştırma alanı korunur. Harness düzeyindeki ek model denemeleri sayılır; sağlayıcının mevcut iç uyumluluk tekrarları nedeniyle bu sayı kesin faturalanan HTTP isteği kotası değildir. Runtime çalışma süresi 900 saniye, final için ayrılan süre 180 saniyedir. Her isteğin bu sınırları tüketmesi beklenmez.
 
 LLM’ye kanıt özetleri sınırlı taşınır; ihtiyaç duyulan özgün metin `read_evidence` ile aralıklı okunabilir. Checkpoint için serileştirilmiş bütçe 2.500.000, açılmış içerik bütçesi 8.000.000 bayttır. Asıl dosya okuma 25 MiB ile sınırlıdır. Frontend ilerleme paketlerini 256 paketten sonra daraltır; ilk çalışma kimliği, son durumlar ve yakın geçmiş tutulurken kaynak, atıf, cevap ve kontrol paketleri korunur. Bunlar bütün uygulamanın bellek kullanımının sabit olduğu iddiası değildir.
+
+Kaynak gezinme tek sayfa ve ilgili blokları tutar; başlık envanteri metin yerine kaynak/chunk/konum metadata'sı taşır. Hüküm, literal/regex arama, atıf ve sürüm karşılaştırması uzun dosyaları kalıcı metin cache'ine doldurmaz. Özgün dosya açılabilir; doğrulama/render için gereken baytlar yalnız o işlem sırasında yaşar. Bu ağır işlemler ortak iki kaynak izniyle sınırlıdır; indeks/chunk araştırması bu ayrı izni beklemez. Dosya manifestleri kimlik/hash/locator taşır; dosya baytları araştırmacı özetine veya checkpoint'e kopyalanmaz. Kanıt defterinde yalnız kabul edilmiş ilgili pasajlar ortak global kimlikle saklanır.
 
 Araştırma kodu uygulama host’una, üretim DB erişimine veya S3 kimlik bilgilerine erişim verilmeden ayrı servise gönderilir. Bash için kısa ömürlü, ağ erişimi kapalı servis oturumu ve servis desteği gerekir. Manifestler kanonik kaynaklardan gelir; hesap veya kod ürünü hukuki otorite sayılmaz. Sonlandırma ve iptal kontrolleri ortak kapsamda çalışır; iptalden sonraki geç sonuçlar yayınlanmaz.
 
@@ -99,7 +107,11 @@ Kayıtlı araç şemasının varlığı bu bağımlılıkların DEV veya başka 
 
 `asv3_progress` paketleri çalışma/olay kimliği, sıra, dil, aşama/durum, doğal başlık/mesaj ve gerektiğinde görev ilişkisini taşır. Frontend kimlik ve sıra denetimiyle eski veya başka çalışmaya ait olayları eler; görev sonlandırmalarını korur. Kullanıcıya teknik aşama veya araç adları yerine sorusuyla ilgili doğal bildirim gösterilir. Dil profilinin ilk yüklenişinden önce nötr bekleme görünümü kullanılır.
 
+Sunum Onyx avatar/timeline/yüzey ve paralel görev sekmelerini kullanır. Doğal görev başlıkları ve parent ilişkisi backend'den gelir. Finalde kullanıcı tercihi korunarak daralır; terminal/reload'da animasyon tekrar başlamaz ve azaltılmış hareket tercihi korunur. Markdown ve citation gösterimi mevcut akıştan gelir.
+
 Model trace ayrımları `asv3_language`, `asv3_coordinator`, `asv3_researcher`, `asv3_verification`, `asv3_source_vision` ve `asv3_final` şeklindedir. Bunlar geliştirici gözlemlenebilirliği içindir. Süre/kalite karşılaştırması için aynı soru, kaynak kapsamı, model ve test koşullarına ait gerçek çalıştırma kanıtı gerekir; bu mimari tek başına hız veya kalite üstünlüğünü kanıtlamaz.
+
+Root trace kullanıcı/chat/mesaj ve seçili model kimliğiyle bağlanır. Araç aşamaları gerçek durum ve kanonik kaynak kimlikleriyle kaydedilir. Kanıt teslim makbuzu başarılı sağlayıcı çağrısının gerçekten gönderilen girdisinden çıkarılır; özgün pasaj yeniden çoğaltılmadan hash ve sınırlarla ilişkilendirilir. Genel kullanıcı bildirimleri bu özel trace/protokol içeriklerini göstermez.
 
 ## İlgili uygulama noktaları
 

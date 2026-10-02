@@ -65,6 +65,35 @@ _INTERNAL_NARRATION = re.compile(
 )
 
 
+def public_narration_valid(title: str, message: str, context: RunContext) -> bool:
+    from onyx.asv3.registry import CapabilityRegistry
+
+    if (
+        not title.strip()
+        or not message.strip()
+        or len(title) > 240
+        or len(message) > 1600
+    ):
+        return False
+    registry = context.services.get("registry")
+    names = (
+        [
+            str(function["name"])
+            for definition in registry.definitions(context)
+            if isinstance(function := definition.get("function"), dict)
+            and isinstance(function.get("name"), str)
+            and "_" in str(function["name"])
+        ]
+        if isinstance(registry, CapabilityRegistry)
+        else []
+    )
+    text = title + " " + message
+    return not _INTERNAL_NARRATION.search(text) and not any(
+        re.search(r"\b" + re.escape(name) + r"\b", text, re.IGNORECASE)
+        for name in names
+    )
+
+
 def build_supplemental_specs() -> list[ToolSpec]:
     def scenario(args: dict[str, JsonValue], context: RunContext) -> ToolOutcome:
         state = context.services.get("scenario_state")
@@ -86,32 +115,24 @@ def build_supplemental_specs() -> list[ToolSpec]:
 
     def progress(args: dict[str, JsonValue], context: RunContext) -> ToolOutcome:
         title, message = str(args["title"]), str(args["message"])
-        from onyx.asv3.registry import CapabilityRegistry
-
-        registry = context.services.get("registry")
-        names = (
-            [
-                str(function["name"])
-                for definition in registry.definitions(context)
-                if isinstance(function := definition.get("function"), dict)
-                and isinstance(function.get("name"), str)
-                and "_" in str(function["name"])
-            ]
-            if isinstance(registry, CapabilityRegistry)
-            else []
-        )
-        text = title + " " + message
-        if _INTERNAL_NARRATION.search(text) or any(
-            re.search(r"\b" + re.escape(name) + r"\b", text, re.IGNORECASE)
-            for name in names
-        ):
+        if not public_narration_valid(title, message, context):
             return ToolOutcome(
                 status=OutcomeStatus.INVALID,
                 summary="Use conversational public narration about the question; omit tool names, URLs, paths and code",
             )
         reporter = context.services.get("progress")
         if isinstance(reporter, ProgressReporter):
-            reporter.report("research", title=title, message=message)
+            task_id, parent = (
+                context.services.get("task_id"),
+                context.services.get("parent_task_id"),
+            )
+            reporter.report(
+                "research",
+                title=title,
+                message=message,
+                task_id=task_id if isinstance(task_id, str) else None,
+                parent_task_id=parent if isinstance(parent, str) else None,
+            )
             return ToolOutcome(
                 status=OutcomeStatus.FOUND, summary="Public progress delivered"
             )

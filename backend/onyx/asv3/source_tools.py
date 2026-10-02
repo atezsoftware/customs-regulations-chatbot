@@ -3,8 +3,11 @@
 import base64
 import csv
 import time
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from hashlib import sha256
 from io import StringIO
+from threading import local
 from typing import cast
 from uuid import UUID
 
@@ -40,6 +43,41 @@ from onyx.utils.process_isolation import run_in_isolated_process
 MAX_ORIGINAL_BYTES = 25 * 1024 * 1024
 MAX_IMAGE_BYTES = 2 * 1024 * 1024
 MAX_EXTRACT_CHARS = 64_000
+_source_slots = local()
+
+
+@contextmanager
+def source_slot(context: RunContext, *, research: bool = True) -> Iterator[None]:
+    """Bound original-file memory for the entire operation, including parsing."""
+    check = context.check_research_active if research else context.check_active
+    check()
+    held: set[int] = getattr(_source_slots, "held", set())
+    key = id(context.budget)
+    if key in held:
+        yield
+        check()
+        return
+    while not context.budget.source_slots.acquire(timeout=0.05):
+        check()
+    held.add(key)
+    _source_slots.held = held
+    try:
+        check()
+        yield
+        check()
+    finally:
+        held.remove(key)
+        context.budget.source_slots.release()
+
+
+def bounded_source_operation(
+    handler: Callable[[dict[str, JsonValue], RunContext], ToolOutcome],
+) -> Callable[[dict[str, JsonValue], RunContext], ToolOutcome]:
+    def run(args: dict[str, JsonValue], context: RunContext) -> ToolOutcome:
+        with source_slot(context):
+            return handler(args, context)
+
+    return run
 
 
 def extract_source_vision(
@@ -404,7 +442,7 @@ def build_source_specs(broker: CorpusBroker) -> list[ToolSpec]:
                 },
                 ["source_id"],
             ),
-            handler=guarded(open_file),
+            handler=guarded(bounded_source_operation(open_file)),
         ),
         ToolSpec(
             name="inspect_source_page",
@@ -417,7 +455,7 @@ def build_source_specs(broker: CorpusBroker) -> list[ToolSpec]:
                 },
                 ["source_id", "page"],
             ),
-            handler=guarded(page),
+            handler=guarded(bounded_source_operation(page)),
         ),
         ToolSpec(
             name="extract_table",
@@ -432,6 +470,6 @@ def build_source_specs(broker: CorpusBroker) -> list[ToolSpec]:
                 },
                 ["source_id"],
             ),
-            handler=guarded(table),
+            handler=guarded(bounded_source_operation(table)),
         ),
     ]

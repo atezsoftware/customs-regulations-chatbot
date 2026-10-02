@@ -312,6 +312,8 @@ const AgentMessage = React.memo(function AgentMessage({
 
       {isASv3 ? (
         <ASv3ProgressPanel
+          agent={effectiveChatState.agent}
+          hasDisplayContent={pacedDisplayGroups.length > 0}
           pending={Boolean(asv3) && !asv3Progress.header}
           state={asv3Progress}
           stopped={stopPacketSeen}
