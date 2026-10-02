@@ -194,11 +194,28 @@ class EvidenceItem(BaseModel):
         return self.source_id, self.chunk_id, self.text_hash
 
 
+class OriginalEvidenceRead(BaseModel):
+    """An exact reopened range of an original already in this run's ledger."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    citation: int = Field(strict=True, ge=1)
+    text_hash: str = Field(pattern=r"^[a-f0-9]{64}$")
+    start_char: int = Field(strict=True, ge=0)
+    end_char: int = Field(strict=True, ge=1)
+
+    @model_validator(mode="after")
+    def ordered_range(self) -> OriginalEvidenceRead:
+        if self.start_char >= self.end_char:
+            raise ValueError("Original evidence range must be nonempty")
+        return self
+
+
 class ToolOutcome(BaseModel):
     status: OutcomeStatus
     summary: str
     data: dict[str, JsonValue] = Field(default_factory=dict)
     evidence: list[EvidenceItem] = Field(default_factory=list)
+    original_reads: list[OriginalEvidenceRead] = Field(default_factory=list)
     artifacts: list[Artifact] = Field(default_factory=list)
 
 

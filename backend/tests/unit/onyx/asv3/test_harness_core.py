@@ -15,12 +15,14 @@ from onyx.asv3.models import (
     Decision,
     EvidenceItem,
     HarnessView,
+    OriginalEvidenceRead,
     OutcomeStatus,
     RunContext,
     RunStopped,
     SharedBudget,
     TaskStatus,
     ToolOutcome,
+    ToolReceipt,
     ToolSpec,
 )
 from onyx.asv3.progress import ProgressReporter, public_action_id
@@ -182,6 +184,154 @@ def test_requested_original_passage_survives_compact_audit_receipt() -> None:
         decide=decide,
     ).run()
     assert result.status == OutcomeStatus.FOUND
+
+
+def test_composed_partial_originals_survive_next_action_and_checkpoint() -> None:
+    from onyx.asv3.sandbox import compose
+
+    context, ledger, registry = RunContext(), EvidenceLedger(), CapabilityRegistry()
+    texts = ["A" * 15000, "B" * 15000]
+    ledger.add(
+        [EvidenceItem(source_id=f"law-{i}", text=text) for i, text in enumerate(texts)],
+        context,
+    )
+    for spec in build_core_specs(registry, ledger, lambda: {}):
+        registry.register(spec)
+    registry.register(
+        ToolSpec(
+            name="compose_tool_calls",
+            description="Compose original reads",
+            parameters={"type": "object"},
+            handler=compose,
+            orchestrates=True,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="next_action",
+            description="A later unrelated action",
+            parameters={"type": "object"},
+            handler=lambda _args, _context: ToolOutcome(
+                status=OutcomeStatus.FOUND, summary="Next action completed"
+            ),
+        )
+    )
+    step = 0
+
+    def decide(view: HarnessView) -> Decision:
+        nonlocal step
+        if step == 1:
+            body = json.loads(view.turns[-1].results[0].content)
+            originals = {row["citation"]: row for row in body["original_evidence"]}
+            assert set(originals) == {1, 2}
+            assert view.receipts[-1].evidence_ids == [1, 2]
+            for number in (1, 2):
+                assert originals[number]["text"] == texts[number - 1][10:7010]
+                assert originals[number]["start_char"] == 10
+                assert originals[number]["end_char"] == 7010
+                assert originals[number]["truncated"] is True
+            assert len(json.dumps(body["outcome"]["data"])) < 2000
+        if step == 2:
+            assert view.receipts[-1].call.name == "next_action"
+            originals = {row["citation"]: row for row in view.original_evidence}
+            for number in (1, 2):
+                assert originals[number]["text"] == texts[number - 1][10:7010]
+                assert originals[number]["truncated"] is True
+            return Decision(answer="The two original ranges apply [1] [2].")
+        arguments: dict[str, JsonValue] = (
+            {
+                "steps": [
+                    {
+                        "id": f"read-{number}",
+                        "tool": "read_evidence",
+                        "arguments": {
+                            "citation": number,
+                            "start_char": 10,
+                            "num_chars": 7000,
+                        },
+                    }
+                    for number in (1, 2)
+                ],
+                "max_parallel": 2,
+            }
+            if step == 0
+            else {}
+        )
+        name = "compose_tool_calls" if step == 0 else "next_action"
+        step += 1
+        call = CapabilityCall(name=name, arguments=arguments, call_id=f"step-{step}")
+        return Decision(
+            calls=[call],
+            assistant_message=AssistantMessage(
+                content=None,
+                tool_calls=[
+                    ToolCall(
+                        id=call.call_id,
+                        function=FunctionCall(
+                            name=name, arguments=json.dumps(arguments)
+                        ),
+                    )
+                ],
+            ),
+        )
+
+    harness = Harness(
+        request="Read two operative ranges",
+        context=context,
+        registry=registry,
+        evidence=ledger,
+        decide=decide,
+    )
+    assert harness.run().status == OutcomeStatus.FOUND
+    restored = Harness(
+        request=harness.request,
+        context=context,
+        registry=registry,
+        evidence=ledger,
+        decide=decide,
+    )
+    restored.restore(harness.snapshot())
+    assert restored.evidence_working_set.export() == [[1, 10, 7010], [2, 10, 7010]]
+    assert (
+        restored.receipts[0].outcome.original_reads
+        == harness.receipts[0].outcome.original_reads
+    )
+
+
+@pytest.mark.parametrize("wrong_hash", [True, False])
+def test_composed_original_pointer_cannot_change_recorded_hash_or_range(
+    wrong_hash: bool,
+) -> None:
+    context, ledger = RunContext(), EvidenceLedger()
+    ledger.add([EvidenceItem(source_id="law", text="Original rule")], context)
+    item = ledger.get(1)
+    assert item is not None
+    receipt = ToolReceipt(
+        call=CapabilityCall(name="compose_tool_calls"),
+        elapsed_seconds=0,
+        outcome=ToolOutcome(
+            status=OutcomeStatus.FOUND,
+            summary="Read",
+            original_reads=[
+                OriginalEvidenceRead(
+                    citation=1,
+                    text_hash="0" * 64 if wrong_hash else item.text_hash,
+                    start_char=0,
+                    end_char=len(item.text) if wrong_hash else len(item.text) + 1,
+                )
+            ],
+        ),
+    )
+    harness = Harness(
+        request="Read a rule",
+        context=context,
+        registry=CapabilityRegistry(),
+        evidence=ledger,
+        decide=lambda _view: Decision(answer="Done"),
+    )
+    with pytest.raises(ValueError, match="differs from this run's original"):
+        harness._commit_receipt(receipt)
+    assert harness.evidence_working_set.export() == []
 
 
 def test_worker_decisions_cannot_spend_coordinator_or_publication_reserve() -> None:

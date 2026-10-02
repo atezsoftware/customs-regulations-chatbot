@@ -427,7 +427,24 @@ class Harness:
                     )
                 )
         receipt.evidence_ids = self.evidence.add(receipt.outcome.evidence, self.context)
-        if receipt.call.name == "read_evidence":
+        reopened_ids: list[int] = []
+        for read in receipt.outcome.original_reads:
+            item = self.evidence.get(read.citation)
+            if (
+                item is None
+                or item.text_hash != read.text_hash
+                or read.end_char > len(item.text)
+            ):
+                raise ValueError("Reopened range differs from this run's original")
+            reopened_ids.append(read.citation)
+        for read in receipt.outcome.original_reads:
+            self.evidence_working_set.remember(
+                read.citation, read.start_char, read.end_char
+            )
+        receipt.evidence_ids = list(
+            dict.fromkeys([*receipt.evidence_ids, *reopened_ids])
+        )
+        if receipt.call.name == "read_evidence" and not receipt.outcome.original_reads:
             number = receipt.call.arguments.get("citation")
             item = self.evidence.get(number) if type(number) is int else None
             if (
@@ -443,6 +460,8 @@ class Harness:
                 self.evidence_working_set.remember(cast(int, number), start, end)
         else:
             for number in receipt.evidence_ids:
+                if number in reopened_ids:
+                    continue
                 item = self.evidence.get(number)
                 if item is not None:
                     self.evidence_working_set.remember(number, 0, len(item.text))
@@ -674,7 +693,7 @@ class Harness:
     def _model_tool_result(self, receipt: ToolReceipt) -> ToolMessage:
         outcome = receipt.outcome.model_dump(mode="json")
         # A compact audit receipt is not the original passage requested by the model.
-        if receipt.call.name == "read_evidence":
+        if receipt.call.name == "read_evidence" and not receipt.outcome.original_reads:
             data = outcome.get("data")
             number = receipt.call.arguments.get("citation")
             if (
@@ -689,11 +708,58 @@ class Harness:
                         cast(int, receipt.call.arguments.get("num_chars", 16000))
                     )
                     data["text"] = item.text[start : start + count]
+        reopened = {read.citation for read in receipt.outcome.original_reads}
         originals = json.loads(
-            self.evidence.serialize_records(receipt.evidence_ids, max_chars=20000)
+            self.evidence.serialize_records(
+                [number for number in receipt.evidence_ids if number not in reopened],
+                max_chars=20000,
+            )
         )
         data = outcome.get("data")
-        if receipt.call.name == "read_evidence" and isinstance(data, dict):
+        if receipt.outcome.original_reads:
+            for read in receipt.outcome.original_reads:
+                item = self.evidence.get(read.citation)
+                if item is None or item.text_hash != read.text_hash:
+                    raise ValueError("Reopened original changed before model delivery")
+                originals.append(
+                    {
+                        "citation": read.citation,
+                        "source_id": item.source_id,
+                        "chunk_id": item.chunk_id,
+                        "text_hash": item.text_hash,
+                        "text": item.text[read.start_char : read.end_char],
+                        "start_char": read.start_char,
+                        "end_char": read.end_char,
+                        "total_chars": len(item.text),
+                        "truncated": read.start_char != 0
+                        or read.end_char != len(item.text),
+                        "question_ids": item.question_ids,
+                    }
+                )
+            identities = {
+                (read.citation, read.text_hash)
+                for read in receipt.outcome.original_reads
+            }
+
+            def without_duplicate_text(value: JsonValue) -> JsonValue:
+                if isinstance(value, dict):
+                    own_original = (
+                        (value.get("citation"), value.get("text_hash")) in identities
+                        if isinstance(value.get("citation"), int)
+                        and isinstance(value.get("text_hash"), str)
+                        else False
+                    )
+                    return {
+                        key: without_duplicate_text(child)
+                        for key, child in value.items()
+                        if key != "text" or not own_original
+                    }
+                if isinstance(value, list):
+                    return [without_duplicate_text(child) for child in value]
+                return value
+
+            outcome["data"] = without_duplicate_text(outcome.get("data", {}))
+        elif receipt.call.name == "read_evidence" and isinstance(data, dict):
             # Respect the requested range; a short peek is not delivery of the full block.
             originals = [
                 {

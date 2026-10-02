@@ -8,6 +8,7 @@ from pydantic import JsonValue
 
 from onyx.asv3.models import (
     CapabilityCall,
+    OriginalEvidenceRead,
     OutcomeStatus,
     RunContext,
     RunStopped,
@@ -171,11 +172,24 @@ def build_core_specs(
         count = args.get("num_chars", 16000)
         assert isinstance(start, int) and isinstance(count, int)
         excerpt = item.text[start : start + count]
+        if not excerpt:
+            return ToolOutcome(
+                status=OutcomeStatus.NOT_FOUND,
+                summary="Requested range is outside the recorded original",
+            )
         return ToolOutcome(
             status=OutcomeStatus.TRUNCATED
             if start + count < len(item.text)
             else OutcomeStatus.FOUND,
             summary="Original recorded evidence",
+            original_reads=[
+                OriginalEvidenceRead(
+                    citation=raw_number,
+                    text_hash=item.text_hash,
+                    start_char=start,
+                    end_char=start + len(excerpt),
+                )
+            ],
             data={
                 "citation": raw_number,
                 "source_id": item.source_id,

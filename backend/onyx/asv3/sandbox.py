@@ -289,6 +289,9 @@ def compose(args: dict[str, JsonValue], context: RunContext) -> ToolOutcome:
             }
         },
         evidence=evidence,
+        original_reads=[
+            read for result in results.values() for read in result.original_reads
+        ],
         artifacts=artifacts,
     )
 
