@@ -1,11 +1,11 @@
 from datetime import datetime, timezone
-from types import SimpleNamespace
 from unittest.mock import Mock, patch
 from uuid import uuid4
 
 from ee.onyx.server.query_history.api import snapshot_from_chat_session
 from ee.onyx.server.query_history.models import ChatSessionMinimal
 from onyx.configs.constants import MessageType
+from onyx.db.models import ChatMessage, ChatSession, Persona, User
 
 
 def _message(
@@ -13,8 +13,8 @@ def _message(
     message_type: MessageType,
     message: str,
     model_display_name: str | None = None,
-) -> SimpleNamespace:
-    return SimpleNamespace(
+) -> ChatMessage:
+    return ChatMessage(
         id=message_id,
         message=message,
         message_type=message_type,
@@ -26,8 +26,14 @@ def _message(
 
 
 def test_snapshot_uses_all_persisted_messages_when_latest_child_is_missing() -> None:
-    chat_session = SimpleNamespace(
-        id=uuid4(), user=None, persona=None, onyxbot_flow=False
+    chat_session = ChatSession(
+        id=uuid4(),
+        user=None,
+        persona=None,
+        onyxbot_flow=False,
+        description="History",
+        persona_id=0,
+        time_created=datetime.now(timezone.utc),
     )
     persisted_messages = [
         _message(1, MessageType.SYSTEM, ""),
@@ -41,10 +47,15 @@ def test_snapshot_uses_all_persisted_messages_when_latest_child_is_missing() -> 
     ]
     db_session = Mock()
 
-    with patch(
-        "ee.onyx.server.query_history.api.get_chat_messages_by_session",
-        return_value=persisted_messages,
-    ) as get_messages:
+    with (
+        patch(
+            "ee.onyx.server.query_history.api.get_chat_messages_by_session",
+            return_value=persisted_messages,
+        ) as get_messages,
+        patch(
+            "ee.onyx.server.query_history.api.get_response_usage", return_value={}
+        ) as get_usage,
+    ):
         snapshot = snapshot_from_chat_session(chat_session, db_session)
 
     assert snapshot is not None
@@ -53,6 +64,7 @@ def test_snapshot_uses_all_persisted_messages_when_latest_child_is_missing() -> 
         "The applicable duty is 10%.",
     ]
     assert snapshot.messages[1].model_display_name == "GPT-5"
+    get_usage.assert_called_once_with(db_session, [1, 2, 3], admin=True)
     get_messages.assert_called_once_with(
         chat_session_id=chat_session.id,
         user_id=None,
@@ -63,12 +75,12 @@ def test_snapshot_uses_all_persisted_messages_when_latest_child_is_missing() -> 
 
 
 def test_minimal_snapshot_includes_each_model_used_in_the_conversation() -> None:
-    chat_session = SimpleNamespace(
+    chat_session = ChatSession(
         id=uuid4(),
-        user=SimpleNamespace(email="admin@example.com"),
+        user=User(email="admin@example.com"),
         description="Duty question",
         persona_id=1,
-        persona=SimpleNamespace(name="Customs Agent"),
+        persona=Persona(name="Customs Agent"),
         time_created=datetime.now(timezone.utc),
         onyxbot_flow=False,
         messages=[

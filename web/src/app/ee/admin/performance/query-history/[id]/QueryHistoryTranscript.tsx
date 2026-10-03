@@ -1,4 +1,5 @@
 "use client";
+import { ResponseUsageView } from "@/sections/chat/usage/ResponseUsage";
 
 import { useMemo, useState } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
@@ -40,11 +41,11 @@ interface SourceGroup {
 const SOURCES_PREVIEW_LIMIT = 6;
 
 function getSourceGroupName(semanticIdentifier: string) {
-  return semanticIdentifier.split(" — ")[0] || semanticIdentifier;
+  return semanticIdentifier.split(/\s[—·]\s/)[0] || semanticIdentifier;
 }
 
 function getSourceReference(semanticIdentifier: string) {
-  const [, ...referenceParts] = semanticIdentifier.split(" — ");
+  const [, ...referenceParts] = semanticIdentifier.split(/\s[—·]\s/);
   return referenceParts.join(" — ");
 }
 
@@ -245,6 +246,7 @@ function AssistantMessage({ message }: TranscriptMessageProps) {
       data-testid="query-history-assistant-message"
     >
       <AssistantMessageMarkdown content={message.message} />
+      <ResponseUsageView usage={message.usage} />
       <div className="flex justify-start">
         <AnswerGraphLink messageId={message.id} />
       </div>

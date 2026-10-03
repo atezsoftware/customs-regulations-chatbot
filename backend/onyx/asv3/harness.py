@@ -9,6 +9,7 @@ from typing import Callable, cast
 from pydantic import JsonValue
 
 from onyx.asv3.artifacts import ArtifactStore, artifact_reference, compact_json
+from onyx.asv3.citation_numbers import extract_citation_numbers
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.models import (
     CapabilityCall,
@@ -277,7 +278,25 @@ class Harness:
             if isinstance(state, ResearchState)
             else []
         )
-        originals = self.evidence_working_set.view(self.evidence, preferred=preferred)
+        required = list(
+            dict.fromkeys(
+                [
+                    *(
+                        state.source_conditions.citations()
+                        if isinstance(state, ResearchState)
+                        else []
+                    ),
+                    *(
+                        extract_citation_numbers(self.last_draft or "")
+                        if self.publication_gap
+                        else []
+                    ),
+                ]
+            )
+        )
+        originals = self.evidence_working_set.view(
+            self.evidence, preferred=preferred, required=required
+        )
         # Receipts retain structured IDs/status while evidence is separately addressable.
         receipts: list[ToolReceipt] = []
         remaining = self.max_context_chars // 3
@@ -318,6 +337,7 @@ class Harness:
             research_state=state.view() if isinstance(state, ResearchState) else {},
             original_evidence=cast(list[dict[str, JsonValue]], originals["records"]),
             original_evidence_omitted=cast(list[JsonValue], originals["omitted"]),
+            required_evidence_numbers=required,
             turns=list(self.turns),
             draft_to_repair=self.last_draft if self.publication_gap else None,
             publication_gap=(

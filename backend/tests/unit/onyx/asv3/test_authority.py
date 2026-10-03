@@ -228,3 +228,50 @@ def test_authority_identity_does_not_copy_original_body() -> None:
     metadata = ledger.authority_metadata()
     assert "LARGE ORIGINAL" not in json.dumps(metadata)
     assert metadata[0]["heading_path"] == ["8917 sayılı Faaliyet Kanunu"]
+
+
+@pytest.mark.parametrize(
+    "instrument", ["Sözleşmenin", "Anlaşmanın", "Convention", "Treaty", "Agreement"]
+)
+def test_later_treaty_cannot_supply_a_statutes_article(instrument: str) -> None:
+    refs = statute_references(
+        f"8917 sayılı Faaliyet Kanunu m. 27 [1] ve {instrument} 45/2-(b) maddesi [2]."
+    )
+    assert [(ref.article, ref.paragraph, ref.clause) for ref in refs] == [
+        ("27", None, None)
+    ]
+
+
+def test_slash_clause_shorthand_uses_canonical_identity_and_requires_citation() -> None:
+    ledger = EvidenceLedger()
+    original = source("kanun", "8917 sayılı Faaliyet Kanunu", "27", "Özel koşul.")
+    original.metadata["clause_label"] = "b"
+    ledger.add([original], RunContext())
+    answer = "8917 sayılı Faaliyet Kanunu Madde 27/b uyarınca özel koşul uygulanır [1]."
+    obligation = authority_obligations(answer, ledger)[0]
+    assert (obligation["article"], obligation["clause"]) == ("27", "b")
+    assert unresolved_authority_gap(answer, ledger) is None
+    assert unresolved_authority_gap(answer.replace("[1]", ""), ledger) is not None
+    assert unresolved_authority_gap(answer.replace("27/b", "27/c"), ledger) is not None
+    # An explicitly capitalized inserted article still needs its own original.
+    assert unresolved_authority_gap(answer.replace("27/b", "27/B"), ledger) is not None
+
+
+def test_real_inserted_article_is_not_satisfied_by_base_article_clause() -> None:
+    ledger = EvidenceLedger()
+    base = source("kanun", "8917 sayılı Faaliyet Kanunu", "27", "Bent hükmü.")
+    base.metadata["clause_label"] = "b"
+    ledger.add(
+        [
+            base,
+            source("kanun", "8917 sayılı Faaliyet Kanunu", "27/B", "Ek madde hükmü."),
+        ],
+        RunContext(),
+    )
+    answer = "8917 sayılı Faaliyet Kanunu Madde 27/B uygulanır [1]."
+    assert unresolved_authority_gap(answer, ledger) is not None
+    assert unresolved_authority_gap(answer.replace("[1]", "[2]"), ledger) is None
+    assert (
+        unresolved_authority_gap(answer.replace("Madde", "Geçici Madde"), ledger)
+        is not None
+    )

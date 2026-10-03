@@ -1,3 +1,4 @@
+import { ResponseUsageView } from "@/sections/chat/usage/ResponseUsage";
 import {
   Table,
   TableHead,
@@ -115,6 +116,9 @@ function QueryHistoryTableRow({
         <Text className="whitespace-normal break-words line-clamp-2">
           {timestampToReadableDate(chatSessionMinimal.time_created)}
         </Text>
+      </TableCell>
+      <TableCell>
+        <ResponseUsageView usage={chatSessionMinimal.usage} compact />
       </TableCell>
     </TableRow>
   );
@@ -359,13 +363,14 @@ export function QueryHistoryTable() {
         <Section>
           <Table className="mt-5 table-fixed">
             <colgroup>
-              <col className="w-[18%]" />
-              <col className="w-[27%]" />
+              <col className="w-[16%]" />
+              <col className="w-[22%]" />
               <col className="w-[8%]" />
               <col className="w-[11%]" />
               <col className="w-[10%]" />
-              <col className="w-[16%]" />
+              <col className="w-[12%]" />
               <col className="w-[10%]" />
+              <col className="w-[11%]" />
             </colgroup>
             <TableHeader>
               <TableRow>
@@ -376,12 +381,13 @@ export function QueryHistoryTable() {
                 <TableHead>Persona</TableHead>
                 <TableHead>AI Model</TableHead>
                 <TableHead>Date</TableHead>
+                <TableHead>Toplam cevap süresi / maliyet</TableHead>
               </TableRow>
             </TableHeader>
             {isLoading ? (
               <TableBody>
                 <TableRow>
-                  <TableCell colSpan={7} className="text-center">
+                  <TableCell colSpan={8} className="text-center">
                     <div className="flex justify-center">
                       <SvgSimpleLoader className="h-6 w-6" />
                     </div>

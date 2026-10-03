@@ -324,6 +324,7 @@ class HarnessView(BaseModel):
     research_state: dict[str, JsonValue] = Field(default_factory=dict)
     original_evidence: list[dict[str, JsonValue]] = Field(default_factory=list)
     original_evidence_omitted: list[JsonValue] = Field(default_factory=list)
+    required_evidence_numbers: list[int] = Field(default_factory=list)
 
 
 class RunStopped(RuntimeError):

@@ -403,6 +403,23 @@ def test_working_set_stores_locators_and_recovers_complete_original_units() -> N
     assert limited["records"] == [] and isinstance(omitted, list) and len(omitted) == 2
 
 
+def test_repair_originals_precede_recent_reads_under_context_pressure() -> None:
+    _, ledger, _ = state_pair()
+    working = EvidenceWorkingSet()
+    recent = ledger.get(2)
+    assert recent is not None
+    working.remember(2, 0, len(recent.text))
+    full = working.view(ledger, preferred=[], required=[1])
+    records = full["records"]
+    assert isinstance(records, list) and isinstance(records[0], dict)
+    capacity = len(json.dumps(records[0], ensure_ascii=False)) + 2
+    bounded = working.view(ledger, preferred=[], required=[1], max_chars=capacity)
+    assert bounded["records"] == records[:1]
+    assert bounded["omitted"] == [
+        {"citation": 2, "start_char": 0, "end_char": len(recent.text)}
+    ]
+
+
 def test_intervening_tools_do_not_erase_originals_or_change_questions() -> None:
     context, ledger, state = state_pair()
     registry = CapabilityRegistry(build_research_specs(state, ledger))

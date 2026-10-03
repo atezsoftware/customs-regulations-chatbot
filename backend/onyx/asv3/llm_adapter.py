@@ -612,11 +612,20 @@ class ResearchModel:
                 list(previous_omissions) if isinstance(previous_omissions, list) else []
             )
             allowance = max(2000, 32000 // (stage + 1))
+            required = compacted.get("required_evidence_numbers")
+            pinned = (
+                {number for number in required if type(number) is int}
+                if isinstance(required, list)
+                else set()
+            )
             for record in originals:
                 if not isinstance(record, dict):
                     continue
                 cost = len(json.dumps(record, ensure_ascii=False))
-                if cost <= allowance:
+                citation = record.get("citation")
+                if (
+                    isinstance(citation, int) and citation in pinned
+                ) or cost <= allowance:
                     retained.append(record)
                     allowance -= cost
                 else:

@@ -31,6 +31,8 @@ import { removeThinkingTokens } from "@/app/app/services/thinkingTokens";
 import { cn } from "@opal/utils";
 import ASv3ProgressPanel from "@/sections/asv3/ASv3ProgressPanel";
 import { useASv3Progress } from "@/lib/asv3/hooks";
+import ChatResponseUsage from "@/sections/chat/usage/ResponseUsage";
+import type { ResponseUsage } from "@/sections/chat/usage/interfaces";
 
 // Type for the regeneration factory function passed from ChatUI
 export type RegenerationFactory = (regenerationRequest: {
@@ -56,6 +58,7 @@ export interface AgentMessageProps {
   parentMessage?: Message | null;
   // Duration in seconds for processing this message (agent messages only)
   processingDurationSeconds?: number;
+  usage?: ResponseUsage | null;
   /** Hide the feedback/toolbar footer (used in multi-model non-preferred panels) */
   hideFooter?: boolean;
   /** Skip TTS streaming (used in multi-model where voice doesn't apply) */
@@ -94,6 +97,7 @@ function arePropsEqual(
     prev.llmManager?.isLoadingProviders ===
       next.llmManager?.isLoadingProviders &&
     prev.processingDurationSeconds === next.processingDurationSeconds &&
+    prev.usage === next.usage &&
     prev.hideFooter === next.hideFooter &&
     prev.asv3 === next.asv3 &&
     prev.fullWidthChat === next.fullWidthChat
@@ -115,6 +119,7 @@ const AgentMessage = React.memo(function AgentMessage({
   onRegenerate,
   parentMessage,
   processingDurationSeconds,
+  usage,
   hideFooter,
   disableTTS,
   fullWidthChat,
@@ -414,6 +419,13 @@ const AgentMessage = React.memo(function AgentMessage({
       </div>
 
       {/* Feedback buttons - only show when streaming and rendering complete */}
+      {isComplete && messageId && (
+        <ChatResponseUsage
+          messageId={messageId}
+          fallbackDuration={processingDurationSeconds}
+          initialUsage={usage}
+        />
+      )}
       {isComplete && !hideFooter && (
         <MessageToolbar
           nodeId={nodeId}

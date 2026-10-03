@@ -1420,6 +1420,7 @@ def build_corpus_specs(broker: CorpusBroker) -> list[ToolSpec]:
                         "type": "string",
                         "minLength": 1,
                         "maxLength": REGULATORY_MAX_SEARCH_QUERY_CHARS,
+                        "description": "Natural-language terms or a focused phrase. This retrieval pipeline does not interpret Boolean AND/OR, parentheses or quoted exact-match syntax. Use independent focused queries for distinct alternatives; source-scoped literal lookup is a separate capability.",
                     },
                     "mode": {
                         "type": "string",

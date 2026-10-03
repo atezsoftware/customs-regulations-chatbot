@@ -156,6 +156,7 @@ export interface SearchSession {
 }
 
 export interface Message {
+  usage?: import("@/sections/chat/usage/interfaces").ResponseUsage | null;
   is_generating?: boolean;
   asv3?: boolean;
   messageId?: number;
@@ -253,6 +254,7 @@ export interface BackendMessage {
   current_feedback: string | null;
   // Duration in seconds for processing this message (agent messages only)
   processing_duration_seconds?: number;
+  usage?: import("@/sections/chat/usage/interfaces").ResponseUsage | null;
 
   sub_questions: SubQuestionDetail[];
   // Keeping existing properties

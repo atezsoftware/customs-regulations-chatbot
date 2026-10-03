@@ -215,5 +215,13 @@ def _build_usage_dict(usage: Any | None) -> dict[str, Any] | None:
         usage_dict["cache_creation_input_tokens"] = cache_creation_input_tokens
     if cost is not None:
         usage_dict["cost"] = cost
+    for field in (
+        "reasoning_tokens",
+        "cache_creation_5m_tokens",
+        "cache_creation_1h_tokens",
+    ):
+        value = getattr(usage, field, None)
+        if value is not None:
+            usage_dict[field] = value
 
     return usage_dict or None

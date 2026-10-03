@@ -11,6 +11,7 @@ from onyx.db.enums import ChatSessionSharedStatus
 from onyx.db.models import ChatSession
 from onyx.file_store.models import FileDescriptor
 from onyx.llm.override_models import LLMOverride
+from onyx.llm.usage_cost import ResponseUsage
 from onyx.server.query_and_chat.streaming_models import Packet
 
 AUTO_PLACE_AFTER_LATEST_MESSAGE = -1
@@ -264,6 +265,7 @@ class ChatMessageDetail(BaseModel):
     error: str | None = None
     current_feedback: str | None = None  # "like" | "dislike" | null
     processing_duration_seconds: float | None = None
+    usage: ResponseUsage | None = None
     preferred_response_id: int | None = None
     model_display_name: str | None = None
 

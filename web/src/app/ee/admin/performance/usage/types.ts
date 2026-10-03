@@ -1,4 +1,5 @@
 import { Feedback, SessionType } from "@/lib/types";
+import type { ResponseUsage } from "@/sections/chat/usage/interfaces";
 
 export interface QueryAnalytics {
   total_queries: number;
@@ -25,6 +26,7 @@ export interface AbridgedSearchDoc {
 }
 
 export interface MessageSnapshot {
+  usage?: ResponseUsage | null;
   id: number;
   message: string;
   message_type: "user" | "assistant";
@@ -47,6 +49,7 @@ export interface ChatSessionSnapshot {
 }
 
 export interface ChatSessionMinimal {
+  usage?: ResponseUsage | null;
   id: string;
   user_email: string | null;
   name: string | null;

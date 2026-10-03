@@ -331,6 +331,7 @@ const ChatUI = React.memo(
                     processingDurationSeconds={
                       message.processingDurationSeconds
                     }
+                    usage={message.usage}
                   />
                 </div>
               );

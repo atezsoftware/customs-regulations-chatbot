@@ -991,6 +991,9 @@ def test_partial_rewrite_verifier_receives_draft_details_and_their_originals(
         if call.kwargs["prompt"][0].content == FINAL_PROMPT
     )
     assert synthesis["draft"] == draft
+    assert synthesis["publication_gap"]["status"] == "partial"
+    assert "Missing condition" in json.dumps(synthesis["publication_gap"])
+    assert synthesis["authority_obligations"] == []
     evidence = json.loads(final_review["evidence"])
     assert {item["citation"] for item in evidence} == {1, 2}
     assert all(item["truncated"] is False for item in evidence)

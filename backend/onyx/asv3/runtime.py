@@ -1012,6 +1012,12 @@ def run_asv3_loop(
                         "question": question,
                         "scenario": scenarios.snapshot(),
                         "draft": draft,
+                        "publication_gap": harness.publication_gap.model_dump(
+                            mode="json"
+                        )
+                        if harness.publication_gap is not None
+                        else None,
+                        "authority_obligations": authority_obligations(draft, ledger),
                         "review": latest_review.model_dump(mode="json")
                         if latest_review
                         else None,
@@ -1104,6 +1110,12 @@ def run_asv3_loop(
                                 "question": question,
                                 "scenario": scenarios.snapshot(),
                                 "draft": draft,
+                                "publication_gap": (
+                                    harness.publication_gap or final_gap
+                                ).model_dump(mode="json"),
+                                "authority_obligations": authority_obligations(
+                                    draft, ledger
+                                ),
                                 "review": latest_review.model_dump(mode="json")
                                 if latest_review
                                 else None,

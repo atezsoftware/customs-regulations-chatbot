@@ -42,6 +42,9 @@ class Usage(BaseModel):
     cache_creation_input_tokens: int
     cache_read_input_tokens: int
     cost: float | None = None
+    reasoning_tokens: int | None = None
+    cache_creation_5m_tokens: int | None = None
+    cache_creation_1h_tokens: int | None = None
 
 
 class ModelResponseStream(BaseModel):
@@ -168,6 +171,15 @@ def _usage_from_usage_data(usage_data: dict[str, Any]) -> Usage:
         )
         or 0,
         cost=usage_data.get("cost"),
+        reasoning_tokens=(usage_data.get("completion_tokens_details") or {}).get(
+            "reasoning_tokens"
+        ),
+        cache_creation_5m_tokens=(usage_data.get("cache_creation") or {}).get(
+            "ephemeral_5m_input_tokens"
+        ),
+        cache_creation_1h_tokens=(usage_data.get("cache_creation") or {}).get(
+            "ephemeral_1h_input_tokens"
+        ),
     )
 
 

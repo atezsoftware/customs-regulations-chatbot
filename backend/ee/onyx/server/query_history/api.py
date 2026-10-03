@@ -45,10 +45,12 @@ from onyx.db.engine.sql_engine import get_session
 from onyx.db.enums import Permission, TaskStatus
 from onyx.db.file_record import get_query_history_export_files
 from onyx.db.models import ChatSession, User
+from onyx.db.response_usage import get_response_usage
 from onyx.db.tasks import get_task_with_id, register_task
 from onyx.error_handling.error_codes import OnyxErrorCode
 from onyx.error_handling.exceptions import OnyxError
 from onyx.file_store.file_store import get_default_file_store
+from onyx.llm.usage_cost import ResponseUsage
 from onyx.server.documents.models import PaginatedReturn
 from onyx.server.query_and_chat.models import ChatSessionDetails, ChatSessionsResponse
 from onyx.server.settings.store import load_settings
@@ -140,6 +142,9 @@ def snapshot_from_chat_session(
     )
 
     flow_type = SessionType.SLACK if chat_session.onyxbot_flow else SessionType.CHAT
+    usage = get_response_usage(
+        db_session, [message.id for message in messages], admin=True
+    )
 
     return ChatSessionSnapshot(
         id=chat_session.id,
@@ -148,7 +153,9 @@ def snapshot_from_chat_session(
         ),
         name=chat_session.description,
         messages=[
-            MessageSnapshot.build(message)
+            MessageSnapshot.build(message).model_copy(
+                update={"usage": usage.get(message.id)}
+            )
             for message in messages
             if message.message_type != MessageType.SYSTEM
         ],
@@ -229,9 +236,43 @@ def get_chat_session_history(
     )
 
     minimal_chat_sessions: list[ChatSessionMinimal] = []
+    usages = get_response_usage(
+        db_session,
+        [message.id for chat in page_of_chat_sessions for message in chat.messages],
+        admin=True,
+    )
 
     for chat_session in page_of_chat_sessions:
         minimal_chat_session = ChatSessionMinimal.from_chat_session(chat_session)
+        responses = [
+            usages[message.id]
+            for message in chat_session.messages
+            if message.id in usages
+        ]
+        if responses:
+            known = [
+                usage.known_cost_usd
+                for usage in responses
+                if usage.known_cost_usd is not None
+            ]
+            durations = [
+                usage.duration_seconds
+                for usage in responses
+                if usage.duration_seconds is not None
+            ]
+            complete = all(usage.status == "complete" for usage in responses)
+            minimal_chat_session.usage = ResponseUsage(
+                duration_seconds=sum(durations) if durations else None,
+                status="complete"
+                if complete
+                else "partial"
+                if known
+                else "unavailable",
+                total_cost_usd=sum(known) if complete else None,
+                known_cost_usd=sum(known) if known else None,
+                calls=sum(usage.calls for usage in responses),
+                unpriced_calls=sum(usage.unpriced_calls for usage in responses),
+            )
         if query_history_type == QueryHistoryType.ANONYMIZED:
             minimal_chat_session.user_email = ONYX_ANONYMIZED_EMAIL
         minimal_chat_sessions.append(minimal_chat_session)

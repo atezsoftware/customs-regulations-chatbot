@@ -68,6 +68,7 @@ from onyx.db.llm import (
 )
 from onyx.db.models import ChatMessage, ChatSessionSharedStatus, Persona, User
 from onyx.db.persona import get_persona_by_id
+from onyx.db.response_usage import get_response_usage
 from onyx.db.tools import get_tools_by_ids
 from onyx.db.usage import UsageType, increment_usage
 from onyx.db.user_file import get_file_id_by_user_file_id
@@ -82,6 +83,7 @@ from onyx.llm.models import (
     parse_user_selectable_reasoning_effort,
 )
 from onyx.llm.override_models import LLMOverride
+from onyx.llm.usage_cost import ResponseUsage
 from onyx.secondary_llm_flows.chat_session_naming import (
     generate_chat_session_name,
     get_fallback_chat_session_name,
@@ -133,6 +135,18 @@ from shared_configs.contextvars import get_current_tenant_id
 logger = setup_logger()
 
 router = APIRouter(prefix="/chat")
+
+
+@router.get("/message/{message_id}/usage")
+def get_message_usage(
+    message_id: int,
+    user: User = Depends(current_chat_accessible_user),
+    db_session: Session = Depends(get_session),
+) -> ResponseUsage:
+    summaries = get_response_usage(db_session, [message_id], user_id=user.id)
+    if message_id not in summaries:
+        raise HTTPException(status_code=404, detail="Message not found")
+    return summaries[message_id]
 
 
 def _get_available_tokens_for_persona(
@@ -428,6 +442,11 @@ def get_chat_session(
     chat_message_details = [
         translate_db_message_to_chat_message_detail(msg) for msg in session_messages
     ]
+    usages = get_response_usage(
+        db_session, [msg.id for msg in session_messages], user_id=user_id
+    )
+    for detail in chat_message_details:
+        detail.usage = usages.get(detail.message_id)
 
     current_run: CurrentRunInfo | None = None
     processing_state_checked = False

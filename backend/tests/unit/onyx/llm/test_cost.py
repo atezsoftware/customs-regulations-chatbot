@@ -152,10 +152,18 @@ class TestComputeCostCents:
         # Output (500 tok @ $10/Mtok) is unaffected by cache reads.
         assert cache_out == pytest.approx(0.5)
 
-    def test_bedrock_model_priced_via_provider(self) -> None:
+    def test_bedrock_model_priced_via_provider(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         # Bedrock names aren't self-identifying — without custom_llm_provider
         # litellm raises and the cost silently collapses to $0. Haiku:
         # $0.25/Mtok in, $1.25/Mtok out → 0.025c in, 0.125c out for 1000 tok.
+        from unittest.mock import Mock
+
+        import litellm
+
+        quote = Mock(return_value=(0.00025, 0.00125))
+        monkeypatch.setattr(litellm, "cost_per_token", quote)
         in_cents, out_cents = compute_cost_cents(
             model="anthropic.claude-3-haiku-20240307-v1:0",
             provider="bedrock",
@@ -164,6 +172,7 @@ class TestComputeCostCents:
         )
         assert in_cents == pytest.approx(0.025)
         assert out_cents == pytest.approx(0.125)
+        assert quote.call_args.kwargs["custom_llm_provider"] == "bedrock"
 
 
 class TestImageFlow:

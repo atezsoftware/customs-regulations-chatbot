@@ -36,6 +36,7 @@ from onyx.db.answer_graph import (
 )
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.db.models import ChatMessage
+from onyx.llm.usage_cost import price_generation
 from onyx.tracing.framework.create import get_current_span, get_current_trace
 from onyx.tracing.framework.processor_interface import TracingProcessor
 from onyx.tracing.framework.span_data import (
@@ -204,6 +205,7 @@ def _span_contents(span: Span[Any]) -> tuple[Any, Any, Any, dict[str, Any], str]
     if isinstance(data, GenerationSpanData):
         attributes: dict[str, Any] = {
             "model": data.model,
+            "provider": (data.model_config or {}).get("model_provider"),
             "usage": redact_graph_value(data.usage),
             "image_count": data.image_count,
             "time_to_first_action_seconds": data.time_to_first_action_seconds,
@@ -314,6 +316,20 @@ class AnswerGraphTracingProcessor(TracingProcessor):
             )
             error = "span_error" if span.error is not None else None
             with get_session_with_current_tenant() as db_session:
+                if isinstance(span.span_data, GenerationSpanData):
+                    data = span.span_data
+                    try:
+                        attributes["usage_cost"] = price_generation(
+                            data.model or "unknown",
+                            (data.model_config or {}).get("model_provider"),
+                            data.usage,
+                            db_session,
+                            data.request_params,
+                        ).model_dump(mode="json")
+                    except Exception:
+                        logger.warning(
+                            "Could not snapshot generation pricing", exc_info=True
+                        )
                 finish_answer_graph_node(
                     db_session,
                     run_id=run_id,

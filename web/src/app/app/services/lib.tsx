@@ -492,6 +492,7 @@ export function processRawChatHistory(
             documents: messageInfo?.context_docs || [],
             citations: messageInfo?.citations || {},
             processingDurationSeconds: messageInfo.processing_duration_seconds,
+            usage: messageInfo.usage,
           }
         : {}),
       toolCall: messageInfo.tool_call,

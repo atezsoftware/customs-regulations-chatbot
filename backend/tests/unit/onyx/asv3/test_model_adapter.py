@@ -68,6 +68,22 @@ def test_repair_context_preserves_exact_draft_and_only_latest_gap() -> None:
     assert llm.invoke.call_count == 1
 
 
+def test_compaction_preserves_repair_originals_and_records_other_omissions() -> None:
+    model = ResearchModel(scripted_model(), RunContext())
+    original: dict[str, JsonValue] = {
+        "citation": 1,
+        "text": "operative condition " * 400,
+    }
+    other: dict[str, JsonValue] = {"citation": 2, "text": "recent background " * 400}
+    payload: dict[str, JsonValue] = {
+        "original_evidence": [original, other],
+        "required_evidence_numbers": [1],
+    }
+    compacted = model._compact_payload(payload, 8)
+    assert compacted["original_evidence"] == [original]
+    assert compacted["original_evidence_omitted"] == [{"citation": 2}]
+
+
 def test_real_adapter_limits_shared_provider_calls_across_worker_contexts() -> None:
     llm = MagicMock(spec=LLM)
     llm.config = LLMConfig(

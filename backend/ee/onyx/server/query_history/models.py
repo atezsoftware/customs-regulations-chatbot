@@ -9,6 +9,7 @@ from onyx.background.task_utils import extract_task_id_from_query_history_report
 from onyx.configs.constants import MessageType, QAFeedbackType, SessionType
 from onyx.db.enums import TaskStatus
 from onyx.db.models import ChatMessage, ChatSession, FileRecord, TaskQueueState
+from onyx.llm.usage_cost import ResponseUsage
 
 
 class AbridgedSearchDoc(BaseModel):
@@ -28,6 +29,7 @@ class MessageSnapshot(BaseModel):
     feedback_type: QAFeedbackType | None
     feedback_text: str | None
     time_created: datetime
+    usage: ResponseUsage | None = None
 
     @classmethod
     def build(cls, message: ChatMessage) -> "MessageSnapshot":
@@ -71,6 +73,7 @@ class MessageSnapshot(BaseModel):
 
 class ChatSessionMinimal(BaseModel):
     id: UUID
+    usage: ResponseUsage | None = None
     user_email: str
     name: str | None
     first_user_message: str

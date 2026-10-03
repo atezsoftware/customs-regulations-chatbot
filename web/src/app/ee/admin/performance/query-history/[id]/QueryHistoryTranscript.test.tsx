@@ -1,6 +1,16 @@
-import { fireEvent, render, screen } from "@testing-library/react";
-import type { MessageSnapshot } from "../../usage/types";
-import QueryHistoryTranscript from "./QueryHistoryTranscript";
+import {
+  fireEvent,
+  render as renderComponent,
+  screen,
+} from "@testing-library/react";
+import { Provider as TooltipProvider } from "@radix-ui/react-tooltip";
+import type { ReactNode } from "react";
+import type { MessageSnapshot } from "@/app/ee/admin/performance/usage/types";
+import QueryHistoryTranscript from "@/app/ee/admin/performance/query-history/[id]/QueryHistoryTranscript";
+
+function render(component: ReactNode) {
+  return renderComponent(<TooltipProvider>{component}</TooltipProvider>);
+}
 
 let mockIsAdmin = false;
 
@@ -80,9 +90,7 @@ describe("QueryHistoryTranscript", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Kaynakları göster" }));
     expect(screen.getByText("Customs Law")).toBeInTheDocument();
-    expect(
-      screen.getByText("Internal tariff schedule")
-    ).toBeInTheDocument();
+    expect(screen.getByText("Internal tariff schedule")).toBeInTheDocument();
 
     fireEvent.click(
       screen.getByRole("button", { name: "Customs Law kaynaklarını göster" })

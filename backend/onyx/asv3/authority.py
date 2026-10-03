@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from pydantic import JsonValue
 
@@ -38,7 +38,9 @@ _SHORTHAND_ARTICLE = re.compile(
 )
 _INSTRUMENT_DESIGNATOR = re.compile(
     r"\b(?:kanun[a-z]*|yonetmeli[kg][a-z]*|teblig[a-z]*|genelge[a-z]*|karar[a-z]*"
-    r"|laws?|acts?|statutes?|regulations?|directives?|decrees?|decisions?|circulars?)\b"
+    r"|sozlesme[a-z]*|anlasma[a-z]*|konvansiyon[a-z]*"
+    r"|laws?|acts?|statutes?|regulations?|directives?|decrees?|decisions?|circulars?"
+    r"|conventions?|treaties|treaty|agreements?)\b"
 )
 
 
@@ -65,14 +67,22 @@ class StatuteReference:
     paragraph: str | None = None
     clause: str | None = None
     qualifier: str | None = None
+    clause_shorthand: bool = False
 
 
 def statute_references(text: str) -> tuple[StatuteReference, ...]:
     # Keep Turkish clause letters distinct while normalizing instrument wording.
-    normalized = "".join(
-        char if char in "çğıöşü" else folded(char)
-        for char in text.replace("**", "").replace("__", "").casefold()
-    ).replace("ı", "i")
+    original = text.replace("**", "").replace("__", "")
+    parts: list[str] = []
+    offsets: list[int] = []
+    for index, char in enumerate(original):
+        part = (
+            char.casefold() if char.casefold() in "çğıöşü" else folded(char)
+        ).replace("ı", "i")
+        parts.append(part)
+        offsets.extend([index] * len(part))
+    offsets.append(len(original))
+    normalized = "".join(parts)
     identity_text = folded(normalized)
     found: dict[
         tuple[str, str | None, str | None, str | None, str | None], StatuteReference
@@ -103,15 +113,22 @@ def statute_references(text: str) -> tuple[StatuteReference, ...]:
             else (None, None, None, None)
         )
         number = match["number"] or match["english_number"]
+        original_reference = original[
+            offsets[match.start()] : offsets[match.end() + len(tail)]
+        ]
+        slash_letter = re.search(
+            r"\b\d+\s*/\s*([a-zçğıöşüA-ZÇĞİÖŞÜ])\b", original_reference
+        )
         found.setdefault(
             (number, article, paragraph, clause, qualifier),
             StatuteReference(
                 number,
                 article,
-                (normalized[match.start() : match.end()] + tail)[:240],
+                original_reference[:240],
                 paragraph,
                 clause,
                 qualifier,
+                slash_letter is not None and slash_letter[1].islower(),
             ),
         )
     return tuple(found.values())
@@ -125,7 +142,7 @@ def authority_obligations(
     originals = ledger.authority_metadata()
     obligations: list[dict[str, JsonValue]] = []
     for reference in statute_references(answer):
-        matching: list[int] = []
+        instrument_originals: list[dict[str, JsonValue]] = []
         for row in originals:
             number = row.get("citation")
             if not isinstance(number, int) or not row.get("citable"):
@@ -139,6 +156,33 @@ def authority_obligations(
             identity = str(metadata.get("title", "")) + " " + str(root)
             if not re.search(rf"(?<!\d){re.escape(reference.number)}(?!\d)", identity):
                 continue
+            instrument_originals.append(row)
+        # Slash letters can denote an inserted article or a clause shorthand.
+        # An actual inserted article takes precedence; never collapse its identity.
+        slash = re.fullmatch(r"(\d+)/([A-ZÇĞİÖŞÜ])", reference.article or "")
+        if (
+            reference.article is not None
+            and reference.clause is None
+            and reference.clause_shorthand
+            and slash is not None
+            and not any(
+                row.get("article_no") == reference.article
+                and row.get("article_qualifier") == reference.qualifier
+                for row in instrument_originals
+            )
+        ):
+            clause = slash[2].lower().replace("i̇", "i")
+            if any(
+                row.get("article_no") == slash[1]
+                and row.get("article_qualifier") == reference.qualifier
+                and row.get("clause_label") == clause
+                for row in instrument_originals
+            ):
+                reference = replace(reference, article=slash[1], clause=clause)
+        matching: list[int] = []
+        for metadata in instrument_originals:
+            number = metadata["citation"]
+            assert isinstance(number, int)
             if (
                 reference.article is not None
                 and str(metadata.get("article_no")) != reference.article

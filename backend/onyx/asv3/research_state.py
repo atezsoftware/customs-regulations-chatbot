@@ -380,7 +380,12 @@ class EvidenceWorkingSet:
             self._ranges.popitem(last=False)
 
     def view(
-        self, ledger: EvidenceLedger, *, preferred: list[int], max_chars: int = 32000
+        self,
+        ledger: EvidenceLedger,
+        *,
+        preferred: list[int],
+        required: list[int] | None = None,
+        max_chars: int = 32000,
     ) -> dict[str, JsonValue]:
         from onyx.asv3.models import model_evidence_metadata
 
@@ -388,6 +393,11 @@ class EvidenceWorkingSet:
         ordered = list(
             dict.fromkeys(
                 [
+                    *(
+                        (n, 0, len(item.text))
+                        for n in required or []
+                        if (item := ledger.get(n)) is not None
+                    ),
                     *ranges,
                     *(
                         (n, 0, len(item.text))
