@@ -17,6 +17,11 @@ from onyx.asv3.models import OutcomeStatus, ToolOutcome
 from onyx.asv3.quotations import normalized, unmatched_quoted_terms
 from onyx.asv3.research_state import ResearchState
 from onyx.asv3.scenario import question_determinations
+from onyx.asv3.source_conditions import (
+    answer_hash,
+    condition_omissions,
+    condition_review_defects,
+)
 
 
 def question_inventory(questions: list[str]) -> list[dict[str, JsonValue]]:
@@ -134,6 +139,7 @@ def publication_gap(
     research_state: ResearchState | None = None,
     require_assertion_checks: bool = False,
     require_determination_checks: bool = False,
+    require_condition_review: bool = False,
 ) -> ToolOutcome | None:
     if review.format_error is not None:
         return ToolOutcome(
@@ -234,6 +240,48 @@ def publication_gap(
                 "Quoted wording has no literal inline-source match or validated translation/application witness."
             )
     allowed = ledger.citation_mapping()
+    condition_defects: list[str] = []
+    condition_delivery: set[int] = set()
+    if review.condition_review is not None:
+        if review.condition_review_answer_hash != answer_hash(answer):
+            condition_defects.append(
+                "Source-condition assessment belongs to a different draft."
+            )
+        condition_defects.extend(
+            condition_review_defects(
+                review.condition_review,
+                answer,
+                scenario,
+                questions,
+                ledger,
+                review.condition_review_call_id,
+            )
+        )
+        if not condition_defects and review.condition_review_call_id:
+            condition_delivery = ledger.completely_delivered(
+                review.condition_review_call_id
+            )
+            if condition_omissions(review.condition_review, answer):
+                reasons.append(
+                    "Independent original review found applicable conditions missing from the answer; correct the retained-source details before publishing."
+                )
+            if any(
+                item.disposition == "uncertain"
+                for item in review.condition_review.conditions
+            ):
+                reasons.append(
+                    "The applicability or interaction of a material original condition remains uncertain; resolve that exact issue rather than asserting it as a missing requirement."
+                )
+    elif (
+        require_sources
+        and require_condition_review
+        and review.safe_to_publish
+        and cited
+    ):
+        condition_defects.append(
+            "An independent original-source condition assessment of this exact draft is required."
+        )
+    reasons.extend(condition_defects)
     if cited - allowed.keys():
         reasons.append("The draft contains unknown or non-citable source numbers.")
     if require_sources and verification_call_id is not None:
@@ -247,7 +295,13 @@ def publication_gap(
                 for part in item.determinations
                 for n in part.evidence_numbers
             }
-            | {item.witness.citation for item in review.omitted_material_source_details}
+            | (
+                {
+                    item.witness.citation
+                    for item in review.omitted_material_source_details
+                }
+                - condition_delivery
+            )
         ) - ledger.completely_delivered(verification_call_id)
         if missing_delivery:
             reasons.append(
@@ -387,6 +441,26 @@ def publication_gap(
             **({"missing": authority_gap["missing"]} if authority_gap else {}),
             **({"unmatched_quoted_terms": quote_gaps} if quote_gaps else {}),
             **({"assertion_gaps": assertion_gaps} if assertion_gaps else {}),
+            **(
+                {"condition_review_defects": condition_defects}
+                if condition_defects
+                else {}
+            ),
+            **(
+                {
+                    "source_condition_gaps": [
+                        item.model_dump(mode="json")
+                        for item in review.condition_review.conditions
+                        if item.disposition in {"omitted", "uncertain"}
+                    ]
+                }
+                if review.condition_review
+                and any(
+                    item.disposition in {"omitted", "uncertain"}
+                    for item in review.condition_review.conditions
+                )
+                else {}
+            ),
             **(
                 {"determination_gaps": determination_gaps} if determination_gaps else {}
             ),

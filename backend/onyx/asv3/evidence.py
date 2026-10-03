@@ -70,6 +70,17 @@ class EvidenceLedger:
         with self._lock:
             return tuple(self._items)
 
+    def delivery_flow(self, call_id: str) -> str | None:
+        with self._lock:
+            return next(
+                (
+                    str(item.get("flow"))
+                    for item in self._deliveries
+                    if item.get("call_id") == call_id
+                ),
+                None,
+            )
+
     def serialize_records(
         self,
         numbers: Iterable[int],

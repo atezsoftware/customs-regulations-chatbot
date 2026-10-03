@@ -14,6 +14,12 @@ import pytest
 
 from onyx.asv3 import runtime
 from onyx.asv3.assertions import assertion_inventory
+from onyx.asv3.evidence import EvidenceLedger
+from onyx.asv3.llm_adapter import (
+    ResearchModel,
+    SourceConditionAuditResult,
+    VerificationResult,
+)
 from onyx.asv3.models import (
     EvidenceItem,
     OutcomeStatus,
@@ -23,6 +29,7 @@ from onyx.asv3.models import (
     ToolOutcome,
     ToolSpec,
 )
+from onyx.asv3.source_conditions import answer_hash, complete_condition_review
 from onyx.cache.interface import CacheBackend
 from onyx.chat.chat_state import ChatStateContainer
 from onyx.chat.emitter import Emitter
@@ -47,6 +54,7 @@ from onyx.server.query_and_chat.streaming_models import (
     CitationInfo,
     Packet,
 )
+from onyx.tracing.flows import LLMFlow
 
 
 def response(
@@ -299,6 +307,8 @@ def setup_run(
         lambda **kwargs: checkpoints.append(kwargs["snapshot"]),
     )
     monkeypatch.setattr(runtime, "load_asv3_checkpoint", lambda **_kwargs: None)
+    # The independent provider boundary has its own contract and runtime-repair tests.
+    monkeypatch.setattr(runtime, "complete_condition_review", scripted_condition_review)
     llm = MagicMock(spec=LLM)
     llm.config = LLMConfig(
         model_provider="openai",
@@ -401,6 +411,100 @@ def setup_run(
         cache=cache,
     )
     return kwargs, broker, llm, checkpoints, queue
+
+
+def scripted_condition_review(
+    review: VerificationResult,
+    _model: ResearchModel,
+    ledger: EvidenceLedger,
+    *,
+    answer: str,
+    evidence: str,
+    **_kwargs: Any,
+) -> VerificationResult:
+    if not review.safe_to_publish or review.format_error:
+        return review
+    records = json.loads(evidence)
+    call_id = "condition-fixture-" + answer_hash(answer)
+    ledger.record_delivery(call_id, LLMFlow.ASV3_CONDITION_REVIEW.value, records)
+    return review.model_copy(
+        update={
+            "condition_review": SourceConditionAuditResult(
+                examined_citations=[row["citation"] for row in records], conditions=[]
+            ),
+            "condition_review_call_id": call_id,
+            "condition_review_answer_hash": answer_hash(answer),
+        }
+    )
+
+
+@pytest.mark.parametrize("provider", ["vertex_ai", "openai", "anthropic"])
+def test_source_condition_audit_repair_preserves_sources_and_selected_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    provider: str,
+) -> None:
+    kwargs, broker, llm, checkpoints, queue = setup_run(monkeypatch)
+    monkeypatch.setattr(runtime, "complete_condition_review", complete_condition_review)
+    llm.config.model_provider = provider
+    source_id = str(broker.sources[0].id)
+    broker.chunks[source_id] = replace(
+        broker.chunks[source_id], text="Tamir şartları. Onaylı belge sunulmalıdır."
+    )
+    script = list(llm.invoke.side_effect)
+    draft = "Tamir [1], değiştirme [2]."
+    final = "Tamir [1], değiştirme [2]. Onaylı belge sunulmalıdır [1]."
+
+    def audit(answer: str, omitted: bool) -> ModelResponse:
+        return response(
+            json.dumps(
+                {
+                    "examined_citations": [1, 2],
+                    "conditions": [
+                        {
+                            "witness": {
+                                "citation": 1,
+                                "source_quote": "Onaylı belge sunulmalıdır.",
+                            },
+                            "determination_ids": ["q0:d0"],
+                            "detail": "Onaylı belge sunulmalıdır.",
+                            "applicability": "Tamir koşulunun gerekli belgesi.",
+                            "disposition": "omitted" if omitted else "covered",
+                            "answer_unit_ids": []
+                            if omitted
+                            else [assertion_inventory(answer)[0]["unit_id"]],
+                        }
+                    ],
+                }
+            )
+        )
+
+    llm.invoke.side_effect = [
+        *script[:3],
+        supported_review([1, 2], draft=draft),
+        audit(draft, True),
+        response(final),
+        supported_review([1, 2], draft=final),
+        audit(final, False),
+    ]
+    runtime.run_asv3_loop(**kwargs)
+    assert llm.invoke.call_count == 8
+    repair = request_data(llm.invoke.call_args_list[5].kwargs)
+    assert repair["draft_to_repair"] == draft
+    assert (
+        repair["publication_gap"]["omitted_material_source_details"][0]["detail"]
+        == "Onaylı belge sunulmalıdır."
+    )
+    saved = checkpoints[-1]
+    assert saved["last_draft"] == final and saved["final_publication_gap"] is None
+    assert (
+        sum(row["call"]["name"] == "read_source_range" for row in saved["receipts"])
+        == 2
+    )
+    assert saved["publication_review"]["condition_review_answer_hash"] == answer_hash(
+        final
+    )
+    emitted = packets(queue)
+    assert any(isinstance(packet.obj, CitationInfo) for packet in emitted)
 
 
 def packets(queue: Queue[Any]) -> list[Packet]:

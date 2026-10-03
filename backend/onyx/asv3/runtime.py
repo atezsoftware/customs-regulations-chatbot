@@ -44,6 +44,7 @@ from onyx.asv3.research_state import ResearchState, build_research_specs
 from onyx.asv3.sandbox import build_sandbox_specs
 from onyx.asv3.scenario import initial_questions
 from onyx.asv3.search_adapter import build_search_adapter
+from onyx.asv3.source_conditions import complete_condition_review
 from onyx.asv3.source_tools import build_source_specs
 from onyx.asv3.supplemental_tools import ScenarioState, build_supplemental_specs
 from onyx.asv3.workers import WorkerPool
@@ -629,6 +630,18 @@ def run_asv3_loop(
             ),
             consume_budget=not research,
         )
+        if profile.requires_sources:
+            latest_review = complete_condition_review(
+                latest_review,
+                model,
+                ledger,
+                answer=draft,
+                scenario=question,
+                questions=view.questions,
+                evidence=evidence,
+                language=context.language,
+                consume_budget=not research,
+            )
         checkpoint(harness.snapshot())
         return latest_review
 
@@ -708,6 +721,7 @@ def run_asv3_loop(
             require_quotation_checks=True,
             require_assertion_checks=True,
             require_determination_checks=profile.requires_sources,
+            require_condition_review=profile.requires_sources,
             research_state=research_state,
         )
         if gap is None:
@@ -838,6 +852,7 @@ def run_asv3_loop(
                 require_quotation_checks=True,
                 require_assertion_checks=True,
                 require_determination_checks=profile.requires_sources,
+                require_condition_review=profile.requires_sources,
                 research_state=research_state,
             )
         else:
@@ -895,6 +910,7 @@ def run_asv3_loop(
                 require_quotation_checks=True,
                 require_assertion_checks=True,
                 require_determination_checks=profile.requires_sources,
+                require_condition_review=profile.requires_sources,
                 research_state=research_state,
             )
         if (
@@ -931,6 +947,7 @@ def run_asv3_loop(
                     require_quotation_checks=True,
                     require_assertion_checks=True,
                     require_determination_checks=profile.requires_sources,
+                    require_condition_review=profile.requires_sources,
                     research_state=research_state,
                 )
             else:
@@ -985,6 +1002,7 @@ def run_asv3_loop(
                         require_quotation_checks=True,
                         require_assertion_checks=True,
                         require_determination_checks=profile.requires_sources,
+                        require_condition_review=profile.requires_sources,
                         research_state=research_state,
                     )
                 complete = False
@@ -1004,6 +1022,7 @@ def run_asv3_loop(
                     require_quotation_checks=True,
                     require_assertion_checks=True,
                     require_determination_checks=profile.requires_sources,
+                    require_condition_review=profile.requires_sources,
                     research_state=research_state,
                 )
                 is None

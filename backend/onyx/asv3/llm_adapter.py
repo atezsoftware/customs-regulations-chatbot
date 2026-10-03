@@ -134,6 +134,18 @@ class MaterialSourceOmission(BaseModel):
     )
 
 
+class SourceConditionCheck(MaterialSourceOmission):
+    disposition: Literal["covered", "omitted", "not_applicable", "uncertain"]
+    answer_unit_ids: list[str] = Field(default_factory=list, max_length=32)
+    scenario_quotes: list[str] = Field(default_factory=list, max_length=6)
+
+
+class SourceConditionAuditResult(BaseModel):
+    model_config = {"extra": "forbid"}
+    examined_citations: list[Annotated[int, Field(strict=True, ge=1)]]
+    conditions: list[SourceConditionCheck] = Field(max_length=64)
+
+
 class VerificationResult(BaseModel):
     status: Literal["supported", "contradicted", "incomplete", "uncertain"]
     explanation: Annotated[str, Field(min_length=1)]
@@ -147,10 +159,13 @@ class VerificationResult(BaseModel):
     need_results: list["NeedVerification"] = Field(default_factory=list)
     omitted_supported_details: list[str] = Field(default_factory=list)
     omitted_material_source_details: list[MaterialSourceOmission] = Field(
-        default_factory=list, max_length=32
+        default_factory=list, max_length=64
     )
     assertion_results: list[AssertionVerification] = Field(default_factory=list)
     format_error: SkipJsonSchema[str | None] = Field(default=None, max_length=500)
+    condition_review: SkipJsonSchema[SourceConditionAuditResult | None] = None
+    condition_review_call_id: SkipJsonSchema[str | None] = None
+    condition_review_answer_hash: SkipJsonSchema[str | None] = None
 
     @model_validator(mode="after")
     def consistent_publication_assessment(self) -> VerificationResult:
@@ -336,6 +351,8 @@ def structured_model(flow: LLMFlow) -> type[BaseModel] | None:
         return LanguageProfile
     if flow == LLMFlow.ASV3_VERIFICATION:
         return VerificationResult
+    if flow == LLMFlow.ASV3_CONDITION_REVIEW:
+        return SourceConditionAuditResult
     return None
 
 
@@ -747,6 +764,13 @@ class ResearchModel:
                     for key in ("claim", "draft")
                     for number in extract_citation_numbers(str(payload.get(key, "")))
                 }
+                required_numbers = payload.get("required_evidence_numbers")
+                if isinstance(required_numbers, list):
+                    cited.update(
+                        number
+                        for number in required_numbers
+                        if type(number) is int and number > 0
+                    )
                 reference = payload.get("preservation_reference")
                 if isinstance(reference, dict):
                     cited.update(
@@ -933,6 +957,7 @@ class ResearchModel:
         max_tokens: int = 6000,
         consume_budget: bool = True,
         response_model_override: type[BaseModel] | None = None,
+        response_validator: Callable[[str], None] | None = None,
     ) -> str:
         self.context.check_active()
         response_model = response_model_override or structured_model(flow)
@@ -988,7 +1013,11 @@ class ResearchModel:
                 normalized_response = normalize_structured_response(
                     text, response_model
                 )
+                if response_validator is not None:
+                    response_validator(normalized_response)
                 return normalized_response
+            if response_validator is not None:
+                response_validator(text)
             return text
 
         try:
