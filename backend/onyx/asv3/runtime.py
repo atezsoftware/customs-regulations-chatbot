@@ -437,29 +437,28 @@ def run_asv3_loop(
             token_counter=token_counter,
         )
         child.consume_research_decision()
-        report = parse_json_object(
-            verifier.invoke_text(
-                VERIFICATION_PROMPT,
-                json.dumps(
-                    {
-                        "language": child.language,
-                        "scenario": question,
-                        "claim": claim,
-                        "evidence": _evidence_record(ledger, anchors),
-                        "available_evidence": ledger.summaries(max_chars=6000),
-                    },
-                    ensure_ascii=False,
-                ),
-                LLMFlow.ASV3_VERIFICATION,
-                max_tokens=2500,
-                consume_budget=False,
-            )
-        )
+        report = verifier.invoke_verification(
+            VERIFICATION_PROMPT,
+            json.dumps(
+                {
+                    "language": child.language,
+                    "scenario": question,
+                    "claim": claim,
+                    "evidence": _evidence_record(ledger, anchors),
+                    "available_evidence": ledger.summaries(max_chars=6000),
+                },
+                ensure_ascii=False,
+            ),
+            max_tokens=2500,
+            consume_budget=False,
+        ).model_dump(mode="json")
         return ToolOutcome(
             status=OutcomeStatus.FOUND
             if report.get("status") == "supported"
             else OutcomeStatus.PARTIAL,
-            summary="Claim checked against original evidence",
+            summary="Original-source assessment format failed; no claim was approved"
+            if report.get("format_error")
+            else "Claim checked against original evidence",
             data=report,
         )
 
@@ -562,7 +561,7 @@ def run_asv3_loop(
         )
         if research:
             context.consume_research_decision()
-        text = model.invoke_text(
+        latest_review = model.invoke_verification(
             VERIFICATION_PROMPT,
             json.dumps(
                 {
@@ -591,7 +590,6 @@ def run_asv3_loop(
                 },
                 ensure_ascii=False,
             ),
-            LLMFlow.ASV3_VERIFICATION,
             max_tokens=max(
                 6000,
                 min(
@@ -605,7 +603,6 @@ def run_asv3_loop(
             ),
             consume_budget=not research,
         )
-        latest_review = VerificationResult.model_validate(parse_json_object(text))
         checkpoint(harness.snapshot())
         return latest_review
 
@@ -679,9 +676,10 @@ def run_asv3_loop(
         if gap is None:
             approved_draft, approved_review, approved_call_id = draft, review, call_id
             approved_questions = list(questions)
-        guard_cache[fingerprint] = (gap, review, call_id, list(questions))
-        if len(guard_cache) > 8:
-            guard_cache.pop(next(iter(guard_cache)))
+        if review.format_error is None:
+            guard_cache[fingerprint] = (gap, review, call_id, list(questions))
+            if len(guard_cache) > 8:
+                guard_cache.pop(next(iter(guard_cache)))
         return gap
 
     harness = Harness(

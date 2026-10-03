@@ -833,6 +833,52 @@ def test_safe_review_with_unsupported_assertions_requires_consistent_repair() ->
     assert llm.invoke.call_count == 2
 
 
+def test_invalid_review_after_repair_returns_unapproved_format_failure() -> None:
+    from onyx.asv3.llm_adapter import PublicationVerificationResult
+
+    llm = scripted_model()
+    contradictory = verification_profile()
+    contradictory["safe_to_publish"] = True
+    contradictory["unsupported_claims"] = ["An assertion has no original support"]
+    contradictory.update(
+        question_results=[], need_results=[], assertion_results=[], quotation_checks=[]
+    )
+    llm.invoke.side_effect = [
+        text_response({"assertion_results": []}),
+        text_response(contradictory),
+    ]
+    review = ResearchModel(llm, RunContext()).invoke_verification(
+        "Verify original evidence",
+        '{"claim":"Exact retained draft","assertion_units":[],"evidence":[]}',
+    )
+    assert llm.invoke.call_count == 2
+    assert review.status == "uncertain" and review.safe_to_publish is False
+    assert "unsupported_claims" in (review.format_error or "")
+    assert review.evidence_numbers == review.missing_conditions == []
+    assert review.question_results == review.assertion_results == []
+    assert (
+        "format_error"
+        not in PublicationVerificationResult.model_json_schema()["properties"]
+    )
+    assert review.model_dump(mode="json")["format_error"] == review.format_error
+
+
+@pytest.mark.parametrize("stopped", [False, True])
+def test_verification_does_not_mask_failures_while_requesting_format_repair(
+    stopped: bool,
+) -> None:
+    from onyx.asv3.models import RunStopped
+
+    llm = scripted_model()
+    error = RunStopped("cancelled") if stopped else ValueError("Unsupported request")
+    llm.invoke.side_effect = [text_response({"assertion_results": []}), error]
+    with pytest.raises(type(error), match=str(error)):
+        ResearchModel(llm, RunContext()).invoke_verification(
+            "Verify originals", '{"claim":"Exact draft","assertion_units":[]}'
+        )
+    assert llm.invoke.call_count == 2
+
+
 def test_publication_review_requires_explicit_assessment_arrays_in_provider_schema() -> (
     None
 ):

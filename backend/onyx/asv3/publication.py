@@ -36,6 +36,15 @@ def publication_gap(
     research_state: ResearchState | None = None,
     require_assertion_checks: bool = False,
 ) -> ToolOutcome | None:
+    if review.format_error is not None:
+        return ToolOutcome(
+            status=OutcomeStatus.PARTIAL,
+            summary="Publication assessment format failed; the draft and originals are retained.",
+            data={
+                "verification_format_error": review.format_error,
+                "instruction": "Request a fresh original-source assessment of this exact draft. A format failure is not a legal evidence gap and does not require rewriting the answer or rereading already retained sources. Publication still requires a valid assessment.",
+            },
+        )
     reasons: list[str] = []
     cited = set(extract_citation_numbers(answer))
     assertion_gaps: list[dict[str, JsonValue]] = []

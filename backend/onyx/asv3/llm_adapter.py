@@ -13,6 +13,7 @@ from typing import Annotated, Literal
 
 import jsonschema
 from pydantic import BaseModel, Field, JsonValue, model_validator
+from pydantic.json_schema import SkipJsonSchema
 
 from onyx.asv3.artifacts import ArtifactStore, compact_json
 from onyx.asv3.assertions import AssertionVerification
@@ -130,9 +131,12 @@ class VerificationResult(BaseModel):
     need_results: list["NeedVerification"] = Field(default_factory=list)
     omitted_supported_details: list[str] = Field(default_factory=list)
     assertion_results: list[AssertionVerification] = Field(default_factory=list)
+    format_error: SkipJsonSchema[str | None] = Field(default=None, max_length=500)
 
     @model_validator(mode="after")
     def consistent_publication_assessment(self) -> VerificationResult:
+        if self.format_error and (self.safe_to_publish or self.status != "uncertain"):
+            raise ValueError("An invalid assessment cannot approve publication")
         if self.safe_to_publish and self.unsupported_claims:
             raise ValueError(
                 "safe_to_publish=true conflicts with unsupported_claims. List actual unsupported assertions there; explicitly disclosed evidence gaps belong in missing_conditions. Reassess the supplied answer and originals."
@@ -159,6 +163,10 @@ class PublicationVerificationResult(VerificationResult):
     need_results: list[NeedVerification] = Field(...)
     assertion_results: list[AssertionVerification] = Field(...)
     quotation_checks: list[QuotationVerification] = Field(...)
+
+
+class StructuredOutputError(ValueError):
+    """The provider's structured output remained invalid after format repair."""
 
 
 def publication_review_inventory(data: str) -> dict[str, set[str]] | None:
@@ -870,17 +878,48 @@ class ResearchModel:
             prompt, tools, output = self._fit(
                 instruction, data, [], max_tokens=max_tokens, repair=correction
             )
-            return valid(
-                self._invoke(
-                    prompt,
-                    tools,
-                    flow,
-                    max_tokens=output,
-                    research=not consume_budget,
-                    structured=False,
-                    response_model=response_model,
-                )
+            repaired = self._invoke(
+                prompt,
+                tools,
+                flow,
+                max_tokens=output,
+                research=not consume_budget,
+                structured=False,
+                response_model=response_model,
             )
+            try:
+                return valid(repaired)
+            except ValueError as repair_error:
+                if response_model is None:
+                    raise
+                raise StructuredOutputError(str(repair_error)) from repair_error
+
+    def invoke_verification(
+        self,
+        instruction: str,
+        data: str,
+        *,
+        max_tokens: int = 6000,
+        consume_budget: bool = True,
+    ) -> VerificationResult:
+        try:
+            text = self.invoke_text(
+                instruction,
+                data,
+                LLMFlow.ASV3_VERIFICATION,
+                max_tokens=max_tokens,
+                consume_budget=consume_budget,
+            )
+        except StructuredOutputError as error:
+            return VerificationResult(
+                status="uncertain",
+                explanation="No valid original-source assessment was returned.",
+                required_conditions=[],
+                missing_conditions=[],
+                evidence_numbers=[],
+                format_error=str(error)[:500],
+            )
+        return VerificationResult.model_validate_json(text)
 
     @staticmethod
     def _decision(

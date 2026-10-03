@@ -346,6 +346,58 @@ def packets(queue: Queue[Any]) -> list[Packet]:
     return result
 
 
+def test_invalid_publication_review_can_reassess_unchanged_draft_without_source_reads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kwargs, broker, llm, checkpoints, queue = setup_run(monkeypatch)
+    script = list(llm.invoke.side_effect)
+    draft = script[2].choice.message.content
+    assert draft is not None
+    contradictory = json.loads(script[3].choice.message.content)
+    contradictory["unsupported_claims"] = ["An assertion has no original support"]
+    llm.invoke.side_effect = script[:3] + [
+        response(json.dumps({"assertion_results": contradictory["assertion_results"]})),
+        response(json.dumps(contradictory)),
+        response(draft),
+        supported_review([1, 2], draft=draft),
+    ]
+    runtime.run_asv3_loop(**kwargs)
+    assert llm.invoke.call_count == 7
+    repair = request_data(llm.invoke.call_args_list[5].kwargs)
+    assert repair["draft_to_repair"] == draft
+    assert "verification_format_error" in repair["publication_gap"]
+    failed = [
+        item
+        for item in checkpoints
+        if (item.get("publication_review") or {}).get("format_error")
+    ]
+    assert failed and all(item["last_draft"] == draft for item in failed)
+    assert all(item["draft_approval"] is None for item in failed)
+    for index in (3, 6):
+        payload = request_data(llm.invoke.call_args_list[index].kwargs)
+        assert payload["claim"] == draft
+        evidence = json.loads(payload["evidence"])
+        assert {item["text"] for item in evidence} == {
+            chunk.text for chunk in broker.chunks.values()
+        }
+        assert not any(item["truncated"] for item in evidence)
+    receipts = checkpoints[-1]["receipts"]
+    assert sum(row["call"]["name"] == "read_source_range" for row in receipts) == 2
+    assert len(checkpoints[-1]["evidence"]["records"]) == 2
+    assert checkpoints[-1]["last_draft"] == draft
+    assert checkpoints[-1]["publication_stop_reason"] == "verified_draft_published"
+    assert (
+        len(
+            [
+                packet
+                for packet in packets(queue)
+                if isinstance(packet.obj, CitationInfo)
+            ]
+        )
+        == 2
+    )
+
+
 @pytest.mark.parametrize(
     "consent,intent", [(False, False), (False, True), (True, False), (True, True)]
 )
