@@ -515,6 +515,40 @@ def packets(queue: Queue[Any]) -> list[Packet]:
     return result
 
 
+def test_host_support_defect_skips_independent_audit_until_targeted_repair(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kwargs, _broker, llm, checkpoints, _queue = setup_run(monkeypatch)
+    monkeypatch.setattr(runtime, "complete_condition_review", complete_condition_review)
+    script = list(llm.invoke.side_effect)
+    bad = "Relevant legislation establishes:\n\nTamir [1], değiştirme [2]."
+    final = "Tamir [1], değiştirme [2]."
+    bad_review = supported_review([1, 2], draft=bad)
+    assert bad_review.choice.message.content is not None
+    assessment = json.loads(bad_review.choice.message.content)
+    assessment["assertion_results"][0].update(basis="presentation", witnesses=[])
+    llm.invoke.side_effect = [
+        *script[:2],
+        response(bad),
+        response(json.dumps(assessment)),
+        response(final),
+        supported_review([1, 2], draft=final),
+        response(json.dumps({"examined_citations": [1, 2], "conditions": []})),
+    ]
+    runtime.run_asv3_loop(**kwargs)
+    assert llm.invoke.call_count == 7
+    repair = request_data(llm.invoke.call_args_list[4].kwargs)
+    assert (
+        repair["publication_gap"]["assertion_gaps"][0]["text"]
+        == "Relevant legislation establishes:"
+    )
+    assert checkpoints[-1]["last_draft"] == final
+    assert checkpoints[-1]["final_publication_gap"] is None
+    assert checkpoints[-1]["publication_review"][
+        "condition_review_answer_hash"
+    ] == answer_hash(final)
+
+
 def test_invalid_publication_review_can_reassess_unchanged_draft_without_source_reads(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

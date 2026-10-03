@@ -4,7 +4,12 @@ import json
 
 import pytest
 
-from onyx.asv3.assertions import AssertionWitness, assertion_inventory
+from onyx.asv3.assertions import (
+    AssertionVerification,
+    AssertionWitness,
+    assertion_inventory,
+    assertion_support_defect,
+)
 from onyx.asv3.llm_adapter import (
     ResearchModel,
     SourceConditionAuditResult,
@@ -406,3 +411,32 @@ def test_repeated_invalid_audit_cannot_publish_or_discard_main_assessment() -> N
         review.question_results == main.question_results
         and review.evidence_numbers == [1]
     )
+
+
+def test_introductory_clause_is_assessed_with_its_first_cited_list_item() -> None:
+    answer = "Under the applicable provisions:\n\n- Release requires a signed certificate [1].\n- A fee is also due [2]."
+    units = assertion_inventory(answer)
+    assert len(units) == 2
+    assert (
+        units[0]["text"]
+        == "Under the applicable provisions:\n\n- Release requires a signed certificate [1]."
+    )
+    assert units[0]["evidence_numbers"] == [1] and not units[0]["presentation_only"]
+    assert units[1]["text"] == "- A fee is also due [2]."
+    check = AssertionVerification(
+        unit_id=units[0]["unit_id"], status="supported", basis="presentation"
+    )
+    assert (
+        assertion_support_defect(
+            units[0], check, {1: "Release requires a signed certificate."}, "facts"
+        )
+        is not None
+    )
+
+
+def test_cited_introductory_claim_is_not_merged_or_hidden_as_presentation() -> None:
+    units = assertion_inventory(
+        "A separate legal claim [1]:\n\n- Release requires a certificate [2]."
+    )
+    assert len(units) == 2
+    assert units[0]["evidence_numbers"] == [1] and units[1]["evidence_numbers"] == [2]

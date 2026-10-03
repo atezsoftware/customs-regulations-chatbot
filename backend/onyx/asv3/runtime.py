@@ -631,17 +631,41 @@ def run_asv3_loop(
             consume_budget=not research,
         )
         if profile.requires_sources:
-            latest_review = complete_condition_review(
-                latest_review,
-                model,
-                ledger,
-                answer=draft,
-                scenario=question,
-                questions=view.questions,
-                evidence=evidence,
-                language=context.language,
-                consume_budget=not research,
+            latest_review = latest_review.model_copy(
+                update={
+                    "condition_review": None,
+                    "condition_review_call_id": None,
+                    "condition_review_answer_hash": None,
+                }
             )
+            # Fix already-detected support defects before paying for another assessment.
+            ordinary_gap = publication_gap(
+                draft,
+                latest_review,
+                view.questions,
+                ledger,
+                require_sources=True,
+                allow_explicit_gaps=not research,
+                verification_call_id=model.last_call_id,
+                require_direct_authority=latest_review.status == "supported",
+                scenario=question,
+                require_quotation_checks=True,
+                require_assertion_checks=True,
+                require_determination_checks=True,
+                research_state=research_state,
+            )
+            if ordinary_gap is None:
+                latest_review = complete_condition_review(
+                    latest_review,
+                    model,
+                    ledger,
+                    answer=draft,
+                    scenario=question,
+                    questions=view.questions,
+                    evidence=evidence,
+                    language=context.language,
+                    consume_budget=not research,
+                )
         checkpoint(harness.snapshot())
         return latest_review
 

@@ -146,8 +146,21 @@ def assertion_inventory(answer: str) -> list[AssertionUnit]:
             lines.append(line)
         if lines:
             blocks.append("\n".join(lines).strip())
-    units: list[AssertionUnit] = []
+    bound_blocks: list[str] = []
     for block in blocks:
+        if (
+            bound_blocks
+            and bound_blocks[-1].endswith(":")
+            and not presentation_block(bound_blocks[-1])
+            and not extract_citation_numbers(bound_blocks[-1])
+            and re.match(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)", block)
+        ):
+            # An introductory clause and its first list item form one cited assertion.
+            bound_blocks[-1] += "\n\n" + block
+        else:
+            bound_blocks.append(block)
+    units: list[AssertionUnit] = []
+    for block in bound_blocks:
         if not block:
             continue
         numbers = extract_citation_numbers(block)
