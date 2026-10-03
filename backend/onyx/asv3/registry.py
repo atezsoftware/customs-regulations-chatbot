@@ -105,6 +105,18 @@ class CapabilityRegistry:
                     "maxItems": 2,
                     "description": "Optional short title and natural action description in the question language; no tool names or paths.",
                 }
+            if context.services.get("lean_native_mode"):
+                # Native system prompts explain shared metadata once.
+                for name in (
+                    "_language",
+                    "_notifications",
+                    "_external_requested",
+                    "_need_id",
+                    "_public_update",
+                ):
+                    metadata = properties.get(name)
+                    if isinstance(metadata, dict):
+                        metadata.pop("description", None)
             definitions.append(definition)
         return definitions
 
