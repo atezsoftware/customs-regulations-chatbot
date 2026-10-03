@@ -31,6 +31,53 @@ from onyx.asv3.workers import WorkerPool
 from onyx.llm.models import AssistantMessage, FunctionCall, ToolCall
 
 
+def test_invalid_argument_checkpoint_cannot_poison_a_valid_empty_call() -> None:
+    context = RunContext()
+    calls: list[dict[str, JsonValue]] = []
+
+    def execute(arguments: dict[str, JsonValue], _context: RunContext) -> ToolOutcome:
+        calls.append(arguments)
+        return ToolOutcome(status=OutcomeStatus.FOUND, summary="Read complete")
+
+    registry = CapabilityRegistry(
+        [
+            ToolSpec(
+                name="read_chunk",
+                description="Read",
+                parameters={"type": "object"},
+                handler=execute,
+            )
+        ]
+    )
+    harness = Harness(
+        request="Read",
+        context=context,
+        registry=registry,
+        decide=lambda _view: Decision(answer="Done"),
+    )
+    invalid = CapabilityCall(
+        name="read_chunk",
+        call_id="broken",
+        argument_error="Malformed JSON",
+        invalid_arguments_hash="0" * 64,
+    )
+    assert harness._dispatch([invalid])[0].outcome.status == OutcomeStatus.INVALID
+    restored = Harness(
+        request="Read",
+        context=context,
+        registry=registry,
+        decide=lambda _view: Decision(answer="Done"),
+    )
+    restored.restore(harness.snapshot())
+    assert restored.receipts[0].call.argument_error == "Malformed JSON"
+    repeated = invalid.model_copy(update={"call_id": "broken-again"})
+    assert restored._dispatch([repeated])[0].outcome.status == OutcomeStatus.INVALID
+    valid = CapabilityCall(name="read_chunk", call_id="valid")
+    assert restored._dispatch([valid])[0].outcome.status == OutcomeStatus.FOUND
+    assert calls == [{}]
+    assert context.budget.snapshot()["tools"] == 1
+
+
 def test_original_action_text_is_delivered_and_identical_read_reuses_global_evidence() -> (
     None
 ):

@@ -334,6 +334,8 @@ class Harness:
 
     @staticmethod
     def _tool_progress_phase(call: CapabilityCall) -> str | None:
+        if call.argument_error is not None:
+            return None
         if call.name in {
             "record_scenario",
             "update_research",
@@ -474,12 +476,7 @@ class Harness:
             OutcomeStatus.ERROR,
             OutcomeStatus.DENIED,
         ):
-            self._seen_failures.add(
-                json.dumps(
-                    {"name": receipt.call.name, "arguments": receipt.call.arguments},
-                    sort_keys=True,
-                )
-            )
+            self._seen_failures.add(self._call_signature(receipt.call))
         receipt.outcome.artifacts = self.artifacts.add(
             receipt.outcome.artifacts, self.context
         )
@@ -578,6 +575,24 @@ class Harness:
             sort_keys=True,
         )
 
+    @staticmethod
+    def _call_signature(call: CapabilityCall) -> str:
+        return json.dumps(
+            {
+                "name": call.name,
+                "arguments": call.arguments,
+                **(
+                    {
+                        "invalid_arguments_hash": call.invalid_arguments_hash,
+                        "argument_error": call.argument_error,
+                    }
+                    if call.argument_error is not None
+                    else {}
+                ),
+            },
+            sort_keys=True,
+        )
+
     def _dispatch(self, calls: list[CapabilityCall]) -> list[ToolReceipt]:
         # Local mutations establish bindings before dependent I/O in the same decision.
         mutations = [call for call in calls if call.name == "update_research"]
@@ -594,9 +609,7 @@ class Harness:
         ready: dict[str, ToolReceipt] = {}
         try:
             for call in calls:
-                signature = json.dumps(
-                    {"name": call.name, "arguments": call.arguments}, sort_keys=True
-                )
+                signature = self._call_signature(call)
                 if call.call_id in self._seen_calls or signature in self._seen_failures:
                     ready[call.call_id] = ToolReceipt(
                         call=call,
@@ -607,7 +620,11 @@ class Harness:
                         ),
                     )
                     continue
-                cached = self._completed_reads.get(self._read_signature(call))
+                cached = (
+                    self._completed_reads.get(self._read_signature(call))
+                    if call.argument_error is None
+                    else None
+                )
                 if cached is not None:
                     ready[call.call_id] = ToolReceipt(
                         call=call,

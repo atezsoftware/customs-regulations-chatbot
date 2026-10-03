@@ -563,11 +563,7 @@ def test_tool_json_and_schema_get_one_selected_model_repair_before_dispatch() ->
     assert llm.config.model_name == "selected-model"
 
 
-def test_repeated_malformed_tool_call_fails_after_one_repair_and_keeps_sources() -> (
-    None
-):
-    import pytest
-
+def test_repeated_malformed_arguments_return_feedback_and_keep_sources() -> None:
     from onyx.asv3.models import HarnessView
 
     context, ledger, tools = original_state()
@@ -578,21 +574,147 @@ def test_repeated_malformed_tool_call_fails_after_one_repair_and_keeps_sources()
     ]
     model = ResearchModel(llm, context)
     before = ledger.export()
-    with pytest.raises(ValueError):
-        model.decide(
-            HarnessView(
-                request="read",
-                questions=[],
-                facts=[],
-                receipts=[],
-                evidence=[],
-                tools=tools,
-            )
+    decision = model.decide(
+        HarnessView(
+            request="read",
+            questions=[],
+            facts=[],
+            receipts=[],
+            evidence=[],
+            tools=tools,
         )
+    )
+    assert decision.calls[0].argument_error
+    assert decision.calls[0].invalid_arguments_hash
+    assert decision.calls[0].arguments == {}
+    assert decision.assistant_message
+    assert decision.assistant_message.tool_calls
+    assert decision.assistant_message.tool_calls[0].function.arguments == '{"citation":'
     assert llm.invoke.call_count == 2
     assert ledger.export() == before
     assert context.budget.model_slots.acquire(blocking=False)
     context.budget.model_slots.release()
+
+
+@pytest.mark.parametrize(
+    "bad_arguments",
+    [
+        '{"needs":',
+        json.dumps({"needs": '[{"need_id":"first"}], "active_need_ids":["first"]'}),
+    ],
+)
+def test_argument_feedback_then_corrected_call_continues_actual_harness(
+    bad_arguments: str,
+) -> None:
+    from onyx.asv3.harness import Harness
+    from onyx.asv3.models import OutcomeStatus, ToolOutcome, ToolSpec
+    from onyx.asv3.registry import CapabilityRegistry
+
+    context, ledger, _ = original_state()
+    executed: list[dict[str, JsonValue]] = []
+
+    def action(arguments: dict[str, JsonValue], _context: RunContext) -> ToolOutcome:
+        executed.append(arguments)
+        return ToolOutcome(status=OutcomeStatus.FOUND, summary="Recorded")
+
+    registry = CapabilityRegistry(
+        [
+            ToolSpec(
+                name="update_research",
+                description="Retain research needs",
+                parameters={
+                    "type": "object",
+                    "properties": {"needs": {"type": "array"}},
+                    "additionalProperties": False,
+                },
+                handler=action,
+            )
+        ]
+    )
+    llm = scripted_model()
+    corrected = tool_response("{}", "update_research")
+    assert corrected.choice.message.tool_calls
+    corrected.choice.message.tool_calls[0].id = "corrected-2"
+    llm.invoke.side_effect = [
+        tool_response(bad_arguments, "update_research"),
+        tool_response(bad_arguments, "update_research"),
+        corrected,
+        ModelResponse(
+            id="final", created="0", choice=Choice(message=Message(content="Done"))
+        ),
+    ]
+    model = ResearchModel(llm, context)
+    before = ledger.export()
+    result = Harness(
+        request="Plan the original questions",
+        context=context,
+        registry=registry,
+        evidence=ledger,
+        decide=model.decide,
+    ).run()
+    assert result.status == OutcomeStatus.FOUND
+    assert executed == [{}]
+    assert context.budget.snapshot()["tools"] == 1
+    assert llm.invoke.call_count == 4
+    assert result.receipts[0].outcome.status == OutcomeStatus.INVALID
+    assert "no action" in result.receipts[0].outcome.summary
+    after = ledger.export()
+    assert {key: value for key, value in after.items() if key != "deliveries"} == {
+        key: value for key, value in before.items() if key != "deliveries"
+    }
+    messages = llm.invoke.call_args_list[2].kwargs["prompt"]
+    feedback = [message for message in messages if message.role == "tool"]
+    if bad_arguments == '{"needs":':
+        assert feedback == []
+        content = messages[-1].content
+        assert isinstance(content, list)
+        assert json.loads(content[0].text)["receipts"][0]["call"]["argument_error"]
+    else:
+        assert len(feedback) == 1
+        assert feedback[0].tool_call_id == "call-1"
+        body = json.loads(feedback[0].content)
+        assert body["outcome"]["data"]["argument_error"]
+        assert body["original_evidence"] == []
+
+
+def test_failed_repair_keeps_valid_parallel_call_and_native_arguments() -> None:
+    from onyx.asv3.models import HarnessView, OutcomeStatus
+    from onyx.asv3.registry import CapabilityRegistry, build_core_specs
+
+    context, ledger, tools = original_state()
+    first = tool_response('{"citation":1}')
+    broken = tool_response('{"citation":"1"}')
+    assert first.choice.message.tool_calls and broken.choice.message.tool_calls
+    broken.choice.message.tool_calls[0].id = "broken-2"
+    first.choice.message.tool_calls += broken.choice.message.tool_calls
+    llm = scripted_model()
+    llm.invoke.side_effect = [first, copy.deepcopy(first)]
+    decision = ResearchModel(llm, context).decide(
+        HarnessView(
+            request="Read",
+            questions=[],
+            facts=[],
+            receipts=[],
+            evidence=[],
+            tools=tools,
+        )
+    )
+    assert decision.calls[0].argument_error is None
+    assert decision.calls[1].argument_error is not None
+    assert decision.assistant_message and decision.assistant_message.tool_calls
+    assert (
+        decision.assistant_message.tool_calls[1].function.arguments
+        == '{"citation":"1"}'
+    )
+    registry = CapabilityRegistry()
+    for spec in build_core_specs(registry, ledger, lambda: {}):
+        registry.register(spec)
+    before = ledger.export()
+    assert registry.dispatch(decision.calls[1], context).status == OutcomeStatus.INVALID
+    assert context.budget.snapshot()["tools"] == 0
+    assert registry.dispatch(decision.calls[0], context).status == OutcomeStatus.FOUND
+    assert context.budget.snapshot()["tools"] == 1
+    assert ledger.export() == before
 
 
 def test_language_json_repair_uses_original_request_and_same_selected_model() -> None:

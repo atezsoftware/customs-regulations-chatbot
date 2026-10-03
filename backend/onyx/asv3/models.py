@@ -223,6 +223,8 @@ class CapabilityCall(BaseModel):
     name: str
     arguments: dict[str, JsonValue] = Field(default_factory=dict)
     call_id: str = Field(default_factory=lambda: str(uuid4()))
+    argument_error: str | None = Field(default=None, max_length=350)
+    invalid_arguments_hash: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
 
 
 class Decision(BaseModel):

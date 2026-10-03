@@ -88,6 +88,15 @@ class CapabilityRegistry:
                     status=OutcomeStatus.DENIED,
                     summary="External access is disabled for this run",
                 )
+            if call.argument_error is not None:
+                return ToolOutcome(
+                    status=OutcomeStatus.INVALID,
+                    summary="Invalid arguments; no action was executed",
+                    data={
+                        "argument_error": call.argument_error,
+                        "instruction": "Send a new call with valid JSON values matching the exposed schema. Keep arrays/objects as JSON values, not quoted JSON strings. Do not change the scenario or invent sources.",
+                    },
+                )
             try:
                 arguments = {
                     key: value

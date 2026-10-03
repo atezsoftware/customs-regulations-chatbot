@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import random
 import time
@@ -507,7 +508,9 @@ class ResearchModel:
             data = json.dumps(payload, ensure_ascii=False)
         # The ledger/checkpoint retains the audit. Provider continuity needs only
         # the most recent complete pair with its original provider call IDs.
-        turns = list(turns[-1:]) if research and turns else []
+        turns = (
+            self._provider_compatible_turns(turns[-1:]) if research and turns else []
+        )
 
         def prompt(text: str) -> list[ChatCompletionMessage]:
             result: list[ChatCompletionMessage] = [SystemMessage(content=instruction)]
@@ -881,7 +884,10 @@ class ResearchModel:
 
     @staticmethod
     def _decision(
-        response: ModelResponse, tools: list[dict[str, JsonValue]]
+        response: ModelResponse,
+        tools: list[dict[str, JsonValue]],
+        *,
+        return_argument_errors: bool = False,
     ) -> Decision:
         definitions = {
             function["name"]: function.get("parameters", {})
@@ -894,22 +900,39 @@ class ResearchModel:
             if (
                 not call.id
                 or not call.function.name
-                or not call.function.arguments
+                or call.function.arguments is None
                 or call.function.name not in definitions
             ):
                 raise ValueError("Malformed or unexposed ASv3 tool call")
-            args = parse_json_object(call.function.arguments)
+            args: dict[str, JsonValue] = {}
+            argument_error = None
             try:
+                args = parse_json_object(call.function.arguments)
                 jsonschema.Draft202012Validator(
                     definitions[call.function.name]
                 ).validate(args)
             except jsonschema.ValidationError as error:
-                raise ValueError(
+                argument_error = (
                     "Tool arguments violate the exposed schema at "
                     + "/".join(str(p) for p in error.absolute_path)
-                ) from error
+                    + f" ({error.validator})"
+                )[:300]
+            except ValueError:
+                argument_error = "Tool arguments must be a complete JSON object"
+            if argument_error and not return_argument_errors:
+                raise ValueError(argument_error)
             calls.append(
-                CapabilityCall(name=call.function.name, arguments=args, call_id=call.id)
+                CapabilityCall(
+                    name=call.function.name,
+                    arguments=args,
+                    call_id=call.id,
+                    argument_error=argument_error,
+                    invalid_arguments_hash=hashlib.sha256(
+                        call.function.arguments.encode()
+                    ).hexdigest()
+                    if argument_error
+                    else None,
+                )
             )
         if len(calls) > 32 or len({call.call_id for call in calls}) != len(calls):
             raise ValueError("Invalid tool-call count or duplicate identities")
@@ -934,6 +957,20 @@ class ResearchModel:
             ),
         )
 
+    @staticmethod
+    def _provider_compatible_turns(turns: list[ResearchTurn]) -> list[ResearchTurn]:
+        compatible: list[ResearchTurn] = []
+        for turn in turns:
+            try:
+                for call in turn.assistant.tool_calls or []:
+                    # Some providers parse historical arguments before sending them.
+                    if not isinstance(json.loads(call.function.arguments), dict):
+                        raise ValueError("Historical arguments are not an object")
+            except ValueError:
+                continue
+            compatible.append(turn)
+        return compatible
+
     def decide(self, view: HarnessView) -> Decision:
         from onyx.asv3.working_memory import WorkingMemory
 
@@ -948,7 +985,9 @@ class ResearchModel:
         if isinstance(working_memory, WorkingMemory):
             payload["working_locators"] = working_memory.view()
         latest_ids = {
-            result.tool_call_id for turn in view.turns[-1:] for result in turn.results
+            result.tool_call_id
+            for turn in self._provider_compatible_turns(view.turns[-1:])
+            for result in turn.results
         }
         failed = [
             receipt
@@ -1074,9 +1113,11 @@ class ResearchModel:
                 research=True,
                 turns=view.turns,
             )
+            repaired_response = self._invoke(
+                prompt, tools, flow, max_tokens=output, research=True
+            )
             decision = self._decision(
-                self._invoke(prompt, tools, flow, max_tokens=output, research=True),
-                tools,
+                repaired_response, tools, return_argument_errors=True
             )
             originals = response.choice.message.tool_calls or []
             if originals and len(originals) != len(decision.calls):
