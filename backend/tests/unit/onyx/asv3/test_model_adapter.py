@@ -457,6 +457,22 @@ def tool_response(arguments: str, name: str = "read_evidence") -> ModelResponse:
     )
 
 
+def argument_patch_response(
+    arguments_json: str | None, call_id: str = "call-1"
+) -> ModelResponse:
+    return text_response(
+        {
+            "entries": [
+                {
+                    "call_id": call_id,
+                    "arguments_json": arguments_json,
+                    "explanation": "Repair only the invalid JSON value.",
+                }
+            ]
+        }
+    )
+
+
 def test_vertex_tool_normalization_does_not_mutate_decision_validation_schema() -> None:
     from litellm.llms.vertex_ai.common_utils import _build_vertex_schema
 
@@ -537,7 +553,7 @@ def test_tool_json_and_schema_get_one_selected_model_repair_before_dispatch() ->
     llm = scripted_model()
     llm.invoke.side_effect = [
         tool_response('{"citation":"1"}'),
-        tool_response('{"citation":1}'),
+        argument_patch_response('{"citation":1}'),
     ]
     model = ResearchModel(llm, context)
     view = HarnessView(
@@ -559,7 +575,11 @@ def test_tool_json_and_schema_get_one_selected_model_repair_before_dispatch() ->
         if isinstance(llm.invoke.call_args_list[1].kwargs["prompt"][1].content, list)
         else llm.invoke.call_args_list[1].kwargs["prompt"][1].content
     )
-    assert "format_repair" in correction and "Do not invent" in correction
+    payload = json.loads(correction)
+    assert payload["invalid_actions"][0]["arguments_json"] == '{"citation":"1"}'
+    assert "Do not invent" in llm.invoke.call_args_list[1].kwargs["prompt"][0].content
+    assert llm.invoke.call_args_list[1].kwargs["tools"] is None
+    assert llm.invoke.call_args_list[1].kwargs["structured_response_format"]
     assert llm.config.model_name == "selected-model"
 
 
@@ -570,7 +590,7 @@ def test_repeated_malformed_arguments_return_feedback_and_keep_sources() -> None
     llm = scripted_model()
     llm.invoke.side_effect = [
         tool_response('{"citation":'),
-        tool_response('{"citation":'),
+        argument_patch_response('{"citation":'),
     ]
     model = ResearchModel(llm, context)
     before = ledger.export()
@@ -637,7 +657,7 @@ def test_argument_feedback_then_corrected_call_continues_actual_harness(
     corrected.choice.message.tool_calls[0].id = "corrected-2"
     llm.invoke.side_effect = [
         tool_response(bad_arguments, "update_research"),
-        tool_response(bad_arguments, "update_research"),
+        argument_patch_response(None),
         corrected,
         ModelResponse(
             id="final", created="0", choice=Choice(message=Message(content="Done"))
@@ -1351,8 +1371,6 @@ def test_final_review_removes_only_uncited_supplemental_context() -> None:
 
 
 def test_schema_repair_cannot_drop_an_already_valid_parallel_action() -> None:
-    import pytest
-
     from onyx.asv3.models import HarnessView
 
     context, _ledger, tools = original_state()
@@ -1362,22 +1380,31 @@ def test_schema_repair_cannot_drop_an_already_valid_parallel_action() -> None:
     assert invalid.choice.message.tool_calls and first.choice.message.tool_calls
     invalid.choice.message.tool_calls[0].id = "call-2"
     first.choice.message.tool_calls += invalid.choice.message.tool_calls
-    repair = tool_response('{"citation":2}')
-    assert repair.choice.message.tool_calls
-    repair.choice.message.tool_calls[0].id = "call-2"
+    repair = argument_patch_response('{"citation":2}', "call-2")
     llm.invoke.side_effect = [first, repair]
     model = ResearchModel(llm, context)
-    with pytest.raises(ValueError, match="action count"):
-        model.decide(
-            HarnessView(
-                request="Read both",
-                questions=[],
-                facts=[],
-                receipts=[],
-                evidence=[],
-                tools=tools,
-            )
+    decision = model.decide(
+        HarnessView(
+            request="Read both",
+            questions=[],
+            facts=[],
+            receipts=[],
+            evidence=[],
+            tools=tools,
         )
+    )
+    assert [call.call_id for call in decision.calls] == ["call-1", "call-2"]
+    assert [call.arguments for call in decision.calls] == [
+        {"citation": 1},
+        {"citation": 2},
+    ]
+    assert all(call.argument_error is None for call in decision.calls)
+    assert decision.assistant_message and decision.assistant_message.tool_calls
+    assert (
+        decision.assistant_message.tool_calls[0].function.arguments == '{"citation":1}'
+    )
+    payload = json.loads(llm.invoke.call_args_list[1].kwargs["prompt"][1].content)
+    assert [action["call_id"] for action in payload["invalid_actions"]] == ["call-2"]
     assert llm.invoke.call_count == 2
 
 
