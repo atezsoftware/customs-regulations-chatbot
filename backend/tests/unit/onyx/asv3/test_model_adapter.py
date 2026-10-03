@@ -733,7 +733,7 @@ def test_failed_repair_keeps_valid_parallel_call_and_native_arguments() -> None:
     assert registry.dispatch(decision.calls[1], context).status == OutcomeStatus.INVALID
     assert context.budget.snapshot()["tools"] == 0
     assert registry.dispatch(decision.calls[0], context).status == OutcomeStatus.FOUND
-    assert context.budget.snapshot()["tools"] == 1
+    assert context.budget.snapshot()["tools"] == 0
     assert ledger.export() == before
 
 

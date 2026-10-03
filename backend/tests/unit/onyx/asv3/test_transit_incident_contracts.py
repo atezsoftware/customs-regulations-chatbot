@@ -3,15 +3,91 @@
 import json
 
 import pytest
+from pydantic import JsonValue
 
 from onyx.asv3.assertions import assertion_inventory, presentation_block
 from onyx.asv3.llm_adapter import ResearchModel
-from onyx.asv3.models import HarnessView, RunContext, RunStopped
+from onyx.asv3.models import (
+    CapabilityCall,
+    HarnessView,
+    OutcomeStatus,
+    RunContext,
+    RunStopped,
+    ToolOutcome,
+    ToolSpec,
+)
 from onyx.asv3.publication import publication_gap
+from onyx.asv3.registry import CapabilityRegistry, build_core_specs
+from onyx.asv3.research_state import ResearchUpdate
 from onyx.asv3.runtime import _evidence_record  # pyright: ignore[reportPrivateUsage]
 from onyx.llm.model_response import Choice, Message, ModelResponse
 from tests.unit.onyx.asv3.test_model_adapter import scripted_model, text_response
+from tests.unit.onyx.asv3.test_research_state import need, state_pair
 from tests.unit.onyx.asv3.test_safe_partial_conditions import partial_case
+
+
+def test_recorded_original_is_readable_after_external_research_capacity_is_used() -> (
+    None
+):
+    context, ledger, state = state_pair()
+    state.update(ResearchUpdate.model_validate({"needs": [need()]}), ledger)
+    registry = CapabilityRegistry()
+    for spec in build_core_specs(registry, ledger, lambda: {}):
+        registry.register(spec)
+    registry.register(
+        ToolSpec(
+            name="new_research",
+            description="Retrieve additional material",
+            parameters={"type": "object"},
+            handler=lambda _args, _context: ToolOutcome(
+                status=OutcomeStatus.FOUND, summary="New material"
+            ),
+        )
+    )
+    context.budget.consume("tools", context.budget.limits["tools"])
+    before = context.budget.snapshot()
+    result = registry.dispatch(
+        CapabilityCall(
+            name="read_evidence", arguments={"citation": 1, "_need_id": "basis"}
+        ),
+        context,
+    )
+    original = ledger.get(1)
+    assert original is not None
+    assert result.status == OutcomeStatus.FOUND
+    assert result.data["text"] == original.text
+    assert result.original_reads[0].text_hash == original.text_hash
+    assert context.budget.snapshot() == before
+    assert (
+        registry.dispatch(CapabilityCall(name="new_research"), context).status
+        == OutcomeStatus.TRUNCATED
+    )
+
+
+@pytest.mark.parametrize("defect", ["invalid_need", "invalid_range", "cancelled"])
+def test_recorded_read_capacity_exemption_preserves_access_guards(defect: str) -> None:
+    context, ledger, state = state_pair()
+    state.require_need_bindings = True
+    state.update(ResearchUpdate.model_validate({"needs": [need()]}), ledger)
+    registry = CapabilityRegistry()
+    for spec in build_core_specs(registry, ledger, lambda: {}):
+        registry.register(spec)
+    context.budget.consume("tools", context.budget.limits["tools"])
+    arguments: dict[str, JsonValue] = {"citation": 1, "_need_id": "basis"}
+    if defect == "invalid_need":
+        arguments["_need_id"] = "unknown"
+    elif defect == "invalid_range":
+        arguments["start_char"] = -1
+    else:
+        context.cancel()
+    result = registry.dispatch(
+        CapabilityCall(name="read_evidence", arguments=arguments), context
+    )
+    assert result.status == (
+        OutcomeStatus.CANCELLED if defect == "cancelled" else OutcomeStatus.INVALID
+    )
+    assert not result.original_reads
+    assert not result.data.get("text")
 
 
 @pytest.mark.parametrize("provider", ["vertex_ai", "anthropic", "openai"])

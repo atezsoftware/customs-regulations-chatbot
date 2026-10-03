@@ -254,6 +254,7 @@ class ToolSpec(BaseModel):
     parameters: dict[str, JsonValue]
     handler: Callable[[dict[str, JsonValue], RunContext], ToolOutcome]
     parallel_safe: bool = True
+    consumes_tool_budget: bool = True
     external: bool = False
     orchestrates: bool = False
     requires_research_need: bool = False

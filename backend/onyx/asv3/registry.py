@@ -151,7 +151,8 @@ class CapabilityRegistry:
                     summary="Arguments do not match the capability schema",
                     data={"path": [str(part) for part in error.absolute_path]},
                 )
-            context.budget.consume("tools")
+            if spec.consumes_tool_budget:
+                context.budget.consume("tools")
             acquired = False
             if not spec.orchestrates:
                 while not acquired:
@@ -347,6 +348,7 @@ def build_core_specs(
         ),
         ToolSpec(
             name="read_evidence",
+            consumes_tool_budget=False,
             requires_research_need=True,
             description="Read immutable original evidence by global citation number; use offsets for complete text.",
             parameters={
