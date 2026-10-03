@@ -267,6 +267,8 @@ def normalize_structured_response(text: str, response_model: type[BaseModel]) ->
         value, end = decoder.raw_decode(text, start)
         offset = end
         if isinstance(value, dict):
+            if set(value) == {"parameter"} and isinstance(value["parameter"], dict):
+                value = value["parameter"]
             try:
                 candidates.append(response_model.model_validate(value))
             except ValueError as error:

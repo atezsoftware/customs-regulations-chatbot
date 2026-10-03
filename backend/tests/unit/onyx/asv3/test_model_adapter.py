@@ -1028,6 +1028,69 @@ def test_wrapped_structured_objects_preserve_strict_rejection(defect: str) -> No
         normalize_structured_response("Çıktı:\n" + raw, LanguageProfile)
 
 
+@pytest.mark.parametrize("native", [False, True])
+def test_parameter_envelope_preserves_negative_review_without_format_repair(
+    native: bool,
+) -> None:
+    llm = scripted_model()
+    review = verification_profile()
+    review.update(
+        status="incomplete",
+        safe_to_publish=False,
+        unsupported_claims=["The stated outcome lacks original support"],
+        missing_conditions=["An operative prerequisite is not addressed"],
+        omitted_supported_details=["A documented later procedural step was lost"],
+        question_results=[],
+        need_results=[],
+        assertion_results=[],
+        quotation_checks=[],
+    )
+    envelope = {"parameter": review}
+    llm.invoke.return_value = (
+        tool_response(json.dumps(envelope), "json_tool_call")
+        if native
+        else text_response(envelope)
+    )
+    result = ResearchModel(llm, RunContext()).invoke_verification(
+        "Verify originals", '{"claim":"Exact draft","assertion_units":[]}'
+    )
+    assert llm.invoke.call_count == 1
+    assert result.format_error is None and result.safe_to_publish is False
+    for key, value in review.items():
+        assert result.model_dump(mode="json")[key] == value
+
+
+@pytest.mark.parametrize(
+    "defect",
+    ["extra", "string", "array", "invalid", "duplicate", "nonfinite", "ambiguous"],
+)
+def test_parameter_envelope_never_salvages_invalid_or_competing_assessments(
+    defect: str,
+) -> None:
+    from onyx.asv3.llm_adapter import VerificationResult, normalize_structured_response
+
+    body = verification_profile()
+    raw = json.dumps({"parameter": body})
+    if defect == "extra":
+        raw = json.dumps({"parameter": body, "metadata": "unknown envelope"})
+    elif defect == "string":
+        raw = json.dumps({"parameter": json.dumps(body)})
+    elif defect == "array":
+        raw = json.dumps({"parameter": [body]})
+    elif defect == "invalid":
+        raw = json.dumps({"parameter": {"evidence_numbers": [1]}})
+    elif defect == "duplicate":
+        raw = raw.replace(
+            '"status": "supported"', '"status": "supported", "status": "uncertain"'
+        )
+    elif defect == "nonfinite":
+        raw = raw.replace('"evidence_numbers": [1]', '"evidence_numbers": [NaN]')
+    else:
+        raw += "\n" + raw
+    with pytest.raises(ValueError):
+        normalize_structured_response(raw, VerificationResult)
+
+
 @pytest.mark.parametrize("error_kind", ["rate_limit", "timeout", "server"])
 def test_transient_provider_retry_preserves_model_schema_and_shared_budget(
     error_kind: str, monkeypatch: pytest.MonkeyPatch

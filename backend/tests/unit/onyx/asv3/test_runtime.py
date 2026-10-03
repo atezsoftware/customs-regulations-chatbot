@@ -398,6 +398,31 @@ def test_invalid_publication_review_can_reassess_unchanged_draft_without_source_
     )
 
 
+def test_runtime_parameter_review_keeps_publication_checks_without_regeneration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kwargs, _broker, llm, checkpoints, queue = setup_run(monkeypatch)
+    script = list(llm.invoke.side_effect)
+    assessment = json.loads(script[3].choice.message.content)
+    script[3] = response(json.dumps({"parameter": assessment}))
+    llm.invoke.side_effect = script
+    runtime.run_asv3_loop(**kwargs)
+    assert llm.invoke.call_count == 4
+    assert checkpoints[-1]["publication_stop_reason"] == "verified_draft_published"
+    assert checkpoints[-1]["publication_review"]["format_error"] is None
+    assert checkpoints[-1]["last_draft"] == script[2].choice.message.content
+    assert (
+        len(
+            [
+                packet
+                for packet in packets(queue)
+                if isinstance(packet.obj, CitationInfo)
+            ]
+        )
+        == 2
+    )
+
+
 @pytest.mark.parametrize(
     "consent,intent", [(False, False), (False, True), (True, False), (True, True)]
 )
