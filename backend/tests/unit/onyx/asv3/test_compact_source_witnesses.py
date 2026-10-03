@@ -111,6 +111,78 @@ def test_catalogue_preserves_original_provenance_and_counts_in_delivery_budget()
     assert ledger.completely_delivered(model.last_call_id) == {1}
 
 
+@pytest.mark.parametrize("provider", ["vertex_ai", "openai", "anthropic"])
+def test_preferred_citations_prioritize_but_do_not_hide_uncited_originals_from_review(
+    provider: str,
+) -> None:
+    ledger, context, answer, data, review = review_fixture(bad_quote=False)
+    evidence = _evidence_record(
+        ledger,
+        answer,
+        preferred_numbers=[2],
+        include_witness_spans=True,
+        include_supplemental_originals=True,
+    )
+    rows = json.loads(evidence)
+    assert [row["citation"] for row in rows] == [1, 2, 3]
+    for row in rows:
+        original = ledger.get(row["citation"])
+        assert original is not None
+        assert row["text"] == original.text and row["text_hash"] == original.text_hash
+        assert row["truncated"] is False
+    review.omitted_material_source_details = [
+        MaterialSourceOmission(
+            witness=AssertionWitness(
+                citation=3, witness_id=rows[2]["witness_spans"][0]["witness_id"]
+            ),
+            determination_ids=["q0:d0"],
+            detail="A separate original contains an applicable prerequisite.",
+            applicability="The uncited implementing rule affects this requested outcome.",
+        )
+    ]
+    payload = json.loads(data)
+    payload["evidence"] = evidence
+    llm = scripted_model()
+    llm.config.model_provider = provider
+    llm.invoke.return_value = text_response(review.model_dump(mode="json"))
+    model = ResearchModel(llm, context)
+    result = model.invoke_verification(
+        "Check material original conditions", json.dumps(payload)
+    )
+    assert llm.invoke.call_count == 1 and model.last_call_id is not None
+    assert ledger.completely_delivered(model.last_call_id) == {1, 2, 3}
+    gap = publication_gap(
+        answer,
+        result,
+        ["Does the condition apply?"],
+        ledger,
+        verification_call_id=model.last_call_id,
+    )
+    assert gap is not None and "separate original" in str(gap.data)
+    # Other consumers keep their existing priority-only selection contract.
+    assert [
+        row["citation"]
+        for row in json.loads(_evidence_record(ledger, answer, preferred_numbers=[2]))
+    ] == [1, 2]
+
+
+def test_supplemental_originals_share_budget_without_clipping_required_originals() -> (
+    None
+):
+    ledger, _context = original_ledger()
+    required = _evidence_record(ledger, "Rule [1].", include_witness_spans=True)
+    bounded = _evidence_record(
+        ledger,
+        "Rule [1].",
+        max_chars=len(required),
+        preferred_numbers=[2],
+        include_witness_spans=True,
+        include_supplemental_originals=True,
+    )
+    assert bounded == required and len(bounded) <= len(required)
+    assert ledger.citation_numbers() == (1, 2, 3)
+
+
 @pytest.mark.parametrize(
     ("original", "answer", "detail"),
     [

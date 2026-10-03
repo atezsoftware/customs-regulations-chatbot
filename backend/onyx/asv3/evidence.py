@@ -65,6 +65,11 @@ class EvidenceLedger:
                 if item.search_doc is not None
             }
 
+    def citation_numbers(self) -> tuple[int, ...]:
+        """Enumerate retained originals without copying passage text."""
+        with self._lock:
+            return tuple(self._items)
+
     def serialize_records(
         self,
         numbers: Iterable[int],

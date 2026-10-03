@@ -994,6 +994,15 @@ class ResearchModel:
         try:
             return valid(response)
         except ValueError as error:
+            repair_max_tokens = max_tokens
+            truncated = response.choice.finish_reason in {"length", "max_tokens"}
+            if truncated and response_model is not None:
+                repair_max_tokens = max(max_tokens, output * 2)
+                _, repair_allowance = self._limits(repair_max_tokens)
+                if repair_allowance <= output:
+                    raise StructuredOutputError(
+                        "Structured assessment exceeded available output capacity; an identical-capacity retry cannot repair truncation. Partition the assessment or reduce redundant output, retaining required originals."
+                    ) from error
             if consume_budget:
                 self.context.budget.consume("decisions")
             else:
@@ -1001,13 +1010,25 @@ class ResearchModel:
             correction = json.dumps(
                 {
                     "format_repair": str(error)[:300],
-                    "previous_output": (response.choice.message.content or "")[:1000],
-                    "instruction": "Repair the output format once. Preserve the original request and sources; do not invent facts or evidence.",
+                    **(
+                        {
+                            "previous_output": (response.choice.message.content or "")[
+                                :1000
+                            ]
+                        }
+                        if not truncated
+                        else {}
+                    ),
+                    "instruction": "Complete the assessment once using the increased output allowance. Keep positive entries compact and preserve all requested IDs, negative conditions and original sources. Do not invent facts or evidence."
+                    if truncated and response_model is not None
+                    else "Complete the response once. Preserve the original request and sources; do not invent facts or evidence."
+                    if truncated
+                    else "Repair the output format once. Preserve the original request and sources; do not invent facts or evidence.",
                 },
                 ensure_ascii=False,
             )
             prompt, tools, output = self._fit(
-                instruction, data, [], max_tokens=max_tokens, repair=correction
+                instruction, data, [], max_tokens=repair_max_tokens, repair=correction
             )
             repaired = self._invoke(
                 prompt,

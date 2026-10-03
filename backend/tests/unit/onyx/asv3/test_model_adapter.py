@@ -1010,6 +1010,88 @@ def test_final_answer_remains_free_text_without_structured_schema() -> None:
     assert llm.invoke.call_args.kwargs["structured_response_format"] is None
 
 
+@pytest.mark.parametrize("finish_reason", ["length", "max_tokens"])
+def test_truncated_structured_review_grows_one_repair_without_losing_originals(
+    finish_reason: str,
+) -> None:
+    from onyx.asv3.llm_adapter import VerificationResult
+    from tests.unit.onyx.asv3.test_citation_contract import original_ledger
+
+    ledger, context = original_ledger()
+    data = json.dumps(
+        {
+            "claim": "Condition [1]",
+            "evidence": ledger.serialize_records([1], required=[1]),
+        }
+    )
+    llm = scripted_model()
+    truncated = text_response(verification_profile())
+    truncated.choice.finish_reason = finish_reason
+    complete = verification_profile()
+    complete["status"] = "incomplete"
+    complete["missing_conditions"] = ["An operative exception remains unresolved."]
+    llm.invoke.side_effect = [truncated, text_response(complete)]
+    model = ResearchModel(llm, context)
+    result = model.invoke_text(
+        "Review original conditions", data, LLMFlow.ASV3_VERIFICATION, max_tokens=1000
+    )
+    assert (
+        VerificationResult.model_validate_json(result).missing_conditions
+        == complete["missing_conditions"]
+    )
+    assert [call.kwargs["max_tokens"] for call in llm.invoke.call_args_list] == [
+        1000,
+        2000,
+    ]
+    assert context.budget.snapshot()["decisions"] == 2
+    for call in llm.invoke.call_args_list:
+        supplied = json.loads(call.kwargs["prompt"][1].content)
+        assert supplied == json.loads(data)
+        assert call.kwargs["reasoning_effort"] == model.reasoning_effort
+    repair = json.loads(llm.invoke.call_args_list[-1].kwargs["prompt"][-1].content)
+    assert "previous_output" not in repair and "increased" in repair["instruction"]
+    assert model.last_call_id is not None
+    assert ledger.completely_delivered(model.last_call_id) == {1}
+
+
+def test_output_policy_cap_does_not_repeat_impossible_identical_capacity_review() -> (
+    None
+):
+    llm = scripted_model(limit=12000)
+    truncated = text_response(verification_profile())
+    truncated.choice.finish_reason = "length"
+    llm.invoke.return_value = truncated
+    context = RunContext()
+    result = ResearchModel(llm, context).invoke_verification(
+        "Review originals",
+        '{"claim":"Condition [1]","evidence":"Original rule"}',
+        max_tokens=3000,
+    )
+    assert (
+        llm.invoke.call_count == 1 and llm.invoke.call_args.kwargs["max_tokens"] == 3000
+    )
+    assert context.budget.snapshot()["decisions"] == 1
+    assert result.safe_to_publish is False and result.status == "uncertain"
+    assert "identical-capacity" in str(result.format_error)
+
+
+def test_second_length_failure_cannot_approve_parseable_partial_assessment() -> None:
+    llm = scripted_model()
+    truncated = text_response(verification_profile())
+    truncated.choice.finish_reason = "length"
+    llm.invoke.return_value = truncated
+    result = ResearchModel(llm, RunContext()).invoke_verification(
+        "Review originals",
+        '{"claim":"Rule [1]","evidence":"Original rule"}',
+        max_tokens=1000,
+    )
+    assert [call.kwargs["max_tokens"] for call in llm.invoke.call_args_list] == [
+        1000,
+        2000,
+    ]
+    assert result.safe_to_publish is False and "truncated" in str(result.format_error)
+
+
 def test_wrapped_unique_structured_object_is_normalized_without_repair() -> None:
     from onyx.asv3.llm_adapter import LanguageProfile
 

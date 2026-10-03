@@ -135,6 +135,7 @@ def _evidence_record(
     *,
     preferred_numbers: list[int] | None = None,
     include_witness_spans: bool = False,
+    include_supplemental_originals: bool = False,
 ) -> str:
     numbers = list(extract_citation_numbers(draft))
     required = tuple(n for n in numbers if ledger.get(n) is not None)
@@ -154,6 +155,8 @@ def _evidence_record(
         numbers = [
             n for item in ledger.summaries() if isinstance(n := item["citation"], int)
         ]
+    if include_supplemental_originals:
+        numbers = list(dict.fromkeys([*numbers, *ledger.citation_numbers()]))
     return ledger.serialize_records(
         numbers,
         required=required,
@@ -581,6 +584,7 @@ def run_asv3_loop(
             max_chars=max(8000, min(180000, (llm.config.max_input_tokens - 18000) * 2)),
             preferred_numbers=research_state.preferred_citations(),
             include_witness_spans=True,
+            include_supplemental_originals=True,
         )
         if research:
             context.consume_research_decision()
