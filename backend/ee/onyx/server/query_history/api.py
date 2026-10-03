@@ -272,6 +272,9 @@ def get_chat_session_history(
                 known_cost_usd=sum(known) if known else None,
                 calls=sum(usage.calls for usage in responses),
                 unpriced_calls=sum(usage.unpriced_calls for usage in responses),
+                excluded_service_calls=sum(
+                    usage.excluded_service_calls for usage in responses
+                ),
             )
         if query_history_type == QueryHistoryType.ANONYMIZED:
             minimal_chat_session.user_email = ONYX_ANONYMIZED_EMAIL

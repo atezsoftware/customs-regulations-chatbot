@@ -42,6 +42,7 @@ class ResponseUsage(BaseModel):
     currency: Literal["USD"] = "USD"
     calls: int = 0
     unpriced_calls: int = 0
+    excluded_service_calls: int = 0
     models: list[GenerationCost] = Field(default_factory=list)
 
 

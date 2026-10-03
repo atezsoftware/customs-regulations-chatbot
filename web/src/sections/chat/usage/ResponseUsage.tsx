@@ -73,8 +73,13 @@ export function ResponseUsageView({
       </summary>
       <div className="flex flex-col gap-3 pt-2">
         <Text font="secondary-body" color="text-03">
-          {`${usage.calls} model çağrısı; araştırma ve denetim çağrıları dahildir. Token × birim fiyat / 1.000.000. Reasoning, output toplamından ayrılarak bir kez hesaplanır. Sağlayıcı faturası, vergi ve ek hizmet ücretleri bu tahmine dahil değildir.`}
+          {`${usage.calls} LLM çağrısı; araştırma ve denetim çağrıları dahildir. Token × birim fiyat / 1.000.000. Reasoning, output toplamından ayrılarak bir kez hesaplanır. Sağlayıcı faturası, vergi ve ek hizmet ücretleri bu tahmine dahil değildir.`}
         </Text>
+        {!!usage.excluded_service_calls && (
+          <Text font="secondary-body" color="text-03">
+            {`${usage.excluded_service_calls} embedding, reranker veya diğer model hizmeti çağrısı LLM token toplamına dahil değildir.`}
+          </Text>
+        )}
         {usage.unpriced_calls > 0 && (
           <Text font="secondary-body" color="text-03">
             {`${usage.unpriced_calls} çağrının fiyat veya token kaydı eksik.`}

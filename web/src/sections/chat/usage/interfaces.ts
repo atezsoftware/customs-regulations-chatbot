@@ -24,5 +24,6 @@ export interface ResponseUsage {
   currency: "USD";
   calls: number;
   unpriced_calls: number;
+  excluded_service_calls?: number;
   models: GenerationCost[];
 }

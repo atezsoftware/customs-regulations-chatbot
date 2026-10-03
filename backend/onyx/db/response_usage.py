@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 from onyx.configs.constants import MessageType
 from onyx.db.models import AnswerGraphNode, AnswerGraphRun, ChatMessage, ChatSession
 from onyx.llm.usage_cost import GenerationCost, ResponseUsage, token_count
+from onyx.tracing.flows import IMAGE_FLOWS, LLMFlow
 from shared_configs.contextvars import get_current_tenant_id
 
 
@@ -71,14 +72,28 @@ def get_response_usage(
             AnswerGraphNode.run_id,
             AnswerGraphNode.attributes,
             AnswerGraphNode.capture_status,
+            AnswerGraphNode.operation,
         ).where(
             AnswerGraphNode.run_id.in_(by_run), AnswerGraphNode.kind == "generation"
         )
     )
     groups: dict[int, dict[str, GenerationCost]] = defaultdict(dict)
-    for run_id, attributes, capture in generations:
+    service_flows = {
+        *IMAGE_FLOWS,
+        LLMFlow.EMBED_QUERY,
+        LLMFlow.EMBED_PASSAGE,
+        LLMFlow.REGULATORY_EMBEDDING_BATCH,
+        LLMFlow.RERANK,
+        LLMFlow.INTENT_CLASSIFICATION,
+        LLMFlow.STT,
+        LLMFlow.TTS,
+    }
+    for run_id, attributes, capture, operation in generations:
         message_id = by_run[run_id]
         summary = summaries[message_id]
+        if operation in service_flows:
+            summary.excluded_service_calls += 1
+            continue
         summary.calls += 1
         try:
             cost = GenerationCost.model_validate(attributes.get("usage_cost"))
