@@ -46,6 +46,26 @@ class CapabilityRegistry:
             assert isinstance(parameters, dict)
             properties = parameters.setdefault("properties", {})
             assert isinstance(properties, dict)
+            if context.services.get("lean_native_mode"):
+                properties["_language"] = {
+                    "type": "string",
+                    "pattern": r"^[a-zA-Z]{2,3}(?:-[a-zA-Z0-9]{2,8})*$",
+                    "description": "Requested answer language (BCP-47); provide alongside a useful action, without a separate profile call.",
+                }
+                properties["_notifications"] = {
+                    "type": "object",
+                    "description": "Optional localized short terminal messages for languages other than Turkish/English: phase maps to [title, natural sentence].",
+                    "additionalProperties": {
+                        "type": "array",
+                        "minItems": 2,
+                        "maxItems": 2,
+                        "items": {"type": "string"},
+                    },
+                }
+                properties["_external_requested"] = {
+                    "type": "boolean",
+                    "description": "True only when the user explicitly requested outside/web sources; host authorization still applies.",
+                }
             if spec.name not in {
                 "update_research",
                 "inspect_research",
@@ -142,7 +162,14 @@ class CapabilityRegistry:
                 arguments = {
                     key: value
                     for key, value in call.arguments.items()
-                    if key not in {"_public_update", "_need_id"}
+                    if key
+                    not in {
+                        "_public_update",
+                        "_need_id",
+                        "_language",
+                        "_notifications",
+                        "_external_requested",
+                    }
                 }
                 jsonschema.Draft202012Validator(spec.parameters).validate(arguments)
             except jsonschema.ValidationError as error:

@@ -52,6 +52,7 @@ class Harness:
         draft_guard: Callable[[str], ToolOutcome | None] | None = None,
         partial_submission: Callable[[], str | None] | None = None,
         report_terminal: bool = True,
+        on_decision: Callable[[Decision], None] | None = None,
     ) -> None:
         self.request = request
         self.context = context
@@ -67,6 +68,7 @@ class Harness:
         self.draft_guard = draft_guard
         self.partial_submission = partial_submission
         self.report_terminal = report_terminal
+        self.on_decision = on_decision
         artifacts = self.context.services.get("artifacts")
         self.artifacts = (
             artifacts if isinstance(artifacts, ArtifactStore) else ArtifactStore()
@@ -348,6 +350,8 @@ class Harness:
         )
 
     def _trim_turns(self) -> None:
+        if self.context.services.get("lean_native_mode"):
+            return
         while self.turns and (
             len(self.turns) > 6
             or sum(len(turn.model_dump_json()) for turn in self.turns) > 120000
@@ -571,7 +575,14 @@ class Harness:
         arguments = {
             key: value
             for key, value in call.arguments.items()
-            if key not in {"_public_update", "_need_id"}
+            if key
+            not in {
+                "_public_update",
+                "_need_id",
+                "_language",
+                "_notifications",
+                "_external_requested",
+            }
         }
         number = arguments.get("citation")
         if (
@@ -604,7 +615,18 @@ class Harness:
         return json.dumps(
             {
                 "name": call.name,
-                "arguments": call.arguments,
+                "arguments": {
+                    key: value
+                    for key, value in call.arguments.items()
+                    if key
+                    not in {
+                        "_public_update",
+                        "_need_id",
+                        "_language",
+                        "_notifications",
+                        "_external_requested",
+                    }
+                },
                 **(
                     {
                         "invalid_arguments_hash": call.invalid_arguments_hash,
@@ -684,6 +706,21 @@ class Harness:
                 }
             # Persist locators before execution; an interrupted batch is never replayed.
             self._save()
+            prepared_searches: dict[str, object] = {}
+            prepare_search_batch = self.context.services.get("prepare_search_batch")
+            if callable(prepare_search_batch):
+                batch = prepare_search_batch(
+                    [
+                        call
+                        for call in calls
+                        if call.call_id not in ready
+                        and call.name == "search_corpus"
+                        and call.argument_error is None
+                    ],
+                    self.context,
+                )
+                if isinstance(batch, dict):
+                    prepared_searches = batch
             for call in calls:
                 if call.call_id in ready:
                     self._commit_receipt(ready[call.call_id])
@@ -691,6 +728,10 @@ class Harness:
                 child = self.context.child()
                 # Tools are not delegated researchers; keep their delegation depth unchanged.
                 child.depth = self.context.depth
+                if call.call_id in prepared_searches:
+                    child.services["search_batch_tool"] = prepared_searches[
+                        call.call_id
+                    ]
                 captured = contextvars.copy_context()
                 future = cast(
                     Future[ToolReceipt],
@@ -852,13 +893,18 @@ class Harness:
                     and limit >= 16
                 ):
                     limit -= 8
-                if budget.snapshot()["tools"] >= limit:
+                if (
+                    not budget.unlimited_execution
+                    and budget.snapshot()["tools"] >= limit
+                ):
                     raise RunStopped(
                         "Shared tools budget exhausted; recorded originals retained for finalization"
                     )
                 self.context.consume_research_decision()
                 decision = self.decide(self.view())
                 self.context.check_active()
+                if self.on_decision:
+                    self.on_decision(decision)
                 research_state = self.context.services.get("research_state")
                 self.questions = (
                     list(research_state.questions)

@@ -193,10 +193,18 @@ it("respects manual expansion across final and does not reactivate a stopped sib
   });
   fireEvent.click(toggle);
   rerender(
-    <ASv3ProgressPanel state={parallelState()} stopped hasDisplayContent />
+    <ASv3ProgressPanel
+      state={parallelState()}
+      stopped={false}
+      hasDisplayContent
+    />
   );
   expect(screen.getAllByRole("tab")).toHaveLength(2);
   expect(screen.queryByTestId("asv3-task-loading")).not.toBeInTheDocument();
+  expect(screen.getByRole("region", { name: "ASv3" })).toHaveAttribute(
+    "aria-busy",
+    "false"
+  );
   rerender(
     <ASv3ProgressPanel state={completedState()} stopped hasDisplayContent />
   );
@@ -267,6 +275,81 @@ it("shows a language-neutral pending state until the localized update arrives", 
     "lang",
     "tr"
   );
+});
+
+it("removes a pending placeholder when the answer arrives without a progress event", () => {
+  const state = createASv3ProgressState();
+  const { rerender } = render(
+    <ASv3ProgressPanel state={state} stopped={false} pending />
+  );
+  expect(screen.getByRole("region", { name: "ASv3" })).toHaveTextContent(
+    /^ASv3$/
+  );
+  rerender(
+    <ASv3ProgressPanel
+      state={state}
+      stopped={false}
+      pending
+      hasDisplayContent
+    />
+  );
+  expect(
+    screen.queryByRole("region", { name: "ASv3" })
+  ).not.toBeInTheDocument();
+});
+
+it("shows a title without an empty expandable body when no details were supplied", () => {
+  const state = applyASv3Progress(createASv3ProgressState(), {
+    type: "asv3_progress",
+    run_id: "r",
+    event_id: "title-only",
+    sequence: 1,
+    language: "tr",
+    phase: "research",
+    status: "running",
+    title: "Kanunun geri geliş şartlarını inceliyorum",
+    message: "   ",
+  });
+  render(<ASv3ProgressPanel state={state} stopped={false} />);
+  expect(
+    screen.getByText("Kanunun geri geliş şartlarını inceliyorum")
+  ).toBeInTheDocument();
+  expect(screen.queryByRole("button")).not.toBeInTheDocument();
+  expect(screen.queryByRole("tab")).not.toBeInTheDocument();
+});
+
+it("leaves no placeholder timeline above a direct answer without localized tool updates", () => {
+  let state = applyASv3Progress(createASv3ProgressState(), {
+    type: "asv3_progress",
+    run_id: "r",
+    event_id: "neutral-start",
+    sequence: 1,
+    language: "und",
+    phase: "started",
+    status: "running",
+    title: "ASv3",
+    message: "…",
+  });
+  const { rerender } = render(
+    <ASv3ProgressPanel state={state} stopped={false} />
+  );
+  expect(screen.getByRole("region", { name: "ASv3" })).toHaveTextContent(
+    /^ASv3$/
+  );
+  expect(screen.queryByRole("button")).not.toBeInTheDocument();
+  state = applyASv3Progress(state, {
+    ...state.header!,
+    event_id: "neutral-end",
+    sequence: 2,
+    phase: "completed",
+    status: "completed",
+  });
+  rerender(
+    <ASv3ProgressPanel state={state} stopped={false} hasDisplayContent />
+  );
+  expect(
+    screen.queryByRole("region", { name: "ASv3" })
+  ).not.toBeInTheDocument();
 });
 
 it.each([

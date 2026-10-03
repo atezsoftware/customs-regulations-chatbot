@@ -31,6 +31,41 @@ from onyx.asv3.workers import WorkerPool
 from onyx.llm.models import AssistantMessage, FunctionCall, ToolCall
 
 
+def test_native_execution_and_resume_do_not_use_legacy_call_limits() -> None:
+    budget = SharedBudget(unlimited_execution=True)
+    context = RunContext(budget=budget, timeout_seconds=float("inf"))
+    registry = CapabilityRegistry(
+        [
+            ToolSpec(
+                name="step",
+                description="Independent useful action",
+                parameters={"type": "object"},
+                handler=lambda _args, _context: ToolOutcome(
+                    status=OutcomeStatus.FOUND, summary="Completed"
+                ),
+            )
+        ]
+    )
+
+    def decide(_view: HarnessView) -> Decision:
+        if budget.snapshot()["tools"] < 70:
+            return Decision(calls=[CapabilityCall(name="step")])
+        return Decision(answer="Complete")
+
+    harness = Harness(
+        request="Research", context=context, registry=registry, decide=decide
+    )
+    assert harness.run().answer == "Complete"
+    assert budget.snapshot()["tools"] == 70
+    assert budget.snapshot()["decisions"] == 71
+    restored = SharedBudget(unlimited_execution=True)
+    restored.restore({key: value for key, value in budget.snapshot().items()})
+    restored.consume_research_decision(researcher=True)
+    restored.consume_repair_decision()
+    assert restored.snapshot()["decisions"] == 73
+    assert context.research_deadline == float("inf")
+
+
 def test_invalid_argument_checkpoint_cannot_poison_a_valid_empty_call() -> None:
     context = RunContext()
     calls: list[dict[str, JsonValue]] = []

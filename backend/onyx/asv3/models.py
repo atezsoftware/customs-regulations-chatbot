@@ -343,10 +343,12 @@ class SharedBudget:
         max_artifact_bytes: int = 4_000_000,
         final_decision_reserve: int = 12,
         coordinator_decision_reserve: int = 6,
+        unlimited_execution: bool = False,
     ) -> None:
         import threading
 
         self._lock = threading.Lock()
+        self.unlimited_execution = unlimited_execution
         self.tool_slots = threading.BoundedSemaphore(max_inflight_tools)
         self.model_slots = threading.BoundedSemaphore(max_inflight_models)
         self.source_slots = threading.BoundedSemaphore(max_inflight_sources)
@@ -367,7 +369,10 @@ class SharedBudget:
 
     def consume(self, kind: str, amount: int = 1) -> None:
         with self._lock:
-            if amount < 0 or self.used[kind] + amount > self.limits[kind]:
+            unbounded = self.unlimited_execution and kind in {"tools", "decisions"}
+            if amount < 0 or (
+                not unbounded and self.used[kind] + amount > self.limits[kind]
+            ):
                 raise RunStopped(f"Shared {kind} budget exhausted")
             self.used[kind] += amount
 
@@ -379,6 +384,9 @@ class SharedBudget:
 
     def consume_research_decision(self, *, researcher: bool = False) -> None:
         with self._lock:
+            if self.unlimited_execution:
+                self.used["decisions"] += 1
+                return
             research_limit = self.limits["decisions"] - self.final_decision_reserve
             if researcher:
                 research_limit -= self.coordinator_decision_reserve
@@ -391,6 +399,9 @@ class SharedBudget:
     def consume_repair_decision(self) -> None:
         """Targeted recovery can use the reserve while keeping publication capacity."""
         with self._lock:
+            if self.unlimited_execution:
+                self.used["decisions"] += 1
+                return
             if self.used["decisions"] >= (
                 self.limits["decisions"] - self.publication_decision_reserve
             ):
@@ -406,7 +417,13 @@ class SharedBudget:
                     kind not in self.limits
                     or not isinstance(value, int)
                     or isinstance(value, bool)
-                    or not 0 <= value <= self.limits[kind]
+                    or value < 0
+                    or (
+                        not (
+                            self.unlimited_execution and kind in {"tools", "decisions"}
+                        )
+                        and value > self.limits[kind]
+                    )
                 ):
                     raise ValueError("Invalid checkpoint budget")
             self.used.update(

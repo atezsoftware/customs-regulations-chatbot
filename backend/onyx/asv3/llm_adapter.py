@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 import random
 import time
 from collections.abc import Callable, Iterator
@@ -551,6 +552,7 @@ class ResearchModel:
         updates: Callable[[], list[str]] | None = None,
         pending_tasks: Callable[[], list[dict[str, JsonValue]]] | None = None,
         token_counter: Callable[[str], int] | None = None,
+        lean_native_mode: bool = False,
     ) -> None:
         self.llm = llm
         self.context = context
@@ -560,6 +562,9 @@ class ResearchModel:
         self.updates = updates or (lambda: [])
         self.pending_tasks = pending_tasks or (lambda: [])
         self.token_counter = token_counter
+        self.lean_native_mode = (
+            lean_native_mode or context.services.get("lean_native_mode") is True
+        )
         self.last_call_id: str | None = None
 
     def _tokens(self, text: str) -> int:
@@ -1016,6 +1021,17 @@ class ResearchModel:
             model_slot(self.context, research=research),
             llm_generation_span(self.llm, flow, prompt, tools or None) as span,
         ):
+            deadline = (
+                self.context.research_deadline if research else self.context.deadline
+            )
+            remaining = deadline - time.monotonic()
+            timeout = (
+                None
+                if self.lean_native_mode and not math.isfinite(deadline)
+                else max(
+                    1, int(remaining if self.lean_native_mode else min(remaining, 120))
+                )
+            )
             response = self.llm.invoke(
                 prompt=prompt,
                 # Provider normalization must not rewrite canonical validation schemas.
@@ -1036,20 +1052,7 @@ class ResearchModel:
                 if response_model is not None
                 else None,
                 max_tokens=max_tokens,
-                timeout_override=max(
-                    1,
-                    int(
-                        min(
-                            120,
-                            (
-                                self.context.research_deadline
-                                if research
-                                else self.context.deadline
-                            )
-                            - time.monotonic(),
-                        )
-                    ),
-                ),
+                timeout_override=timeout,
                 reasoning_effort=self.reasoning_effort,
                 user_identity=self.user_identity,
             )
@@ -1646,7 +1649,210 @@ class ResearchModel:
                 }
             )
 
+    @staticmethod
+    def _complete_native_turns(turns: list[ResearchTurn]) -> list[ResearchTurn]:
+        complete: list[ResearchTurn] = []
+        used_ids: set[str] = set()
+        for turn in ResearchModel._provider_compatible_turns(turns):
+            calls = turn.assistant.tool_calls or []
+            try:
+                for call in calls:
+                    parse_json_object(call.function.arguments)
+            except ValueError:
+                continue
+            call_ids = [call.id for call in calls]
+            result_ids = [result.tool_call_id for result in turn.results]
+            if (
+                not call_ids
+                or any(not call.id or not call.function.name for call in calls)
+                or len(set(call_ids)) != len(call_ids)
+                or len(set(result_ids)) != len(result_ids)
+                or set(call_ids) != set(result_ids)
+                or used_ids.intersection(call_ids)
+            ):
+                continue
+            used_ids.update(call_ids)
+            complete.append(turn)
+        return complete
+
+    @staticmethod
+    def _native_original_records(
+        turns: list[ResearchTurn],
+    ) -> list[dict[str, JsonValue]]:
+        records: list[dict[str, JsonValue]] = []
+        for turn in turns:
+            for result in turn.results:
+                try:
+                    payload = parse_json_object(result.content)
+                except ValueError:
+                    continue
+                originals = payload.get("original_evidence")
+                if isinstance(originals, list):
+                    records.extend(item for item in originals if isinstance(item, dict))
+        return records
+
+    @staticmethod
+    def _original_record_range(
+        record: dict[str, JsonValue],
+    ) -> tuple[int, str, int, int] | None:
+        number, digest, text = (
+            record.get("citation"),
+            record.get("text_hash"),
+            record.get("text"),
+        )
+        start = record.get("start_char", 0)
+        if (
+            type(number) is not int
+            or not isinstance(digest, str)
+            or not isinstance(text, str)
+            or type(start) is not int
+            or start < 0
+        ):
+            return None
+        return number, digest, start, start + len(text)
+
+    def _fit_native_decision(
+        self, view: HarnessView
+    ) -> tuple[list[ChatCompletionMessage], list[dict[str, JsonValue]], int]:
+        instruction = RESEARCHER_PROMPT if self.context.depth else COORDINATOR_PROMPT
+        question: dict[str, JsonValue] = {"request": view.request}
+        if self.history:
+            question["conversation"] = self.history
+        if len(view.questions) > 1:
+            question["questions"] = list(view.questions)
+        assistant_instructions = self.context.services.get("assistant_instructions")
+        if not self.context.depth and isinstance(assistant_instructions, str):
+            question["assistant_instructions"] = assistant_instructions
+        prefix: list[ChatCompletionMessage] = [
+            SystemMessage(content=instruction),
+            UserMessage(content=json.dumps(question, ensure_ascii=False)),
+        ]
+        context: dict[str, JsonValue] = {"language": self.context.language}
+        if view.facts:
+            context["recorded_facts"] = list(view.facts)
+        if view.publication_gap is not None:
+            context["draft_to_repair"] = view.draft_to_repair
+            context["publication_gap"] = view.publication_gap
+        pending = self.pending_tasks()
+        if pending:
+            context["research_tasks"] = pending
+        navigation = [
+            {key: value for key, value in item.items() if key != "text"}
+            for item in view.evidence
+        ]
+        if navigation:
+            context["available_evidence"] = navigation
+            context["evidence_note"] = (
+                "Navigation entries are not original text. Cite only actual delivered "
+                "passages, preserving their conditions; reopen omitted ranges with read_evidence."
+            )
+        retained = self._complete_native_turns(view.turns)
+        native_ids = {
+            result.tool_call_id for turn in retained for result in turn.results
+        }
+        failed = [
+            receipt
+            for receipt in view.receipts
+            if receipt.call.call_id not in native_ids
+            and receipt.call.name != "finalization_status"
+            and receipt.outcome.status.value
+            in {"unavailable", "invalid", "error", "denied", "truncated"}
+        ]
+        if failed:
+            context["failed_calls"] = [
+                {
+                    "name": receipt.call.name,
+                    "arguments": receipt.call.arguments,
+                    "status": receipt.outcome.status.value,
+                    "summary": receipt.outcome.summary,
+                }
+                for receipt in failed[-3:]
+            ]
+        records = [*self._native_original_records(retained), *view.original_evidence]
+        unique: dict[tuple[int, str, int, int], dict[str, JsonValue]] = {}
+        for record in records:
+            identity = self._original_record_range(record)
+            if identity is not None:
+                unique.setdefault(identity, record)
+        required = set(view.required_evidence_numbers)
+        required.update(extract_citation_numbers(view.draft_to_repair or ""))
+        omitted: list[JsonValue] = list(view.original_evidence_omitted)
+        ceiling, output = self._limits(6000)
+        selected = view.tools
+
+        def messages() -> list[ChatCompletionMessage]:
+            native_ranges = [
+                identity
+                for record in self._native_original_records(retained)
+                if (identity := self._original_record_range(record)) is not None
+            ]
+            restored = [
+                record
+                for (number, digest, start, end), record in unique.items()
+                if not any(
+                    number == delivered_number
+                    and digest == delivered_digest
+                    and delivered_start <= start
+                    and end <= delivered_end
+                    for delivered_number, delivered_digest, delivered_start, delivered_end in native_ranges
+                )
+            ]
+            current = dict(context)
+            if restored:
+                current["original_evidence"] = restored
+            if omitted:
+                current["original_evidence_omitted"] = omitted
+            return [
+                *prefix,
+                *(
+                    message
+                    for turn in retained
+                    for message in [turn.assistant, *turn.results]
+                ),
+                UserMessage(content=json.dumps(current, ensure_ascii=False)),
+            ]
+
+        prompt = messages()
+        if self._input_cost(prompt, selected) <= ceiling:
+            return prompt, selected, output
+        # Remove transcript groups atomically; preserve their exact originals separately.
+        while retained and self._input_cost(prompt, selected) > ceiling:
+            retained.pop(0)
+            prompt = messages()
+        if self._input_cost(prompt, selected) > ceiling:
+            context.pop("available_evidence", None)
+            prompt = messages()
+        # Only physical model capacity can evict unrequired originals, never a price target.
+        for identity, record in list(unique.items()):
+            if self._input_cost(prompt, selected) <= ceiling:
+                break
+            if identity[0] in required:
+                continue
+            del unique[identity]
+            omitted.append(
+                {
+                    "citation": identity[0],
+                    "source_id": record.get("source_id"),
+                    "start_char": identity[2],
+                    "end_char": identity[3],
+                    "reason": "physical_model_context",
+                }
+            )
+            prompt = messages()
+        if self._input_cost(prompt, selected) > ceiling:
+            raise RunStopped(
+                "The complete question, required originals and native tools exceed the selected model context"
+            )
+        return prompt, selected, output
+
     def decide(self, view: HarnessView) -> Decision:
+        self.context.check_research_active()
+        if self.lean_native_mode:
+            prompt, tools, output = self._fit_native_decision(view)
+            return self._invoke_decision(view, prompt, tools, output)
+        return self._decide_research(view)
+
+    def _decide_research(self, view: HarnessView) -> Decision:
         from onyx.asv3.working_memory import WorkingMemory
 
         self.context.check_research_active()
@@ -1742,6 +1948,15 @@ class ResearchModel:
             research=True,
             turns=view.turns,
         )
+        return self._invoke_decision(view, prompt, tools, output)
+
+    def _invoke_decision(
+        self,
+        view: HarnessView,
+        prompt: list[ChatCompletionMessage],
+        tools: list[dict[str, JsonValue]],
+        output: int,
+    ) -> Decision:
         content = prompt[-1].content
         assert isinstance(content, str)
         parts: list[ContentPart] = [TextContentPart(text=content)]

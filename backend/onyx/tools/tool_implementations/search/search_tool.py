@@ -920,6 +920,43 @@ class QueryExpansionAndScope(BaseModel):
     time_filter: TimeFilter | None = None
 
 
+class _QueryBatch:
+    """Share preparation, never retrieval results, within one native decision."""
+
+    def __init__(
+        self,
+        message_history: list[ChatMinimalTextMessage],
+        filter_message_history: list[ChatMinimalTextMessage],
+        queries: list[str],
+    ) -> None:
+        self.message_history = [
+            message.model_copy(deep=True) for message in message_history
+        ]
+        self.filter_message_history = [
+            message.model_copy(deep=True) for message in filter_message_history
+        ]
+        self.queries = list(queries)
+        self.expansion: _SharedDecision[tuple[str | None, list[str]]] = (
+            _SharedDecision()
+        )
+
+    def expand(
+        self, llm: LLM, user_info: str | None, memories: list[str]
+    ) -> tuple[str | None, list[str]]:
+        def compute() -> tuple[str | None, list[str]]:
+            arguments = (self.message_history, llm, user_info, memories)
+            results = run_functions_tuples_in_parallel(
+                [
+                    (semantic_query_rephrase, arguments),
+                    (keyword_query_expansion, arguments),
+                ]
+            )
+            return cast(str | None, results[0]), cast(list[str], results[1] or [])
+
+        semantic, keywords = self.expansion.get_or_compute(compute)
+        return semantic, list(keywords)
+
+
 class SearchQueryLane(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -1245,6 +1282,7 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
         )
         self._parallel_scope_decision = parallel_scope_decision
         self._shared_label_snapshot = shared_label_snapshot or _SharedDecision()
+        self._query_batch: _QueryBatch | None = None
 
         self._id = tool_id
 
@@ -1303,6 +1341,21 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
         """Create one isolated fork for callers that do not manage a batch."""
 
         return self.fork_for_parallel_calls(1)[0]
+
+    def fork_for_query_batch(
+        self,
+        call_count: int,
+        *,
+        message_history: list[ChatMinimalTextMessage],
+        filter_message_history: list[ChatMinimalTextMessage],
+        queries: list[str],
+    ) -> list["SearchTool"]:
+        """Prepare one same-context batch lazily, retaining each focused search."""
+        forks = self.fork_for_parallel_calls(call_count)
+        preparation = _QueryBatch(message_history, filter_message_history, queries)
+        for fork in forks:
+            fork._query_batch = preparation
+        return forks
 
     def fork_for_independent_context(
         self,
@@ -1776,12 +1829,17 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
         decide_time = self.auto_detect_filters and not self._time_filter_computed
 
         jobs: list[tuple[Callable, tuple]] = []
+        expansion_job_index: int | None = None
         scope_job_index: int | None = None
         time_job_index: int | None = None
         if expand_queries:
-            expansion_args = (message_history, self.llm, user_info, memories)
-            jobs.append((semantic_query_rephrase, expansion_args))
-            jobs.append((keyword_query_expansion, expansion_args))
+            if self._query_batch is not None:
+                expansion_job_index = len(jobs)
+                jobs.append((self._query_batch.expand, (self.llm, user_info, memories)))
+            else:
+                expansion_args = (message_history, self.llm, user_info, memories)
+                jobs.append((semantic_query_rephrase, expansion_args))
+                jobs.append((keyword_query_expansion, expansion_args))
         if decide_scope:
             scope_job_index = len(jobs)
             jobs.append((self._decide_search_scope, (decide_args,)))
@@ -1799,8 +1857,11 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
         semantic_query: str | None = None
         keyword_queries: list[str] = []
         if expand_queries:
-            semantic_query = results[0]
-            keyword_queries = results[1] or []
+            if expansion_job_index is not None:
+                semantic_query, keyword_queries = results[expansion_job_index]
+            else:
+                semantic_query = results[0]
+                keyword_queries = results[1] or []
             self._cached_expansion = (semantic_query, keyword_queries)
 
         plan_scope: list[DocumentSource] | None = None
@@ -1969,7 +2030,9 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
             override_kwargs.message_history if override_kwargs.message_history else []
         )
         filter_message_history = (
-            override_kwargs.filter_message_history
+            self._query_batch.filter_message_history
+            if self._query_batch is not None
+            else override_kwargs.filter_message_history
             if override_kwargs.filter_message_history is not None
             else message_history
         )
@@ -1997,7 +2060,9 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
             self.llm,
             candidate_sources,
             list(self._search_cycles),
-            override_kwargs.filter_queries or llm_queries,
+            self._query_batch.queries
+            if self._query_batch is not None
+            else override_kwargs.filter_queries or llm_queries,
         )
         expansion = self._expand_queries_and_decide_scope(
             skip_query_expansion=(

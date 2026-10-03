@@ -38,6 +38,11 @@ interface TaskStatusIconProps {
   active: boolean;
 }
 
+function isPlaceholder(event: ASv3Progress): boolean {
+  const message = event.message?.trim();
+  return event.title === "ASv3" && (!message || message === "…");
+}
+
 function TaskStatusIcon({ task, active }: TaskStatusIconProps) {
   const loading =
     active && (task.status === "queued" || task.status === "running");
@@ -210,12 +215,21 @@ export default function ASv3ProgressPanel({
   onResume,
   pending = false,
   agent,
+  hasDisplayContent = false,
 }: ASv3ProgressPanelProps) {
   const detailsId = useId();
   const [expanded, setExpanded] = useState(false);
-  if (!state.header && !pending) return null;
-  const active = !state.terminal && !stopped;
+  if (!state.header && (!pending || hasDisplayContent)) return null;
+  const active = !state.terminal && !stopped && !hasDisplayContent;
   const allTasks = Array.from(state.tasks.values());
+  if (
+    hasDisplayContent &&
+    state.header &&
+    isPlaceholder(state.header) &&
+    [...state.history, ...allTasks].every(isPlaceholder)
+  ) {
+    return null;
+  }
   const actions = allTasks.filter((task) =>
     task.task_id?.startsWith("action:")
   );
@@ -231,6 +245,7 @@ export default function ASv3ProgressPanel({
   const header = state.header;
   const history = state.history.filter(
     (step) =>
+      !isPlaceholder(step) &&
       !actions.some(
         (action) =>
           action.title === step.title &&
@@ -242,6 +257,12 @@ export default function ASv3ProgressPanel({
     .filter((step) => step.event_id !== header?.event_id)
     .sort((left, right) => left.sequence - right.sequence);
   const title = header?.title ?? "ASv3";
+  const hasHeaderMessage = Boolean(
+    header?.message?.trim() && header.message.trim() !== "…"
+  );
+  const hasDetails = Boolean(
+    hasHeaderMessage || pastSteps.length > 0 || tasks.length > 0
+  );
   return (
     <section
       aria-label="ASv3"
@@ -268,21 +289,29 @@ export default function ASv3ProgressPanel({
               active && "asv3-title-running"
             )}
           >
-            <Button
-              prominence="tertiary"
-              size="md"
-              width="full"
-              rightIcon={expanded ? SvgFold : SvgExpand}
-              aria-expanded={expanded}
-              aria-controls={detailsId}
-              onClick={() => setExpanded(!expanded)}
-              title={title}
-            >
-              {title}
-            </Button>
+            {hasDetails ? (
+              <Button
+                prominence="tertiary"
+                size="md"
+                width="full"
+                rightIcon={expanded ? SvgFold : SvgExpand}
+                aria-expanded={expanded}
+                aria-controls={detailsId}
+                onClick={() => setExpanded(!expanded)}
+                title={title}
+              >
+                {title}
+              </Button>
+            ) : (
+              <div className="asv3-title-label px-2 py-1">
+                <Text font="main-ui-action" color="text-03">
+                  {title}
+                </Text>
+              </div>
+            )}
           </div>
         </TimelineHeaderRow>
-        {expanded && (
+        {expanded && hasDetails && (
           <div
             id={detailsId}
             className={cn(
@@ -290,7 +319,7 @@ export default function ASv3ProgressPanel({
                 "motion-safe:animate-in motion-safe:fade-in motion-safe:slide-in-from-top-2 motion-safe:duration-300"
             )}
           >
-            {header?.message && (
+            {hasHeaderMessage && header && (
               <TimelineRow
                 railVariant="spacer"
                 showIcon={false}
@@ -298,7 +327,7 @@ export default function ASv3ProgressPanel({
               >
                 <div className="px-3 pb-2">
                   <Text as="p" font="secondary-body" color="text-03">
-                    {header.message}
+                    {header.message ?? undefined}
                   </Text>
                 </div>
               </TimelineRow>

@@ -1,6 +1,7 @@
 """Run the real V2 search dispatcher and SearchTool with external boundaries faked."""
 
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
 from datetime import date
 from typing import Any, cast
@@ -12,13 +13,19 @@ from pydantic import JsonValue
 
 from onyx.asv3.corpus_tools import CorpusBroker, build_corpus_specs
 from onyx.asv3.models import (
+    CapabilityCall,
     EvidenceItem,
     OutcomeStatus,
     RunContext,
     RunStopped,
     SharedBudget,
+    ToolOutcome,
 )
-from onyx.asv3.search_adapter import ScopedSearchLLM, build_search_adapter
+from onyx.asv3.search_adapter import (
+    ScopedSearchAdapter,
+    ScopedSearchLLM,
+    build_search_adapter,
+)
 from onyx.chat.emitter import NullEmitter
 from onyx.chat.models import ChatMessageSimple
 from onyx.configs.constants import DocumentSource, MessageType
@@ -196,6 +203,222 @@ def test_hybrid_executes_real_query_expansion_with_actual_filter_history_and_mem
     assert (
         tool.user_selected_filters == BaseFilters()
     )  # Original V2 instance untouched.
+
+
+def run_prepared_searches(
+    adapter: ScopedSearchAdapter, calls: list[CapabilityCall], context: RunContext
+) -> list[ToolOutcome]:
+    prepared = adapter.prepare_batch(calls, context)
+
+    def execute(call: CapabilityCall) -> ToolOutcome:
+        child = context.child()
+        child.depth = context.depth
+        child.services["search_batch_tool"] = prepared[call.call_id]
+        return adapter(call.arguments, child)
+
+    with ThreadPoolExecutor(max_workers=len(calls)) as executor:
+        return list(executor.map(execute, calls))
+
+
+def test_native_batch_expands_once_and_preserves_each_query_and_authorized_scope() -> (
+    None
+):
+    tool, broker, llm = tool_and_broker()
+    broker.filters.as_of_date = date(2025, 1, 1)
+    actual_request = "YYS return and the related KDV security as of 2025."
+    memory = UserMemoryContext(
+        user_info=UserInfo(name="Researcher"), memories=("same-request-memory",)
+    )
+    adapter = build_search_adapter(
+        tool,
+        actual_request,
+        broker,
+        message_history=lambda _: [user_message(actual_request)],
+        user_memory_context=memory,
+        user_info="request-profile",
+    )
+    calls = [
+        CapabilityCall(
+            name="search_corpus", arguments={"query": query, "mode": "hybrid"}
+        )
+        for query in ("YYS green-line identity", "KDV returned goods security")
+    ]
+    context = RunContext()
+    with search_boundaries() as (pipeline, scope, time):
+        outcomes = run_prepared_searches(adapter, calls, context)
+
+    assert [outcome.status for outcome in outcomes] == [OutcomeStatus.NOT_FOUND] * 2
+    assert llm.invoke.call_count == 2
+    assert context.budget.snapshot()["decisions"] == 2
+    for invocation in llm.invoke.call_args_list:
+        prompt = str(invocation.kwargs["prompt"])
+        assert actual_request in prompt
+        assert "YYS green-line identity" in prompt
+        assert "KDV returned goods security" in prompt
+        assert "same-request-memory" in prompt
+        assert "request-profile" in prompt
+    scope.assert_called_once()
+    assert scope.call_args.args[-1] == [call.arguments["query"] for call in calls]
+    time.assert_called_once()
+    executed = {
+        invocation.kwargs["chunk_search_request"].query
+        for invocation in pipeline.call_args_list
+    }
+    assert {call.arguments["query"] for call in calls} <= executed
+    for invocation in pipeline.call_args_list:
+        filters = invocation.kwargs["chunk_search_request"].user_selected_filters
+        assert filters.tenant_id == "tenant-under-test"
+        assert filters.access_control_list == ["user:authorized"]
+        assert filters.forced_document_set == ["PC Külliyatı"]
+        assert filters.asv3_document_set_id == 15
+        assert filters.as_of_date == date(2025, 1, 1)
+    assert tool.user_selected_filters == BaseFilters()
+    assert [outcome.data["query"] for outcome in outcomes] == [
+        call.arguments["query"] for call in calls
+    ]
+
+
+def test_native_batch_preparation_is_lazy_and_is_not_shared_with_other_tasks() -> None:
+    tool, broker, llm = tool_and_broker()
+    adapter = build_search_adapter(
+        tool,
+        "root question",
+        broker,
+        message_history=lambda context: [user_message(str(context.services["task"]))],
+    )
+    calls = [
+        CapabilityCall(
+            name="search_corpus",
+            arguments={"query": "literal anchor", "mode": "keyword"},
+        ),
+        CapabilityCall(
+            name="search_corpus",
+            arguments={"query": "repair treatment", "mode": "hybrid"},
+        ),
+    ]
+    with search_boundaries() as (pipeline, scope, time):
+        first = RunContext(services={"task": "first independent task"})
+        prepared = adapter.prepare_batch(calls, first)
+        assert len(prepared) == 2
+        llm.invoke.assert_not_called()
+        pipeline.assert_not_called()
+        run_prepared_searches(adapter, calls, first)
+        second = RunContext(services={"task": "second independent task"})
+        run_prepared_searches(adapter, calls, second)
+    assert llm.invoke.call_count == 4
+    assert first.budget.snapshot()["decisions"] == 2
+    assert second.budget.snapshot()["decisions"] == 2
+    assert scope.call_count == 2
+    assert time.call_count == 2
+    for invocation in llm.invoke.call_args_list[:2]:
+        assert "first independent task" in str(invocation.kwargs["prompt"])
+        assert "second independent task" not in str(invocation.kwargs["prompt"])
+    for invocation in llm.invoke.call_args_list[2:]:
+        assert "second independent task" in str(invocation.kwargs["prompt"])
+        assert "first independent task" not in str(invocation.kwargs["prompt"])
+
+
+def test_batch_expansion_failure_is_shared_without_silently_searching_reduced_lanes() -> (
+    None
+):
+    tool, broker, _ = tool_and_broker()
+    adapter = build_search_adapter(
+        tool, "request", broker, message_history=lambda _: [user_message("request")]
+    )
+    calls = [
+        CapabilityCall(
+            name="search_corpus", arguments={"query": query, "mode": "hybrid"}
+        )
+        for query in ("first issue", "second issue")
+    ]
+    with (
+        search_boundaries() as (pipeline, _, _),
+        patch(
+            f"{MODULE}.semantic_query_rephrase",
+            side_effect=RuntimeError("failed expansion"),
+        ) as semantic,
+        patch(f"{MODULE}.keyword_query_expansion", return_value=["keyword"]) as keyword,
+    ):
+        outcomes = run_prepared_searches(adapter, calls, RunContext())
+    assert [outcome.status for outcome in outcomes] == [OutcomeStatus.UNAVAILABLE] * 2
+    semantic.assert_called_once()
+    keyword.assert_called_once()
+    pipeline.assert_not_called()
+
+
+def test_batch_keeps_query_results_and_canonical_hydration_separate() -> None:
+    tool, broker, _ = tool_and_broker()
+    originals = {
+        query: EvidenceItem(source_id=str(uuid4()), chunk_id=f"rc-{index}", text=text)
+        for index, (query, text) in enumerate(
+            [
+                ("YYS special condition", "Identity condition original"),
+                ("KDV security", "Security condition original"),
+            ]
+        )
+    }
+    chunks = {
+        query: InferenceChunk(
+            document_id=original.source_id,
+            chunk_id=index,
+            content="retrieval projection",
+            source_type=DocumentSource.USER_FILE,
+            semantic_identifier=query,
+            title=query,
+            boost=1,
+            score=0.9,
+            hidden=False,
+            metadata={},
+            match_highlights=[],
+            doc_summary="",
+            chunk_context="",
+            updated_at=None,
+            image_file_id=None,
+            source_links=None,
+            section_continuation=False,
+            blurb="source paragraph",
+            file_id=original.source_id,
+            regulatory_chunk_id=original.chunk_id,
+            heading_path=["MADDE 168"],
+        )
+        for index, (query, original) in enumerate(originals.items())
+    }
+    adapter = build_search_adapter(
+        tool,
+        "user request",
+        broker,
+        message_history=lambda _: [user_message("user request")],
+    )
+    calls = [
+        CapabilityCall(
+            name="search_corpus", arguments={"query": query, "mode": "hybrid"}
+        )
+        for query in originals
+    ]
+    source_originals = {original.source_id: original for original in originals.values()}
+    with (
+        search_boundaries() as (pipeline, _, _),
+        patch.object(
+            broker,
+            "hydrate_search_centers",
+            side_effect=lambda docs, _context: {
+                (doc.document_id, doc.chunk_ind): [source_originals[doc.document_id]]
+                for doc in docs
+            },
+        ) as hydrate,
+    ):
+        pipeline.side_effect = lambda **kwargs: (
+            [chunks[query]]
+            if (query := kwargs["chunk_search_request"].query) in chunks
+            else []
+        )
+        outcomes = run_prepared_searches(adapter, calls, RunContext())
+    assert hydrate.call_count == 2
+    for outcome, original in zip(outcomes, originals.values(), strict=True):
+        assert outcome.status == OutcomeStatus.FOUND
+        assert [item.identity for item in outcome.evidence] == [original.identity]
+        assert outcome.evidence[0].text == original.text
+        assert "retrieval projection" not in str(outcome.evidence)
 
 
 @pytest.mark.parametrize(

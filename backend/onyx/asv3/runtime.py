@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import os
@@ -15,9 +14,6 @@ from uuid import UUID
 
 from pydantic import JsonValue
 
-from onyx.asv3.answer_repair import repair_publication_candidate
-from onyx.asv3.assertions import assertion_inventory, assertion_witness_valid
-from onyx.asv3.authority import authority_obligations, unresolved_authority_gap
 from onyx.asv3.citation_numbers import extract_citation_numbers
 from onyx.asv3.corpus_tools import CorpusBroker, build_corpus_specs
 from onyx.asv3.evidence import EvidenceLedger
@@ -26,29 +22,30 @@ from onyx.asv3.harness import Harness
 from onyx.asv3.llm_adapter import (
     LanguageProfile,
     ResearchModel,
-    VerificationResult,
-    parse_json_object,
 )
 from onyx.asv3.models import (
+    Decision,
     EvidenceItem,
     OutcomeStatus,
     RunContext,
     RunStopped,
+    SharedBudget,
     ToolOutcome,
     ToolReceipt,
     ToolSpec,
 )
-from onyx.asv3.progress import ProgressEvent, ProgressReporter
-from onyx.asv3.publication import publication_gap, question_inventory
-from onyx.asv3.quotations import unmatched_quoted_terms
+from onyx.asv3.progress import ProgressEvent, ProgressReporter, localized_notifications
 from onyx.asv3.registry import CapabilityRegistry, build_core_specs
 from onyx.asv3.research_state import ResearchState, build_research_specs
 from onyx.asv3.sandbox import build_sandbox_specs
-from onyx.asv3.scenario import initial_questions, question_determinations
+from onyx.asv3.scenario import initial_questions
 from onyx.asv3.search_adapter import build_search_adapter
-from onyx.asv3.source_conditions import complete_condition_review
 from onyx.asv3.source_tools import build_source_specs
-from onyx.asv3.supplemental_tools import ScenarioState, build_supplemental_specs
+from onyx.asv3.supplemental_tools import (
+    ScenarioState,
+    build_supplemental_specs,
+    public_narration_valid,
+)
 from onyx.asv3.workers import WorkerPool
 from onyx.cache.interface import CacheBackend
 from onyx.chat.chat_state import ChatStateContainer
@@ -65,8 +62,6 @@ from onyx.db.models import User
 from onyx.llm.interfaces import LLM, LLMUserIdentity
 from onyx.llm.models import ReasoningEffort
 from onyx.prompts.asv3.research import (
-    FINAL_PROMPT,
-    LANGUAGE_PROMPT,
     PROMPT_VERSION,
     VERIFICATION_PROMPT,
 )
@@ -81,8 +76,6 @@ from onyx.server.query_and_chat.streaming_models import (
 )
 from onyx.tools.interface import Tool
 from onyx.tools.tool_implementations.search.search_tool import SearchTool
-from onyx.tracing.answer_graph import graph_step
-from onyx.tracing.flows import LLMFlow
 from onyx.tracing.framework.create import ChatTraceMetadata, ensure_trace
 
 logger = logging.getLogger(__name__)
@@ -110,25 +103,6 @@ def _trace_asv3(function: Callable[P, None]) -> Callable[P, None]:
             function(*args, **kwargs)
 
     return wrapped
-
-
-_LANGUAGE_INSTRUCTION = (
-    LANGUAGE_PROMPT
-    + """
-Also return notifications: a JSON object with started, tools, worker, final, completed,
-failed, cancelled, interrupted, resume, native_citation keys. Each value is [short title, one natural sentence], ALL in the
-question's requested language. Make them specific to this user's topic: what source,
-condition, time limit or alternative is being checked. Never mention tool names,
-functions, file paths, SQL, code, model internals or reasoning. Do not assert unverified
-findings or pretend a particular document has already been read. 'final' means checking
-the proposed answer's conditions and source support while preparing it; do not claim the
-check has passed. 'completed' means answer ready, 'failed' means the research remains incomplete.
-'failed' and 'interrupted' must state that research could not be completed, without
-inventing a technical cause, timeout, provider failure or any diagnosis not in this input.
-'resume' offers to continue research,
-and 'native_citation' labels an excerpt extracted from an original file (derived evidence).
-"""
-)
 
 
 def _evidence_record(
@@ -203,15 +177,18 @@ def run_asv3_loop(
     start = time.monotonic()
     question = next(
         (
-            message.message
-            for message in reversed(simple_chat_history)
-            if message.message_type == MessageType.USER
+            m.message
+            for m in reversed(simple_chat_history)
+            if m.message_type == MessageType.USER
         ),
         "",
     )
     context = RunContext(
+        language="und",
         timeout_seconds=float("inf"),
+        budget=SharedBudget(unlimited_execution=True),
         cancelled=lambda: not is_connected(chat_session_id, cache),
+        services={"lean_native_mode": True},
     )
     if custom_agent_prompt:
         context.services["assistant_instructions"] = custom_agent_prompt
@@ -222,10 +199,37 @@ def run_asv3_loop(
         scope.forced_document_set = document_set_names_override
     scope = bind_pc_corpus_scope(user=user, filters=scope)
     context.scope = scope.model_dump(mode="json")
+    previous = (
+        load_asv3_checkpoint(message_id=resume_message_id, user_id=user.id)
+        if resume_message_id is not None
+        else None
+    )
+    if resume_message_id is not None and (
+        previous is None
+        or previous.get("scope") != context.scope
+        or previous.get("request") != question
+    ):
+        raise ValueError("ASv3 resume requires the same authorized scope and question")
+    if previous is not None:
+        profile = LanguageProfile.model_validate(previous.get("public_profile"))
+        context.run_id = str(previous["run_id"])
+    else:
+        profile = LanguageProfile(
+            language="und",
+            notifications=localized_notifications("und"),
+            requires_sources=question.strip().lower().rstrip("!.?")
+            not in {"merhaba", "selam", "hello", "hi", "thanks", "teşekkürler"},
+        )
+    context.language = profile.language
+    context.corpus_only = not (allow_external and profile.external_requested)
+    ledger = EvidenceLedger()
+    context.services["evidence"] = ledger
+    registry = CapabilityRegistry()
+    broker = CorpusBroker(user, scope, vision_llm=llm)
     history = "\n".join(
-        f"{message.message_type.value}: {message.message}"
-        for message in simple_chat_history[-8:]
-        if message.message_type in (MessageType.USER, MessageType.ASSISTANT)
+        f"{m.message_type.value}: {m.message}"
+        for m in simple_chat_history[-8:]
+        if m.message_type in (MessageType.USER, MessageType.ASSISTANT)
     )
     model = ResearchModel(
         llm,
@@ -234,66 +238,20 @@ def run_asv3_loop(
         reasoning_effort=reasoning_effort,
         history=history,
         token_counter=token_counter,
+        lean_native_mode=True,
     )
-    previous: dict[str, JsonValue] | None = None
-    continuation_usage: dict[str, JsonValue] | None = None
-    if resume_message_id is not None:
-        previous = load_asv3_checkpoint(message_id=resume_message_id, user_id=user.id)
-        if (
-            previous is None
-            or previous.get("scope") != context.scope
-            or previous.get("request") != question
-        ):
-            raise ValueError(
-                "ASv3 resume requires the same authorized scope and question"
-            )
-        profile = LanguageProfile.model_validate(previous.get("public_profile"))
-    else:
-        profile = LanguageProfile.model_validate(
-            parse_json_object(
-                model.invoke_text(
-                    _LANGUAGE_INSTRUCTION,
-                    question,
-                    LLMFlow.ASV3_LANGUAGE,
-                    max_tokens=1800,
-                )
-            )
-        )
-    required_phases = {
-        "started",
-        "tools",
-        "worker",
-        "final",
-        "completed",
-        "failed",
-        "cancelled",
-    }
-    if not required_phases.issubset(profile.notifications) or any(
-        len(value) != 2 for value in profile.notifications.values()
-    ):
-        raise ValueError("Incomplete ASv3 language profile")
-    context.language = profile.language
-    state_container.set_stop_notice(profile.notifications["cancelled"][1])
-    context.services["native_citation_label"] = profile.notifications.get(
-        "native_citation", ["", ""]
-    )[0]
-    # Both application consent and explicit user intent are required.
-    context.corpus_only = not (allow_external and profile.external_requested)
-    ledger = EvidenceLedger()
-    context.services["evidence"] = ledger
-    registry = CapabilityRegistry()
     search = next((tool for tool in tools if isinstance(tool, SearchTool)), None)
-    broker = CorpusBroker(user, scope, vision_llm=llm)
 
     def search_history(child: RunContext) -> list[ChatMessageSimple]:
         private = child.services.get("search_message_history")
-        if isinstance(private, list) and all(
-            isinstance(item, ChatMessageSimple) for item in private
-        ):
-            return cast(list[ChatMessageSimple], private)
-        return list(simple_chat_history)
+        return (
+            cast(list[ChatMessageSimple], private)
+            if isinstance(private, list)
+            and all(isinstance(m, ChatMessageSimple) for m in private)
+            else list(simple_chat_history)
+        )
 
-    broker.search_adapter = build_search_adapter(
+    adapter = build_search_adapter(
         search,
         question,
         broker,
@@ -303,33 +261,26 @@ def run_asv3_loop(
         inject_memories_in_prompt=inject_memories_in_prompt,
         user_identity=user_identity,
     )
-    if previous is not None:
-        context.run_id = str(previous["run_id"])
+    broker.search_adapter = adapter
+    context.services["prepare_search_batch"] = adapter.prepare_batch
     scenarios = ScenarioState(initial_questions(question), frozen=True)
-    context.services["scenario_state"] = scenarios
     research_state = ResearchState(
         initial_questions(question),
         context,
-        require_need_bindings=profile.requires_sources,
+        require_need_bindings=False,
     )
-    context.services["research_state"] = research_state
+    context.services.update(scenario_state=scenarios, research_state=research_state)
     emitted: list[dict[str, JsonValue]] = []
     checkpoint_lock = threading.RLock()
     checkpoint_sequence = 0
     harness: Harness | None = None
     workers: WorkerPool | None = None
     final_published = False
-    latest_review: VerificationResult | None = None
     publication_status = OutcomeStatus.PARTIAL
     publication_stop_reason: str | None = None
-    final_publication_gap: ToolOutcome | None = None
-    approved_draft: str | None = None
-    guard_cache: dict[
-        str, tuple[ToolOutcome | None, VerificationResult, str | None, list[str]]
-    ] = {}
-    approved_review: VerificationResult | None = None
-    approved_call_id: str | None = None
-    approved_questions: list[str] = []
+    clarification: str | None = None
+    partial: str | None = None
+    first_decision = True
 
     def emit_progress(event: ProgressEvent) -> None:
         phase, status = event.phase, event.status
@@ -344,32 +295,8 @@ def run_asv3_loop(
                 language=event.language,
                 phase=phase,
                 status=status,
-                title=event.title
-                if event.public_narration
-                or phase == "research"
-                or (
-                    phase == "worker"
-                    and event.task_id
-                    and workers
-                    and any(
-                        task.task_id == event.task_id and task.public_title
-                        for task in workers.list()
-                    )
-                )
-                else words[0],
-                message=event.message
-                if event.public_narration
-                or phase == "research"
-                or (
-                    phase == "worker"
-                    and event.task_id
-                    and workers
-                    and any(
-                        task.task_id == event.task_id and task.public_message
-                        for task in workers.list()
-                    )
-                )
-                else words[1],
+                title=event.title if event.public_narration else words[0],
+                message=event.message if event.public_narration else words[1],
                 task_id=event.task_id,
                 parent_task_id=event.parent_task_id,
                 active_tasks=event.active_workers,
@@ -379,25 +306,61 @@ def run_asv3_loop(
         with checkpoint_lock:
             emitted.append(packet.model_dump(mode="json"))
             if len(emitted) > 100:
-                latest: dict[str, dict[str, JsonValue]] = {}
-                for saved in emitted:
-                    latest[str(saved.get("task_id") or "coordinator")] = saved
-                retained = list(
-                    {
-                        str(saved["event_id"]): saved
-                        for saved in [emitted[0], *latest.values(), *emitted[-40:]]
-                    }.values()
-                )
+                latest = {
+                    str(row.get("task_id") or "coordinator"): row for row in emitted
+                }
+                retained = {
+                    str(row["event_id"]): row
+                    for row in [emitted[0], *latest.values(), *emitted[-40:]]
+                }
                 emitted[:] = sorted(
-                    retained,
-                    key=lambda saved: (
-                        saved["sequence"] if isinstance(saved["sequence"], int) else 0
-                    ),
+                    retained.values(), key=lambda row: int(str(row["sequence"]))
                 )
         emitter.emit(Packet(placement=Placement(turn_index=0), obj=packet))
 
     progress = ProgressReporter(context.run_id, context.language, emit_progress)
     context.services["progress"] = progress
+
+    def on_decision(decision: Decision) -> None:
+        nonlocal first_decision
+        for call in decision.calls:
+            language = call.arguments.get("_language")
+            if profile.language == "und" and isinstance(language, str):
+                try:
+                    candidate = LanguageProfile(
+                        language=language,
+                        notifications=localized_notifications(language),
+                        requires_sources=profile.requires_sources,
+                        external_requested=profile.external_requested,
+                    )
+                except ValueError:
+                    continue
+                if candidate.language != profile.language:
+                    profile.language, profile.notifications = (
+                        candidate.language,
+                        candidate.notifications,
+                    )
+                context.language = progress.language = candidate.language
+            notifications = call.arguments.get("_notifications")
+            if isinstance(notifications, dict):
+                for phase, pair in notifications.items():
+                    if (
+                        phase in profile.notifications
+                        and isinstance(pair, list)
+                        and len(pair) == 2
+                        and all(isinstance(word, str) and word.strip() for word in pair)
+                    ):
+                        title, message = map(str, pair)
+                        if public_narration_valid(title, message, context):
+                            profile.notifications[phase] = [title[:240], message[:1600]]
+            if first_decision and call.arguments.get("_external_requested") is True:
+                profile.external_requested = True
+        context.corpus_only = not (allow_external and profile.external_requested)
+        context.services["native_citation_label"] = profile.notifications[
+            "native_citation"
+        ][0]
+        state_container.set_stop_notice(profile.notifications["cancelled"][1])
+        first_decision = False
 
     def checkpoint(snapshot: dict[str, JsonValue]) -> None:
         nonlocal checkpoint_sequence
@@ -407,29 +370,19 @@ def run_asv3_loop(
             snapshot.update(
                 sequence=checkpoint_sequence,
                 prompt_version=PROMPT_VERSION,
+                execution_mode="native",
                 scope=context.scope,
                 progress=list(emitted),
                 progress_state=progress.export(),
                 public_profile=profile.model_dump(mode="json"),
                 workers=workers.export() if workers else {},
-                publication_review=latest_review.model_dump(mode="json")
-                if latest_review
-                else None,
                 publication_status=publication_status.value,
                 publication_stop_reason=publication_stop_reason,
-                final_publication_gap=final_publication_gap.model_dump(mode="json")
-                if final_publication_gap
-                else None,
-                draft_approval={
-                    "text_hash": hashlib.sha256(approved_draft.encode()).hexdigest(),
-                    "verification_call_id": approved_call_id,
-                    "questions": approved_questions,
-                }
-                if approved_draft is not None
+                final_publication_gap=harness.publication_gap.model_dump(mode="json")
+                if harness and harness.publication_gap
                 else None,
                 scenario=scenarios.snapshot(),
                 question_message_id=user_message_id,
-                continuation_usage=continuation_usage,
             )
             save_asv3_checkpoint(
                 message_id=assistant_message_id, user_id=user.id, snapshot=snapshot
@@ -439,18 +392,24 @@ def run_asv3_loop(
         for number in receipt.evidence_ids:
             item = ledger.get(number)
             if item and item.search_doc is None and item.metadata.get("source_sha256"):
-                anchored = broker.attach_native_citation(
-                    item, number, assistant_message_id, context
+                ledger.add(
+                    [
+                        broker.attach_native_citation(
+                            item, number, assistant_message_id, context
+                        )
+                    ],
+                    context,
                 )
-                ledger.add([anchored], context)
-        docs = [ledger.get(number) for number in receipt.evidence_ids]
         state_container.add_search_docs(
-            [item.search_doc for item in docs if item and item.search_doc]
+            [
+                item.search_doc
+                for number in receipt.evidence_ids
+                if (item := ledger.get(number)) and item.search_doc
+            ]
         )
 
     def verify(args: dict[str, JsonValue], child: RunContext) -> ToolOutcome:
         numbers = args.get("evidence_numbers", args.get("citations", []))
-        claim = str(args.get("claim", ""))
         anchors = (
             " ".join(f"[{n}]" for n in numbers) if isinstance(numbers, list) else ""
         )
@@ -468,8 +427,14 @@ def run_asv3_loop(
                 {
                     "language": child.language,
                     "scenario": question,
-                    "claim": claim,
-                    "evidence": _evidence_record(ledger, anchors),
+                    "claim": str(args.get("claim", "")),
+                    "evidence": _evidence_record(
+                        ledger,
+                        anchors,
+                        preferred_numbers=[n for n in numbers if isinstance(n, int)]
+                        if isinstance(numbers, list)
+                        else [],
+                    ),
                 },
                 ensure_ascii=False,
             ),
@@ -480,9 +445,7 @@ def run_asv3_loop(
             status=OutcomeStatus.FOUND
             if report.get("status") == "supported"
             else OutcomeStatus.PARTIAL,
-            summary="Original-source assessment format failed; no claim was approved"
-            if report.get("format_error")
-            else "Claim checked against original evidence",
+            summary="Claim checked against selected original evidence",
             data=report,
         )
 
@@ -491,8 +454,7 @@ def run_asv3_loop(
     def researcher(
         task: str, child: RunContext, updates: Callable[[], list[str]]
     ) -> ToolOutcome:
-        local_scenario = ScenarioState([task], frozen=True)
-        child.services["scenario_state"] = local_scenario
+        child.services["scenario_state"] = ScenarioState([task], frozen=True)
         child.services["search_message_history"] = [
             ChatMessageSimple(
                 message=question,
@@ -513,6 +475,7 @@ def run_asv3_loop(
             history=question,
             updates=updates,
             token_counter=token_counter,
+            lean_native_mode=True,
         )
         result = Harness(
             request=task,
@@ -548,773 +511,201 @@ def run_asv3_loop(
         ),
     )
     external_names = {spec.name for spec in external_specs}
-    source_specs = (
+    for spec in (
         build_corpus_specs(broker)
         + build_source_specs(broker)
         + build_sandbox_specs(broker)
         + external_specs
-    )
-    registry_specs = (
-        [
-            spec.model_copy(update={"requires_research_need": True})
-            for spec in source_specs
-        ]
         + workers.tool_specs()
-        + [
-            spec.model_copy(update={"requires_research_need": True})
-            if spec.name == "verify_claim"
-            else spec
-            for spec in build_supplemental_specs()
-        ]
+        + build_supplemental_specs()
         + build_research_specs(research_state, ledger)
-    )
-    for spec in registry_specs:
+    ):
         registry.register(spec)
     model.pending_tasks = lambda: [
         task.model_dump(mode="json") for task in workers.list()
     ]
-
     context.services["wait_for_task_change"] = workers.wait_for_change
 
-    def review_answer(
-        draft: str,
-        *,
-        research: bool,
-        preservation_reference: str | None = None,
-        previous_review: VerificationResult | None = None,
-    ) -> VerificationResult:
-        nonlocal latest_review
-        if harness is None:
-            raise RuntimeError("Research state is not ready for verification")
-        view = harness.view()
-        progress.report("final")
-        assertion_units = assertion_inventory(draft)
-        evidence = _evidence_record(
-            ledger,
-            draft + ("\n" + preservation_reference if preservation_reference else ""),
-            max_chars=max(8000, min(180000, (llm.config.max_input_tokens - 18000) * 2)),
-            preferred_numbers=research_state.preferred_citations(),
-            include_witness_spans=True,
-            include_supplemental_originals=True,
-            required_numbers=research_state.source_conditions.citations(),
-        )
-        if research:
-            context.consume_research_decision()
-        latest_review = model.invoke_verification(
-            VERIFICATION_PROMPT,
-            json.dumps(
-                {
-                    "language": context.language,
-                    "scenario": question,
-                    "questions": question_inventory(view.questions),
-                    "claim": draft,
-                    "assertion_units": assertion_units,
-                    "preservation_reference": {
-                        "draft": preservation_reference,
-                        "previous_review": previous_review.model_dump(mode="json")
-                        if previous_review
-                        else None,
-                    }
-                    if preservation_reference
-                    else None,
-                    "evidence": evidence,
-                    "authority_obligations": authority_obligations(draft, ledger),
-                    "research_state": research_state.view(max_chars=24000),
-                    "unmatched_quoted_terms": unmatched_quoted_terms(
-                        draft, question, ledger
-                    ),
-                    "require_sources": profile.requires_sources,
-                    "publication_mode": "complete" if research else "partial_allowed",
-                    "pending_tasks": model.pending_tasks(),
-                },
-                ensure_ascii=False,
-            ),
-            max_tokens=max(
-                6000,
-                min(
-                    16000,
-                    3000
-                    + 220 * len(assertion_units)
-                    + 130
-                    * sum(len(unit["evidence_numbers"]) for unit in assertion_units)
-                    + 250 * len(view.questions),
-                ),
-            ),
-            consume_budget=not research,
-        )
-        if profile.requires_sources:
-            if latest_review.format_error is None and model.last_call_id:
-                delivered = ledger.completely_delivered(model.last_call_id)
-                determinations = {
-                    row["determination_id"]
-                    for row in question_determinations(view.questions)
-                }
-                research_state.source_conditions.remember(
-                    [
-                        item
-                        for item in latest_review.omitted_material_source_details
-                        if item.witness.citation in delivered
-                        and not (set(item.determination_ids) - determinations)
-                        and (original := ledger.get(item.witness.citation)) is not None
-                        and assertion_witness_valid(
-                            item.witness, {item.witness.citation: original.text}
-                        )
-                    ],
-                    ledger,
-                )
-            latest_review = latest_review.model_copy(
-                update={
-                    "condition_review": None,
-                    "condition_review_call_id": None,
-                    "condition_review_answer_hash": None,
-                    "source_inventory_call_id": None,
-                }
+    def ask_user(args: dict[str, JsonValue], child: RunContext) -> ToolOutcome:
+        nonlocal clarification
+        if child.depth:
+            return ToolOutcome(
+                status=OutcomeStatus.DENIED,
+                summary="Return the missing user fact to the coordinator; only it can request clarification.",
             )
-            # Fix already-detected support defects before paying for another assessment.
-            ordinary_gap = publication_gap(
-                draft,
-                latest_review,
-                view.questions,
-                ledger,
-                require_sources=True,
-                allow_explicit_gaps=not research,
-                verification_call_id=model.last_call_id,
-                require_direct_authority=latest_review.status == "supported",
-                scenario=question,
-                require_quotation_checks=True,
-                require_assertion_checks=True,
-                require_determination_checks=True,
-                research_state=research_state,
+        text = str(args["question"]).strip()
+        if not public_narration_valid("Clarification", text, context):
+            return ToolOutcome(
+                status=OutcomeStatus.INVALID,
+                summary="Ask a concrete user fact without internal details.",
             )
-            if ordinary_gap is None:
-                latest_review = complete_condition_review(
-                    latest_review,
-                    model,
-                    ledger,
-                    answer=draft,
-                    scenario=question,
-                    questions=view.questions,
-                    evidence=evidence,
-                    language=context.language,
-                    consume_budget=not research,
-                    condition_memory=research_state.source_conditions,
-                    allow_explicit_gaps=not research,
-                )
-        checkpoint(harness.snapshot())
-        return latest_review
+        clarification = text
+        return ToolOutcome(
+            status=OutcomeStatus.FOUND, summary="User clarification requested"
+        )
 
-    def draft_guard(draft: str) -> ToolOutcome | None:
-        nonlocal approved_draft, approved_review, approved_call_id, approved_questions
-        approved_draft = None
-        approved_review = None
-        approved_call_id = None
-        approved_questions = []
-        if profile.requires_sources and not ledger.citation_mapping():
+    registry.register(
+        ToolSpec(
+            name="ask_user",
+            description="Ask a missing user fact that materially changes the outcome; publish the question and end this turn. Use source tools for missing legal text. Call on its own.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string", "minLength": 1, "maxLength": 1600}
+                },
+                "required": ["question"],
+                "additionalProperties": False,
+            },
+            handler=ask_user,
+            parallel_safe=False,
+            consumes_tool_budget=False,
+        )
+    )
+
+    def publication_guard(answer: str) -> ToolOutcome | None:
+        numbers = extract_citation_numbers(answer)
+        unknown = sorted(set(numbers) - ledger.citation_mapping().keys())
+        if unknown:
             return ToolOutcome(
                 status=OutcomeStatus.PARTIAL,
-                summary="No original citable evidence is recorded. Source access failures do not justify legal conclusions from memory.",
-                data={
-                    "missing": "original legal evidence",
-                    "available_tasks": model.pending_tasks(),
-                },
+                summary="Use recorded original citation numbers.",
+                data={"unknown_citations": unknown},
             )
-        uncovered = research_state.uncovered_questions()
-        if profile.requires_sources and uncovered:
+        delivered = ledger.completely_delivered(model.last_call_id or "")
+        undelivered = [n for n in numbers if n not in delivered]
+        if undelivered:
             return ToolOutcome(
                 status=OutcomeStatus.PARTIAL,
-                summary="Original questions still lack material research needs and completion tests.",
-                data={
-                    "uncovered_question_ids": uncovered,
-                    "instruction": "Record the missing determinations with update_research, retaining scenario qualifiers. Reuse existing originals. Choose any needed research methods yourself; this does not require repeating completed reads.",
-                },
+                summary="Read cited originals that have not reached the model.",
+                data={"undelivered_citations": undelivered},
             )
-        missing_authority = (
-            unresolved_authority_gap(draft, ledger)
-            if profile.requires_sources
+        if profile.requires_sources and not numbers:
+            return ToolOutcome(
+                status=OutcomeStatus.PARTIAL,
+                summary="A legal answer needs recorded original citations. Retrieve the operative source or disclose the precise gap using submit_partial_answer.",
+                data={"missing": "original legal evidence"},
+            )
+        return None
+
+    def submit_partial(args: dict[str, JsonValue], child: RunContext) -> ToolOutcome:
+        nonlocal partial
+        if child.depth:
+            return ToolOutcome(
+                status=OutcomeStatus.DENIED,
+                summary="Return available originals and precise gaps to the coordinator; only it can publish.",
+            )
+        candidate = str(args["answer"]).strip()
+        gap = (
+            publication_guard(candidate)
+            if extract_citation_numbers(candidate)
             else None
         )
-        if missing_authority is not None:
-            return ToolOutcome(
-                status=OutcomeStatus.PARTIAL,
-                summary="An explicitly used statutory basis still needs its original provision.",
-                data=missing_authority,
-            )
-        assert harness is not None
-        questions = harness.view().questions
-        fingerprint = hashlib.sha256(
-            json.dumps(
-                [
-                    draft,
-                    questions,
-                    scenarios.snapshot(),
-                    ledger.authority_metadata(),
-                    research_state.export(),
-                ],
-                ensure_ascii=False,
-                sort_keys=True,
-            ).encode()
-        ).hexdigest()
-        cached = guard_cache.get(fingerprint)
-        if cached is not None:
-            gap, review, call_id, _ = cached
-            if gap is None:
-                approved_draft, approved_review, approved_call_id = (
-                    draft,
-                    review,
-                    call_id,
-                )
-                approved_questions = list(questions)
+        if gap is not None:
             return gap
-        review = review_answer(draft, research=True)
-        call_id = model.last_call_id
-        gap = publication_gap(
-            draft,
-            review,
-            questions,
-            ledger,
-            require_sources=profile.requires_sources,
-            verification_call_id=call_id,
-            require_direct_authority=True,
-            scenario=question,
-            require_quotation_checks=True,
-            require_assertion_checks=True,
-            require_determination_checks=profile.requires_sources,
-            require_condition_review=profile.requires_sources,
-            require_source_inventory=profile.requires_sources,
-            research_state=research_state,
+        partial = candidate
+        return ToolOutcome(
+            status=OutcomeStatus.PARTIAL,
+            summary="Precise supported partial answer submitted",
         )
-        if gap is None:
-            approved_draft, approved_review, approved_call_id = draft, review, call_id
-            approved_questions = list(questions)
-        if review.format_error is None:
-            guard_cache[fingerprint] = (gap, review, call_id, list(questions))
-            if len(guard_cache) > 8:
-                guard_cache.pop(next(iter(guard_cache)))
-        return gap
 
-    partial_submission_answer: str | None = None
-    partial_submission_reference: str | None = None
-    partial_submission_review: VerificationResult | None = None
-
-    def take_partial_submission() -> str | None:
-        nonlocal partial_submission_answer
-        answer, partial_submission_answer = partial_submission_answer, None
-        return answer
-
+    registry.register(
+        ToolSpec(
+            name="submit_partial_answer",
+            description="End this turn with supported parts and a precise unresolved source gap. Cite each supported legal assertion. Do not turn missing evidence into a claim that no law exists. Call on its own.",
+            parameters={
+                "type": "object",
+                "properties": {"answer": {"type": "string", "minLength": 1}},
+                "required": ["answer"],
+                "additionalProperties": False,
+            },
+            handler=submit_partial,
+            parallel_safe=False,
+            consumes_tool_budget=False,
+        )
+    )
     harness = Harness(
         request=question,
         context=context,
         registry=registry,
         decide=model.decide,
         evidence=ledger,
-        progress=progress,
         on_receipt=record,
         checkpoint=checkpoint,
+        progress=progress,
+        draft_guard=publication_guard,
+        partial_submission=lambda: clarification or partial,
         report_terminal=False,
-        draft_guard=draft_guard,
-        partial_submission=take_partial_submission,
+        on_decision=on_decision,
     )
-    for spec in build_core_specs(
-        registry,
-        ledger,
-        lambda: {
-            "scenario": scenarios.snapshot(),
-            "workers": [task.model_dump(mode="json") for task in workers.list()],
-            "receipts": [
-                receipt.model_dump(mode="json") for receipt in harness.receipts[-20:]
-            ],
-        },
-    ):
+    for spec in build_core_specs(registry, ledger, harness.snapshot):
         registry.register(spec)
 
-    def submit_partial_answer(
-        args: dict[str, JsonValue], submit_context: RunContext
-    ) -> ToolOutcome:
-        nonlocal partial_submission_answer
-        nonlocal partial_submission_reference, partial_submission_review
-        answer = args["answer"]
-        assert isinstance(answer, str)
-        submit_context.check_active()
-        if submit_context.depth != 0:
-            return ToolOutcome(
-                status=OutcomeStatus.DENIED,
-                summary="Only the coordinator can submit the user's partial answer; delegated researchers return their own findings.",
-            )
-        partial_submission_reference = harness.last_draft if harness else None
-        partial_submission_review = latest_review
-        partial_submission_answer = answer
-        return ToolOutcome(
-            status=OutcomeStatus.PARTIAL,
-            summary="Partial candidate submitted for original-source publication checks",
-            data={"reason": args["reason"], "answer_characters": len(answer)},
-        )
+    def revalidate(items: list[EvidenceItem], *, resuming: bool = False) -> None:
+        canonical: list[EvidenceItem] = []
+        for item in items:
+            if item.metadata.get("external"):
+                if (
+                    resuming
+                    or context.corpus_only
+                    or item.metadata.get("external_tool_name") not in external_names
+                ):
+                    raise PermissionError(
+                        "External evidence requires fresh authorized retrieval"
+                    )
+            else:
+                canonical.append(item)
+        context.check_active()
+        broker.revalidate_evidence(canonical, context)
 
-    registry.register(
-        ToolSpec(
-            name="submit_partial_answer",
-            description="End research with a publication-ready partial candidate when a remaining outcome cannot be resolved usefully. Preserve supported answers and disclose each exact gap. This does not approve publication: original-source, citation, authority and independent condition checks still apply. Call on its own.",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "answer": {"type": "string", "minLength": 1, "maxLength": 80000},
-                    "reason": {"type": "string", "minLength": 1, "maxLength": 1200},
-                },
-                "required": ["answer", "reason"],
-                "additionalProperties": False,
-            },
-            handler=submit_partial_answer,
-            parallel_safe=False,
-            consumes_tool_budget=False,
-        )
-    )
     try:
-
-        def revalidate(items: list[EvidenceItem], *, resuming: bool = False) -> None:
-            canonical: list[EvidenceItem] = []
-            for item in items:
-                if item.metadata.get("external"):
-                    if (
-                        resuming
-                        or context.corpus_only
-                        or item.metadata.get("external_tool_name") not in external_names
-                    ):
-                        raise PermissionError(
-                            "External evidence requires fresh authorized retrieval"
-                        )
-                    context.check_active()
-                else:
-                    canonical.append(item)
-            broker.revalidate_evidence(canonical, context)
-
         if previous is not None:
-            context.run_id = str(previous["run_id"])
-            previous["language"] = context.language
             harness.restore(previous)
-            # A durable snapshot is not authorization for current access/publication.
+            harness.publication_gap = None
             revalidate(
-                [
-                    item
-                    for n in ledger.citation_mapping()
-                    if (item := ledger.get(n)) is not None
-                ],
+                [item for n in ledger.citation_mapping() if (item := ledger.get(n))],
                 resuming=True,
             )
-            continuation_usage = {
-                "message_id": resume_message_id,
-                "budget": cast(dict[str, JsonValue], context.budget.snapshot()),
-            }
-            # Explicit continuation grants fresh execution capacity, not more memory.
-            context.budget.restore({"tools": 0, "decisions": 0})
             worker_state = previous.get("workers")
             if isinstance(worker_state, dict):
                 workers.restore(worker_state)
-            scenario = previous.get("scenario")
-            if isinstance(scenario, dict):
-                scenarios.record(
-                    [str(q) for q in scenario.get("questions", [])],
-                    [str(f) for f in scenario.get("facts", [])],
-                )
-            progress.run_id = context.run_id
             progress_state = previous.get("progress_state")
             if isinstance(progress_state, dict):
                 progress.restore(progress_state)
-            sequence = previous.get("sequence", 0)
-            if not isinstance(sequence, int):
+            saved_sequence = previous.get("sequence", 0)
+            if not isinstance(saved_sequence, int):
                 raise ValueError("Invalid checkpoint sequence")
-            checkpoint_sequence = sequence
+            checkpoint_sequence = saved_sequence
         result = harness.run()
         context.check_active()
-        # Finish admitted research before constructing the immutable synthesis input.
-        # A shared decision stop is not evidence that in-flight source reads finished.
-        if result.status != OutcomeStatus.FOUND:
-            workers.settle()
-        checkpoint(harness.snapshot())
-        draft = result.answer or harness.last_draft or ""
-        complete = result.status == OutcomeStatus.FOUND
-        if not draft:
-            draft = json.dumps(
-                {
-                    "status": result.status.value,
-                    "scenario": scenarios.snapshot(),
-                    "warning": "Research is incomplete. State the exact unresolved questions.",
-                    "last_review": latest_review.model_dump(mode="json")
-                    if latest_review
-                    else None,
-                },
-                ensure_ascii=False,
-            )
-        progress.report("final")
-        if complete:
-            if (
-                approved_draft != draft
-                or approved_review is None
-                or approved_call_id is None
-                or approved_questions != harness.view().questions
-            ):
-                raise ValueError(
-                    "Verified draft approval does not match the final answer"
-                )
-            final, final_review = draft, approved_review
-            # The verifier saw this exact text and its complete original evidence.
-            final_gap = publication_gap(
-                final,
-                final_review,
-                approved_questions,
-                ledger,
-                require_sources=profile.requires_sources,
-                verification_call_id=approved_call_id,
-                require_direct_authority=True,
-                scenario=question,
-                require_quotation_checks=True,
-                require_assertion_checks=True,
-                require_determination_checks=profile.requires_sources,
-                require_condition_review=profile.requires_sources,
-                require_source_inventory=profile.requires_sources,
-                research_state=research_state,
-            )
-        elif result.stop_reason == "model_requested_partial_publication":
-            # Keep the exact candidate; an optional gap must not force a lossy rewrite.
-            final = draft
-            final_review = review_answer(
-                final,
-                research=False,
-                preservation_reference=partial_submission_reference,
-                previous_review=partial_submission_review,
-            )
-            final_gap = publication_gap(
-                final,
-                final_review,
-                harness.view().questions,
-                ledger,
-                require_sources=profile.requires_sources,
-                allow_explicit_gaps=True,
-                verification_call_id=model.last_call_id,
-                require_direct_authority=final_review.status == "supported",
-                scenario=question,
-                require_quotation_checks=True,
-                require_assertion_checks=True,
-                require_determination_checks=profile.requires_sources,
-                require_condition_review=profile.requires_sources,
-                require_source_inventory=profile.requires_sources,
-                research_state=research_state,
-            )
-        else:
-            previous_review = latest_review
-            evidence = _evidence_record(
-                ledger,
-                draft,
-                max_chars=max(
-                    8000, min(180000, (llm.config.max_input_tokens - 18000) * 2)
-                ),
-                preferred_numbers=research_state.preferred_citations(),
-                required_numbers=research_state.source_conditions.citations(),
-            )
-            final = model.invoke_text(
-                FINAL_PROMPT,
-                json.dumps(
-                    {
-                        "language": context.language,
-                        "question": question,
-                        "scenario": scenarios.snapshot(),
-                        "draft": draft,
-                        "publication_gap": harness.publication_gap.model_dump(
-                            mode="json"
-                        )
-                        if harness.publication_gap is not None
-                        else None,
-                        "authority_obligations": authority_obligations(draft, ledger),
-                        "review": latest_review.model_dump(mode="json")
-                        if latest_review
-                        else None,
-                        "evidence": evidence,
-                        "research_status": result.status.value,
-                        "research_state": research_state.view(max_chars=24000),
-                        "assistant_instructions": custom_agent_prompt or "",
-                    },
-                    ensure_ascii=False,
-                ),
-                LLMFlow.ASV3_FINAL,
-                max_tokens=9000,
-            )
-            harness.last_draft = final
-            checkpoint(harness.snapshot())
-            # Review the actual published wording, not just the coordinator's draft.
-            final_review = review_answer(
-                final,
-                research=False,
-                preservation_reference=draft
-                if result.answer or harness.last_draft
-                else None,
-                previous_review=previous_review,
-            )
-            final_gap = publication_gap(
-                final,
-                final_review,
-                harness.view().questions,
-                ledger,
-                require_sources=profile.requires_sources,
-                allow_explicit_gaps=not complete,
-                verification_call_id=model.last_call_id,
-                require_direct_authority=final_review.status == "supported",
-                scenario=question,
-                require_quotation_checks=True,
-                require_assertion_checks=True,
-                require_determination_checks=profile.requires_sources,
-                require_condition_review=profile.requires_sources,
-                require_source_inventory=profile.requires_sources,
-                research_state=research_state,
-            )
-        if (
-            final_gap is not None
-            and context.budget.snapshot()["decisions"]
-            < context.budget.limits["decisions"]
-            - context.budget.publication_decision_reserve
-        ):
-            # The final review feeds the same research loop, with its exact candidate.
-            harness.last_draft = final
-            harness.publication_gap = final_gap
-            checkpoint(harness.snapshot())
-            context.services["final_repair"] = True
-            try:
-                repaired = harness.run()
-            finally:
-                context.services.pop("final_repair", None)
-            workers.settle()
-            if (
-                repaired.status == OutcomeStatus.FOUND
-                and approved_draft == repaired.answer
-                and approved_review is not None
-            ):
-                final, final_review = approved_draft, approved_review
-                complete = True
-                final_gap = publication_gap(
-                    final,
-                    final_review,
-                    harness.view().questions,
-                    ledger,
-                    require_sources=profile.requires_sources,
-                    verification_call_id=approved_call_id,
-                    require_direct_authority=True,
-                    scenario=question,
-                    require_quotation_checks=True,
-                    require_assertion_checks=True,
-                    require_determination_checks=profile.requires_sources,
-                    require_condition_review=profile.requires_sources,
-                    require_source_inventory=profile.requires_sources,
-                    research_state=research_state,
-                )
-            else:
-                # Keep the repaired candidate and only publish supported portions.
-                draft = harness.last_draft or final
-                if (
-                    context.budget.snapshot()["decisions"]
-                    <= context.budget.limits["decisions"]
-                    - context.budget.publication_decision_reserve
-                ):
-                    final = repair_publication_candidate(
-                        model,
-                        ledger,
-                        answer=draft,
-                        scenario=question,
-                        gap=harness.publication_gap or final_gap,
-                        evidence=_evidence_record(
-                            ledger,
-                            draft,
-                            preferred_numbers=research_state.preferred_citations(),
-                            required_numbers=research_state.source_conditions.citations(),
-                        ),
-                        research_state=research_state.view(max_chars=24000),
-                    ) or model.invoke_text(
-                        FINAL_PROMPT,
-                        json.dumps(
-                            {
-                                "language": context.language,
-                                "question": question,
-                                "scenario": scenarios.snapshot(),
-                                "draft": draft,
-                                "publication_gap": (
-                                    harness.publication_gap or final_gap
-                                ).model_dump(mode="json"),
-                                "authority_obligations": authority_obligations(
-                                    draft, ledger
-                                ),
-                                "review": latest_review.model_dump(mode="json")
-                                if latest_review
-                                else None,
-                                "research_state": research_state.view(max_chars=24000),
-                                "evidence": _evidence_record(
-                                    ledger,
-                                    draft,
-                                    preferred_numbers=research_state.preferred_citations(),
-                                    required_numbers=research_state.source_conditions.citations(),
-                                ),
-                                "research_status": "incomplete",
-                                "assistant_instructions": custom_agent_prompt or "",
-                            },
-                            ensure_ascii=False,
-                        ),
-                        LLMFlow.ASV3_FINAL,
-                        max_tokens=9000,
-                    )
-                    harness.last_draft = final
-                    final_review = review_answer(
-                        final,
-                        research=False,
-                        preservation_reference=draft,
-                        previous_review=latest_review,
-                    )
-                    final_gap = publication_gap(
-                        final,
-                        final_review,
-                        harness.view().questions,
-                        ledger,
-                        require_sources=profile.requires_sources,
-                        allow_explicit_gaps=True,
-                        verification_call_id=model.last_call_id,
-                        require_direct_authority=final_review.status == "supported",
-                        scenario=question,
-                        require_quotation_checks=True,
-                        require_assertion_checks=True,
-                        require_determination_checks=profile.requires_sources,
-                        require_condition_review=profile.requires_sources,
-                        require_source_inventory=profile.requires_sources,
-                        research_state=research_state,
-                    )
-                complete = False
-        # Research allocation and publication completeness are separate outcomes.
-        # A reviewed finalization can satisfy every obligation after research stops.
-        if final_gap is None and not complete and final_review.status == "supported":
-            complete = (
-                publication_gap(
-                    final,
-                    final_review,
-                    harness.view().questions,
-                    ledger,
-                    require_sources=profile.requires_sources,
-                    verification_call_id=model.last_call_id,
-                    require_direct_authority=True,
-                    scenario=question,
-                    require_quotation_checks=True,
-                    require_assertion_checks=True,
-                    require_determination_checks=profile.requires_sources,
-                    require_condition_review=profile.requires_sources,
-                    require_source_inventory=profile.requires_sources,
-                    research_state=research_state,
-                )
-                is None
-            )
-        # Source-first review can discover missing requirements after the last writer.
-        # Patch those exact gaps while preserving the reviewed remainder, then audit again.
-        if (
-            final_gap is not None
-            and final_gap.data.get("omitted_material_source_details")
-            and context.budget.limits["decisions"]
-            - context.budget.snapshot()["decisions"]
-            >= 3
-        ):
-            candidate = repair_publication_candidate(
-                model,
-                ledger,
-                answer=final,
-                scenario=question,
-                gap=final_gap,
-                evidence=_evidence_record(
-                    ledger,
-                    final,
-                    preferred_numbers=research_state.preferred_citations(),
-                    required_numbers=research_state.source_conditions.citations(),
-                    include_witness_spans=True,
-                    include_supplemental_originals=True,
-                ),
-                research_state=research_state.view(max_chars=24000),
-            )
-            if candidate and candidate != final:
-                previous_final, previous_review = final, final_review
-                final = candidate
-                harness.last_draft = final
-                try:
-                    final_review = review_answer(
-                        final,
-                        research=False,
-                        preservation_reference=previous_final,
-                        previous_review=previous_review,
-                    )
-                except RunStopped:
-                    context.check_active()
-                    final_review = VerificationResult(
-                        status="uncertain",
-                        explanation="Publication assessment capacity exhausted",
-                        required_conditions=[],
-                        missing_conditions=[],
-                        evidence_numbers=[],
-                        safe_to_publish=False,
-                        format_error="The patched candidate has no complete publication assessment",
-                    )
-                    latest_review = final_review
-                final_gap = publication_gap(
-                    final,
-                    final_review,
-                    harness.view().questions,
-                    ledger,
-                    require_sources=profile.requires_sources,
-                    allow_explicit_gaps=True,
-                    verification_call_id=model.last_call_id,
-                    require_direct_authority=final_review.status == "supported",
-                    scenario=question,
-                    require_quotation_checks=True,
-                    require_assertion_checks=True,
-                    require_determination_checks=profile.requires_sources,
-                    require_condition_review=profile.requires_sources,
-                    require_source_inventory=profile.requires_sources,
-                    research_state=research_state,
-                )
-                complete = final_gap is None and final_review.status == "supported"
-                if complete:
-                    approved_draft, approved_review, approved_call_id = (
-                        final,
-                        final_review,
-                        model.last_call_id,
-                    )
-                    approved_questions = harness.view().questions
-        final_publication_gap = final_gap
-        publication_stop_reason = (
-            "publication_guard_rejected"
-            if final_gap is not None
-            else "verified_draft_ready"
-            if complete
-            else result.stop_reason or "incomplete_research"
+        final = (
+            clarification
+            or partial
+            or result.answer
+            or profile.notifications["failed"][1]
+        ).strip()
+        publication_status = (
+            OutcomeStatus.FOUND
+            if result.answer and not clarification and not partial
+            else OutcomeStatus.PARTIAL
         )
-        # Retain the exact rejection before any safe limitation notice replaces it.
-        with graph_step("asv3.publication_guard") as step:
-            step.output_value = {
-                "stop_reason": result.stop_reason,
-                "publication_stop_reason": publication_stop_reason,
-                "publication_gap": final_gap.model_dump(mode="json")
-                if final_gap
-                else None,
-                "verification_call_id": approved_call_id
-                if complete
-                else model.last_call_id,
-                "answer_hash": hashlib.sha256(final.encode()).hexdigest(),
-            }
-        checkpoint(harness.snapshot())
-        if final_gap is not None:
-            # A source-free limitation notice is safe even when synthesis failed.
-            # Reviewer explanations are not substituted for unsupported legal rules.
-            final = profile.notifications["failed"][1]
-            complete = False
-        elif final_review.status != "supported":
-            complete = False
-        publication_status = OutcomeStatus.FOUND if complete else OutcomeStatus.PARTIAL
-        # Unknown citation IDs never reach the UI as plausible evidence links.
+        publication_stop_reason = (
+            "clarification_requested"
+            if clarification
+            else "native_partial_published"
+            if partial
+            else "native_answer_published"
+            if result.answer
+            else result.stop_reason
+        )
+        progress.report("final")
         allowed = ledger.citation_mapping()
-        unknown = set(extract_citation_numbers(final)) - allowed.keys()
-        if unknown:
+        numbers = extract_citation_numbers(final)
+        if set(numbers) - allowed.keys():
             raise ValueError("ASv3 final answer contains unrecorded citation targets")
-        revalidate([item for n in allowed if (item := ledger.get(n)) is not None])
+        revalidate([item for n in numbers if (item := ledger.get(n))])
         state_container.add_search_docs(list(allowed.values()))
         state_container.set_pre_answer_processing_time(time.monotonic() - start)
-        ledger.include(extract_citation_numbers(final))
+        ledger.include(numbers)
         checkpoint(harness.snapshot())
         processor = DynamicCitationProcessor(
             citation_mode=CitationMode.HYPERLINK
@@ -1355,36 +746,20 @@ def run_asv3_loop(
         state_container.set_citation_mapping(processor.citation_to_doc)
         state_container.set_answer_tokens("".join(answer_parts))
         final_published = True
-        if complete:
-            publication_stop_reason = "verified_draft_published"
-        elif final_gap is None:
-            publication_stop_reason = "verified_partial_published"
-        progress.report(
-            "completed" if final_gap is None else "failed",
-            status="completed" if final_gap is None else "failed",
-        )
+        progress.report("completed", status="completed")
         checkpoint(harness.snapshot())
         emitter.emit(Packet(placement=Placement(turn_index=0), obj=SectionEnd()))
     except RunStopped as error:
         logger.info("ASv3 stopped before publication: %s", str(error))
-        if context.is_cancelled():
-            progress.report("cancelled", status="cancelled")
-        else:
-            progress.report("failed", status="failed")
-        # Stop preserves the already durable record; no late write or answer is accepted.
+        progress.report(
+            "cancelled" if context.is_cancelled() else "interrupted", status="failed"
+        )
         raise
-    except Exception as error:
-        publication_stop_reason = f"runtime_error:{type(error).__name__}"
-        publication_status = OutcomeStatus.PARTIAL
-        if harness is not None and not context.is_cancelled():
-            try:
-                checkpoint(harness.snapshot())
-            except RunStopped:
-                pass
-            except Exception:
-                logger.exception("Could not persist ASv3 terminal diagnostics")
+    except Exception:
+        logger.exception("ASv3 native research failed")
+        publication_stop_reason = "native_runtime_error"
         progress.report("failed", status="failed")
-        logger.exception("ASv3 run failed")
         raise
     finally:
-        workers.close()
+        if workers:
+            workers.close()

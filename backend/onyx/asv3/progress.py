@@ -64,7 +64,7 @@ _MESSAGES: dict[str, dict[str, tuple[str, str]]] = {
         ),
         "failed": (
             "Araştırma tamamlanamadı",
-            "Çalışmanın sınırına ulaşıldı; mevcut bulgular korunuyor.",
+            "Araştırma tamamlanamadı; mevcut bulgular korunuyor.",
         ),
     },
     "en": {
@@ -84,10 +84,68 @@ _MESSAGES: dict[str, dict[str, tuple[str, str]]] = {
         ),
         "failed": (
             "Research incomplete",
-            "The run reached its limit; existing findings are preserved.",
+            "Research could not be completed; existing findings are preserved.",
         ),
     },
 }
+
+
+def localized_notifications(language: str) -> dict[str, list[str]]:
+    """Supply terminal UI text without a separate language-model invocation."""
+    base = _MESSAGES.get(language.split("-")[0].lower(), {})
+    result = {
+        phase: list(base.get(phase, ("ASv3", "…")))
+        for phase in (
+            "started",
+            "tools",
+            "worker",
+            "final",
+            "completed",
+            "failed",
+            "cancelled",
+            "interrupted",
+            "resume",
+            "native_citation",
+        )
+    }
+    if language.startswith("tr"):
+        result.update(
+            final=["Yanıt hazırlanıyor", "Kaynakları verilen olaya uyguluyorum."],
+            completed=["Yanıt hazır", "Kaynaklı yanıt tamamlandı."],
+            interrupted=[
+                "Araştırma yarım kaldı",
+                "Araştırma tamamlanamadı; mevcut kanıtlar korunuyor.",
+            ],
+            resume=[
+                "Araştırmaya devam",
+                "Açık kalan hususları incelemeye devam edebilirim.",
+            ],
+            native_citation=[
+                "Özgün kaynaktan pasaj",
+                "Özgün dosyadan çıkarılan kaynak pasajı.",
+            ],
+        )
+    elif language.startswith("en"):
+        result.update(
+            final=[
+                "Preparing the answer",
+                "I am applying the original sources to your facts.",
+            ],
+            completed=["Answer ready", "The source-grounded answer is ready."],
+            interrupted=[
+                "Research interrupted",
+                "Research is incomplete; the evidence is retained.",
+            ],
+            resume=[
+                "Continue research",
+                "I can continue investigating the unresolved issues.",
+            ],
+            native_citation=[
+                "Original source excerpt",
+                "An excerpt extracted from the original file.",
+            ],
+        )
+    return result
 
 
 class ProgressReporter:
@@ -188,13 +246,19 @@ class ProgressReporter:
             raise ValueError("Invalid progress checkpoint")
         events = [ProgressEvent.model_validate(item) for item in raw_events]
         previous = 0
+        localized = False
         for event in events:
             if (
                 event.run_id != self.run_id
-                or event.language != self.language
+                or (
+                    event.language != self.language
+                    and not (event.language == "und" and not localized)
+                )
+                or (event.language == "und" and localized)
                 or event.sequence <= previous
             ):
                 raise ValueError("Invalid progress event sequence")
+            localized = localized or event.language != "und"
             previous = event.sequence
         if sequence != previous:
             raise ValueError("Progress sequence does not match events")

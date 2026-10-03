@@ -10,6 +10,7 @@ from pydantic import JsonValue
 from onyx.asv3.corpus_tools import CorpusBroker
 from onyx.asv3.llm_adapter import model_slot, provider_retry_delay
 from onyx.asv3.models import (
+    CapabilityCall,
     EvidenceItem,
     OutcomeStatus,
     RunContext,
@@ -29,7 +30,7 @@ from onyx.llm.models import LanguageModelInput, ReasoningEffort, ToolChoiceOptio
 from onyx.regulatory.structured_llm import is_retryable_provider_error
 from onyx.server.query_and_chat.placement import Placement
 from onyx.tools.constants import REGULATORY_MAX_SEARCH_QUERY_CHARS
-from onyx.tools.models import ToolCallKickoff
+from onyx.tools.models import ChatMinimalTextMessage, ToolCallKickoff
 from onyx.tools.tool_implementations.search.search_tool import SearchTool
 from onyx.tools.tool_runner import run_tool_calls
 
@@ -139,6 +140,25 @@ class ScopedSearchLLM(LLM):
                 self.wait_to_retry(error, attempt)
 
 
+class ScopedSearchAdapter:
+    def __init__(
+        self,
+        search: Callable[[dict[str, JsonValue], RunContext], ToolOutcome],
+        prepare: Callable[[list[CapabilityCall], RunContext], dict[str, SearchTool]],
+    ) -> None:
+        self._search = search
+        self._prepare = prepare
+
+    def __call__(self, args: dict[str, JsonValue], context: RunContext) -> ToolOutcome:
+        return self._search(args, context)
+
+    def prepare_batch(
+        self, calls: list[CapabilityCall], context: RunContext
+    ) -> dict[str, SearchTool]:
+        """Allocate per-call search state without running any model or source I/O."""
+        return self._prepare(calls, context)
+
+
 def build_search_adapter(
     tool: SearchTool | None,
     original_query: str,
@@ -149,7 +169,64 @@ def build_search_adapter(
     user_info: str | None = None,
     inject_memories_in_prompt: bool = True,
     user_identity: LLMUserIdentity | None = None,
-) -> Callable[[dict[str, JsonValue], RunContext], ToolOutcome]:
+) -> ScopedSearchAdapter:
+    def prepare_batch(
+        calls: list[CapabilityCall], context: RunContext
+    ) -> dict[str, SearchTool]:
+        context.check_active()
+        if tool is None:
+            return {}
+        eligible: list[CapabilityCall] = []
+        queries: list[str] = []
+        for call in calls:
+            query, mode = call.arguments.get("query"), call.arguments.get("mode")
+            if (
+                call.name != "search_corpus"
+                or call.argument_error is not None
+                or not isinstance(query, str)
+                or not query.strip()
+                or len(query) > REGULATORY_MAX_SEARCH_QUERY_CHARS
+                or mode not in ("hybrid", "keyword", "full_text")
+            ):
+                continue
+            eligible.append(call)
+            queries.append(query.strip())
+        if not eligible:
+            return {}
+        history = message_history(context)
+        user_messages = [
+            message.message
+            for message in history
+            if message.message_type == MessageType.USER
+        ]
+        if not user_messages:
+            return {}
+        shared_history = [
+            ChatMinimalTextMessage(
+                message=message.message, message_type=message.message_type
+            )
+            for message in history
+            if message.message_type in {MessageType.USER, MessageType.ASSISTANT}
+        ]
+        expansion_history = [
+            *shared_history,
+            ChatMinimalTextMessage(
+                message=(
+                    "Current model-selected search queries:\n" + "\n".join(queries)
+                ),
+                message_type=MessageType.USER,
+            ),
+        ]
+        scoped = tool.fork_for_independent_context(emitter=NullEmitter())
+        scoped.user_selected_filters = broker.filters.model_copy(deep=True)
+        forks = scoped.fork_for_query_batch(
+            len(eligible),
+            message_history=expansion_history,
+            filter_message_history=shared_history,
+            queries=queries,
+        )
+        return {call.call_id: fork for call, fork in zip(eligible, forks, strict=True)}
+
     def search_in_scope(args: dict[str, JsonValue], context: RunContext) -> ToolOutcome:
         context.check_active()
         if tool is None:
@@ -174,7 +251,12 @@ def build_search_adapter(
                 status=OutcomeStatus.INVALID,
                 summary="Search requires the actual conversation or researcher user/task history",
             )
-        isolated = tool.fork_for_independent_context(emitter=NullEmitter())
+        prepared = context.services.get("search_batch_tool")
+        isolated = (
+            prepared
+            if isinstance(prepared, SearchTool)
+            else tool.fork_for_independent_context(emitter=NullEmitter())
+        )
         # Every index lane must use the same captured authorization as direct reads.
         isolated.user_selected_filters = bind_pc_corpus_scope(
             user=broker.user, filters=broker.filters.model_copy(deep=True)
@@ -320,4 +402,4 @@ def build_search_adapter(
         ):
             return search_in_scope(args, context)
 
-    return search
+    return ScopedSearchAdapter(search, prepare_batch)
