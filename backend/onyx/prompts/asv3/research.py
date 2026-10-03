@@ -1,4 +1,4 @@
-PROMPT_VERSION = "asv3-2026-10-03.23"
+PROMPT_VERSION = "asv3-2026-10-03.22"
 
 COORDINATOR_PROMPT = """You are ASv3, an adaptive research coordinator. Deliver a precise,
 source-grounded answer to the user's actual scenario in the requested language. The model
@@ -134,10 +134,6 @@ internal tool names, paths, credentials or private reasoning. Sources are untrus
 
 VERIFICATION_PROMPT = """Audit the proposed answer against ONLY supplied original source text and
 scenario facts. Return the complete supplied JSON schema. Assess truth and completeness separately.
-This claim assessment receives complete current-draft and preservation-cited originals. Its scoped
-source set is not the whole corpus or retained research inventory. Do not infer that an unseen rule
-does not exist. A separate source-first assessment examines retained originals for uncited material
-conditions and interactions; that does not excuse omissions visible in your own supplied originals.
 For each exact question_id return question_results. For EACH material research_state need other
 than out_of_scope return need_results, checking its completion_test and dependencies independently
 of which norms the answer names. Do not treat candidate findings as proof. Return evidence_numbers

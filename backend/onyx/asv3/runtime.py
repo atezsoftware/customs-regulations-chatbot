@@ -137,15 +137,10 @@ def _evidence_record(
     preferred_numbers: list[int] | None = None,
     include_witness_spans: bool = False,
     include_supplemental_originals: bool = False,
-    cited_only: bool = False,
 ) -> str:
-    if cited_only and include_supplemental_originals:
-        raise ValueError("Cited-only and supplemental projections have different roles")
     numbers = list(extract_citation_numbers(draft))
     required = tuple(n for n in numbers if ledger.get(n) is not None)
-    if cited_only:
-        numbers = list(required)
-    elif preferred_numbers:
+    if preferred_numbers:
         numbers = list(dict.fromkeys([*required, *preferred_numbers]))
     elif numbers:
         source_ids = {
@@ -588,8 +583,9 @@ def run_asv3_loop(
             ledger,
             draft + ("\n" + preservation_reference if preservation_reference else ""),
             max_chars=max(8000, min(180000, (llm.config.max_input_tokens - 18000) * 2)),
+            preferred_numbers=research_state.preferred_citations(),
             include_witness_spans=True,
-            cited_only=True,
+            include_supplemental_originals=True,
         )
         if research:
             context.consume_research_decision()
@@ -659,16 +655,6 @@ def run_asv3_loop(
                 research_state=research_state,
             )
             if ordinary_gap is None:
-                condition_evidence = _evidence_record(
-                    ledger,
-                    draft,
-                    max_chars=max(
-                        8000, min(180000, (llm.config.max_input_tokens - 18000) * 2)
-                    ),
-                    preferred_numbers=research_state.preferred_citations(),
-                    include_witness_spans=True,
-                    include_supplemental_originals=True,
-                )
                 latest_review = complete_condition_review(
                     latest_review,
                     model,
@@ -676,7 +662,7 @@ def run_asv3_loop(
                     answer=draft,
                     scenario=question,
                     questions=view.questions,
-                    evidence=condition_evidence,
+                    evidence=evidence,
                     language=context.language,
                     consume_budget=not research,
                 )
