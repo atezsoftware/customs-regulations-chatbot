@@ -11,6 +11,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from onyx.context.search.models import InferenceChunk
 from onyx.db.regulatory_label_search import (
     label_read_session,
+    load_document_set_search_snapshot,
     load_label_overlay,
     load_search_snapshot,
 )
@@ -59,7 +60,10 @@ class LabelSearchResult(BaseModel):
 
 
 def search_snapshot_for_run_ids(
-    run_ids: tuple[UUID, ...], *, mode: LabelSearchMode = "hybrid"
+    run_ids: tuple[UUID, ...],
+    *,
+    mode: LabelSearchMode = "hybrid",
+    document_set_id: int | None = None,
 ) -> LabelSearchSnapshot | None:
     if not run_ids or len(run_ids) > 32 or mode == "off":
         return None
@@ -70,10 +74,29 @@ def search_snapshot_for_run_ids(
                 tenant_id=get_current_tenant_id(),
                 run_ids=run_ids,
                 mode=mode,
+                document_set_id=document_set_id,
             )
     except SQLAlchemyError:
         logger.warning(
             "Label search snapshot unavailable; preserving baseline retrieval",
+            exc_info=True,
+        )
+        return None
+
+
+def search_snapshot_for_document_set(
+    document_set_id: int,
+) -> LabelSearchSnapshot | None:
+    try:
+        with label_read_session() as session:
+            return load_document_set_search_snapshot(
+                session,
+                tenant_id=get_current_tenant_id(),
+                document_set_id=document_set_id,
+            )
+    except SQLAlchemyError:
+        logger.warning(
+            "Native label snapshot unavailable; preserving baseline retrieval",
             exc_info=True,
         )
         return None

@@ -51,6 +51,7 @@ from onyx.regulatory.heading_path import (
 )
 from onyx.tools.constants import REGULATORY_MAX_SEARCH_QUERY_CHARS
 from onyx.tracing.answer_graph import graph_step
+from onyx.utils.threadpool_concurrency import run_functions_tuples_in_parallel
 
 MAX_SCAN_CHUNKS = 2000
 MAX_RESPONSE_CHARS = 64_000
@@ -372,7 +373,10 @@ class CorpusBroker:
                 native.append(item)
             else:
                 raise CorpusScopeUnavailable("Evidence has no immutable source proof.")
-        for (source_id, as_of), group in canonical.items():
+
+        def revalidate_source(
+            source_id: str, as_of: date | None, group: list[EvidenceItem]
+        ) -> None:
             scoped = self.filters.model_copy(update={"as_of_date": as_of})
             retained: dict[str, list[EvidenceItem]] = {}
             for item in group:
@@ -439,6 +443,14 @@ class CorpusBroker:
                             "Retained evidence chunk no longer exists in its source."
                         )
                 step.output_value = {"verified_chunk_count": len(seen)}
+
+        run_functions_tuples_in_parallel(
+            [
+                (revalidate_source, (source_id, as_of, group))
+                for (source_id, as_of), group in canonical.items()
+            ],
+            max_workers=4,
+        )
         for item in native:
             from onyx.asv3.source_tools import read_verified_original, source_slot
 
@@ -514,8 +526,11 @@ class CorpusBroker:
                     "Retrieved section has no canonical center identity."
                 )
             grouped.setdefault(doc.document_id, []).append(doc)
-        hydrated: dict[tuple[str, int], list[EvidenceItem]] = {}
-        for source_id, centers in grouped.items():
+
+        def hydrate_source(
+            source_id: str, centers: list[SearchDoc]
+        ) -> dict[tuple[str, int], list[EvidenceItem]]:
+            hydrated: dict[tuple[str, int], list[EvidenceItem]] = {}
             context.check_active()
             center_ids = tuple(
                 dict.fromkeys(
@@ -599,6 +614,22 @@ class CorpusBroker:
                     ),
                     "context_expanded": False,
                 }
+            return hydrated
+
+        # Each independent source owns its DB session; captured tenant/read scopes travel with it.
+        results = cast(
+            list[dict[tuple[str, int], list[EvidenceItem]]],
+            run_functions_tuples_in_parallel(
+                [
+                    (hydrate_source, (source_id, centers))
+                    for source_id, centers in grouped.items()
+                ],
+                max_workers=4,
+            ),
+        )
+        hydrated: dict[tuple[str, int], list[EvidenceItem]] = {}
+        for result in results:
+            hydrated.update(result)
         return hydrated
 
     def hydrate_search_results(
@@ -821,7 +852,9 @@ def guarded(
     return run
 
 
-def build_corpus_specs(broker: CorpusBroker) -> list[ToolSpec]:
+def build_corpus_specs(
+    broker: CorpusBroker, *, require_search_targets: bool = False
+) -> list[ToolSpec]:
     def resolve(args: dict[str, JsonValue], context: RunContext) -> ToolOutcome:
         sources, more = broker.sources(
             str(args.get("query", "")),
@@ -1424,20 +1457,34 @@ def build_corpus_specs(broker: CorpusBroker) -> list[ToolSpec]:
                         "type": "string",
                         "minLength": 1,
                         "maxLength": REGULATORY_MAX_SEARCH_QUERY_CHARS,
-                        "description": "Natural-language terms or a focused phrase. This retrieval pipeline does not interpret Boolean AND/OR, parentheses or quoted exact-match syntax. Use independent focused queries for distinct alternatives; source-scoped literal lookup is a separate capability.",
+                        "description": "Natural-language terms or a focused phrase. This pipeline does not interpret Boolean or quoted exact-match syntax. Retain known source/instrument qualifiers in each independent query; a bare article number searches all sources. For a known source_id and article use read_provision. Use independent focused queries for distinct alternatives.",
                     },
                     "mode": {
                         "type": "string",
                         "enum": ["hybrid", "keyword", "full_text"],
                     },
-                    "coverage_item": {"type": "string", "minLength": 1},
-                    "evidence_target": {"type": "string", "minLength": 1},
+                    "coverage_item": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "The unresolved scenario issue this focused query will answer.",
+                    },
+                    "evidence_target": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "The original rule, condition or procedure sought; an investigation target, not an assumed answer.",
+                    },
+                    "expand_query": {
+                        "type": "boolean",
+                        "description": "True when automatic semantic/lexical variants are useful. Otherwise execute your selected query directly; independent explicit searches may run together.",
+                    },
                     "source_anchors": {
                         "type": "array",
                         "items": {"type": "string", "minLength": 1},
                     },
                 },
-                ["query", "mode"],
+                ["query", "mode", "coverage_item", "evidence_target"]
+                if require_search_targets
+                else ["query", "mode"],
             ),
             handler=guarded(search),
         ),

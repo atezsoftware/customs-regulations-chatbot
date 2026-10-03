@@ -114,6 +114,7 @@ from onyx.regulatory.labeling.search_models import LabelSearchHint, LabelSearchS
 from onyx.regulatory.labeling.search_ranking import rank_near_tied_label_candidates
 from onyx.regulatory.labeling.search_runtime import (
     LabelSearchResult,
+    search_snapshot_for_document_set,
     search_snapshot_for_run_ids,
     search_with_labels,
 )
@@ -1287,15 +1288,32 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
         self._id = tool_id
 
     def get_label_search_snapshot(self) -> LabelSearchSnapshot | None:
+        native_set_id = (
+            self.user_selected_filters.asv3_document_set_id
+            if isinstance(self.user_selected_filters, IndexFilters)
+            else None
+        )
         if not (
             self.user_selected_filters
             and self.user_selected_filters.regulatory_chunks_only
-            and self.user_selected_filters.regulatory_workflow_mode == "fast"
+            and (
+                self.user_selected_filters.regulatory_workflow_mode == "fast"
+                or native_set_id is not None
+            )
             and self.user_selected_filters.regulatory_label_search_enabled
-            and self.user_selected_filters.regulatory_label_run_ids
         ):
             return None
         run_ids = self.user_selected_filters.regulatory_label_run_ids
+        if native_set_id is not None:
+            return self._shared_label_snapshot.get_or_compute(
+                lambda: (
+                    search_snapshot_for_run_ids(run_ids, document_set_id=native_set_id)
+                    if run_ids
+                    else search_snapshot_for_document_set(native_set_id)
+                )
+            )
+        if not run_ids:
+            return None
         return self._shared_label_snapshot.get_or_compute(
             lambda: search_snapshot_for_run_ids(run_ids)
         )
@@ -1911,6 +1929,7 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
             and raw_coverage_item.strip()
             and isinstance(raw_evidence_target, str)
             and raw_evidence_target.strip()
+            and llm_kwargs.get("expand_query") is not True
         )
         if regulatory_chunks_only:
             coverage_item = (

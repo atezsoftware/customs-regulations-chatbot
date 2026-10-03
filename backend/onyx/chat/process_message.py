@@ -708,19 +708,30 @@ def _global_regulatory_search_filters(setup: ChatTurnSetup) -> BaseFilters | Non
         return filters
 
     atez_search_v2 = getattr(setup.new_msg_req, "atez_search_v2", False) is True
+    atez_search_v3 = getattr(setup.new_msg_req, "atez_search_v3", False) is True
     regulatory_search_enabled = (
-        setup.new_msg_req.atez_search
-        or atez_search_v2
-        or setup.new_msg_req.atez_search_v3
+        setup.new_msg_req.atez_search or atez_search_v2 or atez_search_v3
+    )
+    source_question = not _is_social_only_message(setup.new_msg_req.message)
+    native_labels = (
+        atez_search_v3
+        and source_question
+        and not (
+            filters is not None
+            and "regulatory_label_search_enabled" in filters.model_fields_set
+            and not filters.regulatory_label_search_enabled
+        )
     )
     updates: dict[str, object] = {
         "source_type": [DocumentSource.USER_FILE],
-        "regulatory_chunks_only": regulatory_search_enabled
-        and not _is_social_only_message(setup.new_msg_req.message),
+        "regulatory_chunks_only": regulatory_search_enabled and source_question,
         "regulatory_workflow_mode": "fast" if atez_search_v2 else "standard",
         "regulatory_label_search_enabled": (
-            atez_search_v2
-            and getattr(setup.new_msg_req, "atez_search_v2_labels", False) is True
+            native_labels
+            or (
+                atez_search_v2
+                and getattr(setup.new_msg_req, "atez_search_v2_labels", False) is True
+            )
         ),
         "regulatory_label_run_ids": (
             tuple(getattr(setup.new_msg_req, "atez_search_v2_label_run_ids", ()))

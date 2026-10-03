@@ -5,7 +5,9 @@ import time
 import tracemalloc
 from collections.abc import Callable, Iterator
 from contextlib import nullcontext
+from contextvars import ContextVar
 from datetime import date
+from threading import Barrier
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import MagicMock
@@ -428,6 +430,93 @@ def validation_broker(
     monkeypatch.setattr(corpus_tools, "require_source", asv3_corpus.require_source)
     monkeypatch.setattr(corpus_tools, "resolve_source_query_index", lambda *_args: None)
     return CorpusBroker(arguments["user"], arguments["filters"])
+
+
+@pytest.mark.parametrize("operation", ["hydrate", "revalidate"])
+def test_independent_original_reads_overlap_with_separate_sessions_and_captured_scope(
+    monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    items = [row(uuid4(), 0, ["Law", "MADDE 3"], text) for text in ("first", "second")]
+    user = cast(User, object())
+    filters = IndexFilters(access_control_list=["user:authorized"])
+    broker = CorpusBroker(user, filters)
+    scope: ContextVar[str] = ContextVar("original_read_test_scope", default="missing")
+    token = scope.set("captured-tenant-and-publication")
+    barrier = Barrier(2)
+    sessions: dict[UUID, Session] = {}
+    sources = {
+        item.user_file_id: CorpusSource(item.user_file_id, "Legal source", "file")
+        for item in items
+    }
+    monkeypatch.setattr(
+        corpus_tools,
+        "get_session_with_current_tenant",
+        lambda: nullcontext(MagicMock(spec=Session)),
+    )
+
+    def source_for(_session: Session, **kwargs: Any) -> CorpusSource:
+        assert scope.get() == "captured-tenant-and-publication"
+        assert kwargs["user"] is user
+        assert kwargs["filters"].access_control_list == ["user:authorized"]
+        return sources[kwargs["source_id"]]
+
+    def originals(session: Session, **kwargs: Any) -> Iterator[CorpusChunk]:
+        assert scope.get() == "captured-tenant-and-publication"
+        assert kwargs["user"] is user and kwargs["index"] is None
+        source_id = kwargs["source_id"]
+        sessions[source_id] = session
+        barrier.wait(timeout=3)  # A serialized read cannot satisfy this barrier.
+        kwargs["check_active"]()
+        item = next(item for item in items if item.user_file_id == source_id)
+        assert kwargs["chunk_ids"] == (item.id,)
+        yield CorpusChunk(
+            item.id,
+            source_id,
+            item.text,
+            0,
+            0,
+            tuple(item.heading_path),
+            {},
+            None,
+            None,
+            "active",
+        )
+
+    monkeypatch.setattr(corpus_tools, "require_source", source_for)
+    monkeypatch.setattr(corpus_tools, "resolve_source_query_index", lambda *_: None)
+    monkeypatch.setattr(corpus_tools, "iter_source_chunks_by_ids", originals)
+    try:
+        if operation == "hydrate":
+            docs = [
+                SearchDoc(
+                    document_id=str(item.user_file_id),
+                    chunk_ind=0,
+                    semantic_identifier="Legal source",
+                    link=None,
+                    blurb="projection",
+                    source_type=DocumentSource.USER_FILE,
+                    boost=0,
+                    hidden=False,
+                    metadata={"regulatory_chunk_id": item.id},
+                    match_highlights=[],
+                )
+                for item in items
+            ]
+            result = broker.hydrate_search_centers(docs, RunContext())
+            assert list(result) == [(str(item.user_file_id), 0) for item in items]
+            assert [group[0].text for group in result.values()] == ["first", "second"]
+            assert all(
+                group[0].text_hash == retained(item).text_hash
+                for group, item in zip(result.values(), items, strict=True)
+            )
+        else:
+            broker.revalidate_evidence([retained(item) for item in items], RunContext())
+        assert (
+            len(sessions) == 2
+            and len({id(session) for session in sessions.values()}) == 2
+        )
+    finally:
+        scope.reset(token)
 
 
 def test_revalidation_reads_fifty_exact_ids_once_without_pages_or_outline(

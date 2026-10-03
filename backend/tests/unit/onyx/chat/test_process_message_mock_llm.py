@@ -111,6 +111,55 @@ def test_atez_search_v2_labels_require_explicit_request_opt_in() -> None:
     assert effective_filters.regulatory_workflow_mode == "fast"
 
 
+@pytest.mark.parametrize("explicit_opt_out", [False, True])
+def test_native_asv3_labels_use_existing_scope_without_fast_workflow(
+    explicit_opt_out: bool,
+) -> None:
+    requested_date = date(2026, 7, 1)
+    requested_filters = BaseFilters(
+        document_set=["Dar kapsam"], as_of_date=requested_date
+    )
+    if explicit_opt_out:
+        requested_filters = requested_filters.model_copy(
+            update={"regulatory_label_search_enabled": False}
+        )
+    setup = SimpleNamespace(
+        persona=SimpleNamespace(id=process_message.DEFAULT_PERSONA_ID),
+        new_msg_req=SendMessageRequest(
+            message="Antrepo rejiminin şartları nelerdir?",
+            atez_search_v3=True,
+            internal_search_filters=requested_filters,
+        ),
+    )
+
+    effective_filters = process_message._global_regulatory_search_filters(
+        cast(ChatTurnSetup, setup)
+    )
+
+    assert effective_filters is not None
+    assert effective_filters.regulatory_chunks_only is True
+    assert effective_filters.regulatory_workflow_mode == "standard"
+    assert effective_filters.regulatory_label_search_enabled is not explicit_opt_out
+    assert effective_filters.regulatory_label_run_ids == ()
+    assert effective_filters.document_set == ["Dar kapsam"]
+    assert effective_filters.as_of_date == requested_date
+
+
+def test_native_asv3_social_turn_does_not_activate_label_search() -> None:
+    setup = SimpleNamespace(
+        persona=SimpleNamespace(id=process_message.DEFAULT_PERSONA_ID),
+        new_msg_req=SendMessageRequest(message="Merhaba!", atez_search_v3=True),
+    )
+
+    effective_filters = process_message._global_regulatory_search_filters(
+        cast(ChatTurnSetup, setup)
+    )
+
+    assert effective_filters is not None
+    assert effective_filters.regulatory_chunks_only is False
+    assert effective_filters.regulatory_label_search_enabled is False
+
+
 @pytest.mark.parametrize(
     "date_expression",
     [

@@ -373,7 +373,7 @@ def test_one_search_delivery_reports_each_original_source_without_extra_executio
     monkeypatch.setattr(
         runtime,
         "build_corpus_specs",
-        lambda _broker: [
+        lambda _broker, **_options: [
             ToolSpec(
                 name="search_corpus",
                 description="Search original provisions",
@@ -537,6 +537,77 @@ def test_citation_guard_repairs_unknown_number_in_native_loop_without_review(
     assert checkpoints[-1]["publication_status"] == "found"
     assert "999" not in kwargs["state_container"].answer_tokens
     assert any(isinstance(packet.obj, CitationInfo) for packet in packets(queue))
+
+
+def test_named_law_uses_its_local_original_without_a_routine_review(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kwargs, broker, llm, checkpoints, _queue = setup_run(monkeypatch)
+    kinds = ["tebliğ", "kanun"]
+    titles = ["UYGULAMA TEBLİĞİ", "8917 SAYILI FAALİYET KANUNU"]
+    for n, (identity, chunk) in enumerate(broker.chunks.items()):
+        broker.chunks[identity] = replace(
+            chunk,
+            heading_path=(titles[n], "MADDE 27"),
+            metadata={
+                **chunk.metadata,
+                "document_type": kinds[n],
+                "title": titles[n],
+                "article_no": "27",
+            },
+        )
+    baseline = llm.invoke.side_effect
+    invocation = 0
+    direct_number = 0
+    rejected = ""
+
+    def scripted(**arguments: Any) -> ModelResponse:
+        nonlocal invocation, direct_number, rejected
+        invocation += 1
+        if invocation == 1:
+            return baseline(**arguments)
+        if invocation == 2:
+            originals = delivered_originals(arguments)
+            numbers = {row["chunk_id"]: row["citation"] for row in originals}
+            direct_number = numbers["chunk-1"]
+            rejected = (
+                "8917 sayılı Faaliyet Kanunu'nun 27 inci maddesi uygulanır "
+                f"[{numbers['chunk-0']}]."
+            )
+            return response(rejected)
+        assert invocation == 3
+        footer = user_payload(arguments["prompt"][-1])
+        assert footer["draft_to_repair"] == rejected
+        assert footer["publication_gap"]["named_authority_gaps"]
+        assert arguments["structured_response_format"] is None
+        return response(
+            "8917 sayılı Faaliyet Kanunu'nun 27 inci maddesi uygulanır "
+            f"[{direct_number}]."
+        )
+
+    llm.invoke.side_effect = scripted
+    runtime.run_asv3_loop(**kwargs)
+    assert llm.invoke.call_count == 3
+    assert checkpoints[-1]["publication_stop_reason"] == "native_answer_published"
+    assert checkpoints[-1]["evidence"]["included"] == [direct_number]
+
+
+def test_native_scope_preserves_excluded_label_snapshot_filters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kwargs, broker, _llm, _checkpoints, _queue = setup_run(monkeypatch)
+    run_id = uuid4()
+    kwargs["filters"] = kwargs["filters"].model_copy(
+        update={
+            "regulatory_label_search_enabled": True,
+            "regulatory_label_run_ids": (run_id,),
+        }
+    )
+    runtime.run_asv3_loop(**kwargs)
+    assert broker.scope is not None
+    assert broker.scope.regulatory_workflow_mode == "standard"
+    assert broker.scope.regulatory_label_search_enabled is True
+    assert broker.scope.regulatory_label_run_ids == (run_id,)
 
 
 def test_targeted_verification_is_only_invoked_when_model_selects_tool(

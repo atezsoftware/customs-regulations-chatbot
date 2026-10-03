@@ -268,6 +268,7 @@ def build_search_adapter(
             "evidence_target",
             "source_anchors",
             "label_hint",
+            "expand_query",
         ):
             if field in args:
                 tool_args[field] = args[field]

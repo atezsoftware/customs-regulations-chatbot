@@ -21,6 +21,7 @@ from onyx.asv3.models import (
     SharedBudget,
     ToolOutcome,
 )
+from onyx.asv3.registry import CapabilityRegistry
 from onyx.asv3.search_adapter import (
     ScopedSearchAdapter,
     ScopedSearchLLM,
@@ -733,3 +734,84 @@ def test_real_search_results_are_canonically_hydrated_once_without_payload_text_
         item.identity for item in originals
     ]
     assert "canonical paragraph" not in str(outcome.data)
+
+
+@pytest.mark.parametrize("expand_query,expected_helpers", [(False, 0), (True, 2)])
+def test_native_targeted_batch_runs_selected_queries_with_optional_shared_expansion(
+    expand_query: bool, expected_helpers: int
+) -> None:
+    tool, broker, llm = tool_and_broker()
+    adapter = build_search_adapter(
+        tool,
+        "actual scenario",
+        broker,
+        message_history=lambda _: [user_message("actual scenario")],
+    )
+    calls = [
+        CapabilityCall(
+            name="search_corpus",
+            arguments={
+                "query": query,
+                "mode": "hybrid",
+                "coverage_item": "Independent unresolved issue",
+                "evidence_target": "Original operative condition",
+                "expand_query": expand_query,
+            },
+        )
+        for query in (
+            "First instrument controlling rule",
+            "Second instrument special condition",
+        )
+    ]
+    with search_boundaries() as (pipeline, _, _):
+        outcomes = run_prepared_searches(adapter, calls, RunContext())
+    assert all(outcome.status == OutcomeStatus.NOT_FOUND for outcome in outcomes)
+    assert llm.invoke.call_count == expected_helpers
+    selected = {call.arguments["query"] for call in calls}
+    assert selected <= {
+        call.kwargs["chunk_search_request"].query for call in pipeline.call_args_list
+    }
+    assert all(
+        call.kwargs["chunk_search_request"].user_selected_filters.forced_document_set
+        == ["PC Külliyatı"]
+        for call in pipeline.call_args_list
+    )
+
+
+def test_native_search_target_contract_rejects_missing_target_before_any_retrieval() -> (
+    None
+):
+    _, broker, _ = tool_and_broker()
+    search = MagicMock(
+        return_value=ToolOutcome(status=OutcomeStatus.NOT_FOUND, summary="No originals")
+    )
+    broker.search_adapter = search
+    arguments: dict[str, JsonValue] = {
+        "query": "A focused legal question",
+        "mode": "hybrid",
+    }
+    registry = CapabilityRegistry(
+        build_corpus_specs(broker, require_search_targets=True)
+    )
+    context = RunContext()
+    rejected = registry.dispatch(
+        CapabilityCall(name="search_corpus", arguments=arguments), context
+    )
+    assert rejected.status == OutcomeStatus.INVALID
+    search.assert_not_called()
+    arguments.update(
+        coverage_item="Unresolved outcome", evidence_target="Operative original"
+    )
+    accepted = registry.dispatch(
+        CapabilityCall(name="search_corpus", arguments=arguments), context
+    )
+    assert accepted.status == OutcomeStatus.NOT_FOUND
+    search.assert_called_once_with(arguments, context)
+    legacy = CapabilityRegistry(build_corpus_specs(broker))
+    legacy.dispatch(
+        CapabilityCall(
+            name="search_corpus", arguments={"query": "legacy query", "mode": "hybrid"}
+        ),
+        context,
+    )
+    assert search.call_count == 2

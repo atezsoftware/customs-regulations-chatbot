@@ -2384,6 +2384,72 @@ def test_label_snapshot_requires_explicit_runs() -> None:
         load.assert_not_called()
 
 
+def test_native_label_snapshot_resolves_captured_scope_once_for_parallel_calls() -> (
+    None
+):
+    from tests.unit.onyx.regulatory.labeling.test_search_overlay import snapshot
+
+    captured_set = 73
+    tool = _make_tool(
+        IndexFilters(
+            access_control_list=["authorized"],
+            asv3_document_set_id=captured_set,
+            regulatory_chunks_only=True,
+            regulatory_label_search_enabled=True,
+        )
+    )
+    state = snapshot().model_copy(update={"document_set_id": captured_set})
+    with (
+        patch(f"{MODULE}.search_snapshot_for_document_set", return_value=state) as load,
+        patch(f"{MODULE}.search_snapshot_for_run_ids") as explicit,
+    ):
+        assert tool.get_label_search_snapshot() is state
+        assert tool.fork_for_parallel_call().get_label_search_snapshot() is state
+        load.assert_called_once_with(captured_set)
+        explicit.assert_not_called()
+
+
+def test_native_explicit_label_runs_must_belong_to_captured_scope() -> None:
+    run_id = uuid4()
+    tool = _make_tool(
+        IndexFilters(
+            access_control_list=["authorized"],
+            asv3_document_set_id=73,
+            regulatory_chunks_only=True,
+            regulatory_label_search_enabled=True,
+            regulatory_label_run_ids=(run_id,),
+        )
+    )
+    with (
+        patch(f"{MODULE}.search_snapshot_for_run_ids", return_value=None) as explicit,
+        patch(f"{MODULE}.search_snapshot_for_document_set") as auto,
+    ):
+        assert tool.get_label_search_snapshot() is None
+        explicit.assert_called_once_with((run_id,), document_set_id=73)
+        auto.assert_not_called()
+
+
+@pytest.mark.parametrize("native_scope", [False, True])
+def test_standard_or_opted_out_search_never_auto_resolves_labels(
+    native_scope: bool,
+) -> None:
+    tool = _make_tool(
+        IndexFilters(
+            access_control_list=["authorized"],
+            asv3_document_set_id=73 if native_scope else None,
+            regulatory_chunks_only=True,
+            regulatory_label_search_enabled=not native_scope,
+        )
+    )
+    with (
+        patch(f"{MODULE}.search_snapshot_for_run_ids") as explicit,
+        patch(f"{MODULE}.search_snapshot_for_document_set") as auto,
+    ):
+        assert tool.get_label_search_snapshot() is None
+        explicit.assert_not_called()
+        auto.assert_not_called()
+
+
 def test_verified_label_near_tie_survives_external_reranking(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

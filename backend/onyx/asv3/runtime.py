@@ -14,6 +14,7 @@ from uuid import UUID
 
 from pydantic import JsonValue
 
+from onyx.asv3.authority import native_named_authority_gap
 from onyx.asv3.citation_numbers import extract_citation_numbers
 from onyx.asv3.corpus_tools import CorpusBroker, build_corpus_specs
 from onyx.asv3.evidence import EvidenceLedger
@@ -222,7 +223,15 @@ def run_asv3_loop(
     if custom_agent_prompt:
         context.services["assistant_instructions"] = custom_agent_prompt
     scope = IndexFilters(
-        **(filters.model_dump() if filters else {}), access_control_list=[]
+        **(filters.model_dump() if filters else {}),
+        access_control_list=[],
+        regulatory_workflow_mode=filters.regulatory_workflow_mode
+        if filters
+        else "standard",
+        regulatory_label_search_enabled=filters.regulatory_label_search_enabled
+        if filters
+        else False,
+        regulatory_label_run_ids=filters.regulatory_label_run_ids if filters else (),
     )
     if document_set_names_override:
         scope.forced_document_set = document_set_names_override
@@ -544,7 +553,7 @@ def run_asv3_loop(
     )
     external_names = {spec.name for spec in external_specs}
     for spec in (
-        build_corpus_specs(broker)
+        build_corpus_specs(broker, require_search_targets=True)
         + build_source_specs(broker)
         + build_sandbox_specs(broker)
         + external_specs
@@ -617,6 +626,13 @@ def run_asv3_loop(
                 summary="A legal answer needs recorded original citations. Retrieve the operative source or disclose the precise gap using submit_partial_answer.",
                 data={"missing": "original legal evidence"},
             )
+        authority_gap = native_named_authority_gap(answer, ledger)
+        if authority_gap is not None:
+            return ToolOutcome(
+                status=OutcomeStatus.PARTIAL,
+                summary="Read and cite the named governing original beside its actual legal assertion; a lower source's reference does not supply that original.",
+                data=authority_gap,
+            )
         return None
 
     def submit_partial(args: dict[str, JsonValue], child: RunContext) -> ToolOutcome:
@@ -632,6 +648,14 @@ def run_asv3_loop(
             if extract_citation_numbers(candidate)
             else None
         )
+        if gap is None:
+            authority_gap = native_named_authority_gap(candidate, ledger)
+            if authority_gap is not None:
+                gap = ToolOutcome(
+                    status=OutcomeStatus.PARTIAL,
+                    summary="A precise missing-original notice cannot assert an unsupported statutory result.",
+                    data=authority_gap,
+                )
         if gap is not None:
             return gap
         partial = candidate

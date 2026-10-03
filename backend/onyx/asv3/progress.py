@@ -110,8 +110,37 @@ def official_corpus_source_name(item: "EvidenceItem") -> str | None:
     return None
 
 
+def _readable_corpus_source_name(item: "EvidenceItem") -> str | None:
+    from onyx.asv3.models import model_evidence_metadata
+
+    metadata = model_evidence_metadata(item.metadata)
+    for value in [
+        metadata.get("title"),
+        item.search_doc.semantic_identifier if item.search_doc else None,
+    ]:
+        if not isinstance(value, str) or re.search(r"https?://", value, re.I):
+            continue
+        title = value.split(" — ", 1)[0].strip()
+        without_numbers = re.sub(r"\b\d{1,4}/\d{1,4}\b", "", title)
+        if "/" in without_numbers or "\\" in without_numbers:
+            title = re.split(r"[/\\]", title)[-1]
+        title = re.sub(
+            r"\.(?:md|pdf|docx?|txt|html?|rtf|odt|xlsx?|csv|pptx?)$",
+            "",
+            title,
+            flags=re.I,
+        )
+        if re.fullmatch(r"(?:[a-f0-9-]{32,}|rc_[a-f0-9]+|\d+)", title, re.I):
+            continue
+        title = re.sub(r"_+", " ", title)
+        name = _source_heading(title)
+        if name and re.search(r"[^\W\d_]", name):
+            return name
+    return None
+
+
 def _source_display(
-    item: "EvidenceItem", language: str, fallback_title: str, citation: int
+    item: "EvidenceItem", language: str, fallback_title: str
 ) -> tuple[str, str | None, str | None]:
     from onyx.asv3.models import model_evidence_metadata
     from onyx.regulatory.heading_path import parse_regulatory_article_heading
@@ -132,7 +161,11 @@ def _source_display(
     if article is None and isinstance(number, str):
         if parsed := parse_regulatory_article_heading("Madde " + number):
             article, qualifier = parsed.article_no, parsed.qualifier
-    source = official_corpus_source_name(item) or f"{fallback_title} [{citation}]"
+    source = (
+        official_corpus_source_name(item)
+        or _readable_corpus_source_name(item)
+        or fallback_title
+    )
     if article:
         if language in {"tr", "en"} and not qualifier:
             source += f" — {'Madde' if language == 'tr' else 'Article'} {article}"
@@ -160,9 +193,12 @@ def report_source_deliveries(
         return
     language = reporter.language.split("-")[0].lower()
     fallback_title, message = {
-        "tr": ("Özgün kaynak", "Bu kaynaktaki ilgili özgün hükümler inceleniyor."),
+        "tr": (
+            "İlgili hükümler inceleniyor",
+            "Bu kaynaktaki ilgili özgün hükümler inceleniyor.",
+        ),
         "en": (
-            "Original source",
+            "Reviewing relevant provisions",
             "Reviewing the relevant original provisions in this source.",
         ),
     }.get(language, tuple(localized_tools))
@@ -177,12 +213,14 @@ def report_source_deliveries(
         item = ledger.get(citation)
         if item is None or not _canonical_corpus_original(item):
             continue
-        title, article, qualifier = _source_display(
-            item, language, fallback_title, citation
-        )
+        title, article, qualifier = _source_display(item, language, fallback_title)
         identity = json.dumps([item.source_id, article, qualifier], ensure_ascii=False)
         task_id = "action:source:" + hashlib.sha256(identity.encode()).hexdigest()[:24]
-        if task_id in seen or not public_narration_valid(title, message, context):
+        if task_id in seen:
+            continue
+        if not public_narration_valid(title, message, context):
+            title = fallback_title
+        if not public_narration_valid(title, message, context):
             continue
         seen.add(task_id)
         reporter.report(

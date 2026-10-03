@@ -296,3 +296,116 @@ def test_native_mode_inherits_into_worker_without_changing_targeted_structured_c
     assert llm.invoke.call_count == 2
     assert adapter.last_call_id is not None
     assert context.services.get("evidence") is None
+
+
+def test_native_completed_answer_uses_provider_output_capacity_without_an_extra_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(llm_adapter, "get_llm_max_output_tokens", lambda *_: 16000)
+    llm = model()
+    llm.invoke.return_value.choice.finish_reason = "stop"
+    adapter = ResearchModel(llm, RunContext(), lean_native_mode=True)
+    result = adapter.decide(view())
+    assert result.answer == "Rule [1]."
+    assert llm.invoke.call_count == 1
+    assert llm.invoke.call_args.kwargs["max_tokens"] == 16000
+    assert adapter.last_finish_reason == "stop" and not adapter.last_response_truncated
+
+
+@pytest.mark.parametrize("finish_reason", ["length", "max_tokens", "MAX_OUTPUT_TOKENS"])
+def test_native_truncated_text_continues_from_same_originals_and_preserves_exact_prefix(
+    monkeypatch: pytest.MonkeyPatch, finish_reason: str
+) -> None:
+    monkeypatch.setattr(llm_adapter, "get_llm_max_output_tokens", lambda *_: 12000)
+    context, ledger = RunContext(), EvidenceLedger()
+    context.services["evidence"] = ledger
+    record = original(ledger, context, "The quoted condition and later outcome.")
+    llm = model()
+    prefix = "## 1\nThe original states “The quoted condition"
+    suffix = " and later outcome.” [1]\n\n## 2\nThe second requested outcome [1]."
+    llm.invoke.side_effect = [
+        ModelResponse(
+            id="cut",
+            created="0",
+            choice=Choice(
+                finish_reason=finish_reason,
+                message=Message(content=prefix),
+            ),
+        ),
+        ModelResponse(
+            id="complete",
+            created="0",
+            choice=Choice(
+                finish_reason="stop",
+                message=Message(content=suffix),
+            ),
+        ),
+    ]
+    adapter = ResearchModel(llm, context, lean_native_mode=True)
+    result = adapter.decide(view(original_evidence=[record]))
+    assert result.answer == prefix + suffix
+    assert llm.invoke.call_count == 2
+    continuation = llm.invoke.call_args.kwargs
+    assert continuation["tools"] is None
+    assert any(
+        isinstance(message, AssistantMessage) and message.content == prefix
+        for message in continuation["prompt"]
+    )
+    assert ledger.completely_delivered(adapter.last_call_id or "") == {1}
+    assert not adapter.last_response_truncated
+
+
+def test_native_truncated_action_never_executes_partial_arguments_when_no_capacity_remains(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(llm_adapter, "get_llm_max_output_tokens", lambda *_: 12000)
+    llm = model()
+    llm.invoke.return_value = ModelResponse(
+        id="cut",
+        created="0",
+        choice=Choice(
+            finish_reason="length",
+            message=Message.model_validate(
+                {
+                    "tool_calls": [
+                        {
+                            "id": "unfinished",
+                            "function": {
+                                "name": "read_provision",
+                                "arguments": '{"source_id":',
+                            },
+                        }
+                    ]
+                }
+            ),
+        ),
+    )
+    adapter = ResearchModel(llm, RunContext(), lean_native_mode=True)
+    with pytest.raises(RunStopped, match="truncated action arguments"):
+        adapter.decide(view())
+    assert llm.invoke.call_count == 1 and adapter.last_response_truncated
+
+
+def test_native_failed_continuation_never_returns_a_complete_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(llm_adapter, "get_llm_max_output_tokens", lambda *_: 12000)
+    llm = model()
+    llm.invoke.side_effect = [
+        ModelResponse(
+            id="cut",
+            created="0",
+            choice=Choice(
+                finish_reason="length", message=Message(content="Unfinished claim")
+            ),
+        ),
+        ModelResponse(
+            id="empty",
+            created="0",
+            choice=Choice(finish_reason="stop", message=Message(content="")),
+        ),
+    ]
+    adapter = ResearchModel(llm, RunContext(), lean_native_mode=True)
+    with pytest.raises(RunStopped, match="did not complete"):
+        adapter.decide(view())
+    assert llm.invoke.call_count == 2 and adapter.last_response_truncated

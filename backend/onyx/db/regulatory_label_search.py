@@ -60,6 +60,7 @@ def load_search_snapshot(
     tenant_id: str,
     run_ids: tuple[UUID, ...],
     mode: LabelSearchMode,
+    document_set_id: int | None = None,
 ) -> LabelSearchSnapshot | None:
     if mode == "off" or not run_ids or len(run_ids) > 32:
         return None
@@ -85,6 +86,10 @@ def load_search_snapshot(
         for run in runs
     ):
         return None
+    if document_set_id is not None and any(
+        run.document_set_id != document_set_id for run in runs
+    ):
+        return None
     if len({run.taxonomy_id for run in runs}) != 1:
         return None
     settings = session.get(RegulatoryLabelSettings, 1)
@@ -98,6 +103,43 @@ def load_search_snapshot(
         run_ids=tuple(dict.fromkeys(run_ids)),
         taxonomy=taxonomy,
         mode=mode,
+        document_set_id=document_set_id,
+    )
+
+
+def load_document_set_search_snapshot(
+    session: Session,
+    *,
+    tenant_id: str,
+    document_set_id: int,
+) -> LabelSearchSnapshot | None:
+    """Reuse finalized current-taxonomy labels in an already authorized source scope."""
+    run_ids = tuple(
+        session.scalars(
+            select(RegulatoryLabelingRun.id)
+            .join(
+                RegulatoryLabelSettings,
+                RegulatoryLabelSettings.taxonomy_id
+                == RegulatoryLabelingRun.taxonomy_id,
+            )
+            .where(
+                RegulatoryLabelSettings.id == 1,
+                RegulatoryLabelingRun.document_set_id == document_set_id,
+                RegulatoryLabelingRun.status.in_(TERMINAL_RUN_STATUSES),
+                RegulatoryLabelingRun.stage == "finished",
+            )
+            .order_by(RegulatoryLabelingRun.created_at.desc())
+            .limit(33)
+        )
+    )
+    if not run_ids or len(run_ids) > 32:
+        return None
+    return load_search_snapshot(
+        session,
+        tenant_id=tenant_id,
+        run_ids=run_ids,
+        mode="hybrid",
+        document_set_id=document_set_id,
     )
 
 
@@ -256,6 +298,7 @@ def load_label_overlay(
         tenant_id=snapshot.tenant_id,
         run_ids=snapshot.run_ids,
         mode=snapshot.mode,
+        document_set_id=snapshot.document_set_id,
     )
     if (
         current is None

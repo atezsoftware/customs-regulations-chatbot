@@ -39,6 +39,7 @@ from onyx.configs.chat_configs import (
     LLM_FIRST_CHUNK_RETRY_MAX_DELAY_S,
 )
 from onyx.llm.interfaces import LLM, LLMUserIdentity
+from onyx.llm.model_capabilities import get_llm_max_output_tokens, get_model_map
 from onyx.llm.model_response import ModelResponse
 from onyx.llm.models import (
     AssistantMessage,
@@ -566,6 +567,18 @@ class ResearchModel:
             lean_native_mode or context.services.get("lean_native_mode") is True
         )
         self.last_call_id: str | None = None
+        self.last_finish_reason: str | None = None
+        self.last_response_truncated = False
+        self._native_output_capacity: int | None = None
+
+    def _native_output_limit(self) -> int:
+        if self._native_output_capacity is None:
+            self._native_output_capacity = get_llm_max_output_tokens(
+                get_model_map(),
+                self.llm.config.model_name,
+                self.llm.config.model_provider,
+            )
+        return self._native_output_capacity
 
     def _tokens(self, text: str) -> int:
         if self.token_counter is None:
@@ -1057,6 +1070,10 @@ class ResearchModel:
                 user_identity=self.user_identity,
             )
             record_llm_response(span, response)
+            self.last_finish_reason = response.choice.finish_reason
+            self.last_response_truncated = (
+                response.choice.finish_reason or ""
+            ).lower() in {"length", "max_tokens", "max_output_tokens"}
             self.last_call_id = (
                 span.span_id if span.span_id != "no-op" else "asv3-call-" + uuid4().hex
             )
@@ -1777,7 +1794,7 @@ class ResearchModel:
         required = set(view.required_evidence_numbers)
         required.update(extract_citation_numbers(view.draft_to_repair or ""))
         omitted: list[JsonValue] = list(view.original_evidence_omitted)
-        ceiling, output = self._limits(6000)
+        ceiling, output = self._limits(self._native_output_limit())
         selected = view.tools
 
         def messages() -> list[ChatCompletionMessage]:
@@ -1986,6 +2003,10 @@ class ResearchModel:
             LLMFlow.ASV3_RESEARCHER if self.context.depth else LLMFlow.ASV3_COORDINATOR
         )
         response = self._invoke(prompt, tools, flow, max_tokens=output, research=True)
+        if self.lean_native_mode:
+            response = self._complete_native_response(
+                prompt, tools, flow, output, response
+            )
         if (
             not response.choice.message.tool_calls
             and not (response.choice.message.content or "").strip()
@@ -2004,6 +2025,10 @@ class ResearchModel:
             response = self._invoke(
                 recovery_prompt, tools, flow, max_tokens=output, research=True
             )
+            if self.lean_native_mode:
+                response = self._complete_native_response(
+                    recovery_prompt, tools, flow, output, response
+                )
             if (
                 not response.choice.message.tool_calls
                 and not (response.choice.message.content or "").strip()
@@ -2018,3 +2043,84 @@ class ResearchModel:
                 response, tools, view.request, flow
             )
         return decision
+
+    def _complete_native_response(
+        self,
+        prompt: list[ChatCompletionMessage],
+        tools: list[dict[str, JsonValue]],
+        flow: LLMFlow,
+        output: int,
+        response: ModelResponse,
+    ) -> ModelResponse:
+        text = ""
+        while (response.choice.finish_reason or "").lower() in {
+            "length",
+            "max_tokens",
+            "max_output_tokens",
+        }:
+            self.last_response_truncated = True
+            self.context.check_research_active()
+            message = response.choice.message
+            if message.tool_calls:
+                # An unfinished argument list is never an executable native action.
+                capacity = min(
+                    self._native_output_limit(),
+                    self.llm.config.max_input_tokens - self._input_cost(prompt, tools),
+                )
+                if capacity <= output:
+                    raise RunStopped(
+                        "Selected provider cannot complete truncated action arguments"
+                    )
+                output = capacity
+                continuation = prompt
+                continuation_tools = tools
+            else:
+                fragment = message.content or ""
+                if not fragment.strip():
+                    raise RunStopped(
+                        "Selected provider returned no text at its output limit"
+                    )
+                text += fragment
+                continuation = [
+                    *prompt,
+                    AssistantMessage(content=text),
+                    UserMessage(
+                        content=(
+                            "The preceding answer was cut off by the provider output limit. "
+                            "Continue exactly where its visible text ends, completing the unfinished "
+                            "sentence/quotation and all remaining requested questions. Return only "
+                            "the continuation, preserving supported details and global citations. "
+                            "Use the same supplied original evidence; do not repeat the opening or "
+                            "restart completed research."
+                        )
+                    ),
+                ]
+                continuation_tools = []
+                output = min(
+                    self._native_output_limit(),
+                    self.llm.config.max_input_tokens
+                    - self._input_cost(continuation, []),
+                )
+                if output <= 0:
+                    raise RunStopped(
+                        "Truncated answer and original evidence exceed selected model context"
+                    )
+            self.context.consume_research_decision()
+            response = self._invoke(
+                continuation, continuation_tools, flow, max_tokens=output, research=True
+            )
+            self.last_response_truncated = True
+            if (
+                not response.choice.message.tool_calls
+                and not (response.choice.message.content or "").strip()
+            ):
+                raise RunStopped(
+                    "Selected provider did not complete the truncated answer"
+                )
+        if text:
+            response = response.model_copy(deep=True)
+            response.choice.message.content = text + (
+                response.choice.message.content or ""
+            )
+        self.last_response_truncated = False
+        return response

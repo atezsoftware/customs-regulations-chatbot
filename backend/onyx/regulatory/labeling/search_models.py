@@ -18,6 +18,7 @@ class LabelSearchSnapshot(BaseModel):
     run_ids: tuple[UUID, ...] = Field(min_length=1, max_length=32)
     taxonomy: TaxonomyDefinition
     mode: LabelSearchMode
+    document_set_id: int | None = None
 
 
 class LabelSearchHint(BaseModel):

@@ -195,6 +195,14 @@ def test_source_progress_uses_actual_genelge_heading_and_safe_unknown_source_lab
     None
 ):
     context, ledger = RunContext(), EvidenceLedger()
+    unknown = canonical_item(
+        "unlabelled",
+        "unlabelled-rule",
+        "Another original condition.",
+        {},
+    )
+    assert unknown.search_doc is not None
+    unknown.search_doc.semantic_identifier = ""
     ledger.add(
         [
             canonical_item(
@@ -209,12 +217,7 @@ def test_source_progress_uses_actual_genelge_heading_and_safe_unknown_source_lab
                     },
                 },
             ),
-            canonical_item(
-                "unlabelled",
-                "unlabelled-rule",
-                "Another original condition.",
-                {"title": "/tmp/private_source_query.pdf"},
-            ),
+            unknown,
         ],
         context,
     )
@@ -225,12 +228,103 @@ def test_source_progress_uses_actual_genelge_heading_and_safe_unknown_source_lab
     )
     assert [event.title for event in reporter.snapshot()] == [
         "2022/4 sayılı Genelge",
-        "Özgün kaynak [2]",
+        "İlgili hükümler inceleniyor",
     ]
     circular, unknown = ledger.get(1), ledger.get(2)
     assert circular is not None and unknown is not None
     assert official_corpus_source_name(circular) == "2022/4 sayılı Genelge"
     assert official_corpus_source_name(unknown) is None
+
+
+@pytest.mark.parametrize(
+    "title,source_name,expected",
+    [
+        (
+            "İhracat Mevzuatı/Genelgeler/genelge_2013-33.docx",
+            "",
+            "genelge 2013-33",
+        ),
+        (
+            r"C:\\Külliyat\\Yazılar\\geri_gelen_esya_23-11-2017.pdf",
+            "",
+            "geri gelen esya 23-11-2017",
+        ),
+        (
+            "",
+            "Külliyat/Yazılar/ihracat_hak_ve_menfaatleri.md",
+            "ihracat hak ve menfaatleri",
+        ),
+        ("2d84e38d-d236-413c-b0e4-01d689329e7e.md", "", "İlgili hükümler inceleniyor"),
+        (
+            "rc_267f107aee3a6817c3b999244d261246f424436e",
+            "",
+            "İlgili hükümler inceleniyor",
+        ),
+        ("https://example.test/private.pdf", "", "İlgili hükümler inceleniyor"),
+        ("42.pdf", "", "İlgili hükümler inceleniyor"),
+        ("api_key_notes.md", "", "İlgili hükümler inceleniyor"),
+    ],
+)
+def test_source_notice_uses_readable_canonical_basename_without_identity_or_type_invention(
+    title: str, source_name: str, expected: str
+) -> None:
+    context, ledger = RunContext(), EvidenceLedger()
+    item = canonical_item(
+        "source-identity",
+        "canonical-chunk",
+        "Original operative text.",
+        {"canonical_metadata": {"title": title}},
+    )
+    assert item.search_doc is not None
+    item.search_doc.semantic_identifier = source_name
+    raw = item.model_dump_json()
+    ledger.add([item], context)
+    delivered(ledger)
+    budget = context.budget.snapshot()
+    reporter = ProgressReporter(context.run_id, context.language)
+    pair = ["Kaynaklar inceleniyor", "İlgili özgün hüküm inceleniyor."]
+    report_source_deliveries(ledger, "coordinator", context, reporter, pair)
+    assert [event.title for event in reporter.snapshot()] == [expected]
+    assert not any(
+        part in expected for part in ["[1]", ".md", ".pdf", ".docx", "_", "\\"]
+    )
+    assert official_corpus_source_name(item) is None
+    assert item.model_dump_json() == raw
+    assert context.budget.snapshot() == budget
+    resumed = ProgressReporter(context.run_id, context.language)
+    resumed.restore(reporter.export())
+    report_source_deliveries(ledger, "coordinator", context, resumed, pair)
+    assert resumed.snapshot() == reporter.snapshot()
+
+
+@pytest.mark.parametrize(
+    "language,pair,expected",
+    [
+        (
+            "en-US",
+            ["Source", "Reading relevant provisions."],
+            "Reviewing relevant provisions",
+        ),
+        (
+            "fr-FR",
+            ["Dispositions pertinentes", "Lecture des dispositions."],
+            "Dispositions pertinentes",
+        ),
+    ],
+)
+def test_unknown_source_notice_fallback_is_localized_without_citation_number(
+    language: str, pair: list[str], expected: str
+) -> None:
+    context, ledger = RunContext(language=language), EvidenceLedger()
+    item = canonical_item("unknown", "canonical", "Original text.", {})
+    assert item.search_doc is not None
+    item.search_doc.semantic_identifier = ""
+    ledger.add([item], context)
+    delivered(ledger)
+    reporter = ProgressReporter(context.run_id, context.language)
+    report_source_deliveries(ledger, "coordinator", context, reporter, pair)
+    assert [event.title for event in reporter.snapshot()] == [expected]
+    assert reporter.snapshot()[0].language == language
 
 
 def test_source_progress_stops_emitting_when_cancelled_between_deliveries() -> None:

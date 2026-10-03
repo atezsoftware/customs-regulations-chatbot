@@ -1,4 +1,4 @@
-PROMPT_VERSION = "asv3-2026-10-03.36"
+PROMPT_VERSION = "asv3-2026-10-03.37"
 
 ANSWER_REPAIR_PROMPT = """Repair only the exact target_unit_ids and required_omissions in this candidate answer.
 Return replacements for every target unit once and insertions for every omission ID once.
@@ -47,7 +47,10 @@ analysis/model stage.
 When useful, _need_id binds an action to an existing material research need;
 update_research may create it in the same decision.
 Choose search_corpus for an unresolved topic and resolve_source/read_provision for a known
-source or provision. Select the appropriate search mode and independent calls yourself.
+source or provision. Preserve its resolved source_id in source-local searches and fallback
+reads; a corpus-wide article-number query can match unrelated instruments. Batch independent
+searches or reads with already-known inputs in the SAME native decision instead of waiting
+between them. Select their search modes, queries and dependencies yourself.
 Use our original-source tools: search_source_text, query_corpus, read_chunk,
 read_chunk_context, read_source_range and follow_reference as useful. For dependent
 resolution and reading, compose_tool_calls can execute the chosen sequence without an
@@ -72,9 +75,11 @@ a neighboring code or an ordinary-import list does not establish another regime'
 PRIORITY ANSWER STANDARD: GOVERNING ORIGINALS AND OPERATIVE DETAIL
 For each material legal conclusion, you must read and use its applicable directly governing
 Kanun or higher operative original, with its own adjacent [n] citation in the answer.
-Prioritize that governing basis and actively pursue its applicable authorized Yönetmelik,
-Tebliğ or Genelge originals for material procedure, proof/forms, periods, calculations and
-later steps; a general governing result does not settle those implementing details. Do not
+Begin your chosen research with directly governing originals for the material outcomes,
+then pursue applicable authorized Yönetmelik, Tebliğ or Genelge originals for concrete
+procedure, proof/forms, periods, calculations and later steps. Lower sources can supply
+navigation leads but cannot replace the governing original; a general rule does not settle
+those implementing details. Do not
 publish a confident tax or statutory result solely from a Tebliğ/Genelge paraphrase of an unread governing
 statute. For example, a KDV consequence governed by KDV Kanunu needs that Kanun's applicable
 operative original alongside useful implementation; this does not require unrelated taxes.
@@ -97,7 +102,7 @@ or override governing law; a broad higher rule also does not erase an authorized
 procedure. When texts differ, assess their authority, scope, delegation, cross-references
 and validity rather than ranking titles alone. Preserve applicable lawful special rules
 and disclose a narrow unresolved conflict instead of blending incompatible texts. Choose
-material links and methods yourself; no fixed source order or every-tier checklist.
+precise queries, anchors, batches and tools yourself; no separate stage or every-tier checklist.
 Where decisive operative wording carries a condition, exception or consequence, include a
 short literal quotation with its adjacent original [n] citation and explain its application.
 Preserve the actual AND/OR conditions and negative qualifiers; do not paraphrase a changed
@@ -241,9 +246,11 @@ An introductory permission referring to enumerated cases does not supply the act
 needed to apply the assigned facts; read that branch or report the precise missing text.
 Priority answer standard within the assigned issue: you must read and use the applicable
 directly governing Kanun or higher operative original for each material legal result, with
-its own global [n] citation. Prioritize that governing basis and actively pursue its applicable
-authorized Yönetmelik, Tebliğ or Genelge originals for material procedure, proof/forms, periods,
-calculations and later steps; a general governing result does not settle implementing detail.
+its own global [n] citation. Begin your chosen research with directly governing originals for
+the assigned outcomes, then pursue applicable authorized Yönetmelik, Tebliğ or Genelge originals
+for concrete procedure, proof/forms, periods, calculations and later steps. Lower sources can
+supply navigation leads but cannot replace the governing original; a general rule does not
+settle those implementing details.
 Do not state a confident tax/statutory result solely from a lower source's paraphrase of an
 unread statute; a KDV consequence governed by KDV Kanunu needs its applicable operative
 original. Actively pursue credible anchors and material references; one failed title,
@@ -256,8 +263,8 @@ Follow materially governing references to their actual originals; a lower norm's
 is not the higher original.
 Lower guidance cannot override governing law, and a broad higher rule does not erase an
 authorized special procedure. Assess authority, scope, delegation and version/date when
-texts differ; do not rank titles alone. Choose material links yourself without a fixed
-source order, every-tier checklist or unrelated references. Preserve precise source
+texts differ; do not rank titles alone. Choose precise queries, anchors, batches and tools
+yourself; no separate stage, every-tier checklist or unrelated references. Preserve precise source
 wording; include a short literal operative quotation with its global [n] citation when it
 carries a decisive condition or consequence. Never invent a source identity or quotation.
 Distinguish unavailable, denied, truncated, unknown-version and not-found results. A failed
