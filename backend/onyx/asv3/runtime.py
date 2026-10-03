@@ -1203,6 +1203,79 @@ def run_asv3_loop(
                 )
                 is None
             )
+        # Source-first review can discover missing requirements after the last writer.
+        # Patch those exact gaps while preserving the reviewed remainder, then audit again.
+        if (
+            final_gap is not None
+            and final_gap.data.get("omitted_material_source_details")
+            and context.budget.limits["decisions"]
+            - context.budget.snapshot()["decisions"]
+            >= 3
+        ):
+            candidate = repair_publication_candidate(
+                model,
+                ledger,
+                answer=final,
+                scenario=question,
+                gap=final_gap,
+                evidence=_evidence_record(
+                    ledger,
+                    final,
+                    preferred_numbers=research_state.preferred_citations(),
+                    required_numbers=research_state.source_conditions.citations(),
+                    include_witness_spans=True,
+                    include_supplemental_originals=True,
+                ),
+                research_state=research_state.view(max_chars=24000),
+            )
+            if candidate and candidate != final:
+                previous_final, previous_review = final, final_review
+                final = candidate
+                harness.last_draft = final
+                try:
+                    final_review = review_answer(
+                        final,
+                        research=False,
+                        preservation_reference=previous_final,
+                        previous_review=previous_review,
+                    )
+                except RunStopped:
+                    context.check_active()
+                    final_review = VerificationResult(
+                        status="uncertain",
+                        explanation="Publication assessment capacity exhausted",
+                        required_conditions=[],
+                        missing_conditions=[],
+                        evidence_numbers=[],
+                        safe_to_publish=False,
+                        format_error="The patched candidate has no complete publication assessment",
+                    )
+                    latest_review = final_review
+                final_gap = publication_gap(
+                    final,
+                    final_review,
+                    harness.view().questions,
+                    ledger,
+                    require_sources=profile.requires_sources,
+                    allow_explicit_gaps=True,
+                    verification_call_id=model.last_call_id,
+                    require_direct_authority=final_review.status == "supported",
+                    scenario=question,
+                    require_quotation_checks=True,
+                    require_assertion_checks=True,
+                    require_determination_checks=profile.requires_sources,
+                    require_condition_review=profile.requires_sources,
+                    require_source_inventory=profile.requires_sources,
+                    research_state=research_state,
+                )
+                complete = final_gap is None and final_review.status == "supported"
+                if complete:
+                    approved_draft, approved_review, approved_call_id = (
+                        final,
+                        final_review,
+                        model.last_call_id,
+                    )
+                    approved_questions = harness.view().questions
         final_publication_gap = final_gap
         publication_stop_reason = (
             "publication_guard_rejected"

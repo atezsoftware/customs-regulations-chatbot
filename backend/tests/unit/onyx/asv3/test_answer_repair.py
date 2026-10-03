@@ -69,3 +69,65 @@ def test_targeted_research_cannot_spend_full_publication_capacity() -> None:
     for _ in range(8):
         budget.consume("decisions")
     assert budget.snapshot()["decisions"] == 41
+
+
+@pytest.mark.parametrize(
+    "bad_patch", [None, "omit_requirement", "foreign_unit", "missing_citation"]
+)
+def test_late_witnessed_omission_is_inserted_without_regenerating_supported_answer(
+    bad_patch: str | None,
+) -> None:
+    ledger, context = original_ledger()
+    answer = "İlk destekli sonuç [1].\n\nİkinci destekli sonuç ve sonraki aşama [2]."
+    units = assertion_inventory(answer)
+    original = ledger.get(1)
+    assert original is not None
+    addition = "Eksik şart ve istisnası da korunur [1]."
+    insertions = [
+        {
+            "after_unit_id": units[0]["unit_id"],
+            "omission_ids": ["om0"],
+            "text": addition,
+        }
+    ]
+    if bad_patch == "omit_requirement":
+        insertions = []
+    elif bad_patch == "foreign_unit":
+        insertions[0]["after_unit_id"] = "foreign"
+    elif bad_patch == "missing_citation":
+        insertions[0]["text"] = "Eksik şartı uygular."
+    llm = scripted_model()
+    llm.invoke.return_value = text_response(
+        {"replacements": [], "insertions": insertions}
+    )
+    candidate = repair_publication_candidate(
+        ResearchModel(llm, context),
+        ledger,
+        answer=answer,
+        scenario="facts",
+        gap=ToolOutcome(
+            status=OutcomeStatus.PARTIAL,
+            summary="Late original condition omitted",
+            data={
+                "omitted_material_source_details": [
+                    {
+                        "witness": {"citation": 1, "source_quote": original.text},
+                        "determination_ids": ["q0:d0"],
+                        "detail": "Eksik şart ve istisna",
+                        "applicability": "İlk sonuç için",
+                    }
+                ]
+            },
+        ),
+        evidence=_evidence_record(ledger, answer),
+        research_state={},
+    )
+    if bad_patch is None:
+        assert (
+            candidate
+            == units[0]["text"] + "\n\n" + addition + "\n\n" + units[1]["text"]
+        )
+        assert llm.invoke.call_count == 1
+    else:
+        assert candidate == answer
+        assert llm.invoke.call_count == 2

@@ -12,6 +12,28 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from onyx.asv3.citation_numbers import extract_citation_numbers
 from onyx.asv3.witnesses import original_witness_text
 
+_DESIGNATOR = re.compile(r"(?<![\w])([A-Z]{2,8})[ -]?(\d{4,6})(?![\w])")
+
+
+def unsupported_designators(
+    text: str, originals: list[str], scenario: str
+) -> list[str]:
+    """A general rule cannot supply a new literal technical classification or code."""
+    from onyx.asv3.quotations import normalized
+
+    supplied = {
+        normalized(match.group(1) + match.group(2))
+        for value in [*originals, scenario]
+        for match in _DESIGNATOR.finditer(value.upper())
+    }
+    return list(
+        dict.fromkeys(
+            match.group(0)
+            for match in _DESIGNATOR.finditer(text)
+            if normalized(match.group(1) + match.group(2)) not in supplied
+        )
+    )
+
 
 class AssertionWitness(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -134,6 +156,16 @@ def assertion_support_defect(
         return "Each inline citation must have this block's own original witness."
     if any(not assertion_witness_valid(w, originals) for w in check.witnesses):
         return "A source witness does not select a catalogued passage or contiguous literal quote in its exact original."
+    invented = unsupported_designators(
+        unit["text"],
+        [originals[n] for n in unit["evidence_numbers"] if n in originals],
+        scenario,
+    )
+    if invented:
+        return (
+            "Literal technical codes lack an inline original or supplied fact: "
+            + ", ".join(invented)
+        )
     return None
 
 

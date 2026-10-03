@@ -1127,7 +1127,7 @@ def test_model_selected_partial_submission_keeps_exact_candidate_and_source_guar
         class NoRepairReserveContext(RunContext):
             def __init__(self, **kwargs: Any) -> None:
                 super().__init__(
-                    budget=SharedBudget(max_decisions=8, final_decision_reserve=5),
+                    budget=SharedBudget(max_decisions=7, final_decision_reserve=4),
                     **kwargs,
                 )
 
@@ -2211,3 +2211,104 @@ def test_local_assertion_failure_repairs_only_rejected_outcome_despite_broad_app
         "Koşullu tamire izin verilir"
     )
     assert "tüm şartları kaldırır" not in kwargs["state_container"].answer_tokens
+
+
+@pytest.mark.parametrize("patched_supported", [True, False])
+def test_late_source_omission_patch_requires_new_complete_publication_review(
+    monkeypatch: pytest.MonkeyPatch, patched_supported: bool
+) -> None:
+    from onyx.prompts.asv3.research import ANSWER_REPAIR_PROMPT
+
+    class ReservedContext(RunContext):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(
+                budget=SharedBudget(max_decisions=14, final_decision_reserve=6),
+                **kwargs,
+            )
+
+    monkeypatch.setattr(runtime, "RunContext", ReservedContext)
+    draft = "Tamir [1], değiştirme [2]."
+    kwargs, broker, llm, checkpoints, _queue = setup_run(monkeypatch, final=draft)
+    monkeypatch.setattr(runtime, "complete_condition_review", complete_condition_review)
+    for key, chunk in broker.chunks.items():
+        broker.chunks[key] = replace(
+            chunk, text=chunk.text + " Onaylı belge sunulmalıdır."
+        )
+    added = "Onaylı belge sunulmalıdır [1]."
+    final = draft + "\n\n" + added
+    draft_id = assertion_inventory(draft)[0]["unit_id"]
+    added_id = assertion_inventory(final)[1]["unit_id"]
+
+    def condition(covered: bool) -> ModelResponse:
+        return response(
+            json.dumps(
+                {
+                    "examined_citations": [1, 2],
+                    "conditions": [
+                        {
+                            "witness": {
+                                "citation": 1,
+                                "source_quote": "Onaylı belge sunulmalıdır.",
+                            },
+                            "determination_ids": ["q0:d0"],
+                            "detail": "Onaylı belge sunulmalıdır.",
+                            "applicability": "Tamir sonucunun gerekli belgesi.",
+                            "disposition": "covered" if covered else "omitted",
+                            "answer_unit_ids": [added_id] if covered else [],
+                        }
+                    ],
+                }
+            )
+        )
+
+    script = incomplete_script(llm)
+    final_review = (
+        supported_review([1, 2], draft=final)
+        if patched_supported
+        else unsafe_review("Added detail is unsupported")
+    )
+    llm.invoke.side_effect = [
+        *script,
+        condition(False),
+        response(
+            json.dumps(
+                {
+                    "replacements": [],
+                    "insertions": [
+                        {
+                            "after_unit_id": draft_id,
+                            "omission_ids": ["om0"],
+                            "text": added,
+                        }
+                    ],
+                }
+            )
+        ),
+        final_review,
+        *([condition(True)] if patched_supported else []),
+    ]
+    runtime.run_asv3_loop(**kwargs)
+    saved = checkpoints[-1]
+    patch_call = next(
+        c
+        for c in llm.invoke.call_args_list
+        if c.kwargs["prompt"][0].content.startswith(ANSWER_REPAIR_PROMPT)
+    )
+    assert (
+        request_data(patch_call.kwargs)["required_omissions"]["om0"]["detail"]
+        == "Onaylı belge sunulmalıdır."
+    )
+    assert saved["last_draft"] == final
+    if patched_supported:
+        assert saved["final_publication_gap"] is None
+        assert saved["publication_status"] == "found"
+        assert saved["draft_approval"]["text_hash"] == answer_hash(final)
+        assert saved["draft_approval"]["verification_call_id"]
+        assert saved["publication_review"][
+            "condition_review_answer_hash"
+        ] == answer_hash(final)
+        assert kwargs["state_container"].answer_tokens.startswith("Tamir")
+    else:
+        assert saved["final_publication_gap"] is not None
+        assert saved["publication_status"] == "partial"
+        assert "Onaylı belge" not in kwargs["state_container"].answer_tokens

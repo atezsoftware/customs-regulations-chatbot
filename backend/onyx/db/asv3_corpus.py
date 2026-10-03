@@ -1,6 +1,7 @@
 """Read-only, ACL and publication fenced corpus access for ASv3."""
 
 import json
+import re
 from collections.abc import Callable, Generator
 from dataclasses import dataclass
 from datetime import date
@@ -1073,10 +1074,19 @@ def find_sources(
         func.translate(UserFile.name, "ÇĞİÖŞÜÂÎÛçğıöşüâîû", "CGIOSUAIUcgiosuaiu")
     )
     order = []
-    if normalized_query:
+    references = list(
+        re.finditer(r"(?<!\d)(\d{4})[/_.-](\d{1,4})(?!\d)", normalized_query)
+    )
+    for reference in references:
+        # A source number retains its identity across filename punctuation and zero padding.
+        year, number = reference.groups()
+        pattern = rf"(^|[^0-9]){year}[/_. -]+0*{int(number)}([^0-9]|$)"
+        statement = statement.where(normalized_name.op("~")(pattern))
+    lexical_query = re.sub(r"(?<!\d)\d{4}[/_.-]\d{1,4}(?!\d)", " ", normalized_query)
+    if lexical_query.strip():
         escaped_terms = [
             term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-            for term in normalized_query.split()[:12]
+            for term in lexical_query.split()[:12]
         ]
         for term in escaped_terms:
             statement = statement.where(

@@ -257,3 +257,33 @@ def test_missing_block_stays_a_gap_and_grouped_inline_sources_all_need_witnesses
         )
         is not None
     )
+
+
+@pytest.mark.parametrize(
+    ("original", "scenario", "rejected"),
+    [
+        ("Dangerous goods use compliant vehicles.", "", True),
+        ("UN 1170 is subject to the applicable vehicle requirements.", "", False),
+        ("UN-1170 is subject to the applicable vehicle requirements.", "", False),
+        (
+            "Dangerous goods use compliant vehicles.",
+            "The consignment is UN1170.",
+            False,
+        ),
+        ("UN11700 has different requirements.", "", True),
+    ],
+)
+def test_technical_code_requires_its_literal_inline_original_or_supplied_fact(
+    original: str, scenario: str, rejected: bool
+) -> None:
+    from onyx.asv3.assertions import assertion_support_defect
+
+    answer = "UN1170 uses compliant vehicles [1]."
+    unit = assertion_inventory(answer)[0]
+    check = AssertionVerification(
+        unit_id=unit["unit_id"],
+        status="supported",
+        witnesses=[AssertionWitness(citation=1, source_quote=original)],
+    )
+    defect = assertion_support_defect(unit, check, {1: original}, scenario)
+    assert (defect is not None) == rejected
