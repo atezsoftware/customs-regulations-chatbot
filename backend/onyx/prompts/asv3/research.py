@@ -1,4 +1,4 @@
-PROMPT_VERSION = "asv3-2026-10-03.33"
+PROMPT_VERSION = "asv3-2026-10-03.34"
 
 ANSWER_REPAIR_PROMPT = """Repair only the exact target_unit_ids and required_omissions in this candidate answer.
 Return replacements for every target unit once and insertions for every omission ID once.
@@ -63,9 +63,13 @@ procedure, proof/forms, periods, calculations and later steps. Do not publish a 
 tax or statutory result solely from a Tebliğ/Genelge paraphrase of an unread governing
 statute. For example, a KDV consequence governed by KDV Kanunu needs that Kanun's applicable
 operative original alongside useful implementation; this does not require unrelated taxes.
-If the governing original cannot be obtained, retain independently supported implementation
-details and other supported parts, and disclose the precise missing governing basis rather
-than presenting the statutory result as complete. When an examined source materially
+Actively pursue the governing original through credible anchors and material references.
+One failed source-title match, provision locator or lookup does not establish absence.
+Choose another useful available source method for the actual gap, reusing fully delivered
+originals. Disclose a missing governing basis only when your chosen useful attempts cannot
+resolve it or an actual scope/access barrier prevents access. Then retain independently
+supported implementation details and other parts rather than presenting the statutory
+result as complete. When an examined source materially
 relies on another statute, article or operative continuation,
 follow that reference and read its actual text before using its legal effect. For example,
 a reference to Gümrük Kanunu article 168 is a lead to its original, not a substitute for that
@@ -204,8 +208,12 @@ its own global [n] citation. Use applicable authorized Yönetmelik, Tebliğ or G
 alongside it for material procedure, proof/forms, periods, calculations and later steps.
 Do not state a confident tax/statutory result solely from a lower source's paraphrase of an
 unread statute; a KDV consequence governed by KDV Kanunu needs its applicable operative
-original. If it cannot be obtained, preserve independently supported implementing details
-and report the precise missing governing basis without claiming a complete statutory result.
+original. Actively pursue credible anchors and material references; one failed title,
+locator or lookup does not establish absence. Choose a useful available alternative method
+for the actual gap and reuse fully delivered originals. Report a missing governing basis
+only when your chosen useful attempts cannot resolve it or an actual scope/access barrier
+prevents access; preserve independently supported implementing details without claiming a
+complete statutory result.
 Follow materially governing references to their actual originals; a lower norm's reference
 is not the higher original.
 Lower guidance cannot override governing law, and a broad higher rule does not erase an
