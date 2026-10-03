@@ -45,7 +45,7 @@ function isPlaceholder(event: ASv3Progress): boolean {
 
 function progressTitle(event: ASv3Progress): string {
   if (
-    !/^(?:Özgün Kaynak|Original source)\s*\[\d+\]$/iu.test(event.title.trim())
+    !/^(?:Özgün Kaynak|Original source)\s*\[\d+\]$/i.test(event.title.trim())
   ) {
     return event.title;
   }
