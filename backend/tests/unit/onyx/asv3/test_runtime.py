@@ -439,20 +439,39 @@ def scripted_condition_review(
 
 
 @pytest.mark.parametrize("provider", ["vertex_ai", "openai", "anthropic"])
+@pytest.mark.parametrize("uncited_condition", [False, True])
 def test_source_condition_audit_repair_preserves_sources_and_selected_provider(
     monkeypatch: pytest.MonkeyPatch,
     provider: str,
+    uncited_condition: bool,
 ) -> None:
     kwargs, broker, llm, checkpoints, queue = setup_run(monkeypatch)
     monkeypatch.setattr(runtime, "complete_condition_review", complete_condition_review)
     llm.config.model_provider = provider
-    source_id = str(broker.sources[0].id)
+    source_id = str(broker.sources[1 if uncited_condition else 0].id)
     broker.chunks[source_id] = replace(
         broker.chunks[source_id], text="Tamir şartları. Onaylı belge sunulmalıdır."
     )
     script = list(llm.invoke.side_effect)
-    draft = "Tamir [1], değiştirme [2]."
-    final = "Tamir [1], değiştirme [2]. Onaylı belge sunulmalıdır [1]."
+    draft = final = ""
+    condition_citation = base_citation = 0
+
+    def first_draft(**arguments: Any) -> ModelResponse:
+        nonlocal draft, final, condition_citation, base_citation
+        originals = request_data(arguments)["original_evidence"]
+        condition_citation = next(
+            item["citation"] for item in originals if item["source_id"] == source_id
+        )
+        base_citation = next(
+            item["citation"] for item in originals if item["source_id"] != source_id
+        )
+        draft = (
+            f"Tamir [{base_citation}]."
+            if uncited_condition
+            else "Tamir [1], değiştirme [2]."
+        )
+        final = draft + f" Onaylı belge sunulmalıdır [{condition_citation}]."
+        return response(draft)
 
     def audit(answer: str, omitted: bool) -> ModelResponse:
         return response(
@@ -462,7 +481,7 @@ def test_source_condition_audit_repair_preserves_sources_and_selected_provider(
                     "conditions": [
                         {
                             "witness": {
-                                "citation": 1,
+                                "citation": condition_citation,
                                 "source_quote": "Onaylı belge sunulmalıdır.",
                             },
                             "determination_ids": ["q0:d0"],
@@ -478,16 +497,38 @@ def test_source_condition_audit_repair_preserves_sources_and_selected_provider(
             )
         )
 
-    llm.invoke.side_effect = [
-        *script[:3],
-        supported_review([1, 2], draft=draft),
-        audit(draft, True),
-        response(final),
-        supported_review([1, 2], draft=final),
-        audit(final, False),
-    ]
+    stages = iter(
+        [
+            *script[:2],
+            first_draft,
+            lambda **_kwargs: supported_review(
+                [base_citation] if uncited_condition else [1, 2], draft=draft
+            ),
+            lambda **_kwargs: audit(draft, True),
+            lambda **_kwargs: response(final),
+            lambda **_kwargs: supported_review([1, 2], draft=final),
+            lambda **_kwargs: audit(final, False),
+        ]
+    )
+
+    def invoke(**arguments: Any) -> ModelResponse:
+        stage = next(stages)
+        return stage(**arguments) if callable(stage) else stage
+
+    llm.invoke.side_effect = invoke
     runtime.run_asv3_loop(**kwargs)
     assert llm.invoke.call_count == 8
+    claim_input = json.loads(
+        request_data(llm.invoke.call_args_list[3].kwargs)["evidence"]
+    )
+    assert {item["citation"] for item in claim_input} == (
+        {base_citation} if uncited_condition else {1, 2}
+    )
+    condition_input = request_data(llm.invoke.call_args_list[4].kwargs)
+    assert {item["citation"] for item in condition_input["original_evidence"]} == {
+        1,
+        2,
+    }
     repair = request_data(llm.invoke.call_args_list[5].kwargs)
     assert repair["draft_to_repair"] == draft
     assert (
@@ -1103,14 +1144,10 @@ def test_runtime_recovers_uncited_governing_source_without_losing_special_proced
     def first_review(**arguments: Any) -> ModelResponse:
         data = request_data(arguments)
         originals = json.loads(data["evidence"])
-        assert {item["citation"] for item in originals} == set(citations.values())
+        assert {item["citation"] for item in originals} == {citations["genelge"]}
         assert all(item["truncated"] is False for item in originals)
         assert "available_evidence" not in data
-        assert {item["metadata"]["document_type"] for item in originals} == {
-            "kanun",
-            "genelge",
-        }
-        assert any(item["citation"] == citations["kanun"] for item in originals)
+        assert {item["metadata"]["document_type"] for item in originals} == {"genelge"}
         return response(
             json.dumps(
                 {

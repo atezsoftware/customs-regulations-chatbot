@@ -716,7 +716,14 @@ class Harness:
             executor.shutdown(wait=False, cancel_futures=True)
 
     def _model_tool_result(self, receipt: ToolReceipt) -> ToolMessage:
-        outcome = receipt.outcome.model_dump(mode="json")
+        # Originals and image parts have dedicated delivery channels, not raw transport copies.
+        outcome = receipt.outcome.model_dump(
+            mode="json", exclude={"evidence", "artifacts"}
+        )
+        outcome["artifacts"] = [
+            artifact_reference(item).model_dump(mode="json")
+            for item in receipt.outcome.artifacts
+        ]
         # A compact audit receipt is not the original passage requested by the model.
         if receipt.call.name == "read_evidence" and not receipt.outcome.original_reads:
             data = outcome.get("data")
@@ -737,7 +744,7 @@ class Harness:
         originals = json.loads(
             self.evidence.serialize_records(
                 [number for number in receipt.evidence_ids if number not in reopened],
-                max_chars=20000,
+                max_chars=self.max_context_chars,
             )
         )
         data = outcome.get("data")
@@ -784,7 +791,14 @@ class Harness:
                 return value
 
             outcome["data"] = without_duplicate_text(outcome.get("data", {}))
-        elif receipt.call.name == "read_evidence" and isinstance(data, dict):
+        elif (
+            receipt.call.name == "read_evidence"
+            and isinstance(data, dict)
+            and isinstance(data.get("citation"), int)
+            and isinstance(data.get("text"), str)
+            and receipt.outcome.status
+            in {OutcomeStatus.FOUND, OutcomeStatus.PARTIAL, OutcomeStatus.TRUNCATED}
+        ):
             # Respect the requested range; a short peek is not delivery of the full block.
             originals = [
                 {
@@ -797,6 +811,8 @@ class Harness:
             outcome["data"] = {
                 key: value for key, value in data.items() if key != "text"
             }
+        delivered = {row["citation"] for row in originals}
+        omitted = [number for number in receipt.evidence_ids if number not in delivered]
         return ToolMessage(
             tool_call_id=receipt.call.call_id,
             content=json.dumps(
@@ -804,6 +820,14 @@ class Harness:
                     "outcome": outcome,
                     "evidence_ids": receipt.evidence_ids,
                     "original_evidence": originals,
+                    **(
+                        {
+                            "original_evidence_omitted": omitted,
+                            "original_delivery_notice": "These retained originals did not fit this result. Reopen by global citation with read_evidence; an omitted original was not delivered as source text.",
+                        }
+                        if omitted
+                        else {}
+                    ),
                 },
                 ensure_ascii=False,
             ),

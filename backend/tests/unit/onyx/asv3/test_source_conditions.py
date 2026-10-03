@@ -30,6 +30,34 @@ from tests.unit.onyx.asv3.test_citation_contract import original_ledger, support
 from tests.unit.onyx.asv3.test_model_adapter import scripted_model, text_response
 
 
+def test_claim_projection_keeps_preservation_citations_without_supplemental_text() -> (
+    None
+):
+    ledger, _context = original_ledger()
+    evidence = _evidence_record(
+        ledger,
+        "Current rule [1].\nPrevious supported qualification [3].",
+        preferred_numbers=[2],
+        include_witness_spans=True,
+        cited_only=True,
+    )
+    rows = json.loads(evidence)
+    assert {row["citation"] for row in rows} == {1, 3}
+    for row in rows:
+        original = ledger.get(row["citation"])
+        assert original is not None
+        assert row["text"] == original.text and row["truncated"] is False
+        assert row["witness_spans"]
+    assert (
+        json.loads(_evidence_record(ledger, "No source assertion.", cited_only=True))
+        == []
+    )
+    with pytest.raises(ValueError, match="different roles"):
+        _evidence_record(
+            ledger, "Rule [1].", cited_only=True, include_supplemental_originals=True
+        )
+
+
 @pytest.fixture
 def condition() -> SourceConditionCheck:
     ledger, _context = original_ledger()
