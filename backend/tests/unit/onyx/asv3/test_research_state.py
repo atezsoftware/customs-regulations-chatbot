@@ -4,6 +4,7 @@ import json
 import threading
 
 import pytest
+from pydantic import JsonValue
 
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.harness import Harness
@@ -11,6 +12,7 @@ from onyx.asv3.llm_adapter import (
     NeedVerification,
     QuestionVerification,
     VerificationResult,
+    publication_review_inventory,
 )
 from onyx.asv3.models import (
     CapabilityCall,
@@ -20,6 +22,7 @@ from onyx.asv3.models import (
     RunContext,
     TaskStatus,
     ToolOutcome,
+    ToolSpec,
 )
 from onyx.asv3.publication import publication_gap
 from onyx.asv3.registry import CapabilityRegistry, build_core_specs
@@ -73,6 +76,229 @@ def need(key: str = "basis", **changes: object) -> dict[str, object]:
         "completion_test": "Operative original plus applicable exception",
         **changes,
     }
+
+
+@pytest.mark.parametrize("binding", [None, "unknown", "excluded", "incidental"])
+def test_source_action_binding_is_checked_before_io_and_budget(
+    binding: str | None,
+) -> None:
+    context, ledger, old_state = state_pair()
+    state = ResearchState(
+        list(old_state.questions), context, require_need_bindings=True
+    )
+    context.services["research_state"] = state
+    state.update(
+        ResearchUpdate.model_validate(
+            {
+                "needs": [
+                    need(
+                        "excluded",
+                        status="out_of_scope",
+                        gap="Unrelated to this request",
+                    ),
+                    need("incidental", material=False),
+                ]
+            }
+        ),
+        ledger,
+    )
+    executed: list[str] = []
+    registry = CapabilityRegistry(
+        [
+            ToolSpec(
+                name="read_original",
+                description="Read an original",
+                parameters={
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": False,
+                },
+                requires_research_need=True,
+                handler=lambda _args, _context: (
+                    executed.append("read")
+                    or ToolOutcome(status=OutcomeStatus.FOUND, summary="Original")
+                ),
+            )
+        ]
+    )
+    before = context.budget.snapshot()
+    result = registry.dispatch(
+        CapabilityCall(
+            name="read_original", arguments={"_need_id": binding} if binding else {}
+        ),
+        context,
+    )
+    assert result.status == OutcomeStatus.INVALID
+    assert "completion test" in str(result.data)
+    assert not executed and context.budget.snapshot() == before
+    definition = registry.definitions(context)[0]["function"]
+    assert isinstance(definition, dict) and isinstance(definition["parameters"], dict)
+    assert "_need_id" in definition["parameters"]["required"]
+
+
+def test_need_update_and_parallel_original_reads_share_one_decision() -> None:
+    context, ledger, old_state = state_pair()
+    state = ResearchState(
+        list(old_state.questions), context, require_need_bindings=True
+    )
+    context.services["research_state"] = state
+    registry = CapabilityRegistry(build_research_specs(state, ledger))
+    barrier = threading.Barrier(2)
+    entered: list[str] = []
+
+    def read(args: dict[str, JsonValue], _context: RunContext) -> ToolOutcome:
+        assert state.has_need("basis")
+        entered.append(str(args["anchor"]))
+        barrier.wait(timeout=2)
+        return ToolOutcome(status=OutcomeStatus.FOUND, summary="Original retained")
+
+    registry.register(
+        ToolSpec(
+            name="read_original",
+            description="Read selected original",
+            requires_research_need=True,
+            parameters={
+                "type": "object",
+                "properties": {"anchor": {"type": "string"}},
+                "required": ["anchor"],
+                "additionalProperties": False,
+            },
+            handler=read,
+        )
+    )
+    decisions = iter(
+        [
+            Decision(
+                calls=[
+                    CapabilityCall(
+                        name="read_original",
+                        arguments={"anchor": "a", "_need_id": "basis"},
+                    ),
+                    CapabilityCall(
+                        name="update_research",
+                        arguments={"needs": [need(question_ids=["q0", "q1"])]},
+                    ),
+                    CapabilityCall(
+                        name="read_original",
+                        arguments={"anchor": "b", "_need_id": "basis"},
+                    ),
+                ]
+            ),
+            Decision(answer="Research completed"),
+        ]
+    )
+    result = Harness(
+        request="Resolve both questions",
+        context=context,
+        registry=registry,
+        decide=lambda _view: next(decisions),
+        evidence=ledger,
+    ).run()
+    assert result.status == OutcomeStatus.FOUND
+    assert sorted(entered) == ["a", "b"]
+    assert state.uncovered_questions() == []
+    assert [r.call.name for r in result.receipts] == [
+        "update_research",
+        "read_original",
+        "read_original",
+    ]
+
+
+def test_cached_original_read_cannot_bypass_current_need_binding() -> None:
+    context, ledger, old_state = state_pair()
+    state = ResearchState(
+        list(old_state.questions), context, require_need_bindings=True
+    )
+    context.services["research_state"] = state
+    state.update(ResearchUpdate.model_validate({"needs": [need()]}), ledger)
+    registry = CapabilityRegistry()
+    for spec in build_core_specs(registry, ledger, lambda: {}):
+        registry.register(spec)
+    for spec in build_research_specs(state, ledger):
+        registry.register(spec)
+    decisions = iter(
+        [
+            Decision(
+                calls=[
+                    CapabilityCall(
+                        name="read_evidence",
+                        arguments={"citation": 1, "_need_id": "basis"},
+                    )
+                ]
+            ),
+            Decision(
+                calls=[
+                    CapabilityCall(
+                        name="update_research",
+                        arguments={
+                            "needs": [
+                                need(status="out_of_scope", gap="No longer material")
+                            ]
+                        },
+                    ),
+                    CapabilityCall(
+                        name="read_evidence",
+                        arguments={"citation": 1, "_need_id": "basis"},
+                    ),
+                ]
+            ),
+            Decision(answer="Done"),
+        ]
+    )
+    result = Harness(
+        request="Read an original",
+        context=context,
+        registry=registry,
+        decide=lambda _view: next(decisions),
+        evidence=ledger,
+    ).run()
+    reads = [r for r in result.receipts if r.call.name == "read_evidence"]
+    assert [r.outcome.status for r in reads] == [
+        OutcomeStatus.FOUND,
+        OutcomeStatus.INVALID,
+    ]
+    assert reads[-1].evidence_ids == []
+
+
+def test_research_binding_failure_can_recover_after_the_need_is_recorded() -> None:
+    context, ledger, old_state = state_pair()
+    state = ResearchState(
+        list(old_state.questions), context, require_need_bindings=True
+    )
+    context.services["research_state"] = state
+    registry = CapabilityRegistry()
+    for spec in build_core_specs(registry, ledger, lambda: {}):
+        registry.register(spec)
+    for spec in build_research_specs(state, ledger):
+        registry.register(spec)
+    arguments: dict[str, JsonValue] = {"citation": 1, "_need_id": "basis"}
+    decisions = iter(
+        [
+            Decision(calls=[CapabilityCall(name="read_evidence", arguments=arguments)]),
+            Decision(
+                calls=[
+                    CapabilityCall(
+                        name="update_research", arguments={"needs": [need()]}
+                    ),
+                    CapabilityCall(name="read_evidence", arguments=arguments),
+                ]
+            ),
+            Decision(answer="Done"),
+        ]
+    )
+    result = Harness(
+        request="Read an original",
+        context=context,
+        registry=registry,
+        decide=lambda _view: next(decisions),
+        evidence=ledger,
+    ).run()
+    reads = [r for r in result.receipts if r.call.name == "read_evidence"]
+    assert [r.outcome.status for r in reads] == [
+        OutcomeStatus.INVALID,
+        OutcomeStatus.FOUND,
+    ]
+    assert reads[-1].evidence_ids == [1]
 
 
 @pytest.mark.parametrize(
@@ -294,6 +520,89 @@ def test_need_verification_cannot_be_bypassed_by_omitting_the_norm_name() -> Non
         )
         is None
     )
+
+
+def test_publication_rejects_an_uncovered_original_question() -> None:
+    context, ledger, old_state = state_pair()
+    state = ResearchState(
+        list(old_state.questions), context, require_need_bindings=True
+    )
+    state.update(ResearchUpdate.model_validate({"needs": [need()]}), ledger)
+    review = VerificationResult(
+        status="supported",
+        explanation="Original assertions verified",
+        required_conditions=[],
+        missing_conditions=[],
+        evidence_numbers=[1],
+        safe_to_publish=True,
+        question_results=[
+            QuestionVerification(
+                question_id=f"q{i}",
+                status="supported",
+                evidence_numbers=[1],
+                missing_conditions=[],
+            )
+            for i in range(2)
+        ],
+        need_results=[
+            NeedVerification(
+                need_id="basis",
+                status="supported",
+                evidence_numbers=[1],
+                missing_conditions=[],
+            )
+        ],
+    )
+    gap = publication_gap(
+        "Rule and procedure [1].",
+        review,
+        list(state.questions),
+        ledger,
+        research_state=state,
+    )
+    assert gap is not None and "q1" in str(gap.data)
+    state.update(
+        ResearchUpdate.model_validate(
+            {"needs": [need("procedure", question_ids=["q1"])]}
+        ),
+        ledger,
+    )
+    review.need_results.append(
+        NeedVerification(
+            need_id="procedure",
+            status="supported",
+            evidence_numbers=[1],
+            missing_conditions=[],
+        )
+    )
+    assert (
+        publication_gap(
+            "Rule and procedure [1].",
+            review,
+            list(state.questions),
+            ledger,
+            research_state=state,
+        )
+        is None
+    )
+
+
+def test_review_inventory_uses_only_material_in_scope_needs() -> None:
+    inventory = publication_review_inventory(
+        json.dumps(
+            {
+                "assertion_units": [],
+                "research_state": {
+                    "needs": [
+                        need("material", material=True),
+                        need("excluded", material=True, status="out_of_scope"),
+                        need("incidental", material=False),
+                    ]
+                },
+            }
+        )
+    )
+    assert inventory is not None and inventory["need_results"] == {"material"}
 
 
 def test_worker_binds_and_reuses_an_already_assigned_need() -> None:

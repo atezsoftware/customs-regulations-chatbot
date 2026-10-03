@@ -15,6 +15,7 @@ from onyx.asv3.models import (
     ToolOutcome,
     ToolSpec,
 )
+from onyx.asv3.research_state import ResearchState
 
 if TYPE_CHECKING:
     from onyx.asv3.evidence import EvidenceLedger
@@ -51,11 +52,26 @@ class CapabilityRegistry:
                 "record_scenario",
                 "report_progress",
             }:
-                properties["_need_id"] = {
-                    "type": "string",
-                    "maxLength": 64,
-                    "description": "Optional existing research need ID binding this action's originals to the stable user questions.",
-                }
+                if spec.research_need_argument == "_need_id":
+                    properties["_need_id"] = {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 64,
+                        "description": "Existing material research need ID binding this action to its unresolved question and completion test. May be created by update_research in the same decision.",
+                    }
+                state = context.services.get("research_state")
+                if (
+                    spec.requires_research_need
+                    and isinstance(state, ResearchState)
+                    and state.require_need_bindings
+                ):
+                    required = parameters.setdefault("required", [])
+                    assert isinstance(required, list)
+                    required.append(spec.research_need_argument)
+                    if spec.research_need_argument == "need_ids":
+                        binding = properties["need_ids"]
+                        assert isinstance(binding, dict)
+                        binding["minItems"] = 1
             if not spec.orchestrates and spec.name not in {
                 "report_progress",
                 "record_scenario",
@@ -74,6 +90,28 @@ class CapabilityRegistry:
 
     def get(self, name: str) -> ToolSpec | None:
         return self._specs.get(name)
+
+    def research_binding_gap(
+        self, call: CapabilityCall, context: RunContext
+    ) -> ToolOutcome | None:
+        spec = self.get(call.name)
+        state = context.services.get("research_state")
+        if (
+            spec is not None
+            and spec.requires_research_need
+            and isinstance(state, ResearchState)
+        ):
+            if spec.research_need_argument == "need_ids":
+                needs = call.arguments.get("need_ids")
+                if isinstance(needs, list) and needs:
+                    for need in needs:
+                        gap = state.action_binding_gap(need)
+                        if gap is not None:
+                            return gap
+                    return None
+                return state.action_binding_gap(None)
+            return state.action_binding_gap(call.arguments.get("_need_id"))
+        return None
 
     def dispatch(self, call: CapabilityCall, context: RunContext) -> ToolOutcome:
         try:
@@ -97,6 +135,9 @@ class CapabilityRegistry:
                         "instruction": "Send a new call with valid JSON values matching the exposed schema. Keep arrays/objects as JSON values, not quoted JSON strings. Do not change the scenario or invent sources.",
                     },
                 )
+            binding_gap = self.research_binding_gap(call, context)
+            if binding_gap is not None:
+                return binding_gap
             try:
                 arguments = {
                     key: value
@@ -306,6 +347,7 @@ def build_core_specs(
         ),
         ToolSpec(
             name="read_evidence",
+            requires_research_need=True,
             description="Read immutable original evidence by global citation number; use offsets for complete text.",
             parameters={
                 "type": "object",

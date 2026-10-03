@@ -162,6 +162,13 @@ def publication_gap(
             + str(review.omitted_supported_details)
         )
     if research_state is not None:
+        if research_state.require_need_bindings:
+            uncovered = research_state.uncovered_questions()
+            if uncovered:
+                reasons.append(
+                    "Original questions lack material research needs and completion tests: "
+                    + str(uncovered)
+                )
         state = research_state.export()
         needs = state.get("needs", [])
         material = (

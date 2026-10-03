@@ -83,6 +83,11 @@ class WorkerPool:
                 )
         needs = list(dict.fromkeys(need_ids or []))
         state = delegation.services.get("research_state")
+        if isinstance(state, ResearchState) and state.require_need_bindings:
+            if not needs or any(state.action_binding_gap(n) is not None for n in needs):
+                raise ValueError(
+                    "Delegation requires existing material information need IDs"
+                )
         if needs and (
             not isinstance(state, ResearchState)
             or any(not state.has_need(n) for n in needs)
@@ -363,6 +368,20 @@ class WorkerPool:
         def spawn(args: dict[str, JsonValue], context: RunContext) -> ToolOutcome:
             parent = context.services.get("task_id")
             raw_needs = args.get("need_ids")
+            state = context.services.get("research_state")
+            if isinstance(state, ResearchState) and state.require_need_bindings:
+                if (
+                    not isinstance(raw_needs, list)
+                    or not raw_needs
+                    or any(state.action_binding_gap(n) is not None for n in raw_needs)
+                ):
+                    return ToolOutcome(
+                        status=OutcomeStatus.INVALID,
+                        summary="Delegation requires existing material information need IDs; no researcher was started.",
+                        data={
+                            "instruction": "Record the independent need with update_research, then supply need_ids. Choose the tasks and concurrency yourself."
+                        },
+                    )
             task_id = self.spawn(
                 str(args["task"]),
                 request_context=context,
@@ -429,6 +448,8 @@ class WorkerPool:
         return [
             ToolSpec(
                 name="spawn_researcher",
+                requires_research_need=True,
+                research_need_argument="need_ids",
                 description="Delegate one independent information need. The researcher chooses its own tools.",
                 parameters=schema(
                     {

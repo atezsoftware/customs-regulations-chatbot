@@ -194,7 +194,9 @@ def publication_review_inventory(data: str) -> dict[str, set[str]] | None:
             [
                 row
                 for row in needs
-                if isinstance(row, dict) and row.get("status") != "out_of_scope"
+                if isinstance(row, dict)
+                and row.get("material")
+                and row.get("status") != "out_of_scope"
             ]
             if isinstance(needs, list)
             else [],

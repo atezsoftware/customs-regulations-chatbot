@@ -98,7 +98,9 @@ class WorkingMemory:
     def observe(self, receipt: ToolReceipt) -> None:
         with self._lock:
             data, args = receipt.outcome.data, receipt.call.arguments
-            need = args.get("coverage_item", args.get("question_id"))
+            need = args.get(
+                "_need_id", args.get("coverage_item", args.get("question_id"))
+            )
             purpose: dict[str, JsonValue] = (
                 {"information_need": need} if isinstance(need, str) else {}
             )

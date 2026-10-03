@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Mapping
 from enum import StrEnum
-from typing import Callable
+from typing import Callable, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
@@ -256,6 +256,8 @@ class ToolSpec(BaseModel):
     parallel_safe: bool = True
     external: bool = False
     orchestrates: bool = False
+    requires_research_need: bool = False
+    research_need_argument: Literal["_need_id", "need_ids"] = "_need_id"
 
     def definition(self) -> dict[str, JsonValue]:
         import copy

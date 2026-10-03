@@ -68,12 +68,19 @@ class ResearchCheckpointUpdate(ResearchUpdate):
 
 
 class ResearchState:
-    def __init__(self, questions: list[str], context: RunContext) -> None:
+    def __init__(
+        self,
+        questions: list[str],
+        context: RunContext,
+        *,
+        require_need_bindings: bool = False,
+    ) -> None:
         self.run_id = context.run_id
         self.scope_hash = hashlib.sha256(
             json.dumps(context.scope, sort_keys=True).encode()
         ).hexdigest()
         self.questions = tuple(questions)
+        self.require_need_bindings = require_need_bindings
         self._lock = threading.RLock()
         self._needs: OrderedDict[str, ResearchNeed] = OrderedDict()
         self._findings: OrderedDict[str, ResearchFinding] = OrderedDict()
@@ -88,6 +95,38 @@ class ResearchState:
     def has_need(self, need_id: str) -> bool:
         with self._lock:
             return need_id in self._needs
+
+    def action_binding_gap(self, need_id: JsonValue) -> ToolOutcome | None:
+        if not self.require_need_bindings:
+            return None
+        with self._lock:
+            need = self._needs.get(need_id) if isinstance(need_id, str) else None
+            if need is not None and need.material and need.status != "out_of_scope":
+                return None
+        return ToolOutcome(
+            status=OutcomeStatus.INVALID,
+            summary="Research needs an existing material information need; no source action was executed.",
+            data={
+                "research_binding_error": True,
+                "instruction": "Use update_research to record the unresolved question, purpose and observable completion test, then bind source actions with _need_id or delegation with need_ids. The update and independent actions may share one decision. Choose the methods and queries yourself.",
+                "questions": [
+                    {"question_id": f"q{i}", "question": text}
+                    for i, text in enumerate(self.questions)
+                ],
+            },
+        )
+
+    def uncovered_questions(self) -> list[str]:
+        with self._lock:
+            covered = {
+                question_id
+                for need in self._needs.values()
+                if need.material and need.status != "out_of_scope"
+                for question_id in need.question_ids
+            }
+            return [
+                f"q{i}" for i in range(len(self.questions)) if f"q{i}" not in covered
+            ]
 
     def update(self, update: ResearchUpdate, ledger: EvidenceLedger) -> None:
         with self._lock:
@@ -201,6 +240,7 @@ class ResearchState:
         with self._lock:
             result: dict[str, JsonValue] = {
                 "revision": self.revision,
+                "need_bindings_required": self.require_need_bindings,
                 "questions": [
                     {"question_id": f"q{i}", "question": q}
                     for i, q in enumerate(self.questions)

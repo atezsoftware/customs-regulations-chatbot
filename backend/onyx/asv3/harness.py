@@ -470,7 +470,9 @@ class Harness:
         if isinstance(state, ResearchState):
             for need_id in need_ids:
                 state.attach(need_id, receipt.evidence_ids)
-        if receipt.outcome.status in (
+        if receipt.outcome.data.get(
+            "research_binding_error"
+        ) is not True and receipt.outcome.status in (
             OutcomeStatus.UNAVAILABLE,
             OutcomeStatus.INVALID,
             OutcomeStatus.ERROR,
@@ -609,6 +611,12 @@ class Harness:
         ready: dict[str, ToolReceipt] = {}
         try:
             for call in calls:
+                binding_gap = self.registry.research_binding_gap(call, self.context)
+                if binding_gap is not None:
+                    ready[call.call_id] = ToolReceipt(
+                        call=call, outcome=binding_gap, elapsed_seconds=0
+                    )
+                    continue
                 signature = self._call_signature(call)
                 if call.call_id in self._seen_calls or signature in self._seen_failures:
                     ready[call.call_id] = ToolReceipt(

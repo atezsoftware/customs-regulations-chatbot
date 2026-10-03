@@ -287,7 +287,11 @@ def run_asv3_loop(
         context.run_id = str(previous["run_id"])
     scenarios = ScenarioState(initial_questions(question), frozen=True)
     context.services["scenario_state"] = scenarios
-    research_state = ResearchState(initial_questions(question), context)
+    research_state = ResearchState(
+        initial_questions(question),
+        context,
+        require_need_bindings=profile.requires_sources,
+    )
     context.services["research_state"] = research_state
     emitted: list[dict[str, JsonValue]] = []
     checkpoint_lock = threading.RLock()
@@ -524,14 +528,25 @@ def run_asv3_loop(
         ),
     )
     external_names = {spec.name for spec in external_specs}
-    registry_specs = (
+    source_specs = (
         build_corpus_specs(broker)
         + build_source_specs(broker)
         + build_sandbox_specs(broker)
-        + workers.tool_specs()
-        + build_supplemental_specs()
-        + build_research_specs(research_state, ledger)
         + external_specs
+    )
+    registry_specs = (
+        [
+            spec.model_copy(update={"requires_research_need": True})
+            for spec in source_specs
+        ]
+        + workers.tool_specs()
+        + [
+            spec.model_copy(update={"requires_research_need": True})
+            if spec.name == "verify_claim"
+            else spec
+            for spec in build_supplemental_specs()
+        ]
+        + build_research_specs(research_state, ledger)
     )
     for spec in registry_specs:
         registry.register(spec)
@@ -619,6 +634,16 @@ def run_asv3_loop(
                 data={
                     "missing": "original legal evidence",
                     "available_tasks": model.pending_tasks(),
+                },
+            )
+        uncovered = research_state.uncovered_questions()
+        if profile.requires_sources and uncovered:
+            return ToolOutcome(
+                status=OutcomeStatus.PARTIAL,
+                summary="Original questions still lack material research needs and completion tests.",
+                data={
+                    "uncovered_question_ids": uncovered,
+                    "instruction": "Record the missing determinations with update_research, retaining scenario qualifiers. Reuse existing originals. Choose any needed research methods yourself; this does not require repeating completed reads.",
                 },
             )
         missing_authority = (

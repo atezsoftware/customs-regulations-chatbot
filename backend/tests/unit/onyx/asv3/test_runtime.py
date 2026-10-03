@@ -72,6 +72,25 @@ def response(
     )
 
 
+def research_update(
+    question_count: int = 1, need_ids: tuple[str, ...] = ("comparison",)
+) -> tuple[str, dict[str, Any]]:
+    return (
+        "update_research",
+        {
+            "needs": [
+                {
+                    "need_id": need_id,
+                    "question_ids": [f"q{i}" for i in range(question_count)],
+                    "purpose": "Resolve the requested outcome and conditions",
+                    "completion_test": "Operative originals establish the requested outcome and applicable conditions",
+                }
+                for need_id in need_ids
+            ]
+        },
+    )
+
+
 def supported_review(
     numbers: list[int],
     question_count: int = 1,
@@ -89,7 +108,14 @@ def supported_review(
                 "evidence_numbers": numbers,
                 "safe_to_publish": True,
                 "unsupported_claims": [],
-                "need_results": [],
+                "need_results": [
+                    {
+                        "need_id": "comparison",
+                        "status": "supported",
+                        "evidence_numbers": numbers,
+                        "missing_conditions": [],
+                    }
+                ],
                 "quotation_checks": [],
                 "assertion_results": [
                     {
@@ -145,7 +171,14 @@ def unsafe_review(claim: str, question_count: int = 1) -> ModelResponse:
                 "evidence_numbers": [],
                 "safe_to_publish": False,
                 "unsupported_claims": [claim],
-                "need_results": [],
+                "need_results": [
+                    {
+                        "need_id": "comparison",
+                        "status": "incomplete",
+                        "evidence_numbers": [],
+                        "missing_conditions": ["özgün kaynak"],
+                    }
+                ],
                 "quotation_checks": [],
                 "assertion_results": [],
                 "question_results": [
@@ -285,7 +318,25 @@ def setup_run(
         response(json.dumps({"language": "tr", "notifications": notifications})),
         response(
             calls=[
-                ("read_source_range", {"source_id": str(source.id)})
+                (
+                    "update_research",
+                    {
+                        "needs": [
+                            {
+                                "need_id": "comparison",
+                                "question_ids": ["q0"],
+                                "purpose": "Compare the requested outcomes",
+                                "completion_test": "Applicable original rules and their conditions support both outcomes",
+                            }
+                        ]
+                    },
+                )
+            ]
+            + [
+                (
+                    "read_source_range",
+                    {"source_id": str(source.id), "_need_id": "comparison"},
+                )
                 for source in broker.sources
             ]
             + [
@@ -603,6 +654,7 @@ def test_runtime_parallel_sources_full_original_review_and_final_citations(
         call["id"] for call in calls
     ]
     assert [call["function"]["name"] for call in calls] == [
+        "update_research",
         "read_source_range",
         "read_source_range",
         "report_progress",
@@ -654,6 +706,14 @@ def test_numbered_questions_are_verified_separately_and_approved_details_are_unc
         "Application, documents and later settlement [1, 2]."
     )
     script = list(llm.invoke.side_effect)
+    script[1] = response(
+        calls=[research_update(3)]
+        + [
+            (call.function.name, json.loads(call.function.arguments))
+            for call in script[1].choice.message.tool_calls or []
+            if call.function.name != "update_research"
+        ]
+    )
     llm.invoke.side_effect = [
         *script[:2],
         response(draft),
@@ -871,7 +931,8 @@ def test_runtime_recovers_uncited_governing_source_without_losing_special_proced
     def first_review(**arguments: Any) -> ModelResponse:
         data = request_data(arguments)
         originals = json.loads(data["evidence"])
-        assert [item["citation"] for item in originals] == [citations["genelge"]]
+        assert {item["citation"] for item in originals} == set(citations.values())
+        assert all(item["truncated"] is False for item in originals)
         navigation = data["available_evidence"]
         assert {item["document_type"] for item in navigation} == {"kanun", "genelge"}
         assert any(item["citation"] == citations["kanun"] for item in navigation)
@@ -881,7 +942,14 @@ def test_runtime_recovers_uncited_governing_source_without_losing_special_proced
                 {
                     "status": "incomplete",
                     "explanation": "Kanuni dayanağın özgün hükmü ve atfı eksik.",
-                    "need_results": [],
+                    "need_results": [
+                        {
+                            "need_id": "comparison",
+                            "status": "incomplete",
+                            "evidence_numbers": [],
+                            "missing_conditions": ["kanuni dayanak"],
+                        }
+                    ],
                     "quotation_checks": [],
                     "assertion_results": [],
                     "required_conditions": [],
@@ -903,7 +971,14 @@ def test_runtime_recovers_uncited_governing_source_without_losing_special_proced
 
     def reopen(**arguments: Any) -> ModelResponse:
         assert "kanuni dayanak" in str(request_data(arguments))
-        return response(calls=[("read_evidence", {"citation": citations["kanun"]})])
+        return response(
+            calls=[
+                (
+                    "read_evidence",
+                    {"citation": citations["kanun"], "_need_id": "comparison"},
+                )
+            ]
+        )
 
     final = ""
 
@@ -1001,7 +1076,14 @@ def test_runtime_follows_named_statutory_basis_before_accepting_a_supported_draf
         data = request_data(arguments)
         assert "unresolved_original" in json.dumps(data)
         assert "8917" in json.dumps(data)
-        return response(calls=[("read_evidence", {"citation": numbers["kanun"]})])
+        return response(
+            calls=[
+                (
+                    "read_evidence",
+                    {"citation": numbers["kanun"], "_need_id": "comparison"},
+                )
+            ]
+        )
 
     final = ""
 
@@ -1190,6 +1272,7 @@ def test_runtime_incident_2888_zero_evidence_never_publishes_legal_memory(
         language_response,
         response(
             calls=[
+                research_update(),
                 (
                     "record_scenario",
                     {
@@ -1201,10 +1284,23 @@ def test_runtime_incident_2888_zero_evidence_never_publishes_legal_memory(
                         "facts": ["Standart değişim izni yok."],
                     },
                 ),
-                ("resolve_source", {"query": "Hariçte işleme"}),
-                ("query_corpus", {"operation": "inventory"}),
-                ("search_corpus", {"query": "garanti tamir", "mode": "keyword"}),
-                ("run_research_code", {"code": "print('source inventory')"}),
+                (
+                    "resolve_source",
+                    {"query": "Hariçte işleme", "_need_id": "comparison"},
+                ),
+                ("query_corpus", {"operation": "inventory", "_need_id": "comparison"}),
+                (
+                    "search_corpus",
+                    {
+                        "query": "garanti tamir",
+                        "mode": "keyword",
+                        "_need_id": "comparison",
+                    },
+                ),
+                (
+                    "run_research_code",
+                    {"code": "print('source inventory')", "_need_id": "comparison"},
+                ),
             ]
         ),
         response(unsupported),
@@ -1216,11 +1312,13 @@ def test_runtime_incident_2888_zero_evidence_never_publishes_legal_memory(
     runtime.run_asv3_loop(**kwargs)
     final_checkpoint = checkpoints[-1]
     receipts = final_checkpoint["receipts"]
-    assert [item["call"]["name"] for item in receipts[:5]] == [
+    assert [item["call"]["name"] for item in receipts[:6]] == [
+        "update_research",
         "record_scenario",
         *failures,
     ]
-    assert [item["outcome"]["status"] for item in receipts[:5]] == [
+    assert [item["outcome"]["status"] for item in receipts[:6]] == [
+        "found",
         "found",
         "unavailable",
         "unavailable",
@@ -1271,7 +1369,16 @@ def test_runtime_review_gap_drives_new_source_before_supported_publication(
         [
             initial_profile,
             response(
-                calls=[("read_source_range", {"source_id": str(broker.sources[0].id)})]
+                calls=[
+                    research_update(),
+                    (
+                        "read_source_range",
+                        {
+                            "source_id": str(broker.sources[0].id),
+                            "_need_id": "comparison",
+                        },
+                    ),
+                ]
             ),
             response("Tamir ve yeni makine de muaftır [1]."),
             response(json.dumps(incomplete)),
@@ -1299,7 +1406,12 @@ def test_runtime_review_gap_drives_new_source_before_supported_publication(
         assert [item["citation"] for item in data["evidence"]] == [1]
         recovery_observed = True
         return response(
-            calls=[("read_source_range", {"source_id": str(broker.sources[1].id)})]
+            calls=[
+                (
+                    "read_source_range",
+                    {"source_id": str(broker.sources[1].id), "_need_id": "comparison"},
+                )
+            ]
         )
 
     llm.invoke.side_effect = invoke
@@ -1380,10 +1492,23 @@ def test_finalization_waits_for_admitted_worker_originals_after_shared_decision_
         data = request_data(arguments)
         if instruction == COORDINATOR_PROMPT:
             return response(
-                calls=[("spawn_researcher", {"task": "independent condition"})]
+                calls=[
+                    research_update(),
+                    (
+                        "spawn_researcher",
+                        {"task": "independent condition", "need_ids": ["comparison"]},
+                    ),
+                ]
             )
         if instruction == RESEARCHER_PROMPT:
-            return response(calls=[("read_source_range", {"source_id": selected})])
+            return response(
+                calls=[
+                    (
+                        "read_source_range",
+                        {"source_id": selected, "_need_id": "comparison"},
+                    )
+                ]
+            )
         if instruction == FINAL_PROMPT:
             originals = json.loads(data["evidence"])
             assert len(originals) == 1
@@ -1449,12 +1574,19 @@ def test_runtime_researchers_keep_scenario_facts_isolated_and_selected_llm(
                     coordinator_started = True
                     return response(
                         calls=[
+                            research_update(need_ids=("branch_a", "branch_b")),
                             (
                                 "record_scenario",
                                 {"questions": ["parent"], "facts": ["parent fact"]},
                             ),
-                            ("spawn_researcher", {"task": "branch-A"}),
-                            ("spawn_researcher", {"task": "branch-B"}),
+                            (
+                                "spawn_researcher",
+                                {"task": "branch-A", "need_ids": ["branch_a"]},
+                            ),
+                            (
+                                "spawn_researcher",
+                                {"task": "branch-B", "need_ids": ["branch_b"]},
+                            ),
                         ]
                     )
                 if any(
@@ -1579,7 +1711,7 @@ def test_rejected_final_candidate_can_reopen_research_and_publish_exact_repaired
     )
     llm.invoke.side_effect = [
         *script,
-        response(calls=[("read_evidence", {"citation": 2})]),
+        response(calls=[("read_evidence", {"citation": 2, "_need_id": "comparison"})]),
         response(corrected),
         supported_review([1, 2], draft=corrected),
     ]
