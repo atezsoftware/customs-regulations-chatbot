@@ -43,6 +43,19 @@ function isPlaceholder(event: ASv3Progress): boolean {
   return event.title === "ASv3" && (!message || message === "…");
 }
 
+function progressTitle(event: ASv3Progress): string {
+  if (
+    !/^(?:Özgün Kaynak|Original source)\s*\[\d+\]$/iu.test(event.title.trim())
+  ) {
+    return event.title;
+  }
+  const language = event.language.split("-")[0]?.toLowerCase();
+  if (language === "tr") return "Kaynaklar inceleniyor";
+  if (language === "en") return "Reviewing sources";
+  const message = event.message?.trim();
+  return message && message !== "…" ? message : "ASv3";
+}
+
 function TaskStatusIcon({ task, active }: TaskStatusIconProps) {
   const loading =
     active && (task.status === "queued" || task.status === "running");
@@ -81,6 +94,7 @@ interface ASv3PastStepProps {
 function ASv3PastStep({ step, first, last, active }: ASv3PastStepProps) {
   const detailsId = useId();
   const [expanded, setExpanded] = useState(false);
+  const title = progressTitle(step);
   const Icon =
     step.status === "completed"
       ? SvgCheckCircle
@@ -105,9 +119,9 @@ function ASv3PastStep({ step, first, last, active }: ASv3PastStepProps) {
               aria-expanded={expanded}
               aria-controls={detailsId}
               onClick={() => setExpanded(!expanded)}
-              title={step.title}
+              title={title}
             >
-              {step.title}
+              {title}
             </Button>
           </div>
         }
@@ -166,7 +180,7 @@ function ASv3TaskGroup({
           roundedBottom={children.length === 0}
           className="min-w-0 flex-1 p-1"
         >
-          <Tabs.List aria-label={selectedTask.title}>
+          <Tabs.List aria-label={progressTitle(selectedTask)}>
             {tasks.map((task) => (
               <Tabs.Trigger
                 key={task.task_id}
@@ -178,7 +192,7 @@ function ASv3TaskGroup({
                 <span className="flex items-center gap-1.5">
                   <TaskStatusIcon task={task} active={active} />
                   <Text font="secondary-action" color="inherit">
-                    {task.title}
+                    {progressTitle(task)}
                   </Text>
                 </span>
               </Tabs.Trigger>
@@ -256,7 +270,7 @@ export default function ASv3ProgressPanel({
   const pastSteps = [...history, ...actions]
     .filter((step) => step.event_id !== header?.event_id)
     .sort((left, right) => left.sequence - right.sequence);
-  const title = header?.title ?? "ASv3";
+  const title = header ? progressTitle(header) : "ASv3";
   const hasHeaderMessage = Boolean(
     header?.message?.trim() && header.message.trim() !== "…"
   );

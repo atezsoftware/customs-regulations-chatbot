@@ -12,6 +12,69 @@ import {
 } from "@/lib/asv3/progress";
 import type { ASv3Progress } from "@/app/app/services/streamingModels";
 
+it.each([
+  [
+    "tr-TR",
+    "Özgün Kaynak [9]",
+    "Kaynaklar inceleniyor",
+    "Özgün hükümler inceleniyor.",
+  ],
+  [
+    "en-US",
+    "Original source [27]",
+    "Reviewing sources",
+    "Reviewing original provisions.",
+  ],
+  [
+    "de",
+    "Original source [9]",
+    "Die relevanten Bestimmungen werden geprüft.",
+    "Die relevanten Bestimmungen werden geprüft.",
+  ],
+])(
+  "replays opaque legacy source titles safely in %s without changing source identities",
+  (language, legacyTitle, safeTitle, message) => {
+    const original: ASv3Progress = {
+      type: "asv3_progress",
+      run_id: "legacy-run",
+      event_id: "source-delivery",
+      sequence: 1,
+      language,
+      phase: "tools",
+      status: "completed",
+      task_id: "action:source:original-identity",
+      title: legacyTitle,
+      message,
+    };
+    let state = applyASv3Progress(createASv3ProgressState(), original);
+    state = applyASv3Progress(state, {
+      ...original,
+      event_id: "official-source",
+      sequence: 2,
+      task_id: "action:source:official-identity",
+      title: "2024/22 Genelge",
+    });
+    state = applyASv3Progress(state, {
+      ...original,
+      event_id: "done",
+      sequence: 3,
+      task_id: null,
+      title: "ASv3",
+    });
+
+    render(<ASv3ProgressPanel state={state} stopped />);
+    fireEvent.click(screen.getByRole("button", { name: "ASv3" }));
+
+    expect(screen.queryByText(legacyTitle)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: safeTitle })).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "2024/22 Genelge" })
+    ).toBeInTheDocument();
+    expect(state.tasks.get(original.task_id!)).toBe(original);
+    expect(original.title).toBe(legacyTitle);
+  }
+);
+
 it("shows sequential source actions as distinct informative history, without fake parallel tabs or duplicate headers", () => {
   const first: ASv3Progress = {
     type: "asv3_progress",
