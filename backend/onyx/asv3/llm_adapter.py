@@ -150,6 +150,18 @@ class QuestionVerification(BaseModel):
     status: Literal["supported", "contradicted", "incomplete", "uncertain"]
     evidence_numbers: list[Annotated[int, Field(strict=True, ge=1)]]
     missing_conditions: list[str]
+    determinations: list["DeterminationVerification"] = Field(default_factory=list)
+
+
+class DeterminationVerification(BaseModel):
+    model_config = {"extra": "forbid"}
+    determination_id: str
+    status: Literal["supported", "contradicted", "incomplete", "uncertain"]
+    answer_unit_ids: list[str] = Field(max_length=64)
+    evidence_numbers: list[Annotated[int, Field(strict=True, ge=1)]] = Field(
+        max_length=40
+    )
+    missing_conditions: list[str] = Field(max_length=16)
 
 
 class NeedVerification(BaseModel):
@@ -231,7 +243,9 @@ def assessment_contract_defects(
         item.unit_id
         for item in review.assertion_results
         if item.status == "supported"
+        and item.basis == "original"
         and item.unit_id in expected
+        and expected[item.unit_id]
         and (
             {w.citation for w in item.witnesses} != expected[item.unit_id]
             or any(
@@ -919,6 +933,9 @@ class ResearchModel:
                 + json.dumps(
                     {field: sorted(ids) for field, ids in review_inventory.items()}
                 )
+                + "\nWithin each question_results entry, assess EACH supplied determination_id separately. "
+                "Bind it to answer_unit_ids containing that particular answer and their inline original citations; "
+                "support for a different determination in the same numbered question is insufficient."
             )
         if response_model is not None:
             instruction += (

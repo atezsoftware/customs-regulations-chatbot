@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pydantic import JsonValue
 
-from onyx.asv3.assertions import assertion_inventory
+from onyx.asv3.assertions import assertion_inventory, assertion_support_defect
 from onyx.asv3.authority import unresolved_authority_gap
 from onyx.asv3.citation_numbers import extract_citation_numbers
 from onyx.asv3.evidence import EvidenceLedger
@@ -12,13 +12,107 @@ from onyx.asv3.llm_adapter import VerificationResult
 from onyx.asv3.models import OutcomeStatus, ToolOutcome
 from onyx.asv3.quotations import normalized, unmatched_quoted_terms
 from onyx.asv3.research_state import ResearchState
+from onyx.asv3.scenario import question_determinations
 
 
 def question_inventory(questions: list[str]) -> list[dict[str, JsonValue]]:
+    determinations = question_determinations(questions)
     return [
-        {"question_id": f"q{index}", "question": text}
+        {
+            "question_id": f"q{index}",
+            "question": text,
+            "determinations": [
+                dict(item)
+                for item in determinations
+                if item["question_id"] == f"q{index}"
+            ],
+        }
         for index, text in enumerate(questions)
     ]
+
+
+def determination_support_gaps(
+    answer: str,
+    review: VerificationResult,
+    questions: list[str],
+    *,
+    require_sources: bool,
+    allow_explicit_gaps: bool,
+) -> list[dict[str, JsonValue]]:
+    """Require each requested outcome to point to its independently assessed answer."""
+    determination_gaps: list[dict[str, JsonValue]] = []
+    units_by_id = {unit["unit_id"]: unit for unit in assertion_inventory(answer)}
+    assessments = {item.unit_id: item for item in review.assertion_results}
+    questions_by_id = {item.question_id: item for item in review.question_results}
+    for row in question_inventory(questions):
+        question_id = str(row["question_id"])
+        question_review = questions_by_id.get(question_id)
+        results = question_review.determinations if question_review else []
+        expected = [
+            item
+            for item in question_determinations(questions)
+            if item["question_id"] == question_id
+        ]
+        by_id = {item.determination_id: item for item in results}
+        if set(by_id) != {item["determination_id"] for item in expected} or len(
+            by_id
+        ) != len(results):
+            determination_gaps.append(
+                {
+                    "question_id": question_id,
+                    "defect": "Each requested determination needs its own current assessment.",
+                }
+            )
+        for item in expected:
+            assessed = by_id.get(item["determination_id"])
+            if assessed is None:
+                determination_gaps.append(
+                    {
+                        **item,
+                        "defect": "This requested determination was not assessed.",
+                    }
+                )
+                continue
+            if assessed.status != "supported":
+                if (
+                    allow_explicit_gaps
+                    and assessed.status != "contradicted"
+                    and assessed.missing_conditions
+                ):
+                    continue
+                determination_gaps.append(
+                    {**item, "assessment": assessed.model_dump(mode="json")}
+                )
+                continue
+            bound_units = [units_by_id.get(key) for key in assessed.answer_unit_ids]
+            bound_checks = [assessments.get(key) for key in assessed.answer_unit_ids]
+            inline_numbers = {
+                number
+                for unit in bound_units
+                if unit
+                for number in unit["evidence_numbers"]
+            }
+            if (
+                assessed.missing_conditions
+                or not bound_units
+                or any(unit is None for unit in bound_units)
+                or any(
+                    check is None
+                    or check.status != "supported"
+                    or check.basis not in {"original", "scenario"}
+                    for check in bound_checks
+                )
+                or (require_sources and not assessed.evidence_numbers)
+                or set(assessed.evidence_numbers) - inline_numbers
+            ):
+                determination_gaps.append(
+                    {
+                        **item,
+                        "assessment": assessed.model_dump(mode="json"),
+                        "defect": "Support must come from the assessed answer blocks addressing this determination, not another answer in the same question.",
+                    }
+                )
+    return determination_gaps
 
 
 def publication_gap(
@@ -35,6 +129,7 @@ def publication_gap(
     require_quotation_checks: bool = False,
     research_state: ResearchState | None = None,
     require_assertion_checks: bool = False,
+    require_determination_checks: bool = False,
 ) -> ToolOutcome | None:
     if review.format_error is not None:
         return ToolOutcome(
@@ -55,39 +150,53 @@ def publication_gap(
             str(unit["unit_id"]) for unit in units
         }:
             reasons.append(
-                "Every cited answer block needs its own current original-source assessment; a general approval is insufficient."
+                "Every answer block, including uncited claims, needs a current assessment of its own basis; a general approval is insufficient."
             )
+        originals = {
+            number: item.text
+            for number in cited
+            if (item := ledger.get(number)) is not None
+        }
         for unit in units:
             check = checks.get(str(unit["unit_id"]))
-            numbers = unit["evidence_numbers"]
-            valid = (
-                check is not None
-                and check.status == "supported"
-                and not check.missing_conditions
+            defect = (
+                assertion_support_defect(
+                    unit,
+                    check,
+                    originals,
+                    scenario,
+                    allow_explicit_gaps=allow_explicit_gaps,
+                )
+                if check
+                else "This block was not assessed."
             )
-            if check is not None:
-                witnessed = {w.citation for w in check.witnesses}
-                valid = valid and witnessed == set(numbers)
-                for witness in check.witnesses:
-                    original = ledger.get(witness.citation)
-                    valid = (
-                        valid
-                        and original is not None
-                        and bool(witness.source_quote.strip())
-                        and normalized(witness.source_quote)
-                        in normalized(original.text)
-                    )
-            if not valid:
+            if defect:
                 assertion_gaps.append(
                     {
                         **unit,
+                        "defect": defect,
                         "assessment": check.model_dump(mode="json") if check else None,
                     }
                 )
         if assertion_gaps:
             reasons.append(
-                "Cited assertions need support for all stated conditions and outcomes from their own inline originals."
+                "Legal assertions require their own inline originals; scenario facts, presentation and explicit evidence gaps require their distinct valid basis."
             )
+    determination_gaps = (
+        determination_support_gaps(
+            answer,
+            review,
+            questions,
+            require_sources=require_sources,
+            allow_explicit_gaps=allow_explicit_gaps,
+        )
+        if require_determination_checks
+        else []
+    )
+    if determination_gaps:
+        reasons.append(
+            "Independent outcomes and alternatives inside numbered questions need their own assessed answer support."
+        )
     authority_gap = (
         unresolved_authority_gap(answer, ledger)
         if require_sources and require_direct_authority
@@ -128,6 +237,12 @@ def publication_gap(
             cited
             | set(review.evidence_numbers)
             | {n for need in review.need_results for n in need.evidence_numbers}
+            | {
+                n
+                for item in review.question_results
+                for part in item.determinations
+                for n in part.evidence_numbers
+            }
         ) - ledger.completely_delivered(verification_call_id)
         if missing_delivery:
             reasons.append(
@@ -245,6 +360,9 @@ def publication_gap(
             **({"missing": authority_gap["missing"]} if authority_gap else {}),
             **({"unmatched_quoted_terms": quote_gaps} if quote_gaps else {}),
             **({"assertion_gaps": assertion_gaps} if assertion_gaps else {}),
+            **(
+                {"determination_gaps": determination_gaps} if determination_gaps else {}
+            ),
             "review": review.model_dump(mode="json"),
             "instruction": "A found source may need delivery or complete reading, not another search. Choose methods yourself. Do not substitute general legal knowledge.",
         },

@@ -12,12 +12,18 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.models import OutcomeStatus, RunContext, ToolOutcome, ToolSpec
+from onyx.asv3.scenario import question_determinations
 
 
 class ResearchNeed(BaseModel):
     model_config = ConfigDict(extra="forbid")
     need_id: str = Field(pattern=r"^[a-zA-Z][a-zA-Z0-9_-]{0,63}$")
     question_ids: list[str] = Field(min_length=1, max_length=20)
+    determination_ids: list[str] = Field(
+        default_factory=list,
+        max_length=40,
+        description="Requested determination IDs addressed by this need. Independent outcomes in one numbered question remain distinct; choose related groupings yourself.",
+    )
     purpose: str = Field(min_length=1, max_length=1000)
     completion_test: str = Field(min_length=1, max_length=1000)
     kind: Literal[
@@ -142,6 +148,15 @@ class ResearchState:
                     raise ValueError(
                         "Research needs must bind to original question IDs"
                     )
+                bound_determinations = {
+                    item["determination_id"]
+                    for item in question_determinations(list(self.questions))
+                    if item["question_id"] in need.question_ids
+                }
+                if set(need.determination_ids) - bound_determinations:
+                    raise ValueError(
+                        "Research determinations must belong to their original question IDs"
+                    )
                 previous = needs.get(need.need_id)
                 if previous and previous.question_ids != need.question_ids:
                     raise ValueError(
@@ -246,6 +261,9 @@ class ResearchState:
                     for i, q in enumerate(self.questions)
                 ],
                 "active_need_ids": list(self._active),
+                "determinations": [
+                    dict(item) for item in question_determinations(list(self.questions))
+                ],
                 "needs": [],
                 "findings": [],
                 "notice": "Findings are source-bound candidates, not verified law. Original witnesses must be delivered and evaluated before publication.",

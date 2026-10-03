@@ -78,6 +78,26 @@ def need(key: str = "basis", **changes: object) -> dict[str, object]:
     }
 
 
+def test_determination_binding_cannot_move_to_another_question() -> None:
+    context, ledger, state = state_pair()
+    before = state.export()
+    with pytest.raises(ValueError, match="original question IDs"):
+        state.update(
+            ResearchUpdate.model_validate(
+                {"needs": [need(determination_ids=["q1:d0"])]}
+            ),
+            ledger,
+        )
+    assert state.export() == before
+    state.update(
+        ResearchUpdate.model_validate({"needs": [need(determination_ids=["q0:d0"])]}),
+        ledger,
+    )
+    restored = ResearchState(list(state.questions), context)
+    restored.restore(state.export(), ledger)
+    assert restored.export() == state.export()
+
+
 @pytest.mark.parametrize("binding", [None, "unknown", "excluded", "incidental"])
 def test_source_action_binding_is_checked_before_io_and_budget(
     binding: str | None,

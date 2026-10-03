@@ -694,6 +694,7 @@ def run_asv3_loop(
             scenario=question,
             require_quotation_checks=True,
             require_assertion_checks=True,
+            require_determination_checks=profile.requires_sources,
             research_state=research_state,
         )
         if gap is None:
@@ -823,6 +824,7 @@ def run_asv3_loop(
                 scenario=question,
                 require_quotation_checks=True,
                 require_assertion_checks=True,
+                require_determination_checks=profile.requires_sources,
                 research_state=research_state,
             )
         else:
@@ -879,6 +881,7 @@ def run_asv3_loop(
                 scenario=question,
                 require_quotation_checks=True,
                 require_assertion_checks=True,
+                require_determination_checks=profile.requires_sources,
                 research_state=research_state,
             )
         if (
@@ -914,6 +917,7 @@ def run_asv3_loop(
                     scenario=question,
                     require_quotation_checks=True,
                     require_assertion_checks=True,
+                    require_determination_checks=profile.requires_sources,
                     research_state=research_state,
                 )
             else:
@@ -967,6 +971,7 @@ def run_asv3_loop(
                         scenario=question,
                         require_quotation_checks=True,
                         require_assertion_checks=True,
+                        require_determination_checks=profile.requires_sources,
                         research_state=research_state,
                     )
                 complete = False
@@ -985,6 +990,7 @@ def run_asv3_loop(
                     scenario=question,
                     require_quotation_checks=True,
                     require_assertion_checks=True,
+                    require_determination_checks=profile.requires_sources,
                     research_state=research_state,
                 )
                 is None

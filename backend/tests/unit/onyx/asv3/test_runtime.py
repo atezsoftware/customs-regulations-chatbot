@@ -141,6 +141,18 @@ def supported_review(
                         "status": "supported",
                         "evidence_numbers": numbers,
                         "missing_conditions": [],
+                        "determinations": [
+                            {
+                                "determination_id": f"q{index}:d0",
+                                "status": "supported",
+                                "answer_unit_ids": [
+                                    unit["unit_id"]
+                                    for unit in assertion_inventory(draft)
+                                ],
+                                "evidence_numbers": numbers,
+                                "missing_conditions": [],
+                            }
+                        ],
                     }
                     for index in range(question_count)
                 ],
