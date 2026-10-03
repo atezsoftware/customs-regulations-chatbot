@@ -23,6 +23,7 @@ from onyx.asv3.models import (
     ToolOutcome,
     ToolSpec,
 )
+from onyx.asv3.progress import ProgressReporter, action_narration, public_action_id
 from onyx.asv3.registry import CapabilityRegistry
 from onyx.configs.app_configs import CODE_INTERPRETER_BASE_URL
 from onyx.db.asv3_corpus import research_code_enabled
@@ -204,6 +205,80 @@ def compose(args: dict[str, JsonValue], context: RunContext) -> ToolOutcome:
         remaining -= ready
     results: dict[str, ToolOutcome] = {}
     remaining = set(steps)
+    reporter = context.services.get("progress")
+    narrated_capabilities: set[str] = set()
+    if isinstance(reporter, ProgressReporter):
+        for definition in registry.definitions(context):
+            function = definition.get("function")
+            if not isinstance(function, dict):
+                continue
+            parameters = function.get("parameters")
+            properties = (
+                parameters.get("properties") if isinstance(parameters, dict) else None
+            )
+            name = function.get("name")
+            if (
+                isinstance(name, str)
+                and isinstance(properties, dict)
+                and "_public_update" in properties
+            ):
+                narrated_capabilities.add(name)
+
+    def dispatch_step(call: CapabilityCall) -> ToolOutcome:
+        narration = (
+            action_narration(call.arguments, context)
+            if call.name in narrated_capabilities
+            else None
+        )
+        parent = context.services.get("task_id")
+        parent_task_id = parent if isinstance(parent, str) else None
+        action_id = public_action_id(call.call_id)
+        phase = "final" if call.name == "verify_claim" else "tools"
+        if (
+            isinstance(reporter, ProgressReporter)
+            and narration is not None
+            and not context.is_cancelled()
+        ):
+            title, message = narration
+            if context.depth == 0:
+                reporter.report(phase, title=title, message=message)
+            reporter.report(
+                phase,
+                task_id=action_id,
+                parent_task_id=parent_task_id,
+                title=title,
+                message=message,
+            )
+        outcome = registry.dispatch(call, context)
+        if (
+            isinstance(reporter, ProgressReporter)
+            and narration is not None
+            and not context.is_cancelled()
+        ):
+            status = (
+                "cancelled"
+                if outcome.status == OutcomeStatus.CANCELLED
+                else "failed"
+                if outcome.status
+                in {
+                    OutcomeStatus.TRUNCATED,
+                    OutcomeStatus.INVALID,
+                    OutcomeStatus.ERROR,
+                    OutcomeStatus.DENIED,
+                    OutcomeStatus.UNAVAILABLE,
+                }
+                else "completed"
+            )
+            reporter.report(
+                phase,
+                status=status,
+                task_id=action_id,
+                parent_task_id=parent_task_id,
+                title=narration[0],
+                message=narration[1],
+            )
+        return outcome
+
     pool = ThreadPoolExecutor(
         max_workers=min(4, int(cast(int, args.get("max_parallel", 4))))
     )
@@ -250,9 +325,8 @@ def compose(args: dict[str, JsonValue], context: RunContext) -> ToolOutcome:
                 active[
                     pool.submit(
                         copy_context().run,
-                        registry.dispatch,
+                        dispatch_step,
                         CapabilityCall(name=str(item["tool"]), arguments=arguments),
-                        context,
                     )
                 ] = key
             while active:

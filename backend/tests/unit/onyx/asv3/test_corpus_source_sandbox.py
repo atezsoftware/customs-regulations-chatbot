@@ -24,6 +24,7 @@ from onyx.asv3.models import (
     ToolOutcome,
     ToolSpec,
 )
+from onyx.asv3.progress import ProgressEvent, ProgressReporter
 from onyx.asv3.registry import CapabilityRegistry
 from onyx.asv3.sandbox import build_sandbox_specs, calculate, compose, run_code
 from onyx.asv3.source_tools import build_source_specs, original_evidence, selected_pdf
@@ -711,6 +712,211 @@ def test_composition_runs_real_dependencies_and_propagates_contextvars(
         assert cast(dict, cast(dict, result.data["steps"])["b"])["data"]["value"] == "4"
     finally:
         tenant.reset(token)
+
+
+@pytest.mark.parametrize("depth", [0, 1])
+def test_composition_narrates_executed_steps_without_extra_calls(
+    broker: MemoryBroker, depth: int
+) -> None:
+    program: dict[str, JsonValue] = {
+        "steps": [
+            {
+                "id": "rule",
+                "tool": "read_rule",
+                "arguments": {
+                    "value": "4",
+                    "_public_update": [
+                        "Vergi koşulları",
+                        "Geri gelen eşyanın vergi şartlarını inceliyorum.",
+                    ],
+                },
+            },
+            {
+                "id": "settlement",
+                "tool": "read_rule",
+                "arguments": {
+                    "value": {"$ref": "rule.data.value"},
+                    "_public_update": [
+                        "Teminat işlemleri",
+                        "Teslimden sonraki işlemleri inceliyorum.",
+                    ],
+                },
+                "depends_on": ["rule"],
+            },
+            {
+                "id": "skipped",
+                "tool": "read_rule",
+                "arguments": {
+                    "_public_update": ["Başka durum", "Diğer olasılığı inceliyorum."]
+                },
+                "depends_on": ["rule"],
+                "when": {"value": {"$ref": "rule.data.value"}, "equals": "9"},
+            },
+            {
+                "id": "blocked",
+                "tool": "read_rule",
+                "arguments": {
+                    "_public_update": ["Bağlı durum", "Bağlı sonucu inceliyorum."]
+                },
+                "depends_on": ["skipped"],
+            },
+            {"id": "quiet", "tool": "read_rule", "arguments": {"value": "5"}},
+        ]
+    }
+
+    def exercise(
+        with_progress: bool,
+    ) -> tuple[ToolOutcome, int, list[str], list[ProgressEvent]]:
+        invoked: list[str] = []
+        reporter = ProgressReporter("program", "tr")
+
+        def read(args: dict[str, JsonValue], child: RunContext) -> ToolOutcome:
+            assert child.scope == {"tenant_id": "captured"}
+            assert "_public_update" not in args
+            invoked.append(str(args["value"]))
+            return ToolOutcome(
+                status=OutcomeStatus.FOUND,
+                summary="original",
+                data={"value": args["value"]},
+            )
+
+        registry = CapabilityRegistry(
+            [
+                ToolSpec(
+                    name="read_rule",
+                    description="read",
+                    parameters={"type": "object"},
+                    handler=read,
+                ),
+                *build_sandbox_specs(broker),
+            ]
+        )
+        context = RunContext(
+            language="tr",
+            depth=depth,
+            scope={"tenant_id": "captured"},
+            services={"registry": registry, "task_id": "worker-one"},
+        )
+        if with_progress:
+            context.services["progress"] = reporter
+        result = registry.dispatch(
+            CapabilityCall(name="compose_tool_calls", arguments=program), context
+        )
+        return result, context.budget.snapshot()["tools"], invoked, reporter.snapshot()
+
+    baseline, baseline_calls, baseline_invoked, _ = exercise(False)
+    result, calls, invoked, events = exercise(True)
+    assert result == baseline
+    assert calls == baseline_calls == 4
+    assert sorted(invoked) == sorted(baseline_invoked) == ["4", "4", "5"]
+    actions = [event for event in events if event.task_id is not None]
+    assert {event.title for event in actions} == {
+        "Vergi koşulları",
+        "Teminat işlemleri",
+    }
+    ids = {event.task_id for event in actions if event.task_id is not None}
+    assert len(ids) == 2
+    assert all(identifier.startswith("action:") for identifier in ids)
+    for identifier in ids:
+        lifecycle = [event for event in actions if event.task_id == identifier]
+        assert [event.status for event in lifecycle] == ["running", "completed"]
+        assert all(event.parent_task_id == "worker-one" for event in lifecycle)
+        assert all(
+            event.language == "tr" and event.public_narration for event in lifecycle
+        )
+    assert len([event for event in events if event.task_id is None]) == (
+        2 if depth == 0 else 0
+    )
+
+
+@pytest.mark.parametrize("tool", ["read_rule", "discover_tools"])
+def test_composition_does_not_publish_invalid_or_unexposed_narration(
+    broker: MemoryBroker, tool: str
+) -> None:
+    reporter = ProgressReporter("program", "tr")
+    registry = CapabilityRegistry(
+        [
+            ToolSpec(
+                name=tool,
+                description="read",
+                parameters={"type": "object"},
+                handler=lambda _args, _context: ToolOutcome(
+                    status=OutcomeStatus.FOUND, summary="original"
+                ),
+            ),
+            *build_sandbox_specs(broker),
+        ]
+    )
+    context = RunContext(services={"registry": registry, "progress": reporter})
+    narration = (
+        ["read_rule", "Kaynak /tmp/private dosyasında."]
+        if tool == "read_rule"
+        else ["Kaynaklar", "İlgili hükmü inceliyorum."]
+    )
+    result = registry.dispatch(
+        CapabilityCall(
+            name="compose_tool_calls",
+            arguments={
+                "steps": [
+                    {
+                        "id": "a",
+                        "tool": tool,
+                        "arguments": {"_public_update": narration},
+                    }
+                ]
+            },
+        ),
+        context,
+    )
+    assert result.status == OutcomeStatus.FOUND
+    assert context.budget.snapshot()["tools"] == 2
+    assert reporter.snapshot() == []
+
+
+def test_composition_revokes_late_progress_after_cancellation(
+    broker: MemoryBroker,
+) -> None:
+    reporter = ProgressReporter("program", "tr")
+
+    def cancel(_args: dict[str, JsonValue], context: RunContext) -> ToolOutcome:
+        context.cancel()
+        return ToolOutcome(status=OutcomeStatus.FOUND, summary="late original")
+
+    registry = CapabilityRegistry(
+        [
+            ToolSpec(
+                name="read_rule",
+                description="read",
+                parameters={"type": "object"},
+                handler=cancel,
+            ),
+            *build_sandbox_specs(broker),
+        ]
+    )
+    context = RunContext(services={"registry": registry, "progress": reporter})
+    result = registry.dispatch(
+        CapabilityCall(
+            name="compose_tool_calls",
+            arguments={
+                "steps": [
+                    {
+                        "id": "a",
+                        "tool": "read_rule",
+                        "arguments": {
+                            "_public_update": [
+                                "Vergi koşulları",
+                                "Kaynak hükmünü inceliyorum.",
+                            ]
+                        },
+                    }
+                ]
+            },
+        ),
+        context,
+    )
+    assert result.status == OutcomeStatus.CANCELLED
+    assert reporter.snapshot()
+    assert all(event.status == "running" for event in reporter.snapshot())
 
 
 def test_code_uses_isolated_client_and_authorized_manifest_and_cleans_inputs(
