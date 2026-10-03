@@ -3,8 +3,9 @@ import { OnyxDocument } from "@/lib/search/interfaces";
 import { ValidSources } from "@/lib/types";
 import {
   citationsToSourceInfoArray,
+  documentToSourceInfo,
   getDisplayNameForSource,
-} from "./sourceTagUtils";
+} from "@/refresh-components/buttons/source-tag/sourceTagUtils";
 
 function makeDocument(overrides: Partial<OnyxDocument> = {}): OnyxDocument {
   return {
@@ -20,6 +21,7 @@ function makeDocument(overrides: Partial<OnyxDocument> = {}): OnyxDocument {
     chunk_ind: 46,
     match_highlights: [],
     metadata: {
+      asv3_source_display_name: "Gümrük Kanunu",
       regulatory_heading_path:
         "4458 SAYILI GÜMRÜK KANUNU > İKİNCİ KISIM > MADDE 46 > (1)",
     },
@@ -57,6 +59,16 @@ describe("regulatory citation presentation", () => {
         })
       )
     ).toMatch(/46\. Madde$/);
+  });
+
+  it("uses the official title and article even when the legacy filename is empty", () => {
+    const document = makeDocument({ semantic_identifier: "" });
+    expect(getDisplayNameForSource(document)).toBe("Gümrük Kanunu · 46. Madde");
+    expect(documentToSourceInfo(document)).toMatchObject({
+      id: document.document_id,
+      title: "Gümrük Kanunu",
+      sourceUrl: document.link,
+    });
   });
 
   it("does not substitute another chunk from the same document", () => {

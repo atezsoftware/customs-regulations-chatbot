@@ -1,8 +1,11 @@
 """Behavioral recovery, scope and execution tests for the research source tools."""
 
+import hashlib
+import json
 from collections.abc import Generator
 from contextlib import nullcontext
 from contextvars import ContextVar
+from copy import deepcopy
 from datetime import date
 from decimal import Decimal
 from io import BytesIO
@@ -324,6 +327,46 @@ def broker() -> MemoryBroker:
         ),
     ]
     return MemoryBroker(rows)
+
+
+@pytest.mark.parametrize("canonical_title", [None, "", " \t", "Existing source title"])
+def test_direct_read_preserves_source_navigation_and_canonical_original(
+    broker: MemoryBroker, canonical_title: str | None
+) -> None:
+    from onyx.asv3.evidence import EvidenceLedger
+
+    source_path = "Special Procedures/Rules/source_document.md"
+    broker.item = CorpusSource(broker.item.id, source_path, broker.item.file_id)
+    chunk = broker.items[0]
+    if canonical_title is not None:
+        chunk.metadata["title"] = canonical_title
+    metadata_before = deepcopy(chunk.metadata)
+    context = RunContext()
+    outcome = CapabilityRegistry(build_corpus_specs(broker)).dispatch(
+        CapabilityCall(
+            name="read_chunk",
+            arguments={"source_id": str(broker.item.id), "chunk_id": chunk.id},
+        ),
+        context,
+    )
+    assert outcome.status == OutcomeStatus.FOUND
+    ledger = EvidenceLedger()
+    numbers = ledger.add(outcome.evidence, context)
+    supplied = json.loads(ledger.serialize_records(numbers))[0]
+    expected_title = (
+        canonical_title
+        if canonical_title is not None and canonical_title.strip()
+        else source_path
+    )
+    assert supplied["metadata"]["title"] == expected_title
+    assert supplied["metadata"]["heading_path"] == list(chunk.heading_path)
+    assert supplied["source_id"] == str(chunk.source_id)
+    assert supplied["chunk_id"] == chunk.id
+    assert supplied["text"] == chunk.text
+    assert supplied["text_hash"] == hashlib.sha256(chunk.text.encode()).hexdigest()
+    assert chunk.metadata == metadata_before
+    assert outcome.evidence[0].search_doc is not None
+    assert outcome.evidence[0].search_doc.semantic_identifier == source_path
 
 
 def test_provision_keeps_qualifier_continuation_and_exact_citation(

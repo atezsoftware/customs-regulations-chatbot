@@ -713,6 +713,10 @@ class CorpusBroker:
 
 
 def evidence_for_chunk(source: CorpusSource, chunk: CorpusChunk) -> EvidenceItem:
+    canonical_metadata = compact_evidence_metadata(chunk.metadata)
+    title = canonical_metadata.get("title")
+    if not isinstance(title, str) or not title.strip():
+        canonical_metadata["title"] = source.name
     metadata = {
         "regulatory_chunk_id": chunk.id,
         "regulatory_heading_path": list(chunk.heading_path),
@@ -753,7 +757,7 @@ def evidence_for_chunk(source: CorpusSource, chunk: CorpusChunk) -> EvidenceItem
             if chunk.validity_end
             else None,
             "version_unknown": chunk.validity_start is None,
-            "canonical_metadata": compact_evidence_metadata(chunk.metadata),
+            "canonical_metadata": canonical_metadata,
             "read_as_of_date": cast(JsonValue, chunk.metadata.get("read_as_of_date")),
         },
     )

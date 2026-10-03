@@ -12,6 +12,7 @@ import { ValidSources } from "@/lib/types";
 import { cn } from "@opal/utils";
 import Truncated from "@/refresh-components/texts/Truncated";
 import Text from "@/refresh-components/texts/Text";
+import { getDocumentSourceDisplayName } from "@/lib/regulatory/sourceDisplayName";
 
 interface DocumentMetadataBlockProps {
   modal?: boolean;
@@ -70,8 +71,8 @@ export default function ChatDocumentDisplay({
 }: ChatDocumentDisplayProps) {
   const isInternet = document.is_internet;
   const title = useMemo(
-    () => document.semantic_identifier || document.document_id,
-    [document.semantic_identifier, document.document_id]
+    () => getDocumentSourceDisplayName(document) || document.document_id,
+    [document]
   );
 
   if (document.score === null) {

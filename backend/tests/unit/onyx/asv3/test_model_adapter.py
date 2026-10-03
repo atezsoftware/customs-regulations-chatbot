@@ -1359,7 +1359,8 @@ def test_pathological_context_fits_selected_limit_and_originals_remain_reopenabl
                 },
             }
         )
-    llm = scripted_model(40000)
+    # Fit instructions/history while still forcing original and catalog compaction.
+    llm = scripted_model(50000)
     llm.invoke.return_value = ModelResponse(
         id="valid",
         created="0",

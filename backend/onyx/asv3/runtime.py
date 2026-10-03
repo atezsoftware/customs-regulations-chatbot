@@ -7,7 +7,7 @@ import logging
 import os
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from functools import wraps
 from typing import ParamSpec, cast
 from uuid import UUID
@@ -34,7 +34,13 @@ from onyx.asv3.models import (
     ToolReceipt,
     ToolSpec,
 )
-from onyx.asv3.progress import ProgressEvent, ProgressReporter, localized_notifications
+from onyx.asv3.progress import (
+    ProgressEvent,
+    ProgressReporter,
+    localized_notifications,
+    official_corpus_source_name,
+    report_source_deliveries,
+)
 from onyx.asv3.registry import CapabilityRegistry, build_core_specs
 from onyx.asv3.research_state import ResearchState, build_research_specs
 from onyx.asv3.sandbox import build_sandbox_specs
@@ -54,7 +60,7 @@ from onyx.chat.emitter import Emitter
 from onyx.chat.models import ChatMessageSimple
 from onyx.chat.stop_signal_checker import is_connected
 from onyx.configs.constants import MessageType
-from onyx.context.search.models import BaseFilters, IndexFilters
+from onyx.context.search.models import BaseFilters, IndexFilters, SearchDoc
 from onyx.db.asv3_corpus import bind_pc_corpus_scope
 from onyx.db.asv3_runs import load_asv3_checkpoint, save_asv3_checkpoint
 from onyx.db.memory import UserMemoryContext
@@ -80,6 +86,29 @@ from onyx.tracing.framework.create import ChatTraceMetadata, ensure_trace
 
 logger = logging.getLogger(__name__)
 P = ParamSpec("P")
+
+
+def _presentation_search_doc(item: EvidenceItem) -> SearchDoc | None:
+    if item.search_doc is None:
+        return None
+    document = item.search_doc.model_copy(deep=True)
+    name = official_corpus_source_name(item)
+    if name:
+        document.metadata["asv3_source_display_name"] = name
+    return document
+
+
+def _presentation_search_docs(
+    ledger: EvidenceLedger, numbers: Iterable[int]
+) -> dict[int, SearchDoc]:
+    documents: dict[int, SearchDoc] = {}
+    for number in numbers:
+        item = ledger.get(number)
+        if item is not None:
+            document = _presentation_search_doc(item)
+            if document is not None:
+                documents[number] = document
+    return documents
 
 
 def _trace_asv3(function: Callable[P, None]) -> Callable[P, None]:
@@ -361,6 +390,13 @@ def run_asv3_loop(
         ][0]
         state_container.set_stop_notice(profile.notifications["cancelled"][1])
         first_decision = False
+        report_source_deliveries(
+            ledger,
+            model.last_call_id,
+            context,
+            progress,
+            profile.notifications["tools"],
+        )
 
     def checkpoint(snapshot: dict[str, JsonValue]) -> None:
         nonlocal checkpoint_sequence
@@ -401,11 +437,7 @@ def run_asv3_loop(
                     context,
                 )
         state_container.add_search_docs(
-            [
-                item.search_doc
-                for number in receipt.evidence_ids
-                if (item := ledger.get(number)) and item.search_doc
-            ]
+            list(_presentation_search_docs(ledger, receipt.evidence_ids).values())
         )
 
     def verify(args: dict[str, JsonValue], child: RunContext) -> ToolOutcome:
@@ -698,7 +730,7 @@ def run_asv3_loop(
             else result.stop_reason
         )
         progress.report("final")
-        allowed = ledger.citation_mapping()
+        allowed = _presentation_search_docs(ledger, ledger.citation_mapping())
         numbers = extract_citation_numbers(final)
         if set(numbers) - allowed.keys():
             raise ValueError("ASv3 final answer contains unrecorded citation targets")

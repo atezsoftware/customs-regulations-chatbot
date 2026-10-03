@@ -18,6 +18,7 @@ import {
   getMetadataTags,
 } from "./searchStateUtils";
 import Text from "@/refresh-components/texts/Text";
+import { getDocumentSourceDisplayName } from "@/lib/regulatory/sourceDisplayName";
 
 const queryToSourceInfo = (query: string, index: number): SourceInfo => ({
   id: `query-${index}`,
@@ -28,7 +29,7 @@ const queryToSourceInfo = (query: string, index: number): SourceInfo => ({
 
 const resultToSourceInfo = (doc: OnyxDocument): SourceInfo => ({
   id: doc.document_id,
-  title: doc.semantic_identifier || "",
+  title: getDocumentSourceDisplayName(doc),
   sourceType: doc.source_type,
   sourceUrl: doc.link,
   description: doc.blurb,

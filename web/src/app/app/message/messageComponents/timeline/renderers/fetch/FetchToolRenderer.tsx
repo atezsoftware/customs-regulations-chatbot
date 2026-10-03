@@ -15,6 +15,7 @@ import {
 } from "./fetchStateUtils";
 import Text from "@/refresh-components/texts/Text";
 import { SvgCircle } from "@opal/icons";
+import { getDocumentSourceDisplayName } from "@/lib/regulatory/sourceDisplayName";
 
 const urlToSourceInfo = (url: string, index: number): SourceInfo => ({
   id: `url-${index}`,
@@ -25,7 +26,7 @@ const urlToSourceInfo = (url: string, index: number): SourceInfo => ({
 
 const documentToSourceInfo = (doc: OnyxDocument): SourceInfo => ({
   id: doc.document_id,
-  title: doc.semantic_identifier || doc.link || "",
+  title: getDocumentSourceDisplayName(doc) || doc.link || "",
   sourceType: doc.source_type || ValidSources.Web,
   sourceUrl: doc.link,
   description: doc.blurb,

@@ -10,8 +10,10 @@ from unittest.mock import MagicMock
 from uuid import uuid4
 
 import pytest
+from pydantic import JsonValue
 
 from onyx.asv3 import runtime
+from onyx.asv3.corpus_tools import evidence_for_chunk
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.models import (
     EvidenceItem,
@@ -339,6 +341,133 @@ def test_native_parallel_originals_preserve_selected_provider_and_publish_withou
         i
         for i, packet in enumerate(output)
         if isinstance(packet.obj, (AgentResponseDelta, CitationInfo))
+    )
+
+
+def test_one_search_delivery_reports_each_original_source_without_extra_execution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kwargs, broker, llm, checkpoints, queue = setup_run(monkeypatch)
+    names = ["4458 SAYILI GÜMRÜK KANUNU", "KATMA DEĞER VERGİSİ KANUNU"]
+    articles = ["168", "16"]
+    for n, (identity, chunk) in enumerate(broker.chunks.items()):
+        broker.chunks[identity] = replace(
+            chunk, heading_path=(names[n], f"MADDE {articles[n]}")
+        )
+    searches = 0
+
+    def search(arguments: dict[str, JsonValue], context: RunContext) -> ToolOutcome:
+        nonlocal searches
+        context.check_active()
+        searches += 1
+        assert arguments == {"query": "Relevant relief and procedure"}
+        return ToolOutcome(
+            status=OutcomeStatus.FOUND,
+            summary="Actual original passages returned",
+            evidence=[
+                evidence_for_chunk(source, broker.chunks[str(source.id)])
+                for source in broker.sources
+            ],
+        )
+
+    monkeypatch.setattr(
+        runtime,
+        "build_corpus_specs",
+        lambda _broker: [
+            ToolSpec(
+                name="search_corpus",
+                description="Search original provisions",
+                parameters={
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"],
+                    "additionalProperties": False,
+                },
+                handler=search,
+            )
+        ],
+    )
+    invocation = 0
+
+    def scripted(**arguments: Any) -> ModelResponse:
+        nonlocal invocation
+        invocation += 1
+        if invocation == 1:
+            return response(
+                calls=[
+                    (
+                        "search_corpus",
+                        {
+                            "query": "Relevant relief and procedure",
+                            "_language": "tr",
+                            "_public_update": [
+                                "İade koşulları",
+                                "İlgili hükümleri arıyorum.",
+                            ],
+                        },
+                    )
+                ]
+            )
+        assert invocation == 2
+        assert {row["text"] for row in delivered_originals(arguments)} == {
+            chunk.text for chunk in broker.chunks.values()
+        }
+        assert [
+            doc.metadata["asv3_source_display_name"]
+            for doc in kwargs["state_container"].get_all_search_docs().values()
+        ] == names
+        return response("Tamir [1], değiştirme [2].")
+
+    llm.invoke.side_effect = scripted
+    runtime.run_asv3_loop(**kwargs)
+    assert llm.invoke.call_count == 2 and searches == 1
+    assert len(checkpoints[-1]["receipts"]) == 1
+    output = packets(queue)
+    updates = [packet.obj for packet in output if isinstance(packet.obj, ASv3Progress)]
+    sources = [
+        event
+        for event in updates
+        if event.task_id and event.task_id.startswith("action:source:")
+    ]
+    assert [event.title for event in sources] == [
+        f"{name} — Madde {article}" for name, article in zip(names, articles)
+    ]
+    assert all(
+        event.status == "completed" and event.language == "tr" for event in sources
+    )
+    assert all(
+        event.message == "Bu kaynaktaki ilgili özgün hükümler inceleniyor."
+        for event in sources
+    )
+    assert not any(
+        "Relevant relief" in event.title + (event.message or "") for event in sources
+    )
+    assert (
+        len(
+            [
+                event
+                for event in updates
+                if event.phase == "completed" and event.task_id is None
+            ]
+        )
+        == 1
+    )
+    final = next(
+        packet.obj for packet in output if isinstance(packet.obj, AgentResponseStart)
+    )
+    assert final.final_documents is not None
+    canonical = {
+        row["item"]["source_id"]: row["item"]["search_doc"]
+        for row in checkpoints[-1]["evidence"]["records"]
+    }
+    for document in final.final_documents:
+        rendered = json.loads(document.model_dump_json())
+        assert rendered["metadata"].pop("asv3_source_display_name") in names
+        assert rendered == canonical[document.document_id]
+    assert all(
+        item.search_doc is not None
+        and "asv3_source_display_name" not in item.search_doc.metadata
+        for item in broker.revalidated
     )
 
 

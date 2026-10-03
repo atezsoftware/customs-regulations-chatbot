@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import re
 import threading
 from typing import TYPE_CHECKING, Callable
 from uuid import uuid4
@@ -8,7 +10,8 @@ from uuid import uuid4
 from pydantic import BaseModel, JsonValue
 
 if TYPE_CHECKING:
-    from onyx.asv3.models import RunContext
+    from onyx.asv3.evidence import EvidenceLedger
+    from onyx.asv3.models import EvidenceItem, RunContext
 
 
 class ProgressEvent(BaseModel):
@@ -47,6 +50,144 @@ def action_narration(
     title, message = update
     assert isinstance(title, str) and isinstance(message, str)
     return (title, message) if public_narration_valid(title, message, context) else None
+
+
+def _source_heading(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    heading = " ".join(value.strip(" #\t\r\n").split())
+    without_numbers = re.sub(r"\b\d{1,4}/\d{1,4}\b", "", heading)
+    if (
+        not heading
+        or len(heading) > 200
+        or any(part in without_numbers for part in ("/", "\\", "_"))
+        or re.search(r"\.(?:md|pdf|docx?|txt|html?)\b|https?://", heading, re.I)
+    ):
+        return None
+    return heading
+
+
+def _canonical_corpus_original(item: "EvidenceItem") -> bool:
+    from onyx.asv3.models import model_evidence_metadata
+
+    metadata = model_evidence_metadata(item.metadata)
+    return bool(
+        item.chunk_id
+        and item.search_doc is not None
+        and item.search_doc.document_id == item.source_id
+        and item.search_doc.metadata.get("regulatory_chunk_id") == item.chunk_id
+        and not metadata.get("derived")
+        and not metadata.get("external")
+    )
+
+
+def official_corpus_source_name(item: "EvidenceItem") -> str | None:
+    """Return a verified presentation name without changing canonical source identity."""
+    from onyx.asv3.models import model_evidence_metadata
+
+    if not _canonical_corpus_original(item):
+        return None
+    metadata = model_evidence_metadata(item.metadata)
+    raw_headings = metadata.get("heading_path")
+    headings = raw_headings if isinstance(raw_headings, list) else []
+    if str(metadata.get("document_type", "")).lower() == "genelge":
+        for heading in headings:
+            if not isinstance(heading, str):
+                continue
+            match = re.fullmatch(r"\s*\(?\s*(\d{4}/\d{1,4})\s*\)?\s*", heading)
+            if match:
+                return f"{match.group(1)} sayılı Genelge"
+    source_type = re.compile(
+        r"\b(?:kanun(?:u|un|unun)?|yönetmeli(?:k|ği)|tebli(?:ğ|ği)|genelge(?:si)?|"
+        r"karar(?:ı|name)?|tüzü(?:k|ğü)|sirküler(?:i)?|özelge|law|act|code|"
+        r"regulation|directive|decision|circular)\b",
+        re.I,
+    )
+    for candidate in [headings[0] if headings else None, metadata.get("title")]:
+        name = _source_heading(candidate)
+        if name and source_type.search(name):
+            return name
+    return None
+
+
+def _source_display(
+    item: "EvidenceItem", language: str, fallback_title: str, citation: int
+) -> tuple[str, str | None, str | None]:
+    from onyx.asv3.models import model_evidence_metadata
+    from onyx.regulatory.heading_path import parse_regulatory_article_heading
+
+    metadata = model_evidence_metadata(item.metadata)
+    raw_headings = metadata.get("heading_path")
+    headings = raw_headings if isinstance(raw_headings, list) else []
+    article, qualifier, article_heading = None, None, None
+    for heading in reversed(headings):
+        if not isinstance(heading, str):
+            continue
+        parsed = parse_regulatory_article_heading(heading)
+        if parsed:
+            article, qualifier = parsed.article_no, parsed.qualifier
+            article_heading = _source_heading(heading)
+            break
+    number = metadata.get("article_no")
+    if article is None and isinstance(number, str):
+        if parsed := parse_regulatory_article_heading("Madde " + number):
+            article, qualifier = parsed.article_no, parsed.qualifier
+    source = official_corpus_source_name(item) or f"{fallback_title} [{citation}]"
+    if article:
+        if language in {"tr", "en"} and not qualifier:
+            source += f" — {'Madde' if language == 'tr' else 'Article'} {article}"
+        elif article_heading:
+            source += " — " + article_heading
+    return source[:240], article, qualifier
+
+
+def report_source_deliveries(
+    ledger: "EvidenceLedger",
+    call_id: str | None,
+    context: "RunContext",
+    reporter: "ProgressReporter",
+    localized_tools: list[str],
+) -> None:
+    from onyx.asv3.supplemental_tools import public_narration_valid
+    from onyx.tracing.flows import LLMFlow
+
+    if (
+        not call_id
+        or context.depth
+        or context.is_cancelled()
+        or ledger.delivery_flow(call_id) != LLMFlow.ASV3_COORDINATOR.value
+    ):
+        return
+    language = reporter.language.split("-")[0].lower()
+    fallback_title, message = {
+        "tr": ("Özgün kaynak", "Bu kaynaktaki ilgili özgün hükümler inceleniyor."),
+        "en": (
+            "Original source",
+            "Reviewing the relevant original provisions in this source.",
+        ),
+    }.get(language, tuple(localized_tools))
+    seen = {
+        event.task_id
+        for event in reporter.snapshot()
+        if event.task_id and event.task_id.startswith("action:source:")
+    }
+    for citation in sorted(ledger.completely_delivered(call_id)):
+        if context.is_cancelled():
+            return
+        item = ledger.get(citation)
+        if item is None or not _canonical_corpus_original(item):
+            continue
+        title, article, qualifier = _source_display(
+            item, language, fallback_title, citation
+        )
+        identity = json.dumps([item.source_id, article, qualifier], ensure_ascii=False)
+        task_id = "action:source:" + hashlib.sha256(identity.encode()).hexdigest()[:24]
+        if task_id in seen or not public_narration_valid(title, message, context):
+            continue
+        seen.add(task_id)
+        reporter.report(
+            "tools", status="completed", task_id=task_id, title=title, message=message
+        )
 
 
 _MESSAGES: dict[str, dict[str, tuple[str, str]]] = {

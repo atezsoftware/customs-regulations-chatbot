@@ -3,7 +3,11 @@ import { SubQuestionDetail } from "@/app/app/interfaces";
 import { StreamingCitation } from "@/app/app/services/streamingModels";
 import { ValidSources } from "@/lib/types";
 import { getSourceDisplayName } from "@/lib/sources";
-import { SourceInfo } from "./SourceTagDetailsCard";
+import { SourceInfo } from "@/refresh-components/buttons/source-tag/SourceTagDetailsCard";
+import {
+  getDocumentSourceDisplayName,
+  getRegulatorySourceDisplayName,
+} from "@/lib/regulatory/sourceDisplayName";
 
 const MAX_TITLE_LENGTH = 40;
 
@@ -20,7 +24,7 @@ export function documentToSourceInfo(doc: OnyxDocument): SourceInfo {
 
   return {
     id: doc.document_id,
-    title: doc.semantic_identifier || "Unknown",
+    title: getDocumentSourceDisplayName(doc) || "Unknown",
     sourceType,
     sourceUrl: doc.link,
     description: doc.blurb,
@@ -89,11 +93,12 @@ export function citationsToSourceInfoArray(
 }
 
 function getRegulatoryCitationLabel(doc: OnyxDocument): string | null {
-  const semanticIdentifier = doc.semantic_identifier?.trim();
-  if (!semanticIdentifier) return null;
+  const semanticIdentifier = doc.semantic_identifier?.trim() || "";
 
   const [fileName, ...semanticHeadingParts] = semanticIdentifier.split(" — ");
-  const documentTitle = fileName?.replace(/\.[^.]+$/, "").trim();
+  const documentTitle =
+    getRegulatorySourceDisplayName(doc) ||
+    fileName?.replace(/\.[^.]+$/, "").trim();
   const metadataHeading: unknown = doc.metadata?.regulatory_heading_path;
   const headingPath = Array.isArray(metadataHeading)
     ? metadataHeading.join(" > ")
@@ -133,7 +138,7 @@ export function getDisplayNameForSource(doc: OnyxDocument): string {
   if (regulatoryLabel) return regulatoryLabel;
 
   return (
-    truncateText(doc.semantic_identifier || "", MAX_TITLE_LENGTH) ||
+    truncateText(getDocumentSourceDisplayName(doc), MAX_TITLE_LENGTH) ||
     getSourceDisplayName(sourceType) ||
     "Unknown"
   );
