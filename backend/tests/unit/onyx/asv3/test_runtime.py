@@ -432,6 +432,7 @@ def test_invalid_publication_review_can_reassess_unchanged_draft_without_source_
             chunk.text for chunk in broker.chunks.values()
         }
         assert not any(item["truncated"] for item in evidence)
+        assert "available_evidence" not in payload
     receipts = checkpoints[-1]["receipts"]
     assert sum(row["call"]["name"] == "read_source_range" for row in receipts) == 2
     assert len(checkpoints[-1]["evidence"]["records"]) == 2
@@ -601,6 +602,7 @@ def test_runtime_parallel_sources_full_original_review_and_final_citations(
     assert {item.chunk_id for item in broker.revalidated} == {"chunk-0", "chunk-1"}
     for call in llm.invoke.call_args_list[-1:]:
         data = json.loads(call.kwargs["prompt"][1].content)
+        assert "available_evidence" not in data
         evidence = json.loads(data["evidence"])
         assert {item["text"] for item in evidence} == {
             chunk.text for chunk in broker.chunks.values()
@@ -933,10 +935,12 @@ def test_runtime_recovers_uncited_governing_source_without_losing_special_proced
         originals = json.loads(data["evidence"])
         assert {item["citation"] for item in originals} == set(citations.values())
         assert all(item["truncated"] is False for item in originals)
-        navigation = data["available_evidence"]
-        assert {item["document_type"] for item in navigation} == {"kanun", "genelge"}
-        assert any(item["citation"] == citations["kanun"] for item in navigation)
-        assert len(json.dumps(navigation, ensure_ascii=False)) <= 6000
+        assert "available_evidence" not in data
+        assert {item["metadata"]["document_type"] for item in originals} == {
+            "kanun",
+            "genelge",
+        }
+        assert any(item["citation"] == citations["kanun"] for item in originals)
         return response(
             json.dumps(
                 {

@@ -101,7 +101,7 @@ def publication_gap(
         for term in unmatched_quoted_terms(answer, scenario, ledger):
             check = checks.get(str(term["term_id"]))
             # An unmatched literal cannot become supported just by being labelled so.
-            if check is None or check.kind in {"literal", "unsupported"}:
+            if check is None or check.kind not in {"translation", "application"}:
                 quote_gaps.append(term)
                 continue
             evidence = (

@@ -23,7 +23,11 @@ class AssertionVerification(BaseModel):
     status: Literal["supported", "unsupported", "uncertain"]
     witnesses: list[AssertionWitness] = Field(default_factory=list, max_length=32)
     missing_conditions: list[str] = Field(default_factory=list, max_length=16)
-    explanation: str = Field(min_length=1, max_length=1000)
+    explanation: str = Field(
+        min_length=1,
+        max_length=4000,
+        description="One short sentence about this block's decisive support or defect. Put actionable gaps in missing_conditions; avoid repeating the answer or other assessments.",
+    )
 
 
 class AssertionUnit(TypedDict):

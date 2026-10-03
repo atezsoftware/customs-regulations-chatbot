@@ -6,7 +6,20 @@ from datetime import date
 from time import perf_counter
 from uuid import UUID
 
-from sqlalchemy import JSON, Integer, Text, and_, cast, column, func, or_, select, true
+from pydantic import JsonValue
+from sqlalchemy import (
+    JSON,
+    Integer,
+    Text,
+    and_,
+    cast,
+    column,
+    func,
+    literal_column,
+    or_,
+    select,
+    true,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Session
 
@@ -55,16 +68,13 @@ def get_asv3_initial_rerank_context(
     observation = observe_publication_read()
     require_publication_files(observation, tuple(indexes))
     projection, canonical = RegulatoryTemporalProjection, RegulatoryChunk
-    # JSON extraction avoids constructing a binary JSON tree for every vector.
-    source_fields = (
-        func.json_to_record(
-            cast(projection.payload["projection"]["source_json"].astext, JSON)
-        )
-        .table_valued(column("heading_path", JSON))
-        .render_derived(with_types=True)
-        .lateral("parent_fields")
-    )
-    headings = cast(source_fields.c.heading_path, JSONB)
+    # This expression matches the frozen-parent index; never use mutable headings.
+    headings = cast(
+        projection.payload.op("#>>")(literal_column("'{projection,source_json}'")),
+        JSONB,
+    ).op("->", return_type=JSONB)(literal_column("'heading_path'"))
+    parent = headings.op("-", return_type=JSONB)(literal_column("-1"))
+    parent_hash = func.md5(cast(parent, Text))
     qualified = (
         or_(
             *[
@@ -94,43 +104,18 @@ def get_asv3_initial_rerank_context(
         canonical.id == projection.canonical_chunk_id,
         canonical.user_file_id == projection.user_file_id,
     )
-    locators = (
+    seed_query = (
         select(
             projection.id.label("binding_id"),
             projection.canonical_chunk_id.label("chunk_id"),
             projection.user_file_id.label("file_id"),
             projection.index_uuid.label("index_uuid"),
-            projection.projection_ordinal.label("ordinal"),
-            headings.op("-", return_type=JSONB)(-1).label("parent"),
+            parent.label("parent"),
+            parent_hash.label("parent_hash"),
             (func.jsonb_array_length(headings) > 0).label("parent_known"),
         )
         .join(canonical, canonical_join)
-        .join(source_fields, true())
-        .where(*qualified)
-        .cte("asv3_parent_locators")
-        .prefix_with("MATERIALIZED")
-    )
-    seeds, siblings = locators.alias("parent_seed"), locators.alias("parent_sibling")
-    query = (
-        select(seeds.c.chunk_id, siblings.c.binding_id)
-        .select_from(seeds)
-        .join(
-            siblings,
-            and_(
-                siblings.c.file_id == seeds.c.file_id,
-                siblings.c.index_uuid == seeds.c.index_uuid,
-                or_(
-                    and_(
-                        seeds.c.parent_known,
-                        siblings.c.parent_known,
-                        siblings.c.parent == seeds.c.parent,
-                    ),
-                    siblings.c.binding_id == seeds.c.binding_id,
-                ),
-            ),
-        )
-        .where(seeds.c.chunk_id.in_(unique_ids))
-        .order_by(seeds.c.chunk_id, siblings.c.ordinal, siblings.c.chunk_id)
+        .where(*qualified, projection.canonical_chunk_id.in_(unique_ids))
         .execution_options(stream_results=True, yield_per=128)
     )
     with graph_step(
@@ -144,16 +129,64 @@ def get_asv3_initial_rerank_context(
     ) as span:
         leads: dict[str, list[UUID]] = {}
         started = perf_counter()
-        result = session.execute(query)
+        # Retain only selected parent locators, not an inventory of the source.
+        families: dict[tuple[UUID, str, str], list[tuple[str, JsonValue]]] = {}
+        result = session.execute(seed_query)
         try:
-            for seed_id, binding_id in result:
+            for row in result:
                 scope.check_active()
-                leads.setdefault(seed_id, []).append(binding_id)
+                leads.setdefault(row.chunk_id, [])
+                if not row.parent_known:
+                    leads[row.chunk_id].append(row.binding_id)
+                    continue
+                key = (row.file_id, row.index_uuid, row.parent_hash)
+                families.setdefault(key, []).append((row.chunk_id, row.parent))
         finally:
             result.close()
-        lead_seconds = perf_counter() - started
         if set(leads) != set(unique_ids):
             raise ValueError("ASv3 initial context lost a selected seed")
+        if families:
+            family_query = (
+                select(
+                    projection.id.label("binding_id"),
+                    projection.user_file_id.label("file_id"),
+                    projection.index_uuid,
+                    parent.label("parent"),
+                    parent_hash.label("parent_hash"),
+                    (func.jsonb_array_length(headings) > 0).label("parent_known"),
+                )
+                .join(canonical, canonical_join)
+                .where(
+                    *qualified,
+                    or_(
+                        *[
+                            and_(
+                                projection.user_file_id == file_id,
+                                projection.index_uuid == index_uuid,
+                                parent_hash == digest,
+                            )
+                            for file_id, index_uuid, digest in families
+                        ]
+                    ),
+                )
+                .order_by(projection.projection_ordinal, projection.canonical_chunk_id)
+                .execution_options(stream_results=True, yield_per=128)
+            )
+            result = session.execute(family_query)
+            try:
+                for row in result:
+                    scope.check_active()
+                    key = (row.file_id, row.index_uuid, row.parent_hash)
+                    # A hash only locates candidates; exact equality defines membership.
+                    for seed_id, seed_parent in families.get(key, []):
+                        if row.parent_known and row.parent == seed_parent:
+                            leads[seed_id].append(row.binding_id)
+            finally:
+                result.close()
+        leads = {key: list(dict.fromkeys(ids)) for key, ids in leads.items()}
+        if any(not ids for ids in leads.values()):
+            raise ValueError("ASv3 initial context lost a selected parent family")
+        lead_seconds = perf_counter() - started
         selected_ids = tuple(
             dict.fromkeys(member for ids in leads.values() for member in ids)
         )

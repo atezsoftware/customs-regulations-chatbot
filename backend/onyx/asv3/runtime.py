@@ -449,7 +449,6 @@ def run_asv3_loop(
                     "scenario": question,
                     "claim": claim,
                     "evidence": _evidence_record(ledger, anchors),
-                    "available_evidence": ledger.summaries(max_chars=6000),
                 },
                 ensure_ascii=False,
             ),
@@ -594,7 +593,6 @@ def run_asv3_loop(
                     if preservation_reference
                     else None,
                     "evidence": evidence,
-                    "available_evidence": ledger.summaries(max_chars=6000),
                     "authority_obligations": authority_obligations(draft, ledger),
                     "research_state": research_state.view(max_chars=24000),
                     "unmatched_quoted_terms": unmatched_quoted_terms(

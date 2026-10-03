@@ -9400,6 +9400,16 @@ class RegulatoryTemporalProjection(Base):
             "effective_start",
             "effective_end",
         ),
+        Index(
+            "ix_temporal_projection_frozen_parent",
+            "user_file_id",
+            "index_uuid",
+            text(
+                "md5((((payload #>> '{projection,source_json}')::jsonb "
+                "-> 'heading_path') - -1)::text)"
+            ),
+            postgresql_where=text("retired_at IS NULL"),
+        ),
         CheckConstraint(
             "effective_end IS NULL OR effective_start IS NULL OR effective_end > effective_start "
             "OR (effective_end = effective_start AND COALESCE("

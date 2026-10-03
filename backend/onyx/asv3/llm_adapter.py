@@ -112,7 +112,7 @@ class LanguageProfile(BaseModel):
 
 class QuotationVerification(BaseModel):
     term_id: str
-    kind: Literal["literal", "translation", "application", "unsupported"]
+    kind: Literal["literal", "translation", "application", "unsupported", "uncertain"]
     evidence_number: Annotated[int, Field(strict=True, ge=1)] | None
     source_quote: str
     explanation: Annotated[str, Field(min_length=1)]
