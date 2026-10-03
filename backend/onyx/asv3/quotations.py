@@ -7,12 +7,37 @@ from pydantic import JsonValue
 from onyx.asv3.authority import folded
 from onyx.asv3.citation_numbers import extract_citation_numbers
 from onyx.asv3.evidence import EvidenceLedger
+from onyx.asv3.models import EvidenceItem
 
 _QUOTES = re.compile(r"“([^”\n]{1,600})”|\"([^\"\n]{1,600})\"")
 
 
 def normalized(text: str) -> str:
     return " ".join(folded(text).split())
+
+
+def canonical_heading_labels(item: EvidenceItem) -> set[str]:
+    """Literal labels are structural context, not witnesses to operative rules."""
+    canonical = item.metadata.get("canonical_metadata")
+    headings = item.metadata.get("heading_path")
+    if (
+        item.metadata.get("external")
+        or item.metadata.get("derived")
+        or not item.chunk_id
+        or not isinstance(canonical, dict)
+        or canonical.get("document_id") != item.source_id
+        or canonical.get("regulatory_chunk_id") != item.chunk_id
+        or not isinstance(headings, list)
+        or canonical.get("heading_path") != headings
+    ):
+        return set()
+    return {
+        normalized(label)
+        for label in headings
+        if isinstance(label, str)
+        and label.strip()
+        and not label.rstrip().endswith(("...", "…"))
+    }
 
 
 def unmatched_quoted_terms(
@@ -31,6 +56,12 @@ def unmatched_quoted_terms(
             for n in citations
             if (item := ledger.get(n)) is not None
         ]
+        labels = {
+            label
+            for n in citations
+            if (item := ledger.get(n)) is not None
+            for label in canonical_heading_labels(item)
+        }
         for match in _QUOTES.finditer(passage):
             term = match[1] or match[2]
             key = normalized(term), citations
@@ -38,6 +69,7 @@ def unmatched_quoted_terms(
                 key in seen
                 or key[0] in facts
                 or any(key[0] in text for text in originals)
+                or key[0] in labels
             ):
                 continue
             seen.add(key)

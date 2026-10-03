@@ -1,7 +1,80 @@
+import pytest
+from pydantic import JsonValue
+
+from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.llm_adapter import QuotationVerification
+from onyx.asv3.models import EvidenceItem, RunContext
 from onyx.asv3.publication import publication_gap
 from onyx.asv3.quotations import unmatched_quoted_terms
 from tests.unit.onyx.asv3.test_citation_contract import original_ledger, supported
+
+
+def test_verified_canonical_heading_is_literal_context_without_becoming_a_rule() -> (
+    None
+):
+    context, ledger = RunContext(), EvidenceLedger()
+    label = "OPERATIVE SCHEDULE"
+    ledger.add(
+        [
+            EvidenceItem(
+                source_id="source",
+                chunk_id="clause",
+                text="a) Category A.",
+                metadata={
+                    "heading_path": [label, "a) Category A."],
+                    "canonical_metadata": {
+                        "document_id": "source",
+                        "regulatory_chunk_id": "clause",
+                        "heading_path": [label, "a) Category A."],
+                    },
+                },
+            )
+        ],
+        context,
+    )
+    assert (
+        unmatched_quoted_terms('Listed under "Operative Schedule" [1].', "", ledger)
+        == []
+    )
+    assert unmatched_quoted_terms('The rule is "Category A is exempt" [1].', "", ledger)
+
+
+@pytest.mark.parametrize("defect", ["source", "chunk", "path", "derived", "truncated"])
+def test_unbound_or_incomplete_heading_cannot_approve_quoted_wording(
+    defect: str,
+) -> None:
+    context, ledger = RunContext(), EvidenceLedger()
+    label = "Operative Schedule"
+    canonical: dict[str, JsonValue] = {
+        "document_id": "source",
+        "regulatory_chunk_id": "clause",
+        "heading_path": [label],
+    }
+    if defect == "source":
+        canonical["document_id"] = "other"
+    elif defect == "chunk":
+        canonical["regulatory_chunk_id"] = "other"
+    elif defect == "path":
+        canonical["heading_path"] = ["Other Schedule"]
+    elif defect == "truncated":
+        label += "..."
+        canonical["heading_path"] = [label]
+    ledger.add(
+        [
+            EvidenceItem(
+                source_id="source",
+                chunk_id="clause",
+                text="a) Category A.",
+                metadata={
+                    "heading_path": [label],
+                    "canonical_metadata": canonical,
+                    "derived": defect == "derived",
+                },
+            )
+        ],
+        context,
+    )
+    assert unmatched_quoted_terms('Listed under "Operative Schedule" [1].', "", ledger)
 
 
 def test_literal_mismatch_cannot_be_approved_by_generic_supported_status() -> None:

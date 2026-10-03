@@ -234,6 +234,7 @@ def run_asv3_loop(
         token_counter=token_counter,
     )
     previous: dict[str, JsonValue] | None = None
+    continuation_usage: dict[str, JsonValue] | None = None
     if resume_message_id is not None:
         previous = load_asv3_checkpoint(message_id=resume_message_id, user_id=user.id)
         if (
@@ -426,6 +427,7 @@ def run_asv3_loop(
                 else None,
                 scenario=scenarios.snapshot(),
                 question_message_id=user_message_id,
+                continuation_usage=continuation_usage,
             )
             save_asv3_checkpoint(
                 message_id=assistant_message_id, user_id=user.id, snapshot=snapshot
@@ -841,6 +843,12 @@ def run_asv3_loop(
                 ],
                 resuming=True,
             )
+            continuation_usage = {
+                "message_id": resume_message_id,
+                "budget": cast(dict[str, JsonValue], context.budget.snapshot()),
+            }
+            # Explicit continuation grants fresh execution capacity, not more memory.
+            context.budget.restore({"tools": 0, "decisions": 0})
             worker_state = previous.get("workers")
             if isinstance(worker_state, dict):
                 workers.restore(worker_state)

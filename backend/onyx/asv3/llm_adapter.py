@@ -254,6 +254,56 @@ class PublicationAssessmentPatch(BaseModel):
     need_results: list[NeedVerification]
 
 
+def bind_declared_gap_diagnostics(
+    data: str, review: VerificationResult
+) -> VerificationResult:
+    """Reuse an assessed outcome's negative diagnostic without changing its verdict."""
+    try:
+        payload = parse_json_object(data)
+    except ValueError:
+        return review
+    raw_units = payload.get("assertion_units")
+    if not isinstance(raw_units, list):
+        return review
+    units = {
+        str(row["unit_id"]): row
+        for row in raw_units
+        if isinstance(row, dict) and isinstance(row.get("unit_id"), str)
+    }
+    results: list[AssertionVerification] = []
+    for item in review.assertion_results:
+        unit = units.get(item.unit_id)
+        if (
+            unit is None
+            or item.basis != "evidence_gap"
+            or item.status != "uncertain"
+            or item.missing_conditions
+            or item.witnesses
+            or item.scenario_quotes
+            or unit.get("evidence_numbers") != []
+        ):
+            results.append(item)
+            continue
+        gaps = list(
+            dict.fromkeys(
+                detail
+                for question in review.question_results
+                if question.status in {"incomplete", "uncertain"}
+                for part in question.determinations
+                if part.status in {"incomplete", "uncertain"}
+                and item.unit_id in part.answer_unit_ids
+                for detail in part.missing_conditions
+                if detail.strip()
+            )
+        )
+        results.append(
+            item.model_copy(update={"missing_conditions": gaps})
+            if gaps and len(gaps) <= 16
+            else item
+        )
+    return review.model_copy(update={"assertion_results": results})
+
+
 def assessment_contract_defects(
     data: str, review: VerificationResult
 ) -> dict[str, list[str]]:
@@ -1142,7 +1192,9 @@ class ResearchModel:
                 evidence_numbers=[],
                 format_error=str(error)[:500],
             )
-        review = VerificationResult.model_validate_json(text)
+        review = bind_declared_gap_diagnostics(
+            data, VerificationResult.model_validate_json(text)
+        )
         defects = assessment_contract_defects(data, review)
         if not defects:
             return review

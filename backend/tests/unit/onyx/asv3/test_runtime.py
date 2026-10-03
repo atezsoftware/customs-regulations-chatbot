@@ -703,6 +703,33 @@ def test_resume_reuses_saved_question_language_without_reclassifying(
     )
 
 
+def test_explicit_continuation_renews_execution_but_keeps_original_memory_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kwargs, _broker, llm, checkpoints, queue = setup_run(monkeypatch)
+    runtime.run_asv3_loop(**kwargs)
+    previous = checkpoints[-1]
+    previous["budget"]["tools"] = 64
+    previous["budget"]["decisions"] = 41
+    retained_bytes = previous["budget"]["evidence_bytes"]
+    packets(queue)
+    monkeypatch.setattr(runtime, "load_asv3_checkpoint", lambda **_kwargs: previous)
+    llm.reset_mock()
+    llm.invoke.side_effect = [
+        response("Tamir [1], değiştirme [2]."),
+        supported_review([1, 2]),
+    ]
+    runtime.run_asv3_loop(**kwargs, resume_message_id=2)
+    saved = checkpoints[-1]
+    assert saved["publication_status"] == "found"
+    assert saved["budget"]["decisions"] < 41
+    assert saved["budget"]["evidence_bytes"] == retained_bytes
+    assert saved["continuation_usage"]["message_id"] == 2
+    assert saved["continuation_usage"]["budget"]["decisions"] == 41
+    assert saved["continuation_usage"]["budget"]["tools"] == 64
+    assert saved["evidence"]["records"] == previous["evidence"]["records"]
+
+
 @pytest.mark.parametrize(
     "provider,model_name",
     [

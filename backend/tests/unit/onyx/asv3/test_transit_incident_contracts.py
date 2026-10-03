@@ -6,7 +6,7 @@ import pytest
 from pydantic import JsonValue
 
 from onyx.asv3.assertions import assertion_inventory, presentation_block
-from onyx.asv3.llm_adapter import ResearchModel
+from onyx.asv3.llm_adapter import ResearchModel, bind_declared_gap_diagnostics
 from onyx.asv3.models import (
     CapabilityCall,
     HarnessView,
@@ -24,6 +24,54 @@ from onyx.llm.model_response import Choice, Message, ModelResponse
 from tests.unit.onyx.asv3.test_model_adapter import scripted_model, text_response
 from tests.unit.onyx.asv3.test_research_state import need, state_pair
 from tests.unit.onyx.asv3.test_safe_partial_conditions import partial_case
+
+
+def test_omitted_gap_field_reuses_only_its_declared_negative_outcome() -> None:
+    ledger, _context, state, answer, review, _condition = partial_case()
+    review.assertion_results[1].missing_conditions = []
+    payload = json.dumps({"assertion_units": assertion_inventory(answer)})
+    bound = bind_declared_gap_diagnostics(payload, review)
+    assert bound.assertion_results[1].missing_conditions == (
+        review.question_results[1].determinations[0].missing_conditions
+    )
+    assert review.assertion_results[1].missing_conditions == []
+    assert bound.safe_to_publish == review.safe_to_publish
+    assert bound.status == review.status
+    assert bound.question_results == review.question_results
+    assert (
+        publication_gap(
+            answer,
+            bound,
+            list(state.questions),
+            ledger,
+            allow_explicit_gaps=True,
+            require_assertion_checks=True,
+            require_determination_checks=True,
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "defect", ["different_unit", "positive_outcome", "no_diagnostic"]
+)
+def test_gap_diagnostic_binding_cannot_invent_or_borrow_another_outcomes_gap(
+    defect: str,
+) -> None:
+    _ledger, _context, _state, answer, review, _condition = partial_case()
+    review.assertion_results[1].missing_conditions = []
+    part = review.question_results[1].determinations[0]
+    if defect == "different_unit":
+        part.answer_unit_ids = ["another-answer"]
+    elif defect == "positive_outcome":
+        part.status = "supported"
+    else:
+        part.missing_conditions = []
+    bound = bind_declared_gap_diagnostics(
+        json.dumps({"assertion_units": assertion_inventory(answer)}), review
+    )
+    assert bound.assertion_results[1].missing_conditions == []
+    assert bound.safe_to_publish == review.safe_to_publish
 
 
 def test_recorded_original_is_readable_after_external_research_capacity_is_used() -> (
@@ -221,7 +269,7 @@ def test_partial_review_bookkeeping_is_repaired_without_discarding_supported_ans
     ]
     model = ResearchModel(llm, context)
     result = model.invoke_verification("Assess original support", payload)
-    assert llm.invoke.call_count == 2
+    assert llm.invoke.call_count == (1 if defect == "missing_gap" else 2)
     assert result.format_error is None
     assert result.safe_to_publish and result.status == "incomplete"
     assert result.assertion_results[0] == review.assertion_results[0]
