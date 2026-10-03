@@ -91,6 +91,64 @@ def test_explicit_subunit_reference_is_a_locator_not_invented_rule() -> None:
     assert statute_references("2024/17 sayılı Genelge.") == ()
 
 
+@pytest.mark.parametrize(
+    "article",
+    ["27 nci maddesi", "27. maddesi", "Madde 27", "m. 27", "(27/2-ç) maddesi"],
+)
+def test_later_implementing_reference_never_relabels_a_statute(article: str) -> None:
+    answer = (
+        f"8917 sayılı Faaliyet Kanunu’nun {article} [1], "
+        "Uygulama Yönetmeliği’nin 55 inci maddesi [2] ve "
+        "Faaliyet Tebliği m. 3/4 [3] uyarınca işlem yapılır."
+    )
+    references = statute_references(answer)
+    assert [(r.number, r.article) for r in references] == [("8917", "27")]
+    expected_subunit = ("2", "ç") if article.startswith("(") else (None, None)
+    assert [(r.paragraph, r.clause) for r in references] == [expected_subunit]
+    ledger = EvidenceLedger()
+    original = source("kanun", "8917 sayılı Faaliyet Kanunu", "27", "İşlem yapılır.")
+    if article.startswith("("):
+        original.metadata.update(paragraph_no="2", clause_label="ç")
+    ledger.add([original], RunContext())
+    assert unresolved_authority_gap(answer, ledger) is None
+
+
+def test_unqualified_statute_does_not_acquire_another_instruments_article() -> None:
+    references = statute_references(
+        "8917 sayılı Faaliyet Kanunu [1] ve Uygulama Yönetmeliği m. 3/4 [2] uygulanır."
+    )
+    assert [(r.number, r.article, r.paragraph) for r in references] == [
+        ("8917", None, None)
+    ]
+
+
+def test_adjacent_statutes_keep_their_own_article_and_clause() -> None:
+    references = statute_references(
+        "8917 sayılı Faaliyet Kanunu’nun 27 nci maddesi [1] ile "
+        "7251 sayılı Veri Kanunu m. 45/2-ç [2] uygulanır."
+    )
+    assert [(r.number, r.article, r.paragraph, r.clause) for r in references] == [
+        ("8917", "27", None, None),
+        ("7251", "45", "2", "ç"),
+    ]
+
+
+def test_later_sentence_cannot_supply_a_missing_statutory_article() -> None:
+    references = statute_references(
+        "8917 sayılı Faaliyet Kanunu uygulanır. 27 nci maddesi ayrıca incelenir."
+    )
+    assert [(r.number, r.article) for r in references] == [("8917", None)]
+
+
+def test_english_reference_does_not_use_the_later_regulations_subunit() -> None:
+    references = statute_references(
+        "Law No. 8917 Article 27 [1] and Implementation Regulation art. 3/4 [2] apply."
+    )
+    assert [(r.number, r.article, r.paragraph) for r in references] == [
+        ("8917", "27", None)
+    ]
+
+
 def test_wrong_paragraph_or_clause_cannot_close_explicit_original_need() -> None:
     ledger, context = EvidenceLedger(), RunContext()
     answer = "8917 sayılı Faaliyet Kanunu m. 27/1-ç gereğince izin gerekir [1]."

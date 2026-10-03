@@ -10,7 +10,9 @@ from pydantic import JsonValue
 
 from onyx.asv3.citation_numbers import extract_citation_numbers
 from onyx.asv3.evidence import EvidenceLedger
-from onyx.regulatory.heading_path import extract_regulatory_provision_references
+from onyx.regulatory.heading_path import (
+    extract_regulatory_provision_reference_occurrences,
+)
 
 
 def folded(text: str) -> str:
@@ -34,6 +36,25 @@ _SHORTHAND_ARTICLE = re.compile(
     r"\b(?:(?P<qualifier>geçici|gecici|mükerrer|mukerrer|ek)\s+)?m\.?\s*(?P<article>\d{1,4})(?!\d)"
     r"(?:\s*/\s*(?P<paragraph>\d+)(?:\s*[-(]\s*(?P<clause>[a-zçğıöşü])\)?)?)?"
 )
+_INSTRUMENT_DESIGNATOR = re.compile(
+    r"\b(?:kanun[a-z]*|yonetmeli[kg][a-z]*|teblig[a-z]*|genelge[a-z]*|karar[a-z]*"
+    r"|laws?|acts?|statutes?|regulations?|directives?|decrees?|decisions?|circulars?)\b"
+)
+
+
+def _reference_tail(text: str) -> str:
+    for boundary in re.finditer(r"[;\n]|\.(?=\s+\S)", text):
+        if boundary[0] == ".":
+            prefix = folded(text[: boundary.start()])
+            suffix = folded(text[boundary.end() :]).lstrip()
+            if re.search(r"\b(?:m|md|art|no)$", prefix) or (
+                re.search(r"\d$", prefix) and re.match(r"madd[a-z]*\b", suffix)
+            ):
+                continue
+        text = text[: boundary.start()]
+        break
+    instrument = _INSTRUMENT_DESIGNATOR.search(folded(text))
+    return text[: instrument.start()] if instrument is not None else text
 
 
 @dataclass(frozen=True)
@@ -57,32 +78,37 @@ def statute_references(text: str) -> tuple[StatuteReference, ...]:
         tuple[str, str | None, str | None, str | None, str | None], StatuteReference
     ] = {}
     for match in _STATUTE.finditer(identity_text):
-        tail = normalized[match.end() : match.end() + 180]
-        # Do not attach a later sentence's article to this instrument.
-        tail = re.split(r"[;\n]|\.(?=\s+[A-ZÇĞİÖŞÜa-zçğıöşü])", tail, 1)[0]
-        explicit = extract_regulatory_provision_references(tail)
-        compact = _COMPACT_ARTICLE.search(tail)
-        shorthand = _SHORTHAND_ARTICLE.search(tail)
-        subunit = compact or shorthand
-        article = (
-            subunit["article"]
-            if subunit
-            else explicit[0].article_no
-            if explicit
-            else None
+        tail = _reference_tail(normalized[match.end() : match.end() + 180])
+        candidates: list[tuple[int, str, str | None, str | None, str | None]] = [
+            (offset, reference.article_no, None, None, reference.qualifier)
+            for offset, reference in extract_regulatory_provision_reference_occurrences(
+                tail
+            )
+        ]
+        for pattern in (_COMPACT_ARTICLE, _SHORTHAND_ARTICLE):
+            for subunit in pattern.finditer(tail):
+                qualifier = subunit.groupdict().get("qualifier")
+                candidates.append(
+                    (
+                        subunit.start(),
+                        subunit["article"],
+                        subunit["paragraph"],
+                        subunit["clause"],
+                        folded(qualifier) if qualifier else None,
+                    )
+                )
+        article, paragraph, clause, qualifier = (
+            min(candidates, key=lambda candidate: candidate[0])[1:]
+            if candidates
+            else (None, None, None, None)
         )
-        paragraph = subunit["paragraph"] if subunit else None
-        clause = subunit["clause"] if subunit else None
-        qualifier = explicit[0].qualifier if explicit else None
-        if shorthand and shorthand["qualifier"]:
-            qualifier = folded(shorthand["qualifier"])
         number = match["number"] or match["english_number"]
         found.setdefault(
             (number, article, paragraph, clause, qualifier),
             StatuteReference(
                 number,
                 article,
-                normalized[match.start() : match.end() + 100][:240],
+                (normalized[match.start() : match.end()] + tail)[:240],
                 paragraph,
                 clause,
                 qualifier,

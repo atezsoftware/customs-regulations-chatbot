@@ -147,6 +147,20 @@ def extract_regulatory_provision_references(
     words, and duplicate references are returned only once.
     """
 
+    references: list[RegulatoryProvisionReference] = []
+    seen: set[RegulatoryProvisionReference] = set()
+    for _, reference in extract_regulatory_provision_reference_occurrences(text):
+        if reference in seen:
+            continue
+        seen.add(reference)
+        references.append(reference)
+    return tuple(references)
+
+
+def extract_regulatory_provision_reference_occurrences(
+    text: str,
+) -> tuple[tuple[int, RegulatoryProvisionReference], ...]:
+    """Return structural references in order, with offsets in folded text."""
     folded_text = _fold(text)
     occurrences: list[tuple[int, RegulatoryProvisionReference]] = []
     for match in _QUERY_FORWARD_ARTICLE_RE.finditer(folded_text):
@@ -170,14 +184,7 @@ def extract_regulatory_provision_references(
             )
         )
 
-    references: list[RegulatoryProvisionReference] = []
-    seen: set[RegulatoryProvisionReference] = set()
-    for _, reference in sorted(occurrences, key=lambda occurrence: occurrence[0]):
-        if reference in seen:
-            continue
-        seen.add(reference)
-        references.append(reference)
-    return tuple(references)
+    return tuple(sorted(occurrences, key=lambda occurrence: occurrence[0]))
 
 
 def _matching_provision_starts(

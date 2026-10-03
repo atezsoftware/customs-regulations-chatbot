@@ -14,7 +14,11 @@ from onyx.asv3.citation_numbers import extract_citation_numbers
 class AssertionWitness(BaseModel):
     model_config = ConfigDict(extra="forbid")
     citation: Annotated[int, Field(strict=True, ge=1)]
-    source_quote: str = Field(min_length=1, max_length=800)
+    source_quote: str = Field(
+        min_length=1,
+        max_length=800,
+        description="A short contiguous verbatim passage copied from this citation's supplied original. Do not paraphrase, concatenate separated clauses or insert ellipses unless they occur literally in the original.",
+    )
 
 
 class AssertionVerification(BaseModel):
