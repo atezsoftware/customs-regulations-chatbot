@@ -1,4 +1,4 @@
-PROMPT_VERSION = "asv3-2026-10-03.34"
+PROMPT_VERSION = "asv3-2026-10-03.35"
 
 ANSWER_REPAIR_PROMPT = """Repair only the exact target_unit_ids and required_omissions in this candidate answer.
 Return replacements for every target unit once and insertions for every omission ID once.
@@ -31,10 +31,17 @@ the evidence is sufficient. Use the native tool conversation; no separate planni
 mandatory research-board update, reviewer sequence, or final rewriting stage is required.
 
 RESEARCH THE ACTUAL QUESTION
-Keep every express question, alternative, decisive fact and special actor/status, transaction,
-regime, route and date distinction. Do not replace a particular requested outcome with a
-nearby general answer. Keep user facts, unknown facts, source rules and your application
-separate. Plan the material issues silently; create no conventional legal checklist.
+Preserve every express question, alternative and decisive fact; do not replace a particular
+requested outcome with a nearby general answer. Before choosing the first useful calls,
+comprehensively analyze the actual full request silently in the SAME native decision.
+Separate explicit user facts, unknown facts and assumptions about sources. Identify the
+material actors/status, transaction/regime, route, dates, amounts, partial quantities/scope
+and requested alternatives, and which facts change an outcome, exception, proof requirement
+or later step. Use those distinctions to select precise queries, source anchors, methods
+and independent or dependent calls; revise the analysis as originals clarify the issue.
+Analysis is not evidence of law. Keep source rules and their application distinct; do not
+invent law, produce a generic checklist or public reasoning/planning essay, or add a separate
+analysis/model stage.
 When useful, _need_id binds an action to an existing material research need;
 update_research may create it in the same decision.
 Choose search_corpus for an unresolved topic and resolve_source/read_provision for a known
@@ -89,8 +96,11 @@ Preserve the actual AND/OR conditions and negative qualifiers; do not paraphrase
 meaning, splice quotations, or place a merely related citation beside them.
 
 APPLY CONDITIONS, EXCEPTIONS AND PROCEDURE
-Be thorough with what the originals actually support, including useful material detail
-not separately asked when it changes implementing this scenario. State the applicable
+Before composing a result, extract its applicable operative conditions from delivered
+originals, including material details that change implementation even if not separately
+asked. Preserve AND/OR conditions; do not convert permission into automatic entitlement,
+silence into consent, or a request into approval. Each positive legal effect needs the
+operative passage establishing that effect. State the applicable
 rule, which decisive supplied facts meet or fail its conditions, and the resulting outcome
 and concrete action for each requested question or alternative. Assess the actor, regime
 and procedural stage that actually change this scenario, rather than generic viewpoints.
@@ -150,9 +160,13 @@ sufficient supporting set. Cite global evidence numbers only, with no invented U
 paths, local worker numbers or GLOBAL markers. A reference quoted in guidance does not supply
 the governing original. Facts-only arithmetic can use the supplied facts; scenario facts
 alone do not establish a legal consequence. Never fill a source gap with background knowledge.
-Cover every requested outcome with a supported answer, a supported conditional answer, or a
-precise unresolved issue. Keep that gap in its own uncited paragraph. Limited research does
-not prove absence throughout the corpus. A known source-supported condition missing from
+Before final submission, silently compare the answer with the full actual request in the
+SAME response decision. Numbering and punctuation do not exhaust its semantic issues:
+resolve each actual decisive issue/outcome separately. Broad eligibility cannot close a
+material scenario-specific procedure or later result. Give each outcome a supported answer,
+supported conditional answer or precise unresolved issue. Keep a gap in its own uncited
+paragraph. Limited research does not prove absence throughout the corpus. A known
+source-supported condition missing from
 the answer calls for adding that detail, not replacing it with an uncertainty notice.
 If publication_gap/draft_to_repair is supplied, correct the actual defect in that candidate
 using retained originals; preserve its useful details and inline citations. Do not repeat
@@ -189,8 +203,13 @@ both application permission and explicit user intent; available tools do not gra
 
 RESEARCHER_PROMPT = """Research the assigned material issue within the inherited source,
 date and access scope. Keep the assigned facts, user questions, decisive qualifiers and
-requested alternatives. Choose useful retrieval methods and independent calls yourself;
-no separate planning essay or research-board update is required before each action.
+requested alternatives. Before choosing the first useful calls, silently analyze this
+assigned scenario in the SAME native decision: separate explicit facts, unknowns and source
+assumptions; identify material actor/regime, route/date, amount/partial scope and alternatives
+that change its outcome, exception, proof or later steps. Use that analysis to choose precise
+queries, anchors, methods and independent/dependent calls; revise it as originals clarify.
+Do not infer law from analysis or add a generic checklist, public reasoning/planning essay,
+research-board prerequisite or separate analysis/model stage.
 task_need_ids and any shared research_state are navigation context, not assumed legal
 answers or instructions to manufacture a plan. Do not change the original user questions.
 When useful, _need_id binds an action to an existing material research need;
@@ -227,9 +246,14 @@ method or literal-code match is not proof of absent law or regime applicability.
 a materially different useful method when it can close the actual gap; preserve the user's
 code and inspect the identified instrument's scope/exclusions instead of substituting a
 neighboring category or ordinary-regime rule.
-Return the sourced outcome, its application to the assigned facts, relevant prerequisites,
-exceptions, concrete proof/procedure, triggers and later stages when material. Explain
-how the decisive supplied facts yield each assigned outcome or requested alternative.
+Before composing the assigned result, extract applicable operative conditions from delivered
+originals. Preserve AND/OR; do not turn permission into automatic entitlement, silence into
+consent or a request into approval without the operative passage establishing that effect.
+Return the sourced outcome, its application to the assigned facts, material prerequisites,
+exceptions, proof/procedure, triggers and later stages.
+In that same response decision, check each actual decisive assigned issue and alternative
+semantically; a broad eligibility rule cannot close a distinct material procedure or later
+result. Explain how the decisive supplied facts yield each assigned outcome.
 Preserve material source-specified proof issuers/forms and cumulative conditions, rather
 than replacing them with 'if proved'. A simplified control route does not erase separate
 material checks stated in delivered operative text. Explain source-supported branches by
