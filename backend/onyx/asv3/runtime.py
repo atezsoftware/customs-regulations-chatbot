@@ -35,6 +35,7 @@ from onyx.asv3.models import (
     RunStopped,
     ToolOutcome,
     ToolReceipt,
+    ToolSpec,
 )
 from onyx.asv3.progress import ProgressEvent, ProgressReporter
 from onyx.asv3.publication import publication_gap, question_inventory
@@ -622,6 +623,7 @@ def run_asv3_loop(
                         draft, question, ledger
                     ),
                     "require_sources": profile.requires_sources,
+                    "publication_mode": "complete" if research else "partial_allowed",
                     "pending_tasks": model.pending_tasks(),
                 },
                 ensure_ascii=False,
@@ -787,6 +789,15 @@ def run_asv3_loop(
                 guard_cache.pop(next(iter(guard_cache)))
         return gap
 
+    partial_submission_answer: str | None = None
+    partial_submission_reference: str | None = None
+    partial_submission_review: VerificationResult | None = None
+
+    def take_partial_submission() -> str | None:
+        nonlocal partial_submission_answer
+        answer, partial_submission_answer = partial_submission_answer, None
+        return answer
+
     harness = Harness(
         request=question,
         context=context,
@@ -798,6 +809,7 @@ def run_asv3_loop(
         checkpoint=checkpoint,
         report_terminal=False,
         draft_guard=draft_guard,
+        partial_submission=take_partial_submission,
     )
     for spec in build_core_specs(
         registry,
@@ -811,6 +823,47 @@ def run_asv3_loop(
         },
     ):
         registry.register(spec)
+
+    def submit_partial_answer(
+        args: dict[str, JsonValue], submit_context: RunContext
+    ) -> ToolOutcome:
+        nonlocal partial_submission_answer
+        nonlocal partial_submission_reference, partial_submission_review
+        answer = args["answer"]
+        assert isinstance(answer, str)
+        submit_context.check_active()
+        if submit_context.depth != 0:
+            return ToolOutcome(
+                status=OutcomeStatus.DENIED,
+                summary="Only the coordinator can submit the user's partial answer; delegated researchers return their own findings.",
+            )
+        partial_submission_reference = harness.last_draft if harness else None
+        partial_submission_review = latest_review
+        partial_submission_answer = answer
+        return ToolOutcome(
+            status=OutcomeStatus.PARTIAL,
+            summary="Partial candidate submitted for original-source publication checks",
+            data={"reason": args["reason"], "answer_characters": len(answer)},
+        )
+
+    registry.register(
+        ToolSpec(
+            name="submit_partial_answer",
+            description="End research with a publication-ready partial candidate when a remaining outcome cannot be resolved usefully. Preserve supported answers and disclose each exact gap. This does not approve publication: original-source, citation, authority and independent condition checks still apply. Call on its own.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "answer": {"type": "string", "minLength": 1, "maxLength": 80000},
+                    "reason": {"type": "string", "minLength": 1, "maxLength": 1200},
+                },
+                "required": ["answer", "reason"],
+                "additionalProperties": False,
+            },
+            handler=submit_partial_answer,
+            parallel_safe=False,
+            consumes_tool_budget=False,
+        )
+    )
     try:
 
         def revalidate(items: list[EvidenceItem], *, resuming: bool = False) -> None:
@@ -908,6 +961,31 @@ def run_asv3_loop(
                 require_sources=profile.requires_sources,
                 verification_call_id=approved_call_id,
                 require_direct_authority=True,
+                scenario=question,
+                require_quotation_checks=True,
+                require_assertion_checks=True,
+                require_determination_checks=profile.requires_sources,
+                require_condition_review=profile.requires_sources,
+                research_state=research_state,
+            )
+        elif result.stop_reason == "model_requested_partial_publication":
+            # Keep the exact candidate; an optional gap must not force a lossy rewrite.
+            final = draft
+            final_review = review_answer(
+                final,
+                research=False,
+                preservation_reference=partial_submission_reference,
+                previous_review=partial_submission_review,
+            )
+            final_gap = publication_gap(
+                final,
+                final_review,
+                harness.view().questions,
+                ledger,
+                require_sources=profile.requires_sources,
+                allow_explicit_gaps=True,
+                verification_call_id=model.last_call_id,
+                require_direct_authority=final_review.status == "supported",
                 scenario=question,
                 require_quotation_checks=True,
                 require_assertion_checks=True,
@@ -1170,9 +1248,11 @@ def run_asv3_loop(
         final_published = True
         if complete:
             publication_stop_reason = "verified_draft_published"
+        elif final_gap is None:
+            publication_stop_reason = "verified_partial_published"
         progress.report(
-            "completed" if complete else "failed",
-            status="completed" if complete else "failed",
+            "completed" if final_gap is None else "failed",
+            status="completed" if final_gap is None else "failed",
         )
         checkpoint(harness.snapshot())
         emitter.emit(Packet(placement=Placement(turn_index=0), obj=SectionEnd()))

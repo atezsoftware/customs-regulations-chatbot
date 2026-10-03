@@ -781,6 +781,7 @@ class ResearchModel:
                 "discover_tools",
                 "read_evidence",
                 "read_research_state",
+                "submit_partial_answer",
                 "wait_researcher",
                 "report_progress",
                 "update_research",

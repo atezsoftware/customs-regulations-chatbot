@@ -49,6 +49,7 @@ class Harness:
         max_context_chars: int = 60000,
         finalize_guard: Callable[[], ToolOutcome | None] | None = None,
         draft_guard: Callable[[str], ToolOutcome | None] | None = None,
+        partial_submission: Callable[[], str | None] | None = None,
         report_terminal: bool = True,
     ) -> None:
         self.request = request
@@ -63,6 +64,7 @@ class Harness:
         self.max_context_chars = max_context_chars
         self.finalize_guard = finalize_guard
         self.draft_guard = draft_guard
+        self.partial_submission = partial_submission
         self.report_terminal = report_terminal
         artifacts = self.context.services.get("artifacts")
         self.artifacts = (
@@ -861,6 +863,15 @@ class Harness:
                         )
                         self._trim_turns()
                     self._save()
+                    partial_answer = (
+                        self.partial_submission() if self.partial_submission else None
+                    )
+                    if isinstance(partial_answer, str) and partial_answer.strip():
+                        # Submission ends research, not source-backed publication checks.
+                        self.last_draft = answer = partial_answer
+                        status = OutcomeStatus.PARTIAL
+                        self.stop_reason = "model_requested_partial_publication"
+                        break
                     if all(
                         call.name in {"wait_researcher", "list_researchers"}
                         for call in decision.calls

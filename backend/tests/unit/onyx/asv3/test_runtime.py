@@ -1107,6 +1107,109 @@ def test_precise_source_condition_gap_does_not_replace_partial_answer_with_failu
     assert len(conditions) == 1
 
 
+@pytest.mark.parametrize("omitted_condition", [False, True])
+def test_model_selected_partial_submission_keeps_exact_candidate_and_source_guards(
+    monkeypatch: pytest.MonkeyPatch, omitted_condition: bool
+) -> None:
+    from onyx.prompts.asv3.research import FINAL_PROMPT
+    from tests.unit.onyx.asv3.test_safe_partial_conditions import partial_case
+
+    if omitted_condition:
+
+        class NoRepairReserveContext(RunContext):
+            def __init__(self, **kwargs: Any) -> None:
+                super().__init__(
+                    budget=SharedBudget(max_decisions=8, final_decision_reserve=5),
+                    **kwargs,
+                )
+
+        monkeypatch.setattr(runtime, "RunContext", NoRepairReserveContext)
+    kwargs, _broker, llm, checkpoints, queue = setup_run(monkeypatch)
+    monkeypatch.setattr(runtime, "complete_condition_review", complete_condition_review)
+    _ledger, _context, case_state, answer, review, condition = partial_case()
+    kwargs["simple_chat_history"] = [
+        ChatMessageSimple(
+            message="\n".join(
+                f"{index + 1}. {question}"
+                for index, question in enumerate(case_state.questions)
+            ),
+            token_count=30,
+            message_type=MessageType.USER,
+        )
+    ]
+    script = list(llm.invoke.side_effect)
+    for call in script[1].choice.message.tool_calls or []:
+        if call.function.name == "update_research":
+            arguments = json.loads(call.function.arguments)
+            arguments["needs"][0]["question_ids"] = ["q0", "q1"]
+            call.function.arguments = json.dumps(arguments)
+    review.need_results = [
+        NeedVerification(
+            need_id="comparison",
+            status="incomplete",
+            evidence_numbers=[1],
+            missing_conditions=list(review.missing_conditions),
+        )
+    ]
+    review.assertion_results[0].witnesses = [
+        AssertionWitness(citation=1, source_quote="Tamir şartları.")
+    ]
+    condition.witness = AssertionWitness(citation=2, source_quote="Tamir şartları.")
+    if omitted_condition:
+        condition.disposition = "omitted"
+        condition.answer_unit_ids = []
+    llm.invoke.side_effect = [
+        *script[:2],
+        response(
+            calls=[
+                (
+                    "submit_partial_answer",
+                    {
+                        "answer": answer,
+                        "reason": "The reference's exact effect cannot be established with the admitted evidence.",
+                    },
+                )
+            ]
+        ),
+        response(review.model_dump_json()),
+        response(
+            SourceConditionAuditResult(
+                examined_citations=[1, 2], conditions=[condition]
+            ).model_dump_json()
+        ),
+    ]
+    runtime.run_asv3_loop(**kwargs)
+    saved = checkpoints[-1]
+    assert llm.invoke.call_count == 5
+    assert saved["last_draft"] == answer
+    assert saved["stop_reason"] == "model_requested_partial_publication"
+    assert saved["publication_status"] == "partial"
+    assert all(
+        call.kwargs["prompt"][0].content != FINAL_PROMPT
+        for call in llm.invoke.call_args_list
+    )
+    verification = request_data(llm.invoke.call_args_list[3].kwargs)
+    assert verification["publication_mode"] == "partial_allowed"
+    assert verification["claim"] == answer
+    emitted = packets(queue)
+    if omitted_condition:
+        assert saved["final_publication_gap"] is not None
+        assert saved["publication_stop_reason"] == "publication_guard_rejected"
+        assert (
+            "The operation is permitted" not in kwargs["state_container"].answer_tokens
+        )
+    else:
+        assert saved["final_publication_gap"] is None
+        assert saved["publication_stop_reason"] == "verified_partial_published"
+        assert "The operation is permitted" in kwargs["state_container"].answer_tokens
+        assert review.missing_conditions[0] in kwargs["state_container"].answer_tokens
+        assert any(isinstance(packet.obj, CitationInfo) for packet in emitted)
+    statuses = [
+        packet.obj.status for packet in emitted if isinstance(packet.obj, ASv3Progress)
+    ]
+    assert statuses[-1] == ("failed" if omitted_condition else "completed")
+
+
 def test_failed_final_verification_preserves_successful_final_original_delivery_without_publication(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
