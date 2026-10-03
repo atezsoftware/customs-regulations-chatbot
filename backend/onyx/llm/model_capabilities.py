@@ -46,26 +46,45 @@ CUSTOM_LITELLM_MODEL_OVERRIDES: dict[str, dict[str, Any]] = {
 }
 
 
-@lru_cache(maxsize=1)  # the copy.deepcopy is expensive, so we cache the result
-def get_model_map() -> dict:
+def _snapshot_model_metadata(value: object) -> object:
+    """Detach each container before traversal of LiteLLM's mutable registry."""
+    if isinstance(value, dict):
+        return {
+            key: _snapshot_model_metadata(item)
+            for key, item in cast(dict[str, object], value).copy().items()
+        }
+    if isinstance(value, list):
+        return [
+            _snapshot_model_metadata(item) for item in cast(list[object], value).copy()
+        ]
+    if isinstance(value, tuple):
+        return tuple(
+            _snapshot_model_metadata(item) for item in cast(tuple[object, ...], value)
+        )
+    return copy.deepcopy(value)
+
+
+@lru_cache(maxsize=1)
+def get_model_map() -> dict[str, dict[str, Any]]:
     import litellm
 
     DIVIDER = "/"
 
-    original_map = cast(dict[str, dict], litellm.model_cost)
-    starting_map = copy.deepcopy(original_map)
-    for key in original_map:
+    starting_map = cast(
+        dict[str, dict[str, Any]], _snapshot_model_metadata(litellm.model_cost)
+    )
+    original_keys = frozenset(starting_map)
+    for key, potential_truncated_value in tuple(starting_map.items()):
         if DIVIDER in key:
             truncated_key = key.split(DIVIDER)[-1]
             # make sure not to overwrite an original key
-            if truncated_key in original_map:
+            if truncated_key in original_keys:
                 continue
 
             # if there are multiple possible matches, choose the most "detailed"
             # one as a heuristic. "detailed" = the description of the model
             # has the most filled out fields.
             existing_truncated_value = starting_map.get(truncated_key)
-            potential_truncated_value = original_map[key]
             if not existing_truncated_value or len(potential_truncated_value) > len(
                 existing_truncated_value
             ):

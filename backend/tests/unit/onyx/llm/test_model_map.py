@@ -1,3 +1,5 @@
+from collections.abc import Callable
+from typing import Any
 from unittest.mock import patch
 
 import litellm
@@ -216,5 +218,61 @@ def test_enrichment_refreshes_cached_capabilities(warm_cache: bool) -> None:
                 == "Friendly model"
             )
             assert litellm_thinks_model_supports_image_input("fictional-model", "proxy")
+        finally:
+            get_model_map.cache_clear()
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_registry_snapshot_does_not_iterate_mutating_litellm_dictionaries(
+    nested: bool,
+) -> None:
+    class RegisterOnCopy:
+        def __init__(self, register: Callable[[], None]) -> None:
+            self.register = register
+
+        def __deepcopy__(self, _memo: dict[int, object]) -> str:
+            self.register()
+            return "registered"
+
+    metadata: dict[str, Any] = {"max_input_tokens": 32000, "supports_vision": True}
+    registry: dict[str, dict[str, Any]] = {"vendor/model": metadata}
+    if nested:
+        pricing: dict[str, Any] = {}
+
+        def register() -> None:
+            pricing["concurrent-registration"] = 3
+
+        pricing.update(base=RegisterOnCopy(register), premium=2)
+        metadata["pricing"] = pricing
+    else:
+
+        def register() -> None:
+            registry["concurrent-registration"] = {"max_input_tokens": 4096}
+
+        metadata["registration"] = RegisterOnCopy(register)
+    with patch.object(litellm, "model_cost", registry):
+        get_model_map.cache_clear()
+        try:
+            result = get_model_map()
+            assert result["vendor/model"]["max_input_tokens"] == 32000
+            assert result["model"]["max_input_tokens"] == 32000
+            assert "concurrent-registration" not in result
+        finally:
+            get_model_map.cache_clear()
+
+
+def test_cached_provider_aliases_do_not_share_mutable_registry_metadata() -> None:
+    registry: dict[str, dict[str, Any]] = {
+        "vendor/model": {"max_input_tokens": 32000, "pricing": {"tiers": [1, 2]}}
+    }
+    with patch.object(litellm, "model_cost", registry):
+        get_model_map.cache_clear()
+        try:
+            result = get_model_map()
+            registry["vendor/model"]["max_input_tokens"] = 64
+            registry["vendor/model"]["pricing"]["tiers"].append(3)
+            assert result["model"]["max_input_tokens"] == 32000
+            assert result["model"]["pricing"]["tiers"] == [1, 2]
+            assert result["vendor/model"]["pricing"]["tiers"] == [1, 2]
         finally:
             get_model_map.cache_clear()
