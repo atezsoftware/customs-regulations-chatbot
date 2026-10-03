@@ -7,19 +7,32 @@ import re
 from collections.abc import Mapping
 from typing import Annotated, Literal, TypedDict
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from onyx.asv3.citation_numbers import extract_citation_numbers
+from onyx.asv3.witnesses import original_witness_text
 
 
 class AssertionWitness(BaseModel):
     model_config = ConfigDict(extra="forbid")
     citation: Annotated[int, Field(strict=True, ge=1)]
     source_quote: str = Field(
-        min_length=1,
+        default="",
         max_length=800,
-        description="A short contiguous verbatim passage copied from this citation's supplied original. Do not paraphrase, concatenate separated clauses or insert ellipses unless they occur literally in the original.",
+        description="Legacy literal witness when no witness catalogue is supplied. Leave empty when selecting witness_id; never paraphrase or insert ellipses.",
     )
+    witness_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=120,
+        description="Select a supplied witness_spans identifier from this citation's original. Do not calculate offsets, invent IDs or recopy its text.",
+    )
+
+    @model_validator(mode="after")
+    def exactly_one_witness(self) -> AssertionWitness:
+        if bool(self.source_quote.strip()) == bool(self.witness_id):
+            raise ValueError("Select exactly one original witness ID or literal quote")
+        return self
 
 
 class AssertionVerification(BaseModel):
@@ -35,10 +48,29 @@ class AssertionVerification(BaseModel):
     witnesses: list[AssertionWitness] = Field(default_factory=list, max_length=32)
     missing_conditions: list[str] = Field(default_factory=list, max_length=16)
     explanation: str = Field(
-        min_length=1,
+        default="",
         max_length=4000,
-        description="One short sentence about this block's decisive support or defect. Put actionable gaps in missing_conditions; avoid repeating the answer or other assessments.",
+        description="Omit for a supported block. For a defect, give one short actionable sentence without repeating the answer or other assessments.",
     )
+
+
+def assertion_witness_valid(
+    witness: AssertionWitness, originals: Mapping[int, str]
+) -> bool:
+    from onyx.asv3.quotations import normalized
+
+    text = originals.get(witness.citation)
+    if text is None:
+        return False
+    if witness.witness_id:
+        return (
+            not witness.source_quote.strip()
+            and original_witness_text(witness.citation, text, witness.witness_id)
+            is not None
+        )
+    return bool(witness.source_quote.strip()) and normalized(
+        witness.source_quote
+    ) in normalized(text)
 
 
 class AssertionUnit(TypedDict):
@@ -97,13 +129,8 @@ def assertion_support_defect(
         unit["evidence_numbers"]
     ):
         return "Each inline citation must have this block's own original witness."
-    if any(
-        w.citation not in originals
-        or not w.source_quote.strip()
-        or normalized(w.source_quote) not in normalized(originals[w.citation])
-        for w in check.witnesses
-    ):
-        return "A source witness is not a contiguous literal passage in its original."
+    if any(not assertion_witness_valid(w, originals) for w in check.witnesses):
+        return "A source witness does not select a catalogued passage or contiguous literal quote in its exact original."
     return None
 
 

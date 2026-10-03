@@ -14,6 +14,7 @@ from onyx.asv3.models import (
     RunStopped,
     model_evidence_metadata,
 )
+from onyx.asv3.witnesses import original_witness_spans
 from onyx.context.search.models import SearchDoc
 
 
@@ -70,6 +71,7 @@ class EvidenceLedger:
         *,
         required: Iterable[int] = (),
         max_chars: int = 180000,
+        include_witness_spans: bool = False,
     ) -> str:
         """Fit full serialized originals, including provenance, without clipping required rules."""
         required_numbers = list(dict.fromkeys(required))
@@ -94,6 +96,10 @@ class EvidenceLedger:
                     "citable": item.search_doc is not None,
                     "metadata": model_evidence_metadata(item.metadata),
                 }
+                if include_witness_spans:
+                    record["witness_spans"] = [
+                        dict(span) for span in original_witness_spans(number, item.text)
+                    ]
                 cost = len(json.dumps(record, ensure_ascii=False)) + (
                     2 if records else 0
                 )

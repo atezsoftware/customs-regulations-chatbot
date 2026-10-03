@@ -11,7 +11,11 @@ from onyx.asv3.assertions import (
     assertion_inventory,
 )
 from onyx.asv3.evidence import EvidenceLedger
-from onyx.asv3.llm_adapter import ResearchModel, VerificationResult
+from onyx.asv3.llm_adapter import (
+    DeterminationVerification,
+    ResearchModel,
+    VerificationResult,
+)
 from onyx.asv3.models import RunContext
 from onyx.asv3.publication import publication_gap
 from onyx.asv3.runtime import _evidence_record
@@ -247,3 +251,40 @@ def test_uncited_background_is_not_required_inline_support() -> None:
     result = ResearchModel(llm, context).invoke_verification("Assess", data)
     assert result.question_results[0].evidence_numbers == [1]
     assert result.safe_to_publish and result.format_error is None
+
+
+@pytest.mark.parametrize("attempt", ["upgrade", "omit"])
+def test_bookkeeping_patch_cannot_erase_a_negative_requested_outcome(
+    attempt: str,
+) -> None:
+    _ledger, context, _answer, data, review = review_fixture(bad_quote=False)
+    review.question_results[0].evidence_numbers = [1, 2]
+    negative = DeterminationVerification(
+        determination_id="q0:d0",
+        status="incomplete",
+        answer_unit_ids=[],
+        evidence_numbers=[],
+        missing_conditions=["The later settlement is unsupported."],
+    )
+    review.question_results[0].determinations = [negative]
+    entry = review.question_results[0].model_copy(deep=True)
+    entry.evidence_numbers = [1]
+    if attempt == "upgrade":
+        entry.determinations[0].status = "supported"
+        entry.determinations[0].missing_conditions = []
+    else:
+        entry.determinations = []
+    patch = {
+        "assertion_results": [],
+        "question_results": [entry.model_dump(mode="json")],
+        "need_results": [],
+    }
+    llm = scripted_model()
+    llm.invoke.side_effect = [
+        text_response(review.model_dump(mode="json")),
+        text_response(patch),
+    ]
+    result = ResearchModel(llm, context).invoke_verification("Assess", data)
+    assert result.question_results[0].determinations == [negative]
+    assert not result.safe_to_publish
+    assert llm.invoke.call_count == 2

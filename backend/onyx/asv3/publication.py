@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from pydantic import JsonValue
 
-from onyx.asv3.assertions import assertion_inventory, assertion_support_defect
+from onyx.asv3.assertions import (
+    assertion_inventory,
+    assertion_support_defect,
+    assertion_witness_valid,
+)
 from onyx.asv3.authority import unresolved_authority_gap
 from onyx.asv3.citation_numbers import extract_citation_numbers
 from onyx.asv3.evidence import EvidenceLedger
@@ -243,6 +247,7 @@ def publication_gap(
                 for part in item.determinations
                 for n in part.evidence_numbers
             }
+            | {item.witness.citation for item in review.omitted_material_source_details}
         ) - ledger.completely_delivered(verification_call_id)
         if missing_delivery:
             reasons.append(
@@ -276,6 +281,28 @@ def publication_gap(
             "Useful original-supported details were lost: "
             + str(review.omitted_supported_details)
         )
+    determination_ids = {
+        item["determination_id"] for item in question_determinations(questions)
+    }
+    for omission in review.omitted_material_source_details:
+        original = ledger.get(omission.witness.citation)
+        if (
+            original is None
+            or omission.witness.citation not in allowed
+            or not assertion_witness_valid(
+                omission.witness, {omission.witness.citation: original.text}
+            )
+            or set(omission.determination_ids) - determination_ids
+            or len(set(omission.determination_ids)) != len(omission.determination_ids)
+        ):
+            reasons.append(
+                "A material-detail assessment has an invalid original witness or requested determination identity; correct the assessment against retained originals."
+            )
+        else:
+            reasons.append(
+                "An applicable detail is present in the supplied original but absent from the answer: "
+                + omission.detail
+            )
     if research_state is not None:
         if research_state.require_need_bindings:
             uncovered = research_state.uncovered_questions()
@@ -363,7 +390,17 @@ def publication_gap(
             **(
                 {"determination_gaps": determination_gaps} if determination_gaps else {}
             ),
+            **(
+                {
+                    "omitted_material_source_details": [
+                        item.model_dump(mode="json")
+                        for item in review.omitted_material_source_details
+                    ]
+                }
+                if review.omitted_material_source_details
+                else {}
+            ),
             "review": review.model_dump(mode="json"),
-            "instruction": "A found source may need delivery or complete reading, not another search. Choose methods yourself. Do not substitute general legal knowledge.",
+            "instruction": "A found source may need delivery or complete reading, not another search. Source-bound omissions require a targeted answer edit using the supplied original; do not search again for text already delivered. Choose methods yourself. Do not substitute general legal knowledge.",
         },
     )

@@ -861,7 +861,11 @@ def test_invalid_review_after_repair_returns_unapproved_format_failure() -> None
     contradictory["safe_to_publish"] = True
     contradictory["unsupported_claims"] = ["An assertion has no original support"]
     contradictory.update(
-        question_results=[], need_results=[], assertion_results=[], quotation_checks=[]
+        question_results=[],
+        need_results=[],
+        assertion_results=[],
+        quotation_checks=[],
+        omitted_material_source_details=[],
     )
     llm.invoke.side_effect = [
         text_response({"assertion_results": []}),
@@ -926,6 +930,7 @@ def test_publication_review_requires_explicit_assessment_arrays_in_provider_sche
         ],
         "need_results": [],
         "quotation_checks": [],
+        "omitted_material_source_details": [],
     }
     llm.invoke.side_effect = [
         text_response(verification_profile()),
@@ -951,6 +956,7 @@ def test_publication_review_requires_explicit_assessment_arrays_in_provider_sche
         "need_results",
         "assertion_results",
         "quotation_checks",
+        "omitted_material_source_details",
     } <= set(native["required"])
     assert llm.invoke.call_count == 2
     repair_prompt = llm.invoke.call_args_list[1].kwargs["prompt"]
@@ -1064,6 +1070,7 @@ def test_parameter_envelope_preserves_negative_review_without_format_repair(
         need_results=[],
         assertion_results=[],
         quotation_checks=[],
+        omitted_material_source_details=[],
     )
     envelope = {"parameter": review}
     llm.invoke.return_value = (

@@ -36,6 +36,7 @@ def test_uncertain_negative_assessment_retains_full_explanation_without_repair()
                 "explanation": explanation,
             }
         ],
+        "omitted_material_source_details": [],
         "quotation_checks": [
             {
                 "term_id": "qt0",

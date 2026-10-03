@@ -117,6 +117,7 @@ def supported_review(
                     }
                 ],
                 "quotation_checks": [],
+                "omitted_material_source_details": [],
                 "assertion_results": [
                     {
                         "unit_id": unit["unit_id"],
@@ -193,6 +194,7 @@ def unsafe_review(claim: str, question_count: int = 1) -> ModelResponse:
                 ],
                 "quotation_checks": [],
                 "assertion_results": [],
+                "omitted_material_source_details": [],
                 "question_results": [
                     {
                         "question_id": f"q{index}",
@@ -570,7 +572,25 @@ def test_runtime_parallel_sources_full_original_review_and_final_citations(
         scheduled = next(scripted)
         if current == 3:
             data = request_data(arguments)
-            return supported_review([1, 2], draft=data["claim"])
+            with queue.mutex:
+                updates = [
+                    packet.obj
+                    for _, packet in queue.queue
+                    if isinstance(packet.obj, ASv3Progress)
+                ]
+            assert updates[-1].phase == "final" and updates[-1].language == "tr"
+            originals = {row["citation"]: row for row in json.loads(data["evidence"])}
+            review = json.loads(
+                supported_review([1, 2], draft=data["claim"]).choice.message.content
+            )
+            for item in review["assertion_results"]:
+                item.pop("explanation")
+                for witness in item["witnesses"]:
+                    witness.pop("source_quote")
+                    witness["witness_id"] = originals[witness["citation"]][
+                        "witness_spans"
+                    ][0]["witness_id"]
+            return response(json.dumps(review))
         if current not in (2, 4):
             return scheduled
         evidence = request_data(arguments)["evidence"]
@@ -968,6 +988,7 @@ def test_runtime_recovers_uncited_governing_source_without_losing_special_proced
                     ],
                     "quotation_checks": [],
                     "assertion_results": [],
+                    "omitted_material_source_details": [],
                     "required_conditions": [],
                     "missing_conditions": ["kanuni dayanağın özgün hükmü ve atfı"],
                     "evidence_numbers": [citations["genelge"]],

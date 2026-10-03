@@ -117,8 +117,9 @@ failed, cancelled, interrupted, resume, native_citation keys. Each value is [sho
 question's requested language. Make them specific to this user's topic: what source,
 condition, time limit or alternative is being checked. Never mention tool names,
 functions, file paths, SQL, code, model internals or reasoning. Do not assert unverified
-findings or pretend a particular document has already been read. 'final' means preparing
-the answer, 'completed' means answer ready, 'failed' means the research remains incomplete.
+findings or pretend a particular document has already been read. 'final' means checking
+the proposed answer's conditions and source support while preparing it; do not claim the
+check has passed. 'completed' means answer ready, 'failed' means the research remains incomplete.
 'failed' and 'interrupted' must state that research could not be completed, without
 inventing a technical cause, timeout, provider failure or any diagnosis not in this input.
 'resume' offers to continue research,
@@ -133,6 +134,7 @@ def _evidence_record(
     max_chars: int = 180000,
     *,
     preferred_numbers: list[int] | None = None,
+    include_witness_spans: bool = False,
 ) -> str:
     numbers = list(extract_citation_numbers(draft))
     required = tuple(n for n in numbers if ledger.get(n) is not None)
@@ -152,7 +154,12 @@ def _evidence_record(
         numbers = [
             n for item in ledger.summaries() if isinstance(n := item["citation"], int)
         ]
-    return ledger.serialize_records(numbers, required=required, max_chars=max_chars)
+    return ledger.serialize_records(
+        numbers,
+        required=required,
+        max_chars=max_chars,
+        include_witness_spans=include_witness_spans,
+    )
 
 
 @_trace_asv3
@@ -566,12 +573,14 @@ def run_asv3_loop(
         if harness is None:
             raise RuntimeError("Research state is not ready for verification")
         view = harness.view()
+        progress.report("final")
         assertion_units = assertion_inventory(draft)
         evidence = _evidence_record(
             ledger,
             draft + ("\n" + preservation_reference if preservation_reference else ""),
             max_chars=max(8000, min(180000, (llm.config.max_input_tokens - 18000) * 2)),
             preferred_numbers=research_state.preferred_citations(),
+            include_witness_spans=True,
         )
         if research:
             context.consume_research_decision()
