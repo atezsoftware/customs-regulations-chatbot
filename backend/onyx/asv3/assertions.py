@@ -83,7 +83,10 @@ class AssertionUnit(TypedDict):
 def presentation_block(text: str) -> bool:
     """Recognize structure, not whether a heading's content is legally true."""
     return all(
-        re.fullmatch(r"\s*(?:#{1,6}\s+.+|(?:[-*_]\s*){3,}|\*\*[^*]+:\*\*)\s*", line)
+        re.fullmatch(
+            r"\s*(?:#{1,6}\s+.+|(?:[-*_]\s*){3,}|(?:[-*+]\s+|\d+[.)]\s+)?\*\*[^*]+:\*\*)\s*",
+            line,
+        )
         for line in text.splitlines()
     )
 

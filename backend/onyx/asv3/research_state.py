@@ -6,10 +6,11 @@ import hashlib
 import json
 import threading
 from collections import OrderedDict
-from typing import Annotated, Literal
+from typing import Annotated, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
+from onyx.asv3.condition_memory import SourceConditionMemory
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.models import OutcomeStatus, RunContext, ToolOutcome, ToolSpec
 from onyx.asv3.scenario import question_determinations
@@ -86,6 +87,9 @@ class ResearchState:
             json.dumps(context.scope, sort_keys=True).encode()
         ).hexdigest()
         self.questions = tuple(questions)
+        self.source_conditions = SourceConditionMemory(
+            self.run_id, self.scope_hash, questions
+        )
         self.require_need_bindings = require_need_bindings
         self._lock = threading.RLock()
         self._needs: OrderedDict[str, ResearchNeed] = OrderedDict()
@@ -237,16 +241,21 @@ class ResearchState:
             ]
             return list(
                 dict.fromkeys(
-                    n
-                    for key in dict.fromkeys(ordered)
-                    for n in [
+                    [
+                        *self.source_conditions.citations(),
                         *(
-                            w.citation
-                            for f in self._findings.values()
-                            if f.need_id == key
-                            for w in f.witnesses
+                            n
+                            for key in dict.fromkeys(ordered)
+                            for n in [
+                                *(
+                                    w.citation
+                                    for f in self._findings.values()
+                                    if f.need_id == key
+                                    for w in f.witnesses
+                                ),
+                                *self._needs[key].evidence_numbers,
+                            ]
                         ),
-                        *self._needs[key].evidence_numbers,
                     ]
                 )
             )
@@ -262,10 +271,16 @@ class ResearchState:
                 ],
                 "active_need_ids": list(self._active),
                 "determinations": [
-                    dict(item) for item in question_determinations(list(self.questions))
+                    cast(dict[str, JsonValue], dict(item))
+                    for item in question_determinations(list(self.questions))
                 ],
                 "needs": [],
                 "findings": [],
+                "source_conditions": [],
+                "source_conditions_omitted": 0,
+                "needs_omitted": 0,
+                "findings_omitted": 0,
+                "reopen": "inspect_research with a larger max_chars; originals use global citation numbers",
                 "notice": "Findings are source-bound candidates, not verified law. Original witnesses must be delivered and evaluated before publication.",
             }
             order = list(dict.fromkeys([*self._active, *self._needs]))
@@ -273,19 +288,26 @@ class ResearchState:
             finding_rows = [
                 f for key in order for f in self._findings.values() if f.need_id == key
             ]
-            for field, rows in (("needs", need_rows), ("findings", finding_rows)):
+            # Requirements survive context pressure ahead of descriptive findings.
+            condition_rows = self.source_conditions.required_conditions()
+            for field, rows in (
+                ("source_conditions", condition_rows),
+                ("needs", need_rows),
+                ("findings", finding_rows),
+            ):
                 selected: list[JsonValue] = []
                 for row in rows:
-                    candidate = row.model_dump(mode="json")
+                    candidate = (
+                        row.model_dump(mode="json")
+                        if isinstance(row, (ResearchNeed, ResearchFinding))
+                        else row
+                    )
                     trial = {**result, field: [*selected, candidate]}
                     if len(json.dumps(trial, ensure_ascii=False)) > max_chars:
                         break
                     selected.append(candidate)
                 result[field] = selected
                 result[field + "_omitted"] = len(rows) - len(selected)
-            result["reopen"] = (
-                "inspect_research with a larger max_chars; originals use global citation numbers"
-            )
             return result
 
     def export(self) -> dict[str, JsonValue]:
@@ -301,6 +323,7 @@ class ResearchState:
                     f.model_dump(mode="json") for f in self._findings.values()
                 ],
                 "active_need_ids": list(self._active),
+                "source_conditions": self.source_conditions.export(),
             }
 
     def restore(self, data: dict[str, JsonValue], ledger: EvidenceLedger) -> None:
@@ -324,6 +347,9 @@ class ResearchState:
             ledger,
         )
         self.revision = revision
+        conditions = data.get("source_conditions")
+        if isinstance(conditions, dict):
+            self.source_conditions.restore(conditions, ledger)
 
 
 class EvidenceWorkingSet:

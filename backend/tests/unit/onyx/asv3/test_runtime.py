@@ -13,9 +13,10 @@ from uuid import uuid4
 import pytest
 
 from onyx.asv3 import runtime
-from onyx.asv3.assertions import assertion_inventory
+from onyx.asv3.assertions import AssertionWitness, assertion_inventory
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.llm_adapter import (
+    NeedVerification,
     ResearchModel,
     SourceConditionAuditResult,
     VerificationResult,
@@ -439,17 +440,20 @@ def scripted_condition_review(
 
 
 @pytest.mark.parametrize("provider", ["vertex_ai", "openai", "anthropic"])
+@pytest.mark.parametrize("forget_previous", [False, True])
 def test_source_condition_audit_repair_preserves_sources_and_selected_provider(
     monkeypatch: pytest.MonkeyPatch,
     provider: str,
+    forget_previous: bool,
 ) -> None:
     kwargs, broker, llm, checkpoints, queue = setup_run(monkeypatch)
     monkeypatch.setattr(runtime, "complete_condition_review", complete_condition_review)
     llm.config.model_provider = provider
-    source_id = str(broker.sources[0].id)
-    broker.chunks[source_id] = replace(
-        broker.chunks[source_id], text="Tamir şartları. Onaylı belge sunulmalıdır."
-    )
+    # Parallel reads assign global citations on arrival, not source-list order.
+    for source_id, chunk in broker.chunks.items():
+        broker.chunks[source_id] = replace(
+            chunk, text=chunk.text + " Onaylı belge sunulmalıdır."
+        )
     script = list(llm.invoke.side_effect)
     draft = "Tamir [1], değiştirme [2]."
     final = "Tamir [1], değiştirme [2]. Onaylı belge sunulmalıdır [1]."
@@ -478,16 +482,29 @@ def test_source_condition_audit_repair_preserves_sources_and_selected_provider(
             )
         )
 
+    forgotten = "Tamir muafiyeti [1], değiştirme rejimi [2]."
+    forgotten_review = (
+        [
+            response(forgotten),
+            supported_review([1, 2], draft=forgotten),
+            response(json.dumps({"examined_citations": [1, 2], "conditions": []})),
+            response(json.dumps({"examined_citations": [1, 2], "conditions": []})),
+        ]
+        if forget_previous
+        else []
+    )
     llm.invoke.side_effect = [
         *script[:3],
         supported_review([1, 2], draft=draft),
         audit(draft, True),
+        *forgotten_review,
         response(final),
         supported_review([1, 2], draft=final),
         audit(final, False),
     ]
     runtime.run_asv3_loop(**kwargs)
-    assert llm.invoke.call_count == 8
+    assert checkpoints[-1]["last_draft"] == final
+    assert llm.invoke.call_count == (12 if forget_previous else 8)
     repair = request_data(llm.invoke.call_args_list[5].kwargs)
     assert repair["draft_to_repair"] == draft
     assert (
@@ -995,6 +1012,74 @@ def test_explicit_unresolved_question_does_not_become_complete_after_finalizatio
     assert checkpoints[-1]["publication_stop_reason"] != "verified_draft_published"
 
 
+def test_precise_source_condition_gap_does_not_replace_partial_answer_with_failure_notice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tests.unit.onyx.asv3.test_safe_partial_conditions import partial_case
+
+    class FinalOnlyContext(RunContext):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(
+                budget=SharedBudget(max_decisions=5, final_decision_reserve=3),
+                **kwargs,
+            )
+
+    monkeypatch.setattr(runtime, "RunContext", FinalOnlyContext)
+    kwargs, _broker, llm, checkpoints, queue = setup_run(monkeypatch)
+    monkeypatch.setattr(runtime, "complete_condition_review", complete_condition_review)
+    _ledger, _context, case_state, answer, review, condition = partial_case()
+    request = "\n".join(
+        f"{index + 1}. {question}"
+        for index, question in enumerate(case_state.questions)
+    )
+    kwargs["simple_chat_history"] = [
+        ChatMessageSimple(
+            message=request, token_count=30, message_type=MessageType.USER
+        )
+    ]
+    script = list(llm.invoke.side_effect)
+    tool_response = script[1]
+    assert isinstance(tool_response, ModelResponse)
+    for call in tool_response.choice.message.tool_calls or []:
+        if call.function.name == "update_research":
+            arguments = json.loads(call.function.arguments)
+            arguments["needs"][0]["question_ids"] = ["q0", "q1"]
+            call.function.arguments = json.dumps(arguments)
+    review.need_results = [
+        NeedVerification(
+            need_id="comparison",
+            status="incomplete",
+            evidence_numbers=[1],
+            missing_conditions=list(review.missing_conditions),
+        )
+    ]
+    review.assertion_results[0].witnesses = [
+        AssertionWitness(citation=1, source_quote="Tamir şartları.")
+    ]
+    condition.witness = AssertionWitness(citation=2, source_quote="Tamir şartları.")
+    llm.invoke.side_effect = [
+        *script[:2],
+        response(answer),
+        response(review.model_dump_json()),
+        response(
+            SourceConditionAuditResult(
+                examined_citations=[1, 2], conditions=[condition]
+            ).model_dump_json()
+        ),
+    ]
+    runtime.run_asv3_loop(**kwargs)
+    saved = checkpoints[-1]
+    assert llm.invoke.call_count == 5
+    assert saved["publication_status"] == "partial"
+    assert saved["publication_stop_reason"] != "publication_guard_rejected"
+    assert saved["final_publication_gap"] is None
+    assert "The operation is permitted" in kwargs["state_container"].answer_tokens
+    assert review.missing_conditions[0] in kwargs["state_container"].answer_tokens
+    assert any(isinstance(packet.obj, CitationInfo) for packet in packets(queue))
+    conditions = saved["research_state"]["source_conditions"]["conditions"]
+    assert len(conditions) == 1
+
+
 def test_failed_final_verification_preserves_successful_final_original_delivery_without_publication(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1487,19 +1572,19 @@ def test_runtime_incident_2888_zero_evidence_never_publishes_legal_memory(
     runtime.run_asv3_loop(**kwargs)
     final_checkpoint = checkpoints[-1]
     receipts = final_checkpoint["receipts"]
-    assert [item["call"]["name"] for item in receipts[:6]] == [
+    assert [item["call"]["name"] for item in receipts[:2]] == [
         "update_research",
         "record_scenario",
-        *failures,
     ]
-    assert [item["outcome"]["status"] for item in receipts[:6]] == [
+    assert [item["outcome"]["status"] for item in receipts[:2]] == [
         "found",
         "found",
-        "unavailable",
-        "unavailable",
-        "invalid",
-        "unavailable",
     ]
+    # Independent tool receipts arrive in completion order.
+    assert len(receipts[2:6]) == 4
+    assert {
+        item["call"]["name"]: item["outcome"]["status"] for item in receipts[2:6]
+    } == {name: outcome.status.value for name, outcome in failures.items()}
     assert sum(item["call"]["name"] == "finalization_status" for item in receipts) == 3
     assert final_checkpoint["evidence"]["records"] == []
     assert final_checkpoint["publication_status"] == "partial"

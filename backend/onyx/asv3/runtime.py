@@ -15,7 +15,7 @@ from uuid import UUID
 
 from pydantic import JsonValue
 
-from onyx.asv3.assertions import assertion_inventory
+from onyx.asv3.assertions import assertion_inventory, assertion_witness_valid
 from onyx.asv3.authority import authority_obligations, unresolved_authority_gap
 from onyx.asv3.citation_numbers import extract_citation_numbers
 from onyx.asv3.corpus_tools import CorpusBroker, build_corpus_specs
@@ -42,7 +42,7 @@ from onyx.asv3.quotations import unmatched_quoted_terms
 from onyx.asv3.registry import CapabilityRegistry, build_core_specs
 from onyx.asv3.research_state import ResearchState, build_research_specs
 from onyx.asv3.sandbox import build_sandbox_specs
-from onyx.asv3.scenario import initial_questions
+from onyx.asv3.scenario import initial_questions, question_determinations
 from onyx.asv3.search_adapter import build_search_adapter
 from onyx.asv3.source_conditions import complete_condition_review
 from onyx.asv3.source_tools import build_source_specs
@@ -137,9 +137,15 @@ def _evidence_record(
     preferred_numbers: list[int] | None = None,
     include_witness_spans: bool = False,
     include_supplemental_originals: bool = False,
+    required_numbers: list[int] | None = None,
 ) -> str:
     numbers = list(extract_citation_numbers(draft))
-    required = tuple(n for n in numbers if ledger.get(n) is not None)
+    required = tuple(
+        n
+        for n in dict.fromkeys([*numbers, *(required_numbers or [])])
+        if ledger.get(n) is not None
+    )
+    numbers = list(required)
     if preferred_numbers:
         numbers = list(dict.fromkeys([*required, *preferred_numbers]))
     elif numbers:
@@ -586,6 +592,7 @@ def run_asv3_loop(
             preferred_numbers=research_state.preferred_citations(),
             include_witness_spans=True,
             include_supplemental_originals=True,
+            required_numbers=research_state.source_conditions.citations(),
         )
         if research:
             context.consume_research_decision()
@@ -631,6 +638,25 @@ def run_asv3_loop(
             consume_budget=not research,
         )
         if profile.requires_sources:
+            if latest_review.format_error is None and model.last_call_id:
+                delivered = ledger.completely_delivered(model.last_call_id)
+                determinations = {
+                    row["determination_id"]
+                    for row in question_determinations(view.questions)
+                }
+                research_state.source_conditions.remember(
+                    [
+                        item
+                        for item in latest_review.omitted_material_source_details
+                        if item.witness.citation in delivered
+                        and not (set(item.determination_ids) - determinations)
+                        and (original := ledger.get(item.witness.citation)) is not None
+                        and assertion_witness_valid(
+                            item.witness, {item.witness.citation: original.text}
+                        )
+                    ],
+                    ledger,
+                )
             latest_review = latest_review.model_copy(
                 update={
                     "condition_review": None,
@@ -665,6 +691,8 @@ def run_asv3_loop(
                     evidence=evidence,
                     language=context.language,
                     consume_budget=not research,
+                    condition_memory=research_state.source_conditions,
+                    allow_explicit_gaps=not research,
                 )
         checkpoint(harness.snapshot())
         return latest_review
@@ -888,6 +916,7 @@ def run_asv3_loop(
                     8000, min(180000, (llm.config.max_input_tokens - 18000) * 2)
                 ),
                 preferred_numbers=research_state.preferred_citations(),
+                required_numbers=research_state.source_conditions.citations(),
             )
             final = model.invoke_text(
                 FINAL_PROMPT,
@@ -997,6 +1026,7 @@ def run_asv3_loop(
                                     ledger,
                                     draft,
                                     preferred_numbers=research_state.preferred_citations(),
+                                    required_numbers=research_state.source_conditions.citations(),
                                 ),
                                 "research_status": "incomplete",
                                 "assistant_instructions": custom_agent_prompt or "",

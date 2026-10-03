@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 from pydantic import JsonValue
 
 from onyx.asv3.assertions import (
@@ -21,6 +23,7 @@ from onyx.asv3.source_conditions import (
     answer_hash,
     condition_omissions,
     condition_review_defects,
+    disclosed_condition_gaps,
 )
 
 
@@ -31,7 +34,7 @@ def question_inventory(questions: list[str]) -> list[dict[str, JsonValue]]:
             "question_id": f"q{index}",
             "question": text,
             "determinations": [
-                dict(item)
+                cast(dict[str, JsonValue], dict(item))
                 for item in determinations
                 if item["question_id"] == f"q{index}"
             ],
@@ -73,11 +76,12 @@ def determination_support_gaps(
                 }
             )
         for item in expected:
+            json_item = cast(dict[str, JsonValue], dict(item))
             assessed = by_id.get(item["determination_id"])
             if assessed is None:
                 determination_gaps.append(
                     {
-                        **item,
+                        **json_item,
                         "defect": "This requested determination was not assessed.",
                     }
                 )
@@ -90,7 +94,7 @@ def determination_support_gaps(
                 ):
                     continue
                 determination_gaps.append(
-                    {**item, "assessment": assessed.model_dump(mode="json")}
+                    {**json_item, "assessment": assessed.model_dump(mode="json")}
                 )
                 continue
             bound_units = [units_by_id.get(key) for key in assessed.answer_unit_ids]
@@ -116,7 +120,7 @@ def determination_support_gaps(
             ):
                 determination_gaps.append(
                     {
-                        **item,
+                        **json_item,
                         "assessment": assessed.model_dump(mode="json"),
                         "defect": "Support must come from the assessed answer blocks addressing this determination, not another answer in the same question.",
                     }
@@ -183,7 +187,7 @@ def publication_gap(
             if defect:
                 assertion_gaps.append(
                     {
-                        **unit,
+                        **cast(dict[str, JsonValue], dict(unit)),
                         "defect": defect,
                         "assessment": check.model_dump(mode="json") if check else None,
                     }
@@ -207,9 +211,24 @@ def publication_gap(
         reasons.append(
             "Independent outcomes and alternatives inside numbered questions need their own assessed answer support."
         )
+    authority_answer = answer
+    if allow_explicit_gaps and require_assertion_checks:
+        checks = {item.unit_id: item for item in review.assertion_results}
+        authority_answer = "\n\n".join(
+            unit["text"]
+            for unit in assertion_inventory(answer)
+            if (check := checks.get(unit["unit_id"])) is not None
+            and check.basis == "original"
+            and check.status == "supported"
+            and not check.missing_conditions
+        )
     authority_gap = (
-        unresolved_authority_gap(answer, ledger)
-        if require_sources and require_direct_authority
+        unresolved_authority_gap(authority_answer, ledger)
+        if require_sources
+        and (
+            require_direct_authority
+            or (allow_explicit_gaps and require_assertion_checks)
+        )
         else None
     )
     if authority_gap is not None:
@@ -242,14 +261,27 @@ def publication_gap(
     allowed = ledger.citation_mapping()
     condition_defects: list[str] = []
     condition_delivery: set[int] = set()
+    condition_audit = review.condition_review
     if review.condition_review is not None:
+        assert condition_audit is not None
+        if research_state is not None:
+            condition_audit, retention_defects = (
+                research_state.source_conditions.materialize(
+                    review.condition_review, ledger
+                )
+            )
+            condition_defects.extend(retention_defects)
+        elif condition_audit.resolutions:
+            condition_defects.append(
+                "Retained-condition resolutions require their request-bound state."
+            )
         if review.condition_review_answer_hash != answer_hash(answer):
             condition_defects.append(
                 "Source-condition assessment belongs to a different draft."
             )
         condition_defects.extend(
             condition_review_defects(
-                review.condition_review,
+                condition_audit,
                 answer,
                 scenario,
                 questions,
@@ -261,16 +293,21 @@ def publication_gap(
             condition_delivery = ledger.completely_delivered(
                 review.condition_review_call_id
             )
-            if condition_omissions(review.condition_review, answer):
+            if condition_omissions(condition_audit, answer):
                 reasons.append(
                     "Independent original review found applicable conditions missing from the answer; correct the retained-source details before publishing."
                 )
+            disclosed: set[int] = (
+                disclosed_condition_gaps(condition_audit, review, answer)
+                if allow_explicit_gaps
+                else set()
+            )
             if any(
-                item.disposition == "uncertain"
-                for item in review.condition_review.conditions
+                item.disposition == "uncertain" and index not in disclosed
+                for index, item in enumerate(condition_audit.conditions)
             ):
                 reasons.append(
-                    "The applicability or interaction of a material original condition remains uncertain; resolve that exact issue rather than asserting it as a missing requirement."
+                    "A material original condition remains uncertain without a precise, assessed disclosure bound to its requested outcome; resolve that exact issue or disclose it in a safe partial answer."
                 )
     elif (
         require_sources
@@ -367,7 +404,7 @@ def publication_gap(
                 )
         state = research_state.export()
         needs = state.get("needs", [])
-        material = (
+        material: set[str] = (
             {
                 str(row["need_id"])
                 for row in needs
@@ -436,45 +473,50 @@ def publication_gap(
     return ToolOutcome(
         status=OutcomeStatus.PARTIAL,
         summary="Evidence-backed finalization is incomplete; choose a useful next action or report the exact gap.",
-        data={
-            "gaps": reasons,
-            **({"missing": authority_gap["missing"]} if authority_gap else {}),
-            **({"unmatched_quoted_terms": quote_gaps} if quote_gaps else {}),
-            **({"assertion_gaps": assertion_gaps} if assertion_gaps else {}),
-            **(
-                {"condition_review_defects": condition_defects}
-                if condition_defects
-                else {}
-            ),
-            **(
-                {
-                    "source_condition_gaps": [
-                        item.model_dump(mode="json")
-                        for item in review.condition_review.conditions
-                        if item.disposition in {"omitted", "uncertain"}
-                    ]
-                }
-                if review.condition_review
-                and any(
-                    item.disposition in {"omitted", "uncertain"}
-                    for item in review.condition_review.conditions
-                )
-                else {}
-            ),
-            **(
-                {"determination_gaps": determination_gaps} if determination_gaps else {}
-            ),
-            **(
-                {
-                    "omitted_material_source_details": [
-                        item.model_dump(mode="json")
-                        for item in review.omitted_material_source_details
-                    ]
-                }
-                if review.omitted_material_source_details
-                else {}
-            ),
-            "review": review.model_dump(mode="json"),
-            "instruction": "A found source may need delivery or complete reading, not another search. Source-bound omissions require a targeted answer edit using the supplied original; do not search again for text already delivered. Choose methods yourself. Do not substitute general legal knowledge.",
-        },
+        data=cast(
+            dict[str, JsonValue],
+            {
+                "gaps": reasons,
+                **({"missing": authority_gap["missing"]} if authority_gap else {}),
+                **({"unmatched_quoted_terms": quote_gaps} if quote_gaps else {}),
+                **({"assertion_gaps": assertion_gaps} if assertion_gaps else {}),
+                **(
+                    {"condition_review_defects": condition_defects}
+                    if condition_defects
+                    else {}
+                ),
+                **(
+                    {
+                        "source_condition_gaps": [
+                            item.model_dump(mode="json")
+                            for item in condition_audit.conditions
+                            if item.disposition in {"omitted", "uncertain"}
+                        ]
+                    }
+                    if condition_audit
+                    and any(
+                        item.disposition in {"omitted", "uncertain"}
+                        for item in condition_audit.conditions
+                    )
+                    else {}
+                ),
+                **(
+                    {"determination_gaps": determination_gaps}
+                    if determination_gaps
+                    else {}
+                ),
+                **(
+                    {
+                        "omitted_material_source_details": [
+                            item.model_dump(mode="json")
+                            for item in review.omitted_material_source_details
+                        ]
+                    }
+                    if review.omitted_material_source_details
+                    else {}
+                ),
+                "review": review.model_dump(mode="json"),
+                "instruction": "A found source may need delivery or complete reading, not another search. Source-bound omissions require a targeted answer edit using the supplied original; do not search again for text already delivered. Choose methods yourself. Do not substitute general legal knowledge.",
+            },
+        ),
     )

@@ -9,7 +9,7 @@ import random
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from typing import Annotated, Literal
+from typing import Annotated, Literal, cast
 
 import jsonschema
 from pydantic import BaseModel, Field, JsonValue, model_validator
@@ -140,10 +140,27 @@ class SourceConditionCheck(MaterialSourceOmission):
     scenario_quotes: list[str] = Field(default_factory=list, max_length=6)
 
 
+class SourceConditionResolution(BaseModel):
+    model_config = {"extra": "forbid"}
+    condition_id: str = Field(min_length=1, max_length=80)
+    disposition: Literal["covered", "omitted", "not_applicable", "uncertain"]
+    answer_unit_ids: list[str] = Field(default_factory=list, max_length=32)
+    scenario_quotes: list[str] = Field(default_factory=list, max_length=6)
+    witness: AssertionWitness | None = Field(
+        default=None,
+        description="Select a delivered operative original when further research resolved an earlier reference/uncertainty. Null reuses the retained original witness; the retained requirement itself cannot be changed.",
+    )
+
+
 class SourceConditionAuditResult(BaseModel):
     model_config = {"extra": "forbid"}
     examined_citations: list[Annotated[int, Field(strict=True, ge=1)]]
-    conditions: list[SourceConditionCheck] = Field(max_length=64)
+    conditions: list[SourceConditionCheck] = Field(max_length=256)
+    resolutions: list[SourceConditionResolution] = Field(
+        default_factory=list,
+        max_length=256,
+        description="Assess each supplied retained condition_id against this exact answer. An absent resolution does not close a previously identified requirement. New conditions belong in conditions.",
+    )
 
 
 class VerificationResult(BaseModel):
@@ -240,7 +257,7 @@ class PublicationAssessmentPatch(BaseModel):
 def assessment_contract_defects(
     data: str, review: VerificationResult
 ) -> dict[str, list[str]]:
-    """Locate invalid positive assessment witnesses, without interpreting law."""
+    """Locate inconsistent assessment bindings, without interpreting law."""
     try:
         payload = parse_json_object(data)
     except ValueError:
@@ -251,30 +268,33 @@ def assessment_contract_defects(
     originals = payload.get("evidence")
     if isinstance(originals, str):
         try:
-            originals = json.loads(originals)
+            originals = cast(JsonValue, json.loads(originals))
         except ValueError:
             return {}
     if not isinstance(originals, list):
         return {}
-    texts = {
-        row["citation"]: row["text"]
-        for row in originals
-        if isinstance(row, dict)
-        and isinstance(row.get("citation"), int)
-        and isinstance(row.get("text"), str)
-        and not row.get("truncated")
-    }
+    texts: dict[int, str] = {}
+    for row in originals:
+        if isinstance(row, dict):
+            number, text = row.get("citation"), row.get("text")
+            if (
+                type(number) is int
+                and isinstance(text, str)
+                and not row.get("truncated")
+            ):
+                texts[number] = text
     cited = set(extract_citation_numbers(str(payload.get("claim", ""))))
     if cited - texts.keys():
         # Missing originals need source recovery, not assessment bookkeeping repair.
         return {}
-    expected = {
-        row["unit_id"]: set(row["evidence_numbers"])
-        for row in units
-        if isinstance(row, dict)
-        and isinstance(row.get("unit_id"), str)
-        and isinstance(row.get("evidence_numbers"), list)
-    }
+    expected: dict[str, set[int]] = {}
+    for row in units:
+        if isinstance(row, dict):
+            identity, numbers = row.get("unit_id"), row.get("evidence_numbers")
+            if isinstance(identity, str) and isinstance(numbers, list):
+                expected[identity] = {
+                    number for number in numbers if type(number) is int
+                }
     invalid = [
         item.unit_id
         for item in review.assertion_results
@@ -287,17 +307,39 @@ def assessment_contract_defects(
             or any(not assertion_witness_valid(w, texts) for w in item.witnesses)
         )
     ]
+    invalid.extend(
+        item.unit_id
+        for item in review.assertion_results
+        if item.basis == "evidence_gap"
+        and item.unit_id in expected
+        and (
+            item.status != "uncertain"
+            or not item.missing_conditions
+            or item.witnesses
+            or item.scenario_quotes
+            or expected[item.unit_id]
+        )
+    )
     defects = {
         "assertion_results": invalid,
         "question_results": [
             item.question_id
             for item in review.question_results
-            if item.status == "supported" and set(item.evidence_numbers) - cited
+            if item.status == "supported"
+            and (
+                set(item.evidence_numbers) - cited
+                or item.missing_conditions
+                or any(
+                    part.status == "supported" and part.missing_conditions
+                    for part in item.determinations
+                )
+            )
         ],
         "need_results": [
             item.need_id
             for item in review.need_results
-            if item.status == "supported" and set(item.evidence_numbers) - cited
+            if item.status == "supported"
+            and (set(item.evidence_numbers) - cited or item.missing_conditions)
         ],
     }
     return defects if any(defects.values()) else {}
@@ -1105,15 +1147,18 @@ class ResearchModel:
         if not defects:
             return review
         payload = parse_json_object(data)
-        payload["assessment_contract_repair"] = {
-            "required_ids": defects,
-            "previous_assessment": review.model_dump(mode="json"),
-        }
+        payload["assessment_contract_repair"] = cast(
+            dict[str, JsonValue],
+            {
+                "required_ids": defects,
+                "previous_assessment": review.model_dump(mode="json"),
+            },
+        )
         try:
             if not consume_budget:
                 self.context.consume_research_decision()
             patch_text = self.invoke_text(
-                "Repair ONLY the supplied positive assessment entries whose source-witness contract failed. "
+                "Repair ONLY the supplied assessment entries whose source-witness or uncertainty contract failed. "
                 "This is assessment repair, not answer rewriting or new research. Return exactly the requested IDs "
                 "in the three patch arrays; leave other arrays empty. For assertion witnesses, select supplied "
                 "witness_spans IDs and omit source_quote. Only when no catalogue is supplied, copy a short "
@@ -1121,6 +1166,10 @@ class ResearchModel:
                 "exactly that block's inline citation numbers. For supported question/need entries, evidence_numbers "
                 "must be actual inline citations in the unchanged claim. Extra original sources are background, "
                 "not inline support. Never discard a substantive missing condition to keep a supported label. "
+                "For a precise evidence-gap block, use basis evidence_gap, status uncertain, nonempty "
+                "missing_conditions and no witnesses, citations or scenario_quotes. A gap describes what "
+                "remains unknown; it does not assert its legal answer. When a question, determination or "
+                "need retains missing_conditions, label it incomplete/uncertain rather than supported. "
                 "If the cited originals cannot support the assertion or required outcome, mark the entry "
                 "unsupported/incomplete/uncertain as its schema permits and state the precise gap. "
                 "Do not edit the answer, upgrade an existing negative verdict, invent evidence or change IDs. "
@@ -1165,10 +1214,32 @@ class ResearchModel:
                 question.determinations = [
                     prior_parts[item.determination_id]
                     if prior_parts[item.determination_id].status != "supported"
-                    or prior_parts[item.determination_id].missing_conditions
                     else item
                     for item in question.determinations
                 ]
+                for part in question.determinations:
+                    prior = prior_parts[part.determination_id]
+                    if set(prior.missing_conditions) - set(part.missing_conditions):
+                        raise ValueError(
+                            "Assessment patch erased a requested condition"
+                        )
+            for field, key in (
+                ("assertion_results", "unit_id"),
+                ("question_results", "question_id"),
+                ("need_results", "need_id"),
+            ):
+                prior_entries = {
+                    getattr(item, key): item for item in getattr(review, field)
+                }
+                for item in getattr(patch, field):
+                    prior = prior_entries[getattr(item, key)]
+                    if set(prior.missing_conditions) - set(item.missing_conditions):
+                        raise ValueError("Assessment patch erased a material condition")
+                    if field == "assertion_results" and prior.basis == "evidence_gap":
+                        if item.basis != "evidence_gap" or item.status != "uncertain":
+                            raise ValueError(
+                                "Assessment patch turned uncertainty into a legal assertion"
+                            )
             updates: dict[str, object] = {}
             declined = any(
                 part.status != "supported" or part.missing_conditions
@@ -1190,14 +1261,67 @@ class ResearchModel:
                     replacements.get(getattr(item, key), item)
                     for item in getattr(review, field)
                 ]
-            if declined:
-                updates.update(status="incomplete", safe_to_publish=False)
             repaired = VerificationResult.model_validate(
                 {**review.model_dump(), **updates}
             )
             if assessment_contract_defects(data, repaired):
                 raise ValueError(
                     "Assessment patch still has invalid positive source witnesses"
+                )
+            if declined:
+                raw_units = payload.get("assertion_units")
+                units = (
+                    {
+                        str(row["unit_id"]): row
+                        for row in raw_units
+                        if isinstance(row, dict) and "unit_id" in row
+                    }
+                    if isinstance(raw_units, list)
+                    else {}
+                )
+                gap_ids = {
+                    item.unit_id
+                    for item in repaired.assertion_results
+                    if item.basis == "evidence_gap"
+                    and item.status == "uncertain"
+                    and item.missing_conditions
+                    and not item.witnesses
+                    and not item.scenario_quotes
+                    and item.unit_id in units
+                    and not units[item.unit_id].get("evidence_numbers")
+                }
+                supported_ids = {
+                    item.unit_id
+                    for item in repaired.assertion_results
+                    if item.status == "supported" and not item.missing_conditions
+                }
+                honest_partial = (
+                    review.safe_to_publish
+                    and all(
+                        item.unit_id in gap_ids | supported_ids
+                        for item in repaired.assertion_results
+                    )
+                    and all(
+                        part.status == "supported"
+                        and not part.missing_conditions
+                        or part.status in {"incomplete", "uncertain"}
+                        and bool(part.missing_conditions)
+                        and bool(part.answer_unit_ids)
+                        and bool(set(part.answer_unit_ids) & gap_ids)
+                        and set(part.answer_unit_ids) <= gap_ids | supported_ids
+                        for question in repaired.question_results
+                        for part in question.determinations
+                    )
+                    and all(
+                        item.status != "contradicted"
+                        and (
+                            item.status == "supported" or bool(item.missing_conditions)
+                        )
+                        for item in [*repaired.question_results, *repaired.need_results]
+                    )
+                )
+                repaired = repaired.model_copy(
+                    update={"status": "incomplete", "safe_to_publish": honest_partial}
                 )
             return repaired
         except ValueError as error:
@@ -1573,6 +1697,31 @@ class ResearchModel:
             LLMFlow.ASV3_RESEARCHER if self.context.depth else LLMFlow.ASV3_COORDINATOR
         )
         response = self._invoke(prompt, tools, flow, max_tokens=output, research=True)
+        if (
+            not response.choice.message.tool_calls
+            and not (response.choice.message.content or "").strip()
+        ):
+            # Empty provider output is recoverable; it is not an argument defect.
+            self.context.consume_research_decision()
+            recovery_prompt = [
+                *prompt,
+                UserMessage(
+                    content="The preceding provider response contained neither actions nor answer text. "
+                    "Continue from the unchanged evidence and task state: choose an exposed action "
+                    "or return a source-grounded candidate with precise unresolved issues. "
+                    "Do not repeat completed research solely because the previous response was empty."
+                ),
+            ]
+            response = self._invoke(
+                recovery_prompt, tools, flow, max_tokens=output, research=True
+            )
+            if (
+                not response.choice.message.tool_calls
+                and not (response.choice.message.content or "").strip()
+            ):
+                raise RunStopped(
+                    "Selected model returned repeated empty decisions; retained evidence and draft need finalization"
+                )
         try:
             decision = self._decision(response, tools)
         except ValueError:
