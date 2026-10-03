@@ -351,6 +351,8 @@ class SharedBudget:
         self.model_slots = threading.BoundedSemaphore(max_inflight_models)
         self.source_slots = threading.BoundedSemaphore(max_inflight_sources)
         self.final_decision_reserve = min(final_decision_reserve, max_decisions)
+        # Writer plus assertion, source inventory and condition checks, with format repair.
+        self.publication_decision_reserve = min(8, self.final_decision_reserve)
         self.coordinator_decision_reserve = min(
             coordinator_decision_reserve,
             max(0, max_decisions - self.final_decision_reserve - 1),
@@ -389,8 +391,8 @@ class SharedBudget:
     def consume_repair_decision(self) -> None:
         """Targeted recovery can use the reserve while keeping publication capacity."""
         with self._lock:
-            if self.used["decisions"] >= self.limits["decisions"] - min(
-                4, self.final_decision_reserve
+            if self.used["decisions"] >= (
+                self.limits["decisions"] - self.publication_decision_reserve
             ):
                 raise RunStopped(
                     "Targeted repair capacity used; publication reserve retained"

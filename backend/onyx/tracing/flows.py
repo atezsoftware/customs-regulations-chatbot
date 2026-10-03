@@ -23,6 +23,7 @@ class LLMFlow(StrEnum):
     ASV3_SOURCE_INVENTORY = "asv3_source_inventory"
     ASV3_CONDITION_REVIEW = "asv3_condition_review"
     ASV3_FINAL = "asv3_final"
+    ASV3_ANSWER_REPAIR = "asv3_answer_repair"
     ASV3_LANGUAGE = "asv3_language"
     ASV3_SOURCE_VISION = "asv3_source_vision"
 

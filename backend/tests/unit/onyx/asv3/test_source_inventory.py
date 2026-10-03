@@ -9,6 +9,7 @@ from onyx.asv3.llm_adapter import (
     ResearchModel,
     StructuredOutputError,
 )
+from onyx.asv3.models import SharedBudget
 from onyx.asv3.publication import publication_gap
 from onyx.asv3.runtime import _evidence_record
 from onyx.asv3.source_conditions import (
@@ -55,6 +56,9 @@ def test_blind_inventory_retains_uncited_prerequisite_and_reuses_same_originals(
     assert ledger.completely_delivered(receipt) == {1, 2, 3}
     assert memory.citations() == [3] and len(memory.required_conditions()) == 1
     payload["answer_units"] = [{"unit_id": "changed-draft", "text": "Different answer"}]
+    originals = payload["original_evidence"]
+    assert isinstance(originals, list)
+    payload["original_evidence"] = list(reversed(originals))
     assert (
         retain_source_inventory(
             model, ledger, payload, [question], memory, consume_budget=True
@@ -67,6 +71,31 @@ def test_blind_inventory_retains_uncited_prerequisite_and_reuses_same_originals(
         model, ledger, payload, [question], memory, consume_budget=True
     )
     assert llm.invoke.call_count == 2
+
+
+def test_exhausted_condition_format_repair_rejects_without_runtime_error() -> None:
+    ledger, context = original_ledger()
+    context.budget = SharedBudget(max_decisions=2)
+    llm = scripted_model()
+    llm.invoke.side_effect = [
+        text_response({"examined_citations": [1, 2, 3], "requirements": []}),
+        text_response({"examined_citations": [1], "conditions": [], "resolutions": []}),
+    ]
+    review = complete_condition_review(
+        supported([1]),
+        ResearchModel(llm, context),
+        ledger,
+        answer="Rule [1].",
+        scenario="facts",
+        questions=["Question?"],
+        evidence=_evidence_record(
+            ledger, "Rule [1].", include_supplemental_originals=True
+        ),
+        language="en",
+        consume_budget=True,
+    )
+    assert not review.safe_to_publish and review.format_error
+    assert review.condition_review is None and llm.invoke.call_count == 2
 
 
 @pytest.mark.parametrize("foreign_witness", [False, True])

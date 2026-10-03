@@ -18,6 +18,7 @@ from onyx.configs.chat_configs import (
 from onyx.configs.constants import DocumentSource, MessageType
 from onyx.context.search.models import (
     BaseFilters,
+    IndexFilters,
     InferenceChunk,
     InferenceSection,
     SearchDocsResponse,
@@ -1541,6 +1542,64 @@ def test_fast_regulatory_search_fetches_enough_candidates_for_staged_rerank() ->
     assert [
         len(lane) for lane in standard_rrf[0].call_args.kwargs["ranked_results"]
     ] == [50]
+
+
+def test_asv3_lane_head_outside_first_48_reaches_staged_reranker() -> None:
+    from onyx.reranking.candidate_selection import candidate_lineage
+    from tests.unit.onyx.regulatory.labeling.test_search_overlay import chunk
+
+    candidates = [chunk(str(index)) for index in range(1, 101)]
+    lane_head = candidates[50]
+    raw_lane = [lane_head, *[item for item in candidates if item is not lane_head]]
+    configured = RerankerRuntimeConfig(
+        enabled=True,
+        provider_type=RerankerProvider.SILICONFLOW,
+        model_name="Qwen/Qwen3-Reranker-8B",
+        api_key=make_mock_sensitive_value("test-key"),
+        configuration_generation="test",
+    )
+    submitted: list[list[InferenceChunk]] = []
+
+    def rank_batch(
+        *, query: str, chunks: list[InferenceChunk], config: RerankerRuntimeConfig
+    ) -> RerankResult:
+        assert query == "ticket" and config.enabled
+        submitted.append(chunks)
+        return RerankResult(
+            ordered_chunks=chunks,
+            scores_by_chunk={},
+            submitted_count=len(chunks),
+            result_count=len(chunks),
+            outcome=RerankOutcome.SUCCESS,
+            fallback_used=False,
+        )
+
+    filters = IndexFilters(
+        regulatory_chunks_only=True, asv3_document_set_id=15, access_control_list=None
+    )
+    _run(
+        _make_tool(filters, auto_detect_filters=False),
+        connected_sources=[DocumentSource.USER_FILE],
+        pipeline_chunks=raw_lane,
+        fused_chunks=candidates,
+        rerank_behavior=rank_batch,
+        reranker_config=configured,
+    )
+    assert [len(batch) for batch in submitted] == [32, 32, 32, 48]
+    initial = [item for batch in submitted[:3] for item in batch]
+    assert all(item in initial for item in raw_lane[:5])
+    assert len({item.unique_id for item in initial}) == 96
+    row = next(
+        row
+        for row in candidate_lineage(candidates, [raw_lane], initial)
+        if row["candidate_id"] == lane_head.unique_id
+    )
+    assert row["fused_rank"] == 51 and row["lane_ranks"] == {"0": 1}
+    assert row["submitted_rank"] == 2 and row["disposition"] == "submitted"
+    assert (
+        filters.regulatory_workflow_mode == "standard"
+        and filters.asv3_document_set_id == 15
+    )
 
 
 def test_regulatory_luna_rerank_is_enabled_for_followup_query() -> None:

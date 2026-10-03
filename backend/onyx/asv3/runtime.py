@@ -15,6 +15,7 @@ from uuid import UUID
 
 from pydantic import JsonValue
 
+from onyx.asv3.answer_repair import repair_publication_candidate
 from onyx.asv3.assertions import assertion_inventory, assertion_witness_valid
 from onyx.asv3.authority import authority_obligations, unresolved_authority_gap
 from onyx.asv3.citation_numbers import extract_citation_numbers
@@ -1066,7 +1067,8 @@ def run_asv3_loop(
         if (
             final_gap is not None
             and context.budget.snapshot()["decisions"]
-            < context.budget.limits["decisions"] - 4
+            < context.budget.limits["decisions"]
+            - context.budget.publication_decision_reserve
         ):
             # The final review feeds the same research loop, with its exact candidate.
             harness.last_draft = final
@@ -1106,9 +1108,23 @@ def run_asv3_loop(
                 draft = harness.last_draft or final
                 if (
                     context.budget.snapshot()["decisions"]
-                    <= context.budget.limits["decisions"] - 4
+                    <= context.budget.limits["decisions"]
+                    - context.budget.publication_decision_reserve
                 ):
-                    final = model.invoke_text(
+                    final = repair_publication_candidate(
+                        model,
+                        ledger,
+                        answer=draft,
+                        scenario=question,
+                        gap=harness.publication_gap or final_gap,
+                        evidence=_evidence_record(
+                            ledger,
+                            draft,
+                            preferred_numbers=research_state.preferred_citations(),
+                            required_numbers=research_state.source_conditions.citations(),
+                        ),
+                        research_state=research_state.view(max_chars=24000),
+                    ) or model.invoke_text(
                         FINAL_PROMPT,
                         json.dumps(
                             {

@@ -25,6 +25,7 @@ from onyx.asv3.llm_adapter import (
     StructuredOutputError,
     VerificationResult,
 )
+from onyx.asv3.models import RunStopped
 from onyx.asv3.quotations import normalized
 from onyx.asv3.scenario import question_determinations
 from onyx.prompts.asv3.research import (
@@ -232,6 +233,11 @@ def retain_source_inventory(
             "required_evidence_numbers",
         )
     }
+    # Draft citation order cannot invalidate an inventory of the same originals.
+    blind_payload["original_evidence"] = sorted(
+        cast(list[dict[str, JsonValue]], blind_payload["original_evidence"]),
+        key=lambda record: int(cast(int, record["citation"])),
+    )
     serialized = json.dumps(blind_payload, ensure_ascii=False, sort_keys=True)
     identity = hashlib.sha256(serialized.encode()).hexdigest()
     numbers = set(cast(list[int], payload["required_evidence_numbers"]))
@@ -369,7 +375,13 @@ def complete_condition_review(
             SOURCE_CONDITION_PROMPT,
             json.dumps(payload, ensure_ascii=False),
             LLMFlow.ASV3_CONDITION_REVIEW,
-            max_tokens=6000,
+            max_tokens=min(
+                16000,
+                max(
+                    6000,
+                    2000 + 240 * len(memory.required_conditions()) + 30 * len(numbers),
+                ),
+            ),
             consume_budget=consume_budget,
             response_model_override=SourceConditionAuditResult,
             response_validator=validate_response,
@@ -410,7 +422,9 @@ def complete_condition_review(
             result.safe_to_publish = False
         if omissions or unresolved:
             result.status = "incomplete"
-    except StructuredOutputError as error:
+    except (StructuredOutputError, RunStopped) as error:
+        # Cancellation/deadline must still stop the run; exhausted review capacity cannot approve it.
+        model.context.check_active()
         result.safe_to_publish = False
         result.status = "uncertain"
         result.format_error = (

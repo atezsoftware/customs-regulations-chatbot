@@ -129,6 +129,7 @@ from onyx.regulatory.provision_retrieval import (
     expand_selected_regulatory_source_lexical_matches,
     regulatory_provision_navigation_payload,
 )
+from onyx.reranking.candidate_selection import candidate_lineage, select_lane_candidates
 from onyx.reranking.constants import (
     MAX_CHAT_RERANK_CANDIDATES,
     uses_chat_completion_reranking,
@@ -2100,10 +2101,18 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
             )
 
         effective_filters = _resolve_regulatory_as_of_date(effective_filters)
+        asv3_regulatory_search = bool(
+            isinstance(effective_filters, IndexFilters)
+            and effective_filters.regulatory_chunks_only
+            and effective_filters.asv3_document_set_id is not None
+        )
         fast_regulatory_search = bool(
             effective_filters
             and effective_filters.regulatory_chunks_only
-            and effective_filters.regulatory_workflow_mode == "fast"
+            and (
+                effective_filters.regulatory_workflow_mode == "fast"
+                or asv3_regulatory_search
+            )
         )
         regulatory_rerank_candidate_limit = min(
             override_kwargs.rerank_candidate_limit,
@@ -2217,6 +2226,7 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
             weights=[lane.weight for lane in query_lanes],
             id_extractor=lambda chunk: chunk.unique_id,
         )
+        fused_order = list(top_chunks) if asv3_regulatory_search else []
         lexical_first_search_results = [
             results
             for lane, results in zip(query_lanes, all_search_results)
@@ -2393,6 +2403,21 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
                 else override_kwargs.rerank_candidate_limit
             )
         ]
+        if asv3_regulatory_search:
+            fused_candidates = select_lane_candidates(
+                rerank_candidate_pool,
+                all_search_results,
+                limit=regulatory_rerank_candidate_limit,
+            )
+            with graph_step("search.pre_rerank_selection") as selection_step:
+                selection_step.output_value = {
+                    "candidate_limit": regulatory_rerank_candidate_limit,
+                    "heads_per_lane": 5,
+                    "lanes": [lane.model_dump() for lane in query_lanes],
+                    "candidates": candidate_lineage(
+                        fused_order, all_search_results, fused_candidates
+                    ),
+                }
         effective_reranker_config = reranker_config
         if (
             regulatory_chunks_only
@@ -2460,6 +2485,19 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
                 chunks=rerank_input_chunks,
                 config=effective_reranker_config,
             )
+        if asv3_regulatory_search:
+            with graph_step("search.post_rerank_selection") as ranking_step:
+                ranking_step.output_value = {
+                    "used_external": rerank_result.used_external,
+                    "fallback_used": rerank_result.fallback_used,
+                    "ordered_candidate_ids": [
+                        chunk.unique_id for chunk in rerank_result.ordered_chunks
+                    ],
+                    "ordered_regulatory_chunk_ids": [
+                        chunk.regulatory_chunk_id
+                        for chunk in rerank_result.ordered_chunks
+                    ],
+                }
         diverse_candidate_chunks = apply_soft_diversity(
             chunks=rerank_result.ordered_chunks,
             scores=rerank_result.scores_by_chunk,
@@ -2798,6 +2836,14 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
                     },
                     "label_fusion_scores": [
                         score.model_dump() for score in label_result.fusion_scores
+                    ],
+                }
+        if asv3_regulatory_search:
+            with graph_step("search.candidate_delivery") as delivery_step:
+                delivery_step.output_value = {
+                    "llm_visible_regulatory_chunk_ids": [
+                        section.center_chunk.regulatory_chunk_id
+                        for section in selected_sections[:max_selected_sections]
                     ],
                 }
         search_docs = convert_inference_sections_to_search_docs(
