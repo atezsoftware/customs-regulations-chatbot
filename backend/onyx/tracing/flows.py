@@ -20,6 +20,7 @@ class LLMFlow(StrEnum):
     ASV3_COORDINATOR = "asv3_coordinator"
     ASV3_RESEARCHER = "asv3_researcher"
     ASV3_VERIFICATION = "asv3_verification"
+    ASV3_SOURCE_INVENTORY = "asv3_source_inventory"
     ASV3_CONDITION_REVIEW = "asv3_condition_review"
     ASV3_FINAL = "asv3_final"
     ASV3_LANGUAGE = "asv3_language"

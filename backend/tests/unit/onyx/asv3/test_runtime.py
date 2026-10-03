@@ -57,6 +57,8 @@ from onyx.server.query_and_chat.streaming_models import (
 )
 from onyx.tracing.flows import LLMFlow
 
+pytestmark = pytest.mark.usefixtures("empty_source_inventory")
+
 
 def response(
     text: str | None = None, calls: list[tuple[str, dict[str, Any]]] | None = None
@@ -428,12 +430,15 @@ def scripted_condition_review(
     records = json.loads(evidence)
     call_id = "condition-fixture-" + answer_hash(answer)
     ledger.record_delivery(call_id, LLMFlow.ASV3_CONDITION_REVIEW.value, records)
+    inventory_id = "source-fixture-" + answer_hash(answer)
+    ledger.record_delivery(inventory_id, LLMFlow.ASV3_SOURCE_INVENTORY.value, records)
     return review.model_copy(
         update={
             "condition_review": SourceConditionAuditResult(
                 examined_citations=[row["citation"] for row in records], conditions=[]
             ),
             "condition_review_call_id": call_id,
+            "source_inventory_call_id": inventory_id,
             "condition_review_answer_hash": answer_hash(answer),
         }
     )

@@ -666,6 +666,7 @@ def run_asv3_loop(
                     "condition_review": None,
                     "condition_review_call_id": None,
                     "condition_review_answer_hash": None,
+                    "source_inventory_call_id": None,
                 }
             )
             # Fix already-detected support defects before paying for another assessment.
@@ -778,6 +779,7 @@ def run_asv3_loop(
             require_assertion_checks=True,
             require_determination_checks=profile.requires_sources,
             require_condition_review=profile.requires_sources,
+            require_source_inventory=profile.requires_sources,
             research_state=research_state,
         )
         if gap is None:
@@ -966,6 +968,7 @@ def run_asv3_loop(
                 require_assertion_checks=True,
                 require_determination_checks=profile.requires_sources,
                 require_condition_review=profile.requires_sources,
+                require_source_inventory=profile.requires_sources,
                 research_state=research_state,
             )
         elif result.stop_reason == "model_requested_partial_publication":
@@ -991,6 +994,7 @@ def run_asv3_loop(
                 require_assertion_checks=True,
                 require_determination_checks=profile.requires_sources,
                 require_condition_review=profile.requires_sources,
+                require_source_inventory=profile.requires_sources,
                 research_state=research_state,
             )
         else:
@@ -1056,6 +1060,7 @@ def run_asv3_loop(
                 require_assertion_checks=True,
                 require_determination_checks=profile.requires_sources,
                 require_condition_review=profile.requires_sources,
+                require_source_inventory=profile.requires_sources,
                 research_state=research_state,
             )
         if (
@@ -1093,6 +1098,7 @@ def run_asv3_loop(
                     require_assertion_checks=True,
                     require_determination_checks=profile.requires_sources,
                     require_condition_review=profile.requires_sources,
+                    require_source_inventory=profile.requires_sources,
                     research_state=research_state,
                 )
             else:
@@ -1155,6 +1161,7 @@ def run_asv3_loop(
                         require_assertion_checks=True,
                         require_determination_checks=profile.requires_sources,
                         require_condition_review=profile.requires_sources,
+                        require_source_inventory=profile.requires_sources,
                         research_state=research_state,
                     )
                 complete = False
@@ -1175,6 +1182,7 @@ def run_asv3_loop(
                     require_assertion_checks=True,
                     require_determination_checks=profile.requires_sources,
                     require_condition_review=profile.requires_sources,
+                    require_source_inventory=profile.requires_sources,
                     research_state=research_state,
                 )
                 is None

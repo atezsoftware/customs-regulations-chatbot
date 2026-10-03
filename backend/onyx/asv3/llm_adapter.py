@@ -10,6 +10,7 @@ import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import Annotated, Literal, cast
+from uuid import uuid4
 
 import jsonschema
 from pydantic import BaseModel, Field, JsonValue, model_validator
@@ -163,6 +164,12 @@ class SourceConditionAuditResult(BaseModel):
     )
 
 
+class SourceRequirementInventory(BaseModel):
+    model_config = {"extra": "forbid"}
+    examined_citations: list[Annotated[int, Field(strict=True, ge=1)]]
+    requirements: list[MaterialSourceOmission] = Field(max_length=64)
+
+
 class VerificationResult(BaseModel):
     status: Literal["supported", "contradicted", "incomplete", "uncertain"]
     explanation: Annotated[str, Field(min_length=1)]
@@ -183,6 +190,7 @@ class VerificationResult(BaseModel):
     condition_review: SkipJsonSchema[SourceConditionAuditResult | None] = None
     condition_review_call_id: SkipJsonSchema[str | None] = None
     condition_review_answer_hash: SkipJsonSchema[str | None] = None
+    source_inventory_call_id: SkipJsonSchema[str | None] = None
 
     @model_validator(mode="after")
     def consistent_publication_assessment(self) -> VerificationResult:
@@ -445,6 +453,8 @@ def structured_model(flow: LLMFlow) -> type[BaseModel] | None:
         return VerificationResult
     if flow == LLMFlow.ASV3_CONDITION_REVIEW:
         return SourceConditionAuditResult
+    if flow == LLMFlow.ASV3_SOURCE_INVENTORY:
+        return SourceRequirementInventory
     return None
 
 
@@ -1044,9 +1054,11 @@ class ResearchModel:
                 user_identity=self.user_identity,
             )
             record_llm_response(span, response)
-            self.last_call_id = span.span_id
+            self.last_call_id = (
+                span.span_id if span.span_id != "no-op" else "asv3-call-" + uuid4().hex
+            )
             if isinstance(ledger, EvidenceLedger):
-                ledger.record_delivery(span.span_id, flow.value, records)
+                ledger.record_delivery(self.last_call_id, flow.value, records)
         self.context.check_active()
         return response
 

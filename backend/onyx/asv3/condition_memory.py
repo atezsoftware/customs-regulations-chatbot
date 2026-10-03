@@ -41,7 +41,16 @@ class SourceConditionMemory:
         self.run_id, self.scope_hash = run_id, scope_hash
         self.questions = tuple(questions)
         self._records: dict[str, RetainedSourceCondition] = {}
+        self._inventory_receipts: dict[str, str] = {}
         self._lock = threading.RLock()
+
+    def inventory_receipt(self, identity: str) -> str | None:
+        with self._lock:
+            return self._inventory_receipts.get(identity)
+
+    def retain_inventory_receipt(self, identity: str, call_id: str) -> None:
+        with self._lock:
+            self._inventory_receipts[identity] = call_id
 
     def _record(
         self, item: MaterialSourceOmission, ledger: EvidenceLedger

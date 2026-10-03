@@ -20,12 +20,17 @@ from onyx.asv3.llm_adapter import (
     MaterialSourceOmission,
     ResearchModel,
     SourceConditionAuditResult,
+    SourceConditionCheck,
+    SourceRequirementInventory,
     StructuredOutputError,
     VerificationResult,
 )
 from onyx.asv3.quotations import normalized
 from onyx.asv3.scenario import question_determinations
-from onyx.prompts.asv3.research import SOURCE_CONDITION_PROMPT
+from onyx.prompts.asv3.research import (
+    SOURCE_CONDITION_PROMPT,
+    SOURCE_REQUIREMENT_PROMPT,
+)
 from onyx.tracing.flows import LLMFlow
 
 
@@ -42,6 +47,7 @@ def condition_review_defects(
     call_id: str | None,
     *,
     expected_citations: set[int] | None = None,
+    expected_flow: LLMFlow = LLMFlow.ASV3_CONDITION_REVIEW,
 ) -> list[str]:
     """Validate identity and actual delivery; semantic materiality remains model-assessed."""
     defects: list[str] = []
@@ -49,7 +55,7 @@ def condition_review_defects(
     delivered: set[int] = ledger.completely_delivered(call_id) if call_id else set()
     if (
         not call_id
-        or ledger.delivery_flow(call_id) != LLMFlow.ASV3_CONDITION_REVIEW.value
+        or ledger.delivery_flow(call_id) != expected_flow.value
         or len(examined) != len(audit.examined_citations)
         or examined != delivered
         or (expected_citations is not None and examined != expected_citations)
@@ -206,6 +212,77 @@ def condition_payload(
     return payload, numbers
 
 
+def retain_source_inventory(
+    model: ResearchModel,
+    ledger: EvidenceLedger,
+    payload: dict[str, JsonValue],
+    questions: list[str],
+    memory: SourceConditionMemory,
+    *,
+    consume_budget: bool,
+) -> str:
+    """Read originals without the candidate, then retain witnessed obligations for repair."""
+    blind_payload = {
+        key: payload[key]
+        for key in (
+            "language",
+            "scenario",
+            "determinations",
+            "original_evidence",
+            "required_evidence_numbers",
+        )
+    }
+    serialized = json.dumps(blind_payload, ensure_ascii=False, sort_keys=True)
+    identity = hashlib.sha256(serialized.encode()).hexdigest()
+    numbers = set(cast(list[int], payload["required_evidence_numbers"]))
+    cached = memory.inventory_receipt(identity)
+    if cached and (
+        ledger.delivery_flow(cached) == LLMFlow.ASV3_SOURCE_INVENTORY.value
+        and ledger.completely_delivered(cached) == numbers
+    ):
+        return cached
+
+    def validate(text: str) -> None:
+        inventory = SourceRequirementInventory.model_validate_json(text)
+        audit = SourceConditionAuditResult(
+            examined_citations=inventory.examined_citations,
+            conditions=[
+                SourceConditionCheck(**item.model_dump(), disposition="omitted")
+                for item in inventory.requirements
+            ],
+        )
+        defects = condition_review_defects(
+            audit,
+            "",
+            str(payload["scenario"]),
+            questions,
+            ledger,
+            model.last_call_id,
+            expected_citations=numbers,
+            expected_flow=LLMFlow.ASV3_SOURCE_INVENTORY,
+        )
+        if defects:
+            raise ValueError(" ".join(defects))
+
+    if not consume_budget:
+        model.context.consume_research_decision()
+    text = model.invoke_text(
+        SOURCE_REQUIREMENT_PROMPT,
+        serialized,
+        LLMFlow.ASV3_SOURCE_INVENTORY,
+        max_tokens=6000,
+        consume_budget=consume_budget,
+        response_model_override=SourceRequirementInventory,
+        response_validator=validate,
+    )
+    inventory = SourceRequirementInventory.model_validate_json(text)
+    if model.last_call_id is None:
+        raise StructuredOutputError("Source inventory has no original-delivery receipt")
+    memory.remember(inventory.requirements, ledger)
+    memory.retain_inventory_receipt(identity, model.last_call_id)
+    return model.last_call_id
+
+
 def complete_condition_review(
     review: VerificationResult,
     model: ResearchModel,
@@ -226,6 +303,7 @@ def complete_condition_review(
             "condition_review": None,
             "condition_review_call_id": None,
             "condition_review_answer_hash": None,
+            "source_inventory_call_id": None,
         }
     )
     if (
@@ -255,12 +333,14 @@ def complete_condition_review(
     if not numbers:
         return result
     main_call_id = model.last_call_id
+    memory = condition_memory or SourceConditionMemory(
+        model.context.run_id, answer_hash(scenario), questions
+    )
 
     def validate_response(text: str) -> None:
         audit = SourceConditionAuditResult.model_validate_json(text)
         retention_defects: list[str] = []
-        if condition_memory is not None:
-            audit, retention_defects = condition_memory.materialize(audit, ledger)
+        audit, retention_defects = memory.materialize(audit, ledger)
         defects = condition_review_defects(
             audit,
             answer,
@@ -274,6 +354,15 @@ def complete_condition_review(
             raise ValueError(" ".join([*defects, *retention_defects]))
 
     try:
+        result.source_inventory_call_id = retain_source_inventory(
+            model,
+            ledger,
+            payload,
+            questions,
+            memory,
+            consume_budget=consume_budget,
+        )
+        payload["retained_conditions"] = cast(JsonValue, memory.required_conditions())
         if not consume_budget:
             model.context.consume_research_decision()
         text = model.invoke_text(
@@ -287,11 +376,10 @@ def complete_condition_review(
         )
         audit = SourceConditionAuditResult.model_validate_json(text)
         effective_audit = audit
-        if condition_memory is not None:
-            effective_audit, defects = condition_memory.materialize(audit, ledger)
-            if defects:
-                raise StructuredOutputError(" ".join(defects))
-            condition_memory.remember(audit.conditions, ledger)
+        effective_audit, defects = memory.materialize(audit, ledger)
+        if defects:
+            raise StructuredOutputError(" ".join(defects))
+        memory.remember(audit.conditions, ledger)
         result.condition_review = audit
         result.condition_review_call_id = model.last_call_id
         result.condition_review_answer_hash = answer_hash(answer)

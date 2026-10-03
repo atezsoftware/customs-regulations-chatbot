@@ -25,6 +25,7 @@ from onyx.asv3.source_conditions import (
     condition_review_defects,
     disclosed_condition_gaps,
 )
+from onyx.tracing.flows import LLMFlow
 
 
 def question_inventory(questions: list[str]) -> list[dict[str, JsonValue]]:
@@ -144,6 +145,7 @@ def publication_gap(
     require_assertion_checks: bool = False,
     require_determination_checks: bool = False,
     require_condition_review: bool = False,
+    require_source_inventory: bool = False,
 ) -> ToolOutcome | None:
     if review.format_error is not None:
         return ToolOutcome(
@@ -264,6 +266,16 @@ def publication_gap(
     condition_audit = review.condition_review
     if review.condition_review is not None:
         assert condition_audit is not None
+        if require_source_inventory and (
+            not review.source_inventory_call_id
+            or ledger.delivery_flow(review.source_inventory_call_id)
+            != LLMFlow.ASV3_SOURCE_INVENTORY.value
+            or ledger.completely_delivered(review.source_inventory_call_id)
+            != set(condition_audit.examined_citations)
+        ):
+            condition_defects.append(
+                "A source-first inventory of the actually supplied originals is required before answer-condition comparison."
+            )
         if research_state is not None:
             condition_audit, retention_defects = (
                 research_state.source_conditions.materialize(

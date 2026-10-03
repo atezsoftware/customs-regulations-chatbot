@@ -21,6 +21,8 @@ from onyx.tracing.flows import LLMFlow
 from tests.unit.onyx.asv3.test_citation_contract import original_ledger, supported
 from tests.unit.onyx.asv3.test_model_adapter import scripted_model, text_response
 
+pytestmark = pytest.mark.usefixtures("empty_source_inventory")
+
 
 @pytest.fixture
 def requirement() -> SourceConditionCheck:
