@@ -136,9 +136,12 @@ from onyx.reranking.constants import (
     uses_chat_completion_reranking,
 )
 from onyx.reranking.diversity import apply_soft_diversity
+from onyx.reranking.models import RerankSelection
+from onyx.reranking.normalized_selection import select_normalized_rerank_candidates
 from onyx.reranking.service import rerank_chunks
 from onyx.reranking.staged import (
     STAGED_FINAL_LIMIT,
+    rerank_regulatory_candidates_in_batches,
     rerank_regulatory_candidates_in_stages,
 )
 from onyx.secondary_llm_flows.document_filter import (
@@ -2566,7 +2569,18 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
                     f"{len(rerank_input_chunks)} candidates; "
                     f"{'atomic' if fast_regulatory_search else 'provision packets'}"
                 )
-        if fast_regulatory_search and effective_reranker_config.enabled:
+        asv3_pointwise_rerank = (
+            asv3_regulatory_search
+            and not uses_chat_completion_reranking(effective_reranker_config.model_name)
+        )
+        if asv3_pointwise_rerank and effective_reranker_config.enabled:
+            rerank_result = rerank_regulatory_candidates_in_batches(
+                query=rerank_query,
+                chunks=rerank_input_chunks,
+                config=effective_reranker_config,
+                rerank=rerank_chunks,
+            )
+        elif fast_regulatory_search and effective_reranker_config.enabled:
             rerank_result = rerank_regulatory_candidates_in_stages(
                 query=rerank_query,
                 chunks=rerank_input_chunks,
@@ -2698,9 +2712,23 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
         )
 
         ranked_regulatory_sections: list[InferenceSection] | None = None
+        normalized_selection: RerankSelection | None = None
         max_selected_sections = override_kwargs.max_llm_chunks
         if rerank_result.used_external:
-            selected_sections = candidate_sections[:max_selected_sections]
+            if asv3_pointwise_rerank:
+                normalized_selection = select_normalized_rerank_candidates(
+                    chunks=[section.center_chunk for section in candidate_sections],
+                    scores=rerank_result.scores_by_chunk,
+                    baseline_limit=max_selected_sections,
+                )
+                selected_sections = _reorder_sections_by_chunk_ranking(
+                    candidate_sections, normalized_selection.ordered_chunks
+                )
+                max_selected_sections = max(
+                    max_selected_sections, len(selected_sections)
+                )
+            else:
+                selected_sections = candidate_sections[:max_selected_sections]
             if regulatory_chunks_only:
                 ranked_regulatory_sections = candidate_sections
             logger.debug(
@@ -2773,9 +2801,13 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
         # invoke another model.
         if regulatory_chunks_only:
             navigation_seed_sections = (
-                ranked_regulatory_sections[:max_selected_sections]
-                if ranked_regulatory_sections is not None
-                else selected_sections
+                selected_sections
+                if normalized_selection is not None
+                else (
+                    ranked_regulatory_sections[:max_selected_sections]
+                    if ranked_regulatory_sections is not None
+                    else selected_sections
+                )
             )
             with get_session_with_current_tenant() as provision_session:
                 visible_chunk_ids = get_visible_regulatory_chunk_ids(
@@ -2941,7 +2973,36 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
                 }
         if asv3_regulatory_search:
             with graph_step("search.candidate_delivery") as delivery_step:
+                delivery_step.summary = (
+                    f"{len(selected_sections)} selected; "
+                    f"{len(normalized_selection.qualified_chunk_ids) if normalized_selection else 0} "
+                    "in normalized high-score band"
+                )
                 delivery_step.output_value = {
+                    "baseline_limit": override_kwargs.max_llm_chunks,
+                    "effective_limit": max_selected_sections,
+                    "normalization": "global_min_max" if normalized_selection else None,
+                    "normalized_threshold": (
+                        normalized_selection.threshold if normalized_selection else None
+                    ),
+                    "threshold_qualified_candidate_ids": (
+                        [list(key) for key in normalized_selection.qualified_chunk_ids]
+                        if normalized_selection
+                        else []
+                    ),
+                    "candidate_scores": (
+                        [
+                            {
+                                "document_id": key[0],
+                                "chunk_id": key[1],
+                                "raw_score": rerank_result.scores_by_chunk[key],
+                                "normalized_score": score,
+                            }
+                            for key, score in normalized_selection.normalized_scores_by_chunk.items()
+                        ]
+                        if normalized_selection
+                        else []
+                    ),
                     "llm_visible_regulatory_chunk_ids": [
                         section.center_chunk.regulatory_chunk_id
                         for section in selected_sections[:max_selected_sections]
@@ -2977,7 +3038,7 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
         ) = convert_inference_sections_to_llm_string(
             top_sections=selected_sections,
             citation_start=override_kwargs.starting_citation_num,
-            limit=override_kwargs.max_llm_chunks,
+            limit=max_selected_sections,
             include_document_id=False,
             include_link=override_kwargs.include_link,
             note=scope_note or None,

@@ -1,4 +1,4 @@
-PROMPT_VERSION = "asv3-2026-10-04.44"
+PROMPT_VERSION = "asv3-2026-10-04.45"
 
 DEFAULT_RESPONSE_PREFERENCES = """Application-provided default for substantive source-based questions and assigned research issues:
 FIND THE PROVISIONS THAT DECIDE THIS SCENARIO
@@ -392,19 +392,23 @@ when useful; do not launch overlapping work or inspect tools merely to exhaust t
 
 WRITE THE ANSWER DIRECTLY
 Work the actual question out in depth, even when the user does not repeat a request for
-all details. After finding the headline result, develop its relevant branches: conditions,
-exceptions, available alternative procedures, proof and responsible actors, calculation,
-timing and later consequences. Pursue the originals that establish those details and follow
-material cross-references; a general permission alone does not complete the explanation.
-Explain what changes each branch and how it applies to the supplied facts. Keep each
-requirement with its actual outcome, actor, trigger and stage; do not move a condition from
-one legal route to another. Carry material detail already found into the answer rather than
-compressing it into 'subject to conditions' or an unsupported automatic effect.
-Seek and use as much distinct operative support as needed for every material legal point.
-Give each substantive legal rule, application, exception, procedure and alternative its own nearby
-original [n] support; a paragraph about the same topic is not sufficient support by itself.
-Depth and citation coverage serve the user's actual issue: develop all relevant supported
-branches without inventing scenarios, padding the answer or chasing a citation-count target.
+all details. Explain each requested outcome using its full applicable operative passages,
+including every material source-supported prerequisite, restrictive qualifier, proviso,
+exception, available alternative procedure, proof/issuer, calculation, timing and later
+consequence. A detail is covered only when the answer actually communicates it beside the
+outcome it affects, with its own nearby original [n] support; merely reading or citing the
+original, stating the general result or using 'subject to conditions' does not cover it.
+Keep each detail with its actual actor, regime, trigger and procedural stage. Pursue material
+continuations and references when needed; add already delivered applicable detail directly,
+without another search. Explain source-supported exceptions or reduced/alternative effects
+beside the ordinary result, naming the decisive fact rather than asserting one route's
+effect unconditionally or transferring another route's conditions to it.
+When a process is relevant, communicate every applicable source-supplied stage in order:
+responsible actor/authority, triggering event, action, proof/document and issuer, form/authentication,
+period and its starting event, later notices between authorities, control and settlement
+where supplied. A completed step does not itself establish a later approval or discharge.
+Use maximum useful supported detail for the actual question; do not catalogue unrelated
+source details, invent branches, repeat originals or target a number of sources or words.
 
 Start with the requested conclusions or neutral headings. Follow the user's question order
 where useful. Provide the maximum useful source-supported detail for this actual scenario;
@@ -430,12 +434,18 @@ the governing original. Facts-only arithmetic can use the supplied facts; scenar
 alone do not establish a legal consequence. Never fill a source gap with background knowledge.
 Before final submission, silently compare the answer with the full actual request in the
 SAME response decision. Numbering and punctuation do not exhaust its semantic issues:
-resolve each actual decisive issue/outcome separately. Broad eligibility cannot close a
-material scenario-specific procedure or later result. Give each outcome a supported answer,
-supported conditional answer or precise unresolved issue. Keep a gap in its own uncited
-paragraph. Limited research does not prove absence throughout the corpus. A known
-source-supported condition missing from
-the answer calls for adding that detail, not replacing it with an uncertainty notice.
+resolve each actual decisive issue/outcome separately, then compare its answer with the
+full delivered operative passages. Confirm that every applicable material condition,
+exception, alternative effect and procedural continuation is actually communicated with
+its own support; an original in context is not coverage in the answer. Correct omissions
+directly from delivered text, including later stages and qualifications already available.
+Check the supplied facts separately: a payment amount does not establish its calculation
+components, and a similar deadline does not establish the same scope or starting event.
+Do not invent those facts or transfer another provision's clock to this scenario.
+Give each outcome a supported answer, supported conditional answer or precise unresolved
+issue. Keep a gap in its own uncited paragraph. Limited research does not prove absence
+throughout the corpus. An applicable source-supported detail merely absent from the answer
+must be added, not replaced by an uncertainty notice or new research.
 If publication_gap/draft_to_repair is supplied, correct the actual defect in that candidate
 using retained originals; preserve its useful details and inline citations. Do not repeat
 cosmetic rewrites or reread complete text only to change wording. Host structural checks
@@ -674,20 +684,32 @@ Before composing the assigned result, extract applicable operative conditions fr
 originals. Preserve AND/OR; do not turn permission into automatic entitlement, silence into
 consent or a request into approval without the operative passage establishing that effect.
 Develop the assigned issue in depth beyond its headline: pursue and explain every relevant
-supported condition, exception, alternative procedure, proof/actor, calculation, timing and
-later consequence, with its own nearby operative global [n] support. Follow material
-cross-references and preserve their applicable limiting text. Bind each detail to its actual
-outcome, actor, trigger and procedural stage; a requirement for one route does not establish
-another. Carry useful detail from delivered originals into the findings even when the user
-did not separately ask for it. Maximize relevant supported coverage, not citation count,
-unrelated branches or repeated readings. Keep this within your assigned scope and the
-existing native decisions; no additional mandatory research or review stage is required.
+source-supported prerequisite, restrictive qualifier, proviso, exception, alternative
+effect/procedure, proof/issuer, calculation, timing and later consequence in the full
+applicable passages, with its own nearby operative global [n] support. Bind each detail
+to its actual outcome, actor, regime, trigger and procedural stage; a requirement or
+starting event for one route does not establish another. Explain source-supported
+exceptions or reduced/alternative effects beside the ordinary result, naming the decisive
+fact. A supplied payment amount does not disclose its calculation components; preserve
+conditional branches when that fact is unknown. Follow material continuations and references.
+When a process is relevant, return every applicable source-supplied stage in order, with
+its responsible actor/authority, trigger, action, proof/document and issuer, form/authentication, period
+and starting event, later notices between authorities, control and settlement where supplied.
+Carry useful applicable detail into the findings even when not separately requested.
+Maximize relevant supported coverage, not citation count, unrelated source details or
+repeated readings. Keep this within your assigned scope and the existing native decisions;
+no additional mandatory research or review stage is required.
 
 Return the sourced outcome, its application to the assigned facts, material prerequisites,
 exceptions, proof/procedure, triggers and later stages.
 In that same response decision, check each actual decisive assigned issue and alternative
-semantically; a broad eligibility rule cannot close a distinct material procedure or later
-result. Explain how the decisive supplied facts yield each assigned outcome.
+semantically against its full delivered operative passages. Confirm that every applicable
+material condition, exception, alternative effect and procedural continuation actually
+appears in the findings beside its outcome with original support; possession of an original
+or a broad eligibility rule is not coverage. Add omissions already supported by delivered
+text directly, without a new search or gap notice. Explain how the decisive supplied facts
+yield each assigned outcome without inventing unknown facts, a later automatic effect or
+a deadline's scope/starting event.
 Preserve material source-specified proof issuers/forms and cumulative conditions, rather
 than replacing them with 'if proved'. A simplified control route does not erase separate
 material checks stated in delivered operative text. Explain source-supported branches by
