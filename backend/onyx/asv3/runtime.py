@@ -48,6 +48,10 @@ from onyx.asv3.research_state import ResearchState, build_research_specs
 from onyx.asv3.sandbox import build_sandbox_specs
 from onyx.asv3.scenario import initial_questions
 from onyx.asv3.search_adapter import build_search_adapter
+from onyx.asv3.session_research import (
+    retain_session_research,
+    session_research_checkpoint,
+)
 from onyx.asv3.source_tools import build_source_specs
 from onyx.asv3.supplemental_tools import (
     ScenarioState,
@@ -64,7 +68,11 @@ from onyx.chat.stop_signal_checker import is_connected
 from onyx.configs.constants import MessageType
 from onyx.context.search.models import BaseFilters, IndexFilters, SearchDoc
 from onyx.db.asv3_corpus import bind_pc_corpus_scope
-from onyx.db.asv3_runs import load_asv3_checkpoint, save_asv3_checkpoint
+from onyx.db.asv3_runs import (
+    load_asv3_checkpoint,
+    load_asv3_session_checkpoint,
+    save_asv3_checkpoint,
+)
 from onyx.db.memory import UserMemoryContext
 from onyx.db.models import User
 from onyx.llm.interfaces import LLM, LLMUserIdentity
@@ -216,8 +224,7 @@ def run_asv3_loop(
     )
     context = RunContext(
         language="und",
-        timeout_seconds=300,
-        research_reserve_seconds=60,
+        timeout_seconds=float("inf"),
         budget=SharedBudget(unlimited_execution=True),
         cancelled=lambda: not is_connected(chat_session_id, cache),
         services={"lean_native_mode": True},
@@ -438,6 +445,7 @@ def run_asv3_loop(
                 else None,
                 scenario=scenarios.snapshot(),
                 question_message_id=user_message_id,
+                session_research=session_research_checkpoint(context, question),
             )
             save_asv3_checkpoint(
                 message_id=assistant_message_id, user_id=user.id, snapshot=snapshot
@@ -501,6 +509,30 @@ def run_asv3_loop(
         )
 
     context.services["verify_claim"] = verify
+
+    def remember_session_originals(active_harness: Harness) -> None:
+        memory = context.services.get("session_research")
+        numbers = (
+            memory.get("reused_evidence_numbers", [])
+            if isinstance(memory, dict)
+            else []
+        )
+        if isinstance(numbers, list):
+            for number in numbers:
+                item = ledger.get(number) if type(number) is int else None
+                if item is not None:
+                    if item.search_doc is None and item.metadata.get("source_sha256"):
+                        ledger.add(
+                            [
+                                broker.attach_native_citation(
+                                    item, number, assistant_message_id, context
+                                )
+                            ],
+                            context,
+                        )
+                    active_harness.evidence_working_set.remember(
+                        number, 0, len(item.text)
+                    )
 
     def researcher(
         task: str, child: RunContext, updates: Callable[[], list[str]]
@@ -609,6 +641,7 @@ def run_asv3_loop(
             partial_submission=lambda: child_partial,
         )
         if independent:
+            remember_session_originals(child_harness)
             for spec in build_core_specs(
                 child_registry, ledger, child_harness.snapshot
             ):
@@ -628,7 +661,7 @@ def run_asv3_loop(
             },
         )
 
-    workers = WorkerPool(context, researcher, progress=progress, max_tasks=24)
+    workers = WorkerPool(context, researcher, progress=progress)
     question_research = QuestionResearch(context, workers, initial_questions(question))
     context.services["registry"] = registry
     external_specs = build_external_specs(
@@ -755,9 +788,15 @@ def run_asv3_loop(
             return None
         return source_publication_gap(answer, model.last_call_id)
 
-    question_research.publish_guard = lambda answer: publication_guard(
-        answer, host_gap_assembly=True
-    )
+    def check_assembly(answer: str) -> ToolOutcome | None:
+        gap = publication_guard(answer, host_gap_assembly=True)
+        if harness is not None:
+            harness.publication_gap = gap
+            if gap is not None:
+                harness.last_draft = answer
+        return gap
+
+    question_research.publish_guard = check_assembly
 
     def submit_partial(args: dict[str, JsonValue], child: RunContext) -> ToolOutcome:
         nonlocal partial
@@ -839,7 +878,22 @@ def run_asv3_loop(
         broker.revalidate_evidence(canonical, context)
 
     try:
+        if previous is None:
+            retain_session_research(
+                load_asv3_session_checkpoint(
+                    chat_session_id=chat_session_id,
+                    user_message_id=user_message_id,
+                    user_id=user.id,
+                ),
+                context,
+                ledger,
+                broker.revalidate_evidence,
+            )
+            remember_session_originals(harness)
         if previous is not None:
+            remembered = previous.get("session_research")
+            if isinstance(remembered, dict):
+                context.services["session_research"] = remembered
             question_research.restore(previous.get("question_research"))
             harness.restore(previous)
             harness.publication_gap = None

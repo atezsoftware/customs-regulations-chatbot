@@ -1,5 +1,6 @@
 """Exercise the native harness and publication path with external boundaries faked."""
 
+import copy
 import json
 import threading
 from dataclasses import replace
@@ -282,6 +283,7 @@ def setup_run(
         lambda **kwargs: checkpoints.append(kwargs["snapshot"]),
     )
     monkeypatch.setattr(runtime, "load_asv3_checkpoint", lambda **_kwargs: None)
+    monkeypatch.setattr(runtime, "load_asv3_session_checkpoint", lambda **_kwargs: None)
     llm = MagicMock(spec=LLM)
     llm.config = LLMConfig(
         model_provider="openai",
@@ -399,7 +401,7 @@ def test_native_parallel_originals_preserve_selected_provider_and_publish_withou
     ]
     for call in llm.invoke.call_args_list:
         assert call.kwargs["structured_response_format"] is None
-        assert 1 <= call.kwargs["timeout_override"] <= 300
+        assert call.kwargs["timeout_override"] is None
         assert (
             user_payload(call.kwargs["prompt"][1])["assistant_instructions"]
             == kwargs["custom_agent_prompt"]
@@ -456,6 +458,81 @@ def test_native_parallel_originals_preserve_selected_provider_and_publish_withou
         for i, packet in enumerate(output)
         if isinstance(packet.obj, (AgentResponseDelta, CitationInfo))
     )
+
+
+def test_followup_reuses_session_originals_without_repeating_source_research(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kwargs, broker, llm, checkpoints, queue = setup_run(monkeypatch)
+    run_independent(**kwargs)
+    prior = copy.deepcopy(checkpoints[-1])
+    original_question = kwargs["simple_chat_history"][-1].message
+    prior_request = prior["request"]
+    seen_loads: list[dict[str, Any]] = []
+
+    def load(**arguments: Any) -> dict[str, Any]:
+        seen_loads.append(arguments)
+        return prior
+
+    monkeypatch.setattr(runtime, "load_asv3_session_checkpoint", load)
+
+    def no_source_read(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("Originals were already retained")
+
+    monkeypatch.setattr(broker, "page", no_source_read)
+    kwargs["user_message_id"] += 2
+    kwargs["assistant_message_id"] += 2
+    kwargs["simple_chat_history"] = [
+        *kwargs["simple_chat_history"],
+        ChatMessageSimple(
+            message="Önceki kaynaklı yanıt",
+            token_count=10,
+            message_type=MessageType.ASSISTANT,
+        ),
+        ChatMessageSimple(
+            message="Peki bu durumda hangi hüküm uygulanıyor?",
+            token_count=12,
+            message_type=MessageType.USER,
+        ),
+    ]
+    llm.reset_mock()
+    kwargs["state_container"] = ChatStateContainer()
+
+    def answer_from_memory(**arguments: Any) -> ModelResponse:
+        assert arguments["prompt"][0].content == RESEARCHER_PROMPT
+        payload = user_payload(arguments["prompt"][1])
+        assert original_question in payload["conversation"]
+        footer = user_payload(arguments["prompt"][-1])
+        assert prior_request in footer["session_research"]["requests"]
+        originals = delivered_originals(arguments)
+        assert {row["text"] for row in originals} == {
+            chunk.text for chunk in broker.chunks.values()
+        }
+        assert arguments["timeout_override"] is None
+        return response(
+            "**Hızlı cevap:** Önceden okunmuş özgün hüküm uygulanır [1].\n\nKoşul ve uygulama ayrıntısı [2]."
+        )
+
+    llm.invoke.side_effect = answer_from_memory
+    run_independent(**kwargs)
+    assert llm.invoke.call_count == 3
+    assert seen_loads == [
+        {
+            "chat_session_id": kwargs["chat_session_id"],
+            "user_message_id": kwargs["user_message_id"],
+            "user_id": kwargs["user"].id,
+        }
+    ]
+    final = checkpoints[-1]
+    assert final["publication_status"] == "found"
+    assert (
+        final["session_research"]["requests"][-1]
+        == kwargs["simple_chat_history"][-1].message
+    )
+    assert final["session_research"]["reused_evidence_numbers"] == [1, 2]
+    assert final["budget"]["tools"] == 0
+    assert len(final["workers"]["tasks"]) == 1
+    assert final["question_research"]["answers"][0]["answer"] in final["last_draft"]
 
 
 def test_related_questions_use_fresh_children_and_keep_full_bodies_and_originals(
@@ -1288,3 +1365,141 @@ def test_final_evidence_keeps_uncited_same_source_exception_without_unrelated_so
     records = json.loads(runtime._evidence_record(ledger, "Result [1]."))
     assert [row["citation"] for row in records] == [1, 2]
     assert records[1]["text"] == "Only after the approved document is supplied."
+
+
+def test_followup_rebinds_retained_native_citation_before_root_and_child_decisions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hashlib import sha256
+
+    from onyx.asv3.corpus_tools import CorpusBroker
+    from onyx.server.asv3_citations import saved_item_from_checkpoint
+
+    kwargs, broker, llm, checkpoints, queue = setup_run(monkeypatch)
+    kwargs["user_message_id"], kwargs["assistant_message_id"] = 11, 12
+    source = broker.sources[0]
+    original_text = broker.chunks[str(source.id)].text
+    native = EvidenceItem(
+        source_id=str(source.id),
+        text=original_text,
+        metadata={
+            "derived": True,
+            "source_sha256": sha256(original_text.encode()).hexdigest(),
+            "locator": {"page": 1},
+        },
+    )
+    monkeypatch.setattr(broker, "source", lambda *_args: source, raising=False)
+    native = CorpusBroker.attach_native_citation(
+        cast(CorpusBroker, broker), native, 5, 2, RunContext()
+    )
+    assert native.search_doc is not None
+    assert native.search_doc.chunk_ind == -5
+    earlier = [
+        EvidenceItem(
+            source_id=f"external-{index}", text="External", metadata={"external": True}
+        )
+        if index % 2
+        else EvidenceItem(
+            source_id=f"unavailable-{index}", chunk_id=f"chunk-{index}", text="Old text"
+        )
+        for index in range(1, 5)
+    ]
+    prior: dict[str, Any] = {
+        "request": "Önceki sorunun tam senaryosu",
+        "evidence": {
+            "version": 1,
+            "records": [
+                {"citation": number, "item": item.model_dump(mode="json")}
+                for number, item in enumerate([*earlier, native], 1)
+            ],
+        },
+    }
+    unchanged_records = copy.deepcopy(prior["evidence"])
+
+    def load_prior(**_arguments: Any) -> dict[str, Any]:
+        assert broker.scope is not None
+        prior["scope"] = broker.scope.model_dump(mode="json")
+        return prior
+
+    monkeypatch.setattr(runtime, "load_asv3_session_checkpoint", load_prior)
+    original_revalidate = broker.revalidate_evidence
+
+    def revalidate(items: list[EvidenceItem], context: RunContext) -> None:
+        if any(item.source_id != str(source.id) for item in items):
+            raise PermissionError("Prior source is no longer authorized")
+        original_revalidate(items, context)
+
+    monkeypatch.setattr(broker, "revalidate_evidence", revalidate)
+    rebound: list[EvidenceItem] = []
+
+    def attach(
+        item: EvidenceItem, number: int, message_id: int, context: RunContext
+    ) -> EvidenceItem:
+        attached = CorpusBroker.attach_native_citation(
+            cast(CorpusBroker, broker), item, number, message_id, context
+        )
+        rebound.append(attached)
+        return attached
+
+    monkeypatch.setattr(broker, "attach_native_citation", attach, raising=False)
+    decision_roles: list[str] = []
+
+    def invoke(**arguments: Any) -> ModelResponse:
+        assert len(rebound) == 1
+        current = rebound[0]
+        assert current.text == original_text and current.text_hash == native.text_hash
+        assert current.search_doc is not None
+        assert current.search_doc.chunk_ind == -1
+        assert current.search_doc.metadata["asv3_citation_preview_url"] == (
+            "/api/asv3/citation/12/1"
+        )
+        originals = delivered_originals(arguments)
+        assert [(row["citation"], row["text"]) for row in originals] == [
+            (1, original_text)
+        ]
+        assert originals[0]["start_char"] == 0
+        assert originals[0]["end_char"] == len(original_text)
+        if arguments["prompt"][0].content == RESEARCHER_PROMPT:
+            decision_roles.append("child")
+            return response("Önceki özgün hükmün koşulları bu soruya uygulanır [1].")
+        decision_roles.append("root")
+        names = {tool["function"]["name"] for tool in arguments["tools"]}
+        if "research_questions" in names:
+            return response(
+                calls=[
+                    (
+                        "research_questions",
+                        {
+                            "questions": [
+                                {
+                                    "question_id": "followup",
+                                    "question": "Önceki hükmün bu senaryoya uygulanması",
+                                    "parent_question_ids": [1],
+                                    "public_title": "Hükmün uygulanması",
+                                    "public_message": "Önceki özgün hükmün koşulları inceleniyor.",
+                                }
+                            ],
+                            "_language": "tr",
+                        },
+                    )
+                ]
+            )
+        assert names == {"assemble_answers"}
+        return response(calls=[("assemble_answers", {"order": ["followup"]})])
+
+    llm.invoke.side_effect = invoke
+    runtime.run_asv3_loop(
+        **{key: value for key, value in kwargs.items() if key != "test_language"}
+    )
+    assert decision_roles == ["root", "child", "root"]
+    assert prior["evidence"] == unchanged_records
+    assert checkpoints[-1]["session_research"]["reused_evidence_numbers"] == [1]
+    saved, _scope = saved_item_from_checkpoint(checkpoints[-1], 1)
+    assert saved.text == original_text and saved.text_hash == native.text_hash
+    assert saved.search_doc is not None and saved.search_doc.chunk_ind == -1
+    emitted = [
+        packet.obj for packet in packets(queue) if isinstance(packet.obj, CitationInfo)
+    ]
+    assert len(emitted) == 1
+    assert emitted[0].citation_number == 1 and emitted[0].chunk_ind == -1
+    assert emitted[0].preview_url == "/api/asv3/citation/12/1"
