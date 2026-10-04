@@ -101,6 +101,153 @@ def last_payload(llm: MagicMock) -> dict[str, Any]:
     return cast(dict[str, Any], json.loads(content[0].text))
 
 
+def seed_forks(llm: MagicMock) -> list[MagicMock]:
+    forks: list[MagicMock] = []
+
+    def fork(seed: int) -> MagicMock:
+        selected = model(llm.config.max_input_tokens)
+        selected.config = llm.config.model_copy(update={"seed": seed})
+        selected.invoke.side_effect = llm.invoke
+        forks.append(selected)
+        return selected
+
+    llm.with_seed.side_effect = fork
+    return forks
+
+
+def test_native_coordinator_pins_first_and_adaptive_decisions_without_extra_calls() -> (
+    None
+):
+    llm = model(500000)
+    llm.config = llm.config.model_copy(
+        update={
+            "model_provider": "vertex_ai",
+            "model_name": "gemini-3.8-flash",
+            "temperature": 1,
+        }
+    )
+    forks = seed_forks(llm)
+    adapter = ResearchModel(llm, RunContext(), lean_native_mode=True)
+    adapter._native_output_capacity = 65536
+    adapter.decide(view())
+    first_state = adapter.native_sampling_snapshot()
+    adapter.decide(view())
+    assert [fork.config.seed for fork in forks] == [31, 1424088823]
+    assert [fork.invoke.call_count for fork in forks] == [1, 1]
+    assert llm.invoke.call_count == 2
+    assert llm.config.seed is None
+    assert all(fork.config.temperature == 1 for fork in forks)
+    assert all(fork.invoke.call_args.kwargs["max_tokens"] == 65536 for fork in forks)
+    assert first_state["first_decision_started"] is True
+    assert first_state["first_decision_completed"] is True
+    assert first_state["settings"] == {
+        "mode": "native_coordinator",
+        "version": 1,
+        "first_seed": 31,
+        "continuation_seed": 1424088823,
+    }
+
+
+@pytest.mark.parametrize(
+    ("provider", "name", "seed", "depth", "native"),
+    [
+        ("vertex_ai", "gemini-3.8-flash", 0, 0, True),
+        ("vertex_ai", "gemini-3.8-flash", 42, 0, True),
+        ("openai", "gemini-3.8-flash", None, 0, True),
+        ("vertex_ai", "another-model", None, 0, True),
+        ("vertex_ai", "gemini-3.8-flash", None, 1, True),
+        ("vertex_ai", "gemini-3.8-flash", None, 0, False),
+    ],
+)
+def test_native_default_seed_profile_preserves_explicit_seed_and_other_llms(
+    provider: str,
+    name: str,
+    seed: int | None,
+    depth: int,
+    native: bool,
+) -> None:
+    llm = model()
+    llm.config = llm.config.model_copy(
+        update={"model_provider": provider, "model_name": name, "seed": seed}
+    )
+    adapter = ResearchModel(llm, RunContext(depth=depth), lean_native_mode=native)
+    assert adapter._native_decision_llm(view()) is llm
+    llm.with_seed.assert_not_called()
+    assert llm.config.seed == seed
+
+
+def test_native_provider_retries_keep_the_same_first_seed_fork(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    llm = model()
+    llm.config = llm.config.model_copy(
+        update={"model_provider": "vertex_ai", "model_name": "gemini-3.8-flash"}
+    )
+    successful = llm.invoke.return_value
+    llm.invoke.side_effect = [
+        RuntimeError("retryable provider failure"),
+        successful,
+        successful,
+    ]
+    monkeypatch.setattr(llm_adapter, "is_retryable_provider_error", lambda _error: True)
+    monkeypatch.setattr(llm_adapter, "provider_retry_delay", lambda _error, _attempt: 0)
+    forks = seed_forks(llm)
+    adapter = ResearchModel(llm, RunContext(), lean_native_mode=True)
+    adapter._native_output_capacity = 65536
+    adapter.decide(view())
+    adapter.decide(view())
+    assert [fork.config.seed for fork in forks] == [31, 1424088823]
+    assert [fork.invoke.call_count for fork in forks] == [2, 1]
+    assert llm.config.seed is None
+
+
+@pytest.mark.parametrize(
+    "progress",
+    [
+        {"pending_calls": [{"name": "read_provision"}]},
+        {"turns": [{}]},
+        {"receipts": [{}]},
+        {"evidence": {"records": [{}]}},
+        {"last_draft": "Supported outcome [1]."},
+    ],
+)
+def test_native_resume_uses_continuation_for_recorded_decisions(
+    progress: dict[str, JsonValue],
+) -> None:
+    llm = model()
+    llm.config = llm.config.model_copy(
+        update={"model_provider": "vertex_ai", "model_name": "gemini-3.8-flash"}
+    )
+    forks = seed_forks(llm)
+    adapter = ResearchModel(llm, RunContext(), lean_native_mode=True)
+    interrupted = adapter.native_sampling_snapshot()
+    interrupted["first_decision_started"] = True
+    for saved in (progress, {**progress, "native_coordinator_sampling": interrupted}):
+        adapter.restore_native_sampling(saved)
+        adapter._native_decision_llm(view())
+    assert [fork.config.seed for fork in forks] == [1424088823, 1424088823]
+
+
+def test_native_interrupted_first_resume_replays_first_and_rejects_changed_profile() -> (
+    None
+):
+    llm = model()
+    llm.config = llm.config.model_copy(
+        update={"model_provider": "vertex_ai", "model_name": "gemini-3.8-flash"}
+    )
+    forks = seed_forks(llm)
+    adapter = ResearchModel(llm, RunContext(), lean_native_mode=True)
+    interrupted = adapter.native_sampling_snapshot()
+    interrupted["first_decision_started"] = True
+    adapter.restore_native_sampling({"native_coordinator_sampling": interrupted})
+    adapter._native_decision_llm(view())
+    assert forks[0].config.seed == 31
+    llm.config = llm.config.model_copy(update={"seed": 0})
+    with pytest.raises(ValueError, match="same coordinator sampling profile"):
+        adapter.restore_native_sampling({"native_coordinator_sampling": interrupted})
+    llm.invoke.assert_not_called()
+
+
 def test_native_history_preserves_each_complete_batch_and_delivers_originals_once() -> (
     None
 ):

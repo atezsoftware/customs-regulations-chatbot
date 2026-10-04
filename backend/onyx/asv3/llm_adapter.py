@@ -546,6 +546,10 @@ def model_slot(context: RunContext, *, research: bool = False) -> Iterator[None]
         context.budget.model_slots.release()
 
 
+NATIVE_COORDINATOR_FIRST_SEED = 31
+NATIVE_COORDINATOR_CONTINUATION_SEED = 1424088823
+
+
 class ResearchModel:
     def __init__(
         self,
@@ -575,6 +579,96 @@ class ResearchModel:
         self.last_finish_reason: str | None = None
         self.last_response_truncated = False
         self._native_output_capacity: int | None = None
+        self._native_first_decision_started = False
+        self._native_first_decision_completed = False
+
+    def native_sampling_snapshot(self) -> dict[str, JsonValue]:
+        config = self.llm.config
+        settings: dict[str, JsonValue] = {"mode": "unchanged"}
+        if config.seed is not None:
+            settings = {"mode": "explicit_seed", "seed": config.seed}
+        elif (
+            self.lean_native_mode
+            and self.context.depth == 0
+            and config.model_provider == "vertex_ai"
+            and config.model_name == "gemini-3.8-flash"
+        ):
+            settings = {
+                "mode": "native_coordinator",
+                "version": 1,
+                "first_seed": NATIVE_COORDINATOR_FIRST_SEED,
+                "continuation_seed": NATIVE_COORDINATOR_CONTINUATION_SEED,
+            }
+        return {
+            "settings": settings,
+            "first_decision_started": self._native_first_decision_started,
+            "first_decision_completed": self._native_first_decision_completed,
+        }
+
+    def restore_native_sampling(self, checkpoint: dict[str, JsonValue]) -> None:
+        saved = checkpoint.get("native_coordinator_sampling")
+        if saved is not None:
+            if (
+                not isinstance(saved, dict)
+                or saved.get("settings") != self.native_sampling_snapshot()["settings"]
+            ):
+                raise ValueError(
+                    "ASv3 resume requires the same coordinator sampling profile"
+                )
+            if any(
+                type(saved.get(key)) is not bool
+                for key in ("first_decision_started", "first_decision_completed")
+            ):
+                raise ValueError("Invalid ASv3 coordinator sampling checkpoint")
+            self._native_first_decision_started = (
+                saved["first_decision_started"] is True
+            )
+            self._native_first_decision_completed = (
+                saved["first_decision_completed"] is True
+            )
+            if (
+                self._native_first_decision_completed
+                and not self._native_first_decision_started
+            ):
+                raise ValueError("Invalid ASv3 coordinator sampling checkpoint")
+        # Pending tools prove a native decision returned; a failed provider with
+        # no recorded decision remains a first-decision retry.
+        if any(
+            checkpoint.get(key)
+            for key in (
+                "receipts",
+                "turns",
+                "last_draft",
+                "pending_calls",
+                "pending_call_count",
+            )
+        ) or (
+            isinstance(evidence := checkpoint.get("evidence"), dict)
+            and evidence.get("records")
+        ):
+            self._native_first_decision_started = True
+            self._native_first_decision_completed = True
+
+    def _native_decision_llm(self, view: HarnessView) -> LLM:
+        settings = self.native_sampling_snapshot()["settings"]
+        if (
+            not isinstance(settings, dict)
+            or settings.get("mode") != "native_coordinator"
+        ):
+            return self.llm
+        continued = self._native_first_decision_completed or bool(
+            view.turns
+            or view.receipts
+            or view.original_evidence
+            or view.draft_to_repair
+        )
+        selected = self.llm.with_seed(
+            NATIVE_COORDINATOR_CONTINUATION_SEED
+            if continued
+            else NATIVE_COORDINATOR_FIRST_SEED
+        )
+        self._native_first_decision_started = True
+        return selected
 
     def _native_output_limit(self) -> int:
         if self._native_output_capacity is None:
@@ -946,6 +1040,7 @@ class ResearchModel:
         research: bool,
         structured: bool = True,
         response_model: type[BaseModel] | None = None,
+        call_llm: LLM | None = None,
     ) -> ModelResponse:
         check = (
             self.context.check_research_active
@@ -964,6 +1059,7 @@ class ResearchModel:
                     research=research,
                     structured=structured,
                     response_model=response_model,
+                    call_llm=call_llm,
                 )
             except Exception as error:
                 if attempt == 2 or not is_retryable_provider_error(error):
@@ -994,7 +1090,9 @@ class ResearchModel:
         research: bool,
         structured: bool = True,
         response_model: type[BaseModel] | None = None,
+        call_llm: LLM | None = None,
     ) -> ModelResponse:
+        selected_llm = call_llm if call_llm is not None else self.llm
         response_model = (
             (response_model or structured_model(flow)) if structured else None
         )
@@ -1037,7 +1135,7 @@ class ResearchModel:
                         records.append(data)
         with (
             model_slot(self.context, research=research),
-            llm_generation_span(self.llm, flow, prompt, tools or None) as span,
+            llm_generation_span(selected_llm, flow, prompt, tools or None) as span,
         ):
             deadline = (
                 self.context.research_deadline if research else self.context.deadline
@@ -1050,7 +1148,7 @@ class ResearchModel:
                     1, int(remaining if self.lean_native_mode else min(remaining, 120))
                 )
             )
-            response = self.llm.invoke(
+            response = selected_llm.invoke(
                 prompt=prompt,
                 # Provider normalization must not rewrite canonical validation schemas.
                 tools=copy.deepcopy(tools) if tools else None,
@@ -1530,6 +1628,8 @@ class ResearchModel:
         tools: list[dict[str, JsonValue]],
         request: str,
         flow: LLMFlow,
+        *,
+        call_llm: LLM | None = None,
     ) -> Decision:
         original = self._decision(response, tools, return_argument_errors=True)
         invalid = {call.call_id: call for call in original.calls if call.argument_error}
@@ -1579,6 +1679,7 @@ class ResearchModel:
             max_tokens=output,
             research=True,
             response_model=ToolArgumentPatch,
+            call_llm=call_llm,
         )
         try:
             if repaired_response.choice.finish_reason in {"length", "max_tokens"}:
@@ -2125,10 +2226,15 @@ class ResearchModel:
         flow = (
             LLMFlow.ASV3_RESEARCHER if self.context.depth else LLMFlow.ASV3_COORDINATOR
         )
-        response = self._invoke(prompt, tools, flow, max_tokens=output, research=True)
+        call_llm = (
+            self._native_decision_llm(view) if self.lean_native_mode else self.llm
+        )
+        response = self._invoke(
+            prompt, tools, flow, max_tokens=output, research=True, call_llm=call_llm
+        )
         if self.lean_native_mode:
             response = self._complete_native_response(
-                prompt, tools, flow, output, response
+                prompt, tools, flow, output, response, call_llm=call_llm
             )
         if (
             not response.choice.message.tool_calls
@@ -2146,11 +2252,16 @@ class ResearchModel:
                 ),
             ]
             response = self._invoke(
-                recovery_prompt, tools, flow, max_tokens=output, research=True
+                recovery_prompt,
+                tools,
+                flow,
+                max_tokens=output,
+                research=True,
+                call_llm=call_llm,
             )
             if self.lean_native_mode:
                 response = self._complete_native_response(
-                    recovery_prompt, tools, flow, output, response
+                    recovery_prompt, tools, flow, output, response, call_llm=call_llm
                 )
             if (
                 not response.choice.message.tool_calls
@@ -2163,8 +2274,10 @@ class ResearchModel:
             decision = self._decision(response, tools)
         except ValueError:
             decision = self._repair_action_arguments(
-                response, tools, view.request, flow
+                response, tools, view.request, flow, call_llm=call_llm
             )
+        self._native_first_decision_started = True
+        self._native_first_decision_completed = True
         return decision
 
     def _complete_native_response(
@@ -2174,6 +2287,8 @@ class ResearchModel:
         flow: LLMFlow,
         output: int,
         response: ModelResponse,
+        *,
+        call_llm: LLM | None = None,
     ) -> ModelResponse:
         text = ""
         while (response.choice.finish_reason or "").lower() in {
@@ -2230,7 +2345,12 @@ class ResearchModel:
                     )
             self.context.consume_research_decision()
             response = self._invoke(
-                continuation, continuation_tools, flow, max_tokens=output, research=True
+                continuation,
+                continuation_tools,
+                flow,
+                max_tokens=output,
+                research=True,
+                call_llm=call_llm,
             )
             self.last_response_truncated = True
             if (

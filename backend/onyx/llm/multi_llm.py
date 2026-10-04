@@ -1208,6 +1208,12 @@ class LitellmLLM(LLM):
 
             raise e
 
+    def with_seed(self, seed: LLMSeed) -> "LitellmLLM":
+        validated_seed = TypeAdapter(LLMSeed).validate_python(seed)
+        bound = copy.copy(self)
+        bound._seed = validated_seed
+        return bound
+
     @property
     def config(self) -> LLMConfig:
         return LLMConfig(

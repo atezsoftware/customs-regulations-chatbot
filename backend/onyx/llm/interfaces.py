@@ -72,6 +72,10 @@ class LLM(abc.ABC):
     def config(self) -> LLMConfig:
         raise NotImplementedError
 
+    def with_seed(self, seed: LLMSeed) -> "LLM":
+        """Return an independent seed binding without changing this LLM."""
+        raise NotImplementedError("This LLM does not support an isolated seed binding")
+
     def invoke(
         self,
         prompt: LanguageModelInput,

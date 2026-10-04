@@ -278,6 +278,8 @@ def run_asv3_loop(
         token_counter=token_counter,
         lean_native_mode=True,
     )
+    if previous is not None:
+        model.restore_native_sampling(previous)
     search = next((tool for tool in tools if isinstance(tool, SearchTool)), None)
 
     def search_history(child: RunContext) -> list[ChatMessageSimple]:
@@ -416,6 +418,7 @@ def run_asv3_loop(
                 sequence=checkpoint_sequence,
                 prompt_version=PROMPT_VERSION,
                 execution_mode="native",
+                native_coordinator_sampling=model.native_sampling_snapshot(),
                 scope=context.scope,
                 progress=list(emitted),
                 progress_state=progress.export(),
