@@ -434,6 +434,7 @@ def run_tool_calls(
     inject_memories_in_prompt: bool = True,
     search_llm_chunks_per_call_cap: int | None = None,
     tool_execution_timeout_seconds: float | None = TOOL_EXECUTION_TIMEOUT_SECONDS,
+    search_rerank_context: str | None = None,
 ) -> ParallelToolCallResponse:
     """Run (optionally merged) tool calls in parallel and update citation mappings.
 
@@ -598,6 +599,7 @@ def run_tool_calls(
             override_kwargs = SearchToolOverrideKwargs(
                 starting_citation_num=starting_citation_num,
                 original_query=search_original_query,
+                rerank_context=search_rerank_context,
                 message_history=search_message_history,
                 filter_message_history=search_filter_history,
                 filter_queries=search_filter_queries or None,

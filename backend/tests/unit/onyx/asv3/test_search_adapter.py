@@ -43,6 +43,7 @@ from onyx.error_handling.exceptions import OnyxError
 from onyx.llm.interfaces import LLM, LLMUserIdentity
 from onyx.llm.model_response import Choice, Message, ModelResponse
 from onyx.llm.models import UserMessage
+from onyx.reranking.models import RerankOutcome, RerankResult
 from onyx.tools.tool_implementations.search.search_tool import SearchTool
 
 MODULE = "onyx.tools.tool_implementations.search.search_tool"
@@ -484,6 +485,126 @@ def test_researcher_task_and_evidence_target_reach_search_receipt_without_invent
         "evidence_target": args["evidence_target"],
     }
     assert "user_file" in str(receipt["note"])
+
+
+def test_reranking_retains_scenario_and_target_without_broadening_retrieval_or_delivery() -> (
+    None
+):
+    tool, broker, llm = tool_and_broker()
+    actual_request = (
+        "Can this shipment use repair relief? No permit was issued before export; "
+        "the goods have not yet been re-imported."
+    )
+    query = "repair relief eligibility"
+    coverage_item = "Effect of the missing prior permit"
+    evidence_target = "Operative conditions for a later application before re-import"
+    source_id = str(uuid4())
+    seed = InferenceChunk(
+        document_id=source_id,
+        chunk_id=0,
+        content="Original operative paragraph",
+        source_type=DocumentSource.USER_FILE,
+        semantic_identifier="Named customs instrument",
+        title="Named customs instrument",
+        boost=1,
+        score=0.9,
+        hidden=False,
+        metadata={},
+        match_highlights=[],
+        doc_summary="",
+        chunk_context="",
+        updated_at=None,
+        image_file_id=None,
+        source_links=None,
+        section_continuation=False,
+        blurb="Original operative paragraph",
+        file_id=source_id,
+        regulatory_chunk_id="rc-0",
+        heading_path=["MADDE 100"],
+    )
+    chunks = [
+        seed.model_copy(
+            update={
+                "chunk_id": index,
+                "regulatory_chunk_id": f"rc-{index}",
+                "heading_path": [f"MADDE {100 + index}"],
+            }
+        )
+        for index in range(30)
+    ]
+    adapter = build_search_adapter(
+        tool,
+        actual_request,
+        broker,
+        message_history=lambda _: [user_message(actual_request)],
+    )
+    with (
+        search_boundaries(chunks) as (pipeline, _, _),
+        patch(
+            f"{MODULE}.get_reranker_configuration",
+            return_value=RerankerRuntimeConfig(
+                enabled=True,
+                provider_type=None,
+                model_name=None,
+                api_key=None,
+                configuration_generation="test",
+            ),
+        ),
+        patch(
+            f"{MODULE}.rerank_chunks",
+            return_value=RerankResult(
+                ordered_chunks=chunks,
+                scores_by_chunk={
+                    (chunk.document_id, chunk.chunk_id): 1 - index / len(chunks)
+                    for index, chunk in enumerate(chunks)
+                },
+                submitted_count=len(chunks),
+                result_count=len(chunks),
+                outcome=RerankOutcome.SUCCESS,
+                fallback_used=False,
+            ),
+        ) as rerank,
+        patch.object(
+            broker,
+            "hydrate_search_centers",
+            side_effect=lambda docs, _context: {
+                (doc.document_id, doc.chunk_ind): [
+                    EvidenceItem(
+                        source_id=doc.document_id,
+                        chunk_id=str(doc.metadata["regulatory_chunk_id"]),
+                        text="Canonical operative paragraph",
+                    )
+                ]
+                for doc in docs
+            },
+        ) as hydrate,
+    ):
+        outcome = adapter(
+            {
+                "query": query,
+                "mode": "keyword",
+                "coverage_item": coverage_item,
+                "evidence_target": evidence_target,
+                "expand_query": False,
+            },
+            RunContext(),
+        )
+
+    rerank.assert_called_once()
+    rerank_query = rerank.call_args.kwargs["query"]
+    assert actual_request in rerank_query
+    assert query in rerank_query
+    assert coverage_item in rerank_query
+    assert evidence_target in rerank_query
+    assert len(rerank.call_args.kwargs["chunks"]) == 30
+    pipeline.assert_called_once()
+    assert pipeline.call_args.kwargs["chunk_search_request"].query == query
+    assert pipeline.call_args.kwargs["chunk_search_request"].limit == 128
+    llm.invoke.assert_not_called()
+    hydrate.assert_called_once()
+    assert len(hydrate.call_args.args[0]) == 25
+    assert outcome.status == OutcomeStatus.FOUND
+    assert len(outcome.evidence) == 25
 
 
 @pytest.mark.parametrize(

@@ -1,4 +1,4 @@
-PROMPT_VERSION = "asv3-2026-10-04.39"
+PROMPT_VERSION = "asv3-2026-10-04.40"
 
 ANSWER_REPAIR_PROMPT = """Repair only the exact target_unit_ids and required_omissions in this candidate answer.
 Return replacements for every target unit once and insertions for every omission ID once.
@@ -51,6 +51,13 @@ source or provision. Preserve its resolved source_id in source-local searches an
 reads; a corpus-wide article-number query can match unrelated instruments. Batch independent
 searches or reads with already-known inputs in the SAME native decision instead of waiting
 between them. Select their search modes, queries and dependencies yourself.
+Preserve the decisive supplied qualifiers and exact unresolved outcome in each focused
+query, coverage_item and evidence_target; a broad topic or article list can lose the
+condition that changes the answer. Search results are a bounded selection, not the whole
+source. When that selection leaves a material qualifier unresolved, choose a focused
+source-local search, provision or heading/context read where useful instead of repeating
+the same broad search or assuming an unread exception does not exist. Reuse complete
+delivered originals; no extra search or mandatory stage is needed when they suffice.
 Use our original-source tools: search_source_text, query_corpus, read_chunk,
 read_chunk_context, read_source_range and follow_reference as useful. For dependent
 resolution and reading, compose_tool_calls can execute the chosen sequence without an
@@ -98,6 +105,133 @@ Yönetmelik -> Tebliğ -> administrative implementation/guidance. Establish each
 actual legal role, delegation and scope; its title alone does not settle a conflict.
 This framework guides source selection and interpretation; it is not evidence for a case
 conclusion or a requirement to collect every tier or read the Constitution for every answer.
+
+OPTIONAL TOPIC-TO-SOURCE NAVIGATION
+The following source families are possible starting points, not mandatory searches,
+a fixed research order, an exhaustive list or evidence that an instrument applies.
+Select, skip, combine or revise these leads according to the actual question, supplied
+facts, relevant dates and originals returned by tools. A known source/provision can be
+resolved and read directly. Verify identity, authority, operative scope and relevant
+version before relying on a source; this guide does not replace the original-evidence
+and citation standards below. A topic match or source title does not establish a legal
+condition or effect. An omitted family does not establish absence of law. Do not expand
+the user's scenario or research every row merely because it appears here.
+
+| Soru / konu | İlgili olduğunda değerlendirilebilecek kaynak aileleri |
+| --- | --- |
+| Gümrük hukukunun genel esasları | 4458 sayılı Gümrük Kanunu; ilgili Gümrük Yönetmeliği ve uygulama hükümleri |
+| Gümrük yükümlülüğü | 4458 sayılı Gümrük Kanunu; ilgili Gümrük Yönetmeliği ve uygulama hükümleri |
+| Gümrük vergisi / mali yükümlülükler | İlgili kanuni dayanaklar, İthalat Rejimi Kararı ve listeleri; ürün, menşe ve tarihe göre ilgili ithalat ve mali yükümlülük düzenlemeleri; 4458, İthalat Rejimi Kararı ve ilgili yetkili oran kararları |
+| Gümrük kıymeti | 4458, Gümrük Yönetmeliği ve ilgili kıymet uygulama hükümleri |
+| GTİP / tarife sınıflandırması | Türk Gümrük Tarife Cetveli, Gümrük Tarife İzahnamesi, ilgili açıklama notları ve sınıflandırma kararları; varsa uygulanabilir BTB |
+| Bağlayıcı Tarife Bilgisi (BTB) | 4458, Gümrük Yönetmeliği ve ilgili tarife / BTB uygulama düzenlemeleri |
+| Menşe – genel | 4458, Gümrük Yönetmeliği ve ilgili menşe düzenlemeleri |
+| Tercihli menşe | İlgili tercihli ticaret anlaşması / STA, menşe protokolü ve uygulanabilir iç hukuk düzenlemeleri |
+| Tercihsiz menşe | 4458, Gümrük Yönetmeliği ve ilgili menşe düzenlemeleri |
+| Menşe şahadetnamesi | Gümrük Yönetmeliği; ilgili menşe / dolaşım kuralları ve uluslararası anlaşma hükümleri |
+| A.TR / EUR.1 / EUR-MED | Gümrük Birliği ve serbest dolaşım / dolaşım belgesi uygulama düzenlemeleri; A.TR'yi menşe ispatı olarak değerlendirme; İlgili tercihli ticaret anlaşması, menşe protokolü ve belgeye özgü uygulama hükümleri |
+| Serbest dolaşıma giriş / ithalat | 4458, Gümrük Yönetmeliği; ilgili ithalat ve muafiyet kararları ile serbest dolaşıma giriş uygulama hükümleri |
+| İhracat | 4458, Gümrük Yönetmeliği; İhracat Rejimi Kararı ve ilgili ihracat düzenlemeleri |
+| Mahrece iade | 4458, Gümrük Yönetmeliği ve ilgili mahrece iade uygulama hükümleri |
+| Nihai kullanım | 4458, Gümrük Yönetmeliği ve ilgili nihai kullanım düzenlemeleri |
+| Dahilde İşleme Rejimi (DİR) | 4458 ve Gümrük Yönetmeliği'nin ilgili rejim hükümleri; Dahilde İşleme Rejimi Kararı ve uygulama Tebliğleri |
+| Hariçte İşleme Rejimi (HİR) | 4458 ve Gümrük Yönetmeliği'nin ilgili rejim hükümleri; Hariçte İşleme Rejimi Kararı ve uygulama Tebliğleri |
+| Geçici ithalat | 4458, Gümrük Yönetmeliği; konuya göre 4458 Sayılı Gümrük Kanununun Bazı Maddelerinin Uygulanması Hakkında Karar ve ilgili geçici ithalat düzenlemeleri |
+| Antrepo rejimi | 4458, Gümrük Yönetmeliği ve ilgili antrepo uygulama hükümleri |
+| Transit rejimi | 4458, Gümrük Yönetmeliği, ilgili transit sözleşmeleri ve uygulama düzenlemeleri |
+| TIR işlemleri | TIR Sözleşmesi, 4458, Gümrük Yönetmeliği ve ilgili TIR / transit uygulama düzenlemeleri |
+| Özet beyan | 4458, Gümrük Yönetmeliği ve ilgili özet beyan uygulama hükümleri |
+| Eşyanın gümrüğe sunulması | 4458 ve Gümrük Yönetmeliği'nin sunma ve gözetim hükümleri |
+| Geçici depolama | 4458, Gümrük Yönetmeliği ve ilgili geçici depolama uygulama hükümleri |
+| Gümrük beyannamesi | 4458, Gümrük Yönetmeliği ve ilgili beyanname düzenlemeleri |
+| Beyan düzeltme / iptal | 4458, Gümrük Yönetmeliği ve ilgili düzeltme / iptal uygulama hükümleri |
+| Eksik / tamamlayıcı beyan | 4458, Gümrük Yönetmeliği ve ilgili basitleştirilmiş beyan düzenlemeleri |
+| Elektronik beyan / BİLGE | 4458, Gümrük Yönetmeliği ve ilgili elektronik işlem / sistem uygulama düzenlemeleri |
+| Muayene / kontrol | 4458, Gümrük Yönetmeliği ve ilgili kontrol / denetim düzenlemeleri |
+| Fiziki kontrol / belge kontrolü | 4458, Gümrük Yönetmeliği ve ilgili kontrol / denetim düzenlemeleri |
+| Ayniyet | Gümrük Yönetmeliği, ilgili özel rejim hükümleri ve yetkili Genelge / Genel Yazılar; ayniyet, eşyanın takibi ve belge / kayıt kontrollerine ilişkin hükümler |
+| Gümrük tahlili / laboratuvar | Gümrük Yönetmeliği, Gümrük Laboratuvarlarının Faaliyetleri Hakkında Yönetmelik ve ilgili tahlil düzenlemeleri |
+| Gümrük laboratuvarı | Gümrük Yönetmeliği, Gümrük Laboratuvarlarının Faaliyetleri Hakkında Yönetmelik ve ilgili tahlil düzenlemeleri |
+| Risk analizi / hedefleme | 4458, Gümrük Yönetmeliği ve erişilebilir, yetkili risk yönetimi düzenlemeleri |
+| Sonradan kontrol | 4458, Sonradan Kontrol ve Riskli İşlemlerin Kontrolü Yönetmeliği ve ilgili uygulama hükümleri |
+| Gümrük denetimi | 4458, Gümrük Yönetmeliği ve ilgili kontrol / denetim düzenlemeleri |
+| Yetkilendirilmiş Yükümlü (YYS) | 4458, Gümrük Yönetmeliği, Gümrük İşlemlerinin Kolaylaştırılması Yönetmeliği ve ilgili izleme / uygulama düzenlemeleri |
+| Onaylanmış Kişi Statüsü (OKSB) | 4458, Gümrük Yönetmeliği ve Onaylanmış Kişi Statüsüne İlişkin Gümrük Genel Tebliği |
+| Basitleştirilmiş usuller | 4458, Gümrük Yönetmeliği; statü ve usule göre Gümrük İşlemlerinin Kolaylaştırılması Yönetmeliği ve ilgili uygulama hükümleri |
+| İzinli gönderici/alıcı | İlgili transit ve kolaylaştırma mevzuatı; Gümrük Yönetmeliği ve statüye özgü yetki / uygulama hükümleri |
+| Teminat | 4458, Gümrük Yönetmeliği; ilgili rejim / transit / kolaylaştırma teminat hükümleri |
+| Teminat türleri / kapsamlı teminat | 4458, Gümrük Yönetmeliği; ilgili rejim / transit / kolaylaştırma teminat hükümleri |
+| Gümrük vergisinin ödenmesi | 4458, Gümrük Yönetmeliği; uygulanabilir 6183 sayılı Amme Alacaklarının Tahsil Usulü Hakkında Kanun hükümleri |
+| Gümrük alacağının takibi | 4458 ve uygulanabilir 6183 hükümleri; ilgili tahsil düzenlemeleri |
+| Faiz | Alacağın ve faizin türüne göre 4458, 6183 ve ilgili mali düzenlemeler |
+| Gümrük vergisinin geri verilmesi | 4458, Gümrük Yönetmeliği ve ilgili geri verme / kaldırma uygulama hükümleri |
+| Gümrük vergisinin kaldırılması | 4458, Gümrük Yönetmeliği ve ilgili geri verme / kaldırma uygulama hükümleri |
+| Ceza / usulsüzlük | 4458'in ilgili ceza hükümleri; özel hüküm ilişkisine göre 5326 sayılı Kabahatler Kanunu ve ilgili usul / uygulama hükümleri |
+| Gümrük kabahatleri | 4458'in ilgili ceza hükümleri; özel hüküm ilişkisine göre 5326 sayılı Kabahatler Kanunu ve ilgili usul / uygulama hükümleri |
+| Kaçakçılık | 5607 sayılı Kaçakçılıkla Mücadele Kanunu; somut suç için ilgili diğer ceza hükümleri |
+| Uzlaşma | 4458 ve Gümrük Uzlaşma Yönetmeliği |
+| İtiraz | 4458, Gümrük Yönetmeliği; somut başvuru aşamasında ilgili usul ve yargı hükümleri |
+| İdari dava | 2577 sayılı İdari Yargılama Usulü Kanunu; 4458 ve uyuşmazlığa uygulanabilir diğer hükümler |
+| Zamanaşımı | Yükümlülük, tahsil, ceza veya başvurunun türüne göre 4458, 6183 ve ilgili diğer zamanaşımı hükümleri |
+| Tasfiye | 4458, Gümrük Yönetmeliği ve ilgili tasfiye düzenlemeleri |
+| Eşyanın terk edilmesi | 4458, Gümrük Yönetmeliği ve ilgili tasfiye düzenlemeleri |
+| Eşyanın imhası | 4458, Gümrük Yönetmeliği ve ilgili tasfiye düzenlemeleri |
+| Geri gelen eşya | 4458, Gümrük Yönetmeliği; somut işleme özgü uygulama ve ilgili vergi hükümleri |
+| Bedelsiz ithalat | 4458, ilgili muafiyet / ithalat ve bedelsiz ithalat düzenlemeleri; ödeme yapılmamasını tek başına vergi muafiyeti sayma |
+| Bedelsiz ihracat | İlgili ihracat ve bedelsiz ihracat düzenlemeleri; varsa somut işleme özgü gümrük ve vergi hükümleri |
+| Posta yoluyla eşya | 4458, Gümrük Yönetmeliği; ilgili posta / hızlı kargo ve muafiyet uygulama hükümleri |
+| Hızlı kargo | 4458, Gümrük Yönetmeliği; ilgili posta / hızlı kargo ve muafiyet uygulama hükümleri |
+| Yolcu işlemleri | 4458, Gümrük Yönetmeliği ve ilgili yolcu / muafiyet düzenlemeleri |
+| Yolcu beraberi eşya | 4458, Gümrük Yönetmeliği ve ilgili yolcu / muafiyet düzenlemeleri |
+| Kişisel eşya | 4458, Gümrük Yönetmeliği ve ilgili yolcu / muafiyet düzenlemeleri |
+| Taşıt işlemleri | 4458, Gümrük Yönetmeliği; işlemin türüne göre geçici ithalat, yolcu ve taşıta özgü düzenlemeler |
+| Konteynerler | İlgili uluslararası konteyner sözleşmeleri; Gümrük Yönetmeliği ve konteyner uygulama hükümleri |
+| Gümrüksüz satış mağazaları | 4458 ve Gümrüksüz Satış Mağazaları Yönetmeliği |
+| Serbest bölgeler | 3218 sayılı Serbest Bölgeler Kanunu; ilgili serbest bölge, gümrük ve vergi hükümleri |
+| Ticaret politikası önlemleri | İlgili kanuni dayanaklar, yetkili kararlar ve önleme özgü ithalat düzenlemeleri |
+| Anti-damping | 3577 sayılı İthalatta Haksız Rekabetin Önlenmesi Hakkında Kanun; ilgili Karar / Yönetmelik ve ürün / ülke kapsamındaki önlem Tebliğleri |
+| Telafi edici önlemler | 3577 sayılı İthalatta Haksız Rekabetin Önlenmesi Hakkında Kanun; ilgili Karar / Yönetmelik ve ürün / ülke kapsamındaki önlem Tebliğleri |
+| Korunma önlemleri | İthalatta Korunma Önlemleri Hakkında Karar / Yönetmelik; ilgili ürün ve önlem kararları / Tebliğleri |
+| Gözetim | İthalatta Gözetim Uygulanması Hakkında Karar / Yönetmelik; ilgili ürün Tebliğleri |
+| Tarife kontenjanı / kota | İlgili ithalat ve tarife kontenjanı / kota kararları; ürün ve döneme özgü dağıtım / uygulama düzenlemeleri |
+| Ek mali yükümlülük | İlgili kanuni dayanak, yetkili mali yükümlülük kararı ve ürün / menşe / tarihe özgü uygulama düzenlemeleri |
+| İthalat lisansları / izinleri | Yetkili kurumun ürün mevzuatı; ilgili ithalat ve izin / uygunluk düzenlemeleri |
+| İhracat yasakları / kısıtlamaları | İhracat Rejimi Kararı; ürüne ve yetkili kuruma özgü yasak / kısıtlama düzenlemeleri |
+| İthal yasakları / kısıtlamaları | İthalat Rejimi Kararı; ürüne ve yetkili kuruma özgü yasak / kısıtlama düzenlemeleri |
+| Ürün güvenliği | 7223 sayılı Ürün Güvenliği ve Teknik Düzenlemeler Kanunu; ürüne özgü teknik kurallar ve ilgili Ürün Güvenliği ve Denetimi düzenlemeleri |
+| TAREKS | 7223 sayılı Ürün Güvenliği ve Teknik Düzenlemeler Kanunu; ürüne özgü teknik kurallar ve ilgili Ürün Güvenliği ve Denetimi düzenlemeleri |
+| CE / teknik mevzuat | 7223; ürüne özgü teknik düzenlemeler ve uygulanabilir uygunluk değerlendirmesi / ÜGD hükümleri |
+| Tarım ürünleri | Ürüne özgü Tarım ve Orman Bakanlığı düzenlemeleri; ilgili ithalat, ÜGD ve gümrük hükümleri |
+| Bitki sağlığı / bitki karantinası | 5996 sayılı Veteriner Hizmetleri, Bitki Sağlığı, Gıda ve Yem Kanunu; ilgili bitki sağlığı / karantina ve kontrol düzenlemeleri |
+| Veteriner kontrolleri | 5996; ilgili veteriner, sınır kontrolü ve yetkili kurum düzenlemeleri |
+| Gıda ürünleri | 5996; ürüne özgü gıda ve ithalat kontrolü düzenlemeleri |
+| Sağlık ürünleri | Yetkili kurumun ürüne özgü mevzuatı; uygulanabilir izin, teknik düzenleme, ÜGD ve gümrük hükümleri |
+| İlaç / tıbbi ürün | Yetkili kurumun ürüne özgü mevzuatı; uygulanabilir izin, teknik düzenleme, ÜGD ve gümrük hükümleri |
+| Kimyasallar | KKDİK, SEA ve ilgili Türk kimyasal / teknik ürün mevzuatı; REACH veya başka dış düzenlemeler için somut işlemle bağlantıyı ve iç hukukta uygulanabilirliği doğrula |
+| Fikri ve sınai mülkiyet | 4458 ve Gümrük Yönetmeliği'nin gümrükte koruma hükümleri; hakkın türüne göre 6769 sayılı Sınai Mülkiyet Kanunu, 5846 sayılı Fikir ve Sanat Eserleri Kanunu ve ilgili düzenlemeler |
+| Sahte/marka ihlalli eşya | 4458 ve Gümrük Yönetmeliği'nin gümrükte koruma hükümleri; hakkın türüne göre 6769 sayılı Sınai Mülkiyet Kanunu, 5846 sayılı Fikir ve Sanat Eserleri Kanunu ve ilgili düzenlemeler |
+| Tütün / alkol | Ürün ve işlem kapsamına göre 4733, 4250, 4760 ve ilgili izin, piyasa, ithalat / ihracat düzenlemeleri |
+| ÖTV | 4760 sayılı Özel Tüketim Vergisi Kanunu; ilgili listeler, yetkili kararlar ve uygulama düzenlemeleri |
+| KDV | 3065 sayılı Katma Değer Vergisi Kanunu; KDV Genel Uygulama Tebliği ve ilgili uygulama hükümleri |
+| Damga vergisi / diğer mali yükümlülükler | İlgili vergi kanunu ve somut belge / işleme uygulanabilir mali hükümler |
+| Döviz / kambiyo bağlantılı işlemler | Türk Parasının Kıymetini Koruma mevzuatı; ödeme ve işlemin türüne özgü dış ticaret düzenlemeleri |
+| Dış ticaret ödemeleri | Türk Parasının Kıymetini Koruma mevzuatı; ödeme ve işlemin türüne özgü dış ticaret düzenlemeleri |
+| Gümrük müşavirliği / temsil | 4458, Gümrük Yönetmeliği ve ilgili müşavirlik düzenlemeleri; 4458 ve Gümrük Yönetmeliği'nin temsil ve sorumluluk hükümleri |
+| Dolaylı / doğrudan temsil | 4458 ve Gümrük Yönetmeliği'nin temsil ve sorumluluk hükümleri |
+| Gümrük idareleri / yetki | 4458, Gümrük Yönetmeliği ve ilgili teşkilat / yetki düzenlemeleri |
+| İhtisas gümrükleri | Gümrük Yönetmeliği; ürün ve işlem kapsamındaki yetkili ihtisas gümrüğü düzenlemeleri |
+| Tek Pencere | 4458, Gümrük Yönetmeliği; belge ve kurum kapsamındaki Tek Pencere uygulama düzenlemeleri |
+| Dijital gümrük / elektronik sistemler | 4458, Gümrük Yönetmeliği ve ilgili elektronik işlem / sistem uygulama düzenlemeleri |
+| Beyanname veri alanları / elektronik işlemler | 4458, Gümrük Yönetmeliği ve ilgili elektronik işlem / sistem uygulama düzenlemeleri |
+| Gümrük istatistikleri | İlgili gümrük, istatistik ve veri derleme düzenlemeleri; sınıflandırma için Türk Gümrük Tarife Cetveli |
+| Uluslararası sözleşmeler | İlgili yürürlükteki sözleşme; uygulanabilir iç hukuk dayanağı ve uygulama hükümleri |
+| Gümrük Birliği | İlgili Ortaklık Konseyi kararları; uygulanabilir iç hukuk ve serbest dolaşım uygulama hükümleri |
+| STA'lar | İlgili yürürlükteki anlaşma, protokoller ve uygulanabilir iç hukuk düzenlemeleri; konuya göre menşe ve taviz hükümleri |
+| WTO / DTÖ bağlantılı konular | İlgili DTÖ anlaşması; somut konuya uygulanabilir Türk iç hukuk hükümleri |
+| Armonize Sistem | Armonize Sistem Sözleşmesi; Türk Gümrük Tarife Cetveli, İzahname ve uygulanabilir sınıflandırma kararları |
+| Kanunun uygulanma detayları, usuller, süreler ve belgeler | Gümrük Yönetmeliği; konuya özgü yetkili uygulama düzenlemeleri |
+| İhracatta vergiler, mali yükümlülükler ve istisnalar | İlgili vergi kanunları, ihracat mevzuatı ve somut işleme özgü vergi veya istisna hükümleri |
+| Gümrük vergisi oranı | 4458, İthalat Rejimi Kararı ve ilgili yetkili oran kararları |
 
 For each material legal conclusion, you must read and use its applicable directly governing
 Kanun or higher operative original, with its own adjacent [n] citation in the answer.
@@ -283,6 +417,13 @@ navigation leads for relevant governing, implementing or tax instruments within 
 scenario; resolve/read originals, never treat those names as proof. Parent/sibling context
 is available when needed, but do not routinely read entire families or reopen complete
 originals already delivered.
+Preserve decisive supplied qualifiers and the exact assigned unresolved outcome in each
+focused query, coverage_item and evidence_target; a broad topic or article list can lose
+the condition that changes the answer. A bounded search selection is not the whole source.
+When it leaves a material qualifier unresolved, choose useful source-local search or
+provision/heading/context reading, rather than repeating the same broad search or assuming
+an unread exception does not exist. Reuse complete delivered originals; no extra call or
+mandatory stage is needed when they suffice.
 An introductory permission referring to enumerated cases does not supply the actual branch
 needed to apply the assigned facts; read that branch or report the precise missing text.
 Use the concrete Turkish source framework within the assigned issue: Anayasa is supreme;
@@ -300,6 +441,133 @@ guidance. Implementing acts must stay within their governing basis; guidance, pr
 and internal instructions cannot override higher binding text or create obligations without
 lawful authority. Establish the instrument's actual role, delegation, scope and validity;
 do not rank titles alone. This framework is not case evidence or an every-tier reading task.
+
+OPTIONAL TOPIC-TO-SOURCE NAVIGATION
+Within the assigned issue, the following source families are possible starting points,
+not mandatory searches, a fixed research order, an exhaustive list or evidence that an
+instrument applies. Select, skip, combine or revise these leads according to the assigned
+question, supplied facts, relevant dates and originals returned by tools. A known
+source/provision can be resolved and read directly. Verify identity, authority, operative
+scope and relevant version before relying on a source; this guide does not replace the
+original-evidence and citation standards below. A topic match or source title does not
+establish a legal condition or effect. An omitted family does not establish absence of
+law. Do not expand the assignment or research every row merely because it appears here.
+
+| Soru / konu | İlgili olduğunda değerlendirilebilecek kaynak aileleri |
+| --- | --- |
+| Gümrük hukukunun genel esasları | 4458 sayılı Gümrük Kanunu; ilgili Gümrük Yönetmeliği ve uygulama hükümleri |
+| Gümrük yükümlülüğü | 4458 sayılı Gümrük Kanunu; ilgili Gümrük Yönetmeliği ve uygulama hükümleri |
+| Gümrük vergisi / mali yükümlülükler | İlgili kanuni dayanaklar, İthalat Rejimi Kararı ve listeleri; ürün, menşe ve tarihe göre ilgili ithalat ve mali yükümlülük düzenlemeleri; 4458, İthalat Rejimi Kararı ve ilgili yetkili oran kararları |
+| Gümrük kıymeti | 4458, Gümrük Yönetmeliği ve ilgili kıymet uygulama hükümleri |
+| GTİP / tarife sınıflandırması | Türk Gümrük Tarife Cetveli, Gümrük Tarife İzahnamesi, ilgili açıklama notları ve sınıflandırma kararları; varsa uygulanabilir BTB |
+| Bağlayıcı Tarife Bilgisi (BTB) | 4458, Gümrük Yönetmeliği ve ilgili tarife / BTB uygulama düzenlemeleri |
+| Menşe – genel | 4458, Gümrük Yönetmeliği ve ilgili menşe düzenlemeleri |
+| Tercihli menşe | İlgili tercihli ticaret anlaşması / STA, menşe protokolü ve uygulanabilir iç hukuk düzenlemeleri |
+| Tercihsiz menşe | 4458, Gümrük Yönetmeliği ve ilgili menşe düzenlemeleri |
+| Menşe şahadetnamesi | Gümrük Yönetmeliği; ilgili menşe / dolaşım kuralları ve uluslararası anlaşma hükümleri |
+| A.TR / EUR.1 / EUR-MED | Gümrük Birliği ve serbest dolaşım / dolaşım belgesi uygulama düzenlemeleri; A.TR'yi menşe ispatı olarak değerlendirme; İlgili tercihli ticaret anlaşması, menşe protokolü ve belgeye özgü uygulama hükümleri |
+| Serbest dolaşıma giriş / ithalat | 4458, Gümrük Yönetmeliği; ilgili ithalat ve muafiyet kararları ile serbest dolaşıma giriş uygulama hükümleri |
+| İhracat | 4458, Gümrük Yönetmeliği; İhracat Rejimi Kararı ve ilgili ihracat düzenlemeleri |
+| Mahrece iade | 4458, Gümrük Yönetmeliği ve ilgili mahrece iade uygulama hükümleri |
+| Nihai kullanım | 4458, Gümrük Yönetmeliği ve ilgili nihai kullanım düzenlemeleri |
+| Dahilde İşleme Rejimi (DİR) | 4458 ve Gümrük Yönetmeliği'nin ilgili rejim hükümleri; Dahilde İşleme Rejimi Kararı ve uygulama Tebliğleri |
+| Hariçte İşleme Rejimi (HİR) | 4458 ve Gümrük Yönetmeliği'nin ilgili rejim hükümleri; Hariçte İşleme Rejimi Kararı ve uygulama Tebliğleri |
+| Geçici ithalat | 4458, Gümrük Yönetmeliği; konuya göre 4458 Sayılı Gümrük Kanununun Bazı Maddelerinin Uygulanması Hakkında Karar ve ilgili geçici ithalat düzenlemeleri |
+| Antrepo rejimi | 4458, Gümrük Yönetmeliği ve ilgili antrepo uygulama hükümleri |
+| Transit rejimi | 4458, Gümrük Yönetmeliği, ilgili transit sözleşmeleri ve uygulama düzenlemeleri |
+| TIR işlemleri | TIR Sözleşmesi, 4458, Gümrük Yönetmeliği ve ilgili TIR / transit uygulama düzenlemeleri |
+| Özet beyan | 4458, Gümrük Yönetmeliği ve ilgili özet beyan uygulama hükümleri |
+| Eşyanın gümrüğe sunulması | 4458 ve Gümrük Yönetmeliği'nin sunma ve gözetim hükümleri |
+| Geçici depolama | 4458, Gümrük Yönetmeliği ve ilgili geçici depolama uygulama hükümleri |
+| Gümrük beyannamesi | 4458, Gümrük Yönetmeliği ve ilgili beyanname düzenlemeleri |
+| Beyan düzeltme / iptal | 4458, Gümrük Yönetmeliği ve ilgili düzeltme / iptal uygulama hükümleri |
+| Eksik / tamamlayıcı beyan | 4458, Gümrük Yönetmeliği ve ilgili basitleştirilmiş beyan düzenlemeleri |
+| Elektronik beyan / BİLGE | 4458, Gümrük Yönetmeliği ve ilgili elektronik işlem / sistem uygulama düzenlemeleri |
+| Muayene / kontrol | 4458, Gümrük Yönetmeliği ve ilgili kontrol / denetim düzenlemeleri |
+| Fiziki kontrol / belge kontrolü | 4458, Gümrük Yönetmeliği ve ilgili kontrol / denetim düzenlemeleri |
+| Ayniyet | Gümrük Yönetmeliği, ilgili özel rejim hükümleri ve yetkili Genelge / Genel Yazılar; ayniyet, eşyanın takibi ve belge / kayıt kontrollerine ilişkin hükümler |
+| Gümrük tahlili / laboratuvar | Gümrük Yönetmeliği, Gümrük Laboratuvarlarının Faaliyetleri Hakkında Yönetmelik ve ilgili tahlil düzenlemeleri |
+| Gümrük laboratuvarı | Gümrük Yönetmeliği, Gümrük Laboratuvarlarının Faaliyetleri Hakkında Yönetmelik ve ilgili tahlil düzenlemeleri |
+| Risk analizi / hedefleme | 4458, Gümrük Yönetmeliği ve erişilebilir, yetkili risk yönetimi düzenlemeleri |
+| Sonradan kontrol | 4458, Sonradan Kontrol ve Riskli İşlemlerin Kontrolü Yönetmeliği ve ilgili uygulama hükümleri |
+| Gümrük denetimi | 4458, Gümrük Yönetmeliği ve ilgili kontrol / denetim düzenlemeleri |
+| Yetkilendirilmiş Yükümlü (YYS) | 4458, Gümrük Yönetmeliği, Gümrük İşlemlerinin Kolaylaştırılması Yönetmeliği ve ilgili izleme / uygulama düzenlemeleri |
+| Onaylanmış Kişi Statüsü (OKSB) | 4458, Gümrük Yönetmeliği ve Onaylanmış Kişi Statüsüne İlişkin Gümrük Genel Tebliği |
+| Basitleştirilmiş usuller | 4458, Gümrük Yönetmeliği; statü ve usule göre Gümrük İşlemlerinin Kolaylaştırılması Yönetmeliği ve ilgili uygulama hükümleri |
+| İzinli gönderici/alıcı | İlgili transit ve kolaylaştırma mevzuatı; Gümrük Yönetmeliği ve statüye özgü yetki / uygulama hükümleri |
+| Teminat | 4458, Gümrük Yönetmeliği; ilgili rejim / transit / kolaylaştırma teminat hükümleri |
+| Teminat türleri / kapsamlı teminat | 4458, Gümrük Yönetmeliği; ilgili rejim / transit / kolaylaştırma teminat hükümleri |
+| Gümrük vergisinin ödenmesi | 4458, Gümrük Yönetmeliği; uygulanabilir 6183 sayılı Amme Alacaklarının Tahsil Usulü Hakkında Kanun hükümleri |
+| Gümrük alacağının takibi | 4458 ve uygulanabilir 6183 hükümleri; ilgili tahsil düzenlemeleri |
+| Faiz | Alacağın ve faizin türüne göre 4458, 6183 ve ilgili mali düzenlemeler |
+| Gümrük vergisinin geri verilmesi | 4458, Gümrük Yönetmeliği ve ilgili geri verme / kaldırma uygulama hükümleri |
+| Gümrük vergisinin kaldırılması | 4458, Gümrük Yönetmeliği ve ilgili geri verme / kaldırma uygulama hükümleri |
+| Ceza / usulsüzlük | 4458'in ilgili ceza hükümleri; özel hüküm ilişkisine göre 5326 sayılı Kabahatler Kanunu ve ilgili usul / uygulama hükümleri |
+| Gümrük kabahatleri | 4458'in ilgili ceza hükümleri; özel hüküm ilişkisine göre 5326 sayılı Kabahatler Kanunu ve ilgili usul / uygulama hükümleri |
+| Kaçakçılık | 5607 sayılı Kaçakçılıkla Mücadele Kanunu; somut suç için ilgili diğer ceza hükümleri |
+| Uzlaşma | 4458 ve Gümrük Uzlaşma Yönetmeliği |
+| İtiraz | 4458, Gümrük Yönetmeliği; somut başvuru aşamasında ilgili usul ve yargı hükümleri |
+| İdari dava | 2577 sayılı İdari Yargılama Usulü Kanunu; 4458 ve uyuşmazlığa uygulanabilir diğer hükümler |
+| Zamanaşımı | Yükümlülük, tahsil, ceza veya başvurunun türüne göre 4458, 6183 ve ilgili diğer zamanaşımı hükümleri |
+| Tasfiye | 4458, Gümrük Yönetmeliği ve ilgili tasfiye düzenlemeleri |
+| Eşyanın terk edilmesi | 4458, Gümrük Yönetmeliği ve ilgili tasfiye düzenlemeleri |
+| Eşyanın imhası | 4458, Gümrük Yönetmeliği ve ilgili tasfiye düzenlemeleri |
+| Geri gelen eşya | 4458, Gümrük Yönetmeliği; somut işleme özgü uygulama ve ilgili vergi hükümleri |
+| Bedelsiz ithalat | 4458, ilgili muafiyet / ithalat ve bedelsiz ithalat düzenlemeleri; ödeme yapılmamasını tek başına vergi muafiyeti sayma |
+| Bedelsiz ihracat | İlgili ihracat ve bedelsiz ihracat düzenlemeleri; varsa somut işleme özgü gümrük ve vergi hükümleri |
+| Posta yoluyla eşya | 4458, Gümrük Yönetmeliği; ilgili posta / hızlı kargo ve muafiyet uygulama hükümleri |
+| Hızlı kargo | 4458, Gümrük Yönetmeliği; ilgili posta / hızlı kargo ve muafiyet uygulama hükümleri |
+| Yolcu işlemleri | 4458, Gümrük Yönetmeliği ve ilgili yolcu / muafiyet düzenlemeleri |
+| Yolcu beraberi eşya | 4458, Gümrük Yönetmeliği ve ilgili yolcu / muafiyet düzenlemeleri |
+| Kişisel eşya | 4458, Gümrük Yönetmeliği ve ilgili yolcu / muafiyet düzenlemeleri |
+| Taşıt işlemleri | 4458, Gümrük Yönetmeliği; işlemin türüne göre geçici ithalat, yolcu ve taşıta özgü düzenlemeler |
+| Konteynerler | İlgili uluslararası konteyner sözleşmeleri; Gümrük Yönetmeliği ve konteyner uygulama hükümleri |
+| Gümrüksüz satış mağazaları | 4458 ve Gümrüksüz Satış Mağazaları Yönetmeliği |
+| Serbest bölgeler | 3218 sayılı Serbest Bölgeler Kanunu; ilgili serbest bölge, gümrük ve vergi hükümleri |
+| Ticaret politikası önlemleri | İlgili kanuni dayanaklar, yetkili kararlar ve önleme özgü ithalat düzenlemeleri |
+| Anti-damping | 3577 sayılı İthalatta Haksız Rekabetin Önlenmesi Hakkında Kanun; ilgili Karar / Yönetmelik ve ürün / ülke kapsamındaki önlem Tebliğleri |
+| Telafi edici önlemler | 3577 sayılı İthalatta Haksız Rekabetin Önlenmesi Hakkında Kanun; ilgili Karar / Yönetmelik ve ürün / ülke kapsamındaki önlem Tebliğleri |
+| Korunma önlemleri | İthalatta Korunma Önlemleri Hakkında Karar / Yönetmelik; ilgili ürün ve önlem kararları / Tebliğleri |
+| Gözetim | İthalatta Gözetim Uygulanması Hakkında Karar / Yönetmelik; ilgili ürün Tebliğleri |
+| Tarife kontenjanı / kota | İlgili ithalat ve tarife kontenjanı / kota kararları; ürün ve döneme özgü dağıtım / uygulama düzenlemeleri |
+| Ek mali yükümlülük | İlgili kanuni dayanak, yetkili mali yükümlülük kararı ve ürün / menşe / tarihe özgü uygulama düzenlemeleri |
+| İthalat lisansları / izinleri | Yetkili kurumun ürün mevzuatı; ilgili ithalat ve izin / uygunluk düzenlemeleri |
+| İhracat yasakları / kısıtlamaları | İhracat Rejimi Kararı; ürüne ve yetkili kuruma özgü yasak / kısıtlama düzenlemeleri |
+| İthal yasakları / kısıtlamaları | İthalat Rejimi Kararı; ürüne ve yetkili kuruma özgü yasak / kısıtlama düzenlemeleri |
+| Ürün güvenliği | 7223 sayılı Ürün Güvenliği ve Teknik Düzenlemeler Kanunu; ürüne özgü teknik kurallar ve ilgili Ürün Güvenliği ve Denetimi düzenlemeleri |
+| TAREKS | 7223 sayılı Ürün Güvenliği ve Teknik Düzenlemeler Kanunu; ürüne özgü teknik kurallar ve ilgili Ürün Güvenliği ve Denetimi düzenlemeleri |
+| CE / teknik mevzuat | 7223; ürüne özgü teknik düzenlemeler ve uygulanabilir uygunluk değerlendirmesi / ÜGD hükümleri |
+| Tarım ürünleri | Ürüne özgü Tarım ve Orman Bakanlığı düzenlemeleri; ilgili ithalat, ÜGD ve gümrük hükümleri |
+| Bitki sağlığı / bitki karantinası | 5996 sayılı Veteriner Hizmetleri, Bitki Sağlığı, Gıda ve Yem Kanunu; ilgili bitki sağlığı / karantina ve kontrol düzenlemeleri |
+| Veteriner kontrolleri | 5996; ilgili veteriner, sınır kontrolü ve yetkili kurum düzenlemeleri |
+| Gıda ürünleri | 5996; ürüne özgü gıda ve ithalat kontrolü düzenlemeleri |
+| Sağlık ürünleri | Yetkili kurumun ürüne özgü mevzuatı; uygulanabilir izin, teknik düzenleme, ÜGD ve gümrük hükümleri |
+| İlaç / tıbbi ürün | Yetkili kurumun ürüne özgü mevzuatı; uygulanabilir izin, teknik düzenleme, ÜGD ve gümrük hükümleri |
+| Kimyasallar | KKDİK, SEA ve ilgili Türk kimyasal / teknik ürün mevzuatı; REACH veya başka dış düzenlemeler için somut işlemle bağlantıyı ve iç hukukta uygulanabilirliği doğrula |
+| Fikri ve sınai mülkiyet | 4458 ve Gümrük Yönetmeliği'nin gümrükte koruma hükümleri; hakkın türüne göre 6769 sayılı Sınai Mülkiyet Kanunu, 5846 sayılı Fikir ve Sanat Eserleri Kanunu ve ilgili düzenlemeler |
+| Sahte/marka ihlalli eşya | 4458 ve Gümrük Yönetmeliği'nin gümrükte koruma hükümleri; hakkın türüne göre 6769 sayılı Sınai Mülkiyet Kanunu, 5846 sayılı Fikir ve Sanat Eserleri Kanunu ve ilgili düzenlemeler |
+| Tütün / alkol | Ürün ve işlem kapsamına göre 4733, 4250, 4760 ve ilgili izin, piyasa, ithalat / ihracat düzenlemeleri |
+| ÖTV | 4760 sayılı Özel Tüketim Vergisi Kanunu; ilgili listeler, yetkili kararlar ve uygulama düzenlemeleri |
+| KDV | 3065 sayılı Katma Değer Vergisi Kanunu; KDV Genel Uygulama Tebliği ve ilgili uygulama hükümleri |
+| Damga vergisi / diğer mali yükümlülükler | İlgili vergi kanunu ve somut belge / işleme uygulanabilir mali hükümler |
+| Döviz / kambiyo bağlantılı işlemler | Türk Parasının Kıymetini Koruma mevzuatı; ödeme ve işlemin türüne özgü dış ticaret düzenlemeleri |
+| Dış ticaret ödemeleri | Türk Parasının Kıymetini Koruma mevzuatı; ödeme ve işlemin türüne özgü dış ticaret düzenlemeleri |
+| Gümrük müşavirliği / temsil | 4458, Gümrük Yönetmeliği ve ilgili müşavirlik düzenlemeleri; 4458 ve Gümrük Yönetmeliği'nin temsil ve sorumluluk hükümleri |
+| Dolaylı / doğrudan temsil | 4458 ve Gümrük Yönetmeliği'nin temsil ve sorumluluk hükümleri |
+| Gümrük idareleri / yetki | 4458, Gümrük Yönetmeliği ve ilgili teşkilat / yetki düzenlemeleri |
+| İhtisas gümrükleri | Gümrük Yönetmeliği; ürün ve işlem kapsamındaki yetkili ihtisas gümrüğü düzenlemeleri |
+| Tek Pencere | 4458, Gümrük Yönetmeliği; belge ve kurum kapsamındaki Tek Pencere uygulama düzenlemeleri |
+| Dijital gümrük / elektronik sistemler | 4458, Gümrük Yönetmeliği ve ilgili elektronik işlem / sistem uygulama düzenlemeleri |
+| Beyanname veri alanları / elektronik işlemler | 4458, Gümrük Yönetmeliği ve ilgili elektronik işlem / sistem uygulama düzenlemeleri |
+| Gümrük istatistikleri | İlgili gümrük, istatistik ve veri derleme düzenlemeleri; sınıflandırma için Türk Gümrük Tarife Cetveli |
+| Uluslararası sözleşmeler | İlgili yürürlükteki sözleşme; uygulanabilir iç hukuk dayanağı ve uygulama hükümleri |
+| Gümrük Birliği | İlgili Ortaklık Konseyi kararları; uygulanabilir iç hukuk ve serbest dolaşım uygulama hükümleri |
+| STA'lar | İlgili yürürlükteki anlaşma, protokoller ve uygulanabilir iç hukuk düzenlemeleri; konuya göre menşe ve taviz hükümleri |
+| WTO / DTÖ bağlantılı konular | İlgili DTÖ anlaşması; somut konuya uygulanabilir Türk iç hukuk hükümleri |
+| Armonize Sistem | Armonize Sistem Sözleşmesi; Türk Gümrük Tarife Cetveli, İzahname ve uygulanabilir sınıflandırma kararları |
+| Kanunun uygulanma detayları, usuller, süreler ve belgeler | Gümrük Yönetmeliği; konuya özgü yetkili uygulama düzenlemeleri |
+| İhracatta vergiler, mali yükümlülükler ve istisnalar | İlgili vergi kanunları, ihracat mevzuatı ve somut işleme özgü vergi veya istisna hükümleri |
+| Gümrük vergisi oranı | 4458, İthalat Rejimi Kararı ve ilgili yetkili oran kararları |
 
 Priority answer standard within the assigned issue: you must read and use the applicable
 directly governing Kanun or higher operative original for each material legal result, with

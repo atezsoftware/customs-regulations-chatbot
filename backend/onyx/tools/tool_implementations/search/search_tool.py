@@ -980,10 +980,21 @@ def _query_deduplication_key(query: str) -> str:
 def _regulatory_rerank_query(
     original_query: str,
     model_rewritten_query: str,
+    *,
+    rerank_context: str | None = None,
+    coverage_item: str = "",
+    evidence_target: str = "",
 ) -> str:
     """Preserve answer intent while retaining the model's focused rewrite."""
 
     queries = [original_query.strip(), model_rewritten_query.strip()]
+    if rerank_context:
+        queries = [
+            rerank_context.strip(),
+            *queries,
+            coverage_item.strip(),
+            evidence_target.strip(),
+        ]
     unique_queries: list[str] = []
     seen: set[str] = set()
     for query in queries:
@@ -2512,7 +2523,13 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
                 update={"enabled": False}
             )
         rerank_query = (
-            _regulatory_rerank_query(canonical_original_query, llm_queries[0])
+            _regulatory_rerank_query(
+                canonical_original_query,
+                llm_queries[0],
+                rerank_context=override_kwargs.rerank_context,
+                coverage_item=coverage_item,
+                evidence_target=evidence_target,
+            )
             if regulatory_chunks_only
             else canonical_original_query
         )

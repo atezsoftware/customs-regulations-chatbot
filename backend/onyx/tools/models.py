@@ -177,6 +177,8 @@ class SearchToolOverrideKwargs(BaseModel):
     # This is needed because the LLM won't be able to do a really detailed semantic query well
     # without help and a specific custom prompt for this
     original_query: str | None = None
+    # Ranking can retain scenario facts without broadening retrieval queries.
+    rerank_context: str | None = None
     message_history: list[ChatMinimalTextMessage] | None = None
     # Parallel searches isolate message_history to improve focused retrieval. Filter
     # decisions still need the complete turn-level user context shared by the batch.

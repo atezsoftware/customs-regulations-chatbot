@@ -289,6 +289,7 @@ def build_search_adapter(
             next_citation_num=1,
             inject_memories_in_prompt=inject_memories_in_prompt,
             tool_execution_timeout_seconds=None,
+            search_rerank_context=original_query,
         )
         context.check_active()
         if len(batch.tool_responses) != 1:
