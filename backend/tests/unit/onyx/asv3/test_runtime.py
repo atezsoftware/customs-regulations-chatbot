@@ -12,7 +12,7 @@ from uuid import uuid4
 import pytest
 from pydantic import JsonValue
 
-from onyx.asv3 import runtime
+from onyx.asv3 import llm_adapter, runtime
 from onyx.asv3.corpus_tools import evidence_for_chunk
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.models import (
@@ -94,8 +94,11 @@ def user_payload(message: UserMessage) -> dict[str, Any]:
     if isinstance(content, list):
         assert isinstance(content[0], TextContentPart)
         content = content[0].text
+        return cast(dict[str, Any], json.loads(content))
     assert isinstance(content, str)
-    return cast(dict[str, Any], json.loads(content))
+    payload, offset = json.JSONDecoder().raw_decode(content)
+    assert content[offset:] in ("", "\n\n" + llm_adapter.DEFAULT_RESPONSE_PREFERENCES)
+    return cast(dict[str, Any], payload)
 
 
 def delivered_originals(arguments: dict[str, Any]) -> list[dict[str, Any]]:

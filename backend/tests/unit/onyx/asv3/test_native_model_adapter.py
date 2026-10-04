@@ -23,6 +23,7 @@ from onyx.llm.interfaces import LLM, LLMConfig
 from onyx.llm.model_response import Choice, Message, ModelResponse
 from onyx.llm.models import (
     AssistantMessage,
+    ChatCompletionMessage,
     FunctionCall,
     ToolCall,
     ToolMessage,
@@ -99,6 +100,14 @@ def view(**kwargs: Any) -> HarnessView:
 def last_payload(llm: MagicMock) -> dict[str, Any]:
     content = llm.invoke.call_args.kwargs["prompt"][-1].content
     return cast(dict[str, Any], json.loads(content[0].text))
+
+
+def first_user_payload(message: ChatCompletionMessage) -> tuple[dict[str, Any], str]:
+    assert isinstance(message, UserMessage)
+    assert isinstance(message.content, str)
+    question, offset = json.JSONDecoder().raw_decode(message.content)
+    assert isinstance(question, dict)
+    return cast(dict[str, Any], question), message.content[offset:]
 
 
 def seed_forks(llm: MagicMock) -> list[MagicMock]:
@@ -276,17 +285,21 @@ def test_native_history_preserves_each_complete_batch_and_delivers_originals_onc
             "publication_gap": {"summary": "Communicate the later control."},
         }
     )
+    canonical_request = current.request
+    canonical_questions = list(current.questions)
     adapter.decide(current)
     prompt = llm.invoke.call_args.kwargs["prompt"]
-    assert isinstance(prompt[1].content, str)
-    first_user = json.loads(prompt[1].content)
-    assert first_user["request"] == current.request
-    assert first_user["questions"] == current.questions
-    assert first_user["conversation"] == history
-    assert first_user["assistant_instructions"] == "Answer briefly in Turkish."
-    assert (
-        first_user["response_preferences"] == llm_adapter.DEFAULT_RESPONSE_PREFERENCES
-    )
+    first_user, preference_paragraph = first_user_payload(prompt[1])
+    assert first_user == {
+        "request": canonical_request,
+        "questions": canonical_questions,
+        "conversation": history,
+        "assistant_instructions": "Answer briefly in Turkish.",
+    }
+    assert preference_paragraph == "\n\n" + llm_adapter.DEFAULT_RESPONSE_PREFERENCES
+    assert current.request == canonical_request
+    assert current.questions == canonical_questions
+    assert context.services["assistant_instructions"] == "Answer briefly in Turkish."
     tool_results = [message for message in prompt if isinstance(message, ToolMessage)]
     assert [message.tool_call_id for message in tool_results] == [
         "read-law",
@@ -328,21 +341,33 @@ def test_core_role_instructions_survive_response_preference_eviction(
 ) -> None:
     context, ledger = RunContext(depth=int(researcher)), EvidenceLedger()
     context.services["evidence"] = ledger
+    context.services["assistant_instructions"] = "Keep the requested units in Turkish."
     first = original(ledger, context, "The first condition must hold. " * 16)
     second = original(ledger, context, "The second condition also applies. " * 16)
     llm = model()
     adapter = ResearchModel(llm, context, lean_native_mode=True, token_counter=len)
-    current = view(original_evidence=[first, second])
+    current = view(original_evidence=[first, second]).model_copy(
+        update={
+            "request": "İki sonucu ve belge şartlarını aynen açıkla.\nSonra süreyi belirt."
+        }
+    )
+    canonical_request = current.request
     complete_prompt, tools, _ = adapter._fit_native_decision(current)
     question_content = complete_prompt[1].content
     assert isinstance(question_content, str)
-    question = json.loads(question_content)
-    assert (
-        question.pop("response_preferences") == llm_adapter.DEFAULT_RESPONSE_PREFERENCES
-    )
+    question, preference_paragraph = first_user_payload(complete_prompt[1])
+    assert preference_paragraph == "\n\n" + llm_adapter.DEFAULT_RESPONSE_PREFERENCES
+    expected_question = {"request": canonical_request}
+    if not researcher:
+        expected_question["assistant_instructions"] = (
+            "Keep the requested units in Turkish."
+        )
+    assert question == expected_question
+    _, offset = json.JSONDecoder().raw_decode(question_content)
+    json_only = question_content[:offset]
     prompt_without_preferences = [
         complete_prompt[0],
-        UserMessage(content=json.dumps(question, ensure_ascii=False)),
+        UserMessage(content=json_only),
         *complete_prompt[2:],
     ]
     required_input = adapter._input_cost(prompt_without_preferences, tools)
@@ -358,7 +383,15 @@ def test_core_role_instructions_survive_response_preference_eviction(
     )
     first_content = prompt[1].content
     assert isinstance(first_content, str)
-    assert "response_preferences" not in json.loads(first_content)
+    delivered_question, preference_paragraph = first_user_payload(prompt[1])
+    assert first_content == json_only
+    assert delivered_question == expected_question
+    assert preference_paragraph == ""
+    assert current.request == canonical_request
+    assert (
+        context.services["assistant_instructions"]
+        == "Keep the requested units in Turkish."
+    )
     assert last_payload(llm)["original_evidence"] == [first, second]
     assert "original_evidence_omitted" not in last_payload(llm)
     assert adapter.last_call_id is not None
@@ -585,20 +618,21 @@ def test_native_mode_inherits_into_worker_without_changing_targeted_structured_c
     llm = model()
     adapter = ResearchModel(llm, context.child())
     assert adapter.lean_native_mode
-    adapter.decide(view())
+    current = view()
+    canonical_request = current.request
+    adapter.decide(current)
     assert (
         llm.invoke.call_args.kwargs["prompt"][0].content
         == "Research the assigned original."
     )
     assert llm.invoke.call_args.kwargs["structured_response_format"] is None
-    first_content = llm.invoke.call_args.kwargs["prompt"][1].content
-    assert isinstance(first_content, str)
-    first_user = json.loads(first_content)
-    assert first_user["request"] == view().request
-    assert (
-        first_user["response_preferences"] == llm_adapter.DEFAULT_RESPONSE_PREFERENCES
+    first_user, preference_paragraph = first_user_payload(
+        llm.invoke.call_args.kwargs["prompt"][1]
     )
-    assert "assistant_instructions" not in first_user
+    assert first_user == {"request": canonical_request}
+    assert preference_paragraph == "\n\n" + llm_adapter.DEFAULT_RESPONSE_PREFERENCES
+    assert current.request == canonical_request
+    assert context.services["assistant_instructions"] == "Coordinator-only instruction."
     llm.invoke.return_value = ModelResponse(
         id="review",
         created="0",
