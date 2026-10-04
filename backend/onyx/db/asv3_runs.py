@@ -8,9 +8,10 @@ import zlib
 from uuid import UUID
 
 from pydantic import JsonValue
-from sqlalchemy import select
+from sqlalchemy import String, cast, literal, select
 from sqlalchemy.orm import Session
 
+from onyx.configs.constants import MessageType
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.db.models import ChatMessage, ChatSession, ToolCall
 
@@ -138,6 +139,86 @@ def load_asv3_checkpoint(
         if payload is None:
             return None
         return decode_asv3_checkpoint(payload)
+
+
+def load_asv3_session_checkpoint(
+    *, chat_session_id: UUID, user_message_id: int, user_id: UUID | None
+) -> dict[str, JsonValue] | None:
+    """Read the nearest checkpoint on this owned user message's ancestor branch."""
+    owned_message = (
+        ChatMessage.id == user_message_id,
+        ChatMessage.chat_session_id == chat_session_id,
+        ChatMessage.message_type == MessageType.USER,
+        ChatSession.id == chat_session_id,
+        ChatSession.user_id == user_id,
+        ChatSession.deleted.is_(False),
+    )
+    with get_session_with_current_tenant() as session:
+        if (
+            session.scalar(
+                select(ChatMessage.id)
+                .join(ChatSession, ChatMessage.chat_session_id == ChatSession.id)
+                .where(*owned_message)
+            )
+            is None
+        ):
+            raise PermissionError(
+                "ASv3 session memory is outside the owned message chain"
+            )
+
+        # Comma-delimited integer IDs detect cycles without truncating long histories.
+        message_path = literal(",") + cast(ChatMessage.id, String) + literal(",")
+        ancestors = (
+            select(
+                ChatMessage.id.label("message_id"),
+                ChatMessage.parent_message_id,
+                literal(0).label("depth"),
+                message_path.label("path"),
+                literal(False).label("cycle"),
+            )
+            .join(ChatSession, ChatMessage.chat_session_id == ChatSession.id)
+            .where(*owned_message)
+            .cte("asv3_session_ancestors", recursive=True)
+        )
+        ancestors = ancestors.union_all(
+            select(
+                ChatMessage.id,
+                ChatMessage.parent_message_id,
+                ancestors.c.depth + 1,
+                ancestors.c.path + cast(ChatMessage.id, String) + literal(","),
+                ancestors.c.path.contains(message_path),
+            )
+            .join(ancestors, ChatMessage.id == ancestors.c.parent_message_id)
+            .where(
+                ChatMessage.chat_session_id == chat_session_id,
+                ancestors.c.cycle.is_(False),
+            )
+        )
+        checkpoint = (
+            select(ToolCall.tool_call_response)
+            .join(ancestors, ToolCall.parent_chat_message_id == ancestors.c.message_id)
+            .join(ChatMessage, ChatMessage.id == ancestors.c.message_id)
+            .where(
+                ancestors.c.depth > 0,
+                ChatMessage.message_type == MessageType.ASSISTANT,
+                ToolCall.chat_session_id == chat_session_id,
+                ToolCall.tool_id == ASV3_CHECKPOINT_TOOL_ID,
+            )
+            .order_by(ancestors.c.depth, ToolCall.id.desc())
+            .limit(1)
+            .scalar_subquery()
+        )
+        cycle, payload = session.execute(
+            select(
+                select(ancestors.c.message_id)
+                .where(ancestors.c.cycle.is_(True))
+                .exists(),
+                checkpoint,
+            )
+        ).one()
+        if cycle:
+            raise ValueError("ASv3 session memory has a cyclic message chain")
+        return decode_asv3_checkpoint(payload) if payload is not None else None
 
 
 def checkpoint_progress_packets(payload: str) -> list[dict[str, JsonValue]]:
