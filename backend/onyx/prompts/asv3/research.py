@@ -1,4 +1,4 @@
-PROMPT_VERSION = "asv3-2026-10-04.41"
+PROMPT_VERSION = "asv3-2026-10-04.42"
 
 DEFAULT_RESPONSE_PREFERENCES = """Application-provided default for substantive source-based questions and assigned research issues:
 Please research and explain the actual question comprehensively, including every material

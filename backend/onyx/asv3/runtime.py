@@ -258,6 +258,8 @@ def run_asv3_loop(
             requires_sources=question.strip().lower().rstrip("!.?")
             not in {"merhaba", "selam", "hello", "hi", "thanks", "teşekkürler"},
         )
+    if profile.requires_sources and reasoning_effort is ReasoningEffort.AUTO:
+        reasoning_effort = ReasoningEffort.HIGH
     context.language = profile.language
     context.corpus_only = not (allow_external and profile.external_requested)
     ledger = EvidenceLedger()
