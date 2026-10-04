@@ -96,6 +96,29 @@ def test_matching_original_elsewhere_cannot_supply_local_attribution() -> None:
     )
 
 
+def test_parentheses_are_not_citations_and_matching_originals_do_not_approve_a_claim() -> (
+    None
+):
+    ledger = ledger_with(original("8917 sayılı Faaliyet Kanunu", "27"))
+    answer = (
+        "8917 sayılı Faaliyet Kanunu m. 27 uyarınca başvuru (2) aşamada incelenir (1)."
+    )
+    gap = native_named_authority_gap(answer, ledger)
+    assert gap is not None
+    assert gap["citation_format"] == "[n]"
+    entries = gap["named_authority_gaps"]
+    assert isinstance(entries, list) and entries
+    for entry in entries:
+        assert isinstance(entry, dict)
+        assert entry["instrument_number"] == "8917"
+        assert entry["article"] == "27"
+        assert entry["inline_evidence"] == []
+        assert entry["matching_original_evidence"] == [1]
+    assert answer.endswith("(2) aşamada incelenir (1).")
+    assert native_named_authority_gap(answer + " [999]", ledger) is not None
+    assert native_named_authority_gap(answer.replace("(1)", "[1]"), ledger) is None
+
+
 def test_compound_statutes_keep_independent_local_article_matches() -> None:
     ledger = ledger_with(
         original("8917 sayılı Faaliyet Kanunu", "27"),
