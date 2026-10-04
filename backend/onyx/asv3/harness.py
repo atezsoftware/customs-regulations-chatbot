@@ -1025,7 +1025,11 @@ class Harness:
                         self._blocked_attempts[fingerprint] = (
                             self._blocked_attempts.get(fingerprint, 0) + 1
                         )
-                        if self._blocked_attempts[fingerprint] >= 3:
+                        if (
+                            self._blocked_attempts[fingerprint] >= 3
+                            and self.context.services.get("independent_question")
+                            is not True
+                        ):
                             status = OutcomeStatus.PARTIAL
                             self.stop_reason = "repeated_publication_gap"
                             break

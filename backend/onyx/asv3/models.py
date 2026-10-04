@@ -378,6 +378,13 @@ class SharedBudget:
                 raise RunStopped(f"Shared {kind} budget exhausted")
             self.used[kind] += amount
 
+    def record_execution(self, kind: str, amount: int = 1) -> None:
+        """Record independent execution without imposing legacy call quotas."""
+        if kind not in {"tools", "decisions"} or amount < 0:
+            raise ValueError("Invalid execution counter")
+        with self._lock:
+            self.used[kind] += amount
+
     def release(self, kind: str, amount: int) -> None:
         with self._lock:
             if amount < 0 or amount > self.used[kind]:
@@ -521,13 +528,10 @@ class RunContext:
             corpus_only=self.corpus_only,
         )
 
-    def independent_child(self, *, max_tools: int, max_decisions: int) -> RunContext:
+    def independent_child(self) -> RunContext:
         child = self.child()
-        child.budget = LocalBudget(
-            self.budget, max_tools=max_tools, max_decisions=max_decisions
-        )
-        child.deadline = min(self.deadline, self.research_deadline)
-        child.research_deadline = child.deadline
+        child.budget = LocalBudget(self.budget)
+        child.deadline = child.research_deadline = float("inf")
         child.services["independent_question"] = True
         return child
 
@@ -536,22 +540,15 @@ class RunContext:
 
 
 class LocalBudget(SharedBudget):
-    """Bound one task's spend without creating more physical resource slots."""
+    """Track independent spend while sharing physical resources and byte accounting."""
 
-    def __init__(
-        self, parent: SharedBudget, *, max_tools: int, max_decisions: int
-    ) -> None:
-        if any(
-            type(value) is not int or value < 1 for value in (max_tools, max_decisions)
-        ):
-            raise ValueError("Local task limits must be positive integers")
+    def __init__(self, parent: SharedBudget) -> None:
         super().__init__(
-            max_tools=max_tools,
-            max_decisions=max_decisions,
             max_evidence_bytes=parent.limits["evidence_bytes"],
             max_artifact_bytes=parent.limits["artifact_bytes"],
             final_decision_reserve=0,
             coordinator_decision_reserve=0,
+            unlimited_execution=True,
         )
         self.parent = parent
         self.tool_slots = parent.tool_slots
@@ -563,9 +560,9 @@ class LocalBudget(SharedBudget):
             self.parent.consume(kind, amount)
             return
         with self._lock:
-            if amount < 0 or self.used[kind] + amount > self.limits[kind]:
-                raise RunStopped(f"Local {kind} budget exhausted")
-            self.parent.consume(kind, amount)
+            if amount < 0:
+                raise ValueError("Invalid local execution count")
+            self.parent.record_execution(kind, amount)
             self.used[kind] += amount
 
     def release(self, kind: str, amount: int) -> None:
@@ -597,7 +594,8 @@ class LocalBudget(SharedBudget):
     def allocation_snapshot(self) -> dict[str, JsonValue]:
         with self._lock:
             return {
-                "limits": {key: self.limits[key] for key in ("tools", "decisions")},
+                "unlimited_execution": True,
+                "limits": {key: None for key in ("tools", "decisions")},
                 "used": {key: self.used[key] for key in ("tools", "decisions")},
             }
 
