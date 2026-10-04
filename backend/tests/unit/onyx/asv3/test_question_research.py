@@ -11,8 +11,10 @@ from onyx.asv3.harness import Harness
 from onyx.asv3.models import (
     CapabilityCall,
     Decision,
+    HarnessView,
     OutcomeStatus,
     RunContext,
+    RunStopped,
     SharedBudget,
     TaskSnapshot,
     TaskStatus,
@@ -376,3 +378,186 @@ def test_repeated_research_call_reuses_completed_answers_without_new_tasks() -> 
     research.research_questions(args, context)
     assert len(workers.calls) == 1
     assert research.answers == original
+
+
+@pytest.mark.parametrize("partial", [False, True])
+def test_host_assembly_finishes_in_two_decisions_without_root_rewriting(
+    partial: bool,
+) -> None:
+    body = "Kaynakla desteklenen tam yanıt [5].\n" + "Koşul ve işlem ayrıntısı. " * 600
+    worker_outcome = ToolOutcome(
+        status=OutcomeStatus.PARTIAL if partial else OutcomeStatus.FOUND,
+        summary=body,
+    )
+    research, _, context = controlled_research([worker_outcome], ["Soru"])
+    registry = CapabilityRegistry(research.tool_specs())
+    research.publish_guard = research.preservation_gap
+    decisions = 0
+
+    def decide(_view: HarnessView) -> Decision:
+        nonlocal decisions
+        decisions += 1
+        if decisions == 1:
+            return Decision(
+                calls=[
+                    CapabilityCall(
+                        name="research_questions",
+                        arguments={"questions": [question("only", "Soru", 1)]},
+                    )
+                ]
+            )
+        assert decisions == 2
+        context.research_deadline = time.monotonic() - 1
+        return Decision(
+            calls=[
+                CapabilityCall(name="assemble_answers", arguments={"order": ["only"]})
+            ]
+        )
+
+    result = Harness(
+        request="Soru",
+        context=context,
+        registry=registry,
+        decide=decide,
+        draft_guard=research.preservation_gap,
+    ).run()
+    assert decisions == 2
+    assert result.answer == f"### 1. Soru\n\n{body}"
+    assert result.status == (OutcomeStatus.PARTIAL if partial else OutcomeStatus.FOUND)
+    assert result.stop_reason == "independent_answers_assembled"
+
+
+def test_completed_checkpoint_resumes_full_bodies_without_dispatching_again() -> None:
+    body = "Özgün yanıt [4].\n" + "Korunacak ayrıntı " * 1000
+    research, _, context = controlled_research([found(body)], ["Soru"])
+    research.research_questions({"questions": [question("only", "Soru", 1)]}, context)
+    resumed, workers, restored_context = controlled_research([], ["Soru"])
+    resumed.restore(copy.deepcopy(research.export()))
+    resumed.research_questions(
+        {"questions": [question("only", "Soru", 1)]}, restored_context
+    )
+    resumed.assemble_answers({"order": ["only"]}, restored_context)
+    assert workers.calls == []
+    assert restored_context.services["assembled_answer"] == f"### 1. Soru\n\n{body}"
+    assert restored_context.services["independent_evidence_numbers"] == [4]
+
+
+def test_inflight_checkpoint_retains_completed_body_and_marks_interruption_without_respawn() -> (
+    None
+):
+    body = "Tam sonuç [7].\n" + "Ayrıntı korunur. " * 1000
+    original, _, _ = controlled_research([], ["First", "Second"])
+    original.assignments = [
+        {**question("first", "First", 1), "task_id": "old-1"},
+        {**question("second", "Second", 2), "task_id": "old-2"},
+    ]
+    snapshot = original.export()
+    resumed, workers, context = controlled_research([], ["First", "Second"])
+    workers.stored_results = [
+        TaskSnapshot(
+            task_id="old-1",
+            task="First",
+            status=TaskStatus.COMPLETED,
+            outcome=found(body),
+            independent_question=True,
+        ),
+        TaskSnapshot(
+            task_id="old-2",
+            task="Second",
+            status=TaskStatus.INTERRUPTED,
+            independent_question=True,
+        ),
+    ]
+    resumed.restore(snapshot)
+    resumed.research_questions(
+        {"questions": [question("new", "Rewritten task", 1)]}, context
+    )
+    resumed.assemble_answers({"order": ["second", "first"]}, context)
+    assert workers.calls == []
+    assert workers.waited == ["old-1", "old-2"]
+    assert resumed.answers[0]["answer"] == body
+    assert resumed.answers[1]["status"] == "interrupted"
+    assert body in str(context.services["assembled_answer"])
+    assert "tamamlanamadı" in str(context.services["assembled_answer"])
+    assert context.services["independent_partial"] is True
+
+
+def test_checkpoint_missing_task_is_an_explicit_gap_and_never_recreated() -> None:
+    resumed, workers, context = controlled_research([], ["First", "Second"])
+    resumed.restore(
+        {
+            "answers": [],
+            "assignments": [
+                {**question("first", "First", 1), "task_id": "known"},
+                {**question("second", "Second", 2), "task_id": None},
+            ],
+        }
+    )
+    workers.stored_results = [
+        TaskSnapshot(
+            task_id="known",
+            task="First",
+            status=TaskStatus.COMPLETED,
+            outcome=found("Known full result [2]"),
+            independent_question=True,
+        )
+    ]
+    resumed.research_questions({}, context)
+    assert workers.calls == []
+    assert resumed.answers[0]["answer"] == "Known full result [2]"
+    assert resumed.answers[1]["status"] == "interrupted"
+    assert resumed.answers[1]["task_id"] is None
+    assert "tamamlanamadı" in str(resumed.answers[1]["answer"])
+
+
+def test_checkpoint_export_cannot_mutate_retained_full_answer() -> None:
+    research, _, context = controlled_research([found("Full answer [6]")], ["Question"])
+    research.research_questions(
+        {"questions": [question("only", "Question", 1)]}, context
+    )
+    snapshot = research.export()
+    answers = snapshot["answers"]
+    assert isinstance(answers, list) and isinstance(answers[0], dict)
+    answers[0]["answer"] = "Shortened answer"
+    assert research.answers[0]["answer"] == "Full answer [6]"
+
+
+def test_assignments_are_checkpointed_before_waiting_for_worker_answers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    research, workers, context = controlled_research(
+        [found("Completed full body [2]"), None], ["First", "Second"]
+    )
+    saved: dict[str, JsonValue] = {}
+
+    def interrupted_wait(_task_ids: list[str]) -> list[TaskSnapshot]:
+        saved.update(research.export())
+        raise RunStopped("Collection interrupted")
+
+    monkeypatch.setattr(workers, "wait_until_all", interrupted_wait)
+    with pytest.raises(RunStopped, match="Collection interrupted"):
+        research.research_questions(
+            {
+                "questions": [
+                    question("first", "First", 1),
+                    question("second", "Second", 2),
+                ]
+            },
+            context,
+        )
+    assert saved["answers"] == []
+    assignments = saved["assignments"]
+    assert isinstance(assignments, list)
+    assert [item["task_id"] for item in assignments if isinstance(item, dict)] == [
+        "task-1",
+        "task-2",
+    ]
+    resumed, resumed_workers, restored_context = controlled_research(
+        [], ["First", "Second"]
+    )
+    resumed_workers.stored_results = workers.results()
+    resumed.restore(saved)
+    resumed.research_questions({}, restored_context)
+    assert resumed_workers.calls == []
+    assert resumed.answers[0]["answer"] == "Completed full body [2]"
+    assert resumed.answers[1]["status"] != "found"
