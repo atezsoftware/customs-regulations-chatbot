@@ -492,9 +492,15 @@ def native_named_authority_gap(
         return None
     return {
         "named_authority_gaps": missing,
+        "citation_format": "[n]",
         "instruction": (
             "Each explicitly named governing statute needs its own matching canonical original "
-            "and adjacent citation in this answer unit. Another instrument's quotation or a "
+            "and adjacent recorded global [n] citation in this answer unit. Parentheses (n) "
+            "are not citation markers; preserve actual legal article/paragraph numbering. "
+            "inline_evidence lists only citation markers parsed in the current unit. "
+            "matching_original_evidence lists identity/navigation candidates, not approval "
+            "of the claim or confirmation of full delivery; choose the actual supporting "
+            "original. Another instrument's quotation or a "
             "citation elsewhere cannot substitute. Reuse a supplied matching original or "
             "resolve/read its relevant provision with the useful method you choose. "
             "Preserve supported details; if its original cannot be obtained, disclose only "

@@ -911,6 +911,77 @@ def test_named_law_uses_its_local_original_without_a_routine_review(
     assert checkpoints[-1]["evidence"]["included"] == [direct_number]
 
 
+@pytest.mark.parametrize("rejected_citation", ["parentheses", "unknown"])
+def test_child_partial_rejection_reaches_next_native_decision_and_repairs_without_read(
+    monkeypatch: pytest.MonkeyPatch, rejected_citation: str
+) -> None:
+    kwargs, broker, llm, checkpoints, _queue = setup_run(monkeypatch)
+    source_id = str(broker.sources[1].id)
+    chunk = broker.chunks[source_id]
+    broker.chunks[source_id] = replace(
+        chunk,
+        text="Başvuru ve inceleme (2) aşamadır.",
+        heading_path=("8917 SAYILI FAALİYET KANUNU", "MADDE 27"),
+        metadata={
+            **chunk.metadata,
+            "document_type": "kanun",
+            "title": "8917 SAYILI FAALİYET KANUNU",
+            "article_no": "27",
+        },
+    )
+    page = MagicMock(wraps=broker.page)
+    monkeypatch.setattr(broker, "page", page)
+    baseline = llm.invoke.side_effect
+    invocation = 0
+    direct_number = 0
+    rejected = ""
+    repaired = ""
+
+    def scripted(**arguments: Any) -> ModelResponse:
+        nonlocal invocation, direct_number, rejected, repaired
+        invocation += 1
+        if invocation == 1:
+            return baseline(**arguments)
+        if invocation == 2:
+            originals = delivered_originals(arguments)
+            number = next(
+                row["citation"] for row in originals if row["chunk_id"] == "chunk-1"
+            )
+            direct_number = number
+            claim = "8917 sayılı Faaliyet Kanunu m. 27 uyarınca başvuru ve inceleme (2) aşamadır"
+            marker = f"({number})" if rejected_citation == "parentheses" else "[999]"
+            rejected = f"{claim} {marker}."
+            repaired = f"{claim} [{number}]."
+            return response(calls=[("submit_partial_answer", {"answer": rejected})])
+        assert invocation == 3
+        footer = user_payload(arguments["prompt"][-1])
+        assert footer["draft_to_repair"] == rejected
+        gap = footer["publication_gap"]
+        if rejected_citation == "parentheses":
+            assert gap["citation_format"] == "[n]"
+            entry = gap["named_authority_gaps"][0]
+            assert entry["inline_evidence"] == []
+            assert entry["matching_original_evidence"] == [direct_number]
+        else:
+            assert gap["unknown_citations"] == [999]
+        assert any(
+            row["citation"] == direct_number for row in footer["original_evidence"]
+        )
+        return response(calls=[("submit_partial_answer", {"answer": repaired})])
+
+    llm.invoke.side_effect = scripted
+    run_independent(**kwargs)
+    assert invocation == 3
+    assert llm.invoke.call_count == 5
+    assert checkpoints[-1]["publication_status"] == "partial"
+    assert checkpoints[-1]["final_publication_gap"] is None
+    assert checkpoints[-1]["evidence"]["included"] == [direct_number]
+    assert page.call_count == 2
+    assert checkpoints[-1]["question_research"]["answers"][0]["answer"] == repaired
+    assert rejected not in kwargs["state_container"].answer_tokens
+    assert "inceleme (2) aşamadır " in kwargs["state_container"].answer_tokens
+
+
 def test_native_scope_preserves_excluded_label_snapshot_filters(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
