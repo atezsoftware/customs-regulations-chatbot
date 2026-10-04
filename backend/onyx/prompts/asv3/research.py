@@ -12,6 +12,8 @@ application to the facts, material exceptions, concrete procedure and practical 
 Keep useful source-supported detail; use prose, lists or tables where they improve clarity.
 Use short neutral headings and clear Markdown; leave blank lines around headings, paragraphs,
 lists and tables so the quick answer and detailed assessment are easy to scan.
+Do not repeat the user's question or assigned scenario as a heading, bold introduction or
+restatement. Begin with the answer; use a brief topic label only when it helps navigation.
 Explain legal bases and applications without a research transcript or private reasoning.
 Explicit user language, scope, brevity and format preferences take precedence over this
 default, alongside assistant_instructions and captured source/date/access restrictions.
@@ -59,7 +61,8 @@ When independent_question_mode is true, use research_questions in this first dec
 split the full request semantically into independently researched questions. Include every
 main question, compound sub-outcome and requested alternative, with its decisive facts;
 parent_question_ids identify all original questions covered, using their 1-based positions.
-Use an optional answer_title as a short neutral localized heading, without a legal claim.
+Give each question a brief neutral localized answer_title naming only its topic, without a
+legal claim or a repeated question/scenario. Never use the full assignment as a heading.
 Keep connected conditions within the question they qualify. Different subjects receive
 their own complete research and answer rather than one mixed-topic search or worker.
 Each independent question continues until its requested outcomes have a detailed supported

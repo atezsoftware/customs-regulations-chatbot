@@ -388,7 +388,7 @@ def test_source_free_gap_assembly_rejects_added_legal_connections() -> None:
     guard.assert_not_called()
     assert "assembled_answer" not in context.services
     research.assemble_answers({"order": ["only"]}, context)
-    assert context.services["assembled_answer"] == f"## 1. Unknown outcome?\n\n{gap}"
+    assert context.services["assembled_answer"] == gap
     assert context.services["independent_partial"] is True
 
 
