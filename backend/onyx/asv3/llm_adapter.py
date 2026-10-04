@@ -2023,16 +2023,15 @@ class ResearchModel:
                 current["original_evidence"] = list(unique.values())
             if unique or navigation:
                 current["evidence_note"] = (
-                    "Original passages available for this decision are collected here; earlier "
-                    "tool original_evidence_refs and navigation entries are identities, not text. "
-                    "Answer the full actual request above, preserving its decisive facts and each "
-                    "requested outcome or alternative. "
-                    "Use each passage for its own operative effect and communicate every applicable "
-                    "material condition, exception and procedural continuation beside its outcome "
-                    "with its global citation. A headline conclusion or shorter summary must not "
-                    "replace those supplied details. An introductory permission does not supply referred "
-                    "enumerated cases or conditions; read a material continuation when needed. "
-                    "Reopen genuinely omitted ranges with read_evidence; do not infer missing law."
+                    "These are the original passages available for this decision; navigation and "
+                    "original_evidence_refs are identities, not text. Choose tools or an answer "
+                    "against each actual requested outcome and legal effect you will assert. "
+                    "If its own governing provision, material exception or implementing step remains "
+                    "unread, choose a useful focused source action before a categorical conclusion. "
+                    "If available methods or access cannot resolve it, disclose that precise gap. "
+                    "Use already delivered conditions and steps directly, with their own global "
+                    "citations and the same qualifications in quick answers, detail and tables. "
+                    "Reopen genuinely omitted ranges with read_evidence."
                 )
             current_omissions = [
                 item for item in omitted if not omission_is_delivered(item)
