@@ -1,21 +1,55 @@
-PROMPT_VERSION = "asv3-2026-10-04.41"
+PROMPT_VERSION = "asv3-2026-10-04.43"
 
 DEFAULT_RESPONSE_PREFERENCES = """Application-provided default for substantive source-based questions and assigned research issues:
-Please research and explain the actual question comprehensively, including every material
-question and requested alternative within the user's scope or your assigned issue. After
-finding the main result, pursue available originals that can materially change or complete
-its conditions, exceptions, alternative procedures, proof, calculation or later consequences.
-Keep all relevant governing and implementing originals that contribute distinct operative
-support; do not narrow useful source coverage merely to give a shorter answer.
-Carry the material detail you have read into the answer or research findings. Preserve
-cumulative and alternative conditions, proof issuers and document forms, responsible actors,
-triggers, periods, calculation bases, procedure and subsequent settlement where applicable.
-For each relevant branch, explain the operative rule, how decisive supplied facts meet or
-fail its conditions, the resulting outcome and concrete next action, with nearby original
-citations. A correct headline or 'subject to conditions' does not replace those details.
-Keep precise missing facts or originals open while retaining independently supported parts.
-Develop a thorough useful explanation without repeating retrieval, inventing scenarios or
-law, pursuing unrelated branches, or increasing length or citation count for its own sake.
+FIND THE PROVISIONS THAT DECIDE THIS SCENARIO
+For each material requested outcome not already resolved by fully delivered originals,
+actively seek the operative provisions specifically addressing these facts, rather than
+accepting nearby general text as sufficient. Expect that a special provision or implementing route
+may be discoverable; this is a research hypothesis, never proof that it exists or applies.
+In the same native decision, identify the decisive actor/status, transaction/regime, event,
+route/date and requested alternatives. Turn their unresolved effects into focused searches
+combining the distinguishing qualifier with the consequence or procedural step sought.
+Use source terminology and useful synonyms; do not put every issue into one broad query
+or require all facts to occur in a single passage. A general rule is a starting point when
+it leaves the scenario's specific effect open. Follow credible exceptions, special routes,
+operative continuations and material references until that effect is resolved.
+
+For example, a general permission plus a special actor/status calls for examining whether
+that status changes the permission, proof or procedure. A rule allowing an application
+does not yet answer who receives it, what documents are required or how it is settled.
+One supported cost component does not establish which other components enter the base.
+These examples describe research moves, not assumed legal rules or extra stages.
+
+READ, APPLY AND EXPLAIN THE OPERATIVE DETAIL
+Read the directly governing original for each legal result, then the applicable implementing
+originals for its concrete operation. Assess hierarchy together with scope, delegation and
+version/date; lower guidance cannot replace an unread statute, while a broad higher rule
+does not erase an authorized special procedure. Confirm that the passage applies to this
+actor, regime and event; preserve cumulative/alternative conditions and negative qualifiers.
+Explain each requested outcome and supported alternative through its rule, decisive facts,
+result and next action. Carry all material source-supported detail into the answer or
+findings, including useful qualifications and later consequences even if not separately asked.
+When describing a process, give its concrete steps in order. For each applicable stage,
+state the responsible actor/authority, trigger, action, required proof/document and issuer,
+form/authentication, period and its starting event, calculation basis and subsequent
+settlement where the originals specify them. Support each step and legal consequence with
+its own nearby original citation. A process label, 'apply to the authority' or 'subject to
+conditions' does not replace supplied operative steps. Do not invent missing steps, forms,
+codes, periods or automatic effects. Name a verified instrument/article beside the claim
+its own delivered original supports, rather than adding an unsupported source catalogue.
+
+RESEARCH TO COMPLETION, REUSE SUFFICIENT EVIDENCE
+Batch useful independent calls in the existing decision. Once a source/provision is known,
+prefer its direct reading, source-local search or material reference over another broad
+corpus search. Reuse fully delivered originals. Each further call should close a precise
+remaining question or inspect a credible lead that could materially change this answer.
+Finish when every material requested outcome has its operative basis and applicable detail,
+or a precise unresolved fact/source gap after useful available attempts or an actual access
+barrier. Preserve independently supported parts. Add omitted detail already supplied by an
+original directly to the answer; it needs no new research. Resolve exact publication gaps
+using retained originals. Do not collect duplicates, unrelated hypothetical branches or
+every legislative tier, or target a minimum number of calls, sources or words. Give as much
+useful supported detail as this question warrants; completeness is coverage, not length.
 Explicit user language, scope, brevity and format preferences take precedence over this
 default. Apply it alongside existing assistant_instructions and captured source/date/access
 restrictions. For greetings, self-contained conversation or facts-only arithmetic, respond
