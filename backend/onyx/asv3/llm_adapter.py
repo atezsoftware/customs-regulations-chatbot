@@ -57,7 +57,11 @@ from onyx.llm.models import (
 from onyx.llm.models import (
     FunctionCall as NativeFunctionCall,
 )
-from onyx.prompts.asv3.research import COORDINATOR_PROMPT, RESEARCHER_PROMPT
+from onyx.prompts.asv3.research import (
+    COORDINATOR_PROMPT,
+    DEFAULT_RESPONSE_PREFERENCES,
+    RESEARCHER_PROMPT,
+)
 from onyx.regulatory.structured_llm import (
     _portable_structured_output_schema,
     _retry_after_seconds,
@@ -1732,7 +1736,10 @@ class ResearchModel:
         self, view: HarnessView
     ) -> tuple[list[ChatCompletionMessage], list[dict[str, JsonValue]], int]:
         instruction = RESEARCHER_PROMPT if self.context.depth else COORDINATOR_PROMPT
-        question: dict[str, JsonValue] = {"request": view.request}
+        question: dict[str, JsonValue] = {
+            "request": view.request,
+            "response_preferences": DEFAULT_RESPONSE_PREFERENCES,
+        }
         if self.history:
             question["conversation"] = self.history
         if len(view.questions) > 1:
@@ -1829,6 +1836,12 @@ class ResearchModel:
                 UserMessage(content=json.dumps(current, ensure_ascii=False)),
             ]
 
+        prompt = messages()
+        if self._input_cost(prompt, selected) <= ceiling:
+            return prompt, selected, output
+        # Optional response defaults must yield before any source text is evicted.
+        question.pop("response_preferences")
+        prefix[1] = UserMessage(content=json.dumps(question, ensure_ascii=False))
         prompt = messages()
         if self._input_cost(prompt, selected) <= ceiling:
             return prompt, selected, output
