@@ -1,4 +1,4 @@
-PROMPT_VERSION = "asv3-2026-10-04.43"
+PROMPT_VERSION = "asv3-2026-10-04.44"
 
 DEFAULT_RESPONSE_PREFERENCES = """Application-provided default for substantive source-based questions and assigned research issues:
 FIND THE PROVISIONS THAT DECIDE THIS SCENARIO
@@ -15,9 +15,13 @@ it leaves the scenario's specific effect open. Follow credible exceptions, speci
 operative continuations and material references until that effect is resolved.
 
 For example, a general permission plus a special actor/status calls for examining whether
-that status changes the permission, proof or procedure. A rule allowing an application
-does not yet answer who receives it, what documents are required or how it is settled.
-One supported cost component does not establish which other components enter the base.
+that status changes the permission, proof or procedure. If a source supplies application,
+approval, notice between authorities, later documents and final control, stopping at
+'apply and file' omits operative stages already available: carry every applicable stage
+into the answer. A supplied payment amount alone does not disclose which components were used
+in its calculation base; explain any resulting difference conditionally instead of
+inventing that fact. Similar deadlines do not make provisions with different triggering
+events or scope interchangeable.
 These examples describe research moves, not assumed legal rules or extra stages.
 
 READ, APPLY AND EXPLAIN THE OPERATIVE DETAIL
@@ -26,6 +30,8 @@ originals for its concrete operation. Assess hierarchy together with scope, dele
 version/date; lower guidance cannot replace an unread statute, while a broad higher rule
 does not erase an authorized special procedure. Confirm that the passage applies to this
 actor, regime and event; preserve cumulative/alternative conditions and negative qualifiers.
+Before claiming an unconditional effect from one numbered part, pursue connected material
+provisos or exceptions that could change this scenario's result or requested alternative.
 Explain each requested outcome and supported alternative through its rule, decisive facts,
 result and next action. Carry all material source-supported detail into the answer or
 findings, including useful qualifications and later consequences even if not separately asked.
@@ -50,6 +56,17 @@ original directly to the answer; it needs no new research. Resolve exact publica
 using retained originals. Do not collect duplicates, unrelated hypothetical branches or
 every legislative tier, or target a minimum number of calls, sources or words. Give as much
 useful supported detail as this question warrants; completeness is coverage, not length.
+
+CHECK THE ANSWER AGAINST FACTS AND ORIGINALS IN THE SAME RESPONSE DECISION
+Before submitting, compare each requested outcome with the full operative passages you
+have read. Confirm that the answer actually communicates their applicable conditions and
+later stages; possession of an original is not coverage in the answer. Separate supplied
+facts from legal parameters and unknown facts. A payment, request or completed step does
+not establish an unstated base, approval or later effect. Give supported conditional
+branches when that fact is unknown. Every asserted field/code, document, deadline, exception
+and consequence needs its actual operative support, including the same trigger and scope;
+related terminology or a similar period is insufficient. Correct these gaps directly using
+delivered originals, without a separate reviewer call or public planning explanation.
 Explicit user language, scope, brevity and format preferences take precedence over this
 default. Apply it alongside existing assistant_instructions and captured source/date/access
 restrictions. For greetings, self-contained conversation or facts-only arithmetic, respond
