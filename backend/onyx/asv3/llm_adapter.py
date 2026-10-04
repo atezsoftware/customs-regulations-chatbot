@@ -1930,6 +1930,9 @@ class ResearchModel:
             "language": self.context.language,
             "request": view.request,
         }
+        session_research = self.context.services.get("session_research")
+        if isinstance(session_research, dict):
+            context["session_research"] = copy.deepcopy(session_research)
         if len(view.questions) > 1:
             context["questions"] = list(view.questions)
         if view.facts:

@@ -16,6 +16,7 @@ from onyx.asv3.models import (
     ResearchTurn,
     RunContext,
     RunStopped,
+    SharedBudget,
     ToolOutcome,
     ToolReceipt,
 )
@@ -205,7 +206,7 @@ def test_independent_child_preserves_user_preferences_and_full_scenario_without_
         ],
         independent_question_mode=True,
     )
-    child = context.independent_child(max_tools=24, max_decisions=10)
+    child = context.independent_child()
     scenario = (
         "Tam kullanıcı senaryosu: A aktörü, B rejimi, iki ayrı alternatif ve tarih C."
     )
@@ -230,6 +231,126 @@ def test_independent_child_preserves_user_preferences_and_full_scenario_without_
     assert len(llm.invoke.call_args.kwargs["tools"]) == 3
     assert llm.invoke.call_args.kwargs["tool_choice"] is ToolChoiceOptions.AUTO
     assert llm.invoke.call_count == 1
+
+
+def test_independent_child_keeps_native_source_tools_and_originals_without_timeout() -> (
+    None
+):
+    context = RunContext(
+        timeout_seconds=float("inf"), budget=SharedBudget(unlimited_execution=True)
+    )
+    child, ledger, llm = context.independent_child(), EvidenceLedger(), model()
+    child.services["evidence"] = ledger
+    source = original(
+        ledger,
+        child,
+        "The actor must satisfy both conditions, present the specified proof and complete later settlement.",
+    )
+    tools: list[dict[str, JsonValue]] = [
+        {
+            "type": "function",
+            "function": {"name": name, "parameters": {"type": "object"}},
+        }
+        for name in ("read_provision", "search_corpus", "submit_partial_answer")
+    ]
+    current = view(
+        original_evidence=[source], required_evidence_numbers=[1]
+    ).model_copy(update={"tools": tools})
+    llm.invoke.side_effect = [
+        ModelResponse(
+            id="continuing",
+            created="0",
+            choice=Choice(
+                message=Message(
+                    tool_calls=[
+                        ChatCompletionMessageToolCall(
+                            id="follow-source",
+                            function=ResponseFunctionCall(
+                                name="read_provision", arguments="{}"
+                            ),
+                        )
+                    ]
+                )
+            ),
+        ),
+        ModelResponse(
+            id="complete",
+            created="0",
+            choice=Choice(
+                message=Message(
+                    content="Both conditions, the specified proof and later settlement apply [1]."
+                )
+            ),
+        ),
+    ]
+    adapter = ResearchModel(llm, child, lean_native_mode=True)
+    assert adapter.decide(current).calls[0].name == "read_provision"
+    assert (
+        adapter.decide(current).answer
+        == "Both conditions, the specified proof and later settlement apply [1]."
+    )
+    assert llm.invoke.call_count == 2
+    for call in llm.invoke.call_args_list:
+        assert call.kwargs["timeout_override"] is None
+        assert call.kwargs["tool_choice"] is ToolChoiceOptions.AUTO
+        assert call.kwargs["tools"] == tools
+    assert last_payload(llm)["original_evidence"] == [source]
+    assert "independent_finalization" not in last_payload(llm)
+    assert adapter.last_call_id is not None
+    assert ledger.completely_delivered(adapter.last_call_id) == {1}
+
+
+@pytest.mark.parametrize("is_child", [False, True])
+def test_session_research_and_revalidated_original_reach_root_and_child(
+    is_child: bool,
+) -> None:
+    context, ledger, llm = RunContext(), EvidenceLedger(), model()
+    memory = {
+        "requests": ["Earlier question with an unresolved alternative."],
+        "status": "revalidated",
+        "reused_evidence_numbers": [1],
+        "source_gaps": [],
+    }
+    context.services.update(
+        independent_question_mode=True,
+        session_research=memory,
+        evidence=ledger,
+    )
+    source = original(
+        ledger,
+        context,
+        "The alternative applies only when the actor meets both stated conditions.",
+    )
+    selected = context.independent_child() if is_child else context
+    current = independent_tool_view(
+        original_evidence=[source], required_evidence_numbers=[1]
+    )
+    history = (
+        "Prior assistant prose is conversation context; the current facts changed."
+    )
+    adapter = ResearchModel(llm, selected, lean_native_mode=True, history=history)
+    adapter.decide(current)
+
+    initial, _ = first_user_payload(llm.invoke.call_args.kwargs["prompt"][1])
+    assert initial["request"] == current.request
+    assert initial["conversation"] == history
+    assert last_payload(llm)["session_research"] == memory
+    assert last_payload(llm)["original_evidence"] == [source]
+    assert memory["requests"] == ["Earlier question with an unresolved alternative."]
+    tool_names = [
+        tool["function"]["name"] for tool in llm.invoke.call_args.kwargs["tools"]
+    ]
+    assert tool_names == (
+        ["research_questions", "assemble_answers", "read_provision"]
+        if is_child
+        else ["research_questions"]
+    )
+    assert llm.invoke.call_args.kwargs["tool_choice"] is (
+        ToolChoiceOptions.AUTO if is_child else ToolChoiceOptions.REQUIRED
+    )
+    assert llm.invoke.call_count == 1
+    assert adapter.last_call_id is not None
+    assert ledger.completely_delivered(adapter.last_call_id) == {1}
 
 
 def test_source_free_gap_assembly_rejects_added_legal_connections() -> None:
@@ -267,7 +388,7 @@ def test_source_free_gap_assembly_rejects_added_legal_connections() -> None:
     guard.assert_not_called()
     assert "assembled_answer" not in context.services
     research.assemble_answers({"order": ["only"]}, context)
-    assert context.services["assembled_answer"] == f"### 1. Unknown outcome?\n\n{gap}"
+    assert context.services["assembled_answer"] == f"## 1. Unknown outcome?\n\n{gap}"
     assert context.services["independent_partial"] is True
 
 

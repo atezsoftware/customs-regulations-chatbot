@@ -41,11 +41,8 @@ class ControlledWorkers:
         public_title: str | None = None,
         public_message: str | None = None,
         independent_question: bool = False,
-        max_tools: int = 24,
-        max_decisions: int = 10,
     ) -> str:
         assert public_title and public_message
-        assert max_tools > 0 and max_decisions > 0
         self.calls.append((task, request_context, independent_question))
         return f"task-{len(self.calls)}"
 
@@ -148,7 +145,7 @@ def test_full_answer_bodies_are_preserved_verbatim_in_requested_order() -> None:
 
     answer = context.services["assembled_answer"]
     assert isinstance(answer, str)
-    assert answer == f"### 1. İkinci soru\n\n{second}\n\n### 2. İlk soru\n\n{first}"
+    assert answer == f"## 1. İkinci soru\n\n{second}\n\n## 2. İlk soru\n\n{first}"
     assert research.preservation_gap(answer) is None
     shortened = answer.replace(first, first[:12_000])
     gap = research.preservation_gap(shortened)
@@ -252,7 +249,7 @@ def test_publication_guard_checks_connections_and_retains_full_answers_on_reject
     )
     assert outcome is rejection
     assert inspected == [
-        "### 1. Soru\n\nSonuç [4]\n\nBu sonuç diğer yükümlülüğü de otomatik kaldırır."
+        "## 1. Soru\n\nSonuç [4]\n\nBu sonuç diğer yükümlülüğü de otomatik kaldırır."
     ]
     assert "assembled_answer" not in context.services
     assert research.answers[0]["answer"] == "Sonuç [4]"
@@ -332,9 +329,9 @@ def test_registry_dispatch_accepts_language_metadata_and_waits_without_holding_t
         pool.close()
 
 
-def test_deadline_cut_keeps_finished_body_and_marks_unfinished_question() -> None:
+def test_independent_questions_keep_running_past_a_previous_research_deadline() -> None:
     entered, release = threading.Event(), threading.Event()
-    context = RunContext(research_deadline=time.monotonic() + 0.15, timeout_seconds=3)
+    context = RunContext(research_deadline=time.monotonic() + 0.01, timeout_seconds=3)
     body = "Tamamlanan yanıt [8]\n" + "Koşul ayrıntısı " * 1_000
 
     def runner(
@@ -347,6 +344,8 @@ def test_deadline_cut_keeps_finished_body_and_marks_unfinished_question() -> Non
 
     pool = WorkerPool(context, runner, max_workers=2)
     research = QuestionResearch(context, pool, ["İki sonuç"])
+    finish = threading.Timer(0.05, release.set)
+    finish.start()
     try:
         research.research_questions(
             {
@@ -359,15 +358,30 @@ def test_deadline_cut_keeps_finished_body_and_marks_unfinished_question() -> Non
         )
         assert entered.is_set()
         assert research.answers[0]["answer"] == body
-        assert research.answers[1]["status"] != "found"
-        assert "tamamlanamadı" in str(research.answers[1]["answer"])
+        assert research.answers[1]["status"] == "found"
+        assert research.answers[1]["answer"] == "Geç kalan yanıt [9]"
         research.assemble_answers({"order": ["fast", "slow"]}, context)
         assert body in str(context.services["assembled_answer"])
-        assert "Geç kalan yanıt" not in str(context.services["assembled_answer"])
-        assert context.services["independent_partial"] is True
+        assert "Geç kalan yanıt [9]" in str(context.services["assembled_answer"])
+        assert context.services["independent_partial"] is False
     finally:
         release.set()
+        finish.join()
         pool.close()
+
+
+def test_brief_neutral_headings_do_not_replace_or_shorten_question_bodies() -> None:
+    body = (
+        "**Hızlı cevap:** Kaynakla desteklenen sonuç [3].\n\n"
+        + "Ayrıntı ve koşul. " * 1000
+    )
+    research, _, context = controlled_research([found(body)], ["Uzun asıl soru"])
+    entry = question("only", "Tam olgular ve ayrıntılı alt soru " * 150, 1)
+    entry["answer_title"] = "Belge koşulları"
+    research.research_questions({"questions": [entry]}, context)
+    research.assemble_answers({"order": ["only"]}, context)
+    assert context.services["assembled_answer"] == f"## 1. Belge koşulları\n\n{body}"
+    assert research.answers[0]["question"] == entry["question"]
 
 
 def test_repeated_research_call_reuses_completed_answers_without_new_tasks() -> None:
@@ -422,7 +436,7 @@ def test_host_assembly_finishes_in_two_decisions_without_root_rewriting(
         draft_guard=research.preservation_gap,
     ).run()
     assert decisions == 2
-    assert result.answer == f"### 1. Soru\n\n{body}"
+    assert result.answer == f"## 1. Soru\n\n{body}"
     assert result.status == (OutcomeStatus.PARTIAL if partial else OutcomeStatus.FOUND)
     assert result.stop_reason == "independent_answers_assembled"
 
@@ -438,7 +452,7 @@ def test_completed_checkpoint_resumes_full_bodies_without_dispatching_again() ->
     )
     resumed.assemble_answers({"order": ["only"]}, restored_context)
     assert workers.calls == []
-    assert restored_context.services["assembled_answer"] == f"### 1. Soru\n\n{body}"
+    assert restored_context.services["assembled_answer"] == f"## 1. Soru\n\n{body}"
     assert restored_context.services["independent_evidence_numbers"] == [4]
 
 
