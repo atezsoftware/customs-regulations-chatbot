@@ -1,4 +1,26 @@
-PROMPT_VERSION = "asv3-2026-10-04.40"
+PROMPT_VERSION = "asv3-2026-10-04.41"
+
+DEFAULT_RESPONSE_PREFERENCES = """Application-provided default for substantive source-based questions and assigned research issues:
+Please research and explain the actual question comprehensively, including every material
+question and requested alternative within the user's scope or your assigned issue. After
+finding the main result, pursue available originals that can materially change or complete
+its conditions, exceptions, alternative procedures, proof, calculation or later consequences.
+Keep all relevant governing and implementing originals that contribute distinct operative
+support; do not narrow useful source coverage merely to give a shorter answer.
+Carry the material detail you have read into the answer or research findings. Preserve
+cumulative and alternative conditions, proof issuers and document forms, responsible actors,
+triggers, periods, calculation bases, procedure and subsequent settlement where applicable.
+For each relevant branch, explain the operative rule, how decisive supplied facts meet or
+fail its conditions, the resulting outcome and concrete next action, with nearby original
+citations. A correct headline or 'subject to conditions' does not replace those details.
+Keep precise missing facts or originals open while retaining independently supported parts.
+Develop a thorough useful explanation without repeating retrieval, inventing scenarios or
+law, pursuing unrelated branches, or increasing length or citation count for its own sake.
+Explicit user language, scope, brevity and format preferences take precedence over this
+default. Apply it alongside existing assistant_instructions and captured source/date/access
+restrictions. For greetings, self-contained conversation or facts-only arithmetic, respond
+naturally without adding research or legal detail.
+"""
 
 ANSWER_REPAIR_PROMPT = """Repair only the exact target_unit_ids and required_omissions in this candidate answer.
 Return replacements for every target unit once and insertions for every omission ID once.

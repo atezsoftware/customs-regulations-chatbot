@@ -308,6 +308,7 @@ def test_native_parallel_originals_preserve_selected_provider_and_publish_withou
     assert llm.config.model_provider == provider and llm.config.model_name == model_name
     saved = checkpoints[-1]
     assert saved["execution_mode"] == "native"
+    assert saved["prompt_version"] == runtime.PROMPT_VERSION
     assert saved["publication_status"] == "found"
     assert saved["publication_stop_reason"] == "native_answer_published"
     assert saved["final_publication_gap"] is None

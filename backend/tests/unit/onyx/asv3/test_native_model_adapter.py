@@ -95,20 +95,34 @@ def test_native_history_preserves_each_complete_batch_and_delivers_originals_onc
 ):
     context, ledger = RunContext(), EvidenceLedger()
     context.services["evidence"] = ledger
+    context.services["assistant_instructions"] = "Answer briefly in Turkish."
     first = original(ledger, context, "The applicant must request the relief.")
     second = original(
         ledger, context, "Release requires completion of institution checks."
     )
     llm = model()
-    adapter = ResearchModel(llm, context, lean_native_mode=True)
+    history = "User: Preserve the two requested alternatives."
+    adapter = ResearchModel(llm, context, lean_native_mode=True, history=history)
     batch1, batch2 = turn("read-law", [first]), turn("read-condition", [second])
     current = view(
         turns=[batch1, batch2],
         original_evidence=[first, second],
         research_state={"needs": [{"description": "UNNEEDED_BOARD" * 10000}]},
     )
+    current = current.model_copy(
+        update={"questions": ["First outcome?", "Second outcome?"]}
+    )
     adapter.decide(current)
     prompt = llm.invoke.call_args.kwargs["prompt"]
+    assert isinstance(prompt[1].content, str)
+    first_user = json.loads(prompt[1].content)
+    assert first_user["request"] == current.request
+    assert first_user["questions"] == current.questions
+    assert first_user["conversation"] == history
+    assert first_user["assistant_instructions"] == "Answer briefly in Turkish."
+    assert (
+        first_user["response_preferences"] == llm_adapter.DEFAULT_RESPONSE_PREFERENCES
+    )
     tool_results = [message for message in prompt if isinstance(message, ToolMessage)]
     assert [message.tool_call_id for message in tool_results] == [
         "read-law",
@@ -125,6 +139,27 @@ def test_native_history_preserves_each_complete_batch_and_delivers_originals_onc
     adapter.decide(current)
     assert llm.invoke.call_args.kwargs["prompt"][:2] == first_prefix
     assert llm.invoke.call_count == 2
+
+
+def test_response_preferences_yield_before_any_original_is_removed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(llm_adapter, "COORDINATOR_PROMPT", "Use original evidence.")
+    context, ledger = RunContext(), EvidenceLedger()
+    context.services["evidence"] = ledger
+    first = original(ledger, context, "The first condition must hold. " * 16)
+    second = original(ledger, context, "The second condition also applies. " * 16)
+    llm = model(4000)
+    adapter = ResearchModel(llm, context, lean_native_mode=True, token_counter=len)
+    adapter.decide(view(original_evidence=[first, second]))
+    first_content = llm.invoke.call_args.kwargs["prompt"][1].content
+    assert isinstance(first_content, str)
+    assert "response_preferences" not in json.loads(first_content)
+    assert last_payload(llm)["original_evidence"] == [first, second]
+    assert "original_evidence_omitted" not in last_payload(llm)
+    assert adapter.last_call_id is not None
+    assert ledger.completely_delivered(adapter.last_call_id) == {1, 2}
+    assert llm.invoke.call_count == 1
 
 
 def test_context_fitting_drops_transcript_atomically_but_restores_required_clause(
@@ -261,6 +296,7 @@ def test_native_mode_inherits_into_worker_without_changing_targeted_structured_c
     )
     context = RunContext()
     context.services["lean_native_mode"] = True
+    context.services["assistant_instructions"] = "Coordinator-only instruction."
     llm = model()
     adapter = ResearchModel(llm, context.child())
     assert adapter.lean_native_mode
@@ -270,6 +306,14 @@ def test_native_mode_inherits_into_worker_without_changing_targeted_structured_c
         == "Research the assigned original."
     )
     assert llm.invoke.call_args.kwargs["structured_response_format"] is None
+    first_content = llm.invoke.call_args.kwargs["prompt"][1].content
+    assert isinstance(first_content, str)
+    first_user = json.loads(first_content)
+    assert first_user["request"] == view().request
+    assert (
+        first_user["response_preferences"] == llm_adapter.DEFAULT_RESPONSE_PREFERENCES
+    )
+    assert "assistant_instructions" not in first_user
     llm.invoke.return_value = ModelResponse(
         id="review",
         created="0",
