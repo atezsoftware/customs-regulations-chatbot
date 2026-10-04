@@ -1890,7 +1890,6 @@ class ResearchModel:
         instruction = RESEARCHER_PROMPT if self.context.depth else COORDINATOR_PROMPT
         question: dict[str, JsonValue] = {
             "request": view.request,
-            "response_preferences": DEFAULT_RESPONSE_PREFERENCES,
         }
         if self.history:
             question["conversation"] = self.history
@@ -1899,9 +1898,12 @@ class ResearchModel:
         assistant_instructions = self.context.services.get("assistant_instructions")
         if not self.context.depth and isinstance(assistant_instructions, str):
             question["assistant_instructions"] = assistant_instructions
+        question_content = json.dumps(question, ensure_ascii=False)
         prefix: list[ChatCompletionMessage] = [
             SystemMessage(content=instruction),
-            UserMessage(content=json.dumps(question, ensure_ascii=False)),
+            UserMessage(
+                content=f"{question_content}\n\n{DEFAULT_RESPONSE_PREFERENCES}"
+            ),
         ]
         context: dict[str, JsonValue] = {
             "language": self.context.language,
@@ -2051,8 +2053,7 @@ class ResearchModel:
         if self._input_cost(prompt, selected) <= ceiling:
             return prompt, selected, output
         # Optional response defaults must yield before any source text is evicted.
-        question.pop("response_preferences")
-        prefix[1] = UserMessage(content=json.dumps(question, ensure_ascii=False))
+        prefix[1] = UserMessage(content=question_content)
         prompt = messages()
         if self._input_cost(prompt, selected) <= ceiling:
             return prompt, selected, output
