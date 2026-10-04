@@ -259,13 +259,13 @@ def run_asv3_loop(
         raise ValueError("ASv3 resume requires the same authorized scope and question")
     if previous is not None:
         profile = LanguageProfile.model_validate(previous.get("public_profile"))
+        profile.requires_sources = True
         context.run_id = str(previous["run_id"])
     else:
         profile = LanguageProfile(
             language="und",
             notifications=localized_notifications("und"),
-            requires_sources=question.strip().lower().rstrip("!.?")
-            not in {"merhaba", "selam", "hello", "hi", "thanks", "teşekkürler"},
+            requires_sources=True,
         )
     context.language = profile.language
     context.services["independent_question_mode"] = profile.requires_sources
@@ -332,6 +332,7 @@ def run_asv3_loop(
     clarification: str | None = None
     partial: str | None = None
     first_decision = True
+    standalone_answer_call = False
 
     def emit_progress(event: ProgressEvent) -> None:
         phase, status = event.phase, event.status
@@ -373,7 +374,10 @@ def run_asv3_loop(
     context.services["progress"] = progress
 
     def on_decision(decision: Decision) -> None:
-        nonlocal first_decision
+        nonlocal first_decision, standalone_answer_call
+        standalone_answer_call = (
+            len(decision.calls) == 1 and decision.calls[0].name == "submit_answer"
+        )
         for call in decision.calls:
             language = call.arguments.get("_language")
             if profile.language == "und" and isinstance(language, str):
@@ -729,7 +733,10 @@ def run_asv3_loop(
     )
 
     def source_publication_gap(
-        answer: str, model_call_id: str | None
+        answer: str,
+        model_call_id: str | None,
+        *,
+        requires_sources: bool | None = None,
     ) -> ToolOutcome | None:
         numbers = extract_citation_numbers(answer)
         unknown = sorted(set(numbers) - ledger.citation_mapping().keys())
@@ -747,7 +754,9 @@ def run_asv3_loop(
                 summary="Read cited originals that have not reached the model.",
                 data={"undelivered_citations": undelivered},
             )
-        if profile.requires_sources and not numbers:
+        if (
+            profile.requires_sources if requires_sources is None else requires_sources
+        ) and not numbers:
             return ToolOutcome(
                 status=OutcomeStatus.PARTIAL,
                 summary="A legal answer needs recorded original citations. Retrieve the operative source or disclose the precise gap using submit_partial_answer.",
@@ -763,9 +772,12 @@ def run_asv3_loop(
         return None
 
     def publication_guard(
-        answer: str, *, host_gap_assembly: bool = False
+        answer: str,
+        *,
+        host_gap_assembly: bool = False,
+        requires_sources: bool | None = None,
     ) -> ToolOutcome | None:
-        if context.services.get("independent_question_mode") is True:
+        if question_research.assignments or question_research.answers:
             gap = question_research.preservation_gap(answer)
             if gap is not None:
                 return gap
@@ -786,7 +798,61 @@ def run_asv3_loop(
                     data=authority_gap,
                 )
             return None
-        return source_publication_gap(answer, model.last_call_id)
+        return source_publication_gap(
+            answer, model.last_call_id, requires_sources=requires_sources
+        )
+
+    def submit_answer(args: dict[str, JsonValue], child: RunContext) -> ToolOutcome:
+        if child.depth or not standalone_answer_call:
+            return ToolOutcome(
+                status=OutcomeStatus.DENIED,
+                summary="Only the coordinator may submit a complete answer, on its own.",
+            )
+        if question_research.assignments or question_research.answers:
+            return ToolOutcome(
+                status=OutcomeStatus.DENIED,
+                summary="Arrange the complete independent answer bodies using assemble_answers.",
+            )
+        candidate = str(args["answer"]).strip()
+        if not candidate:
+            return ToolOutcome(
+                status=OutcomeStatus.INVALID, summary="Supply an answer."
+            )
+        # The model selects this candidate's support type; it does not change run policy.
+        gap = publication_guard(
+            candidate, requires_sources=args["basis"] == "originals"
+        )
+        if harness is not None:
+            harness.last_draft = candidate
+            harness.publication_gap = gap
+        if gap is not None:
+            return gap
+        context.services["submitted_answer"] = candidate
+        return ToolOutcome(
+            status=OutcomeStatus.FOUND, summary="Complete answer submitted"
+        )
+
+    registry.register(
+        ToolSpec(
+            name="submit_answer",
+            description="Publish a complete answer and end this turn, on its own. basis=conversation only for social dialogue with no legal claims; scenario only for supplied facts or arithmetic with no legal effects; originals for legal answers supported by fully delivered original citations. Otherwise research or ask_user.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "answer": {"type": "string", "minLength": 1},
+                    "basis": {
+                        "type": "string",
+                        "enum": ["conversation", "scenario", "originals"],
+                    },
+                },
+                "required": ["answer", "basis"],
+                "additionalProperties": False,
+            },
+            handler=submit_answer,
+            parallel_safe=False,
+            consumes_tool_budget=False,
+        )
+    )
 
     def check_assembly(answer: str) -> ToolOutcome | None:
         gap = publication_guard(answer, host_gap_assembly=True)
@@ -806,11 +872,13 @@ def run_asv3_loop(
                 summary="Return available originals and precise gaps to the coordinator; only it can publish.",
             )
         candidate = str(args["answer"]).strip()
-        gap = (
-            publication_guard(candidate)
-            if extract_citation_numbers(candidate)
-            or context.services.get("independent_question_mode") is True
-            else None
+        gap = publication_guard(
+            candidate,
+            requires_sources=bool(
+                extract_citation_numbers(candidate)
+                or question_research.assignments
+                or question_research.answers
+            ),
         )
         if gap is None:
             authority_gap = native_named_authority_gap(candidate, ledger)

@@ -1156,11 +1156,11 @@ class ResearchModel:
                     ToolChoiceOptions.REQUIRED
                     if not self.context.depth
                     and self.context.services.get("independent_question_mode") is True
+                    and bool(self.context.services.get("independent_answers"))
                     and bool(tools)
                     and all(
                         isinstance(function := tool.get("function"), dict)
-                        and function.get("name")
-                        in {"research_questions", "assemble_answers", "ask_user"}
+                        and function.get("name") == "assemble_answers"
                         for tool in tools
                     )
                     else ToolChoiceOptions.AUTO
@@ -2039,33 +2039,17 @@ class ResearchModel:
                     original_lengths[(number, digest)] = len(item.text)
         ceiling, output = self._limits(self._native_output_limit())
         selected = view.tools
-        if independent_mode:
-            required_tool = (
-                "research_questions"
-                if context["question_research_started"] is False
-                else "assemble_answers"
-                if independent_answers and view.publication_gap is None
-                else None
-            )
-            if required_tool is not None:
-                selected = [
-                    tool
-                    for tool in selected
-                    if isinstance(function := tool.get("function"), dict)
-                    and (
-                        function.get("name") == required_tool
-                        or required_tool == "research_questions"
-                        and function.get("name") == "ask_user"
-                    )
-                ]
-                if not any(
-                    isinstance(function := tool.get("function"), dict)
-                    and function.get("name") == required_tool
-                    for tool in selected
-                ):
-                    raise RunStopped(
-                        f"Required independent-question tool missing: {required_tool}"
-                    )
+        if independent_mode and independent_answers and view.publication_gap is None:
+            selected = [
+                tool
+                for tool in selected
+                if isinstance(function := tool.get("function"), dict)
+                and function.get("name") == "assemble_answers"
+            ]
+            if not selected:
+                raise RunStopped(
+                    "Required independent-question tool missing: assemble_answers"
+                )
 
         def omission_is_delivered(omission: JsonValue) -> bool:
             if not isinstance(omission, dict):
