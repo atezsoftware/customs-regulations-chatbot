@@ -299,6 +299,8 @@ class TaskSnapshot(BaseModel):
     public_message: str | None = None
     updates: list[str] = Field(default_factory=list)
     outcome: ToolOutcome | None = None
+    independent_question: bool = False
+    local_budget: dict[str, JsonValue] = Field(default_factory=dict)
 
 
 class HarnessResult(BaseModel):
@@ -519,8 +521,85 @@ class RunContext:
             corpus_only=self.corpus_only,
         )
 
+    def independent_child(self, *, max_tools: int, max_decisions: int) -> RunContext:
+        child = self.child()
+        child.budget = LocalBudget(
+            self.budget, max_tools=max_tools, max_decisions=max_decisions
+        )
+        child.deadline = min(self.deadline, self.research_deadline)
+        child.research_deadline = child.deadline
+        child.services["independent_question"] = True
+        return child
+
     def is_cancelled(self) -> bool:
         return self._stop.is_set() or self._cancelled()
+
+
+class LocalBudget(SharedBudget):
+    """Bound one task's spend without creating more physical resource slots."""
+
+    def __init__(
+        self, parent: SharedBudget, *, max_tools: int, max_decisions: int
+    ) -> None:
+        if any(
+            type(value) is not int or value < 1 for value in (max_tools, max_decisions)
+        ):
+            raise ValueError("Local task limits must be positive integers")
+        super().__init__(
+            max_tools=max_tools,
+            max_decisions=max_decisions,
+            max_evidence_bytes=parent.limits["evidence_bytes"],
+            max_artifact_bytes=parent.limits["artifact_bytes"],
+            final_decision_reserve=0,
+            coordinator_decision_reserve=0,
+        )
+        self.parent = parent
+        self.tool_slots = parent.tool_slots
+        self.model_slots = parent.model_slots
+        self.source_slots = parent.source_slots
+
+    def consume(self, kind: str, amount: int = 1) -> None:
+        if kind in {"evidence_bytes", "artifact_bytes"}:
+            self.parent.consume(kind, amount)
+            return
+        with self._lock:
+            if amount < 0 or self.used[kind] + amount > self.limits[kind]:
+                raise RunStopped(f"Local {kind} budget exhausted")
+            self.parent.consume(kind, amount)
+            self.used[kind] += amount
+
+    def release(self, kind: str, amount: int) -> None:
+        if kind in {"evidence_bytes", "artifact_bytes"}:
+            self.parent.release(kind, amount)
+            return
+        with self._lock:
+            if amount < 0 or amount > self.used[kind]:
+                raise ValueError("Invalid local budget release")
+            self.parent.release(kind, amount)
+            self.used[kind] -= amount
+
+    def consume_research_decision(self, *, researcher: bool = False) -> None:
+        del researcher
+        self.consume("decisions")
+
+    def consume_repair_decision(self) -> None:
+        self.consume("decisions")
+
+    def snapshot(self) -> dict[str, int]:
+        shared = self.parent.snapshot()
+        with self._lock:
+            return {
+                **self.used,
+                "evidence_bytes": shared["evidence_bytes"],
+                "artifact_bytes": shared["artifact_bytes"],
+            }
+
+    def allocation_snapshot(self) -> dict[str, JsonValue]:
+        with self._lock:
+            return {
+                "limits": {key: self.limits[key] for key in ("tools", "decisions")},
+                "used": {key: self.used[key] for key in ("tools", "decisions")},
+            }
 
 
 ToolSpec.model_rebuild()

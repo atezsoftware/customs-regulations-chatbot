@@ -13,6 +13,7 @@ from pydantic import JsonValue
 from onyx.asv3.artifacts import artifact_reference, compact_json
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.models import (
+    LocalBudget,
     OutcomeStatus,
     RunContext,
     RunStopped,
@@ -67,6 +68,9 @@ class WorkerPool:
         public_title: str | None = None,
         public_message: str | None = None,
         need_ids: builtins.list[str] | None = None,
+        independent_question: bool = False,
+        max_tools: int = 24,
+        max_decisions: int = 10,
     ) -> str:
         delegation = request_context or self.context
         delegation.check_active()
@@ -99,6 +103,7 @@ class WorkerPool:
             for snapshot in self._tasks.values():
                 if (
                     snapshot.status in (TaskStatus.QUEUED, TaskStatus.RUNNING)
+                    and snapshot.independent_question == independent_question
                     and needs
                     and set(needs) == set(snapshot.need_ids)
                 ):
@@ -108,7 +113,13 @@ class WorkerPool:
             if delegation.depth >= delegation.max_depth:
                 raise RunStopped("Research delegation depth exhausted")
             task_id = str(uuid4())
-            child = delegation.child()
+            child = (
+                delegation.independent_child(
+                    max_tools=max_tools, max_decisions=max_decisions
+                )
+                if independent_question
+                else delegation.child()
+            )
             child.services["task_id"] = task_id
             child.services["parent_task_id"] = parent_task_id
             child.services["task_need_ids"] = needs
@@ -121,6 +132,7 @@ class WorkerPool:
                 need_ids=needs,
                 public_title=public_title,
                 public_message=public_message,
+                independent_question=independent_question,
             )
             captured = contextvars.copy_context()
             self._futures[task_id] = cast(
@@ -232,6 +244,14 @@ class WorkerPool:
             snapshot = self._tasks[task_id]
             if snapshot.status in (TaskStatus.QUEUED, TaskStatus.RUNNING):
                 return task_id
+            budget = self._contexts[task_id].budget
+            remaining_tools, remaining_decisions = 24, 10
+            if isinstance(budget, LocalBudget):
+                used = budget.snapshot()
+                remaining_tools = budget.limits["tools"] - used["tools"]
+                remaining_decisions = budget.limits["decisions"] - used["decisions"]
+                if min(remaining_tools, remaining_decisions) <= 0:
+                    raise RunStopped("Independent question budget exhausted")
             return self.spawn(
                 snapshot.task + "\nFollow-up: " + message,
                 parent_task_id=task_id,
@@ -239,6 +259,9 @@ class WorkerPool:
                 public_title=snapshot.public_title,
                 public_message=snapshot.public_message,
                 need_ids=snapshot.need_ids,
+                independent_question=snapshot.independent_question,
+                max_tools=remaining_tools,
+                max_decisions=remaining_decisions,
             )
 
     def cancel(self, task_id: str) -> None:
@@ -253,7 +276,9 @@ class WorkerPool:
         self._report_task(task_id)
 
     @staticmethod
-    def _task_view(task: TaskSnapshot) -> TaskSnapshot:
+    def _task_view(task: TaskSnapshot, *, full: bool = False) -> TaskSnapshot:
+        if full or task.independent_question:
+            return task.model_copy(deep=True)
         outcome = task.outcome
         if outcome is not None:
             data = compact_json(outcome.data, max_chars=6000)
@@ -272,9 +297,51 @@ class WorkerPool:
             deep=False, update={"updates": list(task.updates[-16:]), "outcome": outcome}
         )
 
-    def list(self) -> builtins.list[TaskSnapshot]:
+    def results(
+        self,
+        task_ids: builtins.list[str] | None = None,
+        *,
+        full: bool = True,
+    ) -> builtins.list[TaskSnapshot]:
         with self._lock:
-            return [self._task_view(item) for item in self._tasks.values()]
+            selected = (
+                [self._tasks[key] for key in dict.fromkeys(task_ids)]
+                if task_ids is not None
+                else list(self._tasks.values())
+            )
+            for task in selected:
+                budget = self._contexts[task.task_id].budget
+                if isinstance(budget, LocalBudget):
+                    task.local_budget = budget.allocation_snapshot()
+            return [self._task_view(item, full=full) for item in selected]
+
+    def list(self, *, full: bool = False) -> builtins.list[TaskSnapshot]:
+        return self.results(full=full)
+
+    def wait_until_all(
+        self, task_ids: builtins.list[str]
+    ) -> builtins.list[TaskSnapshot]:
+        selected = list(dict.fromkeys(task_ids))
+        with self._changed:
+            while any(
+                self._tasks[key].status in (TaskStatus.QUEUED, TaskStatus.RUNNING)
+                for key in selected
+            ):
+                remaining = (
+                    min(self.context.deadline, self.context.research_deadline)
+                    - time.monotonic()
+                )
+                if remaining <= 0:
+                    for key in selected:
+                        if self._tasks[key].status in (
+                            TaskStatus.QUEUED,
+                            TaskStatus.RUNNING,
+                        ):
+                            self.cancel(key)
+                    break
+                self.context.check_active()
+                self._changed.wait(min(remaining, 0.25))
+            return self.results(selected)
 
     def wait(
         self,
@@ -545,6 +612,33 @@ class WorkerPool:
         snapshots = [TaskSnapshot.model_validate(item) for item in raw]
         if len({item.task_id for item in snapshots}) != len(snapshots):
             raise ValueError("Duplicate restored task")
+        contexts: dict[str, RunContext] = {}
+        for snapshot in snapshots:
+            if snapshot.independent_question:
+                limits = snapshot.local_budget.get("limits")
+                used = snapshot.local_budget.get("used")
+                if (
+                    not isinstance(limits, dict)
+                    or not isinstance(used, dict)
+                    or set(limits) != {"tools", "decisions"}
+                    or set(used) != {"tools", "decisions"}
+                ):
+                    raise ValueError("Missing independent question budget")
+                max_tools, max_decisions = limits.get("tools"), limits.get("decisions")
+                if type(max_tools) is not int or type(max_decisions) is not int:
+                    raise ValueError("Invalid independent question limits")
+                child = self.context.independent_child(
+                    max_tools=max_tools, max_decisions=max_decisions
+                )
+                child.budget.restore(used)
+            else:
+                child = self.context.child()
+            child.services.update(
+                task_id=snapshot.task_id,
+                parent_task_id=snapshot.parent_task_id,
+                task_need_ids=list(snapshot.need_ids),
+            )
+            contexts[snapshot.task_id] = child
         with self._lock:
             if self._tasks:
                 raise ValueError("Cannot restore into an active pool")
@@ -553,4 +647,4 @@ class WorkerPool:
                     snapshot.status = TaskStatus.INTERRUPTED
                     snapshot.outcome = None
                 self._tasks[snapshot.task_id] = snapshot
-                self._contexts[snapshot.task_id] = self.context.child()
+                self._contexts[snapshot.task_id] = contexts[snapshot.task_id]
