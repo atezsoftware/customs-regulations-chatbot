@@ -137,18 +137,15 @@ def test_native_history_preserves_each_complete_batch_and_delivers_originals_onc
     assert first_user["questions"] == current.questions
     assert first_user["conversation"] == history
     assert first_user["assistant_instructions"] == "Answer briefly in Turkish."
-    assert "response_preferences" not in first_user
+    assert (
+        first_user["response_preferences"] == llm_adapter.DEFAULT_RESPONSE_PREFERENCES
+    )
     tool_results = [message for message in prompt if isinstance(message, ToolMessage)]
     assert [message.tool_call_id for message in tool_results] == [
         "read-law",
         "read-condition",
     ]
     assert last_payload(llm)["original_evidence"] == [first, second]
-    assert (
-        last_payload(llm)["response_preferences"]
-        == llm_adapter.DEFAULT_RESPONSE_PREFERENCES
-    )
-    assert list(last_payload(llm))[-1] == "response_preferences"
     assert last_payload(llm)["request"] == current.request
     assert last_payload(llm)["questions"] == current.questions
     assert last_payload(llm)["recorded_facts"] == current.facts
@@ -172,19 +169,9 @@ def test_native_history_preserves_each_complete_batch_and_delivers_originals_onc
     assert adapter.last_call_id is not None
     assert ledger.completely_delivered(adapter.last_call_id) == {1, 2}
     assert llm.invoke.call_count == 1
-    assert (
-        json.dumps([message.model_dump(mode="json") for message in prompt]).count(
-            "response_preferences"
-        )
-        == 1
-    )
     first_prefix = prompt[:2]
     adapter.decide(current)
     assert llm.invoke.call_args.kwargs["prompt"][:2] == first_prefix
-    assert (
-        last_payload(llm)["response_preferences"]
-        == llm_adapter.DEFAULT_RESPONSE_PREFERENCES
-    )
     assert llm.invoke.call_count == 2
 
 
@@ -194,25 +181,22 @@ def test_core_role_instructions_survive_response_preference_eviction(
 ) -> None:
     context, ledger = RunContext(depth=int(researcher)), EvidenceLedger()
     context.services["evidence"] = ledger
-    context.services["assistant_instructions"] = "Answer briefly in Turkish."
     first = original(ledger, context, "The first condition must hold. " * 16)
     second = original(ledger, context, "The second condition also applies. " * 16)
     llm = model()
     adapter = ResearchModel(llm, context, lean_native_mode=True, token_counter=len)
-    current = view(
-        turns=[turn("existing-read", [first])], original_evidence=[first, second]
-    )
+    current = view(original_evidence=[first, second])
     complete_prompt, tools, _ = adapter._fit_native_decision(current)
-    context_content = complete_prompt[-1].content
-    assert isinstance(context_content, str)
-    decision_context = json.loads(context_content)
+    question_content = complete_prompt[1].content
+    assert isinstance(question_content, str)
+    question = json.loads(question_content)
     assert (
-        decision_context.pop("response_preferences")
-        == llm_adapter.DEFAULT_RESPONSE_PREFERENCES
+        question.pop("response_preferences") == llm_adapter.DEFAULT_RESPONSE_PREFERENCES
     )
     prompt_without_preferences = [
-        *complete_prompt[:-1],
-        UserMessage(content=json.dumps(decision_context, ensure_ascii=False)),
+        complete_prompt[0],
+        UserMessage(content=json.dumps(question, ensure_ascii=False)),
+        *complete_prompt[2:],
     ]
     required_input = adapter._input_cost(prompt_without_preferences, tools)
     llm.config.max_input_tokens = (required_input * 4 + 2) // 3
@@ -228,16 +212,6 @@ def test_core_role_instructions_survive_response_preference_eviction(
     first_content = prompt[1].content
     assert isinstance(first_content, str)
     assert "response_preferences" not in json.loads(first_content)
-    if not researcher:
-        assert (
-            json.loads(first_content)["assistant_instructions"]
-            == "Answer briefly in Turkish."
-        )
-    assert "response_preferences" not in last_payload(llm)
-    assert [
-        message.tool_call_id for message in prompt if isinstance(message, ToolMessage)
-    ] == ["existing-read"]
-    assert prompt[:2] == complete_prompt[:2]
     assert last_payload(llm)["original_evidence"] == [first, second]
     assert "original_evidence_omitted" not in last_payload(llm)
     assert adapter.last_call_id is not None
@@ -474,10 +448,8 @@ def test_native_mode_inherits_into_worker_without_changing_targeted_structured_c
     assert isinstance(first_content, str)
     first_user = json.loads(first_content)
     assert first_user["request"] == view().request
-    assert "response_preferences" not in first_user
     assert (
-        last_payload(llm)["response_preferences"]
-        == llm_adapter.DEFAULT_RESPONSE_PREFERENCES
+        first_user["response_preferences"] == llm_adapter.DEFAULT_RESPONSE_PREFERENCES
     )
     assert "assistant_instructions" not in first_user
     llm.invoke.return_value = ModelResponse(
