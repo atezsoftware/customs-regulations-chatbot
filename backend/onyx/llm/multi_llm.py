@@ -1,13 +1,14 @@
 import copy
+import math
 import os
 import random
 import re
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from functools import lru_cache
 from itertools import chain
-from typing import TYPE_CHECKING, Any, Union, cast
+from typing import TYPE_CHECKING, Any, Literal, TypedDict, Union, cast
 
 from pydantic import TypeAdapter
 from readerwriterlock import rwlock
@@ -110,6 +111,110 @@ _REASONING_KWARG_KEYS = frozenset(
     {"thinking", "output_config", "reasoning", "reasoning_effort"}
 )
 _BEST_EFFORT_KWARG_KEYS = _REASONING_KWARG_KEYS | frozenset({"temperature"})
+
+
+SamplingValueState = Literal[
+    "value", "explicit_null", "non_scalar", "non_finite", "unknown"
+]
+
+
+class SamplingSource(TypedDict):
+    path: str
+    state: SamplingValueState
+    value: int | float | None
+
+
+class SamplingParameter(TypedDict):
+    state: SamplingValueState | Literal["unset", "multiple_sources"]
+    value: int | float | None
+    sources: list[SamplingSource]
+
+
+class SamplingSnapshot(TypedDict):
+    boundary: Literal["litellm_completion_kwargs"]
+    wire_observed: Literal[False]
+    requested_seed: int | None
+    requested_seed_state: Literal["value", "unset"]
+    seed: SamplingParameter
+    top_p: SamplingParameter
+    temperature: SamplingParameter
+
+
+def _sampling_source(path: str, value: object) -> SamplingSource:
+    if value is None:
+        return {"path": path, "state": "explicit_null", "value": None}
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return {"path": path, "state": "non_scalar", "value": None}
+    if isinstance(value, float) and not math.isfinite(value):
+        return {"path": path, "state": "non_finite", "value": None}
+    return {"path": path, "state": "value", "value": value}
+
+
+def _sampling_parameter(
+    aliases: tuple[str, ...],
+    containers: list[tuple[str, Mapping[str, Any] | None]],
+) -> SamplingParameter:
+    sources: list[SamplingSource] = []
+    for path, container in containers:
+        if container is None:
+            sources.append({"path": path, "state": "unknown", "value": None})
+        else:
+            sources.extend(
+                _sampling_source(f"{path}.{key}", container[key])
+                for key in aliases
+                if key in container
+            )
+    if not sources:
+        return {"state": "unset", "value": None, "sources": []}
+    if len(sources) > 1:
+        return {"state": "multiple_sources", "value": None, "sources": sources}
+    source = sources[0]
+    return {"state": source["state"], "value": source["value"], "sources": sources}
+
+
+def _sampling_snapshot(
+    opts: Mapping[str, Any],
+    passthrough_kwargs: Mapping[str, Any],
+    requested_seed: int | None,
+) -> SamplingSnapshot:
+    # Known numeric paths only: provider defaults and HTTP serialization are unobserved.
+    containers: list[tuple[str, Mapping[str, Any] | None]] = [
+        ("opts", opts),
+        ("passthrough_kwargs", passthrough_kwargs),
+    ]
+    for path, container in list(containers):
+        if container is not None and "extra_body" in container:
+            extra_body = container["extra_body"]
+            containers.append(
+                (
+                    f"{path}.extra_body",
+                    extra_body if isinstance(extra_body, Mapping) else None,
+                )
+            )
+    for path, container in list(containers):
+        if container is None:
+            continue
+        for key in ("generationConfig", "generation_config"):
+            if key in container:
+                generation_config = container[key]
+                containers.append(
+                    (
+                        f"{path}.{key}",
+                        generation_config
+                        if isinstance(generation_config, Mapping)
+                        else None,
+                    )
+                )
+    return {
+        "boundary": "litellm_completion_kwargs",
+        "wire_observed": False,
+        "requested_seed": requested_seed,
+        "requested_seed_state": "unset" if requested_seed is None else "value",
+        "seed": _sampling_parameter(("seed",), containers),
+        "top_p": _sampling_parameter(("top_p", "topP"), containers),
+        "temperature": _sampling_parameter(("temperature",), containers),
+    }
+
 
 # Substrings provider 400s use to name each strippable kwarg (errors may
 # cite only inner fields like budget_tokens or effort).
@@ -1023,6 +1128,7 @@ class LitellmLLM(LLM):
                     attempts.append(stripped)
 
             for i, opts in enumerate(attempts):
+                sampling = _sampling_snapshot(opts, passthrough_kwargs, self._seed)
                 # Last write wins: sent_kwargs holds what the returning (or
                 # final failing) attempt sent, reasoning_effort the requested
                 # intent.
@@ -1030,6 +1136,7 @@ class LitellmLLM(LLM):
                     {
                         "reasoning_effort": reasoning_effort.value,
                         "max_tokens": max_tokens,
+                        "sampling": sampling,
                         **(
                             {"requested_seed": self._seed}
                             if self._seed is not None
@@ -1053,6 +1160,7 @@ class LitellmLLM(LLM):
                             "messages": messages,
                             "tools": tools,
                             "sent_kwargs": opts,
+                            "sampling": sampling,
                             "stream": stream,
                         },
                     ) as graph_call:
