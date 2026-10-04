@@ -112,8 +112,8 @@ class QuestionResearch:
         return None
 
     def _validated_questions(self, raw: JsonValue) -> list[dict[str, JsonValue]]:
-        if not isinstance(raw, list) or not raw or len(raw) > 24:
-            raise ValueError("Supply 1–24 independent material subquestions")
+        if not isinstance(raw, list) or not raw:
+            raise ValueError("Supply independent material subquestions")
         questions: list[dict[str, JsonValue]] = []
         covered: set[int] = set()
         identifiers: set[str] = set()
@@ -129,7 +129,6 @@ class QuestionResearch:
                 or identifier in identifiers
                 or not isinstance(question, str)
                 or not question.strip()
-                or len(question) > 4000
                 or not isinstance(title, str)
                 or not title.strip()
                 or not isinstance(message, str)
@@ -148,6 +147,14 @@ class QuestionResearch:
                 )
             identifiers.add(identifier)
             covered.update(number for number in parents if type(number) is int)
+            answer_title = entry.get("answer_title")
+            if answer_title is not None and (
+                not isinstance(answer_title, str)
+                or not answer_title.strip()
+                or "\n" in answer_title
+                or "\r" in answer_title
+            ):
+                raise ValueError("An answer title must be a nonempty single line")
             questions.append(dict(entry))
         if covered != set(range(1, len(self.original_questions) + 1)):
             raise ValueError(
@@ -180,8 +187,6 @@ class QuestionResearch:
                         public_title=str(item["public_title"]),
                         public_message=str(item["public_message"]),
                         independent_question=True,
-                        max_tools=24,
-                        max_decisions=10,
                     )
                     item["task_id"] = task_id
         available = {item.task_id: item for item in self.workers.results(full=True)}
@@ -214,6 +219,7 @@ class QuestionResearch:
                 {
                     "question_id": question["question_id"],
                     "question": question["question"],
+                    "answer_title": question.get("answer_title", question["question"]),
                     "parent_question_ids": question["parent_question_ids"],
                     "task_id": task_id,
                     "status": result.outcome.status.value
@@ -255,7 +261,7 @@ class QuestionResearch:
         ):
             raise ValueError("Connections require recorded original evidence")
         parts = [
-            f"### {index}. {expected[str(identifier)]['question']}\n\n"
+            f"## {index}. {expected[str(identifier)].get('answer_title', expected[str(identifier)]['question'])}\n\n"
             f"{expected[str(identifier)]['answer']}"
             for index, identifier in enumerate(order, 1)
         ]
@@ -278,14 +284,13 @@ class QuestionResearch:
         return [
             ToolSpec(
                 name="research_questions",
-                description="In the first decision, separate every material semantic subquestion. Preserve alternatives and prose outcomes; map each to its original question number. Each gets the same full scenario but a separate history and budget. Related questions remain separate. All assignments run concurrently; complete answers return without shortening.",
+                description="In the first decision, inspect the conversation and retained session originals, then separate every material semantic subquestion. Preserve alternatives and prose outcomes; map each to its original question number. Each gets the same full scenario and retained originals with a separate history, without time or execution quotas. Research only new or unresolved issues. Related questions remain separate. Assignments run in parallel; complete answers return without shortening. Give each a brief neutral answer_title for presentation.",
                 parameters={
                     "type": "object",
                     "properties": {
                         "questions": {
                             "type": "array",
                             "minItems": 1,
-                            "maxItems": 24,
                             "items": {
                                 "type": "object",
                                 "properties": {
@@ -293,7 +298,11 @@ class QuestionResearch:
                                     "question": {
                                         "type": "string",
                                         "minLength": 1,
-                                        "maxLength": 4000,
+                                    },
+                                    "answer_title": {
+                                        "type": "string",
+                                        "minLength": 1,
+                                        "description": "Brief neutral heading for this answer, without asserting an uncited legal conclusion.",
                                     },
                                     "parent_question_ids": {
                                         "type": "array",

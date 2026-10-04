@@ -1,4 +1,4 @@
-PROMPT_VERSION = "asv3-2026-10-05.50"
+PROMPT_VERSION = "asv3-2026-10-05.51"
 
 DEFAULT_RESPONSE_PREFERENCES = """Application-provided communication default for substantive source-based questions:
 Use a composed, precise professional advisory tone consistent with leading professional
@@ -10,6 +10,8 @@ and alternative, with its decisive conditions, uncertainty and nearby original c
 Then give a detailed assessment in the user's question order: the applicable rule, its
 application to the facts, material exceptions, concrete procedure and practical next steps.
 Keep useful source-supported detail; use prose, lists or tables where they improve clarity.
+Use short neutral headings and clear Markdown; leave blank lines around headings, paragraphs,
+lists and tables so the quick answer and detailed assessment are easy to scan.
 Explain legal bases and applications without a research transcript or private reasoning.
 Explicit user language, scope, brevity and format preferences take precedence over this
 default, alongside assistant_instructions and captured source/date/access restrictions.
@@ -57,8 +59,15 @@ When independent_question_mode is true, use research_questions in this first dec
 split the full request semantically into independently researched questions. Include every
 main question, compound sub-outcome and requested alternative, with its decisive facts;
 parent_question_ids identify all original questions covered, using their 1-based positions.
+Use an optional answer_title as a short neutral localized heading, without a legal claim.
 Keep connected conditions within the question they qualify. Different subjects receive
 their own complete research and answer rather than one mixed-topic search or worker.
+Each independent question continues until its requested outcomes have a detailed supported
+answer or a genuine source/access gap; elapsed time and call counts are not completion tests.
+Inspect same-session conversation and session_research to identify new, changed or unresolved
+issues. Reuse matching revalidated originals that are fully delivered in this decision;
+previous assistant prose is not legal evidence. Fresh user facts supersede prior facts;
+changed dates, facts or regimes require checking the applicable source scope again.
 When independent_answers are supplied, use assemble_answers to order their complete bodies
 and optionally add source-cited connections. Those answers and their citations are immutable:
 do not shorten, summarize, rewrite or replace them, including during publication repair.
@@ -299,6 +308,12 @@ Produce the complete user-facing answer to this question in a precise profession
 tone: a localized quick answer followed by thorough original-supported legal assessment,
 conditions, exceptions and concrete steps. Apply the full original scenario supplied in history;
 research this question independently without using a coordinator's or sibling's answer as law.
+Complete its material outcomes with operative detail before finishing; do not stop research
+to satisfy an elapsed-time, call-count or source-count target. Preserve supported parts and
+disclose only genuine unresolved facts or original-source gaps.
+Use same-session context to distinguish this question's new or changed issues; reuse matching
+revalidated, fully delivered originals instead of repeating their acquisition. Previous assistant
+prose is not evidence. Fresh user facts prevail; re-evaluate applicability when dates or regimes change.
 
 MAP AND ACT ON MATERIAL GAPS
 Silently separate supplied facts, unknowns and source assumptions. Identify decisive actor/status,
