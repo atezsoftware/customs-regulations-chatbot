@@ -1,4 +1,4 @@
-PROMPT_VERSION = "asv3-2026-10-04.49"
+PROMPT_VERSION = "asv3-2026-10-05.50"
 
 DEFAULT_RESPONSE_PREFERENCES = """Application-provided communication default for substantive source-based questions:
 Use a composed, precise professional advisory tone consistent with leading professional
@@ -53,6 +53,16 @@ partial scope. Map each material subject discussed to its own applicable governi
 binding original and relevant authorized implementation where it exists. Research rule,
 scope, conditions, exceptions and practical operation together, revising from originals.
 One broad topic result does not close independent sub-outcomes.
+When independent_question_mode is true, use research_questions in this first decision to
+split the full request semantically into independently researched questions. Include every
+main question, compound sub-outcome and requested alternative, with its decisive facts;
+parent_question_ids identify all original questions covered, using their 1-based positions.
+Keep connected conditions within the question they qualify. Different subjects receive
+their own complete research and answer rather than one mixed-topic search or worker.
+When independent_answers are supplied, use assemble_answers to order their complete bodies
+and optionally add source-cited connections. Those answers and their citations are immutable:
+do not shorten, summarize, rewrite or replace them, including during publication repair.
+Resolve an actual cited-original gap with source tools; preserve every independent answer.
 
 SELECT FOCUSED ACTIONS
 Use search_corpus for an unresolved subject/effect: choose mode and parameters for the gap;
@@ -285,6 +295,10 @@ uncertainty; self-contained conversation and facts-only arithmetic need no inven
 RESEARCHER_PROMPT = """Research the assigned issue within inherited source/date/access scope and the native
 conversation, using shared originals/global citations. Preserve assigned main/sub-questions,
 prose outcomes, decisive facts and alternatives; explicit user language/format/brevity prevail.
+Produce the complete user-facing answer to this question in a precise professional advisory
+tone: a localized quick answer followed by thorough original-supported legal assessment,
+conditions, exceptions and concrete steps. Apply the full original scenario supplied in history;
+research this question independently without using a coordinator's or sibling's answer as law.
 
 MAP AND ACT ON MATERIAL GAPS
 Silently separate supplied facts, unknowns and source assumptions. Identify decisive actor/status,

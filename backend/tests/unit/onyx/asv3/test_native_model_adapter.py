@@ -20,12 +20,19 @@ from onyx.asv3.models import (
     ToolReceipt,
 )
 from onyx.llm.interfaces import LLM, LLMConfig
-from onyx.llm.model_response import Choice, Message, ModelResponse
+from onyx.llm.model_response import (
+    ChatCompletionMessageToolCall,
+    Choice,
+    Message,
+    ModelResponse,
+)
+from onyx.llm.model_response import FunctionCall as ResponseFunctionCall
 from onyx.llm.models import (
     AssistantMessage,
     ChatCompletionMessage,
     FunctionCall,
     ToolCall,
+    ToolChoiceOptions,
     ToolMessage,
     UserMessage,
 )
@@ -100,6 +107,286 @@ def view(**kwargs: Any) -> HarnessView:
 def last_payload(llm: MagicMock) -> dict[str, Any]:
     content = llm.invoke.call_args.kwargs["prompt"][-1].content
     return cast(dict[str, Any], json.loads(content[0].text))
+
+
+def independent_tool_view(**kwargs: Any) -> HarnessView:
+    return view(**kwargs).model_copy(
+        update={
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {"name": name, "parameters": {"type": "object"}},
+                }
+                for name in ("research_questions", "assemble_answers", "read_provision")
+            ]
+        }
+    )
+
+
+@pytest.mark.parametrize("started", [False, True])
+def test_independent_root_forces_only_the_current_tool(started: bool) -> None:
+    context, llm = RunContext(), model()
+    context.services.update(
+        independent_question_mode=True,
+        question_research_started=started,
+        independent_answers=[{"question_id": "q1", "answer": "Complete answer."}]
+        if started
+        else [],
+    )
+    current = independent_tool_view()
+    original_tools = current.model_dump(mode="json")["tools"]
+    ResearchModel(llm, context, lean_native_mode=True).decide(current)
+    assert llm.invoke.call_args.kwargs["tool_choice"] is ToolChoiceOptions.REQUIRED
+    assert [t["function"]["name"] for t in llm.invoke.call_args.kwargs["tools"]] == [
+        "assemble_answers" if started else "research_questions"
+    ]
+    assert current.model_dump(mode="json")["tools"] == original_tools
+    assert llm.invoke.call_count == 1
+
+
+def test_independent_first_decision_can_ask_a_decisive_user_fact_with_required_tools() -> (
+    None
+):
+    context, llm = RunContext(), model()
+    context.services["independent_question_mode"] = True
+    current = independent_tool_view()
+    current.tools.append(
+        {
+            "type": "function",
+            "function": {
+                "name": "ask_user",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"question": {"type": "string"}},
+                    "required": ["question"],
+                },
+            },
+        }
+    )
+    clarification = "Bu işlemde eşyanın sahibi hangi taraftır?"
+    llm.invoke.return_value = ModelResponse(
+        id="clarification",
+        created="0",
+        choice=Choice(
+            message=Message(
+                tool_calls=[
+                    ChatCompletionMessageToolCall(
+                        id="ask-fact",
+                        function=ResponseFunctionCall(
+                            name="ask_user",
+                            arguments=json.dumps({"question": clarification}),
+                        ),
+                    )
+                ]
+            )
+        ),
+    )
+    canonical_tools = current.model_dump(mode="json")["tools"]
+    decision = ResearchModel(llm, context, lean_native_mode=True).decide(current)
+    assert llm.invoke.call_args.kwargs["tool_choice"] is ToolChoiceOptions.REQUIRED
+    assert [
+        tool["function"]["name"] for tool in llm.invoke.call_args.kwargs["tools"]
+    ] == ["research_questions", "ask_user"]
+    assert [call.name for call in decision.calls] == ["ask_user"]
+    assert decision.calls[0].arguments == {"question": clarification}
+    assert current.model_dump(mode="json")["tools"] == canonical_tools
+    assert llm.invoke.call_count == 1
+
+
+def test_independent_child_preserves_user_preferences_and_full_scenario_without_sibling_answers() -> (
+    None
+):
+    context, llm = RunContext(), model()
+    preferences = "Her alternatifin kendi dayanağını ve somut işlem adımlarını açıkla."
+    context.services.update(
+        assistant_instructions=preferences,
+        independent_answers=[
+            {"question_id": "sibling", "answer": "Sibling draft must not leak."}
+        ],
+        independent_question_mode=True,
+    )
+    child = context.independent_child(max_tools=24, max_decisions=10)
+    scenario = (
+        "Tam kullanıcı senaryosu: A aktörü, B rejimi, iki ayrı alternatif ve tarih C."
+    )
+    current = independent_tool_view().model_copy(
+        update={
+            "request": "Yalnız ikinci alternatifin sonucunu araştır.",
+            "questions": ["Yalnız ikinci alternatifin sonucunu araştır."],
+        }
+    )
+    adapter = ResearchModel(llm, child, lean_native_mode=True, history=scenario)
+    adapter.decide(current)
+    payload, _ = first_user_payload(llm.invoke.call_args.kwargs["prompt"][1])
+    assert payload == {
+        "request": current.request,
+        "conversation": scenario,
+        "assistant_instructions": preferences,
+    }
+    assert "independent_answers" not in last_payload(llm)
+    assert context.services["assistant_instructions"] == preferences
+    assert child.services["assistant_instructions"] == preferences
+    assert current.request == "Yalnız ikinci alternatifin sonucunu araştır."
+    assert len(llm.invoke.call_args.kwargs["tools"]) == 3
+    assert llm.invoke.call_args.kwargs["tool_choice"] is ToolChoiceOptions.AUTO
+    assert llm.invoke.call_count == 1
+
+
+def test_source_free_gap_assembly_rejects_added_legal_connections() -> None:
+    from onyx.asv3.question_research import QuestionResearch
+    from onyx.asv3.workers import WorkerPool
+
+    context = RunContext()
+    research = QuestionResearch(
+        context, MagicMock(spec=WorkerPool), ["Unknown outcome?"]
+    )
+    gap = "Bu sonucun belirleyici özgün hükmü henüz doğrulanamadı."
+    research.restore(
+        {
+            "answers": [
+                {
+                    "question_id": "only",
+                    "question": "Unknown outcome?",
+                    "answer": gap,
+                    "status": "partial",
+                    "evidence_numbers": [],
+                }
+            ]
+        }
+    )
+    guard = MagicMock(return_value=None)
+    research.publish_guard = guard
+    with pytest.raises(ValueError, match="(?i)connections"):
+        research.assemble_answers(
+            {
+                "order": ["only"],
+                "connections": "Bu nedenle vergi otomatik olarak ortadan kalkar.",
+            },
+            context,
+        )
+    guard.assert_not_called()
+    assert "assembled_answer" not in context.services
+    research.assemble_answers({"order": ["only"]}, context)
+    assert context.services["assembled_answer"] == f"### 1. Unknown outcome?\n\n{gap}"
+    assert context.services["independent_partial"] is True
+
+
+def test_independent_answers_and_body_citations_survive_capacity_pressure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        llm_adapter, "COORDINATOR_PROMPT", "Keep complete answers and originals."
+    )
+    context, ledger, llm = RunContext(), EvidenceLedger(), model()
+    context.services["evidence"] = ledger
+    required = original(ledger, context, "Full cumulative condition. " * 24)
+    optional = original(ledger, context, "Uncited supplementary original. " * 300)
+    answers = [
+        {
+            "question_id": "q1",
+            "question": "All conditions?",
+            "answer": "Precise condition [1].\n" * 12,
+            "status": "found",
+            "evidence_numbers": [],
+        }
+    ]
+    context.services.update(
+        independent_question_mode=True,
+        question_research_started=True,
+        independent_answers=answers,
+    )
+    adapter = ResearchModel(llm, context, lean_native_mode=True, token_counter=len)
+    current = independent_tool_view(original_evidence=[required, optional])
+    complete, tools, _ = adapter._fit_native_decision(current)
+    payload = json.loads(cast(str, complete[-1].content))
+    payload["original_evidence"] = [required]
+    payload["original_evidence_omitted"] = [
+        {
+            "citation": 2,
+            "source_id": "law",
+            "start_char": 0,
+            "end_char": len(str(optional["text"])),
+            "reason": "physical_model_context",
+        }
+    ]
+    minimal = [
+        *complete[:-1],
+        UserMessage(content=json.dumps(payload, ensure_ascii=False)),
+    ]
+    cost = adapter._input_cost(minimal, tools)
+    llm.config.max_input_tokens = (cost * 4 + 2) // 3
+    adapter.decide(current)
+    assert last_payload(llm)["independent_answers"] == answers
+    assert last_payload(llm)["original_evidence"] == [required]
+    assert last_payload(llm)["original_evidence_omitted"][0]["citation"] == 2
+    assert ledger.completely_delivered(cast(str, adapter.last_call_id)) == {1}
+    assert llm.invoke.call_count == 1
+    llm.config.max_input_tokens = 300
+    with pytest.raises(RunStopped, match="required originals"):
+        adapter.decide(current)
+    assert llm.invoke.call_count == 1
+    assert context.services["independent_answers"] == answers
+
+
+def test_independent_assembly_recovery_uses_global_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context, llm = RunContext(), model()
+    context.services.update(
+        independent_question_mode=True,
+        question_research_started=True,
+        independent_answers=[{"question_id": "q1", "answer": "Complete answer."}],
+    )
+    research_check = MagicMock(side_effect=RunStopped("Research ended"))
+    monkeypatch.setattr(context, "check_research_active", research_check)
+    llm.invoke.side_effect = [
+        ModelResponse(id="empty", created="0", choice=Choice(message=Message())),
+        ModelResponse(
+            id="partial",
+            created="0",
+            choice=Choice(
+                finish_reason="length", message=Message(content="Exact first part. ")
+            ),
+        ),
+        ModelResponse(
+            id="complete",
+            created="0",
+            choice=Choice(message=Message(content="Exact remaining part.")),
+        ),
+    ]
+    result = ResearchModel(llm, context, lean_native_mode=True).decide(
+        independent_tool_view()
+    )
+    assert result.answer == "Exact first part. Exact remaining part."
+    research_check.assert_not_called()
+    assert llm.invoke.call_count == 3
+    assert (
+        llm.invoke.call_args_list[0].kwargs["tool_choice"] is ToolChoiceOptions.REQUIRED
+    )
+    assert llm.invoke.call_args_list[-1].kwargs["tool_choice"] is ToolChoiceOptions.NONE
+
+
+def test_independent_researcher_and_publication_repair_keep_source_tools() -> None:
+    context = RunContext()
+    context.services.update(
+        independent_question_mode=True,
+        question_research_started=True,
+        independent_answers=[
+            {"question_id": "q1", "answer": "Sibling body must not leak."}
+        ],
+    )
+    for selected_context, gap in [
+        (context.child(), None),
+        (context, {"missing": "original"}),
+    ]:
+        llm = model()
+        ResearchModel(llm, selected_context, lean_native_mode=True).decide(
+            independent_tool_view(publication_gap=gap)
+        )
+        assert len(llm.invoke.call_args.kwargs["tools"]) == 3
+        assert llm.invoke.call_args.kwargs["tool_choice"] is ToolChoiceOptions.AUTO
+        if selected_context.depth:
+            assert "independent_answers" not in last_payload(llm)
 
 
 def first_user_payload(message: ChatCompletionMessage) -> tuple[dict[str, Any], str]:
