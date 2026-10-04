@@ -288,6 +288,13 @@ class Harness:
             dict.fromkeys(
                 [
                     *(
+                        n
+                        for n in self.context.services.get(
+                            "independent_evidence_numbers", []
+                        )
+                        if type(n) is int
+                    ),
+                    *(
                         state.source_conditions.citations()
                         if isinstance(state, ResearchState)
                         else []
@@ -391,7 +398,10 @@ class Harness:
     def _execute(self, call: CapabilityCall, context: RunContext) -> ToolReceipt:
         start = time.monotonic()
         try:
-            context.check_research_active()
+            if call.name == "assemble_answers" and context.depth == 0:
+                context.check_active()
+            else:
+                context.check_research_active()
             phase = self._tool_progress_phase(call)
             if self.progress and phase:
                 self._progress_calls.add(call.call_id)
@@ -427,7 +437,13 @@ class Harness:
                     ],
                 }
             # The handler may not support cancellation; its late payload is still revoked.
-            context.check_research_active()
+            if (
+                call.name in {"research_questions", "assemble_answers"}
+                and context.depth == 0
+            ):
+                context.check_active()
+            else:
+                context.check_research_active()
         except RunStopped as error:
             outcome = ToolOutcome(
                 status=OutcomeStatus.CANCELLED
@@ -761,7 +777,13 @@ class Harness:
                 if not pending:
                     break
                 try:
-                    self.context.check_research_active()
+                    if self.context.depth == 0 and all(
+                        call.name in {"research_questions", "assemble_answers"}
+                        for call, _, _ in pending.values()
+                    ):
+                        self.context.check_active()
+                    else:
+                        self.context.check_research_active()
                 except RunStopped as error:
                     for call_id, (call, child, future) in pending.items():
                         child.cancel()
@@ -776,9 +798,7 @@ class Harness:
                         )
                         self._commit_receipt(ready[call_id])
                     break
-                time.sleep(
-                    min(0.02, max(0, self.context.research_deadline - time.monotonic()))
-                )
+                time.sleep(0.02)
             return [ready[call.call_id] for call in calls]
         finally:
             for _, child, future in futures:
@@ -893,12 +913,16 @@ class Harness:
         answer: str | None = None
         try:
             while True:
-                self.context.check_research_active()
+                if self.context.services.get("question_research_started") is True:
+                    self.context.check_active()
+                else:
+                    self.context.check_research_active()
                 budget = self.context.budget
                 limit = budget.limits["tools"]
                 if (
                     self.context.services.get("research_state")
                     and self.context.services.get("final_repair") is not True
+                    and self.context.services.get("independent_question") is not True
                     and limit >= 16
                 ):
                     limit -= 8
@@ -938,6 +962,20 @@ class Harness:
                         )
                         self._trim_turns()
                     self._save()
+                    assembled = self.context.services.get("assembled_answer")
+                    if (
+                        not self.context.depth
+                        and isinstance(assembled, str)
+                        and assembled.strip()
+                    ):
+                        self.last_draft = answer = assembled
+                        status = (
+                            OutcomeStatus.PARTIAL
+                            if self.context.services.get("independent_partial") is True
+                            else OutcomeStatus.FOUND
+                        )
+                        self.stop_reason = "independent_answers_assembled"
+                        break
                     partial_answer = (
                         self.partial_submission() if self.partial_submission else None
                     )
