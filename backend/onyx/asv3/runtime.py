@@ -595,14 +595,16 @@ def run_asv3_loop(
                 else None
             )
             authority_gap = native_named_authority_gap(candidate, ledger)
-            if gap is not None:
-                return gap
-            if authority_gap is not None:
-                return ToolOutcome(
+            if gap is None and authority_gap is not None:
+                gap = ToolOutcome(
                     status=OutcomeStatus.PARTIAL,
                     summary="An unresolved answer cannot assert an unsupported statutory result.",
                     data=authority_gap,
                 )
+            child_harness.last_draft = candidate
+            child_harness.publication_gap = gap
+            if gap is not None:
+                return gap
             child_partial = candidate
             return ToolOutcome(
                 status=OutcomeStatus.PARTIAL,
@@ -616,7 +618,13 @@ def run_asv3_loop(
                     description="Finish this question with supported parts and its precise unresolved source gap. Preserve available detail and original citations. Missing source text is not proof that no rule exists.",
                     parameters={
                         "type": "object",
-                        "properties": {"answer": {"type": "string", "minLength": 1}},
+                        "properties": {
+                            "answer": {
+                                "type": "string",
+                                "minLength": 1,
+                                "description": "Complete supported answer and precise source gaps. Use recorded global [n] citations beside supported legal claims; (n) is not a citation. Preserve legal article/paragraph numbering.",
+                            }
+                        },
                         "required": ["answer"],
                         "additionalProperties": False,
                     },
