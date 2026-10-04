@@ -204,6 +204,14 @@ def setup_run(
         temperature=0,
         max_input_tokens=500000,
     )
+
+    def with_seed(seed: int) -> MagicMock:
+        selected = MagicMock(spec=LLM)
+        selected.config = llm.config.model_copy(update={"seed": seed})
+        selected.invoke.side_effect = llm.invoke
+        return selected
+
+    llm.with_seed.side_effect = with_seed
     title, description = (
         (
             "Tamir ve değişim",
@@ -788,6 +796,63 @@ def test_resume_retains_native_history_and_revalidates_originals_without_profile
         for packet in packets(queue)
         if isinstance(packet.obj, ASv3Progress)
     )
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_native_runtime_seed_profile_survives_checkpoint_and_legacy_resume(
+    monkeypatch: pytest.MonkeyPatch,
+    legacy: bool,
+) -> None:
+    kwargs, broker, llm, checkpoints, _queue = setup_run(monkeypatch)
+    llm.config = llm.config.model_copy(
+        update={"model_provider": "vertex_ai", "model_name": "gemini-3.8-flash"}
+    )
+    runtime.run_asv3_loop(**kwargs)
+    assert [call.args[0] for call in llm.with_seed.call_args_list] == [31, 1424088823]
+    previous = dict(checkpoints[-1])
+    saved = previous["native_coordinator_sampling"]
+    assert saved["first_decision_started"] is True
+    assert saved["first_decision_completed"] is True
+    assert len(previous["evidence"]["records"]) == 2
+    assert broker.search_adapter is not None
+    assert llm.config.seed is None
+    if legacy:
+        previous.pop("native_coordinator_sampling")
+    monkeypatch.setattr(runtime, "load_asv3_checkpoint", lambda **_kwargs: previous)
+    llm.reset_mock()
+    llm.invoke.side_effect = lambda **_kwargs: response("Tamir [1], değiştirme [2].")
+    runtime.run_asv3_loop(**kwargs, resume_message_id=2)
+    llm.with_seed.assert_called_once_with(1424088823)
+    assert llm.invoke.call_count == 1
+    assert checkpoints[-1]["evidence"]["records"] == previous["evidence"]["records"]
+
+
+def test_native_runtime_explicit_seed_zero_is_uniform_and_profile_change_blocks_resume(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kwargs, _broker, llm, checkpoints, _queue = setup_run(monkeypatch)
+    llm.config = llm.config.model_copy(
+        update={
+            "model_provider": "vertex_ai",
+            "model_name": "gemini-3.8-flash",
+            "seed": 0,
+        }
+    )
+    runtime.run_asv3_loop(**kwargs)
+    assert llm.invoke.call_count == 2
+    llm.with_seed.assert_not_called()
+    previous = checkpoints[-1]
+    assert previous["native_coordinator_sampling"]["settings"] == {
+        "mode": "explicit_seed",
+        "seed": 0,
+    }
+    monkeypatch.setattr(runtime, "load_asv3_checkpoint", lambda **_kwargs: previous)
+    llm.reset_mock()
+    llm.config = llm.config.model_copy(update={"seed": None})
+    with pytest.raises(ValueError, match="same coordinator sampling profile"):
+        runtime.run_asv3_loop(**kwargs, resume_message_id=2)
+    llm.invoke.assert_not_called()
+    llm.with_seed.assert_not_called()
 
 
 def test_runtime_has_no_legacy_execution_limit_and_retains_more_than_six_native_groups(

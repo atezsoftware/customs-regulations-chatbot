@@ -3125,11 +3125,139 @@ def test_seed_isolation_across_concurrent_instances_and_subsequent_calls() -> No
         assert "top_p" not in kwargs
 
 
+@pytest.mark.parametrize("original_seed", [None, 41])
+def test_seed_binding_preserves_original_and_sibling_configuration(
+    original_seed: int | None,
+) -> None:
+    model_kwargs = {"seed": 19, "top_p": 0.89, "api_key": None}
+    original = _seeded_vertex_llm(original_seed, model_kwargs=model_kwargs)
+    original_config = original.config.model_dump()
+    original_kwargs = dict(model_kwargs)
+    first = original.with_seed(0)
+    second = first.with_seed(73)
+
+    assert first is not original
+    assert second is not first
+    assert original.config.model_dump() == original_config
+    assert first.config.seed == 0
+    assert second.config.seed == 73
+    assert first.config.model_dump(exclude={"seed"}) == original.config.model_dump(
+        exclude={"seed"}
+    )
+    with patch("litellm.completion", return_value=_seed_test_response()) as completion:
+        for llm in (first, second, original, first):
+            llm.invoke([UserMessage(content="Inspect sources.")], use_streaming=False)
+    assert [call.kwargs["seed"] for call in completion.call_args_list] == [
+        0,
+        73,
+        19 if original_seed is None else original_seed,
+        0,
+    ]
+    assert all(call.kwargs["top_p"] == 0.89 for call in completion.call_args_list)
+    assert original.config.model_dump() == original_config
+    assert model_kwargs == original_kwargs
+
+
+@pytest.mark.parametrize(
+    "invalid_seed", [None, True, False, "0", 0.5, -(2**31) - 1, 2**31]
+)
+def test_seed_binding_rejects_invalid_values_without_mutating_original(
+    invalid_seed: Any,
+) -> None:
+    from pydantic import ValidationError
+
+    original = _seeded_vertex_llm(73)
+    with (
+        patch("litellm.completion") as completion,
+        pytest.raises(ValidationError),
+    ):
+        original.with_seed(invalid_seed)
+    assert original.config.seed == 73
+    completion.assert_not_called()
+
+
+def test_concurrent_seed_bindings_match_each_provider_call_and_generation_trace() -> (
+    None
+):
+    from concurrent.futures import ThreadPoolExecutor
+
+    from onyx.tracing.framework.create import generation_span, trace
+    from onyx.tracing.framework.span_data import GenerationSpanData
+
+    original = _seeded_vertex_llm(None, model_kwargs={"top_p": 0.89})
+    llms = {
+        "first": original.with_seed(0),
+        "second": original.with_seed(73),
+        "default": original,
+    }
+    overlap = threading.Barrier(len(llms))
+
+    def fake_completion(**_kwargs: Any) -> litellm.ModelResponse:
+        overlap.wait(timeout=10)
+        return _seed_test_response()
+
+    def invoke_and_capture(label: str) -> tuple[str, dict[str, Any]]:
+        with (
+            trace(f"seed-binding-{label}"),
+            generation_span(model="gemini-3.8-flash") as span,
+        ):
+            response = llms[label].invoke(
+                [UserMessage(content=label)], use_streaming=False
+            )
+        assert response.choice.message.content == "source-backed result"
+        assert isinstance(span.span_data, GenerationSpanData)
+        assert span.span_data.request_params is not None
+        return label, dict(span.span_data.request_params)
+
+    with (
+        patch("litellm.completion", side_effect=fake_completion) as completion,
+        patch("onyx.llm.multi_llm.graph_step") as provider_step,
+    ):
+        with ThreadPoolExecutor(max_workers=len(llms)) as pool:
+            futures = [pool.submit(invoke_and_capture, label) for label in llms]
+            generation_params = dict(future.result(timeout=20) for future in futures)
+
+    assert completion.call_count == provider_step.call_count == len(llms)
+    attempt_params = {
+        call.args[1]["messages"][0]["content"]: call.args[1]
+        for call in provider_step.call_args_list
+    }
+    for call in completion.call_args_list:
+        kwargs = call.kwargs
+        label = kwargs["messages"][0]["content"]
+        expected_seed = llms[label].config.seed
+        request_params = generation_params[label]
+        sampling = request_params["sampling"]
+        assert sampling == attempt_params[label]["sampling"]
+        assert sampling["boundary"] == "litellm_completion_kwargs"
+        assert sampling["wire_observed"] is False
+        assert sampling["requested_seed"] == expected_seed
+        assert sampling["seed"]["value"] == kwargs.get("seed") == expected_seed
+        assert sampling["temperature"]["value"] == kwargs["temperature"] == 1
+        assert sampling["top_p"]["value"] == kwargs["top_p"] == 0.89
+        if expected_seed is None:
+            assert sampling["seed"]["state"] == "unset"
+            assert sampling["requested_seed_state"] == "unset"
+            assert "seed" not in kwargs
+            assert "requested_seed" not in request_params
+        else:
+            assert sampling["seed"]["state"] == "value"
+            assert sampling["requested_seed_state"] == "value"
+            assert request_params["requested_seed"] == expected_seed
+            assert request_params["sent_kwargs"]["seed"] == expected_seed
+    assert original.config.seed is None
+    assert llms["first"].config.seed == 0
+    assert llms["second"].config.seed == 73
+
+
 @pytest.mark.parametrize("supported", [None, ["temperature"]])
+@pytest.mark.parametrize("use_seed_binding", [False, True])
 def test_unsupported_explicit_seed_fails_before_provider_call(
     supported: list[str] | None,
+    use_seed_binding: bool,
 ) -> None:
-    llm = _seeded_vertex_llm(0)
+    original = _seeded_vertex_llm(None if use_seed_binding else 0)
+    llm = original.with_seed(0) if use_seed_binding else original
     with (
         patch("litellm.get_supported_openai_params", return_value=supported),
         patch("litellm.completion") as completion,
@@ -3137,12 +3265,17 @@ def test_unsupported_explicit_seed_fails_before_provider_call(
     ):
         llm.invoke([UserMessage(content="Inspect sources.")], use_streaming=False)
     completion.assert_not_called()
+    assert original.config.seed == (None if use_seed_binding else 0)
 
 
-def test_explicit_seed_survives_provider_reasoning_retry() -> None:
+@pytest.mark.parametrize("use_seed_binding", [False, True])
+def test_explicit_seed_survives_provider_reasoning_retry(
+    use_seed_binding: bool,
+) -> None:
     from litellm.exceptions import BadRequestError
 
-    llm = _seeded_vertex_llm(0)
+    original = _seeded_vertex_llm(None if use_seed_binding else 0)
+    llm = original.with_seed(0) if use_seed_binding else original
     error = BadRequestError(
         "reasoning_effort unsupported", "gemini-3.8-flash", "vertex_ai"
     )
@@ -3160,6 +3293,7 @@ def test_explicit_seed_survives_provider_reasoning_retry() -> None:
         assert "top_p" not in call.kwargs
     assert "reasoning_effort" in completion.call_args_list[0].kwargs
     assert "reasoning_effort" not in completion.call_args_list[1].kwargs
+    assert original.config.seed == (None if use_seed_binding else 0)
 
 
 def test_seed_rejection_does_not_fall_back_even_when_sampling_is_also_named() -> None:
