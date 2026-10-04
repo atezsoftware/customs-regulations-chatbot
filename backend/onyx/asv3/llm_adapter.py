@@ -1787,7 +1787,10 @@ class ResearchModel:
         self, view: HarnessView
     ) -> tuple[list[ChatCompletionMessage], list[dict[str, JsonValue]], int]:
         instruction = RESEARCHER_PROMPT if self.context.depth else COORDINATOR_PROMPT
-        question: dict[str, JsonValue] = {"request": view.request}
+        question: dict[str, JsonValue] = {
+            "request": view.request,
+            "response_preferences": DEFAULT_RESPONSE_PREFERENCES,
+        }
         if self.history:
             question["conversation"] = self.history
         if len(view.questions) > 1:
@@ -1802,7 +1805,6 @@ class ResearchModel:
         context: dict[str, JsonValue] = {
             "language": self.context.language,
             "request": view.request,
-            "response_preferences": DEFAULT_RESPONSE_PREFERENCES,
         }
         if len(view.questions) > 1:
             context["questions"] = list(view.questions)
@@ -1914,7 +1916,6 @@ class ResearchModel:
 
         def messages() -> list[ChatCompletionMessage]:
             current = dict(context)
-            response_preferences = current.pop("response_preferences", None)
             if unique:
                 current["original_evidence"] = list(unique.values())
             if unique or navigation:
@@ -1935,8 +1936,6 @@ class ResearchModel:
             ]
             if current_omissions:
                 current["original_evidence_omitted"] = current_omissions
-            if response_preferences is not None:
-                current["response_preferences"] = response_preferences
             return [
                 *prefix,
                 *(
@@ -1950,8 +1949,9 @@ class ResearchModel:
         prompt = messages()
         if self._input_cost(prompt, selected) <= ceiling:
             return prompt, selected, output
-        # Optional response defaults must yield before transcript or source text is evicted.
-        context.pop("response_preferences")
+        # Optional response defaults must yield before any source text is evicted.
+        question.pop("response_preferences")
+        prefix[1] = UserMessage(content=json.dumps(question, ensure_ascii=False))
         prompt = messages()
         if self._input_cost(prompt, selected) <= ceiling:
             return prompt, selected, output
