@@ -2,6 +2,7 @@
 
 import json
 import threading
+from unittest.mock import MagicMock
 
 import pytest
 from pydantic import JsonValue
@@ -11,6 +12,7 @@ from onyx.asv3.harness import Harness
 from onyx.asv3.llm_adapter import (
     NeedVerification,
     QuestionVerification,
+    ResearchModel,
     VerificationResult,
     publication_review_inventory,
 )
@@ -18,10 +20,13 @@ from onyx.asv3.models import (
     CapabilityCall,
     Decision,
     EvidenceItem,
+    OriginalEvidenceRead,
     OutcomeStatus,
+    ResearchTurn,
     RunContext,
     TaskStatus,
     ToolOutcome,
+    ToolReceipt,
     ToolSpec,
 )
 from onyx.asv3.publication import publication_gap
@@ -36,6 +41,8 @@ from onyx.asv3.research_state import (
 from onyx.asv3.workers import WorkerPool
 from onyx.configs.constants import DocumentSource
 from onyx.context.search.models import SearchDoc
+from onyx.llm.interfaces import LLM, LLMConfig
+from onyx.llm.models import AssistantMessage, FunctionCall, ToolCall, UserMessage
 
 
 def state_pair() -> tuple[RunContext, EvidenceLedger, ResearchState]:
@@ -506,6 +513,182 @@ def test_selected_original_range_survives_a_large_attached_candidate_prefix() ->
     restored = EvidenceWorkingSet()
     restored.restore(working.export(), ledger)
     assert restored.view(ledger, preferred=preferred, max_chars=2500) == current
+
+
+@pytest.mark.parametrize("native", [False, True])
+def test_native_original_pool_survives_receipt_view_and_checkpoint_without_fixed_caps(
+    native: bool,
+) -> None:
+    context = RunContext(services={"lean_native_mode": native})
+    ledger = EvidenceLedger()
+    harness = Harness(
+        request="Explain the rule, exceptions and subsequent procedure.",
+        context=context,
+        registry=CapabilityRegistry(),
+        evidence=ledger,
+        decide=lambda _: Decision(answer="Result."),
+    )
+    items = [
+        EvidenceItem(
+            source_id="authorized-source",
+            chunk_id=str(index),
+            text=f"Original {index}: "
+            + "Applicable conditions and later stages. " * 30,
+        )
+        for index in range(140)
+    ]
+    call = CapabilityCall(name="search_corpus", call_id="source-pool")
+    receipt = ToolReceipt(
+        call=call,
+        elapsed_seconds=0,
+        outcome=ToolOutcome(
+            status=OutcomeStatus.FOUND, summary="Retrieved originals", evidence=items
+        ),
+    )
+    harness._commit_receipt(receipt)
+    ledger.add(
+        [
+            EvidenceItem(
+                source_id="authorized-source", chunk_id="unread", text="Unread."
+            )
+        ],
+        context,
+    )
+    tool_result = harness._model_tool_result(receipt)
+    tool_payload = json.loads(str(tool_result.content))
+    assert 0 < len(tool_payload["original_evidence"]) < len(items)
+    harness.turns.append(
+        ResearchTurn(
+            assistant=AssistantMessage(
+                tool_calls=[
+                    ToolCall(
+                        id=call.call_id,
+                        function=FunctionCall(name=call.name, arguments="{}"),
+                    )
+                ]
+            ),
+            results=[tool_result],
+        )
+    )
+    current = harness.view()
+    assert len(harness.evidence_working_set.export()) == (140 if native else 128)
+    if native:
+        assert len(current.original_evidence) == 140
+        assert not current.original_evidence_omitted
+    else:
+        assert len(current.original_evidence) < 128
+        assert current.original_evidence_omitted
+    assert all(record["citation"] != 141 for record in current.original_evidence)
+    restored = Harness(
+        request=harness.request,
+        context=RunContext(
+            run_id=context.run_id, services={"lean_native_mode": native}
+        ),
+        registry=CapabilityRegistry(),
+        decide=lambda _: Decision(answer="Result."),
+    )
+    restored.restore(harness.snapshot())
+    assert restored.view().original_evidence == current.original_evidence
+    assert (
+        restored.evidence_working_set.export() == harness.evidence_working_set.export()
+    )
+    if not native:
+        return
+    legacy = Harness(
+        request=harness.request,
+        context=RunContext(run_id=context.run_id),
+        registry=CapabilityRegistry(),
+        decide=lambda _: Decision(answer="Result."),
+    )
+    with pytest.raises(ValueError, match="Evidence working set capacity exceeded"):
+        legacy.restore(harness.snapshot())
+    assert len(json.dumps(current.original_evidence, ensure_ascii=False)) > 32000
+    llm = MagicMock(spec=LLM)
+    llm.config = LLMConfig(
+        model_provider="openai",
+        model_name="selected-model",
+        temperature=0,
+        max_input_tokens=1000000,
+    )
+    adapter = ResearchModel(llm, context, lean_native_mode=True)
+    prompt, _, _ = adapter._fit_native_decision(current)
+    assert isinstance(prompt[-1], UserMessage)
+    payload = json.loads(str(prompt[-1].content))
+    records = payload["original_evidence"]
+    assert len(records) == len(items)
+    assert "original_evidence_omitted" not in payload
+    for number, item in enumerate(items, start=1):
+        matching = [record for record in records if record["citation"] == number]
+        assert len(matching) == 1
+        assert matching[0]["text"] == item.text
+        assert matching[0]["text_hash"] == item.text_hash
+        assert matching[0].get("start_char", 0) == 0
+        assert matching[0].get("end_char", len(item.text)) == len(item.text)
+        assert sum(str(message.content).count(item.text) for message in prompt) == 1
+    llm.invoke.assert_not_called()
+
+
+def test_native_original_view_preserves_only_the_exact_reopened_range() -> None:
+    context = RunContext(services={"lean_native_mode": True})
+    ledger = EvidenceLedger()
+    items = [
+        EvidenceItem(source_id="authorized-source", chunk_id="a", text="A" * 100),
+        EvidenceItem(source_id="authorized-source", chunk_id="b", text="B" * 100),
+    ]
+    ledger.add(items, context)
+    harness = Harness(
+        request="Explain the selected condition.",
+        context=context,
+        registry=CapabilityRegistry(),
+        evidence=ledger,
+        decide=lambda _: Decision(answer="Result."),
+    )
+    receipt = ToolReceipt(
+        elapsed_seconds=0,
+        call=CapabilityCall(
+            name="read_evidence", arguments={"citation": 1, "start_char": 20}
+        ),
+        outcome=ToolOutcome(
+            status=OutcomeStatus.FOUND,
+            summary="Selected original range",
+            original_reads=[
+                OriginalEvidenceRead(
+                    citation=1, text_hash=items[0].text_hash, start_char=20, end_char=47
+                )
+            ],
+        ),
+    )
+    harness._commit_receipt(receipt)
+    current = harness.view()
+    assert len(current.original_evidence) == 1
+    record = current.original_evidence[0]
+    assert record["citation"] == 1
+    assert record["text"] == items[0].text[20:47]
+    assert record["start_char"] == 20 and record["end_char"] == 47
+    assert record["truncated"] is True
+    assert harness.evidence_working_set.export() == [[1, 20, 47]]
+    restored = Harness(
+        request=harness.request,
+        context=RunContext(run_id=context.run_id, services={"lean_native_mode": True}),
+        registry=CapabilityRegistry(),
+        decide=lambda _: Decision(answer="Result."),
+    )
+    restored.restore(harness.snapshot())
+    assert restored.view().original_evidence == current.original_evidence
+    llm = MagicMock(spec=LLM)
+    llm.config = LLMConfig(
+        model_provider="openai",
+        model_name="selected-model",
+        temperature=0,
+        max_input_tokens=100000,
+    )
+    adapter = ResearchModel(llm, context, lean_native_mode=True)
+    prompt, _, _ = adapter._fit_native_decision(current)
+    payload = json.loads(str(prompt[-1].content))
+    assert payload["original_evidence"] == current.original_evidence
+    assert items[0].text not in str(prompt[-1].content)
+    assert items[1].text not in str(prompt[-1].content)
+    llm.invoke.assert_not_called()
 
 
 def test_need_verification_cannot_be_bypassed_by_omitting_the_norm_name() -> None:

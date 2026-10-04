@@ -353,9 +353,12 @@ class ResearchState:
 
 
 class EvidenceWorkingSet:
-    """Keep locators only; hydrate a bounded current set from the shared originals."""
+    """Keep exact locators and hydrate them within the caller's context policy."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, max_ranges: int | None = 128) -> None:
+        if max_ranges is not None and max_ranges < 1:
+            raise ValueError("Evidence working set capacity must be positive")
+        self.max_ranges = max_ranges
         self._ranges: OrderedDict[tuple[int, int, int], None] = OrderedDict()
 
     def remember(self, number: int, start: int, end: int) -> None:
@@ -376,7 +379,7 @@ class EvidenceWorkingSet:
             if key[0] == number and start <= key[1] and end >= key[2]:
                 del self._ranges[key]
         self._ranges[number, start, end] = None
-        while len(self._ranges) > 128:
+        while self.max_ranges is not None and len(self._ranges) > self.max_ranges:
             self._ranges.popitem(last=False)
 
     def view(
@@ -385,7 +388,7 @@ class EvidenceWorkingSet:
         *,
         preferred: list[int],
         required: list[int] | None = None,
-        max_chars: int = 32000,
+        max_chars: int | None = 32000,
     ) -> dict[str, JsonValue]:
         from onyx.asv3.models import model_evidence_metadata
 
@@ -429,22 +432,23 @@ class EvidenceWorkingSet:
                 "truncated": start != 0 or end != len(item.text),
                 "metadata": model_evidence_metadata(item.metadata),
             }
-            cost = len(json.dumps(record, ensure_ascii=False))
-            if used + cost > max_chars:
-                omitted.append(
-                    {"citation": number, "start_char": start, "end_char": end}
-                )
-                continue
+            if max_chars is not None:
+                cost = len(json.dumps(record, ensure_ascii=False))
+                if used + cost > max_chars:
+                    omitted.append(
+                        {"citation": number, "start_char": start, "end_char": end}
+                    )
+                    continue
+                used += cost
             records.append(record)
             included.append((number, start, end))
-            used += cost
         return {"records": records, "omitted": omitted, "reopen": "read_evidence"}
 
     def export(self) -> list[JsonValue]:
         return [[n, start, end] for n, start, end in self._ranges]
 
     def restore(self, rows: list[JsonValue], ledger: EvidenceLedger) -> None:
-        if len(rows) > 128:
+        if self.max_ranges is not None and len(rows) > self.max_ranges:
             raise ValueError("Evidence working set capacity exceeded")
         for row in rows:
             if (

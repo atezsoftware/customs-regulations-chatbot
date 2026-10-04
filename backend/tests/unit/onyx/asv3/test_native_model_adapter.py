@@ -71,7 +71,12 @@ def turn(
             ToolMessage(
                 tool_call_id=identity,
                 content=json.dumps(
-                    {"original_evidence": records, "navigation": extra},
+                    {
+                        "outcome": {"status": "found", "data": {"provision": "168"}},
+                        "evidence_ids": [record["citation"] for record in records],
+                        "original_evidence": records,
+                        "navigation": extra,
+                    },
                     ensure_ascii=False,
                 ),
             )
@@ -110,13 +115,19 @@ def test_native_history_preserves_each_complete_batch_and_delivers_originals_onc
     history = "User: Preserve the two requested alternatives."
     adapter = ResearchModel(llm, context, lean_native_mode=True, history=history)
     batch1, batch2 = turn("read-law", [first]), turn("read-condition", [second])
+    original_turns = [batch1.model_dump(mode="json"), batch2.model_dump(mode="json")]
     current = view(
         turns=[batch1, batch2],
         original_evidence=[first, second],
         research_state={"needs": [{"description": "UNNEEDED_BOARD" * 10000}]},
     )
     current = current.model_copy(
-        update={"questions": ["First outcome?", "Second outcome?"]}
+        update={
+            "questions": ["First outcome?", "Second outcome?"],
+            "facts": ["The user requested both outcomes."],
+            "draft_to_repair": "Explain the request and later control [1] [2].",
+            "publication_gap": {"summary": "Communicate the later control."},
+        }
     )
     adapter.decide(current)
     prompt = llm.invoke.call_args.kwargs["prompt"]
@@ -134,7 +145,24 @@ def test_native_history_preserves_each_complete_batch_and_delivers_originals_onc
         "read-law",
         "read-condition",
     ]
-    assert "original_evidence" not in last_payload(llm)
+    assert last_payload(llm)["original_evidence"] == [first, second]
+    assert last_payload(llm)["request"] == current.request
+    assert last_payload(llm)["questions"] == current.questions
+    assert last_payload(llm)["recorded_facts"] == current.facts
+    assert last_payload(llm)["draft_to_repair"] == current.draft_to_repair
+    assert last_payload(llm)["publication_gap"] == current.publication_gap
+    for result, record in zip(tool_results, [first, second], strict=True):
+        payload = json.loads(result.content)
+        assert "original_evidence" not in payload
+        assert payload["original_evidence_refs"] == [
+            {key: value for key, value in record.items() if key != "text"}
+        ]
+        assert payload["evidence_ids"] == [record["citation"]]
+        assert payload["outcome"] == {"status": "found", "data": {"provision": "168"}}
+    assert [
+        batch1.model_dump(mode="json"),
+        batch2.model_dump(mode="json"),
+    ] == original_turns
     assert "UNNEEDED_BOARD" not in json.dumps(
         [message.model_dump(mode="json") for message in prompt]
     )
@@ -216,7 +244,7 @@ def test_context_fitting_drops_transcript_atomically_but_restores_required_claus
         message.tool_call_id for message in prompt if isinstance(message, ToolMessage)
     ] == ["latest"]
     restored = last_payload(llm)["original_evidence"]
-    assert restored == [first]
+    assert restored == [first, second]
     assert "OLD_NAVIGATION" not in json.dumps(
         [message.model_dump(mode="json") for message in prompt]
     )
@@ -227,6 +255,87 @@ def test_context_fitting_drops_transcript_atomically_but_restores_required_claus
         adapter._input_cost(prompt, []) + request["max_tokens"]
         <= llm.config.max_input_tokens
     )
+
+
+@pytest.mark.parametrize("full_first", [False, True])
+def test_final_originals_replace_only_literally_covered_partial_ranges(
+    full_first: bool,
+) -> None:
+    context, ledger = RunContext(), EvidenceLedger()
+    context.services["evidence"] = ledger
+    full = original(
+        ledger, context, "Permission requires the notice and subsequent control."
+    )
+    text = cast(str, full["text"])
+    partial = {
+        **full,
+        "text": text[11:34],
+        "start_char": 11,
+        "end_char": 34,
+        "total_chars": len(text),
+        "truncated": True,
+    }
+    records = [full, partial] if full_first else [partial, full]
+    llm = model()
+    adapter = ResearchModel(llm, context, lean_native_mode=True)
+    adapter.decide(
+        view(turns=[turn("read-parts", records)], original_evidence=[partial, full])
+    )
+    assert last_payload(llm)["original_evidence"] == [full]
+    assert ledger.completely_delivered(adapter.last_call_id or "") == {1}
+    assert llm.invoke.call_count == 1
+
+
+def test_final_originals_keep_overlapping_ranges_without_reading_the_full_ledger_text() -> (
+    None
+):
+    context, ledger = RunContext(), EvidenceLedger()
+    context.services["evidence"] = ledger
+    full = original(
+        ledger,
+        context,
+        "First permission. Later notice. Final control. Separate exception.",
+    )
+    text = cast(str, full["text"])
+    parts = [
+        {
+            **full,
+            "text": text[start:end],
+            "start_char": start,
+            "end_char": end,
+            "total_chars": len(text),
+            "truncated": True,
+        }
+        for start, end in [(0, 25), (15, 45), (18, 23)]
+    ]
+    llm = model()
+    adapter = ResearchModel(llm, context, lean_native_mode=True)
+    adapter.decide(view(turns=[turn("read-parts", parts)], original_evidence=parts))
+    assert last_payload(llm)["original_evidence"] == parts[:2]
+    assert ledger.completely_delivered(adapter.last_call_id or "") == set()
+    assert llm.invoke.call_count == 1
+
+
+def test_final_originals_clear_only_current_ledger_verified_omissions() -> None:
+    context, ledger = RunContext(), EvidenceLedger()
+    context.services["evidence"] = ledger
+    full = original(
+        ledger, context, "A request requires notice followed by authority control."
+    )
+    unknown = {"citation": 2, "reason": "serialized_evidence_limit"}
+    changed = {"citation": 1, "text_hash": "another-version", "reason": "old_context"}
+    beyond = {"citation": 1, "start_char": 0, "end_char": 1000, "reason": "old_context"}
+    llm = model()
+    adapter = ResearchModel(llm, context, lean_native_mode=True)
+    adapter.decide(
+        view(
+            turns=[turn("read-full", [full])],
+            original_evidence_omitted=[{"citation": 1}, unknown, changed, beyond],
+        )
+    )
+    assert last_payload(llm)["original_evidence"] == [full]
+    assert last_payload(llm)["original_evidence_omitted"] == [unknown, changed, beyond]
+    assert llm.invoke.call_count == 1
 
 
 def test_physical_capacity_omission_is_explicit_and_never_changes_ledger_text(

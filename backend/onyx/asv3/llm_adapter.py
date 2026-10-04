@@ -52,6 +52,7 @@ from onyx.llm.models import (
     TextContentPart,
     ToolCall,
     ToolChoiceOptions,
+    ToolMessage,
     UserMessage,
 )
 from onyx.llm.models import (
@@ -1732,6 +1733,56 @@ class ResearchModel:
             return None
         return number, digest, start, start + len(text)
 
+    @staticmethod
+    def _native_turns_with_original_references(
+        turns: list[ResearchTurn],
+    ) -> list[ResearchTurn]:
+        referenced: list[ResearchTurn] = []
+        for turn in turns:
+            results: list[ToolMessage] = []
+            for result in turn.results:
+                try:
+                    payload = parse_json_object(result.content)
+                except ValueError:
+                    results.append(result)
+                    continue
+                originals = payload.get("original_evidence")
+                if not isinstance(originals, list):
+                    results.append(result)
+                    continue
+                references: list[JsonValue] = []
+                remaining: list[JsonValue] = []
+                for record in originals:
+                    if (
+                        isinstance(record, dict)
+                        and ResearchModel._original_record_range(record) is not None
+                    ):
+                        references.append(
+                            {
+                                key: value
+                                for key, value in record.items()
+                                if key != "text"
+                            }
+                        )
+                    else:
+                        remaining.append(record)
+                if remaining:
+                    payload["original_evidence"] = remaining
+                else:
+                    payload.pop("original_evidence")
+                previous = payload.get("original_evidence_refs")
+                payload["original_evidence_refs"] = [
+                    *(previous if isinstance(previous, list) else []),
+                    *references,
+                ]
+                results.append(
+                    result.model_copy(
+                        update={"content": json.dumps(payload, ensure_ascii=False)}
+                    )
+                )
+            referenced.append(turn.model_copy(update={"results": results}))
+        return referenced
+
     def _fit_native_decision(
         self, view: HarnessView
     ) -> tuple[list[ChatCompletionMessage], list[dict[str, JsonValue]], int]:
@@ -1751,7 +1802,12 @@ class ResearchModel:
             SystemMessage(content=instruction),
             UserMessage(content=json.dumps(question, ensure_ascii=False)),
         ]
-        context: dict[str, JsonValue] = {"language": self.context.language}
+        context: dict[str, JsonValue] = {
+            "language": self.context.language,
+            "request": view.request,
+        }
+        if len(view.questions) > 1:
+            context["questions"] = list(view.questions)
         if view.facts:
             context["recorded_facts"] = list(view.facts)
         if view.publication_gap is not None:
@@ -1766,10 +1822,6 @@ class ResearchModel:
         ]
         if navigation:
             context["available_evidence"] = navigation
-            context["evidence_note"] = (
-                "Navigation entries are not original text. Cite only actual delivered "
-                "passages, preserving their conditions; reopen omitted ranges with read_evidence."
-            )
         retained = self._complete_native_turns(view.turns)
         native_ids = {
             result.tool_call_id for turn in retained for result in turn.results
@@ -1797,35 +1849,93 @@ class ResearchModel:
         for record in records:
             identity = self._original_record_range(record)
             if identity is not None:
+                previous = unique.get(identity)
+                if previous is not None and previous.get("text") != record.get("text"):
+                    raise ValueError(
+                        "Conflicting text for the same original evidence range"
+                    )
                 unique.setdefault(identity, record)
+        # A wider delivered passage replaces only literally covered ranges of the same original.
+        for identity, record in list(unique.items()):
+            number, digest, start, end = identity
+            if any(
+                other != identity
+                and other[0] == number
+                and other[1] == digest
+                and other[2] <= start
+                and end <= other[3]
+                and isinstance(text := candidate.get("text"), str)
+                and text[start - other[2] : end - other[2]] == record.get("text")
+                for other, candidate in unique.items()
+            ):
+                del unique[identity]
+        retained = self._native_turns_with_original_references(retained)
         required = set(view.required_evidence_numbers)
         required.update(extract_citation_numbers(view.draft_to_repair or ""))
         omitted: list[JsonValue] = list(view.original_evidence_omitted)
+        from onyx.asv3.evidence import EvidenceLedger
+
+        ledger = self.context.services.get("evidence")
+        verified: set[tuple[int, str, int, int]] = set()
+        original_lengths: dict[tuple[int, str], int] = {}
+        if isinstance(ledger, EvidenceLedger):
+            for identity, record in unique.items():
+                number, digest, start, end = identity
+                item = ledger.get(number)
+                if (
+                    item is not None
+                    and item.text_hash == digest
+                    and item.text[start:end] == record.get("text")
+                ):
+                    verified.add(identity)
+                    original_lengths[(number, digest)] = len(item.text)
         ceiling, output = self._limits(self._native_output_limit())
         selected = view.tools
 
+        def omission_is_delivered(omission: JsonValue) -> bool:
+            if not isinstance(omission, dict):
+                return False
+            number = omission.get("citation")
+            digest = omission.get("text_hash")
+            start = omission.get("start_char", 0)
+            for identity in unique:
+                citation, text_hash, included_start, included_end = identity
+                if (
+                    identity not in verified
+                    or type(number) is not int
+                    or number != citation
+                    or (digest is not None and digest != text_hash)
+                    or type(start) is not int
+                    or start < 0
+                ):
+                    continue
+                end = omission.get("end_char", original_lengths[(citation, text_hash)])
+                if type(end) is int and included_start <= start <= end <= included_end:
+                    return True
+            return False
+
         def messages() -> list[ChatCompletionMessage]:
-            native_ranges = [
-                identity
-                for record in self._native_original_records(retained)
-                if (identity := self._original_record_range(record)) is not None
-            ]
-            restored = [
-                record
-                for (number, digest, start, end), record in unique.items()
-                if not any(
-                    number == delivered_number
-                    and digest == delivered_digest
-                    and delivered_start <= start
-                    and end <= delivered_end
-                    for delivered_number, delivered_digest, delivered_start, delivered_end in native_ranges
-                )
-            ]
             current = dict(context)
-            if restored:
-                current["original_evidence"] = restored
-            if omitted:
-                current["original_evidence_omitted"] = omitted
+            if unique:
+                current["original_evidence"] = list(unique.values())
+            if unique or navigation:
+                current["evidence_note"] = (
+                    "Original passages available for this decision are collected here; earlier "
+                    "tool original_evidence_refs and navigation entries are identities, not text. "
+                    "Answer the full actual request above, preserving its decisive facts and each "
+                    "requested outcome or alternative. "
+                    "Use each passage for its own operative effect and communicate every applicable "
+                    "material condition, exception and procedural continuation beside its outcome "
+                    "with its global citation. A headline conclusion or shorter summary must not "
+                    "replace those supplied details. An introductory permission does not supply referred "
+                    "enumerated cases or conditions; read a material continuation when needed. "
+                    "Reopen genuinely omitted ranges with read_evidence; do not infer missing law."
+                )
+            current_omissions = [
+                item for item in omitted if not omission_is_delivered(item)
+            ]
+            if current_omissions:
+                current["original_evidence_omitted"] = current_omissions
             return [
                 *prefix,
                 *(
