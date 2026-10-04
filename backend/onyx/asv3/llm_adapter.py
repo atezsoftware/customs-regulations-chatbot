@@ -1152,7 +1152,21 @@ class ResearchModel:
                 prompt=prompt,
                 # Provider normalization must not rewrite canonical validation schemas.
                 tools=copy.deepcopy(tools) if tools else None,
-                tool_choice=ToolChoiceOptions.AUTO if tools else ToolChoiceOptions.NONE,
+                tool_choice=(
+                    ToolChoiceOptions.REQUIRED
+                    if not self.context.depth
+                    and self.context.services.get("independent_question_mode") is True
+                    and bool(tools)
+                    and all(
+                        isinstance(function := tool.get("function"), dict)
+                        and function.get("name")
+                        in {"research_questions", "assemble_answers", "ask_user"}
+                        for tool in tools
+                    )
+                    else ToolChoiceOptions.AUTO
+                    if tools
+                    else ToolChoiceOptions.NONE
+                ),
                 structured_response_format={
                     "type": "json_schema",
                     "json_schema": {
@@ -1630,6 +1644,7 @@ class ResearchModel:
         flow: LLMFlow,
         *,
         call_llm: LLM | None = None,
+        research: bool = True,
     ) -> Decision:
         original = self._decision(response, tools, return_argument_errors=True)
         invalid = {call.call_id: call for call in original.calls if call.argument_error}
@@ -1655,7 +1670,10 @@ class ResearchModel:
                 if call.id in invalid
             ],
         }
-        self.context.consume_research_decision()
+        if research:
+            self.context.consume_research_decision()
+        else:
+            self.context.budget.consume("decisions")
         instruction = (
             "Repair only the invalid action arguments supplied below. Return one entry for every supplied "
             "call_id, using exactly those IDs. The host retains all other actions and the original answer. "
@@ -1670,14 +1688,14 @@ class ResearchModel:
             json.dumps(payload, ensure_ascii=False),
             [],
             max_tokens=6000,
-            research=True,
+            research=research,
         )
         repaired_response = self._invoke(
             prompt,
             repair_tools,
             flow,
             max_tokens=output,
-            research=True,
+            research=research,
             response_model=ToolArgumentPatch,
             call_llm=call_llm,
         )
@@ -1896,7 +1914,10 @@ class ResearchModel:
         if len(view.questions) > 1:
             question["questions"] = list(view.questions)
         assistant_instructions = self.context.services.get("assistant_instructions")
-        if not self.context.depth and isinstance(assistant_instructions, str):
+        if (
+            not self.context.depth
+            or self.context.services.get("independent_question") is True
+        ) and isinstance(assistant_instructions, str):
             question["assistant_instructions"] = assistant_instructions
         question_content = json.dumps(question, ensure_ascii=False)
         prefix: list[ChatCompletionMessage] = [
@@ -1913,6 +1934,18 @@ class ResearchModel:
             context["questions"] = list(view.questions)
         if view.facts:
             context["recorded_facts"] = list(view.facts)
+        independent_mode = (
+            not self.context.depth
+            and self.context.services.get("independent_question_mode") is True
+        )
+        independent_answers = self.context.services.get("independent_answers")
+        if independent_mode:
+            context["independent_question_mode"] = True
+            context["question_research_started"] = (
+                self.context.services.get("question_research_started") is True
+            )
+            if isinstance(independent_answers, list):
+                context["independent_answers"] = copy.deepcopy(independent_answers)
         if view.publication_gap is not None:
             context["draft_to_repair"] = view.draft_to_repair
             context["publication_gap"] = view.publication_gap
@@ -1975,6 +2008,15 @@ class ResearchModel:
         retained = self._native_turns_with_original_references(retained)
         required = set(view.required_evidence_numbers)
         required.update(extract_citation_numbers(view.draft_to_repair or ""))
+        if independent_mode and isinstance(independent_answers, list):
+            for answer in independent_answers:
+                if isinstance(answer, dict):
+                    required.update(
+                        extract_citation_numbers(str(answer.get("answer", "")))
+                    )
+                    numbers = answer.get("evidence_numbers")
+                    if isinstance(numbers, list):
+                        required.update(n for n in numbers if type(n) is int and n > 0)
         omitted: list[JsonValue] = list(view.original_evidence_omitted)
         from onyx.asv3.evidence import EvidenceLedger
 
@@ -1994,6 +2036,33 @@ class ResearchModel:
                     original_lengths[(number, digest)] = len(item.text)
         ceiling, output = self._limits(self._native_output_limit())
         selected = view.tools
+        if independent_mode:
+            required_tool = (
+                "research_questions"
+                if context["question_research_started"] is False
+                else "assemble_answers"
+                if independent_answers and view.publication_gap is None
+                else None
+            )
+            if required_tool is not None:
+                selected = [
+                    tool
+                    for tool in selected
+                    if isinstance(function := tool.get("function"), dict)
+                    and (
+                        function.get("name") == required_tool
+                        or required_tool == "research_questions"
+                        and function.get("name") == "ask_user"
+                    )
+                ]
+                if not any(
+                    isinstance(function := tool.get("function"), dict)
+                    and function.get("name") == required_tool
+                    for tool in selected
+                ):
+                    raise RunStopped(
+                        f"Required independent-question tool missing: {required_tool}"
+                    )
 
         def omission_is_delivered(omission: JsonValue) -> bool:
             if not isinstance(omission, dict):
@@ -2087,7 +2156,13 @@ class ResearchModel:
         return prompt, selected, output
 
     def decide(self, view: HarnessView) -> Decision:
-        self.context.check_research_active()
+        if (
+            not self.context.depth
+            and self.context.services.get("question_research_started") is True
+        ):
+            self.context.check_active()
+        else:
+            self.context.check_research_active()
         if self.lean_native_mode:
             prompt, tools, output = self._fit_native_decision(view)
             return self._invoke_decision(view, prompt, tools, output)
@@ -2229,19 +2304,32 @@ class ResearchModel:
         call_llm = (
             self._native_decision_llm(view) if self.lean_native_mode else self.llm
         )
+        research = not (
+            not self.context.depth
+            and self.context.services.get("question_research_started") is True
+        )
         response = self._invoke(
-            prompt, tools, flow, max_tokens=output, research=True, call_llm=call_llm
+            prompt, tools, flow, max_tokens=output, research=research, call_llm=call_llm
         )
         if self.lean_native_mode:
             response = self._complete_native_response(
-                prompt, tools, flow, output, response, call_llm=call_llm
+                prompt,
+                tools,
+                flow,
+                output,
+                response,
+                call_llm=call_llm,
+                research=research,
             )
         if (
             not response.choice.message.tool_calls
             and not (response.choice.message.content or "").strip()
         ):
             # Empty provider output is recoverable; it is not an argument defect.
-            self.context.consume_research_decision()
+            if research:
+                self.context.consume_research_decision()
+            else:
+                self.context.budget.consume("decisions")
             recovery_prompt = [
                 *prompt,
                 UserMessage(
@@ -2256,12 +2344,18 @@ class ResearchModel:
                 tools,
                 flow,
                 max_tokens=output,
-                research=True,
+                research=research,
                 call_llm=call_llm,
             )
             if self.lean_native_mode:
                 response = self._complete_native_response(
-                    recovery_prompt, tools, flow, output, response, call_llm=call_llm
+                    recovery_prompt,
+                    tools,
+                    flow,
+                    output,
+                    response,
+                    call_llm=call_llm,
+                    research=research,
                 )
             if (
                 not response.choice.message.tool_calls
@@ -2274,7 +2368,12 @@ class ResearchModel:
             decision = self._decision(response, tools)
         except ValueError:
             decision = self._repair_action_arguments(
-                response, tools, view.request, flow, call_llm=call_llm
+                response,
+                tools,
+                view.request,
+                flow,
+                call_llm=call_llm,
+                research=research,
             )
         self._native_first_decision_started = True
         self._native_first_decision_completed = True
@@ -2289,6 +2388,7 @@ class ResearchModel:
         response: ModelResponse,
         *,
         call_llm: LLM | None = None,
+        research: bool = True,
     ) -> ModelResponse:
         text = ""
         while (response.choice.finish_reason or "").lower() in {
@@ -2297,7 +2397,10 @@ class ResearchModel:
             "max_output_tokens",
         }:
             self.last_response_truncated = True
-            self.context.check_research_active()
+            if research:
+                self.context.check_research_active()
+            else:
+                self.context.check_active()
             message = response.choice.message
             if message.tool_calls:
                 # An unfinished argument list is never an executable native action.
@@ -2343,13 +2446,16 @@ class ResearchModel:
                     raise RunStopped(
                         "Truncated answer and original evidence exceed selected model context"
                     )
-            self.context.consume_research_decision()
+            if research:
+                self.context.consume_research_decision()
+            else:
+                self.context.budget.consume("decisions")
             response = self._invoke(
                 continuation,
                 continuation_tools,
                 flow,
                 max_tokens=output,
-                research=True,
+                research=research,
                 call_llm=call_llm,
             )
             self.last_response_truncated = True
