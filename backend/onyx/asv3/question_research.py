@@ -219,7 +219,7 @@ class QuestionResearch:
                 {
                     "question_id": question["question_id"],
                     "question": question["question"],
-                    "answer_title": question.get("answer_title", question["question"]),
+                    "answer_title": question.get("answer_title"),
                     "parent_question_ids": question["parent_question_ids"],
                     "task_id": task_id,
                     "status": result.outcome.status.value
@@ -260,11 +260,15 @@ class QuestionResearch:
             item.get("evidence_numbers") for item in self.answers
         ):
             raise ValueError("Connections require recorded original evidence")
-        parts = [
-            f"## {index}. {expected[str(identifier)].get('answer_title', expected[str(identifier)]['question'])}\n\n"
-            f"{expected[str(identifier)]['answer']}"
-            for index, identifier in enumerate(order, 1)
-        ]
+        parts: list[str] = []
+        for index, identifier in enumerate(order, 1):
+            item = expected[str(identifier)]
+            title, body = item.get("answer_title"), str(item["answer"])
+            parts.append(
+                f"## {index}. {title}\n\n{body}"
+                if isinstance(title, str) and title.strip() and len(title) <= 120
+                else body
+            )
         if connections.strip():
             parts.append(connections)
         answer = "\n\n".join(parts)
@@ -302,7 +306,7 @@ class QuestionResearch:
                                     "answer_title": {
                                         "type": "string",
                                         "minLength": 1,
-                                        "description": "Brief neutral heading for this answer, without asserting an uncited legal conclusion.",
+                                        "description": "Brief neutral topic label for this answer. Do not repeat the question or scenario, and do not assert an uncited legal conclusion.",
                                     },
                                     "parent_question_ids": {
                                         "type": "array",

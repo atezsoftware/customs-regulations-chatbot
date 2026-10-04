@@ -71,6 +71,7 @@ def question(identifier: str, text: str, parent: int) -> dict[str, JsonValue]:
     return {
         "question_id": identifier,
         "question": text,
+        "answer_title": text,
         "parent_question_ids": [parent],
         "public_title": "İlgili sonuç araştırılıyor",
         "public_message": "Bu sonucun koşulları özgün kaynaklardan inceleniyor.",
@@ -382,6 +383,22 @@ def test_brief_neutral_headings_do_not_replace_or_shorten_question_bodies() -> N
     research.assemble_answers({"order": ["only"]}, context)
     assert context.services["assembled_answer"] == f"## 1. Belge koşulları\n\n{body}"
     assert research.answers[0]["question"] == entry["question"]
+
+
+@pytest.mark.parametrize("repeated_title", [False, True])
+def test_missing_or_long_title_never_repeats_the_long_question(
+    repeated_title: bool,
+) -> None:
+    full_question = "Uzun kullanıcı sorusu ve bütün senaryo ayrıntıları " * 100
+    body = "**Hızlı cevap:** Kaynakla desteklenen sonuç [3].\n\nEksiksiz ayrıntı [4]."
+    research, _, context = controlled_research([found(body)], [full_question])
+    entry = question("only", full_question, 1)
+    if not repeated_title:
+        entry.pop("answer_title")
+    research.research_questions({"questions": [entry]}, context)
+    research.assemble_answers({"order": ["only"]}, context)
+    assert context.services["assembled_answer"] == body
+    assert full_question not in str(context.services["assembled_answer"])
 
 
 def test_repeated_research_call_reuses_completed_answers_without_new_tasks() -> None:
