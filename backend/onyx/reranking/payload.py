@@ -2,8 +2,28 @@ from collections.abc import Sequence
 from urllib.parse import urlsplit, urlunsplit
 
 from onyx.context.search.models import InferenceChunk
-from onyx.reranking.constants import RERANK_TOKEN_SAFETY_MARGIN_PERCENT
+from onyx.reranking.constants import (
+    MAX_CHAT_RERANK_CANDIDATES,
+    MAX_CHAT_RERANK_DOCUMENT_BYTES,
+    MAX_CHAT_RERANK_DOCUMENT_TOKENS,
+    MAX_CHAT_RERANK_TOTAL_BYTES,
+    MAX_CHAT_RERANK_TOTAL_TOKENS,
+    RERANK_TOKEN_SAFETY_MARGIN_PERCENT,
+    uses_chat_completion_reranking,
+)
 from onyx.reranking.models import RerankPayloadLimits, SerializedRerankCandidates
+
+
+def payload_limits_for_reranker(model: str | None) -> RerankPayloadLimits:
+    if uses_chat_completion_reranking(model):
+        return RerankPayloadLimits(
+            max_candidates=MAX_CHAT_RERANK_CANDIDATES,
+            max_document_bytes=MAX_CHAT_RERANK_DOCUMENT_BYTES,
+            max_document_tokens=MAX_CHAT_RERANK_DOCUMENT_TOKENS,
+            max_total_bytes=MAX_CHAT_RERANK_TOTAL_BYTES,
+            max_total_tokens=MAX_CHAT_RERANK_TOTAL_TOKENS,
+        )
+    return RerankPayloadLimits()
 
 
 def estimate_text_tokens(text: str) -> int:

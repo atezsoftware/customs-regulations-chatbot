@@ -1,15 +1,115 @@
-"""Bounded two-stage reranking for large regulatory candidate pools."""
+"""Payload-bounded reranking for regulatory candidate pools."""
 
+import math
 from collections.abc import Callable, Sequence
 
 from onyx.context.search.models import InferenceChunk
 from onyx.db.reranking import RerankerRuntimeConfig
-from onyx.reranking.models import RerankResult
+from onyx.reranking.models import RerankOutcome, RerankResult
+from onyx.reranking.payload import (
+    payload_limits_for_reranker,
+    serialize_rerank_candidates,
+)
 from onyx.tracing.answer_graph import graph_step
 
 RerankCall = Callable[..., RerankResult]
 STAGED_BATCH_SIZE = 32
 STAGED_FINAL_LIMIT = 48
+
+
+def rerank_regulatory_candidates_in_batches(
+    *,
+    query: str,
+    chunks: Sequence[InferenceChunk],
+    config: RerankerRuntimeConfig,
+    rerank: RerankCall,
+) -> RerankResult:
+    """Merge all pointwise scores without a per-batch finalist quota."""
+    original = list(chunks)
+    if not original or not config.enabled:
+        return rerank(query=query, chunks=original, config=config)
+    limits = payload_limits_for_reranker(config.model_name)
+    scores: dict[tuple[str, int], float] = {}
+    submitted_count = 0
+    result_count = 0
+    batch_outcomes: list[str] = []
+    start = 0
+    with graph_step(
+        "rerank.batched",
+        {"candidate_count": len(original), "batch_size": STAGED_BATCH_SIZE},
+    ) as batch_step:
+        while start < len(original):
+            payload = serialize_rerank_candidates(
+                original[start : start + STAGED_BATCH_SIZE], limits=limits
+            )
+            batch = payload.submitted_chunks
+            if not batch:
+                result = RerankResult(
+                    ordered_chunks=original,
+                    scores_by_chunk={},
+                    submitted_count=submitted_count,
+                    result_count=result_count,
+                    outcome=RerankOutcome.INVALID_RESPONSE,
+                    fallback_used=True,
+                )
+            else:
+                result = rerank(query=query, chunks=batch, config=config)
+                submitted_count += result.submitted_count
+                result_count += result.result_count
+            batch_outcomes.append(result.outcome.value)
+            batch_ids = {(chunk.document_id, chunk.chunk_id) for chunk in batch}
+            complete = (
+                bool(batch)
+                and result.used_external
+                and batch_ids == result.scores_by_chunk.keys()
+                and all(
+                    math.isfinite(score) for score in result.scores_by_chunk.values()
+                )
+            )
+            if not complete:
+                batch_step.summary = "incomplete scoring; complete baseline retained"
+                batch_step.output_value = {
+                    "batch_outcomes": batch_outcomes,
+                    "scored_count": len(scores),
+                    "fallback_used": True,
+                }
+                return result.model_copy(
+                    update={
+                        "ordered_chunks": original,
+                        "scores_by_chunk": {},
+                        "submitted_count": submitted_count,
+                        "result_count": result_count,
+                        "outcome": (
+                            result.outcome
+                            if not result.used_external
+                            else RerankOutcome.INVALID_RESPONSE
+                        ),
+                        "fallback_used": True,
+                    }
+                )
+            scores.update(result.scores_by_chunk)
+            start += len(batch)
+        ordered = sorted(
+            original,
+            key=lambda chunk: scores[(chunk.document_id, chunk.chunk_id)],
+            reverse=True,
+        )
+        batch_step.summary = (
+            f"{len(original)} candidates scored in {len(batch_outcomes)} batches"
+        )
+        batch_step.output_value = {
+            "batch_outcomes": batch_outcomes,
+            "scored_count": len(scores),
+            "fallback_used": False,
+        }
+        return RerankResult(
+            ordered_chunks=ordered,
+            scores_by_chunk=scores,
+            submitted_count=submitted_count,
+            result_count=result_count,
+            outcome=RerankOutcome.SUCCESS,
+            fallback_used=False,
+        )
 
 
 def rerank_regulatory_candidates_in_stages(

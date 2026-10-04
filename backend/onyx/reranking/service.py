@@ -10,20 +10,10 @@ from onyx.reranking.circuit_breaker import (
     RerankCircuitBreaker,
     reranker_configuration_fingerprint,
 )
-from onyx.reranking.constants import (
-    MAX_CHAT_RERANK_CANDIDATES,
-    MAX_CHAT_RERANK_DOCUMENT_BYTES,
-    MAX_CHAT_RERANK_DOCUMENT_TOKENS,
-    MAX_CHAT_RERANK_TOTAL_BYTES,
-    MAX_CHAT_RERANK_TOTAL_TOKENS,
-    MAX_RERANK_CANDIDATES,
-    uses_chat_completion_reranking,
-)
 from onyx.reranking.models import (
     InvalidRerankResponse,
     RerankCircuitKey,
     RerankOutcome,
-    RerankPayloadLimits,
     RerankPayloadTooLarge,
     RerankProviderError,
     RerankRateLimited,
@@ -31,7 +21,10 @@ from onyx.reranking.models import (
     RerankTimeout,
 )
 from onyx.reranking.openrouter import OpenRouterRerankClient
-from onyx.reranking.payload import serialize_rerank_candidates
+from onyx.reranking.payload import (
+    payload_limits_for_reranker,
+    serialize_rerank_candidates,
+)
 from onyx.reranking.siliconflow import SiliconFlowRerankClient
 from onyx.server.metrics.reranking import observe_rerank
 from onyx.tracing.flows import LLMFlow
@@ -168,17 +161,7 @@ class RerankingService:
                 fallback_used=True,
             )
 
-        payload_limits = (
-            RerankPayloadLimits(
-                max_candidates=MAX_CHAT_RERANK_CANDIDATES,
-                max_document_bytes=MAX_CHAT_RERANK_DOCUMENT_BYTES,
-                max_document_tokens=MAX_CHAT_RERANK_DOCUMENT_TOKENS,
-                max_total_bytes=MAX_CHAT_RERANK_TOTAL_BYTES,
-                max_total_tokens=MAX_CHAT_RERANK_TOTAL_TOKENS,
-            )
-            if uses_chat_completion_reranking(config.model_name)
-            else RerankPayloadLimits(max_candidates=MAX_RERANK_CANDIDATES)
-        )
+        payload_limits = payload_limits_for_reranker(config.model_name)
         payload = serialize_rerank_candidates(chunks, limits=payload_limits)
         if not payload.documents:
             return self._result(

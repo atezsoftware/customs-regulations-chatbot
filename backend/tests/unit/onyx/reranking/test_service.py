@@ -14,6 +14,7 @@ from onyx.reranking.constants import OPENROUTER_LUNA_RERANK_MODEL
 from onyx.reranking.models import (
     InvalidRerankResponse,
     RerankOutcome,
+    RerankPayloadLimits,
     RerankPayloadTooLarge,
     RerankProviderError,
     RerankRateLimited,
@@ -110,7 +111,10 @@ def test_partial_response_appends_omitted_and_unsent_tail(
 ) -> None:
     chunks = [_chunk("d1"), _chunk("d2"), _chunk("d3")]
     client.rerank.return_value = [RerankScore(index=1, relevance_score=0.9)]
-    monkeypatch.setattr("onyx.reranking.service.MAX_RERANK_CANDIDATES", 2)
+    monkeypatch.setattr(
+        "onyx.reranking.service.payload_limits_for_reranker",
+        lambda _model: RerankPayloadLimits(max_candidates=2),
+    )
 
     result = service.rerank_chunks(query="q", chunks=chunks, config=_config())
 

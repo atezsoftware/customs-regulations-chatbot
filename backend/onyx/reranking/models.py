@@ -46,6 +46,13 @@ class RerankScore(BaseModel):
     relevance_score: float
 
 
+class RerankSelection(BaseModel):
+    ordered_chunks: list[InferenceChunk]
+    normalized_scores_by_chunk: dict[tuple[str, int], float]
+    qualified_chunk_ids: list[tuple[str, int]]
+    threshold: float
+
+
 class RerankPayloadLimits(BaseModel):
     model_config = ConfigDict(frozen=True)
 

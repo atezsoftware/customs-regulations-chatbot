@@ -1035,6 +1035,8 @@ def _run(
     rerank_candidate_limit: int = 100,
     placement_turn_index: int = 0,
     reranker_config: RerankerRuntimeConfig | None = None,
+    visible_regulatory_chunk_ids: set[str] | None = None,
+    visibility_sink: list[MagicMock] | None = None,
 ) -> MagicMock:
     """Run tool.run() with all DB/LLM deps mocked; returns the search_pipeline mock.
 
@@ -1063,6 +1065,13 @@ def _run(
     )
     decide = (
         decide_mock if decide_mock is not None else MagicMock(return_value=decision)
+    )
+    visibility_mock = MagicMock(
+        side_effect=lambda _session, chunk_ids, **_kwargs: (
+            set(chunk_ids)
+            if visible_regulatory_chunk_ids is None
+            else set(chunk_ids) & visible_regulatory_chunk_ids
+        )
     )
     with (
         patch(f"{MODULE}.get_session_with_current_tenant") as mock_session_ctx,
@@ -1111,7 +1120,7 @@ def _run(
         ),
         patch(
             f"{MODULE}.get_visible_regulatory_chunk_ids",
-            side_effect=lambda _session, chunk_ids, **_kwargs: set(chunk_ids),
+            visibility_mock,
         ),
         patch(f"{MODULE}.get_llm_token_counter", return_value=lambda text: len(text)),
         patch(f"{MODULE}.search_pipeline", mock_search_pipeline),
@@ -1160,6 +1169,8 @@ def _run(
             rerank_sink.append(rerank_mock)
         if rrf_sink is not None:
             rrf_sink.append(rrf_mock)
+        if visibility_sink is not None:
+            visibility_sink.append(visibility_mock)
     return mock_search_pipeline
 
 
@@ -1544,7 +1555,7 @@ def test_fast_regulatory_search_fetches_enough_candidates_for_staged_rerank() ->
     ] == [50]
 
 
-def test_asv3_lane_head_outside_first_48_reaches_staged_reranker() -> None:
+def test_asv3_lane_head_outside_first_48_reaches_batched_reranker() -> None:
     from onyx.reranking.candidate_selection import candidate_lineage
     from tests.unit.onyx.regulatory.labeling.test_search_overlay import chunk
 
@@ -1567,7 +1578,7 @@ def test_asv3_lane_head_outside_first_48_reaches_staged_reranker() -> None:
         submitted.append(chunks)
         return RerankResult(
             ordered_chunks=chunks,
-            scores_by_chunk={},
+            scores_by_chunk={(item.document_id, item.chunk_id): 0.5 for item in chunks},
             submitted_count=len(chunks),
             result_count=len(chunks),
             outcome=RerankOutcome.SUCCESS,
@@ -1585,7 +1596,7 @@ def test_asv3_lane_head_outside_first_48_reaches_staged_reranker() -> None:
         rerank_behavior=rank_batch,
         reranker_config=configured,
     )
-    assert [len(batch) for batch in submitted] == [32, 32, 32, 48]
+    assert [len(batch) for batch in submitted] == [32, 32, 32]
     initial = [item for batch in submitted[:3] for item in batch]
     assert all(item in initial for item in raw_lane[:5])
     assert len({item.unique_id for item in initial}) == 96
@@ -1600,6 +1611,96 @@ def test_asv3_lane_head_outside_first_48_reaches_staged_reranker() -> None:
         filters.regulatory_workflow_mode == "standard"
         and filters.asv3_document_set_id == 15
     )
+
+
+@pytest.mark.parametrize(
+    ("asv3_scope", "excluded_chunk_id"), [(True, None), (False, None), (True, "29")]
+)
+def test_normalized_high_score_candidates_reach_model_only_in_asv3(
+    asv3_scope: bool,
+    excluded_chunk_id: str | None,
+) -> None:
+    from tests.unit.onyx.regulatory.labeling.test_search_overlay import chunk
+
+    candidates = [chunk(str(index)) for index in range(31)]
+    for item in candidates:
+        item.content = f"Operative source passage {item.chunk_id}."
+    configured = RerankerRuntimeConfig(
+        enabled=True,
+        provider_type=RerankerProvider.SILICONFLOW,
+        model_name="Qwen/Qwen3-Reranker-8B",
+        api_key=make_mock_sensitive_value("test-key"),
+        configuration_generation="test-generation",
+    )
+    filters = IndexFilters(
+        regulatory_chunks_only=True,
+        asv3_document_set_id=15 if asv3_scope else None,
+        regulatory_workflow_mode="fast",
+        access_control_list=None,
+        as_of_date=date(2026, 9, 30),
+    )
+
+    def rank_batch(
+        *, query: str, chunks: list[InferenceChunk], config: RerankerRuntimeConfig
+    ) -> RerankResult:
+        assert query == "ticket" and config.enabled
+        return RerankResult(
+            ordered_chunks=chunks,
+            scores_by_chunk={
+                (item.document_id, item.chunk_id): 1.0 if item.chunk_id < 30 else 0.0
+                for item in chunks
+            },
+            submitted_count=len(chunks),
+            result_count=len(chunks),
+            outcome=RerankOutcome.SUCCESS,
+            fallback_used=False,
+        )
+
+    responses: list[ToolResponse] = []
+    selector_mocks: list[MagicMock] = []
+    visibility_mocks: list[MagicMock] = []
+    _run(
+        _make_tool(filters, auto_detect_filters=False),
+        connected_sources=[DocumentSource.USER_FILE],
+        pipeline_chunks=candidates,
+        fused_chunks=candidates,
+        rerank_behavior=rank_batch,
+        reranker_config=configured,
+        response_sink=responses,
+        selector_sink=selector_mocks,
+        max_llm_chunks=25,
+        num_hits=5,
+        visible_regulatory_chunk_ids={
+            str(index) for index in range(31) if str(index) != excluded_chunk_id
+        },
+        visibility_sink=visibility_mocks,
+    )
+
+    expected_ids = set(range(30 if asv3_scope else 25))
+    if excluded_chunk_id is not None:
+        expected_ids.discard(int(excluded_chunk_id))
+    expected_count = len(expected_ids)
+    rich = responses[0].rich_response
+    assert isinstance(rich, SearchDocsResponse)
+    assert len(rich.search_docs) == expected_count
+    assert {doc.chunk_ind for doc in rich.search_docs} == expected_ids
+    payload = json.loads(responses[0].llm_facing_response)
+    assert len(payload["results"]) == expected_count
+    assert all(
+        any(
+            f"Operative source passage {index}." in result["content"]
+            for result in payload["results"]
+        )
+        for index in expected_ids
+    )
+    if excluded_chunk_id is not None:
+        assert all(
+            f"Operative source passage {excluded_chunk_id}." not in result["content"]
+            for result in payload["results"]
+        )
+    assert visibility_mocks[0].call_args.kwargs["as_of_date"] == date(2026, 9, 30)
+    assert rich.displayed_docs is not None and len(rich.displayed_docs) == 5
+    selector_mocks[0].assert_not_called()
 
 
 def test_regulatory_luna_rerank_is_enabled_for_followup_query() -> None:

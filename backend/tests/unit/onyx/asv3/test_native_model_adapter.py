@@ -21,7 +21,13 @@ from onyx.asv3.models import (
 )
 from onyx.llm.interfaces import LLM, LLMConfig
 from onyx.llm.model_response import Choice, Message, ModelResponse
-from onyx.llm.models import AssistantMessage, FunctionCall, ToolCall, ToolMessage
+from onyx.llm.models import (
+    AssistantMessage,
+    FunctionCall,
+    ToolCall,
+    ToolMessage,
+    UserMessage,
+)
 
 
 def model(limit: int = 100000) -> MagicMock:
@@ -141,18 +147,41 @@ def test_native_history_preserves_each_complete_batch_and_delivers_originals_onc
     assert llm.invoke.call_count == 2
 
 
-def test_response_preferences_yield_before_any_original_is_removed(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("researcher", [False, True], ids=["coordinator", "researcher"])
+def test_core_role_instructions_survive_response_preference_eviction(
+    researcher: bool,
 ) -> None:
-    monkeypatch.setattr(llm_adapter, "COORDINATOR_PROMPT", "Use original evidence.")
-    context, ledger = RunContext(), EvidenceLedger()
+    context, ledger = RunContext(depth=int(researcher)), EvidenceLedger()
     context.services["evidence"] = ledger
     first = original(ledger, context, "The first condition must hold. " * 16)
     second = original(ledger, context, "The second condition also applies. " * 16)
-    llm = model(4000)
+    llm = model()
     adapter = ResearchModel(llm, context, lean_native_mode=True, token_counter=len)
-    adapter.decide(view(original_evidence=[first, second]))
-    first_content = llm.invoke.call_args.kwargs["prompt"][1].content
+    current = view(original_evidence=[first, second])
+    complete_prompt, tools, _ = adapter._fit_native_decision(current)
+    question_content = complete_prompt[1].content
+    assert isinstance(question_content, str)
+    question = json.loads(question_content)
+    assert (
+        question.pop("response_preferences") == llm_adapter.DEFAULT_RESPONSE_PREFERENCES
+    )
+    prompt_without_preferences = [
+        complete_prompt[0],
+        UserMessage(content=json.dumps(question, ensure_ascii=False)),
+        *complete_prompt[2:],
+    ]
+    required_input = adapter._input_cost(prompt_without_preferences, tools)
+    llm.config.max_input_tokens = (required_input * 4 + 2) // 3
+    ceiling, _ = adapter._limits(adapter._native_output_limit())
+    assert required_input <= ceiling
+    assert adapter._input_cost(complete_prompt, tools) > ceiling
+
+    adapter.decide(current)
+    prompt = llm.invoke.call_args.kwargs["prompt"]
+    assert prompt[0].content == (
+        llm_adapter.RESEARCHER_PROMPT if researcher else llm_adapter.COORDINATOR_PROMPT
+    )
+    first_content = prompt[1].content
     assert isinstance(first_content, str)
     assert "response_preferences" not in json.loads(first_content)
     assert last_payload(llm)["original_evidence"] == [first, second]
