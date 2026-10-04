@@ -38,18 +38,17 @@ def test_local_spend_and_shared_physical_and_byte_resources() -> None:
         max_inflight_sources=1,
     )
     context = RunContext(budget=parent)
-    first = context.independent_child(max_tools=2, max_decisions=2)
-    second = context.independent_child(max_tools=2, max_decisions=2)
+    first = context.independent_child()
+    second = context.independent_child()
     first.budget.consume("tools", 2)
-    with pytest.raises(RunStopped, match="Local tools"):
-        first.budget.consume("tools")
+    first.budget.consume("tools", 100)
     second.budget.consume("tools")
     for _ in range(2):
         first.consume_research_decision()
-    with pytest.raises(RunStopped, match="Local decisions"):
+    for _ in range(100):
         first.consume_research_decision()
     second.consume_research_decision()
-    assert parent.snapshot()["tools"] == parent.snapshot()["decisions"] == 3
+    assert parent.snapshot()["tools"] == parent.snapshot()["decisions"] == 103
     assert parent.unlimited_execution is True
     for name in ("tool_slots", "model_slots", "source_slots"):
         shared = getattr(parent, name)
@@ -75,7 +74,8 @@ def test_local_spend_and_shared_physical_and_byte_resources() -> None:
         == 3
     )
     assert first.child().budget is first.budget
-    assert first.deadline == context.research_deadline
+    assert first.deadline == first.research_deadline == float("inf")
+    assert first.budget.unlimited_execution is True
     first.cancel()
     with pytest.raises(RunStopped, match="cancelled"):
         first.check_active()
@@ -83,21 +83,25 @@ def test_local_spend_and_shared_physical_and_byte_resources() -> None:
     context.check_active()
 
 
-def test_global_rejection_does_not_spend_local_quota() -> None:
-    parent = SharedBudget(max_tools=1)
-    first = LocalBudget(parent, max_tools=3, max_decisions=2)
-    second = LocalBudget(parent, max_tools=3, max_decisions=2)
-    first.consume("tools")
+def test_independent_execution_ignores_legacy_limits_without_mutating_parent_policy() -> (
+    None
+):
+    parent = SharedBudget(max_tools=1, max_decisions=1)
+    first, second = LocalBudget(parent), LocalBudget(parent)
+    first.consume("tools", 100)
+    second.consume("tools", 100)
+    for _ in range(100):
+        first.consume_research_decision()
+        second.consume_research_decision()
+    assert first.snapshot()["tools"] == first.snapshot()["decisions"] == 100
+    assert parent.snapshot()["tools"] == parent.snapshot()["decisions"] == 200
+    assert parent.unlimited_execution is False
     with pytest.raises(RunStopped, match="Shared tools"):
-        second.consume("tools")
-    assert second.snapshot()["tools"] == 0
-    assert parent.snapshot()["tools"] == 1
-
-
-@pytest.mark.parametrize("limit", [0, -1, True])
-def test_local_limits_are_strict_positive_integers(limit: int) -> None:
-    with pytest.raises(ValueError, match="positive integers"):
-        LocalBudget(SharedBudget(), max_tools=limit, max_decisions=2)
+        parent.consume("tools")
+    assert first.allocation_snapshot()["limits"] == {"tools": None, "decisions": None}
+    assert first.allocation_snapshot()["unlimited_execution"] is True
+    with pytest.raises(ValueError, match="execution count"):
+        first.consume("tools", -1)
 
 
 def test_independent_results_and_checkpoint_preserve_complete_answers() -> None:
@@ -156,8 +160,8 @@ def test_wait_deadline_preserves_completed_and_rejects_late_answer() -> None:
 
     pool = WorkerPool(context, runner)
     try:
-        complete = pool.spawn("Completed", independent_question=True)
-        slow = pool.spawn("Slow", independent_question=True)
+        complete = pool.spawn("Completed")
+        slow = pool.spawn("Slow")
         assert started.wait(1)
         pool.wait(complete, timeout_seconds=1)
         context.research_deadline = time.monotonic() + 0.02
@@ -176,6 +180,69 @@ def test_wait_deadline_preserves_completed_and_rejects_late_answer() -> None:
         pool.close()
 
 
+def test_independent_wait_ignores_elapsed_parent_clock_and_preserves_complete_answer() -> (
+    None
+):
+    started, release = threading.Event(), threading.Event()
+    context = RunContext(timeout_seconds=10)
+    answer = "Kaynaklı koşul ve devamı. " * 1_000
+
+    def runner(
+        _task: str, child: RunContext, _updates: Callable[[], list[str]]
+    ) -> ToolOutcome:
+        started.set()
+        assert release.wait(2)
+        child.check_research_active()
+        return ToolOutcome(status=OutcomeStatus.FOUND, summary=answer)
+
+    pool = WorkerPool(context, runner)
+    results = []
+    try:
+        task = pool.spawn("Independent", independent_question=True)
+        assert started.wait(1)
+        context.deadline = context.research_deadline = time.monotonic() - 1
+        waiter = threading.Thread(
+            target=lambda: results.extend(pool.wait_until_all([task]))
+        )
+        waiter.start()
+        waiter.join(0.05)
+        assert waiter.is_alive()
+        release.set()
+        waiter.join(1)
+        assert not waiter.is_alive()
+        assert results[0].status == TaskStatus.COMPLETED
+        assert results[0].outcome is not None and results[0].outcome.summary == answer
+    finally:
+        release.set()
+        pool.close()
+
+
+def test_independent_task_count_and_text_are_unbounded_and_restore_without_old_caps() -> (
+    None
+):
+    context = RunContext(timeout_seconds=float("inf"))
+    pool = WorkerPool(context, done, max_tasks=1)
+    restored = WorkerPool(RunContext(run_id=context.run_id), done, max_tasks=1)
+    try:
+        tasks = [
+            pool.spawn("Question " * 600, independent_question=True) for _ in range(30)
+        ]
+        assert len(pool.wait_until_all(tasks)) == 30
+        ordinary = pool.spawn("Ordinary")
+        pool.wait_until_all([ordinary])
+        with pytest.raises(RunStopped, match="capacity"):
+            pool.spawn("Another ordinary")
+        restored.restore(pool.export())
+        assert len(restored.results()) == 31
+        assert all(
+            item.local_budget["unlimited_execution"] is True
+            for item in restored.results(tasks)
+        )
+    finally:
+        pool.close()
+        restored.close()
+
+
 def test_restore_local_spend_and_interruption_without_reexecution() -> None:
     context = RunContext()
     pool = WorkerPool(context, done)
@@ -183,9 +250,7 @@ def test_restore_local_spend_and_interruption_without_reexecution() -> None:
     restored = WorkerPool(restored_context, done)
     invalid = WorkerPool(RunContext(run_id=context.run_id), done)
     try:
-        task = pool.spawn(
-            "Question", independent_question=True, max_tools=2, max_decisions=2
-        )
+        task = pool.spawn("Question", independent_question=True)
         pool.wait_until_all([task])
         snapshot = pool.export()
         tasks = cast(list[dict[str, JsonValue]], snapshot["tasks"])
@@ -201,13 +266,16 @@ def test_restore_local_spend_and_interruption_without_reexecution() -> None:
         assert result.local_budget["used"] == {"tools": 1, "decisions": 2}
         assert restored_context.budget.snapshot()["decisions"] == 2
         assert not restored._futures
-        with pytest.raises(RunStopped, match="Independent question budget"):
-            restored.followup(task, "Continue")
+        # A .50 checkpoint's old quota is historical metadata, never a renewed cap.
+        resumed = restored.followup(task, "Continue")
+        followup = restored.wait_until_all([resumed])[0]
+        assert followup.status == TaskStatus.COMPLETED
+        assert followup.local_budget["unlimited_execution"] is True
         corrupt = copy.deepcopy(snapshot)
         corrupt_tasks = cast(list[dict[str, JsonValue]], corrupt["tasks"])
         corrupt_tasks[0]["local_budget"] = {
             "limits": {"tools": 2, "decisions": 2},
-            "used": {"tools": 1, "decisions": 3},
+            "used": {"tools": 1, "decisions": -1},
         }
         with pytest.raises(ValueError, match="checkpoint budget"):
             invalid.restore(corrupt)

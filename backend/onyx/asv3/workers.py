@@ -69,12 +69,10 @@ class WorkerPool:
         public_message: str | None = None,
         need_ids: builtins.list[str] | None = None,
         independent_question: bool = False,
-        max_tools: int = 24,
-        max_decisions: int = 10,
     ) -> str:
         delegation = request_context or self.context
         delegation.check_active()
-        if not task.strip() or len(task) > 4000:
+        if not task.strip() or (not independent_question and len(task) > 4000):
             raise ValueError("Research task must contain 1–4000 characters")
         if (public_title is None) != (public_message is None):
             raise ValueError("Public task narration needs both title and message")
@@ -108,15 +106,17 @@ class WorkerPool:
                     and set(needs) == set(snapshot.need_ids)
                 ):
                     return snapshot.task_id
-            if self._closed or len(self._tasks) >= self.max_tasks:
+            if self._closed or (
+                not independent_question
+                and sum(not task.independent_question for task in self._tasks.values())
+                >= self.max_tasks
+            ):
                 raise RunStopped("Research task capacity exhausted")
             if delegation.depth >= delegation.max_depth:
                 raise RunStopped("Research delegation depth exhausted")
             task_id = str(uuid4())
             child = (
-                delegation.independent_child(
-                    max_tools=max_tools, max_decisions=max_decisions
-                )
+                delegation.independent_child()
                 if independent_question
                 else delegation.child()
             )
@@ -244,14 +244,6 @@ class WorkerPool:
             snapshot = self._tasks[task_id]
             if snapshot.status in (TaskStatus.QUEUED, TaskStatus.RUNNING):
                 return task_id
-            budget = self._contexts[task_id].budget
-            remaining_tools, remaining_decisions = 24, 10
-            if isinstance(budget, LocalBudget):
-                used = budget.snapshot()
-                remaining_tools = budget.limits["tools"] - used["tools"]
-                remaining_decisions = budget.limits["decisions"] - used["decisions"]
-                if min(remaining_tools, remaining_decisions) <= 0:
-                    raise RunStopped("Independent question budget exhausted")
             return self.spawn(
                 snapshot.task + "\nFollow-up: " + message,
                 parent_task_id=task_id,
@@ -260,8 +252,6 @@ class WorkerPool:
                 public_message=snapshot.public_message,
                 need_ids=snapshot.need_ids,
                 independent_question=snapshot.independent_question,
-                max_tools=remaining_tools,
-                max_decisions=remaining_decisions,
             )
 
     def cancel(self, task_id: str) -> None:
@@ -331,16 +321,23 @@ class WorkerPool:
                     min(self.context.deadline, self.context.research_deadline)
                     - time.monotonic()
                 )
+                independent = any(
+                    self._tasks[key].independent_question for key in selected
+                )
                 if remaining <= 0:
                     for key in selected:
-                        if self._tasks[key].status in (
+                        if not self._tasks[key].independent_question and self._tasks[
+                            key
+                        ].status in (
                             TaskStatus.QUEUED,
                             TaskStatus.RUNNING,
                         ):
                             self.cancel(key)
-                    break
-                self.context.check_active()
-                self._changed.wait(min(remaining, 0.25))
+                    if not independent:
+                        break
+                if self.context.is_cancelled() or not independent:
+                    self.context.check_active()
+                self._changed.wait(0.25)
             return self.results(selected)
 
     def wait(
@@ -607,9 +604,11 @@ class WorkerPool:
         if payload.get("version") != 1 or payload.get("run_id") != self.context.run_id:
             raise ValueError("Worker checkpoint identity mismatch")
         raw = payload.get("tasks")
-        if not isinstance(raw, list) or len(raw) > self.max_tasks:
+        if not isinstance(raw, list):
             raise ValueError("Invalid worker checkpoint")
         snapshots = [TaskSnapshot.model_validate(item) for item in raw]
+        if sum(not item.independent_question for item in snapshots) > self.max_tasks:
+            raise ValueError("Invalid worker checkpoint")
         if len({item.task_id for item in snapshots}) != len(snapshots):
             raise ValueError("Duplicate restored task")
         contexts: dict[str, RunContext] = {}
@@ -624,12 +623,12 @@ class WorkerPool:
                     or set(used) != {"tools", "decisions"}
                 ):
                     raise ValueError("Missing independent question budget")
-                max_tools, max_decisions = limits.get("tools"), limits.get("decisions")
-                if type(max_tools) is not int or type(max_decisions) is not int:
+                if any(
+                    value is not None and (type(value) is not int or value < 1)
+                    for value in limits.values()
+                ):
                     raise ValueError("Invalid independent question limits")
-                child = self.context.independent_child(
-                    max_tools=max_tools, max_decisions=max_decisions
-                )
+                child = self.context.independent_child()
                 child.budget.restore(used)
             else:
                 child = self.context.child()

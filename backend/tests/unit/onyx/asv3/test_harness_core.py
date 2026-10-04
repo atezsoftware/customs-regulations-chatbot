@@ -66,6 +66,84 @@ def test_native_execution_and_resume_do_not_use_legacy_call_limits() -> None:
     assert context.research_deadline == float("inf")
 
 
+def test_independent_native_child_keeps_sources_and_retries_past_old_execution_caps() -> (
+    None
+):
+    parent = RunContext(budget=SharedBudget(max_tools=1, max_decisions=1))
+    context = parent.independent_child()
+    context.services["lean_native_mode"] = True
+    ledger = EvidenceLedger()
+    original = "The operative condition, exception and later step. " * 500
+    registry = CapabilityRegistry(
+        [
+            ToolSpec(
+                name="read_original",
+                description="Read original",
+                parameters={
+                    "type": "object",
+                    "properties": {"iteration": {"type": "integer"}},
+                },
+                handler=lambda _args, _context: ToolOutcome(
+                    status=OutcomeStatus.FOUND,
+                    summary="Recorded original",
+                    evidence=[
+                        EvidenceItem(source_id="law", chunk_id="unit", text=original)
+                    ],
+                ),
+            )
+        ]
+    )
+    decisions = 0
+    rejected = 0
+
+    def decide(view: HarnessView) -> Decision:
+        nonlocal decisions
+        decisions += 1
+        if decisions <= 70:
+            return Decision(
+                calls=[
+                    CapabilityCall(
+                        name="read_original", arguments={"iteration": decisions}
+                    )
+                ]
+            )
+        assert view.original_evidence[0]["text"] == original
+        assert view.original_evidence[0]["end_char"] == len(original)
+        if decisions <= 73:
+            return Decision(answer="Unsupported reference [999].")
+        return Decision(answer="The source-supported condition applies [1].")
+
+    def guard(answer: str) -> ToolOutcome | None:
+        nonlocal rejected
+        if "[999]" in answer:
+            rejected += 1
+            return ToolOutcome(
+                status=OutcomeStatus.PARTIAL,
+                summary="Use the actual original",
+                data={"unknown_citations": [999]},
+            )
+        item = ledger.get(1)
+        assert item is not None and item.text == original
+        return None
+
+    result = Harness(
+        request="Independent issue",
+        context=context,
+        registry=registry,
+        decide=decide,
+        evidence=ledger,
+        draft_guard=guard,
+    ).run()
+    assert result.status == OutcomeStatus.FOUND
+    assert result.answer == "The source-supported condition applies [1]."
+    assert rejected == 3
+    assert context.budget.snapshot()["tools"] == 70
+    assert context.budget.snapshot()["decisions"] == 74
+    assert parent.budget.snapshot()["tools"] == 70
+    assert context.deadline == context.research_deadline == float("inf")
+    assert "independent_finalization" not in context.services
+
+
 def test_invalid_argument_checkpoint_cannot_poison_a_valid_empty_call() -> None:
     context = RunContext()
     calls: list[dict[str, JsonValue]] = []
