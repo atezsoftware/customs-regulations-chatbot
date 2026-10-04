@@ -46,7 +46,7 @@ from onyx.llm.models import (
     ToolMessage,
     UserMessage,
 )
-from onyx.prompts.asv3.research import COORDINATOR_PROMPT
+from onyx.prompts.asv3.research import COORDINATOR_PROMPT, RESEARCHER_PROMPT
 from onyx.server.query_and_chat.streaming_models import (
     AgentResponseDelta,
     AgentResponseStart,
@@ -109,6 +109,88 @@ def delivered_originals(arguments: dict[str, Any]) -> list[dict[str, Any]]:
         elif isinstance(message, UserMessage):
             result.extend(user_payload(message).get("original_evidence", []))
     return result
+
+
+def run_independent(
+    *,
+    external_requested: bool = False,
+    first_decision: ModelResponse | None = None,
+    **kwargs: Any,
+) -> None:
+    """Script the two host decisions while exercising the real child source path."""
+    llm = kwargs["llm"]
+    child_script = llm.invoke.side_effect
+
+    def invoke(**arguments: Any) -> ModelResponse:
+        prompt = arguments["prompt"]
+        if prompt[0].content == COORDINATOR_PROMPT:
+            names = {tool["function"]["name"] for tool in arguments["tools"]}
+            if "research_questions" in names:
+                assert names <= {"research_questions", "ask_user"}
+                if first_decision is not None:
+                    return first_decision
+                request = user_payload(prompt[1])["request"]
+                return response(
+                    calls=[
+                        (
+                            "research_questions",
+                            {
+                                "questions": [
+                                    {
+                                        "question_id": "comparison",
+                                        "question": request,
+                                        "parent_question_ids": [1],
+                                        "public_title": "İstenen karşılaştırma"
+                                        if kwargs.get("test_language", "tr") == "tr"
+                                        else "Requested comparison",
+                                        "public_message": "Bu sonucun koşulları özgün kaynaklardan inceleniyor."
+                                        if kwargs.get("test_language", "tr") == "tr"
+                                        else "I am checking the conditions in original sources.",
+                                    }
+                                ],
+                                "_language": kwargs.get("test_language", "tr"),
+                                "_external_requested": external_requested,
+                            },
+                        )
+                    ]
+                )
+            assert names == {"assemble_answers"}
+            footer = user_payload(prompt[-1])
+            originals = {row["citation"]: row for row in delivered_originals(arguments)}
+            for answer in footer["independent_answers"]:
+                for number in answer["evidence_numbers"]:
+                    assert number in originals
+                    original = originals[number]
+                    assert original["start_char"] == 0
+                    assert original["end_char"] == original["total_chars"]
+            if kwargs.get("resume_message_id") is not None and callable(child_script):
+                child_script(**arguments)
+            return response(
+                calls=[
+                    (
+                        "assemble_answers",
+                        {
+                            "order": [
+                                item["question_id"]
+                                for item in footer["independent_answers"]
+                            ]
+                        },
+                    )
+                ]
+            )
+        assert prompt[0].content != COORDINATOR_PROMPT
+        if callable(child_script):
+            return child_script(**arguments)
+        return next(child_script)
+
+    llm.invoke.side_effect = invoke
+    call_kwargs = {
+        key: value for key, value in kwargs.items() if key != "test_language"
+    }
+    try:
+        runtime.run_asv3_loop(**call_kwargs)
+    finally:
+        llm.invoke.side_effect = child_script
 
 
 class CorpusBoundary:
@@ -287,6 +369,7 @@ def setup_run(
         reasoning_effort=ReasoningEffort.AUTO,
         include_citations=True,
         cache=cache,
+        test_language=language,
     )
     return kwargs, broker, llm, checkpoints, queue
 
@@ -305,13 +388,18 @@ def test_native_parallel_originals_preserve_selected_provider_and_publish_withou
     kwargs, broker, llm, checkpoints, queue = setup_run(monkeypatch)
     llm.config.model_provider, llm.config.model_name = provider, model_name
     kwargs["custom_agent_prompt"] = "Her soruya ayrı ve kısa uygulama sonucu ver."
-    runtime.run_asv3_loop(**kwargs)
-    assert llm.invoke.call_count == 2
+    run_independent(**kwargs)
+    assert llm.invoke.call_count == 4
     assert broker.peak == 2
+    assert [call.kwargs["prompt"][0].content for call in llm.invoke.call_args_list] == [
+        COORDINATOR_PROMPT,
+        RESEARCHER_PROMPT,
+        RESEARCHER_PROMPT,
+        COORDINATOR_PROMPT,
+    ]
     for call in llm.invoke.call_args_list:
-        assert call.kwargs["prompt"][0].content == COORDINATOR_PROMPT
         assert call.kwargs["structured_response_format"] is None
-        assert call.kwargs["timeout_override"] is None
+        assert 1 <= call.kwargs["timeout_override"] <= 300
         assert (
             user_payload(call.kwargs["prompt"][1])["assistant_instructions"]
             == kwargs["custom_agent_prompt"]
@@ -330,9 +418,23 @@ def test_native_parallel_originals_preserve_selected_provider_and_publish_withou
         call["id"] for call in turn["assistant"]["tool_calls"]
     ]
     assert [call["function"]["name"] for call in turn["assistant"]["tool_calls"]] == [
+        "research_questions",
+    ]
+    child_messages = llm.invoke.call_args_list[2].kwargs["prompt"]
+    child_turn = next(
+        message for message in child_messages if isinstance(message, AssistantMessage)
+    )
+    child_results = [
+        message for message in child_messages if isinstance(message, ToolMessage)
+    ]
+    assert [call.function.name for call in child_turn.tool_calls] == [
         "read_source_range",
         "read_source_range",
     ]
+    assert [message.tool_call_id for message in child_results] == [
+        call.id for call in child_turn.tool_calls
+    ]
+    assert saved["question_research"]["answers"][0]["answer"] in saved["last_draft"]
     assert len(kwargs["state_container"].citation_to_doc) == 2
     output = packets(queue)
     for packet in output:
@@ -354,6 +456,120 @@ def test_native_parallel_originals_preserve_selected_provider_and_publish_withou
         for i, packet in enumerate(output)
         if isinstance(packet.obj, (AgentResponseDelta, CitationInfo))
     )
+
+
+def test_related_questions_use_fresh_children_and_keep_full_bodies_and_originals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kwargs, broker, llm, checkpoints, _queue = setup_run(monkeypatch)
+    tasks = [
+        "Garanti kapsamındaki tamirin sonucu nedir?",
+        "Yeni makine gönderilmesinin sonucu nedir?",
+    ]
+    decisions = {task: 0 for task in tasks}
+    bodies: dict[str, str] = {}
+    lock = threading.Lock()
+
+    def scripted(**arguments: Any) -> ModelResponse:
+        prompt = arguments["prompt"]
+        prefix, footer = user_payload(prompt[1]), user_payload(prompt[-1])
+        if prompt[0].content == COORDINATOR_PROMPT:
+            if not footer["question_research_started"]:
+                return response(
+                    calls=[
+                        (
+                            "research_questions",
+                            {
+                                "questions": [
+                                    {
+                                        "question_id": str(index),
+                                        "question": task,
+                                        "parent_question_ids": [1],
+                                        "public_title": "İstenen sonuç araştırılıyor",
+                                        "public_message": "Bu sonucun koşulları özgün kaynaklardan inceleniyor.",
+                                    }
+                                    for index, task in enumerate(tasks)
+                                ],
+                                "_language": "tr",
+                            },
+                        )
+                    ]
+                )
+            originals = delivered_originals(arguments)
+            assert len(originals) == 2
+            assert {item["text"] for item in originals} == {
+                item.text for item in broker.chunks.values()
+            }
+            assert all(
+                item["start_char"] == 0 and item["end_char"] == item["total_chars"]
+                for item in originals
+            )
+            assert {item["answer"] for item in footer["independent_answers"]} == set(
+                bodies.values()
+            )
+            return response(calls=[("assemble_answers", {"order": ["1", "0"]})])
+        assert prompt[0].content == RESEARCHER_PROMPT
+        task = prefix["request"]
+        assert task in tasks
+        assert kwargs["simple_chat_history"][0].message in prefix["conversation"]
+        assert footer["request"] == task
+        assert "independent_answers" not in footer
+        with lock:
+            decisions[task] += 1
+            ordinal = decisions[task]
+        index = tasks.index(task)
+        if ordinal == 1:
+            assert not any(
+                isinstance(message, (AssistantMessage, ToolMessage))
+                for message in prompt
+            )
+            assert not delivered_originals(arguments)
+            return response(
+                calls=[
+                    ("read_source_range", {"source_id": str(broker.sources[index].id)})
+                ]
+            )
+        assert ordinal == 2
+        assistant = [
+            message for message in prompt if isinstance(message, AssistantMessage)
+        ]
+        assert len(assistant) == 1
+        assert assistant[0].tool_calls[0].function.name == "read_source_range"
+        assert json.loads(assistant[0].tool_calls[0].function.arguments)[
+            "source_id"
+        ] == str(broker.sources[index].id)
+        originals = delivered_originals(arguments)
+        assert len(originals) == 1
+        assert originals[0]["text"] == broker.chunks[str(broker.sources[index].id)].text
+        body = (
+            f"Sonuç {index}: "
+            + "Kaynaklı koşul ve sonraki işlem. " * 450
+            + f"[{originals[0]['citation']}]"
+        )
+        assert len(body) > 12_000
+        with lock:
+            bodies[task] = body
+        return response(body)
+
+    llm.invoke.side_effect = scripted
+    runtime.run_asv3_loop(
+        **{key: value for key, value in kwargs.items() if key != "test_language"}
+    )
+    assert llm.invoke.call_count == 6
+    assert broker.peak == 2
+    assert decisions == {task: 2 for task in tasks}
+    saved = checkpoints[-1]
+    assert saved["publication_status"] == "found"
+    assert len(saved["workers"]["tasks"]) == 2
+    assert all(
+        item["local_budget"]["used"] == {"tools": 1, "decisions": 2}
+        for item in saved["workers"]["tasks"]
+    )
+    assert all(body in saved["last_draft"] for body in bodies.values())
+    assert saved["last_draft"].index(bodies[tasks[1]]) < saved["last_draft"].index(
+        bodies[tasks[0]]
+    )
+    assert {item.chunk_id for item in broker.revalidated} == {"chunk-0", "chunk-1"}
 
 
 def test_one_search_delivery_reports_each_original_source_without_extra_execution(
@@ -431,9 +647,12 @@ def test_one_search_delivery_reports_each_original_source_without_extra_executio
         return response("Tamir [1], değiştirme [2].")
 
     llm.invoke.side_effect = scripted
-    runtime.run_asv3_loop(**kwargs)
-    assert llm.invoke.call_count == 2 and searches == 1
-    assert len(checkpoints[-1]["receipts"]) == 1
+    run_independent(**kwargs)
+    assert llm.invoke.call_count == 4 and searches == 1
+    assert [receipt["call"]["name"] for receipt in checkpoints[-1]["receipts"]] == [
+        "research_questions",
+        "assemble_answers",
+    ]
     output = packets(queue)
     updates = [packet.obj for packet in output if isinstance(packet.obj, ASv3Progress)]
     sources = [
@@ -488,11 +707,11 @@ def test_first_useful_action_localizes_existing_progress_without_a_profile_call(
     monkeypatch: pytest.MonkeyPatch, language: str
 ) -> None:
     kwargs, _broker, llm, checkpoints, queue = setup_run(monkeypatch, language=language)
-    runtime.run_asv3_loop(**kwargs)
+    run_independent(**kwargs)
     updates = [
         packet.obj for packet in packets(queue) if isinstance(packet.obj, ASv3Progress)
     ]
-    assert llm.invoke.call_count == 2
+    assert llm.invoke.call_count == 4
     assert all(
         event.language == language for event in updates if event.language != "und"
     )
@@ -517,8 +736,8 @@ def test_available_crossreference_is_model_navigation_and_adds_no_forced_audit_o
             text=chunk.text
             + " 4458 sayılı Gümrük Kanununun 168 inci maddesine göre uygulanır.",
         )
-    runtime.run_asv3_loop(**kwargs)
-    assert llm.invoke.call_count == 2
+    run_independent(**kwargs)
+    assert llm.invoke.call_count == 4
     assert len(checkpoints[-1]["receipts"]) == 2
     assert checkpoints[-1]["publication_status"] == "found"
 
@@ -544,8 +763,8 @@ def test_citation_guard_repairs_unknown_number_in_native_loop_without_review(
         return response("Tamir [1], değiştirme [2].")
 
     llm.invoke.side_effect = scripted
-    runtime.run_asv3_loop(**kwargs)
-    assert llm.invoke.call_count == 3
+    run_independent(**kwargs)
+    assert llm.invoke.call_count == 5
     assert checkpoints[-1]["publication_status"] == "found"
     assert "999" not in kwargs["state_container"].answer_tokens
     assert any(isinstance(packet.obj, CitationInfo) for packet in packets(queue))
@@ -598,8 +817,8 @@ def test_named_law_uses_its_local_original_without_a_routine_review(
         )
 
     llm.invoke.side_effect = scripted
-    runtime.run_asv3_loop(**kwargs)
-    assert llm.invoke.call_count == 3
+    run_independent(**kwargs)
+    assert llm.invoke.call_count == 5
     assert checkpoints[-1]["publication_stop_reason"] == "native_answer_published"
     assert checkpoints[-1]["evidence"]["included"] == [direct_number]
 
@@ -615,7 +834,7 @@ def test_native_scope_preserves_excluded_label_snapshot_filters(
             "regulatory_label_run_ids": (run_id,),
         }
     )
-    runtime.run_asv3_loop(**kwargs)
+    run_independent(**kwargs)
     assert broker.scope is not None
     assert broker.scope.regulatory_workflow_mode == "standard"
     assert broker.scope.regulatory_label_search_enabled is True
@@ -668,8 +887,8 @@ def test_targeted_verification_is_only_invoked_when_model_selects_tool(
         return response("Tamir [1], değiştirme [2].")
 
     llm.invoke.side_effect = scripted
-    runtime.run_asv3_loop(**kwargs)
-    assert llm.invoke.call_count == 4
+    run_independent(**kwargs)
+    assert llm.invoke.call_count == 6
 
 
 def test_citation_guard_rejects_only_partial_delivery_before_exact_native_repair(
@@ -709,8 +928,8 @@ def test_citation_guard_rejects_only_partial_delivery_before_exact_native_repair
 
     monkeypatch.setattr(EvidenceLedger, "record_delivery", deliver)
     llm.invoke.side_effect = scripted
-    runtime.run_asv3_loop(**kwargs)
-    assert llm.invoke.call_count == 3
+    run_independent(**kwargs)
+    assert llm.invoke.call_count == 5
     assert checkpoints[-1]["publication_status"] == "found"
 
 
@@ -743,7 +962,7 @@ def test_external_capability_requires_host_permission_and_first_action_explicit_
         invocation += 1
         names = {tool["function"]["name"] for tool in arguments["tools"]}
         if invocation == 1:
-            assert "external_read_public_source" not in names
+            assert ("external_read_public_source" in names) is (consent and intent)
             return response(
                 calls=[
                     (
@@ -769,15 +988,15 @@ def test_external_capability_requires_host_permission_and_first_action_explicit_
         )
 
     llm.invoke.side_effect = scripted
-    runtime.run_asv3_loop(**kwargs, allow_external=consent)
-    assert llm.invoke.call_count == 2
+    run_independent(**kwargs, allow_external=consent, external_requested=intent)
+    assert llm.invoke.call_count == 4
 
 
 def test_resume_retains_native_history_and_revalidates_originals_without_profile_or_reread(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     kwargs, broker, llm, checkpoints, queue = setup_run(monkeypatch)
-    runtime.run_asv3_loop(**kwargs)
+    run_independent(**kwargs)
     previous = checkpoints[-1]
     packets(queue)
     monkeypatch.setattr(runtime, "load_asv3_checkpoint", lambda **_kwargs: previous)
@@ -790,7 +1009,7 @@ def test_resume_retains_native_history_and_revalidates_originals_without_profile
         return response("Tamir [1], değiştirme [2].")
 
     llm.invoke.side_effect = resume
-    runtime.run_asv3_loop(**kwargs, resume_message_id=2)
+    run_independent(**kwargs, resume_message_id=2)
     assert llm.invoke.call_count == 1
     assert checkpoints[-1]["evidence"]["records"] == previous["evidence"]["records"]
     assert {item.chunk_id for item in broker.revalidated} == {"chunk-0", "chunk-1"}
@@ -810,7 +1029,7 @@ def test_native_runtime_seed_profile_survives_checkpoint_and_legacy_resume(
     llm.config = llm.config.model_copy(
         update={"model_provider": "vertex_ai", "model_name": "gemini-3.8-flash"}
     )
-    runtime.run_asv3_loop(**kwargs)
+    run_independent(**kwargs)
     assert [call.args[0] for call in llm.with_seed.call_args_list] == [31, 1424088823]
     previous = dict(checkpoints[-1])
     saved = previous["native_coordinator_sampling"]
@@ -824,7 +1043,7 @@ def test_native_runtime_seed_profile_survives_checkpoint_and_legacy_resume(
     monkeypatch.setattr(runtime, "load_asv3_checkpoint", lambda **_kwargs: previous)
     llm.reset_mock()
     llm.invoke.side_effect = lambda **_kwargs: response("Tamir [1], değiştirme [2].")
-    runtime.run_asv3_loop(**kwargs, resume_message_id=2)
+    run_independent(**kwargs, resume_message_id=2)
     llm.with_seed.assert_called_once_with(1424088823)
     assert llm.invoke.call_count == 1
     assert checkpoints[-1]["evidence"]["records"] == previous["evidence"]["records"]
@@ -841,8 +1060,8 @@ def test_native_runtime_explicit_seed_zero_is_uniform_and_profile_change_blocks_
             "seed": 0,
         }
     )
-    runtime.run_asv3_loop(**kwargs)
-    assert llm.invoke.call_count == 2
+    run_independent(**kwargs)
+    assert llm.invoke.call_count == 4
     llm.with_seed.assert_not_called()
     previous = checkpoints[-1]
     assert previous["native_coordinator_sampling"]["settings"] == {
@@ -853,12 +1072,12 @@ def test_native_runtime_explicit_seed_zero_is_uniform_and_profile_change_blocks_
     llm.reset_mock()
     llm.config = llm.config.model_copy(update={"seed": None})
     with pytest.raises(ValueError, match="same coordinator sampling profile"):
-        runtime.run_asv3_loop(**kwargs, resume_message_id=2)
+        run_independent(**kwargs, resume_message_id=2)
     llm.invoke.assert_not_called()
     llm.with_seed.assert_not_called()
 
 
-def test_runtime_has_no_legacy_execution_limit_and_retains_more_than_six_native_groups(
+def test_independent_local_budget_retains_more_than_six_native_groups(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     kwargs, _broker, llm, checkpoints, _queue = setup_run(monkeypatch)
@@ -867,7 +1086,7 @@ def test_runtime_has_no_legacy_execution_limit_and_retains_more_than_six_native_
     def scripted(**arguments: Any) -> ModelResponse:
         nonlocal invocation
         invocation += 1
-        if invocation <= 70:
+        if invocation <= 8:
             return response(
                 calls=[
                     (
@@ -900,11 +1119,13 @@ def test_runtime_has_no_legacy_execution_limit_and_retains_more_than_six_native_
         )
 
     llm.invoke.side_effect = scripted
-    runtime.run_asv3_loop(**kwargs)
-    assert llm.invoke.call_count == 71
-    assert checkpoints[-1]["budget"]["decisions"] == 71
-    assert len(checkpoints[-1]["turns"]) == 71
-    assert checkpoints[-1]["publication_stop_reason"] == "native_partial_published"
+    run_independent(**kwargs)
+    assert llm.invoke.call_count == 11
+    assert checkpoints[-1]["budget"]["decisions"] == 11
+    assert len(checkpoints[-1]["turns"]) == 2
+    worker = checkpoints[-1]["workers"]["tasks"][0]
+    assert worker["local_budget"]["used"]["decisions"] == 9
+    assert checkpoints[-1]["publication_status"] == "partial"
 
 
 def test_zero_evidence_discloses_precise_gap_without_uncited_legal_memory(
@@ -935,8 +1156,8 @@ def test_zero_evidence_discloses_precise_gap_without_uncited_legal_memory(
         )
 
     llm.invoke.side_effect = scripted
-    runtime.run_asv3_loop(**kwargs)
-    assert llm.invoke.call_count == 2
+    run_independent(**kwargs)
+    assert llm.invoke.call_count == 4
     assert "vergiden muaftır" not in kwargs["state_container"].answer_tokens
     assert checkpoints[-1]["publication_status"] == "partial"
     assert not any(isinstance(packet.obj, CitationInfo) for packet in packets(queue))
@@ -946,20 +1167,18 @@ def test_clarification_can_end_turn_without_research_or_regeneration(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     kwargs, _broker, llm, checkpoints, _queue = setup_run(monkeypatch)
-    llm.invoke.side_effect = [
-        response(
-            calls=[
-                (
-                    "ask_user",
-                    {
-                        "question": "Makine garanti kapsamında mı gönderiliyor?",
-                        "_language": "tr",
-                    },
-                )
-            ]
-        )
-    ]
-    runtime.run_asv3_loop(**kwargs)
+    clarification = response(
+        calls=[
+            (
+                "ask_user",
+                {
+                    "question": "Makine garanti kapsamında mı gönderiliyor?",
+                    "_language": "tr",
+                },
+            )
+        ]
+    )
+    run_independent(**kwargs, first_decision=clarification)
     assert llm.invoke.call_count == 1
     assert (
         kwargs["state_container"].answer_tokens
@@ -977,7 +1196,7 @@ def test_cancel_discards_late_parallel_results_and_durable_writes(
 
     def run() -> None:
         try:
-            runtime.run_asv3_loop(**kwargs)
+            run_independent(**kwargs)
         except Exception as error:
             errors.append(error)
 
@@ -991,7 +1210,7 @@ def test_cancel_discards_late_parallel_results_and_durable_writes(
         assert not thread.is_alive()
         assert len(errors) == 1 and isinstance(errors[0], RunStopped)
         assert len(checkpoints) == writes_before_cancel
-        assert llm.invoke.call_count == 1
+        assert llm.invoke.call_count == 2
         assert kwargs["state_container"].answer_tokens is None
         output = packets(queue)
         assert not any(
@@ -1001,7 +1220,7 @@ def test_cancel_discards_late_parallel_results_and_durable_writes(
         assert [
             packet.obj.phase
             for packet in output
-            if isinstance(packet.obj, ASv3Progress)
+            if isinstance(packet.obj, ASv3Progress) and packet.obj.task_id is None
         ][-1] == "cancelled"
     finally:
         broker.release.set()
@@ -1022,8 +1241,8 @@ def test_canonical_revalidation_rejects_acl_revocation_before_any_answer_packet(
 
     monkeypatch.setattr(broker, "revalidate_evidence", revoke)
     with pytest.raises(RunStopped):
-        runtime.run_asv3_loop(**kwargs)
-    assert llm.invoke.call_count == 2
+        run_independent(**kwargs)
+    assert llm.invoke.call_count == 4
     assert len(checkpoints) == writes_before_cancel
     assert kwargs["state_container"].answer_tokens is None
     assert not any(

@@ -42,6 +42,7 @@ from onyx.asv3.progress import (
     official_corpus_source_name,
     report_source_deliveries,
 )
+from onyx.asv3.question_research import QuestionResearch
 from onyx.asv3.registry import CapabilityRegistry, build_core_specs
 from onyx.asv3.research_state import ResearchState, build_research_specs
 from onyx.asv3.sandbox import build_sandbox_specs
@@ -215,7 +216,8 @@ def run_asv3_loop(
     )
     context = RunContext(
         language="und",
-        timeout_seconds=float("inf"),
+        timeout_seconds=300,
+        research_reserve_seconds=60,
         budget=SharedBudget(unlimited_execution=True),
         cancelled=lambda: not is_connected(chat_session_id, cache),
         services={"lean_native_mode": True},
@@ -259,6 +261,7 @@ def run_asv3_loop(
             not in {"merhaba", "selam", "hello", "hi", "thanks", "teşekkürler"},
         )
     context.language = profile.language
+    context.services["independent_question_mode"] = profile.requires_sources
     context.corpus_only = not (allow_external and profile.external_requested)
     ledger = EvidenceLedger()
     context.services["evidence"] = ledger
@@ -315,6 +318,7 @@ def run_asv3_loop(
     checkpoint_sequence = 0
     harness: Harness | None = None
     workers: WorkerPool | None = None
+    question_research: QuestionResearch | None = None
     final_published = False
     publication_status = OutcomeStatus.PARTIAL
     publication_stop_reason: str | None = None
@@ -424,6 +428,9 @@ def run_asv3_loop(
                 progress_state=progress.export(),
                 public_profile=profile.model_dump(mode="json"),
                 workers=workers.export() if workers else {},
+                question_research=question_research.export()
+                if question_research
+                else {},
                 publication_status=publication_status.value,
                 publication_stop_reason=publication_stop_reason,
                 final_publication_gap=harness.publication_gap.model_dump(mode="json")
@@ -499,6 +506,13 @@ def run_asv3_loop(
         task: str, child: RunContext, updates: Callable[[], list[str]]
     ) -> ToolOutcome:
         child.services["scenario_state"] = ScenarioState([task], frozen=True)
+        independent = child.services.get("independent_question") is True
+        if independent:
+            child.services.pop("independent_answers", None)
+            child.services.pop("independent_evidence_numbers", None)
+            child.services["research_state"] = ResearchState(
+                [task], child, require_need_bindings=False
+            )
         child.services["search_message_history"] = [
             ChatMessageSimple(
                 message=question,
@@ -516,25 +530,95 @@ def run_asv3_loop(
             child,
             user_identity=user_identity,
             reasoning_effort=reasoning_effort,
-            history=question,
+            history=history,
             updates=updates,
             token_counter=token_counter,
             lean_native_mode=True,
         )
-        result = Harness(
+        child_registry = (
+            CapabilityRegistry(
+                common_specs
+                + build_research_specs(
+                    cast(ResearchState, child.services["research_state"]), ledger
+                )
+            )
+            if independent
+            else registry
+        )
+        child.services["registry"] = child_registry
+        child_partial: str | None = None
+
+        def submit_child_partial(
+            args: dict[str, JsonValue], _context: RunContext
+        ) -> ToolOutcome:
+            nonlocal child_partial
+            candidate = str(args["answer"])
+            gap = (
+                source_publication_gap(candidate, researcher_model.last_call_id)
+                if extract_citation_numbers(candidate)
+                else None
+            )
+            authority_gap = native_named_authority_gap(candidate, ledger)
+            if gap is not None:
+                return gap
+            if authority_gap is not None:
+                return ToolOutcome(
+                    status=OutcomeStatus.PARTIAL,
+                    summary="An unresolved answer cannot assert an unsupported statutory result.",
+                    data=authority_gap,
+                )
+            child_partial = candidate
+            return ToolOutcome(
+                status=OutcomeStatus.PARTIAL,
+                summary="Supported partial answer and precise source gap retained.",
+            )
+
+        if independent:
+            child_registry.register(
+                ToolSpec(
+                    name="submit_partial_answer",
+                    description="Finish this question with supported parts and its precise unresolved source gap. Preserve available detail and original citations. Missing source text is not proof that no rule exists.",
+                    parameters={
+                        "type": "object",
+                        "properties": {"answer": {"type": "string", "minLength": 1}},
+                        "required": ["answer"],
+                        "additionalProperties": False,
+                    },
+                    handler=submit_child_partial,
+                    parallel_safe=False,
+                    consumes_tool_budget=False,
+                )
+            )
+        child_harness = Harness(
             request=task,
             context=child,
-            registry=registry,
+            registry=child_registry,
             decide=researcher_model.decide,
             evidence=ledger,
             on_receipt=record,
             progress=progress,
             report_terminal=False,
             max_workers=2,
-        ).run()
+            draft_guard=(
+                lambda answer: source_publication_gap(
+                    answer, researcher_model.last_call_id
+                )
+            )
+            if independent
+            else None,
+            partial_submission=lambda: child_partial,
+        )
+        if independent:
+            for spec in build_core_specs(
+                child_registry, ledger, child_harness.snapshot
+            ):
+                child_registry.register(spec)
+        result = child_harness.run()
         return ToolOutcome(
             status=result.status,
-            summary=(result.answer or "Research incomplete")[:12000],
+            summary=result.answer or ""
+            if independent
+            else (result.answer or "Research incomplete")[:12000],
             data={
                 "evidence_numbers": sorted(
                     {n for receipt in result.receipts for n in receipt.evidence_ids}
@@ -544,7 +628,8 @@ def run_asv3_loop(
             },
         )
 
-    workers = WorkerPool(context, researcher, progress=progress)
+    workers = WorkerPool(context, researcher, progress=progress, max_tasks=24)
+    question_research = QuestionResearch(context, workers, initial_questions(question))
     context.services["registry"] = registry
     external_specs = build_external_specs(
         tools,
@@ -555,13 +640,17 @@ def run_asv3_loop(
         ),
     )
     external_names = {spec.name for spec in external_specs}
-    for spec in (
+    common_specs = (
         build_corpus_specs(broker, require_search_targets=True)
         + build_source_specs(broker)
         + build_sandbox_specs(broker)
         + external_specs
-        + workers.tool_specs()
         + build_supplemental_specs()
+    )
+    for spec in (
+        common_specs
+        + workers.tool_specs()
+        + question_research.tool_specs()
         + build_research_specs(research_state, ledger)
     ):
         registry.register(spec)
@@ -572,10 +661,10 @@ def run_asv3_loop(
 
     def ask_user(args: dict[str, JsonValue], child: RunContext) -> ToolOutcome:
         nonlocal clarification
-        if child.depth:
+        if child.depth or question_research.answers:
             return ToolOutcome(
                 status=OutcomeStatus.DENIED,
-                summary="Return the missing user fact to the coordinator; only it can request clarification.",
+                summary="Preserve completed independent answers; retain a precise missing fact beside its conditional outcome.",
             )
         text = str(args["question"]).strip()
         if not public_narration_valid("Clarification", text, context):
@@ -606,7 +695,9 @@ def run_asv3_loop(
         )
     )
 
-    def publication_guard(answer: str) -> ToolOutcome | None:
+    def source_publication_gap(
+        answer: str, model_call_id: str | None
+    ) -> ToolOutcome | None:
         numbers = extract_citation_numbers(answer)
         unknown = sorted(set(numbers) - ledger.citation_mapping().keys())
         if unknown:
@@ -615,7 +706,7 @@ def run_asv3_loop(
                 summary="Use recorded original citation numbers.",
                 data={"unknown_citations": unknown},
             )
-        delivered = ledger.completely_delivered(model.last_call_id or "")
+        delivered = ledger.completely_delivered(model_call_id or "")
         undelivered = [n for n in numbers if n not in delivered]
         if undelivered:
             return ToolOutcome(
@@ -638,6 +729,36 @@ def run_asv3_loop(
             )
         return None
 
+    def publication_guard(
+        answer: str, *, host_gap_assembly: bool = False
+    ) -> ToolOutcome | None:
+        if context.services.get("independent_question_mode") is True:
+            gap = question_research.preservation_gap(answer)
+            if gap is not None:
+                return gap
+        if (
+            host_gap_assembly
+            and not extract_citation_numbers(answer)
+            and question_research.answers
+            and all(
+                item.get("status") != OutcomeStatus.FOUND.value
+                for item in question_research.answers
+            )
+        ):
+            authority_gap = native_named_authority_gap(answer, ledger)
+            if authority_gap is not None:
+                return ToolOutcome(
+                    status=OutcomeStatus.PARTIAL,
+                    summary="An unresolved answer cannot assert an unsupported statutory result.",
+                    data=authority_gap,
+                )
+            return None
+        return source_publication_gap(answer, model.last_call_id)
+
+    question_research.publish_guard = lambda answer: publication_guard(
+        answer, host_gap_assembly=True
+    )
+
     def submit_partial(args: dict[str, JsonValue], child: RunContext) -> ToolOutcome:
         nonlocal partial
         if child.depth:
@@ -649,6 +770,7 @@ def run_asv3_loop(
         gap = (
             publication_guard(candidate)
             if extract_citation_numbers(candidate)
+            or context.services.get("independent_question_mode") is True
             else None
         )
         if gap is None:
@@ -718,6 +840,7 @@ def run_asv3_loop(
 
     try:
         if previous is not None:
+            question_research.restore(previous.get("question_research"))
             harness.restore(previous)
             harness.publication_gap = None
             revalidate(
@@ -743,7 +866,7 @@ def run_asv3_loop(
             or profile.notifications["failed"][1]
         ).strip()
         publication_status = (
-            OutcomeStatus.FOUND
+            result.status
             if result.answer and not clarification and not partial
             else OutcomeStatus.PARTIAL
         )

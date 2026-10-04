@@ -7,10 +7,9 @@ import jsonschema
 import pytest
 from pydantic import JsonValue
 
-from onyx.asv3 import runtime
 from onyx.asv3.models import RunContext
 from onyx.asv3.registry import CapabilityRegistry
-from tests.unit.onyx.asv3.test_runtime import setup_run
+from tests.unit.onyx.asv3.test_runtime import run_independent, setup_run
 
 
 def test_native_catalogue_preserves_every_capability_and_validation_without_repeating_metadata_descriptions(
@@ -29,7 +28,9 @@ def test_native_catalogue_preserves_every_capability_and_validation_without_repe
         legacy = definitions(registry, legacy_context)
         native_tools = cast(list[dict[str, Any]], native)
         legacy_tools = cast(list[dict[str, Any]], legacy)
-        assert len(native) == len(legacy) == 35
+        assert len(native) == len(legacy)
+        if context.depth == 0:
+            assert len(native) == 37
         assert [row["function"]["name"] for row in native_tools] == [
             row["function"]["name"] for row in legacy_tools
         ]
@@ -81,6 +82,5 @@ def test_native_catalogue_preserves_every_capability_and_validation_without_repe
         return native
 
     monkeypatch.setattr(CapabilityRegistry, "definitions", compare)
-    runtime.run_asv3_loop(**kwargs)
-    assert examined and set(examined) == {35}
-    assert llm.invoke.call_count == 2
+    run_independent(**kwargs)
+    assert examined and 37 in examined
