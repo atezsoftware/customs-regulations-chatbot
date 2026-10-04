@@ -88,7 +88,11 @@ class Harness:
         self._pending_calls: dict[str, dict[str, JsonValue]] = {}
         self._progress_calls: set[str] = set()
         self._completed_reads: dict[str, ToolReceipt] = {}
-        self.evidence_working_set = EvidenceWorkingSet()
+        self.evidence_working_set = EvidenceWorkingSet(
+            max_ranges=None
+            if self.context.services.get("lean_native_mode") is True
+            else 128
+        )
         self.working_memory = WorkingMemory(self.context.scope)
         self.context.services["working_memory"] = self.working_memory
         self.context.services["registry"] = registry
@@ -297,7 +301,12 @@ class Harness:
             )
         )
         originals = self.evidence_working_set.view(
-            self.evidence, preferred=preferred, required=required
+            self.evidence,
+            preferred=preferred,
+            required=required,
+            max_chars=None
+            if self.context.services.get("lean_native_mode") is True
+            else 32000,
         )
         # Receipts retain structured IDs/status while evidence is separately addressable.
         receipts: list[ToolReceipt] = []
