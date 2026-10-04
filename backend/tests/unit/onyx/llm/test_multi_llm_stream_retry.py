@@ -99,12 +99,14 @@ def test_stream_does_not_retry_after_first_chunk() -> None:
     mock_logger.warning.assert_not_called()
 
 
-def test_real_llm_retries_timeout_deferred_until_first_chunk() -> None:
+@pytest.mark.parametrize("seed", [None, 0, -(2**31)])
+def test_real_llm_retries_timeout_deferred_until_first_chunk(seed: int | None) -> None:
     llm = LitellmLLM(
         api_key="test-key",
         model_provider="vertex_ai",
         model_name="gemini-3.8-flash",
         max_input_tokens=100000,
+        seed=seed,
     )
     attempt_count = 0
 
@@ -116,7 +118,9 @@ def test_real_llm_retries_timeout_deferred_until_first_chunk() -> None:
         yield object()
 
     with (
-        patch("onyx.llm.litellm_singleton.litellm.completion", side_effect=completion),
+        patch(
+            "onyx.llm.litellm_singleton.litellm.completion", side_effect=completion
+        ) as provider,
         patch("onyx.llm.multi_llm.LLM_FIRST_CHUNK_MAX_RETRIES", 1),
         patch("onyx.llm.multi_llm.time.sleep"),
         patch(
@@ -128,3 +132,9 @@ def test_real_llm_retries_timeout_deferred_until_first_chunk() -> None:
 
     assert [result.choice.delta.content for result in results] == ["hello"]
     assert attempt_count == 2
+    for call in provider.call_args_list:
+        if seed is None:
+            assert "seed" not in call.kwargs
+        else:
+            assert call.kwargs["seed"] == seed
+        assert "top_p" not in call.kwargs

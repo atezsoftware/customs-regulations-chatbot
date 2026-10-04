@@ -725,3 +725,90 @@ def test_llm_from_provider_never_sets_ollama_num_ctx_for_non_ollama_provider() -
         kwargs = mock_get_llm.call_args.kwargs
         assert kwargs["max_input_tokens"] == 16384
         assert kwargs["model_kwargs"] == {}
+
+
+@pytest.mark.parametrize("seed", [None, 0, -(2**31), 2**31 - 1])
+def test_seed_override_round_trip_and_factory_transport(seed: int | None) -> None:
+    override = LLMOverride.model_validate({"seed": seed})
+    assert LLMOverride.model_validate_json(override.model_dump_json()).seed == seed
+    with patch("onyx.llm.factory.LitellmLLM") as constructor:
+        get_llm(
+            provider=LlmProviderNames.VERTEX_AI,
+            model="gemini-3.8-flash",
+            max_input_tokens=100_000,
+            deployment_name=None,
+            seed=override.seed,
+        )
+    assert constructor.call_args.kwargs["seed"] == seed
+    assert "top_p" not in constructor.call_args.kwargs
+
+
+@pytest.mark.parametrize("seed", [True, False, "0", 0.0, -(2**31) - 1, 2**31])
+def test_seed_override_rejects_non_integer_and_out_of_range_values(
+    seed: object,
+) -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        LLMOverride.model_validate({"seed": seed})
+
+
+@pytest.mark.parametrize(
+    "route", ["no_persona", "no_configuration", "missing", "denied", "selected"]
+)
+def test_persona_seed_override_reaches_selected_provider_or_default(route: str) -> None:
+    persona = (
+        None
+        if route == "no_persona"
+        else cast(
+            Persona,
+            SimpleNamespace(
+                id=1,
+                default_model_configuration_id=None
+                if route == "no_configuration"
+                else 17,
+            ),
+        )
+    )
+    provider = MagicMock()
+    selected = None if route == "missing" else (provider, "gemini-3.8-flash")
+    user = cast(User, SimpleNamespace(id="user-1", role="admin"))
+    with (
+        patch("onyx.llm.factory.get_session_with_current_tenant"),
+        patch("onyx.llm.factory._resolve_provider_and_model", return_value=selected),
+        patch("onyx.llm.factory.fetch_user_group_ids", return_value=set()),
+        patch(
+            "onyx.llm.factory.can_user_access_llm_provider",
+            return_value=route != "denied",
+        ),
+        patch("onyx.llm.factory.LLMProviderView.from_model", return_value=provider),
+        patch("onyx.llm.factory.get_default_llm") as default,
+        patch("onyx.llm.factory.llm_from_provider") as configured,
+    ):
+        get_llm_for_persona(
+            persona=persona, user=user, llm_override=LLMOverride(seed=0)
+        )
+    factory = configured if route == "selected" else default
+    other_factory = default if route == "selected" else configured
+    factory.assert_called_once()
+    other_factory.assert_not_called()
+    assert factory.call_args.kwargs["seed"] == 0
+    assert "top_p" not in factory.call_args.kwargs
+
+
+def test_default_provider_factory_carries_seed_into_instance() -> None:
+    from onyx.llm.factory import get_default_llm
+
+    provider = _build_provider_view(
+        provider=LlmProviderNames.VERTEX_AI,
+        max_input_tokens=100_000,
+    )
+    model = SimpleNamespace(name="test-model", llm_provider=provider)
+    with (
+        patch("onyx.llm.factory.get_session_with_current_tenant"),
+        patch("onyx.llm.factory.fetch_default_llm_model", return_value=model),
+        patch("onyx.llm.factory.LLMProviderView.from_model", return_value=provider),
+    ):
+        llm = get_default_llm(seed=0, temperature=0)
+    assert llm.config.seed == 0
+    assert llm.config.temperature == 0
