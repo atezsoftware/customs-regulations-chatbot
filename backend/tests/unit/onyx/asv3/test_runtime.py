@@ -301,6 +301,7 @@ def test_native_parallel_originals_preserve_selected_provider_and_publish_withou
         assert call.kwargs["prompt"][0].content == COORDINATOR_PROMPT
         assert call.kwargs["structured_response_format"] is None
         assert call.kwargs["timeout_override"] is None
+        assert call.kwargs["reasoning_effort"] is ReasoningEffort.HIGH
         assert (
             user_payload(call.kwargs["prompt"][1])["assistant_instructions"]
             == kwargs["custom_agent_prompt"]
@@ -318,6 +319,7 @@ def test_native_parallel_originals_preserve_selected_provider_and_publish_withou
     assert [result["tool_call_id"] for result in turn["results"]] == [
         call["id"] for call in turn["assistant"]["tool_calls"]
     ]
+
     assert [call["function"]["name"] for call in turn["assistant"]["tool_calls"]] == [
         "read_source_range",
         "read_source_range",
@@ -342,6 +344,35 @@ def test_native_parallel_originals_preserve_selected_provider_and_publish_withou
         i
         for i, packet in enumerate(output)
         if isinstance(packet.obj, (AgentResponseDelta, CitationInfo))
+    )
+
+
+@pytest.mark.parametrize(
+    "effort,question,expected",
+    [
+        (ReasoningEffort.OFF, None, ReasoningEffort.OFF),
+        (ReasoningEffort.LOW, None, ReasoningEffort.LOW),
+        (ReasoningEffort.MEDIUM, None, ReasoningEffort.MEDIUM),
+        (ReasoningEffort.HIGH, None, ReasoningEffort.HIGH),
+        (ReasoningEffort.XHIGH, None, ReasoningEffort.XHIGH),
+        (ReasoningEffort.AUTO, "Merhaba!", ReasoningEffort.AUTO),
+    ],
+)
+def test_native_research_preserves_explicit_effort_and_source_free_default(
+    monkeypatch: pytest.MonkeyPatch,
+    effort: ReasoningEffort,
+    question: str | None,
+    expected: ReasoningEffort,
+) -> None:
+    kwargs, _broker, llm, _checkpoints, _queue = setup_run(monkeypatch)
+    kwargs["reasoning_effort"] = effort
+    if question is not None:
+        kwargs["simple_chat_history"][0].message = question
+    runtime.run_asv3_loop(**kwargs)
+    assert llm.invoke.call_count == 2
+    assert all(
+        call.kwargs["reasoning_effort"] is expected
+        for call in llm.invoke.call_args_list
     )
 
 
