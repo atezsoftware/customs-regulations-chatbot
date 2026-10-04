@@ -3020,3 +3020,255 @@ def test_ui_only_keys_never_injected_or_warned(
             llm.invoke([UserMessage(content="Hi")])
         assert env_during_call["BEDROCK_AUTH_METHOD"] is None
         mock_warn.assert_not_called()
+
+
+def _seeded_vertex_llm(
+    seed: int | None, model_kwargs: dict[str, Any] | None = None
+) -> LitellmLLM:
+    return LitellmLLM(
+        api_key=None,
+        model_provider=LlmProviderNames.VERTEX_AI,
+        model_name="gemini-3.8-flash",
+        max_input_tokens=100_000,
+        temperature=0,
+        seed=seed,
+        model_kwargs=model_kwargs,
+    )
+
+
+def _seed_test_response() -> litellm.ModelResponse:
+    return litellm.ModelResponse(
+        id="seed-test",
+        model="gemini-3.8-flash",
+        choices=[
+            litellm.Choices(
+                message=litellm.Message(
+                    role="assistant", content="source-backed result"
+                ),
+                finish_reason="stop",
+                index=0,
+            )
+        ],
+    )
+
+
+def test_explicit_seed_preserves_gemini_sampling_and_provider_parameters() -> None:
+    inputs: LanguageModelInput = [
+        UserMessage(content="Read the applicable operative conditions.")
+    ]
+    snapshots: list[dict[str, Any]] = []
+    for seed in [None, 0, -(2**31), 2**31 - 1]:
+        llm = _seeded_vertex_llm(seed)
+        with (
+            patch(
+                "litellm.completion", return_value=_seed_test_response()
+            ) as completion,
+            patch("onyx.llm.multi_llm.record_llm_request_params") as record_params,
+        ):
+            response = llm.invoke(
+                inputs, use_streaming=False, reasoning_effort=ReasoningEffort.HIGH
+            )
+        assert response.choice.message.content == "source-backed result"
+        assert llm.config.seed == seed
+        kwargs = dict(completion.call_args.kwargs)
+        assert kwargs["temperature"] == 1
+        assert "top_p" not in kwargs
+        if seed is None:
+            assert "seed" not in kwargs
+            assert "seed" not in record_params.call_args.args[0]["sent_kwargs"]
+            assert "requested_seed" not in record_params.call_args.args[0]
+        else:
+            assert kwargs.pop("seed") == seed
+            assert record_params.call_args.args[0]["sent_kwargs"]["seed"] == seed
+            assert record_params.call_args.args[0]["requested_seed"] == seed
+            mapped = litellm.VertexGeminiConfig().map_openai_params(
+                {"seed": seed}, {}, "gemini-3.8-flash", False
+            )
+            assert mapped["seed"] == seed
+            assert "top_p" not in mapped
+        snapshots.append(kwargs)
+    assert all(snapshot == snapshots[0] for snapshot in snapshots)
+
+
+def test_seed_isolation_across_concurrent_instances_and_subsequent_calls() -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    llms = {
+        "first": _seeded_vertex_llm(0),
+        "second": _seeded_vertex_llm(73),
+        "default": _seeded_vertex_llm(None),
+    }
+    labels = [(name, stage) for name in llms for stage in range(4)]
+    with patch("litellm.completion", return_value=_seed_test_response()) as completion:
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = [
+                pool.submit(
+                    llms[name].invoke,
+                    UserMessage(content=f"{name}:{stage}"),
+                    use_streaming=False,
+                )
+                for name, stage in labels
+            ]
+            for future in futures:
+                assert future.result().choice.message.content == "source-backed result"
+    assert completion.call_count == len(labels)
+    for call in completion.call_args_list:
+        kwargs = call.kwargs
+        name = kwargs["messages"][0]["content"].split(":")[0]
+        if name == "default":
+            assert "seed" not in kwargs
+        else:
+            assert kwargs["seed"] == llms[name].config.seed
+        assert kwargs["temperature"] == 1
+        assert "top_p" not in kwargs
+
+
+@pytest.mark.parametrize("supported", [None, ["temperature"]])
+def test_unsupported_explicit_seed_fails_before_provider_call(
+    supported: list[str] | None,
+) -> None:
+    llm = _seeded_vertex_llm(0)
+    with (
+        patch("litellm.get_supported_openai_params", return_value=supported),
+        patch("litellm.completion") as completion,
+        pytest.raises(ValueError, match="does not support an explicit seed"),
+    ):
+        llm.invoke([UserMessage(content="Inspect sources.")], use_streaming=False)
+    completion.assert_not_called()
+
+
+def test_explicit_seed_survives_provider_reasoning_retry() -> None:
+    from litellm.exceptions import BadRequestError
+
+    llm = _seeded_vertex_llm(0)
+    error = BadRequestError(
+        "reasoning_effort unsupported", "gemini-3.8-flash", "vertex_ai"
+    )
+    with patch(
+        "litellm.completion", side_effect=[error, _seed_test_response()]
+    ) as completion:
+        llm.invoke(
+            [UserMessage(content="Inspect sources.")],
+            use_streaming=False,
+            reasoning_effort=ReasoningEffort.HIGH,
+        )
+    assert completion.call_count == 2
+    for call in completion.call_args_list:
+        assert call.kwargs["seed"] == 0
+        assert "top_p" not in call.kwargs
+    assert "reasoning_effort" in completion.call_args_list[0].kwargs
+    assert "reasoning_effort" not in completion.call_args_list[1].kwargs
+
+
+def test_seed_rejection_does_not_fall_back_even_when_sampling_is_also_named() -> None:
+    from litellm.exceptions import BadRequestError
+
+    llm = _seeded_vertex_llm(0)
+    error = BadRequestError(
+        "seed and temperature unsupported", "gemini-3.8-flash", "vertex_ai"
+    )
+    with (
+        patch("litellm.completion", side_effect=error) as completion,
+        pytest.raises(BadRequestError),
+    ):
+        llm.invoke([UserMessage(content="Inspect sources.")], use_streaming=False)
+    assert completion.call_count == 1
+    assert completion.call_args.kwargs["seed"] == 0
+
+
+def test_explicit_seed_keeps_existing_top_p_and_does_not_mutate_shared_kwargs() -> None:
+    model_kwargs = {"top_p": 0.89, "seed": 41}
+    llm = _seeded_vertex_llm(0, model_kwargs=model_kwargs)
+    default = _seeded_vertex_llm(None, model_kwargs=model_kwargs)
+    with patch("litellm.completion", return_value=_seed_test_response()) as completion:
+        llm.invoke([UserMessage(content="Inspect sources.")], use_streaming=False)
+        default.invoke([UserMessage(content="Inspect sources.")], use_streaming=False)
+    assert completion.call_args_list[0].kwargs["seed"] == 0
+    assert completion.call_args_list[1].kwargs["seed"] == 41
+    assert all(call.kwargs["top_p"] == 0.89 for call in completion.call_args_list)
+    assert model_kwargs["seed"] == 41
+    assert model_kwargs["top_p"] == 0.89
+
+
+def test_provider_drop_configuration_cannot_remove_explicit_seed() -> None:
+    llm = _seeded_vertex_llm(0, model_kwargs={"additional_drop_params": ["seed"]})
+    with (
+        patch("litellm.completion") as completion,
+        pytest.raises(ValueError, match="cannot be dropped"),
+    ):
+        llm.invoke([UserMessage(content="Inspect sources.")], use_streaming=False)
+    completion.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "model_kwargs",
+    [
+        {"extra_body": {"seed": 41}},
+        {"extra_body": {"seed": 0}},
+        {"extra_body": {"generationConfig": {"seed": 41}}},
+        {"extra_body": {"generation_config": {"seed": 41}}},
+        {"generationConfig": {"seed": 41}},
+        {"extra_body": {"generationConfig": None}},
+        {"extra_body": {"generation_config": []}},
+        {"extra_body": "invalid"},
+    ],
+)
+def test_nested_provider_config_cannot_override_or_remove_explicit_seed(
+    model_kwargs: dict[str, Any],
+) -> None:
+    llm = _seeded_vertex_llm(0, model_kwargs=model_kwargs)
+    with (
+        patch("litellm.completion") as completion,
+        pytest.raises(ValueError, match="explicit seed"),
+    ):
+        llm.invoke([UserMessage(content="Inspect sources.")], use_streaming=False)
+    completion.assert_not_called()
+
+
+def test_nonconflicting_generation_config_preserves_seed_and_shared_config() -> None:
+    model_kwargs = {"extra_body": {"generationConfig": {"topP": 0.89}}}
+    llm = _seeded_vertex_llm(0, model_kwargs=model_kwargs)
+    with patch("litellm.completion", return_value=_seed_test_response()) as completion:
+        llm.invoke([UserMessage(content="Inspect sources.")], use_streaming=False)
+    assert completion.call_args.kwargs["seed"] == 0
+    assert completion.call_args.kwargs["extra_body"] == model_kwargs["extra_body"]
+    assert model_kwargs["extra_body"] == {"generationConfig": {"topP": 0.89}}
+
+
+@pytest.mark.parametrize("model", ["gpt-4o", "gpt-5.4"])
+def test_responses_bridge_rejects_seed_before_provider_call(model: str) -> None:
+    llm = LitellmLLM(
+        api_key="test_key",
+        model_provider=LlmProviderNames.OPENAI,
+        model_name=model,
+        max_input_tokens=100_000,
+        seed=0,
+    )
+    with (
+        patch("litellm.completion") as completion,
+        pytest.raises(ValueError, match="Responses API does not support"),
+    ):
+        llm.invoke([UserMessage(content="Inspect sources.")], use_streaming=False)
+    completion.assert_not_called()
+
+
+def test_explicit_responses_surface_rejects_seed_before_provider_call() -> None:
+    from onyx.llm.well_known_providers.constants import (
+        PORTKEY_API_MODE_CONFIG_KEY,
+        PORTKEY_API_MODE_RESPONSES,
+    )
+
+    llm = LitellmLLM(
+        api_key="test_key",
+        model_provider=LlmProviderNames.PORTKEY,
+        model_name="configured-route",
+        max_input_tokens=100_000,
+        custom_config={PORTKEY_API_MODE_CONFIG_KEY: PORTKEY_API_MODE_RESPONSES},
+        seed=0,
+    )
+    with (
+        patch("litellm.completion") as completion,
+        pytest.raises(ValueError, match="Responses API does not support"),
+    ):
+        llm.invoke([UserMessage(content="Inspect sources.")], use_streaming=False)
+    completion.assert_not_called()

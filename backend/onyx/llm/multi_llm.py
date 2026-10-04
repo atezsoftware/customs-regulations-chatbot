@@ -9,6 +9,7 @@ from functools import lru_cache
 from itertools import chain
 from typing import TYPE_CHECKING, Any, Union, cast
 
+from pydantic import TypeAdapter
 from readerwriterlock import rwlock
 
 from onyx.configs.app_configs import (
@@ -54,6 +55,7 @@ from onyx.llm.models import (
     ANTHROPIC_REASONING_EFFORT_BUDGET,
     OPENAI_REASONING_EFFORT,
 )
+from onyx.llm.override_models import LLMSeed
 from onyx.llm.request_context import get_llm_mock_response
 from onyx.llm.utils import build_litellm_passthrough_kwargs
 from onyx.llm.well_known_providers.constants import VERTEX_LOCATION_KWARG
@@ -422,6 +424,7 @@ class LitellmLLM(LLM):
         extra_headers: dict[str, str] | None = None,
         extra_body: dict | None = LITELLM_EXTRA_BODY,
         model_kwargs: dict[str, Any] | None = None,
+        seed: int | None = None,
     ):
         # Timeout in seconds for each socket read operation (i.e., max time between
         # receiving data chunks/tokens). This is NOT a total request timeout - a
@@ -433,6 +436,9 @@ class LitellmLLM(LLM):
             self._timeout = LLM_SOCKET_READ_TIMEOUT
 
         self._temperature = GEN_AI_TEMPERATURE if temperature is None else temperature
+        self._seed = (
+            TypeAdapter(LLMSeed).validate_python(seed) if seed is not None else None
+        )
 
         self._model_provider = model_provider
         self._model_version = model_name
@@ -685,6 +691,20 @@ class LitellmLLM(LLM):
         else:
             model = f"{model_provider}/{model_bare}"
 
+        if self._seed is not None:
+            if is_openai_model or self._api_surface is LlmApiSurface.OPENAI_RESPONSES:
+                raise ValueError(
+                    "The selected Responses API does not support an explicit seed."
+                )
+            supported_params = litellm.get_supported_openai_params(
+                model=model, custom_llm_provider=self._custom_llm_provider
+            )
+            if supported_params is None or "seed" not in supported_params:
+                raise ValueError(
+                    "The selected provider/model does not support an explicit seed."
+                )
+            optional_kwargs["seed"] = self._seed
+
         # Tool choice
         # Downgrade tool_choice=required to AUTO for models that mishandle it:
         # Claude skips reasoning when it's set, and Qwen thinking models reject
@@ -835,6 +855,32 @@ class LitellmLLM(LLM):
             model_kwargs=self._model_kwargs,
             user_identity=user_identity,
         )
+        if self._seed is not None:
+            if "seed" in (passthrough_kwargs.get("additional_drop_params") or []):
+                raise ValueError(
+                    "An explicit seed cannot be dropped by provider configuration."
+                )
+            passthrough_kwargs = dict(passthrough_kwargs)
+            passthrough_kwargs.pop("seed", None)
+            extra_body = passthrough_kwargs.get("extra_body")
+            if extra_body is not None and not isinstance(extra_body, dict):
+                raise ValueError("An explicit seed requires an object extra_body.")
+            if isinstance(extra_body, dict) and "seed" in extra_body:
+                raise ValueError("An explicit seed cannot be overridden by extra_body.")
+            for config_scope in (passthrough_kwargs, extra_body):
+                if not isinstance(config_scope, dict):
+                    continue
+                for config_key in ("generationConfig", "generation_config"):
+                    if config_key not in config_scope:
+                        continue
+                    generation_config = config_scope[config_key]
+                    if (
+                        not isinstance(generation_config, dict)
+                        or "seed" in generation_config
+                    ):
+                        raise ValueError(
+                            "An explicit seed cannot be overridden by generation config."
+                        )
 
         # OpenRouter: inject session_id and user into extra_body.
         #
@@ -984,9 +1030,16 @@ class LitellmLLM(LLM):
                     {
                         "reasoning_effort": reasoning_effort.value,
                         "max_tokens": max_tokens,
+                        **(
+                            {"requested_seed": self._seed}
+                            if self._seed is not None
+                            else {}
+                        ),
                         "sent_kwargs": {
                             k: opts[k]
-                            for k in sorted(_BEST_EFFORT_KWARG_KEYS & opts.keys())
+                            for k in sorted(
+                                (_BEST_EFFORT_KWARG_KEYS | {"seed"}) & opts.keys()
+                            )
                         },
                     }
                 )
@@ -1021,6 +1074,8 @@ class LitellmLLM(LLM):
                         }
                         return chain((first_chunk,), chunks)
                 except BadRequestError as e:
+                    if self._seed is not None and "seed" in str(e).lower():
+                        raise
                     if i == len(attempts) - 1:
                         raise
                     # Only retry rejections a later attempt can strip away.
@@ -1051,6 +1106,7 @@ class LitellmLLM(LLM):
             model_provider=self._model_provider,
             model_name=self._model_version,
             temperature=self._temperature,
+            seed=self._seed,
             api_key=self._api_key,
             api_base=self._api_base,
             api_version=self._api_version,

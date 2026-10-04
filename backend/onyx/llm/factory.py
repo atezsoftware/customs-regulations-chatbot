@@ -208,6 +208,7 @@ def get_llm_for_persona(
     provider_id_override = llm_override.model_provider_id if llm_override else None
     model_version_override = llm_override.model_version if llm_override else None
     temperature_override = llm_override.temperature if llm_override else None
+    seed_override = llm_override.seed if llm_override else None
     has_model_selection_override = bool(
         provider_id_override
         or provider_name_override
@@ -222,7 +223,7 @@ def get_llm_for_persona(
                 "The selected language model is unavailable.",
             )
         logger.warning("No persona provided, using default LLM")
-        return get_default_llm()
+        return get_default_llm(seed=seed_override)
 
     if (
         not provider_name_override
@@ -237,6 +238,7 @@ def get_llm_for_persona(
             )
         return get_default_llm(
             temperature=temperature_override or GEN_AI_TEMPERATURE,
+            seed=seed_override,
             additional_headers=additional_headers,
         )
 
@@ -261,6 +263,7 @@ def get_llm_for_persona(
                     if temperature_override is not None
                     else GEN_AI_TEMPERATURE
                 ),
+                seed=seed_override,
                 additional_headers=additional_headers,
             )
         provider_model, model = resolved
@@ -283,6 +286,7 @@ def get_llm_for_persona(
                 )
             return get_default_llm(
                 temperature=temperature_override or GEN_AI_TEMPERATURE,
+                seed=seed_override,
                 additional_headers=additional_headers,
             )
 
@@ -292,6 +296,7 @@ def get_llm_for_persona(
         model_name=model,
         llm_provider=llm_provider,
         temperature=temperature_override,
+        seed=seed_override,
         additional_headers=additional_headers,
     )
 
@@ -300,6 +305,7 @@ def get_default_llm_with_vision(
     timeout: int | None = None,
     temperature: float | None = None,
     additional_headers: dict[str, str] | None = None,
+    seed: int | None = None,
 ) -> LLM | None:
     """Get an LLM that supports image input, with the following priority:
     1. Use the designated default vision provider if it exists and supports image input
@@ -315,6 +321,7 @@ def get_default_llm_with_vision(
             llm_provider=provider,
             timeout=timeout,
             temperature=temperature,
+            seed=seed,
             additional_headers=additional_headers,
         )
 
@@ -403,6 +410,7 @@ def llm_from_provider(
     timeout: int | None = None,
     temperature: float | None = None,
     additional_headers: dict[str, str] | None = None,
+    seed: int | None = None,
 ) -> LLM:
     configured_max_input_tokens = _get_model_configured_max_input_tokens(
         llm_provider=llm_provider, model_name=model_name
@@ -428,6 +436,7 @@ def llm_from_provider(
         custom_config=llm_provider.custom_config,
         timeout=timeout,
         temperature=temperature,
+        seed=seed,
         additional_headers=additional_headers,
         max_input_tokens=max_input_tokens,
         model_kwargs=model_kwargs,
@@ -466,6 +475,7 @@ def get_default_llm(
     timeout: int | None = None,
     temperature: float | None = None,
     additional_headers: dict[str, str] | None = None,
+    seed: int | None = None,
 ) -> LLM:
     with get_session_with_current_tenant() as db_session:
         model = fetch_default_llm_model(db_session)
@@ -478,6 +488,7 @@ def get_default_llm(
             llm_provider=LLMProviderView.from_model(model.llm_provider),
             timeout=timeout,
             temperature=temperature,
+            seed=seed,
             additional_headers=additional_headers,
         )
 
@@ -495,6 +506,7 @@ def get_llm(
     timeout: int | None = None,
     additional_headers: dict[str, str] | None = None,
     model_kwargs: dict[str, Any] | None = None,
+    seed: int | None = None,
 ) -> LLM:
     if temperature is None:
         temperature = GEN_AI_TEMPERATURE
@@ -516,6 +528,7 @@ def get_llm(
         api_version=api_version,
         timeout=timeout,
         temperature=temperature,
+        seed=seed,
         custom_config=custom_config,
         extra_headers=extra_headers,
         model_kwargs=model_kwargs or {},

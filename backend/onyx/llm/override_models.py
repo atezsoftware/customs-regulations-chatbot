@@ -4,7 +4,11 @@ NOTE: these models are used in many places, so have to be
 kepy in a separate file to avoid circular imports.
 """
 
-from pydantic import BaseModel
+from typing import Annotated
+
+from pydantic import BaseModel, Field
+
+LLMSeed = Annotated[int, Field(strict=True, ge=-(2**31), le=2**31 - 1)]
 
 
 class LLMOverride(BaseModel):
@@ -27,6 +31,8 @@ class LLMOverride(BaseModel):
             When ``None``, the persona's default model is used.
         temperature: Sampling temperature in ``[0, 2]``. When ``None``, the
             persona's default temperature is used.
+        seed: Optional signed 32-bit sampling seed. Support depends on the
+            provider and model; ``None`` preserves their default behavior.
         display_name: Human-readable label shown in the UI for this model,
             e.g. ``"GPT-4 Turbo"``. Optional; falls back to ``model_version``
             when not set.
@@ -37,6 +43,7 @@ class LLMOverride(BaseModel):
     model_provider_id: int | None = None
     model_version: str | None = None
     temperature: float | None = None
+    seed: LLMSeed | None = None
     display_name: str | None = None
 
     # This disables the "model_" protected namespace for pydantic

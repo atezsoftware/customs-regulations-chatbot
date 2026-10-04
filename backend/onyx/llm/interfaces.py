@@ -6,6 +6,7 @@ from pydantic import BaseModel
 
 from onyx.llm.model_response import ModelResponse, ModelResponseStream
 from onyx.llm.models import LanguageModelInput, ReasoningEffort, ToolChoiceOptions
+from onyx.llm.override_models import LLMSeed
 from onyx.llm.tracing_wrap import wrap_invoke, wrap_stream
 from onyx.utils.logger import setup_logger
 
@@ -21,6 +22,7 @@ class LLMConfig(BaseModel):
     model_provider: str
     model_name: str
     temperature: float
+    seed: LLMSeed | None = None
     api_key: str | None = None
     api_base: str | None = None
     api_version: str | None = None
