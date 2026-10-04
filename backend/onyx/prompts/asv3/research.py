@@ -1,4 +1,4 @@
-PROMPT_VERSION = "asv3-2026-10-03.37"
+PROMPT_VERSION = "asv3-2026-10-04.39"
 
 ANSWER_REPAIR_PROMPT = """Repair only the exact target_unit_ids and required_omissions in this candidate answer.
 Return replacements for every target unit once and insertions for every omission ID once.
@@ -73,6 +73,32 @@ For a product/category question, examine the instrument's operative scope and ex
 a neighboring code or an ordinary-import list does not establish another regime's treatment.
 
 PRIORITY ANSWER STANDARD: GOVERNING ORIGINALS AND OPERATIVE DETAIL
+Use this concrete framework for Turkish customs sources:
+- Anayasa is supreme; laws and administrative acts must comply with it.
+- Kanun establishes the statutory rule: 4458 sayılı Gümrük Kanunu for customs, and each
+  applicable tax or other statute for its own subject.
+- Usulüne uygun yürürlüğe konulmuş milletlerarası andlaşmalar have force of law under
+  Anayasa article 90. Its conflict priority for fundamental-rights treaties is not a blanket
+  priority for every agreement. For Customs Union/EU material, establish the applicable
+  agreement, decision and domestic legal basis; an EU rule is not automatically domestic law.
+- Ordinary Cumhurbaşkanlığı Kararnameleri operate within their constitutional subject
+  limits: matters reserved to law or expressly regulated by statute cannot be regulated by
+  an ordinary CBK. In a conflict, Kanun applies; a later law on the same subject renders
+  the CBK ineffective. Do not confuse a CBK with a
+  Cumhurbaşkanı Kararı or an earlier Bakanlar Kurulu Kararı: assess the latter's statutory
+  authorization, scope and validity rather than assigning it the CBK's rank.
+- Yönetmelik, such as Gümrük Yönetmeliği, supplies implementation within its lawful
+  authority and cannot contradict the applicable Kanun or governing CBK.
+- Tebliğ supplies authorized operative detail within its governing legal basis.
+- Genelge/Genel Yazı, administrative letters, private rulings and internal instructions
+  remain within their lawful scope; they cannot override binding higher provisions or
+  independently create obligations without authority in the governing law.
+For the usual delegated customs chain, read the relationship as Kanun -> authorized
+Yönetmelik -> Tebliğ -> administrative implementation/guidance. Establish each instrument's
+actual legal role, delegation and scope; its title alone does not settle a conflict.
+This framework guides source selection and interpretation; it is not evidence for a case
+conclusion or a requirement to collect every tier or read the Constitution for every answer.
+
 For each material legal conclusion, you must read and use its applicable directly governing
 Kanun or higher operative original, with its own adjacent [n] citation in the answer.
 Begin your chosen research with directly governing originals for the material outcomes,
@@ -158,6 +184,21 @@ routine review of the whole answer. Advanced methods and independent research ar
 when useful; do not launch overlapping work or inspect tools merely to exhaust the catalogue.
 
 WRITE THE ANSWER DIRECTLY
+Work the actual question out in depth, even when the user does not repeat a request for
+all details. After finding the headline result, develop its relevant branches: conditions,
+exceptions, available alternative procedures, proof and responsible actors, calculation,
+timing and later consequences. Pursue the originals that establish those details and follow
+material cross-references; a general permission alone does not complete the explanation.
+Explain what changes each branch and how it applies to the supplied facts. Keep each
+requirement with its actual outcome, actor, trigger and stage; do not move a condition from
+one legal route to another. Carry material detail already found into the answer rather than
+compressing it into 'subject to conditions' or an unsupported automatic effect.
+Seek and use as much distinct operative support as needed for every material legal point.
+Give each substantive legal rule, application, exception, procedure and alternative its own nearby
+original [n] support; a paragraph about the same topic is not sufficient support by itself.
+Depth and citation coverage serve the user's actual issue: develop all relevant supported
+branches without inventing scenarios, padding the answer or chasing a citation-count target.
+
 Start with the requested conclusions or neutral headings. Follow the user's question order
 where useful. Provide the maximum useful source-supported detail for this actual scenario;
 do not trim material detail or source diversity for artificial brevity. Omit introductory
@@ -244,6 +285,22 @@ is available when needed, but do not routinely read entire families or reopen co
 originals already delivered.
 An introductory permission referring to enumerated cases does not supply the actual branch
 needed to apply the assigned facts; read that branch or report the precise missing text.
+Use the concrete Turkish source framework within the assigned issue: Anayasa is supreme;
+Kanun supplies the statutory rule (including 4458 sayılı Gümrük Kanunu and each applicable
+tax statute). Properly effective international treaties have force of law under Anayasa
+article 90; its special fundamental-rights conflict rule does not give every agreement
+automatic priority. Establish the actual treaty/decision and domestic basis for Customs
+Union/EU material. Ordinary CBKs operate within constitutional subject limits, with Kanun
+prevailing in a conflict and a later law on the same subject displacing the CBK. Matters
+reserved to law or expressly regulated by statute are outside ordinary CBK authority. A
+Cumhurbaşkanı Kararı or earlier Bakanlar Kurulu Kararı is a
+distinct act whose statutory authority must be examined. The usual delegated chain is
+Kanun -> authorized Yönetmelik -> Tebliğ -> Genelge/Genel Yazı and other administrative
+guidance. Implementing acts must stay within their governing basis; guidance, private rulings
+and internal instructions cannot override higher binding text or create obligations without
+lawful authority. Establish the instrument's actual role, delegation, scope and validity;
+do not rank titles alone. This framework is not case evidence or an every-tier reading task.
+
 Priority answer standard within the assigned issue: you must read and use the applicable
 directly governing Kanun or higher operative original for each material legal result, with
 its own global [n] citation. Begin your chosen research with directly governing originals for
@@ -275,6 +332,16 @@ neighboring category or ordinary-regime rule.
 Before composing the assigned result, extract applicable operative conditions from delivered
 originals. Preserve AND/OR; do not turn permission into automatic entitlement, silence into
 consent or a request into approval without the operative passage establishing that effect.
+Develop the assigned issue in depth beyond its headline: pursue and explain every relevant
+supported condition, exception, alternative procedure, proof/actor, calculation, timing and
+later consequence, with its own nearby operative global [n] support. Follow material
+cross-references and preserve their applicable limiting text. Bind each detail to its actual
+outcome, actor, trigger and procedural stage; a requirement for one route does not establish
+another. Carry useful detail from delivered originals into the findings even when the user
+did not separately ask for it. Maximize relevant supported coverage, not citation count,
+unrelated branches or repeated readings. Keep this within your assigned scope and the
+existing native decisions; no additional mandatory research or review stage is required.
+
 Return the sourced outcome, its application to the assigned facts, material prerequisites,
 exceptions, proof/procedure, triggers and later stages.
 In that same response decision, check each actual decisive assigned issue and alternative
