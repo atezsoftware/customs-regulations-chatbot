@@ -1,3 +1,4 @@
+import json
 import os
 import threading
 import time
@@ -29,6 +30,7 @@ from onyx.llm.multi_llm import (
     LitellmLLM,
     LLMTimeoutError,
     _parse_anthropic_model_version,
+    _sampling_snapshot,
     temporary_env_and_lock,
 )
 
@@ -3272,3 +3274,201 @@ def test_explicit_responses_surface_rejects_seed_before_provider_call() -> None:
     ):
         llm.invoke([UserMessage(content="Inspect sources.")], use_streaming=False)
     completion.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("seed", "model_kwargs", "expected_top_p_path", "expected_top_p"),
+    [
+        (None, {}, None, None),
+        (0, {"top_p": 0.89}, "passthrough_kwargs.top_p", 0.89),
+        (
+            None,
+            {
+                "extra_body": {
+                    "generationConfig": {"seed": 41, "topP": 0.89},
+                    "authorization": "private-config-value",
+                }
+            },
+            "passthrough_kwargs.extra_body.generationConfig.topP",
+            0.89,
+        ),
+    ],
+)
+def test_sampling_trace_matches_actual_provider_kwargs(
+    seed: int | None,
+    model_kwargs: dict[str, Any],
+    expected_top_p_path: str | None,
+    expected_top_p: float | None,
+) -> None:
+    original_kwargs = json.loads(json.dumps(model_kwargs))
+    llm = _seeded_vertex_llm(seed, model_kwargs=model_kwargs)
+    with (
+        patch("litellm.completion", return_value=_seed_test_response()) as completion,
+        patch("onyx.llm.multi_llm.record_llm_request_params") as record_params,
+        patch("onyx.llm.multi_llm.graph_step") as provider_step,
+    ):
+        llm.invoke([UserMessage(content="Inspect sources.")], use_streaming=False)
+    assert completion.call_count == 1
+    assert {key: model_kwargs[key] for key in original_kwargs} == original_kwargs
+    provider_kwargs = completion.call_args.kwargs
+    generation_sampling = record_params.call_args.args[0]["sampling"]
+    attempt_sampling = provider_step.call_args.args[1]["sampling"]
+    assert generation_sampling == attempt_sampling
+    assert generation_sampling["boundary"] == "litellm_completion_kwargs"
+    assert generation_sampling["wire_observed"] is False
+    assert generation_sampling["requested_seed"] == seed
+    assert generation_sampling["requested_seed_state"] == (
+        "unset" if seed is None else "value"
+    )
+    assert generation_sampling["temperature"]["value"] == provider_kwargs["temperature"]
+    if expected_top_p_path is None:
+        assert generation_sampling["top_p"] == {
+            "state": "unset",
+            "value": None,
+            "sources": [],
+        }
+        assert "top_p" not in provider_kwargs
+    else:
+        assert generation_sampling["top_p"] == {
+            "state": "value",
+            "value": expected_top_p,
+            "sources": [
+                {
+                    "path": expected_top_p_path,
+                    "state": "value",
+                    "value": expected_top_p,
+                }
+            ],
+        }
+        if "top_p" in provider_kwargs:
+            assert provider_kwargs["top_p"] == expected_top_p
+        else:
+            assert provider_kwargs["extra_body"]["generationConfig"]["topP"] == (
+                expected_top_p
+            )
+    if seed == 0:
+        assert generation_sampling["seed"]["value"] == provider_kwargs["seed"] == 0
+    elif "extra_body" in provider_kwargs:
+        assert (
+            generation_sampling["seed"]["value"]
+            == (provider_kwargs["extra_body"]["generationConfig"]["seed"])
+        )
+    else:
+        assert generation_sampling["seed"]["state"] == "unset"
+    serialized_sampling = json.dumps(generation_sampling, allow_nan=False)
+    assert "private-config-value" not in serialized_sampling
+    assert "Inspect sources" not in serialized_sampling
+    assert "source-backed result" not in serialized_sampling
+
+
+def test_sampling_trace_preserves_individual_retry_snapshots() -> None:
+    from litellm.exceptions import BadRequestError
+
+    llm = _seeded_vertex_llm(0, model_kwargs={"top_p": 0.89})
+    errors = [
+        BadRequestError(
+            "reasoning_effort unsupported", "gemini-3.8-flash", "vertex_ai"
+        ),
+        BadRequestError("temperature unsupported", "gemini-3.8-flash", "vertex_ai"),
+    ]
+    with (
+        patch(
+            "litellm.completion", side_effect=[*errors, _seed_test_response()]
+        ) as completion,
+        patch("onyx.llm.multi_llm.record_llm_request_params") as record_params,
+        patch("onyx.llm.multi_llm.graph_step") as provider_step,
+    ):
+        llm.invoke(
+            [UserMessage(content="Inspect sources.")],
+            use_streaming=False,
+            reasoning_effort=ReasoningEffort.HIGH,
+        )
+    assert completion.call_count == provider_step.call_count == 3
+    snapshots = [call.args[1]["sampling"] for call in provider_step.call_args_list]
+    assert len({id(snapshot) for snapshot in snapshots}) == 3
+    assert [snapshot["temperature"]["state"] for snapshot in snapshots] == [
+        "value",
+        "value",
+        "unset",
+    ]
+    for ordinal, (call, snapshot) in enumerate(
+        zip(completion.call_args_list, snapshots), start=1
+    ):
+        assert provider_step.call_args_list[ordinal - 1].args[1]["attempt"] == ordinal
+        assert snapshot["seed"]["value"] == call.kwargs["seed"] == 0
+        assert snapshot["top_p"]["value"] == call.kwargs["top_p"] == 0.89
+        assert snapshot["temperature"]["value"] == call.kwargs.get("temperature")
+        assert record_params.call_args_list[ordinal - 1].args[0]["sampling"] == snapshot
+    assert record_params.call_args.args[0]["sampling"] == snapshots[-1]
+
+
+@pytest.mark.parametrize(
+    ("value", "expected_state"),
+    [
+        (None, "explicit_null"),
+        (True, "non_scalar"),
+        ("private-value", "non_scalar"),
+        ({"secret": "private-value"}, "non_scalar"),
+        (float("inf"), "non_finite"),
+        (float("nan"), "non_finite"),
+    ],
+)
+def test_sampling_trace_does_not_log_invalid_or_private_parameter_values(
+    value: object, expected_state: str
+) -> None:
+    snapshot = _sampling_snapshot({}, {"top_p": value}, requested_seed=None)
+    assert snapshot["top_p"]["state"] == expected_state
+    assert snapshot["top_p"]["value"] is None
+    serialized = json.dumps(snapshot, allow_nan=False)
+    assert "private-value" not in serialized
+    assert "secret" not in serialized
+
+
+def test_sampling_trace_does_not_guess_duplicate_or_unreadable_config() -> None:
+    snapshot = _sampling_snapshot(
+        {"seed": 0, "temperature": 1},
+        {
+            "seed": 41,
+            "top_p": 0.89,
+            "extra_body": {"generationConfig": {"topP": 0.92}},
+        },
+        requested_seed=0,
+    )
+    assert snapshot["seed"]["state"] == "multiple_sources"
+    assert snapshot["seed"]["value"] is None
+    assert [source["value"] for source in snapshot["seed"]["sources"]] == [0, 41]
+    assert snapshot["top_p"]["state"] == "multiple_sources"
+    assert snapshot["top_p"]["value"] is None
+    assert [source["value"] for source in snapshot["top_p"]["sources"]] == [0.89, 0.92]
+    unknown = _sampling_snapshot(
+        {}, {"extra_body": {"generationConfig": "private-value"}}, requested_seed=None
+    )
+    assert all(
+        unknown[name]["state"] == "unknown" for name in ("seed", "top_p", "temperature")
+    )
+    assert "private-value" not in json.dumps(unknown)
+
+
+def test_sampling_trace_is_retained_by_real_generation_span() -> None:
+    from onyx.tracing.framework.create import generation_span, trace
+    from onyx.tracing.framework.span_data import GenerationSpanData
+
+    llm = _seeded_vertex_llm(0, model_kwargs={"top_p": 0.89})
+    with (
+        patch("litellm.completion", return_value=_seed_test_response()) as completion,
+        trace("sampling-observability-test"),
+        generation_span(model="gemini-3.8-flash") as span,
+    ):
+        llm.invoke([UserMessage(content="Inspect sources.")], use_streaming=False)
+    assert completion.call_count == 1
+    assert isinstance(span.span_data, GenerationSpanData)
+    assert span.span_data.request_params is not None
+    sampling = span.span_data.request_params["sampling"]
+    assert sampling["seed"]["value"] == completion.call_args.kwargs["seed"] == 0
+    assert sampling["top_p"]["value"] == completion.call_args.kwargs["top_p"] == 0.89
+    assert (
+        sampling["temperature"]["value"] == (completion.call_args.kwargs["temperature"])
+    )
+    exported_span = span.export()
+    assert exported_span is not None
+    assert exported_span["span_data"]["request_params"]["sampling"] == sampling
