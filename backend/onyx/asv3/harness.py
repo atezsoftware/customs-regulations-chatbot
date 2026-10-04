@@ -962,6 +962,16 @@ class Harness:
                         )
                         self._trim_turns()
                     self._save()
+                    submitted = self.context.services.get("submitted_answer")
+                    if (
+                        not self.context.depth
+                        and isinstance(submitted, str)
+                        and submitted.strip()
+                    ):
+                        self.last_draft = answer = submitted
+                        status = OutcomeStatus.FOUND
+                        self.stop_reason = "model_submitted_answer"
+                        break
                     assembled = self.context.services.get("assembled_answer")
                     if (
                         not self.context.depth

@@ -127,7 +127,8 @@ def run_independent(
         if prompt[0].content == COORDINATOR_PROMPT:
             names = {tool["function"]["name"] for tool in arguments["tools"]}
             if "research_questions" in names:
-                assert names <= {"research_questions", "ask_user"}
+                assert {"submit_answer", "ask_user"} <= names
+                assert arguments["tool_choice"] == llm_adapter.ToolChoiceOptions.AUTO
                 if first_decision is not None:
                     return first_decision
                 request = user_payload(prompt[1])["request"]
@@ -499,7 +500,7 @@ def test_followup_reuses_session_originals_without_repeating_source_research(
     kwargs["state_container"] = ChatStateContainer()
 
     def answer_from_memory(**arguments: Any) -> ModelResponse:
-        assert arguments["prompt"][0].content == RESEARCHER_PROMPT
+        assert arguments["prompt"][0].content == COORDINATOR_PROMPT
         payload = user_payload(arguments["prompt"][1])
         assert original_question in payload["conversation"]
         footer = user_payload(arguments["prompt"][-1])
@@ -510,12 +511,22 @@ def test_followup_reuses_session_originals_without_repeating_source_research(
         }
         assert arguments["timeout_override"] is None
         return response(
-            "**Hızlı cevap:** Önceden okunmuş özgün hüküm uygulanır [1].\n\nKoşul ve uygulama ayrıntısı [2]."
+            calls=[
+                (
+                    "submit_answer",
+                    {
+                        "answer": "Önceden okunmuş özgün hüküm uygulanır [1].\n\nKoşul ve uygulama ayrıntısı [2].",
+                        "basis": "originals",
+                    },
+                )
+            ]
         )
 
     llm.invoke.side_effect = answer_from_memory
-    run_independent(**kwargs)
-    assert llm.invoke.call_count == 3
+    runtime.run_asv3_loop(
+        **{key: value for key, value in kwargs.items() if key != "test_language"}
+    )
+    assert llm.invoke.call_count == 1
     assert seen_loads == [
         {
             "chat_session_id": kwargs["chat_session_id"],
@@ -531,8 +542,8 @@ def test_followup_reuses_session_originals_without_repeating_source_research(
     )
     assert final["session_research"]["reused_evidence_numbers"] == [1, 2]
     assert final["budget"]["tools"] == 0
-    assert len(final["workers"]["tasks"]) == 1
-    assert final["question_research"]["answers"][0]["answer"] in final["last_draft"]
+    assert final["workers"]["tasks"] == []
+    assert final["question_research"]["answers"] == []
 
 
 def test_related_questions_use_fresh_children_and_keep_full_bodies_and_originals(
@@ -1075,6 +1086,7 @@ def test_resume_retains_native_history_and_revalidates_originals_without_profile
     kwargs, broker, llm, checkpoints, queue = setup_run(monkeypatch)
     run_independent(**kwargs)
     previous = checkpoints[-1]
+    previous["public_profile"]["requires_sources"] = False
     packets(queue)
     monkeypatch.setattr(runtime, "load_asv3_checkpoint", lambda **_kwargs: previous)
     llm.reset_mock()
@@ -1087,6 +1099,7 @@ def test_resume_retains_native_history_and_revalidates_originals_without_profile
 
     llm.invoke.side_effect = resume
     run_independent(**kwargs, resume_message_id=2)
+    assert checkpoints[-1]["public_profile"]["requires_sources"] is True
     assert llm.invoke.call_count == 1
     assert checkpoints[-1]["evidence"]["records"] == previous["evidence"]["records"]
     assert {item.chunk_id for item in broker.revalidated} == {"chunk-0", "chunk-1"}
@@ -1205,8 +1218,10 @@ def test_independent_local_budget_retains_more_than_six_native_groups(
     assert checkpoints[-1]["publication_status"] == "partial"
 
 
+@pytest.mark.parametrize("delegate", [True, False])
 def test_zero_evidence_discloses_precise_gap_without_uncited_legal_memory(
     monkeypatch: pytest.MonkeyPatch,
+    delegate: bool,
 ) -> None:
     kwargs, _broker, llm, checkpoints, queue = setup_run(monkeypatch)
     invocation = 0
@@ -1233,8 +1248,13 @@ def test_zero_evidence_discloses_precise_gap_without_uncited_legal_memory(
         )
 
     llm.invoke.side_effect = scripted
-    run_independent(**kwargs)
-    assert llm.invoke.call_count == 4
+    if delegate:
+        run_independent(**kwargs)
+    else:
+        runtime.run_asv3_loop(
+            **{key: value for key, value in kwargs.items() if key != "test_language"}
+        )
+    assert llm.invoke.call_count == (4 if delegate else 2)
     assert "vergiden muaftır" not in kwargs["state_container"].answer_tokens
     assert checkpoints[-1]["publication_status"] == "partial"
     assert not any(isinstance(packet.obj, CitationInfo) for packet in packets(queue))
@@ -1262,6 +1282,100 @@ def test_clarification_can_end_turn_without_research_or_regeneration(
         == "Makine garanti kapsamında mı gönderiliyor?"
     )
     assert checkpoints[-1]["publication_stop_reason"] == "clarification_requested"
+
+
+@pytest.mark.parametrize(
+    "question,answer,basis",
+    [
+        (
+            "nasılsın",
+            "İyiyim, teşekkürler. Sana nasıl yardımcı olabilirim?",
+            "conversation",
+        ),
+        ("Good morning", "Good morning! How can I help?", "conversation"),
+        ("4000 avronun iki katı kaçtır?", "8.000 avro.", "scenario"),
+    ],
+)
+def test_first_decision_publishes_social_or_fact_answer_without_research(
+    monkeypatch: pytest.MonkeyPatch, question: str, answer: str, basis: str
+) -> None:
+    kwargs, _broker, llm, checkpoints, _queue = setup_run(monkeypatch)
+    kwargs["simple_chat_history"][0].message = question
+    llm.invoke.side_effect = [
+        response(calls=[("submit_answer", {"answer": answer, "basis": basis})])
+    ]
+    runtime.run_asv3_loop(
+        **{key: value for key, value in kwargs.items() if key != "test_language"}
+    )
+    assert llm.invoke.call_count == 1
+    assert kwargs["state_container"].answer_tokens == answer
+    assert checkpoints[-1]["publication_status"] == "found"
+    assert checkpoints[-1]["public_profile"]["requires_sources"] is True
+    assert checkpoints[-1]["workers"]["tasks"] == []
+
+
+@pytest.mark.parametrize(
+    "candidate,basis,gap_key",
+    [
+        ("Önceki sonuç [999].", "conversation", "unknown_citations"),
+        ("Önceki sonuç [999].", "scenario", "unknown_citations"),
+        ("Bu işlemde vergi ödenmez.", "originals", "missing"),
+        (
+            "4458 sayılı Gümrük Kanunu'nun 142 nci maddesi uyarınca vergi ödenmez.",
+            "conversation",
+            "named_authority_gaps",
+        ),
+    ],
+)
+def test_rejected_terminal_candidate_does_not_change_later_source_policy(
+    monkeypatch: pytest.MonkeyPatch, candidate: str, basis: str, gap_key: str
+) -> None:
+    kwargs, _broker, llm, checkpoints, _queue = setup_run(monkeypatch)
+    responses = iter(
+        [
+            response(calls=[("submit_answer", {"answer": candidate, "basis": basis})]),
+            response("Bu işlemde vergi ödenmez."),
+            response(
+                calls=[("ask_user", {"question": "Makinenin kullanım amacı nedir?"})]
+            ),
+        ]
+    )
+
+    def invoke(**arguments: Any) -> ModelResponse:
+        if llm.invoke.call_count == 2:
+            footer = user_payload(arguments["prompt"][-1])
+            assert gap_key in footer["publication_gap"]
+        if llm.invoke.call_count == 3:
+            footer = user_payload(arguments["prompt"][-1])
+            assert footer["publication_gap"]["missing"] == "original legal evidence"
+        return next(responses)
+
+    llm.invoke.side_effect = invoke
+    runtime.run_asv3_loop(
+        **{key: value for key, value in kwargs.items() if key != "test_language"}
+    )
+    assert llm.invoke.call_count == 3
+    assert kwargs["state_container"].answer_tokens == "Makinenin kullanım amacı nedir?"
+    assert checkpoints[-1]["public_profile"]["requires_sources"] is True
+
+
+def test_terminal_answer_cannot_publish_beside_another_action(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kwargs, _broker, llm, checkpoints, _queue = setup_run(monkeypatch)
+    llm.invoke.side_effect = [
+        response(
+            calls=[
+                ("submit_answer", {"answer": "Erken cevap.", "basis": "conversation"}),
+                ("ask_user", {"question": "Makinenin kullanım amacı nedir?"}),
+            ]
+        )
+    ]
+    runtime.run_asv3_loop(
+        **{key: value for key, value in kwargs.items() if key != "test_language"}
+    )
+    assert kwargs["state_container"].answer_tokens == "Makinenin kullanım amacı nedir?"
+    assert checkpoints[-1]["receipts"][0]["outcome"]["status"] == "denied"
 
 
 def test_cancel_discards_late_parallel_results_and_durable_writes(

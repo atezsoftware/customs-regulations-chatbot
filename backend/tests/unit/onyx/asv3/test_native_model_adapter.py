@@ -124,8 +124,150 @@ def independent_tool_view(**kwargs: Any) -> HarnessView:
     )
 
 
+def adaptive_tool_view(**kwargs: Any) -> HarnessView:
+    current = independent_tool_view(**kwargs)
+    for name in ("search_corpus", "ask_user"):
+        current.tools.append(
+            {
+                "type": "function",
+                "function": {"name": name, "parameters": {"type": "object"}},
+            }
+        )
+    current.tools.append(
+        {
+            "type": "function",
+            "function": {
+                "name": "submit_answer",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "answer": {"type": "string", "minLength": 1},
+                        "basis": {
+                            "type": "string",
+                            "enum": ["conversation", "scenario", "originals"],
+                        },
+                    },
+                    "required": ["answer", "basis"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+    )
+    return current
+
+
+@pytest.mark.parametrize(
+    "action,arguments",
+    [
+        (
+            "submit_answer",
+            {"answer": "Merhaba, nasıl yardımcı olabilirim?", "basis": "conversation"},
+        ),
+        ("ask_user", {"question": "Belirleyici işlem hangi tarihte yapıldı?"}),
+        ("read_provision", {"source_id": "known-source", "article": "7"}),
+        (
+            "search_corpus",
+            {
+                "query": "İşleme uygulanabilir koşul",
+                "mode": "hybrid",
+                "coverage_item": "İşlemin uygulanabilirliği",
+                "evidence_target": "Uygulanabilir özgün koşul",
+            },
+        ),
+        (
+            "research_questions",
+            {"questions": [{"question_id": "new", "question": "Yeni etki?"}]},
+        ),
+        (None, {}),
+    ],
+)
+def test_first_native_decision_preserves_all_adaptive_choices_in_one_call(
+    action: str | None, arguments: dict[str, Any]
+) -> None:
+    context, llm = RunContext(), model()
+    context.services["independent_question_mode"] = True
+    current = adaptive_tool_view()
+    canonical_tools = current.model_dump(mode="json")["tools"]
+    llm.invoke.return_value = ModelResponse(
+        id="first-decision",
+        created="0",
+        choice=Choice(
+            message=Message(
+                content="Doğrudan yerel cevap." if action is None else None,
+                tool_calls=[
+                    ChatCompletionMessageToolCall(
+                        id="chosen-action",
+                        function=ResponseFunctionCall(
+                            name=action, arguments=json.dumps(arguments)
+                        ),
+                    )
+                ]
+                if action is not None
+                else None,
+            )
+        ),
+    )
+    decision = ResearchModel(llm, context, lean_native_mode=True).decide(current)
+    assert llm.invoke.call_count == 1
+    assert llm.invoke.call_args.kwargs["tool_choice"] is ToolChoiceOptions.AUTO
+    assert llm.invoke.call_args.kwargs["tools"] == canonical_tools
+    assert current.model_dump(mode="json")["tools"] == canonical_tools
+    if action is None:
+        assert decision.answer == "Doğrudan yerel cevap." and decision.calls == []
+    else:
+        assert [call.name for call in decision.calls] == [action]
+        assert decision.calls[0].arguments == arguments
+
+
+def test_first_native_decision_can_submit_a_source_memory_answer_without_new_research() -> (
+    None
+):
+    context, ledger, llm = RunContext(), EvidenceLedger(), model()
+    source_text = "The applicable exception needs both supplied conditions. " * 500
+    source = original(ledger, context, source_text)
+    memory = {"status": "revalidated", "reused_evidence_numbers": [1]}
+    context.services.update(
+        independent_question_mode=True, session_research=memory, evidence=ledger
+    )
+    current = adaptive_tool_view(original_evidence=[source])
+    answer = "Both supplied conditions meet the applicable exception [1]."
+    llm.invoke.return_value = ModelResponse(
+        id="source-memory-answer",
+        created="0",
+        choice=Choice(
+            message=Message(
+                tool_calls=[
+                    ChatCompletionMessageToolCall(
+                        id="finish",
+                        function=ResponseFunctionCall(
+                            name="submit_answer",
+                            arguments=json.dumps(
+                                {"answer": answer, "basis": "originals"}
+                            ),
+                        ),
+                    )
+                ]
+            )
+        ),
+    )
+    adapter = ResearchModel(llm, context, lean_native_mode=True)
+    decision = adapter.decide(current)
+    assert llm.invoke.call_count == 1
+    assert llm.invoke.call_args.kwargs["tool_choice"] is ToolChoiceOptions.AUTO
+    assert [call.name for call in decision.calls] == ["submit_answer"]
+    assert decision.calls[0].arguments == {"answer": answer, "basis": "originals"}
+    assert last_payload(llm)["session_research"] == memory
+    assert last_payload(llm)["original_evidence"] == [source]
+    assert adapter.last_call_id is not None
+    assert ledger.completely_delivered(adapter.last_call_id) == {1}
+    assert source["text"] == source_text
+    assert context.services.get("question_research_started") is not True
+
+
 @pytest.mark.parametrize("started", [False, True])
-def test_independent_root_forces_only_the_current_tool(started: bool) -> None:
+def test_independent_root_keeps_first_choice_adaptive_and_forces_completed_assembly(
+    started: bool,
+) -> None:
     context, llm = RunContext(), model()
     context.services.update(
         independent_question_mode=True,
@@ -134,18 +276,29 @@ def test_independent_root_forces_only_the_current_tool(started: bool) -> None:
         if started
         else [],
     )
-    current = independent_tool_view()
+    current = adaptive_tool_view()
     original_tools = current.model_dump(mode="json")["tools"]
     ResearchModel(llm, context, lean_native_mode=True).decide(current)
-    assert llm.invoke.call_args.kwargs["tool_choice"] is ToolChoiceOptions.REQUIRED
-    assert [t["function"]["name"] for t in llm.invoke.call_args.kwargs["tools"]] == [
-        "assemble_answers" if started else "research_questions"
-    ]
+    assert llm.invoke.call_args.kwargs["tool_choice"] is (
+        ToolChoiceOptions.REQUIRED if started else ToolChoiceOptions.AUTO
+    )
+    assert [t["function"]["name"] for t in llm.invoke.call_args.kwargs["tools"]] == (
+        ["assemble_answers"]
+        if started
+        else [
+            "research_questions",
+            "assemble_answers",
+            "read_provision",
+            "search_corpus",
+            "ask_user",
+            "submit_answer",
+        ]
+    )
     assert current.model_dump(mode="json")["tools"] == original_tools
     assert llm.invoke.call_count == 1
 
 
-def test_independent_first_decision_can_ask_a_decisive_user_fact_with_required_tools() -> (
+def test_independent_first_decision_can_ask_a_decisive_user_fact_with_auto_tools() -> (
     None
 ):
     context, llm = RunContext(), model()
@@ -184,10 +337,10 @@ def test_independent_first_decision_can_ask_a_decisive_user_fact_with_required_t
     )
     canonical_tools = current.model_dump(mode="json")["tools"]
     decision = ResearchModel(llm, context, lean_native_mode=True).decide(current)
-    assert llm.invoke.call_args.kwargs["tool_choice"] is ToolChoiceOptions.REQUIRED
+    assert llm.invoke.call_args.kwargs["tool_choice"] is ToolChoiceOptions.AUTO
     assert [
         tool["function"]["name"] for tool in llm.invoke.call_args.kwargs["tools"]
-    ] == ["research_questions", "ask_user"]
+    ] == ["research_questions", "assemble_answers", "read_provision", "ask_user"]
     assert [call.name for call in decision.calls] == ["ask_user"]
     assert decision.calls[0].arguments == {"question": clarification}
     assert current.model_dump(mode="json")["tools"] == canonical_tools
@@ -340,14 +493,8 @@ def test_session_research_and_revalidated_original_reach_root_and_child(
     tool_names = [
         tool["function"]["name"] for tool in llm.invoke.call_args.kwargs["tools"]
     ]
-    assert tool_names == (
-        ["research_questions", "assemble_answers", "read_provision"]
-        if is_child
-        else ["research_questions"]
-    )
-    assert llm.invoke.call_args.kwargs["tool_choice"] is (
-        ToolChoiceOptions.AUTO if is_child else ToolChoiceOptions.REQUIRED
-    )
+    assert tool_names == ["research_questions", "assemble_answers", "read_provision"]
+    assert llm.invoke.call_args.kwargs["tool_choice"] is ToolChoiceOptions.AUTO
     assert llm.invoke.call_count == 1
     assert adapter.last_call_id is not None
     assert ledger.completely_delivered(adapter.last_call_id) == {1}
