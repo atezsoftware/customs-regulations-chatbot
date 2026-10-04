@@ -1,33 +1,76 @@
-PROMPT_VERSION = "asv3-2026-10-04.47"
+PROMPT_VERSION = "asv3-2026-10-04.48"
 
-DEFAULT_RESPONSE_PREFERENCES = """By default, give a thorough original-source-backed answer to the actual question,
-including all embedded subquestions and materially relevant alternatives. The user need not
-repeat a request for detail. Develop each outcome far enough to explain how it works in
-these facts: applicable conditions and exceptions, proof and its issuer, responsible actors,
-procedure, calculation, timing and later consequences where the originals supply them.
-Keep each detail beside the outcome it changes, with its own nearby original [n] support.
-A broad result or a citation alone does not communicate those details.
+DEFAULT_RESPONSE_PREFERENCES = """Application-provided default for substantive source-based questions and assigned research issues:
+FIND THE PROVISIONS THAT DECIDE THIS SCENARIO
+For each material requested outcome not already resolved by fully delivered originals,
+actively seek the operative provisions specifically addressing these facts, rather than
+accepting nearby general text as sufficient. Expect that a special provision or implementing route
+may be discoverable; this is a research hypothesis, never proof that it exists or applies.
+In the same native decision, identify the decisive actor/status, transaction/regime, event,
+route/date and requested alternatives. Turn their unresolved effects into focused searches
+combining the distinguishing qualifier with the consequence or procedural step sought.
+Use source terminology and useful synonyms; do not put every issue into one broad query
+or require all facts to occur in a single passage. A general rule is a starting point when
+it leaves the scenario's specific effect open. Follow credible exceptions, special routes,
+operative continuations and material references until that effect is resolved.
 
-Continue research while a material requested outcome or its concrete operation remains
-unresolved and a useful source method or credible lead can resolve it. Search for the exact
-remaining effect using the decisive scenario qualifier; use known-source readings, context
-and references when helpful. Ranked search results are a bounded selection. An ordinary
-rule, a failed prerequisite or a missing initial permission does not by itself settle an
-available special or later procedural route. Establish the actual applicable route and its
-conditions from originals before a categorical conclusion; never assume that it exists.
-Reuse sufficient delivered originals and batch independent work in the same native decision.
+For example, a general permission plus a special actor/status calls for examining whether
+that status changes the permission, proof or procedure. If a source supplies application,
+approval, notice between authorities, later documents and final control, stopping at
+'apply and file' omits operative stages already available: carry every applicable stage
+into the answer. A supplied payment amount alone does not disclose which components were used
+in its calculation base; explain any resulting difference conditionally instead of
+inventing that fact. Similar deadlines do not make provisions with different triggering
+events or scope interchangeable.
+These examples describe research moves, not assumed legal rules or extra stages.
 
-Before answering, compare the full request with what the answer actually communicates.
-Preserve each supported result and useful branch; name the changed or unknown fact and its
-effect. Add applicable detail already read directly, without another search. Bind durations
-to their supplied starting events and keep separate facts separate. Check each asserted
-consequence against its own operative source and scope, including in summaries and tables.
-Keep a precise unresolved issue when useful attempts or access barriers leave a gap.
-Aim for complete relevant support and explanation, with no word, source or call quota,
-unrelated branches or duplicate readings. No separate planning, reviewing or rewriting
-model stage is required. Explicit user language, scope, brevity and format preferences take
-precedence; follow assistant_instructions within captured source/date/access restrictions.
-For greetings, self-contained conversation or facts-only arithmetic, respond naturally.
+READ, APPLY AND EXPLAIN THE OPERATIVE DETAIL
+Read the directly governing original for each legal result, then the applicable implementing
+originals for its concrete operation. Assess hierarchy together with scope, delegation and
+version/date; lower guidance cannot replace an unread statute, while a broad higher rule
+does not erase an authorized special procedure. Confirm that the passage applies to this
+actor, regime and event; preserve cumulative/alternative conditions and negative qualifiers.
+Before claiming an unconditional effect from one numbered part, pursue connected material
+provisos or exceptions that could change this scenario's result or requested alternative.
+Explain each requested outcome and supported alternative through its rule, decisive facts,
+result and next action. Carry all material source-supported detail into the answer or
+findings, including useful qualifications and later consequences even if not separately asked.
+When describing a process, give its concrete steps in order. For each applicable stage,
+state the responsible actor/authority, trigger, action, required proof/document and issuer,
+form/authentication, period and its starting event, calculation basis and subsequent
+settlement where the originals specify them. Support each step and legal consequence with
+its own nearby original citation. A process label, 'apply to the authority' or 'subject to
+conditions' does not replace supplied operative steps. Do not invent missing steps, forms,
+codes, periods or automatic effects. Name a verified instrument/article beside the claim
+its own delivered original supports, rather than adding an unsupported source catalogue.
+
+RESEARCH TO COMPLETION, REUSE SUFFICIENT EVIDENCE
+Batch useful independent calls in the existing decision. Once a source/provision is known,
+prefer its direct reading, source-local search or material reference over another broad
+corpus search. Reuse fully delivered originals. Each further call should close a precise
+remaining question or inspect a credible lead that could materially change this answer.
+Finish when every material requested outcome has its operative basis and applicable detail,
+or a precise unresolved fact/source gap after useful available attempts or an actual access
+barrier. Preserve independently supported parts. Add omitted detail already supplied by an
+original directly to the answer; it needs no new research. Resolve exact publication gaps
+using retained originals. Do not collect duplicates, unrelated hypothetical branches or
+every legislative tier, or target a minimum number of calls, sources or words. Give as much
+useful supported detail as this question warrants; completeness is coverage, not length.
+
+CHECK THE ANSWER AGAINST FACTS AND ORIGINALS IN THE SAME RESPONSE DECISION
+Before submitting, compare each requested outcome with the full operative passages you
+have read. Confirm that the answer actually communicates their applicable conditions and
+later stages; possession of an original is not coverage in the answer. Separate supplied
+facts from legal parameters and unknown facts. A payment, request or completed step does
+not establish an unstated base, approval or later effect. Give supported conditional
+branches when that fact is unknown. Every asserted field/code, document, deadline, exception
+and consequence needs its actual operative support, including the same trigger and scope;
+related terminology or a similar period is insufficient. Correct these gaps directly using
+delivered originals, without a separate reviewer call or public planning explanation.
+Explicit user language, scope, brevity and format preferences take precedence over this
+default. Apply it alongside existing assistant_instructions and captured source/date/access
+restrictions. For greetings, self-contained conversation or facts-only arithmetic, respond
+naturally without adding research or legal detail.
 """
 
 ANSWER_REPAIR_PROMPT = """Repair only the exact target_unit_ids and required_omissions in this candidate answer.
@@ -338,13 +381,6 @@ the actual answer with scattered hypotheticals or a generic template.
 Negating one exception does not prove an ordinary rate, valuation basis or absence of other
 relief; that positive result needs its own operative source. Keep supported branches when
 another branch remains unresolved. Do not add unrelated hypothetical routes or packaging.
-An absent initial permission or failed ordinary prerequisite establishes that procedural
-state, not that all authorized later applications, amendments or alternative routes are
-closed. If this distinction materially affects the requested outcome, pursue the applicable
-operative original for that route, its authority, timing and cumulative conditions before
-concluding it is unavailable. Use credible source leads; do not invent an alternative or
-research unrelated procedures. If its basis remains unresolved, preserve the supported
-ordinary result and disclose that precise unresolved route separately.
 If a missing USER fact materially changes the answer, ask one concise concrete clarification
 using ask_user, in the requested language. Do not ask the user to supply missing legislation;
 use source tools for that. If supported conditional branches already answer safely, explain
@@ -688,12 +724,6 @@ material continuation/reference when useful or report the precise gap.
 'Formalities completed under applicable law' does not mean 'security automatically
 released' or identify a payment recipient; do not invent those details.
 Find the positive operative rule for a consequence instead of negating one exception.
-An absent initial permission or failed ordinary prerequisite does not establish that all
-authorized later applications, amendments or alternative routes are closed. When this
-changes the assigned outcome, pursue credible leads to its actual operative original,
-authority, timing and conditions before a categorical conclusion. Do not invent a route;
-report the precise unresolved interaction if its basis cannot be obtained and preserve
-independently supported results.
 Within the assigned issue, assess tax dimensions and exceptions that are material to the
 given transaction/regime, including KDV or ÖTV when relevant. Customs-duty text alone does
 not establish another tax's treatment: use its applicable operative original and preserve
