@@ -322,3 +322,79 @@ def test_flush_swallows_record_errors(
 
     processor.force_flush()
     assert recorded_calls == []
+
+
+def test_buffered_measurement_keeps_origin_after_context_changes(
+    processor: UserUsageTracingProcessor,
+) -> None:
+    from onyx.tracing.usage_measurement import (
+        CURRENT_USAGE_MEASUREMENT,
+        UsageMeasurementContext,
+    )
+
+    user_id = str(uuid4())
+    first = UsageMeasurementContext(
+        epoch="old",
+        request_id=uuid4(),
+        started_at=datetime.now(timezone.utc),
+        user_id=user_id,
+        session_id=uuid4(),
+        question_id=1,
+        workflow="deep",
+    )
+    token = CURRENT_USER_ID_CONTEXTVAR.set(user_id)
+    measurement_token = CURRENT_USAGE_MEASUREMENT.set(first)
+    try:
+        old_record = processor._capture(_generation_span(usage={"input_tokens": 10}))
+        CURRENT_USAGE_MEASUREMENT.set(
+            first.model_copy(
+                update={"epoch": "new", "request_id": uuid4(), "workflow": "normal"}
+            )
+        )
+        new_record = processor._capture(_generation_span(usage={"input_tokens": 20}))
+    finally:
+        CURRENT_USAGE_MEASUREMENT.reset(measurement_token)
+        CURRENT_USER_ID_CONTEXTVAR.reset(token)
+    assert old_record is not None and new_record is not None
+    assert old_record.measurement == first
+    aggregated = processor._aggregate_batch([old_record, new_record])
+    assert len(aggregated) == 2
+    assert [record.input_tokens for record in aggregated] == [10, 20]
+
+
+def test_measurement_failure_does_not_erase_enforcement_usage(
+    processor: UserUsageTracingProcessor,
+    recorded_calls: list[dict[str, Any]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from onyx.tracing.usage_measurement import (
+        CURRENT_USAGE_MEASUREMENT,
+        UsageMeasurementContext,
+    )
+
+    user_id = str(uuid4())
+
+    def fail_measurement(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("measurement unavailable")
+
+    monkeypatch.setattr(proc_mod, "record_measurement", fail_measurement)
+    token = CURRENT_USER_ID_CONTEXTVAR.set(user_id)
+    measurement_token = CURRENT_USAGE_MEASUREMENT.set(
+        UsageMeasurementContext(
+            epoch="new",
+            request_id=uuid4(),
+            started_at=datetime.now(timezone.utc),
+            user_id=user_id,
+            session_id=uuid4(),
+            question_id=1,
+            workflow="deep",
+        )
+    )
+    try:
+        processor.on_span_end(_generation_span(usage={"input_tokens": 10}))
+    finally:
+        CURRENT_USAGE_MEASUREMENT.reset(measurement_token)
+        CURRENT_USER_ID_CONTEXTVAR.reset(token)
+    processor.force_flush()
+    assert len(recorded_calls) == 1
+    assert recorded_calls[0]["input_tokens"] == 10

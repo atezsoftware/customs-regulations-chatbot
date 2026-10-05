@@ -9469,3 +9469,29 @@ class AnnexPublicationEmbedding(Base):
             name="annex_embedding_status_check",
         ),
     )
+
+
+class UsageMeasurement(Base):
+    """Reporting ledger attributed to the originating request, separate from limits."""
+
+    __tablename__ = "usage_measurement"
+
+    request_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True)
+    model: Mapped[str] = mapped_column(String, primary_key=True)
+    flow: Mapped[str] = mapped_column(String, primary_key=True)
+    provider: Mapped[str] = mapped_column(String, primary_key=True)
+    epoch: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    started_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True))
+    user_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("user.id", ondelete="SET NULL"), nullable=True
+    )
+    session_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True))
+    question_id: Mapped[int] = mapped_column(BigInteger)
+    workflow: Mapped[str] = mapped_column(String)
+    benchmark: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    input_tokens: Mapped[int] = mapped_column(BigInteger, default=0)
+    output_tokens: Mapped[int] = mapped_column(BigInteger, default=0)
+    cache_read_tokens: Mapped[int] = mapped_column(BigInteger, default=0)
+    cost_cents: Mapped[float] = mapped_column(
+        Numeric(18, 6, asdecimal=False), default=0
+    )
