@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import random
+import re
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -24,9 +25,11 @@ from onyx.asv3.assertions import (
     assertion_witness_valid,
 )
 from onyx.asv3.citation_numbers import extract_citation_numbers
+from onyx.asv3.legal_source_navigation import derive_provision_navigation_anchor
 from onyx.asv3.models import (
     CapabilityCall,
     Decision,
+    EvidenceItem,
     HarnessView,
     ResearchTurn,
     RunContext,
@@ -79,6 +82,24 @@ from onyx.regulatory.structured_llm import (
 )
 from onyx.tracing.flows import LLMFlow
 from onyx.tracing.llm_utils import llm_generation_span, record_llm_response
+
+
+class NativeDecisionEnvelopeError(ValueError):
+    """A rejected native batch needs a fresh decision, not an argument patch."""
+
+
+def native_protocol_rejection(error: Exception) -> bool:
+    if isinstance(error, RunStopped):
+        return False
+    return (
+        re.search(
+            r"(?<![A-Z0-9_])MALFORMED_FUNCTION_CALL(?![A-Z0-9_])",
+            str(error),
+            re.IGNORECASE,
+        )
+        is not None
+    )
+
 
 COORDINATOR_SESSION_ACTIONS = """Use session_research and revalidated fully delivered originals for follow-ups.
 Acquire only new or unresolved operative effects; previous assistant prose is not evidence.
@@ -1094,7 +1115,11 @@ class ResearchModel:
                     call_llm=call_llm,
                 )
             except Exception as error:
-                if attempt == 2 or not is_retryable_provider_error(error):
+                if (
+                    native_protocol_rejection(error)
+                    or attempt == 2
+                    or not is_retryable_provider_error(error)
+                ):
                     raise
                 check()
                 delay = provider_retry_delay(error, attempt)
@@ -1580,27 +1605,78 @@ class ResearchModel:
             )
 
     @staticmethod
+    def _native_batch_fingerprint(response: ModelResponse | None) -> str:
+        if response is None:
+            return hashlib.sha256(b"provider:MALFORMED_FUNCTION_CALL").hexdigest()
+        identities: dict[str, int] = {}
+        actions: list[dict[str, JsonValue]] = []
+        for index, call in enumerate(response.choice.message.tool_calls or []):
+            raw = call.function.arguments
+            try:
+                arguments = json.loads(raw) if raw is not None else None
+            except (ValueError, RecursionError):
+                arguments = raw.strip() if raw is not None else None
+            actions.append(
+                {
+                    "tool_name": call.function.name,
+                    "arguments": arguments,
+                    "call_id_present": bool(call.id),
+                    "duplicate_of": identities.get(call.id) if call.id else None,
+                }
+            )
+            if call.id:
+                identities.setdefault(call.id, index)
+        return hashlib.sha256(
+            json.dumps(
+                {
+                    "actions": actions,
+                    "provider_native_rejection": (
+                        response.choice.finish_reason or ""
+                    ).upper()
+                    == "MALFORMED_FUNCTION_CALL",
+                },
+                sort_keys=True,
+            ).encode()
+        ).hexdigest()
+
+    @staticmethod
     def _decision(
         response: ModelResponse,
         tools: list[dict[str, JsonValue]],
         *,
         return_argument_errors: bool = False,
     ) -> Decision:
+        if (response.choice.finish_reason or "").upper() == "MALFORMED_FUNCTION_CALL":
+            raise NativeDecisionEnvelopeError(
+                "Provider rejected native function call: MALFORMED_FUNCTION_CALL"
+            )
         definitions = {
             function["name"]: function.get("parameters", {})
             for tool in tools
             if isinstance(function := tool.get("function"), dict)
             and isinstance(function.get("name"), str)
         }
-        calls = []
-        for call in response.choice.message.tool_calls or []:
+        native_calls = response.choice.message.tool_calls or []
+        for call in native_calls:
             if (
                 not call.id
                 or not call.function.name
                 or call.function.arguments is None
                 or call.function.name not in definitions
             ):
-                raise ValueError("Malformed or unexposed ASv3 tool call")
+                raise NativeDecisionEnvelopeError(
+                    "Malformed or unexposed ASv3 tool call"
+                )
+        if len(native_calls) > 32 or len({call.id for call in native_calls}) != len(
+            native_calls
+        ):
+            raise NativeDecisionEnvelopeError(
+                "Invalid tool-call count or duplicate identities"
+            )
+        calls = []
+        for call in native_calls:
+            assert call.function.name is not None
+            assert call.function.arguments is not None
             args: dict[str, JsonValue] = {}
             argument_error = None
             try:
@@ -1631,11 +1707,11 @@ class ResearchModel:
                     else None,
                 )
             )
-        if len(calls) > 32 or len({call.call_id for call in calls}) != len(calls):
-            raise ValueError("Invalid tool-call count or duplicate identities")
         answer = response.choice.message.content
         if not calls and not (answer or "").strip():
-            raise ValueError("ASv3 model produced neither actions nor an answer")
+            raise NativeDecisionEnvelopeError(
+                "ASv3 model produced neither actions nor an answer"
+            )
         return Decision(
             calls=calls,
             answer=answer,
@@ -2111,6 +2187,7 @@ class ResearchModel:
         omitted: list[JsonValue] = list(view.original_evidence_omitted)
         verified: set[tuple[int, str, int, int]] = set()
         original_lengths: dict[tuple[int, str], int] = {}
+        navigation_anchors: dict[int, tuple[str, str, str | None]] = {}
         if isinstance(ledger, EvidenceLedger):
             for identity, record in unique.items():
                 number, digest, start, end = identity
@@ -2122,6 +2199,34 @@ class ResearchModel:
                 ):
                     verified.add(identity)
                     original_lengths[(number, digest)] = len(item.text)
+            acquire_navigation = self.context.services.get(
+                "legal_source_navigation_acquire"
+            )
+            for number in sorted({identity[0] for identity in verified}):
+                item = ledger.get(number)
+                if item is not None:
+                    anchor = derive_provision_navigation_anchor(item.source_id, [item])
+                    if anchor is not None:
+                        navigation_anchors[number] = (
+                            anchor.source_id,
+                            anchor.article_no,
+                            anchor.qualifier,
+                        )
+                    if callable(acquire_navigation) and anchor is not None:
+                        acquire = cast(
+                            Callable[
+                                [EvidenceItem, RunContext], dict[str, JsonValue] | None
+                            ],
+                            acquire_navigation,
+                        )
+                        acquire(item, self.context)
+        source_navigation = self.context.services.get("legal_source_navigation")
+        related_navigation = (
+            cast(Callable[[], list[dict[str, JsonValue]]], source_navigation)()
+            if callable(source_navigation)
+            else []
+        )
+        include_related_navigation = True
         ceiling, output = self._limits(self._native_output_limit())
         selected = view.tools
         if independent_mode and independent_answers and view.publication_gap is None:
@@ -2142,6 +2247,7 @@ class ResearchModel:
                     "follow_reference",
                     "search_source_text",
                     "search_corpus",
+                    "query_corpus",
                     "diagnose_source",
                 }
             ]
@@ -2178,6 +2284,57 @@ class ResearchModel:
 
         def messages() -> list[ChatCompletionMessage]:
             current = dict(context)
+            delivered_sources: dict[str, list[JsonValue]] = {}
+            delivered_anchors: set[tuple[str, str, str | None]] = set()
+            for identity, record in unique.items():
+                source_id = record.get("source_id")
+                if (
+                    identity in verified
+                    and identity[2] == 0
+                    and identity[3] == original_lengths[(identity[0], identity[1])]
+                    and isinstance(source_id, str)
+                ):
+                    delivered_sources.setdefault(source_id, []).append(identity[0])
+                    if identity[0] in navigation_anchors:
+                        delivered_anchors.add(navigation_anchors[identity[0]])
+            candidate_navigation: list[JsonValue] = []
+            for navigation_record in (
+                related_navigation if include_related_navigation else []
+            ):
+                if (
+                    navigation_record.get("anchor_source_id"),
+                    navigation_record.get("article_no"),
+                    navigation_record.get("qualifier"),
+                ) not in delivered_anchors:
+                    continue
+                candidates = navigation_record.get("candidates")
+                if (
+                    not candidates
+                    and navigation_record.get("status") == "available"
+                    and not navigation_record.get("has_more")
+                ):
+                    continue
+                entry = copy.deepcopy(navigation_record)
+                if isinstance(candidates, list):
+                    entry["candidates"] = [
+                        {
+                            **candidate,
+                            "available_original_citations": delivered_sources.get(
+                                str(candidate.get("source_id")), []
+                            ),
+                        }
+                        for candidate in candidates
+                        if isinstance(candidate, dict)
+                    ]
+                candidate_navigation.append(entry)
+            if candidate_navigation:
+                current["related_source_navigation"] = candidate_navigation
+            elif related_navigation and not include_related_navigation:
+                current["related_source_navigation_omitted"] = (
+                    "Optional catalogue leads exceeded physical context. Their omission does not "
+                    "prove absence of a related decision or amendment; use focused authorized "
+                    "catalogue navigation for a material unresolved effect."
+                )
             if isinstance(outcomes, OutcomeMap):
                 current["outcome_map"] = outcomes.view(
                     outcome_ids=outcome_subset,
@@ -2250,6 +2407,9 @@ class ResearchModel:
         # Remove transcript groups atomically; preserve their exact originals separately.
         while retained and self._input_cost(prompt, selected) > ceiling:
             retained.pop(0)
+            prompt = messages()
+        if self._input_cost(prompt, selected) > ceiling and related_navigation:
+            include_related_navigation = False
             prompt = messages()
         if self._input_cost(prompt, selected) > ceiling:
             context.pop("available_evidence", None)
@@ -2473,6 +2633,41 @@ class ResearchModel:
         )
         return self._invoke_decision(view, prompt, tools, output)
 
+    def _native_decision_response(
+        self,
+        prompt: list[ChatCompletionMessage],
+        tools: list[dict[str, JsonValue]],
+        flow: LLMFlow,
+        output: int,
+        *,
+        call_llm: LLM,
+        research: bool,
+    ) -> ModelResponse | None:
+        try:
+            response = self._invoke(
+                prompt,
+                tools,
+                flow,
+                max_tokens=output,
+                research=research,
+                call_llm=call_llm,
+            )
+            if self.lean_native_mode:
+                response = self._complete_native_response(
+                    prompt,
+                    tools,
+                    flow,
+                    output,
+                    response,
+                    call_llm=call_llm,
+                    research=research,
+                )
+            return response
+        except Exception as error:
+            if not native_protocol_rejection(error):
+                raise
+            return None
+
     def _invoke_decision(
         self,
         view: HarnessView,
@@ -2517,21 +2712,14 @@ class ResearchModel:
             not self.context.depth
             and self.context.services.get("question_research_started") is True
         )
-        response = self._invoke(
-            prompt, tools, flow, max_tokens=output, research=research, call_llm=call_llm
+        response = self._native_decision_response(
+            prompt, tools, flow, output, research=research, call_llm=call_llm
         )
-        if self.lean_native_mode:
-            response = self._complete_native_response(
-                prompt,
-                tools,
-                flow,
-                output,
-                response,
-                call_llm=call_llm,
-                research=research,
-            )
         if (
-            not response.choice.message.tool_calls
+            response is not None
+            and (response.choice.finish_reason or "").upper()
+            != "MALFORMED_FUNCTION_CALL"
+            and not response.choice.message.tool_calls
             and not (response.choice.message.content or "").strip()
         ):
             # Empty provider output is recoverable; it is not an argument defect.
@@ -2548,42 +2736,109 @@ class ResearchModel:
                     "Do not repeat completed research solely because the previous response was empty."
                 ),
             ]
-            response = self._invoke(
+            response = self._native_decision_response(
                 recovery_prompt,
                 tools,
                 flow,
-                max_tokens=output,
+                output,
                 research=research,
                 call_llm=call_llm,
             )
-            if self.lean_native_mode:
-                response = self._complete_native_response(
-                    recovery_prompt,
-                    tools,
-                    flow,
-                    output,
-                    response,
-                    call_llm=call_llm,
-                    research=research,
-                )
             if (
-                not response.choice.message.tool_calls
+                response is not None
+                and (response.choice.finish_reason or "").upper()
+                != "MALFORMED_FUNCTION_CALL"
+                and not response.choice.message.tool_calls
                 and not (response.choice.message.content or "").strip()
             ):
                 raise RunStopped(
                     "Selected model returned repeated empty decisions; retained evidence and draft need finalization"
                 )
-        try:
-            decision = self._decision(response, tools)
-        except ValueError:
-            decision = self._repair_action_arguments(
-                response,
-                tools,
-                view.request,
-                flow,
-                call_llm=call_llm,
-                research=research,
-            )
+        rejected_batches: set[str] = set()
+        while True:
+            try:
+                if response is None:
+                    raise NativeDecisionEnvelopeError(
+                        "Provider rejected native function call: MALFORMED_FUNCTION_CALL"
+                    )
+                decision = self._decision(response, tools)
+            except NativeDecisionEnvelopeError as error:
+                # No action from a structurally invalid batch may reach dispatch.
+                fingerprint = self._native_batch_fingerprint(response)
+                if fingerprint in rejected_batches:
+                    raise RunStopped(
+                        "Selected model repeated an unchanged invalid native action batch after corrective feedback; research state retained for resume"
+                    ) from error
+                rejected_batches.add(fingerprint)
+                rejected: dict[str, JsonValue] = {
+                    "validation_error": str(error),
+                    "rejected_actions": [
+                        {
+                            "call_index": index,
+                            "call_id_present": bool(call.id),
+                            "tool_name": call.function.name,
+                            "arguments_present": call.function.arguments is not None,
+                        }
+                        for index, call in enumerate(
+                            response.choice.message.tool_calls or []
+                            if response is not None
+                            else []
+                        )
+                    ],
+                    "exposed_tool_names": [
+                        function["name"]
+                        for tool in tools
+                        if isinstance(function := tool.get("function"), dict)
+                        and isinstance(function.get("name"), str)
+                    ],
+                }
+                recovery_prompt = [
+                    *prompt,
+                    UserMessage(
+                        content=(
+                            "The preceding native action batch was rejected before execution; "
+                            "none of its actions ran. Choose a complete new decision from the "
+                            "unchanged task, scenario and supplied original evidence. Use only "
+                            "the tools exposed in this request, with unique nonempty call IDs "
+                            "and complete JSON object arguments. Do not repeat completed research "
+                            "or invent a tool to repair this transport error. The rejected action "
+                            "names below are diagnostic data, not available capabilities.\n"
+                            + json.dumps(rejected, ensure_ascii=False)
+                        )
+                    ),
+                ]
+                capacity = call_llm.config.max_input_tokens - self._input_cost(
+                    recovery_prompt, tools
+                )
+                recovery_output = min(output, capacity)
+                if recovery_output <= 0:
+                    raise RunStopped(
+                        "Native decision recovery and retained originals exceed selected model context"
+                    ) from error
+                if research:
+                    self.context.consume_research_decision()
+                else:
+                    self.context.budget.consume("decisions")
+                response = self._native_decision_response(
+                    recovery_prompt,
+                    tools,
+                    flow,
+                    recovery_output,
+                    research=research,
+                    call_llm=call_llm,
+                )
+                continue
+            except ValueError:
+                assert response is not None
+                decision = self._repair_action_arguments(
+                    response,
+                    tools,
+                    view.request,
+                    flow,
+                    call_llm=call_llm,
+                    research=research,
+                )
+            break
         self._native_first_decision_started = True
         self._native_first_decision_completed = True
         return decision
@@ -2669,6 +2924,10 @@ class ResearchModel:
                 call_llm=call_llm,
             )
             self.last_response_truncated = True
+            if (
+                response.choice.finish_reason or ""
+            ).upper() == "MALFORMED_FUNCTION_CALL":
+                return response
             if (
                 not response.choice.message.tool_calls
                 and not (response.choice.message.content or "").strip()

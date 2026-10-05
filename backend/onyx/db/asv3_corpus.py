@@ -23,6 +23,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Session
+from sqlalchemy.sql.elements import ColumnElement
 
 from onyx.access.access import get_access_for_user_files, get_acl_for_user
 from onyx.configs.constants import DocumentSource
@@ -1050,30 +1051,17 @@ def _source_statement(filters: IndexFilters) -> Any:
     return statement
 
 
-def find_sources(
-    session: Session,
-    *,
-    user: User,
-    filters: IndexFilters,
-    query: str = "",
-    source_ids: tuple[UUID, ...] | None = None,
-    offset: int = 0,
-    limit: int = 50,
-) -> tuple[list[CorpusSource], bool]:
-    """Page metadata before text hydration; every returned source passes actual ACL."""
-    if offset < 0 or not 1 <= limit <= 100:
-        raise ValueError("Source pages require offset >= 0 and limit 1..100.")
-    _validate_filters(session, user, filters)
-    statement = _source_statement(filters)
-    if source_ids is not None:
-        statement = statement.where(UserFile.id.in_(source_ids))
+def _source_title_query(
+    query: str,
+) -> tuple[list[ColumnElement[bool]], list[ColumnElement[Any]]]:
     # Corpus filenames commonly transliterate Turkish letters and use underscores.
     translation = str.maketrans("ÇĞİÖŞÜÂÎÛçğıöşüâîû", "CGIOSUAIUcgiosuaiu")
     normalized_query = query.translate(translation).lower().strip()
     normalized_name = func.lower(
         func.translate(UserFile.name, "ÇĞİÖŞÜÂÎÛçğıöşüâîû", "CGIOSUAIUcgiosuaiu")
     )
-    order = []
+    conditions: list[ColumnElement[bool]] = []
+    order: list[ColumnElement[Any]] = []
     references = list(
         re.finditer(r"(?<!\d)(\d{4})[/_.-](\d{1,4})(?!\d)", normalized_query)
     )
@@ -1081,7 +1069,7 @@ def find_sources(
         # A source number retains its identity across filename punctuation and zero padding.
         year, number = reference.groups()
         pattern = rf"(^|[^0-9]){year}[/_. -]+0*{int(number)}([^0-9]|$)"
-        statement = statement.where(normalized_name.op("~")(pattern))
+        conditions.append(normalized_name.op("~")(pattern))
     lexical_query = re.sub(r"(?<!\d)\d{4}[/_.-]\d{1,4}(?!\d)", " ", normalized_query)
     if lexical_query.strip():
         escaped_terms = [
@@ -1089,9 +1077,7 @@ def find_sources(
             for term in lexical_query.split()[:12]
         ]
         for term in escaped_terms:
-            statement = statement.where(
-                normalized_name.ilike("%" + term + "%", escape="\\")
-            )
+            conditions.append(normalized_name.ilike("%" + term + "%", escape="\\"))
         basename = func.regexp_replace(normalized_name, "^.*/", "")
         order = [
             case(
@@ -1108,6 +1094,31 @@ def find_sources(
             ),
             func.length(basename),
         ]
+    return conditions, order
+
+
+def _find_sources_with_title_queries(
+    session: Session,
+    *,
+    user: User,
+    filters: IndexFilters,
+    queries: tuple[str, ...],
+    source_ids: tuple[UUID, ...] | None,
+    offset: int,
+    limit: int,
+) -> tuple[list[CorpusSource], bool]:
+    if offset < 0 or not 1 <= limit <= 100:
+        raise ValueError("Source pages require offset >= 0 and limit 1..100.")
+    _validate_filters(session, user, filters)
+    statement = _source_statement(filters)
+    if source_ids is not None:
+        statement = statement.where(UserFile.id.in_(source_ids))
+    parsed = [_source_title_query(query) for query in queries]
+    if len(parsed) == 1:
+        statement = statement.where(*parsed[0][0])
+    else:
+        statement = statement.where(or_(*(and_(*parts) for parts, _ in parsed)))
+    order = parsed[0][1]
     records = session.execute(
         statement.order_by(*order, UserFile.id).offset(offset).limit(limit + 1)
     ).all()
@@ -1122,6 +1133,51 @@ def find_sources(
         observe_publication_read(), sources, lambda row: str(row.id)
     )
     return retained, len(records) > limit
+
+
+def find_sources(
+    session: Session,
+    *,
+    user: User,
+    filters: IndexFilters,
+    query: str = "",
+    source_ids: tuple[UUID, ...] | None = None,
+    offset: int = 0,
+    limit: int = 50,
+) -> tuple[list[CorpusSource], bool]:
+    """Page metadata before text hydration; every returned source passes actual ACL."""
+    return _find_sources_with_title_queries(
+        session,
+        user=user,
+        filters=filters,
+        queries=(query,),
+        source_ids=source_ids,
+        offset=offset,
+        limit=limit,
+    )
+
+
+def find_related_sources(
+    session: Session,
+    *,
+    user: User,
+    filters: IndexFilters,
+    query_variants: tuple[str, ...],
+    offset: int = 0,
+    limit: int = 50,
+) -> tuple[list[CorpusSource], bool]:
+    """Union explicit name/number title leads in one ACL/publication-fenced page."""
+    if not query_variants or any(not query.strip() for query in query_variants):
+        raise ValueError("Related source lookup needs explicit nonempty title queries.")
+    return _find_sources_with_title_queries(
+        session,
+        user=user,
+        filters=filters,
+        queries=query_variants,
+        source_ids=None,
+        offset=offset,
+        limit=limit,
+    )
 
 
 def require_source(

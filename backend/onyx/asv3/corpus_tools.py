@@ -1,5 +1,6 @@
 """Canonical corpus tools with one shared, least-privilege source broker."""
 
+import copy
 import difflib
 import json
 import re
@@ -13,7 +14,13 @@ from typing import cast
 from uuid import UUID
 
 from pydantic import JsonValue
+from sqlalchemy.exc import SQLAlchemyError
 
+from onyx.asv3.legal_source_navigation import (
+    ProvisionNavigationAnchor,
+    derive_provision_navigation_anchor,
+    match_related_source_name,
+)
 from onyx.asv3.models import (
     EvidenceItem,
     OutcomeStatus,
@@ -29,6 +36,7 @@ from onyx.db.asv3_corpus import (
     CorpusChunk,
     CorpusScopeUnavailable,
     CorpusSource,
+    find_related_sources,
     find_sources,
     iter_source_chunks_by_ids,
     read_search_source_closures,
@@ -172,6 +180,10 @@ class CorpusBroker:
         self.file_store = file_store
         self.vision_llm = vision_llm
         self._index_lock = RLock()
+        self._related_sources_lock = RLock()
+        self._related_sources: dict[
+            tuple[str, ProvisionNavigationAnchor, int], dict[str, JsonValue]
+        ] = {}
 
     def source(self, source_id: str, context: RunContext) -> CorpusSource:
         context.check_active()
@@ -192,6 +204,141 @@ class CorpusBroker:
                 query=query,
                 offset=offset,
                 limit=limit,
+            )
+
+    def related_catalog_sources(
+        self,
+        query_variants: tuple[str, ...],
+        context: RunContext,
+        *,
+        offset: int = 0,
+        limit: int = 50,
+    ) -> tuple[list[CorpusSource], bool]:
+        context.check_active()
+        with get_session_with_current_tenant() as session:
+            return find_related_sources(
+                session,
+                user=self.user,
+                filters=self.filters,
+                query_variants=query_variants,
+                offset=offset,
+                limit=limit,
+            )
+
+    def related_sources_for_provision(
+        self,
+        source: CorpusSource,
+        evidence: list[EvidenceItem],
+        target: tuple[str, str | None],
+        context: RunContext,
+        *,
+        offset: int = 0,
+    ) -> dict[str, JsonValue] | None:
+        """Locate explicit title relationships without acquiring or approving their text."""
+        anchor = derive_provision_navigation_anchor(
+            str(source.id), evidence, target[0], target[1]
+        )
+        if anchor is None:
+            return None
+        context.check_active()
+        key = (self.filters.model_dump_json(), anchor, offset)
+        # One broker belongs to one captured user/scope. Sibling workers share its pages.
+        with self._related_sources_lock:
+            if key not in self._related_sources:
+                query = " ".join(
+                    part
+                    for part in (
+                        anchor.instrument_name,
+                        anchor.qualifier,
+                        anchor.article_no,
+                    )
+                    if part
+                )
+                query_variants = (query,)
+                if anchor.instrument_number:
+                    query_variants += (
+                        " ".join(
+                            part
+                            for part in (
+                                anchor.instrument_number,
+                                "sayılı Kanun",
+                                anchor.qualifier,
+                                anchor.article_no,
+                            )
+                            if part
+                        ),
+                    )
+                status = "available"
+                try:
+                    sources, more = self.related_catalog_sources(
+                        query_variants, context, offset=offset, limit=50
+                    )
+                except PermissionError:
+                    sources, more, status = [], False, "denied"
+                except (CorpusScopeUnavailable, SQLAlchemyError):
+                    sources, more, status = [], False, "unavailable"
+                candidates: list[JsonValue] = []
+                for candidate in sources:
+                    role = match_related_source_name(anchor, candidate.name)
+                    if candidate.id != source.id and role is not None:
+                        candidates.append(
+                            {
+                                "source_id": str(candidate.id),
+                                "name": candidate.name,
+                                "candidate_role": role,
+                            }
+                        )
+                self._related_sources[key] = {
+                    "anchor_source_id": anchor.source_id,
+                    "instrument_name": anchor.instrument_name,
+                    "instrument_number": anchor.instrument_number,
+                    "article_no": anchor.article_no,
+                    "qualifier": anchor.qualifier,
+                    "navigation_only": True,
+                    "absence_proven": False,
+                    "status": status,
+                    "query": query,
+                    "query_variants": list(query_variants),
+                    "offset": offset,
+                    "next_offset": offset + 50 if more else None,
+                    "has_more": more,
+                    "candidates": candidates,
+                    "instruction": "Source titles are reading leads, not holdings or proof of legal effect. Read a material candidate's actual operative text and dates before applying it; an empty page does not establish absence.",
+                }
+            return copy.deepcopy(self._related_sources[key])
+
+    def related_sources_for_evidence(
+        self, item: EvidenceItem, context: RunContext
+    ) -> dict[str, JsonValue] | None:
+        """Accept a retained genuine original; acquisition and delivery checks stay upstream."""
+        anchor = derive_provision_navigation_anchor(item.source_id, [item])
+        if anchor is None:
+            return None
+        assert item.search_doc is not None
+        source = CorpusSource(
+            UUID(item.source_id),
+            item.search_doc.semantic_identifier,
+            item.search_doc.file_id or "",
+        )
+        return self.related_sources_for_provision(
+            source, [item], (anchor.article_no, anchor.qualifier), context
+        )
+
+    def related_source_navigation(self) -> list[dict[str, JsonValue]]:
+        """Keep captured reading leads available after a native tool turn is compacted."""
+        scope = self.filters.model_dump_json()
+        with self._related_sources_lock:
+            return copy.deepcopy(
+                [
+                    record
+                    for (key, _, _), record in self._related_sources.items()
+                    if key == scope
+                    and (
+                        record["candidates"]
+                        or record["has_more"]
+                        or record["status"] != "available"
+                    )
+                ]
             )
 
     def page(
@@ -1038,6 +1185,12 @@ def build_corpus_specs(
         partial = (
             more or clipped or bool((paragraph or clause) and not subunit_verified)
         )
+        navigation = getattr(broker, "related_sources_for_provision", None)
+        related = (
+            navigation(stream.source, evidence, target, context)
+            if callable(navigation)
+            else None
+        )
         return ToolOutcome(
             status=OutcomeStatus.PARTIAL
             if partial
@@ -1053,6 +1206,11 @@ def build_corpus_specs(
                 "next_position": stream.next_position,
                 "evidence_next_position": selection.next_position,
                 "absence_proven": False,
+                **(
+                    {"related_source_candidates": related}
+                    if related is not None
+                    else {}
+                ),
             },
             evidence=evidence,
         )

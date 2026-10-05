@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import threading
 from typing import TYPE_CHECKING, Callable, Iterable
 
@@ -22,6 +23,48 @@ if TYPE_CHECKING:
     from onyx.asv3.evidence import EvidenceLedger
 
 
+def _outcome_metadata_properties() -> dict[str, JsonValue]:
+    schema: dict[str, JsonValue] = OutcomeUpdate.model_json_schema()
+    references = schema.get("$defs", {})
+    assert isinstance(references, dict)
+
+    def inline(value: JsonValue) -> JsonValue:
+        if isinstance(value, list):
+            return [inline(item) for item in value]
+        if not isinstance(value, dict):
+            return value
+        result: dict[str, JsonValue] = {}
+        reference = value.get("$ref")
+        if isinstance(reference, str):
+            if not reference.startswith("#/$defs/"):
+                raise ValueError("Outcome schema references must be local")
+            resolved = inline(references[reference.removeprefix("#/$defs/")])
+            assert isinstance(resolved, dict)
+            result.update(resolved)
+        result.update(
+            {
+                key: inline(item)
+                for key, item in value.items()
+                if key not in {"$ref", "$defs", "title", "default"}
+            }
+        )
+        return result
+
+    properties = inline(schema["properties"])
+    assert isinstance(properties, dict)
+    return {
+        "_outcomes": properties["outcomes"],
+        "_coverage": {
+            "type": "object",
+            "properties": {
+                "conditions": properties["conditions"],
+                "resolutions": properties["resolutions"],
+            },
+            "additionalProperties": False,
+        },
+    }
+
+
 class CapabilityRegistry:
     def __init__(self, specs: Iterable[ToolSpec] = ()) -> None:
         self._specs: dict[str, ToolSpec] = {}
@@ -37,6 +80,12 @@ class CapabilityRegistry:
 
     def definitions(self, context: RunContext) -> list[dict[str, JsonValue]]:
         definitions: list[dict[str, JsonValue]] = []
+        outcome_properties = (
+            _outcome_metadata_properties()
+            if context.services.get("lean_native_mode")
+            and isinstance(context.services.get("outcome_map"), OutcomeMap)
+            else None
+        )
         for spec in self._specs.values():
             if context.corpus_only and spec.external:
                 continue
@@ -67,12 +116,8 @@ class CapabilityRegistry:
                     "type": "boolean",
                     "description": "True only when the user explicitly requested outside/web sources; host authorization still applies.",
                 }
-                if isinstance(context.services.get("outcome_map"), OutcomeMap):
-                    properties["_outcomes"] = {
-                        "type": "array",
-                        "items": {"type": "object"},
-                    }
-                    properties["_coverage"] = {"type": "object"}
+                if outcome_properties is not None:
+                    properties.update(copy.deepcopy(outcome_properties))
             if spec.name not in {
                 "update_research",
                 "inspect_research",

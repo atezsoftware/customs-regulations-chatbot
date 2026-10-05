@@ -285,6 +285,10 @@ def run_asv3_loop(
     context.services["evidence"] = ledger
     registry = CapabilityRegistry()
     broker = CorpusBroker(user, scope, vision_llm=research_llm or llm)
+    context.services["legal_source_navigation_acquire"] = (
+        broker.related_sources_for_evidence
+    )
+    context.services["legal_source_navigation"] = broker.related_source_navigation
     history = "\n".join(
         f"{m.message_type.value}: {m.message}"
         for m in simple_chat_history[-8:]

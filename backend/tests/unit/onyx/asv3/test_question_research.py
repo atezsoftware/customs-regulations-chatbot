@@ -191,8 +191,9 @@ def test_invalid_original_question_coverage_starts_no_workers(
     entries: list[dict[str, JsonValue]],
 ) -> None:
     research, workers, context = controlled_research([], ["First", "Second"])
-    with pytest.raises(ValueError):
-        research.research_questions({"questions": entries}, context)
+    result = research.research_questions({"questions": entries}, context)
+    assert result.status is OutcomeStatus.INVALID
+    assert result.data["validation_error"]
     assert workers.calls == []
     assert "question_research_started" not in context.services
 
@@ -890,14 +891,79 @@ def test_assignment_outcomes_are_validated_against_their_original_question(
         ["two"],
     )
     if wrong_binding:
-        with pytest.raises(ValueError, match="original questions"):
-            research.research_questions({"questions": [first, second]}, context)
+        result = research.research_questions({"questions": [first, second]}, context)
+        assert result.status is OutcomeStatus.INVALID
+        assert "original questions" in str(result.data["validation_error"])
         assert workers.calls == []
     else:
         research.research_questions({"questions": [first, second]}, context)
         assert workers.outcome_bindings == [["one"], ["two"]]
         assert research.answers[0]["outcome_ids"] == ["one"]
         assert research.answers[1]["outcome_ids"] == ["two"]
+
+
+def test_undeclared_assignment_outcomes_return_invalid_without_starting_research() -> (
+    None
+):
+    research, workers, context = controlled_research([found("Answer [1]")], ["First"])
+    outcomes = OutcomeMap(["First"], context)
+    context.services["outcome_map"] = outcomes
+    entry = question("first", "First", 1)
+    entry["outcome_ids"] = ["o1", "o2", "o3", "o4"]
+    context.services["evidence"] = EvidenceLedger()
+    registry = CapabilityRegistry(research.tool_specs())
+    result = registry.dispatch(
+        CapabilityCall(name="research_questions", arguments={"questions": [entry]}),
+        context,
+    )
+    assert result.status is OutcomeStatus.INVALID
+    assert result.data["validation_error"] == (
+        "Undeclared assignment outcomes for first: o1, o2, o3, o4"
+    )
+    assert "Omit outcome_ids" in str(result.data["instruction"])
+    assert workers.calls == []
+    assert research.assignments == []
+    assert research.answers == []
+    assert outcomes.outcome_ids() == []
+    assert "question_research_started" not in context.services
+
+    entry.pop("outcome_ids")
+    retried = registry.dispatch(
+        CapabilityCall(name="research_questions", arguments={"questions": [entry]}),
+        context,
+    )
+    assert retried.status is OutcomeStatus.FOUND
+    assert len(workers.calls) == 1
+    assert workers.outcome_bindings == [None]
+    assert outcomes.outcome_ids() == []
+
+
+def test_assignment_outcomes_may_be_declared_on_the_same_useful_action() -> None:
+    research, workers, context = controlled_research([found("Answer [1]")], ["First"])
+    outcomes = OutcomeMap(["First"], context)
+    context.services["outcome_map"] = outcomes
+    entry = question("first", "First", 1)
+    entry["outcome_ids"] = ["first-outcome"]
+    context.services["evidence"] = EvidenceLedger()
+    result = CapabilityRegistry(research.tool_specs()).dispatch(
+        CapabilityCall(
+            name="research_questions",
+            arguments={
+                "questions": [entry],
+                "_outcomes": [
+                    {
+                        "outcome_id": "first-outcome",
+                        "question_ids": ["q0"],
+                        "detail": "The requested first outcome",
+                    }
+                ],
+            },
+        ),
+        context,
+    )
+    assert result.status is OutcomeStatus.FOUND
+    assert workers.outcome_bindings == [["first-outcome"]]
+    assert outcomes.outcome_ids() == ["first-outcome"]
 
 
 def test_worker_outcome_binding_is_available_before_the_worker_starts() -> None:

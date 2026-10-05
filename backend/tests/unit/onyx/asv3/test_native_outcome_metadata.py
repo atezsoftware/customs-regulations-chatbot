@@ -3,6 +3,7 @@ from collections.abc import Callable
 from unittest.mock import MagicMock
 
 import pytest
+from jsonschema import Draft202012Validator
 from pydantic import JsonValue
 
 from onyx.asv3.evidence import EvidenceLedger
@@ -87,6 +88,102 @@ def read_call(arguments: dict[str, JsonValue] | None = None) -> CapabilityCall:
         name="read_provision",
         arguments={"source_id": "original", "article": "1", **(arguments or {})},
     )
+
+
+def native_parameters(context: RunContext) -> dict[str, JsonValue]:
+    registry = source_registry(
+        lambda _arguments, _context: ToolOutcome(
+            status=OutcomeStatus.FOUND, summary="Original read"
+        )
+    )
+    definition = registry.definitions(context)[0]
+    function = definition["function"]
+    assert isinstance(function, dict)
+    parameters = function["parameters"]
+    assert isinstance(parameters, dict)
+    return parameters
+
+
+def test_native_outcome_schema_exposes_actual_required_fields_without_references() -> (
+    None
+):
+    context, _, _ = research_context()
+    parameters = native_parameters(context)
+    Draft202012Validator.check_schema(parameters)
+    serialized = json.dumps(parameters)
+    assert '"$ref"' not in serialized
+    assert '"$defs"' not in serialized
+    properties = parameters["properties"]
+    assert isinstance(properties, dict)
+    declarations = properties["_outcomes"]
+    assert isinstance(declarations, dict)
+    item = declarations["items"]
+    assert isinstance(item, dict)
+    assert set(item["required"]) == {"outcome_id", "question_ids", "detail"}
+    assert item["additionalProperties"] is False
+    required = parameters["required"]
+    assert isinstance(required, list)
+    assert "_outcomes" not in required
+    assert "_coverage" not in required
+    validator = Draft202012Validator(parameters)
+    assert validator.is_valid(read_call().arguments)
+    assert validator.is_valid(read_call({"_outcomes": [], "_coverage": {}}).arguments)
+    assert validator.is_valid(read_call({"_outcomes": [requested()]}).arguments)
+    invalid = requested()
+    invalid.pop("detail")
+    assert not validator.is_valid(read_call({"_outcomes": [invalid]}).arguments)
+
+
+def test_native_coverage_schema_checks_source_ranges_and_resolution_contract() -> None:
+    context, _, _ = research_context()
+    parameters = native_parameters(context)
+    validator = Draft202012Validator(parameters)
+    coverage: dict[str, JsonValue] = {
+        "conditions": [
+            {
+                "condition_id": "approval",
+                "outcome_ids": ["first"],
+                "detail": "The result depends on an authenticated document.",
+                "witnesses": [{"citation": 1, "start_char": 0, "end_char": 60}],
+            }
+        ],
+        "resolutions": [
+            {
+                "outcome_id": "first",
+                "status": "conditional",
+                "condition_ids": ["approval"],
+                "evidence_numbers": [1],
+            }
+        ],
+    }
+    assert validator.is_valid(read_call({"_coverage": coverage}).arguments)
+    assert (
+        OutcomeUpdate.model_validate(coverage).conditions[0].condition_id == "approval"
+    )
+    encoded = json.dumps(coverage)
+    for old, new in (
+        ('"end_char": 60', '"end_char": 0'),
+        ('"citation": 1', '"citation": 0'),
+        ('"start_char": 0', '"start_char": -1'),
+        ('"status": "conditional"', '"status": "complete"'),
+        (
+            '"detail": "The result depends on an authenticated document."',
+            '"unexpected": "not a condition field"',
+        ),
+    ):
+        changed = json.loads(encoded.replace(old, new))
+        assert not validator.is_valid(read_call({"_coverage": changed}).arguments)
+
+
+@pytest.mark.parametrize("service", ["outcome_map", "lean_native_mode"])
+def test_outcome_metadata_schema_is_not_exposed_when_inactive(service: str) -> None:
+    context, _, _ = research_context()
+    context.services.pop(service)
+    parameters = native_parameters(context)
+    properties = parameters["properties"]
+    assert isinstance(properties, dict)
+    assert "_outcomes" not in properties
+    assert "_coverage" not in properties
 
 
 @pytest.mark.parametrize("through_harness", [False, True])

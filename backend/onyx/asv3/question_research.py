@@ -216,20 +216,32 @@ class QuestionResearch:
                         not isinstance(value, str) or not value for value in outcomes
                     )
                     or len(set(outcomes)) != len(outcomes)
-                    or not isinstance(state, OutcomeMap)
-                    or set(outcomes)
-                    - set(
-                        state.outcome_ids(
-                            question_ids=[
-                                f"q{number - 1}"
-                                for number in parents
-                                if type(number) is int
-                            ]
-                        )
+                ):
+                    raise ValueError(
+                        "Assignment outcome_ids must be unique nonempty IDs"
+                    )
+                if not isinstance(state, OutcomeMap):
+                    raise ValueError(
+                        "Assignment outcome_ids require recorded outcomes; omit the optional binding or declare _outcomes on this same action"
+                    )
+                known = set(state.outcome_ids())
+                unknown = set(outcomes) - known
+                if unknown:
+                    raise ValueError(
+                        f"Undeclared assignment outcomes for {identifier}: "
+                        + ", ".join(sorted(unknown))
+                    )
+                if set(outcomes) - set(
+                    state.outcome_ids(
+                        question_ids=[
+                            f"q{number - 1}"
+                            for number in parents
+                            if type(number) is int
+                        ]
                     )
                 ):
                     raise ValueError(
-                        "Assignment outcomes must belong to its original questions"
+                        f"Assignment outcomes must belong to its original questions: {identifier}"
                     )
             questions.append(dict(entry))
         if covered != set(range(1, len(self.original_questions) + 1)):
@@ -251,7 +263,17 @@ class QuestionResearch:
                 summary="Existing independent answers retained; do not duplicate research.",
             )
         if not self.assignments:
-            questions = self._validated_questions(arguments.get("questions"))
+            try:
+                questions = self._validated_questions(arguments.get("questions"))
+            except ValueError as error:
+                return ToolOutcome(
+                    status=OutcomeStatus.INVALID,
+                    summary="Independent assignments were rejected; no researcher was started.",
+                    data={
+                        "validation_error": str(error),
+                        "instruction": "Correct the assignment coverage and bindings, preserving the original questions and scenario. outcome_ids are optional: use only recorded outcomes belonging to those original questions, or declare them with _outcomes on this same useful action. Omit outcome_ids when not using an outcome map; do not invent IDs or repeat completed research.",
+                    },
+                )
             with self._lock:
                 self.assignments = [{**item, "task_id": None} for item in questions]
             for item in self.assignments:
@@ -510,7 +532,7 @@ class QuestionResearch:
                                         "minItems": 1,
                                         "uniqueItems": True,
                                         "items": {"type": "string", "minLength": 1},
-                                        "description": "Existing outcome-map IDs for this assignment's original questions; preserve their full scenario and new source-bound conditions.",
+                                        "description": "Optional IDs already recorded for this assignment's original questions, or declared with _outcomes on this same action. Omit outcome_ids when not using an outcome map; never invent undeclared IDs. Preserve the full scenario and source-bound conditions.",
                                     },
                                     "public_title": {"type": "string", "minLength": 1},
                                     "public_message": {

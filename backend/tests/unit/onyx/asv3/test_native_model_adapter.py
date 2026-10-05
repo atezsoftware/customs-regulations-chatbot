@@ -3,10 +3,12 @@ from typing import Any, cast
 from unittest.mock import MagicMock
 
 import pytest
+from litellm.exceptions import BadRequestError, InternalServerError
 from pydantic import JsonValue
 
 from onyx.asv3 import llm_adapter
 from onyx.asv3.evidence import EvidenceLedger
+from onyx.asv3.harness import Harness
 from onyx.asv3.llm_adapter import ResearchModel
 from onyx.asv3.models import (
     CapabilityCall,
@@ -19,8 +21,10 @@ from onyx.asv3.models import (
     SharedBudget,
     ToolOutcome,
     ToolReceipt,
+    ToolSpec,
 )
 from onyx.asv3.outcome_map import OutcomeMap, OutcomeUpdate
+from onyx.asv3.registry import CapabilityRegistry
 from onyx.llm.interfaces import LLM, LLMConfig
 from onyx.llm.model_response import (
     ChatCompletionMessageToolCall,
@@ -116,6 +120,368 @@ def view(**kwargs: Any) -> HarnessView:
 def last_payload(llm: MagicMock) -> dict[str, Any]:
     content = llm.invoke.call_args.kwargs["prompt"][-1].content
     return cast(dict[str, Any], json.loads(content[0].text))
+
+
+def native_response(
+    name: str | None,
+    arguments: str | None = "{}",
+    *,
+    call_id: str = "native-call",
+) -> ModelResponse:
+    return ModelResponse(
+        id="native-response",
+        created="0",
+        choice=Choice(
+            message=Message(
+                tool_calls=[
+                    ChatCompletionMessageToolCall(
+                        id=call_id,
+                        function=ResponseFunctionCall(name=name, arguments=arguments),
+                    )
+                ]
+            )
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "name,arguments,call_id",
+    [
+        ("report_message", '{"title":"Status","message":"Work continues"}', "live-id"),
+        (
+            "repair_question_answer",
+            '{"expected_answer_hash":"recorded","question_id":"q1","edits":[]}',
+            "live-repair-id",
+        ),
+        ("unavailable_capability", "{}", "unknown-name"),
+        ("read_provision", "{}", ""),
+        (None, "{}", "missing-name"),
+        ("read_provision", None, "null-arguments"),
+    ],
+)
+def test_malformed_native_batch_gets_a_fresh_decision_from_actual_exposed_tools(
+    name: str | None, arguments: str | None, call_id: str
+) -> None:
+    context, llm = RunContext(), model()
+    ledger = EvidenceLedger()
+    context.services["evidence"] = ledger
+    context.services["task_outcome_ids"] = ["retained-outcome"]
+    record = original(ledger, context, "Applicable original text")
+    current = adaptive_tool_view(original_evidence=[record])
+    rejected = native_response(name, arguments, call_id=call_id)
+    rejected_copy = rejected.model_dump()
+    llm.invoke.side_effect = [
+        rejected,
+        native_response("read_provision", '{"source_id":"existing"}', call_id="fresh"),
+    ]
+    decision = ResearchModel(llm, context, lean_native_mode=True).decide(current)
+    assert [call.name for call in decision.calls] == ["read_provision"]
+    assert decision.calls[0].call_id == "fresh"
+    first, recovery = llm.invoke.call_args_list
+    assert recovery.kwargs["prompt"][:-1] == first.kwargs["prompt"]
+    assert recovery.kwargs["tools"] == first.kwargs["tools"]
+    assert "rejected before execution" in recovery.kwargs["prompt"][-1].content
+    assert "report_message" not in {
+        tool["function"]["name"] for tool in recovery.kwargs["tools"]
+    }
+    assert context.services["task_outcome_ids"] == ["retained-outcome"]
+    retained = ledger.get(1)
+    assert retained is not None
+    assert retained.text == record["text"]
+    assert rejected.model_dump() == rejected_copy
+    assert llm.invoke.call_count == 2
+    assert context.budget.snapshot()["tools"] == 0
+
+
+@pytest.mark.parametrize("provider_error", [BadRequestError, InternalServerError])
+def test_provider_native_rejection_gets_fresh_decision_without_transport_retry(
+    provider_error: type[BadRequestError] | type[InternalServerError],
+) -> None:
+    context, llm = RunContext(), model()
+    ledger = EvidenceLedger()
+    context.services["evidence"] = ledger
+    context.services["task_outcome_ids"] = ["retained"]
+    record = original(ledger, context, "Retained governing text")
+    current = adaptive_tool_view(original_evidence=[record])
+    llm.invoke.side_effect = [
+        provider_error(
+            message="MALFORMED_FUNCTION_CALL: private-provider-detail",
+            model="mock",
+            llm_provider="vertex_ai",
+        ),
+        native_response("read_provision", '{"source_id":"existing"}'),
+    ]
+    adapter = ResearchModel(llm, context, lean_native_mode=True)
+    decision = adapter.decide(current)
+    assert [call.name for call in decision.calls] == ["read_provision"]
+    first, corrected = llm.invoke.call_args_list
+    assert corrected.kwargs["prompt"][:-1] == first.kwargs["prompt"]
+    assert corrected.kwargs["tools"] == first.kwargs["tools"]
+    diagnostic = corrected.kwargs["prompt"][-1].content
+    assert "MALFORMED_FUNCTION_CALL" in diagnostic
+    assert "private-provider-detail" not in diagnostic
+    assert ledger.get(1) is not None
+    assert context.services["task_outcome_ids"] == ["retained"]
+    assert context.budget.snapshot()["tools"] == 0
+    assert llm.invoke.call_count == 2
+
+
+@pytest.mark.parametrize("has_calls", [True, False])
+def test_malformed_provider_finish_rejects_content_and_calls(has_calls: bool) -> None:
+    rejected = native_response("read_provision", '{"source_id":"rejected"}')
+    rejected.choice.finish_reason = "MALFORMED_FUNCTION_CALL"
+    rejected.choice.message.content = "A seemingly complete answer."
+    if not has_calls:
+        rejected.choice.message.tool_calls = None
+    llm = model()
+    llm.invoke.side_effect = [
+        rejected,
+        native_response("read_provision", '{"source_id":"replacement"}'),
+    ]
+    decision = ResearchModel(llm, RunContext(), lean_native_mode=True).decide(
+        adaptive_tool_view()
+    )
+    assert decision.answer is None
+    assert [call.arguments for call in decision.calls] == [{"source_id": "replacement"}]
+    assert (
+        "rejected before execution"
+        in llm.invoke.call_args_list[1].kwargs["prompt"][-1].content
+    )
+    assert llm.invoke.call_count == 2
+
+
+def test_repeated_provider_native_rejection_preserves_research_and_stops_protocol_loop() -> (
+    None
+):
+    context, llm = RunContext(), model()
+    context.services["task_outcome_ids"] = ["retained"]
+    llm.invoke.side_effect = [
+        BadRequestError(
+            message=f"MALFORMED_FUNCTION_CALL: opaque-request-{index}",
+            model="mock",
+            llm_provider="vertex_ai",
+        )
+        for index in range(2)
+    ]
+    with pytest.raises(RunStopped, match="unchanged invalid native action batch"):
+        ResearchModel(llm, context, lean_native_mode=True).decide(adaptive_tool_view())
+    assert context.services["task_outcome_ids"] == ["retained"]
+    assert context.budget.snapshot()["tools"] == 0
+    assert llm.invoke.call_count == 2
+    assert "opaque-request" not in llm.invoke.call_args.kwargs["prompt"][-1].content
+
+
+@pytest.mark.parametrize("message", ["Invalid schema", "NOT_MALFORMED_FUNCTION_CALL"])
+def test_unrelated_provider_bad_request_is_not_native_recovery(message: str) -> None:
+    llm = model()
+    llm.invoke.side_effect = BadRequestError(
+        message=message, model="mock", llm_provider="vertex_ai"
+    )
+    with pytest.raises(BadRequestError):
+        ResearchModel(llm, RunContext(), lean_native_mode=True).decide(
+            adaptive_tool_view()
+        )
+    assert llm.invoke.call_count == 1
+
+
+def test_no_choices_without_provider_marker_is_not_native_recovery() -> None:
+    llm = model()
+    llm.invoke.side_effect = ValueError(
+        "LiteLLM response must include at least one choice."
+    )
+    with pytest.raises(ValueError, match="at least one choice"):
+        ResearchModel(llm, RunContext(), lean_native_mode=True).decide(
+            adaptive_tool_view()
+        )
+    assert llm.invoke.call_count == 1
+
+
+def test_provider_rejection_during_truncated_completion_restarts_native_decision() -> (
+    None
+):
+    llm = model()
+    llm.invoke.side_effect = [
+        ModelResponse(
+            id="incomplete",
+            created="0",
+            choice=Choice(
+                finish_reason="length", message=Message(content="Incomplete ")
+            ),
+        ),
+        BadRequestError(
+            message="MALFORMED_FUNCTION_CALL", model="mock", llm_provider="vertex_ai"
+        ),
+        native_response("read_provision"),
+    ]
+    decision = ResearchModel(llm, RunContext(), lean_native_mode=True).decide(
+        adaptive_tool_view()
+    )
+    assert [call.name for call in decision.calls] == ["read_provision"]
+    first, _, corrected = llm.invoke.call_args_list
+    assert corrected.kwargs["prompt"][:-1] == first.kwargs["prompt"]
+    assert corrected.kwargs["tools"] == first.kwargs["tools"]
+    assert llm.invoke.call_count == 3
+
+
+def test_native_recovery_reuses_base_context_after_repeated_envelope_defects() -> None:
+    llm = model()
+    llm.invoke.side_effect = [
+        native_response("report_message"),
+        native_response("read_provision", call_id=""),
+        native_response("read_provision", call_id="complete"),
+    ]
+    context = RunContext()
+    decision = ResearchModel(llm, context, lean_native_mode=True).decide(
+        adaptive_tool_view()
+    )
+    assert decision.calls[0].call_id == "complete"
+    first, second, third = llm.invoke.call_args_list
+    assert second.kwargs["prompt"][:-1] == first.kwargs["prompt"]
+    assert third.kwargs["prompt"][:-1] == first.kwargs["prompt"]
+    assert llm.invoke.call_count == 3
+
+
+def test_identical_invalid_protocol_stops_without_echoing_opaque_provider_ids() -> None:
+    context, llm = RunContext(), model()
+    opaque = "__thought__" + "signature" * 1000
+    llm.invoke.side_effect = [
+        native_response(
+            "report_message", '{"title":"Status","message":"Continues"}', call_id=opaque
+        ),
+        native_response(
+            "report_message",
+            '{ "message": "Continues", "title": "Status" }',
+            call_id="different-provider-id-" + opaque,
+        ),
+    ]
+    with pytest.raises(RunStopped, match="unchanged invalid native action batch"):
+        ResearchModel(llm, context, lean_native_mode=True).decide(adaptive_tool_view())
+    diagnostic = llm.invoke.call_args_list[1].kwargs["prompt"][-1].content
+    assert "signature" not in diagnostic
+    assert "__thought__" not in diagnostic
+    assert '"call_index": 0' in diagnostic
+    assert '"call_id_present": true' in diagnostic
+    assert len(diagnostic) < 2000
+    assert llm.invoke.call_count == 2
+    assert context.budget.snapshot()["tools"] == 0
+
+
+def test_envelope_preflight_precedes_every_argument_patch() -> None:
+    context, llm = RunContext(), model()
+    current = adaptive_tool_view()
+    current.tools[2]["function"] = {
+        "name": "read_provision",
+        "parameters": {
+            "type": "object",
+            "properties": {"article": {"type": "string"}},
+            "required": ["article"],
+        },
+    }
+    rejected = native_response("read_provision", '{"article":17}')
+    assert rejected.choice.message.tool_calls is not None
+    rejected.choice.message.tool_calls.append(
+        ChatCompletionMessageToolCall(
+            id="unexposed-peer",
+            function=ResponseFunctionCall(name="report_message", arguments="{}"),
+        )
+    )
+    llm.invoke.side_effect = [
+        rejected,
+        native_response("read_provision", '{"article":"17"}'),
+    ]
+    decision = ResearchModel(llm, context, lean_native_mode=True).decide(current)
+    assert [call.arguments for call in decision.calls] == [{"article": "17"}]
+    recovery = llm.invoke.call_args_list[1].kwargs
+    assert recovery["tools"] == llm.invoke.call_args_list[0].kwargs["tools"]
+    assert recovery["structured_response_format"] is None
+    assert llm.invoke.call_count == 2
+
+
+def test_duplicate_native_call_id_requires_replacement_of_the_whole_batch() -> None:
+    rejected = native_response("read_provision", call_id="duplicate")
+    assert rejected.choice.message.tool_calls is not None
+    rejected.choice.message.tool_calls.append(
+        ChatCompletionMessageToolCall(
+            id="duplicate",
+            function=ResponseFunctionCall(name="read_provision", arguments="{}"),
+        )
+    )
+    llm = model()
+    llm.invoke.side_effect = [
+        rejected,
+        native_response("read_provision", call_id="unique"),
+    ]
+    decision = ResearchModel(llm, RunContext(), lean_native_mode=True).decide(
+        adaptive_tool_view()
+    )
+    assert [call.call_id for call in decision.calls] == ["unique"]
+    assert llm.invoke.call_count == 2
+
+
+def test_native_envelope_recovery_respects_run_cancellation() -> None:
+    context, llm = RunContext(), model()
+
+    def invoke(**_arguments: Any) -> ModelResponse:
+        if llm.invoke.call_count == 2:
+            context.cancel()
+        return native_response("report_message")
+
+    llm.invoke.side_effect = invoke
+    with pytest.raises(RunStopped, match="cancelled"):
+        ResearchModel(llm, context, lean_native_mode=True).decide(adaptive_tool_view())
+    assert llm.invoke.call_count == 2
+    assert context.budget.snapshot()["tools"] == 0
+
+
+def test_a_malformed_peer_prevents_execution_of_the_entire_native_batch() -> None:
+    executed: list[str] = []
+
+    def read(arguments: dict[str, JsonValue], _context: RunContext) -> ToolOutcome:
+        executed.append(str(arguments["label"]))
+        return ToolOutcome(status=OutcomeStatus.FOUND, summary="Source read")
+
+    registry = CapabilityRegistry(
+        [
+            ToolSpec(
+                name="read_test_source",
+                description="Read the requested original",
+                parameters={
+                    "type": "object",
+                    "properties": {"label": {"type": "string"}},
+                    "required": ["label"],
+                },
+                handler=read,
+            )
+        ]
+    )
+    rejected = native_response("read_test_source", '{"label":"rejected-batch"}')
+    assert rejected.choice.message.tool_calls is not None
+    malformed = native_response("report_message", call_id="unknown")
+    assert malformed.choice.message.tool_calls is not None
+    rejected.choice.message.tool_calls.extend(malformed.choice.message.tool_calls)
+    llm, context = model(), RunContext()
+
+    def invoke(**_arguments: Any) -> ModelResponse:
+        if llm.invoke.call_count == 1:
+            return rejected
+        if llm.invoke.call_count == 2:
+            assert executed == []
+            return native_response("read_test_source", '{"label":"replacement"}')
+        return ModelResponse(
+            id="done", created="0", choice=Choice(message=Message(content="Complete"))
+        )
+
+    llm.invoke.side_effect = invoke
+    result = Harness(
+        request="Read the requested original",
+        context=context,
+        registry=registry,
+        decide=ResearchModel(llm, context, lean_native_mode=True).decide,
+    ).run()
+    assert result.status is OutcomeStatus.FOUND
+    assert executed == ["replacement"]
+    assert len(result.receipts) == 1
+    assert llm.invoke.call_count == 3
 
 
 def independent_tool_view(**kwargs: Any) -> HarnessView:

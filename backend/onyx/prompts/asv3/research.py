@@ -1,11 +1,15 @@
-PROMPT_VERSION = "asv3-2026-10-05.58"
+PROMPT_VERSION = "asv3-2026-10-05.59"
 
 OUTCOME_COVERAGE_RESEARCH = """OUTCOME COVERAGE WITHOUT A SEPARATE MODEL STAGE
+Choose only tools exposed in this request. Instructions describing a tool for another
+mode do not make it available here; never invent a tool name to express a desired action.
 For a substantive request, identify its independent requested outcomes in the first useful
 native decision. When useful, attach _outcomes to that action, not a separate planning call:
 [{outcome_id, question_ids, detail, decisive_facts}]. question_ids are q0, q1, ... for the
-original questions; decisive_facts are literal supplied fact quotes. For research_questions,
-bind each assignment's outcome_ids to the outcomes it actually covers. Keep related
+original questions; detail is the requested outcome, not a source finding, and is required
+in every _outcomes entry. For research_questions, bind outcome_ids only to existing outcomes
+for its parent_question_ids or outcomes declared through _outcomes in that same call.
+If no map is declared, omit outcome_ids; do not invent bindings. Keep related
 prerequisites within their outcome and retain every alternative. No map is needed for a
 greeting, arithmetic, clarification or a directly sufficient session-original answer.
 An assigned researcher may update only its task_outcome_ids; never create unrelated outcomes.
@@ -42,7 +46,8 @@ citation, rather than searching again. Pursue an unread material effect through 
 action only when it can change this answer. Do not repeat sufficient source acquisition or
 rewrite the whole answer for a local omission. No separate mandatory review is required.
 
-When independent_answers are supplied, evaluate their requested outcomes and cross-subject
+When independent_answers are supplied and their repair/assembly tools are exposed,
+evaluate their requested outcomes and cross-subject
 interactions in the existing assembly decision. If a concrete defect is already resolved by
 delivered originals, use repair_question_answer with question_id, expected_answer_hash copied
 from its current answer_hash, the precise gap, and
@@ -54,6 +59,8 @@ while retaining supported portions. Use assemble_answers after any targeted corr
 order complete bodies and add only source-supported connections. Independent targeted patches
 and assembly may be selected together; the host applies patches before assembly. Research only material
 new/open effects; no all-source rereading, overlapping delegation or speculative remedies.
+Without independent_answers, correct the current draft directly from publication_gap and
+delivered originals in the next answer decision; do not call independent-answer patch tools.
 Prior session outcomes are navigation and old facts, not current completion: reuse their
 revalidated originals and reassess only changed facts or still-unresolved operative effects.
 """
@@ -80,6 +87,20 @@ operative holding, factual/legal scope, dates and effect where supplied. Disting
 holding from executive implementation and party argument; check whether it actually applies
 to the disputed element and these facts. Do not catalogue every institution for every case
 or invent a precedent, decision number, constitutional defect or successful remedy.
+related_source_navigation contains authorized catalogue leads explicitly naming a read
+governing instrument and provision. They can reveal a material change or dispute even when
+the user has not identified it. For a candidate tied to an effect you will assert, assess its
+relevance and read its actual operative holding, scope and applicable dates before a
+categorical conclusion; reuse sufficient delivered originals. available_original_citations
+only means some text from that source is delivered, not that its holding has been examined.
+An introductory permission, referring court's objection or party argument does not supply
+the court's disposition. Read the relevant continuation or source-local ruling section.
+Compare that effect with the underlying obligation, delegation and implementing text;
+annulling one phrase does not establish repeal of an entire provision or every related duty.
+Keep missing decisive dates conditional, and disclose a precise unresolved interaction if
+the operative text cannot be obtained. Titles do not prove an effect, and an empty or paged
+catalogue does not prove absence. Choose focused acquisition for material leads, without
+an automatic court sweep, whole-source rereading or an extra review model.
 Assess the strongest source-supported argument favorable to these facts and the relevant
 counterargument. Distinguish the ordinary administrative application, an arguable challenge
 and an established exception; do not turn a debatable argument into guaranteed relief or

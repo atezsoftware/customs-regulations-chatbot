@@ -70,6 +70,7 @@ ASSEMBLY_TOOLS = {
     "follow_reference",
     "search_source_text",
     "search_corpus",
+    "query_corpus",
     "diagnose_source",
 }
 
@@ -247,6 +248,14 @@ class CorpusBoundary:
         self.revalidated: list[EvidenceItem] = []
         self.search_adapter: Any = None
         self.scope: IndexFilters | None = None
+
+    def related_sources_for_evidence(
+        self, _item: EvidenceItem, _context: RunContext
+    ) -> dict[str, JsonValue] | None:
+        return None
+
+    def related_source_navigation(self) -> list[dict[str, JsonValue]]:
+        return []
 
     def page(
         self, source_id: str, _context: RunContext, **_kwargs: Any
