@@ -701,6 +701,14 @@ def _is_social_only_message(message: str) -> bool:
     return not tokens or all(token in _SOCIAL_TURN_TOKENS for token in tokens)
 
 
+def _uses_deep_asv3(setup: ChatTurnSetup) -> bool:
+    return (
+        getattr(setup.new_msg_req, "deep_research", False) is True
+        and setup.persona.id == DEFAULT_PERSONA_ID
+        and setup.chat_session.project_id is None
+    )
+
+
 def _global_regulatory_search_filters(setup: ChatTurnSetup) -> BaseFilters | None:
     """Build default-chat filters and opt into Atez Search only when selected."""
     filters = setup.new_msg_req.internal_search_filters
@@ -708,7 +716,9 @@ def _global_regulatory_search_filters(setup: ChatTurnSetup) -> BaseFilters | Non
         return filters
 
     atez_search_v2 = getattr(setup.new_msg_req, "atez_search_v2", False) is True
-    atez_search_v3 = getattr(setup.new_msg_req, "atez_search_v3", False) is True
+    atez_search_v3 = (
+        getattr(setup.new_msg_req, "atez_search_v3", False) is True
+    ) or _uses_deep_asv3(setup)
     regulatory_search_enabled = (
         setup.new_msg_req.atez_search or atez_search_v2 or atez_search_v3
     )
@@ -1566,7 +1576,7 @@ def _run_models(
                 # Per-thread copy: run_llm_loop mutates simple_chat_history in-place.
                 # Deep Research receives the same internal-only, global regulatory
                 # SearchTool as the standard loop.
-                if setup.new_msg_req.atez_search_v3:
+                if setup.new_msg_req.atez_search_v3 or _uses_deep_asv3(setup):
                     from onyx.asv3.runtime import run_asv3_loop
 
                     if setup.persona.id != DEFAULT_PERSONA_ID:
@@ -1592,6 +1602,9 @@ def _run_models(
                         reasoning_effort=setup.reasoning_effort,
                         include_citations=setup.new_msg_req.include_citations,
                         cache=setup.cache,
+                        research_profile="deep"
+                        if _uses_deep_asv3(setup)
+                        else setup.new_msg_req.asv3_research_profile,
                         resume_message_id=setup.new_msg_req.asv3_resume_message_id,
                         custom_agent_prompt=setup.custom_agent_prompt,
                         allow_external=setup.new_msg_req.asv3_allow_external,

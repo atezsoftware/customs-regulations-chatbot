@@ -58,6 +58,10 @@ from onyx.llm.models import (
 from onyx.llm.models import (
     FunctionCall as NativeFunctionCall,
 )
+from onyx.prompts.asv3.coordinator_reference import (
+    COORDINATOR_REFERENCE_PROMPT,
+    RESEARCHER_REFERENCE_PROMPT,
+)
 from onyx.prompts.asv3.research import (
     COORDINATOR_PROMPT,
     DEFAULT_RESPONSE_PREFERENCES,
@@ -70,6 +74,15 @@ from onyx.regulatory.structured_llm import (
 )
 from onyx.tracing.flows import LLMFlow
 from onyx.tracing.llm_utils import llm_generation_span, record_llm_response
+
+COORDINATOR_SESSION_ACTIONS = """Use session_research and revalidated fully delivered originals for follow-ups.
+Acquire only new or unresolved operative effects; previous assistant prose is not evidence.
+In the first useful native decision you may use submit_answer with basis=conversation for
+social replies, basis=scenario for facts-only arithmetic, or basis=originals for legal answers
+supported by delivered originals and adjacent global citations. You may ask a concrete
+clarification or choose focused source tools. No preliminary model stage is required.
+Use brief neutral topic headings; never repeat the full question or scenario as a heading.
+"""
 
 REQUIRED_NOTIFICATION_PHASES = (
     "started",
@@ -1902,10 +1915,18 @@ class ResearchModel:
             referenced.append(turn.model_copy(update={"results": results}))
         return referenced
 
+    def _research_instruction(self) -> str:
+        normal = self.context.services.get("research_profile") == "normal"
+        if self.context.depth:
+            return RESEARCHER_REFERENCE_PROMPT if normal else RESEARCHER_PROMPT
+        if normal:
+            return COORDINATOR_REFERENCE_PROMPT + "\n\n" + COORDINATOR_SESSION_ACTIONS
+        return COORDINATOR_PROMPT
+
     def _fit_native_decision(
         self, view: HarnessView
     ) -> tuple[list[ChatCompletionMessage], list[dict[str, JsonValue]], int]:
-        instruction = RESEARCHER_PROMPT if self.context.depth else COORDINATOR_PROMPT
+        instruction = self._research_instruction()
         question: dict[str, JsonValue] = {
             "request": view.request,
         }
@@ -2232,7 +2253,7 @@ class ResearchModel:
                 for task in self.pending_tasks()
             ],
         )
-        instruction = RESEARCHER_PROMPT if self.context.depth else COORDINATOR_PROMPT
+        instruction = self._research_instruction()
         artifacts = [
             artifact
             for receipt in view.receipts[-3:]

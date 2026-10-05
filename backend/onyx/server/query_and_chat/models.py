@@ -1,6 +1,6 @@
 from datetime import datetime
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, Field, model_validator
@@ -129,6 +129,7 @@ class SendMessageRequest(BaseModel):
     )
     # ASv3 owns an independent adaptive research harness.
     atez_search_v3: bool = False
+    asv3_research_profile: Literal["normal", "deep"] = "deep"
     asv3_allow_external: bool = False
     asv3_resume_message_id: int | None = None
 
@@ -176,11 +177,19 @@ class SendMessageRequest(BaseModel):
             raise ValueError("ATEZ Search workflows are mutually exclusive")
         if self.atez_search_v3 and self.deep_research:
             raise ValueError("ASv3 and Deep Research are mutually exclusive")
-        if self.atez_search_v3 and self.llm_overrides and len(self.llm_overrides) > 1:
+        if (
+            (self.atez_search_v3 or self.deep_research)
+            and self.llm_overrides
+            and len(self.llm_overrides) > 1
+        ):
             raise ValueError("ASv3 uses one coordinator model per request")
-        if self.asv3_resume_message_id is not None and not self.atez_search_v3:
+        if self.asv3_research_profile == "normal" and not self.atez_search_v3:
+            raise ValueError("The coordinator profile requires the ASv3 workflow")
+        if self.asv3_resume_message_id is not None and not (
+            self.atez_search_v3 or self.deep_research
+        ):
             raise ValueError("An ASv3 checkpoint requires the ASv3 workflow")
-        if self.asv3_allow_external and not self.atez_search_v3:
+        if self.asv3_allow_external and not (self.atez_search_v3 or self.deep_research):
             raise ValueError(
                 "ASv3 external source permission requires the ASv3 workflow"
             )
