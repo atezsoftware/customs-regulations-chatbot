@@ -65,6 +65,7 @@ from onyx.prompts.asv3.coordinator_reference import (
 from onyx.prompts.asv3.research import (
     COORDINATOR_PROMPT,
     DEFAULT_RESPONSE_PREFERENCES,
+    LEGAL_DEPARTMENT_RESEARCH,
     RESEARCHER_PROMPT,
 )
 from onyx.regulatory.structured_llm import (
@@ -576,8 +577,10 @@ class ResearchModel:
         pending_tasks: Callable[[], list[dict[str, JsonValue]]] | None = None,
         token_counter: Callable[[str], int] | None = None,
         lean_native_mode: bool = False,
+        research_llm: LLM | None = None,
     ) -> None:
         self.llm = llm
+        self.research_llm = research_llm
         self.context = context
         self.user_identity = user_identity
         self.reasoning_effort = reasoning_effort
@@ -690,6 +693,15 @@ class ResearchModel:
                 self.llm.config.model_name,
                 self.llm.config.model_provider,
             )
+        if self.research_llm is not None:
+            return min(
+                self._native_output_capacity,
+                get_llm_max_output_tokens(
+                    get_model_map(),
+                    self.research_llm.config.model_name,
+                    self.research_llm.config.model_provider,
+                ),
+            )
         return self._native_output_capacity
 
     def _tokens(self, text: str) -> int:
@@ -733,6 +745,8 @@ class ResearchModel:
 
     def _limits(self, max_tokens: int) -> tuple[int, int]:
         limit = self.llm.config.max_input_tokens
+        if self.research_llm is not None:
+            limit = min(limit, self.research_llm.config.max_input_tokens)
         output = max(1, min(max_tokens, limit // 4))
         return limit - output, output
 
@@ -1918,15 +1932,29 @@ class ResearchModel:
     def _research_instruction(self) -> str:
         normal = self.context.services.get("research_profile") == "normal"
         if self.context.depth:
-            return RESEARCHER_REFERENCE_PROMPT if normal else RESEARCHER_PROMPT
-        if normal:
-            return COORDINATOR_REFERENCE_PROMPT + "\n\n" + COORDINATOR_SESSION_ACTIONS
-        return COORDINATOR_PROMPT
+            instruction = RESEARCHER_REFERENCE_PROMPT if normal else RESEARCHER_PROMPT
+        elif normal:
+            instruction = (
+                COORDINATOR_REFERENCE_PROMPT + "\n\n" + COORDINATOR_SESSION_ACTIONS
+            )
+        else:
+            instruction = COORDINATOR_PROMPT
+        return (
+            instruction + "\n\n" + LEGAL_DEPARTMENT_RESEARCH if normal else instruction
+        )
 
     def _fit_native_decision(
         self, view: HarnessView
     ) -> tuple[list[ChatCompletionMessage], list[dict[str, JsonValue]], int]:
         instruction = self._research_instruction()
+        if view.draft_to_repair and view.publication_gap is None:
+            instruction += (
+                "\nThe research candidate is ready for the selected answer model. "
+                "Use delivered originals to produce its complete answer, retaining every "
+                "supported condition, exception, contested point, procedural step and citation. "
+                "Correct unsupported assertions; do not shorten supported detail. "
+                "Research further only for a precise unresolved material effect."
+            )
         question: dict[str, JsonValue] = {
             "request": view.request,
         }
@@ -1970,8 +1998,9 @@ class ResearchModel:
             )
             if isinstance(independent_answers, list):
                 context["independent_answers"] = copy.deepcopy(independent_answers)
-        if view.publication_gap is not None:
+        if view.draft_to_repair is not None:
             context["draft_to_repair"] = view.draft_to_repair
+        if view.publication_gap is not None:
             context["publication_gap"] = view.publication_gap
         pending = self.pending_tasks()
         if pending:
@@ -2173,8 +2202,43 @@ class ResearchModel:
             self.context.check_research_active()
         if self.lean_native_mode:
             prompt, tools, output = self._fit_native_decision(view)
-            return self._invoke_decision(view, prompt, tools, output)
+            use_research_model = self.research_llm is not None and (
+                self.context.depth > 0 or self._native_first_decision_completed
+            )
+            decision = self._invoke_decision(
+                view,
+                prompt,
+                tools,
+                output,
+                call_llm_override=self.research_llm if use_research_model else None,
+            )
+            if use_research_model and self._needs_answer_model(decision):
+                candidate = decision.answer or next(
+                    (
+                        str(call.arguments.get("answer", ""))
+                        for call in decision.calls
+                        if call.name in {"submit_answer", "submit_partial_answer"}
+                    ),
+                    "",
+                )
+                handoff = view.model_copy(update={"draft_to_repair": candidate})
+                prompt, tools, output = self._fit_native_decision(handoff)
+                return self._invoke_decision(handoff, prompt, tools, output)
+            return decision
         return self._decide_research(view)
+
+    @staticmethod
+    def _needs_answer_model(decision: Decision) -> bool:
+        if decision.answer:
+            return True
+        return any(
+            call.name == "submit_partial_answer"
+            or (
+                call.name == "submit_answer"
+                and call.arguments.get("basis") == "originals"
+            )
+            for call in decision.calls
+        )
 
     def _decide_research(self, view: HarnessView) -> Decision:
         from onyx.asv3.working_memory import WorkingMemory
@@ -2280,6 +2344,8 @@ class ResearchModel:
         prompt: list[ChatCompletionMessage],
         tools: list[dict[str, JsonValue]],
         output: int,
+        *,
+        call_llm_override: LLM | None = None,
     ) -> Decision:
         content = prompt[-1].content
         assert isinstance(content, str)
@@ -2309,7 +2375,7 @@ class ResearchModel:
         flow = (
             LLMFlow.ASV3_RESEARCHER if self.context.depth else LLMFlow.ASV3_COORDINATOR
         )
-        call_llm = (
+        call_llm = call_llm_override or (
             self._native_decision_llm(view) if self.lean_native_mode else self.llm
         )
         research = not (
@@ -2414,7 +2480,8 @@ class ResearchModel:
                 # An unfinished argument list is never an executable native action.
                 capacity = min(
                     self._native_output_limit(),
-                    self.llm.config.max_input_tokens - self._input_cost(prompt, tools),
+                    (call_llm or self.llm).config.max_input_tokens
+                    - self._input_cost(prompt, tools),
                 )
                 if capacity <= output:
                     raise RunStopped(
@@ -2447,7 +2514,7 @@ class ResearchModel:
                 continuation_tools = []
                 output = min(
                     self._native_output_limit(),
-                    self.llm.config.max_input_tokens
+                    (call_llm or self.llm).config.max_input_tokens
                     - self._input_cost(continuation, []),
                 )
                 if output <= 0:

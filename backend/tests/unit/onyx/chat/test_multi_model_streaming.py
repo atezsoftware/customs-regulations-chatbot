@@ -999,6 +999,12 @@ def test_selected_asv3_profile_preserves_stream(deep: bool) -> None:
     from onyx.chat.process_message import DEFAULT_PERSONA_ID
 
     setup = _make_setup()
+    setup.llms[0].config.model_provider = "vertex_ai"
+    setup.llms[0].config.max_input_tokens = 1048576
+    setup.llms[0].config.api_key = None
+    cheap = MagicMock()
+    cheap.config.api_key = None
+    setup.llms[0].with_model.return_value = cheap
     setup.persona.id = DEFAULT_PERSONA_ID
     setup.chat_session.project_id = None
     setup.new_msg_req = _make_request(
@@ -1035,6 +1041,12 @@ def test_selected_asv3_profile_preserves_stream(deep: bool) -> None:
 
     asv3.assert_called_once()
     assert asv3.call_args.kwargs["research_profile"] == ("deep" if deep else "normal")
+    assert asv3.call_args.kwargs["llm"] is setup.llms[0]
+    assert asv3.call_args.kwargs["research_llm"] is cheap
+    setup.llms[0].with_model.assert_called_once_with(
+        "gemini-3.5-flash-lite",
+        max_input_tokens=1048576,
+    )
     legacy.assert_not_called()
     legacy_deep.assert_not_called()
     persist.assert_called_once()

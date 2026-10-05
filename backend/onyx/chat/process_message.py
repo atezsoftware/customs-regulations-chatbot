@@ -1583,12 +1583,37 @@ def _run_models(
                         raise ValueError("ASv3 requires the default assistant")
                     if setup.search_params.project_id_filter is not None:
                         raise ValueError("ASv3 is unavailable inside a project")
+                    research_llm = (
+                        model_llm.with_model(
+                            "gemini-3.5-flash-lite",
+                            max_input_tokens=min(
+                                model_llm.config.max_input_tokens, 1048576
+                            ),
+                        )
+                        if model_llm.config.model_provider in {"vertex_ai", "gemini"}
+                        else get_llm_for_persona(
+                            persona=setup.persona,
+                            user=user,
+                            llm_override=LLMOverride(
+                                model_provider_type="vertex_ai",
+                                model_version="gemini-3.5-flash-lite",
+                            ),
+                        )
+                    )
+                    if research_llm.config.api_key != model_llm.config.api_key:
+                        with get_session_with_current_tenant() as cost_db_session:
+                            check_llm_cost_limit_for_provider(
+                                db_session=cost_db_session,
+                                tenant_id=get_current_tenant_id(),
+                                llm_provider_api_key=research_llm.config.api_key,
+                            )
                     run_asv3_loop(
                         emitter=model_emitter,
                         state_container=sc,
                         simple_chat_history=list(setup.simple_chat_history),
                         tools=model_tools,
                         llm=model_llm,
+                        research_llm=research_llm,
                         token_counter=get_llm_token_counter(model_llm),
                         user=user,
                         filters=_global_regulatory_search_filters(setup),

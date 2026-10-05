@@ -42,6 +42,7 @@ _cached_recommendations_time: float = 0.0
 
 _DEPLOYMENT_VISIBLE_VERTEX_MODELS: dict[str, str] = {
     "gemini-3.8-flash": "Gemini 3.8 Flash",
+    "gemini-3.5-flash-lite": "Gemini 3.5 Flash Lite",
     "gemini-3.1-flash-lite": "Gemini 3.1 Flash Lite",
 }
 

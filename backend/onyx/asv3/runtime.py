@@ -207,6 +207,7 @@ def run_asv3_loop(
     include_citations: bool,
     cache: CacheBackend,
     research_profile: str = "deep",
+    research_llm: LLM | None = None,
     resume_message_id: int | None = None,
     custom_agent_prompt: str | None = None,
     allow_external: bool = False,
@@ -282,7 +283,7 @@ def run_asv3_loop(
     ledger = EvidenceLedger()
     context.services["evidence"] = ledger
     registry = CapabilityRegistry()
-    broker = CorpusBroker(user, scope, vision_llm=llm)
+    broker = CorpusBroker(user, scope, vision_llm=research_llm or llm)
     history = "\n".join(
         f"{m.message_type.value}: {m.message}"
         for m in simple_chat_history[-8:]
@@ -296,10 +297,14 @@ def run_asv3_loop(
         history=history,
         token_counter=token_counter,
         lean_native_mode=True,
+        research_llm=research_llm,
     )
     if previous is not None:
         model.restore_native_sampling(previous)
     search = next((tool for tool in tools if isinstance(tool, SearchTool)), None)
+    if search is not None and research_llm is not None:
+        search = search.fork_for_independent_context()
+        search.llm = research_llm
 
     def search_history(child: RunContext) -> list[ChatMessageSimple]:
         private = child.services.get("search_message_history")
@@ -487,7 +492,7 @@ def run_asv3_loop(
             " ".join(f"[{n}]" for n in numbers) if isinstance(numbers, list) else ""
         )
         verifier = ResearchModel(
-            llm,
+            research_llm or llm,
             child,
             user_identity=user_identity,
             reasoning_effort=reasoning_effort,
@@ -580,6 +585,7 @@ def run_asv3_loop(
             updates=updates,
             token_counter=token_counter,
             lean_native_mode=True,
+            research_llm=research_llm,
         )
         child_registry = (
             CapabilityRegistry(

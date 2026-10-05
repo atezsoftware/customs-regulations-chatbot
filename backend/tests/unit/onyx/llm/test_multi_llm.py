@@ -3606,3 +3606,25 @@ def test_sampling_trace_is_retained_by_real_generation_span() -> None:
     exported_span = span.export()
     assert exported_span is not None
     assert exported_span["span_data"]["request_params"]["sampling"] == sampling
+
+
+def test_model_binding_preserves_provider_and_isolates_selected_answer_model() -> None:
+    original = _seeded_vertex_llm(31, model_kwargs={"seed": 19, "top_p": 0.89})
+    original_config = original.config.model_dump()
+    cheap = original.with_model("gemini-3.5-flash-lite", max_input_tokens=100_000)
+    assert original.config.model_dump() == original_config
+    assert cheap.config.model_name == "gemini-3.5-flash-lite"
+    assert cheap.config.seed is None
+    assert cheap.config.model_dump(
+        exclude={"model_name", "seed"}
+    ) == original.config.model_dump(exclude={"model_name", "seed"})
+    with patch("litellm.completion", return_value=_seed_test_response()) as completion:
+        cheap.invoke([UserMessage(content="Inspect sources.")], use_streaming=False)
+        original.invoke([UserMessage(content="Write the answer.")], use_streaming=False)
+    cheap_call, answer_call = [call.kwargs for call in completion.call_args_list]
+    assert cheap_call["model"].endswith("gemini-3.5-flash-lite")
+    assert "seed" not in cheap_call
+    assert answer_call["model"].endswith("gemini-3.8-flash")
+    assert answer_call["seed"] == 31
+    assert cheap_call["top_p"] == answer_call["top_p"] == 0.89
+    assert original.config.model_dump() == original_config

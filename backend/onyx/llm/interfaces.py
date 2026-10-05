@@ -76,6 +76,10 @@ class LLM(abc.ABC):
         """Return an independent seed binding without changing this LLM."""
         raise NotImplementedError("This LLM does not support an isolated seed binding")
 
+    def with_model(self, model_name: str, *, max_input_tokens: int) -> "LLM":
+        """Bind another model on this authorized provider without changing this LLM."""
+        raise NotImplementedError("This LLM does not support an isolated model binding")
+
     def invoke(
         self,
         prompt: LanguageModelInput,
