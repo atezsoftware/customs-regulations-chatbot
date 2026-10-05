@@ -3,7 +3,7 @@ from enum import Enum
 from typing import Any
 from uuid import UUID
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, PrivateAttr, model_validator
 
 from onyx.configs.constants import DocumentSource, MessageType, SessionType
 from onyx.context.search.models import BaseFilters, SavedSearchDoc, SearchDoc, Tag
@@ -13,6 +13,7 @@ from onyx.file_store.models import FileDescriptor
 from onyx.llm.override_models import LLMOverride
 from onyx.llm.usage_cost import ResponseUsage
 from onyx.server.query_and_chat.streaming_models import Packet
+from onyx.tracing.usage_measurement import UsageMeasurementOrigin
 
 AUTO_PLACE_AFTER_LATEST_MESSAGE = -1
 
@@ -98,7 +99,18 @@ class ChatFeedbackRequest(BaseModel):
 
 # NOTE: This model is used for the core flow of the Onyx application, any changes to it should be reviewed and approved by an
 # experienced team member. It is very important to 1. avoid bloat and 2. that this remains backwards compatible across versions.
+
+
 class SendMessageRequest(BaseModel):
+    _usage_measurement_origin: UsageMeasurementOrigin | None = PrivateAttr(default=None)
+
+    @property
+    def usage_measurement_origin(self) -> UsageMeasurementOrigin | None:
+        return self._usage_measurement_origin
+
+    def set_usage_measurement_origin(self, origin: UsageMeasurementOrigin) -> None:
+        self._usage_measurement_origin = origin
+
     message: str
 
     llm_override: LLMOverride | None = None
@@ -174,16 +186,12 @@ class SendMessageRequest(BaseModel):
             raise ValueError("atez_search_v2_label_run_ids requires labels")
         if sum((self.atez_search, self.atez_search_v2, self.atez_search_v3)) > 1:
             raise ValueError("ATEZ Search workflows are mutually exclusive")
-        if self.atez_search_v3 and self.deep_research:
-            raise ValueError("ASv3 and Deep Research are mutually exclusive")
-        if self.atez_search_v3 and self.llm_overrides and len(self.llm_overrides) > 1:
+        if (
+            (self.atez_search_v3 or self.deep_research)
+            and self.llm_overrides
+            and len(self.llm_overrides) > 1
+        ):
             raise ValueError("ASv3 uses one coordinator model per request")
-        if self.asv3_resume_message_id is not None and not self.atez_search_v3:
-            raise ValueError("An ASv3 checkpoint requires the ASv3 workflow")
-        if self.asv3_allow_external and not self.atez_search_v3:
-            raise ValueError(
-                "ASv3 external source permission requires the ASv3 workflow"
-            )
         # If neither is provided, default to creating a new chat session using the
         # default ChatSessionCreationRequest values.
         if self.chat_session_id is None and self.chat_session_info is None:

@@ -73,8 +73,10 @@ from onyx.db.asv3_runs import (
     load_asv3_session_checkpoint,
     save_asv3_checkpoint,
 )
+from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.db.memory import UserMemoryContext
 from onyx.db.models import User
+from onyx.db.usage_measurement import set_measurement_workflow
 from onyx.llm.interfaces import LLM, LLMUserIdentity
 from onyx.llm.models import ReasoningEffort
 from onyx.prompts.asv3.research import (
@@ -93,6 +95,7 @@ from onyx.server.query_and_chat.streaming_models import (
 from onyx.tools.interface import Tool
 from onyx.tools.tool_implementations.search.search_tool import SearchTool
 from onyx.tracing.framework.create import ChatTraceMetadata, ensure_trace
+from onyx.tracing.usage_measurement import CURRENT_USAGE_MEASUREMENT
 
 logger = logging.getLogger(__name__)
 P = ParamSpec("P")
@@ -206,6 +209,7 @@ def run_asv3_loop(
     reasoning_effort: ReasoningEffort,
     include_citations: bool,
     cache: CacheBackend,
+    research_profile: str = "deep",
     resume_message_id: int | None = None,
     custom_agent_prompt: str | None = None,
     allow_external: bool = False,
@@ -267,8 +271,26 @@ def run_asv3_loop(
             notifications=localized_notifications("und"),
             requires_sources=True,
         )
+    if previous is not None:
+        research_profile = str(
+            previous.get("research_profile")
+            or ("deep" if "question_research" in previous else "normal")
+        )
+    if research_profile not in {"normal", "deep"}:
+        raise ValueError("Unknown ASv3 research profile")
     context.language = profile.language
-    context.services["independent_question_mode"] = profile.requires_sources
+    context.services["research_profile"] = research_profile
+    measurement = CURRENT_USAGE_MEASUREMENT.get()
+    if measurement is not None and measurement.workflow != research_profile:
+        with get_session_with_current_tenant() as measurement_db:
+            set_measurement_workflow(
+                measurement_db, str(measurement.request_id), research_profile
+            )
+            measurement_db.commit()
+        CURRENT_USAGE_MEASUREMENT.set(
+            measurement.model_copy(update={"workflow": research_profile})
+        )
+    context.services["independent_question_mode"] = research_profile == "deep"
     context.corpus_only = not (allow_external and profile.external_requested)
     ledger = EvidenceLedger()
     context.services["evidence"] = ledger
@@ -432,6 +454,7 @@ def run_asv3_loop(
             snapshot.update(
                 sequence=checkpoint_sequence,
                 prompt_version=PROMPT_VERSION,
+                research_profile=research_profile,
                 execution_mode="native",
                 native_coordinator_sampling=model.native_sampling_snapshot(),
                 scope=context.scope,
@@ -695,7 +718,7 @@ def run_asv3_loop(
     for spec in (
         common_specs
         + workers.tool_specs()
-        + question_research.tool_specs()
+        + (question_research.tool_specs() if research_profile == "deep" else [])
         + build_research_specs(research_state, ledger)
     ):
         registry.register(spec)
