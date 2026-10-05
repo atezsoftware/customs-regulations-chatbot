@@ -666,7 +666,9 @@ export default function useChatController({
       }
 
       if (!isMultiModel) {
-        initialAgentNode.asv3 = atezSearchV3;
+        initialAgentNode.asv3 =
+          atezSearchV3 ||
+          Boolean(deepResearch && liveAgent?.id === 0 && !projectId);
         // Freeze provenance on the answer itself; changing the input selector
         // later must not relabel historical assistant messages.
         initialAgentNode.overridden_model = finalLLM.modelName;
@@ -1238,7 +1240,7 @@ export default function useChatController({
               } else {
                 // Single-model
                 packets.push(typedPacket);
-                if (atezSearchV3 && typedPacket.obj.type === "asv3_progress") {
+                if (typedPacket.obj.type === "asv3_progress") {
                   packets = compactASv3ProgressPackets(packets);
                 }
                 packetsVersion++;

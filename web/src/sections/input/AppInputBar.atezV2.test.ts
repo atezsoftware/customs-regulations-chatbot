@@ -1,13 +1,42 @@
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { sendMessage } from "@/app/app/services/lib";
 
-test("Atez Search V2 keeps its label visible while unselected", () => {
-  const source = readFileSync(join(__dirname, "AppInputBar.tsx"), "utf8");
-  const start = source.indexOf("{showAtezSearch && toggleAtezSearchV2 && (");
-  const end = source.indexOf("Atez Search V2", start);
-  const v2Button = source.slice(start, end);
-
-  expect(start).toBeGreaterThanOrEqual(0);
-  expect(end).toBeGreaterThan(start);
-  expect(v2Button).toContain("foldable={false}");
+const originalFetch = global.fetch;
+afterEach(() => {
+  global.fetch = originalFetch;
 });
+
+it.each([
+  [false, false, false, "deep"],
+  [true, false, true, "normal"],
+  [false, true, false, "deep"],
+  [true, true, false, "deep"],
+])(
+  "sends mutually exclusive research modes (%s, %s)",
+  async (single, deep, expectedASv3, profile) => {
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: false,
+      status: 400,
+      json: async () => ({ detail: "captured" }),
+    });
+    await expect(
+      sendMessage({
+        message: "Soru",
+        chatSessionId: "session-1",
+        parentMessageId: null,
+        filters: null,
+        atezSearchV3: Boolean(single),
+        deepResearch: Boolean(deep),
+        atezSearch: true,
+        atezSearchV2: true,
+      }).next()
+    ).rejects.toThrow("captured");
+    const payload = JSON.parse(
+      String(jest.mocked(global.fetch).mock.calls[0]![1]?.body)
+    );
+    expect(payload.atez_search_v3).toBe(expectedASv3);
+    expect(payload.deep_research).toBe(deep);
+    expect(payload.asv3_research_profile).toBe(profile);
+    expect(payload.atez_search).toBe(false);
+    expect(payload.atez_search_v2).toBe(false);
+  }
+);
