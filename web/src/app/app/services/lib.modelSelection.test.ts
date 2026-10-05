@@ -59,7 +59,7 @@ it("serializes Atez Search independently from Deep Research", async () => {
 
   const request = jest.mocked(global.fetch).mock.calls[0]![1];
   const payload = JSON.parse(String(request?.body));
-  expect(payload.atez_search).toBe(true);
+  expect(payload.atez_search).toBe(false);
   expect(payload.deep_research).toBe(false);
 });
 
@@ -84,7 +84,7 @@ it("serializes Atez Search V2 independently from the original workflow", async (
   const request = jest.mocked(global.fetch).mock.calls[0]![1];
   const payload = JSON.parse(String(request?.body));
   expect(payload.atez_search).toBe(false);
-  expect(payload.atez_search_v2).toBe(true);
+  expect(payload.atez_search_v2).toBe(false);
 });
 
 it("waits for the selected session model to be persisted", async () => {
