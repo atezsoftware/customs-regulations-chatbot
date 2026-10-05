@@ -124,6 +124,10 @@ def db_session() -> Generator[Session, None, None]:
             'CREATE TABLE "user" (id CHAR(36) PRIMARY KEY, email VARCHAR)'
         )
     cast(Table, UserUsage.__table__).create(bind=engine)
+    with engine.begin() as connection:
+        connection.execute(
+            text("CREATE TABLE key_value_store (key VARCHAR PRIMARY KEY, value JSON)")
+        )
     SessionLocal = sessionmaker(bind=engine)
     session = SessionLocal()
     try:

@@ -40,17 +40,24 @@ export interface UsageExportResponse {
   users: UsageExportUser[];
 }
 
-export function buildUsageExportUrl(timeRange?: UsageExportDateRange): string {
-  if (!timeRange) return SWR_KEYS.adminUsageExport;
+export function buildUsageExportUrl(
+  timeRange?: UsageExportDateRange,
+  workflow?: string
+): string {
+  if (!timeRange && !workflow) return SWR_KEYS.adminUsageExport;
   return buildApiPath(SWR_KEYS.adminUsageExport, {
-    period_from: convertDateToStartOfDay(timeRange.from)?.toISOString(),
-    period_to: convertDateToEndOfDay(timeRange.to)?.toISOString(),
+    workflow,
+    period_from: convertDateToStartOfDay(timeRange?.from)?.toISOString(),
+    period_to: convertDateToEndOfDay(timeRange?.to)?.toISOString(),
   });
 }
 
 /** Company-wide per-user usage with a revalidation callback. */
-export function useUsageExport(timeRange?: UsageExportDateRange) {
-  const url = buildUsageExportUrl(timeRange);
+export function useUsageExport(
+  timeRange?: UsageExportDateRange,
+  workflow?: string
+) {
+  const url = buildUsageExportUrl(timeRange, workflow);
   const { data, error, isLoading, mutate } = useSWR<UsageExportResponse>(
     url,
     errorHandlingFetcher,

@@ -1,5 +1,6 @@
 from collections.abc import Generator
 from datetime import datetime
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Response
 from fastapi.responses import StreamingResponse
@@ -72,6 +73,7 @@ def generate_report(
 
 @router.get("/admin/usage-report/summary")
 def fetch_usage_summary(
+    workflow: Literal["normal", "deep", "other"] | None = None,
     period_from: datetime | None = None,
     period_to: datetime | None = None,
     _: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
@@ -94,6 +96,7 @@ def fetch_usage_summary(
             if period_from is not None and period_to is not None
             else None
         ),
+        workflow=workflow,
     )
 
 
