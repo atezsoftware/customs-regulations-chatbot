@@ -1359,7 +1359,18 @@ def test_intermediate_model_research_hands_full_originals_to_answer_model(
     context.services["evidence"] = ledger
     text = "Permission requires both authenticated proof and a later approval."
     record = original(ledger, context, text)
-    current = adaptive_tool_view(original_evidence=[record])
+    current = adaptive_tool_view(
+        original_evidence=[record],
+        research_state={
+            "needs": [
+                {
+                    "need_id": "later_stage",
+                    "status": "open",
+                    "gap": "The later stage remains unresolved.",
+                }
+            ]
+        },
+    )
     selected.invoke.return_value = ModelResponse(
         id="full-answer",
         created="0",
@@ -1405,8 +1416,94 @@ def test_intermediate_model_research_hands_full_originals_to_answer_model(
         == "Permission requires authenticated proof and later approval [1]."
     )
     assert payload["original_evidence"][0]["text"] == text
+    assert (
+        payload["research_gap_signals"] == last_payload(cheap)["research_gap_signals"]
+    )
+    assert payload["research_gap_signals"][0]["need_id"] == "later_stage"
     assert adapter.last_call_id is not None
     assert ledger.completely_delivered(adapter.last_call_id) == {1}
+
+
+@pytest.mark.parametrize("profile,depth", [("normal", 0), ("deep", 0), ("deep", 1)])
+def test_native_gap_leads_reuse_complete_originals_without_an_extra_model_call(
+    profile: str, depth: int
+) -> None:
+    context, ledger, llm = RunContext(depth=depth), EvidenceLedger(), model()
+    context.services.update(evidence=ledger, research_profile=profile)
+    record = original(
+        ledger, context, "Both cumulative conditions and their exception."
+    )
+    receipt = ToolReceipt(
+        call=CapabilityCall(name="search_corpus", call_id="source-lookup"),
+        outcome=ToolOutcome(
+            status=OutcomeStatus.PARTIAL,
+            summary="Two centers were not mapped",
+            data={
+                "unhydrated_centers": [
+                    {"source_id": "law", "canonical_chunk_id": record["chunk_id"]},
+                    {"source_id": "law", "canonical_chunk_id": "unread"},
+                ]
+            },
+        ),
+        elapsed_seconds=1,
+    )
+    current = adaptive_tool_view(original_evidence=[record]).model_copy(
+        update={"receipts": [receipt]}
+    )
+    before = current.model_dump(mode="json")
+    adapter = ResearchModel(llm, context, lean_native_mode=True)
+    adapter.decide(current)
+    assert llm.invoke.call_count == 1
+    assert llm.invoke.call_args.kwargs["tools"] == current.tools
+    payload = last_payload(llm)
+    assert payload["research_gap_signals"] == [
+        {
+            "kind": "retrieved_original_not_delivered",
+            "source_id": "law",
+            "canonical_chunk_id": "unread",
+            "call_id": "source-lookup",
+        }
+    ]
+    assert payload["original_evidence"] == [record]
+    assert current.model_dump(mode="json") == before
+
+
+@pytest.mark.parametrize("incomplete", ["partial_range", "different_hash"])
+def test_incomplete_or_unverified_text_cannot_close_a_source_delivery_gap(
+    incomplete: str,
+) -> None:
+    context, ledger, llm = RunContext(), EvidenceLedger(), model()
+    context.services["evidence"] = ledger
+    record = original(
+        ledger, context, "A complete original with its restrictive conditions."
+    )
+    receipt = ToolReceipt(
+        call=CapabilityCall(name="search_corpus", call_id="lookup"),
+        outcome=ToolOutcome(
+            status=OutcomeStatus.PARTIAL,
+            summary="Original missing",
+            data={
+                "unhydrated_centers": [
+                    {"source_id": "law", "canonical_chunk_id": record["chunk_id"]}
+                ]
+            },
+        ),
+        elapsed_seconds=1,
+    )
+    if incomplete == "partial_range":
+        record["text"] = str(record["text"])[:10]
+    else:
+        record["text_hash"] = "0" * 64
+    current = view(original_evidence=[record]).model_copy(
+        update={"receipts": [receipt]}
+    )
+    adapter = ResearchModel(llm, context, lean_native_mode=True)
+    prompt, _, _ = adapter._fit_native_decision(current)
+    payload = json.loads(cast(str, prompt[-1].content))
+    assert (
+        payload["research_gap_signals"][0]["canonical_chunk_id"] == record["chunk_id"]
+    )
+    llm.invoke.assert_not_called()
 
 
 @pytest.mark.parametrize(

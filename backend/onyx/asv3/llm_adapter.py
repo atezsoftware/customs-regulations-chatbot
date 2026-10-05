@@ -33,6 +33,7 @@ from onyx.asv3.models import (
     RunStopped,
     model_evidence_metadata,
 )
+from onyx.asv3.research_gaps import research_gap_signals
 from onyx.configs.chat_configs import (
     LLM_FIRST_CHUNK_RETRY_BASE_DELAY_S,
     LLM_FIRST_CHUNK_RETRY_JITTER_RATIO,
@@ -2125,6 +2126,18 @@ class ResearchModel:
 
         def messages() -> list[ChatCompletionMessage]:
             current = dict(context)
+            gaps = research_gap_signals(
+                view,
+                [
+                    record
+                    for identity, record in unique.items()
+                    if identity in verified
+                    and identity[2] == 0
+                    and identity[3] == original_lengths[(identity[0], identity[1])]
+                ],
+            )
+            if gaps:
+                current["research_gap_signals"] = gaps
             if unique:
                 current["original_evidence"] = list(unique.values())
             if unique or navigation:
