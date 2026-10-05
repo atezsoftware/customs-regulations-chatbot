@@ -13,6 +13,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from onyx.db.engine.sql_engine import get_session_with_tenant
+from onyx.db.usage_measurement import record_measurement
 from onyx.db.user_usage import USER_USAGE_BUCKET_SECONDS, record_user_usage
 from onyx.llm.cost import compute_cost_cents
 from onyx.tracing.flows import IMAGE_FLOWS
@@ -20,6 +21,10 @@ from onyx.tracing.framework.processor_interface import TracingProcessor
 from onyx.tracing.framework.span_data import GenerationSpanData
 from onyx.tracing.framework.spans import Span
 from onyx.tracing.framework.traces import Trace
+from onyx.tracing.usage_measurement import (
+    CURRENT_USAGE_MEASUREMENT,
+    UsageMeasurementContext,
+)
 from onyx.utils.datetime import get_window_start
 from onyx.utils.logger import setup_logger
 from shared_configs.contextvars import (
@@ -56,6 +61,7 @@ class _UsageRecord:
     cache_read_tokens: int
     image_count: int
     window_start: datetime
+    measurement: UsageMeasurementContext | None = None
 
 
 def _usage_field(usage: dict[str, Any], *names: str) -> int:
@@ -144,6 +150,7 @@ class UserUsageTracingProcessor(TracingProcessor):
             cache_read_tokens=cache_read_tokens,
             image_count=data.image_count or 1,
             window_start=window_start,
+            measurement=CURRENT_USAGE_MEASUREMENT.get(),
         )
 
     def _drain_loop(self) -> None:
@@ -196,7 +203,7 @@ class UserUsageTracingProcessor(TracingProcessor):
     @staticmethod
     def _aggregate_batch(batch: list[_UsageRecord]) -> list[_UsageRecord]:
         aggregated: dict[
-            tuple[str, str, str, str, str | None, datetime], _UsageRecord
+            tuple[str, str, str, str, str | None, datetime, str | None], _UsageRecord
         ] = {}
         for record in batch:
             key = (
@@ -206,6 +213,7 @@ class UserUsageTracingProcessor(TracingProcessor):
                 record.flow,
                 record.provider,
                 record.window_start,
+                str(record.measurement.request_id) if record.measurement else None,
             )
             current = aggregated.get(key)
             if current is None:
@@ -255,6 +263,25 @@ class UserUsageTracingProcessor(TracingProcessor):
             cost_cents=input_cost + output_cost,
             window_start=record.window_start,
         )
+
+        if record.measurement is not None:
+            try:
+                with db_session.begin_nested():
+                    record_measurement(
+                        db_session,
+                        record.measurement,
+                        model=record.model,
+                        flow=record.flow,
+                        provider=record.provider,
+                        input_tokens=record.input_tokens,
+                        output_tokens=record.output_tokens,
+                        cache_read_tokens=record.cache_read_tokens,
+                        cost_cents=input_cost + output_cost,
+                    )
+            except Exception:
+                logger.exception(
+                    "Failed to record measurement usage; enforcement usage retained"
+                )
 
     # --- TracingProcessor interface (non-generation events are no-ops) ---
 
