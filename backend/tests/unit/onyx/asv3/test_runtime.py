@@ -119,6 +119,11 @@ def run_independent(
     **kwargs: Any,
 ) -> None:
     """Script the two host decisions while exercising the real child source path."""
+    if kwargs.get("research_profile") == "normal":
+        runtime.run_asv3_loop(
+            **{key: value for key, value in kwargs.items() if key != "test_language"}
+        )
+        return
     llm = kwargs["llm"]
     child_script = llm.invoke.side_effect
 
@@ -461,10 +466,13 @@ def test_native_parallel_originals_preserve_selected_provider_and_publish_withou
     )
 
 
+@pytest.mark.parametrize("research_profile", ["normal", "deep"])
 def test_followup_reuses_session_originals_without_repeating_source_research(
     monkeypatch: pytest.MonkeyPatch,
+    research_profile: str,
 ) -> None:
     kwargs, broker, llm, checkpoints, queue = setup_run(monkeypatch)
+    kwargs["research_profile"] = research_profile
     run_independent(**kwargs)
     prior = copy.deepcopy(checkpoints[-1])
     original_question = kwargs["simple_chat_history"][-1].message
@@ -500,7 +508,9 @@ def test_followup_reuses_session_originals_without_repeating_source_research(
     kwargs["state_container"] = ChatStateContainer()
 
     def answer_from_memory(**arguments: Any) -> ModelResponse:
-        assert arguments["prompt"][0].content == COORDINATOR_PROMPT
+        assert (arguments["prompt"][0].content == COORDINATOR_PROMPT) == (
+            research_profile == "deep"
+        )
         payload = user_payload(arguments["prompt"][1])
         assert original_question in payload["conversation"]
         footer = user_payload(arguments["prompt"][-1])
@@ -1688,3 +1698,89 @@ def test_followup_rebinds_retained_native_citation_before_root_and_child_decisio
     assert len(emitted) == 1
     assert emitted[0].citation_number == 1 and emitted[0].chunk_ind == -1
     assert emitted[0].preview_url == "/api/asv3/citation/12/1"
+
+
+@pytest.mark.parametrize("research_profile", ["normal", "deep"])
+def test_first_decision_profiles_can_answer_without_research(
+    monkeypatch: pytest.MonkeyPatch, research_profile: str
+) -> None:
+    from onyx.prompts.asv3.coordinator_reference import COORDINATOR_REFERENCE_PROMPT
+
+    kwargs, _broker, llm, checkpoints, queue = setup_run(monkeypatch)
+    kwargs["research_profile"] = research_profile
+    kwargs.pop("test_language")
+    kwargs["simple_chat_history"] = [
+        ChatMessageSimple(
+            message="Merhaba", message_type=MessageType.USER, token_count=1
+        )
+    ]
+
+    def greet(**arguments: Any) -> ModelResponse:
+        instruction = arguments["prompt"][0].content
+        tools = {item["function"]["name"] for item in arguments["tools"]}
+        if research_profile == "normal":
+            assert instruction.startswith(COORDINATOR_REFERENCE_PROMPT)
+            assert "research_questions" not in tools
+            assert "assemble_answers" not in tools
+        else:
+            assert instruction == COORDINATOR_PROMPT
+            assert "research_questions" in tools
+        return response(
+            calls=[
+                (
+                    "submit_answer",
+                    {
+                        "answer": "Merhaba, nasıl yardımcı olabilirim?",
+                        "basis": "conversation",
+                        "_language": "tr",
+                    },
+                )
+            ]
+        )
+
+    llm.invoke.side_effect = greet
+    runtime.run_asv3_loop(**kwargs)
+    assert llm.invoke.call_count == 1
+    assert checkpoints[-1]["research_profile"] == research_profile
+    assert any(isinstance(packet.obj, AgentResponseDelta) for packet in packets(queue))
+
+
+@pytest.mark.parametrize("original_profile", ["normal", "deep"])
+def test_checkpoint_resume_pins_original_research_profile(
+    monkeypatch: pytest.MonkeyPatch, original_profile: str
+) -> None:
+    kwargs, _broker, llm, checkpoints, _queue = setup_run(monkeypatch)
+    kwargs.pop("test_language")
+    kwargs["research_profile"] = original_profile
+    kwargs["simple_chat_history"] = [
+        ChatMessageSimple(
+            message="Merhaba", token_count=1, message_type=MessageType.USER
+        )
+    ]
+    llm.invoke.side_effect = lambda **_args: response(
+        calls=[
+            (
+                "submit_answer",
+                {"answer": "Merhaba!", "basis": "conversation", "_language": "tr"},
+            )
+        ]
+    )
+    runtime.run_asv3_loop(**kwargs)
+    previous = copy.deepcopy(checkpoints[-1])
+    monkeypatch.setattr(runtime, "load_asv3_checkpoint", lambda **_args: previous)
+    kwargs["research_profile"] = "normal" if original_profile == "deep" else "deep"
+    kwargs["resume_message_id"] = 2
+    llm.reset_mock()
+
+    def finish(**arguments: Any) -> ModelResponse:
+        tools = {item["function"]["name"] for item in arguments["tools"]}
+        assert ("research_questions" in tools) == (original_profile == "deep")
+        assert arguments["timeout_override"] is None
+        return response(
+            calls=[("submit_answer", {"answer": "Merhaba!", "basis": "conversation"})]
+        )
+
+    llm.invoke.side_effect = finish
+    runtime.run_asv3_loop(**kwargs)
+    assert llm.invoke.call_count == 1
+    assert checkpoints[-1]["research_profile"] == original_profile

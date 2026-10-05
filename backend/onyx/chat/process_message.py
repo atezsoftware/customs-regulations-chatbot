@@ -15,9 +15,10 @@ import unicodedata
 from collections.abc import Callable, Generator
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import Token
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Final, cast
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy.orm import Session
 
@@ -86,6 +87,7 @@ from onyx.db.models import ChatMessage, Persona, User, UserFile
 from onyx.db.persona import get_effective_persona_tools
 from onyx.db.projects import get_user_files_from_project
 from onyx.db.tools import get_tools
+from onyx.db.usage_measurement import get_measurement_period, record_measurement
 from onyx.deep_research.dr_loop import run_deep_research_llm_loop
 from onyx.error_handling.error_codes import OnyxErrorCode
 from onyx.error_handling.exceptions import OnyxError, log_onyx_error
@@ -148,6 +150,11 @@ from onyx.tools.tool_constructor import (
 )
 from onyx.tools.tool_implementations.search.search_tool import SearchTool
 from onyx.tracing.answer_graph import record_final_answer_message
+from onyx.tracing.usage_measurement import (
+    CURRENT_USAGE_MEASUREMENT,
+    UsageMeasurementContext,
+    UsageMeasurementOrigin,
+)
 from onyx.utils.logger import setup_logger
 from onyx.utils.telemetry import mt_cloud_telemetry
 from onyx.utils.timing import log_function_time
@@ -701,14 +708,23 @@ def _is_social_only_message(message: str) -> bool:
     return not tokens or all(token in _SOCIAL_TURN_TOKENS for token in tokens)
 
 
+def _uses_default_asv3(setup: ChatTurnSetup) -> bool:
+    return (
+        setup.persona.id == DEFAULT_PERSONA_ID
+        and setup.chat_session.project_id is None
+        and not setup.new_msg_req.atez_search
+        and not setup.new_msg_req.atez_search_v2
+    )
+
+
 def _global_regulatory_search_filters(setup: ChatTurnSetup) -> BaseFilters | None:
-    """Build default-chat filters and opt into Atez Search only when selected."""
+    """Use authorized regulatory filters for both default ASv3 profiles."""
     filters = setup.new_msg_req.internal_search_filters
     if setup.persona.id != DEFAULT_PERSONA_ID:
         return filters
 
     atez_search_v2 = getattr(setup.new_msg_req, "atez_search_v2", False) is True
-    atez_search_v3 = getattr(setup.new_msg_req, "atez_search_v3", False) is True
+    atez_search_v3 = _uses_default_asv3(setup) or setup.new_msg_req.atez_search_v3
     regulatory_search_enabled = (
         setup.new_msg_req.atez_search or atez_search_v2 or atez_search_v3
     )
@@ -852,6 +868,15 @@ def build_chat_turn(
             eager_load_persona=True,
         )
 
+    CURRENT_USAGE_MEASUREMENT.set(None)
+    measurement_origin = new_msg_req.usage_measurement_origin
+    if measurement_origin is None:
+        measurement_period = get_measurement_period(db_session)
+        measurement_origin = UsageMeasurementOrigin(
+            epoch=measurement_period.id if measurement_period else None,
+            started_at=datetime.now(timezone.utc),
+        )
+
     persona = chat_session.persona
     is_global_regulatory_chat = persona.id == DEFAULT_PERSONA_ID
     message_text = new_msg_req.message
@@ -969,6 +994,30 @@ def build_chat_turn(
             commit=True,
         )
         chat_history.append(user_message)
+
+    if measurement_origin.epoch is not None:
+        measurement_context = UsageMeasurementContext(
+            epoch=measurement_origin.epoch,
+            request_id=uuid4(),
+            started_at=measurement_origin.started_at,
+            user_id=str(user.id),
+            session_id=chat_session.id,
+            question_id=user_message.id,
+            workflow=(
+                "deep"
+                if new_msg_req.deep_research or new_msg_req.atez_search_v3
+                else "normal"
+            )
+            if persona.id == DEFAULT_PERSONA_ID
+            and chat_session.project_id is None
+            and not new_msg_req.atez_search
+            and not new_msg_req.atez_search_v2
+            else "other",
+            benchmark=chat_session.benchmark_flow,
+        )
+        record_measurement(db_session, measurement_context)
+        db_session.commit()
+        CURRENT_USAGE_MEASUREMENT.set(measurement_context)
 
     # Collect file IDs for the file reader tool *before* summary truncation so
     # that files attached to older (summarized-away) messages are still accessible
@@ -1566,7 +1615,11 @@ def _run_models(
                 # Per-thread copy: run_llm_loop mutates simple_chat_history in-place.
                 # Deep Research receives the same internal-only, global regulatory
                 # SearchTool as the standard loop.
-                if setup.new_msg_req.atez_search_v3:
+                if (
+                    _uses_default_asv3(setup)
+                    or setup.new_msg_req.atez_search_v3
+                    or setup.new_msg_req.asv3_resume_message_id is not None
+                ):
                     from onyx.asv3.runtime import run_asv3_loop
 
                     if setup.persona.id != DEFAULT_PERSONA_ID:
@@ -1592,6 +1645,12 @@ def _run_models(
                         reasoning_effort=setup.reasoning_effort,
                         include_citations=setup.new_msg_req.include_citations,
                         cache=setup.cache,
+                        research_profile="deep"
+                        if (
+                            setup.new_msg_req.deep_research
+                            or setup.new_msg_req.atez_search_v3
+                        )
+                        else "normal",
                         resume_message_id=setup.new_msg_req.asv3_resume_message_id,
                         custom_agent_prompt=setup.custom_agent_prompt,
                         allow_external=setup.new_msg_req.asv3_allow_external,

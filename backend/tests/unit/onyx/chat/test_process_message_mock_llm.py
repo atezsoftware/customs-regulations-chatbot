@@ -15,15 +15,16 @@ from onyx.context.search.models import BaseFilters
 from onyx.server.query_and_chat.models import MessageResponseIDInfo, SendMessageRequest
 
 
-def test_default_persona_uses_original_search_scope_without_atez_search() -> None:
+def test_default_persona_uses_asv3_scope_without_discarding_user_filters() -> None:
     requested_date = date(2026, 7, 1)
     requested_filters = BaseFilters(
         document_set=["Dar kapsam"],
         as_of_date=requested_date,
     )
     setup = SimpleNamespace(
+        chat_session=SimpleNamespace(project_id=None),
         persona=SimpleNamespace(id=process_message.DEFAULT_PERSONA_ID),
-        new_msg_req=SimpleNamespace(
+        new_msg_req=SendMessageRequest(
             internal_search_filters=requested_filters,
             message="Antrepo rejiminin şartları nelerdir?",
             atez_search=False,
@@ -35,7 +36,7 @@ def test_default_persona_uses_original_search_scope_without_atez_search() -> Non
     )
 
     assert effective_filters is not None
-    assert effective_filters.regulatory_chunks_only is False
+    assert effective_filters.regulatory_chunks_only is True
     assert effective_filters.source_type == [DocumentSource.USER_FILE]
     assert effective_filters.document_set == ["Dar kapsam"]
     assert effective_filters.as_of_date == requested_date
@@ -48,8 +49,9 @@ def test_atez_search_forces_regulatory_scope_without_discarding_user_filters() -
         as_of_date=requested_date,
     )
     setup = SimpleNamespace(
+        chat_session=SimpleNamespace(project_id=None),
         persona=SimpleNamespace(id=process_message.DEFAULT_PERSONA_ID),
-        new_msg_req=SimpleNamespace(
+        new_msg_req=SendMessageRequest(
             internal_search_filters=requested_filters,
             message="26 Haziran 2026 tarihinde antrepo rejiminin şartları nelerdir?",
             atez_search=True,
@@ -70,8 +72,9 @@ def test_atez_search_forces_regulatory_scope_without_discarding_user_filters() -
 
 def test_atez_search_v2_uses_fast_regulatory_profile() -> None:
     setup = SimpleNamespace(
+        chat_session=SimpleNamespace(project_id=None),
         persona=SimpleNamespace(id=process_message.DEFAULT_PERSONA_ID),
-        new_msg_req=SimpleNamespace(
+        new_msg_req=SendMessageRequest(
             internal_search_filters=None,
             message="Antrepo rejiminin şartları nelerdir?",
             atez_search=False,
@@ -92,6 +95,7 @@ def test_atez_search_v2_uses_fast_regulatory_profile() -> None:
 def test_atez_search_v2_labels_require_explicit_request_opt_in() -> None:
     run_id = uuid4()
     setup = SimpleNamespace(
+        chat_session=SimpleNamespace(project_id=None),
         persona=SimpleNamespace(id=process_message.DEFAULT_PERSONA_ID),
         new_msg_req=SendMessageRequest(
             message="Antrepo rejiminin şartları nelerdir?",
@@ -124,6 +128,7 @@ def test_native_asv3_labels_use_existing_scope_without_fast_workflow(
             update={"regulatory_label_search_enabled": False}
         )
     setup = SimpleNamespace(
+        chat_session=SimpleNamespace(project_id=None),
         persona=SimpleNamespace(id=process_message.DEFAULT_PERSONA_ID),
         new_msg_req=SendMessageRequest(
             message="Antrepo rejiminin şartları nelerdir?",
@@ -147,6 +152,7 @@ def test_native_asv3_labels_use_existing_scope_without_fast_workflow(
 
 def test_native_asv3_social_turn_does_not_activate_label_search() -> None:
     setup = SimpleNamespace(
+        chat_session=SimpleNamespace(project_id=None),
         persona=SimpleNamespace(id=process_message.DEFAULT_PERSONA_ID),
         new_msg_req=SendMessageRequest(message="Merhaba!", atez_search_v3=True),
     )
@@ -174,8 +180,9 @@ def test_atez_search_v2_uses_explicit_historical_date_from_user_query(
     date_expression: str,
 ) -> None:
     setup = SimpleNamespace(
+        chat_session=SimpleNamespace(project_id=None),
         persona=SimpleNamespace(id=process_message.DEFAULT_PERSONA_ID),
-        new_msg_req=SimpleNamespace(
+        new_msg_req=SendMessageRequest(
             internal_search_filters=None,
             message=(
                 f"{date_expression} GÜMRÜK GENEL TEBLİĞİ "
@@ -197,8 +204,9 @@ def test_atez_search_v2_uses_explicit_historical_date_from_user_query(
 
 def test_atez_search_v2_does_not_guess_between_multiple_query_dates() -> None:
     setup = SimpleNamespace(
+        chat_session=SimpleNamespace(project_id=None),
         persona=SimpleNamespace(id=process_message.DEFAULT_PERSONA_ID),
-        new_msg_req=SimpleNamespace(
+        new_msg_req=SendMessageRequest(
             internal_search_filters=None,
             message=(
                 "26 Haziran 2026 ile 4 Temmuz 2026 arasında taşıt onay "
@@ -232,8 +240,9 @@ def test_default_persona_keeps_social_messages_out_of_regulatory_research(
     message: str,
 ) -> None:
     setup = SimpleNamespace(
+        chat_session=SimpleNamespace(project_id=None),
         persona=SimpleNamespace(id=process_message.DEFAULT_PERSONA_ID),
-        new_msg_req=SimpleNamespace(
+        new_msg_req=SendMessageRequest(
             internal_search_filters=None,
             message=message,
             atez_search=True,
@@ -260,8 +269,9 @@ def test_default_persona_keeps_substantive_short_queries_in_regulatory_research(
     message: str,
 ) -> None:
     setup = SimpleNamespace(
+        chat_session=SimpleNamespace(project_id=None),
         persona=SimpleNamespace(id=process_message.DEFAULT_PERSONA_ID),
-        new_msg_req=SimpleNamespace(
+        new_msg_req=SendMessageRequest(
             internal_search_filters=None,
             message=message,
             atez_search=True,

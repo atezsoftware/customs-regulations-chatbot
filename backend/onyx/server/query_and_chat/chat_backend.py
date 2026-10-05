@@ -2,7 +2,7 @@ import datetime
 import json
 import time
 from collections.abc import Generator
-from datetime import timedelta
+from datetime import timedelta, timezone
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
@@ -71,6 +71,7 @@ from onyx.db.persona import get_persona_by_id
 from onyx.db.response_usage import get_response_usage
 from onyx.db.tools import get_tools_by_ids
 from onyx.db.usage import UsageType, increment_usage
+from onyx.db.usage_measurement import get_measurement_period, latest_session_measurement
 from onyx.db.user_file import get_file_id_by_user_file_id
 from onyx.error_handling.error_codes import OnyxErrorCode
 from onyx.error_handling.exceptions import OnyxError
@@ -127,6 +128,10 @@ from onyx.server.usage_limits import (
 )
 from onyx.server.utils import get_json_line
 from onyx.tracing.framework.create import ChatTraceMetadata, ensure_trace
+from onyx.tracing.usage_measurement import (
+    CURRENT_USAGE_MEASUREMENT,
+    UsageMeasurementOrigin,
+)
 from onyx.utils.headers import get_custom_tool_additional_request_headers
 from onyx.utils.logger import setup_logger
 from onyx.utils.telemetry import mt_cloud_telemetry
@@ -563,6 +568,12 @@ def _generate_or_fallback_chat_session_name(
     llm_override: LLMOverride | None,
 ) -> str:
     user_id = user.id
+    with get_session_with_current_tenant() as measurement_db:
+        CURRENT_USAGE_MEASUREMENT.set(
+            latest_session_measurement(
+                measurement_db, str(user.id), str(chat_session_id)
+            )
+        )
     fallback_name = get_fallback_chat_session_name(chat_history)
     max_tokens_for_naming = 3000
 
@@ -769,6 +780,15 @@ def handle_send_chat_message(
     Returns:
         StreamingResponse | ChatFullResponse: Either streams or returns complete response.
     """
+    with get_session_with_current_tenant() as measurement_db:
+        period = get_measurement_period(measurement_db)
+    chat_message_req.set_usage_measurement_origin(
+        UsageMeasurementOrigin(
+            epoch=period.id if period else None,
+            started_at=datetime.datetime.now(timezone.utc),
+        )
+    )
+
     logger.debug("Received new chat message: %s", chat_message_req.message)
 
     tenant_id = get_current_tenant_id()
