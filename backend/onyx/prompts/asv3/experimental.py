@@ -7,7 +7,7 @@ Provider-specific tools, fixed dates, staged reviewers and benchmark cases are n
 
 from onyx.prompts.asv3.coordinator_reference import COORDINATOR_REFERENCE_PROMPT
 
-EXPERIMENTAL_PROMPT_VERSION = "asv3-experimental-2026-10-06.2"
+EXPERIMENTAL_PROMPT_VERSION = "asv3-experimental-2026-10-06.3"
 
 
 def _source_navigation(reference_prompt: str) -> str:

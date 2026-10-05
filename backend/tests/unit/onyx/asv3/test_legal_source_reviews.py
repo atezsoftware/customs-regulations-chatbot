@@ -207,6 +207,23 @@ def test_invalid_closure_is_atomic(changes: dict[str, JsonValue]) -> None:
     assert reviews.export() == before
 
 
+@pytest.mark.parametrize("status", ["examined", "not_material"])
+def test_nonempty_closed_review_gap_reports_metadata_defect_without_missing_originals(
+    status: str,
+) -> None:
+    context, ledger, reviews = setup_reviews()
+    seen(context, ledger, reviews)
+    deliver(ledger, "assessment", [1, 2])
+    with pytest.raises(ValueError, match="must leave gap empty"):
+        reviews.apply(
+            [review(status=status, gap="An open applicability issue remains.")],
+            "assessment",
+            context,
+            ledger,
+        )
+    assert reviews.view(context, ledger, {1, 2})["pending_lead_ids"] == [lead_id()]
+
+
 def test_not_material_also_requires_candidate_original_and_current_full_delivery() -> (
     None
 ):

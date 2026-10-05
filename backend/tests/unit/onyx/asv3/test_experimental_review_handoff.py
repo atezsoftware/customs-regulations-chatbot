@@ -25,11 +25,14 @@ from tests.unit.onyx.asv3.test_shared_originals import full_record
 
 
 @pytest.mark.parametrize("selected_action", ["submit_answer", "read_provision"])
-def test_pending_review_handoff_requires_native_action_and_keeps_research_available(
+@pytest.mark.parametrize("provider", ["openai", "vertex_ai"])
+def test_pending_review_handoff_uses_compatible_transport_and_keeps_research_available(
     selected_action: str,
+    provider: str,
 ) -> None:
     context, ledger, reviews = experimental_context(depth=1)
     selected, cheap = model(), model()
+    selected.config = selected.config.model_copy(update={"model_provider": provider})
     arguments: dict[str, JsonValue] = {
         "answer": "The limited holding affects this rule [1] [2].",
         "basis": "originals",
@@ -50,7 +53,11 @@ def test_pending_review_handoff_requires_native_action_and_keeps_research_availa
     decision = adapter.decide(current)
     assert selected.invoke.call_count == cheap.invoke.call_count == 1
     assert cheap.invoke.call_args.kwargs["tool_choice"] is ToolChoiceOptions.AUTO
-    assert selected.invoke.call_args.kwargs["tool_choice"] is ToolChoiceOptions.REQUIRED
+    assert selected.invoke.call_args.kwargs["tool_choice"] is (
+        ToolChoiceOptions.AUTO
+        if provider == "vertex_ai"
+        else ToolChoiceOptions.REQUIRED
+    )
     assert selected.invoke.call_args.kwargs["tools"] == current.tools
     assert last_payload(selected)["candidate_related_source_reviews"] == [review()]
     assert reviews.view(context, ledger, {1, 2})["pending_lead_ids"]
@@ -168,11 +175,14 @@ def content_response(text: str) -> ModelResponse:
 
 
 @pytest.mark.parametrize("terminal", ["submit_answer", "submit_partial_answer"])
+@pytest.mark.parametrize("provider", ["openai", "vertex_ai"])
 def test_selected_strict_terminal_content_closes_review_without_another_model_call(
     terminal: str,
+    provider: str,
 ) -> None:
     context, ledger, reviews = experimental_context(depth=1)
     selected, cheap = model(), model()
+    selected.config = selected.config.model_copy(update={"model_provider": provider})
     cheap.invoke.return_value = native_action(
         "submit_answer",
         cast(dict[str, JsonValue], terminal_envelope(assessment=review())["arguments"]),
@@ -198,6 +208,11 @@ def test_selected_strict_terminal_content_closes_review_without_another_model_ca
     assert decision.assistant_message.tool_calls is not None
     assert decision.assistant_message.tool_calls[0].id == decision.calls[0].call_id
     assert selected.invoke.call_count == cheap.invoke.call_count == 1
+    assert selected.invoke.call_args.kwargs["tool_choice"] is (
+        ToolChoiceOptions.AUTO
+        if provider == "vertex_ai"
+        else ToolChoiceOptions.REQUIRED
+    )
     assert "strict JSON" in last_payload(selected)["related_source_terminal_transport"]
     assert reviews.view(context, ledger, {1, 2})["pending_lead_ids"]
     assert registry.dispatch(decision.calls[0], context).status == OutcomeStatus.FOUND

@@ -29,7 +29,10 @@ class RelatedSourceReview(BaseModel):
     effect: str = Field(min_length=1)
     limitations: str = Field(min_length=1)
     witnesses: list[OutcomeWitness] = Field(default_factory=list)
-    gap: str = ""
+    gap: str = Field(
+        default="",
+        description="Precise open interaction for unresolved only; otherwise empty.",
+    )
 
 
 class _LeadRecord(BaseModel):
@@ -286,7 +289,12 @@ class LegalSourceReviews:
                     "An unresolved source interaction needs its precise gap"
                 )
         else:
-            if review.gap.strip() or not review.witnesses:
+            if review.gap.strip():
+                raise ValueError(
+                    "Examined and not-material reviews must leave gap empty; "
+                    "use unresolved for an open interaction"
+                )
+            if not review.witnesses:
                 raise ValueError("Examined and excluded leads need their own originals")
             if review.status == "examined" and review.source_role != "operative_text":
                 raise ValueError("An argument alone cannot close operative examination")

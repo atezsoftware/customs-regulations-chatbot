@@ -1241,7 +1241,12 @@ class ResearchModel:
                     ToolChoiceOptions.REQUIRED
                     if bool(tools)
                     and (
-                        require_source_review_action
+                        (
+                            require_source_review_action
+                            # Vertex constrained calling rejects this tool catalogue.
+                            # Selected terminal actions still undergo provenance validation.
+                            and selected_llm.config.model_provider != "vertex_ai"
+                        )
                         or (
                             not self.context.depth
                             and self.context.services.get("independent_question_mode")
