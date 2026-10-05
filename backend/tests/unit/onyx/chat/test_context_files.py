@@ -27,6 +27,7 @@ from onyx.db.models import UserFile
 from onyx.error_handling.error_codes import OnyxErrorCode
 from onyx.error_handling.exceptions import OnyxError
 from onyx.file_store.models import ChatFileType, InMemoryChatFile
+from onyx.server.query_and_chat.models import SendMessageRequest
 from onyx.tools.models import SearchToolUsage
 from onyx.tools.tool_implementations.search.search_tool import SearchTool
 
@@ -81,15 +82,15 @@ def test_global_regulatory_filters_do_not_invent_an_as_of_date() -> None:
     setup = MagicMock()
     setup.persona.id = DEFAULT_PERSONA_ID
     setup.new_msg_req.internal_search_filters = None
-    setup.new_msg_req.atez_search = False
-    setup.new_msg_req.message = "Antrepo nedir?"
+    setup.chat_session.project_id = None
+    setup.new_msg_req = SendMessageRequest(message="Antrepo nedir?")
 
     filters = _global_regulatory_search_filters(setup)
 
     assert filters is not None
     assert filters.source_type == [DocumentSource.USER_FILE]
     assert filters.as_of_date is None
-    assert filters.regulatory_chunks_only is False
+    assert filters.regulatory_chunks_only is True
 
 
 def test_atez_search_enables_structure_aware_regulatory_workflow() -> None:
@@ -266,6 +267,32 @@ class TestResolveContextUserFiles:
 
 class TestExtractContextFiles:
     """All-or-nothing context window fit check."""
+
+    @pytest.fixture(autouse=True)
+    def isolate_publication_boundary(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from onyx.document_index.publication_models import (
+            PublicationScope,
+            ReadObservation,
+        )
+
+        observation = ReadObservation(
+            scope=PublicationScope(
+                tenant_id="test", environment="test", database_identity="test"
+            ),
+            committed_epoch=0,
+        )
+        monkeypatch.setattr(
+            "onyx.regulatory.publication_reads.observe_publication_read",
+            lambda: observation,
+        )
+        monkeypatch.setattr(
+            "onyx.regulatory.publication_reads.require_publication_files",
+            lambda *_args: None,
+        )
+        monkeypatch.setattr(
+            "onyx.db.regulatory_original_ingestion.unavailable_original_file_ids",
+            lambda *_args: (),
+        )
 
     def test_empty_user_files_returns_empty(self) -> None:
         db_session = MagicMock()
