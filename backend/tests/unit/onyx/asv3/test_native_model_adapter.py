@@ -1327,3 +1327,122 @@ def test_native_failed_continuation_never_returns_a_complete_candidate(
     with pytest.raises(RunStopped, match="did not complete"):
         adapter.decide(view())
     assert llm.invoke.call_count == 2 and adapter.last_response_truncated
+
+
+def native_action(name: str, arguments: dict[str, Any]) -> ModelResponse:
+    return ModelResponse(
+        id=name,
+        created="0",
+        choice=Choice(
+            message=Message(
+                tool_calls=[
+                    ChatCompletionMessageToolCall(
+                        id=name,
+                        function=ResponseFunctionCall(
+                            name=name,
+                            arguments=json.dumps(arguments),
+                        ),
+                    ),
+                ]
+            )
+        ),
+    )
+
+
+@pytest.mark.parametrize("depth", [0, 1])
+def test_intermediate_model_research_hands_full_originals_to_answer_model(
+    depth: int,
+) -> None:
+    selected, cheap = model(), model()
+    context = RunContext(depth=depth)
+    ledger = EvidenceLedger()
+    context.services["evidence"] = ledger
+    text = "Permission requires both authenticated proof and a later approval."
+    record = original(ledger, context, text)
+    current = adaptive_tool_view(original_evidence=[record])
+    selected.invoke.return_value = ModelResponse(
+        id="full-answer",
+        created="0",
+        choice=Choice(
+            message=Message(
+                content="Permission requires authenticated proof and later approval [1].",
+            )
+        ),
+    )
+    cheap.invoke.side_effect = [
+        native_action("read_provision", {"source_id": "law", "article": "7"}),
+        ModelResponse(
+            id="candidate",
+            created="0",
+            choice=Choice(
+                message=Message(
+                    content="Permission requires authenticated proof and later approval [1].",
+                )
+            ),
+        ),
+    ]
+    adapter = ResearchModel(
+        selected, context, research_llm=cheap, lean_native_mode=True
+    )
+    if depth == 0:
+        selected.invoke.return_value = native_action(
+            "read_provision", {"source_id": "law", "article": "7"}
+        )
+        assert adapter.decide(current).calls[0].name == "read_provision"
+        selected.invoke.return_value = ModelResponse(
+            id="full-answer",
+            created="0",
+            choice=Choice(message=Message(content="Complete rule [1].")),
+        )
+    assert adapter.decide(current).calls[0].name == "read_provision"
+    decision = adapter.decide(current)
+    assert decision.answer and "[1]" in decision.answer
+    assert cheap.invoke.call_count == 2
+    assert selected.invoke.call_count == (2 if depth == 0 else 1)
+    payload = last_payload(selected)
+    assert (
+        payload["draft_to_repair"]
+        == "Permission requires authenticated proof and later approval [1]."
+    )
+    assert payload["original_evidence"][0]["text"] == text
+    assert adapter.last_call_id is not None
+    assert ledger.completely_delivered(adapter.last_call_id) == {1}
+
+
+@pytest.mark.parametrize(
+    "name,arguments",
+    [
+        ("ask_user", {"question": "İşlemin tarihi nedir?"}),
+        ("submit_answer", {"answer": "Merhaba!", "basis": "conversation"}),
+        ("submit_answer", {"answer": "2 + 2 = 4", "basis": "scenario"}),
+    ],
+)
+def test_intermediate_model_can_clarify_or_answer_conversation_without_handoff(
+    name: str,
+    arguments: dict[str, Any],
+) -> None:
+    selected, cheap = model(), model()
+    cheap.invoke.return_value = native_action(name, arguments)
+    adapter = ResearchModel(
+        selected, RunContext(depth=1), research_llm=cheap, lean_native_mode=True
+    )
+    assert adapter.decide(adaptive_tool_view()).calls[0].name == name
+    assert cheap.invoke.call_count == 1
+    selected.invoke.assert_not_called()
+
+
+def test_intermediate_legal_submission_runs_selected_answer_model() -> None:
+    selected, cheap = model(), model()
+    cheap.invoke.return_value = native_action(
+        "submit_answer", {"answer": "Rule [1].", "basis": "originals"}
+    )
+    selected.invoke.return_value = native_action(
+        "submit_answer", {"answer": "Rule and exception [1].", "basis": "originals"}
+    )
+    adapter = ResearchModel(
+        selected, RunContext(depth=1), research_llm=cheap, lean_native_mode=True
+    )
+    decision = adapter.decide(adaptive_tool_view())
+    assert decision.calls[0].arguments["answer"] == "Rule and exception [1]."
+    assert last_payload(selected)["draft_to_repair"] == "Rule [1]."
+    assert cheap.invoke.call_count == selected.invoke.call_count == 1

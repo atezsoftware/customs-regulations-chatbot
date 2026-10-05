@@ -1214,6 +1214,19 @@ class LitellmLLM(LLM):
         bound._seed = validated_seed
         return bound
 
+    def with_model(self, model_name: str, *, max_input_tokens: int) -> "LitellmLLM":
+        if not model_name.strip() or max_input_tokens <= 0:
+            raise ValueError(
+                "A model identity and positive context capacity are required"
+            )
+        bound = copy.copy(self)
+        bound._model_version = model_name
+        bound._max_input_tokens = max_input_tokens
+        bound._seed = None
+        bound._model_kwargs = copy.deepcopy(self._model_kwargs)
+        bound._model_kwargs.pop("seed", None)
+        return bound
+
     @property
     def config(self) -> LLMConfig:
         return LLMConfig(
