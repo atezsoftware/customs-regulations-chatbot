@@ -1,4 +1,4 @@
-PROMPT_VERSION = "asv3-2026-10-05.53"
+PROMPT_VERSION = "asv3-2026-10-05.55"
 
 DEFAULT_RESPONSE_PREFERENCES = """Application-provided communication default for substantive source-based questions:
 Use a composed, precise professional advisory tone consistent with leading professional

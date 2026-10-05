@@ -262,7 +262,7 @@ def _make_setup(n_models: int = 1) -> MagicMock:
     setup.extracted_context_files.publication_evidence = None
     # Fields consumed by SearchToolConfig / CustomToolConfig / FileReaderToolConfig
     # constructors inside _run_model — must be typed correctly for Pydantic.
-    setup.new_msg_req.deep_research = False
+    setup.new_msg_req = _make_request()
     setup.new_msg_req.internal_search_filters = None
     setup.new_msg_req.allowed_tool_ids = None
     setup.new_msg_req.include_citations = True
@@ -275,6 +275,9 @@ def _make_setup(n_models: int = 1) -> MagicMock:
     setup.forced_tool_id = None
     setup.simple_chat_history = []
     setup.chat_session.id = uuid4()
+    setup.chat_session.project_id = None
+    setup.chat_session.benchmark_flow = False
+    setup.persona.id = 1
     setup.user_message.id = None
     setup.custom_tool_additional_headers = None
     setup.mcp_headers = None
@@ -989,3 +992,54 @@ class TestRunModels:
         # The state_container kwarg passed to run_llm_loop must be the external one
         call_kwargs = mock_llm.call_args.kwargs
         assert call_kwargs["state_container"] is external
+
+
+@pytest.mark.parametrize("deep", [False, True])
+def test_selected_asv3_profile_preserves_stream(deep: bool) -> None:
+    from onyx.chat.process_message import DEFAULT_PERSONA_ID
+
+    setup = _make_setup()
+    setup.persona.id = DEFAULT_PERSONA_ID
+    setup.chat_session.project_id = None
+    setup.new_msg_req = _make_request(
+        deep_research=deep,
+        atez_search_v3=not deep,
+        asv3_research_profile="deep" if deep else "normal",
+    )
+
+    def emit_answer(**kwargs: Any) -> None:
+        from onyx.server.query_and_chat.streaming_models import AgentResponseDelta
+
+        kwargs["emitter"].emit(
+            Packet(
+                placement=Placement(turn_index=0),
+                obj=AgentResponseDelta(content="Tam cevap"),
+            )
+        )
+
+    with (
+        patch(
+            "onyx.chat.process_message.load_settings",
+            return_value=MagicMock(auto_detect_search_filters=False),
+        ),
+        patch("onyx.asv3.runtime.run_asv3_loop", side_effect=emit_answer) as asv3,
+        patch("onyx.chat.process_message.run_llm_loop") as legacy,
+        patch("onyx.chat.process_message.run_deep_research_llm_loop") as legacy_deep,
+        patch("onyx.chat.process_message.construct_tools", return_value={}),
+        patch("onyx.chat.process_message.llm_loop_completion_handle") as persist,
+        patch(
+            "onyx.chat.process_message.get_llm_token_counter", return_value=lambda _: 0
+        ),
+    ):
+        packets = _run_models_collect(setup)
+
+    asv3.assert_called_once()
+    assert asv3.call_args.kwargs["research_profile"] == ("deep" if deep else "normal")
+    legacy.assert_not_called()
+    legacy_deep.assert_not_called()
+    persist.assert_called_once()
+    assert any(
+        isinstance(p, Packet) and getattr(p.obj, "content", None) == "Tam cevap"
+        for p in packets
+    )
+    assert not any(isinstance(p, StreamingError) for p in packets)
