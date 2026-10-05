@@ -288,6 +288,87 @@ def test_concurrent_repeat_exposure_deduplicates_and_preserves_completed_review(
     assert reviews.view(context, ledger, {1, 2})["pending_lead_ids"] == []
 
 
+def test_extra_unchanged_anchor_continuation_preserves_completed_review() -> None:
+    context, ledger, reviews = setup_reviews()
+    seen(context, ledger, reviews)
+    deliver(ledger, "answer-call", [1, 2])
+    reviews.apply([review()], "answer-call", context, ledger)
+    prior = copy.deepcopy(reviews.export())
+    continuation = original(
+        "law-17-continuation",
+        "A connected operative condition.",
+        source="law",
+        headings=["Example Law", "MADDE 17"],
+    )
+    assert continuation.search_doc is not None
+    assert continuation.chunk_id is not None
+    continuation.search_doc.metadata["regulatory_chunk_id"] = continuation.chunk_id
+    number = ledger.add([continuation], context)[0]
+    deliver(ledger, "continuation-call", [1, 2, number])
+    reviews.record_delivery("continuation-call", context, navigation(), ledger)
+    assert reviews.view(context, ledger, {1, 2, number})["pending_lead_ids"] == []
+    records = cast(list[dict[str, JsonValue]], reviews.export()["records"])
+    prior_records = cast(list[dict[str, JsonValue]], prior["records"])
+    assert records[0]["review"] == prior_records[0]["review"]
+    assert records[0]["review_hashes"] == prior_records[0]["review_hashes"]
+    assert set(cast(dict[str, JsonValue], records[0]["anchor_hashes"])) == {
+        "1",
+        str(number),
+    }
+    restored = LegalSourceReviews(context, "Can the rule be applied?")
+    restored.restore(reviews.export(), context, "Can the rule be applied?", ledger)
+    assert restored.export() == reviews.export()
+
+
+def test_alternating_fitted_anchor_subsets_preserve_review_without_reopening() -> None:
+    context, ledger, reviews = setup_reviews()
+    another = original(
+        "law-17-second",
+        "A second passage of the same governing provision.",
+        source="law",
+        headings=["Example Law", "MADDE 17"],
+    )
+    assert another.search_doc is not None
+    assert another.chunk_id is not None
+    another.search_doc.metadata["regulatory_chunk_id"] = another.chunk_id
+    number = ledger.add([another], context)[0]
+    seen(context, ledger, reviews)
+    deliver(ledger, "answer-call", [1, 2])
+    reviews.apply([review()], "answer-call", context, ledger)
+    for index, citations in enumerate(([number], [1], [1, number], [number], [1])):
+        call = f"fitted-{index}"
+        deliver(ledger, call, citations)
+        reviews.record_delivery(call, context, navigation(), ledger)
+        assert reviews.view(context, ledger, set(citations))["pending_lead_ids"] == []
+        assert (
+            reviews.publication_gap("Supported rule [1].", call, context, ledger)
+            is None
+        )
+    records = cast(list[dict[str, JsonValue]], reviews.export()["records"])
+    assert set(cast(dict[str, JsonValue], records[0]["anchor_hashes"])) == {
+        "1",
+        str(number),
+    }
+
+
+def test_repeat_exposure_rejects_changed_saved_anchor_atomically() -> None:
+    context, ledger, reviews = setup_reviews()
+    seen(context, ledger, reviews)
+    prior = copy.deepcopy(reviews.export())
+    checkpoint = ledger.export()
+    rows = cast(list[dict[str, JsonValue]], checkpoint["records"])
+    first = cast(dict[str, JsonValue], rows[0]["item"])
+    first["text"] = "Changed operative text."
+    first["text_hash"] = ""
+    checkpoint["deliveries"] = []
+    changed = EvidenceLedger()
+    changed.restore(checkpoint, context)
+    deliver(changed, "changed-call", [1])
+    with pytest.raises(ValueError, match="anchor original changed"):
+        reviews.record_delivery("changed-call", context, navigation(), changed)
+    assert reviews.export() == prior
+
+
 def test_resume_is_fenced_and_cannot_silently_replace_live_records() -> None:
     context, ledger, reviews = setup_reviews()
     seen(context, ledger, reviews)

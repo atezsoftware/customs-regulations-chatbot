@@ -130,14 +130,11 @@ def test_existing_prompt_instructions_remain_exact(profile: str, depth: int) -> 
 
 
 @pytest.mark.parametrize("depth", [0, 1])
-def test_experimental_uses_normal_reference_without_deep_prompt(depth: int) -> None:
+def test_experimental_uses_isolated_prompt_without_deep_prompt(depth: int) -> None:
     context, _, _ = experimental_context(depth=depth)
     actual = ResearchModel(
         model(), context, lean_native_mode=True
     )._research_instruction()
-    assert actual.startswith(
-        RESEARCHER_REFERENCE_PROMPT if depth else COORDINATOR_REFERENCE_PROMPT
-    )
     assert actual == (
         EXPERIMENTAL_RESEARCHER_PROMPT
         if depth

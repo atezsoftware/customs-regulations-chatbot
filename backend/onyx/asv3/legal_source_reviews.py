@@ -201,8 +201,28 @@ class LegalSourceReviews:
                     previous = records.get(key)
                     if previous is None:
                         records[key] = record
-                    elif previous.anchor_hashes != record.anchor_hashes:
-                        records[key] = record
+                    else:
+                        self._validate_saved(previous, ledger)
+                        previous_citations = {
+                            witness.citation for witness in previous.anchor_witnesses
+                        }
+                        records[key] = previous.model_copy(
+                            deep=True,
+                            update={
+                                "anchor_witnesses": [
+                                    *previous.anchor_witnesses,
+                                    *(
+                                        witness
+                                        for witness in record.anchor_witnesses
+                                        if witness.citation not in previous_citations
+                                    ),
+                                ],
+                                "anchor_hashes": {
+                                    **previous.anchor_hashes,
+                                    **record.anchor_hashes,
+                                },
+                            },
+                        )
             self._records = records
 
     @staticmethod

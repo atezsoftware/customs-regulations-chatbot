@@ -1164,6 +1164,7 @@ class ResearchModel:
         ledger = self.context.services.get("evidence")
         records: list[dict[str, JsonValue]] = []
         navigation: list[dict[str, JsonValue]] = []
+        require_source_review_action = False
         if isinstance(ledger, EvidenceLedger):
             for message in prompt:
                 content = message.content
@@ -1186,6 +1187,21 @@ class ResearchModel:
                         navigation.extend(
                             item for item in leads if isinstance(item, dict)
                         )
+                    source_reviews = payload.get("related_source_reviews")
+                    if (
+                        self.context.services.get("research_profile") == "experimental"
+                        and isinstance(
+                            self.context.services.get("legal_source_reviews"),
+                            LegalSourceReviews,
+                        )
+                        and isinstance(source_reviews, dict)
+                        and isinstance(source_reviews.get("pending_lead_ids"), list)
+                        and source_reviews.get("pending_lead_ids")
+                        and isinstance(
+                            payload.get("candidate_related_source_reviews"), list
+                        )
+                    ):
+                        require_source_review_action = True
                     evidence = payload.get("original_evidence") or payload.get(
                         "evidence", []
                     )
@@ -1223,14 +1239,20 @@ class ResearchModel:
                 tools=copy.deepcopy(tools) if tools else None,
                 tool_choice=(
                     ToolChoiceOptions.REQUIRED
-                    if not self.context.depth
-                    and self.context.services.get("independent_question_mode") is True
-                    and bool(self.context.services.get("independent_answers"))
-                    and bool(tools)
-                    and any(
-                        isinstance(function := tool.get("function"), dict)
-                        and function.get("name") == "assemble_answers"
-                        for tool in tools
+                    if bool(tools)
+                    and (
+                        require_source_review_action
+                        or (
+                            not self.context.depth
+                            and self.context.services.get("independent_question_mode")
+                            is True
+                            and bool(self.context.services.get("independent_answers"))
+                            and any(
+                                isinstance(function := tool.get("function"), dict)
+                                and function.get("name") == "assemble_answers"
+                                for tool in tools
+                            )
+                        )
                     )
                     else ToolChoiceOptions.AUTO
                     if tools
@@ -2155,6 +2177,19 @@ class ResearchModel:
         records = [*self._native_original_records(retained), *view.original_evidence]
         required = set(view.required_evidence_numbers)
         required.update(extract_citation_numbers(view.draft_to_repair or ""))
+        if self.context.services.get("research_profile") == "experimental":
+            for source_review in candidate_reviews or []:
+                witnesses = (
+                    source_review.get("witnesses")
+                    if isinstance(source_review, dict)
+                    else None
+                )
+                if isinstance(witnesses, list):
+                    for witness in witnesses:
+                        if isinstance(witness, dict):
+                            citation = witness.get("citation")
+                            if type(citation) is int and citation > 0:
+                                required.add(citation)
         if independent_mode and isinstance(independent_answers, list):
             for answer in independent_answers:
                 if isinstance(answer, dict):
@@ -2390,6 +2425,19 @@ class ResearchModel:
                 )
                 if candidate_reviews is not None:
                     current["candidate_related_source_reviews"] = candidate_reviews
+                    source_review_state = current["related_source_reviews"]
+                    if isinstance(
+                        source_review_state, dict
+                    ) and source_review_state.get("pending_lead_ids"):
+                        current["related_source_terminal_transport"] = (
+                            "Assess the candidate yourself against the supplied originals. "
+                            "Use an exposed native action for more research or your own terminal "
+                            "assessment. If the provider returns a terminal action as content, "
+                            "return only one strict JSON object with exactly name and arguments: "
+                            "name must be an exposed submit_answer or submit_partial_answer; "
+                            "arguments must match its actual schema and contain your own "
+                            "_related_source_reviews. No prose, fences or copied approval."
+                        )
             if isinstance(outcomes, OutcomeMap):
                 current["outcome_map"] = outcomes.view(
                     outcome_ids=outcome_subset,
@@ -2568,6 +2616,7 @@ class ResearchModel:
                     else None,
                 )
                 decision = self._invoke_decision(handoff, prompt, tools, output)
+                decision = self._experimental_terminal_envelope(decision, tools)
             if not self.context.depth and self.context.services.get(
                 "independent_answers"
             ):
@@ -2577,6 +2626,82 @@ class ResearchModel:
                 )
             return decision
         return self._decide_research(view)
+
+    def _experimental_terminal_envelope(
+        self, decision: Decision, tools: list[dict[str, JsonValue]]
+    ) -> Decision:
+        reviews = self.context.services.get("legal_source_reviews")
+        ledger = self.context.services.get("evidence")
+        if (
+            self.context.services.get("research_profile") != "experimental"
+            or decision.calls
+            or not decision.answer
+            or not isinstance(reviews, LegalSourceReviews)
+            or not isinstance(ledger, EvidenceLedger)
+            or not reviews.view(
+                self.context,
+                ledger,
+                ledger.completely_delivered(self.last_call_id or ""),
+            )["pending_lead_ids"]
+        ):
+            return decision
+        try:
+            envelope = strict_json_decoder().decode(decision.answer)
+            if not isinstance(envelope, dict) or set(envelope) != {"name", "arguments"}:
+                return decision
+            name, arguments = envelope["name"], envelope["arguments"]
+            if (
+                not isinstance(name, str)
+                or name not in {"submit_answer", "submit_partial_answer"}
+                or not isinstance(arguments, dict)
+            ):
+                return decision
+            parameters = next(
+                (
+                    function.get("parameters")
+                    for tool in tools
+                    if isinstance(function := tool.get("function"), dict)
+                    and function.get("name") == name
+                ),
+                None,
+            )
+            if not isinstance(parameters, dict):
+                return decision
+            jsonschema.Draft202012Validator(parameters).validate(arguments)
+            answer, raw_reviews = (
+                arguments.get("answer"),
+                arguments.get("_related_source_reviews"),
+            )
+            if not isinstance(answer, str) or not isinstance(raw_reviews, list):
+                return decision
+            if (
+                reviews.publication_gap(
+                    answer,
+                    self.last_call_id or "",
+                    self.context,
+                    ledger,
+                    raw_reviews=raw_reviews,
+                )
+                is not None
+            ):
+                return decision
+        except (ValueError, jsonschema.ValidationError):
+            return decision
+        call = CapabilityCall(name=name, arguments=arguments)
+        return Decision(
+            calls=[call],
+            assistant_message=AssistantMessage(
+                tool_calls=[
+                    ToolCall(
+                        id=call.call_id,
+                        function=NativeFunctionCall(
+                            name=call.name,
+                            arguments=json.dumps(call.arguments, ensure_ascii=False),
+                        ),
+                    )
+                ]
+            ),
+        )
 
     @staticmethod
     def _needs_answer_model(decision: Decision) -> bool:
