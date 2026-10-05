@@ -118,13 +118,7 @@ const AppInputBar = React.memo(
     handleFileUpload,
     llmManager,
     deepResearchEnabled,
-    atezSearchEnabled = false,
-    atezSearchV2Enabled = false,
-    atezSearchV3Enabled = false,
     toggleDeepResearch,
-    toggleAtezSearch,
-    toggleAtezSearchV2,
-    toggleAtezSearchV3,
     isMultiModelActive,
     setPresentingDocument,
     disabled,
@@ -573,15 +567,6 @@ const AppInputBar = React.memo(
       currentProjectId,
     ]);
 
-    const showAtezSearch = useMemo(() => {
-      const isProjectWorkflow = currentProjectId !== null;
-      return (
-        !isProjectWorkflow &&
-        selectedAgent?.id === DEFAULT_AGENT_ID &&
-        hasSearchToolsAvailable(selectedAgent.tools || [])
-      );
-    }, [selectedAgent, currentProjectId]);
-
     function handleKeyDownForPromptShortcuts(
       e: React.KeyboardEvent<HTMLDivElement>
     ) {
@@ -703,57 +688,6 @@ const AppInputBar = React.memo(
               </SelectButton>
             ) : (
               <>
-                {showAtezSearch && toggleAtezSearch && (
-                  <SelectButton
-                    disabled={disabled || isMultiModelActive}
-                    variant="select-light"
-                    icon={SvgSearch}
-                    onClick={toggleAtezSearch}
-                    state={atezSearchEnabled ? "selected" : "empty"}
-                    foldable={!atezSearchEnabled}
-                    tooltip={
-                      isMultiModelActive
-                        ? "Atez Search is disabled in multi-model mode"
-                        : "Structure-aware regulatory research"
-                    }
-                  >
-                    Atez Search
-                  </SelectButton>
-                )}
-                {showAtezSearch && toggleAtezSearchV2 && (
-                  <SelectButton
-                    disabled={disabled || isMultiModelActive}
-                    variant="select-light"
-                    icon={SvgSearch}
-                    onClick={toggleAtezSearchV2}
-                    state={atezSearchV2Enabled ? "selected" : "empty"}
-                    foldable={false}
-                    tooltip={
-                      isMultiModelActive
-                        ? "Atez Search V2 is disabled in multi-model mode"
-                        : "Faster structure-aware regulatory research"
-                    }
-                  >
-                    Atez Search V2
-                  </SelectButton>
-                )}
-                {showAtezSearch && toggleAtezSearchV3 && (
-                  <SelectButton
-                    disabled={disabled || isMultiModelActive}
-                    variant="select-light"
-                    icon={SvgSearch}
-                    onClick={toggleAtezSearchV3}
-                    state={atezSearchV3Enabled ? "selected" : "empty"}
-                    foldable={false}
-                    tooltip={
-                      isMultiModelActive
-                        ? "ASv3 runs with one model. Remove extra models to use it."
-                        : "Adaptive regulatory research"
-                    }
-                  >
-                    ASv3
-                  </SelectButton>
-                )}
                 {showDeepResearch && (
                   <SelectButton
                     disabled={disabled || isMultiModelActive}
@@ -761,7 +695,7 @@ const AppInputBar = React.memo(
                     icon={SvgHourglass}
                     onClick={toggleDeepResearch}
                     state={deepResearchEnabled ? "selected" : "empty"}
-                    foldable={!deepResearchEnabled}
+                    foldable={false}
                     tooltip={
                       isMultiModelActive
                         ? "Deep Research is disabled in multi-model mode"
