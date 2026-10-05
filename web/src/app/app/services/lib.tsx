@@ -192,8 +192,6 @@ export async function* sendMessage({
   filters,
   signal,
   deepResearch,
-  atezSearch,
-  atezSearchV2,
   atezSearchV3,
   asv3ResumeMessageId,
   asv3AllowExternal,
@@ -215,11 +213,14 @@ export async function* sendMessage({
     file_descriptors: fileDescriptors,
     internal_search_filters: filters,
     deep_research: deepResearch ?? false,
-    atez_search: atezSearch ?? false,
-    atez_search_v2: atezSearchV2 ?? false,
-    atez_search_v3: atezSearchV3 ?? false,
+    atez_search: false,
+    atez_search_v2: false,
+    atez_search_v3: Boolean(atezSearchV3 && !deepResearch),
+    asv3_research_profile: atezSearchV3 && !deepResearch ? "normal" : "deep",
     asv3_resume_message_id: asv3ResumeMessageId,
-    asv3_allow_external: Boolean(atezSearchV3 && asv3AllowExternal),
+    asv3_allow_external: Boolean(
+      (atezSearchV3 || deepResearch) && asv3AllowExternal
+    ),
     allowed_tool_ids: enabledToolIds,
     forced_tool_id: forcedToolId ?? null,
     llm_override:
