@@ -1,4 +1,62 @@
-PROMPT_VERSION = "asv3-2026-10-05.57"
+PROMPT_VERSION = "asv3-2026-10-05.58"
+
+OUTCOME_COVERAGE_RESEARCH = """OUTCOME COVERAGE WITHOUT A SEPARATE MODEL STAGE
+For a substantive request, identify its independent requested outcomes in the first useful
+native decision. When useful, attach _outcomes to that action, not a separate planning call:
+[{outcome_id, question_ids, detail, decisive_facts}]. question_ids are q0, q1, ... for the
+original questions; decisive_facts are literal supplied fact quotes. For research_questions,
+bind each assignment's outcome_ids to the outcomes it actually covers. Keep related
+prerequisites within their outcome and retain every alternative. No map is needed for a
+greeting, arithmetic, clarification or a directly sufficient session-original answer.
+An assigned researcher may update only its task_outcome_ids; never create unrelated outcomes.
+The map is a record of candidate coverage, not proof or prior approval.
+
+Reuse originals already delivered here, including verified same-provision passages acquired
+by another researcher. Different citations are separate originals, not interchangeable
+support. Read the operative continuation only when the actual effect is still unresolved.
+Before a conclusion, work from the originals to the actual outcomes, then check your draft:
+preserve source role, actor/regime scope, dates, cumulative/alternative logic, proof issuer,
+request versus approval, calculation assumptions, exceptions and subsequent stages when
+material. A quoted litigant argument or a referral is not an operative court holding;
+older implementing text cannot settle an effect changed by an applicable governing original.
+Unknown version/date evidence remains uncertainty, not proof of current validity or repeal.
+Do not introduce a predefined tax, court, topic or article checklist. The actual request,
+facts, source restrictions and material references decide which further queries are useful.
+Never invent a rate, base or favorable factual assumption; distinguish supplied facts,
+supported conditional branches and precise unknowns in quick answers, tables and detail alike.
+
+Optionally retain material original-bound conditions and assessments on the SAME useful
+action using _coverage: {conditions:[{condition_id,outcome_ids,detail,witnesses:[{citation,
+start_char,end_char}]}],resolutions:[{outcome_id,status,condition_ids,evidence_numbers,gap}]}.
+Use displayed original range boundaries; do not invent offsets, text or citation numbers.
+Retained condition requirements are immutable. status is supported, conditional or unresolved;
+an unresolved outcome needs its precise gap, and supported/conditional retains all bound
+conditions and supporting originals. Plain direct answers remain available without another
+metadata or reviewer call. A self-assessment does not authorize unsupported claims.
+
+At answer handoff, assess the actual operative originals before accepting the candidate's
+conclusions. candidate_outcome_coverage is the research model's proposal, never completion
+approval; reassess each proposed condition and outcome against the actual originals and facts.
+Add a delivered condition omitted from the candidate directly, with its original
+citation, rather than searching again. Pursue an unread material effect through a focused
+action only when it can change this answer. Do not repeat sufficient source acquisition or
+rewrite the whole answer for a local omission. No separate mandatory review is required.
+
+When independent_answers are supplied, evaluate their requested outcomes and cross-subject
+interactions in the existing assembly decision. If a concrete defect is already resolved by
+delivered originals, use repair_question_answer with question_id, expected_answer_hash copied
+from its current answer_hash, the precise gap, and
+edits [{kind:replace|insert_after,target_text,text}] with a unique exact anchor. Preserve every useful
+qualification and citation inside the edited target as well. Never replace an entire answer,
+shorten bodies, perform stylistic rewrites or alter other questions. If the governing text is
+unread, acquire that exact original first; if inaccessible, disclose only that precise gap
+while retaining supported portions. Use assemble_answers after any targeted correction to
+order complete bodies and add only source-supported connections. Independent targeted patches
+and assembly may be selected together; the host applies patches before assembly. Research only material
+new/open effects; no all-source rereading, overlapping delegation or speculative remedies.
+Prior session outcomes are navigation and old facts, not current completion: reuse their
+revalidated originals and reassess only changed facts or still-unresolved operative effects.
+"""
 
 LEGAL_DEPARTMENT_RESEARCH = """Act as a careful legal department analyzing and advising on this concrete case.
 Research each material issue with that responsibility.
@@ -145,10 +203,11 @@ Inspect same-session conversation and session_research to identify new, changed 
 issues. Reuse matching revalidated originals that are fully delivered in this decision;
 previous assistant prose is not legal evidence. Fresh user facts supersede prior facts;
 changed dates, facts or regimes require checking the applicable source scope again.
-When independent_answers are supplied, use assemble_answers to order their complete bodies
-and optionally add source-cited connections. Those answers and their citations are immutable:
-do not shorten, summarize, rewrite or replace them, including during publication repair.
-Resolve an actual cited-original gap with source tools; preserve every independent answer.
+When independent_answers are supplied, compare actual outcomes with delivered originals in
+the existing assembly decision. Use a precise source-supported repair_question_answer only
+for a material defect; all untargeted text and other answer bodies remain immutable.
+Then use assemble_answers to order their complete bodies and optionally add source-cited
+connections. Do not shorten, summarize or broadly rewrite independent answers.
 
 SELECT FOCUSED ACTIONS
 Use search_corpus for an unresolved subject/effect: choose mode and parameters for the gap;
@@ -851,3 +910,5 @@ self-contained greetings, conversation or arithmetic needing no corpus authority
 
 COORDINATOR_PROMPT += "\n\n" + LEGAL_DEPARTMENT_RESEARCH
 RESEARCHER_PROMPT += "\n\n" + LEGAL_DEPARTMENT_RESEARCH
+COORDINATOR_PROMPT += "\n\n" + OUTCOME_COVERAGE_RESEARCH
+RESEARCHER_PROMPT += "\n\n" + OUTCOME_COVERAGE_RESEARCH

@@ -70,6 +70,29 @@ class EvidenceLedger:
         with self._lock:
             return tuple(self._items)
 
+    def provision_metadata(self) -> list[dict[str, JsonValue]]:
+        """Snapshot recorded source identities without copying their original text."""
+        with self._lock:
+            records: list[dict[str, JsonValue]] = []
+            for number, item in self._items.items():
+                canonical = item.metadata.get("canonical_metadata")
+                records.append(
+                    {
+                        "citation": number,
+                        "source_id": item.source_id,
+                        "chunk_id": item.chunk_id,
+                        "text_hash": item.text_hash,
+                        "citable": item.search_doc is not None,
+                        "truncated": item.metadata.get("truncated") is True
+                        or (
+                            isinstance(canonical, dict)
+                            and canonical.get("truncated") is True
+                        ),
+                        "metadata": model_evidence_metadata(item.metadata),
+                    }
+                )
+            return records
+
     def delivery_flow(self, call_id: str) -> str | None:
         with self._lock:
             return next(

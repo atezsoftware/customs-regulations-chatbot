@@ -33,7 +33,9 @@ from onyx.asv3.models import (
     RunStopped,
     model_evidence_metadata,
 )
+from onyx.asv3.outcome_map import OutcomeMap
 from onyx.asv3.research_gaps import research_gap_signals
+from onyx.asv3.shared_originals import related_provision_originals
 from onyx.configs.chat_configs import (
     LLM_FIRST_CHUNK_RETRY_BASE_DELAY_S,
     LLM_FIRST_CHUNK_RETRY_JITTER_RATIO,
@@ -67,6 +69,7 @@ from onyx.prompts.asv3.research import (
     COORDINATOR_PROMPT,
     DEFAULT_RESPONSE_PREFERENCES,
     LEGAL_DEPARTMENT_RESEARCH,
+    OUTCOME_COVERAGE_RESEARCH,
     RESEARCHER_PROMPT,
 )
 from onyx.regulatory.structured_llm import (
@@ -598,6 +601,7 @@ class ResearchModel:
         self._native_output_capacity: int | None = None
         self._native_first_decision_started = False
         self._native_first_decision_completed = False
+        self._assembly_researching = False
 
     def native_sampling_snapshot(self) -> dict[str, JsonValue]:
         config = self.llm.config
@@ -1186,7 +1190,7 @@ class ResearchModel:
                     and self.context.services.get("independent_question_mode") is True
                     and bool(self.context.services.get("independent_answers"))
                     and bool(tools)
-                    and all(
+                    and any(
                         isinstance(function := tool.get("function"), dict)
                         and function.get("name") == "assemble_answers"
                         for tool in tools
@@ -1940,17 +1944,26 @@ class ResearchModel:
             )
         else:
             instruction = COORDINATOR_PROMPT
-        return (
+        instruction = (
             instruction + "\n\n" + LEGAL_DEPARTMENT_RESEARCH if normal else instruction
+        )
+        return (
+            instruction + "\n\n" + OUTCOME_COVERAGE_RESEARCH if normal else instruction
         )
 
     def _fit_native_decision(
-        self, view: HarnessView
+        self,
+        view: HarnessView,
+        *,
+        candidate_coverage: list[dict[str, JsonValue]] | None = None,
     ) -> tuple[list[ChatCompletionMessage], list[dict[str, JsonValue]], int]:
         instruction = self._research_instruction()
         if view.draft_to_repair and view.publication_gap is None:
             instruction += (
                 "\nThe research candidate is ready for the selected answer model. "
+                "Begin with the actual operative originals and requested outcomes, then compare "
+                "the candidate. Check source role, applicable dates, restrictive scope, AND/OR "
+                "conditions, proof, exceptions and subsequent stages in the same answer decision. "
                 "Use delivered originals to produce its complete answer, retaining every "
                 "supported condition, exception, contested point, procedural step and citation. "
                 "Correct unsupported assertions; do not shorten supported detail. "
@@ -1980,6 +1993,8 @@ class ResearchModel:
             "language": self.context.language,
             "request": view.request,
         }
+        if candidate_coverage:
+            context["candidate_outcome_coverage"] = candidate_coverage
         session_research = self.context.services.get("session_research")
         if isinstance(session_research, dict):
             context["session_research"] = copy.deepcopy(session_research)
@@ -2035,6 +2050,39 @@ class ResearchModel:
                 for receipt in failed[-3:]
             ]
         records = [*self._native_original_records(retained), *view.original_evidence]
+        required = set(view.required_evidence_numbers)
+        required.update(extract_citation_numbers(view.draft_to_repair or ""))
+        if independent_mode and isinstance(independent_answers, list):
+            for answer in independent_answers:
+                if isinstance(answer, dict):
+                    required.update(
+                        extract_citation_numbers(str(answer.get("answer", "")))
+                    )
+                    numbers = answer.get("evidence_numbers")
+                    if isinstance(numbers, list):
+                        required.update(n for n in numbers if type(n) is int and n > 0)
+        outcomes = self.context.services.get("outcome_map")
+        assigned = self.context.services.get("task_outcome_ids")
+        outcome_subset = (
+            [value for value in assigned if isinstance(value, str)]
+            if isinstance(assigned, list)
+            else []
+            if self.context.depth
+            else None
+        )
+        if isinstance(outcomes, OutcomeMap):
+            required.update(outcomes.preferred_citations(outcome_ids=outcome_subset))
+        from onyx.asv3.evidence import EvidenceLedger
+
+        ledger = self.context.services.get("evidence")
+        if isinstance(ledger, EvidenceLedger):
+            related = related_provision_originals(
+                ledger, records, citation_numbers=required
+            )
+            records.extend(related)
+            required.update(
+                number for row in related if type(number := row.get("citation")) is int
+            )
         unique: dict[tuple[int, str, int, int], dict[str, JsonValue]] = {}
         for record in records:
             identity = self._original_record_range(record)
@@ -2060,21 +2108,7 @@ class ResearchModel:
             ):
                 del unique[identity]
         retained = self._native_turns_with_original_references(retained)
-        required = set(view.required_evidence_numbers)
-        required.update(extract_citation_numbers(view.draft_to_repair or ""))
-        if independent_mode and isinstance(independent_answers, list):
-            for answer in independent_answers:
-                if isinstance(answer, dict):
-                    required.update(
-                        extract_citation_numbers(str(answer.get("answer", "")))
-                    )
-                    numbers = answer.get("evidence_numbers")
-                    if isinstance(numbers, list):
-                        required.update(n for n in numbers if type(n) is int and n > 0)
         omitted: list[JsonValue] = list(view.original_evidence_omitted)
-        from onyx.asv3.evidence import EvidenceLedger
-
-        ledger = self.context.services.get("evidence")
         verified: set[tuple[int, str, int, int]] = set()
         original_lengths: dict[tuple[int, str], int] = {}
         if isinstance(ledger, EvidenceLedger):
@@ -2095,9 +2129,27 @@ class ResearchModel:
                 tool
                 for tool in selected
                 if isinstance(function := tool.get("function"), dict)
-                and function.get("name") == "assemble_answers"
+                and function.get("name")
+                in {
+                    "assemble_answers",
+                    "repair_question_answer",
+                    "read_evidence",
+                    "resolve_source",
+                    "read_provision",
+                    "read_chunk",
+                    "read_chunk_context",
+                    "read_source_range",
+                    "follow_reference",
+                    "search_source_text",
+                    "search_corpus",
+                    "diagnose_source",
+                }
             ]
-            if not selected:
+            if not any(
+                isinstance(function := tool.get("function"), dict)
+                and function.get("name") == "assemble_answers"
+                for tool in selected
+            ):
                 raise RunStopped(
                     "Required independent-question tool missing: assemble_answers"
                 )
@@ -2126,6 +2178,17 @@ class ResearchModel:
 
         def messages() -> list[ChatCompletionMessage]:
             current = dict(context)
+            if isinstance(outcomes, OutcomeMap):
+                current["outcome_map"] = outcomes.view(
+                    outcome_ids=outcome_subset,
+                    delivered_citations={
+                        identity[0]
+                        for identity in unique
+                        if identity in verified
+                        and identity[2] == 0
+                        and identity[3] == original_lengths[(identity[0], identity[1])]
+                    },
+                )
             gaps = research_gap_signals(
                 view,
                 [
@@ -2140,6 +2203,15 @@ class ResearchModel:
                 current["research_gap_signals"] = gaps
             if unique:
                 current["original_evidence"] = list(unique.values())
+                current["original_evidence_ranges"] = [
+                    {
+                        "citation": identity[0],
+                        "start_char": identity[2],
+                        "end_char": identity[3],
+                    }
+                    for identity in unique
+                    if identity in verified
+                ]
             if unique or navigation:
                 current["evidence_note"] = (
                     "These are the original passages available for this decision; navigation and "
@@ -2215,8 +2287,16 @@ class ResearchModel:
             self.context.check_research_active()
         if self.lean_native_mode:
             prompt, tools, output = self._fit_native_decision(view)
-            use_research_model = self.research_llm is not None and (
-                self.context.depth > 0 or self._native_first_decision_completed
+            assembly_decision = (
+                not self.context.depth
+                and self.context.services.get("independent_question_mode") is True
+                and bool(self.context.services.get("independent_answers"))
+                and not self._assembly_researching
+            )
+            use_research_model = (
+                self.research_llm is not None
+                and not assembly_decision
+                and (self.context.depth > 0 or self._native_first_decision_completed)
             )
             decision = self._invoke_decision(
                 view,
@@ -2235,8 +2315,18 @@ class ResearchModel:
                     "",
                 )
                 handoff = view.model_copy(update={"draft_to_repair": candidate})
-                prompt, tools, output = self._fit_native_decision(handoff)
-                return self._invoke_decision(handoff, prompt, tools, output)
+                coverage = self._retain_candidate_conditions(decision)
+                prompt, tools, output = self._fit_native_decision(
+                    handoff, candidate_coverage=coverage
+                )
+                decision = self._invoke_decision(handoff, prompt, tools, output)
+            if not self.context.depth and self.context.services.get(
+                "independent_answers"
+            ):
+                self._assembly_researching = bool(decision.calls) and not any(
+                    call.name in {"repair_question_answer", "assemble_answers"}
+                    for call in decision.calls
+                )
             return decision
         return self._decide_research(view)
 
@@ -2246,12 +2336,44 @@ class ResearchModel:
             return True
         return any(
             call.name == "submit_partial_answer"
+            or call.name in {"repair_question_answer", "assemble_answers"}
             or (
                 call.name == "submit_answer"
                 and call.arguments.get("basis") == "originals"
             )
             for call in decision.calls
         )
+
+    def _retain_candidate_conditions(
+        self, decision: Decision
+    ) -> list[dict[str, JsonValue]]:
+        from onyx.asv3.registry import CapabilityRegistry
+
+        registry = self.context.services.get("registry")
+        candidates: list[dict[str, JsonValue]] = []
+        for call in decision.calls:
+            if "_outcomes" not in call.arguments and "_coverage" not in call.arguments:
+                continue
+            candidate = {
+                key: copy.deepcopy(value)
+                for key, value in call.arguments.items()
+                if key in {"_outcomes", "_coverage"}
+            }
+            # Carry requirements, never a research model's completion approval.
+            arguments = dict(call.arguments)
+            raw = arguments.get("_coverage")
+            if isinstance(raw, dict):
+                arguments["_coverage"] = {
+                    key: value for key, value in raw.items() if key != "resolutions"
+                }
+            if isinstance(registry, CapabilityRegistry):
+                gap = registry.outcome_metadata_gap(
+                    call.model_copy(update={"arguments": arguments}), self.context
+                )
+                if gap is not None:
+                    candidate["metadata_gap"] = gap.data
+            candidates.append(candidate)
+        return candidates
 
     def _decide_research(self, view: HarnessView) -> Decision:
         from onyx.asv3.working_memory import WorkingMemory

@@ -15,6 +15,7 @@ from onyx.asv3.models import (
     ToolOutcome,
     ToolSpec,
 )
+from onyx.asv3.outcome_map import OutcomeMap, OutcomeUpdate
 from onyx.asv3.research_state import ResearchState
 
 if TYPE_CHECKING:
@@ -66,6 +67,12 @@ class CapabilityRegistry:
                     "type": "boolean",
                     "description": "True only when the user explicitly requested outside/web sources; host authorization still applies.",
                 }
+                if isinstance(context.services.get("outcome_map"), OutcomeMap):
+                    properties["_outcomes"] = {
+                        "type": "array",
+                        "items": {"type": "object"},
+                    }
+                    properties["_coverage"] = {"type": "object"}
             if spec.name not in {
                 "update_research",
                 "inspect_research",
@@ -181,6 +188,8 @@ class CapabilityRegistry:
                         "_language",
                         "_notifications",
                         "_external_requested",
+                        "_outcomes",
+                        "_coverage",
                     }
                 }
                 jsonschema.Draft202012Validator(spec.parameters).validate(arguments)
@@ -190,6 +199,14 @@ class CapabilityRegistry:
                     summary="Arguments do not match the capability schema",
                     data={"path": [str(part) for part in error.absolute_path]},
                 )
+            metadata_applied = (
+                context.services.pop("applied_outcome_metadata_call", None) is call
+            )
+            metadata_gap = (
+                None if metadata_applied else self.outcome_metadata_gap(call, context)
+            )
+            if metadata_gap is not None:
+                return metadata_gap
             if spec.consumes_tool_budget:
                 context.budget.consume("tools")
             acquired = False
@@ -227,6 +244,74 @@ class CapabilityRegistry:
                 status=OutcomeStatus.ERROR,
                 summary="Capability execution failed; try a different supported method",
             )
+
+    def outcome_metadata_gap(
+        self, call: CapabilityCall, context: RunContext
+    ) -> ToolOutcome | None:
+        if "_outcomes" not in call.arguments and "_coverage" not in call.arguments:
+            return None
+        spec = self.get(call.name)
+        if (
+            spec is None
+            or call.argument_error is not None
+            or (spec.external and context.corpus_only)
+        ):
+            return None
+        arguments = {
+            key: value
+            for key, value in call.arguments.items()
+            if key
+            not in {
+                "_public_update",
+                "_need_id",
+                "_language",
+                "_notifications",
+                "_external_requested",
+                "_outcomes",
+                "_coverage",
+            }
+        }
+        if not jsonschema.Draft202012Validator(spec.parameters).is_valid(arguments):
+            return None
+        from onyx.asv3.evidence import EvidenceLedger
+
+        outcomes = context.services.get("outcome_map")
+        ledger = context.services.get("evidence")
+        try:
+            if not isinstance(outcomes, OutcomeMap) or not isinstance(
+                ledger, EvidenceLedger
+            ):
+                raise ValueError("Outcome metadata is unavailable in this context")
+            raw = call.arguments.get("_coverage", {})
+            if not isinstance(raw, dict):
+                raise ValueError("_coverage must be an object")
+            payload = dict(raw)
+            if "_outcomes" in call.arguments:
+                if "outcomes" in payload:
+                    raise ValueError("Use only _outcomes to declare outcomes")
+                payload["outcomes"] = call.arguments["_outcomes"]
+            update = OutcomeUpdate.model_validate(payload)
+            subset = context.services.get("task_outcome_ids")
+            if context.depth:
+                if not isinstance(subset, list) or not subset:
+                    raise ValueError(
+                        "Researcher outcome metadata needs an assigned subset"
+                    )
+                allowed = {value for value in subset if isinstance(value, str)}
+                if (
+                    any(row.outcome_id not in allowed for row in update.outcomes)
+                    or any(set(row.outcome_ids) - allowed for row in update.conditions)
+                    or any(row.outcome_id not in allowed for row in update.resolutions)
+                ):
+                    raise ValueError("Researcher may update only assigned outcomes")
+            outcomes.update(update, ledger)
+        except ValueError as error:
+            return ToolOutcome(
+                status=OutcomeStatus.INVALID,
+                summary="Invalid outcome metadata; correct only its bindings or source ranges.",
+                data={"detail": str(error), "invalid_outcome_metadata": True},
+            )
+        return None
 
 
 def build_core_specs(

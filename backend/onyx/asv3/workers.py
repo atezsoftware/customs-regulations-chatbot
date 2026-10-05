@@ -69,6 +69,7 @@ class WorkerPool:
         public_message: str | None = None,
         need_ids: builtins.list[str] | None = None,
         independent_question: bool = False,
+        outcome_ids: builtins.list[str] | None = None,
     ) -> str:
         delegation = request_context or self.context
         delegation.check_active()
@@ -123,6 +124,8 @@ class WorkerPool:
             child.services["task_id"] = task_id
             child.services["parent_task_id"] = parent_task_id
             child.services["task_need_ids"] = needs
+            if outcome_ids is not None:
+                child.services["task_outcome_ids"] = list(outcome_ids)
             self._contexts[task_id] = child
             self._tasks[task_id] = TaskSnapshot(
                 task_id=task_id,

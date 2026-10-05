@@ -35,6 +35,7 @@ from onyx.asv3.models import (
     ToolReceipt,
     ToolSpec,
 )
+from onyx.asv3.outcome_map import OutcomeMap
 from onyx.asv3.progress import (
     ProgressEvent,
     ProgressReporter,
@@ -334,6 +335,10 @@ def run_asv3_loop(
         require_need_bindings=False,
     )
     context.services.update(scenario_state=scenarios, research_state=research_state)
+    outcome_map = OutcomeMap(
+        initial_questions(question), context, factual_context=question + "\n" + history
+    )
+    context.services["outcome_map"] = outcome_map
     emitted: list[dict[str, JsonValue]] = []
     checkpoint_lock = threading.RLock()
     checkpoint_sequence = 0
@@ -457,6 +462,7 @@ def run_asv3_loop(
                 question_research=question_research.export()
                 if question_research
                 else {},
+                outcome_map=outcome_map.export(),
                 publication_status=publication_status.value,
                 publication_stop_reason=publication_stop_reason,
                 final_publication_gap=harness.publication_gap.model_dump(mode="json")
@@ -559,6 +565,7 @@ def run_asv3_loop(
         child.services["scenario_state"] = ScenarioState([task], frozen=True)
         independent = child.services.get("independent_question") is True
         if independent:
+            child.services.pop("submitted_answer", None)
             child.services.pop("independent_answers", None)
             child.services.pop("independent_evidence_numbers", None)
             child.services["research_state"] = ResearchState(
@@ -628,6 +635,40 @@ def run_asv3_loop(
             )
 
         if independent:
+
+            def submit_child_answer(
+                args: dict[str, JsonValue], _context: RunContext
+            ) -> ToolOutcome:
+                candidate = str(args["answer"]).strip()
+                gap = source_publication_gap(candidate, researcher_model.last_call_id)
+                child_harness.last_draft = candidate
+                child_harness.publication_gap = gap
+                if gap is not None:
+                    return gap
+                child.services["submitted_answer"] = candidate
+                return ToolOutcome(
+                    status=OutcomeStatus.FOUND,
+                    summary="Complete supported question answer retained.",
+                )
+
+            child_registry.register(
+                ToolSpec(
+                    name="submit_answer",
+                    description="Finish this question with its complete original-supported answer; coverage metadata may accompany this same final decision.",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "answer": {"type": "string", "minLength": 1},
+                            "basis": {"type": "string", "enum": ["originals"]},
+                        },
+                        "required": ["answer", "basis"],
+                        "additionalProperties": False,
+                    },
+                    handler=submit_child_answer,
+                    parallel_safe=False,
+                    consumes_tool_budget=False,
+                )
+            )
             child_registry.register(
                 ToolSpec(
                     name="submit_partial_answer",
@@ -826,6 +867,10 @@ def run_asv3_loop(
             answer, model.last_call_id, requires_sources=requires_sources
         )
 
+    question_research.repair_guard = lambda answer: source_publication_gap(
+        answer, model.last_call_id
+    )
+
     def submit_answer(args: dict[str, JsonValue], child: RunContext) -> ToolOutcome:
         if child.depth or not standalone_answer_call:
             return ToolOutcome(
@@ -986,13 +1031,16 @@ def run_asv3_loop(
             remembered = previous.get("session_research")
             if isinstance(remembered, dict):
                 context.services["session_research"] = remembered
-            question_research.restore(previous.get("question_research"))
             harness.restore(previous)
             harness.publication_gap = None
             revalidate(
                 [item for n in ledger.citation_mapping() if (item := ledger.get(n))],
                 resuming=True,
             )
+            saved_outcomes = previous.get("outcome_map")
+            if isinstance(saved_outcomes, dict):
+                outcome_map.restore(saved_outcomes, ledger)
+            question_research.restore(previous.get("question_research"))
             worker_state = previous.get("workers")
             if isinstance(worker_state, dict):
                 workers.restore(worker_state)

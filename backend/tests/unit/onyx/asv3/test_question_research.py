@@ -7,6 +7,7 @@ from typing import cast
 import pytest
 from pydantic import JsonValue
 
+from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.harness import Harness
 from onyx.asv3.models import (
     CapabilityCall,
@@ -21,6 +22,7 @@ from onyx.asv3.models import (
     ToolOutcome,
     ToolSpec,
 )
+from onyx.asv3.outcome_map import OutcomeMap, OutcomeUpdate
 from onyx.asv3.question_research import QuestionResearch
 from onyx.asv3.registry import CapabilityRegistry
 from onyx.asv3.workers import WorkerPool
@@ -32,6 +34,7 @@ class ControlledWorkers:
         self.calls: list[tuple[str, RunContext | None, bool]] = []
         self.waited: list[str] = []
         self.stored_results: list[TaskSnapshot] | None = None
+        self.outcome_bindings: list[list[str] | None] = []
 
     def spawn(
         self,
@@ -41,9 +44,11 @@ class ControlledWorkers:
         public_title: str | None = None,
         public_message: str | None = None,
         independent_question: bool = False,
+        outcome_ids: list[str] | None = None,
     ) -> str:
         assert public_title and public_message
         self.calls.append((task, request_context, independent_question))
+        self.outcome_bindings.append(copy.deepcopy(outcome_ids))
         return f"task-{len(self.calls)}"
 
     def results(self, *, full: bool = True) -> list[TaskSnapshot]:
@@ -592,3 +597,330 @@ def test_assignments_are_checkpointed_before_waiting_for_worker_answers(
     assert resumed_workers.calls == []
     assert resumed.answers[0]["answer"] == "Completed full body [2]"
     assert resumed.answers[1]["status"] != "found"
+
+
+def repair_arguments(research: QuestionResearch) -> dict[str, JsonValue]:
+    return {
+        "question_id": "first",
+        "expected_answer_hash": research.answers[0]["answer_hash"],
+        "gap": "The conclusion omitted the source's approval condition.",
+        "edits": [
+            {
+                "kind": "replace",
+                "target_text": "The entitlement is automatic. [1]",
+                "text": "The entitlement depends on approval [2].",
+            },
+            {
+                "kind": "insert_after",
+                "target_text": "The later stage remains available [3].",
+                "text": "The applicant supplies the specified proof before approval [2].",
+            },
+        ],
+    }
+
+
+def completed_answers_for_repair() -> tuple[
+    QuestionResearch, ControlledWorkers, RunContext
+]:
+    research, workers, context = controlled_research(
+        [
+            found(
+                "The entitlement is automatic. [1]\n\nThe later stage remains available [3]."
+            ),
+            found("The separate outcome and its conditions remain unchanged [4]."),
+        ],
+        ["First", "Second"],
+    )
+    research.research_questions(
+        {"questions": [question("first", "First", 1), question("second", "Second", 2)]},
+        context,
+    )
+    research.repair_guard = lambda _candidate: None
+    return research, workers, context
+
+
+def test_targeted_repair_preserves_other_bodies_and_unedited_text_without_new_workers() -> (
+    None
+):
+    research, workers, context = completed_answers_for_repair()
+    previous = copy.deepcopy(research.answers)
+    arguments = repair_arguments(research)
+    result = research.repair_question_answer(arguments, context)
+    assert result.status == OutcomeStatus.FOUND
+    assert len(workers.calls) == 2
+    assert research.answers[1] == previous[1]
+    assert (
+        research.answers[0]["answer"]
+        == "The entitlement depends on approval [2].\n\nThe later stage remains available [3].\n\nThe applicant supplies the specified proof before approval [2]."
+    )
+    assert research.answer_revisions[0]["previous_answer"] == previous[0]["answer"]
+    assert research.answer_revisions[0]["before_hash"] == previous[0]["answer_hash"]
+    assert (
+        research.answer_revisions[0]["after_hash"] == research.answers[0]["answer_hash"]
+    )
+    research.assemble_answers({"order": ["first", "second"]}, context)
+    assert str(research.answers[0]["answer"]) in str(
+        context.services["assembled_answer"]
+    )
+    assert str(previous[1]["answer"]) in str(context.services["assembled_answer"])
+    assert research.preservation_gap(str(context.services["assembled_answer"])) is None
+
+
+def test_targeted_repair_runs_before_assembly_in_one_native_decision() -> None:
+    research, workers, context = completed_answers_for_repair()
+    registry = CapabilityRegistry(research.tool_specs())
+    other_answer = copy.deepcopy(research.answers[1])
+    repair_call = CapabilityCall(
+        name="repair_question_answer", arguments=repair_arguments(research)
+    )
+    assembly_call = CapabilityCall(
+        name="assemble_answers", arguments={"order": ["first", "second"]}
+    )
+    runner = Harness(
+        request="First and second",
+        context=context,
+        registry=registry,
+        decide=lambda _view: Decision(answer="Complete"),
+    )
+
+    receipts = runner._dispatch([assembly_call, repair_call])
+
+    assert [receipt.call for receipt in receipts] == [assembly_call, repair_call]
+    assert all(receipt.outcome.status == OutcomeStatus.FOUND for receipt in receipts)
+    assert "The entitlement depends on approval [2]." in str(
+        context.services["assembled_answer"]
+    )
+    assert "The entitlement is automatic." not in str(
+        context.services["assembled_answer"]
+    )
+    assert research.answers[1] == other_answer
+    assert str(other_answer["answer"]) in str(context.services["assembled_answer"])
+    assert len(workers.calls) == 2
+    assert len(research.answer_revisions) == 1
+
+
+def test_failed_source_guard_leaves_target_and_revision_journal_unchanged() -> None:
+    research, _, context = completed_answers_for_repair()
+    previous = copy.deepcopy(research.answers)
+    rejection = ToolOutcome(
+        status=OutcomeStatus.PARTIAL, summary="The cited original was not delivered."
+    )
+    research.repair_guard = lambda _candidate: rejection
+    assert (
+        research.repair_question_answer(repair_arguments(research), context)
+        is rejection
+    )
+    assert research.answers == previous
+    assert research.answer_revisions == []
+
+
+def test_rejected_repair_blocks_same_decision_assembly_but_preserves_focused_reads() -> (
+    None
+):
+    research, _, context = completed_answers_for_repair()
+    before = copy.deepcopy(research.answers)
+    research.repair_guard = lambda _candidate: ToolOutcome(
+        status=OutcomeStatus.PARTIAL, summary="The new citation was not delivered."
+    )
+    reads: list[str] = []
+
+    def read_original(
+        _arguments: dict[str, JsonValue], _context: RunContext
+    ) -> ToolOutcome:
+        reads.append("focused-original")
+        return ToolOutcome(status=OutcomeStatus.FOUND, summary="Missing original read")
+
+    registry = CapabilityRegistry(
+        research.tool_specs()
+        + [
+            ToolSpec(
+                name="read_original",
+                description="Read one original",
+                parameters={
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": False,
+                },
+                handler=read_original,
+            )
+        ]
+    )
+    repair_call = CapabilityCall(
+        name="repair_question_answer", arguments=repair_arguments(research)
+    )
+    assembly_call = CapabilityCall(
+        name="assemble_answers", arguments={"order": ["first", "second"]}
+    )
+    read_call = CapabilityCall(name="read_original", arguments={})
+    runner = Harness(
+        request="First and second",
+        context=context,
+        registry=registry,
+        decide=lambda _view: Decision(answer="Complete"),
+    )
+
+    receipts = runner._dispatch([assembly_call, repair_call, read_call])
+
+    assert [receipt.call for receipt in receipts] == [
+        assembly_call,
+        repair_call,
+        read_call,
+    ]
+    assert receipts[0].outcome.status == OutcomeStatus.PARTIAL
+    assert receipts[0].outcome.data["rejected_repair_call_ids"] == [repair_call.call_id]
+    assert receipts[1].outcome.status == OutcomeStatus.PARTIAL
+    assert receipts[2].outcome.status == OutcomeStatus.FOUND
+    assert reads == ["focused-original"]
+    assert "assembled_answer" not in context.services
+    assert research.answers == before
+    assert research.answer_revisions == []
+
+
+@pytest.mark.parametrize(
+    "bad_edit",
+    [
+        {"kind": "replace", "target_text": "Unknown target", "text": "Corrected [2]."},
+        {
+            "kind": "replace",
+            "target_text": "The entitlement is automatic.",
+            "text": "Uncited correction.",
+        },
+        {
+            "kind": "replace",
+            "target_text": "The entitlement is automatic. [1]\n\nThe later stage remains available [3].",
+            "text": "Shortened answer [2].",
+        },
+        {
+            "kind": "insert_after",
+            "target_text": "The entitlement is automatic.",
+            "text": "",
+        },
+    ],
+)
+def test_invalid_targeted_edits_never_modify_completed_answers(
+    bad_edit: dict[str, JsonValue],
+) -> None:
+    research, _, context = completed_answers_for_repair()
+    previous = copy.deepcopy(research.answers)
+    arguments = repair_arguments(research)
+    arguments["edits"] = [bad_edit]
+    with pytest.raises(ValueError):
+        research.repair_question_answer(arguments, context)
+    assert research.answers == previous
+    assert research.answer_revisions == []
+
+
+def test_overlapping_edits_and_stale_revision_cannot_overwrite_a_repaired_answer() -> (
+    None
+):
+    research, _, context = completed_answers_for_repair()
+    arguments = repair_arguments(research)
+    assert isinstance(arguments["edits"], list)
+    overlapping = copy.deepcopy(arguments)
+    overlapping["edits"] = [
+        arguments["edits"][0],
+        {"kind": "replace", "target_text": "automatic", "text": "conditional [2]"},
+    ]
+    with pytest.raises(ValueError, match="overlap"):
+        research.repair_question_answer(overlapping, context)
+    research.repair_question_answer(arguments, context)
+    current = copy.deepcopy(research.answers)
+    with pytest.raises(ValueError, match="current answer_hash"):
+        research.repair_question_answer(arguments, context)
+    assert research.answers == current
+    assert len(research.answer_revisions) == 1
+
+
+def test_repair_requires_guard_and_revisions_restore_with_full_bodies() -> None:
+    research, _, context = completed_answers_for_repair()
+    research.repair_guard = None
+    assert (
+        research.repair_question_answer(repair_arguments(research), context).status
+        == OutcomeStatus.DENIED
+    )
+    assert research.answer_revisions == []
+    research.repair_guard = lambda _candidate: None
+    research.repair_question_answer(repair_arguments(research), context)
+    snapshot = research.export()
+    resumed, workers, _ = controlled_research([], ["First", "Second"])
+    resumed.restore(snapshot)
+    assert resumed.answers == research.answers
+    assert resumed.answer_revisions == research.answer_revisions
+    assert workers.calls == []
+    damaged = copy.deepcopy(snapshot)
+    assert isinstance(damaged["answers"], list) and isinstance(
+        damaged["answers"][0], dict
+    )
+    damaged["answers"][0]["answer"] = "A changed answer [2]."
+    with pytest.raises(ValueError):
+        resumed.restore(damaged)
+
+
+@pytest.mark.parametrize("wrong_binding", [False, True])
+def test_assignment_outcomes_are_validated_against_their_original_question(
+    wrong_binding: bool,
+) -> None:
+    research, workers, context = controlled_research(
+        [found("First [1]"), found("Second [2]")], ["First", "Second"]
+    )
+    outcomes = OutcomeMap(["First", "Second"], context)
+    outcomes.update(
+        OutcomeUpdate.model_validate(
+            {
+                "outcomes": [
+                    {
+                        "outcome_id": "one",
+                        "question_ids": ["q0"],
+                        "detail": "First outcome",
+                    },
+                    {
+                        "outcome_id": "two",
+                        "question_ids": ["q1"],
+                        "detail": "Second outcome",
+                    },
+                ]
+            }
+        ),
+        EvidenceLedger(),
+    )
+    context.services["outcome_map"] = outcomes
+    first, second = question("first", "First", 1), question("second", "Second", 2)
+    first["outcome_ids"], second["outcome_ids"] = (
+        ["two" if wrong_binding else "one"],
+        ["two"],
+    )
+    if wrong_binding:
+        with pytest.raises(ValueError, match="original questions"):
+            research.research_questions({"questions": [first, second]}, context)
+        assert workers.calls == []
+    else:
+        research.research_questions({"questions": [first, second]}, context)
+        assert workers.outcome_bindings == [["one"], ["two"]]
+        assert research.answers[0]["outcome_ids"] == ["one"]
+        assert research.answers[1]["outcome_ids"] == ["two"]
+
+
+def test_worker_outcome_binding_is_available_before_the_worker_starts() -> None:
+    context = RunContext()
+    observed: list[object] = []
+
+    def runner(
+        _task: str, child: RunContext, _updates: Callable[[], list[str]]
+    ) -> ToolOutcome:
+        observed.append(child.services.get("task_outcome_ids"))
+        return found("The result [1].")
+
+    pool = WorkerPool(context, runner)
+    try:
+        task_id = pool.spawn(
+            "A specific outcome",
+            request_context=context,
+            independent_question=True,
+            outcome_ids=["one"],
+        )
+        pool.wait_until_all([task_id])
+        assert observed == [["one"]]
+        assert "task_outcome_ids" not in context.services
+    finally:
+        context.cancel()
+        pool.close()

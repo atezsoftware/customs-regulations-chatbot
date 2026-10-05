@@ -20,6 +20,7 @@ from onyx.asv3.models import (
     ToolOutcome,
     ToolReceipt,
 )
+from onyx.asv3.outcome_map import OutcomeMap, OutcomeUpdate
 from onyx.llm.interfaces import LLM, LLMConfig
 from onyx.llm.model_response import (
     ChatCompletionMessageToolCall,
@@ -36,6 +37,13 @@ from onyx.llm.models import (
     ToolChoiceOptions,
     ToolMessage,
     UserMessage,
+)
+from tests.unit.onyx.asv3.test_shared_originals import (
+    full_record,
+    recorded,
+)
+from tests.unit.onyx.asv3.test_shared_originals import (
+    original as provision_original,
 )
 
 
@@ -283,7 +291,7 @@ def test_independent_root_keeps_first_choice_adaptive_and_forces_completed_assem
         ToolChoiceOptions.REQUIRED if started else ToolChoiceOptions.AUTO
     )
     assert [t["function"]["name"] for t in llm.invoke.call_args.kwargs["tools"]] == (
-        ["assemble_answers"]
+        ["assemble_answers", "read_provision", "search_corpus"]
         if started
         else [
             "research_questions",
@@ -652,7 +660,11 @@ def test_independent_researcher_and_publication_repair_keep_source_tools() -> No
             independent_tool_view(publication_gap=gap)
         )
         assert len(llm.invoke.call_args.kwargs["tools"]) == 3
-        assert llm.invoke.call_args.kwargs["tool_choice"] is ToolChoiceOptions.AUTO
+        assert llm.invoke.call_args.kwargs["tool_choice"] is (
+            ToolChoiceOptions.AUTO
+            if selected_context.depth
+            else ToolChoiceOptions.REQUIRED
+        )
         if selected_context.depth:
             assert "independent_answers" not in last_payload(llm)
 
@@ -1543,3 +1555,222 @@ def test_intermediate_legal_submission_runs_selected_answer_model() -> None:
     assert decision.calls[0].arguments["answer"] == "Rule and exception [1]."
     assert last_payload(selected)["draft_to_repair"] == "Rule [1]."
     assert cheap.invoke.call_count == selected.invoke.call_count == 1
+
+
+@pytest.mark.parametrize("profile,depth", [("normal", 0), ("deep", 0), ("deep", 1)])
+def test_existing_decision_receives_read_siblings_once_without_a_new_source_call(
+    profile: str,
+    depth: int,
+) -> None:
+    ledger = recorded(
+        [
+            provision_original("permission", "An application may be approved."),
+            provision_original(
+                "proof",
+                "Approval requires an authenticated certificate and an authority's consent.",
+                headings=["Statute", "MADDE 17", "(2) Conditions"],
+            ),
+            provision_original(
+                "unrelated", "Another instrument's rule.", source="another-source"
+            ),
+            provision_original(
+                "old", "An older rule.", metadata={"read_as_of_date": "2025-01-01"}
+            ),
+        ]
+    )
+    context = RunContext(
+        depth=depth, services={"evidence": ledger, "research_profile": profile}
+    )
+    llm = model()
+    adapter = ResearchModel(llm, context, lean_native_mode=True)
+    current = adaptive_tool_view(original_evidence=[full_record(ledger, 1)])
+    decision = adapter.decide(current)
+    assert decision.answer == "Rule [1]." and decision.calls == []
+    assert llm.invoke.call_count == 1
+    originals = last_payload(llm)["original_evidence"]
+    assert [record["citation"] for record in originals] == [1, 2]
+    assert originals[1]["text"] == full_record(ledger, 2)["text"]
+    assert adapter.last_call_id is not None
+    assert ledger.completely_delivered(adapter.last_call_id) == {1, 2}
+
+
+def test_root_review_uses_child_citations_without_changing_child_body_or_using_lite() -> (
+    None
+):
+    ledger = recorded(
+        [
+            provision_original("permission", "The transaction is permitted."),
+            provision_original(
+                "exception", "The permission excludes the specified category."
+            ),
+        ]
+    )
+    child_answer = "Detailed result [1].\n\nThe supported procedure remains intact [1]."
+    answers = [{"question_id": "q0", "answer": child_answer, "evidence_numbers": [1]}]
+    context = RunContext(
+        services={
+            "evidence": ledger,
+            "independent_question_mode": True,
+            "question_research_started": True,
+            "independent_answers": answers,
+        }
+    )
+    selected, cheap = model(), model()
+    selected.invoke.return_value = native_action("assemble_answers", {})
+    adapter = ResearchModel(
+        selected, context, research_llm=cheap, lean_native_mode=True
+    )
+    decision = adapter.decide(independent_tool_view())
+    assert [call.name for call in decision.calls] == ["assemble_answers"]
+    assert selected.invoke.call_count == 1 and cheap.invoke.call_count == 0
+    payload = last_payload(selected)
+    assert [record["citation"] for record in payload["original_evidence"]] == [1, 2]
+    assert payload["independent_answers"][0]["answer"] == child_answer
+    assert context.services["independent_answers"] == answers
+
+
+def test_assigned_outcome_carries_a_cross_question_condition_and_its_read_sibling() -> (
+    None
+):
+    ledger = recorded(
+        [
+            provision_original("permission", "The transaction needs a permission."),
+            provision_original(
+                "condition",
+                "Settlement needs an authority's consent.",
+                source="procedure",
+                headings=["Procedure", "MADDE 23"],
+            ),
+            provision_original(
+                "exception",
+                "Consent may be withheld for the specified exception.",
+                source="procedure",
+                headings=["Procedure", "MADDE 23", "(2) Exception"],
+            ),
+            provision_original(
+                "other", "An unrelated question's requirement.", source="other"
+            ),
+        ]
+    )
+    context = RunContext(
+        depth=1, services={"evidence": ledger, "task_outcome_ids": ["settlement"]}
+    )
+    outcomes = OutcomeMap(["Permission?", "Settlement?"], context)
+    outcomes.update(
+        OutcomeUpdate.model_validate(
+            {
+                "outcomes": [
+                    {
+                        "outcome_id": "permission",
+                        "question_ids": ["q0"],
+                        "detail": "Permission",
+                    },
+                    {
+                        "outcome_id": "settlement",
+                        "question_ids": ["q1"],
+                        "detail": "Settlement",
+                    },
+                    {
+                        "outcome_id": "other",
+                        "question_ids": ["q0"],
+                        "detail": "Another independent issue",
+                    },
+                ],
+                "conditions": [
+                    {
+                        "condition_id": "shared-consent",
+                        "outcome_ids": ["permission", "settlement"],
+                        "detail": "Authority's consent",
+                        "witnesses": [{"citation": 2, "end_char": 39}],
+                    },
+                    {
+                        "condition_id": "other-condition",
+                        "outcome_ids": ["other"],
+                        "detail": "Separate condition",
+                        "witnesses": [
+                            {
+                                "citation": 4,
+                                "end_char": len("An unrelated question's requirement."),
+                            }
+                        ],
+                    },
+                ],
+            }
+        ),
+        ledger,
+    )
+    context.services["outcome_map"] = outcomes
+    llm = model()
+    adapter = ResearchModel(llm, context, lean_native_mode=True)
+    adapter.decide(adaptive_tool_view(original_evidence=[full_record(ledger, 1)]))
+    payload = last_payload(llm)
+    assert [record["citation"] for record in payload["original_evidence"]] == [1, 2, 3]
+    assert payload["outcome_map"]["undelivered_evidence_numbers"] == []
+    assert [item["outcome_id"] for item in payload["outcome_map"]["outcomes"]] == [
+        "settlement"
+    ]
+    assert adapter.last_call_id is not None
+    assert ledger.completely_delivered(adapter.last_call_id) == {1, 2, 3}
+    assert llm.invoke.call_count == 1
+
+
+def test_native_bundle_preserves_selected_partial_range_and_non_citable_original() -> (
+    None
+):
+    ledger = recorded(
+        [
+            provision_original("rule", "Start. Selected clause. Original tail."),
+            provision_original(
+                "exception", "A material exception in another read original."
+            ),
+            provision_original(
+                "nonlegal",
+                "A user's self-contained calculation.",
+                source="nonlegal",
+                citable=False,
+            ),
+        ]
+    )
+    own = full_record(ledger, 1)
+    own.update(
+        {"text": "Selected clause.", "start_char": 7, "end_char": 23, "truncated": True}
+    )
+    context = RunContext(services={"evidence": ledger})
+    llm = model()
+    adapter = ResearchModel(llm, context, lean_native_mode=True)
+    adapter.decide(adaptive_tool_view(original_evidence=[own, full_record(ledger, 3)]))
+    originals = last_payload(llm)["original_evidence"]
+    assert originals[0] == own
+    assert [record["citation"] for record in originals] == [1, 3, 2]
+    assert adapter.last_call_id is not None
+    assert ledger.completely_delivered(adapter.last_call_id) == {2, 3}
+    assert llm.invoke.call_count == 1
+
+
+def test_required_related_original_cannot_be_silently_evicted_for_physical_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger = recorded(
+        [
+            provision_original("permission", "A permitted transaction needs proof."),
+            provision_original("proof", "A signed certificate is required. " * 1000),
+        ]
+    )
+    context = RunContext(services={"evidence": ledger})
+    llm = model()
+    adapter = ResearchModel(llm, context, lean_native_mode=True, token_counter=len)
+    current = adaptive_tool_view(
+        original_evidence=[full_record(ledger, 1)], required_evidence_numbers=[1]
+    )
+    prompt, tools, output = adapter._fit_native_decision(current)
+    full_cost = adapter._input_cost(prompt, tools)
+    required_original_cost = len(json.dumps(full_record(ledger, 2)))
+
+    def physical_limits(max_tokens: int) -> tuple[int, int]:
+        del max_tokens
+        return full_cost - required_original_cost, output
+
+    monkeypatch.setattr(adapter, "_limits", physical_limits)
+    with pytest.raises(RunStopped, match="required originals"):
+        adapter.decide(current)
+    assert llm.invoke.call_count == 0

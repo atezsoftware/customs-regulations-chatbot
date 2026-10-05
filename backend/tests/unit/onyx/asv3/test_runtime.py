@@ -58,6 +58,21 @@ from onyx.server.query_and_chat.streaming_models import (
 
 pytestmark = pytest.mark.usefixtures("empty_source_inventory")
 
+ASSEMBLY_TOOLS = {
+    "assemble_answers",
+    "repair_question_answer",
+    "read_evidence",
+    "resolve_source",
+    "read_provision",
+    "read_chunk",
+    "read_chunk_context",
+    "read_source_range",
+    "follow_reference",
+    "search_source_text",
+    "search_corpus",
+    "diagnose_source",
+}
+
 
 def response(
     text: str | None = None, calls: list[tuple[str, dict[str, Any]]] | None = None
@@ -161,7 +176,7 @@ def run_independent(
                         )
                     ]
                 )
-            assert names == {"assemble_answers"}
+            assert "assemble_answers" in names and names <= ASSEMBLY_TOOLS
             footer = user_payload(prompt[-1])
             originals = {row["citation"]: row for row in delivered_originals(arguments)}
             for answer in footer["independent_answers"]:
@@ -1679,7 +1694,7 @@ def test_followup_rebinds_retained_native_citation_before_root_and_child_decisio
                     )
                 ]
             )
-        assert names == {"assemble_answers"}
+        assert "assemble_answers" in names and names <= ASSEMBLY_TOOLS
         return response(calls=[("assemble_answers", {"order": ["followup"]})])
 
     llm.invoke.side_effect = invoke

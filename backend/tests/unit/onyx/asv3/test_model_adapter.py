@@ -1360,9 +1360,14 @@ def test_pathological_context_fits_selected_limit_and_originals_remain_reopenabl
             }
         )
     # Fit instructions/history while still forcing original and catalog compaction.
-    from onyx.prompts.asv3.research import LEGAL_DEPARTMENT_RESEARCH
+    from onyx.prompts.asv3.research import (
+        LEGAL_DEPARTMENT_RESEARCH,
+        OUTCOME_COVERAGE_RESEARCH,
+    )
 
-    llm = scripted_model(55000 + len(LEGAL_DEPARTMENT_RESEARCH))
+    llm = scripted_model(
+        55000 + len(LEGAL_DEPARTMENT_RESEARCH) + len(OUTCOME_COVERAGE_RESEARCH)
+    )
     llm.invoke.return_value = ModelResponse(
         id="valid",
         created="0",

@@ -521,13 +521,16 @@ class Harness:
         if isinstance(state, ResearchState):
             for need_id in need_ids:
                 state.attach(need_id, receipt.evidence_ids)
-        if receipt.outcome.data.get(
-            "research_binding_error"
-        ) is not True and receipt.outcome.status in (
-            OutcomeStatus.UNAVAILABLE,
-            OutcomeStatus.INVALID,
-            OutcomeStatus.ERROR,
-            OutcomeStatus.DENIED,
+        if (
+            receipt.outcome.data.get("invalid_outcome_metadata") is not True
+            and receipt.outcome.data.get("research_binding_error") is not True
+            and receipt.outcome.status
+            in (
+                OutcomeStatus.UNAVAILABLE,
+                OutcomeStatus.INVALID,
+                OutcomeStatus.ERROR,
+                OutcomeStatus.DENIED,
+            )
         ):
             self._seen_failures.add(self._call_signature(receipt.call))
         receipt.outcome.artifacts = self.artifacts.add(
@@ -607,6 +610,8 @@ class Harness:
                 "_language",
                 "_notifications",
                 "_external_requested",
+                "_outcomes",
+                "_coverage",
             }
         }
         number = arguments.get("citation")
@@ -650,6 +655,8 @@ class Harness:
                         "_language",
                         "_notifications",
                         "_external_requested",
+                        "_outcomes",
+                        "_coverage",
                     }
                 },
                 **(
@@ -666,11 +673,36 @@ class Harness:
 
     def _dispatch(self, calls: list[CapabilityCall]) -> list[ToolReceipt]:
         # Local mutations establish bindings before dependent I/O in the same decision.
-        mutations = [call for call in calls if call.name == "update_research"]
+        mutation_names = {"update_research", "repair_question_answer"}
+        mutations = [call for call in calls if call.name in mutation_names]
         if mutations and len(mutations) != len(calls):
-            receipts = self._dispatch(mutations) + self._dispatch(
-                [call for call in calls if call.name != "update_research"]
-            )
+            receipts = self._dispatch(mutations)
+            failed_repairs = [
+                receipt.call.call_id
+                for receipt in receipts
+                if receipt.call.name == "repair_question_answer"
+                and receipt.outcome.status != OutcomeStatus.FOUND
+            ]
+            remaining = []
+            for call in calls:
+                if call.name in mutation_names:
+                    continue
+                if call.name == "assemble_answers" and failed_repairs:
+                    receipt = ToolReceipt(
+                        call=call,
+                        elapsed_seconds=0,
+                        outcome=ToolOutcome(
+                            status=OutcomeStatus.PARTIAL,
+                            summary="Resolve the rejected targeted repair before assembling the answer.",
+                            data={"rejected_repair_call_ids": failed_repairs},
+                        ),
+                    )
+                    self._commit_receipt(receipt)
+                    receipts.append(receipt)
+                else:
+                    remaining.append(call)
+            if remaining:
+                receipts.extend(self._dispatch(remaining))
             by_id = {receipt.call.call_id: receipt for receipt in receipts}
             return [by_id[call.call_id] for call in calls]
         executor = ThreadPoolExecutor(
@@ -684,6 +716,12 @@ class Harness:
                 if binding_gap is not None:
                     ready[call.call_id] = ToolReceipt(
                         call=call, outcome=binding_gap, elapsed_seconds=0
+                    )
+                    continue
+                metadata_gap = self.registry.outcome_metadata_gap(call, self.context)
+                if metadata_gap is not None:
+                    ready[call.call_id] = ToolReceipt(
+                        call=call, outcome=metadata_gap, elapsed_seconds=0
                     )
                     continue
                 signature = self._call_signature(call)
@@ -751,6 +789,7 @@ class Harness:
                     self._commit_receipt(ready[call.call_id])
                     continue
                 child = self.context.child()
+                child.services["applied_outcome_metadata_call"] = call
                 # Tools are not delegated researchers; keep their delegation depth unchanged.
                 child.depth = self.context.depth
                 if call.call_id in prepared_searches:
@@ -964,7 +1003,10 @@ class Harness:
                     self._save()
                     submitted = self.context.services.get("submitted_answer")
                     if (
-                        not self.context.depth
+                        (
+                            not self.context.depth
+                            or self.context.services.get("independent_question") is True
+                        )
                         and isinstance(submitted, str)
                         and submitted.strip()
                     ):
