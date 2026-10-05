@@ -279,6 +279,8 @@ def run_asv3_loop(
         )
     if research_profile not in {"normal", "deep", "experimental"}:
         raise ValueError("Unknown ASv3 research profile")
+    if research_profile == "experimental":
+        research_llm = None
     context.language = profile.language
     context.services["research_profile"] = research_profile
     context.services["independent_question_mode"] = research_profile == "deep"
@@ -316,9 +318,11 @@ def run_asv3_loop(
     if previous is not None:
         model.restore_native_sampling(previous)
     search = next((tool for tool in tools if isinstance(tool, SearchTool)), None)
-    if search is not None and research_llm is not None:
+    if search is not None and (
+        research_llm is not None or research_profile == "experimental"
+    ):
         search = search.fork_for_independent_context()
-        search.llm = research_llm
+        search.llm = research_llm or llm
 
     def search_history(child: RunContext) -> list[ChatMessageSimple]:
         private = child.services.get("search_message_history")

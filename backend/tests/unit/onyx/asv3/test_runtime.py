@@ -55,6 +55,7 @@ from onyx.server.query_and_chat.streaming_models import (
     CitationInfo,
     Packet,
 )
+from onyx.tools.tool_implementations.search.search_tool import SearchTool
 
 pytestmark = pytest.mark.usefixtures("empty_source_inventory")
 
@@ -404,6 +405,40 @@ def setup_run(
         test_language=language,
     )
     return kwargs, broker, llm, checkpoints, queue
+
+
+def test_experimental_runtime_keeps_selected_model_for_search_and_source_tools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kwargs, broker, selected, _, _ = setup_run(monkeypatch)
+    secondary = MagicMock(spec=LLM)
+    secondary.invoke.side_effect = AssertionError("Secondary model must not run")
+    vision_models: list[LLM] = []
+
+    def create_broker(
+        _user: User, scope: IndexFilters, *, vision_llm: LLM
+    ) -> CorpusBoundary:
+        vision_models.append(vision_llm)
+        broker.scope = scope
+        return broker
+
+    monkeypatch.setattr(runtime, "CorpusBroker", create_broker)
+    search = MagicMock(spec=SearchTool)
+    scoped_search = MagicMock(spec=SearchTool)
+    search.llm = secondary
+    search.fork_for_independent_context.return_value = scoped_search
+    kwargs.update(
+        research_profile="experimental", research_llm=secondary, tools=[search]
+    )
+    runtime.run_asv3_loop(
+        **{key: value for key, value in kwargs.items() if key != "test_language"}
+    )
+
+    assert vision_models == [selected]
+    assert scoped_search.llm is selected
+    assert search.llm is secondary
+    assert selected.invoke.call_count == 2
+    secondary.invoke.assert_not_called()
 
 
 @pytest.mark.parametrize(

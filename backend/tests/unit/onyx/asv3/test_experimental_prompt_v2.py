@@ -33,7 +33,7 @@ def test_independent_prompts_reuse_the_complete_baseline_map_once(prompt: str) -
     assert prompt.count(RESEARCH_INSTRUCTIONS) == 1
     assert COORDINATOR_REFERENCE_PROMPT not in prompt
     assert RESEARCHER_REFERENCE_PROMPT not in prompt
-    assert EXPERIMENTAL_PROMPT_VERSION == "asv3-experimental-2026-10-06.3"
+    assert EXPERIMENTAL_PROMPT_VERSION == "asv3-experimental-2026-10-06.4"
 
 
 @pytest.mark.parametrize(

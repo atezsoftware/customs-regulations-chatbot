@@ -994,12 +994,20 @@ class TestRunModels:
         assert call_kwargs["state_container"] is external
 
 
-@pytest.mark.parametrize("profile", ["normal", "deep", "experimental"])
-def test_selected_asv3_profile_preserves_stream(profile: str) -> None:
+@pytest.mark.parametrize(
+    "profile,provider",
+    [
+        ("normal", "vertex_ai"),
+        ("deep", "vertex_ai"),
+        ("experimental", "vertex_ai"),
+        ("experimental", "openai"),
+    ],
+)
+def test_selected_asv3_profile_preserves_stream(profile: str, provider: str) -> None:
     from onyx.chat.process_message import DEFAULT_PERSONA_ID
 
     setup = _make_setup()
-    setup.llms[0].config.model_provider = "vertex_ai"
+    setup.llms[0].config.model_provider = provider
     setup.llms[0].config.max_input_tokens = 1048576
     setup.llms[0].config.api_key = None
     cheap = MagicMock()
@@ -1032,6 +1040,7 @@ def test_selected_asv3_profile_preserves_stream(profile: str) -> None:
         patch("onyx.chat.process_message.run_llm_loop") as legacy,
         patch("onyx.chat.process_message.run_deep_research_llm_loop") as legacy_deep,
         patch("onyx.chat.process_message.construct_tools", return_value={}),
+        patch("onyx.chat.process_message.get_llm_for_persona") as fallback,
         patch("onyx.chat.process_message.llm_loop_completion_handle") as persist,
         patch(
             "onyx.chat.process_message.get_llm_token_counter", return_value=lambda _: 0
@@ -1042,11 +1051,16 @@ def test_selected_asv3_profile_preserves_stream(profile: str) -> None:
     asv3.assert_called_once()
     assert asv3.call_args.kwargs["research_profile"] == profile
     assert asv3.call_args.kwargs["llm"] is setup.llms[0]
-    assert asv3.call_args.kwargs["research_llm"] is cheap
-    setup.llms[0].with_model.assert_called_once_with(
-        "gemini-3.5-flash-lite",
-        max_input_tokens=1048576,
-    )
+    if profile == "experimental":
+        assert asv3.call_args.kwargs["research_llm"] is None
+        setup.llms[0].with_model.assert_not_called()
+        fallback.assert_not_called()
+    else:
+        assert asv3.call_args.kwargs["research_llm"] is cheap
+        setup.llms[0].with_model.assert_called_once_with(
+            "gemini-3.5-flash-lite",
+            max_input_tokens=1048576,
+        )
     legacy.assert_not_called()
     legacy_deep.assert_not_called()
     persist.assert_called_once()

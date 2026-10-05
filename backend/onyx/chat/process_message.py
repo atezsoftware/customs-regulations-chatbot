@@ -1586,8 +1586,15 @@ def _run_models(
                         raise ValueError("ASv3 requires the default assistant")
                     if setup.search_params.project_id_filter is not None:
                         raise ValueError("ASv3 is unavailable inside a project")
+                    research_profile = (
+                        "deep"
+                        if _uses_deep_asv3(setup)
+                        else setup.new_msg_req.asv3_research_profile
+                    )
                     research_llm = (
-                        model_llm.with_model(
+                        None
+                        if research_profile == "experimental"
+                        else model_llm.with_model(
                             "gemini-3.5-flash-lite",
                             max_input_tokens=min(
                                 model_llm.config.max_input_tokens, 1048576
@@ -1603,7 +1610,10 @@ def _run_models(
                             ),
                         )
                     )
-                    if research_llm.config.api_key != model_llm.config.api_key:
+                    if (
+                        research_llm is not None
+                        and research_llm.config.api_key != model_llm.config.api_key
+                    ):
                         with get_session_with_current_tenant() as cost_db_session:
                             check_llm_cost_limit_for_provider(
                                 db_session=cost_db_session,
@@ -1630,9 +1640,7 @@ def _run_models(
                         reasoning_effort=setup.reasoning_effort,
                         include_citations=setup.new_msg_req.include_citations,
                         cache=setup.cache,
-                        research_profile="deep"
-                        if _uses_deep_asv3(setup)
-                        else setup.new_msg_req.asv3_research_profile,
+                        research_profile=research_profile,
                         resume_message_id=setup.new_msg_req.asv3_resume_message_id,
                         custom_agent_prompt=setup.custom_agent_prompt,
                         allow_external=setup.new_msg_req.asv3_allow_external,

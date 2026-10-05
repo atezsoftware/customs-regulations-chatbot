@@ -1,4 +1,4 @@
-"""Pending Experimental reviews require the selected model's own native action."""
+"""Experimental decisions retain the selected model and its source-review action."""
 
 import json
 from typing import cast
@@ -26,11 +26,12 @@ from tests.unit.onyx.asv3.test_shared_originals import full_record
 
 @pytest.mark.parametrize("selected_action", ["submit_answer", "read_provision"])
 @pytest.mark.parametrize("provider", ["openai", "vertex_ai"])
-def test_pending_review_handoff_uses_compatible_transport_and_keeps_research_available(
+def test_pending_review_uses_selected_model_and_keeps_research_available(
     selected_action: str,
     provider: str,
 ) -> None:
     context, ledger, reviews = experimental_context(depth=1)
+    seen(context, ledger, reviews)
     selected, cheap = model(), model()
     selected.config = selected.config.model_copy(update={"model_provider": provider})
     arguments: dict[str, JsonValue] = {
@@ -51,15 +52,15 @@ def test_pending_review_handoff_uses_compatible_transport_and_keeps_research_ava
         selected, context, research_llm=cheap, lean_native_mode=True
     )
     decision = adapter.decide(current)
-    assert selected.invoke.call_count == cheap.invoke.call_count == 1
-    assert cheap.invoke.call_args.kwargs["tool_choice"] is ToolChoiceOptions.AUTO
+    assert selected.invoke.call_count == 1
+    cheap.invoke.assert_not_called()
     assert selected.invoke.call_args.kwargs["tool_choice"] is (
         ToolChoiceOptions.AUTO
         if provider == "vertex_ai"
         else ToolChoiceOptions.REQUIRED
     )
     assert selected.invoke.call_args.kwargs["tools"] == current.tools
-    assert last_payload(selected)["candidate_related_source_reviews"] == [review()]
+    assert "candidate_related_source_reviews" not in last_payload(selected)
     assert reviews.view(context, ledger, {1, 2})["pending_lead_ids"]
     assert decision.calls[0].name == selected_action
     if selected_action == "submit_answer":
@@ -103,8 +104,12 @@ def test_closed_or_inactive_review_handoff_retains_auto_tool_choice(
     )
     assert adapter.decide(current).answer == "Rule [1]."
     assert selected.invoke.call_args.kwargs["tool_choice"] is ToolChoiceOptions.AUTO
-    assert cheap.invoke.call_args.kwargs["tool_choice"] is ToolChoiceOptions.AUTO
-    assert selected.invoke.call_count == cheap.invoke.call_count == 1
+    assert selected.invoke.call_count == 1
+    if profile == "experimental":
+        cheap.invoke.assert_not_called()
+    else:
+        assert cheap.invoke.call_count == 1
+        assert cheap.invoke.call_args.kwargs["tool_choice"] is ToolChoiceOptions.AUTO
 
 
 @pytest.mark.parametrize("profile", ["normal", "deep", "experimental"])
@@ -130,11 +135,11 @@ def test_first_greeting_does_not_force_a_source_review_action(profile: str) -> N
     cheap.invoke.assert_not_called()
 
 
-def test_pending_review_on_research_call_does_not_force_selected_handoff() -> None:
+def test_pending_review_research_stays_on_selected_model_without_a_handoff() -> None:
     context, ledger, reviews = experimental_context(depth=1)
     seen(context, ledger, reviews)
     selected, cheap = model(), model()
-    cheap.invoke.return_value = native_action(
+    selected.invoke.return_value = native_action(
         "read_provision", {"source_id": "decision"}
     )
     registry = terminal_registry([])
@@ -145,9 +150,52 @@ def test_pending_review_on_research_call_does_not_force_selected_handoff() -> No
         selected, context, research_llm=cheap, lean_native_mode=True
     )
     assert adapter.decide(current).calls[0].name == "read_provision"
-    assert cheap.invoke.call_args.kwargs["tool_choice"] is ToolChoiceOptions.AUTO
-    assert cheap.invoke.call_count == 1
-    selected.invoke.assert_not_called()
+    assert selected.invoke.call_args.kwargs["tool_choice"] is ToolChoiceOptions.REQUIRED
+    assert selected.invoke.call_count == 1
+    cheap.invoke.assert_not_called()
+
+
+@pytest.mark.parametrize("depth", [0, 1])
+@pytest.mark.parametrize("provider", ["openai", "vertex_ai"])
+def test_every_experimental_decision_keeps_the_selected_model(
+    depth: int,
+    provider: str,
+) -> None:
+    context, ledger, reviews = experimental_context(depth=depth)
+    seen(context, ledger, reviews)
+    selected, cheap = model(), model(limit=1000)
+    selected.config = selected.config.model_copy(
+        update={"model_provider": provider, "model_name": "user-selected-model"}
+    )
+    selected.invoke.side_effect = [
+        native_action("read_provision", {"source_id": "decision"}),
+        native_action("read_provision", {"source_id": "decision"}),
+        native_action(
+            "submit_answer",
+            {
+                "answer": "The selected model assesses the operative holding [1] [2].",
+                "basis": "originals",
+                "_related_source_reviews": [review()],
+            },
+        ),
+    ]
+    registry = terminal_registry([])
+    current = adaptive_tool_view(
+        original_evidence=[full_record(ledger, 1), full_record(ledger, 2)]
+    ).model_copy(update={"tools": registry.definitions(context)})
+    adapter = ResearchModel(
+        selected, context, research_llm=cheap, lean_native_mode=True
+    )
+    assert adapter.research_llm is None
+    for _ in range(2):
+        assert adapter.decide(current).calls[0].name == "read_provision"
+    decision = adapter.decide(current)
+    assert decision.calls[0].name == "submit_answer"
+    assert selected.invoke.call_count == 3
+    cheap.invoke.assert_not_called()
+    assert selected.config.model_name == "user-selected-model"
+    assert registry.dispatch(decision.calls[0], context).status == OutcomeStatus.FOUND
+    assert reviews.view(context, ledger, {1, 2})["pending_lead_ids"] == []
 
 
 def terminal_envelope(
@@ -181,6 +229,7 @@ def test_selected_strict_terminal_content_closes_review_without_another_model_ca
     provider: str,
 ) -> None:
     context, ledger, reviews = experimental_context(depth=1)
+    seen(context, ledger, reviews)
     selected, cheap = model(), model()
     selected.config = selected.config.model_copy(update={"model_provider": provider})
     cheap.invoke.return_value = native_action(
@@ -207,7 +256,8 @@ def test_selected_strict_terminal_content_closes_review_without_another_model_ca
     assert decision.assistant_message is not None
     assert decision.assistant_message.tool_calls is not None
     assert decision.assistant_message.tool_calls[0].id == decision.calls[0].call_id
-    assert selected.invoke.call_count == cheap.invoke.call_count == 1
+    assert selected.invoke.call_count == 1
+    cheap.invoke.assert_not_called()
     assert selected.invoke.call_args.kwargs["tool_choice"] is (
         ToolChoiceOptions.AUTO
         if provider == "vertex_ai"
@@ -246,6 +296,7 @@ def test_selected_terminal_content_never_salvages_invalid_or_unwitnessed_envelop
     failure: str,
 ) -> None:
     context, ledger, reviews = experimental_context(depth=1)
+    seen(context, ledger, reviews)
     selected, cheap = model(), model()
     cheap.invoke.return_value = native_action(
         "submit_answer",
@@ -308,7 +359,8 @@ def test_selected_terminal_content_never_salvages_invalid_or_unwitnessed_envelop
     )
     decision = adapter.decide(current)
     assert decision.calls == [] and decision.answer == text
-    assert selected.invoke.call_count == cheap.invoke.call_count == 1
+    assert selected.invoke.call_count == 1
+    cheap.invoke.assert_not_called()
     assert reviews.view(context, ledger, {1, 2})["pending_lead_ids"]
 
 
@@ -337,8 +389,9 @@ def test_terminal_content_fallback_does_not_change_existing_workflows(
     assert "related_source_terminal_transport" not in last_payload(selected)
 
 
-def test_cheap_terminal_content_never_supplies_selected_review_approval() -> None:
+def test_experimental_never_uses_secondary_model_terminal_approval() -> None:
     context, ledger, reviews = experimental_context(depth=1)
+    seen(context, ledger, reviews)
     selected, cheap = model(), model()
     text = json.dumps(terminal_envelope())
     cheap.invoke.return_value = content_response(text)
@@ -350,10 +403,10 @@ def test_cheap_terminal_content_never_supplies_selected_review_approval() -> Non
             original_evidence=[full_record(ledger, 1), full_record(ledger, 2)]
         )
     )
-    assert decision.answer == text and decision.calls == []
+    assert decision.answer == "Rule [1]." and decision.calls == []
     assert reviews.view(context, ledger, {1, 2})["pending_lead_ids"]
-    assert cheap.invoke.call_count == 1
-    selected.invoke.assert_not_called()
+    cheap.invoke.assert_not_called()
+    assert selected.invoke.call_count == 1
 
 
 def test_uncited_excluded_source_witness_survives_handoff_capacity_pressure(

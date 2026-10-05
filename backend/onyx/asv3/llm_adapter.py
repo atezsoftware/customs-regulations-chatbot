@@ -611,7 +611,11 @@ class ResearchModel:
         research_llm: LLM | None = None,
     ) -> None:
         self.llm = llm
-        self.research_llm = research_llm
+        self.research_llm = (
+            None
+            if context.services.get("research_profile") == "experimental"
+            else research_llm
+        )
         self.context = context
         self.user_identity = user_identity
         self.reasoning_effort = reasoning_effort
@@ -1197,9 +1201,6 @@ class ResearchModel:
                         and isinstance(source_reviews, dict)
                         and isinstance(source_reviews.get("pending_lead_ids"), list)
                         and source_reviews.get("pending_lead_ids")
-                        and isinstance(
-                            payload.get("candidate_related_source_reviews"), list
-                        )
                     ):
                         require_source_review_action = True
                     evidence = payload.get("original_evidence") or payload.get(
@@ -2430,19 +2431,19 @@ class ResearchModel:
                 )
                 if candidate_reviews is not None:
                     current["candidate_related_source_reviews"] = candidate_reviews
-                    source_review_state = current["related_source_reviews"]
-                    if isinstance(
-                        source_review_state, dict
-                    ) and source_review_state.get("pending_lead_ids"):
-                        current["related_source_terminal_transport"] = (
-                            "Assess the candidate yourself against the supplied originals. "
-                            "Use an exposed native action for more research or your own terminal "
-                            "assessment. If the provider returns a terminal action as content, "
-                            "return only one strict JSON object with exactly name and arguments: "
-                            "name must be an exposed submit_answer or submit_partial_answer; "
-                            "arguments must match its actual schema and contain your own "
-                            "_related_source_reviews. No prose, fences or copied approval."
-                        )
+                source_review_state = current["related_source_reviews"]
+                if isinstance(source_review_state, dict) and source_review_state.get(
+                    "pending_lead_ids"
+                ):
+                    current["related_source_terminal_transport"] = (
+                        "Assess the related sources yourself against the supplied originals. "
+                        "Use an exposed native action for more research or your own terminal "
+                        "assessment. If the provider returns a terminal action as content, "
+                        "return only one strict JSON object with exactly name and arguments: "
+                        "name must be an exposed submit_answer or submit_partial_answer; "
+                        "arguments must match its actual schema and contain your own "
+                        "_related_source_reviews. No prose, fences or copied approval."
+                    )
             if isinstance(outcomes, OutcomeMap):
                 current["outcome_map"] = outcomes.view(
                     outcome_ids=outcome_subset,
@@ -2621,6 +2622,8 @@ class ResearchModel:
                     else None,
                 )
                 decision = self._invoke_decision(handoff, prompt, tools, output)
+                decision = self._experimental_terminal_envelope(decision, tools)
+            if not use_research_model:
                 decision = self._experimental_terminal_envelope(decision, tools)
             if not self.context.depth and self.context.services.get(
                 "independent_answers"

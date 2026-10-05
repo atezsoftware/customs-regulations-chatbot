@@ -259,12 +259,12 @@ def test_failed_provider_call_does_not_register_serialized_navigation() -> None:
 
 
 @pytest.mark.parametrize("candidate_delivered", [False, True])
-def test_pending_candidate_avoids_selected_answer_handoff(
+def test_selected_candidate_keeps_review_pending_until_its_assessment(
     candidate_delivered: bool,
 ) -> None:
     context, ledger, reviews = experimental_context(depth=1)
     selected, cheap = model(), model()
-    cheap.invoke.return_value = native_action(
+    selected.invoke.return_value = native_action(
         "submit_answer", {"answer": "Ordinary rule [1].", "basis": "originals"}
     )
     registry = terminal_registry([])
@@ -278,8 +278,8 @@ def test_pending_candidate_avoids_selected_answer_handoff(
     )
     decision = adapter.decide(current)
     assert decision.calls[0].name == "submit_answer"
-    selected.invoke.assert_not_called()
-    assert cheap.invoke.call_count == 1
+    assert selected.invoke.call_count == 1
+    cheap.invoke.assert_not_called()
     state = reviews.view(
         context, ledger, ledger.completely_delivered(adapter.last_call_id or "")
     )
@@ -291,9 +291,7 @@ def test_pending_candidate_avoids_selected_answer_handoff(
     )
 
 
-def test_valid_candidate_review_reuses_existing_handoff_without_committing_cheap_review() -> (
-    None
-):
+def test_selected_review_applies_only_when_its_terminal_action_is_dispatched() -> None:
     context, ledger, reviews = experimental_context(depth=1)
     selected, cheap = model(), model()
     arguments: dict[str, JsonValue] = {
@@ -312,10 +310,11 @@ def test_valid_candidate_review_reuses_existing_handoff_without_committing_cheap
     )
     decision = adapter.decide(current)
     assert decision.calls[0].name == "submit_answer"
-    assert selected.invoke.call_count == cheap.invoke.call_count == 1
+    assert selected.invoke.call_count == 1
+    cheap.invoke.assert_not_called()
     payload = last_payload(selected)
-    assert payload["candidate_related_source_reviews"] == [review()]
-    assert payload["draft_to_repair"] == arguments["answer"]
+    assert "candidate_related_source_reviews" not in payload
+    assert "draft_to_repair" not in payload
     assert payload["original_evidence"] == current.original_evidence
     assert reviews.view(context, ledger, {1, 2})["pending_lead_ids"] == [lead_id()]
     assert registry.dispatch(decision.calls[0], context).status == OutcomeStatus.FOUND
