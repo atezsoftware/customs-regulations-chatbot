@@ -994,8 +994,8 @@ class TestRunModels:
         assert call_kwargs["state_container"] is external
 
 
-@pytest.mark.parametrize("deep", [False, True])
-def test_selected_asv3_profile_preserves_stream(deep: bool) -> None:
+@pytest.mark.parametrize("profile", ["normal", "deep", "experimental"])
+def test_selected_asv3_profile_preserves_stream(profile: str) -> None:
     from onyx.chat.process_message import DEFAULT_PERSONA_ID
 
     setup = _make_setup()
@@ -1008,9 +1008,9 @@ def test_selected_asv3_profile_preserves_stream(deep: bool) -> None:
     setup.persona.id = DEFAULT_PERSONA_ID
     setup.chat_session.project_id = None
     setup.new_msg_req = _make_request(
-        deep_research=deep,
-        atez_search_v3=not deep,
-        asv3_research_profile="deep" if deep else "normal",
+        deep_research=profile == "deep",
+        atez_search_v3=profile != "deep",
+        asv3_research_profile=profile,
     )
 
     def emit_answer(**kwargs: Any) -> None:
@@ -1040,7 +1040,7 @@ def test_selected_asv3_profile_preserves_stream(deep: bool) -> None:
         packets = _run_models_collect(setup)
 
     asv3.assert_called_once()
-    assert asv3.call_args.kwargs["research_profile"] == ("deep" if deep else "normal")
+    assert asv3.call_args.kwargs["research_profile"] == profile
     assert asv3.call_args.kwargs["llm"] is setup.llms[0]
     assert asv3.call_args.kwargs["research_llm"] is cheap
     setup.llms[0].with_model.assert_called_once_with(

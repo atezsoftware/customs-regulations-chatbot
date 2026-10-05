@@ -129,7 +129,7 @@ class SendMessageRequest(BaseModel):
     )
     # ASv3 owns an independent adaptive research harness.
     atez_search_v3: bool = False
-    asv3_research_profile: Literal["normal", "deep"] = "deep"
+    asv3_research_profile: Literal["normal", "deep", "experimental"] = "deep"
     asv3_allow_external: bool = False
     asv3_resume_message_id: int | None = None
 
@@ -185,6 +185,10 @@ class SendMessageRequest(BaseModel):
             raise ValueError("ASv3 uses one coordinator model per request")
         if self.asv3_research_profile == "normal" and not self.atez_search_v3:
             raise ValueError("The coordinator profile requires the ASv3 workflow")
+        if self.asv3_research_profile == "experimental" and not self.atez_search_v3:
+            raise ValueError(
+                "The experimental profile requires explicit ASv3 selection"
+            )
         if self.asv3_resume_message_id is not None and not (
             self.atez_search_v3 or self.deep_research
         ):

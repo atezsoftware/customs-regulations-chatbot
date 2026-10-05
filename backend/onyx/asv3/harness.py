@@ -1081,6 +1081,12 @@ class Harness:
                             self._blocked_attempts[fingerprint] >= 3
                             and self.context.services.get("independent_question")
                             is not True
+                            and not (
+                                self.context.services.get("research_profile")
+                                == "experimental"
+                                and blocked.data.get("pending_related_source_review")
+                                is True
+                            )
                         ):
                             status = OutcomeStatus.PARTIAL
                             self.stop_reason = "repeated_publication_gap"

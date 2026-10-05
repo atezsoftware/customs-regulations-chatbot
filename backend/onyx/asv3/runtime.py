@@ -20,6 +20,7 @@ from onyx.asv3.corpus_tools import CorpusBroker, build_corpus_specs
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.external_tools import build_external_specs
 from onyx.asv3.harness import Harness
+from onyx.asv3.legal_source_reviews import LegalSourceReviews
 from onyx.asv3.llm_adapter import (
     LanguageProfile,
     ResearchModel,
@@ -78,6 +79,7 @@ from onyx.db.memory import UserMemoryContext
 from onyx.db.models import User
 from onyx.llm.interfaces import LLM, LLMUserIdentity
 from onyx.llm.models import ReasoningEffort
+from onyx.prompts.asv3.experimental import EXPERIMENTAL_PROMPT_VERSION
 from onyx.prompts.asv3.research import (
     PROMPT_VERSION,
     VERIFICATION_PROMPT,
@@ -275,7 +277,7 @@ def run_asv3_loop(
             previous.get("research_profile")
             or ("deep" if "question_research" in previous else "normal")
         )
-    if research_profile not in {"normal", "deep"}:
+    if research_profile not in {"normal", "deep", "experimental"}:
         raise ValueError("Unknown ASv3 research profile")
     context.language = profile.language
     context.services["research_profile"] = research_profile
@@ -283,6 +285,13 @@ def run_asv3_loop(
     context.corpus_only = not (allow_external and profile.external_requested)
     ledger = EvidenceLedger()
     context.services["evidence"] = ledger
+    source_reviews = (
+        LegalSourceReviews(context, question)
+        if research_profile == "experimental"
+        else None
+    )
+    if source_reviews is not None:
+        context.services["legal_source_reviews"] = source_reviews
     registry = CapabilityRegistry()
     broker = CorpusBroker(user, scope, vision_llm=research_llm or llm)
     context.services["legal_source_navigation_acquire"] = (
@@ -454,7 +463,9 @@ def run_asv3_loop(
             checkpoint_sequence += 1
             snapshot.update(
                 sequence=checkpoint_sequence,
-                prompt_version=PROMPT_VERSION,
+                prompt_version=EXPERIMENTAL_PROMPT_VERSION
+                if source_reviews is not None
+                else PROMPT_VERSION,
                 research_profile=research_profile,
                 execution_mode="native",
                 native_coordinator_sampling=model.native_sampling_snapshot(),
@@ -476,6 +487,8 @@ def run_asv3_loop(
                 question_message_id=user_message_id,
                 session_research=session_research_checkpoint(context, question),
             )
+            if source_reviews is not None:
+                snapshot["legal_source_reviews"] = source_reviews.export()
             save_asv3_checkpoint(
                 message_id=assistant_message_id, user_id=user.id, snapshot=snapshot
             )
@@ -617,7 +630,9 @@ def run_asv3_loop(
             nonlocal child_partial
             candidate = str(args["answer"])
             gap = (
-                source_publication_gap(candidate, researcher_model.last_call_id)
+                source_publication_gap(
+                    candidate, researcher_model.last_call_id, run_context=child
+                )
                 if extract_citation_numbers(candidate)
                 else None
             )
@@ -644,7 +659,9 @@ def run_asv3_loop(
                 args: dict[str, JsonValue], _context: RunContext
             ) -> ToolOutcome:
                 candidate = str(args["answer"]).strip()
-                gap = source_publication_gap(candidate, researcher_model.last_call_id)
+                gap = source_publication_gap(
+                    candidate, researcher_model.last_call_id, run_context=child
+                )
                 child_harness.last_draft = candidate
                 child_harness.publication_gap = gap
                 if gap is not None:
@@ -706,7 +723,7 @@ def run_asv3_loop(
             max_workers=2,
             draft_guard=(
                 lambda answer: source_publication_gap(
-                    answer, researcher_model.last_call_id
+                    answer, researcher_model.last_call_id, run_context=child
                 )
             )
             if independent
@@ -806,6 +823,7 @@ def run_asv3_loop(
         model_call_id: str | None,
         *,
         requires_sources: bool | None = None,
+        run_context: RunContext | None = None,
     ) -> ToolOutcome | None:
         numbers = extract_citation_numbers(answer)
         unknown = sorted(set(numbers) - ledger.citation_mapping().keys())
@@ -837,6 +855,10 @@ def run_asv3_loop(
                 status=OutcomeStatus.PARTIAL,
                 summary="Read and cite the named governing original beside its actual legal assertion; a lower source's reference does not supply that original.",
                 data=authority_gap,
+            )
+        if source_reviews is not None:
+            return source_reviews.publication_gap(
+                answer, model_call_id or "", run_context or context, ledger
             )
         return None
 
@@ -1044,6 +1066,9 @@ def run_asv3_loop(
             saved_outcomes = previous.get("outcome_map")
             if isinstance(saved_outcomes, dict):
                 outcome_map.restore(saved_outcomes, ledger)
+            saved_reviews = previous.get("legal_source_reviews")
+            if source_reviews is not None and isinstance(saved_reviews, dict):
+                source_reviews.restore(saved_reviews, context, question, ledger)
             question_research.restore(previous.get("question_research"))
             worker_state = previous.get("workers")
             if isinstance(worker_state, dict):

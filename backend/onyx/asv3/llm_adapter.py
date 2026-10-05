@@ -25,7 +25,9 @@ from onyx.asv3.assertions import (
     assertion_witness_valid,
 )
 from onyx.asv3.citation_numbers import extract_citation_numbers
+from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.legal_source_navigation import derive_provision_navigation_anchor
+from onyx.asv3.legal_source_reviews import LegalSourceReviews, annotate_navigation
 from onyx.asv3.models import (
     CapabilityCall,
     Decision,
@@ -67,6 +69,10 @@ from onyx.llm.models import (
 from onyx.prompts.asv3.coordinator_reference import (
     COORDINATOR_REFERENCE_PROMPT,
     RESEARCHER_REFERENCE_PROMPT,
+)
+from onyx.prompts.asv3.experimental import (
+    EXPERIMENTAL_COORDINATOR_PROMPT,
+    EXPERIMENTAL_RESEARCHER_PROMPT,
 )
 from onyx.prompts.asv3.research import (
     COORDINATOR_PROMPT,
@@ -1157,6 +1163,7 @@ class ResearchModel:
 
         ledger = self.context.services.get("evidence")
         records: list[dict[str, JsonValue]] = []
+        navigation: list[dict[str, JsonValue]] = []
         if isinstance(ledger, EvidenceLedger):
             for message in prompt:
                 content = message.content
@@ -1174,6 +1181,11 @@ class ResearchModel:
                         payload = parse_json_object(text)
                     except ValueError:
                         continue
+                    leads = payload.get("related_source_navigation")
+                    if isinstance(leads, list):
+                        navigation.extend(
+                            item for item in leads if isinstance(item, dict)
+                        )
                     evidence = payload.get("original_evidence") or payload.get(
                         "evidence", []
                     )
@@ -1253,6 +1265,12 @@ class ResearchModel:
             )
             if isinstance(ledger, EvidenceLedger):
                 ledger.record_delivery(self.last_call_id, flow.value, records)
+                reviews = self.context.services.get("legal_source_reviews")
+                if isinstance(reviews, LegalSourceReviews):
+                    reviews.record_delivery(
+                        self.last_call_id, self.context, navigation, ledger
+                    )
+            self.context.services["last_model_call_id"] = self.last_call_id
         self.context.check_active()
         return response
 
@@ -2011,6 +2029,14 @@ class ResearchModel:
         return referenced
 
     def _research_instruction(self) -> str:
+        if self.context.services.get("research_profile") == "experimental":
+            return (
+                EXPERIMENTAL_RESEARCHER_PROMPT
+                if self.context.depth
+                else EXPERIMENTAL_COORDINATOR_PROMPT
+                + "\n\n"
+                + COORDINATOR_SESSION_ACTIONS
+            )
         normal = self.context.services.get("research_profile") == "normal"
         if self.context.depth:
             instruction = RESEARCHER_REFERENCE_PROMPT if normal else RESEARCHER_PROMPT
@@ -2032,6 +2058,7 @@ class ResearchModel:
         view: HarnessView,
         *,
         candidate_coverage: list[dict[str, JsonValue]] | None = None,
+        candidate_reviews: list[JsonValue] | None = None,
     ) -> tuple[list[ChatCompletionMessage], list[dict[str, JsonValue]], int]:
         instruction = self._research_instruction()
         if view.draft_to_repair and view.publication_gap is None:
@@ -2328,6 +2355,17 @@ class ResearchModel:
                     ]
                 candidate_navigation.append(entry)
             if candidate_navigation:
+                reviews = self.context.services.get("legal_source_reviews")
+                if isinstance(reviews, LegalSourceReviews):
+                    candidate_navigation = list(
+                        annotate_navigation(
+                            [
+                                item
+                                for item in candidate_navigation
+                                if isinstance(item, dict)
+                            ]
+                        )
+                    )
                 current["related_source_navigation"] = candidate_navigation
             elif related_navigation and not include_related_navigation:
                 current["related_source_navigation_omitted"] = (
@@ -2335,6 +2373,23 @@ class ResearchModel:
                     "prove absence of a related decision or amendment; use focused authorized "
                     "catalogue navigation for a material unresolved effect."
                 )
+            reviews = self.context.services.get("legal_source_reviews")
+            if isinstance(reviews, LegalSourceReviews) and isinstance(
+                ledger, EvidenceLedger
+            ):
+                current["related_source_reviews"] = reviews.view(
+                    self.context,
+                    ledger,
+                    {
+                        identity[0]
+                        for identity in unique
+                        if identity in verified
+                        and identity[2] == 0
+                        and identity[3] == original_lengths[(identity[0], identity[1])]
+                    },
+                )
+                if candidate_reviews is not None:
+                    current["candidate_related_source_reviews"] = candidate_reviews
             if isinstance(outcomes, OutcomeMap):
                 current["outcome_map"] = outcomes.view(
                     outcome_ids=outcome_subset,
@@ -2475,9 +2530,42 @@ class ResearchModel:
                     "",
                 )
                 handoff = view.model_copy(update={"draft_to_repair": candidate})
+                candidate_reviews = next(
+                    (
+                        call.arguments.get("_related_source_reviews")
+                        for call in decision.calls
+                        if call.name in {"submit_answer", "submit_partial_answer"}
+                    ),
+                    None,
+                )
+                reviews = self.context.services.get("legal_source_reviews")
+                ledger = self.context.services.get("evidence")
+                if isinstance(reviews, LegalSourceReviews) and isinstance(
+                    ledger, EvidenceLedger
+                ):
+                    try:
+                        if candidate_reviews is not None and not isinstance(
+                            candidate_reviews, list
+                        ):
+                            return decision
+                        gap = reviews.publication_gap(
+                            candidate,
+                            self.last_call_id or "",
+                            self.context,
+                            ledger,
+                            raw_reviews=candidate_reviews,
+                        )
+                    except ValueError:
+                        return decision
+                    if gap is not None:
+                        return decision
                 coverage = self._retain_candidate_conditions(decision)
                 prompt, tools, output = self._fit_native_decision(
-                    handoff, candidate_coverage=coverage
+                    handoff,
+                    candidate_coverage=coverage,
+                    candidate_reviews=candidate_reviews
+                    if isinstance(candidate_reviews, list)
+                    else None,
                 )
                 decision = self._invoke_decision(handoff, prompt, tools, output)
             if not self.context.depth and self.context.services.get(

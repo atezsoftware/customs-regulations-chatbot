@@ -4,23 +4,32 @@ import useDeepResearchToggle from "@/hooks/useDeepResearchToggle";
 describe("research mode selection", () => {
   afterEach(cleanup);
 
-  it("selects coordinator and parallel research exclusively, and toggles off", () => {
+  it("selects the three research modes exclusively, and toggles off", () => {
     const { result } = renderHook(() =>
       useDeepResearchToggle({ chatSessionId: null, agentId: 0 })
     );
     expect(result.current.atezSearchV3Enabled).toBe(false);
     expect(result.current.deepResearchEnabled).toBe(false);
+    expect(result.current.experimentalResearchEnabled).toBe(false);
     act(() => result.current.toggleAtezSearchV3());
     expect(result.current.atezSearchV3Enabled).toBe(true);
     act(() => result.current.toggleDeepResearch());
     expect(result.current.atezSearchV3Enabled).toBe(false);
     expect(result.current.deepResearchEnabled).toBe(true);
+    act(() => result.current.toggleExperimentalResearch());
+    expect(result.current.deepResearchEnabled).toBe(false);
+    expect(result.current.atezSearchV3Enabled).toBe(false);
+    expect(result.current.experimentalResearchEnabled).toBe(true);
     act(() => result.current.toggleAtezSearchV3());
     expect(result.current.deepResearchEnabled).toBe(false);
+    expect(result.current.experimentalResearchEnabled).toBe(false);
     act(() => result.current.toggleAtezSearchV3());
     expect(result.current.atezSearchV3Enabled).toBe(false);
     expect(result.current.atezSearchEnabled).toBe(false);
     expect(result.current.atezSearchV2Enabled).toBe(false);
+    act(() => result.current.toggleExperimentalResearch());
+    act(() => result.current.toggleExperimentalResearch());
+    expect(result.current.experimentalResearchEnabled).toBe(false);
   });
 
   it("preserves selection for a new session and resets on session or agent switch", () => {
@@ -37,5 +46,21 @@ describe("research mode selection", () => {
     act(() => result.current.toggleDeepResearch());
     rerender({ chatSessionId: "session-2", agentId: 1 });
     expect(result.current.deepResearchEnabled).toBe(false);
+  });
+
+  it("preserves Experimental for a new session and clears it on navigation", () => {
+    const { result, rerender } = renderHook(
+      ({ chatSessionId, agentId }) =>
+        useDeepResearchToggle({ chatSessionId, agentId }),
+      { initialProps: { chatSessionId: null as string | null, agentId: 0 } }
+    );
+    act(() => result.current.toggleExperimentalResearch());
+    rerender({ chatSessionId: "session-1", agentId: 0 });
+    expect(result.current.experimentalResearchEnabled).toBe(true);
+    rerender({ chatSessionId: "session-2", agentId: 0 });
+    expect(result.current.experimentalResearchEnabled).toBe(false);
+    act(() => result.current.toggleExperimentalResearch());
+    rerender({ chatSessionId: "session-2", agentId: 1 });
+    expect(result.current.experimentalResearchEnabled).toBe(false);
   });
 });

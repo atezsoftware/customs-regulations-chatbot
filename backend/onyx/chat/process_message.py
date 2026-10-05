@@ -890,6 +890,9 @@ def build_chat_turn(
             "atez_search_v2": new_msg_req.atez_search_v2,
             "atez_search_v2_labels": new_msg_req.atez_search_v2_labels,
             "atez_search_v3": new_msg_req.atez_search_v3,
+            "asv3_research_profile": new_msg_req.asv3_research_profile
+            if new_msg_req.atez_search_v3
+            else None,
         },
     )
 

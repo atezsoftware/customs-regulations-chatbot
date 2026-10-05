@@ -6,13 +6,16 @@ afterEach(() => {
 });
 
 it.each([
-  [false, false, false, "deep"],
-  [true, false, true, "normal"],
-  [false, true, false, "deep"],
-  [true, true, false, "deep"],
+  [false, false, false, false, "deep"],
+  [true, false, false, true, "normal"],
+  [false, true, false, false, "deep"],
+  [true, true, false, false, "deep"],
+  [false, false, true, true, "experimental"],
+  [true, false, true, true, "experimental"],
+  [false, true, true, false, "deep"],
 ])(
-  "sends mutually exclusive research modes (%s, %s)",
-  async (single, deep, expectedASv3, profile) => {
+  "sends mutually exclusive research modes (%s, %s, %s)",
+  async (single, deep, experimental, expectedASv3, profile) => {
     global.fetch = jest.fn().mockResolvedValue({
       ok: false,
       status: 400,
@@ -26,6 +29,7 @@ it.each([
         filters: null,
         atezSearchV3: Boolean(single),
         deepResearch: Boolean(deep),
+        experimentalResearch: Boolean(experimental),
         atezSearch: true,
         atezSearchV2: true,
       }).next()

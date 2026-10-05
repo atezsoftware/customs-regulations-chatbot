@@ -180,6 +180,44 @@ it("carries the explicit checkpoint owner when resuming ASv3", async () => {
   expect(payload.atez_search_v3).toBe(true);
 });
 
+it.each([undefined, false, true])(
+  "serializes Experimental with the selected model and explicit external consent (%s)",
+  async (asv3AllowExternal) => {
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: false,
+      status: 400,
+      json: async () => ({ detail: "capture" }),
+    });
+    await expect(
+      sendMessage({
+        message: "Question",
+        parentMessageId: null,
+        chatSessionId: "session-1",
+        filters: null,
+        experimentalResearch: true,
+        asv3AllowExternal,
+        modelProvider: "Vertex Gemini",
+        modelProviderType: "vertex_ai",
+        modelVersion: "gemini-3.8-pro",
+      }).next()
+    ).rejects.toThrow("capture");
+    const payload = JSON.parse(
+      String(jest.mocked(global.fetch).mock.calls[0]![1]?.body)
+    );
+    expect(payload.atez_search_v3).toBe(true);
+    expect(payload.asv3_research_profile).toBe("experimental");
+    expect(payload.deep_research).toBe(false);
+    expect(payload.atez_search).toBe(false);
+    expect(payload.atez_search_v2).toBe(false);
+    expect(payload.asv3_allow_external).toBe(asv3AllowExternal === true);
+    expect(payload.llm_override).toEqual({
+      model_provider: "Vertex Gemini",
+      model_provider_type: "vertex_ai",
+      model_version: "gemini-3.8-pro",
+    });
+  }
+);
+
 it.each([
   [true, undefined, false],
   [true, false, false],

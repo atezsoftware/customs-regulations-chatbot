@@ -206,6 +206,7 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
         atezSearch: atezSearchEnabledForCurrentWorkflow,
         atezSearchV2: atezSearchV2EnabledForCurrentWorkflow,
         atezSearchV3: atezSearchV3EnabledForCurrentWorkflow,
+        experimentalResearch: experimentalResearchEnabledForCurrentWorkflow,
       });
     }
   }
@@ -232,6 +233,8 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
     toggleAtezSearchV2,
     atezSearchV3Enabled,
     toggleAtezSearchV3,
+    experimentalResearchEnabled,
+    toggleExperimentalResearch,
   } = useDeepResearchToggle({
     chatSessionId: currentChatSessionId,
     agentId: selectedAgent?.id,
@@ -251,6 +254,10 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
     currentProjectId === null &&
     (selectedAgent ?? liveAgent)?.id === 0 &&
     atezSearchV3Enabled;
+  const experimentalResearchEnabledForCurrentWorkflow =
+    currentProjectId === null &&
+    (selectedAgent ?? liveAgent)?.id === 0 &&
+    experimentalResearchEnabled;
 
   const [presentingDocument, setPresentingDocument] =
     useState<MinimalOnyxDocument | null>(null);
@@ -571,6 +578,9 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
         atezSearchV2EnabledForCurrentWorkflow && !multiModel.isMultiModelActive,
       atezSearchV3:
         atezSearchV3EnabledForCurrentWorkflow && !multiModel.isMultiModelActive,
+      experimentalResearch:
+        experimentalResearchEnabledForCurrentWorkflow &&
+        !multiModel.isMultiModelActive,
       messageIdToResend: lastUserMsg.messageId,
     });
   }, [
@@ -581,6 +591,7 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
     atezSearchEnabledForCurrentWorkflow,
     atezSearchV2EnabledForCurrentWorkflow,
     atezSearchV3EnabledForCurrentWorkflow,
+    experimentalResearchEnabledForCurrentWorkflow,
     multiModel.isMultiModelActive,
   ]);
 
@@ -608,6 +619,9 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
         atezSearchV3:
           atezSearchV3EnabledForCurrentWorkflow &&
           !multiModel.isMultiModelActive,
+        experimentalResearch:
+          experimentalResearchEnabledForCurrentWorkflow &&
+          !multiModel.isMultiModelActive,
         selectedModels: multiModel.isMultiModelActive
           ? multiModel.selectedModels
           : undefined,
@@ -624,6 +638,7 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
       atezSearchEnabledForCurrentWorkflow,
       atezSearchV2EnabledForCurrentWorkflow,
       atezSearchV3EnabledForCurrentWorkflow,
+      experimentalResearchEnabledForCurrentWorkflow,
       multiModel.isMultiModelActive,
       multiModel.selectedModels,
       foldSidebarForMultiModel,
@@ -676,6 +691,9 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
           atezSearchV3:
             atezSearchV3EnabledForCurrentWorkflow &&
             !multiModel.isMultiModelActive,
+          experimentalResearch:
+            experimentalResearchEnabledForCurrentWorkflow &&
+            !multiModel.isMultiModelActive,
           selectedModels: multiModel.isMultiModelActive
             ? multiModel.selectedModels
             : undefined,
@@ -703,6 +721,7 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
       atezSearchEnabledForCurrentWorkflow,
       atezSearchV2EnabledForCurrentWorkflow,
       atezSearchV3EnabledForCurrentWorkflow,
+      experimentalResearchEnabledForCurrentWorkflow,
       showOnboarding,
       onboardingDismissed,
       finishOnboarding,
@@ -898,6 +917,9 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
                         atezSearchV3Enabled={
                           atezSearchV3EnabledForCurrentWorkflow
                         }
+                        experimentalResearchEnabled={
+                          experimentalResearchEnabledForCurrentWorkflow
+                        }
                         currentMessageFiles={currentMessageFiles}
                         setPresentingDocument={setPresentingDocument}
                         onSubmit={onSubmit}
@@ -1088,8 +1110,12 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
                         atezSearchV3Enabled={
                           atezSearchV3EnabledForCurrentWorkflow
                         }
+                        experimentalResearchEnabled={
+                          experimentalResearchEnabledForCurrentWorkflow
+                        }
                         toggleAtezSearchV2={toggleAtezSearchV2}
                         toggleAtezSearchV3={toggleAtezSearchV3}
+                        toggleExperimentalResearch={toggleExperimentalResearch}
                         isMultiModelActive={multiModel.isMultiModelActive}
                         filterManager={filterManager}
                         llmManager={llmManager}

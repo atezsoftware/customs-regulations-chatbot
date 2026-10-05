@@ -47,6 +47,7 @@ import {
   SvgStop,
   SvgX,
   SvgSimpleLoader,
+  SvgSparkle,
 } from "@opal/icons";
 import { DEFAULT_AGENT_ID } from "@/lib/constants";
 import { Button, SelectButton } from "@opal/components";
@@ -89,11 +90,13 @@ export interface AppInputBarProps {
   atezSearchEnabled?: boolean;
   atezSearchV2Enabled?: boolean;
   atezSearchV3Enabled?: boolean;
+  experimentalResearchEnabled?: boolean;
   setPresentingDocument?: (document: MinimalOnyxDocument) => void;
   toggleDeepResearch: () => void;
   toggleAtezSearch?: () => void;
   toggleAtezSearchV2?: () => void;
   toggleAtezSearchV3?: () => void;
+  toggleExperimentalResearch?: () => void;
   isMultiModelActive?: boolean;
   disabled: boolean;
   awaitingPreferredSelection?: boolean;
@@ -119,8 +122,10 @@ const AppInputBar = React.memo(
     llmManager,
     deepResearchEnabled,
     atezSearchV3Enabled = false,
+    experimentalResearchEnabled = false,
     toggleDeepResearch,
     toggleAtezSearchV3,
+    toggleExperimentalResearch,
     isMultiModelActive,
     setPresentingDocument,
     disabled,
@@ -731,6 +736,23 @@ const AppInputBar = React.memo(
                     }
                   >
                     Deep Research
+                  </SelectButton>
+                )}
+                {showAtezSearch && toggleExperimentalResearch && (
+                  <SelectButton
+                    disabled={disabled || isMultiModelActive}
+                    variant="select-light"
+                    icon={SvgSparkle}
+                    onClick={toggleExperimentalResearch}
+                    state={experimentalResearchEnabled ? "selected" : "empty"}
+                    foldable={false}
+                    tooltip={
+                      isMultiModelActive
+                        ? "Experimental runs with one model. Remove extra models to use it."
+                        : "Kaynakların kapsamını ve tartışmalı hukuki etkileri inceleyen deneysel araştırma"
+                    }
+                  >
+                    Experimental
                   </SelectButton>
                 )}
               </>

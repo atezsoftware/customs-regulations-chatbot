@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Callable, Iterable
 import jsonschema
 from pydantic import JsonValue
 
+from onyx.asv3.legal_source_reviews import LegalSourceReviews, RelatedSourceReview
 from onyx.asv3.models import (
     CapabilityCall,
     OriginalEvidenceRead,
@@ -23,8 +24,7 @@ if TYPE_CHECKING:
     from onyx.asv3.evidence import EvidenceLedger
 
 
-def _outcome_metadata_properties() -> dict[str, JsonValue]:
-    schema: dict[str, JsonValue] = OutcomeUpdate.model_json_schema()
+def _inline_metadata_schema(schema: dict[str, JsonValue]) -> dict[str, JsonValue]:
     references = schema.get("$defs", {})
     assert isinstance(references, dict)
 
@@ -50,7 +50,15 @@ def _outcome_metadata_properties() -> dict[str, JsonValue]:
         )
         return result
 
-    properties = inline(schema["properties"])
+    result = inline(schema)
+    assert isinstance(result, dict)
+    return result
+
+
+def _outcome_metadata_properties() -> dict[str, JsonValue]:
+    properties = _inline_metadata_schema(OutcomeUpdate.model_json_schema())[
+        "properties"
+    ]
     assert isinstance(properties, dict)
     return {
         "_outcomes": properties["outcomes"],
@@ -116,8 +124,33 @@ class CapabilityRegistry:
                     "type": "boolean",
                     "description": "True only when the user explicitly requested outside/web sources; host authorization still applies.",
                 }
-                if outcome_properties is not None:
+                if outcome_properties is not None and (
+                    context.services.get("research_profile") != "experimental"
+                    or spec.name
+                    in {
+                        "search_corpus",
+                        "resolve_source",
+                        "read_provision",
+                        "update_research",
+                        "submit_answer",
+                        "submit_partial_answer",
+                        "assemble_answers",
+                    }
+                ):
                     properties.update(copy.deepcopy(outcome_properties))
+                if context.services.get(
+                    "research_profile"
+                ) == "experimental" and spec.name in {
+                    "submit_answer",
+                    "submit_partial_answer",
+                    "assemble_answers",
+                }:
+                    properties["_related_source_reviews"] = {
+                        "type": "array",
+                        "items": _inline_metadata_schema(
+                            RelatedSourceReview.model_json_schema()
+                        ),
+                    }
             if spec.name not in {
                 "update_research",
                 "inspect_research",
@@ -235,6 +268,12 @@ class CapabilityRegistry:
                         "_external_requested",
                         "_outcomes",
                         "_coverage",
+                        *(
+                            {"_related_source_reviews"}
+                            if context.services.get("research_profile")
+                            == "experimental"
+                            else set()
+                        ),
                     }
                 }
                 jsonschema.Draft202012Validator(spec.parameters).validate(arguments)
@@ -252,6 +291,40 @@ class CapabilityRegistry:
             )
             if metadata_gap is not None:
                 return metadata_gap
+            raw_reviews = call.arguments.get("_related_source_reviews")
+            if raw_reviews is not None:
+                reviews = context.services.get("legal_source_reviews")
+                from onyx.asv3.evidence import EvidenceLedger
+
+                ledger = context.services.get("evidence")
+                call_id = context.services.get("last_model_call_id")
+                try:
+                    if (
+                        context.services.get("research_profile") != "experimental"
+                        or call.name
+                        not in {
+                            "submit_answer",
+                            "submit_partial_answer",
+                            "assemble_answers",
+                        }
+                        or not isinstance(reviews, LegalSourceReviews)
+                        or not isinstance(ledger, EvidenceLedger)
+                        or not isinstance(call_id, str)
+                        or not isinstance(raw_reviews, list)
+                    ):
+                        raise ValueError(
+                            "Related-source assessments require the exposed experimental terminal action"
+                        )
+                    reviews.apply(raw_reviews, call_id, context, ledger)
+                except ValueError as error:
+                    return ToolOutcome(
+                        status=OutcomeStatus.INVALID,
+                        summary="Correct only the related-source assessment or read its operative original.",
+                        data={
+                            "detail": str(error),
+                            "invalid_related_source_review": True,
+                        },
+                    )
             if spec.consumes_tool_budget:
                 context.budget.consume("tools")
             acquired = False
@@ -314,6 +387,11 @@ class CapabilityRegistry:
                 "_external_requested",
                 "_outcomes",
                 "_coverage",
+                *(
+                    {"_related_source_reviews"}
+                    if context.services.get("research_profile") == "experimental"
+                    else set()
+                ),
             }
         }
         if not jsonschema.Draft202012Validator(spec.parameters).is_valid(arguments):

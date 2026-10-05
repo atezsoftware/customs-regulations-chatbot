@@ -42,6 +42,7 @@ export interface ChatUIProps {
     atezSearch?: boolean;
     atezSearchV2?: boolean;
     atezSearchV3?: boolean;
+    experimentalResearch?: boolean;
     asv3ResumeMessageId?: number;
     asv3AllowExternal?: boolean;
     modelOverride?: LlmDescriptor;
@@ -58,6 +59,7 @@ export interface ChatUIProps {
   atezSearchEnabled?: boolean;
   atezSearchV2Enabled?: boolean;
   atezSearchV3Enabled?: boolean;
+  experimentalResearchEnabled?: boolean;
   currentMessageFiles: any[];
 
   onResubmit: () => void;
@@ -87,6 +89,7 @@ const ChatUI = React.memo(
     atezSearchEnabled = false,
     atezSearchV2Enabled = false,
     atezSearchV3Enabled = false,
+    experimentalResearchEnabled = false,
     currentMessageFiles,
     onResubmit,
     anchorNodeId,
@@ -117,6 +120,7 @@ const ChatUI = React.memo(
     const atezSearchEnabledRef = useRef(atezSearchEnabled);
     const atezSearchV2EnabledRef = useRef(atezSearchV2Enabled);
     const atezSearchV3EnabledRef = useRef(atezSearchV3Enabled);
+    const experimentalResearchEnabledRef = useRef(experimentalResearchEnabled);
     const currentMessageFilesRef = useRef(currentMessageFiles);
     const selectedModelsRef = useRef(selectedModels);
     onSubmitRef.current = onSubmit;
@@ -124,6 +128,7 @@ const ChatUI = React.memo(
     atezSearchEnabledRef.current = atezSearchEnabled;
     atezSearchV2EnabledRef.current = atezSearchV2Enabled;
     atezSearchV3EnabledRef.current = atezSearchV3Enabled;
+    experimentalResearchEnabledRef.current = experimentalResearchEnabled;
     currentMessageFilesRef.current = currentMessageFiles;
     selectedModelsRef.current = selectedModels;
 
@@ -150,6 +155,9 @@ const ChatUI = React.memo(
             atezSearchV3:
               Boolean(regenerationRequest.asv3ResumeMessageId) ||
               atezSearchV3EnabledRef.current,
+            experimentalResearch:
+              !regenerationRequest.asv3ResumeMessageId &&
+              experimentalResearchEnabledRef.current,
             asv3ResumeMessageId: regenerationRequest.asv3ResumeMessageId,
             modelOverride,
             messageIdToResend: regenerationRequest.parentMessage.messageId,
@@ -173,6 +181,9 @@ const ChatUI = React.memo(
           atezSearchV2: atezSearchV2EnabledRef.current,
           atezSearchV3:
             atezSearchV3EnabledRef.current && !(models && models.length >= 2),
+          experimentalResearch:
+            experimentalResearchEnabledRef.current &&
+            !(models && models.length >= 2),
           selectedModels: models && models.length >= 2 ? models : undefined,
         });
       },
