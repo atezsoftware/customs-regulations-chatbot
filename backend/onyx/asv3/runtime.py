@@ -206,6 +206,7 @@ def run_asv3_loop(
     reasoning_effort: ReasoningEffort,
     include_citations: bool,
     cache: CacheBackend,
+    research_profile: str = "deep",
     resume_message_id: int | None = None,
     custom_agent_prompt: str | None = None,
     allow_external: bool = False,
@@ -267,8 +268,16 @@ def run_asv3_loop(
             notifications=localized_notifications("und"),
             requires_sources=True,
         )
+    if previous is not None:
+        research_profile = str(
+            previous.get("research_profile")
+            or ("deep" if "question_research" in previous else "normal")
+        )
+    if research_profile not in {"normal", "deep"}:
+        raise ValueError("Unknown ASv3 research profile")
     context.language = profile.language
-    context.services["independent_question_mode"] = profile.requires_sources
+    context.services["research_profile"] = research_profile
+    context.services["independent_question_mode"] = research_profile == "deep"
     context.corpus_only = not (allow_external and profile.external_requested)
     ledger = EvidenceLedger()
     context.services["evidence"] = ledger
@@ -432,6 +441,7 @@ def run_asv3_loop(
             snapshot.update(
                 sequence=checkpoint_sequence,
                 prompt_version=PROMPT_VERSION,
+                research_profile=research_profile,
                 execution_mode="native",
                 native_coordinator_sampling=model.native_sampling_snapshot(),
                 scope=context.scope,
@@ -695,7 +705,7 @@ def run_asv3_loop(
     for spec in (
         common_specs
         + workers.tool_specs()
-        + question_research.tool_specs()
+        + (question_research.tool_specs() if research_profile == "deep" else [])
         + build_research_specs(research_state, ledger)
     ):
         registry.register(spec)
