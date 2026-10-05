@@ -343,6 +343,11 @@ def get_usage_totals_by_email(
     end: datetime,
 ) -> list[UserUsageTotalsByEmail]:
     """Aggregate the usage ledger directly to bounded per-email report rows."""
+    from onyx.db.usage_measurement import get_measurement_period, measurement_totals
+
+    period = get_measurement_period(db_session)
+    if period:
+        return measurement_totals(db_session, period, start, end)
     email_label = func.coalesce(User.email, DELETED_USER_EXPORT_EMAIL)
     rows = db_session.execute(
         select(
@@ -387,6 +392,11 @@ def get_usage_export(
     model: str | None = None,
 ) -> list[UsageExportRow]:
     """Tenant-wide usage by email, model, and UTC day."""
+    from onyx.db.usage_measurement import get_measurement_period, measurement_export
+
+    period = get_measurement_period(db_session)
+    if period:
+        return measurement_export(db_session, period, start, end, model)
     utc_day = func.date(func.timezone("UTC", UserUsage.window_start))
     # Deleted users/API keys leave user_id NULL but keep their spend. An inner
     # join would hide that spend here while the tenant-wide totals still count
@@ -437,6 +447,11 @@ def get_user_activity_counts_by_email(
     end: datetime,
 ) -> list[UserActivityCounts]:
     """Count non-benchmark user queries and distinct sessions over [start, end)."""
+    from onyx.db.usage_measurement import get_measurement_period, measurement_activity
+
+    period = get_measurement_period(db_session)
+    if period:
+        return measurement_activity(db_session, period, start, end)
     email_label = func.coalesce(User.email, DELETED_USER_EXPORT_EMAIL)
     rows = db_session.execute(
         select(

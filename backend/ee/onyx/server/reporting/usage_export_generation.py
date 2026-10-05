@@ -22,6 +22,11 @@ from ee.onyx.server.reporting.usage_export_models import (
 )
 from onyx.configs.constants import FileOrigin
 from onyx.db.models import User
+from onyx.db.usage_measurement import (
+    get_measurement_period,
+    measurement_activity,
+    measurement_totals,
+)
 from onyx.db.user_usage import (
     PerUserUsageSummary,
     get_usage_totals_by_email,
@@ -227,20 +232,33 @@ def create_new_usage_report(
         db_session, file_store, report_id, resolved_period
     )
     users_file_id = generate_user_report(db_session, file_store, report_id)
-    summary = get_usage_summary(db_session, resolved_period)
+    measurement = get_measurement_period(db_session)
+    summary = (
+        get_usage_summary(db_session, resolved_period, measurement_period=measurement)
+        if measurement
+        else get_usage_summary(db_session, resolved_period)
+    )
     summary_csv = render_usage_summary_csv(summary, period)
     # The UI sends an inclusive end-of-day timestamp. The ledger/activity
     # helpers use half-open ranges, so advance by one microsecond for parity.
     end_exclusive = resolved_period[1] + timedelta(microseconds=1)
-    usage_rows = get_usage_totals_by_email(
-        db_session,
-        start=resolved_period[0],
-        end=end_exclusive,
+    usage_rows = (
+        measurement_totals(db_session, measurement, resolved_period[0], end_exclusive)
+        if measurement
+        else get_usage_totals_by_email(
+            db_session,
+            start=resolved_period[0],
+            end=end_exclusive,
+        )
     )
-    activity_rows = get_user_activity_counts_by_email(
-        db_session,
-        start=resolved_period[0],
-        end=end_exclusive,
+    activity_rows = (
+        measurement_activity(db_session, measurement, resolved_period[0], end_exclusive)
+        if measurement
+        else get_user_activity_counts_by_email(
+            db_session,
+            start=resolved_period[0],
+            end=end_exclusive,
+        )
     )
     per_user_usage_csv = render_per_user_usage_csv(
         summarize_usage_by_email(

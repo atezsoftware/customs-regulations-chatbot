@@ -51,8 +51,12 @@ export const useUserAnalytics = (timeRange: DateRangePickerValue) => {
   };
 };
 
-export const useUsageSummary = (timeRange: DateRangePickerValue) => {
+export const useUsageSummary = (
+  timeRange: DateRangePickerValue,
+  workflow?: string
+) => {
   const url = buildApiPath("/api/admin/usage-report/summary", {
+    workflow,
     period_from: convertDateToStartOfDay(timeRange.from)?.toISOString(),
     period_to: convertDateToEndOfDay(timeRange.to)?.toISOString(),
   });

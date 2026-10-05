@@ -3,7 +3,7 @@
 from collections import defaultdict
 from collections.abc import Sequence
 from datetime import date, datetime, time, timedelta, timezone
-from typing import Annotated
+from typing import Annotated, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query
@@ -23,6 +23,13 @@ from onyx.db.token_limit import (
     fetch_all_global_token_rate_limits,
     fetch_all_user_token_rate_limits,
     fetch_user_group_token_rate_limits,
+)
+from onyx.db.usage_measurement import (
+    MeasurementPeriod,
+    get_measurement_period,
+    measurement_activity,
+    measurement_export,
+    start_measurement_period,
 )
 from onyx.db.user_usage import (
     get_cost_window_start,
@@ -259,6 +266,7 @@ def export_usage(
     period_from: datetime | None = None,
     period_to: datetime | None = None,
     model: str | None = None,
+    workflow: Literal["normal", "deep", "other"] | None = None,
     _: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
     db_session: Session = Depends(get_session),
 ) -> UsageExportResponse:
@@ -298,7 +306,12 @@ def export_usage(
         )
 
     # TODO(evan-onyx): this might need to be done in a background task
-    rows = get_usage_export(db_session, start=start_dt, end=end_dt, model=model)
+    period = get_measurement_period(db_session)
+    rows = (
+        measurement_export(db_session, period, start_dt, end_dt, model, workflow)
+        if period
+        else get_usage_export(db_session, start=start_dt, end=end_dt, model=model)
+    )
 
     records_by_email: dict[str, list[UsageExportRecord]] = defaultdict(list)
     for row in rows:
@@ -308,11 +321,9 @@ def export_usage(
 
     summaries = summarize_usage_by_email(
         rows,
-        get_user_activity_counts_by_email(
-            db_session,
-            start=start_dt,
-            end=end_dt,
-        ),
+        measurement_activity(db_session, period, start_dt, end_dt, workflow)
+        if period
+        else get_user_activity_counts_by_email(db_session, start=start_dt, end=end_dt),
         # A model-filtered export cannot attribute sessions or prompts to one
         # model, so it does not add users found only in period-wide activity.
         include_activity_only=model is None,
@@ -335,6 +346,24 @@ def export_usage(
         end=end_date.isoformat(),
         users=users,
     )
+
+
+@admin_usage_router.get("/measurement-period")
+def measurement_period(
+    _: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
+    db_session: Session = Depends(get_session),
+) -> MeasurementPeriod | None:
+    return get_measurement_period(db_session)
+
+
+@admin_usage_router.post("/measurement-period")
+def reset_measurement_period(
+    _: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
+    db_session: Session = Depends(get_session),
+) -> MeasurementPeriod:
+    period = start_measurement_period(db_session)
+    db_session.commit()
+    return period
 
 
 @admin_usage_router.post("/reset")

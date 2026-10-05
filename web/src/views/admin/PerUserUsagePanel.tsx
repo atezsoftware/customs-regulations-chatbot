@@ -116,7 +116,7 @@ function UsageRow({ user, onReset }: UsageRowProps) {
     setResetting(true);
     try {
       await resetUserUsage(user.email);
-      toast.success(`Reset usage for ${user.email}.`);
+      toast.success(`Reset budget usage for ${user.email}.`);
       onReset();
     } catch (error) {
       const message = error instanceof Error ? error.message : "unknown error";
@@ -151,7 +151,7 @@ function UsageRow({ user, onReset }: UsageRowProps) {
         disabled={resetting}
         onClick={handleReset}
       >
-        Reset
+        Reset budget
       </Button>
     </div>
   );
@@ -201,10 +201,15 @@ function SortHeader({
 /** Searchable, sortable admin per-user usage totals. */
 export default function PerUserUsagePanel({
   timeRange,
+  workflow,
 }: {
   timeRange: DateRangePickerValue;
+  workflow?: string;
 }) {
-  const { usage, isLoading, error, refetch } = useUsageExport(timeRange);
+  const { usage, isLoading, error, refetch } = useUsageExport(
+    timeRange,
+    workflow
+  );
   const [page, setPage] = useState(0);
   const [query, setQuery] = useState("");
   const [sortKey, setSortKey] = useState<SortKey>("cost_cents");

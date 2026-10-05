@@ -89,10 +89,12 @@ export function UsageSummaryCards({ summary }: { summary: UsageSummary }) {
 
 export default function UsageSummarySection({
   timeRange,
+  workflow,
 }: {
   timeRange: DateRangePickerValue;
+  workflow?: string;
 }) {
-  const { data, error, isLoading } = useUsageSummary(timeRange);
+  const { data, error, isLoading } = useUsageSummary(timeRange, workflow);
 
   return (
     <CardSection className="mt-8">

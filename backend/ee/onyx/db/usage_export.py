@@ -1,6 +1,6 @@
 import uuid
 from collections.abc import Generator
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import IO, Optional
 
 from fastapi_users_db_sqlalchemy import UUID_ID
@@ -17,6 +17,12 @@ from ee.onyx.server.reporting.usage_export_models import (
 )
 from onyx.configs.constants import MessageType
 from onyx.db.models import ChatMessage, ChatSession, UsageReport, User, UserUsage
+from onyx.db.usage_measurement import (
+    MeasurementPeriod,
+    get_measurement_period,
+    measurement_activity,
+    measurement_totals,
+)
 from onyx.db.user_usage import calculate_usage_rate_metrics
 from onyx.file_store.file_store import get_default_file_store
 
@@ -117,7 +123,28 @@ def get_empty_chat_messages_entries__paginated(
 def get_usage_summary(
     db_session: Session,
     period: tuple[datetime, datetime],
+    workflow: str | None = None,
+    measurement_period: MeasurementPeriod | None = None,
 ) -> UsageSummary:
+    measurement = measurement_period or get_measurement_period(db_session)
+    if measurement:
+        period = (period[0], period[1] + timedelta(microseconds=1))
+        activity = measurement_activity(
+            db_session, measurement, period[0], period[1], workflow
+        )
+        totals = measurement_totals(
+            db_session, measurement, period[0], period[1], workflow
+        )
+        costs = sum(row.cost_cents for row in totals)
+        return UsageSummary(
+            **calculate_usage_rate_metrics(
+                query_count=sum(row.query_count for row in activity),
+                session_count=sum(row.session_count for row in activity),
+                token_count=sum(row.input_tokens + row.output_tokens for row in totals),
+                cost_cents=costs,
+            ).model_dump(),
+            total_cost_cents=costs,
+        )
     total_queries, total_sessions = (
         db_session.query(
             func.count(ChatMessage.id),

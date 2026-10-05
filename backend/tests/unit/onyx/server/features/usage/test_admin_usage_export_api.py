@@ -66,6 +66,10 @@ def db_session() -> Generator[Session, None, None]:
         )
 
     cast(Table, UserUsage.__table__).create(bind=engine)
+    with engine.begin() as connection:
+        connection.execute(
+            text("CREATE TABLE key_value_store (key VARCHAR PRIMARY KEY, value JSON)")
+        )
     # Minimal `user` table: the export JOIN only touches id + email.
     with engine.begin() as conn:
         conn.execute(
@@ -468,3 +472,13 @@ class TestResetUsageEndpoint:
     def test_negative_reset_count_is_invalid(self) -> None:
         with pytest.raises(ValidationError):
             ResetUsageResponse(reset_rows=-1)
+
+
+def test_measurement_reset_requires_admin(db_session: Session) -> None:
+    client = TestClient(_make_app(db_session, _NON_ADMIN))
+    response = client.post("/admin/usage/measurement-period")
+    assert response.status_code == 403
+    assert (
+        db_session.execute(text("SELECT count(*) FROM key_value_store")).scalar_one()
+        == 0
+    )
