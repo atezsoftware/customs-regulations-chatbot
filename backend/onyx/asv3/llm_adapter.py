@@ -24,6 +24,7 @@ from onyx.asv3.assertions import (
     AssertionWitness,
     assertion_witness_valid,
 )
+from onyx.asv3.authority_requirements import AuthorityRequirements
 from onyx.asv3.citation_numbers import extract_citation_numbers
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.legal_source_navigation import derive_provision_navigation_anchor
@@ -36,6 +37,7 @@ from onyx.asv3.models import (
     ResearchTurn,
     RunContext,
     RunStopped,
+    ToolReceipt,
     model_evidence_metadata,
 )
 from onyx.asv3.outcome_map import OutcomeMap
@@ -2149,6 +2151,11 @@ class ResearchModel:
             context["draft_to_repair"] = view.draft_to_repair
         if view.publication_gap is not None:
             context["publication_gap"] = view.publication_gap
+        authority_requirements = self.context.services.get("authority_requirements")
+        if isinstance(authority_requirements, AuthorityRequirements):
+            context["governing_source_requirements"] = authority_requirements.view(
+                self.context
+            )
         pending = self.pending_tasks()
         if pending:
             context["research_tasks"] = pending
@@ -2267,6 +2274,15 @@ class ResearchModel:
                 ):
                     verified.add(identity)
                     original_lengths[(number, digest)] = len(item.text)
+                    if (
+                        self.context.services.get("research_profile") == "experimental"
+                        and record.get("source_id") == item.source_id
+                        and record.get("chunk_id") == item.chunk_id
+                    ):
+                        unique[identity] = {
+                            **record,
+                            "metadata": model_evidence_metadata(item.metadata),
+                        }
             acquire_navigation = self.context.services.get(
                 "legal_source_navigation_acquire"
             )
@@ -2418,7 +2434,7 @@ class ResearchModel:
             if isinstance(reviews, LegalSourceReviews) and isinstance(
                 ledger, EvidenceLedger
             ):
-                current["related_source_reviews"] = reviews.view(
+                source_review_state = reviews.view(
                     self.context,
                     ledger,
                     {
@@ -2429,11 +2445,15 @@ class ResearchModel:
                         and identity[3] == original_lengths[(identity[0], identity[1])]
                     },
                 )
+                if self.context.services.get("research_profile") == "experimental":
+                    source_review_state = self._related_source_range_continuations(
+                        source_review_state, view.receipts, ledger
+                    )
+                current["related_source_reviews"] = source_review_state
                 if candidate_reviews is not None:
                     current["candidate_related_source_reviews"] = candidate_reviews
-                source_review_state = current["related_source_reviews"]
-                if isinstance(source_review_state, dict) and source_review_state.get(
-                    "pending_lead_ids"
+                if self._related_source_terminal_gap(
+                    source_review_state, view.publication_gap
                 ):
                     current["related_source_terminal_transport"] = (
                         "Assess the related sources yourself against the supplied originals. "
@@ -2622,9 +2642,13 @@ class ResearchModel:
                     else None,
                 )
                 decision = self._invoke_decision(handoff, prompt, tools, output)
-                decision = self._experimental_terminal_envelope(decision, tools)
+                decision = self._experimental_terminal_envelope(
+                    decision, tools, publication_gap=view.publication_gap
+                )
             if not use_research_model:
-                decision = self._experimental_terminal_envelope(decision, tools)
+                decision = self._experimental_terminal_envelope(
+                    decision, tools, publication_gap=view.publication_gap
+                )
             if not self.context.depth and self.context.services.get(
                 "independent_answers"
             ):
@@ -2635,8 +2659,132 @@ class ResearchModel:
             return decision
         return self._decide_research(view)
 
+    @staticmethod
+    def _related_source_range_continuations(
+        state: dict[str, JsonValue],
+        receipts: list[ToolReceipt],
+        ledger: EvidenceLedger,
+    ) -> dict[str, JsonValue]:
+        """Project this task's canonical acquisition cursors without approving an effect."""
+        result = copy.deepcopy(state)
+        rows = result.get("reviews")
+        if not isinstance(rows, list):
+            return result
+        by_source: dict[str, list[dict[str, JsonValue]]] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            source_id = row.get("source_id")
+            if isinstance(source_id, str):
+                by_source.setdefault(source_id, []).append(row)
+        projected: set[str] = set()
+        for receipt in reversed(receipts):
+            args, data = receipt.call.arguments, receipt.outcome.data
+            source_id, start = args.get("source_id"), args.get("start", 0)
+            more, next_position = data.get("has_more"), data.get("next_position")
+            status = receipt.outcome.status.value
+            if (
+                receipt.call.name != "read_source_range"
+                or not isinstance(source_id, str)
+                or source_id not in by_source
+                or source_id in projected
+                or status not in {"found", "partial"}
+                or type(start) is not int
+                or start < 0
+                or type(more) is not bool
+                or more != (status == "partial")
+                or type(next_position) is not int
+                or next_position <= start
+                or not receipt.evidence_ids
+            ):
+                continue
+            positions: list[int] = []
+            for number in receipt.evidence_ids:
+                item = ledger.get(number)
+                position = item.metadata.get("position") if item is not None else None
+                doc = item.search_doc if item is not None else None
+                metadata = (
+                    model_evidence_metadata(item.metadata) if item is not None else {}
+                )
+                if (
+                    item is None
+                    or item.source_id != source_id
+                    or not item.chunk_id
+                    or doc is None
+                    or doc.document_id != source_id
+                    or doc.metadata.get("regulatory_chunk_id") != item.chunk_id
+                    or metadata.get("external")
+                    or metadata.get("derived")
+                    or type(position) is not int
+                    or position < start
+                    or position >= next_position
+                ):
+                    break
+                positions.append(position)
+            if (
+                len(positions) != len(receipt.evidence_ids)
+                or max(positions) + 1 != next_position
+            ):
+                continue
+            continuation: dict[str, JsonValue] = {
+                "status": status,
+                "start": start,
+                "has_more": more,
+                "next_position": next_position,
+                "notice": (
+                    "Navigation from a bounded source read, not holding or applicability approval. "
+                    "Neither found nor has_more=false establishes that the operative effect was examined."
+                ),
+            }
+            if len(receipt.call.call_id) <= 256:
+                continuation["receipt_id"] = receipt.call.call_id
+            for row in by_source[source_id]:
+                row["source_range_read"] = continuation
+            projected.add(source_id)
+        return result
+
+    @staticmethod
+    def _related_source_terminal_gap(
+        state: JsonValue,
+        publication_gap: dict[str, JsonValue] | None,
+    ) -> bool:
+        if not isinstance(state, dict):
+            return False
+        if state.get("pending_lead_ids"):
+            return True
+        if (
+            publication_gap is None
+            or publication_gap.get("pending_related_source_review") is not True
+        ):
+            return False
+        rows = state.get("reviews")
+        unresolved: dict[str, str] = {}
+        for row in rows if isinstance(rows, list) else []:
+            if not isinstance(row, dict) or row.get("status") != "unresolved":
+                continue
+            review, lead_id = row.get("review"), row.get("lead_id")
+            gap = review.get("gap") if isinstance(review, dict) else None
+            if isinstance(lead_id, str) and isinstance(gap, str) and gap:
+                unresolved[lead_id] = gap
+        gaps = publication_gap.get("undisclosed_related_source_gaps")
+        for gap in gaps if isinstance(gaps, list) else []:
+            if not isinstance(gap, dict):
+                continue
+            lead_id = gap.get("lead_id")
+            if (
+                isinstance(lead_id, str)
+                and lead_id in unresolved
+                and unresolved[lead_id] == gap.get("gap")
+            ):
+                return True
+        return False
+
     def _experimental_terminal_envelope(
-        self, decision: Decision, tools: list[dict[str, JsonValue]]
+        self,
+        decision: Decision,
+        tools: list[dict[str, JsonValue]],
+        *,
+        publication_gap: dict[str, JsonValue] | None = None,
     ) -> Decision:
         reviews = self.context.services.get("legal_source_reviews")
         ledger = self.context.services.get("evidence")
@@ -2646,11 +2794,14 @@ class ResearchModel:
             or not decision.answer
             or not isinstance(reviews, LegalSourceReviews)
             or not isinstance(ledger, EvidenceLedger)
-            or not reviews.view(
-                self.context,
-                ledger,
-                ledger.completely_delivered(self.last_call_id or ""),
-            )["pending_lead_ids"]
+            or not self._related_source_terminal_gap(
+                reviews.view(
+                    self.context,
+                    ledger,
+                    ledger.completely_delivered(self.last_call_id or ""),
+                ),
+                publication_gap,
+            )
         ):
             return decision
         try:

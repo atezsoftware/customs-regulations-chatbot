@@ -56,6 +56,7 @@ from onyx.regulatory.publication_reads import (
     observe_publication_read,
     require_publication_files,
 )
+from onyx.regulatory.source_identity import source_file_identity_matches
 
 
 class CorpusScopeUnavailable(ValueError):
@@ -1053,6 +1054,8 @@ def _source_statement(filters: IndexFilters) -> Any:
 
 def _source_title_query(
     query: str,
+    *,
+    basename_only: bool = False,
 ) -> tuple[list[ColumnElement[bool]], list[ColumnElement[Any]]]:
     # Corpus filenames commonly transliterate Turkish letters and use underscores.
     translation = str.maketrans("ÇĞİÖŞÜÂÎÛçğıöşüâîû", "CGIOSUAIUcgiosuaiu")
@@ -1060,6 +1063,8 @@ def _source_title_query(
     normalized_name = func.lower(
         func.translate(UserFile.name, "ÇĞİÖŞÜÂÎÛçğıöşüâîû", "CGIOSUAIUcgiosuaiu")
     )
+    if basename_only:
+        normalized_name = func.regexp_replace(normalized_name, "^.*/", "")
     conditions: list[ColumnElement[bool]] = []
     order: list[ColumnElement[Any]] = []
     references = list(
@@ -1106,6 +1111,7 @@ def _find_sources_with_title_queries(
     source_ids: tuple[UUID, ...] | None,
     offset: int,
     limit: int,
+    basename_only: bool = False,
 ) -> tuple[list[CorpusSource], bool]:
     if offset < 0 or not 1 <= limit <= 100:
         raise ValueError("Source pages require offset >= 0 and limit 1..100.")
@@ -1113,7 +1119,9 @@ def _find_sources_with_title_queries(
     statement = _source_statement(filters)
     if source_ids is not None:
         statement = statement.where(UserFile.id.in_(source_ids))
-    parsed = [_source_title_query(query) for query in queries]
+    parsed = [
+        _source_title_query(query, basename_only=basename_only) for query in queries
+    ]
     if len(parsed) == 1:
         statement = statement.where(*parsed[0][0])
     else:
@@ -1144,9 +1152,10 @@ def find_sources(
     source_ids: tuple[UUID, ...] | None = None,
     offset: int = 0,
     limit: int = 50,
+    allow_numbered_title_fallback: bool = False,
 ) -> tuple[list[CorpusSource], bool]:
-    """Page metadata before text hydration; every returned source passes actual ACL."""
-    return _find_sources_with_title_queries(
+    """Resolve scoped titles; an opted-in formal fallback verifies canonical identity."""
+    sources, more = _find_sources_with_title_queries(
         session,
         user=user,
         filters=filters,
@@ -1155,6 +1164,99 @@ def find_sources(
         offset=offset,
         limit=limit,
     )
+    if not allow_numbered_title_fallback or sources or more or source_ids is not None:
+        return sources, more
+    identity = _numbered_law_title(query)
+    if identity is None:
+        return sources, more
+    if offset:
+        first, first_more = _find_sources_with_title_queries(
+            session,
+            user=user,
+            filters=filters,
+            queries=(query,),
+            source_ids=None,
+            offset=0,
+            limit=1,
+        )
+        # A later empty page must not switch from strict to fallback pagination.
+        if first or first_more:
+            return sources, more
+    candidates, more = _find_sources_with_title_queries(
+        session,
+        user=user,
+        filters=filters,
+        queries=(identity.title,),
+        source_ids=None,
+        offset=offset,
+        limit=limit,
+        basename_only=True,
+    )
+    return [
+        source
+        for source in candidates
+        if _source_has_numbered_law_identity(
+            session, user=user, filters=filters, source=source, identity=identity
+        )
+    ], more
+
+
+@dataclass(frozen=True)
+class NumberedLawTitle:
+    number: str
+    title: str
+
+
+def _numbered_law_title(value: str) -> NumberedLawTitle | None:
+    translated = value.translate(
+        str.maketrans("ÇĞİÖŞÜÂÎÛçğıöşüâîû", "CGIOSUAIUcgiosuaiu")
+    ).lower()
+    normalized = " ".join(translated.split())
+    match = re.fullmatch(r"(\d{3,5}) sayili (.+ kanunu?)", normalized)
+    if match is None:
+        return None
+    number, title = match.groups()
+    return NumberedLawTitle(str(int(number)), re.sub(r"kanunu$", "kanun", title))
+
+
+def _source_has_numbered_law_identity(
+    session: Session,
+    *,
+    user: User,
+    filters: IndexFilters,
+    source: CorpusSource,
+    identity: NumberedLawTitle,
+) -> bool:
+    # Own canonical metadata is identity evidence; a law quoted in text is not.
+    index = resolve_source_query_index(session, source.id)
+    _, chunks, _ = read_source_chunks(
+        session,
+        user=user,
+        filters=filters,
+        source_id=source.id,
+        limit=2,
+        query_indexes={source.id: index} if index is not None else None,
+    )
+    if not chunks:
+        return False
+    for chunk in chunks:
+        if (
+            chunk.source_id != source.id
+            or str(chunk.metadata.get("document_type", "")).lower() != "kanun"
+            or not chunk.heading_path
+            or any(
+                chunk.metadata.get(flag)
+                for flag in ("derived", "external", "untrusted")
+            )
+            or _numbered_law_title(chunk.heading_path[0]) != identity
+            or not source_file_identity_matches(
+                f"{identity.number} sayili {identity.title}",
+                source.name,
+                chunk.heading_path[0],
+            )
+        ):
+            return False
+    return True
 
 
 def find_related_sources(

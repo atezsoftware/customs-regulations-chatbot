@@ -1084,8 +1084,23 @@ class Harness:
                             and not (
                                 self.context.services.get("research_profile")
                                 == "experimental"
-                                and blocked.data.get("pending_related_source_review")
-                                is True
+                                and (
+                                    blocked.data.get("pending_related_source_review")
+                                    is True
+                                    or (
+                                        isinstance(
+                                            blocked.data.get(
+                                                "retained_authority_requirements"
+                                            ),
+                                            list,
+                                        )
+                                        and bool(
+                                            blocked.data[
+                                                "retained_authority_requirements"
+                                            ]
+                                        )
+                                    )
+                                )
                             )
                         ):
                             status = OutcomeStatus.PARTIAL

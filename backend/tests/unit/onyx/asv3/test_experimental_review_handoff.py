@@ -409,6 +409,97 @@ def test_experimental_never_uses_secondary_model_terminal_approval() -> None:
     assert selected.invoke.call_count == 1
 
 
+def test_selected_terminal_repairs_an_owned_unresolved_gap_without_pending_ids() -> (
+    None
+):
+    context, ledger, reviews = experimental_context()
+    seen(context, ledger, reviews)
+    deliver(ledger, "prior-unresolved-review", [1])
+    gap_text = "The precise interaction with the governing rule remains unresolved."
+    assessment = review(status="unresolved", witnesses=[], gap=gap_text)
+    reviews.apply([assessment], "prior-unresolved-review", context, ledger)
+    blocked = reviews.publication_gap(
+        "The supported part applies [1].", "prior-unresolved-review", context, ledger
+    )
+    assert blocked is not None
+    assert reviews.view(context, ledger, {1})["pending_lead_ids"] == []
+    envelope = terminal_envelope(assessment=assessment)
+    arguments = cast(dict[str, JsonValue], envelope["arguments"])
+    arguments["answer"] = "The supported part applies [1].\n\n" + gap_text
+    selected = model()
+    selected.config = selected.config.model_copy(update={"model_provider": "vertex_ai"})
+    selected.invoke.return_value = content_response(json.dumps(envelope))
+    registry = terminal_registry([])
+    current = adaptive_tool_view(original_evidence=[full_record(ledger, 1)]).model_copy(
+        update={
+            "tools": registry.definitions(context),
+            "draft_to_repair": "The supported part applies [1].",
+            "publication_gap": {"summary": blocked.summary, **blocked.data},
+        }
+    )
+    adapter = ResearchModel(selected, context, lean_native_mode=True)
+    decision = adapter.decide(current)
+    assert decision.answer is None
+    assert decision.calls[0].arguments == arguments
+    assert selected.invoke.call_count == 1
+    assert selected.invoke.call_args.kwargs["tool_choice"] is ToolChoiceOptions.AUTO
+    assert "strict JSON" in last_payload(selected)["related_source_terminal_transport"]
+    assert registry.dispatch(decision.calls[0], context).status == OutcomeStatus.FOUND
+    assert (
+        reviews.publication_gap(
+            cast(str, arguments["answer"]), adapter.last_call_id or "", context, ledger
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize("host_gap", ["none", "unrelated", "wrong_lead", "wrong_gap"])
+def test_unresolved_terminal_transport_requires_its_actual_owned_host_gap(
+    host_gap: str,
+) -> None:
+    context, ledger, reviews = experimental_context()
+    seen(context, ledger, reviews)
+    deliver(ledger, "prior-unresolved-review", [1])
+    gap_text = "The precise interaction with the governing rule remains unresolved."
+    assessment = review(status="unresolved", witnesses=[], gap=gap_text)
+    reviews.apply([assessment], "prior-unresolved-review", context, ledger)
+    blocked = reviews.publication_gap(
+        "The supported part applies [1].", "prior-unresolved-review", context, ledger
+    )
+    assert blocked is not None
+    publication_gap = {"summary": blocked.summary, **blocked.data}
+    if host_gap == "none":
+        publication_gap = None
+    elif host_gap == "unrelated":
+        publication_gap = {"named_authority_gaps": []}
+    else:
+        publication_gap["undisclosed_related_source_gaps"] = [
+            {
+                "lead_id": "lead_" + "f" * 64
+                if host_gap == "wrong_lead"
+                else assessment["lead_id"],
+                "gap": "A different gap." if host_gap == "wrong_gap" else gap_text,
+            }
+        ]
+    envelope = terminal_envelope(assessment=assessment)
+    arguments = cast(dict[str, JsonValue], envelope["arguments"])
+    arguments["answer"] = "The supported part applies [1].\n\n" + gap_text
+    text = json.dumps(envelope)
+    selected = model()
+    selected.invoke.return_value = content_response(text)
+    registry = terminal_registry([])
+    current = adaptive_tool_view(original_evidence=[full_record(ledger, 1)]).model_copy(
+        update={
+            "tools": registry.definitions(context),
+            "publication_gap": publication_gap,
+        }
+    )
+    decision = ResearchModel(selected, context, lean_native_mode=True).decide(current)
+    assert decision.answer == text and decision.calls == []
+    assert "related_source_terminal_transport" not in last_payload(selected)
+    assert selected.invoke.call_count == 1
+
+
 def test_uncited_excluded_source_witness_survives_handoff_capacity_pressure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

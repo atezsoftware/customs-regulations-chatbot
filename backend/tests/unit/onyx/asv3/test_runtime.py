@@ -416,8 +416,13 @@ def test_experimental_runtime_keeps_selected_model_for_search_and_source_tools(
     vision_models: list[LLM] = []
 
     def create_broker(
-        _user: User, scope: IndexFilters, *, vision_llm: LLM
+        _user: User,
+        scope: IndexFilters,
+        *,
+        vision_llm: LLM,
+        allow_numbered_title_fallback: bool,
     ) -> CorpusBoundary:
+        assert allow_numbered_title_fallback is True
         vision_models.append(vision_llm)
         broker.scope = scope
         return broker
@@ -978,6 +983,220 @@ def test_named_law_uses_its_local_original_without_a_routine_review(
     assert llm.invoke.call_count == 5
     assert checkpoints[-1]["publication_stop_reason"] == "native_answer_published"
     assert checkpoints[-1]["evidence"]["included"] == [direct_number]
+
+
+def configure_governing_basis_sources(broker: CorpusBoundary) -> tuple[str, str]:
+    broker.barrier = threading.Barrier(1)
+    lower, governing = (str(source.id) for source in broker.sources)
+    for identity, kind, title, text in (
+        (lower, "tebliğ", "UYGULAMA TEBLİĞİ", "Başvuruda belge sunulur."),
+        (
+            governing,
+            "kanun",
+            "8917 SAYILI FAALİYET KANUNU",
+            "Faaliyet için izin alınır.",
+        ),
+    ):
+        chunk = broker.chunks[identity]
+        broker.chunks[identity] = replace(
+            chunk,
+            text=text,
+            heading_path=(title, "MADDE 27"),
+            metadata={
+                **chunk.metadata,
+                "document_type": kind,
+                "title": title,
+                "article_no": "27",
+            },
+        )
+    return lower, governing
+
+
+@pytest.mark.parametrize(
+    "research_profile,closure",
+    [("experimental", "original"), ("experimental", "gap"), ("normal", "deleted")],
+)
+def test_runtime_retains_rejected_governing_basis_only_for_experimental(
+    monkeypatch: pytest.MonkeyPatch, research_profile: str, closure: str
+) -> None:
+    kwargs, broker, llm, checkpoints, _queue = setup_run(monkeypatch)
+    kwargs.pop("test_language")
+    kwargs["research_profile"] = research_profile
+    lower, governing = configure_governing_basis_sources(broker)
+    page = MagicMock(wraps=broker.page)
+    monkeypatch.setattr(broker, "page", page)
+    named = "8917 sayılı Faaliyet Kanunu'nun 27. maddesi uyarınca izin gerekir [1]."
+    anonymous = "İzin gerekir [1]."
+    partial = (
+        "Başvuruda belge sunulur [1].\n\n"
+        "8917 sayılı Faaliyet Kanunu'nun 27. maddesinin özgün metni incelenemedi."
+    )
+    invocation = 0
+
+    def scripted(**arguments: Any) -> ModelResponse:
+        nonlocal invocation
+        invocation += 1
+        if invocation == 1:
+            return response(
+                calls=[("read_source_range", {"source_id": lower, "_language": "tr"})]
+            )
+        if invocation == 2:
+            assert [row["citation"] for row in delivered_originals(arguments)] == [1]
+            return response(
+                calls=[("submit_answer", {"answer": named, "basis": "originals"})]
+            )
+        footer = user_payload(arguments["prompt"][-1])
+        if invocation == 3:
+            assert footer["draft_to_repair"] == named
+            assert footer["publication_gap"]["named_authority_gaps"]
+            if research_profile == "experimental":
+                return response(anonymous)
+            return response(
+                calls=[("submit_answer", {"answer": anonymous, "basis": "originals"})]
+            )
+        assert research_profile == "experimental"
+        retained = footer["governing_source_requirements"][
+            "retained_authority_requirements"
+        ]
+        assert len(retained) == 1
+        assert retained[0]["instrument_number"] == "8917"
+        if 4 <= invocation <= 7:
+            assert footer["draft_to_repair"] == anonymous
+            assert footer["publication_gap"]["retained_authority_requirements"]
+            assert "named_authority_gaps" not in footer["publication_gap"]
+            if invocation < 7:
+                return response(anonymous)
+            if closure == "gap":
+                return response(calls=[("submit_partial_answer", {"answer": partial})])
+            return response(calls=[("read_source_range", {"source_id": governing})])
+        assert invocation == 8 and closure == "original"
+        original = next(
+            row for row in delivered_originals(arguments) if row["citation"] == 2
+        )
+        assert original["source_id"] == governing
+        assert original["text"] == broker.chunks[governing].text
+        return response(
+            calls=[
+                ("submit_answer", {"answer": "İzin gerekir [2].", "basis": "originals"})
+            ]
+        )
+
+    llm.invoke.side_effect = scripted
+    runtime.run_asv3_loop(**kwargs)
+    saved = checkpoints[-1]
+    submit_receipts = [
+        row for row in saved["receipts"] if row["call"]["name"] == "submit_answer"
+    ]
+    assert submit_receipts[0]["outcome"]["status"] == "partial"
+    assert saved["final_publication_gap"] is None
+    if research_profile == "normal":
+        assert invocation == 3 and page.call_count == 1
+        assert submit_receipts[1]["outcome"]["status"] == "found"
+        assert "authority_requirements" not in saved
+    else:
+        blocked = [
+            row
+            for row in saved["receipts"]
+            if row["call"]["name"] == "finalization_status"
+        ]
+        assert len(blocked) == 4
+        assert all(row["outcome"]["status"] == "partial" for row in blocked)
+        assert all(
+            row["outcome"]["data"]["retained_authority_requirements"] for row in blocked
+        )
+        assert len(saved["authority_requirements"]["records"]) == 1
+        assert invocation == (8 if closure == "original" else 7)
+        assert page.call_count == (2 if closure == "original" else 1)
+        if closure == "original":
+            assert any(
+                row["citation"] == 2 and row["complete"] is True
+                for row in saved["evidence"]["deliveries"][-1]["records"]
+            )
+    assert saved["publication_status"] == ("partial" if closure == "gap" else "found")
+    assert saved["evidence"]["included"] == ([2] if closure == "original" else [1])
+
+
+def test_experimental_resume_retains_rejected_basis_without_another_source_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kwargs, broker, llm, checkpoints, _queue = setup_run(monkeypatch)
+    kwargs.pop("test_language")
+    kwargs["research_profile"] = "experimental"
+    lower, _governing = configure_governing_basis_sources(broker)
+    page = MagicMock(wraps=broker.page)
+    monkeypatch.setattr(broker, "page", page)
+    named = "8917 sayılı Faaliyet Kanunu'nun 27. maddesi uyarınca izin gerekir [1]."
+    anonymous = "İzin gerekir [1]."
+    invocation = 0
+
+    def interrupted(**arguments: Any) -> ModelResponse:
+        nonlocal invocation
+        invocation += 1
+        if invocation == 1:
+            return response(
+                calls=[("read_source_range", {"source_id": lower, "_language": "tr"})]
+            )
+        if invocation == 2:
+            return response(
+                calls=[("submit_answer", {"answer": named, "basis": "originals"})]
+            )
+        assert invocation == 3
+        footer = user_payload(arguments["prompt"][-1])
+        assert footer["publication_gap"]["retained_authority_requirements"]
+        broker.cancelled.set()
+        raise RunStopped("cancelled")
+
+    llm.invoke.side_effect = interrupted
+    with pytest.raises(RunStopped):
+        runtime.run_asv3_loop(**kwargs)
+    previous = copy.deepcopy(checkpoints[-1])
+    assert len(previous["authority_requirements"]["records"]) == 1
+    broker.cancelled.clear()
+    monkeypatch.setattr(runtime, "load_asv3_checkpoint", lambda **_args: previous)
+    kwargs["resume_message_id"] = 2
+    kwargs["research_profile"] = "normal"
+    llm.reset_mock()
+    invocation = 0
+
+    def resumed(**arguments: Any) -> ModelResponse:
+        nonlocal invocation
+        invocation += 1
+        footer = user_payload(arguments["prompt"][-1])
+        assert (
+            len(
+                footer["governing_source_requirements"][
+                    "retained_authority_requirements"
+                ]
+            )
+            == 1
+        )
+        assert any(row["citation"] == 1 for row in delivered_originals(arguments))
+        if invocation == 1:
+            return response(
+                calls=[("submit_answer", {"answer": anonymous, "basis": "originals"})]
+            )
+        assert invocation == 2
+        assert footer["draft_to_repair"] == anonymous
+        assert footer["publication_gap"]["retained_authority_requirements"]
+        return response(
+            calls=[
+                (
+                    "submit_partial_answer",
+                    {
+                        "answer": "Başvuruda belge sunulur [1].\n\n8917 sayılı Faaliyet Kanunu'nun 27. maddesinin özgün metni incelenemedi."
+                    },
+                )
+            ]
+        )
+
+    llm.invoke.side_effect = resumed
+    runtime.run_asv3_loop(**kwargs)
+    saved = checkpoints[-1]
+    assert invocation == 2 and page.call_count == 1
+    assert saved["research_profile"] == "experimental"
+    assert saved["authority_requirements"] == previous["authority_requirements"]
+    assert saved["publication_status"] == "partial"
+    assert saved["final_publication_gap"] is None
 
 
 @pytest.mark.parametrize("rejected_citation", ["parentheses", "unknown"])

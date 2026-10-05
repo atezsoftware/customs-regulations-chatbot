@@ -33,7 +33,7 @@ def test_independent_prompts_reuse_the_complete_baseline_map_once(prompt: str) -
     assert prompt.count(RESEARCH_INSTRUCTIONS) == 1
     assert COORDINATOR_REFERENCE_PROMPT not in prompt
     assert RESEARCHER_REFERENCE_PROMPT not in prompt
-    assert EXPERIMENTAL_PROMPT_VERSION == "asv3-experimental-2026-10-06.4"
+    assert EXPERIMENTAL_PROMPT_VERSION == "asv3-experimental-2026-10-06.5"
 
 
 @pytest.mark.parametrize(
@@ -56,27 +56,32 @@ def test_source_map_changes_fail_loudly_instead_of_silently_omitting_rows(
 
 def test_related_source_review_requires_read_effect_and_scope_witnesses() -> None:
     for requirement in (
-        "source text was delivered, not that the holding was examined",
-        "operative disposition from reasons, referring-court objections and party arguments",
-        "annulling a phrase does not itself repeal the whole provision",
-        "status=examined needs the read operative effect",
-        "status=not_material needs its own original-bound scope grounds",
-        "argument_only or unknown",
-        "status=unresolved with the precise gap",
-        "supplied start_char/end_char, never invented offsets",
-        "Mere source availability cannot close a review",
-        "does not require a separate reviewer or planning call",
+        "final disposition from its reasoning, the referring court's request",
+        "party submissions and appended materials",
+        "compare every material changed or preserved part",
+        "known source_id and supplied continuation cursor or focused local lookup",
+        "has_more means more text exists, not that every remaining passage is required",
+        "valid witness ranges prove delivery, not legal entailment",
+        "status=examined requires original witnesses establishing the effect AND its material limits",
+        "status=not_material needs original-bound factual/scope exclusion",
+        "argument_only or unknown cannot prove a holding",
+        "status=unresolved with its precise gap",
+        "actual delivered citation numbers and supplied start_char/end_char",
+        "No separate review,\nplanning call or model stage is required",
     ):
         assert requirement in RESEARCH_INSTRUCTIONS
 
 
 def test_arguments_and_scenario_branches_are_source_bound_not_categorical() -> None:
     for requirement in (
-        "strongest source-supported favorable ground AND its",
-        "material counterargument",
-        "ordinary administrative application, an arguable legal",
-        "challenge and an established exception",
-        "decisive facts/evidence and practical next step",
+        "underlying obligation, the legal basis",
+        "surviving obligation does not prove a surviving sanction",
+        "administrative instruction does not establish legal authority",
+        "strongest material original-supported favorable ground and its counterargument",
+        "ordinary administrative practice, an arguable challenge and an established exception",
+        "neither categorical liability nor categorical relief follows",
+        "Use already delivered conditions and favorable clauses",
+        "Give each supported branch beside its outcome and name the",
         "conditional branch beside its outcome and name the fact changing it",
         "same conditions, controversy and uncertainty in quick answers",
         "Complete material exception/objection analysis now",

@@ -416,16 +416,22 @@ def test_terminal_strips_valid_review_metadata_but_retains_assessment() -> None:
 
 
 @pytest.mark.parametrize("profile", ["normal", "deep", "experimental"])
+@pytest.mark.parametrize("dependency", ["related_review", "governing_original"])
 def test_repeated_pending_review_does_not_create_experimental_research_cutoff(
     profile: str,
+    dependency: str,
 ) -> None:
     gap = ToolOutcome(
         status=OutcomeStatus.PARTIAL,
         summary="Read the actual source effect",
-        data={
-            "pending_related_source_review": True,
-            "unread_related_sources": [{"source_id": "decision"}],
-        },
+        data=(
+            {
+                "pending_related_source_review": True,
+                "unread_related_sources": [{"source_id": "decision"}],
+            }
+            if dependency == "related_review"
+            else {"retained_authority_requirements": [{"requirement_id": "original"}]}
+        ),
     )
     count = 0
 

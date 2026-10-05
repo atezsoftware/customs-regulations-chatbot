@@ -172,6 +172,7 @@ class CorpusBroker:
         | None = None,
         file_store: FileStore | None = None,
         vision_llm: LLM | None = None,
+        allow_numbered_title_fallback: bool = False,
     ) -> None:
         self.user = user
         self.filters = filters.model_copy(deep=True)
@@ -179,6 +180,7 @@ class CorpusBroker:
         self.search_adapter = search_adapter
         self.file_store = file_store
         self.vision_llm = vision_llm
+        self.allow_numbered_title_fallback = allow_numbered_title_fallback
         self._index_lock = RLock()
         self._related_sources_lock = RLock()
         self._related_sources: dict[
@@ -204,6 +206,7 @@ class CorpusBroker:
                 query=query,
                 offset=offset,
                 limit=limit,
+                allow_numbered_title_fallback=self.allow_numbered_title_fallback,
             )
 
     def related_catalog_sources(

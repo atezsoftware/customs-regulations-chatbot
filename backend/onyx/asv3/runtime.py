@@ -15,6 +15,7 @@ from uuid import UUID
 from pydantic import JsonValue
 
 from onyx.asv3.authority import native_named_authority_gap
+from onyx.asv3.authority_requirements import AuthorityRequirements
 from onyx.asv3.citation_numbers import extract_citation_numbers
 from onyx.asv3.corpus_tools import CorpusBroker, build_corpus_specs
 from onyx.asv3.evidence import EvidenceLedger
@@ -294,8 +295,37 @@ def run_asv3_loop(
     )
     if source_reviews is not None:
         context.services["legal_source_reviews"] = source_reviews
+    authority_requirements = (
+        AuthorityRequirements(context, question)
+        if research_profile == "experimental"
+        else None
+    )
+    if authority_requirements is not None:
+        context.services["authority_requirements"] = authority_requirements
+
+    def named_authority_gap(
+        answer: str,
+        model_call_id: str | None,
+        run_context: RunContext | None = None,
+    ) -> dict[str, JsonValue] | None:
+        gap = native_named_authority_gap(
+            answer,
+            ledger,
+            strict_reference_boundaries=research_profile == "experimental",
+        )
+        if authority_requirements is not None:
+            return authority_requirements.publication_gap(
+                answer, model_call_id, run_context or context, ledger, native_gap=gap
+            )
+        return gap
+
     registry = CapabilityRegistry()
-    broker = CorpusBroker(user, scope, vision_llm=research_llm or llm)
+    broker = CorpusBroker(
+        user,
+        scope,
+        vision_llm=research_llm or llm,
+        allow_numbered_title_fallback=research_profile == "experimental",
+    )
     context.services["legal_source_navigation_acquire"] = (
         broker.related_sources_for_evidence
     )
@@ -493,6 +523,8 @@ def run_asv3_loop(
             )
             if source_reviews is not None:
                 snapshot["legal_source_reviews"] = source_reviews.export()
+            if authority_requirements is not None:
+                snapshot["authority_requirements"] = authority_requirements.export()
             save_asv3_checkpoint(
                 message_id=assistant_message_id, user_id=user.id, snapshot=snapshot
             )
@@ -640,7 +672,9 @@ def run_asv3_loop(
                 if extract_citation_numbers(candidate)
                 else None
             )
-            authority_gap = native_named_authority_gap(candidate, ledger)
+            authority_gap = named_authority_gap(
+                candidate, researcher_model.last_call_id, child
+            )
             if gap is None and authority_gap is not None:
                 gap = ToolOutcome(
                     status=OutcomeStatus.PARTIAL,
@@ -853,7 +887,7 @@ def run_asv3_loop(
                 summary="A legal answer needs recorded original citations. Retrieve the operative source or disclose the precise gap using submit_partial_answer.",
                 data={"missing": "original legal evidence"},
             )
-        authority_gap = native_named_authority_gap(answer, ledger)
+        authority_gap = named_authority_gap(answer, model_call_id, run_context)
         if authority_gap is not None:
             return ToolOutcome(
                 status=OutcomeStatus.PARTIAL,
@@ -885,7 +919,7 @@ def run_asv3_loop(
                 for item in question_research.answers
             )
         ):
-            authority_gap = native_named_authority_gap(answer, ledger)
+            authority_gap = named_authority_gap(answer, model.last_call_id)
             if authority_gap is not None:
                 return ToolOutcome(
                     status=OutcomeStatus.PARTIAL,
@@ -980,13 +1014,16 @@ def run_asv3_loop(
             ),
         )
         if gap is None:
-            authority_gap = native_named_authority_gap(candidate, ledger)
+            authority_gap = named_authority_gap(candidate, model.last_call_id)
             if authority_gap is not None:
                 gap = ToolOutcome(
                     status=OutcomeStatus.PARTIAL,
                     summary="A precise missing-original notice cannot assert an unsupported statutory result.",
                     data=authority_gap,
                 )
+        if research_profile == "experimental" and harness is not None:
+            harness.last_draft = candidate
+            harness.publication_gap = gap
         if gap is not None:
             return gap
         partial = candidate
@@ -1073,6 +1110,11 @@ def run_asv3_loop(
             saved_reviews = previous.get("legal_source_reviews")
             if source_reviews is not None and isinstance(saved_reviews, dict):
                 source_reviews.restore(saved_reviews, context, question, ledger)
+            saved_requirements = previous.get("authority_requirements")
+            if authority_requirements is not None and isinstance(
+                saved_requirements, dict
+            ):
+                authority_requirements.restore(saved_requirements, context, question)
             question_research.restore(previous.get("question_research"))
             worker_state = previous.get("workers")
             if isinstance(worker_state, dict):

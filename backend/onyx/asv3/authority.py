@@ -25,10 +25,17 @@ def folded(text: str) -> str:
     ).replace("ı", "i")
 
 
+_ENGLISH_STATUTE = r"\b(?:law|act|statute)\s+(?:no\.?\s*)?(?P<english_number>\d{2,7})\b"
 _STATUTE = re.compile(
     r"(?<!\d)(?P<number>\d{2,7})\s+sayili\s+"
     r"[^\n.;:]{0,100}?\bkanun[a-z]*\b"
-    r"|\b(?:law|act|statute)\s+(?:no\.?\s*)?(?P<english_number>\d{2,7})\b"
+    r"|" + _ENGLISH_STATUTE
+)
+_STRICT_STATUTE = re.compile(
+    r"(?<![\d/])(?P<number>\d{2,7})\s+sayili\s+"
+    # A decision number cannot consume a subsequent numbered statute identity.
+    r"(?:(?!\b\d{2,7}\s+sayili\b)[^\n.;:]){0,100}?\bkanun[a-z]*\b"
+    r"|" + _ENGLISH_STATUTE
 )
 _COMPACT_ARTICLE = re.compile(
     r"\(?\b(?P<article>\d{1,4})\s*/\s*(?P<paragraph>\d+)"
@@ -72,7 +79,9 @@ class StatuteReference:
     clause_shorthand: bool = False
 
 
-def statute_references(text: str) -> tuple[StatuteReference, ...]:
+def statute_references(
+    text: str, *, strict_reference_boundaries: bool = False
+) -> tuple[StatuteReference, ...]:
     # Keep Turkish clause letters distinct while normalizing instrument wording.
     original = text.replace("**", "").replace("__", "")
     parts: list[str] = []
@@ -89,7 +98,8 @@ def statute_references(text: str) -> tuple[StatuteReference, ...]:
     found: dict[
         tuple[str, str | None, str | None, str | None, str | None], StatuteReference
     ] = {}
-    for match in _STATUTE.finditer(identity_text):
+    pattern = _STRICT_STATUTE if strict_reference_boundaries else _STATUTE
+    for match in pattern.finditer(identity_text):
         tail = _reference_tail(normalized[match.end() : match.end() + 180])
         candidates: list[tuple[int, str, str | None, str | None, str | None]] = [
             (offset, reference.article_no, None, None, reference.qualifier)
@@ -350,9 +360,17 @@ def _native_original_rows(ledger: EvidenceLedger) -> list[dict[str, JsonValue]]:
 
 
 def _named_native_references(
-    text: str, aliases: dict[str, set[str]]
+    text: str,
+    aliases: dict[str, set[str]],
+    *,
+    strict_reference_boundaries: bool = False,
 ) -> list[tuple[StatuteReference, str | None]]:
-    references = [(ref, _reference_name(ref)) for ref in statute_references(text)]
+    references = [
+        (ref, _reference_name(ref))
+        for ref in statute_references(
+            text, strict_reference_boundaries=strict_reference_boundaries
+        )
+    ]
     normalized = folded(text.replace("**", "").replace("__", ""))
     for name, numbers in aliases.items():
         if len(numbers) > 1:
@@ -425,7 +443,10 @@ def _precise_original_gap(text: str, aliases: dict[str, set[str]]) -> bool:
 
 
 def native_named_authority_gap(
-    answer: str, ledger: EvidenceLedger
+    answer: str,
+    ledger: EvidenceLedger,
+    *,
+    strict_reference_boundaries: bool = False,
 ) -> dict[str, JsonValue] | None:
     """Check local named-statute identity, not legal entailment or unnamed omissions."""
     rows = _native_original_rows(ledger)
@@ -445,7 +466,9 @@ def native_named_authority_gap(
         item = ledger.get(number)
         if item is None:
             continue
-        for reference in statute_references(item.text):
+        for reference in statute_references(
+            item.text, strict_reference_boundaries=strict_reference_boundaries
+        ):
             if name := _reference_name(reference):
                 aliases.setdefault(name, set()).add(reference.number)
     missing: list[dict[str, JsonValue]] = []
@@ -456,7 +479,9 @@ def native_named_authority_gap(
         if not cited and _precise_original_gap(unit["text"], aliases):
             continue
         attributed = _without_verified_quotes(unit["text"], cited, ledger)
-        for reference, name in _named_native_references(attributed, aliases):
+        for reference, name in _named_native_references(
+            attributed, aliases, strict_reference_boundaries=strict_reference_boundaries
+        ):
             matching: list[int] = []
             for row in rows:
                 numbers, names = row["instrument_numbers"], row["formal_names"]

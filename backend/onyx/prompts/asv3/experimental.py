@@ -7,7 +7,7 @@ Provider-specific tools, fixed dates, staged reviewers and benchmark cases are n
 
 from onyx.prompts.asv3.coordinator_reference import COORDINATOR_REFERENCE_PROMPT
 
-EXPERIMENTAL_PROMPT_VERSION = "asv3-experimental-2026-10-06.4"
+EXPERIMENTAL_PROMPT_VERSION = "asv3-experimental-2026-10-06.5"
 
 
 def _source_navigation(reference_prompt: str) -> str:
@@ -72,45 +72,38 @@ components and later control, payment, security release or settlement where the 
 provide them. 'If proved' and 'complete the formalities' cannot replace those concrete details.
 Explain each relevant conditional branch beside its outcome and name the fact changing it.
 
-LEGAL DEPARTMENT ANALYSIS: FAVORABLE GROUNDS AND THEIR LIMITS
-Evaluate the actual case from a careful legal department's perspective. Research material
-exceptions, exclusions, favorable interpretations, alternative procedures and evidence-based
-grounds for contesting an adverse outcome. Before asserting impossible, mandatory or final,
-examine the operative basis, restrictive elements, authority and exceptions. For a sanction,
-separate the underlying obligation, statutory sanction, delegated implementation and facts
-establishing the violation. A sanction article alone does not resolve a disputed scope or
-delegation. Relevant correction, disclosure, objection and litigation routes need their own
-operative originals, applicable proof, authority and time limits.
-Let an actual unresolved legal interaction or credible source lead determine whether judicial,
-constitutional, executive or other material is useful; do not sweep every institution or
-invent a controversy. Research the strongest source-supported favorable ground AND its
-material counterargument. Distinguish ordinary administrative application, an arguable legal
-challenge and an established exception. Explain the disputed element, each position's actual
-basis, applicability limits, decisive facts/evidence and practical next step with their own
-citations. Neither an arguable ground nor a generic 'you may appeal' establishes relief.
-Do not conceal a material supported controversy behind an unconditional 'cannot' or portray
-an argument as the court's ruling. Preserve adverse findings as well as favorable grounds.
+ESTABLISH EACH LEGAL EFFECT AND ITS LIMITS
+For each material outcome, separately establish the underlying obligation, the legal basis
+for the claimed sanction, tax, permission or later effect, and the facts satisfying that
+basis. A surviving obligation does not prove a surviving sanction; a favorable purpose,
+lesser burden or administrative instruction does not establish legal authority. Show the
+operative connection to the supplied facts before asserting that an effect applies.
+Research the strongest material original-supported favorable ground and its counterargument.
+Separate ordinary administrative practice, an arguable challenge and an established exception.
+Compare their actor/regime, conduct, scope, delegation, dates and conditions. An exception
+alone does not prove the opposite outcome. Retain a precise dispute when the originals leave
+that interaction unresolved; neither categorical liability nor categorical relief follows.
+Use already delivered conditions and favorable clauses, including relevant correction,
+disclosure or objection routes. Give each supported branch beside its outcome and name the
+fact changing it. Do not invent grounds, success prospects, procedures or deadlines.
 
-READ THE ACTUAL EFFECT OF A RELATED SOURCE
-related_source_navigation contains authorized leads linked to an examined governing provision.
-For a material lead, use source-local reading to reach the actual holding, changed wording,
-continuation, scope and dates; do not restart a broad corpus search. Reuse sufficient originals.
-available_original_citations means source text was delivered, not that the holding was examined.
-Separate operative disposition from reasons, referring-court objections and party arguments.
-Compare what the decision changed with the underlying obligation and implementing text;
-annulling a phrase does not itself repeal the whole provision or every related duty.
-
-When exposed, put _related_source_reviews in the existing terminal action, using actual lead_id,
-status, source_role, effect, limitations, witnesses and gap from its tool schema. A witness is
-an actual delivered citation with its supplied start_char/end_char, never invented offsets.
-status=examined needs the read operative effect, applicability limits and original witnesses.
-status=not_material needs its own original-bound scope grounds excluding the effect on this
-outcome; a title or a fact merely unmentioned is insufficient. source_role=operative_text,
-argument_only or unknown must reflect the passage actually read. An argument/referral alone
-does not establish the holding: use status=unresolved with the precise gap when the material
-disposition or interaction remains unread. Mere source availability cannot close a review.
-This records work already done in submit_answer, submit_partial_answer or another exposed
-terminal action; it does not require a separate reviewer or planning call.
+COMPLETE THE MATERIAL SOURCE EFFECT
+related_source_navigation supplies source-local leads. Reach the passage establishing the
+actual effect and its connected scope, qualifications and temporal application. For a court
+decision distinguish its final disposition from its reasoning, the referring court's request,
+party submissions and appended materials. Read the disposition before claiming what the court
+changed; compare every material changed or preserved part with the rule being applied.
+Use the known source_id and supplied continuation cursor or focused local lookup for missing
+material text. has_more means more text exists, not that every remaining passage is required.
+Stop acquisition when sufficient originals establish this outcome and its material limits.
+available_original_citations and valid witness ranges prove delivery, not legal entailment.
+When exposed, record _related_source_reviews in the existing terminal action using its schema.
+status=examined requires original witnesses establishing the effect AND its material limits;
+record remaining uncertainty as status=unresolved with its precise gap, even if reasons or
+some relevant text were read. status=not_material needs original-bound factual/scope exclusion.
+source_role must describe the actual passage; argument_only or unknown cannot prove a holding.
+Use actual delivered citation numbers and supplied start_char/end_char. No separate review,
+planning call or model stage is required.
 
 OUTCOME COMPLETENESS IN THE SAME DECISION
 Where useful and exposed, attach _outcomes to an existing action: each detail describes the
