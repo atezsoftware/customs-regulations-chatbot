@@ -1070,7 +1070,10 @@ def guarded(
 
 
 def build_corpus_specs(
-    broker: CorpusBroker, *, require_search_targets: bool = False
+    broker: CorpusBroker,
+    *,
+    require_search_targets: bool = False,
+    source_identity_guidance: bool = False,
 ) -> list[ToolSpec]:
     def resolve(args: dict[str, JsonValue], context: RunContext) -> ToolOutcome:
         sources, more = broker.sources(
@@ -1086,19 +1089,36 @@ def build_corpus_specs(
             if sources
             else OutcomeStatus.NOT_FOUND
         )
+        data: dict[str, JsonValue] = {
+            "sources": [
+                {"source_id": str(source.id), "name": source.name} for source in sources
+            ],
+            "has_more": more,
+            "next_offset": int(cast(int, args.get("offset", 0)))
+            + int(cast(int, args.get("limit", 20))),
+            "absence_proven": False,
+        }
+        if (
+            source_identity_guidance
+            and context.services.get("research_profile") == "experimental"
+            and context.services.get("experimental_parallel") is True
+            and status is OutcomeStatus.NOT_FOUND
+            and not more
+        ):
+            data["lookup_diagnostic"] = {
+                "code": "source_identity_no_match",
+                "query_preserved": True,
+                "instruction": (
+                    "No source identity candidate matched these title/name terms; this does "
+                    "not establish absence of source text or a legal effect. Reuse a supplied "
+                    "source_id, resolve one source's own title/name, or choose content search. "
+                    "Preserve the scenario date/scope and verify validity in originals."
+                ),
+            }
         return ToolOutcome(
             status=OutcomeStatus.PARTIAL if more else status,
             summary="Authorized source candidates; choose an exact source_id before reading.",
-            data={
-                "sources": [
-                    {"source_id": str(source.id), "name": source.name}
-                    for source in sources
-                ],
-                "has_more": more,
-                "next_offset": int(cast(int, args.get("offset", 0)))
-                + int(cast(int, args.get("limit", 20))),
-                "absence_proven": False,
-            },
+            data=data,
         )
 
     def read_range(args: dict[str, JsonValue], context: RunContext) -> ToolOutcome:
@@ -1547,10 +1567,28 @@ def build_corpus_specs(
     return [
         ToolSpec(
             name="resolve_source",
-            description="Resolve authorized canonical source titles; multiple candidates stay ambiguous.",
+            description=(
+                "Resolve one authorized source by its own title/name or identifying number; "
+                "this does not search provision text or establish current validity. Reuse a "
+                "supplied source_id. Multiple candidates stay ambiguous; use read_provision "
+                "or content search for provisions and legal effects."
+                if source_identity_guidance
+                else "Resolve authorized canonical source titles; multiple candidates stay ambiguous."
+            ),
             parameters=schema(
                 {
-                    "query": {"type": "string"},
+                    "query": (
+                        {
+                            "type": "string",
+                            "description": (
+                                "Terms identifying one source's own title/name and number when "
+                                "known. Provision/content and version-validity questions belong "
+                                "to their research tools; retain scenario date/scope."
+                            ),
+                        }
+                        if source_identity_guidance
+                        else {"type": "string"}
+                    ),
                     "offset": {"type": "integer", "minimum": 0},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 100},
                 },
@@ -1625,12 +1663,29 @@ def build_corpus_specs(
         ),
         ToolSpec(
             name="query_corpus",
-            description="Read scoped inventory or source headings; never arbitrary SQL.",
+            description=(
+                "Read scoped source names or headings; never arbitrary SQL. inventory.query "
+                "uses resolve_source's same source-name lookup, not semantic content search. "
+                "Omit query for scoped inventory; headings uses source_id. Results are navigation."
+                if source_identity_guidance
+                else "Read scoped inventory or source headings; never arbitrary SQL."
+            ),
             parameters=schema(
                 {
                     "operation": {"type": "string", "enum": ["inventory", "headings"]},
                     "start": {"type": "integer", "minimum": 0},
-                    "query": {"type": "string"},
+                    "query": (
+                        {
+                            "type": "string",
+                            "description": (
+                                "Optional source-title/name terms for inventory, using the same "
+                                "identity matching as resolve_source. An omitted or empty query "
+                                "pages scoped source names. Use content search for operative text."
+                            ),
+                        }
+                        if source_identity_guidance
+                        else {"type": "string"}
+                    ),
                     "source_id": SOURCE_FIELD,
                     "offset": {"type": "integer", "minimum": 0},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 100},

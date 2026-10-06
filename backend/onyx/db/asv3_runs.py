@@ -11,6 +11,10 @@ from pydantic import JsonValue
 from sqlalchemy import String, cast, literal, select
 from sqlalchemy.orm import Session
 
+from onyx.asv3.parallel_checkpoint import (
+    compact_parallel_checkpoint,
+    restore_parallel_checkpoint,
+)
 from onyx.configs.constants import MessageType
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.db.models import ChatMessage, ChatSession, ToolCall
@@ -23,7 +27,11 @@ MAX_DECODED_CHECKPOINT_BYTES = 8_000_000
 
 def encode_asv3_checkpoint(snapshot: dict[str, JsonValue]) -> str:
     raw = json.dumps(
-        {**snapshot, "version": ASV3_CHECKPOINT_VERSION}, ensure_ascii=False
+        compact_parallel_checkpoint(
+            {**snapshot, "version": ASV3_CHECKPOINT_VERSION},
+            max_unit_bytes=MAX_DECODED_CHECKPOINT_BYTES,
+        ),
+        ensure_ascii=False,
     ).encode()
     if len(raw) > MAX_DECODED_CHECKPOINT_BYTES:
         raise ValueError("ASv3 checkpoint exceeds its decoded payload budget")
@@ -60,7 +68,9 @@ def decode_asv3_checkpoint(payload: str) -> dict[str, JsonValue]:
         data = json.loads(raw)
     if not isinstance(data, dict) or data.get("version") != ASV3_CHECKPOINT_VERSION:
         raise ValueError("Unsupported ASv3 checkpoint version")
-    return data
+    return restore_parallel_checkpoint(
+        data, max_unit_bytes=MAX_DECODED_CHECKPOINT_BYTES
+    )
 
 
 def _require_owned_message(

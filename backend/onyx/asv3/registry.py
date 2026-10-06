@@ -19,6 +19,7 @@ from onyx.asv3.models import (
 )
 from onyx.asv3.outcome_map import OutcomeMap, OutcomeUpdate
 from onyx.asv3.research_state import ResearchState
+from onyx.asv3.scenario import question_determinations
 from onyx.asv3.shared_reads import SharedReads
 
 if TYPE_CHECKING:
@@ -74,6 +75,37 @@ def _outcome_metadata_properties() -> dict[str, JsonValue]:
     }
 
 
+def parallel_child_research_bindings(
+    context: RunContext,
+) -> dict[str, JsonValue] | None:
+    state = context.services.get("research_state")
+    if not (
+        context.services.get("lean_native_mode")
+        and context.services.get("research_profile") == "experimental"
+        and context.services.get("experimental_parallel") is True
+        and context.services.get("independent_question") is True
+        and context.depth > 0
+        and isinstance(state, ResearchState)
+    ):
+        return None
+    return {
+        "namespace": "local_update_research",
+        "question_ids": [f"q{index}" for index in range(len(state.questions))],
+        "determinations": [
+            {
+                "determination_id": item["determination_id"],
+                "question_id": item["question_id"],
+                "question": item["question"],
+            }
+            for item in question_determinations(list(state.questions))
+        ],
+        "notice": (
+            "Use these local IDs for update_research.needs. OutcomeMap.question_ids "
+            "belong to the immutable parent questions, not these local bindings."
+        ),
+    }
+
+
 class CapabilityRegistry:
     def __init__(self, specs: Iterable[ToolSpec] = ()) -> None:
         self._specs: dict[str, ToolSpec] = {}
@@ -103,6 +135,7 @@ class CapabilityRegistry:
             and not unbound_parallel_child
             else None
         )
+        research_bindings = parallel_child_research_bindings(context)
         for spec in self._specs.values():
             if context.corpus_only and spec.external:
                 continue
@@ -123,6 +156,31 @@ class CapabilityRegistry:
                 )
             parameters = function["parameters"]
             assert isinstance(parameters, dict)
+            if spec.name == "update_research" and research_bindings is not None:
+                schema_definitions = parameters["$defs"]
+                assert isinstance(schema_definitions, dict)
+                need = schema_definitions["ResearchNeed"]
+                assert isinstance(need, dict)
+                need_properties = need["properties"]
+                assert isinstance(need_properties, dict)
+                determinations = research_bindings["determinations"]
+                assert isinstance(determinations, list)
+                for field, identifiers in (
+                    ("question_ids", research_bindings["question_ids"]),
+                    (
+                        "determination_ids",
+                        [
+                            item["determination_id"]
+                            for item in determinations
+                            if isinstance(item, dict)
+                        ],
+                    ),
+                ):
+                    binding = need_properties[field]
+                    assert isinstance(binding, dict)
+                    items = binding["items"]
+                    assert isinstance(items, dict)
+                    items["enum"] = identifiers
             properties = parameters.setdefault("properties", {})
             assert isinstance(properties, dict)
             if context.services.get("lean_native_mode"):

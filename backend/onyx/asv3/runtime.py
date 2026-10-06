@@ -904,7 +904,12 @@ def run_asv3_loop(
     )
     external_names = {spec.name for spec in external_specs}
     common_specs = (
-        build_corpus_specs(broker, require_search_targets=True)
+        build_corpus_specs(
+            broker,
+            require_search_targets=True,
+            source_identity_guidance=research_profile == "experimental"
+            and parallel_research,
+        )
         + build_source_specs(broker)
         + build_sandbox_specs(broker)
         + external_specs

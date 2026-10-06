@@ -2235,6 +2235,11 @@ class ResearchModel:
             "language": self.context.language,
             "request": view.request,
         }
+        from onyx.asv3.registry import parallel_child_research_bindings
+
+        research_bindings = parallel_child_research_bindings(self.context)
+        if research_bindings is not None:
+            context["research_bindings"] = research_bindings
         if candidate_coverage:
             context["candidate_outcome_coverage"] = candidate_coverage
         session_research = self.context.services.get("session_research")
