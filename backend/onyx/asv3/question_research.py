@@ -339,23 +339,24 @@ class QuestionResearch:
                 status=OutcomeStatus.FOUND,
                 summary="Existing independent answers retained; do not duplicate research.",
             )
-        if not self.assignments:
-            try:
-                questions = self._validated_questions(arguments.get("questions"))
-            except ValueError as error:
-                return ToolOutcome(
-                    status=OutcomeStatus.INVALID,
-                    summary="Independent assignments were rejected; no researcher was started.",
-                    data={
-                        "validation_error": str(error),
-                        "instruction": "Correct the assignment coverage and bindings, preserving the original questions and scenario. outcome_ids are optional: use only recorded outcomes belonging to those original questions, or declare them with _outcomes on this same useful action. Omit outcome_ids when not using an outcome map; do not invent IDs or repeat completed research.",
-                    },
-                )
-            with self._lock:
+        with self._lock:
+            if not self.assignments:
+                try:
+                    questions = self._validated_questions(arguments.get("questions"))
+                except ValueError as error:
+                    return ToolOutcome(
+                        status=OutcomeStatus.INVALID,
+                        summary="Independent assignments were rejected; no researcher was started.",
+                        data={
+                            "validation_error": str(error),
+                            "instruction": "Correct the assignment coverage and bindings, preserving the original questions and scenario. outcome_ids are optional: use only recorded outcomes belonging to those original questions, or declare them with _outcomes on this same useful action. Omit outcome_ids when not using an outcome map; do not invent IDs or repeat completed research.",
+                        },
+                    )
+                if self.host_assembly:
+                    self.workers.prepare_independent_batch(len(questions))
                 self.assignments = [{**item, "task_id": None} for item in questions]
-            for item in self.assignments:
-                # A worker's checkpoint cannot observe its task without its question binding.
-                with self._lock:
+                for item in self.assignments:
+                    # Checkpoints must observe both the task and its question binding.
                     binding: _AssignmentBinding = (
                         {"assignment_id": str(item["question_id"])}
                         if self.host_assembly

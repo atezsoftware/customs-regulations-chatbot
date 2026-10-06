@@ -47,6 +47,7 @@ class Harness:
         on_receipt: Callable[[ToolReceipt], None] | None = None,
         checkpoint: CheckpointWriter | None = None,
         max_workers: int = 4,
+        adaptive_tool_parallelism: bool = False,
         max_context_chars: int = 60000,
         finalize_guard: Callable[[], ToolOutcome | None] | None = None,
         draft_guard: Callable[[str], ToolOutcome | None] | None = None,
@@ -63,6 +64,7 @@ class Harness:
         self.on_receipt = on_receipt
         self.checkpoint = checkpoint
         self.max_workers = max_workers
+        self.adaptive_tool_parallelism = adaptive_tool_parallelism
         self.max_context_chars = max_context_chars
         self.finalize_guard = finalize_guard
         self.draft_guard = draft_guard
@@ -374,9 +376,13 @@ class Harness:
         ):
             self.turns.pop(0)
 
-    @staticmethod
-    def _tool_progress_phase(call: CapabilityCall) -> str | None:
+    def _tool_progress_phase(self, call: CapabilityCall) -> str | None:
         if call.argument_error is not None:
+            return None
+        if (
+            call.name == "research_questions"
+            and self.context.services.get("experimental_parallel") is True
+        ):
             return None
         if call.name in {
             "record_scenario",
@@ -706,7 +712,10 @@ class Harness:
             by_id = {receipt.call.call_id: receipt for receipt in receipts}
             return [by_id[call.call_id] for call in calls]
         executor = ThreadPoolExecutor(
-            max_workers=self.max_workers, thread_name_prefix="asv3-tool"
+            max_workers=max(1, len(calls))
+            if self.adaptive_tool_parallelism
+            else self.max_workers,
+            thread_name_prefix="asv3-tool",
         )
         futures: list[tuple[CapabilityCall, RunContext, Future[ToolReceipt]]] = []
         ready: dict[str, ToolReceipt] = {}

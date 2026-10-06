@@ -145,6 +145,7 @@ class CapabilityRegistry:
                         "resolve_source",
                         "read_provision",
                         "update_research",
+                        "research_questions",
                         "submit_answer",
                         "submit_partial_answer",
                         "assemble_answers",

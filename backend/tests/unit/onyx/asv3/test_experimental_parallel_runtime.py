@@ -10,6 +10,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from onyx.asv3 import runtime
+from onyx.asv3.harness import Harness
 from onyx.asv3.models import RunContext
 from onyx.chat.models import ChatMessageSimple
 from onyx.configs.constants import MessageType
@@ -22,6 +23,7 @@ from tests.unit.onyx.asv3.test_runtime import (
     delivered_originals,
     packets,
     response,
+    run_independent,
     setup_run,
     user_payload,
 )
@@ -150,7 +152,7 @@ def script_two_children(
 
     physical_read = MagicMock(side_effect=page)
     monkeypatch.setattr(broker, "page", physical_read)
-    arrivals = threading.Barrier(2)
+    arrivals = threading.Barrier(len(TASKS))
     lock = threading.Lock()
     invocations: dict[str, int] = {}
     bodies: dict[str, str] = {}
@@ -247,6 +249,104 @@ def script_two_children(
         bodies,
         requests,
     )
+
+
+def test_adaptive_runtime_starts_three_children_and_preserves_bound_full_answers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario = SCENARIO + "\n3. Ayrı işlemin kaynak koşulları nelerdir?"
+    tasks = (*TASKS, "Ayrı işlemin koşullarını incele.")
+    monkeypatch.setitem(globals(), "SCENARIO", scenario)
+    monkeypatch.setitem(globals(), "TASKS", tasks)
+    original_harness = runtime.Harness
+    harness_options: dict[str, bool] = {}
+
+    def harness(**arguments: Any) -> Harness:
+        context = arguments["context"]
+        assert isinstance(context, RunContext)
+        assert context.services.get("experimental_parallel") is True
+        harness_options[arguments["request"]] = arguments.get(
+            "adaptive_tool_parallelism", False
+        )
+        return original_harness(**arguments)
+
+    monkeypatch.setattr(runtime, "Harness", harness)
+    kwargs, selected, secondary, checkpoints, queue, fence, read, bodies, requests = (
+        script_two_children(monkeypatch)
+    )
+    selected.config = selected.config.model_copy(
+        update={"model_provider": "openai", "model_name": "gpt-6-luna"}
+    )
+    runtime.run_asv3_loop(**kwargs)
+
+    # The fixture barrier requires all first child decisions before any continuation.
+    assert selected.invoke.call_count == 1 + 2 * len(tasks)
+    assert requests.count(scenario) == 1
+    assert all(requests.count(task) == 2 for task in tasks)
+    assert harness_options == {scenario: False, **dict.fromkeys(tasks, True)}
+    secondary.invoke.assert_not_called()
+    assert selected.config.model_name == "gpt-6-luna"
+    assert read.call_count == 1
+    assert fence.call_count == len(tasks)
+    final = checkpoints[-1]
+    assert final["publication_status"] == "found"
+    answers = final["question_research"]["answers"]
+    receipts = final["parallel_answers"]["receipts"]
+    assert len(answers) == len(receipts) == len(tasks)
+    assert len({receipt["model_call_id"] for receipt in receipts}) == len(tasks)
+    for index, task in enumerate(tasks, 1):
+        answer = answers[index - 1]
+        body = bodies[task]
+        assert len(body) > 30000
+        assert answer["answer"] == body
+        assert answer["answer_hash"] == hashlib.sha256(body.encode()).hexdigest()
+        receipt = next(
+            item
+            for item in receipts
+            if item["receipt_id"] == answer["parallel_answer_receipt"]
+        )
+        assert receipt["task_id"] == answer["task_id"]
+        assert receipt["answer"] == body
+        assert receipt["answer_hash"] == answer["answer_hash"]
+        assert receipt["originals"][0]["complete"] is True
+    assert final["last_draft"] == "\n\n".join(
+        f"## {index}. İşlem {index}\n\n{bodies[task]}"
+        for index, task in enumerate(tasks, 1)
+    )
+    rendered = "".join(
+        packet.obj.content
+        for packet in packets(queue)
+        if isinstance(packet.obj, AgentResponseDelta)
+    )
+    assert all(body.split("\n\n", 1)[1] in rendered for body in bodies.values())
+
+
+@pytest.mark.parametrize("profile", ["normal", "deep", "experimental"])
+def test_serial_runtime_keeps_existing_tool_admission(
+    monkeypatch: pytest.MonkeyPatch, profile: str
+) -> None:
+    kwargs, _, selected, checkpoints, _ = setup_run(monkeypatch)
+    kwargs["research_profile"] = profile
+    original_harness = runtime.Harness
+    adaptive_options: list[bool] = []
+
+    def harness(**arguments: Any) -> Harness:
+        context = arguments["context"]
+        assert isinstance(context, RunContext)
+        assert context.services.get("experimental_parallel") is False
+        adaptive_options.append(arguments.get("adaptive_tool_parallelism", False))
+        return original_harness(**arguments)
+
+    monkeypatch.setattr(runtime, "Harness", harness)
+    if profile == "deep":
+        run_independent(**kwargs)
+    else:
+        kwargs.pop("test_language")
+        runtime.run_asv3_loop(**kwargs)
+
+    assert adaptive_options == ([False, False] if profile == "deep" else [False])
+    assert selected.invoke.call_count == (4 if profile == "deep" else 2)
+    assert checkpoints[-1]["publication_status"] == "found"
 
 
 def test_parallel_children_share_reads_and_publish_exact_complete_bodies(

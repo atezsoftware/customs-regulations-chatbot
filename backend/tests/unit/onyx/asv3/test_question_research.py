@@ -5,6 +5,7 @@ from collections.abc import Callable
 from typing import cast
 
 import pytest
+from jsonschema import Draft202012Validator
 from pydantic import JsonValue
 
 from onyx.asv3.evidence import EvidenceLedger
@@ -938,32 +939,87 @@ def test_undeclared_assignment_outcomes_return_invalid_without_starting_research
     assert outcomes.outcome_ids() == []
 
 
-def test_assignment_outcomes_may_be_declared_on_the_same_useful_action() -> None:
+@pytest.mark.parametrize("profile", ["normal", "deep", "experimental"])
+@pytest.mark.parametrize("through_harness", [False, True])
+def test_assignment_outcomes_may_be_declared_on_the_same_useful_action(
+    profile: str, through_harness: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
     research, workers, context = controlled_research([found("Answer [1]")], ["First"])
     outcomes = OutcomeMap(["First"], context)
-    context.services["outcome_map"] = outcomes
+    ledger = EvidenceLedger()
+    context.services.update(
+        evidence=ledger,
+        outcome_map=outcomes,
+        lean_native_mode=True,
+        research_profile=profile,
+    )
     entry = question("first", "First", 1)
     entry["outcome_ids"] = ["first-outcome"]
-    context.services["evidence"] = EvidenceLedger()
-    result = CapabilityRegistry(research.tool_specs()).dispatch(
-        CapabilityCall(
-            name="research_questions",
-            arguments={
-                "questions": [entry],
-                "_outcomes": [
-                    {
-                        "outcome_id": "first-outcome",
-                        "question_ids": ["q0"],
-                        "detail": "The requested first outcome",
-                    }
-                ],
-            },
-        ),
-        context,
+    call = CapabilityCall(
+        name="research_questions",
+        arguments={
+            "questions": [entry],
+            "_language": "tr",
+            "_outcomes": [
+                {
+                    "outcome_id": "first-outcome",
+                    "question_ids": ["q0"],
+                    "detail": "The requested first outcome",
+                }
+            ],
+        },
+    )
+    registry = CapabilityRegistry(research.tool_specs())
+    function = next(
+        definition["function"]
+        for definition in registry.definitions(context)
+        if isinstance(definition["function"], dict)
+        and definition["function"]["name"] == call.name
+    )
+    assert isinstance(function, dict)
+    parameters = function["parameters"]
+    assert isinstance(parameters, dict)
+    Draft202012Validator(parameters).validate(call.arguments)
+
+    original_spawn = workers.spawn
+
+    def spawn_after_declaration(
+        task: str,
+        *,
+        request_context: RunContext | None = None,
+        public_title: str | None = None,
+        public_message: str | None = None,
+        independent_question: bool = False,
+        outcome_ids: list[str] | None = None,
+    ) -> str:
+        assert outcomes.outcome_ids() == ["first-outcome"]
+        return original_spawn(
+            task,
+            request_context=request_context,
+            public_title=public_title,
+            public_message=public_message,
+            independent_question=independent_question,
+            outcome_ids=outcome_ids,
+        )
+
+    monkeypatch.setattr(workers, "spawn", spawn_after_declaration)
+    result = (
+        Harness(
+            request="First",
+            context=context,
+            registry=registry,
+            evidence=ledger,
+            decide=lambda _view: Decision(answer="Complete"),
+        )
+        ._dispatch([call])[0]
+        .outcome
+        if through_harness
+        else registry.dispatch(call, context)
     )
     assert result.status is OutcomeStatus.FOUND
     assert workers.outcome_bindings == [["first-outcome"]]
     assert outcomes.outcome_ids() == ["first-outcome"]
+    assert outcomes.revision == 1
 
 
 def test_worker_outcome_binding_is_available_before_the_worker_starts() -> None:

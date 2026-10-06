@@ -81,6 +81,23 @@ class WorkerPool:
         self._futures: dict[str, Future[None]] = {}
         self._closed = False
 
+    def prepare_independent_batch(self, assignments: int) -> None:
+        """Make every independent outcome runnable; physical I/O remains gated."""
+        if type(assignments) is not int or assignments < 1:
+            raise ValueError("Independent batch size must be a positive integer")
+        self.context.check_active()
+        with self._lock:
+            if self._closed:
+                raise RunStopped("Research pool is closed")
+            if self._tasks or self._futures:
+                raise ValueError("Prepare independent capacity before spawning tasks")
+            previous = self._executors[1]
+            self._executors[1] = ThreadPoolExecutor(
+                max_workers=assignments,
+                thread_name_prefix="asv3-independent",
+            )
+        previous.shutdown(wait=False)
+
     def spawn(
         self,
         task: str,

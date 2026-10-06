@@ -1070,6 +1070,59 @@ def test_harness_progress_skips_lightweight_actions_and_preserves_narration() ->
     assert reporter.snapshot() == [original]
 
 
+@pytest.mark.parametrize("parallel", [False, True])
+def test_parallel_delegation_rejection_is_not_a_failed_source_read(
+    parallel: bool,
+) -> None:
+    reporter = ProgressReporter("delegation", "tr")
+    context = RunContext(run_id="delegation", language="tr")
+    context.services["experimental_parallel"] = parallel
+    registry = CapabilityRegistry(
+        [
+            ToolSpec(
+                name="research_questions",
+                description="Delegate validated outcomes",
+                parameters={"type": "object"},
+                handler=lambda _args, _context: ToolOutcome(
+                    status=OutcomeStatus.INVALID,
+                    summary="Undeclared assignment outcomes",
+                ),
+            ),
+            ToolSpec(
+                name="read_provision",
+                description="Read the original",
+                parameters={"type": "object"},
+                handler=lambda _args, _context: ToolOutcome(
+                    status=OutcomeStatus.UNAVAILABLE,
+                    summary="Original cannot be retrieved",
+                ),
+            ),
+        ]
+    )
+    harness = Harness(
+        request="Question",
+        context=context,
+        registry=registry,
+        decide=lambda _view: Decision(answer="done"),
+        progress=reporter,
+    )
+    delegation = CapabilityCall(name="research_questions")
+    harness._dispatch([delegation])
+    assert harness.receipts[0].outcome.status == OutcomeStatus.INVALID
+    events = reporter.snapshot()
+    if parallel:
+        assert events == []
+    else:
+        assert events[-1].status == "failed"
+        assert events[-1].task_id == public_action_id(delegation.call_id)
+
+    read = CapabilityCall(name="read_provision")
+    harness._dispatch([read])
+    assert harness.receipts[-1].outcome.status == OutcomeStatus.UNAVAILABLE
+    assert reporter.snapshot()[-1].status == "failed"
+    assert reporter.snapshot()[-1].task_id == public_action_id(read.call_id)
+
+
 @pytest.mark.parametrize(
     "outcome,expected",
     [

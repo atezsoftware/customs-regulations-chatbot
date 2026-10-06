@@ -821,6 +821,7 @@ def run_asv3_loop(
             progress=progress,
             report_terminal=False,
             max_workers=2,
+            adaptive_tool_parallelism=parallel_research and independent,
             draft_guard=(
                 lambda answer: source_publication_gap(
                     answer, researcher_model.last_call_id, run_context=child
