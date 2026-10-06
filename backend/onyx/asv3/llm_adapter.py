@@ -3366,6 +3366,9 @@ class ResearchModel:
             self.context.check_active()
         else:
             self.context.check_research_active()
+        acquisition = self._publication_source_acquisition(view)
+        if acquisition is not None:
+            return acquisition
         if self.lean_native_mode:
             preparation = (
                 graph_step(
@@ -3480,6 +3483,121 @@ class ResearchModel:
                 request=view.request,
             )
         return self._decide_research(view)
+
+    def _publication_source_acquisition(self, view: HarnessView) -> Decision | None:
+        """Acquire missing originals for retained publication obligations, not approval."""
+        reviews = self.context.services.get("legal_source_reviews")
+        ledger = self.context.services.get("evidence")
+        if (
+            self.context.services.get("asv3_workflow_variant") != ASV3_TUNED_VARIANT
+            or not view.publication_gap
+            or not view.draft_to_repair
+            or not isinstance(reviews, LegalSourceReviews)
+            or not isinstance(ledger, EvidenceLedger)
+        ):
+            return None
+        state = self._related_source_range_continuations(
+            reviews.view(self.context, ledger, set(ledger.citation_mapping())),
+            view.receipts,
+            ledger,
+        )
+        rows = state.get("reviews")
+        cited = extract_citation_numbers(view.draft_to_repair)
+        unread = view.publication_gap.get("unread_related_sources")
+        rejected_leads: set[str] = set()
+        for row in unread if isinstance(unread, list) else []:
+            if not isinstance(row, dict):
+                continue
+            rejected_lead = row.get("lead_id")
+            if isinstance(rejected_lead, str):
+                rejected_leads.add(rejected_lead)
+        explicit_lead = view.publication_gap.get("lead_id")
+        if isinstance(explicit_lead, str):
+            rejected_leads.add(explicit_lead)
+        eligible: dict[str, dict[str, JsonValue]] = {}
+        for row in rows if isinstance(rows, list) else []:
+            if not isinstance(row, dict) or row.get("status") != "pending":
+                continue
+            anchors = row.get("anchor_evidence_numbers")
+            source_id = row.get("source_id")
+            lead = row.get("lead_id")
+            if (
+                isinstance(source_id, str)
+                and isinstance(anchors, list)
+                and (
+                    any(type(number) is int and number in cited for number in anchors)
+                    or (isinstance(lead, str) and lead in rejected_leads)
+                )
+            ):
+                eligible[source_id] = row
+        if not eligible:
+            return None
+        actions = self._related_source_acquisition_state(
+            {"reviews": list(eligible.values())}, ledger
+        )
+        calls: list[CapabilityCall] = []
+        definitions = {
+            function["name"]: function.get("parameters")
+            for tool in view.tools
+            if isinstance(function := tool.get("function"), dict)
+            and isinstance(function.get("name"), str)
+        }
+        for action in actions:
+            if not isinstance(action, dict):
+                continue
+            suggested = action.get("suggested_acquisition")
+            if not isinstance(suggested, dict):
+                continue
+            name, arguments = suggested.get("name"), suggested.get("arguments")
+            schema = definitions.get(name) if isinstance(name, str) else None
+            if (
+                name != "read_source_range"
+                or not isinstance(arguments, dict)
+                or not isinstance(schema, dict)
+                or not jsonschema.Draft202012Validator(schema).is_valid(arguments)
+                or any(
+                    receipt.call.name == name
+                    and receipt.call.arguments.get("source_id")
+                    == arguments.get("source_id")
+                    and receipt.call.arguments.get("start", 0)
+                    == arguments.get("start", 0)
+                    for receipt in view.receipts
+                )
+            ):
+                continue
+            calls.append(
+                CapabilityCall(
+                    name=name,
+                    arguments=arguments,
+                    call_id="publication-acquire-" + uuid4().hex,
+                )
+            )
+        if not calls:
+            return None
+        with graph_step(
+            "asv3.publication_source_acquisition",
+            {
+                "calls": [
+                    {"name": call.name, "arguments": call.arguments} for call in calls
+                ]
+            },
+        ) as step:
+            step.output_value = {"semantic_review": False, "source_count": len(calls)}
+        return Decision(
+            calls=calls,
+            assistant_message=AssistantMessage(
+                tool_calls=[
+                    ToolCall(
+                        id=call.call_id,
+                        function=NativeFunctionCall(
+                            name=call.name,
+                            arguments=json.dumps(call.arguments, ensure_ascii=False),
+                        ),
+                    )
+                    for call in calls
+                ]
+            ),
+        )
 
     @staticmethod
     def _related_source_range_continuations(

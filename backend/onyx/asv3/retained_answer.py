@@ -304,7 +304,9 @@ def resolve_retained_answer(
             }
             expanded["answer"] = answer
             canonical_name = RETAINED_TERMINALS.get(call.name, call.name)
-            if retained_alias:
+            if retained_alias and (
+                canonical_name == "submit_answer" or parallel_execution_enabled(context)
+            ):
                 expanded["basis"] = "originals"
             calls.append(
                 call.model_copy(update={"name": canonical_name, "arguments": expanded})

@@ -6,13 +6,25 @@ from typing import cast
 import pytest
 from pydantic import JsonValue
 
+from onyx.asv3.evidence import EvidenceLedger
+from onyx.asv3.harness import Harness
 from onyx.asv3.judicial_sections import (
     judicial_disposition_missing,
     judicial_witness_section,
 )
 from onyx.asv3.llm_adapter import ResearchModel
-from onyx.asv3.models import CapabilityCall, EvidenceItem, OutcomeStatus, RunContext
-from onyx.asv3.retained_answer import bind_retained_answer
+from onyx.asv3.models import (
+    CapabilityCall,
+    Decision,
+    EvidenceItem,
+    OutcomeStatus,
+    RunContext,
+    ToolOutcome,
+    ToolReceipt,
+    ToolSpec,
+)
+from onyx.asv3.registry import CapabilityRegistry
+from onyx.asv3.retained_answer import bind_retained_answer, resolve_retained_answer
 from onyx.asv3.workflow_variant import ASV3_TUNED_VARIANT
 from tests.unit.onyx.asv3.test_experimental_workflow import terminal_registry
 from tests.unit.onyx.asv3.test_legal_source_reviews import deliver, review, seen
@@ -246,3 +258,191 @@ def test_protected_normal_and_plain_experimental_do_not_expose_retained_commits(
         )
         assert reference is None
         assert bound == definitions
+
+
+def test_retained_partial_expands_to_actual_canonical_partial_schema() -> None:
+    context, _ledger, _reviews = tuned_context()
+    registry = terminal_registry([])
+    observed: list[dict[str, JsonValue]] = []
+
+    def submit(arguments: dict[str, JsonValue], _context: RunContext) -> ToolOutcome:
+        observed.append(arguments)
+        return ToolOutcome(status=OutcomeStatus.PARTIAL, summary="Partial answer")
+
+    registry.register(
+        ToolSpec(
+            name="submit_partial_answer",
+            description="End with supported parts and a precise gap.",
+            parameters={
+                "type": "object",
+                "properties": {"answer": {"type": "string", "minLength": 1}},
+                "required": ["answer"],
+                "additionalProperties": False,
+            },
+            handler=submit,
+        )
+    )
+    draft = "Supported portion [1].\n\nThe exact source interaction remains unresolved."
+    resolved = resolve_retained_answer(
+        Decision(calls=[CapabilityCall(name="submit_retained_partial_answer")]),
+        context,
+        draft,
+        request="Question",
+    )
+    assert resolved.calls[0].arguments == {"answer": draft}
+    assert registry.dispatch(resolved.calls[0], context).status == OutcomeStatus.PARTIAL
+    assert observed == [{"answer": draft}]
+
+
+def test_publication_acquisition_reads_continuation_before_one_semantic_decision() -> (
+    None
+):
+    context, old_ledger, reviews = tuned_context()
+    law = old_ledger.get(1)
+    assert law is not None
+    ledger = EvidenceLedger()
+    ledger.add([law], context)
+    context.services["evidence"] = ledger
+    deliver(ledger, "law-call", [1])
+    seen(context, ledger, reviews)
+    acquired: list[int] = []
+    registry = terminal_registry([])
+
+    def read(arguments: dict[str, JsonValue], child: RunContext) -> ToolOutcome:
+        assert child.scope == context.scope
+        assert arguments["source_id"] == "decision"
+        start = arguments.get("start", 0)
+        assert type(start) is int
+        acquired.append(start)
+        return ToolOutcome(
+            status=OutcomeStatus.PARTIAL if start == 0 else OutcomeStatus.FOUND,
+            summary="Canonical source page",
+            data={"has_more": start == 0, "next_position": 3 if start == 0 else 4},
+            evidence=reasoning_originals()
+            if start == 0
+            else [judicial_chunk("The identified phrase is annulled.", 3)],
+        )
+
+    registry.register(
+        ToolSpec(
+            name="read_source_range",
+            description="Read a bounded authorized canonical source page.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "source_id": {"type": "string"},
+                    "start": {"type": "integer", "minimum": 0},
+                },
+                "required": ["source_id"],
+                "additionalProperties": False,
+            },
+            handler=read,
+        )
+    )
+    assessment = review(witnesses=[{"citation": 5, "start_char": 0, "end_char": 32}])
+    answer = f"The rule [1].\n\n{assessment['effect']} {assessment['limitations']} [5]."
+
+    def submit(arguments: dict[str, JsonValue], _child: RunContext) -> ToolOutcome:
+        body = str(arguments["answer"])
+        gap = reviews.publication_gap(
+            body,
+            str(context.services["last_model_call_id"]),
+            context,
+            ledger,
+        )
+        assert gap is None
+        context.services["submitted_answer"] = body
+        return ToolOutcome(status=OutcomeStatus.FOUND, summary="Validated answer")
+
+    spec = registry.get("submit_answer")
+    read_spec = registry.get("read_source_range")
+    assert spec is not None
+    assert read_spec is not None
+    registry = CapabilityRegistry(
+        [read_spec, spec.model_copy(update={"handler": submit})]
+    )
+    draft = "The ordinary rule certainly applies [1]."
+    _, reference = bind_retained_answer(
+        registry.definitions(context), context, draft, request="Question"
+    )
+    assert reference is not None
+    units = cast(list[dict[str, JsonValue]], reference["units"])
+    selected = model()
+    selected.invoke.return_value = native_action(
+        "submit_retained_answer",
+        {
+            "retained_answer_edits": [
+                {"unit_id": units[0]["unit_id"], "replacement": answer}
+            ],
+            "_related_source_reviews": [assessment],
+        },
+    )
+    adapter = ResearchModel(selected, context, lean_native_mode=True)
+    harness = Harness(
+        request="Question",
+        context=context,
+        registry=registry,
+        evidence=ledger,
+        decide=adapter.decide,
+    )
+    harness.last_draft = draft
+    harness.publication_gap = ToolOutcome(
+        status=OutcomeStatus.PARTIAL,
+        summary="Related original is unread.",
+        data={"pending_related_source_review": True},
+    )
+    result = harness.run()
+    assert result.answer == answer and result.status == OutcomeStatus.FOUND, (
+        result.stop_reason,
+        [(r.call.name, r.outcome.summary, r.outcome.data) for r in result.receipts],
+    )
+    assert acquired == [0, 3]
+    assert selected.invoke.call_count == 1
+    assert ledger.completely_delivered(adapter.last_call_id or "") == {1, 2, 3, 4, 5}
+
+
+@pytest.mark.parametrize("barrier", ["normal", "experimental", "uncited", "failed"])
+def test_publication_acquisition_is_scoped_and_never_repeats_failed_read(
+    barrier: str,
+) -> None:
+    context, old_ledger, reviews = tuned_context()
+    law = old_ledger.get(1)
+    assert law is not None
+    ledger = EvidenceLedger()
+    ledger.add([law], context)
+    context.services["evidence"] = ledger
+    deliver(ledger, "law-call", [1])
+    seen(context, ledger, reviews)
+    current = adaptive_tool_view(original_evidence=[full_record(ledger, 1)]).model_copy(
+        update={
+            "draft_to_repair": "The rule [1]." if barrier != "uncited" else "Hello.",
+            "publication_gap": {"pending_related_source_review": True},
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "read_source_range",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+        }
+    )
+    if barrier in {"normal", "experimental"}:
+        context.services.pop("asv3_workflow_variant")
+        context.services["research_profile"] = barrier
+    elif barrier == "failed":
+        current.receipts.append(
+            ToolReceipt(
+                call=CapabilityCall(
+                    name="read_source_range", arguments={"source_id": "decision"}
+                ),
+                outcome=ToolOutcome(
+                    status=OutcomeStatus.DENIED, summary="Access denied"
+                ),
+                elapsed_seconds=0,
+            )
+        )
+    assert (
+        ResearchModel(model(), context)._publication_source_acquisition(current) is None
+    )
