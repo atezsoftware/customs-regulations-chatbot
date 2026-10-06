@@ -81,6 +81,7 @@ class OutcomeMap:
         context: RunContext,
         *,
         factual_context: str | None = None,
+        detailed_fact_errors: bool = False,
     ) -> None:
         self.run_id = context.run_id
         self.scope_hash = hashlib.sha256(
@@ -91,6 +92,7 @@ class OutcomeMap:
             "\n".join(questions) if factual_context is None else factual_context
         )
         self.request_hash = hashlib.sha256(self._factual_context.encode()).hexdigest()
+        self._detailed_fact_errors = detailed_fact_errors
         self._outcomes: dict[str, RequestedOutcome] = {}
         self._conditions: dict[str, _ConditionRecord] = {}
         self._resolutions: dict[str, OutcomeResolution] = {}
@@ -128,16 +130,26 @@ class OutcomeMap:
                 identities = [getattr(row, field) for row in rows]
                 if len(identities) != len(set(identities)):
                     raise ValueError("Duplicate outcome metadata record IDs")
-            for outcome in update.outcomes:
+            for outcome_index, outcome in enumerate(update.outcomes):
                 if set(outcome.question_ids) - known_questions or len(
                     outcome.question_ids
                 ) != len(set(outcome.question_ids)):
                     raise ValueError("Outcome must bind to original question IDs")
-                if not outcome.detail.strip() or any(
-                    not fact.strip() or fact not in self._factual_context
-                    for fact in outcome.decisive_facts
-                ):
+                if not outcome.detail.strip():
                     raise ValueError("Outcome facts must quote supplied scenario text")
+                for fact_index, fact in enumerate(outcome.decisive_facts):
+                    if fact.strip() and fact in self._factual_context:
+                        continue
+                    message = "Outcome facts must quote supplied scenario text"
+                    if self._detailed_fact_errors:
+                        message = (
+                            f"_outcomes[{outcome_index}].decisive_facts[{fact_index}] "
+                            f"(outcome_id={outcome.outcome_id}): {message}. "
+                            "Replace only this fact with an exact contiguous quote from the "
+                            "supplied request or conversation, or omit an unsupported fact. "
+                            "Do not normalize or paraphrase it, or rewrite the answer."
+                        )
+                    raise ValueError(message)
                 previous = outcomes.get(outcome.outcome_id)
                 if previous is not None and set(previous.question_ids) != set(
                     outcome.question_ids
@@ -351,6 +363,7 @@ class OutcomeMap:
         restored.run_id, restored.scope_hash = self.run_id, self.scope_hash
         restored.request_hash, restored.questions = self.request_hash, self.questions
         restored._factual_context = self._factual_context
+        restored._detailed_fact_errors = self._detailed_fact_errors
         restored._lock = threading.RLock()
         restored._outcomes, restored._conditions, restored._resolutions = {}, {}, {}
         restored.revision = 0

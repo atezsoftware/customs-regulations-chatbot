@@ -17,7 +17,9 @@ from onyx.prompts.asv3.experimental import (
 
 
 @pytest.mark.parametrize(
-    "prompt", [EXPERIMENTAL_COORDINATOR_PROMPT, EXPERIMENTAL_RESEARCHER_PROMPT]
+    "prompt",
+    [EXPERIMENTAL_COORDINATOR_PROMPT, EXPERIMENTAL_RESEARCHER_PROMPT],
+    ids=["coordinator", "researcher"],
 )
 def test_independent_prompts_reuse_the_complete_baseline_map_once(prompt: str) -> None:
     heading = "TOPIC-TO-SOURCE NAVIGATION\n"
@@ -33,7 +35,7 @@ def test_independent_prompts_reuse_the_complete_baseline_map_once(prompt: str) -
     assert prompt.count(RESEARCH_INSTRUCTIONS) == 1
     assert COORDINATOR_REFERENCE_PROMPT not in prompt
     assert RESEARCHER_REFERENCE_PROMPT not in prompt
-    assert EXPERIMENTAL_PROMPT_VERSION == "asv3-experimental-2026-10-06.5"
+    assert EXPERIMENTAL_PROMPT_VERSION == "asv3-experimental-2026-10-06.6"
 
 
 @pytest.mark.parametrize(

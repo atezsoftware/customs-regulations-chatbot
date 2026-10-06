@@ -100,6 +100,18 @@ class CapabilityRegistry:
             definition = spec.definition()
             function = definition["function"]
             assert isinstance(function, dict)
+            if (
+                context.services.get("lean_native_mode")
+                and context.services.get("research_profile") == "experimental"
+                and spec.name == "read_evidence"
+            ):
+                function["description"] = (
+                    "Reopen recorded original evidence by global citation only when the needed "
+                    "range is absent or truncated in this decision's original_evidence_ranges. "
+                    "Reuse a fully covered original directly for its claims and citations; "
+                    "do not reread it solely to reconfirm wording or obtain a citation. "
+                    "A missing continuation or surrounding source context still needs its source tool."
+                )
             parameters = function["parameters"]
             assert isinstance(parameters, dict)
             properties = parameters.setdefault("properties", {})

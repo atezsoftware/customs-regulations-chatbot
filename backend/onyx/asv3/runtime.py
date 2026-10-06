@@ -383,7 +383,10 @@ def run_asv3_loop(
     )
     context.services.update(scenario_state=scenarios, research_state=research_state)
     outcome_map = OutcomeMap(
-        initial_questions(question), context, factual_context=question + "\n" + history
+        initial_questions(question),
+        context,
+        factual_context=question + "\n" + history,
+        detailed_fact_errors=research_profile == "experimental",
     )
     context.services["outcome_map"] = outcome_map
     emitted: list[dict[str, JsonValue]] = []

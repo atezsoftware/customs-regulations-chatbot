@@ -7,9 +7,60 @@ import jsonschema
 import pytest
 from pydantic import JsonValue
 
-from onyx.asv3.models import RunContext
-from onyx.asv3.registry import CapabilityRegistry
+from onyx.asv3.evidence import EvidenceLedger
+from onyx.asv3.models import CapabilityCall, EvidenceItem, OutcomeStatus, RunContext
+from onyx.asv3.registry import CapabilityRegistry, build_core_specs
 from tests.unit.onyx.asv3.test_runtime import run_independent, setup_run
+
+
+def test_experimental_read_hint_preserves_schema_executor_and_other_profiles() -> None:
+    ledger = EvidenceLedger()
+    context = RunContext(
+        services={"lean_native_mode": True, "research_profile": "normal"}
+    )
+    ledger.add(
+        [EvidenceItem(source_id="law", chunk_id="rule", text="Full rule.")], context
+    )
+    registry = CapabilityRegistry()
+    for spec in build_core_specs(registry, ledger, lambda: {}):
+        registry.register(spec)
+    spec = registry.get("read_evidence")
+    assert spec is not None
+    base = copy.deepcopy(spec.definition())
+    definitions: dict[str, dict[str, JsonValue]] = {}
+    for profile in ("normal", "deep", "experimental"):
+        context.services["research_profile"] = profile
+        definition = next(
+            row["function"]
+            for row in registry.definitions(context)
+            if isinstance(row["function"], dict)
+            and row["function"]["name"] == "read_evidence"
+        )
+        assert isinstance(definition, dict)
+        definitions[profile] = definition
+    assert definitions["normal"] == definitions["deep"]
+    experimental = copy.deepcopy(definitions["experimental"])
+    description = experimental.pop("description")
+    normal = copy.deepcopy(definitions["normal"])
+    normal_description = normal.pop("description")
+    assert experimental == normal
+    assert "absent or truncated" in str(description)
+    assert "original_evidence_ranges" in str(description)
+    assert "missing continuation" in str(description)
+    assert normal_description == spec.description
+    assert spec.definition() == base
+    # Delivery is a reuse hint, not a new restriction on a requested missing range.
+    reopened = registry.dispatch(
+        CapabilityCall(
+            name="read_evidence",
+            arguments={"citation": 1, "start_char": 5, "num_chars": 2},
+        ),
+        context,
+    )
+    assert reopened.status == OutcomeStatus.TRUNCATED
+    assert reopened.data["text"] == "ru"
+    assert reopened.original_reads[0].start_char == 5
+    assert reopened.original_reads[0].end_char == 7
 
 
 def test_native_catalogue_preserves_every_capability_and_validation_without_repeating_metadata_descriptions(

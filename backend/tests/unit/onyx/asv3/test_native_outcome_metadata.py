@@ -336,6 +336,74 @@ def test_corrected_outcome_metadata_does_not_poison_the_same_actual_source_argum
     assert outcomes.outcome_ids() == ["first"]
 
 
+def test_experimental_partial_metadata_error_can_be_corrected_without_rewriting_answer() -> (
+    None
+):
+    context, _outcomes, ledger = research_context()
+    context.services["research_profile"] = "experimental"
+    outcomes = OutcomeMap(
+        ["First outcome?", "Second outcome?"],
+        context,
+        factual_context="A prior request was filed.",
+        detailed_fact_errors=True,
+    )
+    context.services["outcome_map"] = outcomes
+    observed: list[dict[str, JsonValue]] = []
+
+    def partial(arguments: dict[str, JsonValue], _context: RunContext) -> ToolOutcome:
+        observed.append(arguments)
+        return ToolOutcome(status=OutcomeStatus.PARTIAL, summary="Partial submitted")
+
+    registry = CapabilityRegistry(
+        [
+            ToolSpec(
+                name="submit_partial_answer",
+                description="Submit supported portions and the remaining gap",
+                parameters={
+                    "type": "object",
+                    "properties": {"answer": {"type": "string"}},
+                    "required": ["answer"],
+                    "additionalProperties": False,
+                },
+                handler=partial,
+            )
+        ]
+    )
+    runner = harness(context, registry, ledger)
+    answer = "The requested original remains unexamined."
+    declaration = {**requested(), "decisive_facts": ["A prior Request was filed."]}
+    rejected = runner._dispatch(
+        [
+            CapabilityCall(
+                name="submit_partial_answer",
+                arguments={"answer": answer, "_outcomes": [declaration]},
+            )
+        ]
+    )[0]
+    assert rejected.outcome.status == OutcomeStatus.INVALID
+    assert "_outcomes[0].decisive_facts[0]" in str(rejected.outcome.data["detail"])
+    assert observed == [] and outcomes.outcome_ids() == []
+    corrected = runner._dispatch(
+        [
+            CapabilityCall(
+                name="submit_partial_answer",
+                arguments={
+                    "answer": answer,
+                    "_outcomes": [
+                        {
+                            **declaration,
+                            "decisive_facts": ["A prior request was filed."],
+                        }
+                    ],
+                },
+            )
+        ]
+    )[0]
+    assert corrected.outcome.status == OutcomeStatus.PARTIAL
+    assert observed == [{"answer": answer}]
+    assert outcomes.outcome_ids() == ["first"]
+
+
 def test_same_batch_dependent_metadata_is_available_before_parallel_source_io() -> None:
     context, outcomes, ledger = research_context()
     observed: list[str] = []

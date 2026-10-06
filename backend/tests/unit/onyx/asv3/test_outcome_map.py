@@ -104,6 +104,45 @@ def test_invented_facts_unknown_bindings_and_duplicates_leave_state_unchanged(
     assert state.export() == before
 
 
+@pytest.mark.parametrize("detailed", [False, True])
+def test_literal_fact_feedback_identifies_only_the_invalid_entry_without_relaxing_match(
+    detailed: bool,
+) -> None:
+    context, ledger, _state = map_pair()
+    state = OutcomeMap(
+        ["Eligibility and release?", "Applicable sanction?"],
+        context,
+        factual_context="A prior request was filed.",
+        detailed_fact_errors=detailed,
+    )
+    before = state.export()
+    invalid = {
+        **outcome("sanction", "q1"),
+        "decisive_facts": ["A prior request was filed.", "A prior Request was filed."],
+    }
+    with pytest.raises(ValueError) as error:
+        update(state, ledger, outcomes=[outcome(), invalid])
+    assert state.export() == before
+    message = str(error.value)
+    if detailed:
+        assert "_outcomes[1].decisive_facts[1]" in message
+        assert "outcome_id=sanction" in message
+        assert "exact contiguous quote" in message
+        assert "Do not normalize or paraphrase" in message
+    else:
+        assert message == "Outcome facts must quote supplied scenario text"
+    update(
+        state,
+        ledger,
+        outcomes=[
+            outcome(),
+            {**invalid, "decisive_facts": ["A prior request was filed."]},
+        ],
+    )
+    assert state.outcome_ids() == ["release", "sanction"]
+    assert state.revision == 1
+
+
 def test_existing_outcome_cannot_move_but_clarification_reopens_its_resolution() -> (
     None
 ):
