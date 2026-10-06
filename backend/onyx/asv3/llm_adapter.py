@@ -2063,6 +2063,63 @@ class ResearchModel:
             max_tokens=6000,
             research=research,
         )
+        semantic_call = self.last_call_id
+        semantic_context_call = self.context.services.get("last_model_call_id")
+        semantic_finish = self.last_finish_reason
+        semantic_truncated = self.last_response_truncated
+
+        def bind_semantic_origin(decision: Decision) -> Decision:
+            if not parallel_execution_enabled(self.context):
+                return decision
+            repaired_calls = {call.call_id: call for call in decision.calls}
+            semantic_keys = {"answer", "retained_answer_id", "retained_answer_edits"}
+            for call in original.calls:
+                if call.name not in {"submit_answer", "submit_partial_answer"}:
+                    continue
+                repaired = repaired_calls.get(call.call_id)
+                schema = definitions.get(call.name)
+                if repaired is None or not isinstance(schema, dict):
+                    return decision
+                representation = {
+                    key: value
+                    for key, value in call.arguments.items()
+                    if key in semantic_keys
+                }
+                if not representation or representation != {
+                    key: value
+                    for key, value in repaired.arguments.items()
+                    if key in semantic_keys
+                }:
+                    return decision
+                for error in jsonschema.Draft202012Validator(schema).iter_errors(
+                    call.arguments
+                ):
+                    if (
+                        error.absolute_path and error.absolute_path[0] in semantic_keys
+                    ) or (
+                        not error.absolute_path
+                        and error.validator not in {"required", "additionalProperties"}
+                    ):
+                        return decision
+                if not (
+                    isinstance(call.arguments.get("answer"), str)
+                    and str(call.arguments["answer"]).strip()
+                ) and not (
+                    isinstance(call.arguments.get("retained_answer_id"), str)
+                    and str(call.arguments["retained_answer_id"]).strip()
+                ):
+                    return decision
+            # The patch call retains its own trace and physical delivery. The
+            # unchanged decision remains owned by its source-bearing invocation.
+            self.last_call_id = semantic_call
+            if semantic_context_call is None:
+                self.context.services.pop("last_model_call_id", None)
+            else:
+                self.context.services["last_model_call_id"] = semantic_context_call
+            self.last_finish_reason = semantic_finish
+            self.last_response_truncated = semantic_truncated
+            return decision
+
         repaired_response = self._invoke(
             prompt,
             repair_tools,
@@ -2140,38 +2197,42 @@ class ResearchModel:
                 else call
                 for call in native_calls
             ]
-            return self._decision(
-                response.model_copy(
-                    update={
-                        "choice": response.choice.model_copy(
-                            update={
-                                "message": response.choice.message.model_copy(
-                                    update={"tool_calls": merged_calls}
-                                )
-                            }
-                        )
-                    }
-                ),
-                tools,
-                return_argument_errors=True,
+            return bind_semantic_origin(
+                self._decision(
+                    response.model_copy(
+                        update={
+                            "choice": response.choice.model_copy(
+                                update={
+                                    "message": response.choice.message.model_copy(
+                                        update={"tool_calls": merged_calls}
+                                    )
+                                }
+                            )
+                        }
+                    ),
+                    tools,
+                    return_argument_errors=True,
+                )
             )
         except ValueError as error:
             # Invalid actions remain visible feedback, never executable defaults.
-            return original.model_copy(
-                update={
-                    "calls": [
-                        call.model_copy(
-                            update={
-                                "argument_error": f"{call.argument_error}; patch rejected: {error}"[
-                                    :350
-                                ]
-                            }
-                        )
-                        if call.call_id in invalid
-                        else call
-                        for call in original.calls
-                    ]
-                }
+            return bind_semantic_origin(
+                original.model_copy(
+                    update={
+                        "calls": [
+                            call.model_copy(
+                                update={
+                                    "argument_error": f"{call.argument_error}; patch rejected: {error}"[
+                                        :350
+                                    ]
+                                }
+                            )
+                            if call.call_id in invalid
+                            else call
+                            for call in original.calls
+                        ]
+                    }
+                )
             )
 
     @staticmethod

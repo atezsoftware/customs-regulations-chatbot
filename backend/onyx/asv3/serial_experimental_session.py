@@ -679,7 +679,8 @@ class SerialExperimentalSession:
             decide=self.model.decide,
             evidence=ledger,
             on_receipt=on_receipt,
-            checkpoint=lambda _: self._save(),
+            checkpoint=self._checkpoint_callback,
+            checkpoint_snapshot=self.snapshot,
             progress=progress,
             draft_guard=lambda answer: self.publication_gap(
                 answer, self.model.last_call_id

@@ -5,7 +5,10 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import threading
+import weakref
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from typing import Callable, Iterator, Never, TypeGuard, cast
 
 from pydantic import JsonValue
@@ -329,6 +332,123 @@ class _SharedSnapshot(_ImmutableDict):
     compact_bytes: int = _DEFAULT_UNIT_BYTES
 
 
+@dataclass(frozen=True)
+class _ImmutableMember:
+    reference: weakref.ReferenceType[_ImmutableDict | _ImmutableList]
+    container_type: type[_ImmutableDict | _ImmutableList]
+    items: tuple[tuple[str, JsonValue], ...] | None = None
+    values: tuple[JsonValue, ...] | None = None
+
+
+@dataclass(frozen=True)
+class _ValidatedSnapshot:
+    reference: weakref.ReferenceType[_SharedSnapshot]
+    compact_bytes: int
+    members: tuple[_ImmutableMember, ...]
+
+
+_validated_snapshots: dict[int, _ValidatedSnapshot] = {}
+_validation_lock = threading.RLock()
+
+
+def _certify_snapshot(snapshot: _SharedSnapshot, compact_bytes: int) -> None:
+    members: list[_ImmutableMember] = []
+    seen: set[int] = set()
+
+    def retain(value: JsonValue) -> None:
+        if value is None or type(value) in (str, int, float, bool):
+            return
+        if type(value) not in (
+            _ImmutableDict,
+            _ImmutableList,
+            _PoolObject,
+            _SharedSnapshot,
+        ):
+            raise ValueError("Invalid immutable checkpoint JSON value")
+        assert isinstance(value, (_ImmutableDict, _ImmutableList))
+        if id(value) in seen:
+            return
+        seen.add(id(value))
+        if isinstance(value, _ImmutableDict):
+            if any(type(key) is not str for key in dict.keys(value)):
+                raise ValueError("Invalid immutable checkpoint JSON key")
+            items = tuple(dict.items(value))
+            members.append(
+                _ImmutableMember(weakref.ref(value), type(value), items=items)
+            )
+            for _, part in items:
+                retain(part)
+        else:
+            values = tuple(list.__iter__(value))
+            members.append(
+                _ImmutableMember(weakref.ref(value), type(value), values=values)
+            )
+            for part in values:
+                retain(part)
+
+    retain(snapshot)
+    identity = id(snapshot)
+
+    def discard(reference: weakref.ReferenceType[_SharedSnapshot]) -> None:
+        with _validation_lock:
+            retained = _validated_snapshots.get(identity)
+            if retained is not None and retained.reference is reference:
+                del _validated_snapshots[identity]
+
+    certificate = _ValidatedSnapshot(
+        weakref.ref(snapshot, discard), compact_bytes, tuple(members)
+    )
+    with _validation_lock:
+        _validated_snapshots[identity] = certificate
+
+
+def _verified_snapshot(snapshot: dict[str, JsonValue], maximum: int) -> bool:
+    if type(maximum) is not int or maximum < 1:
+        raise ValueError("Invalid checkpoint storage capacity")
+    with _validation_lock:
+        certificate = _validated_snapshots.get(id(snapshot))
+    if certificate is None or certificate.reference() is not snapshot:
+        return False
+    if certificate.compact_bytes > maximum:
+        raise ValueError("Parallel checkpoint unit exceeds its storage capacity")
+    if (
+        not isinstance(snapshot, _SharedSnapshot)
+        or type(snapshot.compact_bytes) is not int
+        or snapshot.compact_bytes != certificate.compact_bytes
+    ):
+        raise ValueError("Validated parallel checkpoint capacity changed")
+    for member in certificate.members:
+        current = member.reference()
+        if type(current) is not member.container_type:
+            raise ValueError("Validated parallel checkpoint changed")
+        if member.items is not None:
+            if not isinstance(current, _ImmutableDict) or dict.__len__(current) != len(
+                member.items
+            ):
+                raise ValueError("Validated parallel checkpoint changed")
+            if any(
+                actual_key != key or actual_value is not value
+                for (actual_key, actual_value), (key, value) in zip(
+                    dict.items(current), member.items, strict=True
+                )
+            ):
+                raise ValueError("Validated parallel checkpoint changed")
+        else:
+            if (
+                not isinstance(current, _ImmutableList)
+                or member.values is None
+                or list.__len__(current) != len(member.values)
+                or any(
+                    actual is not expected
+                    for actual, expected in zip(
+                        list.__iter__(current), member.values, strict=True
+                    )
+                )
+            ):
+                raise ValueError("Validated parallel checkpoint changed")
+    return True
+
+
 def _checked_freeze(
     value: JsonValue,
     memo: dict[int, JsonValue] | None = None,
@@ -600,6 +720,7 @@ def _restore_v2(snapshot: dict[str, JsonValue], maximum: int) -> dict[str, JsonV
     assert isinstance(frozen, dict)
     shared = _SharedSnapshot(frozen)
     shared.compact_bytes = compact_bytes
+    _certify_snapshot(shared, compact_bytes)
     return shared
 
 
@@ -637,6 +758,8 @@ def share_parallel_snapshot(
     snapshot: dict[str, JsonValue], *, max_unit_bytes: int = _DEFAULT_UNIT_BYTES
 ) -> dict[str, JsonValue]:
     """Validate and intern a complete child snapshot before recursive copies."""
+    if _verified_snapshot(snapshot, max_unit_bytes):
+        return snapshot
     return _restore_v2(_compact_v2(snapshot, max_unit_bytes), max_unit_bytes)
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
@@ -39,7 +40,10 @@ from onyx.asv3.models import (
 )
 from onyx.asv3.outcome_map import OutcomeMap
 from onyx.asv3.parallel_answers import ParallelAnswerReceipts
-from onyx.asv3.parallel_execution import ParallelExecutionSlots
+from onyx.asv3.parallel_execution import (
+    ParallelExecutionSlots,
+    parallel_execution_enabled,
+)
 from onyx.asv3.progress import (
     ProgressEvent,
     ProgressReporter,
@@ -116,6 +120,14 @@ from onyx.tracing.framework.create import ChatTraceMetadata, ensure_trace
 
 logger = logging.getLogger(__name__)
 P = ParamSpec("P")
+
+
+def _verification_context(context: RunContext) -> RunContext:
+    if not parallel_execution_enabled(context):
+        return context
+    isolated = copy.copy(context)
+    isolated.services = dict(context.services)
+    return isolated
 
 
 def _presentation_search_doc(item: EvidenceItem) -> SearchDoc | None:
@@ -670,6 +682,7 @@ def run_asv3_loop(
         )
 
     def verify(args: dict[str, JsonValue], child: RunContext) -> ToolOutcome:
+        child = _verification_context(child)
         numbers = args.get("evidence_numbers", args.get("citations", []))
         anchors = (
             " ".join(f"[{n}]" for n in numbers) if isinstance(numbers, list) else ""

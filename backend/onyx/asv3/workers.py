@@ -364,6 +364,12 @@ class WorkerPool:
             integrity = _checkpoint_digest(
                 checkpoint.model_dump(mode="json", exclude={"integrity"})
             )
+        self._require_checkpoint_binding(task, checkpoint, integrity)
+        return checkpoint
+
+    def _require_checkpoint_binding(
+        self, task: TaskSnapshot, checkpoint: _ChildCheckpoint, integrity: str
+    ) -> None:
         if (
             checkpoint.run_id != self.context.run_id
             or checkpoint.task_id != task.task_id
@@ -378,7 +384,6 @@ class WorkerPool:
             raise ValueError(
                 "Child checkpoint task, assignment, scope or integrity changed"
             )
-        return checkpoint
 
     def record_checkpoint(self, task_id: str, snapshot: dict[str, JsonValue]) -> None:
         """Save a request-bound host snapshot without exposing it as worker output."""
@@ -410,7 +415,12 @@ class WorkerPool:
                 if self._shared_checkpoints()
                 else _checkpoint_digest(content),
             }
-            self._validated_checkpoint(task, wrapped)
+            if self._shared_checkpoints():
+                metadata = _ChildCheckpoint.model_validate({**wrapped, "snapshot": {}})
+                checked = metadata.model_copy(update={"snapshot": content["snapshot"]})
+                self._require_checkpoint_binding(task, checked, metadata.integrity)
+            else:
+                self._validated_checkpoint(task, wrapped)
             task.child_checkpoint = wrapped
 
     def checkpoint(self, task_id: str) -> dict[str, JsonValue] | None:

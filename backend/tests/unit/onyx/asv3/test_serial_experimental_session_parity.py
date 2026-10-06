@@ -6,7 +6,7 @@ import threading
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import Any, Literal, cast
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 from pydantic import JsonValue
@@ -200,6 +200,7 @@ def session(
     ledger: EvidenceLedger,
     *,
     verify: Callable[[RunContext, dict[str, JsonValue]], ToolOutcome] | None = None,
+    checkpoint_callback: Callable[[dict[str, JsonValue]], None] | None = None,
 ) -> SerialExperimentalSession:
     def capabilities(context: RunContext) -> list[ToolSpec]:
         context.services.update(
@@ -232,7 +233,38 @@ def session(
                 status=OutcomeStatus.FOUND, summary="Selected verification completed"
             )
         ),
+        checkpoint_callback=checkpoint_callback,
     )
+
+
+def test_hosted_checkpoint_captures_complete_restorable_session_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = "Kullanıcının verdiği miktar on bir parçadır."
+    run = serial_run(monkeypatch, "scenario", body)
+    run.calls.clear()
+    run.selected.reset_mock()
+    checkpoints: list[dict[str, JsonValue]] = []
+    child = session(
+        run, outer(run), EvidenceLedger(), checkpoint_callback=checkpoints.append
+    )
+    result = child.run()
+    assert result.status == OutcomeStatus.FOUND
+    assert result.summary == body
+
+    with patch.object(
+        child.harness, "snapshot", wraps=child.harness.snapshot
+    ) as capture:
+        child.harness._save()
+    assert capture.call_count == 1
+    assert checkpoints[-1] == child.snapshot()
+    assert "serial_experimental_session" in checkpoints[-1]
+
+    restored = session(run, outer(run), child.ledger)
+    restored.restore(checkpoints[-1])
+    run.selected.reset_mock()
+    assert restored.run().summary == body
+    run.selected.invoke.assert_not_called()
 
 
 @pytest.mark.parametrize(

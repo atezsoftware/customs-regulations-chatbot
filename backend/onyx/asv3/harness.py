@@ -58,6 +58,7 @@ class Harness:
         report_terminal: bool = True,
         report_started: bool = True,
         on_decision: Callable[[Decision], None] | None = None,
+        checkpoint_snapshot: Callable[[], dict[str, JsonValue]] | None = None,
     ) -> None:
         self.request = request
         self.context = context
@@ -67,6 +68,7 @@ class Harness:
         self.progress = progress
         self.on_receipt = on_receipt
         self.checkpoint = checkpoint
+        self.checkpoint_snapshot = checkpoint_snapshot
         self.max_workers = max_workers
         self.adaptive_tool_parallelism = adaptive_tool_parallelism
         self.max_context_chars = max_context_chars
@@ -268,8 +270,20 @@ class Harness:
                 if parallel_execution_enabled(self.context)
                 else nullcontext()
             )
-            with preparation:
-                self.checkpoint(self.snapshot())
+            with preparation as checkpoint_step:
+                snapshot_started = time.monotonic()
+                snapshot = (
+                    self.checkpoint_snapshot()
+                    if self.checkpoint_snapshot is not None
+                    else self.snapshot()
+                )
+                snapshot_finished = time.monotonic()
+                self.checkpoint(snapshot)
+                if checkpoint_step is not None:
+                    checkpoint_step.output_value = {
+                        "snapshot_seconds": snapshot_finished - snapshot_started,
+                        "write_seconds": time.monotonic() - snapshot_finished,
+                    }
 
     def view(self) -> HarnessView:
         from onyx.asv3.supplemental_tools import ScenarioState
