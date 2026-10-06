@@ -553,6 +553,38 @@ class LegalSourceReviews:
                     "supported answer detail. Do not relabel or reread the same introduction, "
                     "scan unrelated sources, or claim its operative effect from a title."
                 )
+            if (
+                check_judicial_sections
+                and not available
+                and code
+                in {
+                    "wrong_source",
+                    "missing_own_originals",
+                    "not_fully_delivered",
+                    "argument_cannot_close_operative",
+                }
+            ):
+                retained = [
+                    citation
+                    for citation, doc in ledger.citation_mapping().items()
+                    if doc.document_id == record.source_id
+                ]
+                diagnostic["suggested_acquisition"] = (
+                    {"name": "read_evidence", "arguments": {"citation": retained[0]}}
+                    if retained
+                    else {
+                        "name": "read_source_range",
+                        "arguments": {"source_id": record.source_id, "start": 0},
+                    }
+                )
+                diagnostic["instruction"] = (
+                    "No own original for this candidate was delivered. Metadata edits cannot "
+                    "supply it. Reopen its retained original or read this exact source, then "
+                    "locate the operative section and qualifications before assessment. Do not "
+                    "reuse a different source's citation or repeat the anchor statute search. "
+                    "The suggested acquisition is a navigation lead, not legal approval; "
+                    "follow any required continuation. Preserve the supported answer detail."
+                )
             error = RelatedSourceReviewValidationError(message, diagnostic)
             if errors is not None:
                 errors.append(error)

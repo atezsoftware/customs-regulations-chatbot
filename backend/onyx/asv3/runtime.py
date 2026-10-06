@@ -392,8 +392,13 @@ def run_asv3_loop(
         gap = native_named_authority_gap(
             answer,
             ledger,
-            strict_reference_boundaries=research_profile == "experimental",
-            syntactic_reference_binding=parallel_research,
+            strict_reference_boundaries=(
+                research_profile == "experimental"
+                or workflow_variant == ASV3_TUNED_VARIANT
+            ),
+            syntactic_reference_binding=(
+                parallel_research or workflow_variant == ASV3_TUNED_VARIANT
+            ),
         )
         if authority_requirements is not None:
             return authority_requirements.publication_gap(

@@ -1,6 +1,7 @@
 """Exercise source-lead omission through model delivery, dispatch and publication."""
 
 from dataclasses import replace
+from threading import Barrier
 from typing import Any, cast
 
 import pytest
@@ -154,6 +155,50 @@ def test_examined_effect_and_limitations_need_their_own_substantive_citations() 
     assert reviews.publication_gap("Merhaba!", "answer-call", context, ledger) is None
 
 
+@pytest.mark.parametrize("retained", [False, True])
+def test_unread_candidate_diagnostic_requests_its_own_acquisition_not_metadata_edits(
+    retained: bool,
+) -> None:
+    context, ledger, reviews = tuned_context()
+    if not retained:
+        law = ledger.get(1)
+        assert law is not None
+        ledger = EvidenceLedger()
+        ledger.add([law], context)
+        deliver(ledger, "law-call", [1])
+        context.services["evidence"] = ledger
+    seen(context, ledger, reviews)
+    context.services["last_model_call_id"] = "law-call"
+    outcome = terminal_registry([]).dispatch(
+        CapabilityCall(
+            name="submit_answer",
+            arguments={
+                "answer": "The rule applies [1].",
+                "basis": "originals",
+                "_related_source_reviews": [
+                    review(witnesses=[{"citation": 1, "start_char": 0, "end_char": 10}])
+                ],
+            },
+        ),
+        context,
+    )
+    assert outcome.status == OutcomeStatus.INVALID
+    diagnostic = outcome.data["related_source_review_error"]
+    assert isinstance(diagnostic, dict)
+    assert diagnostic["code"] == "wrong_source"
+    assert diagnostic["available_original_witnesses"] == []
+    assert diagnostic["suggested_acquisition"] == (
+        {"name": "read_evidence", "arguments": {"citation": 2}}
+        if retained
+        else {
+            "name": "read_source_range",
+            "arguments": {"source_id": "decision", "start": 0},
+        }
+    )
+    assert "Metadata edits cannot" in str(diagnostic["instruction"])
+    assert reviews.view(context, ledger, {1})["pending_lead_ids"]
+
+
 def test_unavailable_original_needs_its_precise_standalone_gap() -> None:
     context, ledger, reviews = tuned_context()
     seen(context, ledger, reviews)
@@ -198,6 +243,33 @@ def test_tuned_policy_replaces_one_section_without_case_specific_direction() -> 
     for forbidden in ("241", "royalti", "2026/72", "VAKA", "Anayasa"):
         policy = TUNED_LEGAL_DEPARTMENT_RESEARCH[len(before) : -len(after)]
         assert forbidden not in policy
+
+
+def test_runtime_tuned_statute_binding_does_not_consume_a_neighboring_circular_number(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kwargs, broker, selected, checkpoints, _queue = setup_run(monkeypatch)
+    kwargs.pop("test_language")
+    broker.barrier = Barrier(1)
+    source_id = str(broker.sources[0].id)
+    broker.chunks[source_id] = replace(
+        broker.chunks[source_id],
+        text="MADDE 14: İzin için başvuru gerekir.",
+        heading_path=("8765 sayılı Faaliyet Kanunu", "MADDE 14"),
+        metadata={"document_type": "kanun", "title": "8765 sayılı Faaliyet Kanunu"},
+    )
+    answer = "53 sayılı Genelge ve 8765 sayılı Faaliyet Kanunu m.14 uyarınca izin için başvuru gerekir [1]."
+    selected.invoke.side_effect = [
+        response(
+            calls=[("read_source_range", {"source_id": source_id, "_language": "tr"})]
+        ),
+        response(calls=[("submit_answer", {"answer": answer, "basis": "originals"})]),
+    ]
+    kwargs.update(research_profile="normal", workflow_variant=ASV3_TUNED_VARIANT)
+    runtime.run_asv3_loop(**kwargs)
+    assert selected.invoke.call_count == 2
+    assert checkpoints[-1]["publication_status"] == "found"
+    assert kwargs["state_container"].answer_tokens == answer.replace("[1]", "[[1]]()")
 
 
 @pytest.mark.parametrize("omit_examined_source", [False, True])
