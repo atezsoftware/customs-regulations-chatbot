@@ -69,7 +69,11 @@ from onyx.asv3.terminal_fact_references import (
     normalize_terminal_fact_references,
 )
 from onyx.asv3.terminal_metadata import normalize_terminal_metadata
-from onyx.asv3.terminal_wire_schema import decode_optional_nulls, strict_terminal_tools
+from onyx.asv3.terminal_wire_schema import (
+    bind_terminal_review_citations,
+    decode_optional_nulls,
+    strict_terminal_tools,
+)
 from onyx.configs.chat_configs import (
     LLM_FIRST_CHUNK_RETRY_BASE_DELAY_S,
     LLM_FIRST_CHUNK_RETRY_JITTER_RATIO,
@@ -892,6 +896,13 @@ class ResearchModel:
     def _input_cost(
         self, prompt: list[ChatCompletionMessage], tools: list[dict[str, JsonValue]]
     ) -> int:
+        if parallel_execution_enabled(self.context):
+            tools = strict_terminal_tools(
+                tools,
+                self.context,
+                self.llm.config.model_provider,
+                self.llm.config.model_name,
+            )
         total = 128 + len(prompt) * 16 + len(tools) * 16
         for message in prompt:
             if isinstance(message, AssistantMessage) and message.tool_calls:
@@ -2797,6 +2808,28 @@ class ResearchModel:
                 context["decisive_fact_catalogue"] = fact_catalogue
             if retained_answer is not None:
                 context["draft_to_repair"] = {"units": retained_answer.pop("units")}
+                if view.publication_gap is not None and extract_citation_numbers(
+                    view.draft_to_repair or ""
+                ):
+                    selected = [
+                        tool
+                        for tool in selected
+                        if not (
+                            isinstance(function := tool.get("function"), dict)
+                            and function.get("name")
+                            in {"submit_answer", "submit_partial_answer"}
+                        )
+                    ]
+                    retained_answer["instruction"] = (
+                        "Commit this invocation's draft with submit_retained_answer or "
+                        "submit_retained_partial_answer and your corrected publication metadata. "
+                        "To repair substantive text, supply retained_answer_edits for the exact "
+                        "owned unit_id values. Any units may be corrected when the actual gap "
+                        "requires it; there is no edit-count or replacement-length limit. "
+                        "Untouched units and separators remain exact. Research and clarification "
+                        "actions remain available. All current delivery and legal publication "
+                        "checks apply to the complete reconstructed answer."
+                    )
                 context["retained_answer"] = retained_answer
         if (
             independent_mode
@@ -2856,7 +2889,16 @@ class ResearchModel:
                     return True
             return False
 
+        unbound_selected = (
+            copy.deepcopy(selected)
+            if parallel_execution_enabled(self.context)
+            else None
+        )
+
         def messages() -> list[ChatCompletionMessage]:
+            nonlocal selected
+            if unbound_selected is not None:
+                selected = copy.deepcopy(unbound_selected)
             current = dict(context)
             delivered_sources: dict[str, list[JsonValue]] = {}
             delivered_anchors: set[tuple[str, str, str | None]] = set()
@@ -2955,6 +2997,43 @@ class ResearchModel:
                         "arguments must match its actual schema and contain your own "
                         "_related_source_reviews. No prose, fences or copied approval."
                     )
+                    retained_terminals = [
+                        str(function["name"])
+                        for tool in selected
+                        if isinstance(function := tool.get("function"), dict)
+                        and function.get("name")
+                        in {"submit_retained_answer", "submit_retained_partial_answer"}
+                    ]
+                    if parallel_execution_enabled(self.context) and retained_terminals:
+                        full_terminals = [
+                            str(function["name"])
+                            for tool in selected
+                            if isinstance(function := tool.get("function"), dict)
+                            and function.get("name")
+                            in {"submit_answer", "submit_partial_answer"}
+                        ]
+                        current["related_source_terminal_transport"] = (
+                            "Assess the related sources yourself against the supplied originals. "
+                            "Use an exposed native action for more research or your own terminal "
+                            "assessment. For an unchanged draft_to_repair or a named-unit repair, "
+                            "use "
+                            + " or ".join(retained_terminals)
+                            + "; include only the corrected "
+                            "publication metadata and any retained_answer_edits required by "
+                            "the actual gap. Untouched answer units are retained exactly; "
+                            "all current publication checks still apply. "
+                            + (
+                                "For a full rewrite, use "
+                                + " or ".join(full_terminals)
+                                + ". "
+                                if full_terminals
+                                else "Correct substantive text through the owned unit edits. "
+                            )
+                            + "If returning "
+                            "a terminal action as content, return only one strict JSON object "
+                            "with exactly name and arguments matching its exposed schema and "
+                            "your own _related_source_reviews. No prose, fences or copied approval."
+                        )
             if isinstance(outcomes, OutcomeMap):
                 current["outcome_map"] = outcomes.view(
                     outcome_ids=outcome_subset,
@@ -3001,6 +3080,35 @@ class ResearchModel:
                             and isinstance(row.get("lead_id"), str)
                         )
                 self._bind_related_source_ids(selected, sorted(related_ids))
+                if parallel_execution_enabled(self.context):
+                    review_citations: dict[str, tuple[int, ...]] = {}
+                    binding_rows: list[JsonValue] = []
+                    for navigation_record in candidate_navigation:
+                        if not isinstance(navigation_record, dict):
+                            continue
+                        candidates = navigation_record.get("candidates")
+                        if isinstance(candidates, list):
+                            binding_rows.extend(candidates)
+                    rows = source_review_state.get("reviews")
+                    if isinstance(rows, list):
+                        binding_rows.extend(rows)
+                    for row in binding_rows:
+                        if not isinstance(row, dict):
+                            continue
+                        lead_id = row.get("lead_id")
+                        if not isinstance(lead_id, str):
+                            continue
+                        citations = row.get("available_original_citations")
+                        review_citations[lead_id] = tuple(
+                            number
+                            for number in (
+                                citations if isinstance(citations, list) else []
+                            )
+                            if type(number) is int and number > 0
+                        )
+                    selected = bind_terminal_review_citations(
+                        selected, self.context, review_citations
+                    )
             gaps = research_gap_signals(view, complete_originals)
             if gaps:
                 current["research_gap_signals"] = gaps

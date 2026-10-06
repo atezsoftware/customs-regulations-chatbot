@@ -1,6 +1,7 @@
 """Fail-open read-only integration between label snapshots and normal retrieval."""
 
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from datetime import date
 from typing import Literal
 from uuid import UUID
@@ -59,6 +60,41 @@ class LabelSearchResult(BaseModel):
     ] = "disabled"
 
 
+@dataclass(frozen=True)
+class LabelDiscoveryAcquisition:
+    chunks: tuple[InferenceChunk, ...] = ()
+    error: Exception | None = None
+
+    @classmethod
+    def capture(
+        cls,
+        discover: Callable[[LabelSearchHint], list[InferenceChunk]],
+        hint: LabelSearchHint,
+    ) -> "LabelDiscoveryAcquisition":
+        try:
+            return cls(chunks=tuple(discover(hint)))
+        except Exception as error:
+            return cls(error=error)
+
+    def result(self) -> list[InferenceChunk]:
+        if self.error is not None:
+            raise self.error
+        return list(self.chunks)
+
+
+def prepare_label_search_hint(
+    snapshot: LabelSearchSnapshot, raw_hint: object, query: str
+) -> LabelSearchHint:
+    hint = validate_search_hint(raw_hint, snapshot)
+    explicit = explicit_subject_hint(snapshot, query)
+    vocabulary = query_subject_hint(snapshot, query)
+    return LabelSearchHint(
+        label_ids=tuple(
+            dict.fromkeys((*explicit.label_ids, *vocabulary.label_ids, *hint.label_ids))
+        )[:12]
+    )
+
+
 def search_snapshot_for_run_ids(
     run_ids: tuple[UUID, ...],
     *,
@@ -112,18 +148,12 @@ def search_with_labels(
     retrieve: Callable[[tuple[str, ...]], list[InferenceChunk]],
     query: str = "",
     discover: Callable[[LabelSearchHint], list[InferenceChunk]] | None = None,
+    discovery_acquisition: LabelDiscoveryAcquisition | None = None,
 ) -> LabelSearchResult:
     fallback = LabelSearchResult(candidates=list(baseline))
     if snapshot is None or snapshot.tenant_id != get_current_tenant_id():
         return fallback.model_copy(update={"status": "snapshot_mismatch"})
-    hint = validate_search_hint(raw_hint, snapshot)
-    explicit = explicit_subject_hint(snapshot, query)
-    vocabulary = query_subject_hint(snapshot, query)
-    hint = LabelSearchHint(
-        label_ids=tuple(
-            dict.fromkeys((*explicit.label_ids, *vocabulary.label_ids, *hint.label_ids))
-        )[:12]
-    )
+    hint = prepare_label_search_hint(snapshot, raw_hint, query)
     if not hint.label_ids:
         return fallback.model_copy(update={"status": "no_hint"})
     try:
@@ -138,7 +168,11 @@ def search_with_labels(
             baseline_ids = {chunk.regulatory_chunk_id for chunk in baseline}
             seen = set(baseline_ids)
             proposals = []
-            discovered = discover(hint)
+            discovered = (
+                discovery_acquisition.result()
+                if discovery_acquisition is not None
+                else discover(hint)
+            )
             for chunk in discovered:
                 identifier = chunk.regulatory_chunk_id
                 if identifier and identifier not in seen:

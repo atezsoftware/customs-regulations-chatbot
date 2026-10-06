@@ -211,6 +211,13 @@ def bind_retained_answer(
         assert isinstance(retained_properties, dict)
         for field in ("answer", "retained_answer_id", "basis"):
             retained_properties.pop(field, None)
+        retained_edits = retained_properties.get("retained_answer_edits")
+        assert isinstance(retained_edits, dict)
+        retained_edits["description"] = (
+            "Replace only named units in this invocation's owned draft; no body or "
+            "reference identifier is needed. Every other unit and separator remains "
+            "unchanged. Empty deletions are rejected."
+        )
         retained_parameters["required"] = [
             field for field in required if field not in {"answer", "basis"}
         ]

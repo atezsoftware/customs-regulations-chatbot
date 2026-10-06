@@ -25,7 +25,7 @@ from tests.unit.onyx.asv3.test_shared_originals import full_record, original
 pytestmark = pytest.mark.usefixtures("empty_source_inventory")
 
 
-@pytest.mark.parametrize("representation", ["answer", "reference", "unit_edit"])
+@pytest.mark.parametrize("representation", ["answer", "retained", "unit_edit"])
 @pytest.mark.parametrize("citation", [1, 2])
 @pytest.mark.parametrize("hosted", [False, True])
 def test_native_patch_keeps_semantic_call_and_missing_source_still_blocks(
@@ -79,9 +79,10 @@ def test_native_patch_keeps_semantic_call_and_missing_source_still_blocks(
                 patch_arguments["answer"] = body
             else:
                 current = payloads(kwargs["prompt"])[-1]
-                patch_arguments["retained_answer_id"] = current["retained_answer"][
-                    "retained_answer_id"
-                ]
+                assert current["retained_answer"]["retained_answer_id"]
+                names = {row["function"]["name"] for row in kwargs["tools"]}
+                assert "submit_retained_answer" in names
+                assert "submit_answer" not in names
                 if representation == "unit_edit":
                     unit = current["draft_to_repair"]["units"][0]
                     expected_body = (
@@ -91,7 +92,10 @@ def test_native_patch_keeps_semantic_call_and_missing_source_still_blocks(
                         {"unit_id": unit["unit_id"], "replacement": expected_body}
                     ]
             result = tool_response(
-                json.dumps({**patch_arguments, "unknown_field": True}), "submit_answer"
+                json.dumps({**patch_arguments, "unknown_field": True}),
+                "submit_answer"
+                if representation == "answer"
+                else "submit_retained_answer",
             )
             result.choice.finish_reason = "tool_calls"
             return result

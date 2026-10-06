@@ -137,11 +137,30 @@ def test_terminal_schema_binds_current_navigation_and_prior_owned_leads(
         )
     )
     schema = cast(dict[str, Any], selected[0])["function"]["parameters"]
-    assert schema["properties"]["_related_source_reviews"]["items"]["properties"][
-        "lead_id"
-    ]["enum"] == [lead_id()]
-    assert jsonschema.Draft202012Validator(schema).is_valid(
+    branches = schema["properties"]["_related_source_reviews"]["items"]["anyOf"]
+    assert {
+        identity
+        for branch in branches
+        for identity in branch["properties"]["lead_id"]["enum"]
+    } == {lead_id()}
+    assert all(
+        branch["properties"]["status"]["enum"] == ["unresolved"]
+        and branch["properties"]["witnesses"]["maxItems"] == 0
+        for branch in branches
+    )
+    # The only physically fitted original is the anchor law, not this source.
+    assert not jsonschema.Draft202012Validator(schema).is_valid(
         {"answer": "Text", "_related_source_reviews": [review()]}
+    )
+    assert jsonschema.Draft202012Validator(schema).is_valid(
+        {
+            "answer": "Text",
+            "_related_source_reviews": [
+                review(
+                    status="unresolved", witnesses=[], gap="The candidate is unread."
+                )
+            ],
+        }
     )
     assert not jsonschema.Draft202012Validator(schema).is_valid(
         {
@@ -153,6 +172,33 @@ def test_terminal_schema_binds_current_navigation_and_prior_owned_leads(
     assert reviews.view(context, ledger, {1})["pending_lead_ids"] == (
         [lead_id()] if recorded_lead else []
     )
+    fitted_prompt, fitted, _ = adapter._fit_native_decision(
+        view(
+            original_evidence=[full_record(ledger, 1), full_record(ledger, 2)]
+        ).model_copy(update={"tools": tools})
+    )
+    assert {row["citation"] for row in actual_originals(fitted_prompt)} == {1, 2}
+    own_schema = cast(dict[str, Any], fitted[0])["function"]["parameters"]
+    own_branches = own_schema["properties"]["_related_source_reviews"]["items"]["anyOf"]
+    assert {
+        number
+        for branch in own_branches
+        for number in branch["properties"]["witnesses"]["items"]["properties"][
+            "citation"
+        ]["enum"]
+    } == {2}
+    assert jsonschema.Draft202012Validator(own_schema).is_valid(
+        {"answer": "Text", "_related_source_reviews": [review()]}
+    )
+    assert not jsonschema.Draft202012Validator(own_schema).is_valid(
+        {
+            "answer": "Text",
+            "_related_source_reviews": [
+                review(witnesses=[{"citation": 1, "end_char": 20}])
+            ],
+        }
+    )
+    assert tools == original_tools
 
 
 def test_schema_error_names_the_unexpected_field_without_answer_values() -> None:

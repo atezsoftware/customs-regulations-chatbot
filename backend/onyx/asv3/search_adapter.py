@@ -23,6 +23,9 @@ from onyx.chat.emitter import NullEmitter
 from onyx.chat.models import ChatMessageSimple
 from onyx.configs.constants import MessageType
 from onyx.context.search.models import SearchDocsResponse
+from onyx.context.search.retrieval.parallel_retrieval_scope import (
+    experimental_parallel_retrieval,
+)
 from onyx.context.search.retrieval.query_embedding_scope import (
     ParallelQueryEmbeddingScope,
     experimental_parallel_query_embeddings,
@@ -287,7 +290,12 @@ def build_search_adapter(
             and isinstance(embedding_scope, ParallelQueryEmbeddingScope)
             else nullcontext()
         )
-        with scoped_embeddings:
+        scoped_retrieval = (
+            experimental_parallel_retrieval(check_active=context.check_research_active)
+            if parallel_execution_enabled(context)
+            else nullcontext()
+        )
+        with scoped_embeddings, scoped_retrieval:
             batch = run_tool_calls(
                 tool_calls=[
                     ToolCallKickoff(

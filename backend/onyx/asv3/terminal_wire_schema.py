@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+from collections.abc import Mapping
 
 import jsonschema
 from pydantic import JsonValue
@@ -117,6 +118,19 @@ def _bind_resolution_shapes(properties: dict[str, JsonValue]) -> None:
 def _bind_review_shapes(properties: dict[str, JsonValue]) -> None:
     reviews = properties.get("_related_source_reviews")
     items = reviews.get("items") if isinstance(reviews, dict) else None
+    alternatives = items.get("anyOf") if isinstance(items, dict) else None
+    if isinstance(alternatives, list):
+        if any(not isinstance(alternative, dict) for alternative in alternatives):
+            return
+        shaped: list[JsonValue] = []
+        for alternative in alternatives:
+            assert isinstance(alternative, dict)
+            nested: dict[str, JsonValue] = {"items": alternative}
+            _bind_review_shapes({"_related_source_reviews": nested})
+            shaped.append(nested["items"])
+        assert isinstance(items, dict)
+        items["anyOf"] = shaped
+        return
     fields = items.get("properties") if isinstance(items, dict) else None
     if not isinstance(fields, dict) or not isinstance(items, dict):
         return
@@ -153,6 +167,112 @@ def _bind_review_shapes(properties: dict[str, JsonValue]) -> None:
         branches.append(branch)
     assert isinstance(reviews, dict)
     reviews["items"] = {"anyOf": branches}
+
+
+def bind_terminal_review_citations(
+    tools: list[dict[str, JsonValue]],
+    context: RunContext,
+    review_citations: Mapping[str, tuple[int, ...]],
+) -> list[dict[str, JsonValue]]:
+    """Bind only selected terminal schemas to their invocation's own originals."""
+    if not parallel_execution_enabled(context):
+        return tools
+    available: dict[str, tuple[int, ...]] = {}
+    for lead, numbers in review_citations.items():
+        if not isinstance(lead, str) or any(
+            type(number) is not int or number < 1 for number in numbers
+        ):
+            raise ValueError("Invalid invocation source-review citation binding")
+        available[lead] = tuple(sorted(set(numbers)))
+    selected = copy.deepcopy(tools)
+    for tool in selected:
+        function = tool.get("function")
+        if not isinstance(function, dict) or function.get("name") not in TERMINALS:
+            continue
+        parameters = function.get("parameters")
+        properties = (
+            parameters.get("properties") if isinstance(parameters, dict) else None
+        )
+        reviews = (
+            properties.get("_related_source_reviews")
+            if isinstance(properties, dict)
+            else None
+        )
+        if not isinstance(reviews, dict) or reviews.get("maxItems") == 0:
+            continue
+        items = reviews.get("items")
+        fields = items.get("properties") if isinstance(items, dict) else None
+        lead = fields.get("lead_id") if isinstance(fields, dict) else None
+        identifiers = lead.get("enum") if isinstance(lead, dict) else None
+        witnesses = fields.get("witnesses") if isinstance(fields, dict) else None
+        witness = witnesses.get("items") if isinstance(witnesses, dict) else None
+        witness_fields = (
+            witness.get("properties") if isinstance(witness, dict) else None
+        )
+        citation = (
+            witness_fields.get("citation") if isinstance(witness_fields, dict) else None
+        )
+        status = fields.get("status") if isinstance(fields, dict) else None
+        gap = fields.get("gap") if isinstance(fields, dict) else None
+        if not (
+            isinstance(items, dict)
+            and isinstance(identifiers, list)
+            and identifiers
+            and all(isinstance(identity, str) for identity in identifiers)
+            and isinstance(lead, dict)
+            and isinstance(witnesses, dict)
+            and isinstance(witness, dict)
+            and isinstance(witness_fields, dict)
+            and isinstance(citation, dict)
+            and citation.get("type") == "integer"
+            and isinstance(status, dict)
+            and status.get("enum") == ["examined", "not_material", "unresolved"]
+            and isinstance(gap, dict)
+            and gap.get("type") == "string"
+        ):
+            continue
+        groups: dict[tuple[int, ...], list[JsonValue]] = {}
+        for identity in identifiers:
+            assert isinstance(identity, str)
+            numbers = available.get(identity, ())
+            existing_enum = citation.get("enum")
+            if isinstance(existing_enum, list):
+                numbers = tuple(
+                    number
+                    for number in numbers
+                    if any(
+                        type(member) is int and member == number
+                        for member in existing_enum
+                    )
+                )
+            groups.setdefault(numbers, []).append(identity)
+        branches: list[JsonValue] = []
+        for numbers, identities in groups.items():
+            branch = copy.deepcopy(items)
+            parts = branch["properties"]
+            assert isinstance(parts, dict)
+            parts["lead_id"] = {**lead, "enum": identities}
+            if numbers:
+                parts["witnesses"] = {
+                    **witnesses,
+                    "items": {
+                        **witness,
+                        "properties": {
+                            **witness_fields,
+                            "citation": {**citation, "enum": list(numbers)},
+                        },
+                    },
+                }
+            else:
+                parts["status"] = {**status, "enum": ["unresolved"]}
+                parts["witnesses"] = {**witnesses, "maxItems": 0}
+                parts["gap"] = {**gap, "minLength": 1}
+                required = branch.get("required", [])
+                assert isinstance(required, list)
+                branch["required"] = list(dict.fromkeys([*required, "gap"]))
+            branches.append(branch)
+        reviews["items"] = {"anyOf": branches}
+    return selected
 
 
 def _wire_parameters(

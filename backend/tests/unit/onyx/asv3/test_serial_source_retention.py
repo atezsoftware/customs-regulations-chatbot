@@ -81,6 +81,11 @@ def test_real_terminal_retains_selected_second_source_and_seals_exact_corrected_
         second = ledger.get(2)
         assert second is not None
         body = OMITTED
+        body_arguments: dict[str, JsonValue] = {
+            "answer": body,
+            "basis": "originals",
+        }
+        terminal = "submit_answer"
         if len(run.calls) == 3:
             assert trusted_hosted
             rejected = child.harness.receipts[-1].outcome
@@ -99,15 +104,27 @@ def test_real_terminal_retains_selected_second_source_and_seals_exact_corrected_
                 is True
             )
             body = CORRECTED
+            current = last_payload(run.selected)
+            draft = current["draft_to_repair"]
+            assert isinstance(draft, dict)
+            units = draft["units"]
+            assert isinstance(units, list) and len(units) == 1
+            unit = units[0]
+            assert isinstance(unit, dict) and unit["text"] == OMITTED
+            terminal = "submit_retained_answer"
+            body_arguments = {
+                "retained_answer_edits": [
+                    {"unit_id": unit["unit_id"], "replacement": body}
+                ]
+            }
         else:
             assert len(run.calls) == 2
         return response(
             calls=[
                 (
-                    "submit_answer",
+                    terminal,
                     {
-                        "answer": body,
-                        "basis": "originals",
+                        **body_arguments,
                         "_language": "tr",
                         "_outcomes": [declaration()],
                         "_coverage": {

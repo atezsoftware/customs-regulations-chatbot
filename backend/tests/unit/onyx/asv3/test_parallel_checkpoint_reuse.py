@@ -108,10 +108,12 @@ def test_concurrent_worker_saves_keep_bindings_and_validate_once() -> None:
     lock = threading.Lock()
     original_compact = codec._compact_v2
 
-    def compact(value: dict[str, JsonValue], maximum: int) -> dict[str, JsonValue]:
+    def compact(
+        value: dict[str, JsonValue], maximum: int, *, fast_capacity: bool = False
+    ) -> dict[str, JsonValue]:
         with lock:
             compact_calls.append(cast(str, value["request"]))
-        return original_compact(value, maximum)
+        return original_compact(value, maximum, fast_capacity=fast_capacity)
 
     def run(
         task: str, child: RunContext, _updates: Callable[[], list[str]]

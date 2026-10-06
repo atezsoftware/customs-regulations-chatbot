@@ -5,6 +5,7 @@ import json
 from dataclasses import replace
 from typing import Any, cast
 
+import jsonschema
 import pytest
 from pydantic import JsonValue
 
@@ -236,7 +237,12 @@ def test_real_hosted_serial_reuses_rejected_body_with_fresh_original_delivery(
             assert provider_definition["strict"] is True
             properties = provider_definition["parameters"]["properties"]
             review_schema = properties["_related_source_reviews"]["anyOf"][0]
-            review_branches = review_schema["items"]["anyOf"]
+            source_branches = review_schema["items"]["anyOf"]
+            review_branches = [
+                branch
+                for source_branch in source_branches
+                for branch in source_branch.get("anyOf", [source_branch])
+            ]
             lead_ids = review_branches[0]["properties"]["lead_id"]["enum"]
             assert all(
                 branch["properties"]["lead_id"]["enum"] == lead_ids
@@ -244,6 +250,19 @@ def test_real_hosted_serial_reuses_rejected_body_with_fresh_original_delivery(
             )
             assert len(lead_ids) == 1
             citations = {row["source_id"]: row["citation"] for row in originals}
+            witness_schemas = [
+                branch["properties"]["witnesses"].get(
+                    "anyOf", [branch["properties"]["witnesses"]]
+                )[0]
+                for branch in review_branches
+            ]
+            assert {
+                citation
+                for witness_schema in witness_schemas
+                for citation in witness_schema["items"]["properties"]["citation"][
+                    "enum"
+                ]
+            } == {citations[source_ids[1]]}
             review: dict[str, JsonValue] = {
                 "lead_id": lead_ids[0],
                 "status": "examined",
@@ -252,9 +271,12 @@ def test_real_hosted_serial_reuses_rejected_body_with_fresh_original_delivery(
                 "limitations": "its scope remain unchanged",
                 "witnesses": [
                     {
-                        "citation": citations[source_ids[0 if index == 2 else 1]],
+                        "citation": citations[source_ids[1]],
                         "start_char": 0,
-                        "end_char": 20,
+                        # Provider-valid own-source metadata still needs host range validation.
+                        "end_char": len(broker.chunks[source_ids[1]].text) + 1
+                        if index == 2
+                        else 20,
                     }
                 ],
                 "gap": "",
@@ -268,10 +290,28 @@ def test_real_hosted_serial_reuses_rejected_body_with_fresh_original_delivery(
             if index == 2:
                 terminal["answer"] = body
                 assert "retained_answer_id" not in properties
+                assert "answer" in provider_definition["parameters"]["required"]
+                wrong_source = copy.deepcopy(review)
+                wrong_source["witnesses"] = [
+                    {
+                        "citation": citations[source_ids[0]],
+                        "start_char": 0,
+                        "end_char": 20,
+                    }
+                ]
+                assert not jsonschema.Draft202012Validator(review_schema).is_valid(
+                    [wrong_source]
+                )
+                assert jsonschema.Draft202012Validator(review_schema).is_valid([review])
             else:
                 rejected = child.harness.receipts[-1]
                 assert rejected.outcome.status == OutcomeStatus.INVALID
                 assert rejected.outcome.data["invalid_related_source_review"] is True
+                diagnostic = rejected.outcome.data["related_source_review_error"]
+                assert (
+                    isinstance(diagnostic, dict)
+                    and diagnostic["code"] == "invalid_range"
+                )
                 assert child.harness.last_draft == body
                 rejected_native = child.harness.turns[-1].model_dump_json()
                 current = payloads(arguments["prompt"])[-1]
@@ -279,18 +319,8 @@ def test_real_hosted_serial_reuses_rejected_body_with_fresh_original_delivery(
                 identifier = descriptor["retained_answer_id"]
                 assert identifier.startswith("retained_")
                 assert not {"answer", "basis", "retained_answer_id"} & set(properties)
-                assert (
-                    "answer"
-                    in definitions["submit_answer"]["function"]["parameters"][
-                        "required"
-                    ]
-                )
-                assert (
-                    "retained_answer_id"
-                    not in definitions["submit_answer"]["function"]["parameters"][
-                        "properties"
-                    ]
-                )
+                assert not {"submit_answer", "submit_partial_answer"} & set(definitions)
+                assert "submit_retained_partial_answer" in definitions
                 assert body not in json.dumps(descriptor)
                 units = current["draft_to_repair"]["units"]
                 assert "units" not in descriptor

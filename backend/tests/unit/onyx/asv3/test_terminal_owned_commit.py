@@ -61,6 +61,14 @@ def test_owned_commit_has_no_body_identifier_or_basis_on_wire(
     assert not {"answer", "retained_answer_id", "basis"} & set(
         cast(dict[str, JsonValue], schema["properties"])
     )
+    edit_schema = cast(
+        dict[str, JsonValue],
+        cast(dict[str, JsonValue], schema["properties"])["retained_answer_edits"],
+    )
+    assert "Only with retained_answer_id" not in str(edit_schema["description"])
+    assert "no body or reference identifier is needed" in str(
+        edit_schema["description"]
+    )
     jsonschema.validate({}, schema)
     emitted = decision({}, name=name)
     wire = (

@@ -8,7 +8,7 @@ from collections import Counter
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, nullcontext
 from http import HTTPStatus
-from typing import Any, Generic, TypeVar
+from typing import Any, Generic, TypeVar, cast
 
 from elasticsearch import (
     ApiError,
@@ -30,6 +30,10 @@ from onyx.configs.app_configs import (
     ELASTICSEARCH_USE_SSL,
     ELASTICSEARCH_VERIFY_CERTS,
     PIT_KEEP_ALIVE,
+)
+from onyx.context.search.retrieval.parallel_retrieval_scope import (
+    check_parallel_retrieval_active,
+    parallel_retrieval_enabled,
 )
 from onyx.document_index.elasticsearch.constants import (
     DEFAULT_MAX_CHUNK_SIZE,
@@ -59,6 +63,7 @@ from onyx.server.metrics.elasticsearch_search import (
     track_elasticsearch_search,
 )
 from onyx.utils.logger import setup_logger
+from onyx.utils.threadpool_concurrency import run_functions_tuples_in_parallel
 from onyx.utils.timing import log_function_time
 
 CLIENT_THRESHOLD_TO_LOG_SLOW_SEARCH_MS = 2000
@@ -2067,7 +2072,9 @@ class ElasticsearchIndexClient(ElasticsearchClient):
         timed_out = False
         subquery_node_ids: list[str | None] = []
 
-        for subquery, weight in zip(subqueries, weights, strict=True):
+        def acquire(
+            subquery: dict[str, Any], weight: float
+        ) -> tuple[dict[str, Any], str | None]:
             if "knn" in subquery:
                 knn_query = dict(subquery["knn"])
                 knn_query["filter"] = {"bool": {"filter": filters}}
@@ -2090,6 +2097,7 @@ class ElasticsearchIndexClient(ElasticsearchClient):
                 request_body["explain"] = body["explain"]
 
             operation = "search.vector" if "knn" in subquery else "search.bm25"
+            check_parallel_retrieval_active()
             with graph_step(
                 operation,
                 {"index": self._index_name, "body": request_body, "weight": weight},
@@ -2103,12 +2111,41 @@ class ElasticsearchIndexClient(ElasticsearchClient):
                     if isinstance(raw_response, dict)
                     else dict(raw_response.body)
                 )
-            subquery_node_ids.append(query_step.node_id)
             response = (
                 raw_response
                 if isinstance(raw_response, dict)
                 else dict(raw_response.body)
             )
+            check_parallel_retrieval_active()
+            return response, query_step.node_id
+
+        def acquire_optional_error(
+            subquery: dict[str, Any], weight: float
+        ) -> tuple[dict[str, Any], str | None] | Exception:
+            try:
+                return acquire(subquery, weight)
+            except Exception as error:
+                return error
+
+        acquisitions = zip(subqueries, weights, strict=True)
+        responses = (
+            cast(
+                list[tuple[dict[str, Any], str | None] | Exception],
+                run_functions_tuples_in_parallel(
+                    [
+                        (acquire_optional_error, (subquery, weight))
+                        for subquery, weight in acquisitions
+                    ]
+                ),
+            )
+            if parallel_retrieval_enabled()
+            else (acquire(subquery, weight) for subquery, weight in acquisitions)
+        )
+        for acquisition, weight in zip(responses, weights, strict=True):
+            if isinstance(acquisition, Exception):
+                raise acquisition
+            response, node_id = acquisition
+            subquery_node_ids.append(node_id)
             total_took += int(response.get("took", 0))
             timed_out = timed_out or bool(response.get("timed_out", False))
             hits: list[dict[str, Any]] = response.get("hits", {}).get("hits", [])

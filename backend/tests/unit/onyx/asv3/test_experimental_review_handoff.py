@@ -222,6 +222,96 @@ def content_response(text: str) -> ModelResponse:
     )
 
 
+@pytest.mark.parametrize("owned_session", ["parallel", "hosted", "plain"])
+@pytest.mark.parametrize("has_draft", [False, True])
+def test_terminal_transport_names_only_actually_exposed_owned_commits(
+    owned_session: str, has_draft: bool
+) -> None:
+    context, ledger, reviews = experimental_context()
+    if owned_session == "parallel":
+        context.services.update(
+            experimental_parallel=True,
+            scenario_request="Explain both outcomes without dropping conditions.",
+        )
+    elif owned_session == "hosted":
+        context.services.update(
+            serial_session_diagnostics=True,
+            experimental_parallel=False,
+            task_id="owned-session",
+        )
+    seen(context, ledger, reviews)
+    selected = model()
+    selected.invoke.return_value = native_action(
+        "read_provision", {"source_id": "decision"}
+    )
+    registry = terminal_registry([])
+    current = adaptive_tool_view(
+        original_evidence=[full_record(ledger, 1), full_record(ledger, 2)]
+    ).model_copy(update={"tools": registry.definitions(context)})
+    if has_draft:
+        current.draft_to_repair = "Preserved operative holding [1] [2]."
+        current.publication_gap = {"pending_related_source_review": True}
+    ResearchModel(selected, context, lean_native_mode=True).decide(current)
+    payload = last_payload(selected)
+    instruction = str(payload["related_source_terminal_transport"])
+    names = {
+        definition["function"]["name"]
+        for definition in selected.invoke.call_args.kwargs["tools"]
+    }
+    if has_draft and owned_session != "plain":
+        assert "submit_retained_answer" in names
+        assert "submit_answer" not in names
+        assert "read_provision" in names
+        assert "submit_retained_answer" in instruction
+        assert "retained_answer_edits" in instruction
+        assert "Untouched answer units are retained exactly" in instruction
+        assert isinstance(payload["draft_to_repair"], dict)
+        assert "full rewrite" not in instruction
+    else:
+        assert "submit_retained_answer" not in names
+        assert instruction == (
+            "Assess the related sources yourself against the supplied originals. "
+            "Use an exposed native action for more research or your own terminal "
+            "assessment. If the provider returns a terminal action as content, "
+            "return only one strict JSON object with exactly name and arguments: "
+            "name must be an exposed submit_answer or submit_partial_answer; "
+            "arguments must match its actual schema and contain your own "
+            "_related_source_reviews. No prose, fences or copied approval."
+        )
+
+
+@pytest.mark.parametrize("draft", ["Merhaba!", "The supplied amounts total 17."])
+def test_uncited_repair_keeps_full_terminal_basis_and_research_routes(
+    draft: str,
+) -> None:
+    context, ledger, reviews = experimental_context()
+    context.services.update(
+        serial_session_diagnostics=True,
+        experimental_parallel=False,
+        task_id="owned-session",
+    )
+    seen(context, ledger, reviews)
+    selected = model()
+    selected.invoke.return_value = native_action(
+        "read_provision", {"source_id": "decision"}
+    )
+    registry = terminal_registry([])
+    current = adaptive_tool_view(
+        original_evidence=[full_record(ledger, 1), full_record(ledger, 2)]
+    ).model_copy(update={"tools": registry.definitions(context)})
+    current.draft_to_repair = draft
+    current.publication_gap = {"pending_related_source_review": True}
+    ResearchModel(selected, context, lean_native_mode=True).decide(current)
+    names = {
+        definition["function"]["name"]
+        for definition in selected.invoke.call_args.kwargs["tools"]
+    }
+    assert {"submit_answer", "submit_retained_answer", "read_provision"} <= names
+    assert "full rewrite" in str(
+        last_payload(selected)["related_source_terminal_transport"]
+    )
+
+
 @pytest.mark.parametrize("terminal", ["submit_answer", "submit_partial_answer"])
 @pytest.mark.parametrize("provider", ["openai", "vertex_ai"])
 def test_selected_strict_terminal_content_closes_review_without_another_model_call(

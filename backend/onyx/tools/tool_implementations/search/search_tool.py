@@ -65,6 +65,9 @@ from onyx.context.search.pipeline import search_pipeline
 from onyx.context.search.preprocessing.access_filters import (
     build_access_filters_for_user,
 )
+from onyx.context.search.retrieval.parallel_retrieval_scope import (
+    parallel_retrieval_enabled,
+)
 from onyx.context.search.utils import (
     convert_inference_sections_to_search_docs,
     inference_section_from_single_chunk,
@@ -113,7 +116,9 @@ from onyx.regulatory.labeling.evidence_completion import (
 from onyx.regulatory.labeling.search_models import LabelSearchHint, LabelSearchSnapshot
 from onyx.regulatory.labeling.search_ranking import rank_near_tied_label_candidates
 from onyx.regulatory.labeling.search_runtime import (
+    LabelDiscoveryAcquisition,
     LabelSearchResult,
+    prepare_label_search_hint,
     search_snapshot_for_document_set,
     search_snapshot_for_run_ids,
     search_with_labels,
@@ -193,6 +198,7 @@ from shared_configs.configs import (
     MODEL_SERVER_HOST,
     MODEL_SERVER_PORT,
 )
+from shared_configs.contextvars import get_current_tenant_id
 
 logger = setup_logger()
 
@@ -2263,6 +2269,78 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
             )
         )
 
+        def label_search_callbacks(
+            snapshot: LabelSearchSnapshot,
+            filters: BaseFilters,
+        ) -> tuple[
+            Callable[[tuple[str, ...]], list[InferenceChunk]],
+            Callable[[LabelSearchHint], list[InferenceChunk]],
+        ]:
+            def search_label_sources(
+                query: str,
+                identifiers: tuple[str, ...] | None,
+            ) -> list[InferenceChunk]:
+                scoped = (
+                    filters.model_copy(
+                        update={"regulatory_candidate_ids": list(identifiers)}
+                    )
+                    if identifiers is not None
+                    else filters
+                )
+                chunks = self._run_search_for_query(
+                    query,
+                    None,
+                    False,
+                    64,
+                    acl_filters,
+                    embedding_model,
+                    federated_retrieval_infos,
+                    scoped,
+                )
+                chunks = [
+                    chunk
+                    for chunk in chunks
+                    if chunk.regulatory_chunk_id
+                    and (
+                        identifiers is None or chunk.regulatory_chunk_id in identifiers
+                    )
+                ]
+                with get_session_with_current_tenant() as label_visibility_session:
+                    visible = get_visible_regulatory_chunk_ids(
+                        label_visibility_session,
+                        [
+                            chunk.regulatory_chunk_id
+                            for chunk in chunks
+                            if chunk.regulatory_chunk_id
+                        ],
+                        as_of_date=filters.as_of_date,
+                        query_indexes={
+                            UUID(chunk.document_id): chunk.publication_index
+                            for chunk in chunks
+                            if chunk.publication_index is not None
+                        },
+                    )
+                return [
+                    chunk for chunk in chunks if chunk.regulatory_chunk_id in visible
+                ]
+
+            def retrieve_label_ids(
+                identifiers: tuple[str, ...],
+            ) -> list[InferenceChunk]:
+                return search_label_sources(llm_queries[0], identifiers)
+
+            def discover_label_sources(hint: LabelSearchHint) -> list[InferenceChunk]:
+                subjects = set(hint.candidate_label_ids(snapshot.taxonomy))
+                names = [
+                    label.name
+                    for label in snapshot.taxonomy.labels
+                    if label.id in subjects
+                ][:3]
+                query = llm_queries[0] + " " + " ".join(names)[:240]
+                return search_label_sources(query, None)
+
+            return retrieve_label_ids, discover_label_sources
+
         # Run no more than five bounded lanes. Slack is fetched in parallel but
         # folded into the original lane before RRF, so it cannot create lane six.
         search_functions: list[tuple[Callable, tuple]] = []
@@ -2306,10 +2384,44 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
                 )
             )
 
-        all_search_results = cast(
-            list[list[InferenceChunk]],
-            run_functions_tuples_in_parallel(search_functions),
+        label_snapshot = None
+        retrieve_label_ids = None
+        discover_label_sources = None
+        label_discovery_scheduled = False
+        if parallel_retrieval_enabled():
+            label_snapshot = self.get_label_search_snapshot()
+            if (
+                label_snapshot is not None
+                and label_snapshot.tenant_id == get_current_tenant_id()
+                and effective_filters is not None
+                and self.project_id_filter is None
+                and extract_single_regulatory_provision_reference(llm_queries[0])
+                is None
+            ):
+                retrieve_label_ids, discover_label_sources = label_search_callbacks(
+                    label_snapshot, effective_filters
+                )
+                hint = prepare_label_search_hint(
+                    label_snapshot, llm_kwargs.get("label_hint"), llm_queries[0]
+                )
+                if label_snapshot.mode == "hybrid" and hint.candidate_label_ids(
+                    label_snapshot.taxonomy
+                ):
+                    label_discovery_scheduled = True
+                    search_functions.append(
+                        (
+                            LabelDiscoveryAcquisition.capture,
+                            (discover_label_sources, hint),
+                        )
+                    )
+
+        acquisition_results = run_functions_tuples_in_parallel(search_functions)
+        label_discovery_acquisition = (
+            cast(LabelDiscoveryAcquisition, acquisition_results.pop())
+            if label_discovery_scheduled
+            else None
         )
+        all_search_results = cast(list[list[InferenceChunk]], acquisition_results)
         if slack_search_scheduled:
             slack_results = all_search_results.pop()
             if all_search_results:
@@ -2356,13 +2468,13 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
                     source_anchors,
                 )
             ]
-        retrieve_label_ids = None
         label_result = LabelSearchResult(candidates=rerank_candidate_pool)
         requested_label_search = bool(
             self.user_selected_filters
             and self.user_selected_filters.regulatory_label_search_enabled
         )
-        label_snapshot = self.get_label_search_snapshot()
+        if not parallel_retrieval_enabled():
+            label_snapshot = self.get_label_search_snapshot()
         if label_snapshot is None and requested_label_search:
             label_result = label_result.model_copy(
                 update={"status": "snapshot_unavailable"}
@@ -2375,69 +2487,10 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
             and self.project_id_filter is None
             and extract_single_regulatory_provision_reference(llm_queries[0]) is None
         ):
-
-            def search_label_sources(
-                query: str,
-                identifiers: tuple[str, ...] | None,
-            ) -> list[InferenceChunk]:
-                scoped = (
-                    effective_filters.model_copy(
-                        update={"regulatory_candidate_ids": list(identifiers)}
-                    )
-                    if identifiers is not None
-                    else effective_filters
+            if retrieve_label_ids is None or discover_label_sources is None:
+                retrieve_label_ids, discover_label_sources = label_search_callbacks(
+                    label_snapshot, effective_filters
                 )
-                chunks = self._run_search_for_query(
-                    query,
-                    None,
-                    False,
-                    64,
-                    acl_filters,
-                    embedding_model,
-                    federated_retrieval_infos,
-                    scoped,
-                )
-                chunks = [
-                    chunk
-                    for chunk in chunks
-                    if chunk.regulatory_chunk_id
-                    and (
-                        identifiers is None or chunk.regulatory_chunk_id in identifiers
-                    )
-                ]
-                with get_session_with_current_tenant() as label_visibility_session:
-                    visible = get_visible_regulatory_chunk_ids(
-                        label_visibility_session,
-                        [
-                            chunk.regulatory_chunk_id
-                            for chunk in chunks
-                            if chunk.regulatory_chunk_id
-                        ],
-                        as_of_date=effective_filters.as_of_date,
-                        query_indexes={
-                            UUID(chunk.document_id): chunk.publication_index
-                            for chunk in chunks
-                            if chunk.publication_index is not None
-                        },
-                    )
-                return [
-                    chunk for chunk in chunks if chunk.regulatory_chunk_id in visible
-                ]
-
-            def retrieve_label_ids(
-                identifiers: tuple[str, ...],
-            ) -> list[InferenceChunk]:
-                return search_label_sources(llm_queries[0], identifiers)
-
-            def discover_label_sources(hint: LabelSearchHint) -> list[InferenceChunk]:
-                subjects = set(hint.candidate_label_ids(label_snapshot.taxonomy))
-                names = [
-                    label.name
-                    for label in label_snapshot.taxonomy.labels
-                    if label.id in subjects
-                ][:3]
-                query = llm_queries[0] + " " + " ".join(names)[:240]
-                return search_label_sources(query, None)
 
             label_result = search_with_labels(
                 rerank_candidate_pool,
@@ -2451,6 +2504,7 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
                 ),
                 retrieve=retrieve_label_ids,
                 discover=discover_label_sources,
+                discovery_acquisition=label_discovery_acquisition,
             )
             rerank_candidate_pool = label_result.candidates
 

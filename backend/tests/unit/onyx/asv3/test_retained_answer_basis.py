@@ -132,14 +132,16 @@ def test_real_hosted_terminal_without_basis_keeps_actual_delivery_guard(
         nonlocal wire
         assert {row["citation"] for row in actual_originals(kwargs["prompt"])} == {1}
         current = payloads(kwargs["prompt"])[-1]
+        assert current["retained_answer"]["retained_answer_id"]
+        names = {row["function"]["name"] for row in kwargs["tools"]}
+        assert "submit_retained_answer" in names and "submit_answer" not in names
         wire = json.dumps(
             {
-                "retained_answer_id": current["retained_answer"]["retained_answer_id"],
                 "_language": "tr",
                 "_outcomes": [declaration()],
             }
         )
-        return tool_response(wire, "submit_answer")
+        return tool_response(wire, "submit_retained_answer")
 
     run.selected.invoke.side_effect = invoke
     current_view = child.harness.view()

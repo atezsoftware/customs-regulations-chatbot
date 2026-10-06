@@ -224,7 +224,7 @@ class WorkerPool:
                     )
             if previous_checkpoint is not None:
                 child.services["previous_child_checkpoint"] = (
-                    share_parallel_snapshot(previous_checkpoint)
+                    share_parallel_snapshot(previous_checkpoint, fast_capacity=True)
                     if self._shared_checkpoints()
                     else copy.deepcopy(previous_checkpoint)
                 )
@@ -387,7 +387,7 @@ class WorkerPool:
             raw_snapshot = payload.get("snapshot")
             if not isinstance(raw_snapshot, dict):
                 raise ValueError("Invalid parallel child checkpoint")
-            snapshot = share_parallel_snapshot(raw_snapshot)
+            snapshot = share_parallel_snapshot(raw_snapshot, fast_capacity=True)
             metadata = _ChildCheckpoint.model_validate({**payload, "snapshot": {}})
             content = {
                 **metadata.model_dump(mode="json", exclude={"integrity", "snapshot"}),
@@ -507,7 +507,7 @@ class WorkerPool:
                     "Deferred child checkpoint binding or integrity changed"
                 )
             snapshot = share_parallel_snapshot(
-                {**control.snapshot, "evidence": evidence}
+                {**control.snapshot, "evidence": evidence}, fast_capacity=True
             )
             content: dict[str, JsonValue] = {
                 "version": 1,
@@ -520,7 +520,11 @@ class WorkerPool:
                 "snapshot": snapshot,
             }
             wrapped = {**content, "integrity": parallel_checkpoint_digest(content)}
-            self._validated_checkpoint(task, wrapped)
+            # Revalidate the issued graph, retaining base-method tamper detection.
+            checked_snapshot = share_parallel_snapshot(snapshot, fast_capacity=True)
+            metadata = _ChildCheckpoint.model_validate({**wrapped, "snapshot": {}})
+            checked = metadata.model_copy(update={"snapshot": checked_snapshot})
+            self._require_checkpoint_binding(task, checked, metadata.integrity)
             tasks.append({**value, "child_checkpoint": wrapped})
             materialized[task.task_id] = (control, wrapped)
         if set(capture.controls) - set(materialized):
@@ -552,7 +556,7 @@ class WorkerPool:
                 "request_hash": _checkpoint_digest(task.task),
                 "assignment_id": task.assignment_id,
                 "outcome_ids": list(task.outcome_ids),
-                "snapshot": share_parallel_snapshot(snapshot)
+                "snapshot": share_parallel_snapshot(snapshot, fast_capacity=True)
                 if self._shared_checkpoints()
                 else copy.deepcopy(snapshot),
             }

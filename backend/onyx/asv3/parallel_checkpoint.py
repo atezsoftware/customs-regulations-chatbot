@@ -16,6 +16,7 @@ from pydantic import JsonValue
 _STORAGE_KEY = "parallel_checkpoint_storage"
 _HASH = re.compile(r"[a-f0-9]{64}")
 _DEFAULT_UNIT_BYTES = 8_000_000
+_CAPACITY_MEMO_ITEMS = 4096
 
 
 class _ImmutableDict(dict[str, JsonValue]):
@@ -497,6 +498,61 @@ def _capacity(value: dict[str, JsonValue], maximum: int) -> int:
     return size
 
 
+def _capacity_walk(value: dict[str, JsonValue], maximum: int) -> int:
+    """Count the same JSON bytes without recursive encoder token propagation."""
+    if type(maximum) is not int or maximum < 1:
+        raise ValueError("Invalid checkpoint storage capacity")
+    encoder = json.JSONEncoder(ensure_ascii=False)
+    memo: dict[int, tuple[JsonValue, int]] = {}
+    active: set[int] = set()
+
+    def bounded(size: int) -> int:
+        if size > maximum:
+            raise ValueError("Parallel checkpoint unit exceeds its storage capacity")
+        return size
+
+    def scalar(part: JsonValue) -> int:
+        if part is None or type(part) in (str, int, float, bool):
+            return bounded(len(encoder.encode(part).encode("utf-8")))
+        size = 0
+        for token in encoder.iterencode(part):
+            size = bounded(size + len(token.encode("utf-8")))
+        return size
+
+    def count(part: JsonValue) -> int:
+        if not isinstance(part, (dict, list)):
+            return scalar(part)
+        identity = id(part)
+        if identity in active:
+            raise ValueError("Circular reference detected")
+        previous = memo.get(identity)
+        if previous is not None:
+            return previous[1]
+        # Keep the legacy encoder's handling of non-string JSON keys.
+        if isinstance(part, dict) and any(type(key) is not str for key in part):
+            return scalar(part)
+        active.add(identity)
+        size = bounded(2)
+        if isinstance(part, dict):
+            for index, (key, member) in enumerate(part.items()):
+                size = bounded(size + (2 if index else 0))
+                size = bounded(size + scalar(key) + 2)
+                size = bounded(size + count(member))
+        else:
+            for index, member in enumerate(part):
+                size = bounded(size + (2 if index else 0))
+                size = bounded(size + count(member))
+        active.remove(identity)
+        if len(memo) < _CAPACITY_MEMO_ITEMS:
+            memo[identity] = (part, size)
+        return size
+
+    try:
+        return count(value)
+    except (TypeError, OverflowError, RecursionError) as error:
+        raise ValueError("Invalid checkpoint JSON value") from error
+
+
 def _all_ledgers(
     snapshot: dict[str, JsonValue],
     transform: Callable[[dict[str, JsonValue]], dict[str, JsonValue]],
@@ -538,7 +594,9 @@ def _all_ledgers(
     return result
 
 
-def _compact_v2(snapshot: dict[str, JsonValue], maximum: int) -> dict[str, JsonValue]:
+def _compact_v2(
+    snapshot: dict[str, JsonValue], maximum: int, *, fast_capacity: bool = False
+) -> dict[str, JsonValue]:
     pools: dict[str, dict[str, JsonValue]] = {
         name: {} for name in ("records", "delivery_rows", "readsets", "deliveries")
     }
@@ -597,12 +655,14 @@ def _compact_v2(snapshot: dict[str, JsonValue], maximum: int) -> dict[str, JsonV
 
     result = _all_ledgers(snapshot, transform)
     result[_STORAGE_KEY] = {"version": 2, **pools}
-    _capacity(result, maximum)
+    (_capacity_walk if fast_capacity else _capacity)(result, maximum)
     return result
 
 
-def _restore_v2(snapshot: dict[str, JsonValue], maximum: int) -> dict[str, JsonValue]:
-    compact_bytes = _capacity(snapshot, maximum)
+def _restore_v2(
+    snapshot: dict[str, JsonValue], maximum: int, *, fast_capacity: bool = False
+) -> dict[str, JsonValue]:
+    compact_bytes = (_capacity_walk if fast_capacity else _capacity)(snapshot, maximum)
     storage = snapshot.get(_STORAGE_KEY)
     names = ("records", "delivery_rows", "readsets", "deliveries")
     if not isinstance(storage, dict) or set(storage) != {"version", *names}:
@@ -755,11 +815,20 @@ def restore_parallel_checkpoint(
 
 
 def share_parallel_snapshot(
-    snapshot: dict[str, JsonValue], *, max_unit_bytes: int = _DEFAULT_UNIT_BYTES
+    snapshot: dict[str, JsonValue],
+    *,
+    max_unit_bytes: int = _DEFAULT_UNIT_BYTES,
+    fast_capacity: bool = False,
 ) -> dict[str, JsonValue]:
     """Validate and intern a complete child snapshot before recursive copies."""
     if _verified_snapshot(snapshot, max_unit_bytes):
         return snapshot
+    if fast_capacity:
+        return _restore_v2(
+            _compact_v2(snapshot, max_unit_bytes, fast_capacity=True),
+            max_unit_bytes,
+            fast_capacity=True,
+        )
     return _restore_v2(_compact_v2(snapshot, max_unit_bytes), max_unit_bytes)
 
 
