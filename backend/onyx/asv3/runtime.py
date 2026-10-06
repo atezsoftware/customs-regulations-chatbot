@@ -107,6 +107,8 @@ from onyx.db.asv3_runs import (
 )
 from onyx.db.memory import UserMemoryContext
 from onyx.db.models import User
+from onyx.error_handling.error_codes import OnyxErrorCode
+from onyx.error_handling.exceptions import OnyxError
 from onyx.llm.interfaces import LLM, LLMUserIdentity
 from onyx.llm.models import ReasoningEffort
 from onyx.prompts.asv3.experimental import (
@@ -1844,6 +1846,16 @@ def run_asv3_loop(
         context.check_active()
         if parallel_research and workers is not None:
             workers.close()
+        if workflow_variant == ASV3_TUNED_VARIANT and not (
+            clarification or partial or result.answer
+        ):
+            publication_status = result.status
+            publication_stop_reason = result.stop_reason
+            root_checkpoint(durable=True)
+            failure = localized_notifications(
+                profile.language if profile.language != "und" else "en"
+            )["failed"][1]
+            raise OnyxError(OnyxErrorCode.LLM_PROVIDER_ERROR, failure)
         final = (
             clarification
             or partial
@@ -1928,7 +1940,8 @@ def run_asv3_loop(
         raise
     except Exception:
         logger.exception("ASv3 native research failed")
-        publication_stop_reason = "native_runtime_error"
+        if workflow_variant != ASV3_TUNED_VARIANT or publication_stop_reason is None:
+            publication_stop_reason = "native_runtime_error"
         progress.report("failed", status="failed")
         raise
     finally:

@@ -85,7 +85,11 @@ from onyx.configs.chat_configs import (
 )
 from onyx.llm.interfaces import LLM, LLMUserIdentity
 from onyx.llm.model_capabilities import get_llm_max_output_tokens, get_model_map
-from onyx.llm.model_response import ModelResponse
+from onyx.llm.model_response import (
+    ChatCompletionMessageToolCall,
+    FunctionCall,
+    ModelResponse,
+)
 from onyx.llm.models import (
     AssistantMessage,
     ChatCompletionMessage,
@@ -2023,16 +2027,22 @@ class ResearchModel:
         argument_normalizer: Callable[[str, dict[str, JsonValue]], dict[str, JsonValue]]
         | None = None,
     ) -> Decision:
+        tuned = self.context.services.get("asv3_workflow_variant") == ASV3_TUNED_VARIANT
         original = self._decision(
             response,
             tools,
             return_argument_errors=True,
-            detailed_argument_errors=parallel_execution_enabled(self.context),
+            detailed_argument_errors=parallel_execution_enabled(self.context) or tuned,
             argument_normalizer=argument_normalizer,
         )
         invalid = {call.call_id: call for call in original.calls if call.argument_error}
         if not invalid:
             return original
+        repair_ids = {
+            identity: f"repair:{index}" if tuned else identity
+            for index, identity in enumerate(invalid)
+        }
+        wire_ids = {alias: identity for identity, alias in repair_ids.items()}
         patch_model = (
             ParallelToolArgumentPatch
             if parallel_execution_enabled(self.context)
@@ -2046,9 +2056,12 @@ class ResearchModel:
         native_calls = response.choice.message.tool_calls or []
         retained_answers: dict[str, str] = {}
         repair_definitions = copy.deepcopy(definitions)
-        if self.context.services.get("research_profile") == "experimental" and (
-            response.choice.finish_reason or ""
-        ).lower() not in {"length", "max_tokens"}:
+        if (
+            self.context.services.get("research_profile") == "experimental" or tuned
+        ) and (response.choice.finish_reason or "").lower() not in {
+            "length",
+            "max_tokens",
+        }:
 
             def contains_reference(value: JsonValue) -> bool:
                 if isinstance(value, dict):
@@ -2102,7 +2115,7 @@ class ResearchModel:
             "request": request,
             "invalid_actions": [
                 {
-                    "call_id": call.id,
+                    "call_id": repair_ids[call.id],
                     "tool_name": call.function.name,
                     "arguments_json": (
                         json.dumps(
@@ -2164,7 +2177,7 @@ class ResearchModel:
         semantic_truncated = self.last_response_truncated
 
         def bind_semantic_origin(decision: Decision) -> Decision:
-            if not parallel_execution_enabled(self.context):
+            if not (parallel_execution_enabled(self.context) or tuned):
                 return decision
             repaired_calls = {call.call_id: call for call in decision.calls}
             semantic_keys = {"answer", "retained_answer_id", "retained_answer_edits"}
@@ -2251,26 +2264,27 @@ class ResearchModel:
                 normalize_structured_response(text, patch_model)
             )
             ids = [entry.call_id for entry in patch.entries]
-            if set(ids) != set(invalid) or len(ids) != len(set(ids)):
+            if set(ids) != set(wire_ids) or len(ids) != len(set(ids)):
                 raise ValueError("Argument patch omitted or changed requested IDs")
             replacements: dict[str, str] = {}
             for entry in patch.entries:
                 if entry.arguments_json is None:
                     continue
-                call = invalid[entry.call_id]
+                identity = wire_ids[entry.call_id]
+                call = invalid[identity]
                 schema = definitions[call.name]
                 validator = jsonschema.Draft202012Validator(schema)
                 try:
                     arguments = parse_json_object(entry.arguments_json)
                     if argument_normalizer is not None:
                         arguments = argument_normalizer(call.name, arguments)
-                    if entry.call_id in retained_answers:
+                    if identity in retained_answers:
                         if "answer" in arguments:
                             continue
                         jsonschema.Draft202012Validator(
                             repair_definitions[call.name]
                         ).validate(arguments)
-                        arguments["answer"] = retained_answers[entry.call_id]
+                        arguments["answer"] = retained_answers[identity]
                     validator.validate(arguments)
                 except (ValueError, jsonschema.ValidationError):
                     continue
@@ -2288,9 +2302,9 @@ class ResearchModel:
                     for key, value in call.arguments.items()
                 ):
                     continue
-                replacements[entry.call_id] = (
+                replacements[identity] = (
                     json.dumps(arguments, ensure_ascii=False)
-                    if entry.call_id in retained_answers
+                    if identity in retained_answers
                     else entry.arguments_json
                 )
             merged_calls = [
@@ -2320,7 +2334,8 @@ class ResearchModel:
                     ),
                     tools,
                     return_argument_errors=True,
-                    detailed_argument_errors=parallel_execution_enabled(self.context),
+                    detailed_argument_errors=parallel_execution_enabled(self.context)
+                    or tuned,
                     argument_normalizer=argument_normalizer,
                 )
             )
@@ -3065,6 +3080,26 @@ class ResearchModel:
                         "arguments must match its actual schema and contain your own "
                         "_related_source_reviews. No prose, fences or copied approval."
                     )
+                    if (
+                        self.context.services.get("asv3_workflow_variant")
+                        == ASV3_TUNED_VARIANT
+                    ):
+                        acquisition = self._related_source_acquisition_state(
+                            source_review_state, ledger
+                        )
+                        if acquisition:
+                            current["related_source_acquisition"] = acquisition
+                            current["related_source_terminal_transport"] = (
+                                "These pending candidates lack their own delivered originals. "
+                                "Use the source-specific acquisition leads below before assessing "
+                                "their effect. They supply neither a holding nor approval. Locate "
+                                "the operative section and connected qualifications, following "
+                                "source_range_read continuation when present. Preserve supported "
+                                "draft detail. Editing review metadata, repeating the anchor "
+                                "statute search or choosing not_material cannot supply unread text. "
+                                "If acquisition is unavailable, disclose the exact unresolved "
+                                "interaction through submit_partial_answer; do not assert it as certain."
+                            )
                     retained_terminals = [
                         str(function["name"])
                         for tool in selected
@@ -3512,6 +3547,82 @@ class ResearchModel:
                 row["source_range_read"] = continuation
             projected.add(source_id)
         return result
+
+    @staticmethod
+    def _related_source_acquisition_state(
+        state: dict[str, JsonValue], ledger: EvidenceLedger
+    ) -> list[JsonValue]:
+        actions: list[JsonValue] = []
+        rows = state.get("reviews")
+        for row in rows if isinstance(rows, list) else []:
+            if not isinstance(row, dict) or row.get("status") != "pending":
+                continue
+            source_id = row.get("source_id")
+            if not isinstance(source_id, str) or row.get(
+                "available_original_citations"
+            ):
+                continue
+            retained = [
+                number
+                for number, doc in ledger.citation_mapping().items()
+                if doc.document_id == source_id
+            ]
+            actions.append(
+                {
+                    "lead_id": row.get("lead_id"),
+                    "source_id": source_id,
+                    "suggested_acquisition": (
+                        {
+                            "name": "read_evidence",
+                            "arguments": {"citation": retained[0]},
+                        }
+                        if retained
+                        else {
+                            "name": "read_source_range",
+                            "arguments": {"source_id": source_id, "start": 0},
+                        }
+                    ),
+                }
+            )
+        return actions
+
+    def _tuned_content_action_response(self, response: ModelResponse) -> ModelResponse:
+        """Control envelopes use the same validation path as native actions."""
+        if (
+            self.context.services.get("asv3_workflow_variant") != ASV3_TUNED_VARIANT
+            or response.choice.message.tool_calls
+            or (response.choice.finish_reason or "").upper()
+            == "MALFORMED_FUNCTION_CALL"
+        ):
+            return response
+        try:
+            envelope = strict_json_decoder().decode(
+                response.choice.message.content or ""
+            )
+        except ValueError:
+            return response
+        if not isinstance(envelope, dict) or set(envelope) != {"name", "arguments"}:
+            return response
+        name, arguments = envelope["name"], envelope["arguments"]
+        if not isinstance(name, str) or not isinstance(arguments, dict):
+            return response
+        call = ChatCompletionMessageToolCall(
+            id="content-action-" + uuid4().hex,
+            function=FunctionCall(
+                name=name, arguments=json.dumps(arguments, ensure_ascii=False)
+            ),
+        )
+        return response.model_copy(
+            update={
+                "choice": response.choice.model_copy(
+                    update={
+                        "message": response.choice.message.model_copy(
+                            update={"content": None, "tool_calls": [call]}
+                        )
+                    }
+                )
+            }
+        )
 
     @staticmethod
     def _related_source_terminal_gap(
@@ -4006,6 +4117,7 @@ class ResearchModel:
                     raise NativeDecisionEnvelopeError(
                         "Provider rejected native function call: MALFORMED_FUNCTION_CALL"
                     )
+                response = self._tuned_content_action_response(response)
                 decision = self._decision(
                     response, tools, argument_normalizer=argument_normalizer
                 )
