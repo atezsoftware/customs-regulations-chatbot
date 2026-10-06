@@ -93,6 +93,25 @@ def test_turkish_ordinal_referrals_keep_literal_text_and_canonical_identity(
 
 
 @pytest.mark.parametrize(
+    "kind", ["kanun", "court_decision", "judicial_decision", "judgment"]
+)
+def test_primary_original_does_not_trigger_a_blanket_referral_walk(kind: str) -> None:
+    context, ledger = reference_ledger()
+    citation = ledger.add(
+        [
+            opaque_original(
+                "Court decision",
+                "2",
+                kind=kind,
+                text="7251 sayılı Veri Kanunu m.43 gereğince belirtilen ibare iptal edilmiştir.",
+            )
+        ],
+        context,
+    )[0]
+    assert not cited_lower_statute_references(f"Mahkeme sonucu [{citation}].", ledger)
+
+
+@pytest.mark.parametrize(
     "excluded",
     ["uncited", "heading", "derived", "external", "untrusted", "foreign_chunk"],
 )

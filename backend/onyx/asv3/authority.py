@@ -943,6 +943,13 @@ def cited_lower_statute_references(
                 or citation in own_statutes
                 or not _canonical_source(item)
                 or model_evidence_metadata(item.metadata).get("untrusted")
+                or folded(
+                    str(
+                        model_evidence_metadata(item.metadata).get("document_type")
+                        or ""
+                    )
+                )
+                in _LAW_KINDS | {"court_decision", "judicial_decision", "judgment"}
             ):
                 continue
             for reference, name in _named_native_references(
