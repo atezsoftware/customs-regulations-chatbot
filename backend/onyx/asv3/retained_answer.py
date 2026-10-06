@@ -12,7 +12,7 @@ from pydantic import JsonValue
 
 from onyx.asv3.citation_numbers import extract_citation_numbers
 from onyx.asv3.evidence import EvidenceLedger
-from onyx.asv3.models import Decision, ResearchTurn, RunContext
+from onyx.asv3.models import CapabilityCall, Decision, ResearchTurn, RunContext
 from onyx.asv3.parallel_execution import parallel_execution_enabled
 from onyx.asv3.workflow_variant import ASV3_TUNED_VARIANT
 
@@ -243,10 +243,21 @@ def resolve_retained_answer(
     if not retained_answer_enabled(context):
         return decision
     reference = _reference(context, draft, request)
+
+    def rejected(call: CapabilityCall, error: str) -> CapabilityCall:
+        name = (
+            RETAINED_TERMINALS.get(call.name, call.name)
+            if context.services.get("asv3_workflow_variant") == ASV3_TUNED_VARIANT
+            else call.name
+        )
+        return call.model_copy(update={"name": name, "argument_error": error})
+
     calls = []
     for call in decision.calls:
         if call.name not in _TERMINAL or call.argument_error is not None:
-            calls.append(call)
+            calls.append(
+                rejected(call, call.argument_error) if call.argument_error else call
+            )
             continue
         arguments = call.arguments
         retained_alias = call.name in RETAINED_TERMINALS
@@ -255,10 +266,9 @@ def resolve_retained_answer(
                 key in arguments for key in ("answer", "retained_answer_id", "basis")
             ):
                 calls.append(
-                    call.model_copy(
-                        update={
-                            "argument_error": "This retained commit requires this invocation's owned draft and no explicit body, reference, or basis."
-                        }
+                    rejected(
+                        call,
+                        "This retained commit requires this invocation's owned draft and no explicit body, reference, or basis.",
                     )
                 )
                 continue
@@ -290,10 +300,9 @@ def resolve_retained_answer(
             )
             if answer is None:
                 calls.append(
-                    call.model_copy(
-                        update={
-                            "argument_error": "Use each current owned unit_id once with nonempty replacement text; keep retained_answer_id and omit answer."
-                        }
+                    rejected(
+                        call,
+                        "Use each current owned unit_id once with nonempty replacement text; keep retained_answer_id and omit answer.",
                     )
                 )
                 continue
@@ -313,10 +322,9 @@ def resolve_retained_answer(
             )
         else:
             calls.append(
-                call.model_copy(
-                    update={
-                        "argument_error": "Supply answer or the current owned retained_answer_id, never both; a stale or foreign reference cannot publish.",
-                    }
+                rejected(
+                    call,
+                    "Supply answer or the current owned retained_answer_id, never both; a stale or foreign reference cannot publish.",
                 )
             )
     return decision.model_copy(update={"calls": calls})

@@ -1,11 +1,13 @@
 """Verify judicial section continuation and exact retained draft transitions."""
 
 import copy
-from typing import cast
+from threading import Barrier
+from typing import Any, cast
 
 import pytest
 from pydantic import JsonValue
 
+from onyx.asv3 import runtime
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.harness import Harness
 from onyx.asv3.judicial_sections import (
@@ -17,6 +19,7 @@ from onyx.asv3.models import (
     CapabilityCall,
     Decision,
     EvidenceItem,
+    HarnessView,
     OutcomeStatus,
     RunContext,
     ToolOutcome,
@@ -26,6 +29,7 @@ from onyx.asv3.models import (
 from onyx.asv3.registry import CapabilityRegistry
 from onyx.asv3.retained_answer import bind_retained_answer, resolve_retained_answer
 from onyx.asv3.workflow_variant import ASV3_TUNED_VARIANT
+from onyx.llm.model_response import ModelResponse
 from tests.unit.onyx.asv3.test_experimental_workflow import terminal_registry
 from tests.unit.onyx.asv3.test_legal_source_reviews import deliver, review, seen
 from tests.unit.onyx.asv3.test_native_model_adapter import (
@@ -34,6 +38,7 @@ from tests.unit.onyx.asv3.test_native_model_adapter import (
     model,
     native_action,
 )
+from tests.unit.onyx.asv3.test_runtime import response, setup_run, user_payload
 from tests.unit.onyx.asv3.test_shared_originals import full_record
 from tests.unit.onyx.asv3.test_tuned_focused_reads import judicial_chunk
 from tests.unit.onyx.asv3.test_tuned_source_followthrough import tuned_context
@@ -292,6 +297,193 @@ def test_retained_partial_expands_to_actual_canonical_partial_schema() -> None:
     assert resolved.calls[0].arguments == {"answer": draft}
     assert registry.dispatch(resolved.calls[0], context).status == OutcomeStatus.PARTIAL
     assert observed == [{"answer": draft}]
+
+
+@pytest.mark.parametrize(
+    "terminal", ["submit_retained_answer", "submit_retained_partial_answer"]
+)
+def test_invalid_owned_alias_keeps_specific_repair_error(terminal: str) -> None:
+    context, _ledger, _reviews = tuned_context()
+    registry = terminal_registry([])
+    registry.register(
+        ToolSpec(
+            name="submit_partial_answer",
+            description="Submit a partial answer.",
+            parameters={"type": "object"},
+            handler=lambda _args, _child: ToolOutcome(
+                status=OutcomeStatus.PARTIAL, summary="Accepted"
+            ),
+        )
+    )
+    decision = resolve_retained_answer(
+        Decision(
+            calls=[
+                CapabilityCall(
+                    name=terminal,
+                    arguments={
+                        "retained_answer_edits": [
+                            {"unit_id": "stale-unit", "replacement": "Changed text."}
+                        ]
+                    },
+                )
+            ]
+        ),
+        context,
+        "Owned draft [1].",
+        request="Question",
+    )
+    call = decision.calls[0]
+    assert call.name in {"submit_answer", "submit_partial_answer"}
+    assert (
+        call.argument_error is not None
+        and "current owned unit_id" in call.argument_error
+    )
+    outcome = registry.dispatch(call, context)
+    assert outcome.status == OutcomeStatus.INVALID
+    assert outcome.data["argument_error"] == call.argument_error
+    assert outcome.summary != "Unknown capability"
+
+
+@pytest.mark.parametrize(
+    "status", [OutcomeStatus.PARTIAL, OutcomeStatus.INVALID, OutcomeStatus.DENIED]
+)
+def test_latest_rejected_partial_replaces_previous_draft_and_gap(
+    status: OutcomeStatus,
+) -> None:
+    context, _ledger, _reviews = tuned_context()
+    candidate = "A different current answer [1]."
+    gap = ToolOutcome(
+        status=status,
+        summary="Current source interaction is unread.",
+        data={"pending_related_source_review": True},
+    )
+    registry = CapabilityRegistry(
+        [
+            ToolSpec(
+                name="submit_partial_answer",
+                description="Submit a partial answer.",
+                parameters={"type": "object"},
+                handler=lambda _args, _child: gap,
+            )
+        ]
+    )
+    calls = 0
+
+    def decide(view: HarnessView) -> Decision:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return Decision(
+                calls=[
+                    CapabilityCall(
+                        name="submit_partial_answer", arguments={"answer": candidate}
+                    )
+                ]
+            )
+        assert view.draft_to_repair == candidate
+        assert view.publication_gap == {"summary": gap.summary, **gap.data}
+        return Decision(answer="Finished")
+
+    harness = Harness(
+        request="Question", context=context, registry=registry, decide=decide
+    )
+    harness.last_draft = "An obsolete answer [1]."
+    harness.publication_gap = ToolOutcome(
+        status=OutcomeStatus.PARTIAL, summary="Obsolete authority gap."
+    )
+    assert harness.run().answer == "Finished"
+    assert calls == 2
+
+
+def test_tuned_runtime_retains_first_partial_rejection_for_owned_repair(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kwargs, broker, selected, checkpoints, _queue = setup_run(monkeypatch)
+    kwargs.pop("test_language")
+    broker.barrier = Barrier(1)
+    source_id = str(broker.sources[0].id)
+    calls = 0
+    rejected = "Supported factual condition [999]."
+    repaired = "Supported factual condition [1]."
+
+    def scripted(**arguments: Any) -> ModelResponse:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return response(
+                calls=[
+                    ("read_source_range", {"source_id": source_id, "_language": "tr"})
+                ]
+            )
+        if calls == 2:
+            return response(calls=[("submit_partial_answer", {"answer": rejected})])
+        assert calls == 3
+        footer = user_payload(arguments["prompt"][-1])
+        assert footer["publication_gap"]["unknown_citations"] == [999]
+        units = footer["draft_to_repair"]["units"]
+        assert "".join(unit["text"] for unit in units) == rejected
+        return response(
+            calls=[
+                (
+                    "submit_retained_partial_answer",
+                    {
+                        "retained_answer_edits": [
+                            {"unit_id": units[0]["unit_id"], "replacement": repaired}
+                        ]
+                    },
+                )
+            ]
+        )
+
+    selected.invoke.side_effect = scripted
+    kwargs.update(research_profile="normal", workflow_variant=ASV3_TUNED_VARIANT)
+    runtime.run_asv3_loop(**kwargs)
+    assert calls == 3
+    assert checkpoints[-1]["publication_status"] == "partial"
+    assert checkpoints[-1]["final_publication_gap"] is None
+    assert kwargs["state_container"].answer_tokens == repaired.replace(
+        "[1]", "[[1]](https://example.test/law-0)"
+    )
+
+
+def test_tuned_omission_diagnostic_supplies_only_missing_declared_passage() -> None:
+    context, ledger, reviews = tuned_context()
+    seen(context, ledger, reviews)
+    number = ledger.add(
+        [
+            judicial_chunk(
+                "V. HÜKÜM\nThe challenged phrase is annulled within the stated limits.",
+                0,
+            )
+        ],
+        context,
+    )[0]
+    original = ledger.get(number)
+    assert original is not None
+    deliver(ledger, "current-call", [1, number])
+    assessment = review(
+        witnesses=[
+            {"citation": number, "start_char": 0, "end_char": len(original.text)}
+        ]
+    )
+    answer = f"The rule [1].\n\n{assessment['effect']} [{number}]."
+    gap = reviews.publication_gap(
+        answer, "current-call", context, ledger, raw_reviews=[assessment]
+    )
+    assert gap is not None
+    omissions = cast(
+        list[dict[str, JsonValue]], gap.data["unretained_examined_source_effects"]
+    )
+    assert omissions[0]["required_answer_passages"] == {
+        "limitations": assessment["limitations"]
+    }
+    complete = f"{answer}\n\n{assessment['limitations']} [{number}]."
+    assert (
+        reviews.publication_gap(
+            complete, "current-call", context, ledger, raw_reviews=[assessment]
+        )
+        is None
+    )
 
 
 def test_publication_acquisition_reads_continuation_before_one_semantic_decision() -> (

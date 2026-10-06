@@ -1715,7 +1715,9 @@ def run_asv3_loop(
                     summary="A precise missing-original notice cannot assert an unsupported statutory result.",
                     data=authority_gap,
                 )
-        if research_profile == "experimental" and harness is not None:
+        if (
+            research_profile == "experimental" or workflow_variant == ASV3_TUNED_VARIANT
+        ) and harness is not None:
             harness.last_draft = candidate
             harness.publication_gap = gap
         if gap is not None:

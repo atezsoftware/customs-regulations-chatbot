@@ -241,6 +241,7 @@ def _examined_answer_omission(
     answer: str,
     *,
     delivered: set[int] | None,
+    include_repair_text: bool = False,
 ) -> dict[str, JsonValue] | None:
     """Retain copied passages and their provenance, without assessing legal entailment."""
     review = record.review
@@ -290,6 +291,22 @@ def _examined_answer_omission(
         "required_inline_citations": sorted(numbers),
         "undelivered_evidence_numbers": undelivered,
         **({"unbound_evidence_numbers": unbound} if unbound else {}),
+        **(
+            {
+                "required_answer_passages": {
+                    field: getattr(review, field)
+                    for field in ("effect", "limitations")
+                    if field in omitted
+                },
+                "repair_instruction": (
+                    "Retain these exact declared passages with their original citations, "
+                    "or correct the review and answer together from the delivered originals. "
+                    "This is text retention, not legal approval; do not reread supplied text."
+                ),
+            }
+            if include_repair_text
+            else {}
+        ),
     }
 
 
@@ -953,7 +970,7 @@ class LegalSourceReviews:
                     )
                 elif retain_examined:
                     omission = _examined_answer_omission(
-                        record, answer, delivered=delivered
+                        record, answer, delivered=delivered, include_repair_text=tuned
                     )
                     if omission is not None:
                         unretained.append(omission)

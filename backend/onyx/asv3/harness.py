@@ -30,6 +30,8 @@ from onyx.asv3.parallel_execution import parallel_execution_enabled
 from onyx.asv3.progress import ProgressReporter, action_narration, public_action_id
 from onyx.asv3.registry import CapabilityRegistry
 from onyx.asv3.research_state import EvidenceWorkingSet, ResearchState
+from onyx.asv3.retained_answer import retained_answer_enabled
+from onyx.asv3.workflow_variant import ASV3_TUNED_VARIANT
 from onyx.asv3.working_memory import WorkingMemory
 from onyx.llm.models import ToolMessage
 from onyx.tracing.answer_graph import graph_step
@@ -609,12 +611,19 @@ class Harness:
         receipt.outcome.data = compacted
         candidate = receipt.call.arguments.get("answer")
         if (
-            parallel_execution_enabled(self.context)
+            retained_answer_enabled(self.context)
             and receipt.call.name in {"submit_answer", "submit_partial_answer"}
             and receipt.outcome.status
             in {OutcomeStatus.INVALID, OutcomeStatus.PARTIAL, OutcomeStatus.DENIED}
             and isinstance(candidate, str)
             and candidate.strip()
+            and not (
+                self.context.services.get("asv3_workflow_variant") == ASV3_TUNED_VARIANT
+                and receipt.call.name == "submit_partial_answer"
+                and receipt.outcome.status == OutcomeStatus.PARTIAL
+                and self.partial_submission is not None
+                and self.partial_submission() == candidate
+            )
         ):
             self.last_draft = candidate
             self.publication_gap = receipt.outcome
