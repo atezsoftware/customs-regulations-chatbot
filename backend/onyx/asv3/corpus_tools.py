@@ -270,6 +270,10 @@ class CorpusBroker:
                 offset=offset,
                 limit=limit,
                 allow_numbered_title_fallback=self.allow_numbered_title_fallback,
+                allow_reversed_numbered_title_fallback=(
+                    context.services.get("research_profile") == "experimental"
+                    and context.services.get("experimental_parallel") is True
+                ),
             )
 
     def related_catalog_sources(

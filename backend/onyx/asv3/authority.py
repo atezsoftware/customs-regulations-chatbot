@@ -405,6 +405,180 @@ def _named_native_references(
     return list(dict.fromkeys(references))
 
 
+def _canonical_law_aliases(
+    rows: list[dict[str, JsonValue]],
+) -> dict[str, set[str]]:
+    aliases: dict[str, set[str]] = {}
+    for row in rows:
+        names, numbers = row["formal_names"], row["instrument_numbers"]
+        if isinstance(names, list) and isinstance(numbers, list):
+            for name in names:
+                if isinstance(name, str):
+                    aliases.setdefault(name, set()).update(
+                        number for number in numbers if isinstance(number, str)
+                    )
+    return aliases
+
+
+def _canonical_source(item: object) -> bool:
+    from onyx.asv3.models import EvidenceItem
+
+    if not isinstance(item, EvidenceItem):
+        return False
+    metadata = model_evidence_metadata(item.metadata)
+    return bool(
+        item.search_doc is not None
+        and item.chunk_id
+        and item.search_doc.document_id == item.source_id
+        and item.search_doc.metadata.get("regulatory_chunk_id") == item.chunk_id
+        and not metadata.get("derived")
+        and not metadata.get("external")
+    )
+
+
+def _matching_native_rows(
+    reference: StatuteReference,
+    name: str | None,
+    rows: list[dict[str, JsonValue]],
+) -> list[int]:
+    matching: list[int] = []
+    for row in rows:
+        numbers, names = row["instrument_numbers"], row["formal_names"]
+        if not isinstance(numbers, list) or not isinstance(names, list):
+            continue
+        if reference.number and numbers and reference.number not in numbers:
+            continue
+        if not (
+            reference.number in numbers
+            or (name is not None and name in names and not numbers)
+        ):
+            continue
+        if reference.article is not None and (
+            str(row.get("article_no")) != reference.article
+            or row.get("article_qualifier") != reference.qualifier
+        ):
+            continue
+        if type(citation := row["citation"]) is int:
+            matching.append(citation)
+    return matching
+
+
+def explicit_reference_leads(
+    ledger: EvidenceLedger, complete_originals: list[dict[str, JsonValue]]
+) -> list[dict[str, JsonValue]]:
+    """Project literal source references as navigation, never mandatory legal needs."""
+    rows = _native_original_rows(ledger)
+    aliases = _canonical_law_aliases(rows)
+    complete: set[int] = set()
+    for record in complete_originals:
+        number = record.get("citation")
+        if type(number) is not int:
+            continue
+        item = ledger.get(number)
+        if (
+            item is not None
+            and _canonical_source(item)
+            and record.get("source_id") == item.source_id
+            and record.get("chunk_id") == item.chunk_id
+            and record.get("text_hash") == item.text_hash
+            and record.get("text") == item.text
+            and record.get("start_char", 0) == 0
+            and record.get("end_char", len(item.text)) == len(item.text)
+        ):
+            complete.add(number)
+    leads: dict[tuple[str, str | None, str, str | None], dict[str, JsonValue]] = {}
+    for number in sorted(complete):
+        item = ledger.get(number)
+        assert item is not None
+        for reference, name in _named_native_references(
+            item.text, aliases, strict_reference_boundaries=True
+        ):
+            if reference.article is None:
+                continue
+            matching = _matching_native_rows(reference, name, rows)
+            if complete.intersection(matching):
+                continue
+            key = (
+                reference.number,
+                name if not reference.number else None,
+                reference.article,
+                reference.qualifier,
+            )
+            lead = leads.setdefault(
+                key,
+                {
+                    "instrument_number": reference.number or None,
+                    "formal_name": name,
+                    "article": reference.article,
+                    "qualifier": reference.qualifier,
+                    "origin_citations": [],
+                    "matching_original_evidence": matching,
+                },
+            )
+            origins = lead["origin_citations"]
+            assert isinstance(origins, list)
+            if number not in origins:
+                origins.append(number)
+    return list(leads.values())
+
+
+_DEFINED_ABBREVIATION = re.compile(r"\(\s*([A-ZÇĞİÖŞÜ][A-ZÇĞİÖŞÜ0-9]{1,11})\s*\)")
+
+
+def _defined_statute_abbreviations(
+    answer: str, aliases: dict[str, set[str]]
+) -> dict[str, tuple[str, str | None] | None]:
+    defined: dict[str, set[tuple[str, str | None]]] = {}
+    for match in _DEFINED_ABBREVIATION.finditer(answer):
+        prefix = answer[max(0, match.start() - 180) : match.start()]
+        tail = folded(prefix.replace("**", "").replace("__", "")).strip()
+        identities = {
+            (reference.number, name)
+            for reference, name in _named_native_references(
+                prefix, aliases, strict_reference_boundaries=True
+            )
+            if (
+                (numbered := _STRICT_STATUTE.search(folded(reference.reference_text)))
+                is not None
+                and tail.endswith(numbered[0])
+            )
+            or (
+                name is not None
+                and re.search(rf"(?<!\w){re.escape(name)}(?:u[a-z]*)?$", tail)
+            )
+        }
+        if identities:
+            defined.setdefault(folded(match[1]), set()).update(identities)
+    return {
+        label: next(iter(identities)) if len(identities) == 1 else None
+        for label, identities in defined.items()
+    }
+
+
+def _abbreviated_statute_references(
+    text: str,
+    defined: dict[str, tuple[str, str | None] | None],
+) -> list[tuple[StatuteReference, str | None]]:
+    references: list[tuple[StatuteReference, str | None]] = []
+    for label, identity in defined.items():
+        if identity is None:
+            continue
+        remainder = re.sub(r"\[\d+\]", "", folded(text))
+        remainder = re.sub(rf"(?<!\w){re.escape(label)}(?!\w)", "", remainder)
+        if all(
+            word in _GAP_LOCATOR_WORDS or len(word) == 1
+            for word in re.findall(r"[a-z]+", remainder)
+        ):
+            continue
+        number, name = identity
+        for reference, _ in _named_native_references(
+            text, {label: {number}}, strict_reference_boundaries=True
+        ):
+            if reference.article is not None:
+                references.append((reference, name))
+    return list(dict.fromkeys(references))
+
+
 def _without_verified_quotes(text: str, cited: set[int], ledger: EvidenceLedger) -> str:
     originals = [
         " ".join(item.text.split())
@@ -447,20 +621,11 @@ def native_named_authority_gap(
     ledger: EvidenceLedger,
     *,
     strict_reference_boundaries: bool = False,
+    resolve_defined_abbreviations: bool = False,
 ) -> dict[str, JsonValue] | None:
     """Check local named-statute identity, not legal entailment or unnamed omissions."""
     rows = _native_original_rows(ledger)
-    aliases: dict[str, set[str]] = {}
-    for row in rows:
-        for name in (
-            row["formal_names"] if isinstance(row["formal_names"], list) else []
-        ):
-            if isinstance(name, str):
-                known = row["instrument_numbers"]
-                if isinstance(known, list):
-                    aliases.setdefault(name, set()).update(
-                        number for number in known if isinstance(number, str)
-                    )
+    aliases = _canonical_law_aliases(rows)
     # Lower references supply recognition aliases only, never matching originals.
     for number in ledger.citation_mapping():
         item = ledger.get(number)
@@ -471,37 +636,53 @@ def native_named_authority_gap(
         ):
             if name := _reference_name(reference):
                 aliases.setdefault(name, set()).add(reference.number)
+    units = assertion_inventory(answer)
+    defined = (
+        _defined_statute_abbreviations(
+            "\n".join(
+                _without_verified_quotes(
+                    unit["text"], set(unit["evidence_numbers"]), ledger
+                )
+                for unit in units
+            ),
+            aliases,
+        )
+        if resolve_defined_abbreviations
+        else {}
+    )
+    gap_aliases = {
+        **aliases,
+        **{
+            label: {identity[0]}
+            for label, identity in defined.items()
+            if identity is not None
+        },
+    }
     missing: list[dict[str, JsonValue]] = []
-    for unit in assertion_inventory(answer):
+    for unit in units:
         if unit["presentation_only"]:
             continue
         cited = set(unit["evidence_numbers"])
-        if not cited and _precise_original_gap(unit["text"], aliases):
+        if not cited and _precise_original_gap(unit["text"], gap_aliases):
             continue
         attributed = _without_verified_quotes(unit["text"], cited, ledger)
-        for reference, name in _named_native_references(
+        references = _named_native_references(
             attributed, aliases, strict_reference_boundaries=strict_reference_boundaries
-        ):
-            matching: list[int] = []
-            for row in rows:
-                numbers, names = row["instrument_numbers"], row["formal_names"]
-                if not isinstance(numbers, list) or not isinstance(names, list):
-                    continue
-                if reference.number and numbers and reference.number not in numbers:
-                    continue
-                if not (
-                    reference.number in numbers
-                    or (name is not None and name in names and not numbers)
-                ):
-                    continue
-                if reference.article is not None and (
-                    str(row.get("article_no")) != reference.article
-                    or row.get("article_qualifier") != reference.qualifier
-                ):
-                    continue
-                citation = row["citation"]
-                if isinstance(citation, int):
-                    matching.append(citation)
+        )
+        if resolve_defined_abbreviations:
+            references.extend(_abbreviated_statute_references(attributed, defined))
+        seen: set[tuple[str, str | None, str | None, str | None]] = set()
+        for reference, name in references:
+            identity = (
+                reference.number,
+                name if not reference.number else None,
+                reference.article,
+                reference.qualifier,
+            )
+            if identity in seen:
+                continue
+            seen.add(identity)
+            matching = _matching_native_rows(reference, name, rows)
             if not cited.intersection(matching):
                 missing.append(
                     {

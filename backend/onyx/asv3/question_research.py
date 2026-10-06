@@ -747,8 +747,11 @@ class QuestionResearch:
         if self.host_assembly:
             description = (
                 "When fresh independent research is needed, assign all material outcomes once. "
-                "Group issues whose legal conclusions depend on each other in the same task; "
-                "do not split a rule from its exceptions, disputed applicability or later procedure. "
+                "Separate requested outcomes each answerable from the full supplied scenario and originals; "
+                "shared facts, sources or legal relationships alone do not require one task. Group only "
+                "when another task must first produce an unknown input, or splitting would divide one "
+                "determination. Keep a rule with its conditions, exceptions, disputed applicability "
+                "and later procedure. "
                 "Every task receives the exact full original request, conversation and session originals. "
                 "Use concise neutral answer_title labels and scenario-specific queries. Independent tasks "
                 "run concurrently and their complete validated bodies are arranged verbatim by the host, "

@@ -8,6 +8,7 @@ Provider-specific tools, fixed dates, staged reviewers and benchmark cases are n
 from onyx.prompts.asv3.coordinator_reference import COORDINATOR_REFERENCE_PROMPT
 
 EXPERIMENTAL_PROMPT_VERSION = "asv3-experimental-2026-10-06.7"
+EXPERIMENTAL_PARALLEL_PROMPT_VERSION = "asv3-experimental-parallel-2026-10-06.8"
 
 
 def _source_navigation(reference_prompt: str) -> str:
@@ -198,9 +199,12 @@ EXPERIMENTAL_PARALLEL_COORDINATOR = """PARALLEL RESEARCH WHEN NEEDED
 The first native decision may answer, ask a concrete user clarification, or reuse sufficient
 session originals directly. If fresh independent research is needed, use research_questions
 in this same decision to cover the full request with nonoverlapping assignments. Group a rule
-with its material exceptions, contested applicability, counterarguments and later procedure;
-dependent legal outcomes belong in the same task. Split genuinely independent outcomes, not
-arbitrary article numbers, retrieval methods or legislative tiers. Every child receives the
+with its own conditions, exceptions, contested applicability, counterarguments and later
+procedure. Separate requested outcomes that can each be established from the full supplied
+scenario and originals; shared facts, sources or a legal relationship alone do not require
+one task. Group outcomes only when one must first produce an unknown input needed by another,
+or splitting would divide a single determination. Do not split by arbitrary article numbers,
+retrieval methods or legislative tiers. Every child receives the
 exact original scenario and conversation from the host. Give short neutral topic titles,
 not long repetitions of the user's questions. The host preserves every accepted full answer
 body and global citation verbatim and arranges them without a final rewriting model. Do not

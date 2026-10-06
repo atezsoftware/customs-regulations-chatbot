@@ -1153,6 +1153,7 @@ def find_sources(
     offset: int = 0,
     limit: int = 50,
     allow_numbered_title_fallback: bool = False,
+    allow_reversed_numbered_title_fallback: bool = False,
 ) -> tuple[list[CorpusSource], bool]:
     """Resolve scoped titles; an opted-in formal fallback verifies canonical identity."""
     sources, more = _find_sources_with_title_queries(
@@ -1164,9 +1165,16 @@ def find_sources(
         offset=offset,
         limit=limit,
     )
-    if not allow_numbered_title_fallback or sources or more or source_ids is not None:
+    if (
+        not (allow_numbered_title_fallback or allow_reversed_numbered_title_fallback)
+        or sources
+        or more
+        or source_ids is not None
+    ):
         return sources, more
-    identity = _numbered_law_title(query)
+    identity = _numbered_law_title(query) if allow_numbered_title_fallback else None
+    if identity is None and allow_reversed_numbered_title_fallback:
+        identity = _reversed_numbered_law_title(query)
     if identity is None:
         return sources, more
     if offset:
@@ -1216,6 +1224,18 @@ def _numbered_law_title(value: str) -> NumberedLawTitle | None:
     if match is None:
         return None
     number, title = match.groups()
+    return NumberedLawTitle(str(int(number)), re.sub(r"kanunu$", "kanun", title))
+
+
+def _reversed_numbered_law_title(value: str) -> NumberedLawTitle | None:
+    translated = value.translate(
+        str.maketrans("ÇĞİÖŞÜÂÎÛçğıöşüâîû", "CGIOSUAIUcgiosuaiu")
+    ).lower()
+    normalized = " ".join(translated.split())
+    match = re.fullmatch(r"([^\d]+ kanunu?) (\d{3,5})", normalized)
+    if match is None:
+        return None
+    title, number = match.groups()
     return NumberedLawTitle(str(int(number)), re.sub(r"kanunu$", "kanun", title))
 
 

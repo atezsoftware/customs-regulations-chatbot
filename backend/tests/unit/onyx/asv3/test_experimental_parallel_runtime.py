@@ -17,6 +17,11 @@ from onyx.configs.constants import MessageType
 from onyx.llm.interfaces import LLM
 from onyx.llm.model_response import ModelResponse
 from onyx.llm.models import UserMessage
+from onyx.prompts.asv3.experimental import (
+    EXPERIMENTAL_PARALLEL_PROMPT_VERSION,
+    EXPERIMENTAL_PROMPT_VERSION,
+)
+from onyx.prompts.asv3.research import PROMPT_VERSION
 from onyx.server.query_and_chat.streaming_models import AgentResponseDelta, ASv3Progress
 from tests.unit.onyx.asv3.test_runtime import (
     CorpusBoundary,
@@ -98,6 +103,7 @@ def test_parallel_first_decision_can_finish_without_research(
     final = checkpoints[-1]
     assert final["parallel_research"] is True
     assert final["research_profile"] == "experimental"
+    assert final["prompt_version"] == EXPERIMENTAL_PARALLEL_PROMPT_VERSION
     assert final["workers"]["tasks"] == []
     assert final["parallel_answers"]["receipts"] == []
     assert final["publication_stop_reason"] == (
@@ -347,6 +353,9 @@ def test_serial_runtime_keeps_existing_tool_admission(
     assert adaptive_options == ([False, False] if profile == "deep" else [False])
     assert selected.invoke.call_count == (4 if profile == "deep" else 2)
     assert checkpoints[-1]["publication_status"] == "found"
+    assert checkpoints[-1]["prompt_version"] == (
+        EXPERIMENTAL_PROMPT_VERSION if profile == "experimental" else PROMPT_VERSION
+    )
 
 
 def test_parallel_children_share_reads_and_publish_exact_complete_bodies(

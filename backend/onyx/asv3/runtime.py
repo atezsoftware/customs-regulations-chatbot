@@ -82,7 +82,10 @@ from onyx.db.memory import UserMemoryContext
 from onyx.db.models import User
 from onyx.llm.interfaces import LLM, LLMUserIdentity
 from onyx.llm.models import ReasoningEffort
-from onyx.prompts.asv3.experimental import EXPERIMENTAL_PROMPT_VERSION
+from onyx.prompts.asv3.experimental import (
+    EXPERIMENTAL_PARALLEL_PROMPT_VERSION,
+    EXPERIMENTAL_PROMPT_VERSION,
+)
 from onyx.prompts.asv3.research import (
     PROMPT_VERSION,
     VERIFICATION_PROMPT,
@@ -331,6 +334,8 @@ def run_asv3_loop(
             answer,
             ledger,
             strict_reference_boundaries=research_profile == "experimental",
+            resolve_defined_abbreviations=research_profile == "experimental"
+            and parallel_research,
         )
         if authority_requirements is not None:
             return authority_requirements.publication_gap(
@@ -539,7 +544,9 @@ def run_asv3_loop(
             checkpoint_sequence += 1
             snapshot.update(
                 sequence=checkpoint_sequence,
-                prompt_version=EXPERIMENTAL_PROMPT_VERSION
+                prompt_version=EXPERIMENTAL_PARALLEL_PROMPT_VERSION
+                if parallel_research
+                else EXPERIMENTAL_PROMPT_VERSION
                 if source_reviews is not None
                 else PROMPT_VERSION,
                 research_profile=research_profile,

@@ -24,6 +24,7 @@ from onyx.asv3.assertions import (
     AssertionWitness,
     assertion_witness_valid,
 )
+from onyx.asv3.authority import explicit_reference_leads
 from onyx.asv3.authority_requirements import AuthorityRequirements
 from onyx.asv3.citation_numbers import extract_citation_numbers
 from onyx.asv3.evidence import EvidenceLedger
@@ -40,6 +41,7 @@ from onyx.asv3.models import (
     ToolReceipt,
     model_evidence_metadata,
 )
+from onyx.asv3.native_projection import reference_duplicate_metadata
 from onyx.asv3.outcome_map import OutcomeMap
 from onyx.asv3.research_gaps import research_gap_signals
 from onyx.asv3.shared_originals import related_provision_originals
@@ -2587,18 +2589,26 @@ class ResearchModel:
                         and identity[3] == original_lengths[(identity[0], identity[1])]
                     },
                 )
-            gaps = research_gap_signals(
-                view,
-                [
-                    record
-                    for identity, record in unique.items()
-                    if identity in verified
-                    and identity[2] == 0
-                    and identity[3] == original_lengths[(identity[0], identity[1])]
-                ],
-            )
+            complete_originals = [
+                record
+                for identity, record in unique.items()
+                if identity in verified
+                and identity[2] == 0
+                and identity[3] == original_lengths[(identity[0], identity[1])]
+            ]
+            gaps = research_gap_signals(view, complete_originals)
             if gaps:
                 current["research_gap_signals"] = gaps
+            if (
+                self.context.services.get("research_profile") == "experimental"
+                and self.context.services.get("experimental_parallel") is True
+                and isinstance(ledger, EvidenceLedger)
+            ):
+                reference_leads = explicit_reference_leads(ledger, complete_originals)
+                if reference_leads:
+                    research_navigation = current.setdefault("research_navigation", {})
+                    assert isinstance(research_navigation, dict)
+                    research_navigation["reference_leads"] = reference_leads
             if unique:
                 current["original_evidence"] = list(unique.values())
                 current["original_evidence_ranges"] = [
@@ -2627,11 +2637,25 @@ class ResearchModel:
             ]
             if current_omissions:
                 current["original_evidence_omitted"] = current_omissions
+            native_turns = retained
+            if (
+                self.context.services.get("research_profile") == "experimental"
+                and self.context.services.get("experimental_parallel") is True
+                and isinstance(ledger, EvidenceLedger)
+            ):
+                native_turns = reference_duplicate_metadata(
+                    retained, complete_originals, ledger
+                )
+                if native_turns != retained and "evidence_note" in current:
+                    current["evidence_note"] = str(current["evidence_note"]) + (
+                        " metadata_ref addresses identical metadata in original_evidence "
+                        "for this decision."
+                    )
             return [
                 *prefix,
                 *(
                     message
-                    for turn in retained
+                    for turn in native_turns
                     for message in [turn.assistant, *turn.results]
                 ),
                 UserMessage(content=json.dumps(current, ensure_ascii=False)),

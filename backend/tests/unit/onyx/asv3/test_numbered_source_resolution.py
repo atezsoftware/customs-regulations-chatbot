@@ -116,6 +116,124 @@ def test_nonformal_or_provision_queries_do_not_trigger_fallback(query: str) -> N
     assert asv3_corpus._numbered_law_title(query) is None
 
 
+@pytest.mark.parametrize(
+    "query",
+    ["Faaliyet Kanunu 8237", " FAALİYET  KANUN 8237 ", "Faaliyet Kanunu 08237"],
+)
+def test_reversed_formal_title_retains_exact_number_and_title(query: str) -> None:
+    assert asv3_corpus._reversed_numbered_law_title(query) == NumberedLawTitle(
+        "8237", "faaliyet kanun"
+    )
+    assert asv3_corpus._numbered_law_title(query) is None
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "Faaliyet Kanunu 8237 current consolidated text",
+        "Faaliyet Kanunu 8237 1999",
+        "8237 sayılı Faaliyet Kanunu 1999",
+        "Faaliyet Kanunu 8237 m. 27",
+        "Faaliyet Kanunu 8237 Başka Kanunu 8918",
+        "Faaliyet Kanunu 8237 Başka Yönetmeliği",
+        "Faaliyet Yönetmeliği 8237",
+        "FK 8237",
+        "Kanun 8237",
+    ],
+)
+def test_reversed_fallback_never_removes_query_qualifiers(query: str) -> None:
+    assert asv3_corpus._reversed_numbered_law_title(query) is None
+
+
+def test_serial_formal_fallback_does_not_accept_reversed_queries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = catalogue(monkeypatch, [[]])
+    identity_read = MagicMock()
+    monkeypatch.setattr(asv3_corpus, "_source_has_numbered_law_identity", identity_read)
+    assert asv3_corpus.find_sources(
+        session,
+        user=cast(User, object()),
+        filters=filters(),
+        query="Faaliyet Kanunu 8237",
+        allow_numbered_title_fallback=True,
+    ) == ([], False)
+    assert session.execute.call_count == 1
+    identity_read.assert_not_called()
+
+
+def test_reversed_fallback_keeps_canonical_identity_and_access_date_fences(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    valid, wrong_number, denied, unpublished = (source() for _ in range(4))
+    session = catalogue(
+        monkeypatch,
+        [[], [valid, wrong_number, denied, unpublished]],
+        denied={denied.id},
+        unpublished={unpublished.id},
+    )
+    index = cast(PublicationIndexSnapshot, object())
+    monkeypatch.setattr(asv3_corpus, "resolve_source_query_index", lambda *_args: index)
+    readable = {
+        valid.id: [chunk(valid)],
+        wrong_number.id: [chunk(wrong_number, root="8918 SAYILI FAALİYET KANUNU")],
+    }
+    read = MagicMock(
+        side_effect=lambda _session, **kwargs: (
+            next(row for row in (valid, wrong_number) if row.id == kwargs["source_id"]),
+            readable[kwargs["source_id"]],
+            False,
+        )
+    )
+    monkeypatch.setattr(asv3_corpus, "read_source_chunks", read)
+    scope = filters()
+    original_scope = scope.model_dump()
+    assert asv3_corpus.find_sources(
+        session,
+        user=cast(User, object()),
+        filters=scope,
+        query="Faaliyet Kanunu 8237",
+        allow_reversed_numbered_title_fallback=True,
+    ) == ([valid], False)
+    assert {call.kwargs["source_id"] for call in read.call_args_list} == {
+        valid.id,
+        wrong_number.id,
+    }
+    assert all(call.kwargs["filters"] is scope for call in read.call_args_list)
+    assert all(call.kwargs["limit"] == 2 for call in read.call_args_list)
+    assert all(
+        call.kwargs["query_indexes"] == {call.kwargs["source_id"]: index}
+        for call in read.call_args_list
+    )
+    assert scope.model_dump() == original_scope
+    for call in session.execute.call_args_list:
+        compiled = call.args[0].compile(dialect=postgresql.dialect())
+        assert 73 in compiled.params.values() and 9 in compiled.params.values()
+        assert ["Requested subset"] in compiled.params.values()
+        assert [asv3_corpus.PC_CORPUS_NAME] in compiled.params.values()
+        assert "is_deleting IS false" in str(compiled)
+
+
+def test_reversed_fallback_does_not_expand_abbreviated_title(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate = source("Kanunlar/fk_kanunu_.md")
+    session = catalogue(monkeypatch, [[], [candidate]])
+    monkeypatch.setattr(asv3_corpus, "resolve_source_query_index", lambda *_args: None)
+    monkeypatch.setattr(
+        asv3_corpus,
+        "read_source_chunks",
+        lambda *_args, **_kwargs: (candidate, [chunk(candidate)], False),
+    )
+    assert asv3_corpus.find_sources(
+        session,
+        user=cast(User, object()),
+        filters=filters(),
+        query="FK Kanunu 8237",
+        allow_reversed_numbered_title_fallback=True,
+    ) == ([], False)
+
+
 def test_default_resolution_never_relaxes_numbered_filename_query(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -369,6 +487,85 @@ def test_broker_threads_only_explicit_opt_in(
     )
     broker.sources("8237 sayılı Faaliyet Kanunu", RunContext())
     assert lookup.call_args.kwargs["allow_numbered_title_fallback"] is enabled
+
+
+@pytest.mark.parametrize(
+    "profile,parallel,expected",
+    [
+        ("experimental", True, True),
+        ("experimental", False, False),
+        ("experimental", None, False),
+        ("reference", True, False),
+        ("adaptive", True, False),
+        (None, True, False),
+    ],
+)
+def test_broker_reversed_title_fallback_is_experimental_parallel_only(
+    profile: str | None,
+    parallel: bool | None,
+    expected: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = MagicMock()
+    monkeypatch.setattr(
+        corpus_tools, "get_session_with_current_tenant", lambda: manager
+    )
+    lookup = MagicMock(return_value=([], False))
+    monkeypatch.setattr(corpus_tools, "find_sources", lookup)
+    broker = corpus_tools.CorpusBroker(cast(User, object()), filters())
+    broker.sources(
+        "Faaliyet Kanunu 8237",
+        RunContext(
+            services={"research_profile": profile, "experimental_parallel": parallel}
+        ),
+    )
+    assert lookup.call_args.kwargs["allow_reversed_numbered_title_fallback"] is expected
+
+
+def test_reversed_fallback_preserves_ambiguous_navigation_and_paging(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first, second = source(), source()
+    session = catalogue(monkeypatch, [[], [first, second]])
+    manager = MagicMock()
+    manager.__enter__.return_value = session
+    monkeypatch.setattr(
+        corpus_tools, "get_session_with_current_tenant", lambda: manager
+    )
+    monkeypatch.setattr(
+        asv3_corpus,
+        "_source_has_numbered_law_identity",
+        lambda *_args, **_kwargs: True,
+    )
+    broker = corpus_tools.CorpusBroker(cast(User, object()), filters())
+    resolve = next(
+        spec
+        for spec in corpus_tools.build_corpus_specs(broker)
+        if spec.name == "resolve_source"
+    )
+    context = RunContext(
+        services={"research_profile": "experimental", "experimental_parallel": True}
+    )
+    outcome = resolve.handler({"query": "Faaliyet Kanunu 8237"}, context)
+    assert outcome.status is OutcomeStatus.AMBIGUOUS
+    assert outcome.evidence == [] and outcome.data["absence_proven"] is False
+    assert outcome.data["sources"] == [
+        {"source_id": str(candidate.id), "name": candidate.name}
+        for candidate in (first, second)
+    ]
+
+    session = catalogue(monkeypatch, [[], [], [first, second]])
+    manager.__enter__.return_value = session
+    paged = resolve.handler(
+        {"query": "Faaliyet Kanunu 8237", "offset": 1, "limit": 1}, context
+    )
+    assert paged.status is OutcomeStatus.PARTIAL
+    assert paged.data["has_more"] is True
+    assert paged.data["next_offset"] == 2
+    assert paged.data["sources"] == [{"source_id": str(first.id), "name": first.name}]
+    statement = session.execute.call_args_list[-1].args[0]
+    assert statement._offset_clause.value == 1
+    assert statement._limit_clause.value == 2
 
 
 def test_multiple_verified_source_ids_remain_uncitable_navigation(
