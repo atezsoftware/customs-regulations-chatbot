@@ -258,6 +258,12 @@ class CorpusBoundary:
     def related_source_navigation(self) -> list[dict[str, JsonValue]]:
         return []
 
+    def shared_read_fence(self, source_id: str, context: RunContext) -> str:
+        context.check_active()
+        if source_id not in self.chunks:
+            raise PermissionError("Source is outside the captured test scope")
+        return f"captured-test-source:{source_id}"
+
     def page(
         self, source_id: str, _context: RunContext, **_kwargs: Any
     ) -> tuple[CorpusSource, list[CorpusChunk], bool]:

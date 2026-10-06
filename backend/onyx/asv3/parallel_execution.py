@@ -14,6 +14,7 @@ CANONICAL_IO_TOOLS = frozenset(
     {
         "resolve_source",
         "read_provision",
+        "read_named_provision",
         "read_chunk",
         "read_chunk_context",
         "read_source_range",

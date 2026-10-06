@@ -636,6 +636,7 @@ class Harness:
                 "read_chunk",
                 "read_chunk_context",
                 "read_provision",
+                "read_named_provision",
                 "read_source_range",
             }
         ):

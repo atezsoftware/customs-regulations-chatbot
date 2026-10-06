@@ -120,7 +120,11 @@ from onyx.prompts.asv3.research import (
     OUTCOME_COVERAGE_RESEARCH,
     RESEARCHER_PROMPT,
 )
-from onyx.prompts.asv3.tuned import TUNED_LEGAL_DEPARTMENT_RESEARCH
+from onyx.prompts.asv3.tuned import (
+    TUNED_COORDINATOR_REFERENCE_PROMPT,
+    TUNED_LEGAL_DEPARTMENT_RESEARCH,
+    TUNED_RESEARCHER_REFERENCE_PROMPT,
+)
 from onyx.regulatory.structured_llm import (
     _portable_structured_output_schema,
     _retry_after_seconds,
@@ -2406,7 +2410,24 @@ class ResearchModel:
     @staticmethod
     def _native_turns_with_original_references(
         turns: list[ResearchTurn],
+        *,
+        current_originals: dict[int, dict[str, JsonValue]] | None = None,
     ) -> list[ResearchTurn]:
+        def reference_metadata(record: JsonValue) -> JsonValue:
+            if not isinstance(record, dict) or current_originals is None:
+                return record
+            number = record.get("citation")
+            current = current_originals.get(number) if type(number) is int else None
+            if current is None or any(
+                record.get(key) != current.get(key)
+                for key in ("source_id", "chunk_id", "text_hash")
+            ):
+                return record
+            return {
+                **{key: value for key, value in record.items() if key != "metadata"},
+                "metadata_ref": {"citation": number, "text_hash": current["text_hash"]},
+            }
+
         referenced: list[ResearchTurn] = []
         for turn in turns:
             results: list[ToolMessage] = []
@@ -2442,8 +2463,11 @@ class ResearchModel:
                     payload.pop("original_evidence")
                 previous = payload.get("original_evidence_refs")
                 payload["original_evidence_refs"] = [
-                    *(previous if isinstance(previous, list) else []),
-                    *references,
+                    reference_metadata(record)
+                    for record in [
+                        *(previous if isinstance(previous, list) else []),
+                        *references,
+                    ]
                 ]
                 results.append(
                     result.model_copy(
@@ -2472,11 +2496,24 @@ class ResearchModel:
                 instruction += "\n\n" + EXPERIMENTAL_PARALLEL_COORDINATOR
             return instruction
         normal = self.context.services.get("research_profile") == "normal"
+        tuned = self.context.services.get("asv3_workflow_variant") == ASV3_TUNED_VARIANT
         if self.context.depth:
-            instruction = RESEARCHER_REFERENCE_PROMPT if normal else RESEARCHER_PROMPT
+            instruction = (
+                TUNED_RESEARCHER_REFERENCE_PROMPT
+                if normal and tuned
+                else RESEARCHER_REFERENCE_PROMPT
+                if normal
+                else RESEARCHER_PROMPT
+            )
         elif normal:
             instruction = (
-                COORDINATOR_REFERENCE_PROMPT + "\n\n" + COORDINATOR_SESSION_ACTIONS
+                (
+                    TUNED_COORDINATOR_REFERENCE_PROMPT
+                    if tuned
+                    else COORDINATOR_REFERENCE_PROMPT
+                )
+                + "\n\n"
+                + COORDINATOR_SESSION_ACTIONS
             )
         else:
             instruction = COORDINATOR_PROMPT
@@ -2747,8 +2784,6 @@ class ResearchModel:
         native_original_cache = lossless_original_transport_enabled(
             self.context
         ) and isinstance(ledger, EvidenceLedger)
-        if not native_original_cache:
-            retained = self._native_turns_with_original_references(retained)
         omitted: list[JsonValue] = list(view.original_evidence_omitted)
         verified: set[tuple[int, str, int, int]] = set()
         original_lengths: dict[tuple[int, str], int] = {}
@@ -2765,7 +2800,12 @@ class ResearchModel:
                     verified.add(identity)
                     original_lengths[(number, digest)] = len(item.text)
                     if (
-                        self.context.services.get("research_profile") == "experimental"
+                        (
+                            self.context.services.get("research_profile")
+                            == "experimental"
+                            or self.context.services.get("asv3_workflow_variant")
+                            == ASV3_TUNED_VARIANT
+                        )
                         and record.get("source_id") == item.source_id
                         and record.get("chunk_id") == item.chunk_id
                     ):
@@ -2794,6 +2834,18 @@ class ResearchModel:
                             acquire_navigation,
                         )
                         acquire(item, self.context)
+        if not native_original_cache:
+            retained = self._native_turns_with_original_references(
+                retained,
+                current_originals={
+                    identity[0]: record
+                    for identity, record in unique.items()
+                    if identity in verified
+                }
+                if self.context.services.get("asv3_workflow_variant")
+                == ASV3_TUNED_VARIANT
+                else None,
+            )
         source_navigation = self.context.services.get("legal_source_navigation")
         related_navigation = (
             cast(Callable[[], list[dict[str, JsonValue]]], source_navigation)()
@@ -2990,7 +3042,11 @@ class ResearchModel:
                         and identity[3] == original_lengths[(identity[0], identity[1])]
                     },
                 )
-                if self.context.services.get("research_profile") == "experimental":
+                if (
+                    self.context.services.get("research_profile") == "experimental"
+                    or self.context.services.get("asv3_workflow_variant")
+                    == ASV3_TUNED_VARIANT
+                ):
                     source_review_state = self._related_source_range_continuations(
                         source_review_state, view.receipts, ledger
                     )
@@ -3167,6 +3223,15 @@ class ResearchModel:
                     "citations and the same qualifications in quick answers, detail and tables. "
                     "Reopen genuinely omitted ranges with read_evidence."
                 )
+                if (
+                    self.context.services.get("asv3_workflow_variant")
+                    == ASV3_TUNED_VARIANT
+                ):
+                    current["evidence_note"] = str(current["evidence_note"]) + (
+                        " Retained tool metadata_ref addresses the corresponding current "
+                        "original_evidence citation and hash. Its metadata is supplied once "
+                        "there; full provenance remains in the evidence ledger."
+                    )
             current_omissions = [
                 item for item in omitted if not omission_is_delivered(item)
             ]

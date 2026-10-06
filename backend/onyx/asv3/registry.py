@@ -29,6 +29,7 @@ from onyx.asv3.parallel_execution import capability_slot, parallel_execution_ena
 from onyx.asv3.research_state import ResearchState
 from onyx.asv3.scenario import question_determinations
 from onyx.asv3.shared_reads import SharedReads
+from onyx.asv3.workflow_variant import ASV3_TUNED_VARIANT
 from onyx.tracing.answer_graph import graph_step
 
 if TYPE_CHECKING:
@@ -221,12 +222,17 @@ class CapabilityRegistry:
                     "description": "True only when the user explicitly requested outside/web sources; host authorization still applies.",
                 }
                 if outcome_properties is not None and (
-                    context.services.get("research_profile") != "experimental"
+                    (
+                        context.services.get("research_profile") != "experimental"
+                        and context.services.get("asv3_workflow_variant")
+                        != ASV3_TUNED_VARIANT
+                    )
                     or spec.name
                     in {
                         "search_corpus",
                         "resolve_source",
                         "read_provision",
+                        "read_named_provision",
                         "update_research",
                         "research_questions",
                         "submit_answer",
@@ -417,6 +423,8 @@ class CapabilityRegistry:
                         detailed_errors=(
                             context.services.get("experimental_parallel") is True
                             or serial_session_diagnostics_enabled(context)
+                            or context.services.get("asv3_workflow_variant")
+                            == ASV3_TUNED_VARIANT
                         ),
                     )
                 except ValueError as error:
@@ -458,7 +466,11 @@ class CapabilityRegistry:
             shared_reads = context.services.get("shared_reads")
             outcome = (
                 shared_reads.run(call.name, arguments, context, execute)
-                if context.services.get("research_profile") == "experimental"
+                if (
+                    context.services.get("research_profile") == "experimental"
+                    or context.services.get("asv3_workflow_variant")
+                    == ASV3_TUNED_VARIANT
+                )
                 and isinstance(shared_reads, SharedReads)
                 else execute(context)
             )

@@ -14,6 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue
 from onyx.asv3.assertions import assertion_inventory, presentation_block
 from onyx.asv3.citation_numbers import extract_citation_numbers
 from onyx.asv3.evidence import EvidenceLedger
+from onyx.asv3.judicial_sections import nonoperative_judicial_witness_role
 from onyx.asv3.legal_source_navigation import (
     RelatedSourceRole,
     derive_provision_navigation_anchor,
@@ -172,6 +173,24 @@ class _Checkpoint(BaseModel):
     scope_hash: str
     request_hash: str
     records: list[_LeadRecord]
+
+
+def _only_nonoperative_judicial_witnesses(
+    record: _LeadRecord, review: RelatedSourceReview, ledger: EvidenceLedger
+) -> bool:
+    return (
+        record.candidate_role == "judicial_candidate"
+        and review.status in {"examined", "not_material"}
+        and bool(review.witnesses)
+        and all(
+            (item := ledger.get(witness.citation)) is not None
+            and nonoperative_judicial_witness_role(
+                item, witness.start_char, witness.end_char
+            )
+            in {"preliminary", "argument_only"}
+            for witness in review.witnesses
+        )
+    )
 
 
 def _examined_answer_omission(
@@ -448,6 +467,7 @@ class LegalSourceReviews:
         delivered: set[int] | None,
         diagnostic_index: int | None = None,
         errors: list[RelatedSourceReviewValidationError] | None = None,
+        check_judicial_sections: bool = False,
     ) -> None:
         available: list[JsonValue] | None = None
 
@@ -507,6 +527,14 @@ class LegalSourceReviews:
                     "evidence. An unresolved interaction needs its precise gap; an examined "
                     "or not_material review leaves gap empty. Do not change status merely "
                     "to pass validation, or rewrite supported answer detail."
+                )
+            elif code == "nonoperative_judicial_witnesses":
+                diagnostic["instruction"] = (
+                    "These candidate witnesses identify only a preliminary section or party "
+                    "argument. Locate and read this source's actual disposition and relevant "
+                    "qualifications through source-local search or headings; preserve already "
+                    "supported answer detail. Do not relabel or reread the same introduction, "
+                    "scan unrelated sources, or claim its operative effect from a title."
                 )
             error = RelatedSourceReviewValidationError(message, diagnostic)
             if errors is not None:
@@ -583,6 +611,17 @@ class LegalSourceReviews:
                     witness_index,
                 )
             identities.add(identity)
+        if check_judicial_sections and _only_nonoperative_judicial_witnesses(
+            record, review, ledger
+        ):
+            reject(
+                "The candidate's supplied witnesses contain only a recognized application "
+                "subject, procedural introduction or party argument. Read its own disposition "
+                "and connected qualifications using source-local search or headings, or "
+                "disclose that precise unresolved effect; do not reread the introduction.",
+                "nonoperative_judicial_witnesses",
+                "witnesses",
+            )
 
     def _preview(
         self,
@@ -634,6 +673,8 @@ class LegalSourceReviews:
                 delivered=delivered,
                 diagnostic_index=review_index if detailed_errors else None,
                 errors=errors if detailed_errors else None,
+                check_judicial_sections=context.services.get("asv3_workflow_variant")
+                == ASV3_TUNED_VARIANT,
             )
             if len(errors) != previous_errors:
                 continue
@@ -665,10 +706,15 @@ class LegalSourceReviews:
                 context,
                 ledger,
                 detailed_errors=detailed_errors
-                and context.services.get("research_profile") == "experimental"
                 and (
-                    context.services.get("experimental_parallel") is True
-                    or serial_session_diagnostics_enabled(context)
+                    context.services.get("asv3_workflow_variant") == ASV3_TUNED_VARIANT
+                    or (
+                        context.services.get("research_profile") == "experimental"
+                        and (
+                            context.services.get("experimental_parallel") is True
+                            or serial_session_diagnostics_enabled(context)
+                        )
+                    )
                 ),
             )
 
@@ -704,6 +750,23 @@ class LegalSourceReviews:
                         "candidate_role": record.candidate_role,
                         "status": record.review.status if record.review else "pending",
                         "available_original_citations": originals,
+                        **(
+                            {
+                                "nonoperative_original_citations": [
+                                    number
+                                    for number in originals
+                                    if (item := ledger.get(number)) is not None
+                                    and nonoperative_judicial_witness_role(
+                                        item, 0, len(item.text)
+                                    )
+                                    in {"preliminary", "argument_only"}
+                                ]
+                            }
+                            if context.services.get("asv3_workflow_variant")
+                            == ASV3_TUNED_VARIANT
+                            and record.candidate_role == "judicial_candidate"
+                            else {}
+                        ),
                         **(
                             {
                                 "anchor_evidence_numbers": [
@@ -757,6 +820,22 @@ class LegalSourceReviews:
                 if record_owner != owner:
                     continue
                 self._validate_saved(record, ledger)
+                if (
+                    tuned
+                    and record.review is not None
+                    and _only_nonoperative_judicial_witnesses(
+                        record, record.review, ledger
+                    )
+                ):
+                    return ToolOutcome(
+                        status=OutcomeStatus.PARTIAL,
+                        summary="The saved candidate assessment uses only preliminary or party-argument text. Read its own disposition and connected qualifications or disclose the precise unresolved effect.",
+                        data={
+                            "pending_related_source_review": True,
+                            "nonoperative_judicial_source_id": record.source_id,
+                            "lead_id": record.lead_id,
+                        },
+                    )
                 if record.review is None:
                     pending.append(
                         {

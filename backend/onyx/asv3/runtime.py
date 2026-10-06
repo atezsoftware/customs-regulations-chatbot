@@ -406,9 +406,11 @@ def run_asv3_loop(
         user,
         scope,
         vision_llm=research_llm or llm,
-        allow_numbered_title_fallback=research_profile == "experimental",
+        allow_numbered_title_fallback=(
+            research_profile == "experimental" or workflow_variant == ASV3_TUNED_VARIANT
+        ),
     )
-    if parallel_research:
+    if parallel_research or workflow_variant == ASV3_TUNED_VARIANT:
 
         def shared_producer(caller: RunContext) -> RunContext:
             return RunContext(
@@ -1413,6 +1415,7 @@ def run_asv3_loop(
         build_corpus_specs(
             broker,
             require_search_targets=True,
+            named_provision_reads=workflow_variant == ASV3_TUNED_VARIANT,
         )
         + build_source_specs(broker)
         + build_sandbox_specs(broker)

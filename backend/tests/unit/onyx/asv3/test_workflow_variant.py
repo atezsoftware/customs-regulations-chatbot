@@ -11,6 +11,7 @@ from onyx.asv3 import runtime
 from onyx.asv3.legal_source_reviews import LegalSourceReviews
 from onyx.asv3.llm_adapter import ResearchModel
 from onyx.asv3.models import ASv3WorkflowSelection
+from onyx.asv3.shared_reads import SharedReads
 from onyx.asv3.workflow_variant import (
     ASV3_STANDARD_VARIANT,
     ASV3_TUNED_POLICY,
@@ -105,7 +106,7 @@ def test_tuned_runtime_uses_normal_tools_and_selected_model_everywhere(
 
     def make_broker(_user: Any, scope: Any, **options: Any) -> Any:
         assert options["vision_llm"] is selected
-        assert options["allow_numbered_title_fallback"] is False
+        assert options["allow_numbered_title_fallback"] is True
         broker.scope = scope
         return broker
 
@@ -132,9 +133,9 @@ def test_tuned_runtime_uses_normal_tools_and_selected_model_everywhere(
         "authority_requirements",
         "parallel_execution_slots",
         "parallel_query_embeddings",
-        "shared_reads",
     }.intersection(context.services)
     assert isinstance(context.services["legal_source_reviews"], LegalSourceReviews)
+    assert isinstance(context.services["shared_reads"], SharedReads)
     for invocation in selected.invoke.call_args_list:
         names = {tool["function"]["name"] for tool in invocation.kwargs["tools"]}
         assert not {

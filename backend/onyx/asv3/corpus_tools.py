@@ -30,6 +30,7 @@ from onyx.asv3.models import (
     compact_evidence_metadata,
 )
 from onyx.asv3.parallel_execution import parallel_execution_enabled
+from onyx.asv3.shared_reads import SharedReads
 from onyx.configs.constants import DocumentSource
 from onyx.context.search.models import IndexFilters, SearchDoc
 from onyx.db.asv3_candidate_inventory import current_asv3_source_inventory_scope
@@ -1122,6 +1123,7 @@ def build_corpus_specs(
     *,
     require_search_targets: bool = False,
     source_identity_guidance: bool = False,
+    named_provision_reads: bool = False,
 ) -> list[ToolSpec]:
     def resolve(args: dict[str, JsonValue], context: RunContext) -> ToolOutcome:
         sources, more = broker.sources(
@@ -1350,6 +1352,51 @@ def build_corpus_specs(
                 ),
             },
             evidence=evidence,
+        )
+
+    def named_provision(args: dict[str, JsonValue], context: RunContext) -> ToolOutcome:
+        sources, more = broker.sources(str(args["source_name"]), context, limit=20)
+        if len(sources) != 1 or more:
+            return ToolOutcome(
+                status=OutcomeStatus.AMBIGUOUS
+                if sources or more
+                else OutcomeStatus.NOT_FOUND,
+                summary="Source identity remains unresolved; choose an exact source_id or refine the source title. This is not evidence of absent law.",
+                data={
+                    "sources": [
+                        {"source_id": str(source.id), "name": source.name}
+                        for source in sources
+                    ],
+                    "has_more": more,
+                    "absence_proven": False,
+                },
+            )
+        source = sources[0]
+        canonical_args = {
+            key: value
+            for key, value in args.items()
+            if key in {"article", "start", "paragraph", "clause"}
+        }
+        canonical_args["source_id"] = str(source.id)
+        shared = context.services.get("shared_reads")
+        result = (
+            shared.run(
+                "read_provision",
+                canonical_args,
+                context,
+                lambda producer: provision(canonical_args, producer),
+            )
+            if isinstance(shared, SharedReads)
+            else provision(canonical_args, context)
+        )
+        return result.model_copy(
+            update={
+                "data": {
+                    **result.data,
+                    "source_id": str(source.id),
+                    "source_name": source.name,
+                }
+            }
         )
 
     def text_search(args: dict[str, JsonValue], context: RunContext) -> ToolOutcome:
@@ -1611,7 +1658,7 @@ def build_corpus_specs(
             )
         return broker.search_adapter(args, context)
 
-    return [
+    specs = [
         ToolSpec(
             name="resolve_source",
             description=(
@@ -1819,3 +1866,22 @@ def build_corpus_specs(
             handler=guarded(search),
         ),
     ]
+    if named_provision_reads:
+        specs.append(
+            ToolSpec(
+                name="read_named_provision",
+                description="Resolve one source by its own title/name and read its identified article in the same action. Use for a known instrument and article when source_id is not yet supplied, instead of a corpus-wide article-number search. Ambiguous source identities remain unresolved. Original clauses, continuation and related-source navigation are preserved.",
+                parameters=schema(
+                    {
+                        "source_name": {"type": "string", "minLength": 1},
+                        "article": {"type": "string", "minLength": 1},
+                        "start": {"type": "integer", "minimum": 0},
+                        "paragraph": {"type": "string"},
+                        "clause": {"type": "string"},
+                    },
+                    ["source_name", "article"],
+                ),
+                handler=guarded(named_provision),
+            )
+        )
+    return specs
