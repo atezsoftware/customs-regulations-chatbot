@@ -111,7 +111,7 @@ def need_properties(schema: dict[str, JsonValue]) -> dict[str, JsonValue]:
         ("experimental", True, True, 0, False),
     ],
 )
-def test_first_native_decision_has_matching_local_schema_and_visible_bindings(
+def test_native_policy_rejects_removed_child_path_and_preserves_ordinary_metadata(
     profile: str, parallel: bool, independent: bool, depth: int, bound: bool
 ) -> None:
     context, state, outcomes, registry = setup()
@@ -137,44 +137,34 @@ def test_first_native_decision_has_matching_local_schema_and_visible_bindings(
         lean_native_mode=True,
     )
     tools = registry.definitions(context)
-    decision = adapter.decide(
-        HarnessView(
-            request=TASK,
-            questions=[TASK],
-            facts=[],
-            receipts=[],
-            evidence=[],
-            tools=tools,
-        )
+    view = HarnessView(
+        request=TASK,
+        questions=[TASK],
+        facts=[],
+        receipts=[],
+        evidence=[],
+        tools=tools,
     )
-    payload = last_payload(selected)
     if bound:
-        bindings = payload["research_bindings"]
-        assert bindings["namespace"] == "local_update_research"
-        assert bindings["question_ids"] == ["q0"]
-        assert bindings["determinations"] == [
-            {
-                "determination_id": "q0:d0",
-                "question_id": "q0",
-                "question": "Which permission applies?",
-            },
-            {
-                "determination_id": "q0:d1",
-                "question_id": "q0",
-                "question": "When does it start?",
-            },
-        ]
-        assert "immutable parent" in bindings["notice"]
-        assert payload["outcome_map"]["outcomes"][0]["question_ids"] == ["q1"]
-        actual_tools = selected.invoke.call_args.kwargs["tools"]
-        validator = Draft202012Validator(parameters(actual_tools))
+        validator = Draft202012Validator(parameters(tools))
         assert validator.is_valid(arguments)
         assert not validator.is_valid(update(question="q1"))
         assert not validator.is_valid(update(determination="q1:d1"))
         assert not validator.is_valid(update(determination="q0:d2"))
-    else:
-        assert "research_bindings" not in payload
-        assert need_properties(parameters(tools)) == need_properties(original_schema)
+    if profile == "experimental" and parallel and depth:
+        before_state = state.export()
+        with pytest.raises(ValueError, match="ordinary Experimental session"):
+            adapter.decide(view)
+        selected.invoke.assert_not_called()
+        secondary.invoke.assert_not_called()
+        assert state.export() == before_state
+        assert outcomes.export() == before_outcomes
+        assert spec.parameters == original_schema
+        return
+    decision = adapter.decide(view)
+    payload = last_payload(selected)
+    assert "research_bindings" not in payload
+    assert need_properties(parameters(tools)) == need_properties(original_schema)
     assert selected.invoke.call_count == 1
     secondary.invoke.assert_not_called()
     assert decision.calls[0].argument_error is None

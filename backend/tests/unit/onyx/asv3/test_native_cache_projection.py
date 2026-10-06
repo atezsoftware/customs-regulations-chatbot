@@ -375,6 +375,7 @@ def test_native_navigation_does_not_bind_a_later_narrative_article_to_a_statute(
         "8917 sayılı Faaliyet Kanunu kapsamındaki yetki kullanılarak hazırlanan "
         "düzenlemede 53 üncü madde usulünü açıklar."
     )
+    context.depth = 0
     llm = model()
     adapter = ResearchModel(llm, context, lean_native_mode=True)
     adapter.decide(view(original_evidence=complete(ledger, 1, 2)))

@@ -14,9 +14,7 @@ from onyx.asv3.models import RunContext
 from onyx.prompts.asv3.experimental import (
     EXPERIMENTAL_COORDINATOR_PROMPT,
     EXPERIMENTAL_PARALLEL_COORDINATOR,
-    EXPERIMENTAL_PARALLEL_RESEARCHER,
     EXPERIMENTAL_RESEARCHER_PROMPT,
-    parallel_research_prompt,
 )
 from tests.unit.onyx.asv3.test_native_authority import ledger_with, original
 from tests.unit.onyx.asv3.test_native_model_adapter import model
@@ -422,38 +420,28 @@ def test_declared_identity_label_cannot_mask_a_predicate_inside_a_scope_subject(
 
 
 @pytest.mark.parametrize(
-    "base,suffix,expected_sha,previous_size",
+    "base,expected_sha",
     [
         (
             EXPERIMENTAL_COORDINATOR_PROMPT,
-            EXPERIMENTAL_PARALLEL_COORDINATOR,
             "03537ac639eb90d21592140d522d1b370a6ef1e7324de21ef1fa0553c8a34ea1",
-            28298,
         ),
         (
             EXPERIMENTAL_RESEARCHER_PROMPT,
-            EXPERIMENTAL_PARALLEL_RESEARCHER,
             "87a37be96b0b9e844f38ca3c047c7d28589df4e8cabc14fd03f17e32b63d59fe",
-            27354,
         ),
     ],
 )
-def test_prompt_replacement_preserves_serial_bytes_and_does_not_grow_parallel(
-    base: str, suffix: str, expected_sha: str, previous_size: int
+def test_serial_experimental_prompt_bytes_remain_the_protected_baseline(
+    base: str, expected_sha: str
 ) -> None:
     assert hashlib.sha256(base.encode()).hexdigest() == expected_sha
-    replacement = parallel_research_prompt(base)
-    assert len(replacement + "\n\n" + suffix) < previous_size
-    assert "at least one" in replacement
-    assert "known source date is not unknown" in replacement
-    assert "unmentioned fact is not an exclusion" in replacement
-    assert "do not\nresearch it again" in replacement
-    with pytest.raises(ValueError):
-        parallel_research_prompt(replacement)
 
 
 @pytest.mark.parametrize("depth", [0, 1])
-def test_actual_native_prompt_routing_changes_only_parallel(depth: int) -> None:
+def test_actual_native_prompt_routing_keeps_serial_and_removes_old_parallel_child(
+    depth: int,
+) -> None:
     base = (
         EXPERIMENTAL_RESEARCHER_PROMPT
         if depth
@@ -463,17 +451,12 @@ def test_actual_native_prompt_routing_changes_only_parallel(depth: int) -> None:
     adapter = ResearchModel(model(), context, lean_native_mode=True)
     assert adapter._research_instruction() == base
     context.services["experimental_parallel"] = True
-    expected = (
-        parallel_research_prompt(base)
-        + "\n\n"
-        + (
-            EXPERIMENTAL_PARALLEL_RESEARCHER
-            if depth
-            else EXPERIMENTAL_PARALLEL_COORDINATOR
+    if depth:
+        with pytest.raises(ValueError, match="ordinary Experimental session"):
+            adapter._research_instruction()
+    else:
+        assert adapter._research_instruction() == (
+            base + "\n\n" + EXPERIMENTAL_PARALLEL_COORDINATOR
         )
-    )
-    actual = adapter._research_instruction()
-    assert actual == expected
-    assert len(actual) < (27354 if depth else 28298)
     context.services["experimental_parallel"] = False
     assert adapter._research_instruction() == base

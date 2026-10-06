@@ -52,6 +52,13 @@ from onyx.asv3.research_state import ResearchState, build_research_specs
 from onyx.asv3.sandbox import build_sandbox_specs
 from onyx.asv3.scenario import initial_questions
 from onyx.asv3.search_adapter import build_search_adapter
+from onyx.asv3.serial_experimental_session import (
+    SERIAL_SESSION_POLICY,
+    SerialExperimentalSession,
+    accepted_serial_memory_state,
+    merge_serial_session_memory,
+    validate_serial_session_answer,
+)
 from onyx.asv3.session_research import (
     retain_session_research,
     session_research_checkpoint,
@@ -292,6 +299,12 @@ def run_asv3_loop(
         raise ValueError("Unknown ASv3 research profile")
     if parallel_research and research_profile != "experimental":
         raise ValueError("Parallel research requires the Experimental profile")
+    if (
+        parallel_research
+        and previous is not None
+        and previous.get("parallel_research_policy") != SERIAL_SESSION_POLICY
+    ):
+        raise ValueError("Saved parallel research uses a different session policy")
     if research_profile == "experimental":
         research_llm = None
     context.language = profile.language
@@ -321,8 +334,6 @@ def run_asv3_loop(
         AuthorityRequirements(
             context,
             question,
-            syntactic_reference_binding=research_profile == "experimental"
-            and parallel_research,
         )
         if research_profile == "experimental"
         else None
@@ -339,10 +350,6 @@ def run_asv3_loop(
             answer,
             ledger,
             strict_reference_boundaries=research_profile == "experimental",
-            resolve_defined_abbreviations=research_profile == "experimental"
-            and parallel_research,
-            syntactic_reference_binding=research_profile == "experimental"
-            and parallel_research,
         )
         if authority_requirements is not None:
             return authority_requirements.publication_gap(
@@ -583,7 +590,50 @@ def run_asv3_loop(
             if authority_requirements is not None:
                 snapshot["authority_requirements"] = authority_requirements.export()
             if parallel_answers is not None:
-                snapshot["parallel_answers"] = parallel_answers.export()
+                snapshot["parallel_research_policy"] = SERIAL_SESSION_POLICY
+                receipts = parallel_answers.export()
+                snapshot["parallel_answers"] = receipts
+                accepted_states: list[dict[str, JsonValue]] = []
+                receipt_rows = receipts.get("receipts", [])
+                if (
+                    question_research is not None
+                    and workers is not None
+                    and isinstance(receipt_rows, list)
+                ):
+                    for assignment in question_research.assignments:
+                        task_id = str(assignment["task_id"])
+                        receipt = next(
+                            (
+                                row
+                                for row in receipt_rows
+                                if isinstance(row, dict)
+                                and row.get("task_id") == task_id
+                            ),
+                            None,
+                        )
+                        if receipt is None:
+                            continue
+                        serial_snapshot = workers.checkpoint(task_id)
+                        if serial_snapshot is None:
+                            raise ValueError(
+                                "Sealed serial memory checkpoint is missing"
+                            )
+                        accepted_states.append(
+                            accepted_serial_memory_state(
+                                serial_snapshot,
+                                assignment,
+                                receipt,
+                                context,
+                                question,
+                                history,
+                            )
+                        )
+                memory = snapshot["session_research"]
+                if not isinstance(memory, dict):
+                    raise ValueError("Serial session memory checkpoint is missing")
+                snapshot["session_research"] = merge_serial_session_memory(
+                    memory, accepted_states
+                )
                 # Child acceptance may occur after the caller captured its root snapshot.
                 snapshot["evidence"] = ledger.export()
             save_asv3_checkpoint(
@@ -676,6 +726,111 @@ def run_asv3_loop(
     def researcher(
         task: str, child: RunContext, updates: Callable[[], list[str]]
     ) -> ToolOutcome:
+        if parallel_research and child.services.get("independent_question") is True:
+
+            def serial_capabilities(local: RunContext) -> list[ToolSpec]:
+                serial_broker = CorpusBroker(
+                    user, scope, vision_llm=llm, allow_numbered_title_fallback=True
+                )
+                local.services["search_message_history"] = [
+                    *simple_chat_history,
+                    ChatMessageSimple(
+                        message=task,
+                        token_count=token_counter(task),
+                        message_type=MessageType.USER,
+                    ),
+                ]
+                serial_search = (
+                    search.fork_for_independent_context()
+                    if search is not None
+                    else None
+                )
+                if serial_search is not None:
+                    serial_search.llm = llm
+                serial_adapter = build_search_adapter(
+                    serial_search,
+                    task,
+                    serial_broker,
+                    message_history=search_history,
+                    user_memory_context=user_memory_context,
+                    user_info=user_info,
+                    inject_memories_in_prompt=inject_memories_in_prompt,
+                    user_identity=user_identity,
+                )
+                serial_broker.search_adapter = serial_adapter
+                local.services["prepare_search_batch"] = serial_adapter.prepare_batch
+                local.services["legal_source_navigation_acquire"] = (
+                    serial_broker.related_sources_for_evidence
+                )
+                local.services["legal_source_navigation"] = (
+                    serial_broker.related_source_navigation
+                )
+                return (
+                    build_corpus_specs(serial_broker, require_search_targets=True)
+                    + build_source_specs(serial_broker)
+                    + build_sandbox_specs(serial_broker)
+                    + external_specs
+                    + build_supplemental_specs()
+                )
+
+            def serial_checkpoint(snapshot: dict[str, JsonValue]) -> None:
+                callback = child.services.get("record_child_checkpoint")
+                if not callable(callback) or harness is None:
+                    raise ValueError(
+                        "Serial question requires its task-bound checkpoint writer"
+                    )
+                callback(snapshot)
+                checkpoint(harness.snapshot())
+
+            session = SerialExperimentalSession(
+                outer_context=child,
+                request=task,
+                scenario_request=question,
+                history=history,
+                ledger=ledger,
+                llm=llm,
+                reasoning_effort=reasoning_effort,
+                token_counter=token_counter,
+                capability_factory=serial_capabilities,
+                verify=lambda local, args: verify(args, local),
+                user_identity=user_identity,
+                on_receipt=record,
+                checkpoint_callback=serial_checkpoint,
+                progress=progress,
+                allow_external=allow_external,
+                notifications=profile.notifications,
+            )
+            saved_session = child.services.get("previous_child_checkpoint")
+            if isinstance(saved_session, dict):
+                session.restore(saved_session)
+            serial_result = session.run()
+            if serial_result.summary and "serial_session_state" in serial_result.data:
+                if question_research is None or parallel_answers is None:
+                    raise ValueError(
+                        "Serial answer requires its outer assignment and receipts"
+                    )
+                call_id = session.model.last_call_id or ""
+                child.services["last_model_call_id"] = call_id
+                assignment = question_research.assignment(
+                    str(child.services["task_id"])
+                )
+                receipt_id = parallel_answers.seal(
+                    child,
+                    assignment=assignment,
+                    answer=serial_result.summary,
+                    status=serial_result.status,
+                    model_call_id=call_id,
+                    ledger=ledger,
+                    validate_body=lambda: session.validate_accepted(
+                        serial_result.summary, call_id, serial_result.status
+                    ),
+                    source_state=session.source_state(),
+                )
+                serial_result.data["parallel_answer_receipt"] = receipt_id
+            return serial_result
+        if parallel_research:
+            child.services["experimental_parallel"] = False
+            child.services["independent_question_mode"] = False
         child.services["scenario_state"] = ScenarioState([task], frozen=True)
         independent = child.services.get("independent_question") is True
         if independent:
@@ -914,8 +1069,6 @@ def run_asv3_loop(
         build_corpus_specs(
             broker,
             require_search_targets=True,
-            source_identity_guidance=research_profile == "experimental"
-            and parallel_research,
         )
         + build_source_specs(broker)
         + build_sandbox_specs(broker)
@@ -1033,28 +1186,6 @@ def run_asv3_loop(
                 gap = validate_parallel_answer(item)
                 if gap is not None:
                     return gap
-            accepted_numbers = set(extract_citation_numbers(answer))
-            if authority_requirements is not None:
-                authority_gap = authority_requirements.publication_gap(
-                    answer, None, context, ledger, validated_delivered=accepted_numbers
-                )
-                if authority_gap is not None:
-                    return ToolOutcome(
-                        status=OutcomeStatus.PARTIAL,
-                        summary="Retained governing source requirement is unresolved",
-                        data=authority_gap,
-                    )
-            if source_reviews is not None:
-                return source_reviews.publication_gap_for_assembly(
-                    answer,
-                    context,
-                    ledger,
-                    accepted_owners={
-                        str(item["task_id"])
-                        for item in question_research.answers
-                        if isinstance(item.get("parallel_answer_receipt"), str)
-                    },
-                )
             return None
         if (
             host_gap_assembly
@@ -1109,8 +1240,25 @@ def run_asv3_loop(
             raise ValueError("Parallel body is missing its accepted receipt")
         owner = context.child()
         owner.services["task_id"] = task_id
+        owner.services["assignment_id"] = assignment["question_id"]
         owner.services["task_outcome_ids"] = assignment.get("outcome_ids", [])
         accepted_call = parallel_answers.model_call_id(receipt_id)
+        if workers is None:
+            raise ValueError("Serial publication requires its owned checkpoint")
+        serial_snapshot = workers.checkpoint(task_id)
+        if serial_snapshot is None:
+            raise ValueError("Serial publication checkpoint is missing")
+        serial_state, serial_gap = validate_serial_session_answer(
+            snapshot=serial_snapshot,
+            outer_context=owner,
+            request=str(assignment["question"]),
+            scenario_request=question,
+            history=history,
+            ledger=ledger,
+            body=body,
+            call_id=accepted_call,
+            status=OutcomeStatus(str(item["status"])),
+        )
         parallel_answers.verify(
             context,
             receipt_id=receipt_id,
@@ -1119,13 +1267,8 @@ def run_asv3_loop(
             answer=body,
             status=OutcomeStatus(str(item["status"])),
             ledger=ledger,
-            validate_body=lambda: source_publication_gap(
-                body,
-                accepted_call,
-                run_context=owner,
-                requires_sources=bool(extract_citation_numbers(body)),
-            ),
-            source_state={"owner": task_id},
+            validate_body=lambda: serial_gap,
+            source_state=serial_state,
         )
         return None
 

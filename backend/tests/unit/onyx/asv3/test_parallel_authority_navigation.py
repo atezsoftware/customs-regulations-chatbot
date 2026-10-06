@@ -301,18 +301,19 @@ def test_rejected_cited_dependency_survives_name_deletion_without_an_extra_model
 
 
 @pytest.mark.parametrize(
-    "profile,parallel,expected",
+    "profile,parallel",
     [
-        ("experimental", True, True),
-        ("experimental", False, False),
-        ("normal", True, False),
-        ("deep", True, False),
+        ("experimental", True),
+        ("experimental", False),
+        ("normal", True),
+        ("deep", True),
     ],
 )
-def test_reference_leads_enter_only_parallel_experimental_native_payload_in_the_same_decision(
-    profile: str, parallel: bool, expected: bool
+def test_parallel_dispatcher_uses_ordinary_reference_payload_without_research_overrides(
+    profile: str, parallel: bool
 ) -> None:
     context, ledger = setup()
+    context.depth = 0
     context.services.update(research_profile=profile, experimental_parallel=parallel)
     selected, secondary = model(), model()
     source = ledger.get(1)
@@ -329,17 +330,7 @@ def test_reference_leads_enter_only_parallel_experimental_native_payload_in_the_
     )
     adapter.decide(adaptive_tool_view(original_evidence=complete(ledger, 1, 2)))
     payload = last_payload(selected)
-    if expected:
-        navigation = payload["research_navigation"]
-        assert isinstance(navigation, dict)
-        leads = navigation["reference_leads"]
-        assert isinstance(leads, list) and len(leads) == 1
-        assert isinstance(leads[0], dict)
-        assert leads[0]["instrument_number"] == "8917"
-        assert leads[0]["article"] == "27"
-        assert leads[0]["origin_citations"] == [1]
-    else:
-        assert "research_navigation" not in payload
+    assert "research_navigation" not in payload
     assert selected.invoke.call_count == 1
     secondary.invoke.assert_not_called()
     assert ledger.export()["records"] == before["records"]

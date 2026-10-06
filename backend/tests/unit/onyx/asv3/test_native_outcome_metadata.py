@@ -264,7 +264,7 @@ def test_direct_parallel_child_metadata_still_requires_its_actual_assigned_subse
 
 
 @pytest.mark.parametrize("binding", ["absent", "empty", "assigned", "root"])
-def test_parallel_native_terminal_keeps_full_body_and_source_reviews_in_one_decision(
+def test_native_terminal_preserves_root_body_and_rejects_removed_parallel_child_path(
     binding: str,
 ) -> None:
     from tests.unit.onyx.asv3.test_native_model_adapter import model, native_action
@@ -343,14 +343,30 @@ def test_parallel_native_terminal_keeps_full_body_and_source_reviews_in_one_deci
     )
     before = outcomes.export()
     before_revision = outcomes.revision
-    result = Harness(
+    runner = Harness(
         request="First outcome? Second outcome?",
         context=context,
         registry=registry,
         evidence=ledger,
         decide=adapter.decide,
         partial_submission=lambda: body if observed else None,
-    ).run()
+    )
+    if binding != "root":
+        saved_ledger = ledger.export()
+        reviews = context.services["legal_source_reviews"]
+        assert isinstance(reviews, LegalSourceReviews)
+        saved_reviews = reviews.export()
+        with pytest.raises(ValueError, match="ordinary Experimental session"):
+            runner.run()
+        selected.invoke.assert_not_called()
+        secondary.invoke.assert_not_called()
+        assert observed == []
+        assert runner.receipts == []
+        assert outcomes.export() == before
+        assert ledger.export() == saved_ledger
+        assert reviews.export() == saved_reviews
+        return
+    result = runner.run()
     assert result.answer == body
     assert len(body) > 30000
     assert result.status == OutcomeStatus.PARTIAL

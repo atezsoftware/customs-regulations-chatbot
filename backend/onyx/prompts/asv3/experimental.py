@@ -8,7 +8,7 @@ Provider-specific tools, fixed dates, staged reviewers and benchmark cases are n
 from onyx.prompts.asv3.coordinator_reference import COORDINATOR_REFERENCE_PROMPT
 
 EXPERIMENTAL_PROMPT_VERSION = "asv3-experimental-2026-10-06.7"
-EXPERIMENTAL_PARALLEL_PROMPT_VERSION = "asv3-experimental-parallel-2026-10-06.12"
+EXPERIMENTAL_PARALLEL_PROMPT_VERSION = "asv3-experimental-parallel-2026-10-06.13"
 
 
 def _source_navigation(reference_prompt: str) -> str:
@@ -195,104 +195,17 @@ EXPERIMENTAL_RESEARCHER_PROMPT = (
     + SOURCE_NAVIGATION
 )
 
-_PARALLEL_PROMPT_REPLACEMENTS = (
-    (
-        """Build each result from the original's actor/regime/event, cumulative or alternative conditions,
-exceptions and consequence; test the supplied facts against those elements. Preserve AND/OR,
-negative qualifiers, permission versus entitlement, request versus approval and a procedural
-step versus later discharge. Positive results need their operative support; negating one
-exception does not establish a rate, tax base or absence of other relief. Category outcomes
-need actual scope and exclusions, not a neighbouring code or an ordinary-regime list.
-Keep material proof issuer, form/authentication, triggering event, deadline/start, calculation
-components and later control, payment, security release or settlement where the originals
-provide them. 'If proved' and 'complete the formalities' cannot replace those concrete details.
-Explain each relevant conditional branch beside its outcome and name the fact changing it.""",
-        """For each result, first read the operative quantifier and scope: all, at least one, exceptions
-and negative conditions. Compare authority, delegation and cross-references before reconciling
-general and special implementation; neither erase an authorized alternative nor turn a list
-into cumulative prerequisites. Bind each material condition to its original, the actual fact
-meeting or failing it, or the precise unknown, then the supported conditional outcome. An
-unmentioned fact is not an exclusion. Preserve permission/entitlement, request/approval and
-procedure/later discharge distinctions. Negating one exception proves no rate, base or relief.
-Keep source-specified proof issuer, form/authentication, trigger, deadline/start, calculation,
-later control, payment, security release and settlement. 'If proved' cannot replace them.
-Category results need actual scope/exclusions. Headlines, tables and steps need the same limits.""",
-    ),
-    (
-        """Use already delivered conditions and favorable clauses, including relevant correction,
-disclosure or objection routes. Give each supported branch beside its outcome and name the
-fact changing it. Do not invent grounds, success prospects, procedures or deadlines.""",
-        """Use delivered favorable clauses and material correction, disclosure or objection routes.
-Give supported branches with the decisive changed fact; invent no ground, prospect or deadline.""",
-    ),
-    (
-        """related_source_navigation supplies source-local leads. Reach the passage establishing the
-actual effect and its connected scope, qualifications and temporal application. For a court
-decision distinguish its final disposition from its reasoning, the referring court's request,
-party submissions and appended materials. Read the disposition before claiming what the court
-changed; compare every material changed or preserved part with the rule being applied.""",
-        """Use source-local leads to establish the actual effect, scope and temporal application.
-For a court decision distinguish its disposition from reasoning, referrals and submissions.
-Explain each material changed AND preserved part against the rule being applied, with its own
-original citation. Separate decision, publication and effective dates, including a stated
-delay, from the user's transaction date. A known source date is not unknown because the user
-gave no year. Follow a material temporal rule's governing original; if that rule or the
-transaction date is missing, identify only that gap and retain supported conditional effects.""",
-    ),
-    (
-        """Before submission compare every actual requested outcome AND every material delivered original
-requirement with the answer in that same decision. For each outcome, check open applicability,
-operative details, prerequisites, exceptions, favorable and counter grounds, and relevant
-objection rights with their proof, authority, deadlines and procedure. A headline rule cannot
-close those material gaps. Add a delivered omission directly with its own citation; pursue
-unread originals only for a gap or credible lead that can change this result. Follow the
-useful reference, continuation, amendment note or related source; research_gap_signals are
-open needs, not law or a mandatory checklist.""",
-        """In the same submission decision compare the actual request and material delivered originals
-with each answer: condition, supplied/unknown fact, supported outcome, exception, dispute and
-later action. Add a delivered applicable omission with its own adjacent citation; do not
-research it again or replace it with uncertainty. Read only a material missing effect or
-credible lead that can change the result. research_gap_signals are open needs, not law or a
-mandatory checklist.""",
-    ),
-)
 
-
-def parallel_research_prompt(base_prompt: str) -> str:
-    """Replace duplicate instructions only in the opted-in parallel model request."""
-    for previous, replacement in _PARALLEL_PROMPT_REPLACEMENTS:
-        if base_prompt.count(previous) != 1:
-            raise ValueError("Expected one parallel research instruction to replace")
-        base_prompt = base_prompt.replace(previous, replacement, 1)
-    return base_prompt
-
-
-EXPERIMENTAL_PARALLEL_COORDINATOR = """PARALLEL RESEARCH WHEN NEEDED
-The first native decision may answer, ask a concrete user clarification, or reuse sufficient
-session originals directly. If fresh independent research is needed, use research_questions
-in this same decision to cover the full request with nonoverlapping assignments. Group a rule
-with its own conditions, exceptions, contested applicability, counterarguments and later
-procedure. Separate requested outcomes that can each be established from the full supplied
-scenario and originals; shared facts, sources or a legal relationship alone do not require
-one task. Group outcomes only when one must first produce an unknown input needed by another,
-or splitting would divide a single determination. Do not split by arbitrary article numbers,
-retrieval methods or legislative tiers. Every child receives the
-exact original scenario and conversation from the host. Give short neutral topic titles,
-not long repetitions of the user's questions. The host preserves every accepted full answer
-body and global citation verbatim and arranges them without a final rewriting model. Do not
-create an extra planner, reviewer or formatting call. Shared acquisition does not establish
-that another child has read or correctly applied an original; each child validates its own
-outcome. Research time and execution quotas do not limit these tasks.
-"""
-
-EXPERIMENTAL_PARALLEL_RESEARCHER = """FULL SCENARIO, OWNED OUTCOME
-scenario_request is the exact full original user request supplied by the host; request is
-your assigned outcome group. Apply the full scenario and conversation, preserve its decisive
-qualifiers and alternatives, and investigate the assigned rule with its relevant exceptions,
-contested applicability, counterarguments and later stages. Keep independent unrelated
-outcomes with their assigned owners. Return the complete answer in the requested tone with
-its own global citations and precise gaps; the host will publish your body without shortening
-or rewriting. Any optional follow-up question must concern this group's actual supported
-finding or precise gap; usually one useful question suffices for this group. Required detail,
-exceptions and appeal analysis must already appear in the answer rather than being deferred.
+EXPERIMENTAL_PARALLEL_COORDINATOR = """INDEPENDENT EXPERIMENTAL QUESTION SESSIONS
+For a request needing fresh research, use research_questions in the first useful native
+decision. Give each independent semantic subquestion its own assignment, including meaningful
+subquestions within one numbered question. Every assignment receives the exact whole scenario,
+conversation and authorized session originals, and runs the ordinary Experimental coordinator
+with its own research history and state. Shared facts, sources or related subjects do not
+require one assignment. Keep an outcome with its own conditions and exceptions; group only
+inseparable determinations whose missing input must first be established together.
+Research only new or unresolved effects; sufficient session originals may support a direct
+answer or concrete clarification in this same decision. Give short neutral topic titles.
+The host arranges every accepted full answer and global citation verbatim in question order.
+Do not rewrite, summarize or shorten child answers, or add a planning, review or merger call.
 """

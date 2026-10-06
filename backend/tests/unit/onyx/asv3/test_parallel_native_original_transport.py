@@ -291,15 +291,26 @@ def test_physical_history_eviction_redelivers_every_required_original(
     assert adapter._input_cost(prompt, tools) <= ceiling
 
 
-def test_expanded_native_child_checkpoints_survive_compact_storage_and_resume() -> None:
+def test_owned_root_native_transport_checkpoints_survive_compact_storage_and_resume() -> (
+    None
+):
     root, ledger = context(), EvidenceLedger()
     supplied = originals(large_provenance=True)
 
     def runner(
         task: str, child: RunContext, _updates: Callable[[], list[str]]
     ) -> ToolOutcome:
+        transport_context = RunContext(
+            run_id=child.run_id,
+            scope=child.scope,
+            services=dict(child.services),
+            budget=child.budget,
+            deadline=child.deadline,
+            research_deadline=child.research_deadline,
+            cancelled=child.is_cancelled,
+        )
         research, adapter, _ = harness(
-            child, ledger, request=task, supplied=supplied, later=False
+            transport_context, ledger, request=task, supplied=supplied, later=False
         )
         result = research.run()
         ledger.pin_delivery(adapter.last_call_id or "")
@@ -349,7 +360,8 @@ def test_expanded_native_child_checkpoints_survive_compact_storage_and_resume() 
             assert task.outcome is not None and task.outcome.summary == BODY
             saved = pool.checkpoint(task.task_id)
             assert saved is not None
-            resumed_context = root.independent_child()
+            resumed_context = context()
+            resumed_context.run_id = root.run_id
             resumed_ledger = EvidenceLedger()
             resumed_llm = model(limit=1000000)
             resumed_llm.invoke.return_value = answer()

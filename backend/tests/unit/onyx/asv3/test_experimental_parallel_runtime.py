@@ -9,8 +9,9 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from onyx.asv3 import runtime
+from onyx.asv3 import runtime, serial_experimental_session
 from onyx.asv3.harness import Harness
+from onyx.asv3.llm_adapter import COORDINATOR_SESSION_ACTIONS
 from onyx.asv3.models import RunContext
 from onyx.chat.models import ChatMessageSimple
 from onyx.configs.constants import MessageType
@@ -18,6 +19,7 @@ from onyx.llm.interfaces import LLM
 from onyx.llm.model_response import ModelResponse
 from onyx.llm.models import UserMessage
 from onyx.prompts.asv3.experimental import (
+    EXPERIMENTAL_COORDINATOR_PROMPT,
     EXPERIMENTAL_PARALLEL_PROMPT_VERSION,
     EXPERIMENTAL_PROMPT_VERSION,
 )
@@ -158,7 +160,7 @@ def script_two_children(
 
     physical_read = MagicMock(side_effect=page)
     monkeypatch.setattr(broker, "page", physical_read)
-    arrivals = threading.Barrier(len(TASKS))
+    arrivals = threading.Barrier(min(len(TASKS), 4))
     lock = threading.Lock()
     invocations: dict[str, int] = {}
     bodies: dict[str, str] = {}
@@ -169,12 +171,13 @@ def script_two_children(
         assert isinstance(prompt[1], UserMessage)
         payload = user_payload(prompt[1])
         request = payload["request"]
-        assert payload["scenario_request"] == SCENARIO
         with lock:
             requests.append(request)
             invocations[request] = invocations.get(request, 0) + 1
             count = invocations[request]
+            arrived = sum(invocations.get(task, 0) > 0 for task in TASKS)
         if request == SCENARIO:
+            assert payload["scenario_request"] == SCENARIO
             assert count == 1, "Host assembly must not invoke another model"
             return response(
                 calls=[
@@ -198,10 +201,16 @@ def script_two_children(
                 ]
             )
         assert request in TASKS
+        assert "scenario_request" not in payload
         assert SCENARIO in str(payload["conversation"])
+        assert (
+            prompt[0].content
+            == EXPERIMENTAL_COORDINATOR_PROMPT + "\n\n" + COORDINATOR_SESSION_ACTIONS
+        )
         assert count <= 2
         if count == 1:
-            arrivals.wait(timeout=5)
+            if arrived <= arrivals.parties:
+                arrivals.wait(timeout=5)
             return response(
                 calls=[
                     (
@@ -224,22 +233,79 @@ def script_two_children(
         assert original.get("start_char", 0) == 0
         assert original.get("end_char", len(original["text"])) == len(original["text"])
         citation = original["citation"]
-        if request == TASKS[1] and second_result == "error":
+        if len(TASKS) > 1 and request == TASKS[1] and second_result == "error":
             raise RuntimeError("Synthetic provider transport failure")
         body = (
             f"Bu işlemin kaynakta belirtilen koşulu [{citation}].\n\n"
             + ("Özgün koşul, istisna, belge ve sonraki aşama; İĞŞçöü — 東京. " * 650)
             + f"\n\nTAM_SON_{request}\n  "
         )
-        if request == TASKS[1] and second_result == "partial":
+        if len(TASKS) > 1 and request == TASKS[1] and second_result == "partial":
             body += "\nEksik olan sonraki aşamanın özgün hükmü henüz doğrulanamadı.\n "
         with lock:
-            bodies[request] = body
+            bodies[request] = body.strip()
         return response(
             calls=[
-                ("submit_partial_answer", {"answer": body})
-                if request == TASKS[1] and second_result == "partial"
-                else ("submit_answer", {"answer": body, "basis": "originals"})
+                (
+                    "submit_partial_answer",
+                    {
+                        "answer": body,
+                        "_outcomes": [
+                            {
+                                "outcome_id": "local-outcome",
+                                "question_ids": ["q0"],
+                                "detail": request,
+                            }
+                        ],
+                        "_coverage": {
+                            "conditions": [
+                                {
+                                    "condition_id": "local-condition",
+                                    "outcome_ids": ["local-outcome"],
+                                    "detail": "Özgün uygulama koşulu",
+                                    "witnesses": [
+                                        {
+                                            "citation": citation,
+                                            "start_char": 0,
+                                            "end_char": len(original["text"]),
+                                        }
+                                    ],
+                                }
+                            ]
+                        },
+                    },
+                )
+                if len(TASKS) > 1 and request == TASKS[1] and second_result == "partial"
+                else (
+                    "submit_answer",
+                    {
+                        "answer": body,
+                        "basis": "originals",
+                        "_outcomes": [
+                            {
+                                "outcome_id": "local-outcome",
+                                "question_ids": ["q0"],
+                                "detail": request,
+                            }
+                        ],
+                        "_coverage": {
+                            "conditions": [
+                                {
+                                    "condition_id": "local-condition",
+                                    "outcome_ids": ["local-outcome"],
+                                    "detail": "Özgün uygulama koşulu",
+                                    "witnesses": [
+                                        {
+                                            "citation": citation,
+                                            "start_char": 0,
+                                            "end_char": len(original["text"]),
+                                        }
+                                    ],
+                                }
+                            ]
+                        },
+                    },
+                )
             ]
         )
 
@@ -257,11 +323,18 @@ def script_two_children(
     )
 
 
-def test_adaptive_runtime_starts_three_children_and_preserves_bound_full_answers(
+@pytest.mark.parametrize("branch_count", [1, 3, 5])
+def test_runtime_starts_dynamic_serial_children_and_preserves_bound_full_answers(
     monkeypatch: pytest.MonkeyPatch,
+    branch_count: int,
 ) -> None:
-    scenario = SCENARIO + "\n3. Ayrı işlemin kaynak koşulları nelerdir?"
-    tasks = (*TASKS, "Ayrı işlemin koşullarını incele.")
+    scenario = SCENARIO.split("\n1.", 1)[0] + "".join(
+        f"\n{index}. İşlemin kaynak koşulları nelerdir?"
+        for index in range(1, branch_count + 1)
+    )
+    tasks = tuple(
+        f"İşlem {index} koşullarını incele." for index in range(1, branch_count + 1)
+    )
     monkeypatch.setitem(globals(), "SCENARIO", scenario)
     monkeypatch.setitem(globals(), "TASKS", tasks)
     original_harness = runtime.Harness
@@ -270,13 +343,16 @@ def test_adaptive_runtime_starts_three_children_and_preserves_bound_full_answers
     def harness(**arguments: Any) -> Harness:
         context = arguments["context"]
         assert isinstance(context, RunContext)
-        assert context.services.get("experimental_parallel") is True
+        assert context.services.get("experimental_parallel") is (
+            arguments["request"] == scenario
+        )
         harness_options[arguments["request"]] = arguments.get(
             "adaptive_tool_parallelism", False
         )
         return original_harness(**arguments)
 
     monkeypatch.setattr(runtime, "Harness", harness)
+    monkeypatch.setattr(serial_experimental_session, "Harness", harness)
     kwargs, selected, secondary, checkpoints, queue, fence, read, bodies, requests = (
         script_two_children(monkeypatch)
     )
@@ -289,7 +365,7 @@ def test_adaptive_runtime_starts_three_children_and_preserves_bound_full_answers
     assert selected.invoke.call_count == 1 + 2 * len(tasks)
     assert requests.count(scenario) == 1
     assert all(requests.count(task) == 2 for task in tasks)
-    assert harness_options == {scenario: False, **dict.fromkeys(tasks, True)}
+    assert harness_options == {scenario: False, **dict.fromkeys(tasks, False)}
     secondary.invoke.assert_not_called()
     assert selected.config.model_name == "gpt-6-luna"
     assert read.call_count == 1
@@ -300,6 +376,12 @@ def test_adaptive_runtime_starts_three_children_and_preserves_bound_full_answers
     receipts = final["parallel_answers"]["receipts"]
     assert len(answers) == len(receipts) == len(tasks)
     assert len({receipt["model_call_id"] for receipt in receipts}) == len(tasks)
+    navigation = final["session_research"]["outcome_navigation"]
+    assert len(navigation["outcomes"]) == len(navigation["conditions"]) == len(tasks)
+    assert len({row["outcome_id"] for row in navigation["outcomes"]}) == len(tasks)
+    assert len({row["condition_id"] for row in navigation["conditions"]}) == len(tasks)
+    assert all(row["witnesses"][0]["citation"] == 1 for row in navigation["conditions"])
+    assert final["outcome_map"]["outcomes"] == []
     for index, task in enumerate(tasks, 1):
         answer = answers[index - 1]
         body = bodies[task]

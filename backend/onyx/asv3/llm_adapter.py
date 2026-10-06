@@ -25,7 +25,6 @@ from onyx.asv3.assertions import (
     AssertionWitness,
     assertion_witness_valid,
 )
-from onyx.asv3.authority import explicit_reference_leads
 from onyx.asv3.authority_requirements import AuthorityRequirements
 from onyx.asv3.citation_numbers import extract_citation_numbers
 from onyx.asv3.evidence import EvidenceLedger
@@ -81,9 +80,7 @@ from onyx.prompts.asv3.coordinator_reference import (
 from onyx.prompts.asv3.experimental import (
     EXPERIMENTAL_COORDINATOR_PROMPT,
     EXPERIMENTAL_PARALLEL_COORDINATOR,
-    EXPERIMENTAL_PARALLEL_RESEARCHER,
     EXPERIMENTAL_RESEARCHER_PROMPT,
-    parallel_research_prompt,
 )
 from onyx.prompts.asv3.research import (
     COORDINATOR_PROMPT,
@@ -2255,12 +2252,11 @@ class ResearchModel:
                 + COORDINATOR_SESSION_ACTIONS
             )
             if self.context.services.get("experimental_parallel") is True:
-                instruction = parallel_research_prompt(instruction)
-                instruction += "\n\n" + (
-                    EXPERIMENTAL_PARALLEL_RESEARCHER
-                    if self.context.depth
-                    else EXPERIMENTAL_PARALLEL_COORDINATOR
-                )
+                if self.context.depth:
+                    raise ValueError(
+                        "Parallel questions require an ordinary Experimental session"
+                    )
+                instruction += "\n\n" + EXPERIMENTAL_PARALLEL_COORDINATOR
             return instruction
         normal = self.context.services.get("research_profile") == "normal"
         if self.context.depth:
@@ -2703,18 +2699,6 @@ class ResearchModel:
             gaps = research_gap_signals(view, complete_originals)
             if gaps:
                 current["research_gap_signals"] = gaps
-            if (
-                self.context.services.get("research_profile") == "experimental"
-                and self.context.services.get("experimental_parallel") is True
-                and isinstance(ledger, EvidenceLedger)
-            ):
-                reference_leads = explicit_reference_leads(
-                    ledger, complete_originals, syntactic_reference_binding=True
-                )
-                if reference_leads:
-                    research_navigation = current.setdefault("research_navigation", {})
-                    assert isinstance(research_navigation, dict)
-                    research_navigation["reference_leads"] = reference_leads
             native_turns = retained
             current_originals = list(unique.values())
             if native_original_cache and isinstance(ledger, EvidenceLedger):

@@ -53,6 +53,7 @@ class Harness:
         draft_guard: Callable[[str], ToolOutcome | None] | None = None,
         partial_submission: Callable[[], str | None] | None = None,
         report_terminal: bool = True,
+        report_started: bool = True,
         on_decision: Callable[[Decision], None] | None = None,
     ) -> None:
         self.request = request
@@ -70,6 +71,7 @@ class Harness:
         self.draft_guard = draft_guard
         self.partial_submission = partial_submission
         self.report_terminal = report_terminal
+        self.report_started = report_started
         self.on_decision = on_decision
         artifacts = self.context.services.get("artifacts")
         self.artifacts = (
@@ -956,6 +958,7 @@ class Harness:
         self.stop_reason = None
         if (
             self.progress
+            and self.report_started
             and self.context.depth == 0
             and self.context.services.get("final_repair") is not True
         ):
