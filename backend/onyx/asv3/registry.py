@@ -7,7 +7,11 @@ from typing import TYPE_CHECKING, Callable, Iterable
 import jsonschema
 from pydantic import JsonValue
 
-from onyx.asv3.legal_source_reviews import LegalSourceReviews, RelatedSourceReview
+from onyx.asv3.legal_source_reviews import (
+    LegalSourceReviews,
+    RelatedSourceReview,
+    RelatedSourceReviewValidationError,
+)
 from onyx.asv3.models import (
     CapabilityCall,
     OriginalEvidenceRead,
@@ -395,7 +399,14 @@ class CapabilityRegistry:
                         raise ValueError(
                             "Related-source assessments require the exposed experimental terminal action"
                         )
-                    reviews.apply(raw_reviews, call_id, context, ledger)
+                    reviews.apply(
+                        raw_reviews,
+                        call_id,
+                        context,
+                        ledger,
+                        detailed_errors=context.services.get("experimental_parallel")
+                        is True,
+                    )
                 except ValueError as error:
                     return ToolOutcome(
                         status=OutcomeStatus.INVALID,
@@ -403,6 +414,11 @@ class CapabilityRegistry:
                         data={
                             "detail": str(error),
                             "invalid_related_source_review": True,
+                            **(
+                                {"related_source_review_error": error.diagnostic}
+                                if isinstance(error, RelatedSourceReviewValidationError)
+                                else {}
+                            ),
                         },
                     )
 

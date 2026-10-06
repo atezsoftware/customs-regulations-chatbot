@@ -7,7 +7,7 @@ import hashlib
 import json
 import re
 import threading
-from typing import Literal
+from typing import Literal, NoReturn
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
@@ -33,6 +33,14 @@ class RelatedSourceReview(BaseModel):
         default="",
         description="Precise open interaction for unresolved only; otherwise empty.",
     )
+
+
+class RelatedSourceReviewValidationError(ValueError):
+    """Carry a provenance repair target without changing the rejection message."""
+
+    def __init__(self, message: str, diagnostic: dict[str, JsonValue]) -> None:
+        super().__init__(message)
+        self.diagnostic = diagnostic
 
 
 class _LeadRecord(BaseModel):
@@ -276,30 +284,111 @@ class LegalSourceReviews:
         ledger: EvidenceLedger,
         *,
         delivered: set[int] | None,
+        diagnostic_index: int | None = None,
     ) -> None:
+        def reject(
+            message: str,
+            code: str,
+            field: str,
+            witness_index: int | None = None,
+        ) -> NoReturn:
+            if diagnostic_index is None:
+                raise ValueError(message)
+            available: list[JsonValue] = [
+                {
+                    "citation": citation,
+                    "start_char": 0,
+                    "end_char": len(item.text),
+                }
+                for citation in sorted(delivered or set())
+                if (item := ledger.get(citation)) is not None
+                and item.source_id == record.source_id
+            ]
+            diagnostic: dict[str, JsonValue] = {
+                "review_index": diagnostic_index,
+                "lead_id": record.lead_id,
+                "source_id": record.source_id,
+                "status": review.status,
+                "code": code,
+                "field": f"_related_source_reviews[{diagnostic_index}].{field}",
+                "available_original_witnesses": available,
+                "instruction": (
+                    "Correct only this assessment metadata. Its witnesses must belong "
+                    "to the candidate source and be fully delivered to this decision. "
+                    "Keep other supporting sources and the answer's supported detail; "
+                    "they may remain answer citations but cannot be this candidate's "
+                    "own witnesses. Available ranges identify passages, not legal approval."
+                ),
+            }
+            if witness_index is not None:
+                witness = review.witnesses[witness_index]
+                diagnostic["witness_index"] = witness_index
+                diagnostic["witness"] = witness.model_dump(mode="json")
+                if (item := ledger.get(witness.citation)) is not None:
+                    diagnostic["actual_source_id"] = item.source_id
+            if code == "missing_own_originals" or code == "not_fully_delivered":
+                diagnostic["instruction"] = (
+                    "Use this candidate's actually supporting, fully delivered original "
+                    "ranges if available. If the necessary original has not reached this "
+                    "decision, obtain or deliver it, or report the precise unresolved "
+                    "interaction. Do not mark an unread candidate not_material. Preserve "
+                    "the answer's independently supported detail."
+                )
+            elif code in {"missing_unresolved_gap", "closed_review_has_gap"}:
+                diagnostic["instruction"] = (
+                    "Correct only this status/gap metadata to reflect the actual examined "
+                    "evidence. An unresolved interaction needs its precise gap; an examined "
+                    "or not_material review leaves gap empty. Do not change status merely "
+                    "to pass validation, or rewrite supported answer detail."
+                )
+            raise RelatedSourceReviewValidationError(message, diagnostic)
+
         if (
             review.lead_id != record.lead_id
             or not review.effect.strip()
             or not review.limitations.strip()
         ):
-            raise ValueError("A related-source review needs its effect and limitations")
+            field = (
+                "lead_id"
+                if review.lead_id != record.lead_id
+                else "effect"
+                if not review.effect.strip()
+                else "limitations"
+            )
+            reject(
+                "A related-source review needs its effect and limitations",
+                "missing_assessment_field",
+                field,
+            )
         if review.status == "unresolved":
             if not review.gap.strip():
-                raise ValueError(
-                    "An unresolved source interaction needs its precise gap"
+                reject(
+                    "An unresolved source interaction needs its precise gap",
+                    "missing_unresolved_gap",
+                    "gap",
                 )
         else:
             if review.gap.strip():
-                raise ValueError(
+                reject(
                     "Examined and not-material reviews must leave gap empty; "
-                    "use unresolved for an open interaction"
+                    "use unresolved for an open interaction",
+                    "closed_review_has_gap",
+                    "gap",
                 )
             if not review.witnesses:
-                raise ValueError("Examined and excluded leads need their own originals")
+                reject(
+                    "Examined and excluded leads need their own originals",
+                    "missing_own_originals",
+                    "witnesses",
+                )
             if review.status == "examined" and review.source_role != "operative_text":
-                raise ValueError("An argument alone cannot close operative examination")
+                reject(
+                    "An argument alone cannot close operative examination",
+                    "argument_cannot_close_operative",
+                    "source_role",
+                )
         identities: set[tuple[int, int, int]] = set()
-        for witness in review.witnesses:
+        for witness_index, witness in enumerate(review.witnesses):
             identity = (witness.citation, witness.start_char, witness.end_char)
             item = ledger.get(witness.citation)
             if (
@@ -310,8 +399,23 @@ class LegalSourceReviews:
                 or witness.end_char > len(item.text)
                 or (delivered is not None and witness.citation not in delivered)
             ):
-                raise ValueError(
-                    "A review needs fully delivered candidate-source ranges"
+                code = (
+                    "duplicate_witness"
+                    if identity in identities
+                    else "unknown_citation"
+                    if item is None
+                    else "wrong_source"
+                    if item.source_id != record.source_id
+                    else "invalid_range"
+                    if witness.start_char >= witness.end_char
+                    or witness.end_char > len(item.text)
+                    else "not_fully_delivered"
+                )
+                reject(
+                    "A review needs fully delivered candidate-source ranges",
+                    code,
+                    f"witnesses[{witness_index}]",
+                    witness_index,
                 )
             identities.add(identity)
 
@@ -321,6 +425,8 @@ class LegalSourceReviews:
         call_id: str,
         context: RunContext,
         ledger: EvidenceLedger,
+        *,
+        detailed_errors: bool = False,
     ) -> dict[tuple[str, str], _LeadRecord]:
         if not isinstance(raw, list):
             raise ValueError("Related-source reviews must be a list")
@@ -329,18 +435,33 @@ class LegalSourceReviews:
         owner = self._owner(context)
         records = dict(self._records)
         seen: set[str] = set()
-        for row in raw:
+        for review_index, row in enumerate(raw):
             review = RelatedSourceReview.model_validate(row)
             key = (owner, review.lead_id)
             if review.lead_id in seen or key not in records:
-                raise ValueError(
-                    "Review only this task's actually delivered leads once"
-                )
+                message = "Review only this task's actually delivered leads once"
+                if detailed_errors:
+                    raise RelatedSourceReviewValidationError(
+                        message,
+                        {
+                            "review_index": review_index,
+                            "lead_id": review.lead_id,
+                            "status": review.status,
+                            "code": "duplicate_or_foreign_lead",
+                            "field": f"_related_source_reviews[{review_index}].lead_id",
+                            "instruction": "Assess each of this task's actually delivered leads once; do not use another task's lead inventory or rewrite the answer.",
+                        },
+                    )
+                raise ValueError(message)
             seen.add(review.lead_id)
             record = records[key]
             self._validate_saved(record, ledger)
             self._validate_review(
-                review, record, ledger, delivered=ledger.completely_delivered(call_id)
+                review,
+                record,
+                ledger,
+                delivered=ledger.completely_delivered(call_id),
+                diagnostic_index=review_index if detailed_errors else None,
             )
             records[key] = record.model_copy(
                 deep=True,
@@ -357,10 +478,20 @@ class LegalSourceReviews:
         call_id: str,
         context: RunContext,
         ledger: EvidenceLedger,
+        *,
+        detailed_errors: bool = False,
     ) -> None:
         self._fence(context)
         with self._lock:
-            self._records = self._preview(raw, call_id, context, ledger)
+            self._records = self._preview(
+                raw,
+                call_id,
+                context,
+                ledger,
+                detailed_errors=detailed_errors
+                and context.services.get("research_profile") == "experimental"
+                and context.services.get("experimental_parallel") is True,
+            )
 
     def view(
         self,
