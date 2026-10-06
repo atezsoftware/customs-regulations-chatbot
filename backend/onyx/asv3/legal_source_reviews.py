@@ -21,6 +21,16 @@ from onyx.asv3.models import OutcomeStatus, RunContext, ToolOutcome
 from onyx.asv3.outcome_map import OutcomeWitness
 
 
+def serial_session_diagnostics_enabled(context: RunContext) -> bool:
+    return (
+        context.services.get("serial_session_diagnostics") is True
+        and context.services.get("lean_native_mode") is True
+        and context.services.get("research_profile") == "experimental"
+        and context.services.get("experimental_parallel") is False
+        and context.depth == 0
+    )
+
+
 class RelatedSourceReview(BaseModel):
     model_config = ConfigDict(extra="forbid")
     lead_id: str = Field(pattern=r"^lead_[a-f0-9]{64}$")
@@ -490,7 +500,10 @@ class LegalSourceReviews:
                 ledger,
                 detailed_errors=detailed_errors
                 and context.services.get("research_profile") == "experimental"
-                and context.services.get("experimental_parallel") is True,
+                and (
+                    context.services.get("experimental_parallel") is True
+                    or serial_session_diagnostics_enabled(context)
+                ),
             )
 
     def view(

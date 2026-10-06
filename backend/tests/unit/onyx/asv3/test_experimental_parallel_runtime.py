@@ -25,9 +25,9 @@ from onyx.prompts.asv3.experimental import (
 )
 from onyx.prompts.asv3.research import PROMPT_VERSION
 from onyx.server.query_and_chat.streaming_models import AgentResponseDelta, ASv3Progress
+from tests.unit.onyx.asv3.test_native_cache_projection import actual_originals
 from tests.unit.onyx.asv3.test_runtime import (
     CorpusBoundary,
-    delivered_originals,
     packets,
     response,
     run_independent,
@@ -226,7 +226,7 @@ def script_two_children(
                     )
                 ]
             )
-        originals = delivered_originals(call)
+        originals = actual_originals(call["prompt"])
         assert len(originals) == 1
         original = originals[0]
         assert original["text"] == broker.chunks[source_id].text
@@ -438,6 +438,36 @@ def test_serial_runtime_keeps_existing_tool_admission(
     assert checkpoints[-1]["prompt_version"] == (
         EXPERIMENTAL_PROMPT_VERSION if profile == "experimental" else PROMPT_VERSION
     )
+
+
+def test_child_final_progress_does_not_announce_the_whole_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kwargs, _, _, checkpoints, queue, _, _, _, _ = script_two_children(monkeypatch)
+    original_run = serial_experimental_session.SerialExperimentalSession.run
+
+    def run(session: serial_experimental_session.SerialExperimentalSession) -> Any:
+        reporter = session.context.services["progress"]
+        for phase in ("final", "completed"):
+            reporter.report(phase, task_id=session.owner)
+        return original_run(session)
+
+    monkeypatch.setattr(
+        serial_experimental_session.SerialExperimentalSession, "run", run
+    )
+    runtime.run_asv3_loop(**kwargs)
+
+    events = [
+        packet.obj for packet in packets(queue) if isinstance(packet.obj, ASv3Progress)
+    ]
+    child_ids = {
+        row["task_id"] for row in checkpoints[-1]["question_research"]["answers"]
+    }
+    child_events = [event for event in events if event.task_id in child_ids]
+    assert child_events
+    assert all(event.phase not in {"final", "completed"} for event in child_events)
+    assert any(event.phase == "final" and event.task_id is None for event in events)
+    assert checkpoints[-1]["publication_status"] == "found"
 
 
 def test_parallel_children_share_reads_and_publish_exact_complete_bodies(

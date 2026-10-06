@@ -9,7 +9,8 @@ from dataclasses import dataclass
 from pydantic import JsonValue
 
 from onyx.asv3.evidence import EvidenceLedger
-from onyx.asv3.models import ResearchTurn, model_evidence_metadata
+from onyx.asv3.legal_source_reviews import serial_session_diagnostics_enabled
+from onyx.asv3.models import ResearchTurn, RunContext, model_evidence_metadata
 from onyx.llm.models import ToolMessage
 
 OriginalRange = tuple[int, str, str | None, str, int, int]
@@ -19,6 +20,17 @@ _IDENTITY_FIELDS = frozenset(
 _CATALOGUE_FIELDS = frozenset(
     {"citation", "source_id", "chunk_id", "text_hash", "metadata"}
 )
+
+
+def lossless_original_transport_enabled(context: RunContext) -> bool:
+    if context.services.get("research_profile") != "experimental":
+        return False
+    return context.services.get("experimental_parallel") is True or (
+        context.services.get("serial_original_transport") is True
+        and serial_session_diagnostics_enabled(context)
+        and isinstance(owner := context.services.get("task_id"), str)
+        and bool(owner.strip())
+    )
 
 
 @dataclass(frozen=True)

@@ -23,6 +23,7 @@ from onyx.asv3.models import (
     ToolOutcome,
     ToolReceipt,
 )
+from onyx.asv3.native_cache_projection import lossless_original_transport_enabled
 from onyx.asv3.progress import ProgressReporter, action_narration, public_action_id
 from onyx.asv3.registry import CapabilityRegistry
 from onyx.asv3.research_state import EvidenceWorkingSet, ResearchState
@@ -880,8 +881,7 @@ class Harness:
             self.evidence.serialize_records(
                 [number for number in receipt.evidence_ids if number not in reopened],
                 max_chars=None
-                if self.context.services.get("research_profile") == "experimental"
-                and self.context.services.get("experimental_parallel") is True
+                if lossless_original_transport_enabled(self.context)
                 else 20000,
             )
         )

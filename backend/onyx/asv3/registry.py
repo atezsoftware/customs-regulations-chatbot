@@ -11,6 +11,7 @@ from onyx.asv3.legal_source_reviews import (
     LegalSourceReviews,
     RelatedSourceReview,
     RelatedSourceReviewValidationError,
+    serial_session_diagnostics_enabled,
 )
 from onyx.asv3.models import (
     CapabilityCall,
@@ -79,17 +80,22 @@ def _outcome_metadata_properties() -> dict[str, JsonValue]:
     }
 
 
-def parallel_child_research_bindings(
+def native_research_bindings(
     context: RunContext,
 ) -> dict[str, JsonValue] | None:
     state = context.services.get("research_state")
     if not (
         context.services.get("lean_native_mode")
         and context.services.get("research_profile") == "experimental"
-        and context.services.get("experimental_parallel") is True
-        and context.services.get("independent_question") is True
-        and context.depth > 0
         and isinstance(state, ResearchState)
+        and (
+            serial_session_diagnostics_enabled(context)
+            or (
+                context.services.get("experimental_parallel") is True
+                and context.services.get("independent_question") is True
+                and context.depth > 0
+            )
+        )
     ):
         return None
     return {
@@ -104,7 +110,10 @@ def parallel_child_research_bindings(
             for item in question_determinations(list(state.questions))
         ],
         "notice": (
-            "Use these local IDs for update_research.needs. OutcomeMap.question_ids "
+            "Use these fixed session IDs for update_research.needs; do not use "
+            "the parent assignment's question or outcome IDs."
+            if serial_session_diagnostics_enabled(context)
+            else "Use these local IDs for update_research.needs. OutcomeMap.question_ids "
             "belong to the immutable parent questions, not these local bindings."
         ),
     }
@@ -139,7 +148,7 @@ class CapabilityRegistry:
             and not unbound_parallel_child
             else None
         )
-        research_bindings = parallel_child_research_bindings(context)
+        research_bindings = native_research_bindings(context)
         for spec in self._specs.values():
             if context.corpus_only and spec.external:
                 continue
@@ -404,8 +413,10 @@ class CapabilityRegistry:
                         call_id,
                         context,
                         ledger,
-                        detailed_errors=context.services.get("experimental_parallel")
-                        is True,
+                        detailed_errors=(
+                            context.services.get("experimental_parallel") is True
+                            or serial_session_diagnostics_enabled(context)
+                        ),
                     )
                 except ValueError as error:
                     return ToolOutcome(

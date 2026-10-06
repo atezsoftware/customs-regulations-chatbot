@@ -463,7 +463,14 @@ def run_asv3_loop(
 
     def emit_progress(event: ProgressEvent) -> None:
         phase, status = event.phase, event.status
-        if phase == "completed" and not final_published:
+        if (
+            parallel_research
+            and not final_published
+            and event.task_id is not None
+            and phase in {"final", "completed"}
+        ):
+            phase = "tools"
+        elif phase == "completed" and not final_published:
             phase, status = "final", "running"
         words = profile.notifications.get(phase, profile.notifications["tools"])
         packet = ASv3Progress.model_validate(

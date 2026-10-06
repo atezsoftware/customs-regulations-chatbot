@@ -505,6 +505,8 @@ class SerialExperimentalSession:
             "lean_native_mode": True,
             "research_profile": "experimental",
             "experimental_parallel": False,
+            "serial_session_diagnostics": True,
+            "serial_original_transport": True,
             "independent_question_mode": False,
             "task_id": owner,
             "evidence": ledger,

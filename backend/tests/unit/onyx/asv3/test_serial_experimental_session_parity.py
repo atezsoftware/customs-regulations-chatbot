@@ -43,9 +43,9 @@ from onyx.prompts.asv3.experimental import (
     EXPERIMENTAL_PROMPT_VERSION,
     EXPERIMENTAL_RESEARCHER_PROMPT,
 )
+from tests.unit.onyx.asv3.test_native_cache_projection import actual_originals
 from tests.unit.onyx.asv3.test_runtime import (
     CorpusBoundary,
-    delivered_originals,
     response,
     setup_run,
     user_payload,
@@ -267,7 +267,13 @@ def test_real_serial_and_owned_session_use_same_prompt_schemas_and_terminal_hand
     assert len(run.calls) == len(baseline_calls)
     for base, actual in zip(baseline_calls, run.calls, strict=True):
         assert actual["prompt"][0].content == base["prompt"][0].content == INSTRUCTION
-        assert tool_definitions(actual) == tool_definitions(base)
+        actual_definitions = copy.deepcopy(tool_definitions(actual))
+        need = actual_definitions["update_research"]["function"]["parameters"]["$defs"][
+            "ResearchNeed"
+        ]["properties"]
+        assert need["question_ids"]["items"].pop("enum") == ["q0"]
+        assert need["determination_ids"]["items"].pop("enum") == ["q0:d0"]
+        assert actual_definitions == tool_definitions(base)
         assert actual["tool_choice"] == base["tool_choice"]
         assert actual["timeout_override"] is base["timeout_override"] is None
         request = user_payload(actual["prompt"][1])
@@ -304,7 +310,7 @@ def test_real_serial_and_owned_session_use_same_prompt_schemas_and_terminal_hand
     assert submit["basis"]["enum"] == ["conversation", "scenario", "originals"]
     assert "_outcomes" in submit
     if kind in {"originals", "partial-originals"}:
-        actual = delivered_originals(run.calls[-1])
+        actual = actual_originals(run.calls[-1]["prompt"])
         assert [(row["citation"], row["text"]) for row in actual] == [
             (1, run.broker.chunks[str(run.broker.sources[0].id)].text)
         ]
@@ -425,7 +431,7 @@ def test_fresh_local_state_reuses_authorized_session_originals_without_source_re
         assert len(run.calls) == 1, [
             receipt.outcome.status for receipt in first.harness.receipts
         ]
-        originals = delivered_originals(arguments)
+        originals = actual_originals(arguments["prompt"])
         assert len(originals) == 1 and originals[0]["text"] == checked[0].text
         assert SCENARIO in user_payload(arguments["prompt"][1])["conversation"]
         assert (

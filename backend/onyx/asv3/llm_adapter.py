@@ -43,7 +43,12 @@ from onyx.asv3.models import (
 )
 from onyx.asv3.native_cache_projection import (
     decode_compact_originals,
+    lossless_original_transport_enabled,
     project_native_originals,
+)
+from onyx.asv3.native_token_cache import (
+    NativeTokenCountCache,
+    native_token_cache_enabled,
 )
 from onyx.asv3.outcome_map import OutcomeMap
 from onyx.asv3.research_gaps import research_gap_signals
@@ -692,6 +697,7 @@ class ResearchModel:
         self.updates = updates or (lambda: [])
         self.pending_tasks = pending_tasks or (lambda: [])
         self.token_counter = token_counter
+        self._native_token_count_cache = NativeTokenCountCache()
         self.lean_native_mode = (
             lean_native_mode or context.services.get("lean_native_mode") is True
         )
@@ -810,6 +816,8 @@ class ResearchModel:
         return self._native_output_capacity
 
     def _tokens(self, text: str) -> int:
+        if native_token_cache_enabled(self.context.services):
+            return self._native_token_count_cache.count(text, self.token_counter)
         if self.token_counter is None:
             return len(text.encode("utf-8"))
         try:
@@ -1246,7 +1254,7 @@ class ResearchModel:
             if (
                 not self.lean_native_mode
                 or self.context.services.get("research_profile") != "experimental"
-                or self.context.services.get("experimental_parallel") is not True
+                or not lossless_original_transport_enabled(self.context)
                 or not isinstance(ledger, EvidenceLedger)
             ):
                 raise ValueError(
@@ -2324,9 +2332,9 @@ class ResearchModel:
             "language": self.context.language,
             "request": view.request,
         }
-        from onyx.asv3.registry import parallel_child_research_bindings
+        from onyx.asv3.registry import native_research_bindings
 
-        research_bindings = parallel_child_research_bindings(self.context)
+        research_bindings = native_research_bindings(self.context)
         if research_bindings is not None:
             context["research_bindings"] = research_bindings
         if candidate_coverage:
@@ -2461,11 +2469,9 @@ class ResearchModel:
                 for other, candidate in unique.items()
             ):
                 del unique[identity]
-        native_original_cache = (
-            self.context.services.get("research_profile") == "experimental"
-            and self.context.services.get("experimental_parallel") is True
-            and isinstance(ledger, EvidenceLedger)
-        )
+        native_original_cache = lossless_original_transport_enabled(
+            self.context
+        ) and isinstance(ledger, EvidenceLedger)
         if not native_original_cache:
             retained = self._native_turns_with_original_references(retained)
         omitted: list[JsonValue] = list(view.original_evidence_omitted)
@@ -3313,8 +3319,7 @@ class ResearchModel:
         native_catalogue = (
             _NativeOriginalCatalogue.bind(prompt)
             if self.lean_native_mode
-            and self.context.services.get("research_profile") == "experimental"
-            and self.context.services.get("experimental_parallel") is True
+            and lossless_original_transport_enabled(self.context)
             else None
         )
         flow = (
