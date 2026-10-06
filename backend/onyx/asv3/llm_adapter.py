@@ -79,6 +79,7 @@ from onyx.prompts.asv3.experimental import (
     EXPERIMENTAL_PARALLEL_COORDINATOR,
     EXPERIMENTAL_PARALLEL_RESEARCHER,
     EXPERIMENTAL_RESEARCHER_PROMPT,
+    parallel_research_prompt,
 )
 from onyx.prompts.asv3.research import (
     COORDINATOR_PROMPT,
@@ -2163,6 +2164,7 @@ class ResearchModel:
                 + COORDINATOR_SESSION_ACTIONS
             )
             if self.context.services.get("experimental_parallel") is True:
+                instruction = parallel_research_prompt(instruction)
                 instruction += "\n\n" + (
                     EXPERIMENTAL_PARALLEL_RESEARCHER
                     if self.context.depth

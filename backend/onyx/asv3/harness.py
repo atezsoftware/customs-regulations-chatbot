@@ -877,7 +877,10 @@ class Harness:
         originals = json.loads(
             self.evidence.serialize_records(
                 [number for number in receipt.evidence_ids if number not in reopened],
-                max_chars=20000,
+                max_chars=None
+                if self.context.services.get("research_profile") == "experimental"
+                and self.context.services.get("experimental_parallel") is True
+                else 20000,
             )
         )
         data = outcome.get("data")

@@ -110,7 +110,7 @@ class EvidenceLedger:
         numbers: Iterable[int],
         *,
         required: Iterable[int] = (),
-        max_chars: int = 180000,
+        max_chars: int | None = 180000,
         include_witness_spans: bool = False,
     ) -> str:
         """Fit full serialized originals, including provenance, without clipping required rules."""
@@ -140,17 +140,18 @@ class EvidenceLedger:
                     record["witness_spans"] = [
                         dict(span) for span in original_witness_spans(number, item.text)
                     ]
-                cost = len(json.dumps(record, ensure_ascii=False)) + (
-                    2 if records else 0
-                )
-                if used + cost > max_chars:
-                    if number in required_set:
-                        raise RunStopped(
-                            "Complete cited evidence and provenance exceed the serialized evidence limit"
-                        )
-                    continue
+                if max_chars is not None:
+                    cost = len(json.dumps(record, ensure_ascii=False)) + (
+                        2 if records else 0
+                    )
+                    if used + cost > max_chars:
+                        if number in required_set:
+                            raise RunStopped(
+                                "Complete cited evidence and provenance exceed the serialized evidence limit"
+                            )
+                        continue
+                    used += cost
                 records.append(record)
-                used += cost
         return json.dumps(records, ensure_ascii=False)
 
     def authority_metadata(self) -> list[dict[str, JsonValue]]:

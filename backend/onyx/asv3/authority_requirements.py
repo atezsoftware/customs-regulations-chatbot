@@ -16,8 +16,10 @@ from onyx.asv3.authority import (
     _authority_aliases,
     _defined_statute_abbreviations,
     _formal_law_name,
+    _gap_masking_aliases,
     _named_native_references,
     _native_original_rows,
+    _original_gap_references,
     _precise_original_gap,
     _reference_name,
     _without_verified_quotes,
@@ -321,6 +323,18 @@ class AuthorityRequirements:
             if record.formal_name is not None
             else {}
         )
+        if self.syntactic_reference_binding:
+            aliases = _authority_aliases(
+                ledger,
+                _native_original_rows(ledger),
+                strict_reference_boundaries=True,
+                syntactic_reference_binding=True,
+            )
+            for retained in self._records.values():
+                if retained.owner == record.owner and retained.formal_name is not None:
+                    numbers = aliases.setdefault(retained.formal_name, set())
+                    if retained.instrument_number is not None:
+                        numbers.add(retained.instrument_number)
         declared = (
             _defined_statute_abbreviations(
                 "\n".join(
@@ -343,9 +357,27 @@ class AuthorityRequirements:
                 if identity is not None
             },
         }
+        masking_aliases = (
+            _gap_masking_aliases(_native_original_rows(ledger), declared)
+            if self.syntactic_reference_binding
+            else {}
+        )
         for unit in assertion_inventory(answer):
-            if unit["evidence_numbers"] or not _precise_original_gap(
-                unit["text"], gap_aliases
+            if unit["evidence_numbers"]:
+                continue
+            disclosed = (
+                _original_gap_references(
+                    unit["text"],
+                    gap_aliases,
+                    masking_aliases=masking_aliases,
+                )
+                if self.syntactic_reference_binding
+                else None
+            )
+            if (
+                disclosed is None
+                if self.syntactic_reference_binding
+                else not _precise_original_gap(unit["text"], gap_aliases)
             ):
                 continue
             numbered = statute_references(
@@ -362,19 +394,21 @@ class AuthorityRequirements:
                 )
             ):
                 continue
-            references = _named_native_references(
-                unit["text"],
-                aliases,
-                strict_reference_boundaries=True,
-                syntactic_reference_binding=self.syntactic_reference_binding,
-            )
-            if self.syntactic_reference_binding:
-                references.extend(
-                    _abbreviated_statute_references(
-                        unit["text"], declared, syntactic_reference_binding=True
-                    )
+            references = (
+                disclosed
+                if disclosed is not None
+                else _named_native_references(
+                    unit["text"],
+                    aliases,
+                    strict_reference_boundaries=True,
+                    syntactic_reference_binding=self.syntactic_reference_binding,
                 )
+            )
             for reference, name in references:
+                if self.syntactic_reference_binding and name in declared:
+                    identity = declared[name]
+                    if identity is not None:
+                        name = identity[1]
                 if (
                     (
                         reference.number == record.instrument_number

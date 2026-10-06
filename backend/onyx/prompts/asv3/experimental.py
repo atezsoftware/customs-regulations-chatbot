@@ -8,7 +8,7 @@ Provider-specific tools, fixed dates, staged reviewers and benchmark cases are n
 from onyx.prompts.asv3.coordinator_reference import COORDINATOR_REFERENCE_PROMPT
 
 EXPERIMENTAL_PROMPT_VERSION = "asv3-experimental-2026-10-06.7"
-EXPERIMENTAL_PARALLEL_PROMPT_VERSION = "asv3-experimental-parallel-2026-10-06.10"
+EXPERIMENTAL_PARALLEL_PROMPT_VERSION = "asv3-experimental-parallel-2026-10-06.11"
 
 
 def _source_navigation(reference_prompt: str) -> str:
@@ -194,6 +194,78 @@ EXPERIMENTAL_RESEARCHER_PROMPT = (
     + "\n\n"
     + SOURCE_NAVIGATION
 )
+
+_PARALLEL_PROMPT_REPLACEMENTS = (
+    (
+        """Build each result from the original's actor/regime/event, cumulative or alternative conditions,
+exceptions and consequence; test the supplied facts against those elements. Preserve AND/OR,
+negative qualifiers, permission versus entitlement, request versus approval and a procedural
+step versus later discharge. Positive results need their operative support; negating one
+exception does not establish a rate, tax base or absence of other relief. Category outcomes
+need actual scope and exclusions, not a neighbouring code or an ordinary-regime list.
+Keep material proof issuer, form/authentication, triggering event, deadline/start, calculation
+components and later control, payment, security release or settlement where the originals
+provide them. 'If proved' and 'complete the formalities' cannot replace those concrete details.
+Explain each relevant conditional branch beside its outcome and name the fact changing it.""",
+        """For each result, first read the operative quantifier and scope: all, at least one, exceptions
+and negative conditions. Compare authority, delegation and cross-references before reconciling
+general and special implementation; neither erase an authorized alternative nor turn a list
+into cumulative prerequisites. Bind each material condition to its original, the actual fact
+meeting or failing it, or the precise unknown, then the supported conditional outcome. An
+unmentioned fact is not an exclusion. Preserve permission/entitlement, request/approval and
+procedure/later discharge distinctions. Negating one exception proves no rate, base or relief.
+Keep source-specified proof issuer, form/authentication, trigger, deadline/start, calculation,
+later control, payment, security release and settlement. 'If proved' cannot replace them.
+Category results need actual scope/exclusions. Headlines, tables and steps need the same limits.""",
+    ),
+    (
+        """Use already delivered conditions and favorable clauses, including relevant correction,
+disclosure or objection routes. Give each supported branch beside its outcome and name the
+fact changing it. Do not invent grounds, success prospects, procedures or deadlines.""",
+        """Use delivered favorable clauses and material correction, disclosure or objection routes.
+Give supported branches with the decisive changed fact; invent no ground, prospect or deadline.""",
+    ),
+    (
+        """related_source_navigation supplies source-local leads. Reach the passage establishing the
+actual effect and its connected scope, qualifications and temporal application. For a court
+decision distinguish its final disposition from its reasoning, the referring court's request,
+party submissions and appended materials. Read the disposition before claiming what the court
+changed; compare every material changed or preserved part with the rule being applied.""",
+        """Use source-local leads to establish the actual effect, scope and temporal application.
+For a court decision distinguish its disposition from reasoning, referrals and submissions.
+Explain each material changed AND preserved part against the rule being applied, with its own
+original citation. Separate decision, publication and effective dates, including a stated
+delay, from the user's transaction date. A known source date is not unknown because the user
+gave no year. Follow a material temporal rule's governing original; if that rule or the
+transaction date is missing, identify only that gap and retain supported conditional effects.""",
+    ),
+    (
+        """Before submission compare every actual requested outcome AND every material delivered original
+requirement with the answer in that same decision. For each outcome, check open applicability,
+operative details, prerequisites, exceptions, favorable and counter grounds, and relevant
+objection rights with their proof, authority, deadlines and procedure. A headline rule cannot
+close those material gaps. Add a delivered omission directly with its own citation; pursue
+unread originals only for a gap or credible lead that can change this result. Follow the
+useful reference, continuation, amendment note or related source; research_gap_signals are
+open needs, not law or a mandatory checklist.""",
+        """In the same submission decision compare the actual request and material delivered originals
+with each answer: condition, supplied/unknown fact, supported outcome, exception, dispute and
+later action. Add a delivered applicable omission with its own adjacent citation; do not
+research it again or replace it with uncertainty. Read only a material missing effect or
+credible lead that can change the result. research_gap_signals are open needs, not law or a
+mandatory checklist.""",
+    ),
+)
+
+
+def parallel_research_prompt(base_prompt: str) -> str:
+    """Replace duplicate instructions only in the opted-in parallel model request."""
+    for previous, replacement in _PARALLEL_PROMPT_REPLACEMENTS:
+        if base_prompt.count(previous) != 1:
+            raise ValueError("Expected one parallel research instruction to replace")
+        base_prompt = base_prompt.replace(previous, replacement, 1)
+    return base_prompt
+
 
 EXPERIMENTAL_PARALLEL_COORDINATOR = """PARALLEL RESEARCH WHEN NEEDED
 The first native decision may answer, ask a concrete user clarification, or reuse sufficient

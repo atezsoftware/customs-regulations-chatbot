@@ -882,6 +882,290 @@ def _precise_original_gap(text: str, aliases: dict[str, set[str]]) -> bool:
     )
 
 
+_GAP_RESEARCH_CONTEXT = (
+    r"(?:(?:bu|mevcut|sinirli)\s+)*(?:(?:usul|hukuki)\s+)?"
+    r"(?:incelemede|incelemesinde|arastirmada|arastirmasinda)"
+    r"|in (?:this|the present|this limited) (?:review|research|procedural review)"
+)
+_GAP_ORIGINAL_STATEMENT = re.compile(
+    r"(?P<subject>.+?)\s+(?:ozgun (?:metni|metnin|metinleri|metin|hukmu|hukumleri|hukum)|"
+    r"original (?:texts?|provisions?))\s+(?:henuz\s+)?"
+    r"(?:(?:" + _GAP_RESEARCH_CONTEXT + r")\s+)?"
+    r"(?:ulasilamadi|elde edilemedi|dogrulanamadi|incelenemedi|incelenmedi|"
+    r"degerlendirilmedi|ele alinmadi|incelenmemistir|degerlendirilmemistir|"
+    r"ele alinmamistir|could not be (?:obtained|verified|examined)|"
+    r"(?:has|have) not been (?:obtained|verified|examined|reviewed)|"
+    r"(?:is|are|remains|remain) unavailable)"
+)
+_GAP_SCOPE_STATEMENT = re.compile(
+    r"(?:(?:bu yanit|bu inceleme),?\s+)?(?P<subject>.+?)\s+"
+    r"(?:sonuc(?:u|unu|lari|larini)(?: hakkinda)?|hakkinda)(?: da)?\s+"
+    r"(?:bir )?(?:belirleme yapmiyor|belirleme yapilmiyor|belirlemiyor|"
+    r"sonuc bildirmemektedir|sonuc bildirmiyor)"
+    r"|this (?:answer|review) (?:does not determine|makes no determination about)\s+"
+    r"(?P<english_subject>.+)"
+)
+# Scope subjects are nominal topics, not arbitrary prose or inferred legal claims.
+_GAP_SCOPE_NOMINAL = re.compile(
+    r"(?:sonuc|etki|ceza|faiz|vergi|oran|odeme|beyan|izin|istisna|itiraz|hak|usul|"
+    r"belge|teminat|sure|sorumluluk|yukumluluk|yetki|iade|kiymet|gecikme|"
+    r"yapilmasi|yapilmamasi|verilmesi|verilmemesi|alinmasi|alinmamasi|"
+    r"tamamlanmasi|tamamlanmamasi)"
+    r"(?:nin|nun|in|un|i|u|si|su|sinin|sunun|sinde|sinda|na|ne|ya|ye|"
+    r"lar|ler|lari|leri|larin|lerin|larinin|lerinin)?"
+)
+_GAP_SCOPE_WORDS = _GAP_LOCATOR_WORDS | {
+    "bir",
+    "bu",
+    "herhangi",
+    "eksik",
+    "gec",
+    "tamamlayici",
+    "hukuki",
+    "kapsaminda",
+    "geri",
+    "verme",
+    "kaldirma",
+    "ve",
+    "veya",
+    "ile",
+    "yahut",
+    "and",
+    "or",
+    "a",
+    "an",
+    "payment",
+    "interest",
+    "penalty",
+    "liability",
+    "refund",
+    "permission",
+    "procedure",
+    "objection",
+    "appeal",
+    "right",
+    "scope",
+    "effect",
+    "applicability",
+}
+_GAP_SUBJECT_SUFFIXES = _GAP_LOCATOR_WORDS | {
+    "hukumleri",
+    "hukumlerinin",
+    "maddeleri",
+    "maddelerinin",
+    "ve",
+    "ile",
+    "and",
+    "s",
+}
+
+
+def _gap_reference_identity(
+    reference: StatuteReference, name: str | None
+) -> tuple[str, str | None, str | None, str | None]:
+    return (
+        reference.number,
+        None if reference.number else name,
+        reference.article,
+        reference.qualifier,
+    )
+
+
+_GAP_NUMBER_ONLY_IDENTITY = re.compile(
+    r"\d{2,7}\s+sayili\s+kanun(?:u|un|unun)?"
+    r"|(?:law|act|statute)\s+(?:no\s*)?\d{2,7}"
+)
+
+
+def _gap_masking_aliases(
+    rows: list[dict[str, JsonValue]],
+    declared: dict[str, tuple[str, str | None] | None],
+) -> dict[str, set[str]]:
+    """Only own canonical identities authorize consuming formal title words."""
+    aliases = _canonical_law_aliases(rows)
+    for label, identity in declared.items():
+        if identity is None:
+            continue
+        number, name = identity
+        if (
+            name is not None
+            and name in aliases
+            and (aliases[name] == {number} or (not number and not aliases[name]))
+        ):
+            aliases[label] = {number} if number else set()
+    return aliases
+
+
+def _gap_identity_remainder(subject: str, masking_aliases: dict[str, set[str]]) -> str:
+    spans: list[tuple[int, int]] = []
+    rejected: list[tuple[int, int]] = []
+    for match in _STRICT_STATUTE.finditer(subject):
+        number = match["number"] or match["english_number"]
+        name = _reference_name(StatuteReference(number, None, match[0]))
+        if _GAP_NUMBER_ONLY_IDENTITY.fullmatch(match[0]) or (
+            name is not None and masking_aliases.get(name) == {number}
+        ):
+            spans.append(match.span())
+        else:
+            rejected.append(match.span())
+    alias_matches = sorted(
+        (
+            (_formal_law_name(name) is None, match)
+            for name, numbers in masking_aliases.items()
+            if len(numbers) <= 1
+            for match in re.finditer(
+                rf"(?<!\w){re.escape(name)}(?:u|un|unun)?(?!\w)", subject
+            )
+        ),
+        key=lambda item: (item[0], item[1].start(), -item[1].end()),
+    )
+    for is_label, match in alias_matches:
+        if any(
+            left <= match.start() and match.end() <= right for left, right in rejected
+        ):
+            continue
+        if is_label:
+            prefix = list(subject[: match.start()])
+            for start, end in spans:
+                for left, right in [(start, end)] + [
+                    (locator.start, locator.end)
+                    for locator in _bound_locators(subject, start, end)
+                ]:
+                    if right <= match.start():
+                        prefix[left:right] = " " * (right - left)
+            remainder = "".join(prefix)
+            if (
+                not _bound_locators(subject, match.start(), match.end())
+                or re.search(r"\d|[^a-z\s,'’()/:-]", remainder)
+                or any(
+                    word not in _GAP_SUBJECT_SUFFIXES
+                    for word in re.findall(r"[a-z]+", remainder)
+                )
+            ):
+                continue
+        spans.append(match.span())
+    retained: list[tuple[int, int]] = []
+    for start, end in sorted(set(spans), key=lambda span: (span[0], -span[1])):
+        if any(left <= start and end <= right for left, right in retained):
+            continue
+        retained.append((start, end))
+    masked = list(subject)
+    for start, end in retained:
+        for left, right in [(start, end)] + [
+            (locator.start, locator.end)
+            for locator in _bound_locators(subject, start, end)
+        ]:
+            masked[left:right] = " " * (right - left)
+    return "".join(masked)
+
+
+def _gap_subject_references(
+    subject: str,
+    aliases: dict[str, set[str]],
+    masking_aliases: dict[str, set[str]],
+) -> list[tuple[StatuteReference, str | None]] | None:
+    """Consume only explicit identities, their bound locators and possessive links."""
+    references = _gap_references(subject, aliases)
+    if not references:
+        return None
+    remainder = _gap_identity_remainder(subject, masking_aliases)
+    if re.search(r"\d|[^a-z\s,'’()/:-]", remainder) or any(
+        word not in _GAP_SUBJECT_SUFFIXES for word in re.findall(r"[a-z]+", remainder)
+    ):
+        return None
+    return references
+
+
+def _gap_scope_references(
+    subject: str,
+    aliases: dict[str, set[str]],
+    masking_aliases: dict[str, set[str]],
+) -> list[tuple[StatuteReference, str | None]] | None:
+    remainder = _gap_identity_remainder(subject, masking_aliases)
+    if re.search(r"\d|[^a-z\s,'’()/:-]", remainder) or any(
+        word not in _GAP_SCOPE_WORDS and _GAP_SCOPE_NOMINAL.fullmatch(word) is None
+        for word in re.findall(r"[a-z]+", remainder)
+    ):
+        return None
+    return _gap_references(subject, aliases)
+
+
+def _gap_references(
+    text: str, aliases: dict[str, set[str]]
+) -> list[tuple[StatuteReference, str | None]]:
+    references = _named_native_references(
+        text,
+        aliases,
+        strict_reference_boundaries=True,
+        syntactic_reference_binding=True,
+    )
+    unique: dict[
+        tuple[str, str | None, str | None, str | None],
+        tuple[StatuteReference, str | None],
+    ] = {}
+    for reference, name in references:
+        unique.setdefault(
+            _gap_reference_identity(reference, name),
+            (reference, name),
+        )
+    return list(unique.values())
+
+
+def _original_gap_references(
+    text: str,
+    aliases: dict[str, set[str]],
+    *,
+    masking_aliases: dict[str, set[str]],
+) -> list[tuple[StatuteReference, str | None]] | None:
+    """Recognize a fully negative disclosure, never a mixed legal answer block."""
+    notice = folded(text.replace("**", "").replace("__", ""))
+    notice = re.sub(r"(?<=\d)\.(?=\s*madd)", "", notice)
+    notice = re.sub(r"\b(m|md|art|no)\.", r"\1 ", notice)
+    if re.search(r"\[\d+\]", notice):
+        return None
+    clauses = [part.strip() for part in re.split(r"[.!?;]", notice) if part.strip()]
+    disclosed: list[tuple[StatuteReference, str | None]] = []
+    pending: list[tuple[StatuteReference, str | None]] | None = None
+    for clause in clauses:
+        if scope := _GAP_SCOPE_STATEMENT.fullmatch(clause):
+            if pending is not None:
+                return None
+            pending = _gap_scope_references(
+                scope["subject"] or scope["english_subject"], aliases, masking_aliases
+            )
+            if pending is None:
+                return None
+            continue
+        clause = re.sub(r"^(?:" + _GAP_RESEARCH_CONTEXT + r")\s+", "", clause)
+        original = _GAP_ORIGINAL_STATEMENT.fullmatch(clause)
+        if original is None:
+            return None
+        subject = original["subject"]
+        singular = re.fullmatch(
+            r"bu (?:hukmun|maddenin)|this provision(?:'s)?", subject
+        )
+        plural = re.fullmatch(r"bu hukumlerin|these provisions'?", subject)
+        if singular or plural:
+            if pending is None or (
+                len(pending) != 1 or pending[0][0].article is None
+                if singular
+                else len(pending) < 2
+            ):
+                return None
+            references = pending
+        else:
+            references = _gap_subject_references(subject, aliases, masking_aliases)
+            if references is None:
+                return None
+            if pending and not {
+                _gap_reference_identity(ref, name) for ref, name in pending
+            }.issubset(_gap_reference_identity(ref, name) for ref, name in references):
+                return None
+        disclosed.extend(references)
+        pending = None
+    return list(dict.fromkeys(disclosed)) if disclosed and pending is None else None
+
+
 def native_named_authority_gap(
     answer: str,
     ledger: EvidenceLedger,
@@ -922,12 +1206,22 @@ def native_named_authority_gap(
             if identity is not None
         },
     }
+    masking_aliases = (
+        _gap_masking_aliases(rows, defined) if syntactic_reference_binding else {}
+    )
     missing: list[dict[str, JsonValue]] = []
     for unit in units:
         if unit["presentation_only"]:
             continue
         cited = set(unit["evidence_numbers"])
-        if not cited and _precise_original_gap(unit["text"], gap_aliases):
+        if not cited and (
+            _original_gap_references(
+                unit["text"], gap_aliases, masking_aliases=masking_aliases
+            )
+            is not None
+            if syntactic_reference_binding
+            else _precise_original_gap(unit["text"], gap_aliases)
+        ):
             continue
         attributed = _without_verified_quotes(unit["text"], cited, ledger)
         references = _named_native_references(
