@@ -26,6 +26,7 @@ class EvidenceLedger:
         self._identities: dict[tuple[str, str | None, str], int] = {}
         self._included: set[int] = set()
         self._deliveries: list[dict[str, JsonValue]] = []
+        self._pinned_delivery_calls: set[str] = set()
 
     def add(self, items: Iterable[EvidenceItem], context: RunContext) -> list[int]:
         result: list[int] = []
@@ -255,6 +256,7 @@ class EvidenceLedger:
                 ],
                 "included": sorted(self._included),
                 "deliveries": list(self._deliveries),
+                "pinned_delivery_calls": sorted(self._pinned_delivery_calls),
             }
 
     def restore(self, payload: dict[str, JsonValue], context: RunContext) -> None:
@@ -288,29 +290,51 @@ class EvidenceLedger:
             > context.budget.limits["evidence_bytes"]
         ):
             raise ValueError("Restored evidence exceeds the run budget")
+        raw_deliveries = payload.get("deliveries", [])
+        raw_pins = payload.get("pinned_delivery_calls", [])
+        if (
+            not isinstance(raw_deliveries, list)
+            or not isinstance(raw_pins, list)
+            or any(not isinstance(call, str) or not call for call in raw_pins)
+        ):
+            raise ValueError("Invalid evidence delivery checkpoint")
+        pins = {call for call in raw_pins if isinstance(call, str)}
+        deliveries: list[dict[str, JsonValue]] = []
+        for delivery in raw_deliveries:
+            if not isinstance(delivery, dict) or not isinstance(
+                delivery.get("records"), list
+            ):
+                raise ValueError("Invalid evidence delivery record")
+            for record in delivery["records"]:
+                if not isinstance(record, dict) or record.get("citation") not in items:
+                    raise ValueError("Unknown delivered evidence")
+                number = record["citation"]
+                assert isinstance(number, int)
+                if record.get("text_hash") != items[number].text_hash:
+                    raise ValueError("Changed delivered evidence identity")
+            deliveries.append(delivery)
+        retained_calls = {
+            call for row in deliveries if isinstance(call := row.get("call_id"), str)
+        }
+        if (
+            not pins.issubset(retained_calls)
+            or sum(row.get("call_id") not in pins for row in deliveries) > 200
+        ):
+            raise ValueError("Invalid pinned evidence delivery checkpoint")
         with self._lock:
             context.check_active()
             self._items, self._identities, self._included = items, identities, included
-            raw_deliveries = payload.get("deliveries", [])
-            if not isinstance(raw_deliveries, list) or len(raw_deliveries) > 200:
-                raise ValueError("Invalid evidence delivery checkpoint")
-            self._deliveries = []
-            for delivery in raw_deliveries:
-                if not isinstance(delivery, dict) or not isinstance(
-                    delivery.get("records"), list
-                ):
-                    raise ValueError("Invalid evidence delivery record")
-                for record in delivery["records"]:
-                    if (
-                        not isinstance(record, dict)
-                        or record.get("citation") not in self._items
-                    ):
-                        raise ValueError("Unknown delivered evidence")
-                    number = record["citation"]
-                    assert isinstance(number, int)
-                    if record.get("text_hash") != self._items[number].text_hash:
-                        raise ValueError("Changed delivered evidence identity")
-                self._deliveries.append(delivery)
+            self._deliveries = deliveries
+            self._pinned_delivery_calls = pins
+
+    def pin_delivery(self, call_id: str) -> None:
+        """Retain an actual accepted-child delivery for lossless host assembly."""
+        with self._lock:
+            if not call_id or not any(
+                row.get("call_id") == call_id for row in self._deliveries
+            ):
+                raise ValueError("Cannot pin an unrecorded evidence delivery")
+            self._pinned_delivery_calls.add(call_id)
 
     def record_delivery(
         self, call_id: str, flow: str, records: Iterable[dict[str, JsonValue]]
@@ -348,7 +372,18 @@ class EvidenceLedger:
                 self._deliveries.append(
                     {"call_id": call_id, "flow": flow, "records": delivered}
                 )
-                self._deliveries = self._deliveries[-200:]
+                unpinned = [
+                    index
+                    for index, row in enumerate(self._deliveries)
+                    if row.get("call_id") not in self._pinned_delivery_calls
+                ]
+                retained = set(unpinned[-200:])
+                self._deliveries = [
+                    row
+                    for index, row in enumerate(self._deliveries)
+                    if index in retained
+                    or row.get("call_id") in self._pinned_delivery_calls
+                ]
 
     def include(self, numbers: Iterable[int]) -> None:
         with self._lock:

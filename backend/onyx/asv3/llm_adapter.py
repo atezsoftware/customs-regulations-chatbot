@@ -74,6 +74,8 @@ from onyx.prompts.asv3.coordinator_reference import (
 )
 from onyx.prompts.asv3.experimental import (
     EXPERIMENTAL_COORDINATOR_PROMPT,
+    EXPERIMENTAL_PARALLEL_COORDINATOR,
+    EXPERIMENTAL_PARALLEL_RESEARCHER,
     EXPERIMENTAL_RESEARCHER_PROMPT,
 )
 from onyx.prompts.asv3.research import (
@@ -2151,13 +2153,20 @@ class ResearchModel:
 
     def _research_instruction(self) -> str:
         if self.context.services.get("research_profile") == "experimental":
-            return (
+            instruction = (
                 EXPERIMENTAL_RESEARCHER_PROMPT
                 if self.context.depth
                 else EXPERIMENTAL_COORDINATOR_PROMPT
                 + "\n\n"
                 + COORDINATOR_SESSION_ACTIONS
             )
+            if self.context.services.get("experimental_parallel") is True:
+                instruction += "\n\n" + (
+                    EXPERIMENTAL_PARALLEL_RESEARCHER
+                    if self.context.depth
+                    else EXPERIMENTAL_PARALLEL_COORDINATOR
+                )
+            return instruction
         normal = self.context.services.get("research_profile") == "normal"
         if self.context.depth:
             instruction = RESEARCHER_REFERENCE_PROMPT if normal else RESEARCHER_PROMPT
@@ -2196,6 +2205,13 @@ class ResearchModel:
         question: dict[str, JsonValue] = {
             "request": view.request,
         }
+        if self.context.services.get("experimental_parallel") is True:
+            scenario_request = self.context.services.get("scenario_request")
+            if not isinstance(scenario_request, str) or not scenario_request:
+                raise ValueError(
+                    "Experimental parallel requires its exact original scenario"
+                )
+            question["scenario_request"] = scenario_request
         if self.history:
             question["conversation"] = self.history
         if len(view.questions) > 1:
@@ -2404,7 +2420,12 @@ class ResearchModel:
         include_related_navigation = True
         ceiling, output = self._limits(self._native_output_limit())
         selected = view.tools
-        if independent_mode and independent_answers and view.publication_gap is None:
+        if (
+            independent_mode
+            and independent_answers
+            and view.publication_gap is None
+            and self.context.services.get("experimental_parallel") is not True
+        ):
             selected = [
                 tool
                 for tool in selected

@@ -301,6 +301,9 @@ class TaskSnapshot(BaseModel):
     outcome: ToolOutcome | None = None
     independent_question: bool = False
     local_budget: dict[str, JsonValue] = Field(default_factory=dict)
+    outcome_ids: list[str] = Field(default_factory=list)
+    assignment_id: str | None = None
+    child_checkpoint: dict[str, JsonValue] | None = None
 
 
 class HarnessResult(BaseModel):

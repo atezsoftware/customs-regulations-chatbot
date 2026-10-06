@@ -60,6 +60,7 @@ from onyx.regulatory.heading_path import (
 from onyx.tools.constants import REGULATORY_MAX_SEARCH_QUERY_CHARS
 from onyx.tracing.answer_graph import graph_step
 from onyx.utils.threadpool_concurrency import run_functions_tuples_in_parallel
+from shared_configs.contextvars import CURRENT_TENANT_ID_CONTEXTVAR
 
 MAX_SCAN_CHUNKS = 2000
 MAX_RESPONSE_CHARS = 64_000
@@ -193,6 +194,68 @@ class CorpusBroker:
             return require_source(
                 session, user=self.user, filters=self.filters, source_id=UUID(source_id)
             )
+
+    def shared_read_fence(
+        self, source_id: str, context: RunContext
+    ) -> str | ToolOutcome:
+        """Authorize every subscriber before sharing its exact source acquisition."""
+        context.check_active()
+        try:
+            with get_session_with_current_tenant() as session:
+                source = require_source(
+                    session,
+                    user=self.user,
+                    filters=self.filters,
+                    source_id=UUID(source_id),
+                )
+                inventory = current_asv3_source_inventory_scope()
+                captured = None
+                if inventory is not None:
+                    with inventory.lock:
+                        captured = inventory.query_indexes.get(source.id)
+                with self._index_lock:
+                    previous = self.query_indexes.get(source.id)
+                    if captured is not None:
+                        if previous is not None and not previous.matches_temporal_index(
+                            captured
+                        ):
+                            raise CorpusScopeUnavailable(
+                                "Source index differs from captured authority."
+                            )
+                        self.query_indexes[source.id] = captured
+                    if source.id not in self.query_indexes:
+                        resolved = resolve_source_query_index(session, source.id)
+                        if resolved is not None:
+                            self.query_indexes[source.id] = resolved
+                    snapshot = self.query_indexes.get(source.id)
+            context.check_active()
+            return sha256(
+                json.dumps(
+                    {
+                        "run_id": context.run_id,
+                        "tenant": CURRENT_TENANT_ID_CONTEXTVAR.get(),
+                        "user_id": str(self.user.id),
+                        "scope": context.scope,
+                        "filters": self.filters.model_dump(mode="json"),
+                        "source_id": str(source.id),
+                        "source_name": source.name,
+                        "file_id": source.file_id,
+                        "query_index": snapshot.model_dump(mode="json")
+                        if snapshot is not None
+                        else None,
+                    },
+                    sort_keys=True,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+        except PermissionError:
+            return ToolOutcome(
+                status=OutcomeStatus.DENIED,
+                summary="Requested source/date is outside this run's authorized scope.",
+            )
+        except CorpusScopeUnavailable as error:
+            return ToolOutcome(status=OutcomeStatus.UNAVAILABLE, summary=str(error))
 
     def sources(
         self, query: str, context: RunContext, *, offset: int = 0, limit: int = 50

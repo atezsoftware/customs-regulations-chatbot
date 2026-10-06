@@ -469,6 +469,101 @@ class LegalSourceReviews:
                 records=list(self._records.values()),
             ).model_dump(mode="json")
 
+    def publication_gap_for_assembly(
+        self,
+        answer: str,
+        context: RunContext,
+        ledger: EvidenceLedger,
+        *,
+        accepted_owners: set[str],
+    ) -> ToolOutcome | None:
+        """Check root leads against already validated, immutable child bodies."""
+        self._fence(context)
+        if self._owner(context) != "coordinator" or any(
+            not owner.strip() or owner == "coordinator" for owner in accepted_owners
+        ):
+            raise ValueError("Assembly reviews require accepted child owners")
+        if not extract_citation_numbers(answer):
+            return None
+        paragraphs = {p.strip() for p in re.split(r"\n\s*\n", answer)}
+
+        def disclosed(review: RelatedSourceReview) -> bool:
+            return (
+                review.status == "unresolved"
+                and review.gap.strip() in paragraphs
+                and not extract_citation_numbers(review.gap)
+            )
+
+        pending: list[JsonValue] = []
+        undisclosed: list[JsonValue] = []
+        with self._lock:
+            for (owner, lead), record in self._records.items():
+                if owner != "coordinator":
+                    continue
+                self._validate_saved(record, ledger)
+                if record.review is not None and (
+                    record.review.status != "unresolved" or disclosed(record.review)
+                ):
+                    continue
+                reviews: dict[str, RelatedSourceReview] = {}
+                for child_owner in accepted_owners:
+                    child = self._records.get((child_owner, lead))
+                    if child is None:
+                        continue
+                    self._validate_saved(child, ledger)
+                    if (
+                        child.anchor_source_id,
+                        child.article_no,
+                        child.qualifier,
+                        child.source_id,
+                    ) != (
+                        record.anchor_source_id,
+                        record.article_no,
+                        record.qualifier,
+                        record.source_id,
+                    ):
+                        raise ValueError("Assembly related-source identity changed")
+                    if child.review is not None:
+                        reviews[child_owner] = child.review
+                if any(
+                    review.status == "examined"
+                    and review.source_role == "operative_text"
+                    for review in reviews.values()
+                ) or any(disclosed(review) for review in reviews.values()):
+                    continue
+                if (
+                    accepted_owners
+                    and set(reviews) == accepted_owners
+                    and all(
+                        review.status == "not_material" for review in reviews.values()
+                    )
+                ):
+                    continue
+                if record.review is not None:
+                    undisclosed.append({"lead_id": lead, "gap": record.review.gap})
+                else:
+                    pending.append(
+                        {
+                            "lead_id": lead,
+                            "source_id": record.source_id,
+                            "name": record.name,
+                            "anchor_source_id": record.anchor_source_id,
+                            "article_no": record.article_no,
+                            "qualifier": record.qualifier,
+                        }
+                    )
+        if not pending and not undisclosed:
+            return None
+        return ToolOutcome(
+            status=OutcomeStatus.PARTIAL,
+            summary="The accepted child bodies must retain an examined related original or its precise unresolved interaction. One task's exclusion cannot resolve the whole request.",
+            data={
+                "pending_related_source_review": True,
+                "unread_related_sources": pending,
+                "undisclosed_related_source_gaps": undisclosed,
+            },
+        )
+
     def restore(
         self,
         snapshot: dict[str, JsonValue],

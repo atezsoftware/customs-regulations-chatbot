@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import builtins
 import contextvars
+import copy
+import hashlib
+import json
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import Callable, cast
+from typing import Callable, Literal, cast
 from uuid import uuid4
 
-from pydantic import JsonValue
+from pydantic import BaseModel, ConfigDict, JsonValue
 
 from onyx.asv3.artifacts import artifact_reference, compact_json
 from onyx.asv3.evidence import EvidenceLedger
@@ -28,6 +31,25 @@ from onyx.asv3.research_state import ResearchState
 ResearchRunner = Callable[
     [str, RunContext, Callable[[], builtins.list[str]]], ToolOutcome
 ]
+
+
+def _checkpoint_digest(value: object) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+
+
+class _ChildCheckpoint(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    version: Literal[1] = 1
+    run_id: str
+    task_id: str
+    scope_hash: str
+    request_hash: str
+    assignment_id: str | None
+    outcome_ids: builtins.list[str]
+    snapshot: dict[str, JsonValue]
+    integrity: str
 
 
 class WorkerPool:
@@ -70,6 +92,8 @@ class WorkerPool:
         need_ids: builtins.list[str] | None = None,
         independent_question: bool = False,
         outcome_ids: builtins.list[str] | None = None,
+        assignment_id: str | None = None,
+        previous_checkpoint: dict[str, JsonValue] | None = None,
     ) -> str:
         delegation = request_context or self.context
         delegation.check_active()
@@ -85,6 +109,11 @@ class WorkerPool:
                     "Task narration must use natural question-language labels without internal details"
                 )
         needs = list(dict.fromkeys(need_ids or []))
+        outcomes = list(dict.fromkeys(outcome_ids or []))
+        if any(not item.strip() for item in outcomes) or (
+            assignment_id is not None and not assignment_id.strip()
+        ):
+            raise ValueError("Task assignment and outcome identities must be nonempty")
         state = delegation.services.get("research_state")
         if isinstance(state, ResearchState) and state.require_need_bindings:
             if not needs or any(state.action_binding_gap(n) is not None for n in needs):
@@ -103,6 +132,13 @@ class WorkerPool:
                 if (
                     snapshot.status in (TaskStatus.QUEUED, TaskStatus.RUNNING)
                     and snapshot.independent_question == independent_question
+                    and (
+                        assignment_id is None
+                        or (
+                            snapshot.assignment_id == assignment_id
+                            and snapshot.outcome_ids == outcomes
+                        )
+                    )
                     and needs
                     and set(needs) == set(snapshot.need_ids)
                 ):
@@ -125,7 +161,16 @@ class WorkerPool:
             child.services["parent_task_id"] = parent_task_id
             child.services["task_need_ids"] = needs
             if outcome_ids is not None:
-                child.services["task_outcome_ids"] = list(outcome_ids)
+                child.services["task_outcome_ids"] = outcomes
+            if assignment_id is not None:
+                child.services["assignment_id"] = assignment_id
+                child.services["record_child_checkpoint"] = self._checkpoint_callback(
+                    task_id
+                )
+            if previous_checkpoint is not None:
+                child.services["previous_child_checkpoint"] = copy.deepcopy(
+                    previous_checkpoint
+                )
             self._contexts[task_id] = child
             self._tasks[task_id] = TaskSnapshot(
                 task_id=task_id,
@@ -136,6 +181,8 @@ class WorkerPool:
                 public_title=public_title,
                 public_message=public_message,
                 independent_question=independent_question,
+                outcome_ids=outcomes,
+                assignment_id=assignment_id,
             )
             captured = contextvars.copy_context()
             self._futures[task_id] = cast(
@@ -255,7 +302,96 @@ class WorkerPool:
                 public_message=snapshot.public_message,
                 need_ids=snapshot.need_ids,
                 independent_question=snapshot.independent_question,
+                outcome_ids=snapshot.outcome_ids,
+                assignment_id=snapshot.assignment_id,
+                previous_checkpoint=self.checkpoint(task_id),
             )
+
+    def _checkpoint_callback(
+        self, task_id: str
+    ) -> Callable[[dict[str, JsonValue]], None]:
+        def record(snapshot: dict[str, JsonValue]) -> None:
+            self.record_checkpoint(task_id, snapshot)
+
+        return record
+
+    def _validated_checkpoint(
+        self, task: TaskSnapshot, payload: dict[str, JsonValue]
+    ) -> _ChildCheckpoint:
+        checkpoint = _ChildCheckpoint.model_validate(payload)
+        if (
+            checkpoint.run_id != self.context.run_id
+            or checkpoint.task_id != task.task_id
+            or checkpoint.scope_hash != _checkpoint_digest(self.context.scope)
+            or checkpoint.request_hash != _checkpoint_digest(task.task)
+            or checkpoint.assignment_id != task.assignment_id
+            or checkpoint.outcome_ids != task.outcome_ids
+            or checkpoint.snapshot.get("run_id") != self.context.run_id
+            or checkpoint.snapshot.get("request") != task.task
+            or checkpoint.integrity
+            != _checkpoint_digest(
+                checkpoint.model_dump(mode="json", exclude={"integrity"})
+            )
+        ):
+            raise ValueError(
+                "Child checkpoint task, assignment, scope or integrity changed"
+            )
+        return checkpoint
+
+    def record_checkpoint(self, task_id: str, snapshot: dict[str, JsonValue]) -> None:
+        """Save a request-bound host snapshot without exposing it as worker output."""
+        with self._lock:
+            task = self._tasks[task_id]
+            child = self._contexts[task_id]
+            if (
+                snapshot.get("run_id") != self.context.run_id
+                or snapshot.get("request") != task.task
+                or child.run_id != self.context.run_id
+                or child.scope != self.context.scope
+            ):
+                raise ValueError("Child checkpoint run, scope or request changed")
+            content: dict[str, JsonValue] = {
+                "version": 1,
+                "run_id": self.context.run_id,
+                "task_id": task_id,
+                "scope_hash": _checkpoint_digest(self.context.scope),
+                "request_hash": _checkpoint_digest(task.task),
+                "assignment_id": task.assignment_id,
+                "outcome_ids": list(task.outcome_ids),
+                "snapshot": copy.deepcopy(snapshot),
+            }
+            wrapped = {**content, "integrity": _checkpoint_digest(content)}
+            self._validated_checkpoint(task, wrapped)
+            task.child_checkpoint = wrapped
+
+    def checkpoint(self, task_id: str) -> dict[str, JsonValue] | None:
+        with self._lock:
+            task = self._tasks[task_id]
+            if task.child_checkpoint is None:
+                return None
+            return copy.deepcopy(
+                self._validated_checkpoint(task, task.child_checkpoint).snapshot
+            )
+
+    def _task_binding(self, task: TaskSnapshot) -> dict[str, JsonValue]:
+        return {
+            "run_id": self.context.run_id,
+            "scope_hash": _checkpoint_digest(self.context.scope),
+            "task_id": task.task_id,
+            "task": task.task,
+            "parent_task_id": task.parent_task_id,
+            "independent_question": task.independent_question,
+            "assignment_id": task.assignment_id,
+            "outcome_ids": list(task.outcome_ids),
+        }
+
+    @staticmethod
+    def _has_checkpoint_binding(task: TaskSnapshot) -> bool:
+        return (
+            task.assignment_id is not None
+            or bool(task.outcome_ids)
+            or task.child_checkpoint is not None
+        )
 
     def cancel(self, task_id: str) -> None:
         with self._lock:
@@ -271,7 +407,9 @@ class WorkerPool:
     @staticmethod
     def _task_view(task: TaskSnapshot, *, full: bool = False) -> TaskSnapshot:
         if full or task.independent_question:
-            return task.model_copy(deep=True)
+            return task.model_copy(update={"child_checkpoint": None}).model_copy(
+                deep=True
+            )
         outcome = task.outcome
         if outcome is not None:
             data = compact_json(outcome.data, max_chars=6000)
@@ -287,7 +425,12 @@ class WorkerPool:
                 },
             )
         return task.model_copy(
-            deep=False, update={"updates": list(task.updates[-16:]), "outcome": outcome}
+            deep=False,
+            update={
+                "updates": list(task.updates[-16:]),
+                "outcome": outcome,
+                "child_checkpoint": None,
+            },
         )
 
     def results(
@@ -594,14 +737,28 @@ class WorkerPool:
         ]
 
     def export(self) -> dict[str, JsonValue]:
-        return {
-            "version": 1,
-            "run_id": self.context.run_id,
-            "tasks": [
-                task.model_dump(mode="json", exclude={"outcome": {"evidence"}})
-                for task in self.list()
-            ],
-        }
+        with self._lock:
+            self.results(full=False)
+            tasks: builtins.list[JsonValue] = []
+            for task in self._tasks.values():
+                view = self._task_view(task)
+                view.child_checkpoint = copy.deepcopy(task.child_checkpoint)
+                tasks.append(
+                    view.model_dump(mode="json", exclude={"outcome": {"evidence"}})
+                )
+            result: dict[str, JsonValue] = {
+                "version": 1,
+                "run_id": self.context.run_id,
+                "tasks": tasks,
+            }
+            bindings: dict[str, JsonValue] = {
+                task.task_id: _checkpoint_digest(self._task_binding(task))
+                for task in self._tasks.values()
+                if self._has_checkpoint_binding(task)
+            }
+            if bindings:
+                result["task_binding_integrity"] = bindings
+            return result
 
     def restore(self, payload: dict[str, JsonValue]) -> None:
         if payload.get("version") != 1 or payload.get("run_id") != self.context.run_id:
@@ -614,8 +771,21 @@ class WorkerPool:
             raise ValueError("Invalid worker checkpoint")
         if len({item.task_id for item in snapshots}) != len(snapshots):
             raise ValueError("Duplicate restored task")
+        bindings = payload.get("task_binding_integrity", {})
+        expected = {
+            task.task_id: _checkpoint_digest(self._task_binding(task))
+            for task in snapshots
+            if self._has_checkpoint_binding(task)
+        }
+        if bindings != expected:
+            raise ValueError("Worker checkpoint task, scope or outcome binding changed")
         contexts: dict[str, RunContext] = {}
         for snapshot in snapshots:
+            saved_checkpoint = (
+                self._validated_checkpoint(snapshot, snapshot.child_checkpoint).snapshot
+                if snapshot.child_checkpoint is not None
+                else None
+            )
             if snapshot.independent_question:
                 limits = snapshot.local_budget.get("limits")
                 used = snapshot.local_budget.get("used")
@@ -639,7 +809,17 @@ class WorkerPool:
                 task_id=snapshot.task_id,
                 parent_task_id=snapshot.parent_task_id,
                 task_need_ids=list(snapshot.need_ids),
+                task_outcome_ids=list(snapshot.outcome_ids),
             )
+            if snapshot.assignment_id is not None:
+                child.services["assignment_id"] = snapshot.assignment_id
+                child.services["record_child_checkpoint"] = self._checkpoint_callback(
+                    snapshot.task_id
+                )
+            if saved_checkpoint is not None:
+                child.services["restored_child_checkpoint"] = copy.deepcopy(
+                    saved_checkpoint
+                )
             contexts[snapshot.task_id] = child
         with self._lock:
             if self._tasks:

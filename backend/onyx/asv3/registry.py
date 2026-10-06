@@ -19,6 +19,7 @@ from onyx.asv3.models import (
 )
 from onyx.asv3.outcome_map import OutcomeMap, OutcomeUpdate
 from onyx.asv3.research_state import ResearchState
+from onyx.asv3.shared_reads import SharedReads
 
 if TYPE_CHECKING:
     from onyx.asv3.evidence import EvidenceLedger
@@ -337,23 +338,34 @@ class CapabilityRegistry:
                             "invalid_related_source_review": True,
                         },
                     )
-            if spec.consumes_tool_budget:
-                context.budget.consume("tools")
-            acquired = False
-            if not spec.orchestrates:
-                while not acquired:
-                    context.check_active()
-                    acquired = context.budget.tool_slots.acquire(timeout=0.05)
-            try:
-                if spec.parallel_safe:
-                    outcome = spec.handler(arguments, context)
-                else:
+
+            def execute(execution_context: RunContext) -> ToolOutcome:
+                if spec.consumes_tool_budget:
+                    execution_context.budget.consume("tools")
+                acquired = False
+                if not spec.orchestrates:
+                    while not acquired:
+                        execution_context.check_active()
+                        acquired = execution_context.budget.tool_slots.acquire(
+                            timeout=0.05
+                        )
+                try:
+                    if spec.parallel_safe:
+                        return spec.handler(arguments, execution_context)
                     with self._serial:
-                        context.check_active()
-                        outcome = spec.handler(arguments, context)
-            finally:
-                if acquired:
-                    context.budget.tool_slots.release()
+                        execution_context.check_active()
+                        return spec.handler(arguments, execution_context)
+                finally:
+                    if acquired:
+                        execution_context.budget.tool_slots.release()
+
+            shared_reads = context.services.get("shared_reads")
+            outcome = (
+                shared_reads.run(call.name, arguments, context, execute)
+                if context.services.get("research_profile") == "experimental"
+                and isinstance(shared_reads, SharedReads)
+                else execute(context)
+            )
             context.check_active()
             return outcome
         except RunStopped as error:

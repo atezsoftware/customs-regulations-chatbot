@@ -7,7 +7,7 @@ Provider-specific tools, fixed dates, staged reviewers and benchmark cases are n
 
 from onyx.prompts.asv3.coordinator_reference import COORDINATOR_REFERENCE_PROMPT
 
-EXPERIMENTAL_PROMPT_VERSION = "asv3-experimental-2026-10-06.6"
+EXPERIMENTAL_PROMPT_VERSION = "asv3-experimental-2026-10-06.7"
 
 
 def _source_navigation(reference_prompt: str) -> str:
@@ -150,9 +150,10 @@ material unread text with useful focused methods; an actual scope/access barrier
 gap needs its exact unresolved interaction in its own uncited paragraph, retaining independent
 supported conclusions. Limited research cannot establish absence throughout the corpus.
 Do not replace a delivered condition with an uncertainty notice or leave placeholder blanks.
-Complete material exception/objection analysis now; do not defer it to an offer. Add a brief
-case-specific optional next task only when a supported finding, genuine gap or decisive missing
-fact makes concrete further analysis or document work useful. Omit generic repeated menus.
+Complete material exception/objection analysis now; do not defer it to an offer. When useful,
+end with a few concise optional follow-up questions grounded in this case's supported findings,
+genuine gaps or decisive missing facts. Propose concrete further analysis or document work;
+do not ask permission to do research already needed for this answer or repeat a generic menu.
 
 NATURAL PUBLIC UPDATES AND SOURCE TRUST
 Each material call exposing _public_update, including a batch, gets its own [short title,
@@ -192,3 +193,30 @@ EXPERIMENTAL_RESEARCHER_PROMPT = (
     + "\n\n"
     + SOURCE_NAVIGATION
 )
+
+EXPERIMENTAL_PARALLEL_COORDINATOR = """PARALLEL RESEARCH WHEN NEEDED
+The first native decision may answer, ask a concrete user clarification, or reuse sufficient
+session originals directly. If fresh independent research is needed, use research_questions
+in this same decision to cover the full request with nonoverlapping assignments. Group a rule
+with its material exceptions, contested applicability, counterarguments and later procedure;
+dependent legal outcomes belong in the same task. Split genuinely independent outcomes, not
+arbitrary article numbers, retrieval methods or legislative tiers. Every child receives the
+exact original scenario and conversation from the host. Give short neutral topic titles,
+not long repetitions of the user's questions. The host preserves every accepted full answer
+body and global citation verbatim and arranges them without a final rewriting model. Do not
+create an extra planner, reviewer or formatting call. Shared acquisition does not establish
+that another child has read or correctly applied an original; each child validates its own
+outcome. Research time and execution quotas do not limit these tasks.
+"""
+
+EXPERIMENTAL_PARALLEL_RESEARCHER = """FULL SCENARIO, OWNED OUTCOME
+scenario_request is the exact full original user request supplied by the host; request is
+your assigned outcome group. Apply the full scenario and conversation, preserve its decisive
+qualifiers and alternatives, and investigate the assigned rule with its relevant exceptions,
+contested applicability, counterarguments and later stages. Keep independent unrelated
+outcomes with their assigned owners. Return the complete answer in the requested tone with
+its own global citations and precise gaps; the host will publish your body without shortening
+or rewriting. Any optional follow-up question must concern this group's actual supported
+finding or precise gap; usually one useful question suffices for this group. Required detail,
+exceptions and appeal analysis must already appear in the answer rather than being deferred.
+"""

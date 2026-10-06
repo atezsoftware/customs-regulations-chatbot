@@ -952,6 +952,26 @@ class Harness:
         answer: str | None = None
         try:
             while True:
+                assembled = self.context.services.get("assembled_answer")
+                if (
+                    not self.context.depth
+                    and self.context.services.get("experimental_parallel") is True
+                    and isinstance(assembled, str)
+                    and assembled.strip()
+                ):
+                    self.context.check_active()
+                    blocked = self.draft_guard(assembled) if self.draft_guard else None
+                    if blocked is None:
+                        self.last_draft = answer = assembled
+                        status = (
+                            OutcomeStatus.PARTIAL
+                            if self.context.services.get("independent_partial") is True
+                            else OutcomeStatus.FOUND
+                        )
+                        self.stop_reason = "independent_answers_assembled"
+                        break
+                    self.publication_gap = blocked
+                    self.context.services.pop("assembled_answer", None)
                 if self.context.services.get("question_research_started") is True:
                     self.context.check_active()
                 else:

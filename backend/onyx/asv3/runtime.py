@@ -38,6 +38,7 @@ from onyx.asv3.models import (
     ToolSpec,
 )
 from onyx.asv3.outcome_map import OutcomeMap
+from onyx.asv3.parallel_answers import ParallelAnswerReceipts
 from onyx.asv3.progress import (
     ProgressEvent,
     ProgressReporter,
@@ -55,6 +56,7 @@ from onyx.asv3.session_research import (
     retain_session_research,
     session_research_checkpoint,
 )
+from onyx.asv3.shared_reads import SharedReads
 from onyx.asv3.source_tools import build_source_specs
 from onyx.asv3.supplemental_tools import (
     ScenarioState,
@@ -211,6 +213,7 @@ def run_asv3_loop(
     include_citations: bool,
     cache: CacheBackend,
     research_profile: str = "deep",
+    parallel_research: bool = False,
     research_llm: LLM | None = None,
     resume_message_id: int | None = None,
     custom_agent_prompt: str | None = None,
@@ -278,16 +281,32 @@ def run_asv3_loop(
             previous.get("research_profile")
             or ("deep" if "question_research" in previous else "normal")
         )
+        saved_parallel = previous.get("parallel_research", False)
+        if type(saved_parallel) is not bool:
+            raise ValueError("Invalid saved ASv3 parallel research mode")
+        parallel_research = saved_parallel
     if research_profile not in {"normal", "deep", "experimental"}:
         raise ValueError("Unknown ASv3 research profile")
+    if parallel_research and research_profile != "experimental":
+        raise ValueError("Parallel research requires the Experimental profile")
     if research_profile == "experimental":
         research_llm = None
     context.language = profile.language
     context.services["research_profile"] = research_profile
-    context.services["independent_question_mode"] = research_profile == "deep"
+    context.services["experimental_parallel"] = parallel_research
+    context.services["independent_question_mode"] = (
+        research_profile == "deep" or parallel_research
+    )
+    if parallel_research:
+        context.services["scenario_request"] = question
     context.corpus_only = not (allow_external and profile.external_requested)
     ledger = EvidenceLedger()
     context.services["evidence"] = ledger
+    parallel_answers = (
+        ParallelAnswerReceipts(context, question, user_id=str(user.id))
+        if parallel_research
+        else None
+    )
     source_reviews = (
         LegalSourceReviews(context, question)
         if research_profile == "experimental"
@@ -326,6 +345,26 @@ def run_asv3_loop(
         vision_llm=research_llm or llm,
         allow_numbered_title_fallback=research_profile == "experimental",
     )
+    if parallel_research:
+
+        def shared_producer(caller: RunContext) -> RunContext:
+            return RunContext(
+                run_id=caller.run_id,
+                language=caller.language,
+                scope=caller.scope,
+                services=caller.services,
+                budget=caller.budget,
+                deadline=caller.deadline,
+                research_deadline=caller.research_deadline,
+                depth=caller.depth,
+                max_depth=caller.max_depth,
+                corpus_only=caller.corpus_only,
+                cancelled=context.is_cancelled,
+            )
+
+        context.services["shared_reads"] = SharedReads(
+            fence=broker.shared_read_fence, producer_context=shared_producer
+        )
     context.services["legal_source_navigation_acquire"] = (
         broker.related_sources_for_evidence
     )
@@ -504,6 +543,7 @@ def run_asv3_loop(
                 if source_reviews is not None
                 else PROMPT_VERSION,
                 research_profile=research_profile,
+                parallel_research=parallel_research,
                 execution_mode="native",
                 native_coordinator_sampling=model.native_sampling_snapshot(),
                 scope=context.scope,
@@ -528,6 +568,10 @@ def run_asv3_loop(
                 snapshot["legal_source_reviews"] = source_reviews.export()
             if authority_requirements is not None:
                 snapshot["authority_requirements"] = authority_requirements.export()
+            if parallel_answers is not None:
+                snapshot["parallel_answers"] = parallel_answers.export()
+                # Child acceptance may occur after the caller captured its root snapshot.
+                snapshot["evidence"] = ledger.export()
             save_asv3_checkpoint(
                 message_id=assistant_message_id, user_id=user.id, snapshot=snapshot
             )
@@ -699,7 +743,11 @@ def run_asv3_loop(
             def submit_child_answer(
                 args: dict[str, JsonValue], _context: RunContext
             ) -> ToolOutcome:
-                candidate = str(args["answer"]).strip()
+                candidate = (
+                    str(args["answer"])
+                    if parallel_research
+                    else str(args["answer"]).strip()
+                )
                 gap = source_publication_gap(
                     candidate, researcher_model.last_call_id, run_context=child
                 )
@@ -752,6 +800,16 @@ def run_asv3_loop(
                     consumes_tool_budget=False,
                 )
             )
+
+        def child_checkpoint(snapshot: dict[str, JsonValue]) -> None:
+            callback = child.services.get("record_child_checkpoint")
+            if not callable(callback) or harness is None:
+                raise ValueError(
+                    "Parallel child requires its task-bound checkpoint writer"
+                )
+            callback(snapshot)
+            checkpoint(harness.snapshot())
+
         child_harness = Harness(
             request=task,
             context=child,
@@ -759,6 +817,7 @@ def run_asv3_loop(
             decide=researcher_model.decide,
             evidence=ledger,
             on_receipt=record,
+            checkpoint=child_checkpoint if parallel_research and independent else None,
             progress=progress,
             report_terminal=False,
             max_workers=2,
@@ -778,22 +837,54 @@ def run_asv3_loop(
             ):
                 child_registry.register(spec)
         result = child_harness.run()
+        data: dict[str, JsonValue] = {
+            "evidence_numbers": sorted(
+                {n for receipt in result.receipts for n in receipt.evidence_ids}
+            ),
+            "questions": result.questions,
+            "facts": result.facts,
+        }
+        if parallel_answers is not None and independent and result.answer:
+            if question_research is None:
+                raise ValueError(
+                    "Parallel answer requires its root assignment registry"
+                )
+            assignment = question_research.assignment(str(child.services["task_id"]))
+            receipt_id = parallel_answers.seal(
+                child,
+                assignment=assignment,
+                answer=result.answer,
+                status=result.status,
+                model_call_id=researcher_model.last_call_id or "",
+                ledger=ledger,
+                validate_body=lambda: source_publication_gap(
+                    result.answer or "",
+                    researcher_model.last_call_id,
+                    run_context=child,
+                    requires_sources=bool(
+                        extract_citation_numbers(result.answer or "")
+                    ),
+                ),
+                source_state={"owner": str(child.services["task_id"])},
+            )
+            data["parallel_answer_receipt"] = receipt_id
         return ToolOutcome(
             status=result.status,
             summary=result.answer or ""
             if independent
             else (result.answer or "Research incomplete")[:12000],
-            data={
-                "evidence_numbers": sorted(
-                    {n for receipt in result.receipts for n in receipt.evidence_ids}
-                ),
-                "questions": result.questions,
-                "facts": result.facts,
-            },
+            data=data,
         )
 
-    workers = WorkerPool(context, researcher, progress=progress)
-    question_research = QuestionResearch(context, workers, initial_questions(question))
+    workers = WorkerPool(
+        context,
+        researcher,
+        progress=progress,
+        max_workers=2 if parallel_research else 4,
+    )
+    question_research = QuestionResearch(
+        context, workers, initial_questions(question), host_assembly=parallel_research
+    )
     context.services["registry"] = registry
     external_specs = build_external_specs(
         tools,
@@ -813,8 +904,12 @@ def run_asv3_loop(
     )
     for spec in (
         common_specs
-        + workers.tool_specs()
-        + (question_research.tool_specs() if research_profile == "deep" else [])
+        + (workers.tool_specs() if not parallel_research else [])
+        + (
+            question_research.tool_specs()
+            if research_profile == "deep" or parallel_research
+            else []
+        )
         + build_research_specs(research_state, ledger)
     ):
         registry.register(spec)
@@ -913,6 +1008,34 @@ def run_asv3_loop(
             gap = question_research.preservation_gap(answer)
             if gap is not None:
                 return gap
+        if parallel_answers is not None and question_research.answers:
+            for item in question_research.answers:
+                gap = validate_parallel_answer(item)
+                if gap is not None:
+                    return gap
+            accepted_numbers = set(extract_citation_numbers(answer))
+            if authority_requirements is not None:
+                authority_gap = authority_requirements.publication_gap(
+                    answer, None, context, ledger, validated_delivered=accepted_numbers
+                )
+                if authority_gap is not None:
+                    return ToolOutcome(
+                        status=OutcomeStatus.PARTIAL,
+                        summary="Retained governing source requirement is unresolved",
+                        data=authority_gap,
+                    )
+            if source_reviews is not None:
+                return source_reviews.publication_gap_for_assembly(
+                    answer,
+                    context,
+                    ledger,
+                    accepted_owners={
+                        str(item["task_id"])
+                        for item in question_research.answers
+                        if isinstance(item.get("parallel_answer_receipt"), str)
+                    },
+                )
+            return None
         if (
             host_gap_assembly
             and not extract_citation_numbers(answer)
@@ -937,6 +1060,57 @@ def run_asv3_loop(
     question_research.repair_guard = lambda answer: source_publication_gap(
         answer, model.last_call_id
     )
+
+    def validate_parallel_answer(item: dict[str, JsonValue]) -> ToolOutcome | None:
+        if parallel_answers is None:
+            raise ValueError("Parallel body validation requires its host receipts")
+        task_id = str(item["task_id"])
+        assignment = question_research.assignment(task_id)
+        for key in (
+            "question_id",
+            "question",
+            "answer_title",
+            "parent_question_ids",
+            "outcome_ids",
+        ):
+            if item.get(key) != assignment.get(key):
+                raise ValueError("Parallel answer assignment changed")
+        body = str(item["answer"])
+        if item.get("host_gap") is True:
+            if (
+                item.get("parallel_answer_receipt") is not None
+                or body != question_research.incomplete_answer(context.language)
+                or item.get("status") != OutcomeStatus.PARTIAL.value
+            ):
+                raise ValueError("Unaccepted parallel body is not a precise host gap")
+            return None
+        receipt_id = item.get("parallel_answer_receipt")
+        if not isinstance(receipt_id, str):
+            raise ValueError("Parallel body is missing its accepted receipt")
+        owner = context.child()
+        owner.services["task_id"] = task_id
+        owner.services["task_outcome_ids"] = assignment.get("outcome_ids", [])
+        accepted_call = parallel_answers.model_call_id(receipt_id)
+        parallel_answers.verify(
+            context,
+            receipt_id=receipt_id,
+            task_id=task_id,
+            assignment=assignment,
+            answer=body,
+            status=OutcomeStatus(str(item["status"])),
+            ledger=ledger,
+            validate_body=lambda: source_publication_gap(
+                body,
+                accepted_call,
+                run_context=owner,
+                requires_sources=bool(extract_citation_numbers(body)),
+            ),
+            source_state={"owner": task_id},
+        )
+        return None
+
+    if parallel_answers is not None:
+        question_research.accepted_answer_guard = validate_parallel_answer
 
     def submit_answer(args: dict[str, JsonValue], child: RunContext) -> ToolOutcome:
         if child.depth or not standalone_answer_call:
@@ -1118,6 +1292,13 @@ def run_asv3_loop(
                 saved_requirements, dict
             ):
                 authority_requirements.restore(saved_requirements, context, question)
+            if parallel_answers is not None:
+                saved_parallel = previous.get("parallel_answers")
+                if not isinstance(saved_parallel, dict):
+                    raise ValueError(
+                        "Parallel checkpoint is missing its accepted answer receipts"
+                    )
+                parallel_answers.restore(saved_parallel, context, question, ledger)
             question_research.restore(previous.get("question_research"))
             worker_state = previous.get("workers")
             if isinstance(worker_state, dict):
@@ -1129,6 +1310,8 @@ def run_asv3_loop(
             if not isinstance(saved_sequence, int):
                 raise ValueError("Invalid checkpoint sequence")
             checkpoint_sequence = saved_sequence
+            if parallel_answers is not None and question_research.answers:
+                question_research.assemble_retained_answers()
         result = harness.run()
         context.check_active()
         final = (
@@ -1136,7 +1319,9 @@ def run_asv3_loop(
             or partial
             or result.answer
             or profile.notifications["failed"][1]
-        ).strip()
+        )
+        if not parallel_research:
+            final = final.strip()
         publication_status = (
             result.status
             if result.answer and not clarification and not partial

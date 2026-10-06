@@ -4,13 +4,17 @@ import copy
 import hashlib
 import re
 import threading
-from typing import Callable, cast
+from typing import Callable, TypedDict, cast
 
 from pydantic import JsonValue
 
 from onyx.asv3.citation_numbers import extract_citation_numbers
 from onyx.asv3.models import OutcomeStatus, RunContext, ToolOutcome, ToolSpec
 from onyx.asv3.workers import WorkerPool
+
+
+class _AssignmentBinding(TypedDict, total=False):
+    assignment_id: str
 
 
 class QuestionResearch:
@@ -21,16 +25,46 @@ class QuestionResearch:
         context: RunContext,
         workers: WorkerPool,
         original_questions: list[str],
+        *,
+        host_assembly: bool = False,
     ) -> None:
         self.context = context
         self.workers = workers
         self.original_questions = tuple(original_questions)
+        self.host_assembly = host_assembly
         self.assignments: list[dict[str, JsonValue]] = []
         self.answers: list[dict[str, JsonValue]] = []
         self.answer_revisions: list[dict[str, JsonValue]] = []
         self._lock = threading.RLock()
         self.publish_guard: Callable[[str], ToolOutcome | None] | None = None
         self.repair_guard: Callable[[str], ToolOutcome | None] | None = None
+        self.accepted_answer_guard: (
+            Callable[[dict[str, JsonValue]], ToolOutcome | None] | None
+        ) = None
+
+    def assignment(self, task_id: str) -> dict[str, JsonValue]:
+        with self._lock:
+            matches = [
+                item for item in self.assignments if item.get("task_id") == task_id
+            ]
+            if len(matches) != 1:
+                raise ValueError("Unknown independent task assignment")
+            return copy.deepcopy(matches[0])
+
+    def assemble_retained_answers(self) -> ToolOutcome:
+        return self.assemble_answers(
+            {"order": [item["question_id"] for item in self.assignments]}, self.context
+        )
+
+    @staticmethod
+    def incomplete_answer(language: str) -> str:
+        return (
+            "Bu alt sorunun kaynak araştırması tamamlanamadı; kesin bir sonuç "
+            "verebilmek için ilgili özgün hükümler ve koşulları henüz doğrulanamadı."
+            if language.startswith("tr")
+            else "Research for this subquestion is incomplete; the applicable original "
+            "provisions and their conditions have not yet been established."
+        )
 
     @staticmethod
     def answer_hash(answer: str) -> str:
@@ -147,6 +181,18 @@ class QuestionResearch:
                 summary="Research each material subquestion separately before publication.",
                 data={"missing": "independent question results"},
             )
+        if self.host_assembly:
+            expected = {str(item["question_id"]): item for item in self.answers}
+            order = [str(item["question_id"]) for item in self.assignments]
+            if set(order) != set(expected) or answer != self._arranged_text(
+                order, expected
+            ):
+                return ToolOutcome(
+                    status=OutcomeStatus.PARTIAL,
+                    summary="Publish only the complete deterministic arrangement of accepted answer bodies. No extra claims, omissions, repetitions or rewrites are permitted.",
+                    data={"changed_parallel_arrangement": True},
+                )
+            return None
         missing = [
             item["question_id"]
             for item in self.answers
@@ -160,12 +206,28 @@ class QuestionResearch:
             )
         return None
 
+    @staticmethod
+    def _arranged_text(
+        order: list[str], expected: dict[str, dict[str, JsonValue]]
+    ) -> str:
+        parts: list[str] = []
+        for index, identifier in enumerate(order, 1):
+            item = expected[identifier]
+            title, body = item.get("answer_title"), str(item["answer"])
+            parts.append(
+                f"## {index}. {title}\n\n{body}"
+                if isinstance(title, str) and title.strip() and len(title) <= 120
+                else body
+            )
+        return "\n\n".join(parts)
+
     def _validated_questions(self, raw: JsonValue) -> list[dict[str, JsonValue]]:
         if not isinstance(raw, list) or not raw:
             raise ValueError("Supply independent material subquestions")
         questions: list[dict[str, JsonValue]] = []
         covered: set[int] = set()
         identifiers: set[str] = set()
+        assigned_outcomes: set[str] = set()
         for entry in raw:
             if not isinstance(entry, dict):
                 raise ValueError("Invalid independent question")
@@ -204,6 +266,14 @@ class QuestionResearch:
                 or "\r" in answer_title
             ):
                 raise ValueError("An answer title must be a nonempty single line")
+            if (
+                self.host_assembly
+                and isinstance(answer_title, str)
+                and (len(answer_title) > 120 or extract_citation_numbers(answer_title))
+            ):
+                raise ValueError(
+                    "Use a short neutral topic title without citation numbers"
+                )
             outcomes = entry.get("outcome_ids")
             if outcomes is not None:
                 from onyx.asv3.outcome_map import OutcomeMap
@@ -225,6 +295,11 @@ class QuestionResearch:
                         "Assignment outcome_ids require recorded outcomes; omit the optional binding or declare _outcomes on this same action"
                     )
                 known = set(state.outcome_ids())
+                if self.host_assembly and assigned_outcomes.intersection(outcomes):
+                    raise ValueError(
+                        "Each outcome must have one owning assignment; group dependent issues"
+                    )
+                assigned_outcomes.update(outcomes)
                 unknown = set(outcomes) - known
                 if unknown:
                     raise ValueError(
@@ -258,6 +333,8 @@ class QuestionResearch:
                 status=OutcomeStatus.DENIED, summary="Root assignment only"
             )
         if self.answers:
+            if self.host_assembly:
+                return self.assemble_retained_answers()
             return ToolOutcome(
                 status=OutcomeStatus.FOUND,
                 summary="Existing independent answers retained; do not duplicate research.",
@@ -279,6 +356,11 @@ class QuestionResearch:
             for item in self.assignments:
                 # A worker's checkpoint cannot observe its task without its question binding.
                 with self._lock:
+                    binding: _AssignmentBinding = (
+                        {"assignment_id": str(item["question_id"])}
+                        if self.host_assembly
+                        else {}
+                    )
                     task_id = self.workers.spawn(
                         str(item["question"]),
                         request_context=context,
@@ -291,6 +373,7 @@ class QuestionResearch:
                         ]
                         if isinstance(item.get("outcome_ids"), list)
                         else None,
+                        **binding,
                     )
                     item["task_id"] = task_id
         available = {item.task_id: item for item in self.workers.results(full=True)}
@@ -311,14 +394,15 @@ class QuestionResearch:
             task_id = question["task_id"]
             result = results.get(str(task_id))
             body = result.outcome.summary if result and result.outcome else ""
+            receipt_id = (
+                result.outcome.data.get("parallel_answer_receipt")
+                if result and result.outcome
+                else None
+            )
+            if self.host_assembly and not isinstance(receipt_id, str):
+                body = ""
             if not body.strip():
-                body = (
-                    "Bu alt sorunun kaynak araştırması tamamlanamadı; kesin bir sonuç "
-                    "verebilmek için ilgili özgün hükümler ve koşulları henüz doğrulanamadı."
-                    if context.language.startswith("tr")
-                    else "Research for this subquestion is incomplete; the applicable original "
-                    "provisions and their conditions have not yet been established."
-                )
+                body = self.incomplete_answer(context.language)
             answers.append(
                 {
                     "question_id": question["question_id"],
@@ -326,13 +410,23 @@ class QuestionResearch:
                     "answer_title": question.get("answer_title"),
                     "parent_question_ids": question["parent_question_ids"],
                     "task_id": task_id,
-                    "status": result.outcome.status.value
+                    "status": OutcomeStatus.PARTIAL.value
+                    if self.host_assembly and not isinstance(receipt_id, str)
+                    else result.outcome.status.value
                     if result and result.outcome
                     else result.status.value
                     if result
                     else "interrupted",
                     "answer": body,
                     "answer_hash": self.answer_hash(body),
+                    **(
+                        {
+                            "parallel_answer_receipt": receipt_id,
+                            "host_gap": not isinstance(receipt_id, str),
+                        }
+                        if self.host_assembly
+                        else {}
+                    ),
                     "evidence_numbers": list(extract_citation_numbers(body)),
                     **(
                         {"outcome_ids": copy.deepcopy(question["outcome_ids"])}
@@ -344,6 +438,8 @@ class QuestionResearch:
         with self._lock:
             self.answers = answers
             self._retain()
+        if self.host_assembly:
+            return self.assemble_retained_answers()
         return ToolOutcome(
             status=OutcomeStatus.FOUND,
             summary="Independent question answers retained in full for arrangement.",
@@ -353,6 +449,11 @@ class QuestionResearch:
     def repair_question_answer(
         self, arguments: dict[str, JsonValue], context: RunContext
     ) -> ToolOutcome:
+        if self.host_assembly:
+            return ToolOutcome(
+                status=OutcomeStatus.DENIED,
+                summary="Accepted parallel bodies are immutable; corrections require their owning researcher's source validation.",
+            )
         if context.depth:
             return ToolOutcome(status=OutcomeStatus.DENIED, summary="Root repair only")
         identifier, expected = (
@@ -467,25 +568,38 @@ class QuestionResearch:
             or set(order) != set(expected)
         ):
             raise ValueError("Arrange every independent question ID exactly once")
+        if self.host_assembly and order != [
+            item["question_id"] for item in self.assignments
+        ]:
+            raise ValueError(
+                "Parallel arrangement must preserve its accepted assignment order"
+            )
         connections = arguments.get("connections", "")
+        if self.host_assembly and connections:
+            return ToolOutcome(
+                status=OutcomeStatus.DENIED,
+                summary="Host arrangement cannot add unexamined legal connections. Keep dependent outcomes in the same assignment.",
+            )
         if not isinstance(connections, str):
             raise ValueError("Connections must be text")
         if connections.strip() and not any(
             item.get("evidence_numbers") for item in self.answers
         ):
             raise ValueError("Connections require recorded original evidence")
-        parts: list[str] = []
-        for index, identifier in enumerate(order, 1):
+        for identifier in order:
             item = expected[str(identifier)]
-            title, body = item.get("answer_title"), str(item["answer"])
-            parts.append(
-                f"## {index}. {title}\n\n{body}"
-                if isinstance(title, str) and title.strip() and len(title) <= 120
-                else body
-            )
+            if self.host_assembly:
+                if self.accepted_answer_guard is None:
+                    return ToolOutcome(
+                        status=OutcomeStatus.DENIED,
+                        summary="Parallel arrangement requires accepted child delivery validation",
+                    )
+                rejection = self.accepted_answer_guard(item)
+                if rejection is not None:
+                    return rejection
+        answer = self._arranged_text(cast(list[str], order), expected)
         if connections.strip():
-            parts.append(connections)
-        answer = "\n\n".join(parts)
+            answer += "\n\n" + connections
         if self.publish_guard:
             gap = self.publish_guard(answer)
             if gap is not None:
@@ -499,7 +613,7 @@ class QuestionResearch:
         )
 
     def tool_specs(self) -> list[ToolSpec]:
-        return [
+        specs = [
             ToolSpec(
                 name="research_questions",
                 description="In the first decision, inspect the conversation and retained session originals, then separate every material semantic subquestion. Preserve alternatives and prose outcomes; map each to its original question number. Each gets the same full scenario and retained originals with a separate history, without time or execution quotas. Research only new or unresolved issues. Related questions remain separate. Assignments run in parallel; complete answers return without shortening. Give each a brief neutral answer_title for presentation.",
@@ -629,3 +743,16 @@ class QuestionResearch:
                 consumes_tool_budget=False,
             ),
         ]
+        if self.host_assembly:
+            description = (
+                "When fresh independent research is needed, assign all material outcomes once. "
+                "Group issues whose legal conclusions depend on each other in the same task; "
+                "do not split a rule from its exceptions, disputed applicability or later procedure. "
+                "Every task receives the exact full original request, conversation and session originals. "
+                "Use concise neutral answer_title labels and scenario-specific queries. Independent tasks "
+                "run concurrently and their complete validated bodies are arranged verbatim by the host, "
+                "without another answer-writing model. Do not use this for greetings, clarification or "
+                "a complete answer already supported by retained originals. Do not create overlapping work."
+            )
+            return [specs[0].model_copy(update={"description": description})]
+        return specs

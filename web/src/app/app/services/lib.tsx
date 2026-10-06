@@ -166,6 +166,7 @@ export interface SendMessageParams {
   atezSearchV2?: boolean;
   atezSearchV3?: boolean;
   experimentalResearch?: boolean;
+  experimentalParallelResearch?: boolean;
   asv3ResumeMessageId?: number;
   asv3AllowExternal?: boolean;
   enabledToolIds?: number[];
@@ -195,6 +196,7 @@ export async function* sendMessage({
   deepResearch,
   atezSearchV3,
   experimentalResearch,
+  experimentalParallelResearch,
   asv3ResumeMessageId,
   asv3AllowExternal,
   enabledToolIds,
@@ -218,18 +220,25 @@ export async function* sendMessage({
     atez_search: false,
     atez_search_v2: false,
     atez_search_v3: Boolean(
-      (atezSearchV3 || experimentalResearch) && !deepResearch
+      (atezSearchV3 || experimentalResearch || experimentalParallelResearch) &&
+      !deepResearch
     ),
     asv3_research_profile: deepResearch
       ? "deep"
-      : experimentalResearch
+      : experimentalResearch || experimentalParallelResearch
         ? "experimental"
         : atezSearchV3
           ? "normal"
           : "deep",
+    ...(experimentalParallelResearch && !deepResearch
+      ? { asv3_parallel_research: true }
+      : {}),
     asv3_resume_message_id: asv3ResumeMessageId,
     asv3_allow_external: Boolean(
-      (atezSearchV3 || experimentalResearch || deepResearch) &&
+      (atezSearchV3 ||
+        experimentalResearch ||
+        experimentalParallelResearch ||
+        deepResearch) &&
       asv3AllowExternal
     ),
     allowed_tool_ids: enabledToolIds,

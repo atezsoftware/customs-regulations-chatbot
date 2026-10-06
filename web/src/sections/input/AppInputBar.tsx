@@ -91,12 +91,14 @@ export interface AppInputBarProps {
   atezSearchV2Enabled?: boolean;
   atezSearchV3Enabled?: boolean;
   experimentalResearchEnabled?: boolean;
+  experimentalParallelResearchEnabled?: boolean;
   setPresentingDocument?: (document: MinimalOnyxDocument) => void;
   toggleDeepResearch: () => void;
   toggleAtezSearch?: () => void;
   toggleAtezSearchV2?: () => void;
   toggleAtezSearchV3?: () => void;
   toggleExperimentalResearch?: () => void;
+  toggleExperimentalParallelResearch?: () => void;
   isMultiModelActive?: boolean;
   disabled: boolean;
   awaitingPreferredSelection?: boolean;
@@ -123,9 +125,11 @@ const AppInputBar = React.memo(
     deepResearchEnabled,
     atezSearchV3Enabled = false,
     experimentalResearchEnabled = false,
+    experimentalParallelResearchEnabled = false,
     toggleDeepResearch,
     toggleAtezSearchV3,
     toggleExperimentalResearch,
+    toggleExperimentalParallelResearch,
     isMultiModelActive,
     setPresentingDocument,
     disabled,
@@ -627,12 +631,12 @@ const AppInputBar = React.memo(
           "flex justify-between items-center w-full",
           isSearchMode
             ? "opacity-0 p-0 h-0 overflow-hidden pointer-events-none"
-            : "opacity-100 p-1 h-11 pointer-events-auto",
+            : "opacity-100 p-1 min-h-11 pointer-events-auto",
           "transition-all duration-150"
         )}
       >
         {/* Bottom left controls */}
-        <div className="flex flex-row items-center">
+        <div className="flex flex-row flex-1 min-w-0 items-center">
           {isAdmin && (
             <FilePickerPopover
               onFileClick={handleFileClick}
@@ -671,7 +675,7 @@ const AppInputBar = React.memo(
           <div
             data-testid="actions-container"
             className={cn(
-              "flex flex-row items-center",
+              "flex flex-row flex-wrap items-center",
               controlsLoading && "invisible"
             )}
           >
@@ -755,6 +759,25 @@ const AppInputBar = React.memo(
                     Experimental
                   </SelectButton>
                 )}
+                {showAtezSearch && toggleExperimentalParallelResearch && (
+                  <SelectButton
+                    disabled={disabled || isMultiModelActive}
+                    variant="select-light"
+                    icon={SvgSparkle}
+                    onClick={toggleExperimentalParallelResearch}
+                    state={
+                      experimentalParallelResearchEnabled ? "selected" : "empty"
+                    }
+                    foldable={false}
+                    tooltip={
+                      isMultiModelActive
+                        ? "Experimental Paralel runs with one model. Remove extra models to use it."
+                        : "Bağımsız konuları ayrı paralel araştırma kollarında inceleyen deneysel araştırma"
+                    }
+                  >
+                    Experimental Paralel
+                  </SelectButton>
+                )}
               </>
             )}
 
@@ -788,7 +811,7 @@ const AppInputBar = React.memo(
         </div>
 
         {/* Bottom right controls */}
-        <div className="flex flex-row items-center gap-1">
+        <div className="flex flex-row shrink-0 items-center gap-1">
           {showMicButton &&
             (sttEnabled ? (
               <MicrophoneButton

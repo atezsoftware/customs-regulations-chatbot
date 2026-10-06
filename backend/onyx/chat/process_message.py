@@ -1641,6 +1641,7 @@ def _run_models(
                         include_citations=setup.new_msg_req.include_citations,
                         cache=setup.cache,
                         research_profile=research_profile,
+                        parallel_research=setup.new_msg_req.asv3_parallel_research,
                         resume_message_id=setup.new_msg_req.asv3_resume_message_id,
                         custom_agent_prompt=setup.custom_agent_prompt,
                         allow_external=setup.new_msg_req.asv3_allow_external,

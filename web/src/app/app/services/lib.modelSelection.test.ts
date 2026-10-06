@@ -206,6 +206,7 @@ it.each([undefined, false, true])(
     );
     expect(payload.atez_search_v3).toBe(true);
     expect(payload.asv3_research_profile).toBe("experimental");
+    expect(payload).not.toHaveProperty("asv3_parallel_research");
     expect(payload.deep_research).toBe(false);
     expect(payload.atez_search).toBe(false);
     expect(payload.atez_search_v2).toBe(false);
@@ -214,6 +215,51 @@ it.each([undefined, false, true])(
       model_provider: "Vertex Gemini",
       model_provider_type: "vertex_ai",
       model_version: "gemini-3.8-pro",
+    });
+  }
+);
+
+it.each([
+  [undefined, undefined],
+  [101, false],
+  [undefined, true],
+  [101, true],
+])(
+  "preserves selected model and external consent in parallel send/resume (%s, %s)",
+  async (asv3ResumeMessageId, asv3AllowExternal) => {
+    // Capture POST /api/chat/send-chat-message without starting a model call.
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: false,
+      status: 400,
+      json: async () => ({ detail: "capture" }),
+    });
+    await expect(
+      sendMessage({
+        message: "Question",
+        parentMessageId: 88,
+        chatSessionId: "session-1",
+        filters: null,
+        experimentalParallelResearch: true,
+        asv3ResumeMessageId,
+        asv3AllowExternal,
+        modelProvider: "Vertex Gemini",
+        modelProviderType: "vertex_ai",
+        modelVersion: "gemini-3.8-flash",
+      }).next()
+    ).rejects.toThrow("capture");
+    const payload = JSON.parse(
+      String(jest.mocked(global.fetch).mock.calls[0]![1]?.body)
+    );
+    expect(payload.atez_search_v3).toBe(true);
+    expect(payload.asv3_research_profile).toBe("experimental");
+    expect(payload.asv3_parallel_research).toBe(true);
+    expect(payload.deep_research).toBe(false);
+    expect(payload.asv3_resume_message_id).toBe(asv3ResumeMessageId);
+    expect(payload.asv3_allow_external).toBe(asv3AllowExternal === true);
+    expect(payload.llm_override).toEqual({
+      model_provider: "Vertex Gemini",
+      model_provider_type: "vertex_ai",
+      model_version: "gemini-3.8-flash",
     });
   }
 );

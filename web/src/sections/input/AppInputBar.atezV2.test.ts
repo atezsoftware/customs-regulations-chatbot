@@ -6,16 +6,28 @@ afterEach(() => {
 });
 
 it.each([
-  [false, false, false, false, "deep"],
-  [true, false, false, true, "normal"],
-  [false, true, false, false, "deep"],
-  [true, true, false, false, "deep"],
-  [false, false, true, true, "experimental"],
-  [true, false, true, true, "experimental"],
-  [false, true, true, false, "deep"],
+  [false, false, false, false, false, "deep", false],
+  [true, false, false, false, true, "normal", false],
+  [false, true, false, false, false, "deep", false],
+  [true, true, false, false, false, "deep", false],
+  [false, false, true, false, true, "experimental", false],
+  [true, false, true, false, true, "experimental", false],
+  [false, true, true, false, false, "deep", false],
+  [false, false, false, true, true, "experimental", true],
+  [true, false, false, true, true, "experimental", true],
+  [false, false, true, true, true, "experimental", true],
+  [false, true, false, true, false, "deep", false],
 ])(
-  "sends mutually exclusive research modes (%s, %s, %s)",
-  async (single, deep, experimental, expectedASv3, profile) => {
+  "sends mutually exclusive research modes (%s, %s, %s, %s)",
+  async (
+    single,
+    deep,
+    experimental,
+    parallel,
+    expectedASv3,
+    profile,
+    expectedParallel
+  ) => {
     global.fetch = jest.fn().mockResolvedValue({
       ok: false,
       status: 400,
@@ -30,6 +42,7 @@ it.each([
         atezSearchV3: Boolean(single),
         deepResearch: Boolean(deep),
         experimentalResearch: Boolean(experimental),
+        experimentalParallelResearch: Boolean(parallel),
         atezSearch: true,
         atezSearchV2: true,
       }).next()
@@ -40,6 +53,11 @@ it.each([
     expect(payload.atez_search_v3).toBe(expectedASv3);
     expect(payload.deep_research).toBe(deep);
     expect(payload.asv3_research_profile).toBe(profile);
+    if (expectedParallel) {
+      expect(payload.asv3_parallel_research).toBe(true);
+    } else {
+      expect(payload).not.toHaveProperty("asv3_parallel_research");
+    }
     expect(payload.atez_search).toBe(false);
     expect(payload.atez_search_v2).toBe(false);
   }

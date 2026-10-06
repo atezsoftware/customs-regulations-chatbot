@@ -271,6 +271,7 @@ class AuthorityRequirements:
         ledger: EvidenceLedger,
         *,
         native_gap: dict[str, JsonValue] | None = None,
+        validated_delivered: set[int] | None = None,
     ) -> dict[str, JsonValue] | None:
         """Require acquired support or a precise disclosure, without judging entailment."""
         self._fence(context)
@@ -281,7 +282,9 @@ class AuthorityRequirements:
                 )
             self._remember(answer, native_gap, context)
             delivered = (
-                ledger.completely_delivered(model_call_id)
+                set(validated_delivered)
+                if validated_delivered is not None
+                else ledger.completely_delivered(model_call_id)
                 if model_call_id is not None
                 else set()
             )

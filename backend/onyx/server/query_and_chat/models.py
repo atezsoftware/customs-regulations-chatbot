@@ -130,6 +130,7 @@ class SendMessageRequest(BaseModel):
     # ASv3 owns an independent adaptive research harness.
     atez_search_v3: bool = False
     asv3_research_profile: Literal["normal", "deep", "experimental"] = "deep"
+    asv3_parallel_research: bool = False
     asv3_allow_external: bool = False
     asv3_resume_message_id: int | None = None
 
@@ -188,6 +189,12 @@ class SendMessageRequest(BaseModel):
         if self.asv3_research_profile == "experimental" and not self.atez_search_v3:
             raise ValueError(
                 "The experimental profile requires explicit ASv3 selection"
+            )
+        if self.asv3_parallel_research and not (
+            self.atez_search_v3 and self.asv3_research_profile == "experimental"
+        ):
+            raise ValueError(
+                "Parallel experimental research requires the experimental ASv3 profile"
             )
         if self.asv3_resume_message_id is not None and not (
             self.atez_search_v3 or self.deep_research

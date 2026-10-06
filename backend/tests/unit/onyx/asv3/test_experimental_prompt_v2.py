@@ -35,7 +35,7 @@ def test_independent_prompts_reuse_the_complete_baseline_map_once(prompt: str) -
     assert prompt.count(RESEARCH_INSTRUCTIONS) == 1
     assert COORDINATOR_REFERENCE_PROMPT not in prompt
     assert RESEARCHER_REFERENCE_PROMPT not in prompt
-    assert EXPERIMENTAL_PROMPT_VERSION == "asv3-experimental-2026-10-06.6"
+    assert EXPERIMENTAL_PROMPT_VERSION == "asv3-experimental-2026-10-06.7"
 
 
 @pytest.mark.parametrize(
@@ -87,7 +87,7 @@ def test_arguments_and_scenario_branches_are_source_bound_not_categorical() -> N
         "conditional branch beside its outcome and name the fact changing it",
         "same conditions, controversy and uncertainty in quick answers",
         "Complete material exception/objection analysis now",
-        "case-specific optional next task only when a supported finding",
+        "optional follow-up questions grounded in this case's supported findings",
     ):
         assert requirement in RESEARCH_INSTRUCTIONS
 
