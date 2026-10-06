@@ -90,6 +90,14 @@ _BOUND_PREFIX = re.compile(
     r"\s*(?:['’]\s*(?:nun|nin|un|in|nın|inin|unun)\b\s*)?"
     r"(?:[,:(|]\s*)?"
 )
+_UNICODE_ORDINAL = re.compile(r"(?<=\d)['’]?\s*(?:üncü|ıncı)(?=\s+madd)")
+
+
+def _fold_bound_ordinals(text: str) -> str:
+    """Normalize digit-bound ordinal spelling without changing source offsets."""
+    return _UNICODE_ORDINAL.sub(lambda match: folded(match[0]), text)
+
+
 _BOUND_SEPARATOR = re.compile(r"\s*(?:,|\bve\b|\bile\b|\band\b)\s*")
 _ENUMERATION_END = re.compile(r"\s*(?:maddeler[a-z]*|articles?|sections?)\b")
 
@@ -269,6 +277,7 @@ def statute_references(
     *,
     strict_reference_boundaries: bool = False,
     syntactic_reference_binding: bool = False,
+    unicode_ordinals: bool = False,
 ) -> tuple[StatuteReference, ...]:
     # Keep Turkish clause letters distinct while normalizing instrument wording.
     original = text.replace("**", "").replace("__", "")
@@ -282,6 +291,8 @@ def statute_references(
         offsets.extend([index] * len(part))
     offsets.append(len(original))
     normalized = "".join(parts)
+    if unicode_ordinals:
+        normalized = _fold_bound_ordinals(normalized)
     identity_text = folded(normalized)
     found: dict[tuple[str | bool | None, ...], StatuteReference] = {}
     pattern = _STRICT_STATUTE if strict_reference_boundaries else _STATUTE
@@ -613,6 +624,7 @@ def _named_native_references(
     *,
     strict_reference_boundaries: bool = False,
     syntactic_reference_binding: bool = False,
+    unicode_ordinals: bool = False,
 ) -> list[tuple[StatuteReference, str | None]]:
     references = [
         (ref, _reference_name(ref))
@@ -620,6 +632,7 @@ def _named_native_references(
             text,
             strict_reference_boundaries=strict_reference_boundaries,
             syntactic_reference_binding=syntactic_reference_binding,
+            unicode_ordinals=unicode_ordinals,
         )
     ]
     raw_text = text.replace("**", "").replace("__", "")
@@ -635,6 +648,8 @@ def _named_native_references(
             offsets.extend([index] * len(part))
         offsets.append(len(raw_text))
         normalized = "".join(parts)
+        if unicode_ordinals:
+            normalized = _fold_bound_ordinals(normalized)
     for name, numbers in aliases.items():
         if len(numbers) > 1:
             continue
@@ -898,6 +913,102 @@ def explicit_reference_leads(
             if number not in origins:
                 origins.append(number)
     return list(leads.values())
+
+
+def cited_lower_statute_references(
+    answer: str, ledger: EvidenceLedger
+) -> list[dict[str, JsonValue]]:
+    """Bind cited lower originals to literal provision reads, never legal approval."""
+    rows = _native_original_rows(ledger)
+    aliases = _authority_aliases(
+        ledger,
+        rows,
+        strict_reference_boundaries=True,
+        syntactic_reference_binding=True,
+    )
+    own_statutes = {
+        row["citation"]
+        for row in rows
+        if type(row["citation"]) is int
+        and (row.get("instrument_numbers") or row.get("formal_names"))
+    }
+    references: dict[tuple[str, str | None, str, str | None], dict[str, JsonValue]] = {}
+    for unit in assertion_inventory(answer):
+        if unit["presentation_only"]:
+            continue
+        for citation in unit["evidence_numbers"]:
+            item = ledger.get(citation)
+            if (
+                item is None
+                or citation in own_statutes
+                or not _canonical_source(item)
+                or model_evidence_metadata(item.metadata).get("untrusted")
+            ):
+                continue
+            for reference, name in _named_native_references(
+                item.text,
+                aliases,
+                strict_reference_boundaries=True,
+                syntactic_reference_binding=True,
+                unicode_ordinals=True,
+            ):
+                reference = _normalized_native_reference(reference, name, rows)
+                if reference.article is None:
+                    continue
+                key = (
+                    reference.number,
+                    name if not reference.number else None,
+                    reference.article,
+                    reference.qualifier,
+                )
+                record = references.setdefault(
+                    key,
+                    {
+                        "instrument_number": reference.number or None,
+                        "formal_name": name,
+                        "article": reference.article,
+                        "qualifier": reference.qualifier,
+                        "reference_text": reference.reference_text,
+                        "origin_citations": [],
+                        "answer_unit_ids": [],
+                        "matching_original_evidence": _matching_native_rows(
+                            reference, name, rows
+                        ),
+                    },
+                )
+                origins, units = record["origin_citations"], record["answer_unit_ids"]
+                assert isinstance(origins, list) and isinstance(units, list)
+                if citation not in origins:
+                    origins.append(citation)
+                if unit["unit_id"] not in units:
+                    units.append(unit["unit_id"])
+    return list(references.values())
+
+
+def cited_lower_statute_gap(
+    answer: str, ledger: EvidenceLedger, delivered: set[int]
+) -> dict[str, JsonValue] | None:
+    """Require referenced originals to be read before evaluating a cited lower rule."""
+    missing: list[dict[str, JsonValue]] = []
+    for reference in cited_lower_statute_references(answer, ledger):
+        matching = reference["matching_original_evidence"]
+        assert isinstance(matching, list)
+        if not any(
+            type(citation) is int and citation in delivered for citation in matching
+        ):
+            missing.append(reference)
+    if not missing:
+        return None
+    return {
+        "unread_cited_statute_references": missing,
+        "instruction": (
+            "Read the explicitly referenced provisions in these cited lower originals, "
+            "reusing available originals and canonical identities. Assess their actual "
+            "scope and related-source effects before asserting the result. These are "
+            "bounded reading dependencies, not legal approval or a request to collect "
+            "every legislative tier. Preserve independently supported answer detail."
+        ),
+    }
 
 
 _DEFINED_ABBREVIATION = re.compile(r"\(\s*([A-ZÇĞİÖŞÜ][A-ZÇĞİÖŞÜ0-9]{1,11})\s*\)")

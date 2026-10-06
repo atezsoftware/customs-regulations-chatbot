@@ -25,6 +25,10 @@ from onyx.asv3.assertions import (
     AssertionWitness,
     assertion_witness_valid,
 )
+from onyx.asv3.authority import (
+    cited_lower_statute_references,
+    known_statute_source_ids,
+)
 from onyx.asv3.authority_reference_diagnostics import (
     source_contained_reference_catalogue,
 )
@@ -3496,13 +3500,75 @@ class ResearchModel:
             or not isinstance(ledger, EvidenceLedger)
         ):
             return None
+        references = cited_lower_statute_references(view.draft_to_repair, ledger)
+        definitions = {
+            function["name"]: function.get("parameters")
+            for tool in view.tools
+            if isinstance(function := tool.get("function"), dict)
+            and isinstance(function.get("name"), str)
+        }
+        calls: list[CapabilityCall] = []
+        referenced_originals: set[int] = set()
+        for reference in references:
+            matching = reference["matching_original_evidence"]
+            assert isinstance(matching, list)
+            referenced_originals.update(n for n in matching if type(n) is int)
+            # Existing text will be delivered by the next actual model decision.
+            if (
+                matching
+                or "unread_cited_statute_references" not in view.publication_gap
+            ):
+                continue
+            number, formal = reference["instrument_number"], reference["formal_name"]
+            source_name = (
+                f"{number} sayılı Kanun"
+                if isinstance(number, str) and number
+                else formal
+            )
+            if not isinstance(source_name, str) or not source_name:
+                continue
+            source_ids = known_statute_source_ids(source_name, ledger)
+            name = "read_provision" if len(source_ids) == 1 else "read_named_provision"
+            article = str(reference["article"])
+            qualifier = reference["qualifier"]
+            if isinstance(qualifier, str) and qualifier:
+                article = f"{qualifier} {article}"
+            arguments: dict[str, JsonValue] = {"article": article}
+            arguments["source_id" if name == "read_provision" else "source_name"] = (
+                source_ids[0] if name == "read_provision" else source_name
+            )
+            schema = definitions.get(name)
+            if (
+                not isinstance(schema, dict)
+                or not jsonschema.Draft202012Validator(schema).is_valid(arguments)
+                or any(
+                    receipt.call.name == name
+                    and all(
+                        receipt.call.arguments.get(key) == value
+                        for key, value in arguments.items()
+                    )
+                    for receipt in view.receipts
+                )
+            ):
+                continue
+            calls.append(
+                CapabilityCall(
+                    name=name,
+                    arguments=arguments,
+                    call_id="publication-reference-" + uuid4().hex,
+                )
+            )
+        if calls:
+            return self._source_acquisition_decision(calls)
         state = self._related_source_range_continuations(
             reviews.view(self.context, ledger, set(ledger.citation_mapping())),
             view.receipts,
             ledger,
         )
         rows = state.get("reviews")
-        cited = extract_citation_numbers(view.draft_to_repair)
+        cited = (
+            set(extract_citation_numbers(view.draft_to_repair)) | referenced_originals
+        )
         unread = view.publication_gap.get("unread_related_sources")
         rejected_leads: set[str] = set()
         for row in unread if isinstance(unread, list) else []:
@@ -3535,13 +3601,6 @@ class ResearchModel:
         actions = self._related_source_acquisition_state(
             {"reviews": list(eligible.values())}, ledger
         )
-        calls: list[CapabilityCall] = []
-        definitions = {
-            function["name"]: function.get("parameters")
-            for tool in view.tools
-            if isinstance(function := tool.get("function"), dict)
-            and isinstance(function.get("name"), str)
-        }
         for action in actions:
             if not isinstance(action, dict):
                 continue
@@ -3574,6 +3633,11 @@ class ResearchModel:
             )
         if not calls:
             return None
+        return self._source_acquisition_decision(calls)
+
+    @staticmethod
+    def _source_acquisition_decision(calls: list[CapabilityCall]) -> Decision:
+        """Run ordinary scoped tools; acquisition does not create a semantic review."""
         with graph_step(
             "asv3.publication_source_acquisition",
             {

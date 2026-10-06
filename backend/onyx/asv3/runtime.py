@@ -17,7 +17,7 @@ from uuid import UUID
 
 from pydantic import JsonValue
 
-from onyx.asv3.authority import native_named_authority_gap
+from onyx.asv3.authority import cited_lower_statute_gap, native_named_authority_gap
 from onyx.asv3.authority_requirements import AuthorityRequirements
 from onyx.asv3.citation_numbers import extract_citation_numbers
 from onyx.asv3.corpus_tools import CorpusBroker, build_corpus_specs
@@ -1519,6 +1519,14 @@ def run_asv3_loop(
                 summary="Read and cite the named governing original beside its actual legal assertion; a lower source's reference does not supply that original.",
                 data=authority_gap,
             )
+        if context.services.get("asv3_workflow_variant") == ASV3_TUNED_VARIANT:
+            reference_gap = cited_lower_statute_gap(answer, ledger, delivered)
+            if reference_gap is not None:
+                return ToolOutcome(
+                    status=OutcomeStatus.PARTIAL,
+                    summary="Read the governing provisions explicitly referenced by the cited lower originals before assessing their legal effect.",
+                    data=reference_gap,
+                )
         if source_reviews is not None:
             return source_reviews.publication_gap(
                 answer, model_call_id or "", run_context or context, ledger
