@@ -166,3 +166,32 @@ def related_provision_originals(
             }
         )
     return originals
+
+
+def delivered_provision_navigation(
+    complete_originals: Sequence[dict[str, JsonValue]],
+) -> list[dict[str, JsonValue]]:
+    """Index fitted full chunks by their own structural provision and version.
+
+    Full chunks do not establish complete provision closure. The caller supplies
+    only canonical ranges physically retained in the current decision.
+    """
+    grouped: dict[_ProvisionIdentity, list[int]] = {}
+    for record in complete_originals:
+        identity = _provision_identity(record)
+        citation = record.get("citation")
+        if identity is not None and type(citation) is int:
+            numbers = grouped.setdefault(identity, [])
+            if citation not in numbers:
+                numbers.append(citation)
+    return [
+        {
+            "source_id": identity.source_id,
+            "enclosing_scope": list(identity.enclosing_scope),
+            "article_no": identity.article_no,
+            "qualifier": identity.qualifier,
+            "version": json.loads(identity.version),
+            "available_full_original_citations": sorted(numbers),
+        }
+        for identity, numbers in grouped.items()
+    ]

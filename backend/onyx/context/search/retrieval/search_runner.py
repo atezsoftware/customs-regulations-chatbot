@@ -14,6 +14,10 @@ from onyx.context.search.models import (
     InferenceSection,
 )
 from onyx.context.search.retrieval.concurrency import search_slot
+from onyx.context.search.retrieval.query_embedding_scope import (
+    QueryEmbeddingScopeBinding,
+    current_parallel_query_embedding_scope,
+)
 from onyx.context.search.utils import get_query_embedding, inference_section_from_chunks
 from onyx.document_index.interfaces_new import DocumentIndex, DocumentSectionRequest
 from onyx.federated_connectors.federated_retrieval import (
@@ -31,6 +35,88 @@ _REGULATORY_EMBEDDING_CIRCUIT_SECONDS = 60.0
 _regulatory_embedding_circuit_lock = threading.Lock()
 _regulatory_embedding_circuit_open_until = 0.0
 _regulatory_embedding_probe_succeeded = False
+_regulatory_embedding_failure_revision = 0
+
+
+def _complete_scoped_regulatory_embedding(
+    query_request: ChunkIndexRequest,
+    *,
+    db_session: Session | None,
+    embedding_model: EmbeddingModel | None,
+    failure_revision: int,
+) -> Embedding:
+    global _regulatory_embedding_circuit_open_until
+    global _regulatory_embedding_probe_succeeded
+    global _regulatory_embedding_failure_revision
+
+    try:
+        embedding = get_query_embedding(
+            query_request.query,
+            db_session=db_session,
+            embedding_model=embedding_model,
+        )
+    except RuntimeError:
+        with _regulatory_embedding_circuit_lock:
+            _regulatory_embedding_failure_revision += 1
+            _regulatory_embedding_probe_succeeded = False
+            _regulatory_embedding_circuit_open_until = (
+                time.monotonic() + _REGULATORY_EMBEDDING_CIRCUIT_SECONDS
+            )
+        raise
+
+    with _regulatory_embedding_circuit_lock:
+        if (
+            failure_revision == _regulatory_embedding_failure_revision
+            and time.monotonic() >= _regulatory_embedding_circuit_open_until
+        ):
+            _regulatory_embedding_probe_succeeded = True
+    return embedding
+
+
+def _get_scoped_regulatory_query_embedding(
+    query_request: ChunkIndexRequest,
+    binding: QueryEmbeddingScopeBinding,
+    *,
+    db_session: Session | None,
+    embedding_model: EmbeddingModel | None,
+) -> Embedding | None:
+    binding.check_active()
+    with _regulatory_embedding_circuit_lock:
+        if time.monotonic() < _regulatory_embedding_circuit_open_until:
+            return None
+        probe_required = not _regulatory_embedding_probe_succeeded
+
+    if probe_required:
+        with binding.scope.cold_probe(binding.check_active):
+            with _regulatory_embedding_circuit_lock:
+                if time.monotonic() < _regulatory_embedding_circuit_open_until:
+                    return None
+                probe_required = not _regulatory_embedding_probe_succeeded
+                failure_revision = _regulatory_embedding_failure_revision
+            if probe_required:
+                embedding = _complete_scoped_regulatory_embedding(
+                    query_request,
+                    db_session=db_session,
+                    embedding_model=embedding_model,
+                    failure_revision=failure_revision,
+                )
+                binding.check_active()
+                return embedding
+
+    # A queued cold probe becomes an ordinary concurrent call after first success.
+    binding.check_active()
+    with _regulatory_embedding_circuit_lock:
+        if time.monotonic() < _regulatory_embedding_circuit_open_until:
+            return None
+        failure_revision = _regulatory_embedding_failure_revision
+    embedding = _complete_scoped_regulatory_embedding(
+        query_request,
+        db_session=db_session,
+        embedding_model=embedding_model,
+        failure_revision=failure_revision,
+    )
+    binding.check_active()
+    return embedding
 
 
 def _get_regulatory_query_embedding(
@@ -41,13 +127,23 @@ def _get_regulatory_query_embedding(
 ) -> Embedding | None:
     """Embed with a process-local circuit breaker for regulatory retrieval.
 
-    The first request probes under a lock so parallel query lanes do not stampede
-    a failing provider. After one success, normal calls remain concurrent. A
-    failure opens the circuit briefly and callers use lexical retrieval instead.
+    Unscoped callers keep the serialized first probe. Explicit parallel scopes
+    bound cold probes without holding the state lock during provider I/O. After
+    success, ordinary calls remain concurrent; failure opens the lexical circuit.
     """
 
     global _regulatory_embedding_circuit_open_until
     global _regulatory_embedding_probe_succeeded
+    global _regulatory_embedding_failure_revision
+
+    binding = current_parallel_query_embedding_scope()
+    if binding is not None:
+        return _get_scoped_regulatory_query_embedding(
+            query_request,
+            binding,
+            db_session=db_session,
+            embedding_model=embedding_model,
+        )
 
     with _regulatory_embedding_circuit_lock:
         if time.monotonic() < _regulatory_embedding_circuit_open_until:
@@ -61,6 +157,7 @@ def _get_regulatory_query_embedding(
                     embedding_model=embedding_model,
                 )
             except RuntimeError:
+                _regulatory_embedding_failure_revision += 1
                 _regulatory_embedding_circuit_open_until = (
                     time.monotonic() + _REGULATORY_EMBEDDING_CIRCUIT_SECONDS
                 )
@@ -76,6 +173,7 @@ def _get_regulatory_query_embedding(
         )
     except RuntimeError:
         with _regulatory_embedding_circuit_lock:
+            _regulatory_embedding_failure_revision += 1
             _regulatory_embedding_probe_succeeded = False
             _regulatory_embedding_circuit_open_until = (
                 time.monotonic() + _REGULATORY_EMBEDDING_CIRCUIT_SECONDS
@@ -162,6 +260,9 @@ def _embed_and_hybrid_search(
             )
         )
     except RuntimeError as error:
+        binding = current_parallel_query_embedding_scope()
+        if binding is not None:
+            binding.check_active()
         # A model-selected conceptual search should still return usable indexed
         # evidence when the external embedding service is temporarily unavailable.
         # Keep this fail-soft behavior limited to the regulatory chunk path;

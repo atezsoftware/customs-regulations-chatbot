@@ -11,6 +11,7 @@ from typing import Literal, NoReturn
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
+from onyx.asv3.assertions import assertion_inventory, presentation_block
 from onyx.asv3.citation_numbers import extract_citation_numbers
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.legal_source_navigation import (
@@ -29,6 +30,30 @@ def serial_session_diagnostics_enabled(context: RunContext) -> bool:
         and context.services.get("experimental_parallel") is False
         and context.depth == 0
     )
+
+
+def operative_review_retention_enabled(context: RunContext) -> bool:
+    return context.services.get("research_profile") == "experimental" and (
+        context.services.get("experimental_parallel") is True
+        or (
+            serial_session_diagnostics_enabled(context)
+            and isinstance(owner := context.services.get("task_id"), str)
+            and bool(owner.strip())
+        )
+    )
+
+
+_CITATION_MARKER = re.compile(r"[\[【［]{1,2}\d+(?:, ?\d+)*[\]】］]{1,2}")
+
+
+def _substantive_inline_citations(text: str) -> set[int]:
+    return {
+        citation
+        for line in text.splitlines()
+        if not presentation_block(line)
+        and any(character.isalnum() for character in _CITATION_MARKER.sub("", line))
+        for citation in extract_citation_numbers(line)
+    }
 
 
 class RelatedSourceReview(BaseModel):
@@ -77,6 +102,63 @@ class _Checkpoint(BaseModel):
     scope_hash: str
     request_hash: str
     records: list[_LeadRecord]
+
+
+def _examined_answer_omission(
+    record: _LeadRecord,
+    answer: str,
+    *,
+    delivered: set[int] | None,
+) -> dict[str, JsonValue] | None:
+    """Retain copied passages and their provenance, without assessing legal entailment."""
+    review = record.review
+    if (
+        review is None
+        or review.status != "examined"
+        or review.source_role != "operative_text"
+    ):
+        return None
+    numbers = {witness.citation for witness in review.witnesses}
+    units = [
+        unit for unit in assertion_inventory(answer) if not unit["presentation_only"]
+    ]
+    omitted: list[JsonValue] = []
+    bound: set[int] = set()
+    for field, passage in (
+        ("effect", review.effect),
+        ("limitations", review.limitations),
+    ):
+        exact = passage.strip()
+        if (
+            presentation_block(exact)
+            or not any(
+                character.isalnum() for character in _CITATION_MARKER.sub("", exact)
+            )
+            or exact not in answer
+        ):
+            omitted.append(field)
+            continue
+        matching = [
+            numbers & _substantive_inline_citations(unit["text"])
+            for unit in units
+            if exact in unit["text"]
+        ]
+        if not any(matching):
+            omitted.append(field)
+        for citations in matching:
+            bound.update(citations)
+    undelivered = sorted(numbers - delivered) if delivered is not None else []
+    unbound = sorted(numbers - bound)
+    if not omitted and not undelivered and not unbound:
+        return None
+    return {
+        "lead_id": record.lead_id,
+        "source_id": record.source_id,
+        "missing_answer_passages": omitted,
+        "required_inline_citations": sorted(numbers),
+        "undelivered_evidence_numbers": undelivered,
+        **({"unbound_evidence_numbers": unbound} if unbound else {}),
+    }
 
 
 def _digest(value: object) -> str:
@@ -569,6 +651,11 @@ class LegalSourceReviews:
             )
             pending: list[JsonValue] = []
             undisclosed: list[JsonValue] = []
+            unretained: list[JsonValue] = []
+            retain_examined = operative_review_retention_enabled(context)
+            delivered = (
+                ledger.completely_delivered(call_id) if retain_examined else None
+            )
             paragraphs = {p.strip() for p in re.split(r"\n\s*\n", answer)}
             for (record_owner, _), record in records.items():
                 if record_owner != owner:
@@ -592,14 +679,29 @@ class LegalSourceReviews:
                     undisclosed.append(
                         {"lead_id": record.lead_id, "gap": record.review.gap}
                     )
-            if pending or undisclosed:
+                elif retain_examined:
+                    omission = _examined_answer_omission(
+                        record, answer, delivered=delivered
+                    )
+                    if omission is not None:
+                        unretained.append(omission)
+            if pending or undisclosed or unretained:
                 return ToolOutcome(
                     status=OutcomeStatus.PARTIAL,
-                    summary="Examine the delivered related-source candidates with their own operative originals, or disclose the precise unresolved interaction separately. Available passages and titles do not approve an effect.",
+                    summary=(
+                        "Retain the declared operative effect and limitations in substantive answer blocks with their own witness citations. This checks copied passage retention, not legal entailment."
+                        if unretained and not pending and not undisclosed
+                        else "Examine the delivered related-source candidates with their own operative originals, or disclose the precise unresolved interaction separately. Available passages and titles do not approve an effect."
+                    ),
                     data={
                         "pending_related_source_review": True,
                         "unread_related_sources": pending,
                         "undisclosed_related_source_gaps": undisclosed,
+                        **(
+                            {"unretained_examined_source_effects": unretained}
+                            if unretained
+                            else {}
+                        ),
                     },
                 )
         return None
@@ -640,6 +742,8 @@ class LegalSourceReviews:
 
         pending: list[JsonValue] = []
         undisclosed: list[JsonValue] = []
+        unretained: list[JsonValue] = []
+        retain_examined = operative_review_retention_enabled(context)
         with self._lock:
             for (owner, lead), record in self._records.items():
                 if owner != "coordinator":
@@ -648,8 +752,15 @@ class LegalSourceReviews:
                 if record.review is not None and (
                     record.review.status != "unresolved" or disclosed(record.review)
                 ):
+                    if retain_examined:
+                        omission = _examined_answer_omission(
+                            record, answer, delivered=None
+                        )
+                        if omission is not None:
+                            unretained.append(omission)
                     continue
                 reviews: dict[str, RelatedSourceReview] = {}
+                child_records: dict[str, _LeadRecord] = {}
                 for child_owner in accepted_owners:
                     child = self._records.get((child_owner, lead))
                     if child is None:
@@ -669,6 +780,21 @@ class LegalSourceReviews:
                         raise ValueError("Assembly related-source identity changed")
                     if child.review is not None:
                         reviews[child_owner] = child.review
+                        child_records[child_owner] = child
+                if retain_examined:
+                    child_omissions = [
+                        {**omission, "owner": child_owner}
+                        for child_owner, child_record in child_records.items()
+                        if (
+                            omission := _examined_answer_omission(
+                                child_record, answer, delivered=None
+                            )
+                        )
+                        is not None
+                    ]
+                    unretained.extend(child_omissions)
+                    if child_omissions:
+                        continue
                 if any(
                     review.status == "examined"
                     and review.source_role == "operative_text"
@@ -696,7 +822,7 @@ class LegalSourceReviews:
                             "qualifier": record.qualifier,
                         }
                     )
-        if not pending and not undisclosed:
+        if not pending and not undisclosed and not unretained:
             return None
         return ToolOutcome(
             status=OutcomeStatus.PARTIAL,
@@ -705,6 +831,11 @@ class LegalSourceReviews:
                 "pending_related_source_review": True,
                 "unread_related_sources": pending,
                 "undisclosed_related_source_gaps": undisclosed,
+                **(
+                    {"unretained_examined_source_effects": unretained}
+                    if unretained
+                    else {}
+                ),
             },
         )
 

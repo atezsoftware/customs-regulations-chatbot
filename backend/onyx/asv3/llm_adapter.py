@@ -10,7 +10,7 @@ import random
 import re
 import time
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Annotated, Literal, TypedDict, cast
 from uuid import uuid4
@@ -51,8 +51,17 @@ from onyx.asv3.native_token_cache import (
     native_token_cache_enabled,
 )
 from onyx.asv3.outcome_map import OutcomeMap
+from onyx.asv3.parallel_execution import parallel_execution_enabled
 from onyx.asv3.research_gaps import research_gap_signals
-from onyx.asv3.shared_originals import related_provision_originals
+from onyx.asv3.retained_answer import (
+    bind_retained_answer,
+    project_failed_terminal_turns,
+    resolve_retained_answer,
+)
+from onyx.asv3.shared_originals import (
+    delivered_provision_navigation,
+    related_provision_originals,
+)
 from onyx.configs.chat_configs import (
     LLM_FIRST_CHUNK_RETRY_BASE_DELAY_S,
     LLM_FIRST_CHUNK_RETRY_JITTER_RATIO,
@@ -99,6 +108,7 @@ from onyx.regulatory.structured_llm import (
     _retry_after_seconds,
     is_retryable_provider_error,
 )
+from onyx.tracing.answer_graph import graph_step
 from onyx.tracing.flows import LLMFlow
 from onyx.tracing.llm_utils import llm_generation_span, record_llm_response
 
@@ -1794,6 +1804,7 @@ class ResearchModel:
         tools: list[dict[str, JsonValue]],
         *,
         return_argument_errors: bool = False,
+        detailed_argument_errors: bool = False,
     ) -> Decision:
         if (response.choice.finish_reason or "").upper() == "MALFORMED_FUNCTION_CALL":
             raise NativeDecisionEnvelopeError(
@@ -1839,6 +1850,26 @@ class ResearchModel:
                     + "/".join(str(p) for p in error.absolute_path)
                     + f" ({error.validator})"
                 )[:300]
+                if (
+                    detailed_argument_errors
+                    and error.validator == "additionalProperties"
+                    and isinstance(error.instance, dict)
+                    and isinstance(error.schema, dict)
+                ):
+                    properties = error.schema.get("properties", {})
+                    patterns = error.schema.get("patternProperties", {})
+                    unexpected = sorted(
+                        str(key)
+                        for key in error.instance
+                        if key not in properties
+                        and not any(
+                            re.search(pattern, str(key)) for pattern in patterns
+                        )
+                    )
+                    if unexpected:
+                        argument_error += ": unexpected fields " + ", ".join(
+                            key[:80] for key in unexpected[:8]
+                        )
             except ValueError:
                 argument_error = "Tool arguments must be a complete JSON object"
             if argument_error and not return_argument_errors:
@@ -1903,7 +1934,12 @@ class ResearchModel:
         call_llm: LLM | None = None,
         research: bool = True,
     ) -> Decision:
-        original = self._decision(response, tools, return_argument_errors=True)
+        original = self._decision(
+            response,
+            tools,
+            return_argument_errors=True,
+            detailed_argument_errors=parallel_execution_enabled(self.context),
+        )
         invalid = {call.call_id: call for call in original.calls if call.argument_error}
         if not invalid:
             return original
@@ -2282,6 +2318,58 @@ class ResearchModel:
             instruction + "\n\n" + OUTCOME_COVERAGE_RESEARCH if normal else instruction
         )
 
+    @staticmethod
+    def _bind_related_source_ids(
+        tools: list[dict[str, JsonValue]], identifiers: list[str]
+    ) -> None:
+        for tool in tools:
+            function = tool.get("function")
+            if not isinstance(function, dict):
+                continue
+            parameters = function.get("parameters")
+            if not isinstance(parameters, dict):
+                continue
+            properties = parameters.get("properties")
+            if not isinstance(properties, dict):
+                continue
+            reviews = properties.get("_related_source_reviews")
+            if not isinstance(reviews, dict):
+                continue
+            items = reviews.get("items")
+            if not isinstance(items, dict):
+                continue
+            fields = items.get("properties")
+            if not isinstance(fields, dict):
+                continue
+            lead = fields.get("lead_id")
+            if not isinstance(lead, dict):
+                continue
+            if identifiers:
+                reviews.pop("maxItems", None)
+                lead["enum"] = cast(list[JsonValue], identifiers)
+            else:
+                lead.pop("enum", None)
+                reviews["maxItems"] = 0
+            for key, meaning in (
+                ("effect", "the examined source's actual effect"),
+                ("limitations", "its material scope or applicability limitation"),
+            ):
+                field = fields.get(key)
+                if isinstance(field, dict):
+                    field["description"] = (
+                        "For examined operative_text, copy a contiguous passage from "
+                        "one substantive answer block stating "
+                        + meaning
+                        + "; that block needs this source's own "
+                        "witness citations. For other statuses, state your assessment."
+                    )
+            gap = fields.get("gap")
+            if isinstance(gap, dict):
+                gap["description"] = (
+                    "For unresolved, copy the exact standalone uncited answer paragraph "
+                    "disclosing this precise open interaction. Otherwise empty."
+                )
+
     def _fit_native_decision(
         self,
         view: HarnessView,
@@ -2376,7 +2464,11 @@ class ResearchModel:
         ]
         if navigation:
             context["available_evidence"] = navigation
-        retained = self._complete_native_turns(view.turns)
+        retained = self._complete_native_turns(
+            project_failed_terminal_turns(
+                view.turns, self.context, view.draft_to_repair, view.publication_gap
+            )
+        )
         native_ids = {
             result.tool_call_id for turn in retained for result in turn.results
         }
@@ -2392,7 +2484,17 @@ class ResearchModel:
             context["failed_calls"] = [
                 {
                     "name": receipt.call.name,
-                    "arguments": receipt.call.arguments,
+                    "arguments": {
+                        key: value
+                        for key, value in receipt.call.arguments.items()
+                        if not (
+                            parallel_execution_enabled(self.context)
+                            and view.draft_to_repair
+                            and receipt.call.name
+                            in {"submit_answer", "submit_partial_answer"}
+                            and key == "answer"
+                        )
+                    },
                     "status": receipt.outcome.status.value,
                     "summary": receipt.outcome.summary,
                 }
@@ -2527,7 +2629,17 @@ class ResearchModel:
         )
         include_related_navigation = True
         ceiling, output = self._limits(self._native_output_limit())
-        selected = view.tools
+        selected = copy.deepcopy(view.tools) if native_original_cache else view.tools
+        if parallel_execution_enabled(self.context):
+            selected, retained_answer = bind_retained_answer(
+                selected,
+                self.context,
+                view.draft_to_repair,
+                request=view.request,
+            )
+            if retained_answer is not None:
+                context["draft_to_repair"] = {"units": retained_answer.pop("units")}
+                context["retained_answer"] = retained_answer
         if (
             independent_mode
             and independent_answers
@@ -2651,6 +2763,7 @@ class ResearchModel:
                     "catalogue navigation for a material unresolved effect."
                 )
             reviews = self.context.services.get("legal_source_reviews")
+            source_review_state: dict[str, JsonValue] = {}
             if isinstance(reviews, LegalSourceReviews) and isinstance(
                 ledger, EvidenceLedger
             ):
@@ -2702,6 +2815,34 @@ class ResearchModel:
                 and identity[2] == 0
                 and identity[3] == original_lengths[(identity[0], identity[1])]
             ]
+            if native_original_cache:
+                provision_navigation = delivered_provision_navigation(
+                    complete_originals
+                )
+                if provision_navigation:
+                    current["delivered_provisions"] = provision_navigation
+                related_ids: set[str] = set()
+                for entry in candidate_navigation:
+                    candidates = (
+                        entry.get("candidates") if isinstance(entry, dict) else None
+                    )
+                    if isinstance(candidates, list):
+                        related_ids.update(
+                            str(candidate["lead_id"])
+                            for candidate in candidates
+                            if isinstance(candidate, dict)
+                            and isinstance(candidate.get("lead_id"), str)
+                        )
+                if isinstance(reviews, LegalSourceReviews):
+                    rows = source_review_state.get("reviews")
+                    if isinstance(rows, list):
+                        related_ids.update(
+                            str(row["lead_id"])
+                            for row in rows
+                            if isinstance(row, dict)
+                            and isinstance(row.get("lead_id"), str)
+                        )
+                self._bind_related_source_ids(selected, sorted(related_ids))
             gaps = research_gap_signals(view, complete_originals)
             if gaps:
                 current["research_gap_signals"] = gaps
@@ -2753,6 +2894,10 @@ class ResearchModel:
                     "source, chunk, text hash and current metadata in original_metadata_catalogue. "
                     "The literal passage and its start_char/end_char remain beside that citation. "
                     "A catalogue or text reference alone does not deliver source text."
+                    " delivered_provisions groups the full passages physically present here "
+                    "by canonical source, provision and version. Reuse those passages directly; "
+                    "only a missing clause, continuation or changed source version needs reading. "
+                    "Full chunks alone do not prove a complete provision."
                 )
             return [
                 *prefix,
@@ -2814,7 +2959,19 @@ class ResearchModel:
         else:
             self.context.check_research_active()
         if self.lean_native_mode:
-            prompt, tools, output = self._fit_native_decision(view)
+            preparation = (
+                graph_step(
+                    "asv3.context_preparation",
+                    {
+                        "turns": len(view.turns),
+                        "originals": len(view.original_evidence),
+                    },
+                )
+                if parallel_execution_enabled(self.context)
+                else nullcontext()
+            )
+            with preparation:
+                prompt, tools, output = self._fit_native_decision(view)
             assembly_decision = (
                 not self.context.depth
                 and self.context.services.get("independent_question_mode") is True
@@ -2882,11 +3039,19 @@ class ResearchModel:
                 )
                 decision = self._invoke_decision(handoff, prompt, tools, output)
                 decision = self._experimental_terminal_envelope(
-                    decision, tools, publication_gap=view.publication_gap
+                    decision,
+                    tools,
+                    publication_gap=view.publication_gap,
+                    retained_draft=view.draft_to_repair,
+                    request=view.request,
                 )
             if not use_research_model:
                 decision = self._experimental_terminal_envelope(
-                    decision, tools, publication_gap=view.publication_gap
+                    decision,
+                    tools,
+                    publication_gap=view.publication_gap,
+                    retained_draft=view.draft_to_repair,
+                    request=view.request,
                 )
             if not self.context.depth and self.context.services.get(
                 "independent_answers"
@@ -2895,7 +3060,12 @@ class ResearchModel:
                     call.name in {"repair_question_answer", "assemble_answers"}
                     for call in decision.calls
                 )
-            return decision
+            return resolve_retained_answer(
+                decision,
+                self.context,
+                view.draft_to_repair,
+                request=view.request,
+            )
         return self._decide_research(view)
 
     @staticmethod
@@ -3024,6 +3194,8 @@ class ResearchModel:
         tools: list[dict[str, JsonValue]],
         *,
         publication_gap: dict[str, JsonValue] | None = None,
+        retained_draft: str | None = None,
+        request: str = "",
     ) -> Decision:
         reviews = self.context.services.get("legal_source_reviews")
         ledger = self.context.services.get("evidence")
@@ -3066,9 +3238,17 @@ class ResearchModel:
             if not isinstance(parameters, dict):
                 return decision
             jsonschema.Draft202012Validator(parameters).validate(arguments)
+            resolved = resolve_retained_answer(
+                Decision(calls=[CapabilityCall(name=name, arguments=arguments)]),
+                self.context,
+                retained_draft,
+                request=request,
+            )
+            if resolved.calls[0].argument_error:
+                return decision
             answer, raw_reviews = (
-                arguments.get("answer"),
-                arguments.get("_related_source_reviews"),
+                resolved.calls[0].arguments.get("answer"),
+                resolved.calls[0].arguments.get("_related_source_reviews"),
             )
             if not isinstance(answer, str) or not isinstance(raw_reviews, list):
                 return decision
@@ -3085,7 +3265,7 @@ class ResearchModel:
                 return decision
         except (ValueError, jsonschema.ValidationError):
             return decision
-        call = CapabilityCall(name=name, arguments=arguments)
+        call = resolved.calls[0]
         return Decision(
             calls=[call],
             assistant_message=AssistantMessage(
@@ -3094,7 +3274,7 @@ class ResearchModel:
                         id=call.call_id,
                         function=NativeFunctionCall(
                             name=call.name,
-                            arguments=json.dumps(call.arguments, ensure_ascii=False),
+                            arguments=json.dumps(arguments, ensure_ascii=False),
                         ),
                     )
                 ]

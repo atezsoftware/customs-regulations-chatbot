@@ -3,6 +3,7 @@
 import json
 import time
 from collections.abc import Callable, Iterator
+from contextlib import nullcontext
 from uuid import uuid4
 
 from pydantic import JsonValue
@@ -17,10 +18,15 @@ from onyx.asv3.models import (
     RunStopped,
     ToolOutcome,
 )
+from onyx.asv3.parallel_execution import parallel_execution_enabled
 from onyx.chat.emitter import NullEmitter
 from onyx.chat.models import ChatMessageSimple
 from onyx.configs.constants import MessageType
 from onyx.context.search.models import SearchDocsResponse
+from onyx.context.search.retrieval.query_embedding_scope import (
+    ParallelQueryEmbeddingScope,
+    experimental_parallel_query_embeddings,
+)
 from onyx.db.asv3_candidate_inventory import asv3_source_inventory_scope
 from onyx.db.asv3_corpus import bind_pc_corpus_scope
 from onyx.db.memory import UserMemoryContext
@@ -272,25 +278,35 @@ def build_search_adapter(
         ):
             if field in args:
                 tool_args[field] = args[field]
-        batch = run_tool_calls(
-            tool_calls=[
-                ToolCallKickoff(
-                    tool_call_id=str(uuid4()),
-                    tool_name=SearchTool.NAME,
-                    tool_args=tool_args,
-                    placement=Placement(turn_index=len(history)),
-                )
-            ],
-            tools=[isolated],
-            message_history=history,
-            user_memory_context=user_memory_context,
-            user_info=user_info,
-            citation_mapping={},
-            next_citation_num=1,
-            inject_memories_in_prompt=inject_memories_in_prompt,
-            tool_execution_timeout_seconds=None,
-            search_rerank_context=original_query,
+        embedding_scope = context.services.get("parallel_query_embeddings")
+        scoped_embeddings = (
+            experimental_parallel_query_embeddings(
+                embedding_scope, check_active=context.check_research_active
+            )
+            if parallel_execution_enabled(context)
+            and isinstance(embedding_scope, ParallelQueryEmbeddingScope)
+            else nullcontext()
         )
+        with scoped_embeddings:
+            batch = run_tool_calls(
+                tool_calls=[
+                    ToolCallKickoff(
+                        tool_call_id=str(uuid4()),
+                        tool_name=SearchTool.NAME,
+                        tool_args=tool_args,
+                        placement=Placement(turn_index=len(history)),
+                    )
+                ],
+                tools=[isolated],
+                message_history=history,
+                user_memory_context=user_memory_context,
+                user_info=user_info,
+                citation_mapping={},
+                next_citation_num=1,
+                inject_memories_in_prompt=inject_memories_in_prompt,
+                tool_execution_timeout_seconds=None,
+                search_rerank_context=original_query,
+            )
         context.check_active()
         if len(batch.tool_responses) != 1:
             return ToolOutcome(

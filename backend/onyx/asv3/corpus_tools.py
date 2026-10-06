@@ -9,7 +9,7 @@ from collections.abc import Callable, Generator, Iterator
 from datetime import date
 from hashlib import sha256
 from itertools import islice
-from threading import RLock
+from threading import BoundedSemaphore, Event, RLock
 from typing import cast
 from uuid import UUID
 
@@ -29,6 +29,7 @@ from onyx.asv3.models import (
     ToolSpec,
     compact_evidence_metadata,
 )
+from onyx.asv3.parallel_execution import parallel_execution_enabled
 from onyx.configs.constants import DocumentSource
 from onyx.context.search.models import IndexFilters, SearchDoc
 from onyx.db.asv3_candidate_inventory import current_asv3_source_inventory_scope
@@ -184,6 +185,10 @@ class CorpusBroker:
         self.allow_numbered_title_fallback = allow_numbered_title_fallback
         self._index_lock = RLock()
         self._related_sources_lock = RLock()
+        self._related_sources_slots = BoundedSemaphore(2)
+        self._related_sources_flights: dict[
+            tuple[str, ProvisionNavigationAnchor, int], Event
+        ] = {}
         self._related_sources: dict[
             tuple[str, ProvisionNavigationAnchor, int], dict[str, JsonValue]
         ] = {}
@@ -271,8 +276,7 @@ class CorpusBroker:
                 limit=limit,
                 allow_numbered_title_fallback=self.allow_numbered_title_fallback,
                 allow_reversed_numbered_title_fallback=(
-                    context.services.get("research_profile") == "experimental"
-                    and context.services.get("experimental_parallel") is True
+                    parallel_execution_enabled(context)
                 ),
             )
 
@@ -312,70 +316,114 @@ class CorpusBroker:
             return None
         context.check_active()
         key = (self.filters.model_dump_json(), anchor, offset)
+
+        def lookup() -> dict[str, JsonValue]:
+            query = " ".join(
+                part
+                for part in (
+                    anchor.instrument_name,
+                    anchor.qualifier,
+                    anchor.article_no,
+                )
+                if part
+            )
+            query_variants = (query,)
+            if anchor.instrument_number:
+                query_variants += (
+                    " ".join(
+                        part
+                        for part in (
+                            anchor.instrument_number,
+                            "sayılı Kanun",
+                            anchor.qualifier,
+                            anchor.article_no,
+                        )
+                        if part
+                    ),
+                )
+            status = "available"
+            try:
+                sources, more = self.related_catalog_sources(
+                    query_variants, context, offset=offset, limit=50
+                )
+            except PermissionError:
+                sources, more, status = [], False, "denied"
+            except (CorpusScopeUnavailable, SQLAlchemyError):
+                sources, more, status = [], False, "unavailable"
+            candidates: list[JsonValue] = []
+            for candidate in sources:
+                role = match_related_source_name(anchor, candidate.name)
+                if candidate.id != source.id and role is not None:
+                    candidates.append(
+                        {
+                            "source_id": str(candidate.id),
+                            "name": candidate.name,
+                            "candidate_role": role,
+                        }
+                    )
+            return {
+                "anchor_source_id": anchor.source_id,
+                "instrument_name": anchor.instrument_name,
+                "instrument_number": anchor.instrument_number,
+                "article_no": anchor.article_no,
+                "qualifier": anchor.qualifier,
+                "navigation_only": True,
+                "absence_proven": False,
+                "status": status,
+                "query": query,
+                "query_variants": list(query_variants),
+                "offset": offset,
+                "next_offset": offset + 50 if more else None,
+                "has_more": more,
+                "candidates": candidates,
+                "instruction": "Source titles are reading leads, not holdings or proof of legal effect. Read a material candidate's actual operative text and dates before applying it; an empty page does not establish absence.",
+            }
+
+        if parallel_execution_enabled(context):
+            return self._parallel_related_sources(key, context, lookup)
         # One broker belongs to one captured user/scope. Sibling workers share its pages.
         with self._related_sources_lock:
             if key not in self._related_sources:
-                query = " ".join(
-                    part
-                    for part in (
-                        anchor.instrument_name,
-                        anchor.qualifier,
-                        anchor.article_no,
-                    )
-                    if part
-                )
-                query_variants = (query,)
-                if anchor.instrument_number:
-                    query_variants += (
-                        " ".join(
-                            part
-                            for part in (
-                                anchor.instrument_number,
-                                "sayılı Kanun",
-                                anchor.qualifier,
-                                anchor.article_no,
-                            )
-                            if part
-                        ),
-                    )
-                status = "available"
-                try:
-                    sources, more = self.related_catalog_sources(
-                        query_variants, context, offset=offset, limit=50
-                    )
-                except PermissionError:
-                    sources, more, status = [], False, "denied"
-                except (CorpusScopeUnavailable, SQLAlchemyError):
-                    sources, more, status = [], False, "unavailable"
-                candidates: list[JsonValue] = []
-                for candidate in sources:
-                    role = match_related_source_name(anchor, candidate.name)
-                    if candidate.id != source.id and role is not None:
-                        candidates.append(
-                            {
-                                "source_id": str(candidate.id),
-                                "name": candidate.name,
-                                "candidate_role": role,
-                            }
-                        )
-                self._related_sources[key] = {
-                    "anchor_source_id": anchor.source_id,
-                    "instrument_name": anchor.instrument_name,
-                    "instrument_number": anchor.instrument_number,
-                    "article_no": anchor.article_no,
-                    "qualifier": anchor.qualifier,
-                    "navigation_only": True,
-                    "absence_proven": False,
-                    "status": status,
-                    "query": query,
-                    "query_variants": list(query_variants),
-                    "offset": offset,
-                    "next_offset": offset + 50 if more else None,
-                    "has_more": more,
-                    "candidates": candidates,
-                    "instruction": "Source titles are reading leads, not holdings or proof of legal effect. Read a material candidate's actual operative text and dates before applying it; an empty page does not establish absence.",
-                }
+                self._related_sources[key] = lookup()
             return copy.deepcopy(self._related_sources[key])
+
+    def _parallel_related_sources(
+        self,
+        key: tuple[str, ProvisionNavigationAnchor, int],
+        context: RunContext,
+        lookup: Callable[[], dict[str, JsonValue]],
+    ) -> dict[str, JsonValue]:
+        while True:
+            context.check_active()
+            with self._related_sources_lock:
+                cached = self._related_sources.get(key)
+                if cached is not None:
+                    return copy.deepcopy(cached)
+                flight = self._related_sources_flights.get(key)
+                if flight is None:
+                    flight = Event()
+                    self._related_sources_flights[key] = flight
+                    break
+            while not flight.wait(0.05):
+                context.check_active()
+
+        acquired = False
+        try:
+            while not self._related_sources_slots.acquire(timeout=0.05):
+                context.check_active()
+            acquired = True
+            context.check_active()
+            record = lookup()
+            context.check_active()
+            with self._related_sources_lock:
+                self._related_sources[key] = record
+            return copy.deepcopy(record)
+        finally:
+            if acquired:
+                self._related_sources_slots.release()
+            with self._related_sources_lock:
+                self._related_sources_flights.pop(key, None)
+                flight.set()
 
     def related_sources_for_evidence(
         self, item: EvidenceItem, context: RunContext
@@ -1100,8 +1148,7 @@ def build_corpus_specs(
         }
         if (
             source_identity_guidance
-            and context.services.get("research_profile") == "experimental"
-            and context.services.get("experimental_parallel") is True
+            and parallel_execution_enabled(context)
             and status is OutcomeStatus.NOT_FOUND
             and not more
         ):

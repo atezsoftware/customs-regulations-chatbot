@@ -273,6 +273,45 @@ def test_real_serial_and_owned_session_use_same_prompt_schemas_and_terminal_hand
         ]["properties"]
         assert need["question_ids"]["items"].pop("enum") == ["q0"]
         assert need["determination_ids"]["items"].pop("enum") == ["q0:d0"]
+        for name in ("submit_answer", "submit_partial_answer"):
+            reviews = actual_definitions[name]["function"]["parameters"]["properties"][
+                "_related_source_reviews"
+            ]
+            assert reviews.pop("maxItems") == 0
+            baseline_reviews = tool_definitions(base)[name]["function"]["parameters"][
+                "properties"
+            ]["_related_source_reviews"]
+            fields = reviews["items"]["properties"]
+            baseline_fields = baseline_reviews["items"]["properties"]
+            for key, meaning in (
+                ("effect", "the examined source's actual effect"),
+                ("limitations", "its material scope or applicability limitation"),
+            ):
+                assert fields[key].pop("description") == (
+                    "For examined operative_text, copy a contiguous passage from "
+                    "one substantive answer block stating "
+                    + meaning
+                    + "; that block needs this source's own "
+                    "witness citations. For other statuses, state your assessment."
+                )
+                if "description" in baseline_fields[key]:
+                    fields[key]["description"] = baseline_fields[key]["description"]
+            assert fields["gap"].pop("description") == (
+                "For unresolved, copy the exact standalone uncited answer paragraph "
+                "disclosing this precise open interaction. Otherwise empty."
+            )
+            if "description" in baseline_fields["gap"]:
+                fields["gap"]["description"] = baseline_fields["gap"]["description"]
+        function = actual_definitions["submit_answer"]["function"]
+        hosted_terminal_text = (
+            "and end this turn. Final update_research or verify_claim calls may "
+            "accompany this answer and execute first; source acquisitions require "
+            "a later decision."
+        )
+        assert hosted_terminal_text in function["description"]
+        function["description"] = function["description"].replace(
+            hosted_terminal_text, "and end this turn, on its own."
+        )
         assert actual_definitions == tool_definitions(base)
         assert actual["tool_choice"] == base["tool_choice"]
         assert actual["timeout_override"] is base["timeout_override"] is None

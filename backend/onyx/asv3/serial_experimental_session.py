@@ -10,12 +10,16 @@ from typing import Literal, cast
 
 from pydantic import BaseModel, ConfigDict, JsonValue
 
+from onyx.asv3.answer_source_retention import selected_outcome_source_gap
 from onyx.asv3.authority import native_named_authority_gap
 from onyx.asv3.authority_requirements import AuthorityRequirements
 from onyx.asv3.citation_numbers import extract_citation_numbers
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.harness import Harness
-from onyx.asv3.legal_source_reviews import LegalSourceReviews
+from onyx.asv3.legal_source_reviews import (
+    LegalSourceReviews,
+    serial_session_diagnostics_enabled,
+)
 from onyx.asv3.llm_adapter import LanguageProfile, ResearchModel
 from onyx.asv3.models import (
     Decision,
@@ -358,7 +362,13 @@ def _publication_gap(
             summary="Read and cite the named governing original beside its actual legal assertion; a lower source's reference does not supply that original.",
             data=gap,
         )
-    return reviews.publication_gap(answer, call_id or "", context, ledger)
+    review_gap = reviews.publication_gap(answer, call_id or "", context, ledger)
+    if review_gap is not None:
+        return review_gap
+    outcomes = context.services.get("outcome_map")
+    if requires_sources and isinstance(outcomes, OutcomeMap):
+        return selected_outcome_source_gap(answer, call_id, context, ledger, outcomes)
+    return None
 
 
 def validate_serial_session_answer(
@@ -515,6 +525,8 @@ class SerialExperimentalSession:
             "assistant_instructions",
             "session_research",
             "shared_reads",
+            "parallel_execution_slots",
+            "parallel_query_embeddings",
             "native_citation_label",
         ):
             value = outer_context.services.get(name)
@@ -697,6 +709,30 @@ class SerialExperimentalSession:
         self._standalone_answer_call = (
             len(decision.calls) == 1 and decision.calls[0].name == "submit_answer"
         )
+        self.context.services.pop("hosted_terminal_batch", None)
+        self.context.services.pop("hosted_terminal_completed", None)
+        if (
+            serial_session_diagnostics_enabled(self.context)
+            and isinstance(owner := self.context.services.get("task_id"), str)
+            and bool(owner.strip())
+            and len(decision.calls) > 1
+            and len({call.call_id for call in decision.calls}) == len(decision.calls)
+        ):
+            terminals = [
+                call for call in decision.calls if call.name == "submit_answer"
+            ]
+            predecessors = [
+                call for call in decision.calls if call.name != "submit_answer"
+            ]
+            if len(terminals) == 1 and all(
+                call.name in {"update_research", "verify_claim"}
+                for call in predecessors
+            ):
+                self.context.services["hosted_terminal_batch"] = {
+                    "terminal_call_id": terminals[0].call_id,
+                    "predecessor_call_ids": [call.call_id for call in predecessors],
+                    "model_call_id": self.model.last_call_id or "",
+                }
         for call in decision.calls:
             language = call.arguments.get("_language")
             if self.profile.language == "und" and isinstance(language, str):
@@ -775,6 +811,18 @@ class SerialExperimentalSession:
         )
 
     def _terminal_specs(self) -> list[ToolSpec]:
+        submit_description = "Publish a complete answer and end this turn, on its own. basis=conversation only for social dialogue with no legal claims; scenario only for supplied facts or arithmetic with no legal effects; originals for legal answers supported by fully delivered original citations. Otherwise research or ask_user."
+        if (
+            serial_session_diagnostics_enabled(self.context)
+            and isinstance(owner := self.context.services.get("task_id"), str)
+            and bool(owner.strip())
+        ):
+            submit_description = submit_description.replace(
+                "and end this turn, on its own.",
+                "and end this turn. Final update_research or verify_claim calls may accompany this answer and execute first; source acquisitions require a later decision.",
+                1,
+            )
+
         def ask(args: dict[str, JsonValue], child: RunContext) -> ToolOutcome:
             if child.depth:
                 return ToolOutcome(
@@ -793,7 +841,18 @@ class SerialExperimentalSession:
             )
 
         def submit(args: dict[str, JsonValue], child: RunContext) -> ToolOutcome:
-            if child.depth or not self._standalone_answer_call:
+            batch = self.context.services.get("hosted_terminal_batch")
+            completed_batch = (
+                serial_session_diagnostics_enabled(child)
+                and isinstance(owner := child.services.get("task_id"), str)
+                and bool(owner.strip())
+                and isinstance(batch, dict)
+                and batch == child.services.get("hosted_terminal_completed")
+                and batch.get("model_call_id") == (self.model.last_call_id or "")
+                and child.services.get("hosted_terminal_execution_id")
+                == batch.get("terminal_call_id")
+            )
+            if child.depth or not (self._standalone_answer_call or completed_batch):
                 return ToolOutcome(
                     status=OutcomeStatus.DENIED,
                     summary="Only the coordinator may submit a complete answer, on its own.",
@@ -867,7 +926,7 @@ class SerialExperimentalSession:
             ),
             ToolSpec(
                 name="submit_answer",
-                description="Publish a complete answer and end this turn, on its own. basis=conversation only for social dialogue with no legal claims; scenario only for supplied facts or arithmetic with no legal effects; originals for legal answers supported by fully delivered original citations. Otherwise research or ask_user.",
+                description=submit_description,
                 parameters={
                     "type": "object",
                     "properties": {

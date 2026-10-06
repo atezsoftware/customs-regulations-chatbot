@@ -39,6 +39,7 @@ from onyx.asv3.models import (
 )
 from onyx.asv3.outcome_map import OutcomeMap
 from onyx.asv3.parallel_answers import ParallelAnswerReceipts
+from onyx.asv3.parallel_execution import ParallelExecutionSlots
 from onyx.asv3.progress import (
     ProgressEvent,
     ProgressReporter,
@@ -79,6 +80,9 @@ from onyx.chat.models import ChatMessageSimple
 from onyx.chat.stop_signal_checker import is_connected
 from onyx.configs.constants import MessageType
 from onyx.context.search.models import BaseFilters, IndexFilters, SearchDoc
+from onyx.context.search.retrieval.query_embedding_scope import (
+    ParallelQueryEmbeddingScope,
+)
 from onyx.db.asv3_corpus import bind_pc_corpus_scope
 from onyx.db.asv3_runs import (
     load_asv3_checkpoint,
@@ -314,6 +318,8 @@ def run_asv3_loop(
         research_profile == "deep" or parallel_research
     )
     if parallel_research:
+        context.services["parallel_execution_slots"] = ParallelExecutionSlots()
+        context.services["parallel_query_embeddings"] = ParallelQueryEmbeddingScope()
         context.services["scenario_request"] = question
     context.corpus_only = not (allow_external and profile.external_requested)
     ledger = EvidenceLedger()
@@ -773,7 +779,11 @@ def run_asv3_loop(
                     serial_broker.related_source_navigation
                 )
                 return (
-                    build_corpus_specs(serial_broker, require_search_targets=True)
+                    build_corpus_specs(
+                        serial_broker,
+                        require_search_targets=True,
+                        source_identity_guidance=True,
+                    )
                     + build_source_specs(serial_broker)
                     + build_sandbox_specs(serial_broker)
                     + external_specs

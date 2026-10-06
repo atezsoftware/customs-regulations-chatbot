@@ -4,7 +4,7 @@ import json
 import time
 from calendar import monthrange
 from collections.abc import Callable
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextvars import copy_context
 from datetime import date, timedelta
 from decimal import Decimal, localcontext
@@ -23,6 +23,7 @@ from onyx.asv3.models import (
     ToolOutcome,
     ToolSpec,
 )
+from onyx.asv3.parallel_execution import parallel_execution_enabled
 from onyx.asv3.progress import ProgressReporter, action_narration, public_action_id
 from onyx.asv3.registry import CapabilityRegistry
 from onyx.configs.app_configs import CODE_INTERPRETER_BASE_URL
@@ -159,6 +160,78 @@ def resolve_program_value(
     return value
 
 
+def _continuous_compose_enabled(context: RunContext) -> bool:
+    return parallel_execution_enabled(context)
+
+
+def _continuous_compose(
+    steps: dict[str, dict[str, JsonValue]],
+    dependencies: dict[str, set[str]],
+    context: RunContext,
+    pool: ThreadPoolExecutor,
+    max_parallel: int,
+    dispatch: Callable[[CapabilityCall], ToolOutcome],
+) -> dict[str, ToolOutcome]:
+    remaining = set(steps)
+    results: dict[str, ToolOutcome] = {}
+    active: dict[Future[ToolOutcome], str] = {}
+    while remaining or active:
+        context.check_active()
+        for key, item in steps.items():
+            if key not in remaining or not dependencies[key] <= results.keys():
+                continue
+            context.check_active()
+            if any(
+                results[dependency].status
+                not in {
+                    OutcomeStatus.FOUND,
+                    OutcomeStatus.PARTIAL,
+                    OutcomeStatus.VERSION_UNKNOWN,
+                    OutcomeStatus.AMBIGUOUS,
+                }
+                for dependency in dependencies[key]
+            ):
+                results[key] = ToolOutcome(
+                    status=OutcomeStatus.CANCELLED,
+                    summary="A required dependency failed.",
+                )
+                remaining.remove(key)
+                continue
+            when = item.get("when")
+            if isinstance(when, dict) and resolve_program_value(
+                when.get("value"), results
+            ) != when.get("equals"):
+                results[key] = ToolOutcome(
+                    status=OutcomeStatus.CANCELLED,
+                    summary="Program condition did not match.",
+                )
+                remaining.remove(key)
+                continue
+            if len(active) >= max_parallel:
+                continue
+            arguments = resolve_program_value(item.get("arguments", {}), results)
+            if not isinstance(arguments, dict):
+                raise ValueError("Resolved arguments are not an object.")
+            context.check_active()
+            future = cast(
+                Future[ToolOutcome],
+                pool.submit(
+                    copy_context().run,
+                    dispatch,
+                    CapabilityCall(name=str(item["tool"]), arguments=arguments),
+                ),
+            )
+            active[future] = key
+            remaining.remove(key)
+        if active:
+            done, _ = wait(active, timeout=0.05, return_when=FIRST_COMPLETED)
+            context.check_active()
+            for future in done:
+                results[active.pop(future)] = future.result()
+    context.check_active()
+    return {key: results[key] for key in steps}
+
+
 def compose(args: dict[str, JsonValue], context: RunContext) -> ToolOutcome:
     registry = context.services.get("registry")
     if not isinstance(registry, CapabilityRegistry):
@@ -279,10 +352,14 @@ def compose(args: dict[str, JsonValue], context: RunContext) -> ToolOutcome:
             )
         return outcome
 
-    pool = ThreadPoolExecutor(
-        max_workers=min(4, int(cast(int, args.get("max_parallel", 4))))
-    )
+    max_parallel = min(4, int(cast(int, args.get("max_parallel", 4))))
+    pool = ThreadPoolExecutor(max_workers=max_parallel)
     try:
+        if _continuous_compose_enabled(context):
+            results = _continuous_compose(
+                steps, dependencies, context, pool, max_parallel, dispatch_step
+            )
+            remaining.clear()
         while remaining:
             context.check_active()
             ready = [

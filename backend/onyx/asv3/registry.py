@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import threading
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Callable, Iterable
 
 import jsonschema
@@ -23,9 +24,11 @@ from onyx.asv3.models import (
     ToolSpec,
 )
 from onyx.asv3.outcome_map import OutcomeMap, OutcomeUpdate
+from onyx.asv3.parallel_execution import capability_slot, parallel_execution_enabled
 from onyx.asv3.research_state import ResearchState
 from onyx.asv3.scenario import question_determinations
 from onyx.asv3.shared_reads import SharedReads
+from onyx.tracing.answer_graph import graph_step
 
 if TYPE_CHECKING:
     from onyx.asv3.evidence import EvidenceLedger
@@ -436,22 +439,23 @@ class CapabilityRegistry:
             def execute(execution_context: RunContext) -> ToolOutcome:
                 if spec.consumes_tool_budget:
                     execution_context.budget.consume("tools")
-                acquired = False
-                if not spec.orchestrates:
-                    while not acquired:
-                        execution_context.check_active()
-                        acquired = execution_context.budget.tool_slots.acquire(
-                            timeout=0.05
-                        )
-                try:
-                    if spec.parallel_safe:
-                        return spec.handler(arguments, execution_context)
-                    with self._serial:
-                        execution_context.check_active()
-                        return spec.handler(arguments, execution_context)
-                finally:
-                    if acquired:
-                        execution_context.budget.tool_slots.release()
+                slot = (
+                    nullcontext()
+                    if spec.orchestrates
+                    else capability_slot(call.name, execution_context)
+                )
+                with slot:
+                    handler_span = (
+                        graph_step("asv3.tool_handler", {"tool": call.name})
+                        if parallel_execution_enabled(execution_context)
+                        else nullcontext()
+                    )
+                    with handler_span:
+                        if spec.parallel_safe:
+                            return spec.handler(arguments, execution_context)
+                        with self._serial:
+                            execution_context.check_active()
+                            return spec.handler(arguments, execution_context)
 
             shared_reads = context.services.get("shared_reads")
             outcome = (

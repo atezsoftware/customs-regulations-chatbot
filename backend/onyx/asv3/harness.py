@@ -4,6 +4,7 @@ import contextvars
 import json
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import nullcontext
 from typing import Callable, cast
 
 from pydantic import JsonValue
@@ -24,6 +25,7 @@ from onyx.asv3.models import (
     ToolReceipt,
 )
 from onyx.asv3.native_cache_projection import lossless_original_transport_enabled
+from onyx.asv3.parallel_execution import parallel_execution_enabled
 from onyx.asv3.progress import ProgressReporter, action_narration, public_action_id
 from onyx.asv3.registry import CapabilityRegistry
 from onyx.asv3.research_state import EvidenceWorkingSet, ResearchState
@@ -214,7 +216,7 @@ class Harness:
             self.working_memory.restore(working)
         else:
             for receipt in self.receipts:
-                self.working_memory.observe(receipt)
+                self.working_memory.observe(receipt, context=self.context)
         self._seen_calls.update(self._committed_calls)
         self._pending_calls.clear()
         pending = array("pending_calls")
@@ -261,7 +263,13 @@ class Harness:
             and not self.context.is_cancelled()
             and time.monotonic() < self.context.deadline
         ):
-            self.checkpoint(self.snapshot())
+            preparation = (
+                graph_step("asv3.checkpoint_preparation", {})
+                if parallel_execution_enabled(self.context)
+                else nullcontext()
+            )
+            with preparation:
+                self.checkpoint(self.snapshot())
 
     def view(self) -> HarnessView:
         from onyx.asv3.supplemental_tools import ScenarioState
@@ -402,7 +410,12 @@ class Harness:
             "cancel_researcher",
         }:
             return None
-        return "final" if call.name == "verify_claim" else "tools"
+        return (
+            "final"
+            if call.name == "verify_claim"
+            and not parallel_execution_enabled(self.context)
+            else "tools"
+        )
 
     def _execute(self, call: CapabilityCall, context: RunContext) -> ToolReceipt:
         start = time.monotonic()
@@ -548,10 +561,21 @@ class Harness:
         compacted = compact_json(receipt.outcome.data)
         assert isinstance(compacted, dict)
         receipt.outcome.data = compacted
+        candidate = receipt.call.arguments.get("answer")
+        if (
+            parallel_execution_enabled(self.context)
+            and receipt.call.name in {"submit_answer", "submit_partial_answer"}
+            and receipt.outcome.status
+            in {OutcomeStatus.INVALID, OutcomeStatus.PARTIAL, OutcomeStatus.DENIED}
+            and isinstance(candidate, str)
+            and candidate.strip()
+        ):
+            self.last_draft = candidate
+            self.publication_gap = receipt.outcome
         self.context.check_active()
         if self.on_receipt:
             self.on_receipt(receipt)
-        self.working_memory.observe(receipt)
+        self.working_memory.observe(receipt, context=self.context)
         receipt.outcome = receipt.outcome.model_copy(update={"evidence": []})
         self.receipts.append(receipt)
         self._seen_calls.add(receipt.call.call_id)
@@ -681,6 +705,57 @@ class Harness:
         )
 
     def _dispatch(self, calls: list[CapabilityCall]) -> list[ToolReceipt]:
+        terminal_batch = self.context.services.get("hosted_terminal_batch")
+        if (
+            parallel_execution_enabled(self.context)
+            and isinstance(terminal_batch, dict)
+            and len(calls) > 1
+        ):
+            terminal_id = terminal_batch.get("terminal_call_id")
+            predecessors = [call for call in calls if call.call_id != terminal_id]
+            terminal = [call for call in calls if call.call_id == terminal_id]
+            if (
+                len(terminal) == 1
+                and terminal[0].name == "submit_answer"
+                and all(
+                    call.name in {"update_research", "verify_claim"}
+                    for call in predecessors
+                )
+                and [call.call_id for call in predecessors]
+                == terminal_batch.get("predecessor_call_ids")
+                and terminal_batch.get("model_call_id")
+                == self.context.services.get("last_model_call_id")
+            ):
+                receipts = self._dispatch(predecessors)
+                if all(
+                    receipt.outcome.status == OutcomeStatus.FOUND
+                    and receipt.call.call_id in self._committed_calls
+                    for receipt in receipts
+                ):
+                    self.context.services["hosted_terminal_completed"] = dict(
+                        terminal_batch
+                    )
+                    receipts.extend(self._dispatch(terminal))
+                else:
+                    blocked = ToolReceipt(
+                        call=terminal[0],
+                        elapsed_seconds=0,
+                        outcome=ToolOutcome(
+                            status=OutcomeStatus.PARTIAL,
+                            summary="Correct the rejected same-decision update before submitting the retained answer.",
+                            data={
+                                "rejected_predecessor_call_ids": [
+                                    receipt.call.call_id
+                                    for receipt in receipts
+                                    if receipt.outcome.status != OutcomeStatus.FOUND
+                                ]
+                            },
+                        ),
+                    )
+                    self._commit_receipt(blocked)
+                    receipts.append(blocked)
+                by_id = {receipt.call.call_id: receipt for receipt in receipts}
+                return [by_id[call.call_id] for call in calls]
         # Local mutations establish bindings before dependent I/O in the same decision.
         mutation_names = {"update_research", "repair_question_answer"}
         mutations = [call for call in calls if call.name in mutation_names]
@@ -802,6 +877,13 @@ class Harness:
                     continue
                 child = self.context.child()
                 child.services["applied_outcome_metadata_call"] = call
+                completed = self.context.services.get("hosted_terminal_completed")
+                if (
+                    parallel_execution_enabled(self.context)
+                    and isinstance(completed, dict)
+                    and completed.get("terminal_call_id") == call.call_id
+                ):
+                    child.services["hosted_terminal_execution_id"] = call.call_id
                 # Tools are not delegated researchers; keep their delegation depth unchanged.
                 child.depth = self.context.depth
                 if call.call_id in prepared_searches:
