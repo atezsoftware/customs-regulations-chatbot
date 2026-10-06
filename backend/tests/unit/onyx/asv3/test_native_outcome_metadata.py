@@ -8,6 +8,7 @@ from pydantic import JsonValue
 
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.harness import Harness
+from onyx.asv3.legal_source_reviews import LegalSourceReviews
 from onyx.asv3.llm_adapter import ResearchModel
 from onyx.asv3.models import (
     CapabilityCall,
@@ -186,6 +187,185 @@ def test_outcome_metadata_schema_is_not_exposed_when_inactive(service: str) -> N
     assert "_coverage" not in properties
 
 
+@pytest.mark.parametrize(
+    "profile,parallel,child,assigned,exposed",
+    [
+        ("experimental", True, True, None, False),
+        ("experimental", True, True, [], False),
+        ("experimental", True, True, ["first"], True),
+        ("experimental", True, False, [], True),
+        ("experimental", False, True, [], True),
+        ("normal", True, True, [], True),
+        ("deep", True, True, [], True),
+        (None, True, True, [], True),
+    ],
+)
+def test_only_unbound_experimental_parallel_children_omit_outcome_schema(
+    profile: str | None,
+    parallel: bool,
+    child: bool,
+    assigned: list[str] | None,
+    exposed: bool,
+) -> None:
+    context, _, _ = research_context()
+    context.services.update(research_profile=profile, experimental_parallel=parallel)
+    if child:
+        context = context.independent_child()
+    if assigned is not None:
+        context.services["task_outcome_ids"] = assigned
+    parameters = native_parameters(context)
+    properties = parameters["properties"]
+    assert isinstance(properties, dict)
+    assert ("_outcomes" in properties) is exposed
+    assert ("_coverage" in properties) is exposed
+    validator = Draft202012Validator(parameters)
+    assert validator.is_valid(read_call().arguments)
+    assert (
+        validator.is_valid(read_call({"_outcomes": [requested()]}).arguments) is exposed
+    )
+    assert validator.is_valid(read_call({"_coverage": {}}).arguments) is exposed
+
+
+@pytest.mark.parametrize("assigned", [None, [], ["first"]])
+@pytest.mark.parametrize("through_harness", [False, True])
+def test_direct_parallel_child_metadata_still_requires_its_actual_assigned_subset(
+    assigned: list[str] | None, through_harness: bool
+) -> None:
+    parent, outcomes, ledger = research_context()
+    parent.services.update(research_profile="experimental", experimental_parallel=True)
+    child = parent.independent_child()
+    if assigned is not None:
+        child.services["task_outcome_ids"] = assigned
+    observed: list[dict[str, JsonValue]] = []
+
+    def handler(arguments: dict[str, JsonValue], _context: RunContext) -> ToolOutcome:
+        observed.append(arguments)
+        return ToolOutcome(status=OutcomeStatus.FOUND, summary="Original read")
+
+    registry = source_registry(handler)
+    call = read_call({"_outcomes": [requested("unassigned")], "_coverage": {}})
+    before = outcomes.export()
+    arguments = json.dumps(call.arguments, sort_keys=True)
+    result = (
+        harness(child, registry, ledger)._dispatch([call])[0].outcome
+        if through_harness
+        else registry.dispatch(call, child)
+    )
+    assert result.status == OutcomeStatus.INVALID
+    assert result.data["invalid_outcome_metadata"] is True
+    assert result.data["detail"] == (
+        "Researcher may update only assigned outcomes"
+        if assigned
+        else "Researcher outcome metadata needs an assigned subset"
+    )
+    assert outcomes.export() == before
+    assert observed == []
+    assert json.dumps(call.arguments, sort_keys=True) == arguments
+
+
+@pytest.mark.parametrize("binding", ["absent", "empty", "assigned", "root"])
+def test_parallel_native_terminal_keeps_full_body_and_source_reviews_in_one_decision(
+    binding: str,
+) -> None:
+    from tests.unit.onyx.asv3.test_native_model_adapter import model, native_action
+
+    parent, outcomes, ledger = research_context()
+    parent.services.update(
+        research_profile="experimental",
+        experimental_parallel=True,
+        scenario_request="First outcome? Second outcome?",
+    )
+    context = parent if binding == "root" else parent.independent_child()
+    if binding == "empty":
+        context.services["task_outcome_ids"] = []
+    elif binding == "assigned":
+        outcomes.update(
+            OutcomeUpdate.model_validate({"outcomes": [requested()]}), ledger
+        )
+        context.services["task_outcome_ids"] = ["first"]
+    context.services["legal_source_reviews"] = LegalSourceReviews(
+        context, "First outcome? Second outcome?"
+    )
+    body = ("The specific operative original remains unexamined.\n" * 650) + "\n  "
+    arguments: dict[str, JsonValue] = {
+        "answer": body,
+        "_language": "en",
+        "_related_source_reviews": [],
+    }
+    if binding == "assigned":
+        arguments["_coverage"] = {
+            "resolutions": [
+                {
+                    "outcome_id": "first",
+                    "status": "unresolved",
+                    "gap": "The specific operative original remains unexamined.",
+                }
+            ]
+        }
+    elif binding == "root":
+        arguments["_outcomes"] = [requested()]
+    observed: list[dict[str, JsonValue]] = []
+
+    def partial(values: dict[str, JsonValue], _context: RunContext) -> ToolOutcome:
+        observed.append(values)
+        return ToolOutcome(status=OutcomeStatus.PARTIAL, summary="Partial submitted")
+
+    registry = CapabilityRegistry(
+        [
+            ToolSpec(
+                name="submit_partial_answer",
+                description="Submit supported portions and the remaining gap",
+                parameters={
+                    "type": "object",
+                    "properties": {"answer": {"type": "string"}},
+                    "required": ["answer"],
+                    "additionalProperties": False,
+                },
+                handler=partial,
+                parallel_safe=False,
+            )
+        ]
+    )
+    definition = registry.definitions(context)[0]["function"]
+    assert isinstance(definition, dict)
+    parameters = definition["parameters"]
+    assert isinstance(parameters, dict)
+    properties = parameters["properties"]
+    assert isinstance(properties, dict)
+    assert "_related_source_reviews" in properties
+    assert ("_outcomes" in properties) is (binding in {"assigned", "root"})
+    assert ("_coverage" in properties) is (binding in {"assigned", "root"})
+    Draft202012Validator(parameters).validate(arguments)
+    selected, secondary = model(), model()
+    selected.invoke.return_value = native_action("submit_partial_answer", arguments)
+    adapter = ResearchModel(
+        selected, context, research_llm=secondary, lean_native_mode=True
+    )
+    before = outcomes.export()
+    before_revision = outcomes.revision
+    result = Harness(
+        request="First outcome? Second outcome?",
+        context=context,
+        registry=registry,
+        evidence=ledger,
+        decide=adapter.decide,
+        partial_submission=lambda: body if observed else None,
+    ).run()
+    assert result.answer == body
+    assert len(body) > 30000
+    assert result.status == OutcomeStatus.PARTIAL
+    assert result.stop_reason == "model_requested_partial_publication"
+    assert observed == [{"answer": body}]
+    assert selected.invoke.call_count == 1
+    secondary.invoke.assert_not_called()
+    assert len(result.receipts) == 1
+    assert result.receipts[0].outcome.status == OutcomeStatus.PARTIAL
+    if binding in {"absent", "empty"}:
+        assert outcomes.export() == before
+    else:
+        assert outcomes.revision == before_revision + 1
+
+
 @pytest.mark.parametrize("through_harness", [False, True])
 def test_outcomes_on_first_useful_call_exist_before_source_handler_without_metadata_leaking(
     through_harness: bool,
@@ -311,10 +491,16 @@ def test_cached_original_read_applies_new_source_conditions_without_another_sour
     assert outcomes.revision == 2
 
 
-def test_corrected_outcome_metadata_does_not_poison_the_same_actual_source_arguments() -> (
-    None
-):
+@pytest.mark.parametrize("parallel", [False, True])
+@pytest.mark.parametrize("through_harness", [False, True])
+def test_corrected_outcome_metadata_does_not_poison_the_same_actual_source_arguments(
+    parallel: bool, through_harness: bool
+) -> None:
     context, outcomes, ledger = research_context()
+    if parallel:
+        context.services.update(
+            research_profile="experimental", experimental_parallel=True
+        )
     calls = 0
 
     def handler(_arguments: dict[str, JsonValue], _context: RunContext) -> ToolOutcome:
@@ -322,16 +508,25 @@ def test_corrected_outcome_metadata_does_not_poison_the_same_actual_source_argum
         calls += 1
         return ToolOutcome(status=OutcomeStatus.FOUND, summary="Original read")
 
-    runner = harness(context, source_registry(handler), ledger)
-    invalid = runner._dispatch(
-        [read_call({"_outcomes": [requested(question="outside")]})]
-    )[0]
-    assert invalid.outcome.status == OutcomeStatus.INVALID
-    assert invalid.outcome.data["invalid_outcome_metadata"] is True
+    registry = source_registry(handler)
+    runner = harness(context, registry, ledger)
+
+    def dispatch(call: CapabilityCall) -> ToolOutcome:
+        return (
+            runner._dispatch([call])[0].outcome
+            if through_harness
+            else registry.dispatch(call, context)
+        )
+
+    invalid_call = read_call({"_outcomes": [requested(question="outside")]})
+    Draft202012Validator(native_parameters(context)).validate(invalid_call.arguments)
+    invalid = dispatch(invalid_call)
+    assert invalid.status == OutcomeStatus.INVALID
+    assert invalid.data["invalid_outcome_metadata"] is True
     assert calls == 0
     assert outcomes.outcome_ids() == []
-    corrected = runner._dispatch([read_call({"_outcomes": [requested()]})])[0]
-    assert corrected.outcome.status == OutcomeStatus.FOUND
+    corrected = dispatch(read_call({"_outcomes": [requested()]}))
+    assert corrected.status == OutcomeStatus.FOUND
     assert calls == 1
     assert outcomes.outcome_ids() == ["first"]
 

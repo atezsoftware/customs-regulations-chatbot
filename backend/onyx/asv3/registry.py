@@ -89,10 +89,18 @@ class CapabilityRegistry:
 
     def definitions(self, context: RunContext) -> list[dict[str, JsonValue]]:
         definitions: list[dict[str, JsonValue]] = []
+        task_outcome_ids = context.services.get("task_outcome_ids")
+        unbound_parallel_child = (
+            context.services.get("research_profile") == "experimental"
+            and context.services.get("experimental_parallel") is True
+            and context.depth > 0
+            and (not isinstance(task_outcome_ids, list) or not task_outcome_ids)
+        )
         outcome_properties = (
             _outcome_metadata_properties()
             if context.services.get("lean_native_mode")
             and isinstance(context.services.get("outcome_map"), OutcomeMap)
+            and not unbound_parallel_child
             else None
         )
         for spec in self._specs.values():
