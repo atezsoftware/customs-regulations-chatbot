@@ -53,6 +53,7 @@ _TUNED_RETRIEVAL_OVERRIDES = SearchToolRetrievalOverrides(
     rerank_candidate_limit=192,
     regulatory_rerank_candidate_limit=192,
     max_llm_chunks=50,
+    preserve_source_diversity=True,
 )
 
 

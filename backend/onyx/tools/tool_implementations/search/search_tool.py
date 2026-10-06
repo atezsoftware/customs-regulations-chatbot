@@ -2562,15 +2562,23 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
             )
         ]
         if asv3_regulatory_search:
+            preserve_source_diversity = (
+                isinstance(override_kwargs, SearchToolRetrievalOverrideKwargs)
+                and override_kwargs.preserve_source_diversity
+            )
             fused_candidates = select_lane_candidates(
                 rerank_candidate_pool,
                 all_search_results,
                 limit=regulatory_rerank_candidate_limit,
+                diversity_candidates=(
+                    fused_order if preserve_source_diversity else None
+                ),
             )
             with graph_step("search.pre_rerank_selection") as selection_step:
                 selection_step.output_value = {
                     "candidate_limit": regulatory_rerank_candidate_limit,
                     "heads_per_lane": 5,
+                    "preserve_source_diversity": preserve_source_diversity,
                     "lanes": [lane.model_dump() for lane in query_lanes],
                     "candidates": candidate_lineage(
                         fused_order, all_search_results, fused_candidates

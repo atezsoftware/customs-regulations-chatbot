@@ -12,13 +12,15 @@ def select_lane_candidates(
     *,
     limit: int,
     heads_per_lane: int = 5,
+    diversity_candidates: Sequence[InferenceChunk] | None = None,
 ) -> list[InferenceChunk]:
-    """Keep the fused winner, round-robin lane heads, then fill in fusion order."""
+    """Retain strong lane leads and optionally reserve room for distinct sources."""
     selected: list[InferenceChunk] = []
     seen: set[str] = set()
+    selection_limit = limit if diversity_candidates is None else (limit + 1) // 2
 
     def add(chunk: InferenceChunk) -> None:
-        if len(selected) < limit and chunk.unique_id not in seen:
+        if len(selected) < selection_limit and chunk.unique_id not in seen:
             selected.append(chunk)
             seen.add(chunk.unique_id)
 
@@ -30,6 +32,17 @@ def select_lane_candidates(
                 add(lane[rank])
     for chunk in fused:
         add(chunk)
+    if diversity_candidates is not None:
+        selection_limit = limit
+        represented_sources = {chunk.document_id for chunk in selected}
+        for chunk in diversity_candidates:
+            if chunk.document_id not in represented_sources:
+                add(chunk)
+                represented_sources.add(chunk.document_id)
+        for chunk in fused:
+            add(chunk)
+        for chunk in diversity_candidates:
+            add(chunk)
     return selected
 
 
