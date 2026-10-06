@@ -54,9 +54,25 @@ def payloads(prompt: list[ChatCompletionMessage]) -> list[dict[str, Any]]:
 
 
 def actual_originals(prompt: list[ChatCompletionMessage]) -> list[dict[str, Any]]:
+    parsed = payloads(prompt)
+    catalogue = {
+        row["citation"]: row
+        for payload in parsed
+        for row in payload.get("original_metadata_catalogue", [])
+    }
     return [
-        row
-        for payload in payloads(prompt)
+        {
+            **(
+                {
+                    key: catalogue[row["identity_ref"]][key]
+                    for key in ("source_id", "chunk_id", "text_hash")
+                }
+                if "identity_ref" in row
+                else {}
+            ),
+            **row,
+        }
+        for payload in parsed
         for row in payload.get("original_evidence", [])
         if isinstance(row, dict) and isinstance(row.get("text"), str)
     ]
@@ -78,7 +94,7 @@ def test_native_first_text_and_tail_fallback_are_actually_delivered_once() -> No
     repeated = json.loads(tools[1].content)
     assert acquired["original_evidence"][0]["text"] == first["text"]
     assert "original_evidence" not in repeated
-    assert repeated["original_evidence_refs"][0]["text_hash"] == first["text_hash"]
+    assert repeated["original_evidence_refs"][0]["identity_ref"] == first["citation"]
     current = last_payload(llm)
     assert current["original_evidence"][0]["text"] == second["text"]
     assert [row["metadata"] for row in current["original_metadata_catalogue"]] == [

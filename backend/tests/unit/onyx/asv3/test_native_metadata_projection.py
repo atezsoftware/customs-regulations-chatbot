@@ -76,13 +76,20 @@ def test_real_native_decision_keeps_complete_originals_and_only_parallel_refs(
         assert final["original_metadata_catalogue"][0]["metadata"] == record["metadata"]
         actual = tool_payloads[0]["original_evidence"][0]
         assert actual["text"] == record["text"]
-        assert actual["metadata_ref"] == {
-            "citation": record["citation"],
-            "text_hash": record["text_hash"],
+        assert actual["identity_ref"] == record["citation"]
+        assert {
+            key: final["original_metadata_catalogue"][0][key]
+            for key in ("citation", "source_id", "chunk_id", "text_hash")
+        } == {
+            key: record[key]
+            for key in ("citation", "source_id", "chunk_id", "text_hash")
         }
         assert "metadata" not in actual
         assert "original_evidence" not in tool_payloads[1]
-        assert "metadata_ref" in tool_payloads[1]["original_evidence_refs"][0]
+        assert (
+            tool_payloads[1]["original_evidence_refs"][0]["identity_ref"]
+            == record["citation"]
+        )
     else:
         assert final["original_evidence"][0]["text"] == record["text"]
         assert final["original_evidence"][0]["metadata"] == record["metadata"]

@@ -13,6 +13,12 @@ from onyx.asv3.models import ResearchTurn, model_evidence_metadata
 from onyx.llm.models import ToolMessage
 
 OriginalRange = tuple[int, str, str | None, str, int, int]
+_IDENTITY_FIELDS = frozenset(
+    {"source_id", "chunk_id", "text_hash", "metadata", "metadata_ref"}
+)
+_CATALOGUE_FIELDS = frozenset(
+    {"citation", "source_id", "chunk_id", "text_hash", "metadata"}
+)
 
 
 @dataclass(frozen=True)
@@ -67,6 +73,7 @@ def _project_record(
     *,
     keep_text: bool,
     current_metadata: bool,
+    compact_identities: bool = False,
 ) -> dict[str, JsonValue]:
     result = {key: value for key, value in record.items() if keep_text or key != "text"}
     result["start_char"], result["end_char"] = identity[4], identity[5]
@@ -76,13 +83,42 @@ def _project_record(
             raise ValueError("Native metadata reference addresses another original")
         result.pop("metadata", None)
         result["metadata_ref"] = address
+        if compact_identities:
+            return _compact_identity(result, identity[0])
     return result
+
+
+def _compact_identity(
+    record: dict[str, JsonValue], citation: int
+) -> dict[str, JsonValue]:
+    if "identity_ref" in record and (
+        type(record["identity_ref"]) is not int or record["identity_ref"] != citation
+    ):
+        raise ValueError("Native identity reference addresses another original")
+    return {
+        **{key: value for key, value in record.items() if key not in _IDENTITY_FIELDS},
+        "identity_ref": citation,
+    }
+
+
+def _validate_reference_range(record: dict[str, JsonValue], total_chars: int) -> None:
+    start, end = record.get("start_char", 0), record.get("end_char", total_chars)
+    if (
+        type(start) is not int
+        or type(end) is not int
+        or start < 0
+        or end < start
+        or end > total_chars
+    ):
+        raise ValueError("Native identity reference has an invalid canonical range")
 
 
 def project_native_originals(
     turns: list[ResearchTurn],
     selected_originals: Sequence[dict[str, JsonValue]],
     ledger: EvidenceLedger,
+    *,
+    compact_identities: bool = False,
 ) -> NativeOriginalProjection:
     selected: dict[OriginalRange, dict[str, JsonValue]] = {}
     catalogue: dict[tuple[int, str], dict[str, JsonValue]] = {}
@@ -135,7 +171,11 @@ def project_native_originals(
                 current_metadata = (identity[0], identity[3]) in catalogue
                 keep = identity in selected and identity not in delivered
                 updated = _project_record(
-                    record, identity, keep_text=keep, current_metadata=current_metadata
+                    record,
+                    identity,
+                    keep_text=keep,
+                    current_metadata=current_metadata,
+                    compact_identities=compact_identities,
                 )
                 if keep:
                     kept.append(updated)
@@ -164,16 +204,24 @@ def project_native_originals(
                     raise ValueError(
                         "Native metadata reference addresses another original"
                     )
-                refs.append(
-                    {
-                        **{
-                            key: value
-                            for key, value in reference.items()
-                            if key != "metadata"
-                        },
-                        "metadata_ref": address,
-                    }
-                )
+                updated_reference = {
+                    **{
+                        key: value
+                        for key, value in reference.items()
+                        if key != "metadata"
+                    },
+                    "metadata_ref": address,
+                }
+                if compact_identities:
+                    item = ledger.get(citation)
+                    assert item is not None
+                    if "text" in reference:
+                        raise ValueError(
+                            "Native identity reference cannot contain text"
+                        )
+                    _validate_reference_range(reference, len(item.text))
+                    updated_reference = _compact_identity(updated_reference, citation)
+                refs.append(updated_reference)
             if isinstance(originals, list):
                 if kept:
                     payload["original_evidence"] = kept
@@ -191,8 +239,108 @@ def project_native_originals(
         projected.append(turn.model_copy(update={"results": results}))
 
     fallback = [
-        _project_record(record, identity, keep_text=True, current_metadata=True)
+        _project_record(
+            record,
+            identity,
+            keep_text=True,
+            current_metadata=True,
+            compact_identities=compact_identities,
+        )
         for identity, record in selected.items()
         if identity not in delivered
     ]
     return NativeOriginalProjection(projected, fallback, list(catalogue.values()))
+
+
+def decode_compact_originals(
+    payloads: Sequence[dict[str, JsonValue]],
+    final_host_catalogue: Sequence[dict[str, JsonValue]] | None,
+    ledger: EvidenceLedger,
+) -> list[dict[str, JsonValue]]:
+    """Rehydrate only literal text rows against the caller's invocation-bound catalogue."""
+    catalogue: dict[int, dict[str, JsonValue]] = {}
+    for identity in final_host_catalogue or []:
+        if not isinstance(identity, dict):
+            raise ValueError("Native identity catalogue has an invalid record")
+        citation = identity.get("citation")
+        if type(citation) is not int or citation <= 0 or citation in catalogue:
+            raise ValueError(
+                "Native identity catalogue has an invalid or duplicate citation"
+            )
+        item = ledger.get(citation)
+        if (
+            set(identity) != _CATALOGUE_FIELDS
+            or item is None
+            or identity.get("source_id") != item.source_id
+            or identity.get("chunk_id") != item.chunk_id
+            or identity.get("text_hash") != item.text_hash
+            or json.dumps(identity.get("metadata"), sort_keys=True)
+            != json.dumps(model_evidence_metadata(item.metadata), sort_keys=True)
+        ):
+            raise ValueError(
+                "Native identity catalogue is not current canonical evidence"
+            )
+        catalogue[citation] = identity
+
+    decoded: list[dict[str, JsonValue]] = []
+    for payload in payloads:
+        for field in ("original_evidence", "evidence", "original_evidence_refs"):
+            records = payload.get(field)
+            if not isinstance(records, list):
+                continue
+            for record in records:
+                if not isinstance(record, dict) or "identity_ref" not in record:
+                    continue
+                citation = record.get("citation")
+                if (
+                    type(citation) is not int
+                    or type(record["identity_ref"]) is not int
+                    or record["identity_ref"] != citation
+                    or citation not in catalogue
+                    or _IDENTITY_FIELDS.intersection(record)
+                ):
+                    raise ValueError(
+                        "Native compact original has no matching canonical identity"
+                    )
+                item = ledger.get(citation)
+                assert item is not None
+                _validate_reference_range(record, len(item.text))
+                if field == "original_evidence_refs":
+                    if "text" in record:
+                        raise ValueError(
+                            "Native identity reference cannot contain text"
+                        )
+                    continue
+                if "text" not in record:
+                    continue
+                text, start, end = (
+                    record["text"],
+                    record.get("start_char"),
+                    record.get("end_char"),
+                )
+                if (
+                    not isinstance(text, str)
+                    or not text
+                    or type(start) is not int
+                    or type(end) is not int
+                    or end - start != len(text)
+                    or item.text[start:end] != text
+                ):
+                    raise ValueError(
+                        "Native compact original text is not its canonical range"
+                    )
+                decoded.append(
+                    {
+                        **{
+                            key: value
+                            for key, value in record.items()
+                            if key != "identity_ref"
+                        },
+                        **{
+                            key: value
+                            for key, value in catalogue[citation].items()
+                            if key != "citation"
+                        },
+                    }
+                )
+    return decoded

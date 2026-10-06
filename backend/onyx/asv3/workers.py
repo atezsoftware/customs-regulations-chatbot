@@ -25,6 +25,10 @@ from onyx.asv3.models import (
     ToolOutcome,
     ToolSpec,
 )
+from onyx.asv3.parallel_checkpoint import (
+    parallel_checkpoint_digest,
+    share_parallel_snapshot,
+)
 from onyx.asv3.progress import ProgressReporter
 from onyx.asv3.research_state import ResearchState
 
@@ -53,6 +57,12 @@ class _ChildCheckpoint(BaseModel):
 
 
 class WorkerPool:
+    def _shared_checkpoints(self) -> bool:
+        return (
+            self.context.services.get("research_profile") == "experimental"
+            and self.context.services.get("experimental_parallel") is True
+        )
+
     def __init__(
         self,
         context: RunContext,
@@ -185,8 +195,10 @@ class WorkerPool:
                     task_id
                 )
             if previous_checkpoint is not None:
-                child.services["previous_child_checkpoint"] = copy.deepcopy(
-                    previous_checkpoint
+                child.services["previous_child_checkpoint"] = (
+                    share_parallel_snapshot(previous_checkpoint)
+                    if self._shared_checkpoints()
+                    else copy.deepcopy(previous_checkpoint)
                 )
             self._contexts[task_id] = child
             self._tasks[task_id] = TaskSnapshot(
@@ -335,7 +347,23 @@ class WorkerPool:
     def _validated_checkpoint(
         self, task: TaskSnapshot, payload: dict[str, JsonValue]
     ) -> _ChildCheckpoint:
-        checkpoint = _ChildCheckpoint.model_validate(payload)
+        if self._shared_checkpoints():
+            raw_snapshot = payload.get("snapshot")
+            if not isinstance(raw_snapshot, dict):
+                raise ValueError("Invalid parallel child checkpoint")
+            snapshot = share_parallel_snapshot(raw_snapshot)
+            metadata = _ChildCheckpoint.model_validate({**payload, "snapshot": {}})
+            content = {
+                **metadata.model_dump(mode="json", exclude={"integrity", "snapshot"}),
+                "snapshot": snapshot,
+            }
+            integrity = parallel_checkpoint_digest(content)
+            checkpoint = metadata.model_copy(update={"snapshot": snapshot})
+        else:
+            checkpoint = _ChildCheckpoint.model_validate(payload)
+            integrity = _checkpoint_digest(
+                checkpoint.model_dump(mode="json", exclude={"integrity"})
+            )
         if (
             checkpoint.run_id != self.context.run_id
             or checkpoint.task_id != task.task_id
@@ -345,10 +373,7 @@ class WorkerPool:
             or checkpoint.outcome_ids != task.outcome_ids
             or checkpoint.snapshot.get("run_id") != self.context.run_id
             or checkpoint.snapshot.get("request") != task.task
-            or checkpoint.integrity
-            != _checkpoint_digest(
-                checkpoint.model_dump(mode="json", exclude={"integrity"})
-            )
+            or checkpoint.integrity != integrity
         ):
             raise ValueError(
                 "Child checkpoint task, assignment, scope or integrity changed"
@@ -375,9 +400,16 @@ class WorkerPool:
                 "request_hash": _checkpoint_digest(task.task),
                 "assignment_id": task.assignment_id,
                 "outcome_ids": list(task.outcome_ids),
-                "snapshot": copy.deepcopy(snapshot),
+                "snapshot": share_parallel_snapshot(snapshot)
+                if self._shared_checkpoints()
+                else copy.deepcopy(snapshot),
             }
-            wrapped = {**content, "integrity": _checkpoint_digest(content)}
+            wrapped = {
+                **content,
+                "integrity": parallel_checkpoint_digest(content)
+                if self._shared_checkpoints()
+                else _checkpoint_digest(content),
+            }
             self._validated_checkpoint(task, wrapped)
             task.child_checkpoint = wrapped
 
@@ -759,10 +791,18 @@ class WorkerPool:
             tasks: builtins.list[JsonValue] = []
             for task in self._tasks.values():
                 view = self._task_view(task)
-                view.child_checkpoint = copy.deepcopy(task.child_checkpoint)
-                tasks.append(
-                    view.model_dump(mode="json", exclude={"outcome": {"evidence"}})
-                )
+                if self._shared_checkpoints():
+                    value = view.model_dump(
+                        mode="json",
+                        exclude={"outcome": {"evidence"}, "child_checkpoint": True},
+                    )
+                    value["child_checkpoint"] = copy.deepcopy(task.child_checkpoint)
+                else:
+                    view.child_checkpoint = copy.deepcopy(task.child_checkpoint)
+                    value = view.model_dump(
+                        mode="json", exclude={"outcome": {"evidence"}}
+                    )
+                tasks.append(value)
             result: dict[str, JsonValue] = {
                 "version": 1,
                 "run_id": self.context.run_id,
@@ -783,7 +823,18 @@ class WorkerPool:
         raw = payload.get("tasks")
         if not isinstance(raw, list):
             raise ValueError("Invalid worker checkpoint")
-        snapshots = [TaskSnapshot.model_validate(item) for item in raw]
+        snapshots: builtins.list[TaskSnapshot] = []
+        for item in raw:
+            if self._shared_checkpoints():
+                if not isinstance(item, dict):
+                    raise ValueError("Invalid worker checkpoint task")
+                wrapper = item.get("child_checkpoint")
+                if wrapper is not None and not isinstance(wrapper, dict):
+                    raise ValueError("Invalid parallel child checkpoint")
+                task = TaskSnapshot.model_validate({**item, "child_checkpoint": None})
+                snapshots.append(task.model_copy(update={"child_checkpoint": wrapper}))
+            else:
+                snapshots.append(TaskSnapshot.model_validate(item))
         if sum(not item.independent_question for item in snapshots) > self.max_tasks:
             raise ValueError("Invalid worker checkpoint")
         if len({item.task_id for item in snapshots}) != len(snapshots):
@@ -803,6 +854,12 @@ class WorkerPool:
                 if snapshot.child_checkpoint is not None
                 else None
             )
+            if self._shared_checkpoints() and saved_checkpoint is not None:
+                assert snapshot.child_checkpoint is not None
+                snapshot.child_checkpoint = {
+                    key: saved_checkpoint if key == "snapshot" else copy.deepcopy(value)
+                    for key, value in snapshot.child_checkpoint.items()
+                }
             if snapshot.independent_question:
                 limits = snapshot.local_budget.get("limits")
                 used = snapshot.local_budget.get("used")

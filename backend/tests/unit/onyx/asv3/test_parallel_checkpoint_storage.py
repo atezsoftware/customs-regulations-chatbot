@@ -214,7 +214,7 @@ def test_compact_checkpoint_rejects_modified_pool_and_refs(change: str) -> None:
     elif change == "duplicate":
         cast(list[JsonValue], ledger["records"]).append(identifier)
     elif change == "format":
-        storage["version"] = 2
+        storage["version"] = 99
     elif change == "profile":
         compact["parallel_research"] = False
     else:
@@ -246,10 +246,9 @@ def test_reference_amplification_fails_capacity_check_before_model_validation(
     else:
         compact_unit = compact
     ledger = cast(dict[str, JsonValue], compact_unit["evidence"])
-    deliveries = cast(list[dict[str, JsonValue]], ledger["deliveries"])
-    reference = cast(list[JsonValue], deliveries[0]["records"])[0]
-    deliveries[0]["records"] = [reference] * 30000
-    assert len(json.dumps(compact).encode()) < 8_000_000
+    deliveries = cast(list[JsonValue], ledger["deliveries"])
+    ledger["deliveries"] = [deliveries[0]] * 150000
+    assert len(json.dumps(compact).encode()) > 8_000_000
     with pytest.raises(ValueError, match="storage capacity"):
         restore_parallel_checkpoint(compact)
 

@@ -11,7 +11,8 @@ import re
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from typing import Annotated, Literal, cast
+from dataclasses import dataclass
+from typing import Annotated, Literal, TypedDict, cast
 from uuid import uuid4
 
 import jsonschema
@@ -41,7 +42,10 @@ from onyx.asv3.models import (
     ToolReceipt,
     model_evidence_metadata,
 )
-from onyx.asv3.native_cache_projection import project_native_originals
+from onyx.asv3.native_cache_projection import (
+    decode_compact_originals,
+    project_native_originals,
+)
 from onyx.asv3.outcome_map import OutcomeMap
 from onyx.asv3.research_gaps import research_gap_signals
 from onyx.asv3.shared_originals import related_provision_originals
@@ -99,6 +103,67 @@ from onyx.tracing.llm_utils import llm_generation_span, record_llm_response
 
 class NativeDecisionEnvelopeError(ValueError):
     """A rejected native batch needs a fresh decision, not an argument patch."""
+
+
+@dataclass(frozen=True)
+class _NativeOriginalCatalogue:
+    message_index: int
+    content_sha256: str
+    records: tuple[dict[str, JsonValue], ...]
+
+    @classmethod
+    def bind(cls, prompt: list[ChatCompletionMessage]) -> _NativeOriginalCatalogue:
+        index = len(prompt) - 1
+        text = cls._host_text(prompt, index)
+        payload = parse_json_object(text)
+        records = payload.get("original_metadata_catalogue", [])
+        if not isinstance(records, list) or any(
+            not isinstance(record, dict) for record in records
+        ):
+            raise ValueError("Native original catalogue must contain identity records")
+        return cls(
+            index,
+            hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            tuple(copy.deepcopy(cast(list[dict[str, JsonValue]], records))),
+        )
+
+    @staticmethod
+    def _host_text(prompt: list[ChatCompletionMessage], index: int) -> str:
+        if type(index) is not int or not 0 <= index < len(prompt):
+            raise ValueError("Native original catalogue host message is missing")
+        message = prompt[index]
+        if not isinstance(message, UserMessage):
+            raise ValueError("Native original catalogue needs its host user message")
+        content = message.content
+        texts = (
+            [content]
+            if isinstance(content, str)
+            else [
+                part.text for part in content or [] if isinstance(part, TextContentPart)
+            ]
+        )
+        if len(texts) != 1:
+            raise ValueError("Native original catalogue host text is ambiguous")
+        return texts[0]
+
+    def validate(self, prompt: list[ChatCompletionMessage]) -> None:
+        text = self._host_text(prompt, self.message_index)
+        if hashlib.sha256(text.encode("utf-8")).hexdigest() != self.content_sha256:
+            raise ValueError("Native original catalogue host message changed")
+        if parse_json_object(text).get("original_metadata_catalogue", []) != list(
+            self.records
+        ):
+            raise ValueError("Native original catalogue binding changed")
+
+
+class _NativeCatalogueKwargs(TypedDict, total=False):
+    native_catalogue: _NativeOriginalCatalogue
+
+
+def _native_catalogue_kwargs(
+    catalogue: _NativeOriginalCatalogue | None,
+) -> _NativeCatalogueKwargs:
+    return {"native_catalogue": catalogue} if catalogue is not None else {}
 
 
 def native_protocol_rejection(error: Exception) -> bool:
@@ -1111,6 +1176,7 @@ class ResearchModel:
         structured: bool = True,
         response_model: type[BaseModel] | None = None,
         call_llm: LLM | None = None,
+        native_catalogue: _NativeOriginalCatalogue | None = None,
     ) -> ModelResponse:
         check = (
             self.context.check_research_active
@@ -1130,6 +1196,7 @@ class ResearchModel:
                     structured=structured,
                     response_model=response_model,
                     call_llm=call_llm,
+                    **_native_catalogue_kwargs(native_catalogue),
                 )
             except Exception as error:
                 if (
@@ -1165,6 +1232,7 @@ class ResearchModel:
         structured: bool = True,
         response_model: type[BaseModel] | None = None,
         call_llm: LLM | None = None,
+        native_catalogue: _NativeOriginalCatalogue | None = None,
     ) -> ModelResponse:
         selected_llm = call_llm if call_llm is not None else self.llm
         response_model = (
@@ -1176,6 +1244,18 @@ class ResearchModel:
         records: list[dict[str, JsonValue]] = []
         navigation: list[dict[str, JsonValue]] = []
         require_source_review_action = False
+        payloads: list[dict[str, JsonValue]] = []
+        if native_catalogue is not None:
+            if (
+                not self.lean_native_mode
+                or self.context.services.get("research_profile") != "experimental"
+                or self.context.services.get("experimental_parallel") is not True
+                or not isinstance(ledger, EvidenceLedger)
+            ):
+                raise ValueError(
+                    "Compact native originals require experimental parallel mode"
+                )
+            native_catalogue.validate(prompt)
         if isinstance(ledger, EvidenceLedger):
             for message in prompt:
                 content = message.content
@@ -1193,6 +1273,8 @@ class ResearchModel:
                         payload = parse_json_object(text)
                     except ValueError:
                         continue
+                    if native_catalogue is not None:
+                        payloads.append(payload)
                     leads = payload.get("related_source_navigation")
                     if isinstance(leads, list):
                         navigation.extend(
@@ -1220,12 +1302,21 @@ class ResearchModel:
                             continue
                     if isinstance(evidence, list):
                         records.extend(
-                            item for item in evidence if isinstance(item, dict)
+                            item
+                            for item in evidence
+                            if isinstance(item, dict)
+                            and not (
+                                native_catalogue is not None and "identity_ref" in item
+                            )
                         )
                     outcome = payload.get("outcome")
                     data = outcome.get("data") if isinstance(outcome, dict) else None
                     if isinstance(data, dict):
                         records.append(data)
+            if native_catalogue is not None:
+                records.extend(
+                    decode_compact_originals(payloads, native_catalogue.records, ledger)
+                )
         with (
             model_slot(self.context, research=research),
             llm_generation_span(selected_llm, flow, prompt, tools or None) as span,
@@ -2628,7 +2719,7 @@ class ResearchModel:
             current_originals = list(unique.values())
             if native_original_cache and isinstance(ledger, EvidenceLedger):
                 projection = project_native_originals(
-                    retained, current_originals, ledger
+                    retained, current_originals, ledger, compact_identities=True
                 )
                 native_turns = projection.turns
                 current_originals = projection.fallback_originals
@@ -2668,9 +2759,9 @@ class ResearchModel:
             if native_original_cache and unique:
                 current["evidence_note"] = str(current["evidence_note"]) + (
                     " Full passages occur once in retained native tool results or in this "
-                    "message's original_evidence. metadata_ref addresses current canonical "
-                    "metadata in original_metadata_catalogue by citation and text_hash; "
-                    "historical acquisition metadata is not the current source state. "
+                    "message's original_evidence. identity_ref names the citation's canonical "
+                    "source, chunk, text hash and current metadata in original_metadata_catalogue. "
+                    "The literal passage and its start_char/end_char remain beside that citation. "
                     "A catalogue or text reference alone does not deliver source text."
                 )
             return [
@@ -3172,6 +3263,7 @@ class ResearchModel:
         *,
         call_llm: LLM,
         research: bool,
+        native_catalogue: _NativeOriginalCatalogue | None = None,
     ) -> ModelResponse | None:
         try:
             response = self._invoke(
@@ -3181,6 +3273,7 @@ class ResearchModel:
                 max_tokens=output,
                 research=research,
                 call_llm=call_llm,
+                **_native_catalogue_kwargs(native_catalogue),
             )
             if self.lean_native_mode:
                 response = self._complete_native_response(
@@ -3191,6 +3284,7 @@ class ResearchModel:
                     response,
                     call_llm=call_llm,
                     research=research,
+                    **_native_catalogue_kwargs(native_catalogue),
                 )
             return response
         except Exception as error:
@@ -3232,6 +3326,13 @@ class ResearchModel:
                     if self._input_cost(trial, tools) <= ceiling:
                         parts.append(image)
         prompt[-1] = UserMessage(content=parts)
+        native_catalogue = (
+            _NativeOriginalCatalogue.bind(prompt)
+            if self.lean_native_mode
+            and self.context.services.get("research_profile") == "experimental"
+            and self.context.services.get("experimental_parallel") is True
+            else None
+        )
         flow = (
             LLMFlow.ASV3_RESEARCHER if self.context.depth else LLMFlow.ASV3_COORDINATOR
         )
@@ -3243,7 +3344,13 @@ class ResearchModel:
             and self.context.services.get("question_research_started") is True
         )
         response = self._native_decision_response(
-            prompt, tools, flow, output, research=research, call_llm=call_llm
+            prompt,
+            tools,
+            flow,
+            output,
+            research=research,
+            call_llm=call_llm,
+            **_native_catalogue_kwargs(native_catalogue),
         )
         if (
             response is not None
@@ -3273,6 +3380,7 @@ class ResearchModel:
                 output,
                 research=research,
                 call_llm=call_llm,
+                **_native_catalogue_kwargs(native_catalogue),
             )
             if (
                 response is not None
@@ -3356,6 +3464,7 @@ class ResearchModel:
                     recovery_output,
                     research=research,
                     call_llm=call_llm,
+                    **_native_catalogue_kwargs(native_catalogue),
                 )
                 continue
             except ValueError:
@@ -3383,6 +3492,7 @@ class ResearchModel:
         *,
         call_llm: LLM | None = None,
         research: bool = True,
+        native_catalogue: _NativeOriginalCatalogue | None = None,
     ) -> ModelResponse:
         text = ""
         while (response.choice.finish_reason or "").lower() in {
@@ -3452,6 +3562,7 @@ class ResearchModel:
                 max_tokens=output,
                 research=research,
                 call_llm=call_llm,
+                **_native_catalogue_kwargs(native_catalogue),
             )
             self.last_response_truncated = True
             if (
