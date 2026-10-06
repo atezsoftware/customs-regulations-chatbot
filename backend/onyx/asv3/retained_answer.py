@@ -10,6 +10,8 @@ from collections.abc import Sequence
 
 from pydantic import JsonValue
 
+from onyx.asv3.citation_numbers import extract_citation_numbers
+from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.models import Decision, ResearchTurn, RunContext
 from onyx.asv3.parallel_execution import parallel_execution_enabled
 
@@ -245,6 +247,58 @@ def resolve_retained_answer(
                 )
             )
     return decision.model_copy(update={"calls": calls})
+
+
+def normalize_retained_answer_basis(
+    name: str,
+    arguments: dict[str, JsonValue],
+    context: RunContext,
+    draft: str | None,
+    *,
+    request: str,
+) -> dict[str, JsonValue]:
+    """A valid source-backed owned reference may only inherit strict verification."""
+    if (
+        not _enabled(context)
+        or name != "submit_answer"
+        or "basis" in arguments
+        or "answer" in arguments
+        or "retained_answer_id" not in arguments
+    ):
+        return arguments
+    reference = _reference(context, draft, request)
+    ledger = context.services.get("evidence")
+    if (
+        reference is None
+        or arguments["retained_answer_id"] != reference["retained_answer_id"]
+        or not isinstance(ledger, EvidenceLedger)
+        or not isinstance(draft, str)
+    ):
+        return arguments
+    identifier = reference["retained_answer_id"]
+    assert isinstance(identifier, str)
+    answer = (
+        _edited_answer(draft, identifier, arguments["retained_answer_edits"])
+        if "retained_answer_edits" in arguments
+        else draft
+    )
+    if answer is None:
+        return arguments
+    numbers = extract_citation_numbers(answer)
+    if not numbers:
+        return arguments
+    for number in numbers:
+        item = ledger.get(number)
+        if (
+            item is None
+            or item.search_doc is None
+            or not item.source_id.strip()
+            or not item.text.strip()
+            or item.text_hash != hashlib.sha256(item.text.encode()).hexdigest()
+        ):
+            return arguments
+    # This selects the strongest validation mode; it grants no source approval.
+    return {**arguments, "basis": "originals"}
 
 
 def project_failed_terminal_turns(

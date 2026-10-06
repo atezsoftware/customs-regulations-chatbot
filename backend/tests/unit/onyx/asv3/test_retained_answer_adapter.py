@@ -120,9 +120,11 @@ def test_rejected_native_body_rehydrates_shared_original_not_in_owner_ranges() -
 
 
 @pytest.mark.parametrize("edit_unit", [False, True])
+@pytest.mark.parametrize("omit_basis", [False, True])
 def test_real_hosted_serial_reuses_rejected_body_with_fresh_original_delivery(
     monkeypatch: pytest.MonkeyPatch,
     edit_unit: bool,
+    omit_basis: bool,
 ) -> None:
     _kwargs, broker, selected, _checkpoints, _queue = setup_run(monkeypatch)
     selected.config = selected.config.model_copy(update={"model_name": "gpt-6-luna"})
@@ -297,6 +299,8 @@ def test_real_hosted_serial_reuses_rejected_body_with_fresh_original_delivery(
                     isinstance(message, ToolMessage) for message in arguments["prompt"]
                 )
                 terminal["retained_answer_id"] = identifier
+                if omit_basis:
+                    del terminal["basis"]
                 if edit_unit:
                     unit = units[1]
                     replacement = "The original condition and its scope remain unchanged; the supplied fact is distinct [1][2]."
@@ -331,6 +335,8 @@ def test_real_hosted_serial_reuses_rejected_body_with_fresh_original_delivery(
     final_arguments = json.loads(final_wire.tool_calls[0].function.arguments)
     assert "answer" not in final_arguments and "retained_answer_id" in final_arguments
     assert ("retained_answer_edits" in final_arguments) is edit_unit
+    assert ("basis" not in final_arguments) is omit_basis
+    assert child.harness.receipts[-1].call.arguments["basis"] == "originals"
     assert len(final_wire.model_dump_json()) < len(body) // 5
     accepted_call = child.model.last_call_id or ""
     assert ledger.completely_delivered(accepted_call) == {1, 2}

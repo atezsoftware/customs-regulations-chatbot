@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import re
@@ -29,6 +30,7 @@ from onyx.asv3.authority import (
 )
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.models import RunContext
+from onyx.asv3.parallel_execution import parallel_execution_enabled
 from onyx.regulatory.heading_path import (
     extract_regulatory_provision_reference_occurrences,
 )
@@ -520,14 +522,17 @@ class AuthorityRequirements:
             return saved
 
     def restore(
-        self, snapshot: dict[str, JsonValue], context: RunContext, request: str
+        self,
+        snapshot: dict[str, JsonValue],
+        context: RunContext,
+        request: str,
+        *,
+        allow_legacy_upgrade: bool = False,
+        ledger: EvidenceLedger | None = None,
+        retained_answer: str | None = None,
     ) -> None:
         self._fence(context)
         saved = _Checkpoint.model_validate(snapshot)
-        if saved.reference_policy != (
-            "syntactic-v1" if self.syntactic_reference_binding else "legacy"
-        ):
-            raise ValueError("Authority reference binding policy changed")
         if (saved.run_id, saved.scope_hash, saved.request_hash) != (
             self.run_id,
             self.scope_hash,
@@ -546,5 +551,66 @@ class AuthorityRequirements:
             records[record.requirement_id] = record
         if set(saved.record_integrity) != set(records):
             raise ValueError("Invalid retained authority requirement integrity")
+        expected_policy = (
+            "syntactic-v1" if self.syntactic_reference_binding else "legacy"
+        )
+        if saved.reference_policy != expected_policy:
+            if not (
+                allow_legacy_upgrade
+                and self.syntactic_reference_binding
+                and saved.reference_policy == "legacy"
+                and parallel_execution_enabled(context)
+                and isinstance(ledger, EvidenceLedger)
+            ):
+                raise ValueError("Authority reference binding policy changed")
+            rebuilt = AuthorityRequirements(
+                context, request, syntactic_reference_binding=True
+            )
+            for record in records.values():
+                owner_context = copy.copy(context)
+                owner_context.services = dict(context.services)
+                if record.owner == "coordinator":
+                    owner_context.services.pop("task_id", None)
+                else:
+                    owner_context.services["task_id"] = record.owner
+                owner_context.services["task_outcome_ids"] = list(record.outcome_ids)
+                legacy = AuthorityRequirements(owner_context, request)
+                legacy_gap = native_named_authority_gap(
+                    record.reference_text, ledger, strict_reference_boundaries=True
+                )
+                legacy._remember(
+                    record.reference_text, legacy_gap, owner_context, ledger
+                )
+                if record.requirement_id not in legacy._records:
+                    raise ValueError(
+                        "Legacy authority reference identity cannot be recomputed"
+                    )
+                gap = native_named_authority_gap(
+                    record.reference_text,
+                    ledger,
+                    strict_reference_boundaries=True,
+                    syntactic_reference_binding=True,
+                )
+                if gap is None or not gap.get("named_authority_gaps"):
+                    raise ValueError("Legacy authority reference cannot be recomputed")
+                prior_ids = set(rebuilt._records)
+                rebuilt._remember(record.reference_text, gap, owner_context, ledger)
+                for identifier in rebuilt._records.keys() - prior_ids:
+                    rebuilt._records[identifier] = rebuilt._records[
+                        identifier
+                    ].model_copy(update={"origin_unit_id": record.origin_unit_id})
+            if retained_answer:
+                rebuilt._remember(
+                    retained_answer,
+                    native_named_authority_gap(
+                        retained_answer,
+                        ledger,
+                        strict_reference_boundaries=True,
+                        syntactic_reference_binding=True,
+                    ),
+                    context,
+                    ledger,
+                )
+            records = rebuilt._records
         with self._lock:
             self._records = records

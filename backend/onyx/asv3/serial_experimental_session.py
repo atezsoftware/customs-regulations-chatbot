@@ -30,6 +30,7 @@ from onyx.asv3.models import (
     ToolSpec,
 )
 from onyx.asv3.outcome_map import OutcomeCondition, OutcomeMap, RequestedOutcome
+from onyx.asv3.parallel_execution import parallel_execution_enabled
 from onyx.asv3.progress import (
     ProgressReporter,
     localized_notifications,
@@ -353,7 +354,10 @@ def _publication_gap(
         context,
         ledger,
         native_gap=native_named_authority_gap(
-            answer, ledger, strict_reference_boundaries=True
+            answer,
+            ledger,
+            strict_reference_boundaries=True,
+            syntactic_reference_binding=parallel_execution_enabled(context),
         ),
     )
     if gap is not None:
@@ -432,6 +436,8 @@ def validate_serial_session_answer(
             "task_id": state.owner,
             "research_profile": "experimental",
             "experimental_parallel": False,
+            "serial_session_diagnostics": parallel_execution_enabled(outer_context),
+            "lean_native_mode": parallel_execution_enabled(outer_context),
             "native_citation_label": state.public_profile.notifications[
                 "native_citation"
             ][0],
@@ -442,8 +448,19 @@ def validate_serial_session_answer(
         cancelled=outer_context.is_cancelled,
         corpus_only=outer_context.corpus_only,
     )
-    requirements = AuthorityRequirements(context, request)
-    requirements.restore(state.authority_requirements, context, request)
+    requirements = AuthorityRequirements(
+        context,
+        request,
+        syntactic_reference_binding=parallel_execution_enabled(context),
+    )
+    requirements.restore(
+        state.authority_requirements,
+        context,
+        request,
+        allow_legacy_upgrade=parallel_execution_enabled(context),
+        ledger=ledger,
+        retained_answer=body,
+    )
     reviews = LegalSourceReviews(context, request)
     reviews.restore(state.legal_source_reviews, context, request, ledger)
     outcomes = OutcomeMap(
@@ -578,7 +595,11 @@ class SerialExperimentalSession:
             factual_context=request + "\n" + self.history,
             detailed_fact_errors=True,
         )
-        self.requirements = AuthorityRequirements(self.context, request)
+        self.requirements = AuthorityRequirements(
+            self.context,
+            request,
+            syntactic_reference_binding=parallel_execution_enabled(self.context),
+        )
         self.reviews = LegalSourceReviews(self.context, request)
         self.context.services.update(
             scenario_state=self.scenario,
@@ -805,7 +826,10 @@ class SerialExperimentalSession:
         self, answer: str, call_id: str | None
     ) -> dict[str, JsonValue] | None:
         gap = native_named_authority_gap(
-            answer, self.ledger, strict_reference_boundaries=True
+            answer,
+            self.ledger,
+            strict_reference_boundaries=True,
+            syntactic_reference_binding=parallel_execution_enabled(self.context),
         )
         return self.requirements.publication_gap(
             answer, call_id, self.context, self.ledger, native_gap=gap
@@ -1024,7 +1048,12 @@ class SerialExperimentalSession:
         self.scenario.record([], cast(list[str], facts))
         self.outcomes.restore(state.outcome_map, self.ledger)
         self.requirements.restore(
-            state.authority_requirements, self.context, self.request
+            state.authority_requirements,
+            self.context,
+            self.request,
+            allow_legacy_upgrade=parallel_execution_enabled(self.context),
+            ledger=self.ledger,
+            retained_answer=self.harness.last_draft,
         )
         self.reviews.restore(
             state.legal_source_reviews, self.context, self.request, self.ledger

@@ -7,7 +7,7 @@ import hashlib
 import json
 import re
 import threading
-from typing import Literal, NoReturn
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
@@ -76,6 +76,66 @@ class RelatedSourceReviewValidationError(ValueError):
     def __init__(self, message: str, diagnostic: dict[str, JsonValue]) -> None:
         super().__init__(message)
         self.diagnostic = diagnostic
+
+
+def _combined_validation_error(
+    errors: list[RelatedSourceReviewValidationError],
+) -> RelatedSourceReviewValidationError:
+    """Keep the first repair target and share repeated candidate inventories."""
+    first = errors[0]
+    diagnostic = copy.deepcopy(first.diagnostic)
+    inventories: list[JsonValue] = []
+    instructions: list[JsonValue] = []
+    inventory_refs: dict[tuple[str, str], str] = {}
+    instruction_refs: dict[str, str] = {}
+
+    def inventory_key(details: dict[str, JsonValue]) -> tuple[str, str]:
+        return str(details["source_id"]), json.dumps(
+            details["available_original_witnesses"], sort_keys=True, ensure_ascii=False
+        )
+
+    initial = first.diagnostic
+    if "available_original_witnesses" in initial:
+        inventory_refs[inventory_key(initial)] = "available_original_witnesses"
+    if isinstance(instruction := initial.get("instruction"), str):
+        instruction_refs[instruction] = "instruction"
+    rows: list[JsonValue] = []
+    for error in errors:
+        details = error.diagnostic
+        row = {
+            key: value
+            for key, value in details.items()
+            if key not in {"available_original_witnesses", "instruction"}
+        }
+        if "available_original_witnesses" in details:
+            key = inventory_key(details)
+            if key not in inventory_refs:
+                inventory_refs[key] = (
+                    f"additional_original_witnesses[{len(inventories)}]"
+                )
+                inventories.append(
+                    {
+                        "source_id": details["source_id"],
+                        "available_original_witnesses": details[
+                            "available_original_witnesses"
+                        ],
+                    }
+                )
+            row["available_original_witnesses_ref"] = inventory_refs[key]
+        if isinstance(instruction := details.get("instruction"), str):
+            if instruction not in instruction_refs:
+                instruction_refs[instruction] = (
+                    f"additional_instructions[{len(instructions)}]"
+                )
+                instructions.append(instruction)
+            row["instruction_ref"] = instruction_refs[instruction]
+        rows.append(row)
+    diagnostic["validation_errors"] = rows
+    if inventories:
+        diagnostic["additional_original_witnesses"] = inventories
+    if instructions:
+        diagnostic["additional_instructions"] = instructions
+    return RelatedSourceReviewValidationError(str(first), diagnostic)
 
 
 class _LeadRecord(BaseModel):
@@ -377,25 +437,30 @@ class LegalSourceReviews:
         *,
         delivered: set[int] | None,
         diagnostic_index: int | None = None,
+        errors: list[RelatedSourceReviewValidationError] | None = None,
     ) -> None:
+        available: list[JsonValue] | None = None
+
         def reject(
             message: str,
             code: str,
             field: str,
             witness_index: int | None = None,
-        ) -> NoReturn:
+        ) -> None:
+            nonlocal available
             if diagnostic_index is None:
                 raise ValueError(message)
-            available: list[JsonValue] = [
-                {
-                    "citation": citation,
-                    "start_char": 0,
-                    "end_char": len(item.text),
-                }
-                for citation in sorted(delivered or set())
-                if (item := ledger.get(citation)) is not None
-                and item.source_id == record.source_id
-            ]
+            if available is None:
+                available = [
+                    {
+                        "citation": citation,
+                        "start_char": 0,
+                        "end_char": len(item.text),
+                    }
+                    for citation in sorted(delivered or set())
+                    if (item := ledger.get(citation)) is not None
+                    and item.source_id == record.source_id
+                ]
             diagnostic: dict[str, JsonValue] = {
                 "review_index": diagnostic_index,
                 "lead_id": record.lead_id,
@@ -433,25 +498,23 @@ class LegalSourceReviews:
                     "or not_material review leaves gap empty. Do not change status merely "
                     "to pass validation, or rewrite supported answer detail."
                 )
-            raise RelatedSourceReviewValidationError(message, diagnostic)
+            error = RelatedSourceReviewValidationError(message, diagnostic)
+            if errors is not None:
+                errors.append(error)
+                return
+            raise error
 
-        if (
-            review.lead_id != record.lead_id
-            or not review.effect.strip()
-            or not review.limitations.strip()
+        for field, missing in (
+            ("lead_id", review.lead_id != record.lead_id),
+            ("effect", not review.effect.strip()),
+            ("limitations", not review.limitations.strip()),
         ):
-            field = (
-                "lead_id"
-                if review.lead_id != record.lead_id
-                else "effect"
-                if not review.effect.strip()
-                else "limitations"
-            )
-            reject(
-                "A related-source review needs its effect and limitations",
-                "missing_assessment_field",
-                field,
-            )
+            if missing:
+                reject(
+                    "A related-source review needs its effect and limitations",
+                    "missing_assessment_field",
+                    field,
+                )
         if review.status == "unresolved":
             if not review.gap.strip():
                 reject(
@@ -527,34 +590,43 @@ class LegalSourceReviews:
         owner = self._owner(context)
         records = dict(self._records)
         seen: set[str] = set()
+        errors: list[RelatedSourceReviewValidationError] = []
+        delivered = ledger.completely_delivered(call_id)
         for review_index, row in enumerate(raw):
             review = RelatedSourceReview.model_validate(row)
             key = (owner, review.lead_id)
             if review.lead_id in seen or key not in records:
                 message = "Review only this task's actually delivered leads once"
                 if detailed_errors:
-                    raise RelatedSourceReviewValidationError(
-                        message,
-                        {
-                            "review_index": review_index,
-                            "lead_id": review.lead_id,
-                            "status": review.status,
-                            "code": "duplicate_or_foreign_lead",
-                            "field": f"_related_source_reviews[{review_index}].lead_id",
-                            "instruction": "Assess each of this task's actually delivered leads once; do not use another task's lead inventory or rewrite the answer.",
-                        },
+                    errors.append(
+                        RelatedSourceReviewValidationError(
+                            message,
+                            {
+                                "review_index": review_index,
+                                "lead_id": review.lead_id,
+                                "status": review.status,
+                                "code": "duplicate_or_foreign_lead",
+                                "field": f"_related_source_reviews[{review_index}].lead_id",
+                                "instruction": "Assess each of this task's actually delivered leads once; do not use another task's lead inventory or rewrite the answer.",
+                            },
+                        )
                     )
+                    continue
                 raise ValueError(message)
             seen.add(review.lead_id)
             record = records[key]
             self._validate_saved(record, ledger)
+            previous_errors = len(errors)
             self._validate_review(
                 review,
                 record,
                 ledger,
-                delivered=ledger.completely_delivered(call_id),
+                delivered=delivered,
                 diagnostic_index=review_index if detailed_errors else None,
+                errors=errors if detailed_errors else None,
             )
+            if len(errors) != previous_errors:
+                continue
             records[key] = record.model_copy(
                 deep=True,
                 update={
@@ -562,6 +634,8 @@ class LegalSourceReviews:
                     "review_hashes": _hashes(review.witnesses, ledger),
                 },
             )
+        if errors:
+            raise _combined_validation_error(errors)
         return records
 
     def apply(

@@ -868,7 +868,7 @@ class Harness:
                     "name": call.name,
                     "arguments": arguments,
                 }
-            # Persist locators before execution; an interrupted batch is never replayed.
+            # Checkpoint locators before execution; recorded interrupted batches are never replayed.
             self._save()
             prepared_searches: dict[str, object] = {}
             prepare_search_batch = self.context.services.get("prepare_search_batch")

@@ -6,9 +6,11 @@ import copy
 import json
 import logging
 import os
+import sys
 import threading
 import time
 from collections.abc import Callable, Iterable
+from contextlib import nullcontext
 from functools import wraps
 from typing import ParamSpec, cast
 from uuid import UUID
@@ -40,6 +42,7 @@ from onyx.asv3.models import (
 )
 from onyx.asv3.outcome_map import OutcomeMap
 from onyx.asv3.parallel_answers import ParallelAnswerReceipts
+from onyx.asv3.parallel_checkpoint_writer import ParallelCheckpointWriter
 from onyx.asv3.parallel_execution import (
     ParallelExecutionSlots,
     parallel_execution_enabled,
@@ -116,6 +119,7 @@ from onyx.server.query_and_chat.streaming_models import (
 )
 from onyx.tools.interface import Tool
 from onyx.tools.tool_implementations.search.search_tool import SearchTool
+from onyx.tracing.answer_graph import graph_step
 from onyx.tracing.framework.create import ChatTraceMetadata, ensure_trace
 
 logger = logging.getLogger(__name__)
@@ -352,6 +356,7 @@ def run_asv3_loop(
         AuthorityRequirements(
             context,
             question,
+            syntactic_reference_binding=parallel_research,
         )
         if research_profile == "experimental"
         else None
@@ -368,6 +373,7 @@ def run_asv3_loop(
             answer,
             ledger,
             strict_reference_boundaries=research_profile == "experimental",
+            syntactic_reference_binding=parallel_research,
         )
         if authority_requirements is not None:
             return authority_requirements.publication_gap(
@@ -468,6 +474,7 @@ def run_asv3_loop(
     emitted: list[dict[str, JsonValue]] = []
     checkpoint_lock = threading.RLock()
     checkpoint_sequence = 0
+    checkpoint_writer: ParallelCheckpointWriter | None = None
     harness: Harness | None = None
     workers: WorkerPool | None = None
     question_research: QuestionResearch | None = None
@@ -527,6 +534,8 @@ def run_asv3_loop(
 
     def on_decision(decision: Decision) -> None:
         nonlocal first_decision, standalone_answer_call
+        if checkpoint_writer is not None:
+            checkpoint_writer.raise_if_failed()
         standalone_answer_call = (
             len(decision.calls) == 1 and decision.calls[0].name == "submit_answer"
         )
@@ -576,96 +585,169 @@ def run_asv3_loop(
             profile.notifications["tools"],
         )
 
-    def checkpoint(snapshot: dict[str, JsonValue]) -> None:
-        nonlocal checkpoint_sequence
-        with checkpoint_lock:
-            context.check_active()
-            checkpoint_sequence += 1
-            snapshot.update(
-                sequence=checkpoint_sequence,
-                prompt_version=EXPERIMENTAL_PARALLEL_PROMPT_VERSION
-                if parallel_research
-                else EXPERIMENTAL_PROMPT_VERSION
-                if source_reviews is not None
-                else PROMPT_VERSION,
-                research_profile=research_profile,
-                parallel_research=parallel_research,
-                execution_mode="native",
-                native_coordinator_sampling=model.native_sampling_snapshot(),
-                scope=context.scope,
-                progress=list(emitted),
-                progress_state=progress.export(),
-                public_profile=profile.model_dump(mode="json"),
-                workers=workers.export() if workers else {},
-                question_research=question_research.export()
-                if question_research
-                else {},
-                outcome_map=outcome_map.export(),
-                publication_status=publication_status.value,
-                publication_stop_reason=publication_stop_reason,
-                final_publication_gap=harness.publication_gap.model_dump(mode="json")
-                if harness and harness.publication_gap
-                else None,
-                scenario=scenarios.snapshot(),
-                question_message_id=user_message_id,
-                session_research=session_research_checkpoint(context, question),
-            )
-            if source_reviews is not None:
-                snapshot["legal_source_reviews"] = source_reviews.export()
-            if authority_requirements is not None:
-                snapshot["authority_requirements"] = authority_requirements.export()
-            if parallel_answers is not None:
-                snapshot["parallel_research_policy"] = SERIAL_SESSION_POLICY
-                receipts = parallel_answers.export()
-                snapshot["parallel_answers"] = receipts
-                accepted_states: list[dict[str, JsonValue]] = []
-                receipt_rows = receipts.get("receipts", [])
-                if (
-                    question_research is not None
-                    and workers is not None
-                    and isinstance(receipt_rows, list)
-                ):
-                    for assignment in question_research.assignments:
-                        task_id = str(assignment["task_id"])
-                        receipt = next(
-                            (
-                                row
-                                for row in receipt_rows
-                                if isinstance(row, dict)
-                                and row.get("task_id") == task_id
-                            ),
-                            None,
-                        )
-                        if receipt is None:
-                            continue
-                        serial_snapshot = workers.checkpoint(task_id)
-                        if serial_snapshot is None:
-                            raise ValueError(
-                                "Sealed serial memory checkpoint is missing"
-                            )
-                        accepted_states.append(
-                            accepted_serial_memory_state(
-                                serial_snapshot,
-                                assignment,
-                                receipt,
-                                context,
-                                question,
-                                history,
-                            )
-                        )
-                memory = snapshot["session_research"]
-                if not isinstance(memory, dict):
-                    raise ValueError("Serial session memory checkpoint is missing")
-                snapshot["session_research"] = merge_serial_session_memory(
-                    memory, accepted_states
-                )
-                # Child acceptance may occur after the caller captured its root snapshot.
-                snapshot["evidence"] = ledger.export()
+    def persist_checkpoint(snapshot: dict[str, JsonValue]) -> None:
+        with graph_step(
+            "asv3.checkpoint_persistence", {"sequence": snapshot.get("sequence")}
+        ) as persistence:
+            started = time.monotonic()
             save_asv3_checkpoint(
                 message_id=assistant_message_id, user_id=user.id, snapshot=snapshot
             )
+            persistence.output_value = {"persist_seconds": time.monotonic() - started}
+
+    def checkpoint(
+        snapshot: dict[str, JsonValue],
+        *,
+        durable: bool = False,
+        root_snapshot_seconds: float | None = None,
+    ) -> None:
+        nonlocal checkpoint_sequence
+        if checkpoint_writer is not None:
+            checkpoint_writer.raise_if_failed()
+        capture = (
+            graph_step("asv3.checkpoint_capture", {})
+            if parallel_research and durable
+            else nullcontext()
+        )
+        with capture as capture_step:
+            revision: int | None = None
+            lock_started = time.monotonic()
+            with checkpoint_lock:
+                lock_wait_seconds = time.monotonic() - lock_started
+                context.check_active()
+                if parallel_research:
+                    if harness is None:
+                        raise ValueError("Parallel capture requires its root harness")
+                    snapshot_started = time.monotonic()
+                    snapshot = harness.snapshot()
+                    root_snapshot_seconds = time.monotonic() - snapshot_started
+                augmentation_started = time.monotonic()
+                checkpoint_sequence += 1
+                snapshot.update(
+                    sequence=checkpoint_sequence,
+                    prompt_version=EXPERIMENTAL_PARALLEL_PROMPT_VERSION
+                    if parallel_research
+                    else EXPERIMENTAL_PROMPT_VERSION
+                    if source_reviews is not None
+                    else PROMPT_VERSION,
+                    research_profile=research_profile,
+                    parallel_research=parallel_research,
+                    execution_mode="native",
+                    native_coordinator_sampling=model.native_sampling_snapshot(),
+                    scope=context.scope,
+                    progress=list(emitted),
+                    progress_state=progress.export(),
+                    public_profile=profile.model_dump(mode="json"),
+                    workers=workers.export() if workers else {},
+                    question_research=question_research.export()
+                    if question_research
+                    else {},
+                    outcome_map=outcome_map.export(),
+                    publication_status=publication_status.value,
+                    publication_stop_reason=publication_stop_reason,
+                    final_publication_gap=harness.publication_gap.model_dump(
+                        mode="json"
+                    )
+                    if harness and harness.publication_gap
+                    else None,
+                    scenario=scenarios.snapshot(),
+                    question_message_id=user_message_id,
+                    session_research=session_research_checkpoint(context, question),
+                )
+                if source_reviews is not None:
+                    snapshot["legal_source_reviews"] = source_reviews.export()
+                if authority_requirements is not None:
+                    snapshot["authority_requirements"] = authority_requirements.export()
+                if parallel_answers is not None:
+                    snapshot["parallel_research_policy"] = SERIAL_SESSION_POLICY
+                    receipts = parallel_answers.export()
+                    snapshot["parallel_answers"] = receipts
+                    accepted_states: list[dict[str, JsonValue]] = []
+                    receipt_rows = receipts.get("receipts", [])
+                    if (
+                        question_research is not None
+                        and workers is not None
+                        and isinstance(receipt_rows, list)
+                    ):
+                        for assignment in question_research.assignments:
+                            task_id = str(assignment["task_id"])
+                            receipt = next(
+                                (
+                                    row
+                                    for row in receipt_rows
+                                    if isinstance(row, dict)
+                                    and row.get("task_id") == task_id
+                                ),
+                                None,
+                            )
+                            if receipt is None:
+                                continue
+                            serial_snapshot = workers.checkpoint(task_id)
+                            if serial_snapshot is None:
+                                raise ValueError(
+                                    "Sealed serial memory checkpoint is missing"
+                                )
+                            accepted_states.append(
+                                accepted_serial_memory_state(
+                                    serial_snapshot,
+                                    assignment,
+                                    receipt,
+                                    context,
+                                    question,
+                                    history,
+                                )
+                            )
+                    memory = snapshot["session_research"]
+                    if not isinstance(memory, dict):
+                        raise ValueError("Serial session memory checkpoint is missing")
+                    snapshot["session_research"] = merge_serial_session_memory(
+                        memory, accepted_states
+                    )
+                    # Child acceptance may occur after the caller captured its root snapshot.
+                    snapshot["evidence"] = ledger.export()
+                augmentation_seconds = time.monotonic() - augmentation_started
+                submit_started = time.monotonic()
+                if checkpoint_writer is not None:
+                    revision = checkpoint_writer.submit(snapshot)
+                else:
+                    save_asv3_checkpoint(
+                        message_id=assistant_message_id,
+                        user_id=user.id,
+                        snapshot=snapshot,
+                    )
+                submit_seconds = time.monotonic() - submit_started
+            flush_started = time.monotonic()
+            if durable and checkpoint_writer is not None:
+                checkpoint_writer.flush(revision)
+            if capture_step is not None:
+                capture_step.output_value = {
+                    "sequence": snapshot.get("sequence"),
+                    "revision": revision,
+                    "root_snapshot_seconds": root_snapshot_seconds,
+                    "capture_lock_wait_seconds": lock_wait_seconds,
+                    "augmentation_seconds": augmentation_seconds,
+                    "submit_seconds": submit_seconds,
+                    "flush_seconds": time.monotonic() - flush_started,
+                    "durable_barrier": durable,
+                }
+
+    def root_checkpoint(*, durable: bool = False) -> None:
+        if harness is None:
+            raise ValueError("Root checkpoint requires its harness")
+        if parallel_research:
+            checkpoint({}, durable=durable)
+            return
+        started = time.monotonic()
+        snapshot = harness.snapshot()
+        checkpoint(
+            snapshot,
+            durable=durable,
+            root_snapshot_seconds=time.monotonic() - started,
+        )
 
     def record(receipt: ToolReceipt) -> None:
+        if checkpoint_writer is not None:
+            checkpoint_writer.raise_if_failed()
         for number in receipt.evidence_ids:
             item = ledger.get(number)
             if item and item.search_doc is None and item.metadata.get("source_sha256"):
@@ -810,7 +892,11 @@ def run_asv3_loop(
                         "Serial question requires its task-bound checkpoint writer"
                     )
                 callback(snapshot)
-                checkpoint(harness.snapshot())
+                serial_state = snapshot.get("serial_experimental_session")
+                root_checkpoint(
+                    durable=isinstance(serial_state, dict)
+                    and serial_state.get("accepted") is not None
+                )
 
             session = SerialExperimentalSession(
                 outer_context=child,
@@ -1007,7 +1093,7 @@ def run_asv3_loop(
                     "Parallel child requires its task-bound checkpoint writer"
                 )
             callback(snapshot)
-            checkpoint(harness.snapshot())
+            root_checkpoint()
 
         child_harness = Harness(
             request=task,
@@ -1425,6 +1511,7 @@ def run_asv3_loop(
         evidence=ledger,
         on_receipt=record,
         checkpoint=checkpoint,
+        checkpoint_snapshot=(lambda: {}) if parallel_research else None,
         progress=progress,
         draft_guard=publication_guard,
         partial_submission=lambda: clarification or partial,
@@ -1484,7 +1571,14 @@ def run_asv3_loop(
             if authority_requirements is not None and isinstance(
                 saved_requirements, dict
             ):
-                authority_requirements.restore(saved_requirements, context, question)
+                authority_requirements.restore(
+                    saved_requirements,
+                    context,
+                    question,
+                    allow_legacy_upgrade=parallel_research,
+                    ledger=ledger,
+                    retained_answer=harness.last_draft,
+                )
             if parallel_answers is not None:
                 saved_parallel = previous.get("parallel_answers")
                 if not isinstance(saved_parallel, dict):
@@ -1505,8 +1599,12 @@ def run_asv3_loop(
             checkpoint_sequence = saved_sequence
             if parallel_answers is not None and question_research.answers:
                 question_research.assemble_retained_answers()
+        if parallel_research:
+            checkpoint_writer = ParallelCheckpointWriter(persist_checkpoint)
         result = harness.run()
         context.check_active()
+        if parallel_research and workers is not None:
+            workers.close()
         final = (
             clarification
             or partial
@@ -1538,7 +1636,7 @@ def run_asv3_loop(
         state_container.add_search_docs(list(allowed.values()))
         state_container.set_pre_answer_processing_time(time.monotonic() - start)
         ledger.include(numbers)
-        checkpoint(harness.snapshot())
+        root_checkpoint(durable=True)
         processor = DynamicCitationProcessor(
             citation_mode=CitationMode.HYPERLINK
             if include_citations
@@ -1579,7 +1677,9 @@ def run_asv3_loop(
         state_container.set_answer_tokens("".join(answer_parts))
         final_published = True
         progress.report("completed", status="completed")
-        checkpoint(harness.snapshot())
+        root_checkpoint(durable=True)
+        if checkpoint_writer is not None:
+            checkpoint_writer.close()
         emitter.emit(Packet(placement=Placement(turn_index=0), obj=SectionEnd()))
     except RunStopped as error:
         logger.info("ASv3 stopped before publication: %s", str(error))
@@ -1593,5 +1693,18 @@ def run_asv3_loop(
         progress.report("failed", status="failed")
         raise
     finally:
-        if workers:
-            workers.close()
+        primary_error = sys.exc_info()[0] is not None
+        try:
+            if workers:
+                workers.close()
+        finally:
+            teardown_error = sys.exc_info()[0] is not None
+            if checkpoint_writer is not None:
+                try:
+                    checkpoint_writer.close()
+                except BaseException:
+                    if not primary_error and not teardown_error:
+                        raise
+                    logger.exception(
+                        "Parallel checkpoint persistence failed during teardown"
+                    )

@@ -450,6 +450,27 @@ def test_session_source_gate_matches_actual_serial_gate(
         assert actual is expected is None
     else:
         assert actual is not None and expected is not None
+        if kind == "governing":
+            expected_gap, actual_gap = scoped_gate(expected), scoped_gate(actual)
+            assert actual_gap[:2] == expected_gap[:2]
+            for key in ("named_authority_gaps", "retained_authority_requirements"):
+                actual_rows, expected_rows = actual_gap[2][key], expected_gap[2][key]
+                assert isinstance(actual_rows, list) and isinstance(expected_rows, list)
+                assert len(actual_rows) == len(expected_rows)
+                for actual_row, expected_row in zip(actual_rows, expected_rows):
+                    assert isinstance(actual_row, dict) and isinstance(
+                        expected_row, dict
+                    )
+                    assert (
+                        actual_row["reference_text"]
+                        == "8917 sayılı Faaliyet Kanunu m.27"
+                    )
+                    assert {
+                        k: v for k, v in actual_row.items() if k != "reference_text"
+                    } == {
+                        k: v for k, v in expected_row.items() if k != "reference_text"
+                    }
+            return
         assert scoped_gate(actual) == scoped_gate(expected)
         if kind == "undelivered":
             assert actual.data["undelivered_citations"] == [2]
@@ -491,7 +512,7 @@ def test_fresh_local_state_reuses_authorized_session_originals_without_source_re
     assert first.requirements is not sibling.requirements
     assert first.harness.working_memory is not sibling.harness.working_memory
     assert first.outcomes.outcome_ids() == sibling.outcomes.outcome_ids() == []
-    assert first.requirements.syntactic_reference_binding is False
+    assert first.requirements.syntactic_reference_binding is True
     assert "submitted_answer" not in first.context.services
     assert "task_outcome_ids" not in first.context.services
     assert checked and ledger.completely_delivered("historical-call") == set()
