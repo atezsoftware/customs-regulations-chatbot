@@ -51,6 +51,18 @@ _INSTRUMENT_DESIGNATOR = re.compile(
     r"|laws?|acts?|statutes?|regulations?|directives?|decrees?|decisions?|circulars?"
     r"|conventions?|treaties|treaty|agreements?)\b"
 )
+_OTHER_INSTRUMENT_END = (
+    r"(?:yonetmeli[kg](?:i|in|inin)?|teblig(?:i|in|inin)?|genelge(?:si|nin)?"
+    r"|karar(?:i|in|inin)?|sozlesme(?:si|nin)?|anlasma(?:si|nin)?|konvansiyon(?:u|un|unun)?"
+    r"|regulation|directive|decree|decision|circular|convention|treaty|agreement)"
+)
+_NUMBERED_OTHER_INSTRUMENT = re.compile(
+    r"(?<![\d/])\d{2,7}\s+sayili\s+"
+    r"(?:(?!\b\d{2,7}\s+sayili\b)[^\n.;:]){0,100}?\b"
+    + _OTHER_INSTRUMENT_END
+    + r"\b|\b(?:regulation|directive|decree|decision|circular|convention|treaty|agreement)"
+    r"\s+(?:no\.?\s*)?\d{2,7}\b"
+)
 _BOUND_NUMBER = (
     r"(?P<article>\d{1,4}[a-zçğıöşü]?)"
     r"(?:(?:\s*/\s*(?P<paragraph>\d+)"
@@ -140,14 +152,32 @@ def _bound_locator(
 
 
 def _explicit_reverse_instrument(text: str, start: int) -> bool:
-    tail = text[start:]
+    tail = folded(text[start:])
     if link := re.match(r"\s+of\s+(?:the\s+)?", tail):
-        target = _reference_tail(tail[link.end() :])
-        # _reference_tail stops before the instrument designator itself.
-        return bool(_INSTRUMENT_DESIGNATOR.match(tail[link.end() + len(target) :]))
+        target = tail[link.end() :]
+        if _STRICT_STATUTE.match(target) or _NUMBERED_OTHER_INSTRUMENT.match(target):
+            return True
+        formal = re.match(
+            r"(.+?\b(?:kanun[a-z]*|law|act|statute|" + _OTHER_INSTRUMENT_END + r")\b)",
+            target,
+        )
+        return formal is not None and _explicit_instrument_name(formal[1])
     if parenthesized := re.match(r"\s*\(([^)\n]+)\)", tail):
-        return _INSTRUMENT_DESIGNATOR.search(parenthesized[1]) is not None
+        identity = parenthesized[1].strip()
+        return (
+            _STRICT_STATUTE.fullmatch(identity) is not None
+            or _NUMBERED_OTHER_INSTRUMENT.fullmatch(identity) is not None
+            or _explicit_instrument_name(identity)
+        )
     return False
+
+
+def _explicit_instrument_name(value: str) -> bool:
+    if _formal_law_name(value) is not None:
+        return True
+    if re.search(r"[/\\_]|\.(?:md|docx?|pdf|txt)$", value):
+        return False
+    return re.fullmatch(r".+\s+" + _OTHER_INSTRUMENT_END, value) is not None
 
 
 def _bound_locators(text: str, start: int, end: int) -> list[_BoundLocator]:

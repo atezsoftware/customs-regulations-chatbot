@@ -357,6 +357,37 @@ def test_explicit_reverse_owner_prevents_binding_same_article_to_prior_instrumen
     assert references(text) == [("8917", None, None, None), ("7251", "27", None, None)]
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Law No. 8917: Article 27 of Regulation No. 7251 applies.",
+        "Law No. 8917: Article 27 of the Trade Regulation applies.",
+        "8917 sayılı Faaliyet Kanunu m.27 (7251 sayılı Veri Yönetmeliği) uygulanır.",
+        "8917 sayılı Faaliyet Kanunu m.27 (Veri Yönetmeliği) uygulanır.",
+    ],
+)
+def test_explicit_lower_instrument_reverse_owner_is_not_a_statute_article(
+    text: str,
+) -> None:
+    assert references(text) == [("8917", None, None, None)]
+
+
+@pytest.mark.parametrize(
+    "note",
+    [
+        "Veri Yönetmeliği hükümleri saklıdır",
+        "7251 sayılı Veri Yönetmeliği koşulları ayrıca uygulanır",
+        "another regulation may also apply",
+    ],
+)
+def test_lower_instrument_narrative_parentheses_do_not_transfer_article(
+    note: str,
+) -> None:
+    assert references(f"8917 sayılı Faaliyet Kanunu m.27 ({note}) uygulanır.") == [
+        ("8917", "27", None, None)
+    ]
+
+
 @pytest.mark.parametrize("numbered", [False, True])
 def test_actual_explicit_abbreviation_can_be_retained_and_closed_after_restore(
     numbered: bool,
@@ -416,3 +447,20 @@ def test_verified_source_quote_cannot_supply_answer_abbreviation_declaration() -
     )
     notice = f'"{declaration}" [2].\n\nFK m.27 özgün metni incelenemedi.'
     assert state.publication_gap(notice, None, context, ledger)
+
+
+@pytest.mark.parametrize(
+    "condition",
+    [
+        "karar tebliğ edilince",
+        "kanunun öngördüğü koşullarla",
+        "başka Kanun hükümleri saklıdır",
+        "7251 sayılı Veri Kanunu hükümleri saklıdır",
+        "2 No.lu beyanname",
+    ],
+)
+def test_narrative_parenthetical_cannot_transfer_explicit_article_ownership(
+    condition: str,
+) -> None:
+    parsed = references(f"8917 sayılı Faaliyet Kanunu m.27 ({condition}) uygulanır.")
+    assert parsed[0] == ("8917", "27", None, None)
