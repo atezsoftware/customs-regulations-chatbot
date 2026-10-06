@@ -334,17 +334,7 @@ def test_runtime_rejects_premature_answer_then_reuses_read_originals(
                 footer["related_source_navigation"][0]["candidates"][0]["source_id"]
                 == candidate
             )
-            return response(
-                calls=[
-                    (
-                        "submit_answer",
-                        {
-                            "answer": "The permit is always required [1].",
-                            "basis": "originals",
-                        },
-                    )
-                ]
-            )
+            return response("The permit is always required [1].")
         if calls == 3:
             assert footer["publication_gap"]["pending_related_source_review"] is True
             assert kwargs["state_container"].answer_tokens is None
@@ -380,10 +370,16 @@ def test_runtime_rejects_premature_answer_then_reuses_read_originals(
             return response(
                 calls=[
                     (
-                        "submit_answer",
+                        "submit_retained_answer",
                         {
-                            "answer": answer,
-                            "basis": "originals",
+                            "retained_answer_edits": [
+                                {
+                                    "unit_id": footer["draft_to_repair"]["units"][0][
+                                        "unit_id"
+                                    ],
+                                    "replacement": answer,
+                                }
+                            ],
                             "_related_source_reviews": [assessment],
                         },
                     )
@@ -395,10 +391,16 @@ def test_runtime_rejects_premature_answer_then_reuses_read_originals(
         return response(
             calls=[
                 (
-                    "submit_answer",
+                    "submit_retained_answer",
                     {
-                        "answer": "A permit is required [1]. The judgment has restricted scope. Approval is decisive. [2].",
-                        "basis": "originals",
+                        "retained_answer_edits": [
+                            {
+                                "unit_id": footer["draft_to_repair"]["units"][0][
+                                    "unit_id"
+                                ],
+                                "replacement": "A permit is required [1]. The judgment has restricted scope. Approval is decisive. [2].",
+                            }
+                        ],
                     },
                 )
             ]

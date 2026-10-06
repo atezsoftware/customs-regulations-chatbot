@@ -14,6 +14,7 @@ from onyx.asv3.citation_numbers import extract_citation_numbers
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.models import Decision, ResearchTurn, RunContext
 from onyx.asv3.parallel_execution import parallel_execution_enabled
+from onyx.asv3.workflow_variant import ASV3_TUNED_VARIANT
 
 RETAINED_TERMINALS = {
     "submit_retained_answer": "submit_answer",
@@ -24,8 +25,11 @@ _EOL = r"(?:\r\n|\r(?!\n)|(?<!\r)\n)"
 _PARAGRAPH_BREAK = re.compile(rf"{_EOL}[ \t]*{_EOL}(?:[ \t]*{_EOL})*")
 
 
-def _enabled(context: RunContext) -> bool:
-    return parallel_execution_enabled(context)
+def retained_answer_enabled(context: RunContext) -> bool:
+    return (
+        parallel_execution_enabled(context)
+        or context.services.get("asv3_workflow_variant") == ASV3_TUNED_VARIANT
+    )
 
 
 def _units(draft: str, reference: str) -> list[dict[str, JsonValue]]:
@@ -98,7 +102,12 @@ def _edited_answer(draft: str, reference: str, edits: JsonValue) -> str | None:
 def _reference(
     context: RunContext, draft: str | None, request: str
 ) -> dict[str, JsonValue] | None:
-    if not _enabled(context) or not draft or not draft.strip() or not request.strip():
+    if (
+        not retained_answer_enabled(context)
+        or not draft
+        or not draft.strip()
+        or not request.strip()
+    ):
         return None
     owner = context.services.get("task_id")
     binding = [
@@ -231,7 +240,7 @@ def resolve_retained_answer(
     decision: Decision, context: RunContext, draft: str | None, *, request: str
 ) -> Decision:
     """Expand parsed host calls while preserving the provider's actual native message."""
-    if not _enabled(context):
+    if not retained_answer_enabled(context):
         return decision
     reference = _reference(context, draft, request)
     calls = []
@@ -321,7 +330,7 @@ def normalize_retained_answer_basis(
 ) -> dict[str, JsonValue]:
     """A valid source-backed owned reference may only inherit strict verification."""
     if (
-        not _enabled(context)
+        not retained_answer_enabled(context)
         or name != "submit_answer"
         or "basis" in arguments
         or "answer" in arguments
@@ -370,7 +379,12 @@ def project_failed_terminal_turns(
     publication_gap: dict[str, JsonValue] | None,
 ) -> list[ResearchTurn]:
     """Hide obsolete rejected drafts only when the host supplies the current draft/gap."""
-    if not _enabled(context) or not draft or not draft.strip() or not publication_gap:
+    if (
+        not retained_answer_enabled(context)
+        or not draft
+        or not draft.strip()
+        or not publication_gap
+    ):
         return list(turns)
     projected: list[ResearchTurn] = []
     for turn in turns:

@@ -128,9 +128,9 @@ def test_content_control_envelope_uses_normal_action_validation(extra: bool) -> 
     registry = terminal_registry([])
     adapter = ResearchModel(selected, context, lean_native_mode=True)
     decision = adapter.decide(
-        adaptive_tool_view(original_evidence=[full_record(ledger, 1)]).model_copy(
-            update={"tools": registry.definitions(context)}
-        )
+        adaptive_tool_view(
+            original_evidence=[full_record(ledger, 1), full_record(ledger, 2)]
+        ).model_copy(update={"tools": registry.definitions(context)})
     )
     assert decision.answer is None
     assert decision.calls[0].name == "submit_answer"

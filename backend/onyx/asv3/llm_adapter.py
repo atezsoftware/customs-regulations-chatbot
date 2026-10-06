@@ -31,6 +31,7 @@ from onyx.asv3.authority_reference_diagnostics import (
 from onyx.asv3.authority_requirements import AuthorityRequirements
 from onyx.asv3.citation_numbers import extract_citation_numbers
 from onyx.asv3.evidence import EvidenceLedger
+from onyx.asv3.judicial_sections import judicial_disposition_missing
 from onyx.asv3.legal_source_navigation import derive_provision_navigation_anchor
 from onyx.asv3.legal_source_reviews import LegalSourceReviews, annotate_navigation
 from onyx.asv3.models import (
@@ -62,6 +63,7 @@ from onyx.asv3.retained_answer import (
     normalize_retained_answer_basis,
     project_failed_terminal_turns,
     resolve_retained_answer,
+    retained_answer_enabled,
 )
 from onyx.asv3.shared_originals import (
     delivered_provision_navigation,
@@ -2872,18 +2874,19 @@ class ResearchModel:
         has_reference_catalogue = False
         ceiling, output = self._limits(self._native_output_limit())
         selected = copy.deepcopy(view.tools) if native_original_cache else view.tools
-        if parallel_execution_enabled(self.context):
+        if retained_answer_enabled(self.context):
             selected, retained_answer = bind_retained_answer(
                 selected,
                 self.context,
                 view.draft_to_repair,
                 request=view.request,
             )
-            selected, fact_catalogue = bind_terminal_fact_references(
-                selected, self.context
-            )
-            if fact_catalogue:
-                context["decisive_fact_catalogue"] = fact_catalogue
+            if parallel_execution_enabled(self.context):
+                selected, fact_catalogue = bind_terminal_fact_references(
+                    selected, self.context
+                )
+                if fact_catalogue:
+                    context["decisive_fact_catalogue"] = fact_catalogue
             if retained_answer is not None:
                 context["draft_to_repair"] = {"units": retained_answer.pop("units")}
                 if view.publication_gap is not None and extract_citation_numbers(
@@ -3090,7 +3093,7 @@ class ResearchModel:
                         if acquisition:
                             current["related_source_acquisition"] = acquisition
                             current["related_source_terminal_transport"] = (
-                                "These pending candidates lack their own delivered originals. "
+                                "These pending candidates lack required operative passages. "
                                 "Use the source-specific acquisition leads below before assessing "
                                 "their effect. They supply neither a holding nor approval. Locate "
                                 "the operative section and connected qualifications, following "
@@ -3107,7 +3110,11 @@ class ResearchModel:
                         and function.get("name")
                         in {"submit_retained_answer", "submit_retained_partial_answer"}
                     ]
-                    if parallel_execution_enabled(self.context) and retained_terminals:
+                    if (
+                        retained_answer_enabled(self.context)
+                        and retained_terminals
+                        and not current.get("related_source_acquisition")
+                    ):
                         full_terminals = [
                             str(function["name"])
                             for tool in selected
@@ -3137,6 +3144,16 @@ class ResearchModel:
                             "with exactly name and arguments matching its exposed schema and "
                             "your own _related_source_reviews. No prose, fences or copied approval."
                         )
+                    if current.get("related_source_acquisition"):
+                        selected = [
+                            tool
+                            for tool in selected
+                            if not (
+                                isinstance(function := tool.get("function"), dict)
+                                and function.get("name")
+                                in {"submit_answer", "submit_retained_answer"}
+                            )
+                        ]
             if isinstance(outcomes, OutcomeMap):
                 current["outcome_map"] = outcomes.view(
                     outcome_ids=outcome_subset,
@@ -3558,9 +3575,39 @@ class ResearchModel:
             if not isinstance(row, dict) or row.get("status") != "pending":
                 continue
             source_id = row.get("source_id")
-            if not isinstance(source_id, str) or row.get(
-                "available_original_citations"
-            ):
+            if not isinstance(source_id, str):
+                continue
+            available = row.get("available_original_citations")
+            if isinstance(available, list) and available:
+                cursor = row.get("source_range_read")
+                originals = [
+                    item
+                    for number in available
+                    if type(number) is int
+                    for item in (ledger.get(number),)
+                    if item is not None and item.source_id == source_id
+                ]
+                if (
+                    row.get("candidate_role") == "judicial_candidate"
+                    and isinstance(cursor, dict)
+                    and cursor.get("has_more") is True
+                    and type(cursor.get("next_position")) is int
+                    and judicial_disposition_missing(originals)
+                ):
+                    actions.append(
+                        {
+                            "lead_id": row.get("lead_id"),
+                            "source_id": source_id,
+                            "reason": "reasoning_without_disposition_body",
+                            "suggested_acquisition": {
+                                "name": "read_source_range",
+                                "arguments": {
+                                    "source_id": source_id,
+                                    "start": cursor["next_position"],
+                                },
+                            },
+                        }
+                    )
                 continue
             retained = [
                 number
@@ -4018,7 +4065,7 @@ class ResearchModel:
             )
 
         argument_normalizer = (
-            normalize_arguments if parallel_execution_enabled(self.context) else None
+            normalize_arguments if retained_answer_enabled(self.context) else None
         )
         content = prompt[-1].content
         assert isinstance(content, str)
