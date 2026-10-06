@@ -12,6 +12,7 @@ from onyx.asv3.legal_source_reviews import (
     LegalSourceReviews,
     RelatedSourceReview,
     RelatedSourceReviewValidationError,
+    related_source_reviews_enabled,
     serial_session_diagnostics_enabled,
 )
 from onyx.asv3.models import (
@@ -234,9 +235,7 @@ class CapabilityRegistry:
                     }
                 ):
                     properties.update(copy.deepcopy(outcome_properties))
-                if context.services.get(
-                    "research_profile"
-                ) == "experimental" and spec.name in {
+                if related_source_reviews_enabled(context) and spec.name in {
                     "submit_answer",
                     "submit_partial_answer",
                     "assemble_answers",
@@ -366,8 +365,7 @@ class CapabilityRegistry:
                         "_coverage",
                         *(
                             {"_related_source_reviews"}
-                            if context.services.get("research_profile")
-                            == "experimental"
+                            if related_source_reviews_enabled(context)
                             else set()
                         ),
                     }
@@ -396,7 +394,7 @@ class CapabilityRegistry:
                 call_id = context.services.get("last_model_call_id")
                 try:
                     if (
-                        context.services.get("research_profile") != "experimental"
+                        not related_source_reviews_enabled(context)
                         or call.name
                         not in {
                             "submit_answer",
@@ -511,7 +509,7 @@ class CapabilityRegistry:
                 "_coverage",
                 *(
                     {"_related_source_reviews"}
-                    if context.services.get("research_profile") == "experimental"
+                    if related_source_reviews_enabled(context)
                     else set()
                 ),
             }

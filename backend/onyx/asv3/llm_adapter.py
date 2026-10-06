@@ -77,6 +77,7 @@ from onyx.asv3.terminal_wire_schema import (
     decode_optional_nulls,
     strict_terminal_tools,
 )
+from onyx.asv3.workflow_variant import ASV3_TUNED_VARIANT
 from onyx.configs.chat_configs import (
     LLM_FIRST_CHUNK_RETRY_BASE_DELAY_S,
     LLM_FIRST_CHUNK_RETRY_JITTER_RATIO,
@@ -119,6 +120,7 @@ from onyx.prompts.asv3.research import (
     OUTCOME_COVERAGE_RESEARCH,
     RESEARCHER_PROMPT,
 )
+from onyx.prompts.asv3.tuned import TUNED_LEGAL_DEPARTMENT_RESEARCH
 from onyx.regulatory.structured_llm import (
     _portable_structured_output_schema,
     _retry_after_seconds,
@@ -2478,9 +2480,13 @@ class ResearchModel:
             )
         else:
             instruction = COORDINATOR_PROMPT
-        instruction = (
-            instruction + "\n\n" + LEGAL_DEPARTMENT_RESEARCH if normal else instruction
-        )
+        if normal:
+            instruction += "\n\n" + (
+                TUNED_LEGAL_DEPARTMENT_RESEARCH
+                if self.context.services.get("asv3_workflow_variant")
+                == ASV3_TUNED_VARIANT
+                else LEGAL_DEPARTMENT_RESEARCH
+            )
         return (
             instruction + "\n\n" + OUTCOME_COVERAGE_RESEARCH if normal else instruction
         )

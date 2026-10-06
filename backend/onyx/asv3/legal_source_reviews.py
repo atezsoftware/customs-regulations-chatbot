@@ -20,6 +20,14 @@ from onyx.asv3.legal_source_navigation import (
 )
 from onyx.asv3.models import OutcomeStatus, RunContext, ToolOutcome
 from onyx.asv3.outcome_map import OutcomeWitness
+from onyx.asv3.workflow_variant import ASV3_TUNED_VARIANT
+
+
+def related_source_reviews_enabled(context: RunContext) -> bool:
+    return (
+        context.services.get("research_profile") == "experimental"
+        or context.services.get("asv3_workflow_variant") == ASV3_TUNED_VARIANT
+    )
 
 
 def serial_session_diagnostics_enabled(context: RunContext) -> bool:
@@ -33,6 +41,8 @@ def serial_session_diagnostics_enabled(context: RunContext) -> bool:
 
 
 def operative_review_retention_enabled(context: RunContext) -> bool:
+    if context.services.get("asv3_workflow_variant") == ASV3_TUNED_VARIANT:
+        return True
     return context.services.get("research_profile") == "experimental" and (
         context.services.get("experimental_parallel") is True
         or (
@@ -694,6 +704,17 @@ class LegalSourceReviews:
                         "candidate_role": record.candidate_role,
                         "status": record.review.status if record.review else "pending",
                         "available_original_citations": originals,
+                        **(
+                            {
+                                "anchor_evidence_numbers": [
+                                    witness.citation
+                                    for witness in record.anchor_witnesses
+                                ]
+                            }
+                            if context.services.get("asv3_workflow_variant")
+                            == ASV3_TUNED_VARIANT
+                            else {}
+                        ),
                         "review": record.review.model_dump(mode="json")
                         if record.review
                         else None,
@@ -719,6 +740,7 @@ class LegalSourceReviews:
         if not extract_citation_numbers(answer):
             return None
         owner = self._owner(context)
+        tuned = context.services.get("asv3_workflow_variant") == ASV3_TUNED_VARIANT
         with self._lock:
             records = self._preview(
                 [] if raw_reviews is None else raw_reviews, call_id, context, ledger
@@ -763,7 +785,9 @@ class LegalSourceReviews:
                 return ToolOutcome(
                     status=OutcomeStatus.PARTIAL,
                     summary=(
-                        "Retain the declared operative effect and limitations in substantive answer blocks with their own witness citations. This checks copied passage retention, not legal entailment."
+                        "Use the examined candidate's operative effect and limitations in substantive answer blocks with its own original citations; do not acquire the same passages again."
+                        if tuned and unretained and not pending and not undisclosed
+                        else "Retain the declared operative effect and limitations in substantive answer blocks with their own witness citations. This checks copied passage retention, not legal entailment."
                         if unretained and not pending and not undisclosed
                         else "Examine the delivered related-source candidates with their own operative originals, or disclose the precise unresolved interaction separately. Available passages and titles do not approve an effect."
                     ),

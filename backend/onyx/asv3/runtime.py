@@ -24,7 +24,10 @@ from onyx.asv3.corpus_tools import CorpusBroker, build_corpus_specs
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.external_tools import build_external_specs
 from onyx.asv3.harness import Harness
-from onyx.asv3.legal_source_reviews import LegalSourceReviews
+from onyx.asv3.legal_source_reviews import (
+    LegalSourceReviews,
+    related_source_reviews_enabled,
+)
 from onyx.asv3.llm_adapter import (
     LanguageProfile,
     ResearchModel,
@@ -114,6 +117,7 @@ from onyx.prompts.asv3.research import (
     PROMPT_VERSION,
     VERIFICATION_PROMPT,
 )
+from onyx.prompts.asv3.tuned import TUNED_PROMPT_VERSION
 from onyx.server.query_and_chat.placement import Placement
 from onyx.server.query_and_chat.streaming_models import (
     AgentResponseDelta,
@@ -363,7 +367,7 @@ def run_asv3_loop(
     )
     source_reviews = (
         LegalSourceReviews(context, question)
-        if research_profile == "experimental"
+        if related_source_reviews_enabled(context)
         else None
     )
     if source_reviews is not None:
@@ -658,10 +662,12 @@ def run_asv3_loop(
                 snapshot.update(
                     sequence=checkpoint_sequence,
                     **checkpoint_variant_fields(workflow_variant),
-                    prompt_version=EXPERIMENTAL_PARALLEL_PROMPT_VERSION
+                    prompt_version=TUNED_PROMPT_VERSION
+                    if workflow_variant == ASV3_TUNED_VARIANT
+                    else EXPERIMENTAL_PARALLEL_PROMPT_VERSION
                     if parallel_research
                     else EXPERIMENTAL_PROMPT_VERSION
-                    if source_reviews is not None
+                    if research_profile == "experimental"
                     else PROMPT_VERSION,
                     research_profile=research_profile,
                     parallel_research=parallel_research,
@@ -844,10 +850,12 @@ def run_asv3_loop(
                 snapshot.update(
                     sequence=checkpoint_sequence,
                     **checkpoint_variant_fields(workflow_variant),
-                    prompt_version=EXPERIMENTAL_PARALLEL_PROMPT_VERSION
+                    prompt_version=TUNED_PROMPT_VERSION
+                    if workflow_variant == ASV3_TUNED_VARIANT
+                    else EXPERIMENTAL_PARALLEL_PROMPT_VERSION
                     if parallel_research
                     else EXPERIMENTAL_PROMPT_VERSION
-                    if source_reviews is not None
+                    if research_profile == "experimental"
                     else PROMPT_VERSION,
                     research_profile=research_profile,
                     parallel_research=parallel_research,

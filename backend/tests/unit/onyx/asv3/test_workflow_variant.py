@@ -8,6 +8,7 @@ import pytest
 from pydantic import ValidationError
 
 from onyx.asv3 import runtime
+from onyx.asv3.legal_source_reviews import LegalSourceReviews
 from onyx.asv3.llm_adapter import ResearchModel
 from onyx.asv3.models import ASv3WorkflowSelection
 from onyx.asv3.workflow_variant import (
@@ -21,7 +22,7 @@ from onyx.asv3.workflow_variant import (
 from onyx.chat.models import ChatMessageSimple
 from onyx.configs.constants import MessageType
 from onyx.llm.interfaces import LLM
-from onyx.prompts.asv3.research import PROMPT_VERSION
+from onyx.prompts.asv3.tuned import TUNED_PROMPT_VERSION
 from onyx.tools.tool_implementations.search.search_tool import SearchTool
 from tests.unit.onyx.asv3.test_runtime import response, setup_run
 
@@ -128,12 +129,12 @@ def test_tuned_runtime_uses_normal_tools_and_selected_model_everywhere(
     assert context.services["experimental_parallel"] is False
     assert context.services["independent_question_mode"] is False
     assert not {
-        "legal_source_reviews",
         "authority_requirements",
         "parallel_execution_slots",
         "parallel_query_embeddings",
         "shared_reads",
     }.intersection(context.services)
+    assert isinstance(context.services["legal_source_reviews"], LegalSourceReviews)
     for invocation in selected.invoke.call_args_list:
         names = {tool["function"]["name"] for tool in invocation.kwargs["tools"]}
         assert not {
@@ -141,7 +142,7 @@ def test_tuned_runtime_uses_normal_tools_and_selected_model_everywhere(
             "assemble_answers",
             "commit_retained_answer",
         }.intersection(names)
-    assert checkpoints[-1]["prompt_version"] == PROMPT_VERSION
+    assert checkpoints[-1]["prompt_version"] == TUNED_PROMPT_VERSION
     assert checkpoints[-1]["research_profile"] == "normal"
     assert checkpoints[-1]["parallel_research"] is False
     assert checkpoints[-1]["asv3_workflow_variant"] == ASV3_TUNED_VARIANT
