@@ -771,11 +771,11 @@ const AppInputBar = React.memo(
                     foldable={false}
                     tooltip={
                       isMultiModelActive
-                        ? "Experimental Paralel runs with one model. Remove extra models to use it."
-                        : "Bağımsız konuları ayrı paralel araştırma kollarında inceleyen deneysel araştırma"
+                        ? "Experimental ASv3 runs with one model. Remove extra models to use it."
+                        : "ASv3 araştırma akışını daha geniş kaynak taramasıyla kullanan deneysel seçenek"
                     }
                   >
-                    Experimental Paralel
+                    Experimental ASv3
                   </SelectButton>
                 )}
               </>

@@ -79,6 +79,12 @@ from onyx.asv3.supplemental_tools import (
     public_narration_valid,
 )
 from onyx.asv3.workers import WorkerPool
+from onyx.asv3.workflow_variant import (
+    ASV3_STANDARD_VARIANT,
+    ASV3_TUNED_VARIANT,
+    checkpoint_variant_fields,
+    validate_asv3_variant_resume,
+)
 from onyx.cache.interface import CacheBackend
 from onyx.chat.chat_state import ChatStateContainer
 from onyx.chat.citation_processor import CitationMode, DynamicCitationProcessor
@@ -244,6 +250,7 @@ def run_asv3_loop(
     cache: CacheBackend,
     research_profile: str = "deep",
     parallel_research: bool = False,
+    workflow_variant: str = ASV3_STANDARD_VARIANT,
     research_llm: LLM | None = None,
     resume_message_id: int | None = None,
     custom_agent_prompt: str | None = None,
@@ -296,6 +303,13 @@ def run_asv3_loop(
         or previous.get("request") != question
     ):
         raise ValueError("ASv3 resume requires the same authorized scope and question")
+    validate_asv3_variant_resume(workflow_variant, previous)
+    if workflow_variant == ASV3_TUNED_VARIANT and (
+        research_profile != "normal" or parallel_research
+    ):
+        raise ValueError(
+            "Tuned ASv3 requires the normal profile without parallel research"
+        )
     if previous is not None:
         profile = LanguageProfile.model_validate(previous.get("public_profile"))
         profile.requires_sources = True
@@ -325,11 +339,13 @@ def run_asv3_loop(
         and previous.get("parallel_research_policy") != SERIAL_SESSION_POLICY
     ):
         raise ValueError("Saved parallel research uses a different session policy")
-    if research_profile == "experimental":
+    if research_profile == "experimental" or workflow_variant == ASV3_TUNED_VARIANT:
         research_llm = None
     context.language = profile.language
     context.services["research_profile"] = research_profile
     context.services["experimental_parallel"] = parallel_research
+    if workflow_variant == ASV3_TUNED_VARIANT:
+        context.services["asv3_workflow_variant"] = workflow_variant
     context.services["independent_question_mode"] = (
         research_profile == "deep" or parallel_research
     )
@@ -431,7 +447,9 @@ def run_asv3_loop(
         model.restore_native_sampling(previous)
     search = next((tool for tool in tools if isinstance(tool, SearchTool)), None)
     if search is not None and (
-        research_llm is not None or research_profile == "experimental"
+        research_llm is not None
+        or research_profile == "experimental"
+        or workflow_variant == ASV3_TUNED_VARIANT
     ):
         search = search.fork_for_independent_context()
         search.llm = research_llm or llm
@@ -639,6 +657,7 @@ def run_asv3_loop(
                 checkpoint_sequence += 1
                 snapshot.update(
                     sequence=checkpoint_sequence,
+                    **checkpoint_variant_fields(workflow_variant),
                     prompt_version=EXPERIMENTAL_PARALLEL_PROMPT_VERSION
                     if parallel_research
                     else EXPERIMENTAL_PROMPT_VERSION
@@ -824,6 +843,7 @@ def run_asv3_loop(
                 checkpoint_sequence += 1
                 snapshot.update(
                     sequence=checkpoint_sequence,
+                    **checkpoint_variant_fields(workflow_variant),
                     prompt_version=EXPERIMENTAL_PARALLEL_PROMPT_VERSION
                     if parallel_research
                     else EXPERIMENTAL_PROMPT_VERSION

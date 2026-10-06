@@ -12,6 +12,18 @@ from onyx.context.search.models import SearchDoc
 from onyx.llm.models import AssistantMessage, ToolMessage
 
 
+class ASv3WorkflowSelection(BaseModel):
+    model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
+
+    research_profile: Literal["normal", "deep", "experimental"]
+    parallel_research: bool
+    workflow_variant: Literal["standard", "asv3_tuned"] = "standard"
+
+    @property
+    def selected_model_only(self) -> bool:
+        return self.workflow_variant == "asv3_tuned"
+
+
 class OutcomeStatus(StrEnum):
     FOUND = "found"
     PARTIAL = "partial"

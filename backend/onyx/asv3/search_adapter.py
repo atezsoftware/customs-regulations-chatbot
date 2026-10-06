@@ -19,6 +19,7 @@ from onyx.asv3.models import (
     ToolOutcome,
 )
 from onyx.asv3.parallel_execution import parallel_execution_enabled
+from onyx.asv3.workflow_variant import ASV3_TUNED_VARIANT
 from onyx.chat.emitter import NullEmitter
 from onyx.chat.models import ChatMessageSimple
 from onyx.configs.constants import MessageType
@@ -39,9 +40,20 @@ from onyx.llm.models import LanguageModelInput, ReasoningEffort, ToolChoiceOptio
 from onyx.regulatory.structured_llm import is_retryable_provider_error
 from onyx.server.query_and_chat.placement import Placement
 from onyx.tools.constants import REGULATORY_MAX_SEARCH_QUERY_CHARS
-from onyx.tools.models import ChatMinimalTextMessage, ToolCallKickoff
+from onyx.tools.models import (
+    ChatMinimalTextMessage,
+    SearchToolRetrievalOverrides,
+    ToolCallKickoff,
+)
 from onyx.tools.tool_implementations.search.search_tool import SearchTool
 from onyx.tools.tool_runner import run_tool_calls
+
+_TUNED_RETRIEVAL_OVERRIDES = SearchToolRetrievalOverrides(
+    per_lane_num_hits=192,
+    rerank_candidate_limit=192,
+    regulatory_rerank_candidate_limit=192,
+    max_llm_chunks=50,
+)
 
 
 class ScopedSearchLLM(LLM):
@@ -314,6 +326,12 @@ def build_search_adapter(
                 inject_memories_in_prompt=inject_memories_in_prompt,
                 tool_execution_timeout_seconds=None,
                 search_rerank_context=original_query,
+                search_retrieval_overrides=(
+                    _TUNED_RETRIEVAL_OVERRIDES
+                    if context.services.get("asv3_workflow_variant")
+                    == ASV3_TUNED_VARIANT
+                    else None
+                ),
             )
         context.check_active()
         if len(batch.tool_responses) != 1:

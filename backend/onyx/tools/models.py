@@ -171,6 +171,17 @@ class OpenURLToolOverrideKwargs(BaseModel):
     max_urls: int = 10
 
 
+class SearchToolRetrievalOverrides(BaseModel):
+    """Immutable host-selected retrieval settings for an isolated tool call."""
+
+    per_lane_num_hits: int = Field(gt=0, strict=True)
+    rerank_candidate_limit: int = Field(gt=0, strict=True)
+    regulatory_rerank_candidate_limit: int = Field(gt=0, strict=True)
+    max_llm_chunks: int = Field(gt=0, strict=True)
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+
 class SearchToolOverrideKwargs(BaseModel):
     # To know what citation number to start at for constructing the string to the LLM
     starting_citation_num: int
@@ -202,6 +213,10 @@ class SearchToolOverrideKwargs(BaseModel):
     include_link: bool = False
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
+
+
+class SearchToolRetrievalOverrideKwargs(SearchToolOverrideKwargs):
+    regulatory_rerank_candidate_limit: int = Field(gt=0, strict=True)
 
 
 class ChatFile(BaseModel):

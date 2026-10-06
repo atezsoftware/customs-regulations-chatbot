@@ -172,6 +172,7 @@ from onyx.tools.interface import Tool
 from onyx.tools.models import (
     ChatMinimalTextMessage,
     SearchToolOverrideKwargs,
+    SearchToolRetrievalOverrideKwargs,
     ToolCallException,
     ToolResponse,
 )
@@ -2221,9 +2222,14 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
         regulatory_rerank_candidate_limit = min(
             override_kwargs.rerank_candidate_limit,
             (
-                _FAST_REGULATORY_RERANK_CANDIDATE_LIMIT
-                if fast_regulatory_search
-                else _REGULATORY_RERANK_CANDIDATE_LIMIT
+                override_kwargs.regulatory_rerank_candidate_limit
+                if asv3_regulatory_search
+                and isinstance(override_kwargs, SearchToolRetrievalOverrideKwargs)
+                else (
+                    _FAST_REGULATORY_RERANK_CANDIDATE_LIMIT
+                    if fast_regulatory_search
+                    else _REGULATORY_RERANK_CANDIDATE_LIMIT
+                )
             ),
         )
         per_lane_num_hits = (

@@ -23,6 +23,8 @@ from onyx.tools.models import (
     ParallelToolCallResponse,
     PythonToolOverrideKwargs,
     SearchToolOverrideKwargs,
+    SearchToolRetrievalOverrideKwargs,
+    SearchToolRetrievalOverrides,
     ToolCallException,
     ToolCallKickoff,
     ToolExecutionException,
@@ -435,6 +437,7 @@ def run_tool_calls(
     search_llm_chunks_per_call_cap: int | None = None,
     tool_execution_timeout_seconds: float | None = TOOL_EXECUTION_TIMEOUT_SECONDS,
     search_rerank_context: str | None = None,
+    search_retrieval_overrides: SearchToolRetrievalOverrides | None = None,
 ) -> ParallelToolCallResponse:
     """Run (optionally merged) tool calls in parallel and update citation mappings.
 
@@ -614,9 +617,22 @@ def run_tool_calls(
                     per_call_cap=search_llm_chunks_per_call_cap,
                 ),
             )
+            if search_retrieval_overrides is not None:
+                override_kwargs = SearchToolRetrievalOverrideKwargs.model_validate(
+                    dict(override_kwargs) | search_retrieval_overrides.model_dump()
+                )
             # Increment citation number for next search tool to avoid conflicts
-            # Estimate: reserve 100 citation slots per search tool
-            starting_citation_num += 100
+            # Reserve the full candidate band because score-based retention can
+            # deliver more originals than the selected baseline.
+            starting_citation_num += (
+                max(
+                    100,
+                    search_retrieval_overrides.rerank_candidate_limit,
+                    search_retrieval_overrides.max_llm_chunks,
+                )
+                if search_retrieval_overrides is not None
+                else 100
+            )
 
         elif isinstance(tool, RegulatoryProvisionTool):
             override_kwargs = ProvisionToolOverrideKwargs(

@@ -1581,19 +1581,23 @@ def _run_models(
                 # SearchTool as the standard loop.
                 if setup.new_msg_req.atez_search_v3 or _uses_deep_asv3(setup):
                     from onyx.asv3.runtime import run_asv3_loop
+                    from onyx.asv3.workflow_variant import resolve_asv3_workflow
 
                     if setup.persona.id != DEFAULT_PERSONA_ID:
                         raise ValueError("ASv3 requires the default assistant")
                     if setup.search_params.project_id_filter is not None:
                         raise ValueError("ASv3 is unavailable inside a project")
-                    research_profile = (
+                    workflow = resolve_asv3_workflow(
                         "deep"
                         if _uses_deep_asv3(setup)
-                        else setup.new_msg_req.asv3_research_profile
+                        else setup.new_msg_req.asv3_research_profile,
+                        setup.new_msg_req.asv3_parallel_research,
                     )
+                    research_profile = workflow.research_profile
                     research_llm = (
                         None
                         if research_profile == "experimental"
+                        or workflow.selected_model_only
                         else model_llm.with_model(
                             "gemini-3.5-flash-lite",
                             max_input_tokens=min(
@@ -1641,7 +1645,8 @@ def _run_models(
                         include_citations=setup.new_msg_req.include_citations,
                         cache=setup.cache,
                         research_profile=research_profile,
-                        parallel_research=setup.new_msg_req.asv3_parallel_research,
+                        parallel_research=workflow.parallel_research,
+                        workflow_variant=workflow.workflow_variant,
                         resume_message_id=setup.new_msg_req.asv3_resume_message_id,
                         custom_agent_prompt=setup.custom_agent_prompt,
                         allow_external=setup.new_msg_req.asv3_allow_external,

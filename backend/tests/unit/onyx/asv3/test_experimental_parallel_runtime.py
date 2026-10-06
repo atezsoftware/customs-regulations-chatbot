@@ -582,7 +582,7 @@ def test_parallel_incomplete_child_preserves_complete_sibling(
     assert bodies[TASKS[0]].split("\n\n", 1)[1] in rendered
 
 
-def test_parallel_resume_restores_saved_mode_and_bound_bodies_without_new_children(
+def test_retired_parallel_resume_is_rejected_without_new_research(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     kwargs, selected, _, checkpoints, queue, _, read, _, _ = script_two_children(
@@ -593,28 +593,24 @@ def test_parallel_resume_restores_saved_mode_and_bound_bodies_without_new_childr
     packets(queue)
     monkeypatch.setattr(runtime, "load_asv3_checkpoint", lambda **_args: previous)
     selected.reset_mock()
-
+    saved_count = len(checkpoints)
+    broker = MagicMock(side_effect=AssertionError("Resume must not create a broker"))
+    workers = MagicMock(side_effect=AssertionError("Resume must not create workers"))
+    monkeypatch.setattr(runtime, "CorpusBroker", broker)
+    monkeypatch.setattr(runtime, "WorkerPool", workers)
     selected.invoke.side_effect = AssertionError(
-        "Saved complete branch receipts need no new model call"
+        "A retired parallel checkpoint cannot start a model call"
     )
-    # Resume transport need not carry a new selection: the saved checkpoint owns its mode.
     kwargs.update(
         resume_message_id=2, research_profile="normal", parallel_research=False
     )
-    runtime.run_asv3_loop(**kwargs)
+    with pytest.raises(ValueError, match="retired parallel workflow"):
+        runtime.run_asv3_loop(**kwargs)
 
     selected.invoke.assert_not_called()
+    broker.assert_not_called()
+    workers.assert_not_called()
     assert read.call_count == 1
-    restored = checkpoints[-1]
-    assert restored["research_profile"] == "experimental"
-    assert restored["parallel_research"] is True
-    assert restored["publication_status"] == "found"
-    assert restored["last_draft"] == previous["last_draft"]
-    assert restored["parallel_answers"] == previous["parallel_answers"]
-    assert (
-        restored["question_research"]["answers"]
-        == previous["question_research"]["answers"]
-    )
-    assert {item["task_id"] for item in restored["workers"]["tasks"]} == {
-        item["task_id"] for item in previous["workers"]["tasks"]
-    }
+    assert len(checkpoints) == saved_count
+    assert checkpoints[-1] == previous
+    assert packets(queue) == []
