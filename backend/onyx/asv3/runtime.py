@@ -318,7 +318,12 @@ def run_asv3_loop(
     if source_reviews is not None:
         context.services["legal_source_reviews"] = source_reviews
     authority_requirements = (
-        AuthorityRequirements(context, question)
+        AuthorityRequirements(
+            context,
+            question,
+            syntactic_reference_binding=research_profile == "experimental"
+            and parallel_research,
+        )
         if research_profile == "experimental"
         else None
     )
@@ -335,6 +340,8 @@ def run_asv3_loop(
             ledger,
             strict_reference_boundaries=research_profile == "experimental",
             resolve_defined_abbreviations=research_profile == "experimental"
+            and parallel_research,
+            syntactic_reference_binding=research_profile == "experimental"
             and parallel_research,
         )
         if authority_requirements is not None:

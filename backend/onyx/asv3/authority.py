@@ -51,6 +51,147 @@ _INSTRUMENT_DESIGNATOR = re.compile(
     r"|laws?|acts?|statutes?|regulations?|directives?|decrees?|decisions?|circulars?"
     r"|conventions?|treaties|treaty|agreements?)\b"
 )
+_BOUND_NUMBER = (
+    r"(?P<article>\d{1,4}[a-zçğıöşü]?)"
+    r"(?:(?:\s*/\s*(?P<paragraph>\d+)"
+    r"(?:\s*[-(]\s*\(?(?P<clause>[a-zçğıöşü])\)?)?)"
+    r"|(?:\s*/\s*(?P<inserted>[a-zçğıöşü])))?"
+    r"(?![a-z0-9/]|\.\d)"
+)
+_BOUND_QUALIFIER = r"(?:(?P<qualifier>gecici|geçici|mukerrer|mükerrer|ek)\s+)?"
+_BOUND_FORWARD = re.compile(
+    _BOUND_QUALIFIER
+    + r"(?:madde|article|section|art|md|m)\b\.?\s*:?\s*"
+    + _BOUND_NUMBER
+)
+_BOUND_REVERSE = re.compile(
+    _BOUND_QUALIFIER
+    + _BOUND_NUMBER
+    + r"\s*(?:\.\s*|['’]?\s*(?:inci|nci|uncu|ıncı)\s+|\s+)"
+    + r"madd(?:e(?:de|den|nin|ye|yi)?|es[iı](?:nde|nden|nin|ne|ni)?|eleri(?:nin|ne)?)\b"
+)
+_BOUND_COMPACT = re.compile(
+    r"\(?" + _BOUND_QUALIFIER + _BOUND_NUMBER + r"\)?\s*madd[a-z]*\b"
+)
+_BOUND_LIST_NUMBER = re.compile(_BOUND_QUALIFIER + _BOUND_NUMBER)
+_BOUND_PREFIX = re.compile(
+    r"\s*(?:['’]\s*(?:nun|nin|un|in|nın|inin|unun)\b\s*)?"
+    r"(?:[,:(|]\s*)?"
+)
+_BOUND_SEPARATOR = re.compile(r"\s*(?:,|\bve\b|\bile\b|\band\b)\s*")
+_ENUMERATION_END = re.compile(r"\s*(?:maddeler[a-z]*|articles?|sections?)\b")
+
+
+def _explicit_bare_enumeration(text: str, start: int) -> bool:
+    match = _BOUND_LIST_NUMBER.match(text, start)
+    while match is not None:
+        if _ENUMERATION_END.match(text, match.end()):
+            return True
+        separator = _BOUND_SEPARATOR.match(text, match.end())
+        if separator is None:
+            return False
+        match = _BOUND_LIST_NUMBER.match(text, separator.end())
+    return False
+
+
+@dataclass(frozen=True)
+class _BoundLocator:
+    start: int
+    end: int
+    article: str
+    paragraph: str | None
+    clause: str | None
+    qualifier: str | None
+
+
+def _bound_locator(
+    text: str, start: int, *, bare: bool = False
+) -> _BoundLocator | None:
+    patterns = (
+        (_BOUND_FORWARD, _BOUND_REVERSE, _BOUND_COMPACT, _BOUND_LIST_NUMBER)
+        if bare
+        else (_BOUND_FORWARD, _BOUND_REVERSE, _BOUND_COMPACT)
+    )
+    matches = [
+        match
+        for pattern in patterns
+        if (match := pattern.match(text, start))
+        and (
+            pattern is not _BOUND_LIST_NUMBER or _explicit_bare_enumeration(text, start)
+        )
+    ]
+    if not matches:
+        return None
+    match = max(matches, key=lambda value: value.end())
+    if bare and re.match(r"\s*(?:sayili|tarihli|yil[a-z]*)\b", text[match.end() :]):
+        return None
+    article = match["article"].upper()
+    if inserted := match["inserted"]:
+        article += "/" + inserted.upper()
+    qualifier = match["qualifier"]
+    return _BoundLocator(
+        start,
+        match.end(),
+        article,
+        match["paragraph"],
+        match["clause"],
+        folded(qualifier) if qualifier else None,
+    )
+
+
+def _explicit_reverse_instrument(text: str, start: int) -> bool:
+    tail = text[start:]
+    if link := re.match(r"\s+of\s+(?:the\s+)?", tail):
+        target = _reference_tail(tail[link.end() :])
+        # _reference_tail stops before the instrument designator itself.
+        return bool(_INSTRUMENT_DESIGNATOR.match(tail[link.end() + len(target) :]))
+    if parenthesized := re.match(r"\s*\(([^)\n]+)\)", tail):
+        return _INSTRUMENT_DESIGNATOR.search(parenthesized[1]) is not None
+    return False
+
+
+def _bound_locators(text: str, start: int, end: int) -> list[_BoundLocator]:
+    """Bind locators through explicit syntax, never through a later narrative clause."""
+    found: list[_BoundLocator] = []
+    tail = text[end:]
+    prefix = _BOUND_PREFIX.match(tail)
+    assert prefix is not None
+    cursor = prefix.end()
+    locator = _bound_locator(tail, cursor)
+    while locator is not None:
+        if _explicit_reverse_instrument(tail, locator.end):
+            break
+        found.append(replace(locator, start=end + locator.start, end=end + locator.end))
+        separator = _BOUND_SEPARATOR.match(tail, locator.end)
+        if separator is None:
+            break
+        if _STRICT_STATUTE.match(folded(tail), separator.end()):
+            break
+        locator = _bound_locator(tail, separator.end(), bare=True)
+    # Reverse links require an explicit possessive/prepositional relationship.
+    before = text[:start]
+    boundary = max(before.rfind("\n"), before.rfind(";"), before.rfind("|")) + 1
+    for pattern in (_BOUND_FORWARD, _BOUND_REVERSE, _BOUND_COMPACT):
+        for match in pattern.finditer(before, boundary):
+            connector = before[match.end() :]
+            if not re.fullmatch(r"\s+(?:of\s+(?:the\s+)?)|\s*\(\s*", connector):
+                continue
+            if "(" in connector and not re.match(r"\s*\)", text[end:]):
+                continue
+            locator = _bound_locator(before, match.start())
+            if locator is not None:
+                found.append(locator)
+    return list(dict.fromkeys(found))
+
+
+def _reference_bounds(
+    text: str, start: int, end: int, locator: _BoundLocator | None
+) -> tuple[int, int]:
+    if locator is not None:
+        start, end = min(start, locator.start), max(end, locator.end)
+        if closing := re.match(r"\s*\)", text[end:]):
+            end += closing.end()
+    return start, end
 
 
 def _reference_tail(text: str) -> str:
@@ -80,7 +221,10 @@ class StatuteReference:
 
 
 def statute_references(
-    text: str, *, strict_reference_boundaries: bool = False
+    text: str,
+    *,
+    strict_reference_boundaries: bool = False,
+    syntactic_reference_binding: bool = False,
 ) -> tuple[StatuteReference, ...]:
     # Keep Turkish clause letters distinct while normalizing instrument wording.
     original = text.replace("**", "").replace("__", "")
@@ -100,6 +244,36 @@ def statute_references(
     ] = {}
     pattern = _STRICT_STATUTE if strict_reference_boundaries else _STATUTE
     for match in pattern.finditer(identity_text):
+        if syntactic_reference_binding:
+            bound = _bound_locators(normalized, match.start(), match.end())
+            references: list[_BoundLocator | None] = []
+            references.extend(bound)
+            if not references:
+                references.append(None)
+            for locator in references:
+                number = match["number"] or match["english_number"]
+                reference_start, reference_end = _reference_bounds(
+                    normalized, match.start(), match.end(), locator
+                )
+                original_reference = original[
+                    offsets[reference_start] : offsets[reference_end]
+                ]
+                article = locator.article if locator else None
+                paragraph = locator.paragraph if locator else None
+                clause = locator.clause if locator else None
+                qualifier = locator.qualifier if locator else None
+                found.setdefault(
+                    (number, article, paragraph, clause, qualifier),
+                    StatuteReference(
+                        number,
+                        article,
+                        original_reference[:240],
+                        paragraph,
+                        clause,
+                        qualifier,
+                    ),
+                )
+            continue
         tail = _reference_tail(normalized[match.end() : match.end() + 180])
         candidates: list[tuple[int, str, str | None, str | None, str | None]] = [
             (offset, reference.article_no, None, None, reference.qualifier)
@@ -364,11 +538,14 @@ def _named_native_references(
     aliases: dict[str, set[str]],
     *,
     strict_reference_boundaries: bool = False,
+    syntactic_reference_binding: bool = False,
 ) -> list[tuple[StatuteReference, str | None]]:
     references = [
         (ref, _reference_name(ref))
         for ref in statute_references(
-            text, strict_reference_boundaries=strict_reference_boundaries
+            text,
+            strict_reference_boundaries=strict_reference_boundaries,
+            syntactic_reference_binding=syntactic_reference_binding,
         )
     ]
     normalized = folded(text.replace("**", "").replace("__", ""))
@@ -378,6 +555,26 @@ def _named_native_references(
         # The canonical stem tolerates Turkish case endings but not an acronym.
         pattern = re.compile(rf"(?<!\w){re.escape(name)}(?:u[a-z]*)?(?!\w)")
         for match in pattern.finditer(normalized):
+            if syntactic_reference_binding:
+                bound = _bound_locators(normalized, match.start(), match.end())
+                for locator in list(bound) or [None]:
+                    reference_start, reference_end = _reference_bounds(
+                        normalized, match.start(), match.end(), locator
+                    )
+                    references.append(
+                        (
+                            StatuteReference(
+                                next(iter(numbers), ""),
+                                locator.article if locator else None,
+                                normalized[reference_start:reference_end][:240],
+                                locator.paragraph if locator else None,
+                                locator.clause if locator else None,
+                                locator.qualifier if locator else None,
+                            ),
+                            name,
+                        )
+                    )
+                continue
             tail = _reference_tail(normalized[match.end() : match.end() + 180])
             locators = extract_regulatory_provision_reference_occurrences(tail)
             article = locators[0][1].article_no if locators else None
@@ -417,6 +614,28 @@ def _canonical_law_aliases(
                     aliases.setdefault(name, set()).update(
                         number for number in numbers if isinstance(number, str)
                     )
+    return aliases
+
+
+def _authority_aliases(
+    ledger: EvidenceLedger,
+    rows: list[dict[str, JsonValue]],
+    *,
+    strict_reference_boundaries: bool,
+    syntactic_reference_binding: bool,
+) -> dict[str, set[str]]:
+    aliases = _canonical_law_aliases(rows)
+    for number in ledger.citation_mapping():
+        item = ledger.get(number)
+        if item is None:
+            continue
+        for reference in statute_references(
+            item.text,
+            strict_reference_boundaries=strict_reference_boundaries,
+            syntactic_reference_binding=syntactic_reference_binding,
+        ):
+            if name := _reference_name(reference):
+                aliases.setdefault(name, set()).add(reference.number)
     return aliases
 
 
@@ -464,7 +683,10 @@ def _matching_native_rows(
 
 
 def explicit_reference_leads(
-    ledger: EvidenceLedger, complete_originals: list[dict[str, JsonValue]]
+    ledger: EvidenceLedger,
+    complete_originals: list[dict[str, JsonValue]],
+    *,
+    syntactic_reference_binding: bool = False,
 ) -> list[dict[str, JsonValue]]:
     """Project literal source references as navigation, never mandatory legal needs."""
     rows = _native_original_rows(ledger)
@@ -491,7 +713,10 @@ def explicit_reference_leads(
         item = ledger.get(number)
         assert item is not None
         for reference, name in _named_native_references(
-            item.text, aliases, strict_reference_boundaries=True
+            item.text,
+            aliases,
+            strict_reference_boundaries=True,
+            syntactic_reference_binding=syntactic_reference_binding,
         ):
             if reference.article is None:
                 continue
@@ -526,7 +751,10 @@ _DEFINED_ABBREVIATION = re.compile(r"\(\s*([A-ZÇĞİÖŞÜ][A-ZÇĞİÖŞÜ0-9]
 
 
 def _defined_statute_abbreviations(
-    answer: str, aliases: dict[str, set[str]]
+    answer: str,
+    aliases: dict[str, set[str]],
+    *,
+    syntactic_reference_binding: bool = False,
 ) -> dict[str, tuple[str, str | None] | None]:
     defined: dict[str, set[tuple[str, str | None]]] = {}
     for match in _DEFINED_ABBREVIATION.finditer(answer):
@@ -535,7 +763,10 @@ def _defined_statute_abbreviations(
         identities = {
             (reference.number, name)
             for reference, name in _named_native_references(
-                prefix, aliases, strict_reference_boundaries=True
+                prefix,
+                aliases,
+                strict_reference_boundaries=True,
+                syntactic_reference_binding=syntactic_reference_binding,
             )
             if (
                 (numbered := _STRICT_STATUTE.search(folded(reference.reference_text)))
@@ -558,6 +789,8 @@ def _defined_statute_abbreviations(
 def _abbreviated_statute_references(
     text: str,
     defined: dict[str, tuple[str, str | None] | None],
+    *,
+    syntactic_reference_binding: bool = False,
 ) -> list[tuple[StatuteReference, str | None]]:
     references: list[tuple[StatuteReference, str | None]] = []
     for label, identity in defined.items():
@@ -572,7 +805,10 @@ def _abbreviated_statute_references(
             continue
         number, name = identity
         for reference, _ in _named_native_references(
-            text, {label: {number}}, strict_reference_boundaries=True
+            text,
+            {label: {number}},
+            strict_reference_boundaries=True,
+            syntactic_reference_binding=syntactic_reference_binding,
         ):
             if reference.article is not None:
                 references.append((reference, name))
@@ -622,20 +858,17 @@ def native_named_authority_gap(
     *,
     strict_reference_boundaries: bool = False,
     resolve_defined_abbreviations: bool = False,
+    syntactic_reference_binding: bool = False,
 ) -> dict[str, JsonValue] | None:
     """Check local named-statute identity, not legal entailment or unnamed omissions."""
     rows = _native_original_rows(ledger)
-    aliases = _canonical_law_aliases(rows)
     # Lower references supply recognition aliases only, never matching originals.
-    for number in ledger.citation_mapping():
-        item = ledger.get(number)
-        if item is None:
-            continue
-        for reference in statute_references(
-            item.text, strict_reference_boundaries=strict_reference_boundaries
-        ):
-            if name := _reference_name(reference):
-                aliases.setdefault(name, set()).add(reference.number)
+    aliases = _authority_aliases(
+        ledger,
+        rows,
+        strict_reference_boundaries=strict_reference_boundaries,
+        syntactic_reference_binding=syntactic_reference_binding,
+    )
     units = assertion_inventory(answer)
     defined = (
         _defined_statute_abbreviations(
@@ -646,6 +879,7 @@ def native_named_authority_gap(
                 for unit in units
             ),
             aliases,
+            syntactic_reference_binding=syntactic_reference_binding,
         )
         if resolve_defined_abbreviations
         else {}
@@ -667,10 +901,19 @@ def native_named_authority_gap(
             continue
         attributed = _without_verified_quotes(unit["text"], cited, ledger)
         references = _named_native_references(
-            attributed, aliases, strict_reference_boundaries=strict_reference_boundaries
+            attributed,
+            aliases,
+            strict_reference_boundaries=strict_reference_boundaries,
+            syntactic_reference_binding=syntactic_reference_binding,
         )
         if resolve_defined_abbreviations:
-            references.extend(_abbreviated_statute_references(attributed, defined))
+            references.extend(
+                _abbreviated_statute_references(
+                    attributed,
+                    defined,
+                    syntactic_reference_binding=syntactic_reference_binding,
+                )
+            )
         seen: set[tuple[str, str | None, str | None, str | None]] = set()
         for reference, name in references:
             identity = (

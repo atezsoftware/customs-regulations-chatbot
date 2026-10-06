@@ -12,10 +12,15 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
 from onyx.asv3.assertions import assertion_inventory
 from onyx.asv3.authority import (
+    _abbreviated_statute_references,
+    _authority_aliases,
+    _defined_statute_abbreviations,
     _formal_law_name,
     _named_native_references,
+    _native_original_rows,
     _precise_original_gap,
     _reference_name,
+    _without_verified_quotes,
     folded,
     native_named_authority_gap,
     statute_references,
@@ -52,15 +57,23 @@ class _Checkpoint(BaseModel):
     run_id: str
     scope_hash: str
     request_hash: str
+    reference_policy: Literal["legacy", "syntactic-v1"] = "legacy"
     records: list[_Requirement]
     record_integrity: dict[str, str]
 
 
 class AuthorityRequirements:
-    def __init__(self, context: RunContext, request: str) -> None:
+    def __init__(
+        self,
+        context: RunContext,
+        request: str,
+        *,
+        syntactic_reference_binding: bool = False,
+    ) -> None:
         self.run_id = context.run_id
         self.scope_hash = _digest(context.scope)
         self.request_hash = _digest(request)
+        self.syntactic_reference_binding = syntactic_reference_binding
         self._records: dict[str, _Requirement] = {}
         self._lock = threading.RLock()
 
@@ -91,13 +104,14 @@ class AuthorityRequirements:
         answer: str,
         gap: dict[str, JsonValue] | None,
         context: RunContext,
+        ledger: EvidenceLedger,
     ) -> None:
         if gap is None:
             return
         missing = gap.get("named_authority_gaps")
         if not isinstance(missing, list):
             return
-        units = {unit["unit_id"] for unit in assertion_inventory(answer)}
+        units = {unit["unit_id"]: unit for unit in assertion_inventory(answer)}
         owner = self._owner(context)
         task_outcomes = context.services.get("task_outcome_ids")
         outcome_ids = (
@@ -127,7 +141,9 @@ class AuthorityRequirements:
                 (
                     item
                     for item in statute_references(
-                        reference, strict_reference_boundaries=True
+                        reference,
+                        strict_reference_boundaries=True,
+                        syntactic_reference_binding=self.syntactic_reference_binding,
                     )
                     if item.number == number and item.article == article
                 ),
@@ -137,6 +153,73 @@ class AuthorityRequirements:
             if formal_name is None:
                 name = re.match(r"(.+?\bkanun(?:u|un|unun)?\b)", folded(reference))
                 formal_name = _formal_law_name(name[0]) if name is not None else None
+            bound_reference = parsed
+            if self.syntactic_reference_binding and article is not None:
+                bound = (
+                    [(parsed, formal_name)]
+                    if parsed is not None
+                    else _named_native_references(
+                        reference,
+                        {formal_name: {number or ""}} if formal_name else {},
+                        strict_reference_boundaries=True,
+                        syntactic_reference_binding=True,
+                    )
+                )
+                bound_reference = next(
+                    (
+                        item
+                        for item, name in bound
+                        if item.article == article
+                        and (
+                            item.number == number
+                            if number is not None
+                            else name == formal_name
+                        )
+                    ),
+                    None,
+                )
+                if bound_reference is None:
+                    aliases = _authority_aliases(
+                        ledger,
+                        _native_original_rows(ledger),
+                        strict_reference_boundaries=True,
+                        syntactic_reference_binding=True,
+                    )
+                    declared = _defined_statute_abbreviations(
+                        "\n".join(
+                            _without_verified_quotes(
+                                item["text"], set(item["evidence_numbers"]), ledger
+                            )
+                            for item in units.values()
+                        ),
+                        aliases,
+                        syntactic_reference_binding=True,
+                    )
+                    abbreviated = next(
+                        (
+                            (item, name)
+                            for item, name in _abbreviated_statute_references(
+                                units[unit]["text"],
+                                declared,
+                                syntactic_reference_binding=True,
+                            )
+                            if item.article == article
+                            and (
+                                item.number == number
+                                if number is not None
+                                else name is not None
+                                and (formal_name is None or name == formal_name)
+                            )
+                        ),
+                        None,
+                    )
+                    if abbreviated is not None:
+                        bound_reference, declared_name = abbreviated
+                        formal_name = declared_name or formal_name
+                if bound_reference is None:
+                    raise ValueError(
+                        "An authority requirement needs an explicitly bound article"
+                    )
             if not number and not formal_name:
                 raise ValueError("An authority requirement needs a named instrument")
             record = _Requirement(
@@ -146,8 +229,8 @@ class AuthorityRequirements:
                 formal_name=formal_name,
                 article=article,
                 qualifier=(
-                    parsed.qualifier
-                    if parsed is not None
+                    bound_reference.qualifier
+                    if bound_reference is not None
                     else next(
                         (
                             locator.qualifier
@@ -167,11 +250,14 @@ class AuthorityRequirements:
             if key not in self._records:
                 self._records[key] = record.model_copy(update={"requirement_id": key})
 
-    @staticmethod
-    def _probe(record: _Requirement) -> str:
-        if record.instrument_number:
+    def _probe(self, record: _Requirement) -> str:
+        if record.instrument_number or (
+            self.syntactic_reference_binding and record.formal_name
+        ):
             identity = (
                 f"{record.instrument_number} sayılı {record.formal_name or 'Kanun'}"
+                if record.instrument_number
+                else record.formal_name or ""
             )
             locator = (
                 f" {(record.qualifier + ' ') if record.qualifier else ''}MADDE {record.article}"
@@ -181,22 +267,27 @@ class AuthorityRequirements:
             return identity + locator + " uygulanır."
         return record.reference_text
 
-    @staticmethod
-    def _formal_reference_name(reference: object) -> str | None:
+    def _formal_reference_name(self, reference: object) -> str | None:
         if not isinstance(reference, str):
             return None
-        parsed = statute_references(reference, strict_reference_boundaries=True)
+        parsed = statute_references(
+            reference,
+            strict_reference_boundaries=True,
+            syntactic_reference_binding=self.syntactic_reference_binding,
+        )
         if parsed:
             return _reference_name(parsed[0])
         name = re.match(r"(.+?\bkanun(?:u|un|unun)?\b)", folded(reference))
         return _formal_law_name(name[0]) if name is not None else None
 
-    @staticmethod
-    def _matching_originals(record: _Requirement, ledger: EvidenceLedger) -> set[int]:
+    def _matching_originals(
+        self, record: _Requirement, ledger: EvidenceLedger
+    ) -> set[int]:
         gap = native_named_authority_gap(
-            AuthorityRequirements._probe(record),
+            self._probe(record),
             ledger,
             strict_reference_boundaries=True,
+            syntactic_reference_binding=self.syntactic_reference_binding,
         )
         if gap is None:
             return set()
@@ -210,9 +301,7 @@ class AuthorityRequirements:
             and (
                 row.get("instrument_number") == record.instrument_number
                 if record.instrument_number is not None
-                else AuthorityRequirements._formal_reference_name(
-                    row.get("reference_text")
-                )
+                else self._formal_reference_name(row.get("reference_text"))
                 == record.formal_name
             )
             and row.get("article") == record.article
@@ -224,20 +313,45 @@ class AuthorityRequirements:
             if isinstance(citation, int) and not isinstance(citation, bool)
         }
 
-    @staticmethod
-    def _disclosed(record: _Requirement, answer: str) -> bool:
+    def _disclosed(
+        self, record: _Requirement, answer: str, ledger: EvidenceLedger
+    ) -> bool:
         aliases = (
             {record.formal_name: {record.instrument_number or ""}}
             if record.formal_name is not None
             else {}
         )
+        declared = (
+            _defined_statute_abbreviations(
+                "\n".join(
+                    _without_verified_quotes(
+                        unit["text"], set(unit["evidence_numbers"]), ledger
+                    )
+                    for unit in assertion_inventory(answer)
+                ),
+                aliases,
+                syntactic_reference_binding=True,
+            )
+            if self.syntactic_reference_binding
+            else {}
+        )
+        gap_aliases = {
+            **aliases,
+            **{
+                label: {identity[0]}
+                for label, identity in declared.items()
+                if identity is not None
+            },
+        }
         for unit in assertion_inventory(answer):
             if unit["evidence_numbers"] or not _precise_original_gap(
-                unit["text"], aliases
+                unit["text"], gap_aliases
             ):
                 continue
             numbered = statute_references(
-                unit["text"], strict_reference_boundaries=True
+                unit["text"],
+                strict_reference_boundaries=True,
+                syntactic_reference_binding=self.syntactic_reference_binding,
             )
             if (
                 record.instrument_number is not None
@@ -248,9 +362,19 @@ class AuthorityRequirements:
                 )
             ):
                 continue
-            for reference, name in _named_native_references(
-                unit["text"], aliases, strict_reference_boundaries=True
-            ):
+            references = _named_native_references(
+                unit["text"],
+                aliases,
+                strict_reference_boundaries=True,
+                syntactic_reference_binding=self.syntactic_reference_binding,
+            )
+            if self.syntactic_reference_binding:
+                references.extend(
+                    _abbreviated_statute_references(
+                        unit["text"], declared, syntactic_reference_binding=True
+                    )
+                )
+            for reference, name in references:
                 if (
                     (
                         reference.number == record.instrument_number
@@ -278,9 +402,13 @@ class AuthorityRequirements:
         with self._lock:
             if native_gap is None:
                 native_gap = native_named_authority_gap(
-                    answer, ledger, strict_reference_boundaries=True
+                    answer,
+                    ledger,
+                    strict_reference_boundaries=True,
+                    syntactic_reference_binding=self.syntactic_reference_binding,
+                    resolve_defined_abbreviations=self.syntactic_reference_binding,
                 )
-            self._remember(answer, native_gap, context)
+            self._remember(answer, native_gap, context, ledger)
             delivered = (
                 set(validated_delivered)
                 if validated_delivered is not None
@@ -300,7 +428,7 @@ class AuthorityRequirements:
                     continue
                 matching = self._matching_originals(record, ledger)
                 if matching.intersection(inline, delivered) or self._disclosed(
-                    record, answer
+                    record, answer, ledger
                 ):
                     continue
                 missing.append(
@@ -340,22 +468,32 @@ class AuthorityRequirements:
 
     def export(self) -> dict[str, JsonValue]:
         with self._lock:
-            return _Checkpoint(
+            saved = _Checkpoint(
                 run_id=self.run_id,
                 scope_hash=self.scope_hash,
                 request_hash=self.request_hash,
+                reference_policy=(
+                    "syntactic-v1" if self.syntactic_reference_binding else "legacy"
+                ),
                 records=list(self._records.values()),
                 record_integrity={
                     key: _digest(record.model_dump(mode="json"))
                     for key, record in self._records.items()
                 },
             ).model_dump(mode="json")
+            if not self.syntactic_reference_binding:
+                saved.pop("reference_policy")
+            return saved
 
     def restore(
         self, snapshot: dict[str, JsonValue], context: RunContext, request: str
     ) -> None:
         self._fence(context)
         saved = _Checkpoint.model_validate(snapshot)
+        if saved.reference_policy != (
+            "syntactic-v1" if self.syntactic_reference_binding else "legacy"
+        ):
+            raise ValueError("Authority reference binding policy changed")
         if (saved.run_id, saved.scope_hash, saved.request_hash) != (
             self.run_id,
             self.scope_hash,
