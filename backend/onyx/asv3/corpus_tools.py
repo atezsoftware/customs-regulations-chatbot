@@ -1925,6 +1925,7 @@ def build_corpus_specs(
             ),
             handler=guarded(search),
             orchestrates=named_provision_reads,
+            exposes_public_update=True if named_provision_reads else None,
         ),
     ]
     if named_provision_reads:
@@ -1944,6 +1945,7 @@ def build_corpus_specs(
                 ),
                 handler=guarded(named_provision),
                 orchestrates=True,
+                exposes_public_update=True,
             )
         )
     return specs

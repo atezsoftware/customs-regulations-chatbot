@@ -269,6 +269,7 @@ class ToolSpec(BaseModel):
     consumes_tool_budget: bool = True
     external: bool = False
     orchestrates: bool = False
+    exposes_public_update: bool | None = None
     requires_research_need: bool = False
     research_need_argument: Literal["_need_id", "need_ids"] = "_need_id"
 

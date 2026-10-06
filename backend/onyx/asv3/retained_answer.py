@@ -419,12 +419,20 @@ def project_failed_terminal_turns(
                 break
             outcome = payload.get("outcome") if isinstance(payload, dict) else None
             data = outcome.get("data") if isinstance(outcome, dict) else None
+            known_rejected_repeat = (
+                context.services.get("asv3_workflow_variant") == ASV3_TUNED_VARIANT
+                and isinstance(outcome, dict)
+                and outcome.get("status") == "invalid"
+                and outcome.get("summary")
+                == "Repeated failed call: change the arguments or method"
+                and data == {}
+            )
             if (
                 not isinstance(payload, dict)
                 or not isinstance(outcome, dict)
                 or outcome.get("status") not in {"invalid", "partial", "denied"}
                 or not isinstance(data, dict)
-                or not data
+                or (not data and not known_rejected_repeat)
                 or payload.get("evidence_ids")
                 or payload.get("original_evidence")
                 or outcome.get("evidence")

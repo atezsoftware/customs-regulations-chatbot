@@ -278,7 +278,12 @@ class CapabilityRegistry:
                         binding = properties["need_ids"]
                         assert isinstance(binding, dict)
                         binding["minItems"] = 1
-            if not spec.orchestrates and spec.name not in {
+            public_update = (
+                spec.exposes_public_update
+                if spec.exposes_public_update is not None
+                else not spec.orchestrates
+            )
+            if public_update and spec.name not in {
                 "report_progress",
                 "record_scenario",
                 "discover_tools",

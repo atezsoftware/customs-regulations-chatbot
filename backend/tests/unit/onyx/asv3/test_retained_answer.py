@@ -497,6 +497,30 @@ def test_failed_terminal_projection_drops_only_model_view_without_mutating_journ
     )
 
 
+def test_tuned_known_duplicate_rejection_is_obsolete_but_unknown_empty_result_is_retained() -> (
+    None
+):
+    ctx = context()
+    ctx.services.update(asv3_workflow_variant="asv3_tuned", research_profile="normal")
+    item = turn(data={})
+    payload = json.loads(item.results[0].content)
+    payload["outcome"]["summary"] = (
+        "Repeated failed call: change the arguments or method"
+    )
+    item.results[0].content = json.dumps(payload)
+    before = item.model_dump_json()
+    gap: dict[str, JsonValue] = {"missing": "Actual current gap"}
+    assert project_failed_terminal_turns([item], ctx, DRAFT, gap) == []
+    assert item.model_dump_json() == before
+    assert project_failed_terminal_turns([item], ctx, DRAFT, None) == [item]
+    ctx.services["asv3_workflow_variant"] = "standard"
+    assert project_failed_terminal_turns([item], ctx, DRAFT, gap) == [item]
+    ctx.services["asv3_workflow_variant"] = "asv3_tuned"
+    payload["outcome"]["summary"] = "Unknown empty assessment"
+    item.results[0].content = json.dumps(payload)
+    assert project_failed_terminal_turns([item], ctx, DRAFT, gap) == [item]
+
+
 @pytest.mark.parametrize(
     "keep",
     [

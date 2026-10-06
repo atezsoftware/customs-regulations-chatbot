@@ -73,6 +73,10 @@ from onyx.asv3.shared_originals import (
     delivered_provision_navigation,
     related_provision_originals,
 )
+from onyx.asv3.source_metadata_transport import (
+    expand_source_metadata,
+    share_source_metadata,
+)
 from onyx.asv3.terminal_fact_references import (
     bind_terminal_fact_references,
     normalize_terminal_fact_references,
@@ -162,11 +166,7 @@ class _NativeOriginalCatalogue:
         index = len(prompt) - 1
         text = cls._host_text(prompt, index)
         payload = parse_json_object(text)
-        records = payload.get("original_metadata_catalogue", [])
-        if not isinstance(records, list) or any(
-            not isinstance(record, dict) for record in records
-        ):
-            raise ValueError("Native original catalogue must contain identity records")
+        records = expand_source_metadata(payload)
         return cls(
             index,
             hashlib.sha256(text.encode("utf-8")).hexdigest(),
@@ -196,9 +196,7 @@ class _NativeOriginalCatalogue:
         text = self._host_text(prompt, self.message_index)
         if hashlib.sha256(text.encode("utf-8")).hexdigest() != self.content_sha256:
             raise ValueError("Native original catalogue host message changed")
-        if parse_json_object(text).get("original_metadata_catalogue", []) != list(
-            self.records
-        ):
+        if expand_source_metadata(parse_json_object(text)) != list(self.records):
             raise ValueError("Native original catalogue binding changed")
 
 
@@ -1342,12 +1340,11 @@ class ResearchModel:
         if native_catalogue is not None:
             if (
                 not self.lean_native_mode
-                or self.context.services.get("research_profile") != "experimental"
                 or not lossless_original_transport_enabled(self.context)
                 or not isinstance(ledger, EvidenceLedger)
             ):
                 raise ValueError(
-                    "Compact native originals require experimental parallel mode"
+                    "Compact native originals require their enabled workflow scope"
                 )
             native_catalogue.validate(prompt)
         if isinstance(ledger, EvidenceLedger):
@@ -2719,11 +2716,16 @@ class ResearchModel:
                         key: value
                         for key, value in receipt.call.arguments.items()
                         if not (
-                            parallel_execution_enabled(self.context)
+                            retained_answer_enabled(self.context)
                             and view.draft_to_repair
                             and receipt.call.name
-                            in {"submit_answer", "submit_partial_answer"}
-                            and key == "answer"
+                            in {
+                                "submit_answer",
+                                "submit_partial_answer",
+                                "submit_retained_answer",
+                                "submit_retained_partial_answer",
+                            }
+                            and key in {"answer", "retained_answer_edits"}
                         )
                     },
                     "status": receipt.outcome.status.value,
@@ -3252,8 +3254,16 @@ class ResearchModel:
                 native_turns = projection.turns
                 current_originals = projection.fallback_originals
                 if projection.metadata_catalogue:
+                    catalogue = projection.metadata_catalogue
+                    if (
+                        self.context.services.get("asv3_workflow_variant")
+                        == ASV3_TUNED_VARIANT
+                    ):
+                        catalogue, source_metadata = share_source_metadata(catalogue)
+                        if source_metadata:
+                            current["original_source_metadata"] = source_metadata
                     current["original_metadata_catalogue"] = cast(
-                        list[JsonValue], projection.metadata_catalogue
+                        list[JsonValue], catalogue
                     )
             if current_originals:
                 current["original_evidence"] = cast(list[JsonValue], current_originals)
@@ -3305,6 +3315,13 @@ class ResearchModel:
                     "only a missing clause, continuation or changed source version needs reading. "
                     "Full chunks alone do not prove a complete provision."
                 )
+                if current.get("original_source_metadata"):
+                    current["evidence_note"] = str(current["evidence_note"]) + (
+                        " Each source_metadata_ref names its exact source's shared metadata in "
+                        "original_source_metadata. Combine those fields with that catalogue row's "
+                        "metadata for its full current locators, dates and version evidence; "
+                        "citation-specific fields never override shared fields."
+                    )
             return [
                 *prefix,
                 *(

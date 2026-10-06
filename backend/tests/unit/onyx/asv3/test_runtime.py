@@ -24,6 +24,7 @@ from onyx.asv3.models import (
     ToolOutcome,
     ToolSpec,
 )
+from onyx.asv3.source_metadata_transport import expand_source_metadata
 from onyx.cache.interface import CacheBackend
 from onyx.chat.chat_state import ChatStateContainer
 from onyx.chat.emitter import Emitter
@@ -121,12 +122,19 @@ def user_payload(message: UserMessage) -> dict[str, Any]:
 
 def delivered_originals(arguments: dict[str, Any]) -> list[dict[str, Any]]:
     result = []
+    catalogue = {
+        row["citation"]: row
+        for row in expand_source_metadata(user_payload(arguments["prompt"][-1]))
+    }
     for message in arguments["prompt"]:
         if isinstance(message, ToolMessage):
             result.extend(json.loads(message.content).get("original_evidence", []))
         elif isinstance(message, UserMessage):
             result.extend(user_payload(message).get("original_evidence", []))
-    return result
+    return [
+        {**catalogue[row["identity_ref"]], **row} if "identity_ref" in row else row
+        for row in result
+    ]
 
 
 def run_independent(

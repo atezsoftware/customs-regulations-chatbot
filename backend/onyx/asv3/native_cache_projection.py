@@ -11,6 +11,7 @@ from pydantic import JsonValue
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.legal_source_reviews import serial_session_diagnostics_enabled
 from onyx.asv3.models import ResearchTurn, RunContext, model_evidence_metadata
+from onyx.asv3.workflow_variant import ASV3_TUNED_VARIANT
 from onyx.llm.models import ToolMessage
 
 OriginalRange = tuple[int, str, str | None, str, int, int]
@@ -23,6 +24,8 @@ _CATALOGUE_FIELDS = frozenset(
 
 
 def lossless_original_transport_enabled(context: RunContext) -> bool:
+    if context.services.get("asv3_workflow_variant") == ASV3_TUNED_VARIANT:
+        return context.services.get("research_profile") == "normal"
     if context.services.get("research_profile") != "experimental":
         return False
     return context.services.get("experimental_parallel") is True or (

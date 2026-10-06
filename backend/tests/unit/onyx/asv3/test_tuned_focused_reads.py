@@ -36,11 +36,11 @@ from tests.unit.onyx.asv3.test_legal_source_reviews import deliver, review, seen
 from tests.unit.onyx.asv3.test_native_authority import original
 from tests.unit.onyx.asv3.test_native_metadata_projection import setup_original
 from tests.unit.onyx.asv3.test_native_model_adapter import (
-    last_payload,
     model,
     turn,
     view,
 )
+from tests.unit.onyx.asv3.test_runtime import delivered_originals
 from tests.unit.onyx.asv3.test_tuned_source_followthrough import tuned_context
 
 
@@ -402,7 +402,7 @@ def test_provider_projection_preserves_original_text_range_and_current_validity(
     originals = [turn("read-one", [record])]
     saved = copy.deepcopy(originals)
     adapter.decide(view(turns=originals, original_evidence=[record]))
-    actual = last_payload(selected)["original_evidence"][0]
+    actual = delivered_originals(selected.invoke.call_args.kwargs)[0]
     assert actual["text"] == record["text"]
     assert actual["text_hash"] == record["text_hash"]
     assert actual.get("start_char", 0) == record.get("start_char", 0)
@@ -415,13 +415,15 @@ def test_provider_projection_preserves_original_text_range_and_current_validity(
         for message in selected.invoke.call_args.kwargs["prompt"]
         if isinstance(message, ToolMessage)
     ]
-    ref = payloads[0]["original_evidence_refs"][0]
     if tuned:
+        ref = payloads[0]["original_evidence"][0]
         assert "metadata" not in ref
-        assert ref["metadata_ref"] == {"citation": 1, "text_hash": item.text_hash}
+        assert ref["identity_ref"] == 1
+        assert ref["text"] == record["text"]
         assert "canonical_metadata" not in actual["metadata"]
         assert actual["metadata"]["title"] == "Verified instrument"
     else:
+        ref = payloads[0]["original_evidence_refs"][0]
         assert ref["metadata"] == record["metadata"]
         assert actual["metadata"] == record["metadata"]
 
