@@ -25,6 +25,9 @@ from onyx.asv3.assertions import (
     AssertionWitness,
     assertion_witness_valid,
 )
+from onyx.asv3.authority_reference_diagnostics import (
+    source_contained_reference_catalogue,
+)
 from onyx.asv3.authority_requirements import AuthorityRequirements
 from onyx.asv3.citation_numbers import extract_citation_numbers
 from onyx.asv3.evidence import EvidenceLedger
@@ -2792,6 +2795,8 @@ class ResearchModel:
             else []
         )
         include_related_navigation = True
+        include_reference_catalogue = parallel_execution_enabled(self.context)
+        has_reference_catalogue = False
         ceiling, output = self._limits(self._native_output_limit())
         selected = copy.deepcopy(view.tools) if native_original_cache else view.tools
         if parallel_execution_enabled(self.context):
@@ -2896,7 +2901,8 @@ class ResearchModel:
         )
 
         def messages() -> list[ChatCompletionMessage]:
-            nonlocal selected
+            nonlocal selected, has_reference_catalogue
+            has_reference_catalogue = False
             if unbound_selected is not None:
                 selected = copy.deepcopy(unbound_selected)
             current = dict(context)
@@ -3052,6 +3058,13 @@ class ResearchModel:
                 and identity[2] == 0
                 and identity[3] == original_lengths[(identity[0], identity[1])]
             ]
+            if include_reference_catalogue and isinstance(ledger, EvidenceLedger):
+                reference_catalogue = source_contained_reference_catalogue(
+                    ledger, complete_originals
+                )
+                if reference_catalogue is not None:
+                    current["source_contained_references"] = reference_catalogue
+                    has_reference_catalogue = True
             if native_original_cache:
                 provision_navigation = delivered_provision_navigation(
                     complete_originals
@@ -3183,6 +3196,12 @@ class ResearchModel:
         prompt = messages()
         if self._input_cost(prompt, selected) <= ceiling:
             return prompt, selected, output
+        # Source-reference navigation yields before any actual source text.
+        if has_reference_catalogue:
+            include_reference_catalogue = False
+            prompt = messages()
+            if self._input_cost(prompt, selected) <= ceiling:
+                return prompt, selected, output
         # Remove transcript groups atomically; preserve their exact originals separately.
         while retained and self._input_cost(prompt, selected) > ceiling:
             retained.pop(0)

@@ -563,8 +563,16 @@ class AuthorityRequirements:
                     }
                 )
             if not missing:
+                if native_gap is not None and parallel_execution_enabled(context):
+                    from onyx.asv3.authority_reference_diagnostics import (
+                        authority_reference_diagnostics,
+                    )
+
+                    return authority_reference_diagnostics(
+                        answer, native_gap, ledger, delivered
+                    )
                 return native_gap
-            return {
+            gap: dict[str, JsonValue] = {
                 **(native_gap or {}),
                 "retained_authority_requirements": missing,
                 "instruction": (
@@ -579,6 +587,13 @@ class AuthorityRequirements:
                     "This is source-dependency retention, not semantic approval of a result."
                 ),
             }
+            if parallel_execution_enabled(context):
+                from onyx.asv3.authority_reference_diagnostics import (
+                    authority_reference_diagnostics,
+                )
+
+                return authority_reference_diagnostics(answer, gap, ledger, delivered)
+            return gap
 
     def view(self, context: RunContext) -> dict[str, JsonValue]:
         self._fence(context)
