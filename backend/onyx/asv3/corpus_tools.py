@@ -16,6 +16,9 @@ from uuid import UUID
 from pydantic import JsonValue
 from sqlalchemy.exc import SQLAlchemyError
 
+from onyx.asv3.authority import known_statute_source_ids
+from onyx.asv3.evidence import EvidenceLedger
+from onyx.asv3.focused_source_target import focused_source_target
 from onyx.asv3.legal_source_navigation import (
     ProvisionNavigationAnchor,
     derive_provision_navigation_anchor,
@@ -29,7 +32,7 @@ from onyx.asv3.models import (
     ToolSpec,
     compact_evidence_metadata,
 )
-from onyx.asv3.parallel_execution import parallel_execution_enabled
+from onyx.asv3.parallel_execution import capability_slot, parallel_execution_enabled
 from onyx.asv3.shared_reads import SharedReads
 from onyx.configs.constants import DocumentSource
 from onyx.context.search.models import IndexFilters, SearchDoc
@@ -1355,7 +1358,19 @@ def build_corpus_specs(
         )
 
     def named_provision(args: dict[str, JsonValue], context: RunContext) -> ToolOutcome:
-        sources, more = broker.sources(str(args["source_name"]), context, limit=20)
+        ledger = context.services.get("evidence")
+        known = (
+            known_statute_source_ids(str(args["source_name"]), ledger)
+            if isinstance(ledger, EvidenceLedger)
+            else []
+        )
+        with capability_slot("resolve_source", context):
+            if len(known) == 1:
+                sources, more = [broker.source(known[0], context)], False
+            else:
+                sources, more = broker.sources(
+                    str(args["source_name"]), context, limit=20
+                )
         if len(sources) != 1 or more:
             return ToolOutcome(
                 status=OutcomeStatus.AMBIGUOUS
@@ -1378,16 +1393,21 @@ def build_corpus_specs(
             if key in {"article", "start", "paragraph", "clause"}
         }
         canonical_args["source_id"] = str(source.id)
+
+        def acquire(producer: RunContext) -> ToolOutcome:
+            with capability_slot("read_provision", producer):
+                return provision(canonical_args, producer)
+
         shared = context.services.get("shared_reads")
         result = (
             shared.run(
                 "read_provision",
                 canonical_args,
                 context,
-                lambda producer: provision(canonical_args, producer),
+                acquire,
             )
             if isinstance(shared, SharedReads)
-            else provision(canonical_args, context)
+            else acquire(context)
         )
         return result.model_copy(
             update={
@@ -1651,11 +1671,36 @@ def build_corpus_specs(
         )
 
     def search(args: dict[str, JsonValue], context: RunContext) -> ToolOutcome:
+        if named_provision_reads:
+            target = focused_source_target(args)
+            if target is not None:
+                source_name, article = target
+                outcome = named_provision(
+                    {"source_name": source_name, "article": article}, context
+                )
+                return outcome.model_copy(
+                    update={
+                        "summary": outcome.summary
+                        + " No corpus-wide search was performed; related authorities and unresolved interactions require their own focused investigation.",
+                        "data": {
+                            **outcome.data,
+                            "acquisition_method": "canonical_provision_read"
+                            if outcome.evidence
+                            else "canonical_source_resolution",
+                            "search_performed": False,
+                            "coverage_item": args.get("coverage_item"),
+                            "evidence_target": args.get("evidence_target"),
+                        },
+                    }
+                )
         if broker.search_adapter is None:
             return ToolOutcome(
                 status=OutcomeStatus.UNAVAILABLE,
                 summary="Indexed corpus search is not configured; use source resolution and canonical text tools.",
             )
+        if named_provision_reads:
+            with capability_slot("search_corpus", context):
+                return broker.search_adapter(args, context)
         return broker.search_adapter(args, context)
 
     specs = [
@@ -1827,7 +1872,12 @@ def build_corpus_specs(
         ),
         ToolSpec(
             name="search_corpus",
-            description="Search the authorized PC corpus with the established retrieval, label and citation pipeline. Choose hybrid for semantic plus lexical retrieval, keyword for BM25 lexical ranking, or full_text for high analyzed-term coverage (not a literal substring guarantee). Source anchors and evidence targets are model-written navigation hints, not evidence.",
+            description="Search the authorized PC corpus with the established retrieval, label and citation pipeline. Choose hybrid for semantic plus lexical retrieval, keyword for BM25 lexical ranking, or full_text for high analyzed-term coverage (not a literal substring guarantee). Source anchors and evidence targets are model-written navigation hints, not evidence."
+            + (
+                " An explicit single-source/article evidence target uses canonical provision reading; discover_related_sources keeps corpus discovery open for related authorities."
+                if named_provision_reads
+                else ""
+            ),
             parameters=schema(
                 {
                     "query": {
@@ -1858,12 +1908,23 @@ def build_corpus_specs(
                         "type": "array",
                         "items": {"type": "string", "minLength": 1},
                     },
+                    **(
+                        {
+                            "discover_related_sources": {
+                                "type": "boolean",
+                                "description": "True when seeking other instruments, amendments or decisions concerning a known provision, rather than that provision's own original text.",
+                            }
+                        }
+                        if named_provision_reads
+                        else {}
+                    ),
                 },
                 ["query", "mode", "coverage_item", "evidence_target"]
                 if require_search_targets
                 else ["query", "mode"],
             ),
             handler=guarded(search),
+            orchestrates=named_provision_reads,
         ),
     ]
     if named_provision_reads:
@@ -1882,6 +1943,7 @@ def build_corpus_specs(
                     ["source_name", "article"],
                 ),
                 handler=guarded(named_provision),
+                orchestrates=True,
             )
         )
     return specs

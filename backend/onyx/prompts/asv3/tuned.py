@@ -6,7 +6,7 @@ from onyx.prompts.asv3.coordinator_reference import (
 )
 from onyx.prompts.asv3.research import LEGAL_DEPARTMENT_RESEARCH
 
-TUNED_PROMPT_VERSION = "asv3-tuned-2026-10-06.2"
+TUNED_PROMPT_VERSION = "asv3-tuned-2026-10-06.3"
 
 _SOURCE_ACTIONS = """For a known instrument and article, read_provision uses the supplied source_id;
 otherwise read_named_provision resolves its own title and reads that article in one action.
@@ -14,7 +14,9 @@ Do not search the whole corpus merely to read a known provision: the same articl
 in another instrument is not its original. Ambiguous identities require clarification of
 the source, not choosing the first candidate. Research genuinely unresolved effects,
 exceptions and related authorities separately with their own focused searches. Retain
-source_id for source-local searches and continuation reads."""
+source_id for source-local searches and continuation reads. An explicit single-instrument
+article target uses canonical reading even in search_corpus; set discover_related_sources
+true when seeking other authorities rather than that provision's own text."""
 
 
 def _focused_reference(prompt: str) -> str:

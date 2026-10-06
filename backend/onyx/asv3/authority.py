@@ -582,6 +582,31 @@ def _native_original_rows(ledger: EvidenceLedger) -> list[dict[str, JsonValue]]:
     return rows
 
 
+def known_statute_source_ids(name: str, ledger: EvidenceLedger) -> list[str]:
+    """Reuse canonical identity navigation; callers must authorize any new read."""
+    formal = _formal_law_name(name)
+    references = statute_references(name, strict_reference_boundaries=True)
+    numbers = {reference.number for reference in references}
+    if len(numbers) > 1 or (
+        formal is None and not re.fullmatch(r"\d{2,7}\s+sayili\s+kanun", folded(name))
+    ):
+        return []
+    found: set[str] = set()
+    for row in _native_original_rows(ledger):
+        citation = row.get("citation")
+        item = ledger.get(citation) if isinstance(citation, int) else None
+        row_numbers, row_names = row.get("instrument_numbers"), row.get("formal_names")
+        if (
+            item is not None
+            and isinstance(row_numbers, list)
+            and isinstance(row_names, list)
+            and (not numbers or numbers.issubset(row_numbers))
+            and (formal is None or formal in row_names)
+        ):
+            found.add(item.source_id)
+    return sorted(found)
+
+
 def _named_native_references(
     text: str,
     aliases: dict[str, set[str]],

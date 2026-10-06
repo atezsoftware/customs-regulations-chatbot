@@ -14,12 +14,15 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue
 from onyx.asv3.assertions import assertion_inventory, presentation_block
 from onyx.asv3.citation_numbers import extract_citation_numbers
 from onyx.asv3.evidence import EvidenceLedger
-from onyx.asv3.judicial_sections import nonoperative_judicial_witness_role
+from onyx.asv3.judicial_sections import (
+    JudicialSectionRole,
+    nonoperative_judicial_witness_role,
+)
 from onyx.asv3.legal_source_navigation import (
     RelatedSourceRole,
     derive_provision_navigation_anchor,
 )
-from onyx.asv3.models import OutcomeStatus, RunContext, ToolOutcome
+from onyx.asv3.models import EvidenceItem, OutcomeStatus, RunContext, ToolOutcome
 from onyx.asv3.outcome_map import OutcomeWitness
 from onyx.asv3.workflow_variant import ASV3_TUNED_VARIANT
 
@@ -184,12 +187,26 @@ def _only_nonoperative_judicial_witnesses(
         and bool(review.witnesses)
         and all(
             (item := ledger.get(witness.citation)) is not None
-            and nonoperative_judicial_witness_role(
-                item, witness.start_char, witness.end_char
+            and _judicial_witness_role(
+                item, witness.start_char, witness.end_char, ledger
             )
             in {"preliminary", "argument_only"}
             for witness in review.witnesses
         )
+    )
+
+
+def _judicial_witness_role(
+    item: EvidenceItem, start_char: int, end_char: int, ledger: EvidenceLedger
+) -> JudicialSectionRole:
+    originals: list[EvidenceItem] = []
+    for number, doc in ledger.citation_mapping().items():
+        if doc.document_id == item.source_id:
+            original = ledger.get(number)
+            if original is not None:
+                originals.append(original)
+    return nonoperative_judicial_witness_role(
+        item, start_char, end_char, source_context=originals
     )
 
 
@@ -756,8 +773,8 @@ class LegalSourceReviews:
                                     number
                                     for number in originals
                                     if (item := ledger.get(number)) is not None
-                                    and nonoperative_judicial_witness_role(
-                                        item, 0, len(item.text)
+                                    and _judicial_witness_role(
+                                        item, 0, len(item.text), ledger
                                     )
                                     in {"preliminary", "argument_only"}
                                 ]
