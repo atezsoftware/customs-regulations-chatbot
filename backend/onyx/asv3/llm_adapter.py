@@ -80,6 +80,7 @@ from onyx.asv3.source_metadata_transport import (
 from onyx.asv3.terminal_fact_references import (
     bind_terminal_fact_references,
     normalize_terminal_fact_references,
+    terminal_fact_references_enabled,
 )
 from onyx.asv3.terminal_metadata import normalize_terminal_metadata
 from onyx.asv3.terminal_wire_schema import (
@@ -2887,7 +2888,7 @@ class ResearchModel:
                 view.draft_to_repair,
                 request=view.request,
             )
-            if parallel_execution_enabled(self.context):
+            if terminal_fact_references_enabled(self.context):
                 selected, fact_catalogue = bind_terminal_fact_references(
                     selected, self.context
                 )

@@ -14,13 +14,23 @@ from onyx.asv3.models import RunContext
 from onyx.asv3.outcome_map import OutcomeMap
 from onyx.asv3.parallel_execution import parallel_execution_enabled
 from onyx.asv3.retained_answer import RETAINED_TERMINALS
+from onyx.asv3.workflow_variant import ASV3_TUNED_VARIANT
 
 _TERMINALS = {"submit_answer", "submit_partial_answer", *RETAINED_TERMINALS}
 
 
+def terminal_fact_references_enabled(context: RunContext) -> bool:
+    return parallel_execution_enabled(context) or (
+        context.services.get("asv3_workflow_variant") == ASV3_TUNED_VARIANT
+        and context.services.get("research_profile") == "normal"
+    )
+
+
 def terminal_fact_catalogue(context: RunContext) -> list[dict[str, JsonValue]]:
     outcomes = context.services.get("outcome_map")
-    if not parallel_execution_enabled(context) or not isinstance(outcomes, OutcomeMap):
+    if not terminal_fact_references_enabled(context) or not isinstance(
+        outcomes, OutcomeMap
+    ):
         return []
     scope_hash = hashlib.sha256(
         json.dumps(context.scope, sort_keys=True).encode()
@@ -73,6 +83,12 @@ def bind_terminal_fact_references(
             "items": {"type": "string", "enum": [row["fact_id"] for row in catalogue]},
             "description": "Select exact supplied facts by their owned fact_id. Omit decisive_facts when using references; literal quotations remain available.",
         }
+        if context.services.get("asv3_workflow_variant") == ASV3_TUNED_VARIANT:
+            fields["decisive_fact_refs"]["description"] = (
+                "Prefer selecting relevant supplied facts by their owned fact_id; "
+                "the host expands them to exact literal scenario text. Omit "
+                "decisive_facts when using references. These facts are not legal evidence."
+            )
         bound = True
     return definitions, catalogue if bound else []
 
@@ -82,7 +98,7 @@ def normalize_terminal_fact_references(
     arguments: dict[str, JsonValue],
     context: RunContext,
 ) -> dict[str, JsonValue]:
-    if name not in _TERMINALS or not parallel_execution_enabled(context):
+    if name not in _TERMINALS or not terminal_fact_references_enabled(context):
         return arguments
     rows = arguments.get("_outcomes")
     if not isinstance(rows, list) or not any(
