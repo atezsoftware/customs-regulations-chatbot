@@ -18,8 +18,11 @@ from onyx.asv3.authority import (
     _defined_statute_abbreviations,
     _formal_law_name,
     _gap_masking_aliases,
+    _lowercase_slash_clause,
+    _matching_native_rows,
     _named_native_references,
     _native_original_rows,
+    _normalized_native_reference,
     _original_gap_references,
     _precise_original_gap,
     _reference_name,
@@ -123,6 +126,9 @@ class AuthorityRequirements:
             if isinstance(task_outcomes, list)
             else []
         )
+        native_rows = (
+            _native_original_rows(ledger) if self.syntactic_reference_binding else []
+        )
         for entry in missing:
             if not isinstance(entry, dict):
                 raise ValueError("Invalid named authority requirement")
@@ -141,15 +147,24 @@ class AuthorityRequirements:
                 article is not None and not isinstance(article, str)
             ):
                 raise ValueError("Invalid governing instrument identity")
+            entry_clause = entry.get("clause")
+            parsed_references = [
+                _normalized_native_reference(item, _reference_name(item), native_rows)
+                if self.syntactic_reference_binding
+                else item
+                for item in statute_references(
+                    reference,
+                    strict_reference_boundaries=True,
+                    syntactic_reference_binding=self.syntactic_reference_binding,
+                )
+            ]
             parsed = next(
                 (
                     item
-                    for item in statute_references(
-                        reference,
-                        strict_reference_boundaries=True,
-                        syntactic_reference_binding=self.syntactic_reference_binding,
-                    )
-                    if item.number == number and item.article == article
+                    for item in parsed_references
+                    if item.number == number
+                    and item.article == article
+                    and (entry_clause is None or item.clause == entry_clause)
                 ),
                 None,
             )
@@ -171,9 +186,17 @@ class AuthorityRequirements:
                 )
                 bound_reference = next(
                     (
-                        item
+                        _normalized_native_reference(item, name, native_rows)
                         for item, name in bound
-                        if item.article == article
+                        if _normalized_native_reference(item, name, native_rows).article
+                        == article
+                        and (
+                            entry_clause is None
+                            or _normalized_native_reference(
+                                item, name, native_rows
+                            ).clause
+                            == entry_clause
+                        )
                         and (
                             item.number == number
                             if number is not None
@@ -185,7 +208,7 @@ class AuthorityRequirements:
                 if bound_reference is None:
                     aliases = _authority_aliases(
                         ledger,
-                        _native_original_rows(ledger),
+                        native_rows,
                         strict_reference_boundaries=True,
                         syntactic_reference_binding=True,
                     )
@@ -199,15 +222,20 @@ class AuthorityRequirements:
                         aliases,
                         syntactic_reference_binding=True,
                     )
+                    abbreviated_references = [
+                        (_normalized_native_reference(item, name, native_rows), name)
+                        for item, name in _abbreviated_statute_references(
+                            units[unit]["text"],
+                            declared,
+                            syntactic_reference_binding=True,
+                        )
+                    ]
                     abbreviated = next(
                         (
                             (item, name)
-                            for item, name in _abbreviated_statute_references(
-                                units[unit]["text"],
-                                declared,
-                                syntactic_reference_binding=True,
-                            )
+                            for item, name in abbreviated_references
                             if item.article == article
+                            and (entry_clause is None or item.clause == entry_clause)
                             and (
                                 item.number == number
                                 if number is not None
@@ -231,7 +259,14 @@ class AuthorityRequirements:
                 owner=owner,
                 instrument_number=number,
                 formal_name=formal_name,
-                article=article,
+                article=(
+                    f"{bound_reference.article}/{bound_reference.clause.upper()}"
+                    if self.syntactic_reference_binding
+                    and bound_reference is not None
+                    and bound_reference.clause_shorthand
+                    and bound_reference.clause
+                    else article
+                ),
                 qualifier=(
                     bound_reference.qualifier
                     if bound_reference is not None
@@ -253,6 +288,19 @@ class AuthorityRequirements:
             key = "authority_" + _digest(self._identity(record))
             if key not in self._records:
                 self._records[key] = record.model_copy(update={"requirement_id": key})
+            elif (
+                self.syntactic_reference_binding
+                and bound_reference is not None
+                and not bound_reference.clause_shorthand
+                and _lowercase_slash_clause(
+                    self._records[key].reference_text, record.article
+                )
+            ):
+                # Explicit inserted identity remains required after a shorthand rejection.
+                existing = self._records[key]
+                self._records[key] = existing.model_copy(
+                    update={"reference_text": reference}
+                )
 
     def _probe(self, record: _Requirement) -> str:
         if record.instrument_number or (
@@ -263,8 +311,19 @@ class AuthorityRequirements:
                 if record.instrument_number
                 else record.formal_name or ""
             )
+            article = record.article
+            if self.syntactic_reference_binding and _lowercase_slash_clause(
+                record.reference_text, article
+            ):
+                assert article is not None
+                base, letter = article.split("/")
+                if not re.search(
+                    rf"\b{re.escape(base)}\s*/\s*{re.escape(letter)}\b",
+                    record.reference_text,
+                ):
+                    article = base + "/" + letter.lower().replace("i̇", "i")
             locator = (
-                f" {(record.qualifier + ' ') if record.qualifier else ''}MADDE {record.article}"
+                f" {(record.qualifier + ' ') if record.qualifier else ''}MADDE {article}"
                 if record.article is not None
                 else ""
             )
@@ -287,8 +346,38 @@ class AuthorityRequirements:
     def _matching_originals(
         self, record: _Requirement, ledger: EvidenceLedger
     ) -> set[int]:
+        probe = self._probe(record)
+        if self.syntactic_reference_binding:
+            rows = _native_original_rows(ledger)
+            references = [
+                (reference, name)
+                for reference, name in _named_native_references(
+                    probe,
+                    {record.formal_name: {record.instrument_number or ""}}
+                    if record.formal_name
+                    else {},
+                    strict_reference_boundaries=True,
+                    syntactic_reference_binding=True,
+                )
+                if (
+                    reference.number == record.instrument_number
+                    if record.instrument_number
+                    else name == record.formal_name
+                )
+                and reference.article == record.article
+                and reference.qualifier == record.qualifier
+            ]
+            references.sort(key=lambda value: value[0].clause_shorthand)
+            if references:
+                normalized = _normalized_native_reference(*references[0], rows)
+                return set(
+                    _matching_native_rows(
+                        normalized, references[0][1], rows, clause_specific=True
+                    )
+                )
+            return set()
         gap = native_named_authority_gap(
-            self._probe(record),
+            probe,
             ledger,
             strict_reference_boundaries=True,
             syntactic_reference_binding=self.syntactic_reference_binding,

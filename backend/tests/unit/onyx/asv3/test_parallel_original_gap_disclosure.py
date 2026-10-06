@@ -15,6 +15,7 @@ from onyx.prompts.asv3.experimental import (
     EXPERIMENTAL_COORDINATOR_PROMPT,
     EXPERIMENTAL_PARALLEL_COORDINATOR,
     EXPERIMENTAL_RESEARCHER_PROMPT,
+    parallel_metadata_instructions,
 )
 from tests.unit.onyx.asv3.test_native_authority import ledger_with, original
 from tests.unit.onyx.asv3.test_native_model_adapter import model
@@ -456,7 +457,9 @@ def test_actual_native_prompt_routing_keeps_serial_and_removes_old_parallel_chil
             adapter._research_instruction()
     else:
         assert adapter._research_instruction() == (
-            base + "\n\n" + EXPERIMENTAL_PARALLEL_COORDINATOR
+            parallel_metadata_instructions(base)
+            + "\n\n"
+            + EXPERIMENTAL_PARALLEL_COORDINATOR
         )
     context.services["experimental_parallel"] = False
     assert adapter._research_instruction() == base

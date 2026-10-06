@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextvars
+import copy
 import json
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -35,6 +36,7 @@ from onyx.tracing.answer_graph import graph_step
 
 DecisionMaker = Callable[[HarnessView], Decision]
 CheckpointWriter = Callable[[dict[str, JsonValue]], None]
+_REPEATED_FAILED_CALL = "Repeated failed call: change the arguments or method"
 
 
 class Harness:
@@ -159,6 +161,36 @@ class Harness:
             )
             else {},
         }
+
+    def snapshot_control(self) -> dict[str, JsonValue]:
+        """Detach owner-thread control; shared research is captured separately."""
+        return copy.deepcopy(
+            {
+                "version": 1,
+                "run_id": self.context.run_id,
+                "request": self.request,
+                "language": self.context.language,
+                "questions": list(self.questions),
+                "facts": list(self.facts),
+                "receipts": [
+                    self._receipt_reference(item).model_dump(mode="json")
+                    for item in self.receipts
+                ],
+                "seen_calls": sorted(self._seen_calls),
+                "seen_failures": sorted(self._seen_failures),
+                "pending_calls": list(self._pending_calls.values())[:128],
+                "pending_call_count": len(self._pending_calls),
+                "pending_calls_omitted": max(0, len(self._pending_calls) - 128),
+                "turns": [turn.model_dump(mode="json") for turn in self.turns],
+                "last_draft": self.last_draft,
+                "stop_reason": self.stop_reason,
+                "publication_gap": self.publication_gap.model_dump(mode="json")
+                if self.publication_gap
+                else None,
+                "working_memory": self.working_memory.export(),
+                "evidence_working_set": self.evidence_working_set.export(),
+            }
+        )
 
     def restore(self, snapshot: dict[str, JsonValue]) -> None:
         if (
@@ -718,6 +750,73 @@ class Harness:
             sort_keys=True,
         )
 
+    def _can_revalidate_delivered_review(
+        self, call: CapabilityCall, signature: str
+    ) -> bool:
+        """A newly delivered original can invalidate a cached delivery rejection."""
+        if not parallel_execution_enabled(self.context) or call.name not in {
+            "submit_answer",
+            "submit_partial_answer",
+            "assemble_answers",
+        }:
+            return False
+        model_call = self.context.services.get("last_model_call_id")
+        raw_reviews = call.arguments.get("_related_source_reviews")
+        if not isinstance(model_call, str) or not isinstance(raw_reviews, list):
+            return False
+        witnesses: set[int] = set()
+        for review in raw_reviews:
+            if not isinstance(review, dict):
+                return False
+            ranges = review.get("witnesses", [])
+            if not isinstance(ranges, list):
+                return False
+            for witness in ranges:
+                if not isinstance(witness, dict):
+                    return False
+                citation = witness.get("citation")
+                if type(citation) is not int:
+                    return False
+                witnesses.add(cast(int, citation))
+        if not witnesses or not witnesses <= self.evidence.completely_delivered(
+            model_call
+        ):
+            return False
+        for previous in reversed(self.receipts):
+            if (
+                previous.call.name != call.name
+                or self._call_signature(previous.call) != signature
+            ):
+                continue
+            outcome = previous.outcome
+            # A cached refusal does not replace the underlying validation receipt.
+            if (
+                outcome.status == OutcomeStatus.INVALID
+                and outcome.summary == _REPEATED_FAILED_CALL
+                and not outcome.data
+                and previous.elapsed_seconds == 0
+            ):
+                continue
+            diagnostic = outcome.data.get("related_source_review_error")
+            if (
+                outcome.status != OutcomeStatus.INVALID
+                or outcome.data.get("invalid_related_source_review") is not True
+                or not isinstance(diagnostic, dict)
+            ):
+                return False
+            errors = diagnostic.get("validation_errors")
+            if (
+                diagnostic.get("code") != "not_fully_delivered"
+                or not isinstance(errors, list)
+                or not errors
+            ):
+                return False
+            return all(
+                isinstance(error, dict) and error.get("code") == "not_fully_delivered"
+                for error in errors
+            )
+        return False
+
     def _dispatch(self, calls: list[CapabilityCall]) -> list[ToolReceipt]:
         terminal_batch = self.context.services.get("hosted_terminal_batch")
         if (
@@ -826,13 +925,16 @@ class Harness:
                     )
                     continue
                 signature = self._call_signature(call)
-                if call.call_id in self._seen_calls or signature in self._seen_failures:
+                if call.call_id in self._seen_calls or (
+                    signature in self._seen_failures
+                    and not self._can_revalidate_delivered_review(call, signature)
+                ):
                     ready[call.call_id] = ToolReceipt(
                         call=call,
                         elapsed_seconds=0,
                         outcome=ToolOutcome(
                             status=OutcomeStatus.INVALID,
-                            summary="Repeated failed call: change the arguments or method",
+                            summary=_REPEATED_FAILED_CALL,
                         ),
                     )
                     continue

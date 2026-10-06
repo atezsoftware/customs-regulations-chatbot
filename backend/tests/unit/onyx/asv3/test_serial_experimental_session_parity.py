@@ -42,6 +42,7 @@ from onyx.prompts.asv3.experimental import (
     EXPERIMENTAL_COORDINATOR_PROMPT,
     EXPERIMENTAL_PROMPT_VERSION,
     EXPERIMENTAL_RESEARCHER_PROMPT,
+    parallel_metadata_instructions,
 )
 from tests.unit.onyx.asv3.test_native_cache_projection import actual_originals
 from tests.unit.onyx.asv3.test_runtime import (
@@ -298,7 +299,10 @@ def test_real_serial_and_owned_session_use_same_prompt_schemas_and_terminal_hand
     assert EXPERIMENTAL_PROMPT_VERSION == "asv3-experimental-2026-10-06.7"
     assert len(run.calls) == len(baseline_calls)
     for base, actual in zip(baseline_calls, run.calls, strict=True):
-        assert actual["prompt"][0].content == base["prompt"][0].content == INSTRUCTION
+        assert base["prompt"][0].content == INSTRUCTION
+        assert actual["prompt"][0].content == parallel_metadata_instructions(
+            INSTRUCTION
+        )
         actual_definitions = copy.deepcopy(tool_definitions(actual))
         need = actual_definitions["update_research"]["function"]["parameters"]["$defs"][
             "ResearchNeed"
@@ -672,7 +676,7 @@ def test_optional_worker_keeps_ordinary_serial_researcher_path(
         assert user_payload(arguments["prompt"][1])["conversation"].count(SCENARIO) >= 1
         if instruction == EXPERIMENTAL_RESEARCHER_PROMPT:
             return response("Kullanıcı on bir parça vermiştir.")
-        assert instruction == INSTRUCTION
+        assert instruction == parallel_metadata_instructions(INSTRUCTION)
         coordinator_calls += 1
         tools = tool_definitions(arguments)
         assert "spawn_researcher" in tools
@@ -700,9 +704,13 @@ def test_optional_worker_keeps_ordinary_serial_researcher_path(
     run.selected.invoke.side_effect = invoke
     result = child.run()
     assert result.status == OutcomeStatus.FOUND
-    assert worker_calls.count(INSTRUCTION) == 3
+    assert worker_calls.count(parallel_metadata_instructions(INSTRUCTION)) == 3
     assert worker_calls.count(EXPERIMENTAL_RESEARCHER_PROMPT) == 1
-    assert worker_calls[0] == worker_calls[-1] == INSTRUCTION
+    assert (
+        worker_calls[0]
+        == worker_calls[-1]
+        == parallel_metadata_instructions(INSTRUCTION)
+    )
     workers = child.snapshot()["workers"]
     assert isinstance(workers, dict) and workers["tasks"]
 

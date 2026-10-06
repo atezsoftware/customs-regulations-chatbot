@@ -63,6 +63,7 @@ from onyx.asv3.shared_originals import (
     delivered_provision_navigation,
     related_provision_originals,
 )
+from onyx.asv3.terminal_metadata import normalize_terminal_metadata
 from onyx.configs.chat_configs import (
     LLM_FIRST_CHUNK_RETRY_BASE_DELAY_S,
     LLM_FIRST_CHUNK_RETRY_JITTER_RATIO,
@@ -96,6 +97,7 @@ from onyx.prompts.asv3.experimental import (
     EXPERIMENTAL_COORDINATOR_PROMPT,
     EXPERIMENTAL_PARALLEL_COORDINATOR,
     EXPERIMENTAL_RESEARCHER_PROMPT,
+    parallel_metadata_instructions,
 )
 from onyx.prompts.asv3.research import (
     COORDINATOR_PROMPT,
@@ -2272,6 +2274,7 @@ class ResearchModel:
                     ),
                     tools,
                     return_argument_errors=True,
+                    detailed_argument_errors=parallel_execution_enabled(self.context),
                     argument_normalizer=argument_normalizer,
                 )
             )
@@ -2417,6 +2420,8 @@ class ResearchModel:
                 + "\n\n"
                 + COORDINATOR_SESSION_ACTIONS
             )
+            if parallel_execution_enabled(self.context):
+                instruction = parallel_metadata_instructions(instruction)
             if self.context.services.get("experimental_parallel") is True:
                 if self.context.depth:
                     raise ValueError(
@@ -3360,6 +3365,9 @@ class ResearchModel:
             if not isinstance(parameters, dict):
                 return decision
             emitted_arguments = arguments
+            arguments = normalize_terminal_metadata(
+                name, arguments, self.context, parameters
+            )
             properties = parameters.get("properties")
             if (
                 isinstance(properties, dict)
@@ -3610,12 +3618,6 @@ class ResearchModel:
         def normalize_arguments(
             name: str, arguments: dict[str, JsonValue]
         ) -> dict[str, JsonValue]:
-            if (
-                name != "submit_answer"
-                or "basis" in arguments
-                or "retained_answer_id" not in arguments
-            ):
-                return arguments
             parameters = next(
                 (
                     function.get("parameters")
@@ -3625,6 +3627,17 @@ class ResearchModel:
                 ),
                 None,
             )
+            if not isinstance(parameters, dict):
+                return arguments
+            arguments = normalize_terminal_metadata(
+                name, arguments, self.context, parameters
+            )
+            if (
+                name != "submit_answer"
+                or "basis" in arguments
+                or "retained_answer_id" not in arguments
+            ):
+                return arguments
             properties = (
                 parameters.get("properties") if isinstance(parameters, dict) else None
             )
@@ -3645,9 +3658,7 @@ class ResearchModel:
             )
 
         argument_normalizer = (
-            normalize_arguments
-            if parallel_execution_enabled(self.context) and view.draft_to_repair
-            else None
+            normalize_arguments if parallel_execution_enabled(self.context) else None
         )
         content = prompt[-1].content
         assert isinstance(content, str)

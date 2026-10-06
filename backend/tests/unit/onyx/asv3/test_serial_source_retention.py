@@ -12,6 +12,7 @@ from pydantic import JsonValue
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.models import OutcomeStatus, RunContext, SharedBudget
 from onyx.asv3.parallel_answers import ParallelAnswerReceipts
+from onyx.prompts.asv3.experimental import parallel_metadata_instructions
 from tests.unit.onyx.asv3.test_native_cache_projection import actual_originals
 from tests.unit.onyx.asv3.test_native_model_adapter import last_payload
 from tests.unit.onyx.asv3.test_runtime import response
@@ -56,7 +57,11 @@ def test_real_terminal_retains_selected_second_source_and_seals_exact_corrected_
 
     def invoke(**arguments: Any) -> Any:
         run.calls.append(arguments)
-        assert arguments["prompt"][0].content == INSTRUCTION
+        assert arguments["prompt"][0].content == (
+            parallel_metadata_instructions(INSTRUCTION)
+            if trusted_hosted
+            else INSTRUCTION
+        )
         if len(run.calls) == 1:
             return response(
                 calls=[

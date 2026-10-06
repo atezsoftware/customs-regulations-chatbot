@@ -8,7 +8,7 @@ Provider-specific tools, fixed dates, staged reviewers and benchmark cases are n
 from onyx.prompts.asv3.coordinator_reference import COORDINATOR_REFERENCE_PROMPT
 
 EXPERIMENTAL_PROMPT_VERSION = "asv3-experimental-2026-10-06.7"
-EXPERIMENTAL_PARALLEL_PROMPT_VERSION = "asv3-experimental-parallel-2026-10-06.17"
+EXPERIMENTAL_PARALLEL_PROMPT_VERSION = "asv3-experimental-parallel-2026-10-06.18"
 
 
 def _source_navigation(reference_prompt: str) -> str:
@@ -27,6 +27,29 @@ def _source_navigation(reference_prompt: str) -> str:
 
 
 SOURCE_NAVIGATION = _source_navigation(COORDINATOR_REFERENCE_PROMPT)
+
+
+def parallel_metadata_instructions(instruction: str) -> str:
+    """Clarify bookkeeping fields without changing substantive research instructions."""
+    start = "OUTCOME COMPLETENESS IN THE SAME DECISION\n"
+    end = "Before submission compare every actual requested outcome"
+    if instruction.count(start) != 1 or instruction.count(end) != 1:
+        raise ValueError("Expected one outcome metadata instruction section")
+    before, _, remaining = instruction.partition(start)
+    _, _, after = remaining.partition(end)
+    return (
+        before
+        + start
+        + "When useful and exposed, _outcomes declares requested outcomes with schema-valid "
+        "outcome_id and supplied question_ids. Outcome IDs differ from question/determination "
+        "IDs; reuse outcomes and assigned task_outcome_ids. _coverage.conditions and "
+        "_coverage.resolutions record original-bound conditions and supported, conditional "
+        "or unresolved updates with IDs, citations and witness ranges. Use only this "
+        "action's exposed fields. Retained conditions are immutable; coverage is a proposal, "
+        "never publication "
+        "approval. Social replies need no outcome map.\n" + end + after
+    )
+
 
 RESEARCH_INSTRUCTIONS = """RESEARCH THE REQUEST, NOT A NEARBY GENERAL TOPIC
 In the first useful native decision, silently separate every requested outcome, sub-question

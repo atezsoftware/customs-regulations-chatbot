@@ -11,12 +11,18 @@ from pydantic import JsonValue
 
 
 class ParallelCheckpointWriter:
-    def __init__(self, persist: Callable[[dict[str, JsonValue]], None]) -> None:
+    def __init__(
+        self,
+        persist: Callable[[dict[str, JsonValue]], None],
+        *,
+        capture: Callable[[], dict[str, JsonValue]] | None = None,
+    ) -> None:
         self._persist = persist
+        self._capture = capture
         self._changed = threading.Condition()
         self._issued = 0
         self._durable = 0
-        self._pending: tuple[int, dict[str, JsonValue]] | None = None
+        self._pending: tuple[int, dict[str, JsonValue] | None] | None = None
         self._closing = False
         self._error: BaseException | None = None
         captured = contextvars.copy_context()
@@ -36,6 +42,15 @@ class ParallelCheckpointWriter:
     def submit(self, snapshot: dict[str, JsonValue]) -> int:
         self.raise_if_failed()
         captured = copy.deepcopy(snapshot)
+        return self._submit(captured)
+
+    def notify(self) -> int:
+        """Capture the freshest aggregate on the writer, after coalescing notices."""
+        if self._capture is None:
+            raise ValueError("Deferred checkpoint capture is not configured")
+        return self._submit(None)
+
+    def _submit(self, captured: dict[str, JsonValue] | None) -> int:
         with self._changed:
             if self._error is not None:
                 raise self._error
@@ -73,6 +88,10 @@ class ParallelCheckpointWriter:
                 revision, snapshot = self._pending
                 self._pending = None
             try:
+                if snapshot is None:
+                    if self._capture is None:
+                        raise ValueError("Deferred checkpoint capture is missing")
+                    snapshot = self._capture()
                 self._persist(snapshot)
             except BaseException as error:
                 with self._changed:

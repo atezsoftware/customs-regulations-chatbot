@@ -67,6 +67,7 @@ def test_slow_persistence_does_not_hold_research_but_acceptance_waits(
                 for saved in checkpoints
                 for task in saved["workers"]["tasks"]
                 if task["task_id"] == session.owner
+                and isinstance(task["child_checkpoint"], dict)
             )
             returned.append(session.owner)
         return result
@@ -249,8 +250,8 @@ def test_late_stale_capture_cannot_overwrite_newer_root_control_state(
         root_harnesses.append(captured)
         return captured
 
-    def writer(persist: Any) -> Any:
-        captured = original_writer(persist)
+    def writer(persist: Any, **arguments: Any) -> Any:
+        captured = original_writer(persist, **arguments)
         writers.append(captured)
         return captured
 

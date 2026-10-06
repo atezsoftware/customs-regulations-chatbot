@@ -26,6 +26,7 @@ from onyx.asv3.native_cache_projection import (
 from onyx.asv3.parallel_answers import ParallelAnswerReceipts
 from onyx.asv3.registry import CapabilityRegistry
 from onyx.llm.models import ChatCompletionMessage, ToolMessage
+from onyx.prompts.asv3.experimental import parallel_metadata_instructions
 from tests.unit.onyx.asv3 import (
     test_native_cache_projection as cache_cases,
 )
@@ -240,7 +241,8 @@ def test_transport_removes_repeated_identities_without_dropping_original_charact
     hosted(context)
     compact, actual_schemas, _ = adapter._fit_native_decision(state)
     assert actual_schemas == schemas
-    assert compact[0].content == baseline[0].content
+    assert isinstance(baseline[0].content, str)
+    assert compact[0].content == parallel_metadata_instructions(baseline[0].content)
     assert invocation_originals(compact, ledger) == [
         {**first, "start_char": 0, "end_char": len(cast(str, first["text"]))}
     ]

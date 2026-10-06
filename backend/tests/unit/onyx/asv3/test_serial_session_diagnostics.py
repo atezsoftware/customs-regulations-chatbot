@@ -10,6 +10,7 @@ from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.models import CapabilityCall, OutcomeStatus
 from onyx.asv3.registry import native_research_bindings
 from onyx.asv3.scenario import question_determinations
+from onyx.prompts.asv3.experimental import parallel_metadata_instructions
 from tests.unit.onyx.asv3.test_legal_source_reviews import (
     deliver,
     navigation,
@@ -68,7 +69,8 @@ def test_first_hosted_decision_exposes_exact_local_ids_without_an_extra_model_ca
     decision = child.model.decide(child.harness.view())
     assert run.selected.invoke.call_count == 1
     actual = run.selected.invoke.call_args.kwargs
-    assert actual["prompt"][0].content == base_prompt[0].content == INSTRUCTION
+    assert base_prompt[0].content == INSTRUCTION
+    assert actual["prompt"][0].content == parallel_metadata_instructions(INSTRUCTION)
     bindings = last_payload(run.selected)["research_bindings"]
     assert bindings["question_ids"] == ["q0"]
     assert bindings["determinations"] == [

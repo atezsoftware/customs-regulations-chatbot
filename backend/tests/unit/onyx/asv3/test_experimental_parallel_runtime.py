@@ -22,6 +22,7 @@ from onyx.prompts.asv3.experimental import (
     EXPERIMENTAL_COORDINATOR_PROMPT,
     EXPERIMENTAL_PARALLEL_PROMPT_VERSION,
     EXPERIMENTAL_PROMPT_VERSION,
+    parallel_metadata_instructions,
 )
 from onyx.prompts.asv3.research import PROMPT_VERSION
 from onyx.server.query_and_chat.streaming_models import AgentResponseDelta, ASv3Progress
@@ -203,9 +204,8 @@ def script_two_children(
         assert request in TASKS
         assert "scenario_request" not in payload
         assert SCENARIO in str(payload["conversation"])
-        assert (
-            prompt[0].content
-            == EXPERIMENTAL_COORDINATOR_PROMPT + "\n\n" + COORDINATOR_SESSION_ACTIONS
+        assert prompt[0].content == parallel_metadata_instructions(
+            EXPERIMENTAL_COORDINATOR_PROMPT + "\n\n" + COORDINATOR_SESSION_ACTIONS
         )
         assert count <= 2
         if count == 1:

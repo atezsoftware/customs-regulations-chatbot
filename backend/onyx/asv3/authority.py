@@ -250,6 +250,20 @@ class StatuteReference:
     clause_shorthand: bool = False
 
 
+def _lowercase_slash_clause(text: str, article: str | None) -> bool:
+    slash = re.fullmatch(r"(\d+)/([A-ZÇĞİÖŞÜ])", article or "")
+    if slash is None:
+        return False
+    return any(
+        match[1].islower()
+        and match[1].casefold().replace("ı", "i")
+        == slash[2].casefold().replace("i̇", "i").replace("ı", "i")
+        for match in re.finditer(
+            rf"\b{re.escape(slash[1])}\s*/\s*([a-zçğıöşüA-ZÇĞİÖŞÜ])\b", text
+        )
+    )
+
+
 def statute_references(
     text: str,
     *,
@@ -269,9 +283,7 @@ def statute_references(
     offsets.append(len(original))
     normalized = "".join(parts)
     identity_text = folded(normalized)
-    found: dict[
-        tuple[str, str | None, str | None, str | None, str | None], StatuteReference
-    ] = {}
+    found: dict[tuple[str | bool | None, ...], StatuteReference] = {}
     pattern = _STRICT_STATUTE if strict_reference_boundaries else _STATUTE
     for match in pattern.finditer(identity_text):
         if syntactic_reference_binding:
@@ -292,8 +304,14 @@ def statute_references(
                 paragraph = locator.paragraph if locator else None
                 clause = locator.clause if locator else None
                 qualifier = locator.qualifier if locator else None
+                clause_shorthand = _lowercase_slash_clause(
+                    original[offsets[locator.start] : offsets[locator.end]]
+                    if locator
+                    else "",
+                    article,
+                )
                 found.setdefault(
-                    (number, article, paragraph, clause, qualifier),
+                    (number, article, paragraph, clause, qualifier, clause_shorthand),
                     StatuteReference(
                         number,
                         article,
@@ -301,6 +319,7 @@ def statute_references(
                         paragraph,
                         clause,
                         qualifier,
+                        clause_shorthand,
                     ),
                 )
             continue
@@ -578,28 +597,53 @@ def _named_native_references(
             syntactic_reference_binding=syntactic_reference_binding,
         )
     ]
-    normalized = folded(text.replace("**", "").replace("__", ""))
+    raw_text = text.replace("**", "").replace("__", "")
+    normalized = folded(raw_text)
+    offsets: list[int] = []
+    if syntactic_reference_binding:
+        parts: list[str] = []
+        for index, char in enumerate(raw_text):
+            part = (
+                char.casefold() if char.casefold() in "çğıöşü" else folded(char)
+            ).replace("ı", "i")
+            parts.append(part)
+            offsets.extend([index] * len(part))
+        offsets.append(len(raw_text))
+        normalized = "".join(parts)
     for name, numbers in aliases.items():
         if len(numbers) > 1:
             continue
         # The canonical stem tolerates Turkish case endings but not an acronym.
         pattern = re.compile(rf"(?<!\w){re.escape(name)}(?:u[a-z]*)?(?!\w)")
-        for match in pattern.finditer(normalized):
+        for match in pattern.finditer(
+            folded(normalized) if syntactic_reference_binding else normalized
+        ):
             if syntactic_reference_binding:
                 bound = _bound_locators(normalized, match.start(), match.end())
                 for locator in list(bound) or [None]:
                     reference_start, reference_end = _reference_bounds(
                         normalized, match.start(), match.end(), locator
                     )
+                    raw_reference = raw_text[
+                        offsets[reference_start] : offsets[reference_end]
+                    ]
                     references.append(
                         (
                             StatuteReference(
                                 next(iter(numbers), ""),
                                 locator.article if locator else None,
-                                normalized[reference_start:reference_end][:240],
+                                raw_reference[:240],
                                 locator.paragraph if locator else None,
                                 locator.clause if locator else None,
                                 locator.qualifier if locator else None,
+                                _lowercase_slash_clause(
+                                    raw_text[
+                                        offsets[locator.start] : offsets[locator.end]
+                                    ]
+                                    if locator
+                                    else "",
+                                    locator.article if locator else None,
+                                ),
                             ),
                             name,
                         )
@@ -685,10 +729,52 @@ def _canonical_source(item: object) -> bool:
     )
 
 
+def _normalized_native_reference(
+    reference: StatuteReference,
+    name: str | None,
+    rows: list[dict[str, JsonValue]],
+) -> StatuteReference:
+    """Disambiguate lowercase clause shorthand using canonical own-instrument locators."""
+    slash = re.fullmatch(r"(\d+)/([A-ZÇĞİÖŞÜ])", reference.article or "")
+    if not reference.clause_shorthand or reference.clause is not None or slash is None:
+        return reference
+    own_rows = []
+    for row in rows:
+        numbers, names = row["instrument_numbers"], row["formal_names"]
+        if not isinstance(numbers, list) or not isinstance(names, list):
+            continue
+        if reference.number and numbers and reference.number not in numbers:
+            continue
+        if (
+            reference.number in numbers
+            or (name is not None and name in names and not numbers)
+        ) and row.get("article_qualifier") == reference.qualifier:
+            own_rows.append(row)
+    if any(row.get("article_no") == reference.article for row in own_rows):
+        return reference
+    clause = slash[2].lower().replace("i̇", "i")
+    if any(
+        row.get("article_no") == slash[1]
+        and _canonical_clause_label(row.get("clause_label")) == clause
+        for row in own_rows
+    ):
+        return replace(reference, article=slash[1], clause=clause)
+    return reference
+
+
+def _canonical_clause_label(value: JsonValue) -> str | None:
+    if not isinstance(value, str):
+        return None
+    match = re.fullmatch(r"\(?([a-zçğıöşü])\)?", value.strip().lower())
+    return match[1] if match else None
+
+
 def _matching_native_rows(
     reference: StatuteReference,
     name: str | None,
     rows: list[dict[str, JsonValue]],
+    *,
+    clause_specific: bool = False,
 ) -> list[int]:
     matching: list[int] = []
     for row in rows:
@@ -705,6 +791,13 @@ def _matching_native_rows(
         if reference.article is not None and (
             str(row.get("article_no")) != reference.article
             or row.get("article_qualifier") != reference.qualifier
+        ):
+            continue
+        if (
+            clause_specific
+            and reference.clause_shorthand
+            and reference.clause is not None
+            and _canonical_clause_label(row.get("clause_label")) != reference.clause
         ):
             continue
         if type(citation := row["citation"]) is int:
@@ -750,7 +843,12 @@ def explicit_reference_leads(
         ):
             if reference.article is None:
                 continue
-            matching = _matching_native_rows(reference, name, rows)
+            if syntactic_reference_binding:
+                reference = _normalized_native_reference(reference, name, rows)
+            assert reference.article is not None
+            matching = _matching_native_rows(
+                reference, name, rows, clause_specific=syntactic_reference_binding
+            )
             if complete.intersection(matching):
                 continue
             key = (
@@ -1238,18 +1336,25 @@ def native_named_authority_gap(
                     syntactic_reference_binding=syntactic_reference_binding,
                 )
             )
-        seen: set[tuple[str, str | None, str | None, str | None]] = set()
+        seen: set[tuple[str | None, ...]] = set()
         for reference, name in references:
+            if syntactic_reference_binding:
+                reference = _normalized_native_reference(reference, name, rows)
             identity = (
                 reference.number,
                 name if not reference.number else None,
                 reference.article,
                 reference.qualifier,
+                reference.clause
+                if syntactic_reference_binding and reference.clause_shorthand
+                else None,
             )
             if identity in seen:
                 continue
             seen.add(identity)
-            matching = _matching_native_rows(reference, name, rows)
+            matching = _matching_native_rows(
+                reference, name, rows, clause_specific=syntactic_reference_binding
+            )
             if not cited.intersection(matching):
                 missing.append(
                     {
@@ -1257,6 +1362,13 @@ def native_named_authority_gap(
                         "instrument_number": reference.number or None,
                         "reference_text": reference.reference_text,
                         "article": reference.article,
+                        **(
+                            {"clause": reference.clause}
+                            if syntactic_reference_binding
+                            and reference.clause_shorthand
+                            and reference.clause
+                            else {}
+                        ),
                         "inline_evidence": sorted(cited),
                         "matching_original_evidence": matching,
                     }

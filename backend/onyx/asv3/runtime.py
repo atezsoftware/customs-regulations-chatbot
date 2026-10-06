@@ -473,6 +473,10 @@ def run_asv3_loop(
     context.services["outcome_map"] = outcome_map
     emitted: list[dict[str, JsonValue]] = []
     checkpoint_lock = threading.RLock()
+    progress_lock = threading.RLock()
+    root_control_lock = threading.RLock()
+    root_owner_thread = threading.get_ident()
+    parallel_root_control: dict[str, JsonValue] | None = None
     checkpoint_sequence = 0
     checkpoint_writer: ParallelCheckpointWriter | None = None
     harness: Harness | None = None
@@ -514,7 +518,7 @@ def run_asv3_loop(
                 completed_tasks=event.completed_workers,
             )
         )
-        with checkpoint_lock:
+        with progress_lock if parallel_research else checkpoint_lock:
             emitted.append(packet.model_dump(mode="json"))
             if len(emitted) > 100:
                 latest = {
@@ -595,6 +599,151 @@ def run_asv3_loop(
             )
             persistence.output_value = {"persist_seconds": time.monotonic() - started}
 
+    def publish_root_control() -> None:
+        nonlocal parallel_root_control
+        if threading.get_ident() != root_owner_thread or harness is None:
+            raise ValueError("Root checkpoint control requires its semantic owner")
+        control = harness.snapshot_control()
+        control.update(
+            native_coordinator_sampling=model.native_sampling_snapshot(),
+            scope=copy.deepcopy(context.scope),
+            public_profile=profile.model_dump(mode="json"),
+            publication_status=publication_status.value,
+            publication_stop_reason=publication_stop_reason,
+            final_publication_gap=control["publication_gap"],
+        )
+        with root_control_lock:
+            parallel_root_control = control
+
+    def capture_parallel_checkpoint() -> dict[str, JsonValue]:
+        nonlocal checkpoint_sequence
+        with graph_step(
+            "asv3.checkpoint_capture", {"deferred_aggregate": True}
+        ) as capture:
+            lock_started = time.monotonic()
+            with checkpoint_lock:
+                lock_wait_seconds = time.monotonic() - lock_started
+                with root_control_lock:
+                    if parallel_root_control is None:
+                        raise ValueError("Parallel checkpoint control is missing")
+                    control = parallel_root_control
+                snapshot = copy.deepcopy(control)
+                with progress_lock:
+                    progress_snapshot = list(emitted)
+                augmentation_started = time.monotonic()
+                snapshot["research_state"] = research_state.export()
+                checkpoint_sequence += 1
+                snapshot.update(
+                    sequence=checkpoint_sequence,
+                    prompt_version=EXPERIMENTAL_PARALLEL_PROMPT_VERSION
+                    if parallel_research
+                    else EXPERIMENTAL_PROMPT_VERSION
+                    if source_reviews is not None
+                    else PROMPT_VERSION,
+                    research_profile=research_profile,
+                    parallel_research=parallel_research,
+                    execution_mode="native",
+                    native_coordinator_sampling=snapshot["native_coordinator_sampling"],
+                    scope=snapshot["scope"],
+                    progress=progress_snapshot,
+                    progress_state=progress.export(),
+                    public_profile=snapshot["public_profile"],
+                    workers=workers.export() if workers else {},
+                    question_research=question_research.export()
+                    if question_research
+                    else {},
+                    outcome_map=outcome_map.export(),
+                    publication_status=snapshot["publication_status"],
+                    publication_stop_reason=snapshot["publication_stop_reason"],
+                    final_publication_gap=snapshot["final_publication_gap"],
+                    scenario=scenarios.snapshot(),
+                    question_message_id=user_message_id,
+                    session_research=session_research_checkpoint(context, question),
+                )
+                if source_reviews is not None:
+                    snapshot["legal_source_reviews"] = source_reviews.export()
+                if authority_requirements is not None:
+                    snapshot["authority_requirements"] = authority_requirements.export()
+                if parallel_answers is not None:
+                    snapshot["parallel_research_policy"] = SERIAL_SESSION_POLICY
+                    receipts = parallel_answers.export()
+                    snapshot["parallel_answers"] = receipts
+                    accepted_states: list[dict[str, JsonValue]] = []
+                    receipt_rows = receipts.get("receipts", [])
+                    questions_state = snapshot["question_research"]
+                    assignment_rows = (
+                        questions_state.get("assignments", [])
+                        if isinstance(questions_state, dict)
+                        else []
+                    )
+                    if not isinstance(assignment_rows, list):
+                        raise ValueError("Invalid checkpoint assignments")
+                    if (
+                        question_research is not None
+                        and workers is not None
+                        and isinstance(receipt_rows, list)
+                    ):
+                        for assignment in assignment_rows:
+                            if not isinstance(assignment, dict):
+                                raise ValueError("Invalid checkpoint assignment")
+                            task_id = str(assignment["task_id"])
+                            receipt = next(
+                                (
+                                    row
+                                    for row in receipt_rows
+                                    if isinstance(row, dict)
+                                    and row.get("task_id") == task_id
+                                ),
+                                None,
+                            )
+                            if receipt is None:
+                                continue
+                            serial_snapshot = workers.checkpoint(task_id)
+                            if serial_snapshot is None:
+                                raise ValueError(
+                                    "Sealed serial memory checkpoint is missing"
+                                )
+                            accepted_states.append(
+                                accepted_serial_memory_state(
+                                    serial_snapshot,
+                                    assignment,
+                                    receipt,
+                                    context,
+                                    question,
+                                    history,
+                                )
+                            )
+                    memory = snapshot["session_research"]
+                    if not isinstance(memory, dict):
+                        raise ValueError("Serial session memory checkpoint is missing")
+                    snapshot["session_research"] = merge_serial_session_memory(
+                        memory, accepted_states
+                    )
+                # Export originals after every witness and accepted child reference.
+                snapshot["evidence"] = ledger.export()
+                snapshot["budget"] = context.budget.snapshot()
+                augmentation_seconds = time.monotonic() - augmentation_started
+            capture.output_value = {
+                "sequence": snapshot["sequence"],
+                "capture_lock_wait_seconds": lock_wait_seconds,
+                "augmentation_seconds": augmentation_seconds,
+                "deferred_aggregate": True,
+            }
+        return snapshot
+
+    def notify_checkpoint(*, durable: bool = False) -> None:
+        if checkpoint_writer is None:
+            raise ValueError("Parallel checkpoint writer is missing")
+        context.check_active()
+        revision = checkpoint_writer.notify()
+        if durable:
+            with graph_step(
+                "asv3.checkpoint_barrier", {"revision": revision}
+            ) as barrier:
+                started = time.monotonic()
+                checkpoint_writer.flush(revision)
+                barrier.output_value = {"flush_seconds": time.monotonic() - started}
+
     def checkpoint(
         snapshot: dict[str, JsonValue],
         *,
@@ -602,6 +751,11 @@ def run_asv3_loop(
         root_snapshot_seconds: float | None = None,
     ) -> None:
         nonlocal checkpoint_sequence
+        if parallel_research:
+            if threading.get_ident() == root_owner_thread:
+                publish_root_control()
+            notify_checkpoint(durable=durable)
+            return
         if checkpoint_writer is not None:
             checkpoint_writer.raise_if_failed()
         capture = (
@@ -1600,7 +1754,10 @@ def run_asv3_loop(
             if parallel_answers is not None and question_research.answers:
                 question_research.assemble_retained_answers()
         if parallel_research:
-            checkpoint_writer = ParallelCheckpointWriter(persist_checkpoint)
+            publish_root_control()
+            checkpoint_writer = ParallelCheckpointWriter(
+                persist_checkpoint, capture=capture_parallel_checkpoint
+            )
         result = harness.run()
         context.check_active()
         if parallel_research and workers is not None:
