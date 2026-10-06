@@ -41,7 +41,7 @@ from onyx.asv3.models import (
     ToolReceipt,
     model_evidence_metadata,
 )
-from onyx.asv3.native_projection import reference_duplicate_metadata
+from onyx.asv3.native_cache_projection import project_native_originals
 from onyx.asv3.outcome_map import OutcomeMap
 from onyx.asv3.research_gaps import research_gap_signals
 from onyx.asv3.shared_originals import related_provision_originals
@@ -2372,7 +2372,13 @@ class ResearchModel:
                 for other, candidate in unique.items()
             ):
                 del unique[identity]
-        retained = self._native_turns_with_original_references(retained)
+        native_original_cache = (
+            self.context.services.get("research_profile") == "experimental"
+            and self.context.services.get("experimental_parallel") is True
+            and isinstance(ledger, EvidenceLedger)
+        )
+        if not native_original_cache:
+            retained = self._native_turns_with_original_references(retained)
         omitted: list[JsonValue] = list(view.original_evidence_omitted)
         verified: set[tuple[int, str, int, int]] = set()
         original_lengths: dict[tuple[int, str], int] = {}
@@ -2609,13 +2615,28 @@ class ResearchModel:
                 and self.context.services.get("experimental_parallel") is True
                 and isinstance(ledger, EvidenceLedger)
             ):
-                reference_leads = explicit_reference_leads(ledger, complete_originals)
+                reference_leads = explicit_reference_leads(
+                    ledger, complete_originals, syntactic_reference_binding=True
+                )
                 if reference_leads:
                     research_navigation = current.setdefault("research_navigation", {})
                     assert isinstance(research_navigation, dict)
                     research_navigation["reference_leads"] = reference_leads
+            native_turns = retained
+            current_originals = list(unique.values())
+            if native_original_cache and isinstance(ledger, EvidenceLedger):
+                projection = project_native_originals(
+                    retained, current_originals, ledger
+                )
+                native_turns = projection.turns
+                current_originals = projection.fallback_originals
+                if projection.metadata_catalogue:
+                    current["original_metadata_catalogue"] = cast(
+                        list[JsonValue], projection.metadata_catalogue
+                    )
+            if current_originals:
+                current["original_evidence"] = cast(list[JsonValue], current_originals)
             if unique:
-                current["original_evidence"] = list(unique.values())
                 current["original_evidence_ranges"] = [
                     {
                         "citation": identity[0],
@@ -2642,20 +2663,14 @@ class ResearchModel:
             ]
             if current_omissions:
                 current["original_evidence_omitted"] = current_omissions
-            native_turns = retained
-            if (
-                self.context.services.get("research_profile") == "experimental"
-                and self.context.services.get("experimental_parallel") is True
-                and isinstance(ledger, EvidenceLedger)
-            ):
-                native_turns = reference_duplicate_metadata(
-                    retained, complete_originals, ledger
+            if native_original_cache and unique:
+                current["evidence_note"] = str(current["evidence_note"]) + (
+                    " Full passages occur once in retained native tool results or in this "
+                    "message's original_evidence. metadata_ref addresses current canonical "
+                    "metadata in original_metadata_catalogue by citation and text_hash; "
+                    "historical acquisition metadata is not the current source state. "
+                    "A catalogue or text reference alone does not deliver source text."
                 )
-                if native_turns != retained and "evidence_note" in current:
-                    current["evidence_note"] = str(current["evidence_note"]) + (
-                        " metadata_ref addresses identical metadata in original_evidence "
-                        "for this decision."
-                    )
             return [
                 *prefix,
                 *(
