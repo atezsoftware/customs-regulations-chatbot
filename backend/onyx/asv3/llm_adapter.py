@@ -54,6 +54,7 @@ from onyx.asv3.outcome_map import OutcomeMap
 from onyx.asv3.parallel_execution import parallel_execution_enabled
 from onyx.asv3.research_gaps import research_gap_signals
 from onyx.asv3.retained_answer import (
+    RETAINED_TERMINALS,
     bind_retained_answer,
     normalize_retained_answer_basis,
     project_failed_terminal_turns,
@@ -63,7 +64,12 @@ from onyx.asv3.shared_originals import (
     delivered_provision_navigation,
     related_provision_originals,
 )
+from onyx.asv3.terminal_fact_references import (
+    bind_terminal_fact_references,
+    normalize_terminal_fact_references,
+)
 from onyx.asv3.terminal_metadata import normalize_terminal_metadata
+from onyx.asv3.terminal_wire_schema import decode_optional_nulls, strict_terminal_tools
 from onyx.configs.chat_configs import (
     LLM_FIRST_CHUNK_RETRY_BASE_DELAY_S,
     LLM_FIRST_CHUNK_RETRY_JITTER_RATIO,
@@ -1375,12 +1381,22 @@ class ResearchModel:
                 records.extend(
                     decode_compact_originals(payloads, native_catalogue.records, ledger)
                 )
+        wire_tools = (
+            strict_terminal_tools(
+                tools,
+                self.context,
+                selected_llm.config.model_provider,
+                selected_llm.config.model_name,
+            )
+            if tools
+            else tools
+        )
         with _generation_resources(
             self.context,
             selected_llm,
             flow,
             prompt,
-            tools or None,
+            wire_tools or None,
             research=research,
         ) as span:
             deadline = (
@@ -1397,7 +1413,7 @@ class ResearchModel:
             response = selected_llm.invoke(
                 prompt=prompt,
                 # Provider normalization must not rewrite canonical validation schemas.
-                tools=copy.deepcopy(tools) if tools else None,
+                tools=copy.deepcopy(wire_tools) if wire_tools else None,
                 tool_choice=(
                     ToolChoiceOptions.REQUIRED
                     if bool(tools)
@@ -2133,7 +2149,11 @@ class ResearchModel:
             repaired_calls = {call.call_id: call for call in decision.calls}
             semantic_keys = {"answer", "retained_answer_id", "retained_answer_edits"}
             for call in original.calls:
-                if call.name not in {"submit_answer", "submit_partial_answer"}:
+                if call.name not in {
+                    "submit_answer",
+                    "submit_partial_answer",
+                    *RETAINED_TERMINALS,
+                }:
                     continue
                 repaired = repaired_calls.get(call.call_id)
                 schema = definitions.get(call.name)
@@ -2144,7 +2164,9 @@ class ResearchModel:
                     for key, value in call.arguments.items()
                     if key in semantic_keys
                 }
-                if not representation or representation != {
+                if (
+                    not representation and call.name not in RETAINED_TERMINALS
+                ) or representation != {
                     key: value
                     for key, value in repaired.arguments.items()
                     if key in semantic_keys
@@ -2160,12 +2182,16 @@ class ResearchModel:
                         and error.validator not in {"required", "additionalProperties"}
                     ):
                         return decision
-                if not (
-                    isinstance(call.arguments.get("answer"), str)
-                    and str(call.arguments["answer"]).strip()
-                ) and not (
-                    isinstance(call.arguments.get("retained_answer_id"), str)
-                    and str(call.arguments["retained_answer_id"]).strip()
+                if (
+                    call.name not in RETAINED_TERMINALS
+                    and not (
+                        isinstance(call.arguments.get("answer"), str)
+                        and str(call.arguments["answer"]).strip()
+                    )
+                    and not (
+                        isinstance(call.arguments.get("retained_answer_id"), str)
+                        and str(call.arguments["retained_answer_id"]).strip()
+                    )
                 ):
                     return decision
             # The patch call retains its own trace and physical delivery. The
@@ -2764,6 +2790,11 @@ class ResearchModel:
                 view.draft_to_repair,
                 request=view.request,
             )
+            selected, fact_catalogue = bind_terminal_fact_references(
+                selected, self.context
+            )
+            if fact_catalogue:
+                context["decisive_fact_catalogue"] = fact_catalogue
             if retained_answer is not None:
                 context["draft_to_repair"] = {"units": retained_answer.pop("units")}
                 context["retained_answer"] = retained_answer
@@ -3117,6 +3148,10 @@ class ResearchModel:
                 output,
                 call_llm_override=self.research_llm if use_research_model else None,
             )
+            decision = resolve_retained_answer(
+                decision, self.context, view.draft_to_repair, request=view.request
+            )
+            invocation_draft = view.draft_to_repair
             if use_research_model and self._needs_answer_model(decision):
                 candidate = decision.answer or next(
                     (
@@ -3165,11 +3200,12 @@ class ResearchModel:
                     else None,
                 )
                 decision = self._invoke_decision(handoff, prompt, tools, output)
+                invocation_draft = candidate
                 decision = self._experimental_terminal_envelope(
                     decision,
                     tools,
                     publication_gap=view.publication_gap,
-                    retained_draft=view.draft_to_repair,
+                    retained_draft=invocation_draft,
                     request=view.request,
                 )
             if not use_research_model:
@@ -3190,7 +3226,7 @@ class ResearchModel:
             return resolve_retained_answer(
                 decision,
                 self.context,
-                view.draft_to_repair,
+                invocation_draft,
                 request=view.request,
             )
         return self._decide_research(view)
@@ -3349,7 +3385,8 @@ class ResearchModel:
             name, arguments = envelope["name"], envelope["arguments"]
             if (
                 not isinstance(name, str)
-                or name not in {"submit_answer", "submit_partial_answer"}
+                or name
+                not in {"submit_answer", "submit_partial_answer", *RETAINED_TERMINALS}
                 or not isinstance(arguments, dict)
             ):
                 return decision
@@ -3366,7 +3403,10 @@ class ResearchModel:
                 return decision
             emitted_arguments = arguments
             arguments = normalize_terminal_metadata(
-                name, arguments, self.context, parameters
+                RETAINED_TERMINALS.get(name, name), arguments, self.context, parameters
+            )
+            arguments = normalize_terminal_fact_references(
+                name, arguments, self.context
             )
             properties = parameters.get("properties")
             if (
@@ -3417,7 +3457,7 @@ class ResearchModel:
                     ToolCall(
                         id=call.call_id,
                         function=NativeFunctionCall(
-                            name=call.name,
+                            name=name,
                             arguments=json.dumps(emitted_arguments, ensure_ascii=False),
                         ),
                     )
@@ -3629,8 +3669,19 @@ class ResearchModel:
             )
             if not isinstance(parameters, dict):
                 return arguments
+            arguments = decode_optional_nulls(
+                name,
+                arguments,
+                parameters,
+                self.context,
+                call_llm.config.model_provider,
+                call_llm.config.model_name,
+            )
             arguments = normalize_terminal_metadata(
-                name, arguments, self.context, parameters
+                RETAINED_TERMINALS.get(name, name), arguments, self.context, parameters
+            )
+            arguments = normalize_terminal_fact_references(
+                name, arguments, self.context
             )
             if (
                 name != "submit_answer"

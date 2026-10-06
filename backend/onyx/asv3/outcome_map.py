@@ -99,6 +99,10 @@ class OutcomeMap:
         self._lock = threading.RLock()
         self.revision = 0
 
+    def factual_context(self) -> str:
+        """Return the immutable literal context used to validate decisive facts."""
+        return self._factual_context
+
     def _condition_record(
         self, condition: OutcomeCondition, ledger: EvidenceLedger
     ) -> _ConditionRecord:

@@ -34,6 +34,8 @@ from onyx.asv3.serial_experimental_session import (
 from onyx.asv3.session_research import retain_session_research
 from onyx.asv3.source_tools import build_source_specs
 from onyx.asv3.supplemental_tools import build_supplemental_specs
+from onyx.asv3.terminal_fact_references import bind_terminal_fact_references
+from onyx.asv3.terminal_wire_schema import strict_terminal_tools
 from onyx.chat.models import ChatMessageSimple
 from onyx.configs.constants import MessageType
 from onyx.llm.model_response import ModelResponse
@@ -309,46 +311,70 @@ def test_real_serial_and_owned_session_use_same_prompt_schemas_and_terminal_hand
         ]["properties"]
         assert need["question_ids"]["items"].pop("enum") == ["q0"]
         assert need["determination_ids"]["items"].pop("enum") == ["q0:d0"]
+        # Compare the entire wire contract after only the declared scoped additions.
+        expected_host = copy.deepcopy(tool_definitions(base))
         for name in ("submit_answer", "submit_partial_answer"):
-            reviews = actual_definitions[name]["function"]["parameters"]["properties"][
-                "_related_source_reviews"
-            ]
-            assert reviews.pop("maxItems") == 0
-            baseline_reviews = tool_definitions(base)[name]["function"]["parameters"][
-                "properties"
-            ]["_related_source_reviews"]
+            parameters = expected_host[name]["function"]["parameters"]
+            reviews = parameters["properties"]["_related_source_reviews"]
+            reviews["maxItems"] = 0
             fields = reviews["items"]["properties"]
-            baseline_fields = baseline_reviews["items"]["properties"]
             for key, meaning in (
                 ("effect", "the examined source's actual effect"),
                 ("limitations", "its material scope or applicability limitation"),
             ):
-                assert fields[key].pop("description") == (
+                fields[key]["description"] = (
                     "For examined operative_text, copy a contiguous passage from "
                     "one substantive answer block stating "
                     + meaning
-                    + "; that block needs this source's own "
-                    "witness citations. For other statuses, state your assessment."
+                    + "; that block needs this source's own witness citations. "
+                    "For other statuses, state your assessment."
                 )
-                if "description" in baseline_fields[key]:
-                    fields[key]["description"] = baseline_fields[key]["description"]
-            assert fields["gap"].pop("description") == (
+            fields["gap"]["description"] = (
                 "For unresolved, copy the exact standalone uncited answer paragraph "
                 "disclosing this precise open interaction. Otherwise empty."
             )
-            if "description" in baseline_fields["gap"]:
-                fields["gap"]["description"] = baseline_fields["gap"]["description"]
-        function = actual_definitions["submit_answer"]["function"]
+        partial_parameters = expected_host["submit_partial_answer"]["function"][
+            "parameters"
+        ]
+        partial_fields = partial_parameters["properties"]
+        partial_parameters["properties"] = {
+            "answer": partial_fields["answer"],
+            "basis": {"type": "string", "enum": ["originals"]},
+            **{key: value for key, value in partial_fields.items() if key != "answer"},
+        }
+        function = expected_host["submit_answer"]["function"]
         hosted_terminal_text = (
             "and end this turn. Final update_research or verify_claim calls may "
             "accompany this answer and execute first; source acquisitions require "
             "a later decision."
         )
-        assert hosted_terminal_text in function["description"]
         function["description"] = function["description"].replace(
-            hosted_terminal_text, "and end this turn, on its own."
+            "and end this turn, on its own.", hosted_terminal_text
         )
-        assert actual_definitions == tool_definitions(base)
+        expected_tools, facts = bind_terminal_fact_references(
+            cast(list[dict[str, JsonValue]], list(expected_host.values())),
+            child.context,
+        )
+        assert facts and all(
+            cast(str, row["text"]) in child.outcomes.factual_context() for row in facts
+        )
+        expected_wire = strict_terminal_tools(expected_tools, child.context, "openai")
+        expected_definitions = tool_definitions({"tools": expected_wire})
+        for name in ("submit_answer", "submit_partial_answer"):
+            assert actual_definitions[name]["function"]["strict"] is True
+            parameters = actual_definitions[name]["function"]["parameters"]
+            assert set(parameters["required"]) == set(parameters["properties"])
+            assert parameters["additionalProperties"] is False
+            assert "_notifications" not in parameters["properties"]
+        assert actual_definitions == expected_definitions
+        # The plain provider definitions retain the original optional host fields.
+        assert "strict" not in tool_definitions(base)["submit_answer"]["function"]
+        assert (
+            "basis"
+            not in tool_definitions(base)["submit_partial_answer"]["function"][
+                "parameters"
+            ]["properties"]
+        )
         assert actual["tool_choice"] == base["tool_choice"]
         assert actual["timeout_override"] is base["timeout_override"] is None
         request = user_payload(actual["prompt"][1])

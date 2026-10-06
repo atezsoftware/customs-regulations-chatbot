@@ -763,6 +763,18 @@ def share_parallel_snapshot(
     return _restore_v2(_compact_v2(snapshot, max_unit_bytes), max_unit_bytes)
 
 
+def freeze_parallel_checkpoint_control(
+    control: dict[str, JsonValue], *, max_unit_bytes: int = _DEFAULT_UNIT_BYTES
+) -> dict[str, JsonValue]:
+    """Detach owned control; complete evidence validation occurs on materialization."""
+    if "evidence" in control:
+        raise ValueError("Parallel checkpoint control must not contain a ledger")
+    _capacity(control, max_unit_bytes)
+    frozen = _checked_freeze(control)
+    assert isinstance(frozen, dict)
+    return frozen
+
+
 def parallel_checkpoint_digest(value: dict[str, JsonValue]) -> str:
     """Hash the original JSON byte sequence without allocating expanded JSON."""
     cache: dict[int, bytes] = {}

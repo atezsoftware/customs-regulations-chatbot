@@ -15,7 +15,11 @@ from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.models import Decision, ResearchTurn, RunContext
 from onyx.asv3.parallel_execution import parallel_execution_enabled
 
-_TERMINAL = frozenset({"submit_answer", "submit_partial_answer"})
+RETAINED_TERMINALS = {
+    "submit_retained_answer": "submit_answer",
+    "submit_retained_partial_answer": "submit_partial_answer",
+}
+_TERMINAL = frozenset({"submit_answer", "submit_partial_answer", *RETAINED_TERMINALS})
 _EOL = r"(?:\r\n|\r(?!\n)|(?<!\r)\n)"
 _PARAGRAPH_BREAK = re.compile(rf"{_EOL}[ \t]*{_EOL}(?:[ \t]*{_EOL})*")
 
@@ -117,8 +121,8 @@ def _reference(
         "answer_characters": len(draft),
         "units": _units(draft, identifier),
         "instruction": (
-            "For an unchanged draft_to_repair, supply this retained_answer_id instead of "
-            "answer and correct the publication metadata. To correct specific draft units, "
+            "For an unchanged draft_to_repair, call submit_retained_answer or "
+            "submit_retained_partial_answer with corrected publication metadata. No body or reference ID is needed. To correct specific draft units, "
             "also supply retained_answer_edits with their exact unit_id and replacement text. "
             "Retain supported detail and citations within each replacement. Other units "
             "and outer whitespace remain unchanged. For a full rewrite supply "
@@ -140,9 +144,13 @@ def bind_retained_answer(
     if reference is None:
         return definitions, None
     bound = False
+    retained_tools: list[dict[str, JsonValue]] = []
     for definition in definitions:
         function = definition.get("function")
-        if not isinstance(function, dict) or function.get("name") not in _TERMINAL:
+        if not isinstance(function, dict) or function.get("name") not in {
+            "submit_answer",
+            "submit_partial_answer",
+        }:
             continue
         parameters = function.get("parameters")
         if not isinstance(parameters, dict):
@@ -183,7 +191,32 @@ def bind_retained_answer(
             "description": "Only with retained_answer_id; replace named unit content while keeping every other unit and separator unchanged. Empty deletions are rejected.",
         }
         parameters["required"] = [field for field in required if field != "answer"]
+        retained = copy.deepcopy(definition)
+        retained_function = retained["function"]
+        assert isinstance(retained_function, dict)
+        original_name = function["name"]
+        retained_function["name"] = next(
+            name
+            for name, canonical in RETAINED_TERMINALS.items()
+            if canonical == original_name
+        )
+        retained_function["description"] = (
+            "Commit the exact draft owned by this invocation with corrected publication metadata. "
+            "Optional retained_answer_edits replace only named units. Current original-delivery "
+            "and all legal publication checks remain required. Use the full answer tool for a rewrite."
+        )
+        retained_parameters = retained_function["parameters"]
+        assert isinstance(retained_parameters, dict)
+        retained_properties = retained_parameters["properties"]
+        assert isinstance(retained_properties, dict)
+        for field in ("answer", "retained_answer_id", "basis"):
+            retained_properties.pop(field, None)
+        retained_parameters["required"] = [
+            field for field in required if field not in {"answer", "basis"}
+        ]
+        retained_tools.append(retained)
         bound = True
+    definitions.extend(retained_tools)
     return definitions, reference if bound else None
 
 
@@ -200,6 +233,23 @@ def resolve_retained_answer(
             calls.append(call)
             continue
         arguments = call.arguments
+        retained_alias = call.name in RETAINED_TERMINALS
+        if retained_alias:
+            if reference is None or any(
+                key in arguments for key in ("answer", "retained_answer_id", "basis")
+            ):
+                calls.append(
+                    call.model_copy(
+                        update={
+                            "argument_error": "This retained commit requires this invocation's owned draft and no explicit body, reference, or basis."
+                        }
+                    )
+                )
+                continue
+            arguments = {
+                **arguments,
+                "retained_answer_id": reference["retained_answer_id"],
+            }
         has_body, has_reference = (
             "answer" in arguments,
             "retained_answer_id" in arguments,
@@ -237,7 +287,12 @@ def resolve_retained_answer(
                 if key not in {"retained_answer_id", "retained_answer_edits"}
             }
             expanded["answer"] = answer
-            calls.append(call.model_copy(update={"arguments": expanded}))
+            canonical_name = RETAINED_TERMINALS.get(call.name, call.name)
+            if retained_alias:
+                expanded["basis"] = "originals"
+            calls.append(
+                call.model_copy(update={"name": canonical_name, "arguments": expanded})
+            )
         else:
             calls.append(
                 call.model_copy(

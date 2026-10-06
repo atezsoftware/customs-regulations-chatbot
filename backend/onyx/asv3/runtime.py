@@ -631,6 +631,10 @@ def run_asv3_loop(
                 with progress_lock:
                     progress_snapshot = list(emitted)
                 augmentation_started = time.monotonic()
+                worker_capture = (
+                    workers.capture_checkpoint_state() if workers is not None else None
+                )
+                child_control_capture_seconds = time.monotonic() - augmentation_started
                 snapshot["research_state"] = research_state.export()
                 checkpoint_sequence += 1
                 snapshot.update(
@@ -648,7 +652,7 @@ def run_asv3_loop(
                     progress=progress_snapshot,
                     progress_state=progress.export(),
                     public_profile=snapshot["public_profile"],
-                    workers=workers.export() if workers else {},
+                    workers={},
                     question_research=question_research.export()
                     if question_research
                     else {},
@@ -664,9 +668,23 @@ def run_asv3_loop(
                     snapshot["legal_source_reviews"] = source_reviews.export()
                 if authority_requirements is not None:
                     snapshot["authority_requirements"] = authority_requirements.export()
+                receipts = (
+                    parallel_answers.export() if parallel_answers is not None else {}
+                )
+                # The immutable child controls precede this single canonical ledger cut.
+                ledger_started = time.monotonic()
+                snapshot["evidence"] = ledger.export()
+                ledger_export_seconds = time.monotonic() - ledger_started
+                materialization_started = time.monotonic()
+                if workers is not None and worker_capture is not None:
+                    snapshot["workers"] = workers.materialize_checkpoint_state(
+                        worker_capture, snapshot["evidence"]
+                    )
+                child_materialization_seconds = (
+                    time.monotonic() - materialization_started
+                )
                 if parallel_answers is not None:
                     snapshot["parallel_research_policy"] = SERIAL_SESSION_POLICY
-                    receipts = parallel_answers.export()
                     snapshot["parallel_answers"] = receipts
                     accepted_states: list[dict[str, JsonValue]] = []
                     receipt_rows = receipts.get("receipts", [])
@@ -698,8 +716,34 @@ def run_asv3_loop(
                             )
                             if receipt is None:
                                 continue
-                            serial_snapshot = workers.checkpoint(task_id)
-                            if serial_snapshot is None:
+                            worker_rows = snapshot["workers"]
+                            task_rows = (
+                                worker_rows.get("tasks", [])
+                                if isinstance(worker_rows, dict)
+                                else []
+                            )
+                            if not isinstance(task_rows, list):
+                                raise ValueError("Invalid checkpoint worker tasks")
+                            worker_row = next(
+                                (
+                                    row
+                                    for row in task_rows
+                                    if isinstance(row, dict)
+                                    and row.get("task_id") == task_id
+                                ),
+                                None,
+                            )
+                            wrapper = (
+                                worker_row.get("child_checkpoint")
+                                if worker_row is not None
+                                else None
+                            )
+                            serial_snapshot = (
+                                wrapper.get("snapshot")
+                                if isinstance(wrapper, dict)
+                                else None
+                            )
+                            if not isinstance(serial_snapshot, dict):
                                 raise ValueError(
                                     "Sealed serial memory checkpoint is missing"
                                 )
@@ -719,14 +763,15 @@ def run_asv3_loop(
                     snapshot["session_research"] = merge_serial_session_memory(
                         memory, accepted_states
                     )
-                # Export originals after every witness and accepted child reference.
-                snapshot["evidence"] = ledger.export()
                 snapshot["budget"] = context.budget.snapshot()
                 augmentation_seconds = time.monotonic() - augmentation_started
             capture.output_value = {
                 "sequence": snapshot["sequence"],
                 "capture_lock_wait_seconds": lock_wait_seconds,
                 "augmentation_seconds": augmentation_seconds,
+                "child_control_capture_seconds": child_control_capture_seconds,
+                "ledger_export_seconds": ledger_export_seconds,
+                "child_materialization_seconds": child_materialization_seconds,
                 "deferred_aggregate": True,
             }
         return snapshot
@@ -1040,7 +1085,7 @@ def run_asv3_loop(
                 )
 
             def serial_checkpoint(snapshot: dict[str, JsonValue]) -> None:
-                callback = child.services.get("record_child_checkpoint")
+                callback = child.services.get("record_child_checkpoint_control")
                 if not callable(callback) or harness is None:
                     raise ValueError(
                         "Serial question requires its task-bound checkpoint writer"
@@ -1066,6 +1111,7 @@ def run_asv3_loop(
                 user_identity=user_identity,
                 on_receipt=record,
                 checkpoint_callback=serial_checkpoint,
+                deferred_checkpoint_control=True,
                 progress=progress,
                 allow_external=allow_external,
                 notifications=profile.notifications,

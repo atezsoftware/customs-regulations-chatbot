@@ -504,6 +504,7 @@ class SerialExperimentalSession:
         user_identity: LLMUserIdentity | None = None,
         on_receipt: Callable[[ToolReceipt], None] | None = None,
         checkpoint_callback: Callable[[dict[str, JsonValue]], None] | None = None,
+        deferred_checkpoint_control: bool = False,
         progress: ProgressReporter | None = None,
         allow_external: bool = False,
         notifications: dict[str, list[str]] | None = None,
@@ -567,6 +568,12 @@ class SerialExperimentalSession:
             max_depth=outer_context.max_depth,
         )
         self.progress, self._checkpoint_callback = progress, checkpoint_callback
+        if deferred_checkpoint_control and not (
+            outer_context.services.get("research_profile") == "experimental"
+            and outer_context.services.get("experimental_parallel") is True
+        ):
+            raise ValueError("Deferred serial controls require Experimental Parallel")
+        self._deferred_checkpoint_control = deferred_checkpoint_control
         self._first_decision, self._standalone_answer_call = True, False
         self._allow_external, self._external_requested = (
             allow_external,
@@ -701,7 +708,9 @@ class SerialExperimentalSession:
             evidence=ledger,
             on_receipt=on_receipt,
             checkpoint=self._checkpoint_callback,
-            checkpoint_snapshot=self.snapshot,
+            checkpoint_snapshot=self.snapshot_control
+            if self._deferred_checkpoint_control
+            else self.snapshot,
             progress=progress,
             draft_guard=lambda answer: self.publication_gap(
                 answer, self.model.last_call_id
@@ -973,7 +982,14 @@ class SerialExperimentalSession:
                 description="End this turn with supported parts and a precise unresolved source gap. Cite each supported legal assertion. Do not turn missing evidence into a claim that no law exists. Call on its own.",
                 parameters={
                     "type": "object",
-                    "properties": {"answer": {"type": "string", "minLength": 1}},
+                    "properties": {
+                        "answer": {"type": "string", "minLength": 1},
+                        **(
+                            {"basis": {"type": "string", "enum": ["originals"]}}
+                            if parallel_execution_enabled(self.context)
+                            else {}
+                        ),
+                    },
                     "required": ["answer"],
                     "additionalProperties": False,
                 },
@@ -1010,12 +1026,26 @@ class SerialExperimentalSession:
             "workers": self.workers.export(),
         }
 
+    def snapshot_control(self) -> dict[str, JsonValue]:
+        """Capture this owner; the root writer supplies the shared canonical ledger."""
+        return {
+            **self.harness.snapshot_control(),
+            "budget": self.context.budget.snapshot(),
+            "research_state": self.research.export(),
+            "serial_experimental_session": self._state().model_dump(mode="json"),
+            "workers": self.workers.export(),
+        }
+
     def source_state(self) -> dict[str, JsonValue]:
         return self._state().model_dump(mode="json")
 
     def _save(self) -> None:
         if self._checkpoint_callback is not None:
-            self._checkpoint_callback(self.snapshot())
+            self._checkpoint_callback(
+                self.snapshot_control()
+                if self._deferred_checkpoint_control
+                else self.snapshot()
+            )
 
     def restore(self, snapshot: dict[str, JsonValue]) -> None:
         state = self._validate_state(snapshot)

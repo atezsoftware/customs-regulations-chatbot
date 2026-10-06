@@ -8,7 +8,7 @@ Provider-specific tools, fixed dates, staged reviewers and benchmark cases are n
 from onyx.prompts.asv3.coordinator_reference import COORDINATOR_REFERENCE_PROMPT
 
 EXPERIMENTAL_PROMPT_VERSION = "asv3-experimental-2026-10-06.7"
-EXPERIMENTAL_PARALLEL_PROMPT_VERSION = "asv3-experimental-parallel-2026-10-06.18"
+EXPERIMENTAL_PARALLEL_PROMPT_VERSION = "asv3-experimental-parallel-2026-10-06.19"
 
 
 def _source_navigation(reference_prompt: str) -> str:
@@ -40,14 +40,15 @@ def parallel_metadata_instructions(instruction: str) -> str:
     return (
         before
         + start
-        + "When useful and exposed, _outcomes declares requested outcomes with schema-valid "
-        "outcome_id and supplied question_ids. Outcome IDs differ from question/determination "
-        "IDs; reuse outcomes and assigned task_outcome_ids. _coverage.conditions and "
-        "_coverage.resolutions record original-bound conditions and supported, conditional "
-        "or unresolved updates with IDs, citations and witness ranges. Use only this "
-        "action's exposed fields. Retained conditions are immutable; coverage is a proposal, "
-        "never publication "
-        "approval. Social replies need no outcome map.\n" + end + after
+        + "Use exposed _outcomes with schema-valid outcome_id and supplied question_ids; "
+        "outcome IDs differ from question/determination IDs. Reuse task_outcome_ids. "
+        "decisive_fact_refs selects exact decisive_fact_catalogue quotes. _coverage.conditions "
+        "and _coverage.resolutions retain immutable original-bound conditions, citations, "
+        "witnesses and status; metadata never approves publication. Commit an owned draft "
+        "with submit_retained_answer or submit_retained_partial_answer; edits preserve "
+        "other units. Full tools require answer. Social replies need no map.\n"
+        + end
+        + after
     )
 
 

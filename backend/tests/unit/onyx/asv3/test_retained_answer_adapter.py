@@ -120,11 +120,11 @@ def test_rejected_native_body_rehydrates_shared_original_not_in_owner_ranges() -
 
 
 @pytest.mark.parametrize("edit_unit", [False, True])
-@pytest.mark.parametrize("omit_basis", [False, True])
+@pytest.mark.parametrize("nullable_wire", [False, True])
 def test_real_hosted_serial_reuses_rejected_body_with_fresh_original_delivery(
     monkeypatch: pytest.MonkeyPatch,
     edit_unit: bool,
-    omit_basis: bool,
+    nullable_wire: bool,
 ) -> None:
     _kwargs, broker, selected, _checkpoints, _queue = setup_run(monkeypatch)
     selected.config = selected.config.model_copy(update={"model_name": "gpt-6-luna"})
@@ -231,12 +231,17 @@ def test_real_hosted_serial_reuses_rejected_body_with_fresh_original_delivery(
                 ]
                 assert originals == acquisition_records
             definitions = tool_definitions(arguments)
-            properties = definitions["submit_answer"]["function"]["parameters"][
-                "properties"
-            ]
-            lead_ids = properties["_related_source_reviews"]["items"]["properties"][
-                "lead_id"
-            ]["enum"]
+            tool_name = "submit_answer" if index == 2 else "submit_retained_answer"
+            provider_definition = definitions[tool_name]["function"]
+            assert provider_definition["strict"] is True
+            properties = provider_definition["parameters"]["properties"]
+            review_schema = properties["_related_source_reviews"]["anyOf"][0]
+            review_branches = review_schema["items"]["anyOf"]
+            lead_ids = review_branches[0]["properties"]["lead_id"]["enum"]
+            assert all(
+                branch["properties"]["lead_id"]["enum"] == lead_ids
+                for branch in review_branches
+            )
             assert len(lead_ids) == 1
             citations = {row["source_id"]: row["citation"] for row in originals}
             review: dict[str, JsonValue] = {
@@ -272,11 +277,18 @@ def test_real_hosted_serial_reuses_rejected_body_with_fresh_original_delivery(
                 current = payloads(arguments["prompt"])[-1]
                 descriptor = current["retained_answer"]
                 identifier = descriptor["retained_answer_id"]
-                assert properties["retained_answer_id"]["enum"] == [identifier]
+                assert identifier.startswith("retained_")
+                assert not {"answer", "basis", "retained_answer_id"} & set(properties)
                 assert (
                     "answer"
-                    not in definitions["submit_answer"]["function"]["parameters"][
+                    in definitions["submit_answer"]["function"]["parameters"][
                         "required"
+                    ]
+                )
+                assert (
+                    "retained_answer_id"
+                    not in definitions["submit_answer"]["function"]["parameters"][
+                        "properties"
                     ]
                 )
                 assert body not in json.dumps(descriptor)
@@ -298,9 +310,10 @@ def test_real_hosted_serial_reuses_rejected_body_with_fresh_original_delivery(
                 assert any(
                     isinstance(message, ToolMessage) for message in arguments["prompt"]
                 )
-                terminal["retained_answer_id"] = identifier
-                if omit_basis:
-                    del terminal["basis"]
+                del terminal["basis"]
+                if nullable_wire:
+                    terminal["_coverage"] = None
+                    terminal["retained_answer_edits"] = None
                 if edit_unit:
                     unit = units[1]
                     replacement = "The original condition and its scope remain unchanged; the supplied fact is distinct [1][2]."
@@ -317,7 +330,7 @@ def test_real_hosted_serial_reuses_rejected_body_with_fresh_original_delivery(
                         + suffix
                         + body[unit["end_char"] :]
                     )
-            result = response(calls=[("submit_answer", terminal)])
+            result = response(calls=[(tool_name, terminal)])
         emitted.append(result)
         return result
 
@@ -333,9 +346,10 @@ def test_real_hosted_serial_reuses_rejected_body_with_fresh_original_delivery(
     final_wire = child.harness.turns[-1].assistant
     assert final_wire is not None and final_wire.tool_calls
     final_arguments = json.loads(final_wire.tool_calls[0].function.arguments)
-    assert "answer" not in final_arguments and "retained_answer_id" in final_arguments
-    assert ("retained_answer_edits" in final_arguments) is edit_unit
-    assert ("basis" not in final_arguments) is omit_basis
+    assert not {"answer", "retained_answer_id", "basis"} & set(final_arguments)
+    assert final_wire.tool_calls[0].function.name == "submit_retained_answer"
+    assert (isinstance(final_arguments.get("retained_answer_edits"), list)) is edit_unit
+    assert (final_arguments.get("_coverage", "absent") is None) is nullable_wire
     assert child.harness.receipts[-1].call.arguments["basis"] == "originals"
     assert len(final_wire.model_dump_json()) < len(body) // 5
     accepted_call = child.model.last_call_id or ""

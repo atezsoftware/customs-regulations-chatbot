@@ -7,7 +7,10 @@ import hashlib
 import json
 import threading
 import time
+from collections.abc import Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Callable, Literal, cast
 from uuid import uuid4
 
@@ -26,6 +29,7 @@ from onyx.asv3.models import (
     ToolSpec,
 )
 from onyx.asv3.parallel_checkpoint import (
+    freeze_parallel_checkpoint_control,
     parallel_checkpoint_digest,
     share_parallel_snapshot,
 )
@@ -54,6 +58,23 @@ class _ChildCheckpoint(BaseModel):
     outcome_ids: builtins.list[str]
     snapshot: dict[str, JsonValue]
     integrity: str
+
+
+@dataclass(frozen=True)
+class _ChildCheckpointControl:
+    task_id: str
+    scope_hash: str
+    request_hash: str
+    assignment_id: str
+    outcome_ids: tuple[str, ...]
+    snapshot: dict[str, JsonValue]
+    integrity: str
+
+
+@dataclass(frozen=True)
+class WorkerCheckpointCapture:
+    payload: dict[str, JsonValue]
+    controls: Mapping[str, _ChildCheckpointControl]
 
 
 class WorkerPool:
@@ -89,6 +110,9 @@ class WorkerPool:
         self._tasks: dict[str, TaskSnapshot] = {}
         self._contexts: dict[str, RunContext] = {}
         self._futures: dict[str, Future[None]] = {}
+        self._checkpoint_controls: dict[str, _ChildCheckpointControl] = {}
+        self._materialized_controls: dict[str, _ChildCheckpointControl] = {}
+        self._control_revisions: dict[str, int] = {}
         self._closed = False
 
     def prepare_independent_batch(self, assignments: int) -> None:
@@ -194,6 +218,10 @@ class WorkerPool:
                 child.services["record_child_checkpoint"] = self._checkpoint_callback(
                     task_id
                 )
+                if self._shared_checkpoints() and independent_question:
+                    child.services["record_child_checkpoint_control"] = (
+                        self._control_checkpoint_callback(task_id)
+                    )
             if previous_checkpoint is not None:
                 child.services["previous_child_checkpoint"] = (
                     share_parallel_snapshot(previous_checkpoint)
@@ -344,6 +372,14 @@ class WorkerPool:
 
         return record
 
+    def _control_checkpoint_callback(
+        self, task_id: str
+    ) -> Callable[[dict[str, JsonValue]], None]:
+        def record(control: dict[str, JsonValue]) -> None:
+            self.record_checkpoint_control(task_id, control)
+
+        return record
+
     def _validated_checkpoint(
         self, task: TaskSnapshot, payload: dict[str, JsonValue]
     ) -> _ChildCheckpoint:
@@ -385,6 +421,117 @@ class WorkerPool:
                 "Child checkpoint task, assignment, scope or integrity changed"
             )
 
+    def record_checkpoint_control(
+        self, task_id: str, snapshot: dict[str, JsonValue]
+    ) -> None:
+        """Stage only owned control; the writer adds a coherent full ledger cut."""
+        if not self._shared_checkpoints():
+            raise ValueError("Deferred child controls require Experimental Parallel")
+        with self._lock:
+            task = self._tasks[task_id]
+            child = self._contexts[task_id]
+            if (
+                not task.independent_question
+                or task.assignment_id is None
+                or snapshot.get("run_id") != self.context.run_id
+                or snapshot.get("request") != task.task
+                or child.run_id != self.context.run_id
+                or child.scope != self.context.scope
+            ):
+                raise ValueError("Child checkpoint run, scope or request changed")
+            binding = (
+                _checkpoint_digest(self.context.scope),
+                _checkpoint_digest(task.task),
+                task.assignment_id,
+                tuple(task.outcome_ids),
+            )
+            revision = self._control_revisions.get(task_id, 0) + 1
+            self._control_revisions[task_id] = revision
+        control = freeze_parallel_checkpoint_control(snapshot)
+        staged = _ChildCheckpointControl(
+            task_id, *binding, control, parallel_checkpoint_digest(control)
+        )
+        with self._lock:
+            task = self._tasks[task_id]
+            if binding != (
+                _checkpoint_digest(self.context.scope),
+                _checkpoint_digest(task.task),
+                task.assignment_id,
+                tuple(task.outcome_ids),
+            ):
+                raise ValueError("Child checkpoint task binding changed")
+            if self._control_revisions[task_id] == revision:
+                self._checkpoint_controls[task_id] = staged
+
+    def capture_checkpoint_state(self) -> WorkerCheckpointCapture:
+        """Capture controls before the caller exports their referenced evidence."""
+        with self._lock:
+            return WorkerCheckpointCapture(
+                self._export_locked(), MappingProxyType(dict(self._checkpoint_controls))
+            )
+
+    def materialize_checkpoint_state(
+        self, capture: WorkerCheckpointCapture, evidence: dict[str, JsonValue]
+    ) -> dict[str, JsonValue]:
+        if not self._shared_checkpoints():
+            raise ValueError("Deferred child controls require Experimental Parallel")
+        payload = capture.payload
+        if payload.get("run_id") != self.context.run_id or payload.get("version") != 1:
+            raise ValueError("Worker checkpoint identity mismatch")
+        raw_tasks = payload.get("tasks")
+        if not isinstance(raw_tasks, list):
+            raise ValueError("Invalid worker checkpoint")
+        tasks: builtins.list[JsonValue] = []
+        materialized: dict[
+            str, tuple[_ChildCheckpointControl, dict[str, JsonValue]]
+        ] = {}
+        for value in raw_tasks:
+            if not isinstance(value, dict):
+                raise ValueError("Invalid worker checkpoint task")
+            task = TaskSnapshot.model_validate({**value, "child_checkpoint": None})
+            control = capture.controls.get(task.task_id)
+            if control is None:
+                tasks.append(value)
+                continue
+            if (
+                control.task_id != task.task_id
+                or control.scope_hash != _checkpoint_digest(self.context.scope)
+                or control.request_hash != _checkpoint_digest(task.task)
+                or control.assignment_id != task.assignment_id
+                or control.outcome_ids != tuple(task.outcome_ids)
+                or control.snapshot.get("run_id") != self.context.run_id
+                or control.snapshot.get("request") != task.task
+                or parallel_checkpoint_digest(control.snapshot) != control.integrity
+            ):
+                raise ValueError(
+                    "Deferred child checkpoint binding or integrity changed"
+                )
+            snapshot = share_parallel_snapshot(
+                {**control.snapshot, "evidence": evidence}
+            )
+            content: dict[str, JsonValue] = {
+                "version": 1,
+                "run_id": self.context.run_id,
+                "task_id": task.task_id,
+                "scope_hash": control.scope_hash,
+                "request_hash": control.request_hash,
+                "assignment_id": control.assignment_id,
+                "outcome_ids": list(control.outcome_ids),
+                "snapshot": snapshot,
+            }
+            wrapped = {**content, "integrity": parallel_checkpoint_digest(content)}
+            self._validated_checkpoint(task, wrapped)
+            tasks.append({**value, "child_checkpoint": wrapped})
+            materialized[task.task_id] = (control, wrapped)
+        if set(capture.controls) - set(materialized):
+            raise ValueError("Deferred child checkpoint task is missing")
+        with self._lock:
+            for task_id, (control, wrapped) in materialized.items():
+                if self._checkpoint_controls.get(task_id) is control:
+                    self._tasks[task_id].child_checkpoint = wrapped
+                    self._materialized_controls[task_id] = control
+        return {**payload, "tasks": tasks}
+
     def record_checkpoint(self, task_id: str, snapshot: dict[str, JsonValue]) -> None:
         """Save a request-bound host snapshot without exposing it as worker output."""
         with self._lock:
@@ -422,8 +569,24 @@ class WorkerPool:
             else:
                 self._validated_checkpoint(task, wrapped)
             task.child_checkpoint = wrapped
+            self._checkpoint_controls.pop(task_id, None)
+            self._materialized_controls.pop(task_id, None)
+            self._control_revisions[task_id] = (
+                self._control_revisions.get(task_id, 0) + 1
+            )
 
     def checkpoint(self, task_id: str) -> dict[str, JsonValue] | None:
+        with self._lock:
+            pending = self._checkpoint_controls.get(task_id)
+            needs_materialization = pending is not None and (
+                self._materialized_controls.get(task_id) is not pending
+            )
+        if needs_materialization:
+            ledger = self.context.services.get("evidence")
+            if not isinstance(ledger, EvidenceLedger):
+                raise ValueError("Deferred child checkpoint evidence is missing")
+            capture = self.capture_checkpoint_state()
+            self.materialize_checkpoint_state(capture, ledger.export())
         with self._lock:
             task = self._tasks[task_id]
             if task.child_checkpoint is None:
@@ -797,35 +960,44 @@ class WorkerPool:
 
     def export(self) -> dict[str, JsonValue]:
         with self._lock:
-            self.results(full=False)
-            tasks: builtins.list[JsonValue] = []
-            for task in self._tasks.values():
-                view = self._task_view(task)
-                if self._shared_checkpoints():
-                    value = view.model_dump(
-                        mode="json",
-                        exclude={"outcome": {"evidence"}, "child_checkpoint": True},
-                    )
-                    value["child_checkpoint"] = copy.deepcopy(task.child_checkpoint)
-                else:
-                    view.child_checkpoint = copy.deepcopy(task.child_checkpoint)
-                    value = view.model_dump(
-                        mode="json", exclude={"outcome": {"evidence"}}
-                    )
-                tasks.append(value)
-            result: dict[str, JsonValue] = {
-                "version": 1,
-                "run_id": self.context.run_id,
-                "tasks": tasks,
-            }
-            bindings: dict[str, JsonValue] = {
-                task.task_id: _checkpoint_digest(self._task_binding(task))
-                for task in self._tasks.values()
-                if self._has_checkpoint_binding(task)
-            }
-            if bindings:
-                result["task_binding_integrity"] = bindings
-            return result
+            deferred = bool(self._checkpoint_controls)
+        if deferred:
+            ledger = self.context.services.get("evidence")
+            if not isinstance(ledger, EvidenceLedger):
+                raise ValueError("Deferred child checkpoint evidence is missing")
+            capture = self.capture_checkpoint_state()
+            return self.materialize_checkpoint_state(capture, ledger.export())
+        with self._lock:
+            return self._export_locked()
+
+    def _export_locked(self) -> dict[str, JsonValue]:
+        self.results(full=False)
+        tasks: builtins.list[JsonValue] = []
+        for task in self._tasks.values():
+            view = self._task_view(task)
+            if self._shared_checkpoints():
+                value = view.model_dump(
+                    mode="json",
+                    exclude={"outcome": {"evidence"}, "child_checkpoint": True},
+                )
+                value["child_checkpoint"] = copy.deepcopy(task.child_checkpoint)
+            else:
+                view.child_checkpoint = copy.deepcopy(task.child_checkpoint)
+                value = view.model_dump(mode="json", exclude={"outcome": {"evidence"}})
+            tasks.append(value)
+        result: dict[str, JsonValue] = {
+            "version": 1,
+            "run_id": self.context.run_id,
+            "tasks": tasks,
+        }
+        bindings: dict[str, JsonValue] = {
+            task.task_id: _checkpoint_digest(self._task_binding(task))
+            for task in self._tasks.values()
+            if self._has_checkpoint_binding(task)
+        }
+        if bindings:
+            result["task_binding_integrity"] = bindings
+        return result
 
     def restore(self, payload: dict[str, JsonValue]) -> None:
         if payload.get("version") != 1 or payload.get("run_id") != self.context.run_id:
@@ -900,6 +1072,10 @@ class WorkerPool:
                 child.services["record_child_checkpoint"] = self._checkpoint_callback(
                     snapshot.task_id
                 )
+                if self._shared_checkpoints() and snapshot.independent_question:
+                    child.services["record_child_checkpoint_control"] = (
+                        self._control_checkpoint_callback(snapshot.task_id)
+                    )
             if saved_checkpoint is not None:
                 child.services["restored_child_checkpoint"] = copy.deepcopy(
                     saved_checkpoint
