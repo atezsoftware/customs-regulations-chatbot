@@ -105,6 +105,28 @@ def test_actual_delivery_blocks_unread_lead_without_an_extra_model_call() -> Non
     assert selected.invoke.call_count == 1
 
 
+def test_native_related_review_guidance_does_not_limit_edits_to_reported_gap() -> None:
+    import json
+
+    context, ledger, reviews = tuned_context()
+    seen(context, ledger, reviews)
+    selected = model()
+    adapter = ResearchModel(selected, context, lean_native_mode=True)
+    registry = terminal_registry([])
+    prompt, _, _ = adapter._fit_native_decision(
+        adaptive_tool_view(
+            original_evidence=[full_record(ledger, 1), full_record(ledger, 2)],
+            draft_to_repair="The effect certainly applies [1].",
+            publication_gap={"missing_related_source_reviews": ["the_lead"]},
+        ).model_copy(update={"tools": registry.definitions(context)})
+    )
+    payload = json.loads(cast(str, prompt[-1].content))
+    instruction = payload["related_source_terminal_transport"]
+    assert "not only the host's reported defects" in instruction
+    assert "required by the actual gap" not in instruction
+    selected.invoke.assert_not_called()
+
+
 @pytest.mark.parametrize("status", ["examined", "not_material"])
 def test_a_title_cannot_be_used_to_close_or_exclude_the_candidate(status: str) -> None:
     context, ledger, reviews = tuned_context()

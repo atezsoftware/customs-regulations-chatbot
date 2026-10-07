@@ -2923,16 +2923,20 @@ class ResearchModel:
                             in {"submit_answer", "submit_partial_answer"}
                         )
                     ]
-                    retained_answer["instruction"] = (
-                        "Commit this invocation's draft with submit_retained_answer or "
-                        "submit_retained_partial_answer and your corrected publication metadata. "
-                        "To repair substantive text, supply retained_answer_edits for the exact "
-                        "owned unit_id values. Any units may be corrected when the actual gap "
-                        "requires it; there is no edit-count or replacement-length limit. "
-                        "Untouched units and separators remain exact. Research and clarification "
-                        "actions remain available. All current delivery and legal publication "
-                        "checks apply to the complete reconstructed answer."
-                    )
+                    if (
+                        self.context.services.get("asv3_workflow_variant")
+                        != ASV3_TUNED_VARIANT
+                    ):
+                        retained_answer["instruction"] = (
+                            "Commit this invocation's draft with submit_retained_answer or "
+                            "submit_retained_partial_answer and your corrected publication metadata. "
+                            "To repair substantive text, supply retained_answer_edits for the exact "
+                            "owned unit_id values. Any units may be corrected when the actual gap "
+                            "requires it; there is no edit-count or replacement-length limit. "
+                            "Untouched units and separators remain exact. Research and clarification "
+                            "actions remain available. All current delivery and legal publication "
+                            "checks apply to the complete reconstructed answer."
+                        )
                 context["retained_answer"] = retained_answer
         if (
             independent_mode
@@ -3147,13 +3151,27 @@ class ResearchModel:
                         current["related_source_terminal_transport"] = (
                             "Assess the related sources yourself against the supplied originals. "
                             "Use an exposed native action for more research or your own terminal "
-                            "assessment. For an unchanged draft_to_repair or a named-unit repair, "
-                            "use "
+                            "assessment. "
+                            + (
+                                "Follow retained_answer.instruction to correct all materially "
+                                "affected applications, not only the host's reported defects. "
+                                "Use "
+                                if self.context.services.get("asv3_workflow_variant")
+                                == ASV3_TUNED_VARIANT
+                                else "For an unchanged draft_to_repair or a named-unit repair, use "
+                            )
                             + " or ".join(retained_terminals)
-                            + "; include only the corrected "
-                            "publication metadata and any retained_answer_edits required by "
-                            "the actual gap. Untouched answer units are retained exactly; "
-                            "all current publication checks still apply. "
+                            + (
+                                " with current metadata and the necessary retained_answer_edits. "
+                                "Keep independently supported detail and exact untouched units. "
+                                "All current publication checks still apply. "
+                                if self.context.services.get("asv3_workflow_variant")
+                                == ASV3_TUNED_VARIANT
+                                else "; include only the corrected "
+                                "publication metadata and any retained_answer_edits required by "
+                                "the actual gap. Untouched answer units are retained exactly; "
+                                "all current publication checks still apply. "
+                            )
                             + (
                                 "For a full rewrite, use "
                                 + " or ".join(full_terminals)

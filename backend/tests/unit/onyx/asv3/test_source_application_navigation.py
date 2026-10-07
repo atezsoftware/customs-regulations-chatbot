@@ -7,7 +7,8 @@ import pytest
 from pydantic import JsonValue
 
 from onyx.asv3.llm_adapter import ResearchModel
-from onyx.asv3.models import RunContext
+from onyx.asv3.models import CapabilityCall, Decision, RunContext
+from onyx.asv3.retained_answer import resolve_retained_answer
 from onyx.asv3.shared_originals import delivered_provision_navigation
 from onyx.asv3.workflow_variant import ASV3_TUNED_VARIANT
 from tests.unit.onyx.asv3.test_native_model_adapter import adaptive_tool_view, model
@@ -137,3 +138,60 @@ def test_native_context_uses_actual_owned_edit_ids_without_an_extra_generation(
     else:
         assert "draft_application" not in payload["evidence_note"]
         assert "delivered_provisions" not in payload
+
+
+def test_native_semantic_edit_outside_host_targets_retains_other_units_exactly() -> (
+    None
+):
+    import json
+
+    ledger = recorded(
+        [
+            original("rule", "An application requires approval."),
+            original("relief", "Prior notification permits a reduction."),
+        ]
+    )
+    context = RunContext(
+        services={
+            "research_profile": "normal",
+            "asv3_workflow_variant": ASV3_TUNED_VARIANT,
+            "lean_native_mode": True,
+            "evidence": ledger,
+        }
+    )
+    selected = model()
+    adapter = ResearchModel(selected, context, lean_native_mode=True)
+    draft = (
+        "The rule needs approval [1].\n\nThe charge always applies [1].\n\n## Closing"
+    )
+    view = adaptive_tool_view(
+        original_evidence=[full_record(ledger, 1), full_record(ledger, 2)],
+        draft_to_repair=draft,
+        publication_gap={"target_unit_ids": ["a_mechanical_target"]},
+    )
+    prompt, _, _ = adapter._fit_native_decision(view)
+    payload = json.loads(cast(str, prompt[-1].content))
+    instruction = payload["retained_answer"]["instruction"]
+    assert "unapproved text" in instruction
+    assert "not a complete semantic audit" in instruction
+    assert "even when the host did not name it" in instruction
+    assert "when the actual gap requires it" not in instruction
+    second_unit = payload["draft_to_repair"]["units"][1]
+    replacement = "The charge can be reduced if prior notification qualifies [2]."
+    decision = Decision(
+        calls=[
+            CapabilityCall(
+                name="submit_retained_answer",
+                arguments={
+                    "retained_answer_edits": [
+                        {"unit_id": second_unit["unit_id"], "replacement": replacement}
+                    ]
+                },
+            )
+        ]
+    )
+    resolved = resolve_retained_answer(decision, context, draft, request=view.request)
+    assert resolved.calls[0].arguments["answer"] == (
+        "The rule needs approval [1].\n\n" + replacement + "\n\n## Closing"
+    )
+    selected.invoke.assert_not_called()

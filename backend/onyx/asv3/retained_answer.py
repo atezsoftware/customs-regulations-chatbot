@@ -24,6 +24,22 @@ _TERMINAL = frozenset({"submit_answer", "submit_partial_answer", *RETAINED_TERMI
 _EOL = r"(?:\r\n|\r(?!\n)|(?<!\r)\n)"
 _PARAGRAPH_BREAK = re.compile(rf"{_EOL}[ \t]*{_EOL}(?:[ \t]*{_EOL})*")
 
+_TUNED_APPLICATION_INSTRUCTION = (
+    "This owned draft is unapproved text, not evidence or a prior legal assessment. "
+    "publication_gap reports host defects, not a complete semantic audit. Reassess the "
+    "requested outcomes against current delivered originals and supplied facts, including "
+    "material uncited clauses and related effects in delivered_provisions.draft_application. "
+    "Correct every affected summary, detail, table and next-step unit even when the host "
+    "did not name it. A separate discussion does not qualify a categorical application. "
+    "Keep independently supported detail and citations; preservation does not freeze an "
+    "unsupported conclusion or omitted condition. Use submit_retained_answer or "
+    "submit_retained_partial_answer with current publication metadata and retained_answer_edits "
+    "for the exact owned unit_id values. Omit edits only when no substantive change is needed. "
+    "Untouched units and separators remain exact; there is no edit-count or replacement-length "
+    "limit. Research and clarification remain available. Current publication checks apply to "
+    "the complete reconstructed answer."
+)
+
 
 def retained_answer_enabled(context: RunContext) -> bool:
     return (
@@ -130,7 +146,9 @@ def _reference(
         "answer_characters": len(draft),
         "units": _units(draft, identifier),
         "instruction": (
-            "For an unchanged draft_to_repair, call submit_retained_answer or "
+            _TUNED_APPLICATION_INSTRUCTION
+            if context.services.get("asv3_workflow_variant") == ASV3_TUNED_VARIANT
+            else "For an unchanged draft_to_repair, call submit_retained_answer or "
             "submit_retained_partial_answer with corrected publication metadata. No body or reference ID is needed. To correct specific draft units, "
             "also supply retained_answer_edits with their exact unit_id and replacement text. "
             "Retain supported detail and citations within each replacement. Other units "
@@ -210,7 +228,11 @@ def bind_retained_answer(
             if canonical == original_name
         )
         retained_function["description"] = (
-            "Commit the exact draft owned by this invocation with corrected publication metadata. "
+            "Publish the reevaluated owned draft. Correct all materially affected units "
+            "with retained_answer_edits, including omissions the host did not report. "
+            "Unchanged units remain exact. Current original-delivery and publication checks apply."
+            if context.services.get("asv3_workflow_variant") == ASV3_TUNED_VARIANT
+            else "Commit the exact draft owned by this invocation with corrected publication metadata. "
             "Optional retained_answer_edits replace only named units. Current original-delivery "
             "and all legal publication checks remain required. Use the full answer tool for a rewrite."
         )

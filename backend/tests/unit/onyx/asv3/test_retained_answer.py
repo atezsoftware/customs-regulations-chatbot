@@ -70,6 +70,21 @@ def reference(ctx: RunContext, draft: str = DRAFT, request: str = REQUEST) -> st
     return result
 
 
+@pytest.mark.parametrize("hosted", [False, True])
+def test_protected_retained_draft_guidance_is_unchanged(hosted: bool) -> None:
+    ctx = context(hosted=hosted)
+    _, descriptor = bind_retained_answer(tools(), ctx, DRAFT, request=REQUEST)
+    assert descriptor is not None
+    assert descriptor["instruction"] == (
+        "For an unchanged draft_to_repair, call submit_retained_answer or "
+        "submit_retained_partial_answer with corrected publication metadata. No body or reference ID is needed. To correct specific draft units, "
+        "also supply retained_answer_edits with their exact unit_id and replacement text. "
+        "Retain supported detail and citations within each replacement. Other units "
+        "and outer whitespace remain unchanged. For a full rewrite supply "
+        "answer instead. Current original-delivery and publication checks still apply."
+    )
+
+
 def decision(
     arguments: dict[str, JsonValue], *, name: str = "submit_answer"
 ) -> Decision:
