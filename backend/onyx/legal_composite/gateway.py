@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import re
 from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
+from contextlib import nullcontext
 from contextvars import copy_context
 from threading import BoundedSemaphore
 from typing import TypeVar, cast
@@ -30,6 +32,9 @@ from onyx.llm.models import (
 )
 from onyx.llm.utils import check_number_of_tokens
 from onyx.tracing.flows import LLMFlow
+from onyx.tracing.framework.create import get_current_span
+from onyx.tracing.framework.span_data import GenerationSpanData
+from onyx.tracing.framework.spans import Span
 from onyx.tracing.llm_utils import llm_generation_span, record_llm_response
 
 ResponseModel = TypeVar("ResponseModel", bound=BaseModel)
@@ -38,6 +43,15 @@ _FINAL_OUTPUT_TOKENS = 4_096
 _PROTOCOL_TOKEN_MARGIN = 256
 _TOKEN_ESTIMATE_MARGIN = 1.25
 _COMPATIBILITY_ATTEMPTS = 3
+_AUXILIARY_SPAN_FLOWS = {
+    LLMFlow.UNTAGGED_INVOKE.value,
+    LLMFlow.SEMANTIC_QUERY_REPHRASE.value,
+    LLMFlow.KEYWORD_QUERY_EXPANSION.value,
+    LLMFlow.SOURCE_FILTER_EXTRACTION.value,
+    LLMFlow.TIME_FILTER_EXTRACTION.value,
+    LLMFlow.CLASSIFY_SECTION_RELEVANCE.value,
+    LLMFlow.SELECT_SECTIONS_FOR_EXPANSION.value,
+}
 
 
 def _validate_budgeted_provider_config(settings: Mapping[str, object]) -> None:
@@ -175,6 +189,8 @@ class BudgetedGateway:
         check_active: Callable[[], None] = lambda: None,
         token_counter: Callable[[str], int] | None = None,
         reasoning_effort: ReasoningEffort = ReasoningEffort.AUTO,
+        run_id: str | None = None,
+        scope: dict[str, JsonValue] | None = None,
     ) -> None:
         self.selected_llm = selected_llm
         self.research_llm = research_llm
@@ -184,6 +200,17 @@ class BudgetedGateway:
         self.check_active = check_active
         self.token_counter = token_counter
         self.reasoning_effort = reasoning_effort
+        self._trace_binding: dict[str, str] = {}
+        if run_id is not None:
+            self._trace_binding["legal_composite_run_id"] = run_id
+        if scope is not None:
+            scope_json = json.dumps(
+                scope, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            )
+            self._trace_binding["legal_composite_scope"] = scope_json
+            self._trace_binding["legal_composite_scope_sha256"] = hashlib.sha256(
+                scope_json.encode("utf-8")
+            ).hexdigest()
         self.last_call_id: str | None = None
         self.last_delivered_citations: set[int] = set()
         self._final_output_tokens = _FINAL_OUTPUT_TOKENS
@@ -294,6 +321,37 @@ class BudgetedGateway:
             if number not in omitted:
                 omitted.append(number)
 
+    def _auxiliary_span(
+        self, llm: LLM, messages: list[ChatCompletionMessage]
+    ) -> Span[GenerationSpanData] | None:
+        current = get_current_span()
+        if (
+            current is None
+            or not isinstance(current.span_data, GenerationSpanData)
+            or current.started_at is None
+            or current.ended_at is not None
+        ):
+            return None
+        data = current.span_data
+        config = data.model_config or {}
+        if (
+            data.model != llm.config.model_name
+            or config.get("model_provider") != llm.config.model_provider
+            or config.get("flow") not in _AUXILIARY_SPAN_FLOWS
+            or data.usage
+            or data.output is not None
+            or data.tools
+            or data.input is None
+        ):
+            return None
+        original_input = [
+            item.model_dump(mode="json") if isinstance(item, BaseModel) else item
+            for item in data.input
+        ]
+        if original_input != [item.model_dump(mode="json") for item in messages]:
+            return None
+        return cast(Span[GenerationSpanData], current)
+
     def _invoke(
         self,
         llm: LLM,
@@ -304,10 +362,24 @@ class BudgetedGateway:
         research: bool,
         response_format: dict[str, JsonValue] | None,
         user_identity: LLMUserIdentity | None,
+        call_id: str,
+        auxiliary: bool,
     ) -> ModelResponse:
         self.check_active()
         self.budget.check_active(not research)
-        with llm_generation_span(llm=llm, flow=flow, input_messages=messages) as span:
+        reused = self._auxiliary_span(llm, messages) if auxiliary else None
+        span_context = (
+            nullcontext(reused)
+            if reused is not None
+            else llm_generation_span(llm=llm, flow=flow, input_messages=messages)
+        )
+        with span_context as span:
+            model_config = dict(span.span_data.model_config or {})
+            if reused is not None:
+                model_config["legal_composite_helper_flow"] = model_config["flow"]
+                model_config["flow"] = flow.value
+            model_config.update(self._trace_binding, legal_composite_call_id=call_id)
+            span.span_data.model_config = model_config
             response = llm.invoke(
                 messages,
                 structured_response_format=response_format,
@@ -319,6 +391,7 @@ class BudgetedGateway:
                 user_identity=user_identity,
                 use_streaming=False,
             )
+            model_config["legal_composite_response_id"] = response.id
             record_llm_response(span, response)
             return response
 
@@ -334,6 +407,7 @@ class BudgetedGateway:
         user_identity: LLMUserIdentity | None,
         invocation_output_tokens: int | None = None,
         requested_seconds: int | None = None,
+        auxiliary: bool = False,
     ) -> tuple[CallReservation, ModelResponse]:
         while True:
             self.check_active()
@@ -352,6 +426,7 @@ class BudgetedGateway:
                 user_identity,
                 invocation_output_tokens,
                 requested_seconds,
+                auxiliary,
             )
         finally:
             self._model_slot.release()
@@ -368,6 +443,7 @@ class BudgetedGateway:
         user_identity: LLMUserIdentity | None,
         invocation_output_tokens: int | None,
         requested_seconds: int | None,
+        auxiliary: bool,
     ) -> tuple[CallReservation, ModelResponse]:
         self.check_active()
         self.budget.check_active(finalizing)
@@ -396,6 +472,8 @@ class BudgetedGateway:
             not finalizing,
             response_format,
             user_identity,
+            reservation.call_id,
+            auxiliary,
         )
         try:
             response = cast(ModelResponse, future.result(timeout=call_seconds))
@@ -474,6 +552,7 @@ class BudgetedGateway:
                 max_tokens or _RESEARCH_OUTPUT_TOKENS, _RESEARCH_OUTPUT_TOKENS
             ),
             requested_seconds=timeout_override,
+            auxiliary=True,
         )
         return response
 

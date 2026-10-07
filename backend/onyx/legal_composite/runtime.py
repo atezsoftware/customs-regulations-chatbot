@@ -159,6 +159,8 @@ def run_legal_composite_loop(
                 check_active=context.check_active,
                 token_counter=token_counter,
                 reasoning_effort=reasoning_effort,
+                run_id=context.run_id,
+                scope=context.scope,
             )
     except RunStopped as error:
         raise OnyxError(
