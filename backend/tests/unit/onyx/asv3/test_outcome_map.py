@@ -242,6 +242,94 @@ def test_new_condition_binding_keeps_already_assessed_sibling_outcome() -> None:
     assert state.view()["resolutions"] == [resolution(gap="")]
 
 
+@pytest.mark.parametrize("detailed", [False, True])
+def test_condition_feedback_preserves_immutable_record_and_allows_targeted_repair(
+    detailed: bool,
+) -> None:
+    context, ledger, _state = map_pair()
+    state = OutcomeMap(
+        ["Eligibility and release?", "Applicable sanction?"],
+        context,
+        factual_context="A prior request was filed.",
+        reuse_retained_conditions=detailed,
+    )
+    update(state, ledger, outcomes=[outcome()], conditions=[condition()])
+    before = state.export()
+    additional = condition("exception")
+    additional["witnesses"] = [{"citation": 2, "start_char": 0, "end_char": 21}]
+    modified = {**condition(), "witnesses": additional["witnesses"]}
+    with pytest.raises(ValueError) as error:
+        update(state, ledger, conditions=[additional, modified])
+    assert state.export() == before
+    if detailed:
+        assert "_coverage.conditions[1]" in str(error.value)
+        assert "condition_id=approval" in str(error.value)
+        assert "changed fields: witnesses, source_hashes" in str(error.value)
+        assert "Omit this retained condition" in str(error.value)
+        assert "Preserve the answer edits" in str(error.value)
+    else:
+        assert str(error.value) == "Retained source conditions cannot be replaced"
+    update(
+        state,
+        ledger,
+        conditions=[additional],
+        resolutions=[
+            resolution(condition_ids=["approval", "exception"], evidence_numbers=[1, 2])
+        ],
+    )
+    assert state.view()["unassessed_outcome_ids"] == []
+    retained = state.export()["conditions"]
+    previous = before["conditions"]
+    assert isinstance(retained, list) and isinstance(previous, list)
+    assert retained[0] == previous[0]
+
+
+def test_tuned_duplicate_condition_keeps_original_witnesses_and_new_resolution() -> (
+    None
+):
+    context, ledger, _state = map_pair()
+    state = OutcomeMap(
+        ["Eligibility and release?"],
+        context,
+        factual_context="A prior request was filed.",
+        reuse_retained_conditions=True,
+    )
+    update(state, ledger, outcomes=[outcome()], conditions=[condition()])
+    before = state.export()["conditions"]
+    additional = {"citation": 2, "start_char": 0, "end_char": 21}
+    repeated = condition()
+    witnesses = repeated["witnesses"]
+    assert isinstance(witnesses, list)
+    repeated["witnesses"] = [additional, *witnesses]
+    update(
+        state,
+        ledger,
+        conditions=[repeated],
+        resolutions=[resolution(evidence_numbers=[1, 2])],
+    )
+    assert state.export()["conditions"] == before
+    assert state.view()["resolutions"] == [resolution(evidence_numbers=[1, 2], gap="")]
+    saved = state.export()
+    restored = OutcomeMap(
+        list(state.questions),
+        context,
+        factual_context="A prior request was filed.",
+        reuse_retained_conditions=True,
+    )
+    restored.restore(saved, ledger)
+    update(restored, ledger, conditions=[repeated])
+    assert restored.export() == saved
+    unchanged = restored.export()
+    for invalid in (
+        {**repeated, "detail": "Approval no longer required"},
+        {**repeated, "witnesses": [additional]},
+        {**repeated, "witnesses": [*witnesses, {**additional, "end_char": 999}]},
+    ):
+        with pytest.raises(ValueError):
+            update(restored, ledger, conditions=[invalid])
+        assert restored.export() == unchanged
+
+
 def test_source_ranges_and_checkpoint_provenance_are_validated_atomically() -> None:
     context, ledger, state = map_pair()
     update(state, ledger, outcomes=[outcome()])

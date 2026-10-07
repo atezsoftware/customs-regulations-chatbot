@@ -45,11 +45,45 @@ class SourceUseIssue(BaseModel):
         return self
 
 
+class SourceUseRequirement(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    detail: str = Field(min_length=1)
+    applicability: str = Field(min_length=1)
+    witnesses: list[AssertionWitness] = Field(min_length=1)
+    answer_unit_ids: list[str] = Field(min_length=1)
+    status: Literal["covered", "omitted", "misapplied"]
+
+
+class SourceUseExclusion(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    detail: str = Field(min_length=1)
+    witnesses: list[AssertionWitness] = Field(min_length=1)
+
+
+class SourceUseSourceAssessment(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source_id: str
+    requirements: list[SourceUseRequirement]
+    exclusion: SourceUseExclusion | None
+
+    @model_validator(mode="after")
+    def require_source_assessment(self) -> SourceUseSourceAssessment:
+        if bool(self.requirements) == (self.exclusion is not None):
+            raise ValueError(
+                "Extract material requirements or witness the source exclusion"
+            )
+        return self
+
+
 class SourceUseReview(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     examined_citations: list[Annotated[int, Field(strict=True, ge=1)]]
     reviewed_answer_unit_ids: list[str]
+    source_assessments: list[SourceUseSourceAssessment]
     issues: list[SourceUseIssue]
 
 
@@ -96,6 +130,14 @@ class SourceUseReviewer:
             ),
         )
         records, shared = share_source_metadata(records)
+        records.sort(
+            key=lambda row: (str(row["source_id"]), int(cast(int, row["citation"])))
+        )
+        source_groups: dict[str, list[int]] = {}
+        for row in records:
+            source_groups.setdefault(str(row["source_id"]), []).append(
+                int(cast(int, row["citation"]))
+            )
         units = assertion_inventory(answer)
         payload = {
             "language": context.language,
@@ -104,6 +146,7 @@ class SourceUseReviewer:
             "answer_units": units,
             "original_evidence": records,
             "original_source_metadata": shared,
+            "source_groups": source_groups,
             "required_evidence_numbers": sorted(numbers),
         }
         data = json.dumps(payload, ensure_ascii=False, sort_keys=True)
@@ -119,6 +162,7 @@ class SourceUseReviewer:
             originals = {
                 int(cast(int, row["citation"])): str(row["text"]) for row in records
             }
+            units_by_id = {unit["unit_id"]: unit for unit in units}
 
             def validate(text: str) -> None:
                 result = SourceUseReview.model_validate_json(text)
@@ -132,6 +176,9 @@ class SourceUseReviewer:
                     or len(result.examined_citations) != len(numbers)
                     or set(result.reviewed_answer_unit_ids) != unit_ids
                     or len(result.reviewed_answer_unit_ids) != len(unit_ids)
+                    or {item.source_id for item in result.source_assessments}
+                    != source_groups.keys()
+                    or len(result.source_assessments) != len(source_groups)
                 ):
                     raise ValueError(
                         "Review every exact delivered original and current answer unit"
@@ -148,6 +195,47 @@ class SourceUseReviewer:
                         raise ValueError(
                             "Issues need current answer units and actual delivered witnesses"
                         )
+                for assessment in result.source_assessments:
+                    source_numbers = set(source_groups[assessment.source_id])
+                    if assessment.exclusion is not None and any(
+                        source_numbers.intersection(unit["evidence_numbers"])
+                        for unit in units
+                        if not unit["presentation_only"]
+                    ):
+                        raise ValueError(
+                            "A source used in legal answer blocks needs its operative requirements, not an exclusion"
+                        )
+                    entries: list[SourceUseRequirement | SourceUseExclusion] = [
+                        *assessment.requirements
+                    ]
+                    if assessment.exclusion is not None:
+                        entries.append(assessment.exclusion)
+                    for entry in entries:
+                        if any(
+                            witness.citation not in source_numbers
+                            or not assertion_witness_valid(witness, originals)
+                            for witness in entry.witnesses
+                        ):
+                            raise ValueError(
+                                "Source requirements need that source's actual original witnesses"
+                            )
+                    for requirement in assessment.requirements:
+                        if set(requirement.answer_unit_ids) - unit_ids:
+                            raise ValueError(
+                                "Bind source requirements to current answer units"
+                            )
+                        if requirement.status == "covered":
+                            witness_numbers = {
+                                witness.citation for witness in requirement.witnesses
+                            }
+                            if any(
+                                witness_numbers
+                                - set(units_by_id[identity]["evidence_numbers"])
+                                for identity in requirement.answer_unit_ids
+                            ):
+                                raise ValueError(
+                                    "A covered requirement needs its operative witness inline in the bound units"
+                                )
 
             previous_call = context.services.get("last_model_call_id")
             try:
@@ -182,22 +270,58 @@ class SourceUseReviewer:
                 raise ValueError("Source-use review has no delivery receipt")
             self.ledger.pin_delivery(call_id)
             self._cache[identity] = (call_id, review)
-        if not review.issues:
+        issues = [*review.issues]
+        for assessment in review.source_assessments:
+            issues.extend(
+                SourceUseIssue(
+                    kind="omitted_condition"
+                    if requirement.status == "omitted"
+                    else "inconsistent_application",
+                    answer_unit_ids=requirement.answer_unit_ids,
+                    witnesses=requirement.witnesses,
+                    detail=requirement.detail,
+                    applicability=requirement.applicability,
+                )
+                for requirement in assessment.requirements
+                if requirement.status != "covered"
+            )
+        if not issues:
             return None
         return ToolOutcome(
             status=OutcomeStatus.PARTIAL,
             summary="Repair the witnessed source-use defects in their affected answer blocks; preserve supported detail and research only genuinely missing originals.",
             data={
-                "source_use_gaps": [
-                    issue.model_dump(mode="json") for issue in review.issues
-                ],
+                "source_use_gaps": [issue.model_dump(mode="json") for issue in issues],
                 "affected_answer_units": [
                     cast(dict[str, JsonValue], dict(unit))
                     for unit in units
-                    if any(
-                        unit["unit_id"] in issue.answer_unit_ids
-                        for issue in review.issues
-                    )
+                    if any(unit["unit_id"] in issue.answer_unit_ids for issue in issues)
                 ],
             },
         )
+
+
+def combine_source_publication_gaps(gaps: list[ToolOutcome]) -> ToolOutcome | None:
+    """Return all computed source defects without losing acquisition-routing fields."""
+    if not gaps:
+        return None
+    if len(gaps) == 1:
+        return gaps[0]
+    data: dict[str, JsonValue] = {}
+    instructions: list[JsonValue] = []
+    for gap in gaps:
+        instructions.append(
+            {"summary": gap.summary, "instruction": gap.data.get("instruction")}
+        )
+        for key, value in gap.data.items():
+            if key == "instruction":
+                continue
+            if key in data and data[key] != value:
+                raise ValueError("Conflicting publication check fields")
+            data[key] = value
+    data["publication_check_instructions"] = instructions
+    return ToolOutcome(
+        status=OutcomeStatus.PARTIAL,
+        summary="Address every reported source defect together in the retained candidate; reuse delivered originals and preserve supported detail.",
+        data=data,
+    )

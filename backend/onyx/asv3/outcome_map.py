@@ -82,6 +82,7 @@ class OutcomeMap:
         *,
         factual_context: str | None = None,
         detailed_fact_errors: bool = False,
+        reuse_retained_conditions: bool = False,
     ) -> None:
         self.run_id = context.run_id
         self.scope_hash = hashlib.sha256(
@@ -93,6 +94,7 @@ class OutcomeMap:
         )
         self.request_hash = hashlib.sha256(self._factual_context.encode()).hexdigest()
         self._detailed_fact_errors = detailed_fact_errors
+        self._reuse_retained_conditions = reuse_retained_conditions
         self._outcomes: dict[str, RequestedOutcome] = {}
         self._conditions: dict[str, _ConditionRecord] = {}
         self._resolutions: dict[str, OutcomeResolution] = {}
@@ -162,7 +164,7 @@ class OutcomeMap:
                 if previous != outcome:
                     changed.add(outcome.outcome_id)
                 outcomes[outcome.outcome_id] = outcome.model_copy(deep=True)
-            for condition in update.conditions:
+            for condition_index, condition in enumerate(update.conditions):
                 if (
                     not condition.detail.strip()
                     or set(condition.outcome_ids) - outcomes.keys()
@@ -174,13 +176,43 @@ class OutcomeMap:
                 if previous_record is not None:
                     previous = previous_record.condition
                     if (
-                        previous.detail != condition.detail
-                        or previous.witnesses != condition.witnesses
+                        self._reuse_retained_conditions
+                        and previous.detail == condition.detail
+                        and all(
+                            witness in condition.witnesses
+                            for witness in previous.witnesses
+                        )
+                        and all(
+                            record.source_hashes.get(citation) == text_hash
+                            for citation, text_hash in previous_record.source_hashes.items()
+                        )
+                    ):
+                        # Repeated proof additions do not redefine a retained requirement.
+                        record = previous_record.model_copy(deep=True)
+                    if (
+                        previous.detail != record.condition.detail
+                        or previous.witnesses != record.condition.witnesses
                         or previous_record.source_hashes != record.source_hashes
                     ):
-                        raise ValueError(
-                            "Retained source conditions cannot be replaced"
-                        )
+                        message = "Retained source conditions cannot be replaced"
+                        if self._reuse_retained_conditions:
+                            fields = [
+                                name
+                                for name in ("detail", "witnesses")
+                                if getattr(previous, name) != getattr(condition, name)
+                            ]
+                            if previous_record.source_hashes != record.source_hashes:
+                                fields.append("source_hashes")
+                            message = (
+                                f"_coverage.conditions[{condition_index}] "
+                                f"(condition_id={condition.condition_id}): {message}; "
+                                f"changed fields: {', '.join(fields)}. "
+                                "Omit this retained condition from conditions rather than "
+                                "recopying or modifying it. Bind new operative requirements "
+                                "with new condition IDs and actual witnesses; update "
+                                "resolutions independently. Preserve the answer edits."
+                            )
+                        raise ValueError(message)
                     changed.update(
                         set(condition.outcome_ids) - set(previous.outcome_ids)
                     )
@@ -368,6 +400,7 @@ class OutcomeMap:
         restored.request_hash, restored.questions = self.request_hash, self.questions
         restored._factual_context = self._factual_context
         restored._detailed_fact_errors = self._detailed_fact_errors
+        restored._reuse_retained_conditions = self._reuse_retained_conditions
         restored._lock = threading.RLock()
         restored._outcomes, restored._conditions, restored._resolutions = {}, {}, {}
         restored.revision = 0

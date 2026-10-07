@@ -6,7 +6,7 @@ from onyx.prompts.asv3.coordinator_reference import (
 )
 from onyx.prompts.asv3.research import LEGAL_DEPARTMENT_RESEARCH
 
-TUNED_PROMPT_VERSION = "asv3-tuned-2026-10-07.1"
+TUNED_PROMPT_VERSION = "asv3-tuned-2026-10-07.2"
 
 _SOURCE_ACTIONS = """For a known instrument and article, read_provision uses the supplied source_id;
 otherwise read_named_provision resolves its own title and reads that article in one action.
@@ -17,6 +17,11 @@ exceptions and related authorities separately with their own focused searches. R
 source_id for source-local searches and continuation reads. An explicit single-instrument
 article target uses canonical reading even in search_corpus; set discover_related_sources
 true when seeking other authorities rather than that provision's own text."""
+
+_METADATA_DELTAS = """Outcome metadata is retained by the host. _outcomes and _coverage carry changes only;
+omit unchanged records or use null where the schema requires the field. Keep retained
+condition IDs, requirements and witnesses unchanged. Add genuinely new requirements with
+new IDs, and update outcome resolutions independently; do not repeat the whole catalogue."""
 
 
 def _focused_reference(prompt: str) -> str:
@@ -33,8 +38,12 @@ def _focused_reference(prompt: str) -> str:
     return before + _SOURCE_ACTIONS + after
 
 
-TUNED_COORDINATOR_REFERENCE_PROMPT = _focused_reference(COORDINATOR_REFERENCE_PROMPT)
-TUNED_RESEARCHER_REFERENCE_PROMPT = _focused_reference(RESEARCHER_REFERENCE_PROMPT)
+TUNED_COORDINATOR_REFERENCE_PROMPT = (
+    _focused_reference(COORDINATOR_REFERENCE_PROMPT) + _METADATA_DELTAS
+)
+TUNED_RESEARCHER_REFERENCE_PROMPT = (
+    _focused_reference(RESEARCHER_REFERENCE_PROMPT) + _METADATA_DELTAS
+)
 
 _RELATED_SOURCE_POLICY = """Before a definitive conclusion, check originals and concrete related-source leads for
 authorities changing the rule's validity, scope or application. The user need not know the dispute.

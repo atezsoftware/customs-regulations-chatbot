@@ -76,7 +76,7 @@ from onyx.asv3.session_research import (
 )
 from onyx.asv3.shared_reads import SharedReads
 from onyx.asv3.source_tools import build_source_specs
-from onyx.asv3.source_use import SourceUseReviewer
+from onyx.asv3.source_use import SourceUseReviewer, combine_source_publication_gaps
 from onyx.asv3.supplemental_tools import (
     ScenarioState,
     build_supplemental_specs,
@@ -501,6 +501,7 @@ def run_asv3_loop(
         context,
         factual_context=question + "\n" + history,
         detailed_fact_errors=research_profile == "experimental",
+        reuse_retained_conditions=workflow_variant == ASV3_TUNED_VARIANT,
     )
     context.services["outcome_map"] = outcome_map
     emitted: list[dict[str, JsonValue]] = []
@@ -1524,27 +1525,39 @@ def run_asv3_loop(
                 summary="A legal answer needs recorded original citations. Retrieve the operative source or disclose the precise gap using submit_partial_answer.",
                 data={"missing": "original legal evidence"},
             )
+        tuned = context.services.get("asv3_workflow_variant") == ASV3_TUNED_VARIANT
+        gaps: list[ToolOutcome] = []
         authority_gap = named_authority_gap(answer, model_call_id, run_context)
         if authority_gap is not None:
-            return ToolOutcome(
+            gap = ToolOutcome(
                 status=OutcomeStatus.PARTIAL,
                 summary="Read and cite the named governing original beside its actual legal assertion; a lower source's reference does not supply that original.",
                 data=authority_gap,
             )
-        if context.services.get("asv3_workflow_variant") == ASV3_TUNED_VARIANT:
+            if not tuned:
+                return gap
+            gaps.append(gap)
+        if tuned:
             reference_gap = cited_lower_statute_gap(answer, ledger, delivered)
             if reference_gap is not None:
-                return ToolOutcome(
-                    status=OutcomeStatus.PARTIAL,
-                    summary="Read the governing provisions explicitly referenced by the cited lower originals before assessing their legal effect.",
-                    data=reference_gap,
+                gaps.append(
+                    ToolOutcome(
+                        status=OutcomeStatus.PARTIAL,
+                        summary="Read the governing provisions explicitly referenced by the cited lower originals before assessing their legal effect.",
+                        data=reference_gap,
+                    )
                 )
         if source_reviews is not None:
             review_gap = source_reviews.publication_gap(
                 answer, model_call_id or "", run_context or context, ledger
             )
             if review_gap is not None:
-                return review_gap
+                if not tuned:
+                    return review_gap
+                gaps.append(review_gap)
+        combined = combine_source_publication_gaps(gaps)
+        if combined is not None:
+            return combined
         if run_context is not None and run_context.depth:
             return None
         return source_use_reviewer.publication_gap(
