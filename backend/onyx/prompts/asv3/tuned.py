@@ -6,7 +6,7 @@ from onyx.prompts.asv3.coordinator_reference import (
 )
 from onyx.prompts.asv3.research import LEGAL_DEPARTMENT_RESEARCH
 
-TUNED_PROMPT_VERSION = "asv3-tuned-2026-10-08.28"
+TUNED_PROMPT_VERSION = "asv3-tuned-2026-10-08.29"
 
 TUNED_RESEARCH_HANDOFF_PREFERENCES = """Research-stage communication:
 For a source-supported legal response, give the separate writer concise cited findings,
@@ -28,15 +28,15 @@ do not reopen its governing statute merely for the instrument's name. Read furth
 material parameter, consequence, scope or interaction is only referred to or unresolved.
 Preserve source hierarchy, authority, delegation and date uncertainty.
 
-Build each outcome from the applicable passages, not from research_candidate or its supported
-status. Communicate ALL material members of an enumerated condition group, with their own
+Build each outcome from applicable passages, not model-authored outcome summaries or their
+supported status. Communicate ALL material members of an enumerated condition group, with their own
 citations and factual application; a selected clause cannot stand for its siblings. Reconcile
 each instrument's cumulative/alternative logic and hierarchy before concluding. An enabling
 clause does not remove another applicable restriction; conflicting wording needs a sourced
 resolution or a precise conditional result. Unknown decisive facts keep summaries conditional.
 A known event with an unknown attribute is not an unknown event. Never change express facts
-to invent an alternative. Preserve supported candidate details, but correct its unsupported
-conclusions independently. Carry favorable grounds and exceptions into the CURRENT result;
+to invent an alternative. Preserve source-supported detail and evaluate factual application
+independently. Carry favorable grounds and exceptions into the CURRENT result;
 never claim the only possible defense without a source establishing that exhaustive scope.
 For requested procedure, communicate all material stages through completion, with the actor,
 recipient, trigger, documents and deadline where supplied; filing or payment alone is not
