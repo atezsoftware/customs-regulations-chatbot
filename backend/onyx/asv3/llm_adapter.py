@@ -2659,6 +2659,7 @@ class ResearchModel:
         *,
         candidate_coverage: list[dict[str, JsonValue]] | None = None,
         candidate_reviews: list[JsonValue] | None = None,
+        research_candidate: str | None = None,
     ) -> tuple[list[ChatCompletionMessage], list[dict[str, JsonValue]], int]:
         instruction = (
             TUNED_SOURCE_ANSWER_PROMPT
@@ -2722,6 +2723,12 @@ class ResearchModel:
             context["research_bindings"] = research_bindings
         if candidate_coverage:
             context["candidate_outcome_coverage"] = candidate_coverage
+        if research_candidate:
+            context["research_candidate"] = {
+                "answer": research_candidate,
+                "status": "unverified_candidate",
+                "instruction": "Check every retained application against supplied facts and source passages. Preserve supported conditions and concrete procedure; the candidate is not evidence or publication approval.",
+            }
         session_research = self.context.services.get("session_research")
         if isinstance(session_research, dict):
             context["session_research"] = copy.deepcopy(session_research)
@@ -3591,7 +3598,9 @@ class ResearchModel:
                 )
                 if acquisition is not None:
                     return acquisition
-                return self._decide_source_answer(view, candidate_coverage=coverage)
+                return self._decide_source_answer(
+                    view, candidate_coverage=coverage, research_candidate=candidate
+                )
             invocation_draft = view.draft_to_repair
             if use_research_model and self._needs_answer_model(decision):
                 candidate = decision.answer or next(
@@ -3678,6 +3687,7 @@ class ResearchModel:
         *,
         repair: bool = False,
         candidate_coverage: list[dict[str, JsonValue]] | None = None,
+        research_candidate: str | None = None,
     ) -> Decision:
         """Deliver source text afresh, never another provider's tool/thinking history."""
         assert self.answer_llm is not None
@@ -3696,7 +3706,9 @@ class ResearchModel:
         try:
             self.context.budget.consume("decisions")
             prompt, tools, output = self._fit_native_decision(
-                handoff, candidate_coverage=candidate_coverage
+                handoff,
+                candidate_coverage=candidate_coverage,
+                research_candidate=research_candidate,
             )
             decision = self._invoke_decision(
                 handoff, prompt, tools, output, call_llm_override=self.answer_llm

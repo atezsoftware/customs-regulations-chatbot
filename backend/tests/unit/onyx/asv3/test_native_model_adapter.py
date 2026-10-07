@@ -95,7 +95,7 @@ def source_answer_adapter() -> tuple[ResearchModel, RunContext, MagicMock, Magic
     )
 
 
-def test_source_answer_handoff_preserves_all_text_without_candidate_or_provider_history() -> (
+def test_source_answer_handoff_preserves_sources_and_unverified_candidate_without_provider_history() -> (
     None
 ):
     adapter, context, research, writer = source_answer_adapter()
@@ -121,6 +121,8 @@ def test_source_answer_handoff_preserves_all_text_without_candidate_or_provider_
     assert research.invoke.call_count == writer.invoke.call_count == 1
     payload = last_payload(writer)
     assert "draft_to_repair" not in payload
+    assert payload["research_candidate"]["answer"] == "Duty [1]."
+    assert payload["research_candidate"]["status"] == "unverified_candidate"
     sources = payload["original_evidence"]
     assert {(row["citation"], row["text"]) for row in sources} == {
         (general["citation"], general["text"]),

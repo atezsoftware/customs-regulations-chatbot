@@ -11,6 +11,7 @@ from onyx.asv3.legal_source_reviews import (
     operative_review_retention_enabled,
 )
 from onyx.asv3.models import RunContext, ToolOutcome
+from onyx.asv3.workflow_variant import ASV3_TUNED_VARIANT
 from tests.unit.onyx.asv3.test_legal_source_assembly_reviews import assess
 from tests.unit.onyx.asv3.test_legal_source_reviews import (
     deliver,
@@ -24,6 +25,38 @@ from tests.unit.onyx.asv3.test_shared_originals import full_record, original
 
 EFFECT = "The particular changed wording may affect this outcome."
 LIMITATIONS = "The underlying obligation and applicable dates remain distinct."
+
+
+@pytest.mark.parametrize("tuned", [False, True])
+@pytest.mark.parametrize("citations", ["[2]", "[1]", ""])
+def test_typography_normalization_preserves_local_witness_and_profile_fences(
+    tuned: bool,
+    citations: str,
+) -> None:
+    context, ledger, reviews = setup_reviews()
+    scope(context)
+    if tuned:
+        context.services["asv3_workflow_variant"] = ASV3_TUNED_VARIANT
+    seen(context, ledger, reviews)
+    deliver(ledger, "answer", [1, 2])
+    effect = "The source’s “changed wording” may affect this outcome."
+    assessment = review(effect=effect)
+    answer = f'**The source\'s "changed wording"** may affect this outcome. {citations}\n\n{LIMITATIONS} [2]'
+    gap = reviews.publication_gap(answer, "answer", context, ledger, [assessment])
+    assert (gap is None) is (tuned and citations == "[2]")
+
+
+@pytest.mark.parametrize("changed", ["must", "may not", "will"])
+def test_normalization_does_not_accept_a_changed_legal_effect(changed: str) -> None:
+    context, ledger, reviews = setup_reviews()
+    scope(context)
+    context.services["asv3_workflow_variant"] = ASV3_TUNED_VARIANT
+    seen(context, ledger, reviews)
+    deliver(ledger, "answer", [1, 2])
+    answer = retained().replace("may", changed)
+    assert omissions(
+        reviews.publication_gap(answer, "answer", context, ledger, [review()])
+    )[0]["missing_answer_passages"] == ["effect"]
 
 
 def scope(context: RunContext, *, hosted: bool = False) -> None:
