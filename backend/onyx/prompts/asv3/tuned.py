@@ -6,7 +6,7 @@ from onyx.prompts.asv3.coordinator_reference import (
 )
 from onyx.prompts.asv3.research import LEGAL_DEPARTMENT_RESEARCH
 
-TUNED_PROMPT_VERSION = "asv3-tuned-2026-10-07.24"
+TUNED_PROMPT_VERSION = "asv3-tuned-2026-10-07.25"
 
 TUNED_SOURCE_ANSWER_PROMPT = """Write Atez Customs Assistant's complete answer in the question's language or the explicitly
 requested language, directly from the actual request, supplied facts and numbered source
@@ -124,16 +124,15 @@ TUNED_SOURCE_RESEARCH_PROMPT = (
     + _remaining_application
 )
 
-_RELATED_SOURCE_POLICY = """Before a definitive conclusion, examine concrete related leads changing validity, scope
-or application. Read their material reasoning, holding, qualifications and dates; distinguish party arguments
-and preliminary scope.
+_RELATED_SOURCE_POLICY = """Before a definitive conclusion, examine concrete leads changing validity, scope or application.
+Read material reasoning, holding, qualifications and dates; distinguish arguments and preliminary scope.
 Assess bound leads in the SAME answer action's _related_source_reviews: examined for
 an operative effect, not_material for a sourced exclusion, unresolved for a precise gap.
 source_role describes the original, not favorability; an excluded disposition is operative_text.
 Copy lead_id and ranges from navigation and original_evidence_ranges.
-State the operative effect and applicability limits with adjacent originals in affected
-answer blocks, including a concise explanation for exclusions. Copy those exact sentences
-into effect/limitations; summaries must retain relevant qualifications. A surviving general
+State the effect and applicability limits with adjacent originals, explaining exclusions.
+Copy those exact sentences with citations into effect/limitations. Supporting reasoning
+can remain in its own cited substantive paragraph without duplication. A surviving general
 duty does not establish authority for a disputed sanction or procedural step. Test the exact
 violated duty, governing consequence, stage and dates against each original; do not substitute
 a related obligation or assume unknown facts. Separate settled effects from supported challenges.

@@ -238,6 +238,108 @@ def test_separate_passages_bind_their_own_witnesses_and_cover_the_selected_union
     assert "unbound_evidence_numbers" not in rows[0]
 
 
+@pytest.mark.parametrize("tuned", [False, True])
+@pytest.mark.parametrize(
+    ("reasoning", "bound"),
+    [
+        (
+            "The court distinguishes the delegated power from the underlying duty [4].",
+            True,
+        ),
+        (
+            "The court distinguishes the delegated power from the underlying duty.",
+            False,
+        ),
+        ("# Delegated power [4]", False),
+        ("[4]", False),
+        ("- [4]", False),
+        (
+            "The court distinguishes the delegated power from the underlying duty [3].",
+            False,
+        ),
+    ],
+)
+def test_tuned_supporting_reasoning_retains_its_own_local_witness(
+    tuned: bool, reasoning: str, bound: bool
+) -> None:
+    context, ledger, reviews = setup_reviews()
+    scope(context)
+    if tuned:
+        context.services["asv3_workflow_variant"] = ASV3_TUNED_VARIANT
+    assert ledger.add(
+        [
+            original(
+                "reasoning", "The power is distinct from the duty.", source="decision"
+            )
+        ],
+        context,
+    ) == [4]
+    seen(context, ledger, reviews)
+    deliver(ledger, "answer", [1, 2, 3, 4])
+    assessment = review(
+        witnesses=[
+            {"citation": 2, "start_char": 0, "end_char": 39},
+            {"citation": 4, "start_char": 0, "end_char": 35},
+        ]
+    )
+    answer = retained() + "\n\n" + reasoning
+    gap = reviews.publication_gap(answer, "answer", context, ledger, [assessment])
+    assert (gap is None) is (tuned and bound)
+    if gap is not None:
+        assert omissions(gap)[0]["unbound_evidence_numbers"] == [4]
+    if tuned and bound:
+        assert omissions(
+            reviews.publication_gap(
+                answer.replace(f"{EFFECT} [2]", EFFECT),
+                "answer",
+                context,
+                ledger,
+                [assessment],
+            )
+        )[0]["missing_answer_passages"] == ["effect"]
+        reviews.apply([assessment], "answer", context, ledger)
+        deliver(ledger, "current", [1, 2])
+        assert omissions(reviews.publication_gap(answer, "current", context, ledger))[
+            0
+        ]["undelivered_evidence_numbers"] == [4]
+
+
+def test_tuned_explicit_field_witness_cannot_move_to_a_different_paragraph() -> None:
+    context, ledger, reviews = setup_reviews()
+    scope(context)
+    context.services["asv3_workflow_variant"] = ASV3_TUNED_VARIANT
+    assert ledger.add(
+        [
+            original(
+                "reasoning", "The power is distinct from the duty.", source="decision"
+            )
+        ],
+        context,
+    ) == [4]
+    seen(context, ledger, reviews)
+    deliver(ledger, "answer", [1, 2, 4])
+    assessment = review(
+        effect=EFFECT + " [2, 4]",
+        witnesses=[
+            {"citation": 2, "start_char": 0, "end_char": 39},
+            {"citation": 4, "start_char": 0, "end_char": 35},
+        ],
+    )
+    answer = retained() + "\n\nThe court explains the delegated power [4]."
+    gap = reviews.publication_gap(answer, "answer", context, ledger, [assessment])
+    assert omissions(gap)[0]["missing_answer_passages"] == ["effect"]
+    assert (
+        reviews.publication_gap(
+            answer.replace(EFFECT + " [2]", EFFECT + " [2, 4]"),
+            "answer",
+            context,
+            ledger,
+            [assessment],
+        )
+        is None
+    )
+
+
 def test_each_copied_field_uses_one_substantive_block_as_the_exposed_contract_requires() -> (
     None
 ):
