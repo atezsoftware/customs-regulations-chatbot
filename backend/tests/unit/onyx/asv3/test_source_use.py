@@ -6,6 +6,7 @@ from typing import Any, cast
 from unittest.mock import MagicMock
 
 import pytest
+from pydantic import ValidationError
 
 from onyx.asv3.citation_numbers import strip_citation_markers
 from onyx.asv3.evidence import EvidenceLedger
@@ -13,7 +14,9 @@ from onyx.asv3.llm_adapter import ResearchModel
 from onyx.asv3.models import OutcomeStatus, RunContext
 from onyx.asv3.source_metadata_transport import expand_source_metadata
 from onyx.asv3.source_use import (
+    SourceUseCoverage,
     SourceUseIssue,
+    SourceUseRequirement,
     SourceUseResolution,
     SourceUseReviewer,
     user_fact_spans,
@@ -160,7 +163,7 @@ def test_grouped_bindings_keep_every_actual_application(status: str) -> None:
     counts = scripted_reviews(model, review_mutator=group)
     reviewer = SourceUseReviewer(model, ledger)
     gap = reviewer.publication_gap(
-        "First application [1].\n\nSecond application [1].",
+        "The same application [1].\n\nThe same application [1].",
         "Unknown qualification",
         "coordinator",
     )
@@ -193,7 +196,7 @@ def test_grouped_binding_checks_each_units_inline_support() -> None:
 
     counts = scripted_reviews(model, review_mutator=group)
     gap = SourceUseReviewer(model, ledger).publication_gap(
-        "Supported application [1].\n\nApplication citing a different original [2].",
+        "Supported application [1].\n\nSupported application [2].",
         "facts",
         "coordinator",
     )
@@ -252,6 +255,7 @@ def inventory_for(records: list[dict[str, Any]]) -> dict[str, Any]:
         "requirements": [
             {
                 "detail": "The operation depends on the operative exception.",
+                "option_kind": "none",
                 "applicability": "Retain the conditional branch when its decisive fact is unknown.",
                 "witnesses": [
                     {
@@ -282,12 +286,16 @@ def resolutions_for(payload: dict[str, Any]) -> list[dict[str, Any]]:
         rows.append(
             {
                 "requirement_id": req["requirement_id"],
+                "option_state": "not_an_option"
+                if req["option_kind"] == "none"
+                else "facts_unknown",
                 "status": "covered" if bound else "omitted",
                 "answer_unit_ids": affected,
                 "explanation": "" if bound else "The operative detail is absent.",
                 "coverage": [
                     {
                         "answer_unit_id": unit_id,
+                        "compatible_counterexample": "",
                         "status": "covered"
                         if unit_id in bound
                         else "omitted"
@@ -336,12 +344,18 @@ def scripted_reviews(
             result = inventory_for(payload["original_evidence"])
             if inventory_mutator:
                 inventory_mutator(result, payload)
+            for requirement in result["requirements"]:
+                requirement.setdefault("option_kind", "none")
         else:
             assert (schema.get("name") or "SourceUseReview") == "SourceUseReview"
             counts["review"] += 1
             result = review_for(payload)
             if review_mutator:
                 review_mutator(result, payload)
+            for row in result["resolutions"]:
+                row.setdefault("option_state", "not_an_option")
+                for binding in row["coverage"]:
+                    binding.setdefault("compatible_counterexample", "")
         return text_response(result)
 
     cast(MagicMock, model.llm).invoke.side_effect = script
@@ -472,7 +486,7 @@ def test_compatible_counterexample_cannot_be_approved_or_lost_in_grouping(
     counts = scripted_reviews(model, review_mutator=counterexample)
     reviewer = SourceUseReviewer(model, ledger)
     gap = reviewer.publication_gap(
-        "Unconditional summary [1].\n\nUnconditional application [1].",
+        "Unconditional application [1].\n\nUnconditional application [1].",
         "The decisive fact is unknown.",
         "coordinator",
     )
@@ -509,6 +523,187 @@ def test_inline_support_catalogue_addresses_only_each_units_actual_originals() -
             assert row["witness_ids"] == [
                 span["witness_id"] for span in original["witness_spans"]
             ]
+
+
+def test_conditional_option_and_counterexample_fields_are_required() -> None:
+    with pytest.raises(ValidationError, match="option_kind"):
+        SourceUseRequirement.model_validate(
+            {
+                "detail": "A conditional reduction.",
+                "applicability": "Before official detection.",
+                "witnesses": [{"citation": 1, "witness_id": "source-witness"}],
+            }
+        )
+    with pytest.raises(ValidationError, match="compatible_counterexample"):
+        SourceUseCoverage.model_validate(
+            {"answer_unit_id": "unit", "status": "unaffected"}
+        )
+    with pytest.raises(ValidationError, match="option_state"):
+        SourceUseResolution.model_validate(
+            {
+                "requirement_id": "requirement",
+                "status": "omitted",
+                "answer_unit_ids": [],
+                "coverage": [],
+            }
+        )
+
+
+@pytest.mark.parametrize("status", ["not_applicable", "outside_request"])
+@pytest.mark.parametrize(
+    "state", ["available", "not_invoked_yet", "facts_unknown", "not_an_option"]
+)
+def test_non_invocation_cannot_exclude_a_source_bound_option_without_paid_retry(
+    status: str, state: str
+) -> None:
+    ledger, _context, model = setup_review()
+
+    def conditional(result: dict[str, Any], _payload: dict[str, Any]) -> None:
+        result["requirements"][0]["option_kind"] = "conditional_relief"
+
+    def excluded(result: dict[str, Any], payload: dict[str, Any]) -> None:
+        row = result["resolutions"][0]
+        row.update(
+            status=status,
+            option_state=state,
+            answer_unit_ids=[],
+            scenario_witness_ids=[payload["user_fact_spans"][0]["witness_id"]],
+            explanation="The user has not invoked this source-supported route.",
+        )
+        for binding in row["coverage"]:
+            binding.update(
+                status="unaffected", explanation="This route has not been invoked."
+            )
+
+    counts = scripted_reviews(
+        model, inventory_mutator=conditional, review_mutator=excluded
+    )
+    reviewer = SourceUseReviewer(model, ledger)
+    gap = reviewer.publication_gap(
+        "The burden applies [1].\n\nThe same burden applies to the alternative [1].",
+        "I have not submitted an application. Explain both outcomes.",
+        "coordinator",
+    )
+    assert gap and gap.status == OutcomeStatus.PARTIAL
+    issues = cast(list[dict[str, Any]], gap.data["source_use_gaps"])
+    units = cast(list[dict[str, Any]], gap.data["affected_answer_units"])
+    assert len(issues) == 1 and issues[0]["kind"] == "omitted_condition"
+    assert issues[0]["answer_unit_ids"] == [unit["unit_id"] for unit in units]
+    assert issues[0]["witnesses"][0]["citation"] == 1
+    assert "non-invocation" in issues[0]["detail"]
+    rebased = reviewer.publication_gap(
+        "The burden applies [1,2].\n\nThe same burden applies to the alternative [1,2].",
+        "I have not submitted an application. Explain both outcomes.",
+        "coordinator",
+    )
+    assert rebased and rebased.status == OutcomeStatus.PARTIAL
+    assert counts == {"inventory": 1, "review": 1}
+
+
+@pytest.mark.parametrize("barrier", ["literal", "missing_fact", "missing_explanation"])
+def test_a_conditional_option_can_be_barred_only_with_an_actual_user_fact(
+    barrier: str,
+) -> None:
+    ledger, _context, model = setup_review()
+
+    def conditional(result: dict[str, Any], _payload: dict[str, Any]) -> None:
+        result["requirements"][0]["option_kind"] = "alternative_route"
+
+    def excluded(result: dict[str, Any], payload: dict[str, Any]) -> None:
+        row = result["resolutions"][0]
+        row.update(
+            status="not_applicable",
+            option_state="barred_by_explicit_fact",
+            answer_unit_ids=[],
+            scenario_witness_ids=[]
+            if barrier == "missing_fact"
+            else [payload["user_fact_spans"][0]["witness_id"]],
+            explanation=""
+            if barrier == "missing_explanation"
+            else "The expressly completed deadline bars a new application too.",
+        )
+        for binding in row["coverage"]:
+            binding.update(
+                status="unaffected", explanation="The filing period expired."
+            )
+
+    counts = scripted_reviews(
+        model, inventory_mutator=conditional, review_mutator=excluded
+    )
+    gap = SourceUseReviewer(model, ledger).publication_gap(
+        "The burden applies [1].", "The filing period expired.", "coordinator"
+    )
+    if barrier == "literal":
+        assert gap is None
+        assert counts == {"inventory": 1, "review": 1}
+    else:
+        assert gap and gap.status == OutcomeStatus.UNAVAILABLE
+
+
+def test_a_supported_conditional_option_is_not_a_new_omission() -> None:
+    ledger, _context, model = setup_review()
+
+    def conditional(result: dict[str, Any], _payload: dict[str, Any]) -> None:
+        result["requirements"][0]["option_kind"] = "remedy"
+
+    counts = scripted_reviews(model, inventory_mutator=conditional)
+    assert (
+        SourceUseReviewer(model, ledger).publication_gap(
+            "If the source condition holds, the remedy remains available [1].",
+            "The decisive fact is not yet known.",
+            "coordinator",
+        )
+        is None
+    )
+    assert counts == {"inventory": 1, "review": 1}
+
+
+def test_an_option_for_a_different_effect_is_not_added_to_the_answer() -> None:
+    ledger, _context, model = setup_review()
+
+    def conditional(result: dict[str, Any], _payload: dict[str, Any]) -> None:
+        result["requirements"][0]["option_kind"] = "conditional_relief"
+
+    def unrelated(result: dict[str, Any], payload: dict[str, Any]) -> None:
+        result["resolutions"][0].update(
+            status="outside_request",
+            option_state="not_related_to_asserted_effect",
+            answer_unit_ids=[],
+            coverage=[],
+            explanation="The assessed ownership relief has no interaction with storage permission.",
+            scenario_witness_ids=[payload["user_fact_spans"][0]["witness_id"]],
+        )
+
+    counts = scripted_reviews(
+        model, inventory_mutator=conditional, review_mutator=unrelated
+    )
+    assert (
+        SourceUseReviewer(model, ledger).publication_gap(
+            "Storage permission [2].", "Explain storage permission.", "coordinator"
+        )
+        is None
+    )
+    assert counts == {"inventory": 1, "review": 1}
+
+
+def test_distinct_summary_and_application_cannot_share_a_coverage_binding() -> None:
+    ledger, _context, model = setup_review()
+
+    def grouped(result: dict[str, Any], payload: dict[str, Any]) -> None:
+        row = result["resolutions"][0]
+        row["coverage"][0]["additional_answer_unit_ids"] = [
+            payload["answer_units"][1]["unit_id"]
+        ]
+        row["coverage"] = row["coverage"][:1]
+
+    counts = scripted_reviews(model, review_mutator=grouped)
+    gap = SourceUseReviewer(model, ledger).publication_gap(
+        "A qualified rule [1].\n\nAn unconditional application [1].",
+        "facts",
+        "coordinator",
+    )
+    assert gap and gap.status == OutcomeStatus.UNAVAILABLE
+    assert counts == {"inventory": 1, "review": 2}
 
 
 @pytest.mark.parametrize("provider", ["vertex_ai", "openai", "anthropic"])

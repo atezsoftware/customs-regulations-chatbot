@@ -68,6 +68,11 @@ class SourceUseRequirement(BaseModel):
         description="The original's restrictive scope and trigger, independent of user facts or a draft.",
     )
     witnesses: list[AssertionWitness] = Field(min_length=1)
+    option_kind: Literal[
+        "none", "conditional_relief", "remedy", "alternative_route"
+    ] = Field(
+        description="The original offers a lower burden, remedy or alternative route under conditions, independently of whether a user has invoked it. Use none for other operative effects."
+    )
 
 
 class SourceUseInventory(BaseModel):
@@ -86,7 +91,6 @@ class SourceUseCoverage(BaseModel):
     status: Literal["covered", "omitted", "misapplied", "unaffected"]
     explanation: str = ""
     compatible_counterexample: str = Field(
-        default="",
         description="A source-supported branch compatible with explicit user facts that changes this unit's asserted effect. Give only the decisive condition and changed consequence; empty only when none exists.",
     )
     witnesses: list[AssertionWitness] = Field(
@@ -121,6 +125,16 @@ class SourceUseResolution(BaseModel):
         description="Select supplied user_fact_spans IDs for factual exclusion or the actual request scope; never recopy user text or select assistant statements.",
     )
     coverage: list[SourceUseCoverage]
+    option_state: Literal[
+        "not_an_option",
+        "available",
+        "not_invoked_yet",
+        "facts_unknown",
+        "barred_by_explicit_fact",
+        "not_related_to_asserted_effect",
+    ] = Field(
+        description="Assess availability of a source-bound conditional option separately from current fulfillment. A bar must still prevent the option if invoked next, supported by explicit user facts; non-invocation and missing facts are different states."
+    )
 
 
 def user_fact_spans(
@@ -167,7 +181,12 @@ def _citation_only_identity(payload: dict[str, JsonValue]) -> str:
     mechanical = {
         key: value
         for key, value in payload.items()
-        if key not in {"application_candidates", "inline_support_catalogue"}
+        if key
+        not in {
+            "application_candidates",
+            "inline_support_catalogue",
+            "groupable_application_units",
+        }
     }
     mechanical["answer_units"] = [
         {
@@ -906,6 +925,14 @@ class SourceUseReviewer:
             "application_candidates": application_candidates,
             "inline_support_catalogue": inline_support,
         }
+        identical_units: dict[str, list[str]] = {}
+        for unit in units:
+            identical_units.setdefault(strip_citation_markers(unit["text"]), []).append(
+                unit["unit_id"]
+            )
+        payload["groupable_application_units"] = [
+            identities for identities in identical_units.values() if len(identities) > 1
+        ]
         data = json.dumps(payload, ensure_ascii=False)
         identity = hashlib.sha256(data.encode()).hexdigest()
         originals = {
@@ -972,6 +999,32 @@ class SourceUseReviewer:
                 ):
                     raise ValueError(
                         "Application checks need actual delivered witnesses"
+                    )
+                if any(
+                    len(
+                        {
+                            strip_citation_markers(units_by_id[identity]["text"])
+                            for identity in binding.unit_ids
+                        }
+                    )
+                    != 1
+                    for binding in row.coverage
+                ):
+                    raise ValueError(
+                        "Distinct claim text needs separate application bindings; group only supplied mechanically identical units"
+                    )
+                requirement = requirements[row.requirement_id]
+                if (
+                    requirement.option_kind != "none"
+                    and row.option_state == "barred_by_explicit_fact"
+                    and (
+                        not row.scenario_witness_ids
+                        or not row.explanation.strip()
+                        or set(row.scenario_witness_ids) - fact_ids
+                    )
+                ):
+                    raise ValueError(
+                        "A barred conditional option needs the explicit user-fact barrier and its distinction from non-invocation"
                     )
                 if any(
                     binding.status != "covered"
@@ -1129,6 +1182,29 @@ class SourceUseReviewer:
         issues = [*review.issues]
         for resolution in review.resolutions:
             requirement = requirements[resolution.requirement_id]
+            possible_option_excluded = (
+                requirement.option_kind != "none"
+                and candidate_units[resolution.requirement_id]
+                and resolution.status in {"not_applicable", "outside_request"}
+                and resolution.option_state
+                in {"available", "not_invoked_yet", "facts_unknown", "not_an_option"}
+            )
+            if possible_option_excluded:
+                issues.append(
+                    SourceUseIssue(
+                        kind="omitted_condition",
+                        answer_unit_ids=[
+                            unit["unit_id"]
+                            for unit in units
+                            if unit["unit_id"]
+                            in candidate_units[resolution.requirement_id]
+                        ],
+                        witnesses=requirement.witnesses,
+                        detail=requirement.detail
+                        + " The source-supported option remains conditional; non-invocation or unknown decisive facts do not exclude its availability. Communicate its actual conditions beside the affected outcome without assuming fulfillment.",
+                        applicability=requirement.applicability,
+                    )
+                )
             negative_bindings = [
                 binding
                 for binding in resolution.coverage

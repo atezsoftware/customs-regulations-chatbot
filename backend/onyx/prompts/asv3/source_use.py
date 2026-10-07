@@ -9,6 +9,9 @@ Extract effects supported by the target source's own witnesses; do not inventory
 requirements. Inspect every operative passage within the target, including qualifications of another norm;
 the lack of that other original does not erase the source's own qualification. Return the
 source-supported conditional rule without deciding an unresolved cross-source interaction.
+Classify a source-supported conditional reduction, remedy or alternative procedural route
+in option_kind independently of invocation; use none for other effects. Availability is
+assessed against user facts later, not erased during extraction.
 Separate independent operative effects into atomic requirements; preserve
 cumulative/alternative conditions belonging to the same effect, not broad topic summaries.
 Identify governing scope, favorable and adverse branches,
@@ -59,9 +62,10 @@ qualification; do not merely approve that the draft mentions both sources.
 
 application_candidates identifies possible applications through actual originals, canonical
 provision siblings or recorded inbound anchors. Classify EVERY candidate unit once in coverage
-as covered, omitted, misapplied or unaffected, plus any other affected unit. Group units in
-additional_answer_unit_ids only when status, operative witnesses and assessment truly agree;
-different applications need separate bindings. Do not repeat the same assessment sentence
+as covered, omitted, misapplied or unaffected, plus any other affected unit. Only IDs listed
+together in groupable_application_units may share a binding; these have mechanically
+identical claim text apart from citations. Different applications need separate bindings.
+Do not repeat the same assessment sentence
 for each unit. Unaffected needs the actual different operative effect or established scope
 exclusion, not an abstract-rule label, a citation elsewhere or an unknown decisive fact.
 Use answer_unit_ids for all affected units, excluding unaffected checks. Coverage is an
@@ -84,9 +88,16 @@ related block when present, otherwise use []. Empty locations never approve asse
 
 Preserve cumulative/alternative logic, actor, regime, trigger, proof, calculation, timing,
 exceptions and subsequent stages. Preserve stated boundaries and qualifications in EACH
-application; an unstated procedural convention cannot replace original wording. Unknown
-decisive facts require conditional branches, not invented fulfillment or denial. A remedy
-not yet invoked can remain available; absence of invocation does not make its branch irrelevant.
+application; compare EVERY application clause with the original's actual restrictive wording,
+not just a correct rule in that unit. A procedural convention cannot change a stated boundary.
+Unknown decisive facts require conditional branches, not invented fulfillment or denial.
+For conditional options, assess option_state separately from fulfillment: available,
+not_invoked_yet and facts_unknown retain the source-supported conditional route beside its
+affected outcome. Barred_by_explicit_fact needs a supplied fact that still bars the route if
+attempted next; lack of earlier invocation is not that bar. Not_related_to_asserted_effect
+needs an actual different operative effect, not an unasked or unused remedy. Use not_an_option
+only when option_kind is none. Declare compatible_counterexample for EVERY binding, using
+an empty string only after checking that no compatible contrary branch changes its assertion.
 Not_applicable needs a literal supplied USER fact establishing exclusion. Select actual
 user_fact_spans IDs in scenario_witness_ids; their text_ref and ranges address unchanged
 user text. Draft silence, a missing fact and a legal inference do not establish exclusion.
