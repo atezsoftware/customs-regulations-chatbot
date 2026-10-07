@@ -1,33 +1,46 @@
-name: TEST migration recovery inspection
-run-name: TEST migration inspection ${{ github.run_id }}
+name: TEST migration recovery
+run-name: TEST migration recovery ${{ github.run_id }}
 on:
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
-  inspect:
+  recover:
     runs-on: codebuild-customs-regulations-runner-${{ github.run_id }}-${{ github.run_attempt }}
-    timeout-minutes: 15
+    timeout-minutes: 20
+    env:
+      TEST_NAMESPACE: customs-regulations-test
+      EXPECTED_REVISION: e92f3a1c7b60
+      EXPECTED_BASE_DIGEST: sha256:f88219f593eb0b85ff61bf7a9eb0fbfee8385dd9c6bd5a88a2aedbaf72c113d6
+      RECOVERY_COMMIT: 4eb4bbbaf012bcc4151b9d7299e0c7e9b013409f
+      IMAGE_REPOSITORY: 255114580789.dkr.ecr.eu-central-1.amazonaws.com/customs-regulations-backend-lite-test-v1
     steps:
       - uses: actions/checkout@v5
-      - name: Inspect TEST and DEV
+      - uses: actions/checkout@v5
+        with:
+          ref: 4eb4bbbaf012bcc4151b9d7299e0c7e9b013409f
+          path: recovery-source
+      - name: Verify isolation and build migration-compatible image
         shell: bash
         run: |
           set -euo pipefail
           aws eks update-kubeconfig --name atez-dev-cluster --region eu-central-1
           mkdir -p evidence
-          for ns in customs-regulations-test customs-regulations-dev; do
-            kubectl get deploy,pods -n "$ns" -o json | jq '[.items[] | {kind,name:.metadata.name,images:[.spec.template.spec.containers[]?.image,.spec.containers[]?.image],ready:.status.readyReplicas,containers:[.status.containerStatuses[]? | {name,ready,restartCount,imageID,state}],node:.spec.nodeName}]' | tee "evidence/$ns-workloads.json"
-          done
-          deployment=$(kubectl get deploy -n customs-regulations-test -l app=devops -o json | jq -r '.items[] | select(.metadata.name | contains("customs-regulations-api")) | .metadata.name' | head -n 1)
-          if [[ -z "$deployment" ]]; then
-            deployment=$(kubectl get deploy -n customs-regulations-test -o json | jq -r '.items[] | select(.metadata.name | contains("customs-regulations-api")) | .metadata.name' | head -n 1)
-          fi
-          [[ -n "$deployment" ]]
-          kubectl get deploy "$deployment" -n customs-regulations-test -o json > /tmp/test-deployment.json
+          deployment=test-v1-customs-regulations-api-deployment
+          kubectl get deploy "$deployment" -n "$TEST_NAMESPACE" -o json > /tmp/test-deployment.json
+          kubectl get pods -n "$TEST_NAMESPACE" -o json > /tmp/test-pods.json
           python3 - <<'PY'
           import json,os
           d=json.load(open('/tmp/test-deployment.json'))
+          pods=json.load(open('/tmp/test-pods.json'))['items']
+          found=False
+          for p in pods:
+              for c in p.get('status',{}).get('containerStatuses',[]):
+                  if 'customs-regulations-api' in p['metadata']['name'] and 'backend-lite' in c['image'] and c.get('ready'):
+                      assert c['imageID'].endswith('@'+os.environ['EXPECTED_BASE_DIGEST']), 'TEST image changed since inspection'
+                      found=True
+          assert found, 'No verified base API pod'
+          assert d['metadata']['namespace']=='customs-regulations-test'
           template=d['spec']['template']
           metadata=template['metadata']
           metadata['name']='test-migration-probe-'+os.environ['GITHUB_RUN_ID']
@@ -36,33 +49,109 @@ jobs:
           metadata.pop('creationTimestamp',None)
           spec=template['spec']
           spec['restartPolicy']='Never'
-          spec['activeDeadlineSeconds']=600
+          spec['activeDeadlineSeconds']=1200
           for c in spec['containers']:
-              c['command']=['/bin/sh','-c','sleep 600']
+              c['command']=['/bin/sh','-c','sleep 1200']
               c.pop('args',None)
               for k in ('readinessProbe','livenessProbe','startupProbe'):
                   c.pop(k,None)
           json.dump({'apiVersion':'v1','kind':'Pod','metadata':metadata,'spec':spec},open('/tmp/probe-pod.json','w'))
           PY
           pod="test-migration-probe-${GITHUB_RUN_ID}"
-          trap 'kubectl delete pod "$pod" -n customs-regulations-test --ignore-not-found --wait=false' EXIT
+          trap 'kubectl delete pod "$pod" "test-migration-candidate-${GITHUB_RUN_ID}" -n "$TEST_NAMESPACE" --ignore-not-found --wait=false' EXIT
           kubectl create -f /tmp/probe-pod.json
-          kubectl wait pod "$pod" -n customs-regulations-test --for=condition=Ready --timeout=180s
-          container=$(kubectl get deploy "$deployment" -n customs-regulations-test -o json | jq -r '.spec.template.spec.containers[0].name')
-          kubectl exec -i "$pod" -n customs-regulations-test -c "$container" -- sh -ec '. /vault/secrets/config; cd /app/onyx/db; python - customs-regulations-test' < backend/onyx/db/test_migration_identity_probe.py | tee evidence/test-database.json
+          kubectl wait pod "$pod" -n "$TEST_NAMESPACE" --for=condition=Ready --timeout=180s
+          container=$(kubectl get deploy "$deployment" -n "$TEST_NAMESPACE" -o json | jq -r '.spec.template.spec.containers[0].name')
+          kubectl exec -i "$pod" -n "$TEST_NAMESPACE" -c "$container" -- sh -ec '. /vault/secrets/config; cd /app/onyx/db; python - customs-regulations-test' < backend/onyx/db/test_migration_identity_probe.py > evidence/test-before.json
           devpod=$(kubectl get pods -n customs-regulations-dev -o json | jq -r '.items[] | select(.metadata.deletionTimestamp == null) | select(.metadata.name | contains("customs-regulations-api")) | select(any(.status.containerStatuses[]?; .ready and (.image | contains("backend-lite")))) | .metadata.name' | head -n 1)
-          [[ -n "$devpod" ]]
           devcontainer=$(kubectl get pod "$devpod" -n customs-regulations-dev -o json | jq -r '.spec.containers[] | select(.image | contains("backend-lite")) | .name' | head -n 1)
-          kubectl exec -i "$devpod" -n customs-regulations-dev -c "$devcontainer" -- sh -ec '. /vault/secrets/config; cd /app/onyx/db; python - customs-regulations-dev' < backend/onyx/db/test_migration_identity_probe.py | tee evidence/dev-database.json
+          kubectl exec -i "$devpod" -n customs-regulations-dev -c "$devcontainer" -- sh -ec '. /vault/secrets/config; cd /app/onyx/db; python - customs-regulations-dev' < backend/onyx/db/test_migration_identity_probe.py > evidence/dev-before.json
+          python3 - <<'PY'
+          import json,os
+          test=json.load(open('evidence/test-before.json'))
+          dev=json.load(open('evidence/dev-before.json'))
+          assert test['db_revisions']==[os.environ['EXPECTED_REVISION']]
+          assert (test['server'],test['port'],test['database'])!=(dev['server'],dev['port'],dev['database'])
+          assert {'chunk_changes','applied_new_chunk_ids'} <= set(test['amendment_columns'])
+          print('Verified separate DEV/TEST databases and existing TEST migration columns')
+          print(json.dumps({'test_counts_before':test['counts'],'test_revision':test['db_revisions']}))
+          PY
+          aws ecr get-login-password --region eu-central-1 | docker login --username AWS --password-stdin 255114580789.dkr.ecr.eu-central-1.amazonaws.com
+          cat > /tmp/recovery.Dockerfile <<'DOCKER'
+          ARG BASE_TEST_IMAGE
+          FROM ${BASE_TEST_IMAGE}
+          COPY --chown=onyx:onyx ./alembic/versions /app/alembic/versions
+          COPY --chown=onyx:onyx ./onyx/regulatory/labeling/data /app/onyx/regulatory/labeling/data
+          LABEL io.regulatory.migration-recovery.commit="4eb4bbbaf012bcc4151b9d7299e0c7e9b013409f"
+          DOCKER
+          image="$IMAGE_REPOSITORY:migration-recovery-$RECOVERY_COMMIT"
+          docker build -f /tmp/recovery.Dockerfile --build-arg "BASE_TEST_IMAGE=$IMAGE_REPOSITORY@$EXPECTED_BASE_DIGEST" -t "$image" recovery-source/backend
+          docker run --rm "$image" python -c 'from alembic.config import Config; from alembic.script import ScriptDirectory; s=ScriptDirectory.from_config(Config("/app/alembic.ini")); assert s.get_heads()==["e92f3a1c7b60"]; assert s._upgrade_revs("head","e92f3a1c7b60")==[]; print("Complete migration history verified; zero pending upgrades")'
+          docker push "$image"
+          digest=$(aws ecr describe-images --region eu-central-1 --repository-name customs-regulations-backend-lite-test-v1 --image-ids "imageTag=migration-recovery-$RECOVERY_COMMIT" --query 'imageDetails[0].imageDigest' --output text)
+          candidate_image="$IMAGE_REPOSITORY@$digest"
+          export CANDIDATE_IMAGE="$candidate_image"
+          python3 - <<'PY'
+          import json,os
+          d=json.load(open('/tmp/test-deployment.json'))
+          template=d['spec']['template']
+          metadata=template['metadata']
+          metadata['name']='test-migration-candidate-'+os.environ['GITHUB_RUN_ID']
+          metadata['namespace']='customs-regulations-test'
+          metadata['labels']={'app':'test-migration-candidate'}
+          metadata.pop('creationTimestamp',None)
+          spec=template['spec']
+          spec['restartPolicy']='Never'
+          spec['activeDeadlineSeconds']=900
+          c=spec['containers'][0]
+          c['image']=os.environ['CANDIDATE_IMAGE']
+          c['command']=['bash','-c']
+          c['args']=['source /vault/secrets/config && alembic upgrade head && exec uvicorn onyx.main:app --host 0.0.0.0 --port 8080']
+          json.dump({'apiVersion':'v1','kind':'Pod','metadata':metadata,'spec':spec},open('/tmp/candidate-pod.json','w'))
+          json.dump({'base_digest':os.environ['EXPECTED_BASE_DIGEST'],'candidate_image':os.environ['CANDIDATE_IMAGE'],'migration_source_commit':os.environ['RECOVERY_COMMIT']},open('evidence/image.json','w'))
+          PY
+          candidate="test-migration-candidate-${GITHUB_RUN_ID}"
+          kubectl create -f /tmp/candidate-pod.json
+          kubectl wait pod "$candidate" -n "$TEST_NAMESPACE" --for=condition=Ready --timeout=300s
+          kubectl exec -i "$candidate" -n "$TEST_NAMESPACE" -c "$container" -- sh -ec '. /vault/secrets/config; cd /app/onyx/db; python - customs-regulations-test' < backend/onyx/db/test_migration_identity_probe.py > evidence/test-candidate.json
+          python3 - <<'PY'
+          import json,os
+          before=json.load(open('evidence/test-before.json'))
+          after=json.load(open('evidence/test-candidate.json'))
+          assert after['db_revisions']==before['db_revisions']
+          assert all(after['current_revisions_in_image'].values())
+          assert after['counts']==before['counts'], 'TEST row counts changed during candidate validation'
+          print('Candidate API startup succeeded with migration check; TEST counts and revision unchanged')
+          PY
+          kubectl get deploy "$deployment" -n "$TEST_NAMESPACE" -o json > /tmp/current-test-deployment.json
+          python3 - <<'PY'
+          import json,os
+          before=json.load(open('/tmp/test-deployment.json'))
+          current=json.load(open('/tmp/current-test-deployment.json'))
+          assert before['metadata']['resourceVersion']==current['metadata']['resourceVersion'], 'TEST deployment changed during recovery'
+          c=current['spec']['template']['spec']['containers'][0]
+          patch={'spec':{'template':{'metadata':{'annotations':{'io.regulatory.migration-recovery.commit':os.environ['RECOVERY_COMMIT']}},'spec':{'containers':[{'name':c['name'],'image':os.environ['CANDIDATE_IMAGE'],'command':['bash','-c'],'args':['source /vault/secrets/config && alembic upgrade head && exec uvicorn onyx.main:app --host 0.0.0.0 --port 8080']}]}}}}
+          json.dump(patch,open('/tmp/recovery-patch.json','w'))
+          PY
+          kubectl patch deployment "$deployment" -n "$TEST_NAMESPACE" --type=strategic --patch-file=/tmp/recovery-patch.json
+          kubectl rollout status deployment/"$deployment" -n "$TEST_NAMESPACE" --timeout=300s
+          newpod=$(kubectl get pods -n "$TEST_NAMESPACE" -l app=test-v1-customs-regulations-api -o json | jq -r --arg image "$candidate_image" '.items[] | select(.metadata.deletionTimestamp == null) | select(any(.spec.containers[]; .image==$image)) | .metadata.name' | head -n 1)
+          [[ -n "$newpod" ]]
+          kubectl exec -i "$newpod" -n "$TEST_NAMESPACE" -c "$container" -- sh -ec '. /vault/secrets/config; cd /app/onyx/db; python - customs-regulations-test' < backend/onyx/db/test_migration_identity_probe.py > evidence/test-after.json
+          kubectl get deploy "$deployment" -n "$TEST_NAMESPACE" -o json | jq '{name:.metadata.name,generation:.metadata.generation,ready:.status.readyReplicas,available:.status.availableReplicas,images:[.spec.template.spec.containers[].image],args:[.spec.template.spec.containers[].args]}' > evidence/deployment-after.json
           python3 - <<'PY'
           import json
-          test=json.load(open('evidence/test-database.json'))
-          dev=json.load(open('evidence/dev-database.json'))
-          assert (test['server'],test['port'],test['database']) != (dev['server'],dev['port'],dev['database'])
-          print('Verified TEST and DEV database identities are separate')
+          before=json.load(open('evidence/test-before.json'))
+          after=json.load(open('evidence/test-after.json'))
+          assert after['db_revisions']==before['db_revisions']
+          assert after['counts']==before['counts']
+          assert all(after['current_revisions_in_image'].values())
+          print(json.dumps({'recovered':True,'database':after['database'],'revision':after['db_revisions'],'counts_preserved':after['counts']}))
           PY
+          curl --fail --silent --show-error --max-time 30 https://test-customs-regulations.singlewindow.io/api/health > evidence/frontend-health.json
+          cat evidence/frontend-health.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: test-migration-inspection
+          name: test-migration-recovery
           path: evidence/
