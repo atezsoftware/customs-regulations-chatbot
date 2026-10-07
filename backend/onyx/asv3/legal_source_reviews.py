@@ -16,6 +16,7 @@ from onyx.asv3.citation_numbers import extract_citation_numbers
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.judicial_sections import (
     JudicialSectionRole,
+    canonical_disposition_witness,
     judicial_disposition_missing,
     nonoperative_judicial_witness_role,
 )
@@ -208,6 +209,34 @@ def _judicial_witness_role(
                 originals.append(original)
     return nonoperative_judicial_witness_role(
         item, start_char, end_char, source_context=originals
+    )
+
+
+def _argument_role_contains_disposition(
+    record: _LeadRecord, review: RelatedSourceReview, ledger: EvidenceLedger
+) -> bool:
+    if (
+        record.candidate_role != "judicial_candidate"
+        or review.status not in {"examined", "not_material"}
+        or review.source_role != "argument_only"
+    ):
+        return False
+    originals = [
+        original
+        for number, doc in ledger.citation_mapping().items()
+        if doc.document_id == record.source_id
+        for original in (ledger.get(number),)
+        if original is not None
+    ]
+    return any(
+        (original := ledger.get(witness.citation)) is not None
+        and canonical_disposition_witness(
+            original,
+            witness.start_char,
+            witness.end_char,
+            source_context=originals,
+        )
+        for witness in review.witnesses
     )
 
 
@@ -713,6 +742,17 @@ class LegalSourceReviews:
                 "disclose that precise unresolved effect; do not reread the introduction.",
                 "nonoperative_judicial_witnesses",
                 "witnesses",
+            )
+        if check_judicial_sections and _argument_role_contains_disposition(
+            record, review, ledger
+        ):
+            reject(
+                "The selected original witness is in the judicial disposition body, "
+                "not merely a party argument. Assess that operative text and its connected "
+                "qualifications separately from applicability; a reasoned not-material "
+                "assessment may still use operative_text. Do not reread delivered originals.",
+                "disposition_cannot_be_argument",
+                "source_role",
             )
         if check_judicial_sections and _missing_judicial_disposition(
             record, review, ledger, delivered

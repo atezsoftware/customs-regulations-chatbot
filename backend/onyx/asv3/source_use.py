@@ -18,6 +18,7 @@ from onyx.asv3.assertions import (
 )
 from onyx.asv3.citation_numbers import extract_citation_numbers
 from onyx.asv3.evidence import EvidenceLedger
+from onyx.asv3.judicial_sections import canonical_disposition_witness
 from onyx.asv3.legal_source_reviews import LegalSourceReviews
 from onyx.asv3.llm_adapter import ResearchModel, StructuredOutputError
 from onyx.asv3.models import OutcomeStatus, RunContext, ToolOutcome
@@ -54,7 +55,10 @@ class SourceUseIssue(BaseModel):
 class SourceUseRequirement(BaseModel):
     model_config = ConfigDict(extra="forbid")
     detail: str = Field(min_length=1)
-    applicability: str = Field(min_length=1)
+    applicability: str = Field(
+        min_length=1,
+        description="The original's restrictive scope and trigger, independent of user facts or a draft.",
+    )
     witnesses: list[AssertionWitness] = Field(min_length=1)
 
 
@@ -67,7 +71,10 @@ class SourceUseInventory(BaseModel):
 class SourceUseCoverage(BaseModel):
     model_config = ConfigDict(extra="forbid")
     answer_unit_id: str
-    witnesses: list[AssertionWitness] = Field(min_length=1)
+    witnesses: list[AssertionWitness] = Field(
+        min_length=1,
+        description="Select actual inline originals supporting this unit's application, including a resolved governing original; do not copy discovery witnesses as extra citations.",
+    )
 
 
 class SourceUseResolution(BaseModel):
@@ -256,11 +263,67 @@ class SourceUseReviewer:
                             "article_no",
                             "qualifier",
                             "source_id",
+                            "candidate_role",
                         )
                     }
                     | {"anchor_evidence_numbers": selected}
                 )
         return links
+
+    def _source_effect_payload(
+        self, payload: dict[str, JsonValue]
+    ) -> dict[str, JsonValue]:
+        """Compile originals independently of facts, drafts and applicability decisions."""
+        result = {
+            key: payload[key]
+            for key in (
+                "language",
+                "original_evidence",
+                "original_source_metadata",
+                "source_groups",
+                "source_links",
+                "inventory_source_id",
+                "required_owned_evidence_numbers",
+                "required_evidence_numbers",
+            )
+            if key in payload
+        }
+        records = cast(list[dict[str, JsonValue]], result["original_evidence"])
+        judicial_sources = {
+            str(link["source_id"])
+            for link in cast(list[dict[str, JsonValue]], result["source_links"])
+            if link.get("candidate_role") == "judicial_candidate"
+        }
+        owned = result.get("required_owned_evidence_numbers")
+        originals = [
+            original
+            for row in records
+            if (original := self.ledger.get(int(cast(int, row["citation"]))))
+            is not None
+        ]
+        dispositions: list[JsonValue] = []
+        for row in records:
+            citation = int(cast(int, row["citation"]))
+            if str(row["source_id"]) not in judicial_sources or (
+                isinstance(owned, list) and citation not in owned
+            ):
+                continue
+            original = self.ledger.get(citation)
+            assert original is not None
+            witnesses = [
+                span["witness_id"]
+                for span in cast(list[dict[str, JsonValue]], row["witness_spans"])
+                if canonical_disposition_witness(
+                    original,
+                    int(cast(int, span["start_char"])),
+                    int(cast(int, span["end_char"])),
+                    source_context=originals,
+                )
+            ]
+            if witnesses:
+                dispositions.append({"citation": citation, "witness_ids": witnesses})
+        result["disposition_originals"] = dispositions
+        return result
 
     def _receipt_matches(self, call_id: str, flow: LLMFlow, numbers: set[int]) -> bool:
         return (
@@ -306,6 +369,7 @@ class SourceUseReviewer:
     def _complete_inventory(
         self, payload: dict[str, JsonValue], numbers: set[int]
     ) -> SourceUseInventory:
+        payload = self._source_effect_payload(payload)
         data = json.dumps(payload, ensure_ascii=False, sort_keys=True)
         identity = hashlib.sha256(data.encode()).hexdigest()
         cached = self._inventories.get(identity)
@@ -350,6 +414,19 @@ class SourceUseReviewer:
                 ):
                     raise ValueError(
                         f"Requirement {index} needs the target source's own operative witness; linked context is not a separate inventory target"
+                    )
+            for disposition in cast(
+                list[dict[str, JsonValue]], payload["disposition_originals"]
+            ):
+                if not any(
+                    witness.citation == disposition["citation"]
+                    and witness.witness_id
+                    in cast(list[JsonValue], disposition["witness_ids"])
+                    for item in result.requirements
+                    for witness in item.witnesses
+                ):
+                    raise ValueError(
+                        f"Retain the source-bound effect of supplied disposition [{disposition['citation']}] with its actual body witness; applicability is assessed separately"
                     )
 
         text = self._invoke_assessment(
@@ -456,7 +533,17 @@ class SourceUseReviewer:
             {"requirement_id": identity, **item.model_dump(mode="json")}
             for identity, item in requirements.items()
         ]
-        application_candidates: list[dict[str, JsonValue]] = []
+        candidate_units: dict[str, set[str]] = {
+            identity: {
+                unit["unit_id"]
+                for unit in units
+                if any(
+                    witness.citation in unit["evidence_numbers"]
+                    for witness in requirement.witnesses
+                )
+            }
+            for identity, requirement in requirements.items()
+        }
         for link in cast(list[dict[str, JsonValue]], blind_payload["source_links"]):
             anchors = cast(list[JsonValue], link["anchor_evidence_numbers"])
             affected = [
@@ -472,18 +559,23 @@ class SourceUseReviewer:
                     and item.source_id == link["source_id"]
                     for witness in requirement.witnesses
                 ):
-                    application_candidates.append(
-                        {
-                            "requirement_id": requirement_id,
-                            "answer_unit_ids": affected,
-                        }
-                    )
+                    candidate_units[requirement_id].update(affected)
+        application_candidates: list[dict[str, JsonValue]] = [
+            {
+                "requirement_id": identity,
+                "answer_unit_ids": [
+                    unit["unit_id"] for unit in units if unit["unit_id"] in candidates
+                ],
+            }
+            for identity, candidates in candidate_units.items()
+            if candidates
+        ]
         # Stable original/fact prefix permits provider cache reuse after draft-only edits.
         payload = {
             **blind_payload,
             "retained_requirements": retained,
-            "related_application_candidates": application_candidates,
             "answer_units": units,
+            "application_candidates": application_candidates,
         }
         data = json.dumps(payload, ensure_ascii=False)
         identity = hashlib.sha256(data.encode()).hexdigest()

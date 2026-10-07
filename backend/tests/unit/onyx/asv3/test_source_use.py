@@ -27,6 +27,8 @@ from tests.unit.onyx.asv3.test_legal_source_reviews import (
 )
 from tests.unit.onyx.asv3.test_model_adapter import scripted_model, text_response
 from tests.unit.onyx.asv3.test_runtime import delivered_originals, response, setup_run
+from tests.unit.onyx.asv3.test_tuned_focused_reads import judicial_chunk
+from tests.unit.onyx.asv3.test_tuned_source_followthrough import tuned_context
 
 
 def coordinator_delivery(
@@ -172,8 +174,12 @@ def test_complete_draft_blind_inventory_and_coordinator_identity(provider: str) 
         "draft",
         "retained_requirements",
         "issues",
+        "scenario",
+        "conversation",
+        "user_fact_spans",
     }.intersection(blind)
-    assert blind["conversation"] == [conversation[1]]
+    assessment = model_payload(calls[1].kwargs)
+    assert assessment["conversation"] == [conversation[1]]
     assert {r["citation"] for r in blind["original_evidence"]} == {1, 2, 3}
     for row in blind["original_evidence"]:
         original = ledger.get(row["citation"])
@@ -194,7 +200,7 @@ def test_complete_draft_blind_inventory_and_coordinator_identity(provider: str) 
 
 
 @pytest.mark.parametrize("change", ["answer", "facts", "evidence", "user_conversation"])
-def test_inventory_reuse_is_independent_of_answer_but_bound_to_originals_and_facts(
+def test_source_compilation_reuse_is_independent_of_answer_and_facts(
     change: str,
 ) -> None:
     ledger, context, model = setup_review()
@@ -216,7 +222,7 @@ def test_inventory_reuse_is_independent_of_answer_but_bound_to_originals_and_fac
         if change == "user_conversation"
         else None,
     )
-    assert counts == {"inventory": 1 if change == "answer" else 2, "review": 2}
+    assert counts == {"inventory": 2 if change == "evidence" else 1, "review": 2}
     assert context.services["last_model_call_id"] == "coordinator"
 
 
@@ -317,7 +323,7 @@ def test_literal_user_exclusion_is_not_inferred_from_assistant_context() -> None
         reviewer.publication_gap("Allowed [1].", "Excluded status", "coordinator")
         is None
     )
-    assert counts == {"inventory": 2, "review": 3}
+    assert counts == {"inventory": 1, "review": 3}
 
 
 def test_user_fact_selectors_preserve_every_character_and_reject_assistant_text() -> (
@@ -386,7 +392,7 @@ def test_identical_user_context_is_deduplicated_without_rewriting_facts() -> Non
             {"role": "user", "content": "exact question"},
         ],
     )
-    payload = model_payload(cast(MagicMock, model.llm).invoke.call_args_list[0].kwargs)
+    payload = model_payload(cast(MagicMock, model.llm).invoke.call_args_list[1].kwargs)
     assert payload["scenario"] == "Exact question"
     assert [r["content"] for r in payload["conversation"]] == [
         "A distinct earlier fact",
@@ -630,8 +636,11 @@ def test_source_inventory_receives_only_its_recorded_anchor_context() -> None:
         for r in assessment["retained_requirements"]
         if any(w["citation"] == 2 for w in r["witnesses"])
     }
-    candidates = assessment["related_application_candidates"]
-    assert {r["requirement_id"] for r in candidates} == court_requirements
+    candidates = assessment["application_candidates"]
+    assert court_requirements <= {r["requirement_id"] for r in candidates}
+    assert {r["requirement_id"] for r in candidates} == {
+        r["requirement_id"] for r in assessment["retained_requirements"]
+    }
     assert all(
         r["answer_unit_ids"] == [assessment["answer_units"][0]["unit_id"]]
         for r in candidates
@@ -668,6 +677,102 @@ def test_linked_anchor_cannot_replace_target_inventory_witness() -> None:
         "Result [1, 2, 3].", "facts", "coordinator"
     )
     assert gap and gap.status == OutcomeStatus.UNAVAILABLE
+
+
+@pytest.mark.parametrize("drop_effect", [False, True])
+def test_disposition_body_effects_cannot_be_filtered_by_the_unseen_question(
+    drop_effect: bool,
+) -> None:
+    context, ledger, reviews = tuned_context()
+    seen(context, ledger, reviews)
+    numbers = ledger.add(
+        [
+            judicial_chunk("V. HÜKÜM\nThe identified phrase is annulled.", 0),
+            judicial_chunk("The connected qualification is also annulled.", 1),
+        ],
+        context,
+    )
+    deliver(ledger, "coordinator", [1, *numbers])
+    model = ResearchModel(scripted_model(), context)
+
+    def effects(result: dict[str, Any], payload: dict[str, Any]) -> None:
+        if payload.get("inventory_source_id") != "decision":
+            return
+        assert not {"scenario", "conversation", "user_fact_spans"}.intersection(payload)
+        dispositions = payload["disposition_originals"]
+        assert {r["citation"] for r in dispositions} == set(numbers)
+        result["requirements"] = [
+            {
+                "detail": "The source's own effect and qualification.",
+                "applicability": "Restricted to the identified wording and scope.",
+                "witnesses": [
+                    {"citation": row["citation"], "witness_id": row["witness_ids"][0]}
+                ],
+            }
+            for row in dispositions
+        ]
+        if drop_effect:
+            result["requirements"].pop()
+
+    scripted_reviews(model, inventory_mutator=effects)
+    gap = SourceUseReviewer(model, ledger).publication_gap(
+        f"A result [1, {', '.join(map(str, numbers))}].",
+        "The user asks only for the administrative procedure.",
+        "coordinator",
+    )
+    if drop_effect:
+        assert gap and gap.status == OutcomeStatus.UNAVAILABLE
+    else:
+        assert gap is None
+
+
+def test_application_navigation_keeps_summary_and_detail_for_the_same_original() -> (
+    None
+):
+    ledger, _context, model = setup_review()
+    counts = scripted_reviews(model)
+    assert (
+        SourceUseReviewer(model, ledger).publication_gap(
+            "Unconditional summary [1].\n\nConditional detail [1].\n\nOther rule [2].",
+            "Actual request",
+            "coordinator",
+        )
+        is None
+    )
+    assessment = model_payload(
+        cast(MagicMock, model.llm).invoke.call_args_list[-1].kwargs
+    )
+    assert assessment["application_candidates"] == [
+        {
+            "requirement_id": assessment["retained_requirements"][0]["requirement_id"],
+            "answer_unit_ids": [u["unit_id"] for u in assessment["answer_units"][:2]],
+        }
+    ]
+    assert counts == {"inventory": 1, "review": 1}
+
+
+@pytest.mark.parametrize("text", ["V. HÜKÜM", "The applicant requests relief."])
+def test_unknown_text_or_disposition_heading_does_not_manufacture_an_effect(
+    text: str,
+) -> None:
+    context, ledger, reviews = tuned_context()
+    seen(context, ledger, reviews)
+    number = ledger.add([judicial_chunk(text, 0)], context)[0]
+    deliver(ledger, "coordinator", [1, number])
+    model = ResearchModel(scripted_model(), context)
+
+    def extract(result: dict[str, Any], payload: dict[str, Any]) -> None:
+        if payload.get("inventory_source_id") == "decision":
+            assert payload["disposition_originals"] == []
+            result["requirements"] = []
+
+    scripted_reviews(model, inventory_mutator=extract)
+    assert (
+        SourceUseReviewer(model, ledger).publication_gap(
+            "A governing result [1].", "Actual facts", "coordinator"
+        )
+        is None
+    )
 
 
 @pytest.mark.parametrize(

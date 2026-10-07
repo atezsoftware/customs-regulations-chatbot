@@ -189,6 +189,23 @@ def nonoperative_judicial_witness_role(
     return "unknown"
 
 
+def canonical_disposition_witness(
+    item: EvidenceItem,
+    start_char: int,
+    end_char: int,
+    *,
+    source_context: Sequence[EvidenceItem] = (),
+) -> bool:
+    """Recognize an original disposition body, never its meaning or applicability."""
+    return (
+        _canonical_position(item) is not None
+        and judicial_witness_section(
+            item, start_char, end_char, source_context=source_context
+        )
+        == "disposition"
+    )
+
+
 def judicial_disposition_missing(originals: Sequence[EvidenceItem]) -> bool:
     """Recognized reasoning cannot stand in for the connected disposition body."""
     sections = {

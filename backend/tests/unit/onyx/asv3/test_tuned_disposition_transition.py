@@ -487,6 +487,38 @@ def test_tuned_omission_diagnostic_supplies_only_missing_declared_passage() -> N
     )
 
 
+@pytest.mark.parametrize("tuned", [True, False])
+def test_selected_disposition_cannot_be_closed_as_a_party_argument(tuned: bool) -> None:
+    context, ledger, reviews = tuned_context()
+    if not tuned:
+        context.services["asv3_workflow_variant"] = "standard"
+    seen(context, ledger, reviews)
+    number = ledger.add(
+        [judicial_chunk("V. HÜKÜM\nThe identified phrase is annulled.", 0)], context
+    )[0]
+    original = ledger.get(number)
+    assert original is not None
+    deliver(ledger, "current-call", [1, number])
+    assessment = review(
+        status="not_material",
+        source_role="argument_only",
+        witnesses=[
+            {
+                "citation": number,
+                "start_char": original.text.index("The identified"),
+                "end_char": len(original.text),
+            }
+        ],
+    )
+    if tuned:
+        with pytest.raises(ValueError, match="not merely a party argument"):
+            reviews.apply([assessment], "current-call", context, ledger)
+        assert reviews.view(context, ledger, {1, number})["pending_lead_ids"]
+        assessment["source_role"] = "operative_text"
+    reviews.apply([assessment], "current-call", context, ledger)
+    assert reviews.view(context, ledger, {1, number})["pending_lead_ids"] == []
+
+
 def test_publication_acquisition_reads_continuation_before_one_semantic_decision() -> (
     None
 ):

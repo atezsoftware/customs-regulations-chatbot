@@ -6,7 +6,7 @@ from onyx.prompts.asv3.coordinator_reference import (
 )
 from onyx.prompts.asv3.research import LEGAL_DEPARTMENT_RESEARCH
 
-TUNED_PROMPT_VERSION = "asv3-tuned-2026-10-07.8"
+TUNED_PROMPT_VERSION = "asv3-tuned-2026-10-07.9"
 
 _SOURCE_ACTIONS = """For a known instrument and article, read_provision uses the supplied source_id;
 otherwise read_named_provision resolves its own title and reads that article in one action.
@@ -45,26 +45,23 @@ TUNED_RESEARCHER_REFERENCE_PROMPT = (
     _focused_reference(RESEARCHER_REFERENCE_PROMPT) + _METADATA_DELTAS
 )
 
-_RELATED_SOURCE_POLICY = """Before a definitive conclusion, check originals and concrete related-source leads for
-authorities changing the rule's validity, scope or application. The user need not know the dispute.
-For concrete leads attached to delivered governing originals, read the candidate's operative
-holding, connected qualifications and applicable dates. Distinguish the disposition from
-party arguments, and ordinary administrative practice from a source-supported challenge.
-An application subject, requested relief or procedural introduction is not a disposition;
-locate the candidate's own holding and connected qualifications, not its whole file.
+_RELATED_SOURCE_POLICY = """Before a definitive conclusion, examine concrete related-source leads changing the rule's
+validity, scope or application. The user need not know the dispute. Read the candidate's
+operative holding, connected qualifications and dates. Distinguish these from party arguments,
+requested relief and preliminary scope; separate administrative practice from a sourced challenge.
 Use the SAME answer action's _related_source_reviews to assess those leads: examined for an
 operative effect, not_material for a reasoned exclusion based on that candidate's own text,
-or unresolved for a precise missing interaction. Copy lead_id and witness ranges from
-navigation and original_evidence_ranges; never invent citations or offsets.
+or unresolved for a precise missing interaction. source_role describes the selected original,
+not whether it favors this case: a disposition remains operative_text even if not_material.
+Copy lead_id and ranges from navigation and original_evidence_ranges.
 Apply each material examined effect and its limitations to every affected conclusion,
 including summaries, with its own adjacent original citations. Copy effect and limitations
-into the review as exact sentences from those
-answer blocks; do not rewrite other blocks to close metadata. Do not dismiss an unread lead
-from its title. If its
+into the review as exact sentences from those answer blocks. Preserve other blocks when
+repairing metadata. An unread title does not establish exclusion. If its
 operative text cannot be obtained, use submit_partial_answer and disclose that exact gap
 in a separate uncited paragraph; do not still assert the unresolved effect as certain.
-Reuse sufficient delivered originals. No universal court sweep, whole-source rereading,
-or deferral of this material check to an optional follow-up.
+Reuse delivered originals; avoid universal court sweeps, whole-source rereading and deferring
+a material check to an optional follow-up.
 """
 
 _before, _separator, _remaining = LEGAL_DEPARTMENT_RESEARCH.partition(
