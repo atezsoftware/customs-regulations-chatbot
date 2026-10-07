@@ -270,7 +270,11 @@ def _missing_judicial_disposition(
 
 def _retention_text(value: str) -> str:
     """Normalize presentation only; validate inline witnesses on the original block."""
-    value = re.sub(r"\*\*(\S(?:.*?\S)?)\*\*", r"\1", value)
+    value = re.sub(
+        r"(?<![\w*])\*\*(?=\S)(.+?)(?<=\S)\*\*(?![\w*])",
+        r"\1",
+        value,
+    )
     value = re.sub(r"(?:\s*" + _CITATION_MARKER.pattern + r")+(?=[.,;:!?])", "", value)
     value = _CITATION_MARKER.sub("", value)
     return " ".join(

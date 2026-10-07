@@ -8,6 +8,7 @@ from pydantic import JsonValue
 
 from onyx.asv3.legal_source_reviews import (
     LegalSourceReviews,
+    _retention_text,
     operative_review_retention_enabled,
 )
 from onyx.asv3.models import RunContext, ToolOutcome
@@ -25,6 +26,11 @@ from tests.unit.onyx.asv3.test_shared_originals import full_record, original
 
 EFFECT = "The particular changed wording may affect this outcome."
 LIMITATIONS = "The underlying obligation and applicable dates remain distinct."
+
+
+def test_formatting_normalization_preserves_mathematical_operators() -> None:
+    assert _retention_text("2**3 + 4**5") == "2**3 + 4**5"
+    assert _retention_text("**may apply** [2].") == "may apply."
 
 
 @pytest.mark.parametrize("tuned", [False, True])
