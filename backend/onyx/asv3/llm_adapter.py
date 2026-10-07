@@ -28,6 +28,7 @@ from onyx.asv3.assertions import (
 from onyx.asv3.authority import (
     cited_lower_statute_references,
     known_statute_source_ids,
+    uncited_named_authority_bindings,
 )
 from onyx.asv3.authority_reference_diagnostics import (
     source_contained_reference_catalogue,
@@ -3226,20 +3227,19 @@ class ResearchModel:
                 )
                 review_rows = source_review_state.get("reviews")
                 owned_draft = current.get("draft_to_repair")
-                draft_units = (
+                raw_draft_units = (
                     owned_draft.get("units") if isinstance(owned_draft, dict) else None
                 )
+                draft_units = [
+                    row
+                    for row in (
+                        raw_draft_units if isinstance(raw_draft_units, list) else []
+                    )
+                    if isinstance(row, dict)
+                ]
                 provision_navigation = delivered_provision_navigation(
                     complete_originals,
-                    draft_units=[
-                        row
-                        for row in (
-                            draft_units if isinstance(draft_units, list) else []
-                        )
-                        if isinstance(row, dict)
-                    ]
-                    if tuned_application
-                    else (),
+                    draft_units=draft_units if tuned_application else (),
                     related_reviews=[
                         row
                         for row in (
@@ -3249,6 +3249,11 @@ class ResearchModel:
                     ]
                     if tuned_application
                     else (),
+                    named_original_bindings=uncited_named_authority_bindings(
+                        draft_units, ledger
+                    )
+                    if tuned_application and isinstance(ledger, EvidenceLedger)
+                    else None,
                 )
                 if provision_navigation:
                     current["delivered_provisions"] = provision_navigation
@@ -3356,8 +3361,9 @@ class ResearchModel:
                 ):
                     current["evidence_note"] = (
                         "Evaluate the actual requested outcomes against the delivered originals. "
-                        "delivered_provisions.draft_application links each cited provision to "
-                        "ALL citing answer units and its delivered uncited clauses. Examine those "
+                        "delivered_provisions.draft_application links cited or canonically named "
+                        "provisions to ALL affected answer units and delivered uncited clauses. "
+                        "named_original_candidates are identity matches, not support. Examine those "
                         "clauses for material conditions, exceptions, alternatives and later steps; "
                         "uncited does not mean relevant or mandatory. Related leads can change the "
                         "specific application, including a sourced exclusion. Reassess every linked "

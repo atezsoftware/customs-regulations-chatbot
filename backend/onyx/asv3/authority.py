@@ -4,16 +4,19 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 
 from pydantic import JsonValue
 
-from onyx.asv3.assertions import assertion_inventory
+from onyx.asv3.assertions import AssertionUnit, assertion_inventory
 from onyx.asv3.citation_numbers import extract_citation_numbers
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.models import model_evidence_metadata
 from onyx.regulatory.heading_path import (
+    RegulatoryArticleHeading,
     extract_regulatory_provision_reference_occurrences,
+    parse_regulatory_article_heading,
 )
 
 
@@ -1407,15 +1410,15 @@ def _original_gap_references(
     return list(dict.fromkeys(disclosed)) if disclosed and pending is None else None
 
 
-def native_named_authority_gap(
-    answer: str,
+def _native_named_authority_gaps(
+    units: Sequence[AssertionUnit],
     ledger: EvidenceLedger,
     *,
     strict_reference_boundaries: bool = False,
     resolve_defined_abbreviations: bool = False,
     syntactic_reference_binding: bool = False,
-) -> dict[str, JsonValue] | None:
-    """Check local named-statute identity, not legal entailment or unnamed omissions."""
+    include_reference_identity: bool = False,
+) -> list[dict[str, JsonValue]]:
     rows = _native_original_rows(ledger)
     # Lower references supply recognition aliases only, never matching originals.
     aliases = _authority_aliases(
@@ -1424,7 +1427,6 @@ def native_named_authority_gap(
         strict_reference_boundaries=strict_reference_boundaries,
         syntactic_reference_binding=syntactic_reference_binding,
     )
-    units = assertion_inventory(answer)
     defined = (
         _defined_statute_abbreviations(
             "\n".join(
@@ -1506,6 +1508,11 @@ def native_named_authority_gap(
                         "reference_text": reference.reference_text,
                         "article": reference.article,
                         **(
+                            {"article_qualifier": reference.qualifier}
+                            if include_reference_identity
+                            else {}
+                        ),
+                        **(
                             {"clause": reference.clause}
                             if syntactic_reference_binding
                             and reference.clause_shorthand
@@ -1516,6 +1523,92 @@ def native_named_authority_gap(
                         "matching_original_evidence": matching,
                     }
                 )
+    return missing
+
+
+def uncited_named_authority_bindings(
+    draft_units: Sequence[dict[str, JsonValue]], ledger: EvidenceLedger
+) -> dict[str, list[int]]:
+    """Bind uncited named canonical candidates to their owning draft edit units.
+
+    Names defined elsewhere in the draft remain available for recognition. These
+    bindings establish identity only; the caller must filter physical delivery.
+    """
+    assertions: list[AssertionUnit] = []
+    for unit in draft_units:
+        unit_id, text = unit.get("unit_id"), unit.get("text")
+        if not isinstance(unit_id, str) or not isinstance(text, str):
+            continue
+        for assertion in assertion_inventory(text):
+            assertion["unit_id"] = unit_id
+            assertions.append(assertion)
+    if not assertions:
+        return {}
+    provision_identities: dict[int, RegulatoryArticleHeading] = {}
+    for record in ledger.provision_metadata():
+        citation = record.get("citation")
+        if type(citation) is not int:
+            continue
+        metadata = record.get("metadata")
+        headings = metadata.get("heading_path") if isinstance(metadata, dict) else None
+        if not isinstance(headings, list):
+            continue
+        for heading in headings:
+            parsed = (
+                parse_regulatory_article_heading(heading)
+                if isinstance(heading, str)
+                else None
+            )
+            if parsed is not None:
+                provision_identities[citation] = parsed
+                break
+    bindings: dict[str, list[int]] = {}
+    for gap in _native_named_authority_gaps(
+        assertions,
+        ledger,
+        strict_reference_boundaries=True,
+        resolve_defined_abbreviations=True,
+        syntactic_reference_binding=True,
+        include_reference_identity=True,
+    ):
+        unit_id, candidates = gap["unit_id"], gap["matching_original_evidence"]
+        if (
+            not isinstance(unit_id, str)
+            or not isinstance(candidates, list)
+            or gap.get("article") is None
+        ):
+            continue
+        numbers = bindings.setdefault(unit_id, [])
+        for number in candidates:
+            if type(number) is not int:
+                continue
+            parsed = provision_identities.get(number)
+            if (
+                parsed is not None
+                and parsed.article_no == gap["article"]
+                and parsed.qualifier == gap.get("article_qualifier")
+                and number not in numbers
+            ):
+                numbers.append(number)
+    return bindings
+
+
+def native_named_authority_gap(
+    answer: str,
+    ledger: EvidenceLedger,
+    *,
+    strict_reference_boundaries: bool = False,
+    resolve_defined_abbreviations: bool = False,
+    syntactic_reference_binding: bool = False,
+) -> dict[str, JsonValue] | None:
+    """Check local named-statute identity, not legal entailment or unnamed omissions."""
+    missing = _native_named_authority_gaps(
+        assertion_inventory(answer),
+        ledger,
+        strict_reference_boundaries=strict_reference_boundaries,
+        resolve_defined_abbreviations=resolve_defined_abbreviations,
+        syntactic_reference_binding=syntactic_reference_binding,
+    )
     if not missing:
         return None
     return {

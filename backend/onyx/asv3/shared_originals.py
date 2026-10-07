@@ -1,7 +1,7 @@
 """Share recorded siblings of a selected provision, without source acquisition."""
 
 import json
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from typing import NamedTuple
 
 from pydantic import JsonValue
@@ -173,6 +173,7 @@ def delivered_provision_navigation(
     *,
     draft_units: Sequence[dict[str, JsonValue]] = (),
     related_reviews: Sequence[dict[str, JsonValue]] = (),
+    named_original_bindings: Mapping[str, Sequence[int]] | None = None,
 ) -> list[dict[str, JsonValue]]:
     """Index fitted full chunks by their own structural provision and version.
 
@@ -215,13 +216,19 @@ def delivered_provision_navigation(
             if not presentation_block(line)
             for number in extract_citation_numbers(line)
         }
-        if numbers:
-            units.append((unit_id, numbers))
+        units.append((unit_id, numbers))
     cited = {number for _, numbers in units for number in numbers}
     for row, (identity, numbers) in zip(navigation, grouped.items(), strict=True):
         family = set(numbers)
         used = family & cited
-        if not used:
+        named_targets = {
+            unit_id: family.intersection(
+                (named_original_bindings or {}).get(unit_id, ())
+            )
+            for unit_id, _ in units
+        }
+        named = {number for targets in named_targets.values() for number in targets}
+        if not used and not named:
             continue
         application: dict[str, JsonValue] = {
             "cited_original_citations": sorted(used),
@@ -229,9 +236,11 @@ def delivered_provision_navigation(
             "answer_unit_ids": [
                 unit_id
                 for unit_id, citations in units
-                if family.intersection(citations)
+                if family.intersection(citations) or named_targets[unit_id]
             ],
         }
+        if named:
+            application["named_original_candidates"] = sorted(named)
         related_leads: list[str] = []
         for review in related_reviews:
             anchors, lead_id = (

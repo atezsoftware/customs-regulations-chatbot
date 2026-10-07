@@ -6,13 +6,208 @@ from typing import cast
 import pytest
 from pydantic import JsonValue
 
+from onyx.asv3.authority import uncited_named_authority_bindings
 from onyx.asv3.llm_adapter import ResearchModel
-from onyx.asv3.models import CapabilityCall, Decision, RunContext
+from onyx.asv3.models import CapabilityCall, Decision, EvidenceItem, RunContext
 from onyx.asv3.retained_answer import resolve_retained_answer
 from onyx.asv3.shared_originals import delivered_provision_navigation
 from onyx.asv3.workflow_variant import ASV3_TUNED_VARIANT
 from tests.unit.onyx.asv3.test_native_model_adapter import adaptive_tool_view, model
 from tests.unit.onyx.asv3.test_shared_originals import full_record, original, recorded
+
+
+def canonical_original(
+    chunk: str,
+    text: str,
+    *,
+    article: str = "27",
+    title: str = "8917 sayılı Faaliyet Kanunu",
+    metadata: dict[str, JsonValue] | None = None,
+) -> EvidenceItem:
+    item = original(
+        chunk,
+        text,
+        source=title,
+        headings=[title, f"MADDE {article}"],
+        metadata={"title": title, "document_type": "kanun", **(metadata or {})},
+    )
+    assert item.search_doc is not None
+    item.search_doc.metadata["regulatory_chunk_id"] = chunk
+    return item
+
+
+def test_new_uncited_named_family_links_summary_table_and_related_anchor() -> None:
+    ledger = recorded(
+        [
+            original("lower", "An implementing procedure.", source="lower"),
+            canonical_original("rule", "Approval is possible."),
+            canonical_original("relief", "Prior notification permits a reduction."),
+            canonical_original("other", "A foreign provision.", title="Başka Kanunu"),
+        ]
+    )
+    records = [full_record(ledger, number) for number in range(1, 5)]
+    units: list[dict[str, JsonValue]] = [
+        {"unit_id": "summary", "text": "Faaliyet Kanunu m. 27 uygulanır [1]."},
+        {"unit_id": "detail", "text": "8917 sayılı Faaliyet Kanunu m. 27 uygulanır."},
+        {
+            "unit_id": "table",
+            "text": "| Konu | Etki |\n| Faaliyet Kanunu m. 27 | İzin [1] |",
+        },
+        {"unit_id": "heading", "text": "## Faaliyet Kanunu m. 27 [2]"},
+    ]
+    reviews: list[dict[str, JsonValue]] = [
+        {
+            "lead_id": "operative-related-source",
+            "anchor_source_id": "8917 sayılı Faaliyet Kanunu",
+            "article_no": "27",
+            "qualifier": None,
+            "anchor_evidence_numbers": [2],
+        }
+    ]
+    before = deepcopy((units, records, reviews, ledger.export()))
+    bindings = uncited_named_authority_bindings(units, ledger)
+    rows = delivered_provision_navigation(
+        records,
+        draft_units=units,
+        related_reviews=reviews,
+        named_original_bindings=bindings,
+    )
+    assert rows[1]["draft_application"] == {
+        "cited_original_citations": [],
+        "uncited_full_original_citations": [2, 3],
+        "named_original_candidates": [2, 3],
+        "answer_unit_ids": ["summary", "detail", "table"],
+        "related_lead_ids": ["operative-related-source"],
+    }
+    assert "draft_application" not in rows[2]
+    assert before == (units, records, reviews, ledger.export())
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Madde 27 uygulanır [1].",
+        "FK m. 27 uygulanır [1].",
+        "Başka Kanunu m. 27 uygulanır [1].",
+        "Faaliyet Kanunu geçici m. 27 uygulanır [1].",
+        "Faaliyet Kanunu m. 27/A uygulanır [1].",
+        "## Faaliyet Kanunu m. 27 [1]",
+    ],
+)
+def test_named_navigation_requires_the_actual_bound_identity(text: str) -> None:
+    ledger = recorded(
+        [
+            original("lower", "A lower instrument's text."),
+            canonical_original("rule", "An ordinary provision."),
+        ]
+    )
+    units: list[dict[str, JsonValue]] = [{"unit_id": "owned", "text": text}]
+    rows = delivered_provision_navigation(
+        [full_record(ledger, 2)],
+        draft_units=units,
+        named_original_bindings=uncited_named_authority_bindings(units, ledger),
+    )
+    assert "draft_application" not in rows[0]
+
+
+def test_named_bindings_keep_draft_definitions_and_only_physical_full_ranges() -> None:
+    ledger = recorded(
+        [
+            canonical_original("rule", "A current provision."),
+            canonical_original("partial", "An incompletely supplied condition."),
+            canonical_original("absent", "An original outside this decision."),
+            canonical_original(
+                "old", "An older provision.", metadata={"version": "old"}
+            ),
+        ]
+    )
+    units: list[dict[str, JsonValue]] = [
+        {"unit_id": "definition", "text": "8917 sayılı Faaliyet Kanunu (FK)."},
+        {"unit_id": "owned", "text": "FK m. 27 uygulanır."},
+    ]
+    records = [full_record(ledger, number) for number in [1, 2, 4]]
+    records[1]["truncated"] = True
+    rows = delivered_provision_navigation(
+        records,
+        draft_units=units,
+        named_original_bindings=uncited_named_authority_bindings(units, ledger),
+    )
+    assert len(rows) == 2
+    current, historical = rows[0]["draft_application"], rows[1]["draft_application"]
+    assert isinstance(current, dict) and isinstance(historical, dict)
+    assert current["named_original_candidates"] == [1]
+    assert historical["named_original_candidates"] == [4]
+    answer_units = current["answer_unit_ids"]
+    assert isinstance(answer_units, list)
+    assert "owned" in answer_units
+    assert "definition" not in answer_units
+
+
+def test_named_binding_never_selects_a_descendant_cross_reference_as_own_article() -> (
+    None
+):
+    item = canonical_original("rule", "A different operative provision.")
+    item.metadata["heading_path"] = [
+        "8917 sayılı Faaliyet Kanunu",
+        "MADDE 27",
+        "MADDE 29 uyarınca yapılan işlemler",
+    ]
+    ledger = recorded([item])
+    units: list[dict[str, JsonValue]] = [
+        {"unit_id": "owned", "text": "Faaliyet Kanunu m. 29 uygulanır."}
+    ]
+    rows = delivered_provision_navigation(
+        [full_record(ledger, 1)],
+        draft_units=units,
+        named_original_bindings=uncited_named_authority_bindings(units, ledger),
+    )
+    assert "draft_application" not in rows[0]
+
+
+@pytest.mark.parametrize("tuned", [False, True])
+def test_actual_context_binds_late_original_to_owned_unit_only_when_tuned(
+    tuned: bool,
+) -> None:
+    import json
+
+    ledger = recorded(
+        [
+            original("lower", "An implementing rule."),
+            canonical_original("rule", "The statute's operative rule."),
+            canonical_original("relief", "A conditional relief."),
+        ]
+    )
+    selected = model()
+    context = RunContext(
+        services={
+            "research_profile": "normal",
+            "asv3_workflow_variant": ASV3_TUNED_VARIANT if tuned else "standard",
+            "lean_native_mode": True,
+            "evidence": ledger,
+        }
+    )
+    adapter = ResearchModel(selected, context, lean_native_mode=True)
+    prompt, _, _ = adapter._fit_native_decision(
+        adaptive_tool_view(
+            original_evidence=[full_record(ledger, number) for number in [1, 2, 3]],
+            draft_to_repair="Faaliyet Kanunu m. 27 uyarınca izin gerekir [1].",
+            publication_gap={"kind": "late_original_test"},
+        )
+    )
+    payload = json.loads(cast(str, prompt[-1].content))
+    selected.invoke.assert_not_called()
+    if tuned:
+        row = next(
+            entry
+            for entry in payload["delivered_provisions"]
+            if entry["source_id"] == "8917 sayılı Faaliyet Kanunu"
+        )
+        assert row["draft_application"]["named_original_candidates"] == [2, 3]
+        assert row["draft_application"]["answer_unit_ids"] == [
+            payload["draft_to_repair"]["units"][0]["unit_id"]
+        ]
+    else:
+        assert "delivered_provisions" not in payload
 
 
 def test_uncited_sibling_and_every_citing_owned_unit_are_visible_without_mutation() -> (
