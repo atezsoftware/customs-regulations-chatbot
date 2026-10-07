@@ -251,6 +251,106 @@ def test_source_answer_does_not_add_writer_to_conversation_or_clarification() ->
     writer.invoke.assert_not_called()
 
 
+def test_source_answer_does_not_replace_research_calls_with_a_prose_handoff() -> None:
+    adapter, context, research, writer = source_answer_adapter()
+    record = original(
+        cast(EvidenceLedger, context.services["evidence"]), context, "Rule."
+    )
+    response = native_response("read_provision", '{"source_id":"existing"}')
+    response.choice.message.content = "I will read the unresolved effect."
+    research.invoke.return_value = response
+    decision = adapter.decide(adaptive_tool_view(original_evidence=[record]))
+    assert decision.calls[0].name == "read_provision"
+    writer.invoke.assert_not_called()
+
+
+@pytest.mark.parametrize("terminal", ["submit_answer", "submit_partial_answer"])
+def test_source_answer_binds_same_response_text_before_terminal_validation(
+    terminal: str,
+) -> None:
+    from tests.unit.onyx.asv3.test_runtime import response
+
+    adapter, context, _research, writer = source_answer_adapter()
+    record = original(
+        cast(EvidenceLedger, context.services["evidence"]), context, "Rule."
+    )
+    body = "Duty [1].\n\nIts material condition and supported application [1]."
+    arguments = {"basis": "originals"} if terminal == "submit_answer" else {}
+    schema = {
+        "type": "object",
+        "properties": {
+            "answer": {"type": "string"},
+            **({"basis": {"type": "string"}} if arguments else {}),
+        },
+        "required": ["answer", *arguments],
+        "additionalProperties": False,
+    }
+    writer.invoke.return_value = response(body, calls=[(terminal, arguments)])
+    current = view(original_evidence=[record]).model_copy(
+        update={
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {"name": terminal, "parameters": schema},
+                }
+            ]
+        }
+    )
+    result = adapter.decide(current)
+    assert result.calls[0].arguments == {"answer": body, **arguments}
+    assert result.calls[0].argument_error is None
+    emitted = writer.invoke.call_args.kwargs["tools"][0]["function"]["parameters"]
+    assert "answer" not in emitted["properties"]
+    assert "answer" not in emitted["required"]
+    assert schema["properties"]["answer"] == {"type": "string"}
+
+
+def test_source_answer_reads_a_bound_pending_lead_before_calling_writer() -> None:
+    from tests.unit.onyx.asv3.test_legal_source_reviews import seen
+    from tests.unit.onyx.asv3.test_tuned_source_followthrough import tuned_context
+
+    context, ledger, reviews = tuned_context()
+    law = ledger.get(1)
+    assert law is not None
+    ledger = EvidenceLedger()
+    ledger.add([law], context)
+    context.services["evidence"] = ledger
+    ledger.record_delivery("law-call", "asv3_coordinator", [full_record(ledger, 1)])
+    seen(context, ledger, reviews)
+    research, writer = model(), model()
+    adapter = ResearchModel(research, context, answer_llm=writer, lean_native_mode=True)
+    research.invoke.return_value = ModelResponse(
+        id="candidate",
+        created="0",
+        choice=Choice(message=Message(content="Current result [1].")),
+    )
+    current = view(original_evidence=[full_record(ledger, 1)]).model_copy(
+        update={
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "submit_answer",
+                        "parameters": {"type": "object"},
+                    },
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "read_source_range",
+                        "parameters": {"type": "object"},
+                    },
+                },
+            ]
+        }
+    )
+    result = adapter.decide(current)
+    assert [(call.name, call.arguments) for call in result.calls] == [
+        ("read_source_range", {"source_id": "decision", "start": 0})
+    ]
+    writer.invoke.assert_not_called()
+
+
 def original(
     ledger: EvidenceLedger, context: RunContext, text: str
 ) -> dict[str, JsonValue]:

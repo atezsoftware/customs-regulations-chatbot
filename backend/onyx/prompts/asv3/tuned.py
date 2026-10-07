@@ -6,7 +6,7 @@ from onyx.prompts.asv3.coordinator_reference import (
 )
 from onyx.prompts.asv3.research import LEGAL_DEPARTMENT_RESEARCH
 
-TUNED_PROMPT_VERSION = "asv3-tuned-2026-10-07.19"
+TUNED_PROMPT_VERSION = "asv3-tuned-2026-10-07.20"
 
 TUNED_SOURCE_ANSWER_PROMPT = """Write Atez Customs Assistant's complete answer in the question's language or the explicitly
 requested language, directly from the actual request, supplied facts and numbered source
@@ -38,8 +38,11 @@ literal operative quotations when decisive, with adjacent [n]. End with a few us
 case-specific follow-up questions when they add value; never defer a material requested
 answer, exception or challenge to those questions. Precise unresolved source interactions
 belong in separate uncited paragraphs, without categorical claims about the whole corpus.
-Complete the exposed terminal action's actual metadata from the sources, not a prior model's
-approval. Fix publication_gap in its supplied draft while preserving useful supported detail.
+For submit_answer or submit_partial_answer, write the COMPLETE answer in this response's
+assistant text and put only publication metadata in the tool call. The host binds that text
+to the action; do not duplicate it or submit a pointing sentence. Retained-answer actions
+instead edit their exact owned draft. Complete actual metadata from sources, not a prior
+model's approval. Fix publication_gap while preserving useful supported detail.
 More research is available for a precise material gap; do not repeat already delivered text.
 For each material tool call exposing _public_update, supply a brief natural title/explanation
 in the answer language. Set _language on the first useful call. External tools require both
@@ -81,6 +84,27 @@ TUNED_COORDINATOR_REFERENCE_PROMPT = (
 )
 TUNED_RESEARCHER_REFERENCE_PROMPT = (
     _focused_reference(RESEARCHER_REFERENCE_PROMPT) + _METADATA_DELTAS
+)
+
+_governing, _boundary, _application = TUNED_COORDINATOR_REFERENCE_PROMPT.partition(
+    "For EACH material legal effect, read and cite its own governing original; add implementing\n"
+)
+_old_support, _support_boundary, _remaining_application = _application.partition(
+    "Build each outcome from the original's actor/regime/event, cumulative or alternative conditions,"
+)
+if not _boundary or not _support_boundary:
+    raise ValueError("The coordinator reference has no source-support paragraph")
+
+TUNED_SOURCE_RESEARCH_PROMPT = (
+    _governing
+    + "For each requested effect, obtain the passages that establish its actual conditions and\n"
+    "consequence. A delivered implementing or judicial passage can establish its stated rule;\n"
+    "read a referenced norm for a material parameter or interaction it does not supply, not\n"
+    "merely to repeat the instrument name. Preserve governing authority and useful implementation.\n"
+    "Credible instrument/provision references also lead to related decisions and special rules.\n"
+    "Titles and references alone establish no unseen holding, tax treatment, rate or base.\n"
+    + _support_boundary
+    + _remaining_application
 )
 
 _RELATED_SOURCE_POLICY = """Before a definitive conclusion, examine concrete related leads changing validity, scope

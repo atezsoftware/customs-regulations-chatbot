@@ -77,6 +77,10 @@ from onyx.asv3.shared_originals import (
     delivered_provision_navigation,
     related_provision_originals,
 )
+from onyx.asv3.source_answer_transport import (
+    bind_source_answer_body,
+    source_answer_wire_tools,
+)
 from onyx.asv3.source_metadata_transport import (
     expand_source_metadata,
     share_source_metadata,
@@ -144,6 +148,7 @@ from onyx.prompts.asv3.tuned import (
     TUNED_LEGAL_DEPARTMENT_RESEARCH,
     TUNED_RESEARCHER_REFERENCE_PROMPT,
     TUNED_SOURCE_ANSWER_PROMPT,
+    TUNED_SOURCE_RESEARCH_PROMPT,
 )
 from onyx.regulatory.structured_llm import (
     _portable_structured_output_schema,
@@ -2574,7 +2579,9 @@ class ResearchModel:
         elif normal:
             instruction = (
                 (
-                    TUNED_COORDINATOR_REFERENCE_PROMPT
+                    TUNED_SOURCE_RESEARCH_PROMPT
+                    if self.answer_llm is not None
+                    else TUNED_COORDINATOR_REFERENCE_PROMPT
                     if tuned
                     else COORDINATOR_REFERENCE_PROMPT
                 )
@@ -3556,12 +3563,34 @@ class ResearchModel:
             )
             if (
                 self.answer_llm is not None
-                and self._needs_answer_model(decision)
+                and self._source_answer_ready(decision)
                 and (
                     view.original_evidence or self._native_original_records(view.turns)
                 )
             ):
                 coverage = self._retain_candidate_conditions(decision)
+                candidate = decision.answer or next(
+                    (
+                        str(call.arguments.get("answer", ""))
+                        for call in decision.calls
+                        if call.name in {"submit_answer", "submit_partial_answer"}
+                    ),
+                    "",
+                )
+                # Resolve concrete source leads before paying to write the final body.
+                acquisition = self._publication_source_acquisition(
+                    view.model_copy(
+                        update={
+                            "draft_to_repair": candidate,
+                            "publication_gap": {
+                                "unread_cited_statute_references": [],
+                                "pending_related_source_review": True,
+                            },
+                        }
+                    )
+                )
+                if acquisition is not None:
+                    return acquisition
                 return self._decide_source_answer(view, candidate_coverage=coverage)
             invocation_draft = view.draft_to_repair
             if use_research_model and self._needs_answer_model(decision):
@@ -3687,7 +3716,7 @@ class ResearchModel:
             )
             self._answer_researching = bool(
                 decision.calls
-            ) and not self._needs_answer_model(decision)
+            ) and not self._source_answer_ready(decision)
             return decision
         finally:
             self._writing_answer = False
@@ -4231,6 +4260,18 @@ class ResearchModel:
         )
 
     @staticmethod
+    def _source_answer_ready(decision: Decision) -> bool:
+        if decision.calls:
+            return len(decision.calls) == 1 and (
+                decision.calls[0].name == "submit_partial_answer"
+                or (
+                    decision.calls[0].name == "submit_answer"
+                    and decision.calls[0].arguments.get("basis") == "originals"
+                )
+            )
+        return bool(decision.answer)
+
+    @staticmethod
     def _needs_answer_model(decision: Decision) -> bool:
         if decision.answer:
             return True
@@ -4517,9 +4558,10 @@ class ResearchModel:
             not self.context.depth
             and self.context.services.get("question_research_started") is True
         )
+        wire_tools = source_answer_wire_tools(tools) if self._writing_answer else tools
         response = self._native_decision_response(
             prompt,
-            tools,
+            wire_tools,
             flow,
             output,
             research=research,
@@ -4549,7 +4591,7 @@ class ResearchModel:
             ]
             response = self._native_decision_response(
                 recovery_prompt,
-                tools,
+                wire_tools,
                 flow,
                 output,
                 research=research,
@@ -4574,6 +4616,8 @@ class ResearchModel:
                         "Provider rejected native function call: MALFORMED_FUNCTION_CALL"
                     )
                 response = self._tuned_content_action_response(response)
+                if self._writing_answer:
+                    response = bind_source_answer_body(response, parse_json_object)
                 decision = self._decision(
                     response, tools, argument_normalizer=argument_normalizer
                 )
@@ -4636,7 +4680,7 @@ class ResearchModel:
                     self.context.budget.consume("decisions")
                 response = self._native_decision_response(
                     recovery_prompt,
-                    tools,
+                    wire_tools,
                     flow,
                     recovery_output,
                     research=research,

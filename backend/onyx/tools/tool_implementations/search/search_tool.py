@@ -2238,6 +2238,10 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
                 regulatory_rerank_candidate_limit,
             )
             if fast_regulatory_search
+            and not (
+                asv3_regulatory_search
+                and isinstance(override_kwargs, SearchToolRetrievalOverrideKwargs)
+            )
             else override_kwargs.per_lane_num_hits
         )
 

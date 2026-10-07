@@ -10,6 +10,7 @@ from onyx.asv3.models import OutcomeStatus, ToolOutcome
 from onyx.asv3.publication_gaps import combine_source_publication_gaps
 from onyx.asv3.workflow_variant import ASV3_TUNED_VARIANT
 from onyx.llm.interfaces import LLM
+from tests.unit.onyx.asv3.test_native_model_adapter import last_payload
 from tests.unit.onyx.asv3.test_runtime import delivered_originals, response, setup_run
 
 
@@ -57,6 +58,7 @@ def test_source_answer_runtime_keeps_complete_delivery_and_dynamic_citations(
             "temperature": 0.1,
         }
     )
+
     research.with_temperature.return_value = research
     writer = MagicMock(spec=LLM)
     writer.config = research.config.model_copy(
@@ -90,6 +92,58 @@ def test_source_answer_runtime_keeps_complete_delivery_and_dynamic_citations(
         ]["model"]
         == "claude-sonnet-5-5"
     )
+
+
+@pytest.mark.parametrize("bad_number", [None, 999])
+def test_source_answer_body_publication_keeps_citation_checks_without_statute_rewalk(
+    monkeypatch: pytest.MonkeyPatch,
+    bad_number: int | None,
+) -> None:
+    kwargs, _broker, research, _checkpoints, _queue = setup_run(monkeypatch)
+    kwargs.pop("test_language")
+    kwargs.update(research_profile="normal", workflow_variant=ASV3_TUNED_VARIANT)
+    research.config = research.config.model_copy(
+        update={"model_provider": "vertex_ai", "model_name": "gemini-3.8-flash"}
+    )
+    research.with_temperature.return_value = research
+    writer = MagicMock(spec=LLM)
+    writer.config = research.config.model_copy(
+        update={"model_provider": "anthropic", "model_name": "claude-sonnet-5-5"}
+    )
+    complete = "Tamir sonucu [1]; değiştirme sonucu [2]."
+    results = []
+    if bad_number:
+        results.append(
+            response(
+                f"Tamir sonucu [{bad_number}].",
+                calls=[("submit_answer", {"basis": "originals"})],
+            )
+        )
+    results.append(
+        response(
+            complete,
+            calls=None if bad_number else [("submit_answer", {"basis": "originals"})],
+        )
+    )
+    writer.invoke.side_effect = results
+    monkeypatch.setattr(runtime, "source_answer_model", lambda _user: writer)
+    own_statute = MagicMock(side_effect=AssertionError("No blanket own-statute demand"))
+    lower_reference = MagicMock(side_effect=AssertionError("No every-reference gate"))
+    monkeypatch.setattr(runtime, "native_named_authority_gap", own_statute)
+    monkeypatch.setattr(runtime, "cited_lower_statute_gap", lower_reference)
+    runtime.run_asv3_loop(**kwargs)
+    assert research.invoke.call_count == 2
+    assert writer.invoke.call_count == len(results)
+    assert kwargs["state_container"].answer_tokens == (
+        "Tamir sonucu [[1]](https://example.test/law-0); "
+        "değiştirme sonucu [[2]](https://example.test/law-1)."
+    )
+    own_statute.assert_not_called()
+    lower_reference.assert_not_called()
+    if bad_number:
+        assert last_payload(writer)["publication_gap"]["unknown_citations"] == [
+            bad_number
+        ]
 
 
 def test_batched_publication_gaps_preserve_all_acquisition_bindings() -> None:

@@ -37,7 +37,7 @@ def candidate_chunks() -> list[InferenceChunk]:
             semantic_identifier=f"Source {index}",
             title=f"Source {index}",
             boost=1,
-            score=1 - index / 320,
+            score=1 - index / 512,
             hidden=False,
             metadata={},
             match_highlights=[],
@@ -52,25 +52,26 @@ def candidate_chunks() -> list[InferenceChunk]:
             regulatory_chunk_id=f"rc-{index}",
             heading_path=[f"MADDE {index + 1}"],
         )
-        for index in range(320)
+        for index in range(512)
     ]
 
 
 @pytest.mark.parametrize(
-    "variant,profile,qualifying,candidate_count,delivered_count",
+    "variant,profile,qualifying,lane_hits,candidate_count,delivered_count",
     [
-        (ASV3_TUNED_VARIANT, "normal", 20, 256, 50),
-        (ASV3_TUNED_VARIANT, "normal", 60, 256, 60),
-        (ASV3_TUNED_VARIANT, "normal", 150, 256, 150),
-        (None, "normal", 20, 96, 25),
-        (None, "deep", 20, 96, 25),
-        (None, "experimental", 20, 96, 25),
+        (ASV3_TUNED_VARIANT, "normal", 20, 256, 384, 50),
+        (ASV3_TUNED_VARIANT, "normal", 60, 256, 384, 60),
+        (ASV3_TUNED_VARIANT, "normal", 150, 256, 384, 150),
+        (None, "normal", 20, 96, 96, 25),
+        (None, "deep", 20, 96, 96, 25),
+        (None, "experimental", 20, 96, 96, 25),
     ],
 )
 def test_real_adapter_retains_scoped_candidate_pool_and_canonical_delivery(
     variant: str | None,
     profile: str,
     qualifying: int,
+    lane_hits: int,
     candidate_count: int,
     delivered_count: int,
 ) -> None:
@@ -146,9 +147,13 @@ def test_real_adapter_retains_scoped_candidate_pool_and_canonical_delivery(
             "onyx.asv3.search_adapter.run_tool_calls", side_effect=execute
         ) as dispatch,
     ):
-        pipeline.side_effect = lambda **kwargs: chunks[
-            : kwargs["chunk_search_request"].limit
-        ]
+
+        def lane_candidates(**kwargs: Any) -> list[InferenceChunk]:
+            request = kwargs["chunk_search_request"]
+            offset = 128 if request.query == "lexical variant" else 0
+            return chunks[offset : offset + request.limit]
+
+        pipeline.side_effect = lane_candidates
         outcome = adapter(
             {
                 "query": "Focused source conditions",
@@ -170,7 +175,7 @@ def test_real_adapter_retains_scoped_candidate_pool_and_canonical_delivery(
     assert pipeline.call_count >= 2
     for call in pipeline.call_args_list:
         request = call.kwargs["chunk_search_request"]
-        assert request.limit == max(candidate_count, 128)
+        assert request.limit == max(lane_hits, 128)
         assert request.user_selected_filters == broker.filters
         assert request.user_selected_filters.as_of_date == date(2025, 1, 1)
     batches = [call.kwargs["chunks"] for call in rerank.call_args_list]

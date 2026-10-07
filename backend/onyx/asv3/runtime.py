@@ -407,6 +407,9 @@ def run_asv3_loop(
         model_call_id: str | None,
         run_context: RunContext | None = None,
     ) -> dict[str, JsonValue] | None:
+        if answer_llm is not None:
+            # This policy accepts a supplied passage establishing the actual claim.
+            return None
         gap = native_named_authority_gap(
             answer,
             ledger,
@@ -1542,7 +1545,7 @@ def run_asv3_loop(
             if not tuned:
                 return gap
             gaps.append(gap)
-        if tuned:
+        if tuned and answer_llm is None:
             reference_gap = cited_lower_statute_gap(answer, ledger, delivered)
             if reference_gap is not None:
                 gaps.append(
