@@ -269,7 +269,15 @@ def _missing_judicial_disposition(
 
 
 def _retention_text(value: str) -> str:
-    """Ignore typography only, retaining words, operators and citation placement."""
+    """Normalize presentation; bind citations separately against the original block."""
+    value = re.sub(
+        r"(?<![\w*])\*\*(?=\S)(.+?)(?<=\S)\*\*(?![\w*])",
+        r"\1",
+        value,
+        flags=re.DOTALL,
+    )
+    value = re.sub(r"(?:\s*" + _CITATION_MARKER.pattern + r")+(?=[.,;:!?])", "", value)
+    value = _CITATION_MARKER.sub("", value)
     return " ".join(
         value.translate(
             str.maketrans(

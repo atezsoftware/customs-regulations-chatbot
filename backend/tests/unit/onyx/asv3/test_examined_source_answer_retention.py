@@ -8,6 +8,7 @@ from pydantic import JsonValue
 
 from onyx.asv3.legal_source_reviews import (
     LegalSourceReviews,
+    _retention_text,
     operative_review_retention_enabled,
 )
 from onyx.asv3.models import RunContext, ToolOutcome
@@ -439,6 +440,66 @@ def test_quote_typography_retention_is_isolated_to_tuned(tuned: bool) -> None:
         answer, "answer", context, ledger, [review(effect=effect, limitations=limit)]
     )
     assert (gap is None) is tuned
+
+
+@pytest.mark.parametrize("tuned", [False, True])
+def test_faithful_formatted_passage_keeps_its_local_citations(tuned: bool) -> None:
+    context, ledger, reviews = setup_reviews()
+    scope(context)
+    if tuned:
+        context.services["asv3_workflow_variant"] = "asv3_tuned"
+    seen(context, ledger, reviews)
+    deliver(ledger, "answer", [1, 2])
+    effect = "The particular wording may affect this outcome."
+    limitations = (
+        "The underlying obligation remains distinct. "
+        "Its application depends on the event date."
+    )
+    answer = (
+        "**The particular wording** may affect this outcome [2].\n\n"
+        "**The underlying obligation remains distinct.** "
+        "Its application depends on the event date [2]."
+    )
+    gap = reviews.publication_gap(
+        answer,
+        "answer",
+        context,
+        ledger,
+        [review(effect=effect, limitations=limitations)],
+    )
+    assert (gap is None) is tuned
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        "**The particular wording** cannot affect this outcome [2].",
+        "**The particular wording** may affect this outcome [1].",
+        "**The particular wording** may affect this outcome.\n\nReferences [2].",
+        "# **The particular wording** may affect this outcome [2].",
+        "**The particular wording** may affect this outcome.\n[2]",
+    ],
+)
+def test_formatted_retention_rejects_changed_or_unbound_claims(answer: str) -> None:
+    context, ledger, reviews = setup_reviews()
+    scope(context)
+    context.services["asv3_workflow_variant"] = "asv3_tuned"
+    seen(context, ledger, reviews)
+    deliver(ledger, "answer", [1, 2])
+    gap = reviews.publication_gap(
+        answer + "\n\n" + LIMITATIONS + " [2].",
+        "answer",
+        context,
+        ledger,
+        [review(effect="The particular wording may affect this outcome.")],
+    )
+    assert omissions(gap)[0]["missing_answer_passages"] == ["effect"]
+
+
+def test_retention_presentation_normalization_preserves_arithmetic_operators() -> None:
+    assert _retention_text("The base is x**2 + y**2 [2].") == (
+        "The base is x**2 + y**2."
+    )
 
 
 @pytest.mark.parametrize(
