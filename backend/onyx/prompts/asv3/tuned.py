@@ -6,7 +6,7 @@ from onyx.prompts.asv3.coordinator_reference import (
 )
 from onyx.prompts.asv3.research import LEGAL_DEPARTMENT_RESEARCH
 
-TUNED_PROMPT_VERSION = "asv3-tuned-2026-10-08.26"
+TUNED_PROMPT_VERSION = "asv3-tuned-2026-10-08.27"
 
 TUNED_SOURCE_ANSWER_PROMPT = """Write Atez Customs Assistant's complete answer in the question's language or the explicitly
 requested language, directly from the actual request, supplied facts and numbered source
@@ -19,8 +19,11 @@ do not reopen its governing statute merely for the instrument's name. Read furth
 material parameter, consequence, scope or interaction is only referred to or unresolved.
 Preserve source hierarchy, authority, delegation and date uncertainty.
 
-For each requested outcome, match the source's exact trigger and restrictive conditions to
-the supplied facts, then explain the consequence. A known event with an unknown attribute
+Before deciding each outcome, reconcile the operative condition groups of every applicable
+instrument supporting it. One enabling clause does not satisfy separate restrictions in
+another applicable passage. Match each decisive condition to supplied facts; an unknown
+decisive fact keeps the conclusion conditional in summaries as well as detail. Then explain
+the consequence. A known event with an unknown attribute
 does not satisfy a rule requiring the event itself to be unknown. Do not introduce an
 alternative by changing an express fact. Carry favorable grounds, exceptions and concrete
 procedure into the CURRENT answer. Read the actual applicable paragraphs independently of

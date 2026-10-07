@@ -328,6 +328,42 @@ def test_invalid_source_handoff_cannot_trigger_the_answer_writer(
     writer.invoke.assert_not_called()
 
 
+def test_source_writer_gets_exact_foreign_reference_leads_from_uncited_passages() -> (
+    None
+):
+    from tests.unit.onyx.asv3.test_native_authority import (
+        original as authority_original,
+    )
+
+    adapter, context, _research, writer = source_answer_adapter()
+    ledger = cast(EvidenceLedger, context.services["evidence"])
+    ledger.add(
+        [
+            authority_original("8917 sayılı Faaliyet Kanunu", "27"),
+            authority_original(
+                "İşlem Tebliği",
+                "9",
+                kind="tebliğ",
+                text="Bu sonuç Faaliyet Kanununun 38 inci maddesine göre belirlenir.",
+            ),
+        ],
+        context,
+    )
+    adapter.decide(
+        adaptive_tool_view(
+            original_evidence=[full_record(ledger, 1), full_record(ledger, 2)]
+        )
+    )
+    payload = last_payload(writer)
+    catalogue = payload["source_contained_references"]
+    assert catalogue["references"][0]["citation"] == 2
+    assert catalogue["references"][0]["article"] == "38"
+    assert catalogue["references"][0]["instrument_number"] == "8917"
+    assert catalogue["references"][0]["role"] == "source_contained_reference_navigation"
+    assert ledger.completely_delivered(adapter.last_call_id or "") == {1, 2}
+    assert writer.invoke.call_args.kwargs["tool_choice"].value == "auto"
+
+
 @pytest.mark.parametrize("terminal", ["submit_answer", "submit_partial_answer"])
 def test_source_answer_binds_same_response_text_before_terminal_validation(
     terminal: str,

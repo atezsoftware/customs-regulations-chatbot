@@ -2951,7 +2951,9 @@ class ResearchModel:
             else []
         )
         include_related_navigation = True
-        include_reference_catalogue = parallel_execution_enabled(self.context)
+        include_reference_catalogue = (
+            parallel_execution_enabled(self.context) or self.answer_llm is not None
+        )
         has_reference_catalogue = False
         ceiling, output = self._limits(self._native_output_limit())
         selected = copy.deepcopy(view.tools) if native_original_cache else view.tools
