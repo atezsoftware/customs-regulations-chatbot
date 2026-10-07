@@ -6,7 +6,7 @@ from onyx.prompts.asv3.coordinator_reference import (
 )
 from onyx.prompts.asv3.research import LEGAL_DEPARTMENT_RESEARCH
 
-TUNED_PROMPT_VERSION = "asv3-tuned-2026-10-07.23"
+TUNED_PROMPT_VERSION = "asv3-tuned-2026-10-07.24"
 
 TUNED_SOURCE_ANSWER_PROMPT = """Write Atez Customs Assistant's complete answer in the question's language or the explicitly
 requested language, directly from the actual request, supplied facts and numbered source
@@ -23,10 +23,15 @@ For each requested outcome, match the source's exact trigger and restrictive con
 the supplied facts, then explain the consequence. A known event with an unknown attribute
 does not satisfy a rule requiring the event itself to be unknown. Do not introduce an
 alternative by changing an express fact. Carry favorable grounds, exceptions and concrete
-procedure into the CURRENT answer, including responsible actors and subsequent steps.
+procedure into the CURRENT answer. Read the actual applicable paragraphs independently of
+coverage summaries: they can omit material stages. For a requested procedure, communicate
+each material stage through completion, with its actor, recipient, trigger, documents and
+deadline where supplied; filing or payment alone does not finish that sequence.
 Unknown eligibility needs a sourced conditional branch. research_candidate is an unverified
 visible draft: correct it from passages while retaining its supported detail; it is not
-authority. Check a new outcome's support before expanding beyond acquired research.
+authority. Answer the requested outcomes. Do not append collateral conclusions from a
+cross-reference: read its operative consequence and material related leads before asserting
+that result, or leave that additional issue for a useful optional follow-up.
 Compare obligation, violation and consequence separately. Operative holdings require their
 material reasoning, scope and timing; distinguish submissions from the court's conclusion.
 Conflicting AND/OR wording remains unresolved without a sourced reason for choosing one.
@@ -61,13 +66,13 @@ source_id for source-local searches and continuation reads. An explicit single-i
 article target uses canonical reading even in search_corpus; set discover_related_sources
 true when seeking other authorities rather than that provision's own text."""
 
-_LOCAL_RESEARCH = """Use the delivered condition list or example as a connected unit. If its decisive conclusion,
-reasoning or referenced parameter is missing, read that exact source-local continuation;
-do not infer it from an introduction or load every neighboring provision. Resolve material
-support before writing a full candidate; reuse delivered passages. Before handing off, bind
-each outcome to its decisive supplied facts, source conditions and concrete procedure in
-existing outcome metadata. A missing attribute does not make a known event unknown. Preserve
-these distinctions and relevant favorable branches in the visible answer candidate."""
+_LOCAL_RESEARCH = """Use delivered conditions and examples as connected units. Read a missing decisive conclusion,
+reasoning or parameter through its exact continuation, not every neighboring provision.
+Before handing off, bind each outcome to supplied facts and actual source conditions in
+existing metadata. For a requested procedure retain every material stage through completion,
+including its actor, recipient, trigger and documents; filing or payment alone is insufficient.
+A missing attribute does not make a known event unknown. Preserve these distinctions and
+favorable branches in the visible candidate; resolve material support before writing it."""
 
 _METADATA_DELTAS = """Outcome metadata is retained by the host. _outcomes and _coverage carry changes only;
 omit unchanged records or use null where the schema requires the field. Keep retained
