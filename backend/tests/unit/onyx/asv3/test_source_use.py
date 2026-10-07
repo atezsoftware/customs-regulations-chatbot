@@ -1,20 +1,17 @@
-"""Publication must carry uncited operative conditions without replaying research."""
+"""Draft isolation, immutable coverage, delivery and cache boundaries."""
 
 import json
 from collections import Counter
-from collections.abc import Mapping, Sequence
 from typing import Any, cast
 from unittest.mock import MagicMock
 
 import pytest
 
-from onyx.asv3.assertions import assertion_inventory
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.llm_adapter import ResearchModel
 from onyx.asv3.models import OutcomeStatus, RunContext
 from onyx.asv3.source_metadata_transport import expand_source_metadata
 from onyx.asv3.source_use import SourceUseIssue, SourceUseReviewer
-from onyx.asv3.witnesses import original_witness_spans
 from onyx.asv3.workflow_variant import ASV3_TUNED_VARIANT
 from onyx.tracing.flows import LLMFlow
 from tests.unit.onyx.asv3.test_citation_contract import original_ledger
@@ -43,197 +40,344 @@ def setup_review() -> tuple[EvidenceLedger, RunContext, ResearchModel]:
     return ledger, context, ResearchModel(scripted_model(), context)
 
 
-def review_payload(answer: str, *, omitted: bool = True) -> dict[str, Any]:
-    ledger, _context = original_ledger()
-    item = ledger.get(3)
-    assert item is not None
-    units = assertion_inventory(answer)
+def model_payload(arguments: dict[str, Any]) -> dict[str, Any]:
+    content = arguments["prompt"][1].content
+    return json.loads(content if isinstance(content, str) else content[0].text)
+
+
+def inventory_for(records: list[dict[str, Any]]) -> dict[str, Any]:
+    row = records[0]
     return {
-        "examined_citations": [1, 2, 3],
-        "reviewed_answer_unit_ids": [unit["unit_id"] for unit in units],
-        "source_assessments": source_assessments(
-            json.loads(
-                ledger.serialize_records(
-                    [1, 2, 3], max_chars=None, include_witness_spans=True
-                )
-            ),
-            units,
-        ),
-        "issues": [
+        "examined_citations": [r["citation"] for r in records],
+        "requirements": [
             {
-                "kind": "omitted_condition",
-                "answer_unit_ids": [units[0]["unit_id"]],
+                "detail": "The operation depends on the operative exception.",
+                "applicability": "Retain the conditional branch when its decisive fact is unknown.",
                 "witnesses": [
                     {
-                        "citation": 3,
-                        "witness_id": original_witness_spans(3, item.text)[0][
-                            "witness_id"
-                        ],
+                        "citation": row["citation"],
+                        "witness_id": row["witness_spans"][0]["witness_id"],
                     }
                 ],
-                "detail": "The operative exception is absent.",
-                "applicability": "The user's requested operation depends on this exception.",
             }
-        ]
-        if omitted
-        else [],
+        ],
     }
 
 
-def source_assessments(
-    records: list[dict[str, Any]], units: Sequence[Mapping[str, Any]]
-) -> list[dict[str, Any]]:
-    first = {row["source_id"]: row for row in records}
-    results = []
-    for source_id, first_row in first.items():
-        row = next(
-            (
-                record
-                for record in records
-                if record["source_id"] == source_id
-                and any(
-                    record["citation"] in unit["evidence_numbers"] for unit in units
-                )
-            ),
-            first_row,
-        )
-        witness = [
+def resolutions_for(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    units = payload["answer_units"]
+    rows = []
+    for req in payload["retained_requirements"]:
+        numbers = {w["citation"] for w in req["witnesses"]}
+        bound = [u["unit_id"] for u in units if numbers <= set(u["evidence_numbers"])]
+        rows.append(
             {
-                "citation": row["citation"],
-                "witness_id": row["witness_spans"][0]["witness_id"],
-            }
-        ]
-        bound = [
-            unit["unit_id"]
-            for unit in units
-            if row["citation"] in unit["evidence_numbers"]
-        ]
-        results.append(
-            {
-                "source_id": source_id,
-                "requirements": [
-                    {
-                        "detail": "The operative rule",
-                        "applicability": "It applies to the supplied facts",
-                        "witnesses": witness,
-                        "answer_unit_ids": bound,
-                        "status": "covered",
-                    }
-                ]
-                if bound
-                else [],
-                "exclusion": None
-                if bound
-                else {
-                    "detail": "The original excludes the supplied scope",
-                    "witnesses": witness,
-                },
+                "requirement_id": req["requirement_id"],
+                "status": "covered" if bound else "omitted",
+                "answer_unit_ids": bound or [units[0]["unit_id"]],
+                "explanation": "" if bound else "The operative detail is absent.",
             }
         )
-    return results
+    return rows
+
+
+def review_for(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "examined_citations": payload["required_evidence_numbers"],
+        "reviewed_answer_unit_ids": [u["unit_id"] for u in payload["answer_units"]],
+        "resolutions": resolutions_for(payload),
+        "issues": [],
+    }
+
+
+def scripted_reviews(
+    model: ResearchModel, *, inventory_mutator: Any = None, review_mutator: Any = None
+) -> Counter[str]:
+    counts: Counter[str] = Counter()
+
+    def script(**arguments: Any) -> Any:
+        schema = (arguments.get("structured_response_format") or {}).get(
+            "json_schema"
+        ) or {}
+        payload = model_payload(arguments)
+        if (
+            schema.get("name")
+            or (
+                "SourceUseReview" if "answer_units" in payload else "SourceUseInventory"
+            )
+        ) == "SourceUseInventory":
+            counts["inventory"] += 1
+            result = inventory_for(payload["original_evidence"])
+            if inventory_mutator:
+                inventory_mutator(result, payload)
+        else:
+            assert (schema.get("name") or "SourceUseReview") == "SourceUseReview"
+            counts["review"] += 1
+            result = review_for(payload)
+            if review_mutator:
+                review_mutator(result, payload)
+        return text_response(result)
+
+    cast(MagicMock, model.llm).invoke.side_effect = script
+    return counts
 
 
 @pytest.mark.parametrize("provider", ["vertex_ai", "openai", "anthropic"])
-def test_uncited_originals_are_delivered_and_coordinator_identity_preserved(
-    provider: str,
-) -> None:
+def test_complete_draft_blind_inventory_and_coordinator_identity(provider: str) -> None:
     ledger, context, model = setup_review()
     model.llm.config.model_provider = provider
-    answer = "The operation is permitted [1]."
-    cast(MagicMock, model.llm).invoke.return_value = text_response(
-        review_payload(answer)
-    )
+    counts = scripted_reviews(model)
     reviewer = SourceUseReviewer(model, ledger)
+    answer = "The operation is allowed [2]."
+    conversation = [
+        {"role": "assistant", "content": "Earlier legal conclusion."},
+        {"role": "user", "content": "A decisive supplied fact."},
+    ]
     gap = reviewer.publication_gap(
-        answer, "An operation with an exception", "coordinator"
+        answer, "Actual request", "coordinator", conversation=conversation
     )
     assert gap and gap.status == OutcomeStatus.PARTIAL
-    issues = gap.data["source_use_gaps"]
-    assert isinstance(issues, list)
-    assert SourceUseIssue.model_validate(issues[0]).witnesses[0].citation == 3
+    assert (
+        SourceUseIssue.model_validate(cast(list[Any], gap.data["source_use_gaps"])[0])
+        .witnesses[0]
+        .citation
+        == 1
+    )
+    calls = cast(MagicMock, model.llm).invoke.call_args_list
+    blind = model_payload(calls[0].kwargs)
+    assert not {
+        "answer_units",
+        "draft",
+        "retained_requirements",
+        "issues",
+    }.intersection(blind)
+    assert blind["conversation"] == [conversation[1]]
+    assert {r["citation"] for r in blind["original_evidence"]} == {1, 2, 3}
+    for row in blind["original_evidence"]:
+        original = ledger.get(row["citation"])
+        assert original is not None and row["text"] == original.text
     assert context.services["last_model_call_id"] == "coordinator"
     assert model.last_call_id is not None
     assert ledger.completely_delivered(model.last_call_id) == {1, 2, 3}
     assert (
         ledger.delivery_flow(model.last_call_id) == LLMFlow.ASV3_SOURCE_USE_REVIEW.value
     )
-    assert "coordinator" != model.last_call_id
-    before = cast(MagicMock, model.llm).invoke.call_count
     assert (
         reviewer.publication_gap(
-            answer, "An operation with an exception", "coordinator"
+            answer, "Actual request", "coordinator", conversation=conversation
         )
         == gap
     )
-    assert cast(MagicMock, model.llm).invoke.call_count == before
+    assert counts == {"inventory": 1, "review": 1}
 
 
-@pytest.mark.parametrize("change", ["answer", "facts", "evidence"])
-def test_changed_candidate_facts_or_delivered_originals_cannot_reuse_approval(
+@pytest.mark.parametrize("change", ["answer", "facts", "evidence", "user_conversation"])
+def test_inventory_reuse_is_independent_of_answer_but_bound_to_originals_and_facts(
     change: str,
 ) -> None:
-    ledger, _context, model = setup_review()
-    answer = "The operation is permitted [1]."
-    first = review_payload(answer, omitted=False)
-    cast(MagicMock, model.llm).invoke.return_value = text_response(first)
+    ledger, context, model = setup_review()
+    counts = scripted_reviews(model)
     reviewer = SourceUseReviewer(model, ledger)
-    assert reviewer.publication_gap(answer, "supplied facts", "coordinator") is None
-    if change == "answer":
-        answer = "The operation is permitted only if proved [1]."
-    next_result = review_payload(answer)
-    current_call = "coordinator"
-    if change == "evidence":
-        current_call = "coordinator-next"
-        coordinator_delivery(ledger, [1, 3], current_call)
-        next_result["examined_citations"] = [1, 3]
-        next_result["source_assessments"] = source_assessments(
-            json.loads(
-                ledger.serialize_records(
-                    [1, 3], max_chars=None, include_witness_spans=True
-                )
-            ),
-            assertion_inventory(answer),
-        )
-    cast(MagicMock, model.llm).invoke.return_value = text_response(next_result)
-    gap = reviewer.publication_gap(
-        answer, "changed facts" if change == "facts" else "supplied facts", current_call
+    assert (
+        reviewer.publication_gap("Allowed [1].", "Actual facts", "coordinator") is None
     )
-    assert gap and gap.status == OutcomeStatus.PARTIAL
-    assert cast(MagicMock, model.llm).invoke.call_count == 2
+    answer = "Allowed with proof [1]." if change == "answer" else "Allowed [1]."
+    call_id = "coordinator"
+    if change == "evidence":
+        call_id = "next"
+        coordinator_delivery(ledger, [1, 3], call_id)
+    reviewer.publication_gap(
+        answer,
+        "Changed facts" if change == "facts" else "Actual facts",
+        call_id,
+        conversation=[{"role": "user", "content": "Another actual fact."}]
+        if change == "user_conversation"
+        else None,
+    )
+    assert counts == {"inventory": 1 if change == "answer" else 2, "review": 2}
+    assert context.services["last_model_call_id"] == "coordinator"
+
+
+@pytest.mark.parametrize(
+    "defect", ["missing_citation", "unknown_witness", "duplicate_requirement"]
+)
+def test_inventory_failures_cannot_be_cached_or_approve(defect: str) -> None:
+    ledger, context, model = setup_review()
+
+    def mutate(result: dict[str, Any], _payload: dict[str, Any]) -> None:
+        if defect == "missing_citation":
+            result["examined_citations"].pop()
+        elif defect == "unknown_witness":
+            result["requirements"][0]["witnesses"][0]["witness_id"] = "invented"
+        else:
+            result["requirements"].append(result["requirements"][0])
+
+    counts = scripted_reviews(model, inventory_mutator=mutate)
+    reviewer = SourceUseReviewer(model, ledger)
+    gap = reviewer.publication_gap("Allowed [1].", "facts", "coordinator")
+    assert gap and gap.status == OutcomeStatus.UNAVAILABLE
+    assert counts == {"inventory": 2}
+    assert not reviewer._inventories
+    assert reviewer.publication_gap("Allowed [1].", "facts", "coordinator") == gap
+    assert counts == {"inventory": 2}
+    assert context.services["last_model_call_id"] == "coordinator"
 
 
 @pytest.mark.parametrize(
     "defect",
     [
-        "invented_witness",
-        "uncited_unread_witness",
-        "missing_unit",
-        "missing_original",
+        "missing_resolution",
+        "renamed_requirement",
+        "duplicate_resolution",
         "invented_unit",
+        "missing_unit",
+        "borrowed_citation",
+        "missing_original",
+        "assumed_exclusion",
     ],
 )
-def test_unbound_or_incomplete_review_cannot_approve_publication(defect: str) -> None:
-    ledger, _context, model = setup_review()
-    answer = "The operation is permitted [1].\n\nA separate outcome [2]."
-    payload = review_payload(answer)
-    current_call = "coordinator"
-    if defect == "invented_witness":
-        payload["issues"][0]["witnesses"][0]["witness_id"] = "invented"
-    elif defect == "uncited_unread_witness":
-        current_call = "coordinator-next"
-        coordinator_delivery(ledger, [1, 2], current_call)
-        payload["examined_citations"] = [1, 2]
-    elif defect == "missing_unit":
-        payload["reviewed_answer_unit_ids"].pop()
-    elif defect == "missing_original":
-        payload["examined_citations"].pop()
-    else:
-        payload["issues"][0]["answer_unit_ids"] = ["invented"]
-    cast(MagicMock, model.llm).invoke.return_value = text_response(payload)
+def test_review_cannot_drop_retained_rules_or_borrow_neighboring_citations(
+    defect: str,
+) -> None:
+    ledger, context, model = setup_review()
+
+    def mutate(result: dict[str, Any], payload: dict[str, Any]) -> None:
+        row = result["resolutions"][0]
+        if defect == "missing_resolution":
+            result["resolutions"] = []
+        elif defect == "renamed_requirement":
+            row["requirement_id"] = "invented"
+        elif defect == "duplicate_resolution":
+            result["resolutions"].append(row)
+        elif defect == "invented_unit":
+            row["answer_unit_ids"] = ["invented"]
+        elif defect == "missing_unit":
+            result["reviewed_answer_unit_ids"].pop()
+        elif defect == "missing_original":
+            result["examined_citations"].pop()
+        elif defect == "borrowed_citation":
+            row["answer_unit_ids"] = [payload["answer_units"][-1]["unit_id"]]
+        else:
+            row.update(
+                status="not_applicable",
+                scenario_quote="The decisive condition is excluded.",
+            )
+
+    counts = scripted_reviews(model, review_mutator=mutate)
     gap = SourceUseReviewer(model, ledger).publication_gap(
-        answer, "facts", current_call
+        "Allowed [1].\n\nAnother outcome [2].", "Actual facts", "coordinator"
     )
     assert gap and gap.status == OutcomeStatus.UNAVAILABLE
+    assert counts == {"inventory": 1, "review": 2}
+    assert context.services["last_model_call_id"] == "coordinator"
+
+
+def test_literal_user_exclusion_is_not_inferred_from_assistant_context() -> None:
+    ledger, _context, model = setup_review()
+
+    def mutate(result: dict[str, Any], _payload: dict[str, Any]) -> None:
+        result["resolutions"][0].update(
+            status="not_applicable",
+            scenario_quote="Excluded status",
+            answer_unit_ids=[],
+        )
+
+    counts = scripted_reviews(model, review_mutator=mutate)
+    reviewer = SourceUseReviewer(model, ledger)
+    gap = reviewer.publication_gap(
+        "Allowed [1].",
+        "facts",
+        "coordinator",
+        conversation=[{"role": "assistant", "content": "Excluded status"}],
+    )
+    assert gap and gap.status == OutcomeStatus.UNAVAILABLE
+    assert (
+        reviewer.publication_gap("Allowed [1].", "Excluded status", "coordinator")
+        is None
+    )
+    assert counts == {"inventory": 2, "review": 3}
+
+
+def test_new_issues_need_delivered_witnesses_and_current_units() -> None:
+    ledger, _context, model = setup_review()
+
+    def mutate(result: dict[str, Any], payload: dict[str, Any]) -> None:
+        result["issues"] = [
+            {
+                "kind": "unsupported_claim",
+                "answer_unit_ids": [payload["answer_units"][0]["unit_id"]],
+                "detail": "Exact unsupported effect",
+                "applicability": "Actual requested result",
+                "witnesses": [{"citation": 100, "source_quote": "invented"}],
+            }
+        ]
+
+    counts = scripted_reviews(model, review_mutator=mutate)
+    gap = SourceUseReviewer(model, ledger).publication_gap(
+        "Allowed [1].", "facts", "coordinator"
+    )
+    assert gap and gap.status == OutcomeStatus.UNAVAILABLE
+    assert counts == {"inventory": 1, "review": 2}
+
+
+def test_failed_review_is_reused_without_approval_and_changed_answers_are_rechecked() -> (
+    None
+):
+    ledger, context, model = setup_review()
+
+    def mutate(result: dict[str, Any], _payload: dict[str, Any]) -> None:
+        result["resolutions"][0]["requirement_id"] = "invented"
+
+    counts = scripted_reviews(model, review_mutator=mutate)
+    reviewer = SourceUseReviewer(model, ledger)
+    gap = reviewer.publication_gap("Allowed [1].", "facts", "coordinator")
+    assert gap and gap.status == OutcomeStatus.UNAVAILABLE
+    assert reviewer.publication_gap("Allowed [1].", "facts", "coordinator") == gap
+    assert counts == {"inventory": 1, "review": 2}
+    changed = reviewer.publication_gap(
+        "Allowed with proof [1].", "facts", "coordinator"
+    )
+    assert changed and changed.status == OutcomeStatus.UNAVAILABLE
+    assert counts == {"inventory": 1, "review": 4}
+    assert context.services["last_model_call_id"] == "coordinator"
+
+
+def test_shared_metadata_and_full_text_survive_both_independent_phases() -> None:
+    ledger, context, model = setup_review()
+    item = ledger.get(2)
+    assert item is not None
+    item.source_id = "distinct-source"
+    item.chunk_id = "another-original"
+    item.metadata = {
+        "title": "Actual source",
+        "legal_dates": {"effective_start": "2025-01-01"},
+    }
+    ledger.add([item], context)
+    coordinator_delivery(ledger, [2, 4], "next")
+    scripted_reviews(model)
+    assert (
+        SourceUseReviewer(model, ledger).publication_gap(
+            "Result [2] [4].", "facts", "next"
+        )
+        is None
+    )
+    for call in cast(MagicMock, model.llm).invoke.call_args_list:
+        data = model_payload(call.kwargs)
+        records = expand_source_metadata(
+            {
+                "original_metadata_catalogue": data["original_evidence"],
+                "original_source_metadata": data["original_source_metadata"],
+            }
+        )
+        for record in records:
+            citation = record["citation"]
+            assert isinstance(citation, int)
+            original = ledger.get(citation)
+            assert original is not None
+            assert original.text == record["text"]
+        metadata = next(row for row in records if row["citation"] == 4)["metadata"]
+        assert isinstance(metadata, dict)
+        assert metadata["legal_dates"] == {"effective_start": "2025-01-01"}
 
 
 @pytest.mark.parametrize(
@@ -269,148 +413,6 @@ def test_social_dialogue_does_not_add_a_review() -> None:
         is None
     )
     cast(MagicMock, model.llm).invoke.assert_not_called()
-
-
-def test_complete_text_and_source_dates_survive_shared_metadata_transport() -> None:
-    ledger, context, model = setup_review()
-    second = ledger.get(2)
-    assert second is not None
-    second.source_id = "distinct-source-1"
-    second.chunk_id = "another-exact-chunk"
-    second.metadata = {
-        "title": "Exact instrument",
-        "legal_dates": {"effective_start": "2025-01-01"},
-    }
-    ledger.add([second], context)
-    coordinator_delivery(ledger, [2, 4], "coordinator-next")
-    payload = review_payload("Result [2].", omitted=False)
-    payload["examined_citations"] = [2, 4]
-    payload["source_assessments"] = source_assessments(
-        json.loads(
-            ledger.serialize_records([2, 4], max_chars=None, include_witness_spans=True)
-        ),
-        assertion_inventory("Result [2]."),
-    )
-    cast(MagicMock, model.llm).invoke.return_value = text_response(payload)
-    assert (
-        SourceUseReviewer(model, ledger).publication_gap(
-            "Result [2].", "facts", "coordinator-next"
-        )
-        is None
-    )
-    prompt = cast(MagicMock, model.llm).invoke.call_args.kwargs["prompt"]
-    content = prompt[1].content
-    raw = content if isinstance(content, str) else content[0].text
-    data = json.loads(raw)
-    records = expand_source_metadata(
-        {
-            "original_metadata_catalogue": data["original_evidence"],
-            "original_source_metadata": data["original_source_metadata"],
-        }
-    )
-    for record in records:
-        citation = record["citation"]
-        assert isinstance(citation, int)
-        item = ledger.get(citation)
-        assert item is not None and record["text"] == item.text
-    metadata = next(row for row in records if row["citation"] == 4)["metadata"]
-    assert isinstance(metadata, dict)
-    assert metadata["legal_dates"] == {"effective_start": "2025-01-01"}
-
-
-@pytest.mark.parametrize(
-    "defect", ["missing_source", "wrong_source", "empty_assessment", "unbound_covered"]
-)
-def test_source_assessment_cannot_skip_a_source_or_approve_an_uncited_requirement(
-    defect: str,
-) -> None:
-    ledger, _context, model = setup_review()
-    answer = "Operation permitted [1]."
-    payload = review_payload(answer, omitted=False)
-    if defect == "missing_source":
-        payload["source_assessments"].pop()
-    elif defect == "wrong_source":
-        payload["source_assessments"][2]["exclusion"]["witnesses"] = payload[
-            "source_assessments"
-        ][0]["requirements"][0]["witnesses"]
-    elif defect == "empty_assessment":
-        payload["source_assessments"][0]["requirements"] = []
-        payload["source_assessments"][0]["exclusion"] = None
-    else:
-        witness = payload["source_assessments"][2]["exclusion"]["witnesses"]
-        payload["source_assessments"][2] = {
-            "source_id": "distinct-source-3",
-            "exclusion": None,
-            "requirements": [
-                {
-                    "status": "covered",
-                    "detail": "The applicable exception",
-                    "applicability": "It changes this outcome",
-                    "witnesses": witness,
-                    "answer_unit_ids": payload["reviewed_answer_unit_ids"],
-                }
-            ],
-        }
-    cast(MagicMock, model.llm).invoke.return_value = text_response(payload)
-    gap = SourceUseReviewer(model, ledger).publication_gap(
-        answer, "facts", "coordinator"
-    )
-    assert gap and gap.status == OutcomeStatus.UNAVAILABLE
-
-
-def test_source_requirement_omission_reaches_native_repair_even_without_separate_issue() -> (
-    None
-):
-    ledger, _context, model = setup_review()
-    answer = "Operation permitted [1]."
-    payload = review_payload(answer, omitted=False)
-    witness = payload["source_assessments"][2]["exclusion"]["witnesses"]
-    payload["source_assessments"][2] = {
-        "source_id": "distinct-source-3",
-        "exclusion": None,
-        "requirements": [
-            {
-                "status": "omitted",
-                "detail": "Retain the conditional exception",
-                "applicability": "The triggering fact is not supplied",
-                "witnesses": witness,
-                "answer_unit_ids": payload["reviewed_answer_unit_ids"],
-            }
-        ],
-    }
-    cast(MagicMock, model.llm).invoke.return_value = text_response(payload)
-    gap = SourceUseReviewer(model, ledger).publication_gap(
-        answer, "facts", "coordinator"
-    )
-    assert gap and gap.status == OutcomeStatus.PARTIAL
-    assert len(cast(list[Any], gap.data["source_use_gaps"])) == 1
-    assert (
-        cast(list[Any], gap.data["source_use_gaps"])[0]["witnesses"][0]["citation"] == 3
-    )
-
-
-@pytest.mark.parametrize("defect", ["excluded_used_source", "uncited_neighbor"])
-def test_requirement_coverage_cannot_borrow_another_answer_blocks_citation(
-    defect: str,
-) -> None:
-    ledger, _context, model = setup_review()
-    answer = "Operation permitted [1].\n\nA separate obligation [2]."
-    payload = review_payload(answer, omitted=False)
-    first = payload["source_assessments"][0]
-    requirement = first["requirements"][0]
-    if defect == "excluded_used_source":
-        first["requirements"] = []
-        first["exclusion"] = {
-            "detail": "Outside the scope",
-            "witnesses": requirement["witnesses"],
-        }
-    else:
-        requirement["answer_unit_ids"] = payload["reviewed_answer_unit_ids"]
-    cast(MagicMock, model.llm).invoke.return_value = text_response(payload)
-    gap = SourceUseReviewer(model, ledger).publication_gap(
-        answer, "facts", "coordinator"
-    )
-    assert gap and gap.status == OutcomeStatus.UNAVAILABLE
 
 
 def test_batched_publication_gaps_preserve_all_existing_acquisition_bindings() -> None:
@@ -469,6 +471,11 @@ def test_runtime_repairs_a_witnessed_omission_without_repeating_source_acquisiti
         schema = (arguments.get("structured_response_format") or {}).get(
             "json_schema"
         ) or {}
+        if schema.get("name") == "SourceUseInventory":
+            counts["inventory"] += 1
+            return text_response(
+                inventory_for(model_payload(arguments)["original_evidence"])
+            )
         if schema.get("name") == "SourceUseReview":
             counts["review"] += 1
             content = arguments["prompt"][1].content
@@ -499,7 +506,7 @@ def test_runtime_repairs_a_witnessed_omission_without_repeating_source_acquisiti
                 {
                     "examined_citations": [row["citation"] for row in records],
                     "reviewed_answer_unit_ids": [row["unit_id"] for row in units],
-                    "source_assessments": source_assessments(records, units),
+                    "resolutions": resolutions_for(payload),
                     "issues": issues,
                 }
             )
@@ -514,7 +521,7 @@ def test_runtime_repairs_a_witnessed_omission_without_repeating_source_acquisiti
 
     selected.invoke.side_effect = script
     runtime.run_asv3_loop(**kwargs)
-    assert counts == {"native": 3, "review": 2}
+    assert counts == {"native": 3, "inventory": 1, "review": 2}
     assert page.call_count == 2
     assert (
         kwargs["state_container"].answer_tokens
