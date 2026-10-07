@@ -1,0 +1,830 @@
+{
+  "name": "TARIFF Regulatory Intelligence v2.1 - Tam Etiket Sözlüğü",
+  "labels": [
+    {
+      "id": "SUB.CUS",
+      "name": "Gümrük işlemleri",
+      "description": "Boyut: Konu. Gümrük beyanı, tarife, menşe, kıymet, borç, kontrol ve idari işlemler üst grubu."
+    },
+    {
+      "id": "SUB.CUS.DECL",
+      "name": "Gümrük beyanı",
+      "description": "Boyut: Konu. Beyanname, özet beyan, sözlü/eksik/tamamlayıcı beyan ve düzeltme/iptal. Üst konu kodu: SUB.CUS."
+    },
+    {
+      "id": "SUB.CUS.ENTRY",
+      "name": "Giriş, varış ve çıkış",
+      "description": "Boyut: Konu. Taşıt/eşyanın gümrük bölgesine gelişi, varış bildirimi, boşaltma ve çıkış. Üst konu kodu: SUB.CUS."
+    },
+    {
+      "id": "SUB.CUS.RELEASE",
+      "name": "Teslim ve serbest bırakma",
+      "description": "Boyut: Konu. Eşyanın teslimi, serbest bırakılması ve kontrol sonrası çekilmesi. Üst konu kodu: SUB.CUS."
+    },
+    {
+      "id": "SUB.CUS.REP",
+      "name": "Temsil ve gümrük müşavirliği",
+      "description": "Boyut: Konu. Doğrudan/dolaylı temsil, gümrük müşaviri ve YGM yetki/sorumluluğu. Üst konu kodu: SUB.CUS."
+    },
+    {
+      "id": "SUB.CUS.SIMPL",
+      "name": "Basitleştirmeler ve yetkilendirilmiş yükümlü",
+      "description": "Boyut: Konu. YYS/AEO, OKS, izinli gönderici/alıcı ve basitleştirilmiş usuller. Üst konu kodu: SUB.CUS."
+    },
+    {
+      "id": "SUB.CUS.TARIFF",
+      "name": "Tarife ve sınıflandırma",
+      "description": "Boyut: Konu. GTİP/TGTC, bağlayıcı tarife bilgisi ve sınıflandırma kararları. Üst konu kodu: SUB.CUS."
+    },
+    {
+      "id": "SUB.CUS.ORIGIN",
+      "name": "Menşe ve menşe ispatı",
+      "description": "Boyut: Konu. Tercihli/tercihsiz menşe, kümülasyon ve ispat belgeleri. Üst konu kodu: SUB.CUS."
+    },
+    {
+      "id": "SUB.CUS.VALUE",
+      "name": "Gümrük kıymeti",
+      "description": "Boyut: Konu. Satış bedeli ve alternatif yöntemler, ilaveler, royalti, navlun ve kıymet araştırması. Üst konu kodu: SUB.CUS."
+    },
+    {
+      "id": "SUB.CUS.DUTY",
+      "name": "Gümrük vergileri ve mali yükler",
+      "description": "Boyut: Konu. Gümrük vergisi, İGV, EMY, fon ve ithalde alınan mali yükler. Üst konu kodu: SUB.CUS."
+    },
+    {
+      "id": "SUB.CUS.DEBT",
+      "name": "Gümrük borcu ve tahakkuk",
+      "description": "Boyut: Konu. Gümrük yükümlülüğünün doğması, borçlu, tahakkuk ve sona erme. Üst konu kodu: SUB.CUS."
+    },
+    {
+      "id": "SUB.CUS.GUAR",
+      "name": "Teminat",
+      "description": "Boyut: Konu. Bireysel/toplu/kapsamlı teminat, muafiyet ve çözüm işlemleri. Üst konu kodu: SUB.CUS."
+    },
+    {
+      "id": "SUB.CUS.REFUND",
+      "name": "Geri verme ve kaldırma",
+      "description": "Boyut: Konu. Gümrük vergilerinin geri verilmesi/kaldırılması ve başvurusu. Üst konu kodu: SUB.CUS."
+    },
+    {
+      "id": "SUB.CUS.CONTROL",
+      "name": "Risk, kontrol, muayene ve laboratuvar",
+      "description": "Boyut: Konu. Risk analizi, belge kontrolü, fiziki muayene, numune, tahlil ve laboratuvar. Üst konu kodu: SUB.CUS."
+    },
+    {
+      "id": "SUB.CUS.POSTCONTROL",
+      "name": "Sonradan kontrol ve denetim",
+      "description": "Boyut: Konu. Sonradan kontrol, ikincil kontrol ve gümrük denetimi. Üst konu kodu: SUB.CUS."
+    },
+    {
+      "id": "SUB.CUS.TEMPSTORE",
+      "name": "Geçici depolama",
+      "description": "Boyut: Konu. Geçici depolama statüsü, yerleri, süre ve kayıtları. Üst konu kodu: SUB.CUS."
+    },
+    {
+      "id": "SUB.CUS.FACILITY",
+      "name": "Antrepo ve depolama tesisi",
+      "description": "Boyut: Konu. Antrepo/geçici depolama yerinin açılması, işletilmesi, donanımı ve stok kontrolü. Üst konu kodu: SUB.CUS."
+    },
+    {
+      "id": "SUB.CUS.OFFICE",
+      "name": "Gümrük idaresi, sınır kapısı ve güzergâh",
+      "description": "Boyut: Konu. Yetkili gümrükler, ihtisas gümrükleri, sınır kapıları ve güzergâhlar. Üst konu kodu: SUB.CUS."
+    },
+    {
+      "id": "SUB.CUS.DIGITAL",
+      "name": "Dijital gümrük sistemleri",
+      "description": "Boyut: Konu. BİLGE, NCTS, Tek Pencere, TAREKS entegrasyonu ve elektronik gümrük süreçleri. Üst konu kodu: SUB.CUS."
+    },
+    {
+      "id": "SUB.CUS.IPR",
+      "name": "Fikri mülkiyetin gümrükte korunması",
+      "description": "Boyut: Konu. Sahte/taklit eşya için işlemlerin durdurulması, başvuru ve imha. Üst konu kodu: SUB.CUS."
+    },
+    {
+      "id": "SUB.CUS.DISPOSAL",
+      "name": "Tasfiye, imha ve gümrüğe terk",
+      "description": "Boyut: Konu. Tasfiyelik eşya, satış, imha ve gümrüğe terk süreçleri. Üst konu kodu: SUB.CUS."
+    },
+    {
+      "id": "SUB.REG",
+      "name": "Gümrük rejimleri ve özel kullanımlar",
+      "description": "Boyut: Konu. Gümrük rejimleri, statüler ve özel kullanımlar üst grubu."
+    },
+    {
+      "id": "SUB.REG.FREE_CIRC",
+      "name": "Serbest dolaşıma giriş",
+      "description": "Boyut: Konu. Serbest dolaşımda olmayan eşyanın ithalat yükleri uygulanarak serbest dolaşıma girişi. Üst konu kodu: SUB.REG."
+    },
+    {
+      "id": "SUB.REG.EXPORT",
+      "name": "İhracat rejimi",
+      "description": "Boyut: Konu. Serbest dolaşımdaki eşyanın kesin ihracı ve çıkış rejimi. Üst konu kodu: SUB.REG."
+    },
+    {
+      "id": "SUB.REG.TRANSIT",
+      "name": "Transit - karma veya alt tür belirsiz",
+      "description": "Boyut: Konu. Transit merkezi konu olmakla birlikte ulusal/ortak/TIR ayrımı yapılamıyorsa. Üst konu kodu: SUB.REG."
+    },
+    {
+      "id": "SUB.REG.NAT_TRANSIT",
+      "name": "Ulusal transit",
+      "description": "Boyut: Konu. Türkiye içindeki ulusal transit işlemleri. Üst konu kodu: SUB.REG.TRANSIT."
+    },
+    {
+      "id": "SUB.REG.COMMON_TRANSIT",
+      "name": "Ortak transit ve NCTS",
+      "description": "Boyut: Konu. Ortak Transit Sözleşmesi ve NCTS kapsamındaki transit. Üst konu kodu: SUB.REG.TRANSIT."
+    },
+    {
+      "id": "SUB.REG.TIR",
+      "name": "TIR transit sistemi",
+      "description": "Boyut: Konu. TIR Sözleşmesi, TIR Karnesi, volet ve kefalet zinciri. Üst konu kodu: SUB.REG.TRANSIT."
+    },
+    {
+      "id": "SUB.REG.WAREHOUSE",
+      "name": "Gümrük antrepo rejimi",
+      "description": "Boyut: Konu. Antrepo rejimine giriş, stok, devir, elleçleme ve çıkış. Üst konu kodu: SUB.REG."
+    },
+    {
+      "id": "SUB.REG.INWARD",
+      "name": "Dahilde işleme",
+      "description": "Boyut: Konu. DİİB/Dİİ, şartlı muafiyet, geri ödeme ve taahhüt hesabı. Üst konu kodu: SUB.REG."
+    },
+    {
+      "id": "SUB.REG.OUTWARD",
+      "name": "Hariçte işleme",
+      "description": "Boyut: Konu. HİİB/Hİİ, tamir, standart değişim ve işlenmiş ürünün geri ithali. Üst konu kodu: SUB.REG."
+    },
+    {
+      "id": "SUB.REG.TEMP_ADM",
+      "name": "Geçici ithalat",
+      "description": "Boyut: Konu. Geçici ithalat izni, ATA Karnesi, süre, ayniyet ve yeniden ihracat. Üst konu kodu: SUB.REG."
+    },
+    {
+      "id": "SUB.REG.END_USE",
+      "name": "Nihai kullanım",
+      "description": "Boyut: Konu. Belirli kullanıma bağlı indirimli/sıfır vergi ve izleme. Üst konu kodu: SUB.REG."
+    },
+    {
+      "id": "SUB.REG.FREE_ZONE",
+      "name": "Serbest bölge işlemleri",
+      "description": "Boyut: Konu. Serbest bölgeye giriş/çıkış, kullanıcı, faaliyet ve özel hesap. Üst konu kodu: SUB.REG."
+    },
+    {
+      "id": "SUB.REG.REEXPORT",
+      "name": "Yeniden ihracat",
+      "description": "Boyut: Konu. Serbest dolaşımda olmayan veya geçici ithal eşyanın yeniden ihracı. Üst konu kodu: SUB.REG."
+    },
+    {
+      "id": "SUB.REG.RETURNED",
+      "name": "Geri gelen eşya",
+      "description": "Boyut: Konu. İhraç edilen eşyanın şartlarla yeniden ithali ve muafiyeti. Üst konu kodu: SUB.REG."
+    },
+    {
+      "id": "SUB.REG.SHIP_SUPPLY",
+      "name": "Kumanya ve ihrakiye",
+      "description": "Boyut: Konu. Gemi/uçak kumanyası, yakıt ve donatım teslimleri. Üst konu kodu: SUB.REG."
+    },
+    {
+      "id": "SUB.TRD",
+      "name": "Dış ticaret ve ticaret politikası",
+      "description": "Boyut: Konu. İthalat/ihracat kontrolleri, önlemler ve anlaşmalar üst grubu."
+    },
+    {
+      "id": "SUB.TRD.IMPORT_CONTROL",
+      "name": "İthalat kontrolü ve izin",
+      "description": "Boyut: Konu. İthalat izni, ön izin, kayıt belgesi, kullanılmış eşya ve ihtisas gümrüğü. Üst konu kodu: SUB.TRD."
+    },
+    {
+      "id": "SUB.TRD.EXPORT_CONTROL",
+      "name": "İhracat kontrolü ve izin",
+      "description": "Boyut: Konu. İhracat izni, kayda bağlı ihracat, yasak ve kısıtlar. Üst konu kodu: SUB.TRD."
+    },
+    {
+      "id": "SUB.TRD.SURVEILLANCE",
+      "name": "İthalatta gözetim",
+      "description": "Boyut: Konu. Gözetim belgesi, kıymet/miktar eşiği ve gözetim uygulaması. Üst konu kodu: SUB.TRD."
+    },
+    {
+      "id": "SUB.TRD.DEFENCE",
+      "name": "Damping ve sübvansiyona karşı önlemler",
+      "description": "Boyut: Konu. Damping/sübvansiyon soruşturması, kesin/geçici önlem ve vergi. Üst konu kodu: SUB.TRD."
+    },
+    {
+      "id": "SUB.TRD.SAFEGUARD",
+      "name": "Korunma önlemleri",
+      "description": "Boyut: Konu. Korunma önlemi soruşturması, kota ve ek mali yük. Üst konu kodu: SUB.TRD."
+    },
+    {
+      "id": "SUB.TRD.QUOTA",
+      "name": "Kota, tarife kontenjanı ve tahsis",
+      "description": "Boyut: Konu. Kota/kontenjan açılması, tahsis yöntemi ve kullanım şartları. Üst konu kodu: SUB.TRD."
+    },
+    {
+      "id": "SUB.TRD.PREFERENTIAL",
+      "name": "Tercihli ticaret ve gümrük birliği",
+      "description": "Boyut: Konu. STA/TTA, GTS, Gümrük Birliği ve tercih düzenlemeleri. Üst konu kodu: SUB.TRD."
+    },
+    {
+      "id": "SUB.TRD.PRODUCT_COMPLIANCE",
+      "name": "Ürün güvenliği ve teknik uygunluk",
+      "description": "Boyut: Konu. TAREKS, CE/TSE, teknik düzenleme, uygunluk değerlendirmesi ve denetim. Üst konu kodu: SUB.TRD."
+    },
+    {
+      "id": "SUB.TRD.STRATEGIC",
+      "name": "Stratejik ve çift kullanımlı eşya kontrolü",
+      "description": "Boyut: Konu. Silah, mühimmat, çift kullanımlı, nükleer ve kontrollü teknoloji. Üst konu kodu: SUB.TRD."
+    },
+    {
+      "id": "SUB.TRD.SANCTIONS",
+      "name": "Yaptırım, ambargo ve kısıtlayıcı tedbir",
+      "description": "Boyut: Konu. Ülke/kişi/kuruluş temelli ambargo, malvarlığı dondurma ve ticaret yasağı. Üst konu kodu: SUB.TRD."
+    },
+    {
+      "id": "SUB.TAX",
+      "name": "Vergi, mali ve muhasebe",
+      "description": "Boyut: Konu. Vergi, tahsilat, kambiyo, ödeme ve kayıt üst grubu."
+    },
+    {
+      "id": "SUB.TAX.VAT",
+      "name": "Katma değer vergisi",
+      "description": "Boyut: Konu. KDV'nin konusu, matrahı, oranı, ithalatı, istisnası, indirimi ve iadesi. Üst konu kodu: SUB.TAX."
+    },
+    {
+      "id": "SUB.TAX.EXCISE",
+      "name": "Özel tüketim vergisi",
+      "description": "Boyut: Konu. ÖTV kapsamı, listeler, oranlar, istisna ve bandrol bağlantısı. Üst konu kodu: SUB.TAX."
+    },
+    {
+      "id": "SUB.TAX.OTHER",
+      "name": "Diğer vergi, harç ve fonlar",
+      "description": "Boyut: Konu. Damga, gelir, kurumlar vergisi, harç, KKDF ve diğer fonlar. Üst konu kodu: SUB.TAX."
+    },
+    {
+      "id": "SUB.TAX.PROCEDURE",
+      "name": "Vergi usulü ve beyan",
+      "description": "Boyut: Konu. Vergi beyanı, tarh, tebligat, defter-belge ve usul hükümleri. Üst konu kodu: SUB.TAX."
+    },
+    {
+      "id": "SUB.TAX.COLLECTION",
+      "name": "Kamu alacağı, tahsilat ve yapılandırma",
+      "description": "Boyut: Konu. Tahsil, takip, tecil, faiz, zam ve alacakların yapılandırılması. Üst konu kodu: SUB.TAX."
+    },
+    {
+      "id": "SUB.TAX.FX",
+      "name": "Kambiyo, döviz ve ihracat bedeli",
+      "description": "Boyut: Konu. Türk parasını koruma, döviz işlemleri ve ihracat bedellerinin yurda getirilmesi. Üst konu kodu: SUB.TAX."
+    },
+    {
+      "id": "SUB.TAX.PAYMENT",
+      "name": "Ödeme, transfer ve finansman",
+      "description": "Boyut: Konu. Ödeme, banka transferi, kredi, finansman ve nakit hareketleri. Üst konu kodu: SUB.TAX."
+    },
+    {
+      "id": "SUB.TAX.ACCOUNTING",
+      "name": "Muhasebe, defter ve mali raporlama",
+      "description": "Boyut: Konu. Muhasebe kayıtları, ticari defter, mali tablo ve raporlama. Üst konu kodu: SUB.TAX."
+    },
+    {
+      "id": "SUB.LOG",
+      "name": "Taşıma, lojistik ve yolcu",
+      "description": "Boyut: Konu. Taşıma türleri, lojistik düğümler ve yolcu/posta üst grubu."
+    },
+    {
+      "id": "SUB.LOG.MULTI",
+      "name": "Taşıma ve taşıyıcı - karma",
+      "description": "Boyut: Konu. Taşıma modu karma veya belirtilmemiş; taşıyıcı sorumluluğu. Üst konu kodu: SUB.LOG."
+    },
+    {
+      "id": "SUB.LOG.ROAD",
+      "name": "Karayolu taşımacılığı",
+      "description": "Boyut: Konu. Karayolu taşıma yetkisi, geçiş belgesi, yabancı plaka ve ücretler. Üst konu kodu: SUB.LOG."
+    },
+    {
+      "id": "SUB.LOG.SEA",
+      "name": "Deniz taşımacılığı ve liman",
+      "description": "Boyut: Konu. Gemi, liman, kabotaj, Ro-Ro ve deniz taşıma belgeleri. Üst konu kodu: SUB.LOG."
+    },
+    {
+      "id": "SUB.LOG.AIR",
+      "name": "Havayolu taşımacılığı",
+      "description": "Boyut: Konu. Uçak, hava kargo, havalimanı ve hava taşıma işlemleri. Üst konu kodu: SUB.LOG."
+    },
+    {
+      "id": "SUB.LOG.RAIL",
+      "name": "Demiryolu taşımacılığı",
+      "description": "Boyut: Konu. Demiryolu, CIM/COTIF ve trenle taşıma. Üst konu kodu: SUB.LOG."
+    },
+    {
+      "id": "SUB.LOG.CONTAINER",
+      "name": "Konteyner, liman ve lojistik tesis",
+      "description": "Boyut: Konu. Konteyner kayıt/takip, liman operasyonu ve aktarma. Üst konu kodu: SUB.LOG."
+    },
+    {
+      "id": "SUB.LOG.PASSENGER",
+      "name": "Yolcu, posta ve hızlı kargo",
+      "description": "Boyut: Konu. Yolcu eşyası, pasaport sınır işlemleri, posta ve hızlı kargo. Üst konu kodu: SUB.LOG."
+    },
+    {
+      "id": "SUB.ENF",
+      "name": "Yaptırım ve uyuşmazlık",
+      "description": "Boyut: Konu. Ceza, kaçakçılık, el koyma ve başvuru yolları üst grubu."
+    },
+    {
+      "id": "SUB.ENF.ADMIN_PENALTY",
+      "name": "İdari para cezası ve usulsüzlük",
+      "description": "Boyut: Konu. İdari para cezası, usulsüzlük ve vergi kaybı yaptırımı. Üst konu kodu: SUB.ENF."
+    },
+    {
+      "id": "SUB.ENF.SMUGGLING",
+      "name": "Kaçakçılık ve ceza soruşturması",
+      "description": "Boyut: Konu. Kaçakçılık suçu, adli takip ve etkin pişmanlık. Üst konu kodu: SUB.ENF."
+    },
+    {
+      "id": "SUB.ENF.SEIZURE",
+      "name": "El koyma, müsadere ve yakalama",
+      "description": "Boyut: Konu. El koyma, müsadere, yakalama ve adli emanet. Üst konu kodu: SUB.ENF."
+    },
+    {
+      "id": "SUB.ENF.OBJECTION",
+      "name": "İtiraz ve idari başvuru",
+      "description": "Boyut: Konu. İdari itiraz, şikayet ve yeniden inceleme yolları. Üst konu kodu: SUB.ENF."
+    },
+    {
+      "id": "SUB.ENF.SETTLEMENT",
+      "name": "Uzlaşma",
+      "description": "Boyut: Konu. Gümrük/vergi alacakları ve cezalarında uzlaşma. Üst konu kodu: SUB.ENF."
+    },
+    {
+      "id": "SUB.ENF.LITIGATION",
+      "name": "Dava, yargı ve içtihat",
+      "description": "Boyut: Konu. Mahkeme kararı, dava, temyiz ve yargılama usulü. Üst konu kodu: SUB.ENF."
+    },
+    {
+      "id": "SUB.ADM",
+      "name": "Kamu yönetimi ve kurumsal süreç",
+      "description": "Boyut: Konu. Teşkilat, personel, iç denetim ve kamu süreçleri üst grubu."
+    },
+    {
+      "id": "SUB.ADM.ORG",
+      "name": "Teşkilat, görev ve yetki",
+      "description": "Boyut: Konu. Kamu kurumunun teşkilatı, görev dağılımı ve birim yetkisi. Üst konu kodu: SUB.ADM."
+    },
+    {
+      "id": "SUB.ADM.PERSONNEL",
+      "name": "Kamu personeli ve disiplin",
+      "description": "Boyut: Konu. Atama, özlük, izin, emeklilik ve disiplin. Üst konu kodu: SUB.ADM."
+    },
+    {
+      "id": "SUB.ADM.AUDIT",
+      "name": "İç denetim ve kurumsal kontrol",
+      "description": "Boyut: Konu. İç denetim, teftiş, kalite ve kurumsal risk yönetimi. Üst konu kodu: SUB.ADM."
+    },
+    {
+      "id": "SUB.ADM.PROCUREMENT",
+      "name": "Kamu ihalesi ve varlık yönetimi",
+      "description": "Boyut: Konu. Kamu alımı, ihale, taşınır/taşınmaz ve ihtiyaç fazlası mal. Üst konu kodu: SUB.ADM."
+    },
+    {
+      "id": "SUB.ADM.DATA",
+      "name": "Bilgi, belge, elektronik işlem ve veri",
+      "description": "Boyut: Konu. Bilgi edinme, e-imza, e-tebligat, veri ve elektronik idari süreç. Üst konu kodu: SUB.ADM."
+    },
+    {
+      "id": "SUB.EMP.RIGHTS",
+      "name": "İşçi hakları ve çalışma",
+      "description": "Boyut: Konu. İş ilişkisi, çalışma süresi, ücretli izin, toplu iş sözleşmesi ve işçi hakları."
+    },
+    {
+      "id": "SUB.EMP.SAFETY",
+      "name": "İş sağlığı ve güvenliği",
+      "description": "Boyut: Konu. İş sağlığı, iş güvenliği, iş kazası, risk değerlendirmesi ve işyeri hekimi."
+    },
+    {
+      "id": "SUB.ENV.CHEMICAL",
+      "name": "Kimyasallar ve tehlikeli maddeler",
+      "description": "Boyut: Konu. Kimyasal ve tehlikeli maddeler, güvenlik bilgi formu, REACH ve biyosidal ürünler."
+    },
+    {
+      "id": "SUB.ENV.COMPLIANCE",
+      "name": "Çevresel uygunluk",
+      "description": "Boyut: Konu. Çevre izinleri, emisyon, sera gazı, çevre kirliliği ve çevresel uyum yükümlülükleri."
+    },
+    {
+      "id": "SUB.ENV.WASTE",
+      "name": "Atık ve geri kazanım",
+      "description": "Boyut: Konu. Atık yönetimi, tehlikeli atık, ambalaj atığı ve geri kazanım."
+    },
+    {
+      "id": "SUB.HEALTH.VET",
+      "name": "Sağlık, veteriner ve bitki sağlığı",
+      "description": "Boyut: Konu. Veteriner, bitki sağlığı, gıda güvenliği, hayvan sağlığı ve karantina."
+    },
+    {
+      "id": "SUB.GEN",
+      "name": "Genel hukuk ve diğer düzenleme",
+      "description": "Boyut: Konu. Karma/diğer hukuk alanları üst grubu."
+    },
+    {
+      "id": "SUB.GEN.TREATY",
+      "name": "Uluslararası antlaşma ve işbirliği",
+      "description": "Boyut: Konu. Antlaşma, protokol ve karşılıklı idari yardımın genel çerçevesi. Üst konu kodu: SUB.GEN."
+    },
+    {
+      "id": "SUB.GEN.COMPANY",
+      "name": "Şirketler ve ticaret hukuku",
+      "description": "Boyut: Konu. Şirket, ticari işletme, sicil ve ticari kayıt düzenlemeleri. Üst konu kodu: SUB.GEN."
+    },
+    {
+      "id": "SUB.GEN.CONTRACT",
+      "name": "Sözleşme ve borç ilişkileri",
+      "description": "Boyut: Konu. Sözleşme, teslim, sorumluluk ve özel hukuk borçları. Üst konu kodu: SUB.GEN."
+    },
+    {
+      "id": "SUB.GEN.PROFESSION",
+      "name": "Düzenlenmiş mesleki hizmet",
+      "description": "Boyut: Konu. Meslek ruhsatı, ücret, disiplin ve sorumluluk kuralları. Üst konu kodu: SUB.GEN."
+    },
+    {
+      "id": "SUB.GEN.OTHER",
+      "name": "Diğer düzenleyici konu",
+      "description": "Boyut: Konu. Kontrollü konu listesine güvenle eşlenemeyen fakat düzenleyici içerik taşıyan kayıt. Üst konu kodu: SUB.GEN."
+    },
+    {
+      "id": "EFF.PURPOSE",
+      "name": "Amaç",
+      "description": "Boyut: Hüküm ve etki türü. Düzenlemenin hedefini açıklar."
+    },
+    {
+      "id": "EFF.SCOPE",
+      "name": "Kapsam ve uygulanabilirlik",
+      "description": "Boyut: Hüküm ve etki türü. Kişi, eşya, işlem, yer veya zaman kapsamını belirler."
+    },
+    {
+      "id": "EFF.BASIS",
+      "name": "Hukuki dayanak",
+      "description": "Boyut: Hüküm ve etki türü. Üst norma veya yetki kaynağına dayanır."
+    },
+    {
+      "id": "EFF.DEFINITION",
+      "name": "Tanım",
+      "description": "Boyut: Hüküm ve etki türü. Terim veya kavram tanımlar."
+    },
+    {
+      "id": "EFF.COMPETENCE",
+      "name": "Yetki ve görev",
+      "description": "Boyut: Hüküm ve etki türü. Yetkili makamı, görevi veya sorumluluğu belirler."
+    },
+    {
+      "id": "EFF.GENERAL_RULE",
+      "name": "Genel kural",
+      "description": "Boyut: Hüküm ve etki türü. Diğer özel etkilere girmeyen temel normatif kural."
+    },
+    {
+      "id": "EFF.OBLIGATION",
+      "name": "Yükümlülük",
+      "description": "Boyut: Hüküm ve etki türü. Bir aktöre yapılması gereken davranış yükler."
+    },
+    {
+      "id": "EFF.PROHIBITION",
+      "name": "Yasak",
+      "description": "Boyut: Hüküm ve etki türü. Bir davranışı veya işlemi yasaklar."
+    },
+    {
+      "id": "EFF.PERMISSION",
+      "name": "İzin verilen işlem",
+      "description": "Boyut: Hüküm ve etki türü. Bir davranışa izin verir veya seçim tanır."
+    },
+    {
+      "id": "EFF.AUTHORISATION",
+      "name": "Başvuru, izin ve yetkilendirme",
+      "description": "Boyut: Hüküm ve etki türü. Başvuru, ruhsat, sertifika veya yetki şartı getirir."
+    },
+    {
+      "id": "EFF.ELIGIBILITY",
+      "name": "Uygunluk ve hak kazanma şartı",
+      "description": "Boyut: Hüküm ve etki türü. Hak, statü veya kolaylığa uygunluk ölçütü belirler."
+    },
+    {
+      "id": "EFF.PROCEDURE",
+      "name": "Usul ve işlem adımı",
+      "description": "Boyut: Hüküm ve etki türü. Sıralı işlem, yöntem veya uygulama adımı tanımlar."
+    },
+    {
+      "id": "EFF.CONDITION",
+      "name": "Koşul",
+      "description": "Boyut: Hüküm ve etki türü. Bir sonucun gerçekleşmesini koşula bağlar."
+    },
+    {
+      "id": "EFF.EXCEPTION",
+      "name": "İstisna / ayrık durum",
+      "description": "Boyut: Hüküm ve etki türü. Genel kuraldan ayrılan durumu tanımlar."
+    },
+    {
+      "id": "EFF.EXEMPTION",
+      "name": "Muafiyet",
+      "description": "Boyut: Hüküm ve etki türü. Vergi, izin veya yükümlülükten muafiyet tanır."
+    },
+    {
+      "id": "EFF.DECLARATION",
+      "name": "Beyan yükümlülüğü",
+      "description": "Boyut: Hüküm ve etki türü. Beyan verilmesini veya içeriğini zorunlu kılar."
+    },
+    {
+      "id": "EFF.DOCUMENT",
+      "name": "Belge ibrazı / düzenlenmesi",
+      "description": "Boyut: Hüküm ve etki türü. Belge, sertifika, fatura veya form ister/düzenletir."
+    },
+    {
+      "id": "EFF.RECORDKEEP",
+      "name": "Kayıt ve saklama",
+      "description": "Boyut: Hüküm ve etki türü. Kayıt tutma, arşivleme veya saklama süresi belirler."
+    },
+    {
+      "id": "EFF.REPORTING",
+      "name": "Bildirim ve raporlama",
+      "description": "Boyut: Hüküm ve etki türü. Bildirim, rapor veya bilgi verme yükümlülüğü getirir."
+    },
+    {
+      "id": "EFF.DEADLINE",
+      "name": "Süre ve son tarih",
+      "description": "Boyut: Hüküm ve etki türü. İşlem süresi, uzatma, zamanaşımı veya son tarih belirler."
+    },
+    {
+      "id": "EFF.CALCULATION",
+      "name": "Hesaplama",
+      "description": "Boyut: Hüküm ve etki türü. Tutar, oran, miktar veya formül hesaplar."
+    },
+    {
+      "id": "EFF.VALUATION",
+      "name": "Değerleme",
+      "description": "Boyut: Hüküm ve etki türü. Kıymet/değer tespit yöntemi belirler."
+    },
+    {
+      "id": "EFF.PAYMENT",
+      "name": "Ödeme ve tahsil",
+      "description": "Boyut: Hüküm ve etki türü. Ödeme, tahsil, faiz veya transfer yükümlülüğü."
+    },
+    {
+      "id": "EFF.REFUND",
+      "name": "İade / geri verme",
+      "description": "Boyut: Hüküm ve etki türü. İade, geri verme veya kaldırma hakkı/usulü."
+    },
+    {
+      "id": "EFF.INSPECTION",
+      "name": "Kontrol ve denetim",
+      "description": "Boyut: Hüküm ve etki türü. Muayene, kontrol, numune, denetim veya doğrulama öngörür."
+    },
+    {
+      "id": "EFF.PENALTY",
+      "name": "Ceza ve yaptırım",
+      "description": "Boyut: Hüküm ve etki türü. İdari/cezai sonuç veya müeyyide getirir."
+    },
+    {
+      "id": "EFF.REMEDY",
+      "name": "İtiraz ve dava yolu",
+      "description": "Boyut: Hüküm ve etki türü. İtiraz, uzlaşma, dava veya temyiz yolu tanır."
+    },
+    {
+      "id": "EFF.TRANSITIONAL",
+      "name": "Geçiş hükmü",
+      "description": "Boyut: Hüküm ve etki türü. Eski-yeni düzenleme arasında geçiş veya kazanılmış hak kuralı."
+    },
+    {
+      "id": "EFF.AMENDMENT",
+      "name": "Değişiklik hükmü",
+      "description": "Boyut: Hüküm ve etki türü. Başka metni değiştirir, ekler veya yeniden yazar."
+    },
+    {
+      "id": "EFF.REPEAL",
+      "name": "Yürürlükten kaldırma",
+      "description": "Boyut: Hüküm ve etki türü. Başka hükmü tamamen/kısmen yürürlükten kaldırır."
+    },
+    {
+      "id": "EFF.COMMENCEMENT",
+      "name": "Yürürlük / başlangıç",
+      "description": "Boyut: Hüküm ve etki türü. Yürürlük veya uygulama başlangıcını belirler."
+    },
+    {
+      "id": "EFF.EXECUTION",
+      "name": "Yürütme",
+      "description": "Boyut: Hüküm ve etki türü. Düzenlemeyi yürütecek makamı belirtir."
+    },
+    {
+      "id": "EFF.CROSSREF",
+      "name": "Atıf ve ilişki",
+      "description": "Boyut: Hüküm ve etki türü. Başka act, madde veya eke normatif atıf kurar."
+    },
+    {
+      "id": "ANX.GOODS_LIST",
+      "name": "Eşya / ürün listesi",
+      "description": "Boyut: Ek türü. Kod içermeyen veya karma ürün/eşya listesi."
+    },
+    {
+      "id": "ANX.COMMODITY_CODE_LIST",
+      "name": "GTİP / tarife kodu listesi",
+      "description": "Boyut: Ek türü. GTİP, tarife pozisyonu veya fasıl satırları."
+    },
+    {
+      "id": "ANX.PROHIBITED_LIST",
+      "name": "Yasaklı eşya listesi",
+      "description": "Boyut: Ek türü. İthal/ihracı yasak eşya."
+    },
+    {
+      "id": "ANX.RESTRICTED_LIST",
+      "name": "Kontrollü / kısıtlı eşya listesi",
+      "description": "Boyut: Ek türü. İzin, kontrol veya özel şart kapsamındaki eşya."
+    },
+    {
+      "id": "ANX.COUNTRY_LIST",
+      "name": "Ülke / bölge listesi",
+      "description": "Boyut: Ek türü. Ülke, ülke grubu veya coğrafi kapsam."
+    },
+    {
+      "id": "ANX.AUTHORITY_LIST",
+      "name": "Yetkili makam listesi",
+      "description": "Boyut: Ek türü. Yetkili kurum, kuruluş veya birim."
+    },
+    {
+      "id": "ANX.OFFICE_ROUTE_LIST",
+      "name": "Gümrük idaresi / kapı / güzergâh listesi",
+      "description": "Boyut: Ek türü. İdare, sınır kapısı, rota veya liman listesi."
+    },
+    {
+      "id": "ANX.PERSON_ENTITY_LIST",
+      "name": "Kişi / firma / kuruluş listesi",
+      "description": "Boyut: Ek türü. Listelenmiş gerçek/tüzel kişi, firma veya tesis."
+    },
+    {
+      "id": "ANX.DOC_CODE_LIST",
+      "name": "Belge kodu listesi",
+      "description": "Boyut: Ek türü. Belge türü ve kod eşleştirmesi."
+    },
+    {
+      "id": "ANX.CONDITION_CODE_LIST",
+      "name": "Koşul kodu listesi",
+      "description": "Boyut: Ek türü. Koşul, muafiyet veya işlem kodları."
+    },
+    {
+      "id": "ANX.ADDITIONAL_CODE_LIST",
+      "name": "Ek kod listesi",
+      "description": "Boyut: Ek türü. Ek tarife, vergi veya sistem kodları."
+    },
+    {
+      "id": "ANX.DUTY_RATE_TABLE",
+      "name": "Vergi / oran tablosu",
+      "description": "Boyut: Ek türü. Vergi, mali yük, oran veya fiyat tablosu."
+    },
+    {
+      "id": "ANX.QUOTA_THRESHOLD_TABLE",
+      "name": "Kota / eşik / miktar tablosu",
+      "description": "Boyut: Ek türü. Kota, kontenjan, limit, ağırlık veya parasal eşik."
+    },
+    {
+      "id": "ANX.FEE_PENALTY_TABLE",
+      "name": "Ücret / ceza tablosu",
+      "description": "Boyut: Ek türü. Ücret, harç veya ceza miktarı."
+    },
+    {
+      "id": "ANX.CALCULATION",
+      "name": "Hesaplama formülü / örneği",
+      "description": "Boyut: Ek türü. Formül, hesap tablosu veya sayısal örnek."
+    },
+    {
+      "id": "ANX.APPLICATION_FORM",
+      "name": "Başvuru formu",
+      "description": "Boyut: Ek türü. İzin, belge, statü veya karar başvurusu."
+    },
+    {
+      "id": "ANX.DECLARATION_FORM",
+      "name": "Beyan formu",
+      "description": "Boyut: Ek türü. Gümrük, vergi veya ticari beyan şablonu."
+    },
+    {
+      "id": "ANX.CERTIFICATE",
+      "name": "Sertifika / şahadetname örneği",
+      "description": "Boyut: Ek türü. Menşe, dolaşım, uygunluk veya başka sertifika."
+    },
+    {
+      "id": "ANX.LICENCE_PERMIT",
+      "name": "İzin / lisans örneği",
+      "description": "Boyut: Ek türü. Ruhsat, izin, lisans veya yetki belgesi."
+    },
+    {
+      "id": "ANX.REPORT_TEMPLATE",
+      "name": "Rapor / kayıt / muhasebe şablonu",
+      "description": "Boyut: Ek türü. Rapor, cetvel, kayıt veya mali şablon."
+    },
+    {
+      "id": "ANX.REQUIRED_DOCS",
+      "name": "Gerekli belgeler listesi",
+      "description": "Boyut: Ek türü. Başvuru/beyanla sunulacak belgeler."
+    },
+    {
+      "id": "ANX.TECH_SPEC",
+      "name": "Teknik şartname",
+      "description": "Boyut: Ek türü. Teknik özellik, performans veya tolerans."
+    },
+    {
+      "id": "ANX.TEST_METHOD",
+      "name": "Test / analiz yöntemi",
+      "description": "Boyut: Ek türü. Numune, laboratuvar veya test prosedürü."
+    },
+    {
+      "id": "ANX.PROCEDURE_GUIDE",
+      "name": "Uygulama talimatı / iş akışı",
+      "description": "Boyut: Ek türü. Adımlar, ekranlar, kılavuz veya iş akışı."
+    },
+    {
+      "id": "ANX.EXPLANATORY_NOTES",
+      "name": "Açıklama notları / izahname",
+      "description": "Boyut: Ek türü. Tarife veya düzenleme açıklama notları."
+    },
+    {
+      "id": "ANX.AGREEMENT_PROTOCOL",
+      "name": "Antlaşma eki / protokol",
+      "description": "Boyut: Ek türü. Uluslararası anlaşma protokolü veya eki."
+    },
+    {
+      "id": "ANX.CORRELATION_TABLE",
+      "name": "Korelasyon / karşılaştırma tablosu",
+      "description": "Boyut: Ek türü. Eski-yeni kod, madde veya sistem eşleştirmesi."
+    },
+    {
+      "id": "ANX.EMBEDDED_INSTRUMENT",
+      "name": "Ekli bağımsız düzenleme / rehber",
+      "description": "Boyut: Ek türü. Üst yazıya eklenen ayrı yönerge, genelge, rehber veya karar."
+    },
+    {
+      "id": "ANX.CORRESPONDENCE_ATTACHMENT",
+      "name": "Yazışma eki",
+      "description": "Boyut: Ek türü. 'Ek: 1 adet yazı' gibi idari yazışma eki; hukuki annex değildir."
+    },
+    {
+      "id": "ANX.OTHER",
+      "name": "Diğer annex",
+      "description": "Boyut: Ek türü. Türü metin/tablo yapısından belirlenemeyen annex; inceleme gerekir."
+    },
+    {
+      "id": "SEC.AGRI_FOOD",
+      "name": "Tarım ve gıda",
+      "description": "Boyut: Sektör. Tarım ürünleri, gıda, yem ve balıkçılık."
+    },
+    {
+      "id": "SEC.PLANT_ANIMAL",
+      "name": "Bitki ve hayvan sağlığı",
+      "description": "Boyut: Sektör. Veteriner, karantina, bitki sağlığı ve canlı hayvan."
+    },
+    {
+      "id": "SEC.HEALTH",
+      "name": "Sağlık, ilaç ve tıbbi cihaz",
+      "description": "Boyut: Sektör. İlaç, tıbbi cihaz ve sağlık ürünü."
+    },
+    {
+      "id": "SEC.CHEM_ENV",
+      "name": "Kimyasal, çevre, atık ve tehlikeli madde",
+      "description": "Boyut: Sektör. Atık, kimyasal, ozon, radyoaktif ve tehlikeli madde."
+    },
+    {
+      "id": "SEC.ENERGY",
+      "name": "Enerji, petrol ve akaryakıt",
+      "description": "Boyut: Sektör. Elektrik, gaz, petrol, LPG, yakıt ve maden."
+    },
+    {
+      "id": "SEC.TOBACCO_ALCOHOL",
+      "name": "Tütün ve alkol",
+      "description": "Boyut: Sektör. Tütün, sigara, alkollü içki ve bandrol."
+    },
+    {
+      "id": "SEC.TEXTILE",
+      "name": "Tekstil ve hazır giyim",
+      "description": "Boyut: Sektör. İplik, kumaş, tekstil ve hazır giyim."
+    },
+    {
+      "id": "SEC.VEHICLE_MACHINE",
+      "name": "Taşıt, makina ve aksam",
+      "description": "Boyut: Sektör. Kara/hava/deniz taşıtı, makina ve parçalar."
+    },
+    {
+      "id": "SEC.PRECIOUS",
+      "name": "Kıymetli maden, taş ve mücevher",
+      "description": "Boyut: Sektör. Altın, gümüş, kıymetli taş ve rafineri."
+    },
+    {
+      "id": "SEC.CULTURAL",
+      "name": "Kültür varlığı",
+      "description": "Boyut: Sektör. Sanat, arkeoloji ve kültür varlığı."
+    },
+    {
+      "id": "SEC.DEFENCE",
+      "name": "Savunma, silah ve çift kullanım",
+      "description": "Boyut: Sektör. Silah, mühimmat, askeri malzeme ve çift kullanım."
+    },
+    {
+      "id": "SEC.TELECOM",
+      "name": "Elektronik ve telekom cihazları",
+      "description": "Boyut: Sektör. Telsiz, haberleşme, elektronik cihaz ve bileşen."
+    }
+  ]
+}
