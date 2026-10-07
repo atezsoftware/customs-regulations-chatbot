@@ -148,6 +148,48 @@ def test_named_read_delivers_all_target_clauses_and_related_navigation() -> None
     }
 
 
+@pytest.mark.parametrize("second_source", [False, True])
+def test_named_identity_completes_filtered_pages_without_assuming_uniqueness(
+    second_source: bool,
+) -> None:
+    class PagedBroker(NamedBroker):
+        def __init__(self) -> None:
+            super().__init__()
+            self.offsets: list[int] = []
+
+        def sources(
+            self, query: str, context: RunContext, *, offset: int = 0, limit: int = 50
+        ) -> tuple[list[CorpusSource], bool]:
+            del query
+            context.check_active()
+            assert limit == 20
+            self.offsets.append(offset)
+            if offset == 0:
+                return [self.item], True
+            if offset == 20:
+                return [], True
+            assert offset == 40
+            return (
+                [CorpusSource(uuid4(), "Another verified instrument", "other")]
+                if second_source
+                else [],
+                False,
+            )
+
+    broker = PagedBroker()
+    outcome = read_named(broker, RunContext())
+    assert broker.offsets == [0, 20, 40]
+    if second_source:
+        assert outcome.status == OutcomeStatus.AMBIGUOUS
+        assert len(cast(list[JsonValue], outcome.data["sources"])) == 2
+        assert not outcome.evidence
+        assert broker.acquisitions == 0
+    else:
+        assert outcome.status == OutcomeStatus.FOUND
+        assert outcome.data["source_id"] == str(broker.item.id)
+        assert broker.acquisitions == 1
+
+
 @pytest.mark.parametrize("failure", ["ambiguous", "paged", "missing", "denied"])
 def test_named_read_never_guesses_a_source_or_scans_unrelated_articles(
     failure: str,

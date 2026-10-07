@@ -1446,6 +1446,20 @@ def build_corpus_specs(
                 sources, more = broker.sources(
                     str(args["source_name"]), context, limit=20
                 )
+                seen = {source.id for source in sources}
+                offset = 20
+                # Verified fallback pages can be empty while raw title candidates remain.
+                while len(seen) < 2 and more:
+                    context.check_active()
+                    page, more = broker.sources(
+                        str(args["source_name"]), context, offset=offset, limit=20
+                    )
+                    if any(source.id in seen for source in page):
+                        more = True
+                        break
+                    sources.extend(page)
+                    seen.update(source.id for source in page)
+                    offset += 20
         if len(sources) != 1 or more:
             return ToolOutcome(
                 status=OutcomeStatus.AMBIGUOUS
