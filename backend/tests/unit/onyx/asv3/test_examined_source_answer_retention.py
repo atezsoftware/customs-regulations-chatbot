@@ -422,3 +422,44 @@ def test_foreign_owner_or_foreign_original_cannot_supply_retained_effect() -> No
             ledger,
             [review(witnesses=[{"citation": 3, "start_char": 0, "end_char": 10}])],
         )
+
+
+@pytest.mark.parametrize("tuned", [False, True])
+def test_quote_typography_retention_is_isolated_to_tuned(tuned: bool) -> None:
+    context, ledger, reviews = setup_reviews()
+    scope(context)
+    if tuned:
+        context.services["asv3_workflow_variant"] = "asv3_tuned"
+    seen(context, ledger, reviews)
+    deliver(ledger, "answer", [1, 2])
+    effect = "The ‘particular’ wording may affect this outcome."
+    limit = "The rule’s dates remain distinct."
+    answer = "The 'particular' wording may affect this outcome. [2]\n\nThe rule's dates remain distinct. [2]"
+    gap = reviews.publication_gap(
+        answer, "answer", context, ledger, [review(effect=effect, limitations=limit)]
+    )
+    assert (gap is None) is tuned
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        "The 'particular' wording cannot affect this outcome. [2]",
+        "The 'particular' wording may affect this outcome. [1]",
+    ],
+)
+def test_typography_normalization_does_not_accept_changed_effect_or_citation(
+    changed: str,
+) -> None:
+    context, ledger, reviews = setup_reviews()
+    context.services["asv3_workflow_variant"] = "asv3_tuned"
+    seen(context, ledger, reviews)
+    deliver(ledger, "answer", [1, 2])
+    gap = reviews.publication_gap(
+        changed + "\n\n" + LIMITATIONS + " [2]",
+        "answer",
+        context,
+        ledger,
+        [review(effect="The ‘particular’ wording may affect this outcome.")],
+    )
+    assert omissions(gap)[0]["missing_answer_passages"] == ["effect"]

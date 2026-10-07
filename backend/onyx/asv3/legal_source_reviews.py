@@ -268,6 +268,23 @@ def _missing_judicial_disposition(
     )
 
 
+def _retention_text(value: str) -> str:
+    """Ignore typography only, retaining words, operators and citation placement."""
+    return " ".join(
+        value.translate(
+            str.maketrans(
+                {
+                    "“": '"',
+                    "”": '"',
+                    "‘": "'",
+                    "’": "'",
+                    "\u00a0": " ",
+                }
+            )
+        ).split()
+    )
+
+
 def _examined_answer_omission(
     record: _LeadRecord,
     answer: str,
@@ -275,6 +292,7 @@ def _examined_answer_omission(
     delivered: set[int] | None,
     include_repair_text: bool = False,
     include_exclusions: bool = False,
+    normalize_typography: bool = False,
 ) -> dict[str, JsonValue] | None:
     """Retain copied passages and their provenance, without assessing legal entailment."""
     review = record.review
@@ -289,6 +307,7 @@ def _examined_answer_omission(
     units = [
         unit for unit in assertion_inventory(answer) if not unit["presentation_only"]
     ]
+    comparable_answer = _retention_text(answer) if normalize_typography else answer
     omitted: list[JsonValue] = []
     bound: set[int] = set()
     for field, passage in (
@@ -296,19 +315,21 @@ def _examined_answer_omission(
         ("limitations", review.limitations),
     ):
         exact = passage.strip()
+        comparable = _retention_text(exact) if normalize_typography else exact
         if (
             presentation_block(exact)
             or not any(
                 character.isalnum() for character in _CITATION_MARKER.sub("", exact)
             )
-            or exact not in answer
+            or comparable not in comparable_answer
         ):
             omitted.append(field)
             continue
         matching = [
             numbers & _substantive_inline_citations(unit["text"])
             for unit in units
-            if exact in unit["text"]
+            if comparable
+            in (_retention_text(unit["text"]) if normalize_typography else unit["text"])
         ]
         if not any(matching):
             omitted.append(field)
@@ -1069,6 +1090,7 @@ class LegalSourceReviews:
                         delivered=delivered,
                         include_repair_text=tuned,
                         include_exclusions=tuned,
+                        normalize_typography=tuned,
                     )
                     if omission is not None:
                         unretained.append(omission)
@@ -1144,7 +1166,11 @@ class LegalSourceReviews:
                 ):
                     if retain_examined:
                         omission = _examined_answer_omission(
-                            record, answer, delivered=None, include_exclusions=tuned
+                            record,
+                            answer,
+                            delivered=None,
+                            include_exclusions=tuned,
+                            normalize_typography=tuned,
                         )
                         if omission is not None:
                             unretained.append(omission)
@@ -1181,6 +1207,7 @@ class LegalSourceReviews:
                                 answer,
                                 delivered=None,
                                 include_exclusions=tuned,
+                                normalize_typography=tuned,
                             )
                         )
                         is not None

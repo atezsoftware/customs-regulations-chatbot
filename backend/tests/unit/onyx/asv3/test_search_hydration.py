@@ -629,3 +629,25 @@ def test_qualified_revalidation_requests_only_exact_ids_from_validated_snapshot(
     assert len(calls) == 1
     session.execute.assert_not_called()
     session.scalars.assert_not_called()
+
+
+def test_local_group_maps_aggregate_to_canonical_conditions_without_aggregate_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = uuid4()
+    parent = ("Instrument", "MADDE 7", "(1) Conditions")
+    items = [
+        row(source, 0, list(parent), "Cumulative introduction"),
+        row(source, 1, [*parent, "a) First"], "First condition"),
+        row(source, 2, [*parent, "b) Second"], "Second condition"),
+        row(source, 3, ["Instrument", "MADDE 7", "(2) Other"], "Unrelated paragraph"),
+        row(source, 50, list(parent), "UNCITABLE AGGREGATE"),
+    ]
+    items[-1].chunk_type = "hierarchical_aggregate"
+    _, arguments = boundary(monkeypatch, items)
+    result = read(arguments, [items[-1]], local_groups=True)
+    assert {chunk.id for chunk in result.chunks} == {item.id for item in items[:3]}
+    assert result.members[items[-1].id] == tuple(item.id for item in items[:3])
+    assert result.center_ordinals[items[-1].id] == 50
+    assert result.complete[items[-1].id]
+    assert not result.continuation[items[-1].id]

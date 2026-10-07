@@ -2446,3 +2446,71 @@ def test_required_related_original_cannot_be_silently_evicted_for_physical_capac
     with pytest.raises(RunStopped, match="required originals"):
         adapter.decide(current)
     assert llm.invoke.call_count == 0
+
+
+def test_lightweight_prepare_hands_all_sources_to_writer_without_a_candidate() -> None:
+    adapter, context, research, writer = source_answer_adapter()
+    ledger = cast(EvidenceLedger, context.services["evidence"])
+    first = original(ledger, context, "Operative rule.")
+    second = original(ledger, context, "Distinct applicability limit.")
+    research.invoke.return_value = ModelResponse(
+        id="ready",
+        created="0",
+        choice=Choice(
+            message=Message(
+                tool_calls=[
+                    ChatCompletionMessageToolCall(
+                        id="ready",
+                        type="function",
+                        function=ResponseFunctionCall(
+                            name="prepare_answer",
+                            arguments='{"source_citations":[1,2]}',
+                        ),
+                    ),
+                ]
+            )
+        ),
+    )
+    result = adapter.decide(adaptive_tool_view(original_evidence=[first, second]))
+    assert result.answer == "Rule [1]."
+    assert research.invoke.call_count == writer.invoke.call_count == 1
+    payload = last_payload(writer)
+    assert {row["citation"] for row in payload["original_evidence"]} == {1, 2}
+    assert "draft_to_repair" not in payload
+    assert "prepare_answer" in json.dumps(research.invoke.call_args.kwargs["tools"])
+    assert "prepare_answer" not in json.dumps(writer.invoke.call_args.kwargs["tools"])
+
+
+def test_bad_prepare_citation_is_corrected_without_publication_or_losing_sources() -> (
+    None
+):
+    adapter, context, research, writer = source_answer_adapter()
+    ledger = cast(EvidenceLedger, context.services["evidence"])
+    source = original(ledger, context, "Operative rule.")
+
+    def prepare(numbers: str) -> ModelResponse:
+        return ModelResponse(
+            id="ready",
+            created="0",
+            choice=Choice(
+                message=Message(
+                    tool_calls=[
+                        ChatCompletionMessageToolCall(
+                            id="ready",
+                            type="function",
+                            function=ResponseFunctionCall(
+                                name="prepare_answer",
+                                arguments='{"source_citations":' + numbers + "}",
+                            ),
+                        ),
+                    ]
+                )
+            ),
+        )
+
+    research.invoke.side_effect = [prepare("[999]"), prepare("[1]")]
+    result = adapter.decide(adaptive_tool_view(original_evidence=[source]))
+    assert result.answer == "Rule [1]."
+    assert writer.invoke.call_count == 1
+    assert research.invoke.call_count == 2
+    assert last_payload(writer)["original_evidence"][0]["text"] == source["text"]

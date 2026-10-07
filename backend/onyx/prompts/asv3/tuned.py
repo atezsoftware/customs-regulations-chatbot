@@ -6,7 +6,7 @@ from onyx.prompts.asv3.coordinator_reference import (
 )
 from onyx.prompts.asv3.research import LEGAL_DEPARTMENT_RESEARCH
 
-TUNED_PROMPT_VERSION = "asv3-tuned-2026-10-07.20"
+TUNED_PROMPT_VERSION = "asv3-tuned-2026-10-07.21"
 
 TUNED_SOURCE_ANSWER_PROMPT = """Write Atez Customs Assistant's complete answer in the question's language or the explicitly
 requested language, directly from the actual request, supplied facts and numbered source
@@ -28,8 +28,12 @@ restrictions and timing; distinguish submissions, preliminary discussion and dis
 Do not harmonize conflicting cumulative/alternative wording without a supported reason.
 Keep every affected summary, detailed conclusion and table consistent with those limits.
 Known facts, missing facts and sourced legal requirements are different; do not invent an
-additional factual requirement or research gap. Follow the actual source's AND/OR, exact
-deadline wording and proof requirements. Do not derive a rate or base by negating an exception.
+additional factual requirement or research gap. For each applicable branch, name the actual
+supplied event/fact that triggers it, the resulting consequence and any remaining condition.
+Keep different triggering events and procedural stages distinct; a nearby rule cannot replace
+the one matching these facts. Preserve source AND/OR, deadline wording and proof requirements.
+Reconcile material specific and general passages by scope and authority, or disclose the
+precise conflict. Do not derive a rate or base by negating an exception.
 
 Lead with concise requested conclusions under short neutral labels. Explain the source
 rule, factual application, material alternatives and concrete next steps. Do not repeat the
@@ -104,7 +108,9 @@ TUNED_SOURCE_RESEARCH_PROMPT = (
     "Credible instrument/provision references also lead to related decisions and special rules.\n"
     "Titles and references alone establish no unseen holding, tax treatment, rate or base.\n"
     + _support_boundary
-    + _remaining_application
+    + _remaining_application.partition("Begin with a short localized")[0]
+    + "When sufficient evidence is delivered, hand it to the separate writer with prepare_answer;\n"
+    "do not write a preliminary answer. Concrete user clarification and social replies can be immediate.\n"
 )
 
 _RELATED_SOURCE_POLICY = """Before a definitive conclusion, examine concrete related leads changing validity, scope
@@ -159,3 +165,10 @@ if not _application_end:
 TUNED_LEGAL_DEPARTMENT_RESEARCH = (
     _before + _RELATED_SOURCE_POLICY + _FAVORABLE_APPLICATION + _application_end + _rest
 )
+
+SOURCE_ANSWER_HANDOFF_INSTRUCTIONS = """A separate writer receives ALL delivered source passages and the actual request.
+When research is sufficient, call prepare_answer alone with the supporting global citation
+numbers; do not write a preliminary answer. The writer applies conditions, alternatives
+and related-source reviews itself, and can request more evidence for a material gap.
+Use further source actions when needed; conversation and concrete user clarifications may
+still be answered immediately. This handoff is not publication or approval."""

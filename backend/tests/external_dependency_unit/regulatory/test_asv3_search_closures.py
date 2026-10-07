@@ -91,7 +91,17 @@ def test_actual_db_local_closure_keeps_owner_date_and_annex_scope(
         heading_path=["Law", "Ek 2", "MADDE 3"],
         validity_start_date=date(2026, 1, 1),
     )
-    db_session.add_all([old, current, tail, other])
+    aggregate = RegulatoryChunk(
+        id=uuid4().hex,
+        user_file_id=source.id,
+        position=50,
+        projection_ordinal=4,
+        text="Aggregate text must never be cited",
+        chunk_type="hierarchical_aggregate",
+        heading_path=current.heading_path,
+        validity_start_date=date(2026, 1, 1),
+    )
+    db_session.add_all([old, current, tail, other, aggregate])
     db_session.commit()
     try:
         filters = resolve_pc_corpus_scope(
@@ -112,6 +122,7 @@ def test_actual_db_local_closure_keeps_owner_date_and_annex_scope(
             scoped_filters: IndexFilters = filters,
             scoped_user: User = owner,
             max_chars: int = 64000,
+            local_groups: bool = False,
         ) -> CorpusClosureRead:
             return read_search_source_closures(
                 db_session,
@@ -122,11 +133,19 @@ def test_actual_db_local_closure_keeps_owner_date_and_annex_scope(
                 check_active=lambda: None,
                 center_ids=(center_id,),
                 max_chars=max_chars,
+                local_groups=local_groups,
             )
 
         result = read(current.id)
         assert {chunk.id for chunk in result.chunks} == {current.id, tail.id}
         assert result.complete[current.id]
+        group = read(aggregate.id, local_groups=True)
+        assert [chunk.id for chunk in group.chunks] == [current.id]
+        assert group.members[aggregate.id] == (current.id,)
+        assert group.complete[aggregate.id]
+        assert group.center_ordinals[aggregate.id] == aggregate.projection_ordinal
+        with pytest.raises(PermissionError):
+            read(aggregate.id, local_groups=True, scoped_user=stranger)
         historical = read(
             old.id,
             scoped_filters=filters.model_copy(
@@ -144,7 +163,7 @@ def test_actual_db_local_closure_keeps_owner_date_and_annex_scope(
         db_session.rollback()
         pc_corpus.user_id = None
         db_session.flush()
-        for item in (old, current, tail, other):
+        for item in (old, current, tail, other, aggregate):
             db_session.delete(item)
         db_session.delete(source)
         db_session.delete(owner)

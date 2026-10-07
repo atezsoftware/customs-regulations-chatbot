@@ -144,6 +144,7 @@ from onyx.prompts.asv3.research import (
     RESEARCHER_PROMPT,
 )
 from onyx.prompts.asv3.tuned import (
+    SOURCE_ANSWER_HANDOFF_INSTRUCTIONS,
     TUNED_COORDINATOR_REFERENCE_PROMPT,
     TUNED_LEGAL_DEPARTMENT_RESEARCH,
     TUNED_RESEARCHER_REFERENCE_PROMPT,
@@ -2590,6 +2591,8 @@ class ResearchModel:
             )
         else:
             instruction = COORDINATOR_PROMPT
+        if normal and tuned and self.answer_llm is not None:
+            instruction += "\n\n" + SOURCE_ANSWER_HANDOFF_INSTRUCTIONS
         if normal:
             instruction += "\n\n" + (
                 TUNED_LEGAL_DEPARTMENT_RESEARCH
@@ -2947,6 +2950,56 @@ class ResearchModel:
         has_reference_catalogue = False
         ceiling, output = self._limits(self._native_output_limit())
         selected = copy.deepcopy(view.tools) if native_original_cache else view.tools
+        if (
+            self.answer_llm is not None
+            and not self._writing_answer
+            and (view.original_evidence or self._native_original_records(view.turns))
+            and self.context.services.get("asv3_workflow_variant") == ASV3_TUNED_VARIANT
+        ):
+            selected = copy.deepcopy(selected)
+            handoff_metadata: dict[str, JsonValue] = {}
+            for tool in selected:
+                function = tool.get("function")
+                if (
+                    not isinstance(function, dict)
+                    or function.get("name") != "submit_answer"
+                ):
+                    continue
+                parameters = function.get("parameters")
+                properties = (
+                    parameters.get("properties")
+                    if isinstance(parameters, dict)
+                    else None
+                )
+                if isinstance(properties, dict):
+                    handoff_metadata = {
+                        key: value
+                        for key, value in properties.items()
+                        if key in {"_outcomes", "_coverage"}
+                    }
+            selected.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "prepare_answer",
+                        "description": "Hand all delivered originals to the final writer without drafting an answer. Call alone when research is sufficient; this does not publish or approve a result.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                **handoff_metadata,
+                                "source_citations": {
+                                    "type": "array",
+                                    "minItems": 1,
+                                    "items": {"type": "integer", "minimum": 1},
+                                    "description": "Global citation numbers already fully delivered, supporting the requested outcomes.",
+                                },
+                            },
+                            "required": ["source_citations"],
+                            "additionalProperties": False,
+                        },
+                    },
+                }
+            )
         if retained_answer_enabled(self.context):
             selected, retained_answer = bind_retained_answer(
                 selected,
@@ -3561,15 +3614,20 @@ class ResearchModel:
             decision = resolve_retained_answer(
                 decision, self.context, view.draft_to_repair, request=view.request
             )
+            prepared = self._prepared_source_citations(decision)
             if (
                 self.answer_llm is not None
-                and self._source_answer_ready(decision)
+                and (self._source_answer_ready(decision) or prepared is not None)
                 and (
                     view.original_evidence or self._native_original_records(view.turns)
                 )
             ):
                 coverage = self._retain_candidate_conditions(decision)
-                candidate = decision.answer or next(
+                candidate = (
+                    " ".join(f"[{number}]" for number in prepared)
+                    if prepared is not None
+                    else decision.answer
+                ) or next(
                     (
                         str(call.arguments.get("answer", ""))
                         for call in decision.calls
@@ -3592,6 +3650,26 @@ class ResearchModel:
                 if acquisition is not None:
                     return acquisition
                 return self._decide_source_answer(view, candidate_coverage=coverage)
+            if any(call.name == "prepare_answer" for call in decision.calls):
+                assert decision.assistant_message is not None
+                correction = ResearchTurn(
+                    assistant=decision.assistant_message,
+                    results=[
+                        ToolMessage(
+                            tool_call_id=call.call_id,
+                            content=json.dumps(
+                                {
+                                    "status": "invalid",
+                                    "instruction": "No action executed. Call prepare_answer alone with positive integer global citations fully delivered in this decision, or choose source tools for the actual missing evidence.",
+                                }
+                            ),
+                        )
+                        for call in decision.calls
+                    ],
+                )
+                return self.decide(
+                    view.model_copy(update={"turns": [*view.turns, correction]})
+                )
             invocation_draft = view.draft_to_repair
             if use_research_model and self._needs_answer_model(decision):
                 candidate = decision.answer or next(
@@ -4259,6 +4337,27 @@ class ResearchModel:
             ),
         )
 
+    def _prepared_source_citations(self, decision: Decision) -> list[int] | None:
+        if (
+            self.answer_llm is None
+            or self.context.services.get("asv3_workflow_variant") != ASV3_TUNED_VARIANT
+            or len(decision.calls) != 1
+            or decision.calls[0].name != "prepare_answer"
+            or decision.calls[0].argument_error is not None
+        ):
+            return None
+        numbers = decision.calls[0].arguments.get("source_citations")
+        ledger = self.context.services.get("evidence")
+        if (
+            not isinstance(numbers, list)
+            or not numbers
+            or any(type(number) is not int or number < 1 for number in numbers)
+            or not isinstance(ledger, EvidenceLedger)
+            or not set(numbers) <= ledger.completely_delivered(self.last_call_id or "")
+        ):
+            return None
+        return cast(list[int], numbers)
+
     @staticmethod
     def _source_answer_ready(decision: Decision) -> bool:
         if decision.calls:
@@ -4308,9 +4407,28 @@ class ResearchModel:
                     key: value for key, value in raw.items() if key != "resolutions"
                 }
             if isinstance(registry, CapabilityRegistry):
-                gap = registry.outcome_metadata_gap(
-                    call.model_copy(update={"arguments": arguments}), self.context
-                )
+                metadata_call = call.model_copy(update={"arguments": arguments})
+                if call.name == "prepare_answer":
+                    metadata_call = call.model_copy(
+                        update={
+                            "name": "submit_answer",
+                            "arguments": {
+                                "answer": " ".join(
+                                    f"[{number}]"
+                                    for number in cast(
+                                        list[int], arguments.get("source_citations", [])
+                                    )
+                                ),
+                                "basis": "originals",
+                                **{
+                                    key: value
+                                    for key, value in arguments.items()
+                                    if key in {"_outcomes", "_coverage"}
+                                },
+                            },
+                        }
+                    )
+                gap = registry.outcome_metadata_gap(metadata_call, self.context)
                 if gap is not None:
                     candidate["metadata_gap"] = gap.data
             candidates.append(candidate)
