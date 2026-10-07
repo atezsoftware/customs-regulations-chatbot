@@ -10,7 +10,8 @@ from uuid import uuid4
 import pytest
 
 from onyx.asv3.evidence import EvidenceLedger
-from onyx.asv3.models import RunStopped
+from onyx.asv3.models import RunContext, RunStopped
+from onyx.asv3.search_adapter import ScopedSearchLLM
 from onyx.db.response_usage import get_response_usage
 from onyx.legal_composite.budget import WorkflowBudget
 from onyx.legal_composite.gateway import BudgetedGateway
@@ -164,10 +165,11 @@ def test_matching_search_helper_reuses_explicit_span_once(
 ) -> None:
     workflow = gateway(model)
     proxy = workflow.research_proxy()
+    helper = ScopedSearchLLM(proxy, RunContext(timeout_seconds=120), None)
     prompt = UserMessage(content="Select a legal section")
     with trace("explicit-helper"):
-        with llm_generation_span(proxy, flow, input_messages=[prompt]) as outer:
-            response = proxy.invoke(prompt)
+        with llm_generation_span(helper, flow, input_messages=[prompt]) as outer:
+            response = helper.invoke(prompt)
             record_llm_response(outer, response)
     assert model.invoke.call_count == 1
     assert len(spans) == 1
