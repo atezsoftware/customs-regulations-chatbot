@@ -6,7 +6,7 @@ from onyx.prompts.asv3.coordinator_reference import (
 )
 from onyx.prompts.asv3.research import LEGAL_DEPARTMENT_RESEARCH
 
-TUNED_PROMPT_VERSION = "asv3-tuned-2026-10-07.22"
+TUNED_PROMPT_VERSION = "asv3-tuned-2026-10-07.20"
 
 TUNED_SOURCE_ANSWER_PROMPT = """Write Atez Customs Assistant's complete answer in the question's language or the explicitly
 requested language, directly from the actual request, supplied facts and numbered source

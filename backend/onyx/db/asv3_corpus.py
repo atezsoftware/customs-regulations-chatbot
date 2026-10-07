@@ -3,7 +3,7 @@
 import json
 import re
 from collections.abc import Callable, Generator
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date
 from typing import Any
 from uuid import UUID
@@ -164,7 +164,6 @@ class CorpusClosureRead:
     continuation: dict[str, tuple[str, ...]]
     outline_rows: int
     outline_truncated: bool
-    center_ordinals: dict[str, int] = field(default_factory=dict)
 
 
 def _binding_chunk(
@@ -298,7 +297,6 @@ def read_search_source_closures(
     max_outline_rows: int = 20000,
     max_outline_bytes: int = 4 * 1024 * 1024,
     max_chars: int = 64000,
-    local_groups: bool = False,
 ) -> CorpusClosureRead:
     """Plan local closures once from structure, then hydrate only their exact members."""
     from onyx.db.regulatory_chunks import (
@@ -326,8 +324,6 @@ def read_search_source_closures(
     )
 
     planning_inventory = None
-    aggregate_paths: dict[str, tuple[str, ...]] = {}
-    center_ordinals: dict[str, int] = {}
     if qualified and current_asv3_source_inventory_scope() is not None:
         assert index is not None
         planning_inventory = read_asv3_candidate_inventory(
@@ -344,18 +340,7 @@ def read_search_source_closures(
             if planning_inventory is not None:
                 for row in planning_inventory:
                     check_active()
-                    if row.canonical_chunk_id in center_ids and row.derived_role in {
-                        "canonical",
-                        "hierarchical_aggregate",
-                    }:
-                        center_ordinals[row.canonical_chunk_id] = row.ordinal
                     if row.derived_role != "canonical":
-                        if (
-                            local_groups
-                            and row.canonical_chunk_id in center_ids
-                            and row.derived_role == "hierarchical_aggregate"
-                        ):
-                            aggregate_paths[row.canonical_chunk_id] = row.heading_path
                         continue
                     metadata = row.closure_metadata
                     yield RegulatoryChunkSiblingCandidate(
@@ -391,24 +376,9 @@ def read_search_source_closures(
             try:
                 for binding in bindings:
                     check_active()
-                    payload = json.loads(binding.projection.source_json)
-                    identifier = payload["regulatory_chunk_id"]
-                    if identifier in center_ids and binding.derived_role in {
-                        "canonical",
-                        "hierarchical_aggregate",
-                    }:
-                        center_ordinals[identifier] = binding.projection.ordinal
                     if binding.derived_role != "canonical":
-                        if (
-                            local_groups
-                            and identifier in center_ids
-                            and binding.derived_role == "hierarchical_aggregate"
-                        ):
-                            aggregate_paths[identifier] = tuple(
-                                payload.get("heading_path") or ()
-                            )
-                        del payload
                         continue
+                    payload = json.loads(binding.projection.source_json)
                     metadata = {**payload, **binding.representation_metadata}
                     yield RegulatoryChunkSiblingCandidate(
                         regulatory_chunk_id=payload["regulatory_chunk_id"],
@@ -453,11 +423,8 @@ def read_search_source_closures(
             RegulatoryChunk.projection_ordinal,
         ).where(
             RegulatoryChunk.user_file_id == source_id,
+            RegulatoryChunk.chunk_type.is_distinct_from("hierarchical_aggregate"),
         )
-        if not local_groups:
-            statement = statement.where(
-                RegulatoryChunk.chunk_type.is_distinct_from("hierarchical_aggregate")
-            )
         if filters.as_of_date is None:
             statement = statement.where(RegulatoryChunk.status == "active")
         else:
@@ -480,12 +447,6 @@ def read_search_source_closures(
             for row in rows:
                 check_active()
                 metadata = row.chunk_metadata or {}
-                if row.id in center_ids:
-                    center_ordinals[row.id] = row.projection_ordinal
-                if row.chunk_type == "hierarchical_aggregate":
-                    if local_groups and row.id in center_ids:
-                        aggregate_paths[row.id] = tuple(row.heading_path or ())
-                    continue
                 yield RegulatoryChunkSiblingCandidate(
                     regulatory_chunk_id=row.id,
                     user_file_id=source_id,
@@ -536,31 +497,12 @@ def read_search_source_closures(
     proven: dict[str, bool] = {}
     for center in dict.fromkeys(center_ids):
         seed = by_id.get(center)
-        if truncated or (seed is None and center not in aggregate_paths):
+        if seed is None or truncated:
             members[center], proven[center] = (center,), False
             continue
-        grouped_span: set[int] = set()
-        if local_groups:
-            from onyx.asv3.source_groups import source_group_indices
-
-            grouped_span = source_group_indices(
-                [row.heading_path for row in rows],
-                seed.heading_path if seed is not None else aggregate_paths[center],
-            )
-        if grouped_span:
-            span = grouped_span
-        elif seed is not None:
-            # Without a verified paragraph/decision group, preserve just the selected original.
-            span = (
-                {seed.structural_index}
-                if local_groups
-                else _provision_span_for_seed(
-                    rows, seed.structural_index, as_of_date=filters.as_of_date
-                )
-            )
-        else:
-            members[center], proven[center] = (), False
-            continue
+        span = _provision_span_for_seed(
+            rows, seed.structural_index, as_of_date=filters.as_of_date
+        )
         selected_positions = {rows[i].position for i in span}
         overlap_indices = {
             i for i, row in enumerate(rows) if row.position in selected_positions
@@ -577,15 +519,7 @@ def read_search_source_closures(
             0 <= edge < len(rows) and _candidate_article_no(rows[edge]) is None
             for edge in (min(span) - 1, max(span) + 1)
         )
-        proven[center] = (
-            bool(grouped_span)
-            if local_groups
-            else (
-                seed is not None
-                and _candidate_article_no(seed) is not None
-                and not uncertain_edge
-            )
-        )
+        proven[center] = _candidate_article_no(seed) is not None and not uncertain_edge
     outline_rows = len(candidates)
     del candidates, by_file, by_id, rows
     requested = set(center_ids)
@@ -676,11 +610,7 @@ def read_search_source_closures(
     characters = 0
     hydrated_ids: set[str] = set()
     for identifiers in (
-        tuple(
-            identifier
-            for identifier in dict.fromkeys(center_ids)
-            if identifier not in aggregate_paths
-        ),
+        tuple(dict.fromkeys(center_ids)),
         tuple(requested - set(center_ids)),
     ):
         texts = hydrate(identifiers)
@@ -716,7 +646,6 @@ def read_search_source_closures(
         continuation,
         outline_rows,
         truncated,
-        center_ordinals,
     )
 
 

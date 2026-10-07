@@ -3754,7 +3754,7 @@ class ResearchModel:
                 continue
             number, formal = reference["instrument_number"], reference["formal_name"]
             source_name = (
-                f"{number} sayılı {formal or 'Kanun'}"
+                f"{number} sayılı Kanun"
                 if isinstance(number, str) and number
                 else formal
             )

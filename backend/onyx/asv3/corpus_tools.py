@@ -34,13 +34,11 @@ from onyx.asv3.models import (
 )
 from onyx.asv3.parallel_execution import capability_slot, parallel_execution_enabled
 from onyx.asv3.shared_reads import SharedReads
-from onyx.asv3.workflow_variant import ASV3_TUNED_VARIANT
 from onyx.configs.constants import DocumentSource
 from onyx.context.search.models import IndexFilters, SearchDoc
 from onyx.db.asv3_candidate_inventory import current_asv3_source_inventory_scope
 from onyx.db.asv3_corpus import (
     CorpusChunk,
-    CorpusClosureRead,
     CorpusScopeUnavailable,
     CorpusSource,
     find_related_sources,
@@ -840,33 +838,15 @@ class CorpusBroker:
                             snapshot = resolve_source_query_index(session, source.id)
                             if snapshot is not None:
                                 self.query_indexes[source.id] = snapshot
-                    groups = None
-                    if (
-                        context.services.get("asv3_workflow_variant")
-                        == ASV3_TUNED_VARIANT
-                    ):
-                        groups = read_search_source_closures(
-                            session,
-                            user=self.user,
-                            filters=self.filters,
-                            source_id=source.id,
-                            center_ids=center_ids,
-                            index=self.query_indexes.get(source.id),
-                            check_active=context.check_active,
-                            max_chars=MAX_RESPONSE_CHARS * len(center_ids),
-                            local_groups=True,
-                        )
-                        originals = (chunk for chunk in groups.chunks)
-                    else:
-                        originals = iter_source_chunks_by_ids(
-                            session,
-                            user=self.user,
-                            filters=self.filters,
-                            source_id=source.id,
-                            chunk_ids=center_ids,
-                            index=self.query_indexes.get(source.id),
-                            check_active=context.check_active,
-                        )
+                    originals = iter_source_chunks_by_ids(
+                        session,
+                        user=self.user,
+                        filters=self.filters,
+                        source_id=source.id,
+                        chunk_ids=center_ids,
+                        index=self.query_indexes.get(source.id),
+                        check_active=context.check_active,
+                    )
                     by_id: dict[str, CorpusChunk] = {}
                     try:
                         for chunk in originals:
@@ -881,56 +861,27 @@ class CorpusBroker:
                 for doc in centers:
                     center_id = str(doc.metadata["regulatory_chunk_id"])
                     chunk = by_id.get(center_id)
-                    ordinal = (
-                        groups.center_ordinals.get(center_id)
-                        if groups is not None
-                        else (chunk.projection_ordinal if chunk is not None else None)
-                    )
-                    if ordinal != doc.chunk_ind:
+                    if chunk is None or chunk.projection_ordinal != doc.chunk_ind:
                         hydrated[(doc.document_id, doc.chunk_ind)] = []
                         continue
-                    members = (
-                        groups.members[center_id]
-                        if groups is not None
-                        else (center_id,)
+                    item = evidence_for_chunk(source, chunk)
+                    item.metadata.update(
+                        retrieval_method="established_search_exact_original",
+                        article_closure_complete=False,
+                        section_context="not_inferred",
+                        additional_context="harness_controlled",
+                        follow_context_tool="read_provision",
+                        retrieved_projection_ordinal=doc.chunk_ind,
+                        retrieved_center=True,
                     )
-                    items = []
-                    for member in members:
-                        chunk = by_id.get(member)
-                        if chunk is None:
-                            continue
-                        item = evidence_for_chunk(source, chunk)
-                        item.metadata.update(
-                            retrieval_method="established_search_structural_group"
-                            if groups is not None
-                            else "established_search_exact_original",
-                            article_closure_complete=False,
-                            section_context="not_inferred",
-                            additional_context="canonical_connected_group"
-                            if groups is not None
-                            else "harness_controlled",
-                            follow_context_tool="read_provision",
-                            retrieved_projection_ordinal=doc.chunk_ind,
-                            retrieved_center=member == center_id,
-                        )
-                        if groups is not None:
-                            item.metadata.update(
-                                source_group_complete=groups.complete[center_id],
-                                source_group_continuation=list(
-                                    groups.continuation[center_id]
-                                ),
-                                source_outline_truncated=groups.outline_truncated,
-                            )
-                        items.append(item)
-                    hydrated[(doc.document_id, doc.chunk_ind)] = items
+                    hydrated[(doc.document_id, doc.chunk_ind)] = [item]
                 step.output_value = {
                     "requested_center_count": len(center_ids),
                     "hydrated_chunk_count": len(by_id),
                     "hydrated_characters": sum(
                         len(chunk.text) for chunk in by_id.values()
                     ),
-                    "context_expanded": groups is not None,
-                    "outline_rows": groups.outline_rows if groups is not None else 0,
+                    "context_expanded": False,
                 }
             return hydrated
 
@@ -949,32 +900,6 @@ class CorpusBroker:
         for result in results:
             hydrated.update(result)
         return hydrated
-
-    def hydrate_source_groups(
-        self, source_id: str, centers: tuple[str, ...], context: RunContext
-    ) -> CorpusClosureRead:
-        """Complete selected source-text hits in a single fenced structural read."""
-        with get_session_with_current_tenant() as session:
-            source = require_source(
-                session, user=self.user, filters=self.filters, source_id=UUID(source_id)
-            )
-            with self._index_lock:
-                if source.id not in self.query_indexes:
-                    snapshot = resolve_source_query_index(session, source.id)
-                    if snapshot is not None:
-                        self.query_indexes[source.id] = snapshot
-                index = self.query_indexes.get(source.id)
-            return read_search_source_closures(
-                session,
-                user=self.user,
-                filters=self.filters,
-                source_id=source.id,
-                center_ids=centers,
-                index=index,
-                check_active=context.check_active,
-                max_chars=MAX_RESPONSE_CHARS,
-                local_groups=True,
-            )
 
     def hydrate_search_results(
         self, docs: list[SearchDoc], context: RunContext
@@ -1446,20 +1371,6 @@ def build_corpus_specs(
                 sources, more = broker.sources(
                     str(args["source_name"]), context, limit=20
                 )
-                seen = {source.id for source in sources}
-                offset = 20
-                # Verified fallback pages can be empty while raw title candidates remain.
-                while len(seen) < 2 and more:
-                    context.check_active()
-                    page, more = broker.sources(
-                        str(args["source_name"]), context, offset=offset, limit=20
-                    )
-                    if any(source.id in seen for source in page):
-                        more = True
-                        break
-                    sources.extend(page)
-                    seen.update(source.id for source in page)
-                    offset += 20
         if len(sources) != 1 or more:
             return ToolOutcome(
                 status=OutcomeStatus.AMBIGUOUS
@@ -1569,35 +1480,8 @@ def build_corpus_specs(
             if match_chunks >= 30:
                 match_overflow = True
                 break
-        group_continuations: dict[str, JsonValue] = {}
-        if (
-            selection.items
-            and context.services.get("asv3_workflow_variant") == ASV3_TUNED_VARIANT
-        ):
-            groups = broker.hydrate_source_groups(
-                str(args["source_id"]),
-                tuple(
-                    item.chunk_id
-                    for item in selection.items
-                    if item.chunk_id is not None
-                ),
-                context,
-            )
-            for chunk in groups.chunks:
-                if not any(item.chunk_id == chunk.id for item in selection.items):
-                    selection.add(chunk)
-            group_continuations = {
-                identifier: list(missing)
-                for identifier, missing in groups.continuation.items()
-                if missing
-            }
         evidence, clipped = selection.items, selection.clipped
-        more = (
-            stream.truncated
-            or match_overflow
-            or len(matches) > 200
-            or bool(group_continuations)
-        )
+        more = stream.truncated or match_overflow or len(matches) > 200
         return ToolOutcome(
             status=OutcomeStatus.PARTIAL
             if more or clipped
@@ -1607,7 +1491,6 @@ def build_corpus_specs(
             summary="Original-text matches and canonical surrounding chunks.",
             data={
                 "matches": matches[:200],
-                "source_group_continuations": group_continuations,
                 "scan_truncated": more,
                 "next_position": stream.next_position,
                 "evidence_truncated": clipped,
