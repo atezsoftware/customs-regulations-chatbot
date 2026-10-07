@@ -1,99 +1,68 @@
-name: DEV amendment approval diagnostics
+name: TEST migration recovery inspection
+run-name: TEST migration inspection ${{ github.run_id }}
 on:
   workflow_dispatch:
-    inputs:
-      operation:
-        type: choice
-        options: [inspect, approve_462, approve_465, approve_470]
-        default: inspect
 permissions:
   contents: read
 jobs:
   inspect:
     runs-on: codebuild-customs-regulations-runner-${{ github.run_id }}-${{ github.run_attempt }}
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
-        with:
-          persist-credentials: false
-      - name: Read only batch inventory
+      - uses: actions/checkout@v5
+      - name: Inspect TEST and DEV
         shell: bash
         run: |
           set -euo pipefail
           aws eks update-kubeconfig --name atez-dev-cluster --region eu-central-1
-          kubectl get pods -n customs-regulations-dev -o json > /tmp/amendment-pods.json
-          python - <<'PY'
-          import json
-          from pathlib import Path
-          pods=json.loads(Path('/tmp/amendment-pods.json').read_text())['items']
-          ready=[]
-          for pod in pods:
-              if pod['status']['phase']!='Running' or pod['metadata'].get('deletionTimestamp'):
-                  continue
-              statuses={item['name']:item for item in pod['status'].get('containerStatuses',[])}
-              for container in pod['spec']['containers']:
-                  image=container['image']
-                  if 'customs-regulations-backend-lite-dev:' in image and statuses.get(container['name'],{}).get('ready'):
-                      ready.append((pod['metadata']['name'],container['name'],image))
-          if not ready:
-              raise SystemExit('No ready DEV backend container')
-          ready.sort()
-          pod,container,image=ready[0]
-          print('TARGET',pod,container,image)
-          Path('/tmp/amendment-target').write_text(pod+'\t'+container+'\n')
+          mkdir -p evidence
+          for ns in customs-regulations-test customs-regulations-dev; do
+            kubectl get deploy,pods -n "$ns" -o json | jq '[.items[] | {kind,name:.metadata.name,images:[.spec.template.spec.containers[]?.image,.spec.containers[]?.image],ready:.status.readyReplicas,containers:[.status.containerStatuses[]? | {name,ready,restartCount,imageID,state}],node:.spec.nodeName}]' | tee "evidence/$ns-workloads.json"
+          done
+          deployment=$(kubectl get deploy -n customs-regulations-test -l app=devops -o json | jq -r '.items[] | select(.metadata.name | contains("customs-regulations-api")) | .metadata.name' | head -n 1)
+          if [[ -z "$deployment" ]]; then
+            deployment=$(kubectl get deploy -n customs-regulations-test -o json | jq -r '.items[] | select(.metadata.name | contains("customs-regulations-api")) | .metadata.name' | head -n 1)
+          fi
+          [[ -n "$deployment" ]]
+          kubectl get deploy "$deployment" -n customs-regulations-test -o json > /tmp/test-deployment.json
+          python3 - <<'PY'
+          import json,os
+          d=json.load(open('/tmp/test-deployment.json'))
+          template=d['spec']['template']
+          metadata=template['metadata']
+          metadata['name']='test-migration-probe-'+os.environ['GITHUB_RUN_ID']
+          metadata['namespace']='customs-regulations-test'
+          metadata['labels']={'app':'test-migration-probe'}
+          metadata.pop('creationTimestamp',None)
+          spec=template['spec']
+          spec['restartPolicy']='Never'
+          spec['activeDeadlineSeconds']=600
+          for c in spec['containers']:
+              c['command']=['/bin/sh','-c','sleep 600']
+              c.pop('args',None)
+              for k in ('readinessProbe','livenessProbe','startupProbe'):
+                  c.pop(k,None)
+          json.dump({'apiVersion':'v1','kind':'Pod','metadata':metadata,'spec':spec},open('/tmp/probe-pod.json','w'))
           PY
-          IFS=$'\t' read -r pod container < /tmp/amendment-target
-          kubectl exec -i "$pod" -n customs-regulations-dev -c "$container" -- \
-            sh -ec '. /vault/secrets/config; export PYTHONPATH=/app; exec python -' < \
-            backend/onyx/db/diagnose_amendment_batches_299_310.py
-      - name: Filter amendment approval worker errors
-        if: inputs.operation == 'inspect'
-        shell: bash
-        run: |
-          set -euo pipefail
-          python - <<'PY'
+          pod="test-migration-probe-${GITHUB_RUN_ID}"
+          trap 'kubectl delete pod "$pod" -n customs-regulations-test --ignore-not-found --wait=false' EXIT
+          kubectl create -f /tmp/probe-pod.json
+          kubectl wait pod "$pod" -n customs-regulations-test --for=condition=Ready --timeout=180s
+          container=$(kubectl get deploy "$deployment" -n customs-regulations-test -o json | jq -r '.spec.template.spec.containers[0].name')
+          kubectl exec -i "$pod" -n customs-regulations-test -c "$container" -- sh -ec '. /vault/secrets/config; cd /app/onyx/db; python - customs-regulations-test' < backend/onyx/db/test_migration_identity_probe.py | tee evidence/test-database.json
+          devpod=$(kubectl get pods -n customs-regulations-dev -o json | jq -r '.items[] | select(.metadata.deletionTimestamp == null) | select(.metadata.name | contains("customs-regulations-api")) | select(any(.status.containerStatuses[]?; .ready and (.image | contains("backend-lite")))) | .metadata.name' | head -n 1)
+          [[ -n "$devpod" ]]
+          devcontainer=$(kubectl get pod "$devpod" -n customs-regulations-dev -o json | jq -r '.spec.containers[] | select(.image | contains("backend-lite")) | .name' | head -n 1)
+          kubectl exec -i "$devpod" -n customs-regulations-dev -c "$devcontainer" -- sh -ec '. /vault/secrets/config; cd /app/onyx/db; python - customs-regulations-dev' < backend/onyx/db/test_migration_identity_probe.py | tee evidence/dev-database.json
+          python3 - <<'PY'
           import json
-          import re
-          import subprocess
-          from pathlib import Path
-
-          pods = json.loads(Path('/tmp/amendment-pods.json').read_text())['items']
-          needles = re.compile(r'Amendment proposal (460|462|465|470) approval failed|amendment_(prepared|approved) proposal_id=(460|462|465|470)')
-          for pod in pods:
-              name = pod['metadata']['name']
-              if pod['status']['phase'] != 'Running' or 'background' not in name:
-                  continue
-              for container in pod['spec']['containers']:
-                  result = subprocess.run(
-                      ['kubectl', 'logs', name, '-n', 'customs-regulations-dev',
-                       '-c', container['name'], '--since=36h', '--tail=30000'],
-                      capture_output=True, text=True, check=False,
-                  )
-                  if result.returncode:
-                      print('LOG_READ_FAILED', name, container['name'], result.returncode)
-                      continue
-                  lines = result.stdout.splitlines()
-                  print('LOG_SCAN', name, container['name'], len(lines))
-                  for index, line in enumerate(lines):
-                      if needles.search(line):
-                          print('LOG_MATCH', name, container['name'])
-                          for excerpt in lines[index:index + 45]:
-                              print(excerpt[:500])
+          test=json.load(open('evidence/test-database.json'))
+          dev=json.load(open('evidence/dev-database.json'))
+          assert (test['server'],test['port'],test['database']) != (dev['server'],dev['port'],dev['database'])
+          print('Verified TEST and DEV database identities are separate')
           PY
-      - name: Resume one existing reviewed proposal
-        if: inputs.operation != 'inspect'
-        shell: bash
-        env:
-          OPERATION: ${{ inputs.operation }}
-        run: |
-          set -euo pipefail
-          case "$OPERATION" in
-            approve_462) proposal_id=462 ;;
-            approve_465) proposal_id=465 ;;
-            approve_470) proposal_id=470 ;;
-            *) exit 2 ;;
-          esac
-          IFS=$'\t' read -r pod container < /tmp/amendment-target
-          kubectl exec -i "$pod" -n customs-regulations-dev -c "$container" -- \
-            sh -ec '. /vault/secrets/config; export PYTHONPATH=/app; exec python - "$1"' sh "$proposal_id" < \
-            backend/onyx/db/resume_amendment_approvals_309_310.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-migration-inspection
+          path: evidence/
