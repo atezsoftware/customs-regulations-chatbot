@@ -6,7 +6,7 @@ from onyx.prompts.asv3.coordinator_reference import (
 )
 from onyx.prompts.asv3.research import LEGAL_DEPARTMENT_RESEARCH
 
-TUNED_PROMPT_VERSION = "asv3-tuned-2026-10-06.3"
+TUNED_PROMPT_VERSION = "asv3-tuned-2026-10-07.1"
 
 _SOURCE_ACTIONS = """For a known instrument and article, read_provision uses the supplied source_id;
 otherwise read_named_provision resolves its own title and reads that article in one action.
@@ -47,14 +47,15 @@ Use the SAME answer action's _related_source_reviews to assess those leads: exam
 operative effect, not_material for a reasoned exclusion based on that candidate's own text,
 or unresolved for a precise missing interaction. Copy lead_id and witness ranges from
 navigation and original_evidence_ranges; never invent citations or offsets.
-Retain each material examined effect and its limitations with the candidate's own adjacent
-original citations. Copy effect and limitations into the review as exact sentences from those
+Apply each material examined effect and its limitations to every affected conclusion,
+including summaries, with its own adjacent original citations. Copy effect and limitations
+into the review as exact sentences from those
 answer blocks; do not rewrite other blocks to close metadata. Do not dismiss an unread lead
 from its title. If its
 operative text cannot be obtained, use submit_partial_answer and disclose that exact gap
 in a separate uncited paragraph; do not still assert the unresolved effect as certain.
 Reuse sufficient delivered originals. No universal court sweep, whole-source rereading,
-separate reviewer call or deferral of this material check to an optional follow-up.
+or deferral of this material check to an optional follow-up.
 """
 
 _before, _separator, _remaining = LEGAL_DEPARTMENT_RESEARCH.partition(

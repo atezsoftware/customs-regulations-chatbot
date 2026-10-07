@@ -76,6 +76,7 @@ from onyx.asv3.session_research import (
 )
 from onyx.asv3.shared_reads import SharedReads
 from onyx.asv3.source_tools import build_source_specs
+from onyx.asv3.source_use import SourceUseReviewer
 from onyx.asv3.supplemental_tools import (
     ScenarioState,
     build_supplemental_specs,
@@ -1481,6 +1482,17 @@ def run_asv3_loop(
         )
     )
 
+    source_use_reviewer = SourceUseReviewer(
+        ResearchModel(
+            llm,
+            context,
+            user_identity=user_identity,
+            reasoning_effort=reasoning_effort,
+            token_counter=token_counter,
+        ),
+        ledger,
+    )
+
     def source_publication_gap(
         answer: str,
         model_call_id: str | None,
@@ -1528,10 +1540,23 @@ def run_asv3_loop(
                     data=reference_gap,
                 )
         if source_reviews is not None:
-            return source_reviews.publication_gap(
+            review_gap = source_reviews.publication_gap(
                 answer, model_call_id or "", run_context or context, ledger
             )
-        return None
+            if review_gap is not None:
+                return review_gap
+        if run_context is not None and run_context.depth:
+            return None
+        return source_use_reviewer.publication_gap(
+            answer,
+            question,
+            model_call_id,
+            conversation=[
+                {"role": m.message_type.value, "content": m.message}
+                for m in simple_chat_history[-8:]
+                if m.message_type in (MessageType.USER, MessageType.ASSISTANT)
+            ],
+        )
 
     def publication_guard(
         answer: str,

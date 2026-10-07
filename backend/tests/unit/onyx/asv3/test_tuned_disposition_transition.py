@@ -395,6 +395,7 @@ def test_latest_rejected_partial_replaces_previous_draft_and_gap(
     assert calls == 2
 
 
+@pytest.mark.usefixtures("source_use_review_not_under_test")
 def test_tuned_runtime_retains_first_partial_rejection_for_owned_repair(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

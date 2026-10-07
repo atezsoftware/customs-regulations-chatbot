@@ -245,6 +245,7 @@ def test_tuned_policy_replaces_one_section_without_case_specific_direction() -> 
         assert forbidden not in policy
 
 
+@pytest.mark.usefixtures("source_use_review_not_under_test")
 def test_runtime_tuned_statute_binding_does_not_consume_a_neighboring_circular_number(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -273,6 +274,7 @@ def test_runtime_tuned_statute_binding_does_not_consume_a_neighboring_circular_n
 
 
 @pytest.mark.parametrize("omit_examined_source", [False, True])
+@pytest.mark.usefixtures("source_use_review_not_under_test")
 def test_runtime_rejects_premature_answer_then_reuses_read_originals(
     monkeypatch: pytest.MonkeyPatch, omit_examined_source: bool
 ) -> None:
