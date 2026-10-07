@@ -268,20 +268,6 @@ def _missing_judicial_disposition(
     )
 
 
-def _retention_text(value: str) -> str:
-    """Normalize presentation only; validate inline witnesses on the original block."""
-    value = re.sub(
-        r"(?<![\w*])\*\*(?=\S)(.+?)(?<=\S)\*\*(?![\w*])",
-        r"\1",
-        value,
-    )
-    value = re.sub(r"(?:\s*" + _CITATION_MARKER.pattern + r")+(?=[.,;:!?])", "", value)
-    value = _CITATION_MARKER.sub("", value)
-    return " ".join(
-        value.translate(str.maketrans({"‘": "'", "’": "'", "“": '"', "”": '"'})).split()
-    )
-
-
 def _examined_answer_omission(
     record: _LeadRecord,
     answer: str,
@@ -289,8 +275,6 @@ def _examined_answer_omission(
     delivered: set[int] | None,
     include_repair_text: bool = False,
     include_exclusions: bool = False,
-    normalize_presentation: bool = False,
-    allow_separate_witness_blocks: bool = False,
 ) -> dict[str, JsonValue] | None:
     """Retain copied passages and their provenance, without assessing legal entailment."""
     review = record.review
@@ -303,44 +287,32 @@ def _examined_answer_omission(
         return None
     numbers = {witness.citation for witness in review.witnesses}
     units = [
-        (unit["text"], numbers & _substantive_inline_citations(unit["text"]))
-        for unit in assertion_inventory(answer)
-        if not unit["presentation_only"]
+        unit for unit in assertion_inventory(answer) if not unit["presentation_only"]
     ]
     omitted: list[JsonValue] = []
     bound: set[int] = set()
-    normalize = _retention_text if normalize_presentation else str.strip
     for field, passage in (
         ("effect", review.effect),
         ("limitations", review.limitations),
     ):
-        exact = normalize(passage)
+        exact = passage.strip()
         if (
             presentation_block(exact)
             or not any(
                 character.isalnum() for character in _CITATION_MARKER.sub("", exact)
             )
-            or not exact
+            or exact not in answer
         ):
             omitted.append(field)
             continue
-        declared = (
-            numbers & set(extract_citation_numbers(passage))
-            if allow_separate_witness_blocks
-            else set()
-        )
         matching = [
-            citations
-            for text, citations in units
-            if exact in normalize(text) and declared <= citations
+            numbers & _substantive_inline_citations(unit["text"])
+            for unit in units
+            if exact in unit["text"]
         ]
         if not any(matching):
             omitted.append(field)
         for citations in matching:
-            bound.update(citations)
-    if allow_separate_witness_blocks:
-        # Supporting reasoning can have its own cited paragraph apart from the effect.
-        for _, citations in units:
             bound.update(citations)
     undelivered = sorted(numbers - delivered) if delivered is not None else []
     unbound = sorted(numbers - bound)
@@ -1097,8 +1069,6 @@ class LegalSourceReviews:
                         delivered=delivered,
                         include_repair_text=tuned,
                         include_exclusions=tuned,
-                        normalize_presentation=tuned,
-                        allow_separate_witness_blocks=tuned,
                     )
                     if omission is not None:
                         unretained.append(omission)
@@ -1174,12 +1144,7 @@ class LegalSourceReviews:
                 ):
                     if retain_examined:
                         omission = _examined_answer_omission(
-                            record,
-                            answer,
-                            delivered=None,
-                            include_exclusions=tuned,
-                            normalize_presentation=tuned,
-                            allow_separate_witness_blocks=tuned,
+                            record, answer, delivered=None, include_exclusions=tuned
                         )
                         if omission is not None:
                             unretained.append(omission)
@@ -1216,8 +1181,6 @@ class LegalSourceReviews:
                                 answer,
                                 delivered=None,
                                 include_exclusions=tuned,
-                                normalize_presentation=tuned,
-                                allow_separate_witness_blocks=tuned,
                             )
                         )
                         is not None

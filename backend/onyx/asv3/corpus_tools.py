@@ -34,7 +34,6 @@ from onyx.asv3.models import (
 )
 from onyx.asv3.parallel_execution import capability_slot, parallel_execution_enabled
 from onyx.asv3.shared_reads import SharedReads
-from onyx.asv3.workflow_variant import ASV3_TUNED_VARIANT
 from onyx.configs.constants import DocumentSource
 from onyx.context.search.models import IndexFilters, SearchDoc
 from onyx.db.asv3_candidate_inventory import current_asv3_source_inventory_scope
@@ -48,7 +47,6 @@ from onyx.db.asv3_corpus import (
     read_search_source_closures,
     read_source_chunks,
     require_source,
-    resolve_search_center_members,
     resolve_source_query_index,
     source_diagnostic,
     source_provision_position,
@@ -808,15 +806,10 @@ class CorpusBroker:
                     str(doc.metadata["regulatory_chunk_id"]) for doc in centers
                 )
             )
-            tuned_units = (
-                context.services.get("asv3_workflow_variant") == ASV3_TUNED_VARIANT
-            )
             with graph_step(
                 "asv3.canonical_hydration.centers",
                 {"source_id": source_id, "center_ids": center_ids},
-                summary="Read verified local source units"
-                if tuned_units
-                else "Read exact retrieved originals without implicit expansion",
+                summary="Read exact retrieved originals without implicit expansion",
             ) as step:
                 with get_session_with_current_tenant() as session:
                     source = require_source(
@@ -845,127 +838,50 @@ class CorpusBroker:
                             snapshot = resolve_source_query_index(session, source.id)
                             if snapshot is not None:
                                 self.query_indexes[source.id] = snapshot
+                    originals = iter_source_chunks_by_ids(
+                        session,
+                        user=self.user,
+                        filters=self.filters,
+                        source_id=source.id,
+                        chunk_ids=center_ids,
+                        index=self.query_indexes.get(source.id),
+                        check_active=context.check_active,
+                    )
                     by_id: dict[str, CorpusChunk] = {}
-                    member_ids = {
-                        identifier: (identifier,) for identifier in center_ids
-                    }
-                    if tuned_units:
-                        center_ordinals: dict[str, int] = {}
-                        for doc in centers:
-                            identifier = str(doc.metadata["regulatory_chunk_id"])
-                            if (
-                                identifier in center_ordinals
-                                and center_ordinals[identifier] != doc.chunk_ind
-                            ):
+                    try:
+                        for chunk in originals:
+                            if chunk.id in by_id:
                                 raise CorpusScopeUnavailable(
-                                    "Retrieved center has conflicting projection ordinals."
+                                    "Retrieved original has ambiguous canonical bindings."
                                 )
-                            center_ordinals[identifier] = doc.chunk_ind
-                        member_ids = resolve_search_center_members(
-                            session,
-                            user=self.user,
-                            filters=self.filters,
-                            source_id=source.id,
-                            center_ordinals=center_ordinals,
-                            index=self.query_indexes.get(source.id),
-                            check_active=context.check_active,
-                        )
-                        result = read_search_source_closures(
-                            session,
-                            user=self.user,
-                            filters=self.filters,
-                            source_id=source.id,
-                            center_ids=tuple(
-                                dict.fromkeys(
-                                    identifier
-                                    for members in member_ids.values()
-                                    for identifier in members
-                                )
-                            ),
-                            index=self.query_indexes.get(source.id),
-                            check_active=context.check_active,
-                            max_chars=MAX_RESPONSE_CHARS * len(center_ids),
-                            local_units_only=True,
-                        )
-                        by_id = {chunk.id: chunk for chunk in result.chunks}
-                        member_ids = {
-                            center: tuple(
-                                dict.fromkeys(
-                                    identifier
-                                    for member in members
-                                    for identifier in result.members[member]
-                                )
-                            )
-                            # An aggregate must not silently become only its surviving half.
-                            if all(member in by_id for member in members)
-                            else ()
-                            for center, members in member_ids.items()
-                        }
-                    else:
-                        originals = iter_source_chunks_by_ids(
-                            session,
-                            user=self.user,
-                            filters=self.filters,
-                            source_id=source.id,
-                            chunk_ids=center_ids,
-                            index=self.query_indexes.get(source.id),
-                            check_active=context.check_active,
-                        )
-                        try:
-                            for chunk in originals:
-                                if chunk.id in by_id:
-                                    raise CorpusScopeUnavailable(
-                                        "Retrieved original has ambiguous canonical bindings."
-                                    )
-                                by_id[chunk.id] = chunk
-                        finally:
-                            originals.close()
+                            by_id[chunk.id] = chunk
+                    finally:
+                        originals.close()
                 context.check_active()
                 for doc in centers:
                     center_id = str(doc.metadata["regulatory_chunk_id"])
-                    items = []
-                    for identifier in member_ids[center_id]:
-                        chunk = by_id.get(identifier)
-                        if chunk is None or (
-                            identifier == center_id
-                            and chunk.projection_ordinal != doc.chunk_ind
-                        ):
-                            continue
-                        item = evidence_for_chunk(source, chunk)
-                        item.metadata.update(
-                            retrieval_method="established_search_local_unit"
-                            if tuned_units
-                            else "established_search_exact_original",
-                            article_closure_complete=False,
-                            section_context="not_inferred",
-                            additional_context="canonical_local_unit"
-                            if tuned_units
-                            else "harness_controlled",
-                            follow_context_tool="read_provision",
-                            retrieved_projection_ordinal=doc.chunk_ind,
-                            retrieved_center=identifier == center_id,
-                        )
-                        if tuned_units:
-                            item.metadata["retrieved_center_id"] = center_id
-                            missing = [
-                                member
-                                for member in member_ids[center_id]
-                                if member not in by_id
-                            ]
-                            item.metadata["local_unit_remaining_count"] = len(missing)
-                            item.metadata["local_unit_continuation"] = missing[:100]
-                        items.append(item)
-                    hydrated[(doc.document_id, doc.chunk_ind)] = items
+                    chunk = by_id.get(center_id)
+                    if chunk is None or chunk.projection_ordinal != doc.chunk_ind:
+                        hydrated[(doc.document_id, doc.chunk_ind)] = []
+                        continue
+                    item = evidence_for_chunk(source, chunk)
+                    item.metadata.update(
+                        retrieval_method="established_search_exact_original",
+                        article_closure_complete=False,
+                        section_context="not_inferred",
+                        additional_context="harness_controlled",
+                        follow_context_tool="read_provision",
+                        retrieved_projection_ordinal=doc.chunk_ind,
+                        retrieved_center=True,
+                    )
+                    hydrated[(doc.document_id, doc.chunk_ind)] = [item]
                 step.output_value = {
                     "requested_center_count": len(center_ids),
                     "hydrated_chunk_count": len(by_id),
                     "hydrated_characters": sum(
                         len(chunk.text) for chunk in by_id.values()
                     ),
-                    "context_expanded": tuned_units,
-                    "unit_policy": "explicit_paragraph_or_example"
-                    if tuned_units
-                    else "exact_center",
+                    "context_expanded": False,
                 }
             return hydrated
 

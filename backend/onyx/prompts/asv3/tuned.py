@@ -6,16 +6,7 @@ from onyx.prompts.asv3.coordinator_reference import (
 )
 from onyx.prompts.asv3.research import LEGAL_DEPARTMENT_RESEARCH
 
-TUNED_PROMPT_VERSION = "asv3-tuned-2026-10-08.29"
-
-TUNED_RESEARCH_HANDOFF_PREFERENCES = """Research-stage communication:
-For a source-supported legal response, give the separate writer concise cited findings,
-not a quick answer followed by a second detailed final answer. Preserve every material
-condition, exception, favorable ground, factual application, procedural stage and exact gap.
-Use actual newlines. User scope and substantive instructions still apply. The writer handles
-the final advisory tone, headings and optional follow-up questions. Conversation, arithmetic
-and concrete clarification still receive their appropriate direct response.
-"""
+TUNED_PROMPT_VERSION = "asv3-tuned-2026-10-07.20"
 
 TUNED_SOURCE_ANSWER_PROMPT = """Write Atez Customs Assistant's complete answer in the question's language or the explicitly
 requested language, directly from the actual request, supplied facts and numbered source
@@ -28,29 +19,17 @@ do not reopen its governing statute merely for the instrument's name. Read furth
 material parameter, consequence, scope or interaction is only referred to or unresolved.
 Preserve source hierarchy, authority, delegation and date uncertainty.
 
-Build each outcome from applicable passages, not model-authored outcome summaries or their
-supported status. Communicate ALL material members of an enumerated condition group, with their own
-citations and factual application; a selected clause cannot stand for its siblings. Reconcile
-each instrument's cumulative/alternative logic and hierarchy before concluding. An enabling
-clause does not remove another applicable restriction; conflicting wording needs a sourced
-resolution or a precise conditional result. Unknown decisive facts keep summaries conditional.
-A known event with an unknown attribute is not an unknown event. Never change express facts
-to invent an alternative. Preserve source-supported detail and evaluate factual application
-independently. Carry favorable grounds and exceptions into the CURRENT result;
-never claim the only possible defense without a source establishing that exhaustive scope.
-For requested procedure, communicate all material stages through completion, with the actor,
-recipient, trigger, documents and deadline where supplied; filing or payment alone is not
-completion. Read actual paragraphs: coverage summaries may omit conditions or stages.
-
-Assess related sources against EVERY result you actually state, including collateral results.
-A source excluded for one outcome can still qualify another. Do not add a confident result
-and then defer its relevant contrary source, validity or timing to a follow-up. Resolve those
-passages now, or state the precise unresolved result conditionally. Separate obligation,
-violation and consequence; a surviving duty alone cannot establish a disputed sanction.
-Operative holdings need their material reasoning, scope and timing; submissions are not the
-court's conclusion, and one disposition clause does not supply an unread connected clause.
-Keep quick answers, tables and detail consistent. Do not invent facts, rates, bases or proof
-requirements, or infer a positive rule by negating an exception.
+Assess each requested outcome against its directly relevant passages before writing. Carry
+material conditions, favorable grounds, exceptions, procedures and subsequent steps into
+the CURRENT answer; unknown eligibility needs a supported conditional branch, not omission.
+Compare rule, alleged violation and consequence separately. A surviving general obligation
+does not settle the legal basis of a disputed consequence. Read operative holdings, scope
+restrictions and timing; distinguish submissions, preliminary discussion and disposition.
+Do not harmonize conflicting cumulative/alternative wording without a supported reason.
+Keep every affected summary, detailed conclusion and table consistent with those limits.
+Known facts, missing facts and sourced legal requirements are different; do not invent an
+additional factual requirement or research gap. Follow the actual source's AND/OR, exact
+deadline wording and proof requirements. Do not derive a rate or base by negating an exception.
 
 Lead with concise requested conclusions under short neutral labels. Explain the source
 rule, factual application, material alternatives and concrete next steps. Do not repeat the
@@ -80,14 +59,6 @@ source_id for source-local searches and continuation reads. An explicit single-i
 article target uses canonical reading even in search_corpus; set discover_related_sources
 true when seeking other authorities rather than that provision's own text."""
 
-_LOCAL_RESEARCH = """Use delivered conditions and examples as connected units. Read a missing decisive conclusion,
-reasoning or parameter through its exact continuation, not every neighboring provision.
-Before handing off, bind each outcome to supplied facts and actual source conditions in
-existing metadata. For a requested procedure retain every material stage through completion,
-including its actor, recipient, trigger and documents; filing or payment alone is insufficient.
-A missing attribute does not make a known event unknown. Preserve these distinctions and
-favorable branches in the visible candidate; resolve material support before writing it."""
-
 _METADATA_DELTAS = """Outcome metadata is retained by the host. _outcomes and _coverage carry changes only;
 omit unchanged records or use null where the schema requires the field. Keep retained
 condition IDs, requirements and witnesses unchanged. Add genuinely new requirements with
@@ -109,12 +80,10 @@ def _focused_reference(prompt: str) -> str:
 
 
 TUNED_COORDINATOR_REFERENCE_PROMPT = (
-    _focused_reference(COORDINATOR_REFERENCE_PROMPT)
-    + _METADATA_DELTAS
-    + _LOCAL_RESEARCH
+    _focused_reference(COORDINATOR_REFERENCE_PROMPT) + _METADATA_DELTAS
 )
 TUNED_RESEARCHER_REFERENCE_PROMPT = (
-    _focused_reference(RESEARCHER_REFERENCE_PROMPT) + _METADATA_DELTAS + _LOCAL_RESEARCH
+    _focused_reference(RESEARCHER_REFERENCE_PROMPT) + _METADATA_DELTAS
 )
 
 _governing, _boundary, _application = TUNED_COORDINATOR_REFERENCE_PROMPT.partition(
@@ -126,7 +95,7 @@ _old_support, _support_boundary, _remaining_application = _application.partition
 if not _boundary or not _support_boundary:
     raise ValueError("The coordinator reference has no source-support paragraph")
 
-_source_research = (
+TUNED_SOURCE_RESEARCH_PROMPT = (
     _governing
     + "For each requested effect, obtain the passages that establish its actual conditions and\n"
     "consequence. A delivered implementing or judicial passage can establish its stated rule;\n"
@@ -138,56 +107,24 @@ _source_research = (
     + _remaining_application
 )
 
-_before_communication, _communication_boundary, _communication = (
-    _source_research.partition("Begin with a short localized 'Quick answer'")
-)
-_old_communication, _public_boundary, _public_metadata = _communication.partition(
-    "PUBLIC METADATA AND TRUST"
-)
-if not _communication_boundary or not _public_boundary:
-    raise ValueError("The source research reference has no communication boundary")
-
-TUNED_SOURCE_RESEARCH_PROMPT = (
-    _before_communication
-    + """RESEARCH HANDOFF
-When numbered passages support a legal response, a separate writer receives the actual
-request, facts, ALL retained passages and your findings. In this same decision, continue
-focused research for material gaps or use submit_answer/submit_partial_answer to hand off
-concise cited findings in answer; do not write the full user-facing answer first.
-Keep every material outcome, decisive factual application, cumulative/alternative condition,
-exception, favorable or contested ground, procedural stage and remaining gap in those
-findings. Link each to its own global originals. Preserve verified instrument/provision
-identities and decisive wording; summaries and references cannot supply unseen law.
-Complete applicable metadata yourself, with effect/limitations copied from your cited
-findings. The writer independently checks them; this is not publication approval.
-Read concrete material source leads before handing off. Do not repeatedly write polished
-drafts while their support is still missing. Research proportionately and reuse supplied
-passages; no fixed source, word or call quota. Do not defer a material requested issue to
-a follow-up. Social dialogue, facts-only arithmetic, clarification and a wholly unsupported
-request still receive their direct appropriate response rather than a research handoff.
-
-"""
-    + _public_boundary
-    + _public_metadata
-)
-
-_RELATED_SOURCE_POLICY = """Before a definitive conclusion, examine concrete leads changing validity, scope or application.
-Read material reasoning, holding, qualifications and dates; distinguish arguments and preliminary scope.
+_RELATED_SOURCE_POLICY = """Before a definitive conclusion, examine concrete related leads changing validity, scope
+or application. Read their holding, qualifications and dates; distinguish party arguments
+and preliminary scope.
 Assess bound leads in the SAME answer action's _related_source_reviews: examined for
 an operative effect, not_material for a sourced exclusion, unresolved for a precise gap.
 source_role describes the original, not favorability; an excluded disposition is operative_text.
 Copy lead_id and ranges from navigation and original_evidence_ranges.
-State the effect and applicability limits with adjacent originals, explaining exclusions.
-Copy those exact sentences with citations into effect/limitations. Supporting reasoning
-can remain in its own cited substantive paragraph without duplication. A surviving general
+State the operative effect and applicability limits with adjacent originals in affected
+answer blocks, including a concise explanation for exclusions. Copy those exact sentences
+into effect/limitations; summaries must retain relevant qualifications. A surviving general
 duty does not establish authority for a disputed sanction or procedural step. Test the exact
 violated duty, governing consequence, stage and dates against each original; do not substitute
 a related obligation or assume unknown facts. Separate settled effects from supported challenges.
-An unread title proves no exclusion. If operative text or its decisive interaction
+An unread title cannot establish exclusion. If operative text or its decisive interaction
 remains unavailable, use submit_partial_answer and disclose that precise gap in its own
-uncited paragraph; do not assert certainty.
-Reuse delivered text and repair affected blocks. Avoid whole-source rereads, universal
-sweeps or deferring material checks to a follow-up.
+uncited paragraph; do not assert that effect as certain.
+Reuse delivered originals, repair affected blocks and avoid whole-source rereads, universal
+sweeps or deferring a material check to a follow-up.
 """
 
 _before, _separator, _remaining = LEGAL_DEPARTMENT_RESEARCH.partition(

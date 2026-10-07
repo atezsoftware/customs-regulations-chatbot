@@ -13,42 +13,6 @@ from onyx.llm.model_response import ModelResponse
 _BODY_TERMINALS = frozenset({"submit_answer", "submit_partial_answer"})
 
 
-def source_research_handoff_tools(
-    tools: list[dict[str, JsonValue]],
-) -> list[dict[str, JsonValue]]:
-    """Clarify the research role without changing executable terminal schemas."""
-    result = copy.deepcopy(tools)
-    for tool in result:
-        function = tool.get("function")
-        if (
-            not isinstance(function, dict)
-            or function.get("name") not in _BODY_TERMINALS
-        ):
-            continue
-        function["description"] = (
-            "For a source-supported legal response, hand off complete concise cited findings "
-            "to the separate answer writer, on its own; do not write the full final answer "
-            "first. Preserve material conditions, factual application, exceptions, favorable "
-            "grounds, procedural stages and exact gaps. All original passages and current "
-            "metadata also go to that writer, which may request more research. This is not "
-            "publication approval. Without source-supported findings, use this action's "
-            "ordinary direct-response behavior. Call on its own. All ordinary source, "
-            "metadata and publication validation still apply after the writer's decision."
-        )
-        parameters = function.get("parameters")
-        properties = (
-            parameters.get("properties") if isinstance(parameters, dict) else None
-        )
-        answer = properties.get("answer") if isinstance(properties, dict) else None
-        if isinstance(answer, dict):
-            answer["description"] = (
-                "Complete concise source-cited research findings for the writer, including "
-                "material qualifications and gaps; no polished final response. For a direct "
-                "conversation, facts-only or wholly unsupported response, supply that response."
-            )
-    return result
-
-
 def source_answer_wire_tools(
     tools: list[dict[str, JsonValue]],
 ) -> list[dict[str, JsonValue]]:

@@ -80,7 +80,6 @@ from onyx.asv3.shared_originals import (
 from onyx.asv3.source_answer_transport import (
     bind_source_answer_body,
     source_answer_wire_tools,
-    source_research_handoff_tools,
 )
 from onyx.asv3.source_metadata_transport import (
     expand_source_metadata,
@@ -147,7 +146,6 @@ from onyx.prompts.asv3.research import (
 from onyx.prompts.asv3.tuned import (
     TUNED_COORDINATOR_REFERENCE_PROMPT,
     TUNED_LEGAL_DEPARTMENT_RESEARCH,
-    TUNED_RESEARCH_HANDOFF_PREFERENCES,
     TUNED_RESEARCHER_REFERENCE_PROMPT,
     TUNED_SOURCE_ANSWER_PROMPT,
     TUNED_SOURCE_RESEARCH_PROMPT,
@@ -2707,14 +2705,11 @@ class ResearchModel:
         ) and isinstance(assistant_instructions, str):
             question["assistant_instructions"] = assistant_instructions
         question_content = json.dumps(question, ensure_ascii=False)
-        response_preferences = (
-            TUNED_RESEARCH_HANDOFF_PREFERENCES
-            if self.answer_llm is not None and not self._writing_answer
-            else DEFAULT_RESPONSE_PREFERENCES
-        )
         prefix: list[ChatCompletionMessage] = [
             SystemMessage(content=instruction),
-            UserMessage(content=f"{question_content}\n\n{response_preferences}"),
+            UserMessage(
+                content=f"{question_content}\n\n{DEFAULT_RESPONSE_PREFERENCES}"
+            ),
         ]
         context: dict[str, JsonValue] = {
             "language": self.context.language,
@@ -2948,14 +2943,10 @@ class ResearchModel:
             else []
         )
         include_related_navigation = True
-        include_reference_catalogue = (
-            parallel_execution_enabled(self.context) or self.answer_llm is not None
-        )
+        include_reference_catalogue = parallel_execution_enabled(self.context)
         has_reference_catalogue = False
         ceiling, output = self._limits(self._native_output_limit())
         selected = copy.deepcopy(view.tools) if native_original_cache else view.tools
-        if self.answer_llm is not None and not self._writing_answer:
-            selected = source_research_handoff_tools(selected)
         if retained_answer_enabled(self.context):
             selected, retained_answer = bind_retained_answer(
                 selected,
@@ -3169,15 +3160,6 @@ class ResearchModel:
                         "arguments must match its actual schema and contain your own "
                         "_related_source_reviews. No prose, fences or copied approval."
                     )
-                    if self._writing_answer:
-                        current["related_source_terminal_transport"] = (
-                            "Assess the delivered sources against every legal result in your "
-                            "actual answer. Research actions remain available for missing "
-                            "material text. Supply your own _related_source_reviews in the "
-                            "native terminal call's metadata, and the complete answer in "
-                            "the same response's assistant text. Do not return the terminal "
-                            "call as JSON content or duplicate the answer."
-                        )
                     if (
                         self.context.services.get("asv3_workflow_variant")
                         == ASV3_TUNED_VARIANT
@@ -3586,7 +3568,7 @@ class ResearchModel:
                     view.original_evidence or self._native_original_records(view.turns)
                 )
             ):
-                self._retain_candidate_conditions(decision)
+                coverage = self._retain_candidate_conditions(decision)
                 candidate = decision.answer or next(
                     (
                         str(call.arguments.get("answer", ""))
@@ -3609,7 +3591,7 @@ class ResearchModel:
                 )
                 if acquisition is not None:
                     return acquisition
-                return self._decide_source_answer(view)
+                return self._decide_source_answer(view, candidate_coverage=coverage)
             invocation_draft = view.draft_to_repair
             if use_research_model and self._needs_answer_model(decision):
                 candidate = decision.answer or next(
@@ -3695,8 +3677,9 @@ class ResearchModel:
         view: HarnessView,
         *,
         repair: bool = False,
+        candidate_coverage: list[dict[str, JsonValue]] | None = None,
     ) -> Decision:
-        """Deliver sources afresh, without another model's draft or provider history."""
+        """Deliver source text afresh, never another provider's tool/thinking history."""
         assert self.answer_llm is not None
         handoff = view.model_copy(
             update={
@@ -3712,7 +3695,9 @@ class ResearchModel:
         self._writing_answer = True
         try:
             self.context.budget.consume("decisions")
-            prompt, tools, output = self._fit_native_decision(handoff)
+            prompt, tools, output = self._fit_native_decision(
+                handoff, candidate_coverage=candidate_coverage
+            )
             decision = self._invoke_decision(
                 handoff, prompt, tools, output, call_llm_override=self.answer_llm
             )
@@ -4277,15 +4262,11 @@ class ResearchModel:
     @staticmethod
     def _source_answer_ready(decision: Decision) -> bool:
         if decision.calls:
-            return (
-                len(decision.calls) == 1
-                and not decision.calls[0].argument_error
-                and (
-                    decision.calls[0].name == "submit_partial_answer"
-                    or (
-                        decision.calls[0].name == "submit_answer"
-                        and decision.calls[0].arguments.get("basis") == "originals"
-                    )
+            return len(decision.calls) == 1 and (
+                decision.calls[0].name == "submit_partial_answer"
+                or (
+                    decision.calls[0].name == "submit_answer"
+                    and decision.calls[0].arguments.get("basis") == "originals"
                 )
             )
         return bool(decision.answer)

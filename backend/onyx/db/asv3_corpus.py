@@ -285,111 +285,6 @@ def iter_source_chunks_by_ids(
     require_publication_files(observation, (source_id,))
 
 
-def resolve_search_center_members(
-    session: Session,
-    *,
-    user: User,
-    filters: IndexFilters,
-    source_id: UUID,
-    center_ordinals: dict[str, int],
-    index: PublicationIndexSnapshot | None,
-    check_active: Callable[[], None],
-) -> dict[str, tuple[str, ...]]:
-    """Resolve retrieval representations to atomic IDs without trusting index metadata."""
-    require_source(session, user=user, filters=filters, source_id=source_id)
-    observation = observe_publication_read()
-    effective_date = filters.as_of_date or date.today()
-    centers: dict[str, tuple[int, str | None, dict[str, Any]]] = {}
-    if source_id in qualified_file_ids(session, (source_id,)):
-        if index is None:
-            raise CorpusScopeUnavailable(
-                "Source requires a verified query index snapshot."
-            )
-        bindings = iter_public_temporal_bindings(
-            session,
-            source_id,
-            index=index,
-            as_of_date=effective_date,
-            canonical_chunk_ids=tuple(center_ordinals),
-        )
-        try:
-            for binding in bindings:
-                check_active()
-                payload = json.loads(binding.projection.source_json)
-                identifier = payload["regulatory_chunk_id"]
-                if identifier in centers:
-                    raise CorpusScopeUnavailable(
-                        "Retrieved center has ambiguous visible bindings."
-                    )
-                centers[identifier] = (
-                    binding.projection.ordinal,
-                    binding.derived_role,
-                    {**payload, **binding.representation_metadata},
-                )
-        finally:
-            bindings.close()
-    else:
-        statement = select(
-            RegulatoryChunk.id,
-            RegulatoryChunk.projection_ordinal,
-            RegulatoryChunk.chunk_type,
-            RegulatoryChunk.chunk_metadata,
-        ).where(
-            RegulatoryChunk.user_file_id == source_id,
-            RegulatoryChunk.id.in_(tuple(center_ordinals)),
-        )
-        if filters.as_of_date is None:
-            statement = statement.where(RegulatoryChunk.status == "active")
-        else:
-            statement = statement.where(
-                or_(
-                    RegulatoryChunk.validity_start_date.is_(None),
-                    RegulatoryChunk.validity_start_date <= effective_date,
-                ),
-                or_(
-                    RegulatoryChunk.validity_end_date.is_(None),
-                    RegulatoryChunk.validity_end_date > effective_date,
-                ),
-            )
-        rows = session.execute(statement.execution_options(yield_per=16))
-        try:
-            for row in rows:
-                check_active()
-                centers[row.id] = (
-                    row.projection_ordinal,
-                    row.chunk_type,
-                    row.chunk_metadata or {},
-                )
-        finally:
-            rows.close()
-    result: dict[str, tuple[str, ...]] = {}
-    for identifier, ordinal in center_ordinals.items():
-        record = centers.get(identifier)
-        if record is None or record[0] != ordinal:
-            result[identifier] = ()
-            continue
-        if record[1] == "hierarchical_aggregate":
-            members = record[2].get("source_regulatory_chunk_ids")
-            result[identifier] = (
-                tuple(members)
-                if isinstance(members, list)
-                and members
-                and all(
-                    isinstance(member, str) and member and member != identifier
-                    for member in members
-                )
-                and len(members) == len(set(members))
-                else ()
-            )
-        elif record[1] == "image_companion":
-            result[identifier] = ()
-        else:
-            result[identifier] = (identifier,)
-    require_source(session, user=user, filters=filters, source_id=source_id)
-    require_publication_files(observation, (source_id,))
-    return result
-
-
 def read_search_source_closures(
     session: Session,
     *,
@@ -402,7 +297,6 @@ def read_search_source_closures(
     max_outline_rows: int = 20000,
     max_outline_bytes: int = 4 * 1024 * 1024,
     max_chars: int = 64000,
-    local_units_only: bool = False,
 ) -> CorpusClosureRead:
     """Plan local closures once from structure, then hydrate only their exact members."""
     from onyx.db.regulatory_chunks import (
@@ -606,36 +500,9 @@ def read_search_source_closures(
         if seed is None or truncated:
             members[center], proven[center] = (center,), False
             continue
-        if local_units_only:
-            # Explicit hierarchy joins a condition list or example, never a whole article.
-            unit_depth = next(
-                (
-                    depth
-                    for depth in range(len(seed.heading_path), 0, -1)
-                    if re.match(
-                        r"^\s*(?:\(\d+\)|(?:Örnek|Example)\s+\d+\b)",
-                        seed.heading_path[depth - 1],
-                        re.IGNORECASE,
-                    )
-                ),
-                None,
-            )
-            if unit_depth is None:
-                span = {seed.structural_index}
-            else:
-                unit_path = seed.heading_path[:unit_depth]
-                span = {seed.structural_index}
-                for direction in (-1, 1):
-                    cursor = seed.structural_index + direction
-                    while 0 <= cursor < len(rows):
-                        if rows[cursor].heading_path[:unit_depth] != unit_path:
-                            break
-                        span.add(cursor)
-                        cursor += direction
-        else:
-            span = _provision_span_for_seed(
-                rows, seed.structural_index, as_of_date=filters.as_of_date
-            )
+        span = _provision_span_for_seed(
+            rows, seed.structural_index, as_of_date=filters.as_of_date
+        )
         selected_positions = {rows[i].position for i in span}
         overlap_indices = {
             i for i, row in enumerate(rows) if row.position in selected_positions
@@ -652,11 +519,7 @@ def read_search_source_closures(
             0 <= edge < len(rows) and _candidate_article_no(rows[edge]) is None
             for edge in (min(span) - 1, max(span) + 1)
         )
-        proven[center] = (
-            not local_units_only
-            and _candidate_article_no(seed) is not None
-            and not uncertain_edge
-        )
+        proven[center] = _candidate_article_no(seed) is not None and not uncertain_edge
     outline_rows = len(candidates)
     del candidates, by_file, by_id, rows
     requested = set(center_ids)

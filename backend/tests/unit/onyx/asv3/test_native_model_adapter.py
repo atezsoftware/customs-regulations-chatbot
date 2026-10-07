@@ -12,7 +12,6 @@ from onyx.asv3.harness import Harness
 from onyx.asv3.llm_adapter import ResearchModel
 from onyx.asv3.models import (
     CapabilityCall,
-    Decision,
     EvidenceItem,
     HarnessView,
     OutcomeStatus,
@@ -96,7 +95,7 @@ def source_answer_adapter() -> tuple[ResearchModel, RunContext, MagicMock, Magic
     )
 
 
-def test_source_answer_handoff_preserves_sources_without_research_draft_or_provider_history() -> (
+def test_source_answer_handoff_preserves_all_text_without_candidate_or_provider_history() -> (
     None
 ):
     adapter, context, research, writer = source_answer_adapter()
@@ -122,8 +121,6 @@ def test_source_answer_handoff_preserves_sources_without_research_draft_or_provi
     assert research.invoke.call_count == writer.invoke.call_count == 1
     payload = last_payload(writer)
     assert "draft_to_repair" not in payload
-    assert "research_candidate" not in payload
-    assert "candidate_outcome_coverage" not in payload
     sources = payload["original_evidence"]
     assert {(row["citation"], row["text"]) for row in sources} == {
         (general["citation"], general["text"]),
@@ -155,31 +152,6 @@ def test_source_answer_publication_repair_does_not_repeat_research_model() -> No
     research.invoke.assert_not_called()
     assert writer.invoke.call_count == 1
     assert "Conditional rule" in json.dumps(last_payload(writer), ensure_ascii=False)
-
-
-def test_research_and_writer_get_distinct_communication_defaults() -> None:
-    from onyx.prompts.asv3.research import DEFAULT_RESPONSE_PREFERENCES
-    from onyx.prompts.asv3.tuned import TUNED_RESEARCH_HANDOFF_PREFERENCES
-
-    adapter, context, research, writer = source_answer_adapter()
-    context.services["assistant_instructions"] = "Preserve relevant legal exceptions."
-    record = original(
-        cast(EvidenceLedger, context.services["evidence"]), context, "Rule."
-    )
-    adapter.decide(adaptive_tool_view(original_evidence=[record]))
-    research_question = research.invoke.call_args.kwargs["prompt"][1].content
-    writer_question = writer.invoke.call_args.kwargs["prompt"][1].content
-    assert TUNED_RESEARCH_HANDOFF_PREFERENCES in research_question
-    assert DEFAULT_RESPONSE_PREFERENCES not in research_question
-    assert DEFAULT_RESPONSE_PREFERENCES in writer_question
-    assert "Preserve relevant legal exceptions." in research_question
-    assert "Preserve relevant legal exceptions." in writer_question
-
-    ordinary = model()
-    ResearchModel(ordinary, RunContext(), lean_native_mode=True).decide(view())
-    ordinary_question = ordinary.invoke.call_args.kwargs["prompt"][1].content
-    assert DEFAULT_RESPONSE_PREFERENCES in ordinary_question
-    assert TUNED_RESEARCH_HANDOFF_PREFERENCES not in ordinary_question
 
 
 def test_source_answer_can_request_missing_evidence_then_return_to_research() -> None:
@@ -290,103 +262,6 @@ def test_source_answer_does_not_replace_research_calls_with_a_prose_handoff() ->
     decision = adapter.decide(adaptive_tool_view(original_evidence=[record]))
     assert decision.calls[0].name == "read_provision"
     writer.invoke.assert_not_called()
-
-
-def test_research_handoff_changes_role_without_changing_terminal_validation() -> None:
-    from onyx.asv3.source_answer_transport import source_research_handoff_tools
-
-    tools: list[dict[str, JsonValue]] = [
-        {
-            "type": "function",
-            "function": {
-                "name": "submit_answer",
-                "description": "Publish a complete answer.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "answer": {"type": "string", "minLength": 1},
-                        "basis": {"type": "string", "enum": ["originals"]},
-                    },
-                    "required": ["answer", "basis"],
-                    "additionalProperties": False,
-                },
-            },
-        },
-        {"type": "function", "function": {"name": "read_provision"}},
-    ]
-    before = json.dumps(tools)
-    projected = source_research_handoff_tools(tools)
-    assert json.dumps(tools) == before
-    assert projected[1] == tools[1]
-    projected_function = projected[0]["function"]
-    assert isinstance(projected_function, dict)
-    assert "separate answer writer" in str(projected_function["description"])
-    parameters = projected_function["parameters"]
-    assert isinstance(parameters, dict)
-    properties = parameters["properties"]
-    assert isinstance(properties, dict) and isinstance(properties["answer"], dict)
-    properties["answer"].pop("description")
-    original_function = tools[0]["function"]
-    assert isinstance(original_function, dict)
-    assert parameters == original_function["parameters"]
-
-
-def test_invalid_source_handoff_cannot_trigger_the_answer_writer(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    adapter, context, _research, writer = source_answer_adapter()
-    record = original(
-        cast(EvidenceLedger, context.services["evidence"]), context, "Rule."
-    )
-    invalid = Decision(
-        calls=[
-            CapabilityCall(
-                name="submit_answer",
-                arguments={"answer": "Rule [1].", "basis": "originals"},
-                argument_error="Tool arguments violate the exposed schema",
-            )
-        ]
-    )
-    monkeypatch.setattr(adapter, "_invoke_decision", lambda *_args, **_kwargs: invalid)
-    result = adapter.decide(adaptive_tool_view(original_evidence=[record]))
-    assert result.calls[0].argument_error
-    writer.invoke.assert_not_called()
-
-
-def test_source_writer_gets_exact_foreign_reference_leads_from_uncited_passages() -> (
-    None
-):
-    from tests.unit.onyx.asv3.test_native_authority import (
-        original as authority_original,
-    )
-
-    adapter, context, _research, writer = source_answer_adapter()
-    ledger = cast(EvidenceLedger, context.services["evidence"])
-    ledger.add(
-        [
-            authority_original("8917 sayılı Faaliyet Kanunu", "27"),
-            authority_original(
-                "İşlem Tebliği",
-                "9",
-                kind="tebliğ",
-                text="Bu sonuç Faaliyet Kanununun 38 inci maddesine göre belirlenir.",
-            ),
-        ],
-        context,
-    )
-    adapter.decide(
-        adaptive_tool_view(
-            original_evidence=[full_record(ledger, 1), full_record(ledger, 2)]
-        )
-    )
-    payload = last_payload(writer)
-    catalogue = payload["source_contained_references"]
-    assert catalogue["references"][0]["citation"] == 2
-    assert catalogue["references"][0]["article"] == "38"
-    assert catalogue["references"][0]["instrument_number"] == "8917"
-    assert catalogue["references"][0]["role"] == "source_contained_reference_navigation"
-    assert ledger.completely_delivered(adapter.last_call_id or "") == {1, 2}
-    assert writer.invoke.call_args.kwargs["tool_choice"].value == "auto"
 
 
 @pytest.mark.parametrize("terminal", ["submit_answer", "submit_partial_answer"])
