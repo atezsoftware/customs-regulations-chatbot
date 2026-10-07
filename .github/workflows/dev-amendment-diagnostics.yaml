@@ -2,6 +2,10 @@ name: TEST migration recovery verification
 run-name: TEST migration recovery verification ${{ github.run_id }}
 on:
   workflow_dispatch:
+    inputs:
+      diagnostic:
+        type: boolean
+        default: false
 permissions:
   contents: read
 jobs:
@@ -11,6 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: Verify TEST startup, database preservation, and external health
+        if: ${{ !inputs.diagnostic }}
         shell: bash
         run: |
           set -euo pipefail
@@ -56,6 +61,17 @@ jobs:
           assert d['success'] is True
           print('Frontend API health verified: HTTP 200')
           PY
+      - name: Capture TEST startup state
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws eks update-kubeconfig --name atez-dev-cluster --region eu-central-1
+          mkdir -p evidence
+          kubectl get deploy,pods -n customs-regulations-test -o json | jq '[.items[] | {kind,name:.metadata.name,images:[.spec.template.spec.containers[]?.image,.spec.containers[]?.image],commands:[.spec.template.spec.containers[]?|{name,command,args}],ready:.status.readyReplicas,available:.status.availableReplicas,containers:[.status.containerStatuses[]? | {name,ready,restartCount,imageID,state,lastState}]}]' | tee evidence/startup-workloads.json
+          while IFS=$'\t' read -r pod container; do
+            kubectl logs "$pod" -n customs-regulations-test -c "$container" --tail=200 2>&1 | sed -n '/File "/p;/Error:/p;/Exception:/p;/Application startup complete/p;/Uvicorn running on/p;/Can.t locate revision/p;/Running upgrade/p' | sed '/[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]/d;/[Ss][Ee][Cc][Rr][Ee][Tt]/d;/[Tt][Oo][Kk][Ee][Nn]/d' | tee "evidence/$pod-startup.txt" || true
+          done < <(kubectl get pods -n customs-regulations-test -l app=test-v1-customs-regulations-api -o json | jq -r '.items[] | select(.metadata.deletionTimestamp == null) | .metadata.name as $pod | .spec.containers[] | select(.image | contains("backend-lite")) | [$pod,.name] | @tsv')
       - uses: actions/upload-artifact@v4
         if: always()
         with:
