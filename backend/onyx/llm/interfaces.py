@@ -76,6 +76,12 @@ class LLM(abc.ABC):
         """Return an independent seed binding without changing this LLM."""
         raise NotImplementedError("This LLM does not support an isolated seed binding")
 
+    def with_temperature(self, temperature: float) -> "LLM":
+        """Bind an explicit sampling value without changing this LLM."""
+        raise NotImplementedError(
+            "This LLM does not support an isolated temperature binding"
+        )
+
     def with_model(self, model_name: str, *, max_input_tokens: int) -> "LLM":
         """Bind another model on this authorized provider without changing this LLM."""
         raise NotImplementedError("This LLM does not support an isolated model binding")

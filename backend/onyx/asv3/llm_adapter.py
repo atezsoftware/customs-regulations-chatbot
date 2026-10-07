@@ -143,6 +143,7 @@ from onyx.prompts.asv3.tuned import (
     TUNED_COORDINATOR_REFERENCE_PROMPT,
     TUNED_LEGAL_DEPARTMENT_RESEARCH,
     TUNED_RESEARCHER_REFERENCE_PROMPT,
+    TUNED_SOURCE_ANSWER_PROMPT,
 )
 from onyx.regulatory.structured_llm import (
     _portable_structured_output_schema,
@@ -768,8 +769,21 @@ class ResearchModel:
         token_counter: Callable[[str], int] | None = None,
         lean_native_mode: bool = False,
         research_llm: LLM | None = None,
+        answer_llm: LLM | None = None,
     ) -> None:
+        if answer_llm is not None and (
+            context.services.get("asv3_workflow_variant") != ASV3_TUNED_VARIANT
+            or context.services.get("research_profile") != "normal"
+            or context.depth
+            or research_llm is not None
+        ):
+            raise ValueError(
+                "A source answer model requires the isolated root experiment"
+            )
         self.llm = llm
+        self.answer_llm = answer_llm
+        self._writing_answer = False
+        self._answer_researching = False
         self.research_llm = (
             None
             if context.services.get("research_profile") == "experimental"
@@ -802,6 +816,7 @@ class ResearchModel:
         elif (
             self.lean_native_mode
             and self.context.depth == 0
+            and self.context.services.get("explicit_research_temperature") is not True
             and config.model_provider == "vertex_ai"
             and config.model_name == "gemini-3.8-flash"
         ):
@@ -810,6 +825,14 @@ class ResearchModel:
                 "version": 1,
                 "first_seed": NATIVE_COORDINATOR_FIRST_SEED,
                 "continuation_seed": NATIVE_COORDINATOR_CONTINUATION_SEED,
+            }
+        if self.answer_llm is not None:
+            settings["source_answer_model"] = {
+                "provider": self.answer_llm.config.model_provider,
+                "model": self.answer_llm.config.model_name,
+                "research_provider": config.model_provider,
+                "research_model": config.model_name,
+                "research_temperature": config.temperature,
             }
         return {
             "settings": settings,
@@ -883,6 +906,12 @@ class ResearchModel:
         return selected
 
     def _native_output_limit(self) -> int:
+        if self._writing_answer and self.answer_llm is not None:
+            return get_llm_max_output_tokens(
+                get_model_map(),
+                self.answer_llm.config.model_name,
+                self.answer_llm.config.model_provider,
+            )
         if self._native_output_capacity is None:
             self._native_output_capacity = get_llm_max_output_tokens(
                 get_model_map(),
@@ -949,8 +978,10 @@ class ResearchModel:
         return total
 
     def _limits(self, max_tokens: int) -> tuple[int, int]:
-        limit = self.llm.config.max_input_tokens
-        if self.research_llm is not None:
+        selected = self.answer_llm if self._writing_answer else self.llm
+        assert selected is not None
+        limit = selected.config.max_input_tokens
+        if not self._writing_answer and self.research_llm is not None:
             limit = min(limit, self.research_llm.config.max_input_tokens)
         output = max(1, min(max_tokens, limit // 4))
         return limit - output, output
@@ -2622,8 +2653,20 @@ class ResearchModel:
         candidate_coverage: list[dict[str, JsonValue]] | None = None,
         candidate_reviews: list[JsonValue] | None = None,
     ) -> tuple[list[ChatCompletionMessage], list[dict[str, JsonValue]], int]:
-        instruction = self._research_instruction()
-        if view.draft_to_repair and view.publication_gap is None:
+        instruction = (
+            TUNED_SOURCE_ANSWER_PROMPT
+            + "\n\n"
+            + TUNED_LEGAL_DEPARTMENT_RESEARCH
+            + "\n\n"
+            + OUTCOME_COVERAGE_RESEARCH
+            if self._writing_answer
+            else self._research_instruction()
+        )
+        if (
+            not self._writing_answer
+            and view.draft_to_repair
+            and view.publication_gap is None
+        ):
             instruction += (
                 "\nThe research candidate is ready for the selected answer model. "
                 "Begin with the actual operative originals and requested outcomes, then compare "
@@ -3470,6 +3513,13 @@ class ResearchModel:
         if acquisition is not None:
             return acquisition
         if self.lean_native_mode:
+            if (
+                self.answer_llm is not None
+                and view.publication_gap
+                and view.draft_to_repair
+                and not self._answer_researching
+            ):
+                return self._decide_source_answer(view, repair=True)
             preparation = (
                 graph_step(
                     "asv3.context_preparation",
@@ -3504,6 +3554,15 @@ class ResearchModel:
             decision = resolve_retained_answer(
                 decision, self.context, view.draft_to_repair, request=view.request
             )
+            if (
+                self.answer_llm is not None
+                and self._needs_answer_model(decision)
+                and (
+                    view.original_evidence or self._native_original_records(view.turns)
+                )
+            ):
+                coverage = self._retain_candidate_conditions(decision)
+                return self._decide_source_answer(view, candidate_coverage=coverage)
             invocation_draft = view.draft_to_repair
             if use_research_model and self._needs_answer_model(decision):
                 candidate = decision.answer or next(
@@ -3583,6 +3642,55 @@ class ResearchModel:
                 request=view.request,
             )
         return self._decide_research(view)
+
+    def _decide_source_answer(
+        self,
+        view: HarnessView,
+        *,
+        repair: bool = False,
+        candidate_coverage: list[dict[str, JsonValue]] | None = None,
+    ) -> Decision:
+        """Deliver source text afresh, never another provider's tool/thinking history."""
+        assert self.answer_llm is not None
+        handoff = view.model_copy(
+            update={
+                "original_evidence": [
+                    *self._native_original_records(view.turns),
+                    *view.original_evidence,
+                ],
+                "turns": [],
+                "draft_to_repair": view.draft_to_repair if repair else None,
+                "publication_gap": view.publication_gap if repair else None,
+            }
+        )
+        self._writing_answer = True
+        try:
+            self.context.budget.consume("decisions")
+            prompt, tools, output = self._fit_native_decision(
+                handoff, candidate_coverage=candidate_coverage
+            )
+            decision = self._invoke_decision(
+                handoff, prompt, tools, output, call_llm_override=self.answer_llm
+            )
+            decision = self._experimental_terminal_envelope(
+                decision,
+                tools,
+                publication_gap=handoff.publication_gap,
+                retained_draft=handoff.draft_to_repair,
+                request=handoff.request,
+            )
+            decision = resolve_retained_answer(
+                decision,
+                self.context,
+                handoff.draft_to_repair,
+                request=handoff.request,
+            )
+            self._answer_researching = bool(
+                decision.calls
+            ) and not self._needs_answer_model(decision)
+            return decision
+        finally:
+            self._writing_answer = False
 
     def _publication_source_acquisition(self, view: HarnessView) -> Decision | None:
         """Acquire missing originals for retained publication obligations, not approval."""

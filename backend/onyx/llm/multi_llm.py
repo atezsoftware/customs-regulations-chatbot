@@ -541,6 +541,7 @@ class LitellmLLM(LLM):
             self._timeout = LLM_SOCKET_READ_TIMEOUT
 
         self._temperature = GEN_AI_TEMPERATURE if temperature is None else temperature
+        self._explicit_sampling_temperature: float | None = None
         self._seed = (
             TypeAdapter(LLMSeed).validate_python(seed) if seed is not None else None
         )
@@ -839,13 +840,12 @@ class LitellmLLM(LLM):
             _anthropic_omits_sampling_params(name) for name in model_identity_names
         )
         if not omits_sampling_params:
-            optional_kwargs["temperature"] = (
-                self._temperature
-                if native_pdf_input
-                else 1
-                if is_reasoning
-                else self._temperature
-            )
+            temperature = self._temperature
+            if self._explicit_sampling_temperature is not None:
+                temperature = self._explicit_sampling_temperature
+            elif is_reasoning and not native_pdf_input:
+                temperature = 1
+            optional_kwargs["temperature"] = temperature
         elif native_pdf_input and self._temperature == 0:
             raise ValueError("pdf_model_does_not_support_temperature_zero")
 
@@ -1212,6 +1212,18 @@ class LitellmLLM(LLM):
         validated_seed = TypeAdapter(LLMSeed).validate_python(seed)
         bound = copy.copy(self)
         bound._seed = validated_seed
+        return bound
+
+    def with_temperature(self, temperature: float) -> "LitellmLLM":
+        if (
+            isinstance(temperature, bool)
+            or not math.isfinite(temperature)
+            or not 0 <= temperature <= 2
+        ):
+            raise ValueError("Temperature must be a finite number between 0 and 2")
+        bound = copy.copy(self)
+        bound._temperature = float(temperature)
+        bound._explicit_sampling_temperature = float(temperature)
         return bound
 
     def with_model(self, model_name: str, *, max_input_tokens: int) -> "LitellmLLM":

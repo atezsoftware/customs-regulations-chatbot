@@ -25,6 +25,7 @@ from onyx.asv3.models import (
 )
 from onyx.asv3.outcome_map import OutcomeMap, OutcomeUpdate
 from onyx.asv3.registry import CapabilityRegistry
+from onyx.asv3.workflow_variant import ASV3_TUNED_VARIANT
 from onyx.llm.interfaces import LLM, LLMConfig
 from onyx.llm.model_response import (
     ChatCompletionMessageToolCall,
@@ -63,6 +64,191 @@ def model(limit: int = 100000) -> MagicMock:
         id="answer", created="0", choice=Choice(message=Message(content="Rule [1]."))
     )
     return llm
+
+
+def source_answer_adapter() -> tuple[ResearchModel, RunContext, MagicMock, MagicMock]:
+    context = RunContext(budget=SharedBudget(unlimited_execution=True))
+    context.services.update(
+        research_profile="normal",
+        asv3_workflow_variant=ASV3_TUNED_VARIANT,
+        explicit_research_temperature=True,
+        evidence=EvidenceLedger(),
+    )
+    research, writer = model(), model()
+    research.config = LLMConfig(
+        model_provider="vertex_ai",
+        model_name="gemini-3.8-flash",
+        temperature=0.1,
+        max_input_tokens=1000000,
+    )
+    writer.config = LLMConfig(
+        model_provider="anthropic",
+        model_name="claude-sonnet-5-5",
+        temperature=1,
+        max_input_tokens=1000000,
+    )
+    return (
+        ResearchModel(research, context, answer_llm=writer, lean_native_mode=True),
+        context,
+        research,
+        writer,
+    )
+
+
+def test_source_answer_handoff_preserves_all_text_without_candidate_or_provider_history() -> (
+    None
+):
+    adapter, context, research, writer = source_answer_adapter()
+    ledger = cast(EvidenceLedger, context.services["evidence"])
+    general = original(ledger, context, "General obligation and application.")
+    relief = original(
+        ledger, context, "Notice before detection reduces the consequence."
+    )
+    current = adaptive_tool_view(
+        original_evidence=[relief],
+        turns=[turn("read-general", [general, relief])],
+    )
+    research.invoke.return_value = ModelResponse(
+        id="candidate", created="0", choice=Choice(message=Message(content="Duty [1]."))
+    )
+    writer.invoke.return_value = ModelResponse(
+        id="answer",
+        created="0",
+        choice=Choice(message=Message(content="Duty [1]; conditional relief [2].")),
+    )
+    result = adapter.decide(current)
+    assert result.answer == "Duty [1]; conditional relief [2]."
+    assert research.invoke.call_count == writer.invoke.call_count == 1
+    payload = last_payload(writer)
+    assert "draft_to_repair" not in payload
+    sources = payload["original_evidence"]
+    assert {(row["citation"], row["text"]) for row in sources} == {
+        (general["citation"], general["text"]),
+        (relief["citation"], relief["text"]),
+    }
+    messages = writer.invoke.call_args.kwargs["prompt"]
+    assert not any(
+        isinstance(message, (AssistantMessage, ToolMessage)) for message in messages
+    )
+    assert "EVERY legal assertion" in messages[0].content
+    assert writer.invoke.call_args.kwargs["tool_choice"].value == "auto"
+    assert ledger.completely_delivered(adapter.last_call_id or "") == {1, 2}
+    research.with_seed.assert_not_called()
+    writer.with_seed.assert_not_called()
+
+
+def test_source_answer_publication_repair_does_not_repeat_research_model() -> None:
+    adapter, context, research, writer = source_answer_adapter()
+    record = original(
+        cast(EvidenceLedger, context.services["evidence"]), context, "Rule."
+    )
+    current = view(
+        original_evidence=[record],
+        draft_to_repair="Conditional rule [1].",
+        publication_gap={"uncited_application": True},
+    )
+    result = adapter.decide(current)
+    assert result.answer == "Rule [1]."
+    research.invoke.assert_not_called()
+    assert writer.invoke.call_count == 1
+    assert "Conditional rule" in json.dumps(last_payload(writer), ensure_ascii=False)
+
+
+def test_source_answer_can_request_missing_evidence_then_return_to_research() -> None:
+    adapter, context, research, writer = source_answer_adapter()
+    record = original(
+        cast(EvidenceLedger, context.services["evidence"]), context, "Rule."
+    )
+    current = adaptive_tool_view(original_evidence=[record])
+    writer.invoke.side_effect = [
+        native_response("read_provision", '{"source_id":"existing"}'),
+        ModelResponse(
+            id="complete",
+            created="0",
+            choice=Choice(message=Message(content="Rule [1].")),
+        ),
+    ]
+    first = adapter.decide(current)
+    assert first.calls[0].name == "read_provision"
+    assert adapter._answer_researching is True
+    result = adapter.decide(
+        current.model_copy(
+            update={
+                "draft_to_repair": "Old candidate [1].",
+                "publication_gap": {"unread_parameter": True},
+            }
+        )
+    )
+    assert result.answer == "Rule [1]."
+    assert research.invoke.call_count == writer.invoke.call_count == 2
+    assert adapter._answer_researching is False
+
+
+def test_source_answer_snapshot_fences_model_policy_and_sampling() -> None:
+    adapter, _, _, _ = source_answer_adapter()
+    snapshot = adapter.native_sampling_snapshot()
+    policy = snapshot["settings"]
+    assert isinstance(policy, dict)
+    assert policy["source_answer_model"] == {
+        "provider": "anthropic",
+        "model": "claude-sonnet-5-5",
+        "research_provider": "vertex_ai",
+        "research_model": "gemini-3.8-flash",
+        "research_temperature": 0.1,
+    }
+    adapter.restore_native_sampling({"native_coordinator_sampling": snapshot})
+    with pytest.raises(ValueError, match="same coordinator sampling"):
+        adapter.restore_native_sampling(
+            {
+                "native_coordinator_sampling": {
+                    **snapshot,
+                    "settings": {"mode": "unchanged"},
+                }
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "profile,variant,depth",
+    [
+        ("normal", "standard", 0),
+        ("experimental", ASV3_TUNED_VARIANT, 0),
+        ("normal", ASV3_TUNED_VARIANT, 1),
+    ],
+)
+def test_source_answer_model_cannot_change_protected_modes(
+    profile: str, variant: str, depth: int
+) -> None:
+    context = RunContext(depth=depth)
+    context.services.update(research_profile=profile, asv3_workflow_variant=variant)
+    with pytest.raises(ValueError, match="isolated root experiment"):
+        ResearchModel(model(), context, answer_llm=model(), lean_native_mode=True)
+
+
+def test_source_answer_does_not_add_writer_to_conversation_or_clarification() -> None:
+    adapter, _, research, writer = source_answer_adapter()
+    research.invoke.return_value = native_response(
+        "ask_user", '{"question":"Which date?"}'
+    )
+    current = view().model_copy(
+        update={
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "ask_user",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"question": {"type": "string"}},
+                            "required": ["question"],
+                        },
+                    },
+                }
+            ]
+        }
+    )
+    assert adapter.decide(current).calls[0].name == "ask_user"
+    writer.invoke.assert_not_called()
 
 
 def original(
@@ -1088,6 +1274,26 @@ def test_native_coordinator_pins_first_and_adaptive_decisions_without_extra_call
         "first_seed": 31,
         "continuation_seed": 1424088823,
     }
+
+
+def test_explicit_research_sampling_does_not_insert_automatic_seed() -> None:
+    llm = model(500000)
+    llm.config = llm.config.model_copy(
+        update={
+            "model_provider": "vertex_ai",
+            "model_name": "gemini-3.8-flash",
+            "temperature": 0.1,
+        }
+    )
+    context = RunContext(services={"explicit_research_temperature": True})
+    adapter = ResearchModel(llm, context, lean_native_mode=True)
+    adapter._native_output_capacity = 65536
+    adapter.decide(view())
+    adapter.decide(view())
+    assert llm.invoke.call_count == 2
+    llm.with_seed.assert_not_called()
+    assert adapter.native_sampling_snapshot()["settings"] == {"mode": "unchanged"}
+    assert llm.config.seed is None
 
 
 @pytest.mark.parametrize(

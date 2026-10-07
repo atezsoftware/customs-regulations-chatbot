@@ -17,6 +17,7 @@ from uuid import UUID
 
 from pydantic import JsonValue
 
+from onyx.asv3.answer_model import source_answer_model, uses_source_answer_model
 from onyx.asv3.authority import cited_lower_statute_gap, native_named_authority_gap
 from onyx.asv3.authority_requirements import AuthorityRequirements
 from onyx.asv3.citation_numbers import extract_citation_numbers
@@ -348,6 +349,20 @@ def run_asv3_loop(
         raise ValueError("Saved parallel research uses a different session policy")
     if research_profile == "experimental" or workflow_variant == ASV3_TUNED_VARIANT:
         research_llm = None
+    answer_llm = None
+    if uses_source_answer_model(workflow_variant, llm):
+        # Resolve visibility and user access before starting paid research.
+        answer_llm = source_answer_model(user)
+        llm = llm.with_temperature(0.1)
+        context.services["explicit_research_temperature"] = True
+    elif (
+        workflow_variant == ASV3_TUNED_VARIANT
+        and llm.config.model_provider == "vertex_ai"
+        and llm.config.model_name.startswith("gemini-")
+        and llm.config.temperature == 0.1
+    ):
+        llm = llm.with_temperature(llm.config.temperature)
+        context.services["explicit_research_temperature"] = True
     context.language = profile.language
     context.services["research_profile"] = research_profile
     context.services["experimental_parallel"] = parallel_research
@@ -456,6 +471,7 @@ def run_asv3_loop(
         token_counter=token_counter,
         lean_native_mode=True,
         research_llm=research_llm,
+        answer_llm=answer_llm,
     )
     if previous is not None:
         model.restore_native_sampling(previous)
