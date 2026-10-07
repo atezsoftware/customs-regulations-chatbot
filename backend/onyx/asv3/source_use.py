@@ -21,6 +21,7 @@ from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.llm_adapter import ResearchModel, StructuredOutputError
 from onyx.asv3.models import OutcomeStatus, RunContext, ToolOutcome
 from onyx.asv3.source_metadata_transport import share_source_metadata
+from onyx.asv3.witnesses import original_witness_spans
 from onyx.asv3.workflow_variant import ASV3_TUNED_VARIANT
 from onyx.llm.model_capabilities import get_llm_max_output_tokens, get_model_map
 from onyx.prompts.asv3.source_use import SOURCE_USE_INVENTORY_PROMPT, SOURCE_USE_PROMPT
@@ -72,8 +73,35 @@ class SourceUseResolution(BaseModel):
     status: Literal["covered", "omitted", "misapplied", "not_applicable"]
     answer_unit_ids: list[str]
     explanation: str = ""
-    scenario_quote: str = ""
-    coverage: list[SourceUseCoverage] = Field(default_factory=list)
+    scenario_witness_ids: list[str] = Field(
+        default_factory=list,
+        description="Select supplied user_fact_spans IDs proving actual exclusion; never recopy user text or select assistant statements.",
+    )
+    coverage: list[SourceUseCoverage]
+
+
+def user_fact_spans(
+    scenario: str, conversation: list[dict[str, str]]
+) -> list[dict[str, JsonValue]]:
+    """Address unchanged user text without generating another copy of each fact."""
+    texts = {"scenario": scenario}
+    texts.update(
+        {
+            f"conversation-{index}": row["content"]
+            for index, row in enumerate(conversation)
+            if row.get("role") == "user"
+        }
+    )
+    return [
+        {
+            "witness_id": f"{key}-{span['witness_id']}",
+            "text_ref": key,
+            "start_char": span["start_char"],
+            "end_char": span["end_char"],
+        }
+        for key, text in texts.items()
+        for span in original_witness_spans(0, text)
+    ]
 
 
 class SourceUseReview(BaseModel):
@@ -303,15 +331,19 @@ class SourceUseReviewer:
             source_groups.setdefault(str(row["source_id"]), []).append(
                 int(cast(int, row["citation"]))
             )
-        user_conversation = [
-            row for row in conversation or [] if row.get("role") == "user"
-        ]
+        user_conversation: list[dict[str, str]] = []
+        supplied_texts = {scenario}
+        for row in conversation or []:
+            if row.get("role") == "user" and row["content"] not in supplied_texts:
+                user_conversation.append(row)
+                supplied_texts.add(row["content"])
         blind_payload = cast(
             dict[str, JsonValue],
             {
                 "language": context.language,
                 "scenario": scenario,
                 "conversation": user_conversation,
+                "user_fact_spans": user_fact_spans(scenario, user_conversation),
                 "original_evidence": records,
                 "original_source_metadata": shared,
                 "source_groups": source_groups,
@@ -349,12 +381,13 @@ class SourceUseReviewer:
             {"requirement_id": identity, **item.model_dump(mode="json")}
             for identity, item in requirements.items()
         ]
+        # Stable original/fact prefix permits provider cache reuse after draft-only edits.
         payload = {
             **blind_payload,
-            "answer_units": units,
             "retained_requirements": retained,
+            "answer_units": units,
         }
-        data = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        data = json.dumps(payload, ensure_ascii=False)
         identity = hashlib.sha256(data.encode()).hexdigest()
         cached = self._cache.get(identity)
         if cached and self._receipt_matches(
@@ -370,13 +403,12 @@ class SourceUseReviewer:
             }
             units_by_id = {unit["unit_id"]: unit for unit in units}
             unit_ids = set(units_by_id)
-            user_facts = [
-                str(blind_payload["scenario"]),
-                *[
-                    str(row["content"])
-                    for row in cast(list[dict[str, str]], blind_payload["conversation"])
-                ],
-            ]
+            fact_ids = {
+                str(row["witness_id"])
+                for row in cast(
+                    list[dict[str, JsonValue]], blind_payload["user_fact_spans"]
+                )
+            }
 
             def validate(text: str) -> None:
                 result = SourceUseReview.model_validate_json(text)
@@ -408,11 +440,14 @@ class SourceUseReviewer:
                             f"Resolution {row.requirement_id} needs exact current answer-unit IDs"
                         )
                     if row.status == "not_applicable":
-                        if not row.scenario_quote.strip() or not any(
-                            row.scenario_quote in facts for facts in user_facts
+                        if (
+                            not row.scenario_witness_ids
+                            or set(row.scenario_witness_ids) - fact_ids
+                            or len(row.scenario_witness_ids)
+                            != len(set(row.scenario_witness_ids))
                         ):
                             raise ValueError(
-                                f"Resolution {row.requirement_id} needs a literal user fact establishing exclusion"
+                                f"Resolution {row.requirement_id} needs exact supplied user-fact witnesses establishing exclusion"
                             )
                         continue
                     if not row.answer_unit_ids:

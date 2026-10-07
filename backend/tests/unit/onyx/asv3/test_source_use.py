@@ -11,7 +11,12 @@ from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.llm_adapter import ResearchModel
 from onyx.asv3.models import OutcomeStatus, RunContext
 from onyx.asv3.source_metadata_transport import expand_source_metadata
-from onyx.asv3.source_use import SourceUseIssue, SourceUseReviewer
+from onyx.asv3.source_use import (
+    SourceUseIssue,
+    SourceUseResolution,
+    SourceUseReviewer,
+    user_fact_spans,
+)
 from onyx.asv3.workflow_variant import ASV3_TUNED_VARIANT
 from onyx.tracing.flows import LLMFlow
 from tests.unit.onyx.asv3.test_citation_contract import original_ledger
@@ -269,7 +274,7 @@ def test_review_cannot_drop_retained_rules_or_borrow_neighboring_citations(
         else:
             row.update(
                 status="not_applicable",
-                scenario_quote="The decisive condition is excluded.",
+                scenario_witness_ids=["invented-fact"],
             )
 
     counts = scripted_reviews(model, review_mutator=mutate)
@@ -284,11 +289,14 @@ def test_review_cannot_drop_retained_rules_or_borrow_neighboring_citations(
 def test_literal_user_exclusion_is_not_inferred_from_assistant_context() -> None:
     ledger, _context, model = setup_review()
 
-    def mutate(result: dict[str, Any], _payload: dict[str, Any]) -> None:
+    def mutate(result: dict[str, Any], payload: dict[str, Any]) -> None:
         result["resolutions"][0].update(
             status="not_applicable",
-            scenario_quote="Excluded status",
+            scenario_witness_ids=[payload["user_fact_spans"][0]["witness_id"]]
+            if payload["scenario"] == "Excluded status"
+            else ["assistant-fact"],
             answer_unit_ids=[],
+            coverage=[],
         )
 
     counts = scripted_reviews(model, review_mutator=mutate)
@@ -305,6 +313,103 @@ def test_literal_user_exclusion_is_not_inferred_from_assistant_context() -> None
         is None
     )
     assert counts == {"inventory": 2, "review": 3}
+
+
+def test_user_fact_selectors_preserve_every_character_and_reject_assistant_text() -> (
+    None
+):
+    scenario = "Condition unknown.\n" + "A factual qualification; " * 95
+    conversation = [
+        {"role": "user", "content": "A distinct earlier user fact."},
+        {"role": "assistant", "content": "An assumed decisive exclusion."},
+    ]
+    spans = user_fact_spans(scenario, conversation)
+    texts = {"scenario": scenario, "conversation-0": conversation[0]["content"]}
+    for reference, original in texts.items():
+        selected = [s for s in spans if s["text_ref"] == reference]
+        assert (
+            "".join(
+                original[cast(int, s["start_char"]) : cast(int, s["end_char"])]
+                for s in selected
+            )
+            == original
+        )
+    assert {s["text_ref"] for s in spans} == texts.keys()
+    assert not {
+        s["witness_id"] for s in spans if s["text_ref"] == "scenario"
+    }.intersection(s["witness_id"] for s in user_fact_spans(scenario + "!", []))
+
+
+@pytest.mark.parametrize("defect", ["missing", "stale", "repeated"])
+def test_exclusions_need_current_unique_user_fact_selectors(defect: str) -> None:
+    ledger, _context, model = setup_review()
+
+    def mutate(result: dict[str, Any], payload: dict[str, Any]) -> None:
+        supplied = payload["user_fact_spans"][0]["witness_id"]
+        selectors = (
+            []
+            if defect == "missing"
+            else [user_fact_spans("An older fact", [])[0]["witness_id"]]
+            if defect == "stale"
+            else [supplied, supplied]
+        )
+        result["resolutions"][0].update(
+            status="not_applicable",
+            answer_unit_ids=[],
+            coverage=[],
+            scenario_witness_ids=selectors,
+        )
+
+    scripted_reviews(model, review_mutator=mutate)
+    gap = SourceUseReviewer(model, ledger).publication_gap(
+        "Allowed [1].", "A current actual exclusion", "coordinator"
+    )
+    assert gap and gap.status == OutcomeStatus.UNAVAILABLE
+
+
+def test_identical_user_context_is_deduplicated_without_rewriting_facts() -> None:
+    ledger, _context, model = setup_review()
+    scripted_reviews(model)
+    SourceUseReviewer(model, ledger).publication_gap(
+        "Allowed [1].",
+        "Exact question",
+        "coordinator",
+        conversation=[
+            {"role": "user", "content": "Exact question"},
+            {"role": "user", "content": "A distinct earlier fact"},
+            {"role": "user", "content": "A distinct earlier fact"},
+            {"role": "user", "content": "exact question"},
+        ],
+    )
+    payload = model_payload(cast(MagicMock, model.llm).invoke.call_args_list[0].kwargs)
+    assert payload["scenario"] == "Exact question"
+    assert [r["content"] for r in payload["conversation"]] == [
+        "A distinct earlier fact",
+        "exact question",
+    ]
+
+
+def test_required_coverage_and_stable_original_prefix_after_answer_edit() -> None:
+    assert "coverage" in SourceUseResolution.model_json_schema()["required"]
+    assert "scenario_quote" not in SourceUseResolution.model_json_schema()["properties"]
+    ledger, _context, model = setup_review()
+    scripted_reviews(model)
+    reviewer = SourceUseReviewer(model, ledger)
+    reviewer.publication_gap("Allowed [1].", "Actual facts", "coordinator")
+    reviewer.publication_gap(
+        "Allowed with qualification [1].", "Actual facts", "coordinator"
+    )
+    calls = cast(MagicMock, model.llm).invoke.call_args_list
+    serialized = [
+        c.kwargs["prompt"][1].content
+        for c in calls
+        if "answer_units" in model_payload(c.kwargs)
+    ]
+    assert len(serialized) == 2
+    prefixes = [text.partition('"answer_units":')[0] for text in serialized]
+    assert prefixes[0] == prefixes[1]
+    assert '"original_evidence"' in prefixes[0]
+    assert '"retained_requirements"' in prefixes[0]
 
 
 def test_new_issues_need_delivered_witnesses_and_current_units() -> None:

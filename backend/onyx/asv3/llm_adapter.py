@@ -1553,8 +1553,20 @@ class ResearchModel:
             response_model=response_model,
         )
 
+        def truncated_output(result: ModelResponse) -> bool:
+            if flow in {
+                LLMFlow.ASV3_SOURCE_INVENTORY,
+                LLMFlow.ASV3_SOURCE_USE_REVIEW,
+            }:
+                return (result.choice.finish_reason or "").lower() in {
+                    "length",
+                    "max_tokens",
+                    "max_output_tokens",
+                }
+            return result.choice.finish_reason in {"length", "max_tokens"}
+
         def valid(result: ModelResponse) -> str:
-            if result.choice.finish_reason in {"length", "max_tokens"}:
+            if truncated_output(result):
                 raise ValueError("ASv3 output was truncated before completion")
             text = result.choice.message.content or ""
             calls = result.choice.message.tool_calls or []
@@ -1582,7 +1594,7 @@ class ResearchModel:
             return valid(response)
         except ValueError as error:
             repair_max_tokens = max_tokens
-            truncated = response.choice.finish_reason in {"length", "max_tokens"}
+            truncated = truncated_output(response)
             if truncated and response_model is not None:
                 repair_max_tokens = max(max_tokens, output * 2)
                 _, repair_allowance = self._limits(repair_max_tokens)

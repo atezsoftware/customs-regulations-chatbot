@@ -1091,6 +1091,33 @@ def test_output_policy_cap_does_not_repeat_impossible_identical_capacity_review(
     assert "identical-capacity" in str(result.format_error)
 
 
+@pytest.mark.parametrize(
+    "flow", [LLMFlow.ASV3_SOURCE_INVENTORY, LLMFlow.ASV3_SOURCE_USE_REVIEW]
+)
+@pytest.mark.parametrize(
+    "finish_reason", ["MAX_TOKENS", "MAX_OUTPUT_TOKENS", "max_output_tokens"]
+)
+def test_source_assessment_truncation_cannot_approve_or_repeat_equal_capacity(
+    flow: LLMFlow, finish_reason: str
+) -> None:
+    from onyx.asv3.llm_adapter import StructuredOutputError
+    from onyx.asv3.source_use import SourceUseInventory
+
+    llm = scripted_model(limit=12000)
+    truncated = text_response({"examined_citations": [], "requirements": []})
+    truncated.choice.finish_reason = finish_reason
+    llm.invoke.return_value = truncated
+    with pytest.raises(StructuredOutputError, match="identical-capacity"):
+        ResearchModel(llm, RunContext()).invoke_text(
+            "Examine supplied originals",
+            "{}",
+            flow,
+            max_tokens=3000,
+            response_model_override=SourceUseInventory,
+        )
+    assert llm.invoke.call_count == 1
+
+
 def test_second_length_failure_cannot_approve_parseable_partial_assessment() -> None:
     llm = scripted_model()
     truncated = text_response(verification_profile())
