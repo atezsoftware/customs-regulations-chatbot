@@ -17,6 +17,7 @@ from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.judicial_sections import (
     JudicialSectionRole,
     canonical_disposition_witness,
+    judicial_disposition_gap,
     judicial_disposition_missing,
     nonoperative_judicial_witness_role,
 )
@@ -253,15 +254,17 @@ def _missing_judicial_disposition(
         or review.source_role != "operative_text"
     ):
         return False
-    return judicial_disposition_missing(
-        [
-            item
-            for number, doc in ledger.citation_mapping().items()
-            if doc.document_id == record.source_id
-            and (delivered is None or number in delivered)
-            for item in (ledger.get(number),)
-            if item is not None
-        ]
+    originals = [
+        item
+        for number, doc in ledger.citation_mapping().items()
+        if doc.document_id == record.source_id
+        and (delivered is None or number in delivered)
+        for item in (ledger.get(number),)
+        if item is not None
+    ]
+    return (
+        judicial_disposition_missing(originals)
+        or judicial_disposition_gap(originals) is not None
     )
 
 
@@ -617,14 +620,33 @@ class LegalSourceReviews:
                     "or not_material review leaves gap empty. Do not change status merely "
                     "to pass validation, or rewrite supported answer detail."
                 )
-            elif code == "nonoperative_judicial_witnesses":
+            elif code in {
+                "nonoperative_judicial_witnesses",
+                "missing_judicial_disposition",
+            }:
                 diagnostic["instruction"] = (
-                    "These candidate witnesses identify only a preliminary section or party "
-                    "argument. Locate and read this source's actual disposition and relevant "
+                    "The candidate's connected disposition is incomplete. Locate and read "
+                    "this source's actual disposition and relevant "
                     "qualifications through source-local search or headings; preserve already "
                     "supported answer detail. Do not relabel or reread the same introduction, "
                     "scan unrelated sources, or claim its operative effect from a title."
                 )
+                originals = [
+                    item
+                    for citation in sorted(delivered or set())
+                    if (item := ledger.get(citation)) is not None
+                    and item.source_id == record.source_id
+                ]
+                gap = judicial_disposition_gap(originals)
+                if gap is not None:
+                    diagnostic["suggested_acquisition"] = {
+                        "name": "read_source_range",
+                        "arguments": {
+                            "source_id": record.source_id,
+                            "start": gap,
+                            "limit": 2,
+                        },
+                    }
             if (
                 check_judicial_sections
                 and not available
@@ -758,8 +780,8 @@ class LegalSourceReviews:
             record, review, ledger, delivered
         ):
             reject(
-                "The supplied candidate includes judicial reasoning but not its connected "
-                "disposition body. Read that source's actual continuation or locate its "
+                "The supplied candidate includes judicial reasoning but lacks a complete "
+                "connected disposition body. Read that source's actual continuation or locate its "
                 "disposition before claiming the effect; a heading is not its operative text.",
                 "missing_judicial_disposition",
                 "witnesses",
@@ -877,8 +899,16 @@ class LegalSourceReviews:
                 self._validate_saved(record, ledger)
                 missing_disposition = context.services.get(
                     "asv3_workflow_variant"
-                ) == ASV3_TUNED_VARIANT and _missing_judicial_disposition(
-                    record, record.review, ledger, delivered_citations
+                ) == ASV3_TUNED_VARIANT and (
+                    _missing_judicial_disposition(
+                        record, record.review, ledger, delivered_citations
+                    )
+                    or (
+                        record.review is not None
+                        and _argument_role_contains_disposition(
+                            record, record.review, ledger
+                        )
+                    )
                 )
                 originals = [
                     number
@@ -886,6 +916,19 @@ class LegalSourceReviews:
                     if (item := ledger.get(number)) is not None
                     and item.source_id == record.source_id
                 ]
+                disposition_gap = (
+                    judicial_disposition_gap(
+                        [
+                            item
+                            for number in originals
+                            if (item := ledger.get(number)) is not None
+                        ]
+                    )
+                    if context.services.get("asv3_workflow_variant")
+                    == ASV3_TUNED_VARIANT
+                    and record.candidate_role == "judicial_candidate"
+                    else None
+                )
                 rows.append(
                     {
                         "lead_id": record.lead_id,
@@ -899,6 +942,11 @@ class LegalSourceReviews:
                         if record.review and not missing_disposition
                         else "pending",
                         "available_original_citations": originals,
+                        **(
+                            {"disposition_gap_position": disposition_gap}
+                            if disposition_gap is not None
+                            else {}
+                        ),
                         **(
                             {
                                 "nonoperative_original_citations": [
@@ -976,6 +1024,9 @@ class LegalSourceReviews:
                         _only_nonoperative_judicial_witnesses(
                             record, record.review, ledger
                         )
+                        or _argument_role_contains_disposition(
+                            record, record.review, ledger
+                        )
                         or _missing_judicial_disposition(
                             record, record.review, ledger, delivered
                         )
@@ -983,7 +1034,7 @@ class LegalSourceReviews:
                 ):
                     return ToolOutcome(
                         status=OutcomeStatus.PARTIAL,
-                        summary="The saved candidate assessment lacks its own disposition text. Read its connected qualifications and operative body or disclose the precise unresolved effect.",
+                        summary="The saved assessment lacks connected disposition text or misclassifies its operative body. Reuse delivered originals, complete the actual connected gap and correct the source role; otherwise disclose the precise unresolved effect.",
                         data={
                             "pending_related_source_review": True,
                             "nonoperative_judicial_source_id": record.source_id,

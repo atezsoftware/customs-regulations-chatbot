@@ -21,12 +21,19 @@ from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.judicial_sections import canonical_disposition_witness
 from onyx.asv3.legal_source_reviews import LegalSourceReviews
 from onyx.asv3.llm_adapter import ResearchModel, StructuredOutputError
-from onyx.asv3.models import OutcomeStatus, RunContext, ToolOutcome
+from onyx.asv3.models import (
+    EvidenceItem,
+    OutcomeStatus,
+    RunContext,
+    ToolOutcome,
+    model_evidence_metadata,
+)
 from onyx.asv3.source_metadata_transport import share_source_metadata
 from onyx.asv3.witnesses import original_witness_spans
 from onyx.asv3.workflow_variant import ASV3_TUNED_VARIANT
 from onyx.llm.model_capabilities import get_llm_max_output_tokens, get_model_map
 from onyx.prompts.asv3.source_use import SOURCE_USE_INVENTORY_PROMPT, SOURCE_USE_PROMPT
+from onyx.regulatory.heading_path import parse_regulatory_article_heading
 from onyx.tracing.flows import LLMFlow
 
 
@@ -71,10 +78,18 @@ class SourceUseInventory(BaseModel):
 class SourceUseCoverage(BaseModel):
     model_config = ConfigDict(extra="forbid")
     answer_unit_id: str
+    status: Literal["covered", "omitted", "misapplied", "unaffected"]
+    explanation: str = ""
     witnesses: list[AssertionWitness] = Field(
-        min_length=1,
-        description="Select actual inline originals supporting this unit's application, including a resolved governing original; do not copy discovery witnesses as extra citations.",
+        default_factory=list,
+        description="Covered needs its actual inline originals, including a resolved governing original. Other checks may reuse the immutable requirement's witnesses with [] rather than copy them; select different delivered witnesses when needed.",
     )
+
+    @model_validator(mode="after")
+    def require_positive_witness(self) -> SourceUseCoverage:
+        if self.status == "covered" and not self.witnesses:
+            raise ValueError("A covered application needs its operative inline witness")
+        return self
 
 
 class SourceUseResolution(BaseModel):
@@ -140,6 +155,57 @@ def source_requirement_id(requirement: SourceUseRequirement) -> str:
         requirement.model_dump(mode="json"), ensure_ascii=False, sort_keys=True
     )
     return "sr-" + hashlib.sha256(data.encode()).hexdigest()[:16]
+
+
+def _provision_context(item: EvidenceItem) -> tuple[str, str, str | None, str] | None:
+    metadata = model_evidence_metadata(item.metadata)
+    doc = item.search_doc
+    if (
+        not item.chunk_id
+        or doc is None
+        or doc.document_id != item.source_id
+        or doc.metadata.get("regulatory_chunk_id") != item.chunk_id
+        or any(
+            metadata.get(key)
+            for key in ("derived", "external", "untrusted", "truncated")
+        )
+        or metadata.get("document_type")
+        not in {
+            "kanun",
+            "yonetmelik",
+            "yönetmelik",
+            "teblig",
+            "tebliğ",
+            "genelge",
+            "law",
+            "act",
+            "statute",
+            "regulation",
+            "circular",
+            "decree",
+        }
+    ):
+        return None
+    headings = metadata.get("heading_path")
+    if not isinstance(headings, list):
+        return None
+    identities = {
+        (parsed.article_no, parsed.qualifier)
+        for heading in headings
+        if isinstance(heading, str)
+        if (parsed := parse_regulatory_article_heading(heading)) is not None
+    }
+    if len(identities) != 1:
+        return None
+    own = next(iter(identities))
+    dates = json.dumps(
+        {
+            key: metadata.get(key)
+            for key in ("read_as_of_date", "validity_start", "validity_end")
+        },
+        sort_keys=True,
+    )
+    return item.source_id, own[0], own[1], dates
 
 
 class SourceUseReviewer:
@@ -544,6 +610,29 @@ class SourceUseReviewer:
             }
             for identity, requirement in requirements.items()
         }
+        provision_groups: dict[tuple[str, str, str | None, str], set[int]] = {}
+        provision_by_number: dict[int, tuple[str, str, str | None, str]] = {}
+        for number in sorted(numbers):
+            original = self.ledger.get(number)
+            if original is None:
+                continue
+            key = _provision_context(original)
+            if key is None:
+                continue
+            provision_by_number[number] = key
+            provision_groups.setdefault(key, set()).add(number)
+        for identity, requirement in requirements.items():
+            siblings = {
+                number
+                for witness in requirement.witnesses
+                if witness.citation in provision_by_number
+                for number in provision_groups[provision_by_number[witness.citation]]
+            }
+            candidate_units[identity].update(
+                unit["unit_id"]
+                for unit in units
+                if siblings.intersection(unit["evidence_numbers"])
+            )
         for link in cast(list[dict[str, JsonValue]], blind_payload["source_links"]):
             anchors = cast(list[JsonValue], link["anchor_evidence_numbers"])
             affected = [
@@ -629,9 +718,38 @@ class SourceUseReviewer:
                         raise ValueError(
                             f"Resolution {row.requirement_id} needs exact current answer-unit IDs"
                         )
+                    checked = [binding.answer_unit_id for binding in row.coverage]
+                    required_units = candidate_units[row.requirement_id] | set(
+                        row.answer_unit_ids
+                    )
+                    if set(checked) != required_units or len(checked) != len(
+                        set(checked)
+                    ):
+                        raise ValueError(
+                            f"Resolution {row.requirement_id} must classify every application candidate once, including unaffected units; do not approve only a neighboring block"
+                        )
+                    if any(
+                        not assertion_witness_valid(witness, originals)
+                        for binding in row.coverage
+                        for witness in binding.witnesses
+                    ):
+                        raise ValueError(
+                            "Application checks need actual delivered witnesses"
+                        )
+                    if any(
+                        binding.status != "covered" and not binding.explanation.strip()
+                        for binding in row.coverage
+                    ):
+                        raise ValueError(
+                            "A negative or unaffected application needs its exact scope or logic distinction"
+                        )
                     if row.status == "not_applicable":
                         if (
                             not row.scenario_witness_ids
+                            or any(
+                                binding.status != "unaffected"
+                                for binding in row.coverage
+                            )
                             or set(row.scenario_witness_ids) - fact_ids
                             or len(row.scenario_witness_ids)
                             != len(set(row.scenario_witness_ids))
@@ -643,7 +761,10 @@ class SourceUseReviewer:
                     if row.status == "outside_request":
                         if (
                             row.answer_unit_ids
-                            or row.coverage
+                            or any(
+                                binding.status != "unaffected"
+                                for binding in row.coverage
+                            )
                             or not row.explanation.strip()
                             or not row.scenario_witness_ids
                             or set(row.scenario_witness_ids) - fact_ids
@@ -659,7 +780,11 @@ class SourceUseReviewer:
                             f"Resolution {row.requirement_id} needs affected answer-unit IDs"
                         )
                     if row.status == "covered":
-                        covered_ids = [b.answer_unit_id for b in row.coverage]
+                        covered_ids = [
+                            b.answer_unit_id
+                            for b in row.coverage
+                            if b.status != "unaffected"
+                        ]
                         if set(covered_ids) != set(row.answer_unit_ids) or len(
                             covered_ids
                         ) != len(row.answer_unit_ids):
@@ -707,9 +832,29 @@ class SourceUseReviewer:
             self._cache[identity] = (call_id, review)
         issues = [*review.issues]
         for resolution in review.resolutions:
+            requirement = requirements[resolution.requirement_id]
+            negative_bindings = [
+                binding
+                for binding in resolution.coverage
+                if binding.status in {"omitted", "misapplied"}
+            ]
+            for binding in negative_bindings:
+                issues.append(
+                    SourceUseIssue(
+                        kind="omitted_condition"
+                        if binding.status == "omitted"
+                        else "inconsistent_application",
+                        answer_unit_ids=[binding.answer_unit_id],
+                        witnesses=binding.witnesses or requirement.witnesses,
+                        detail=requirement.detail + " " + binding.explanation.strip(),
+                        applicability=requirement.applicability,
+                    )
+                )
             if resolution.status == "covered":
                 units_by_id = {unit["unit_id"]: unit for unit in units}
                 for binding in resolution.coverage:
+                    if binding.status != "covered":
+                        continue
                     missing = {w.citation for w in binding.witnesses} - set(
                         units_by_id[binding.answer_unit_id]["evidence_numbers"]
                     )
@@ -728,6 +873,8 @@ class SourceUseReviewer:
                         )
                 continue
             if resolution.status not in {"omitted", "misapplied"}:
+                continue
+            if negative_bindings:
                 continue
             requirement = requirements[resolution.requirement_id]
             issues.append(

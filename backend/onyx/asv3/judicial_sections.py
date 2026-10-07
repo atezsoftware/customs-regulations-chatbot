@@ -214,3 +214,45 @@ def judicial_disposition_missing(originals: Sequence[EvidenceItem]) -> bool:
         if _canonical_position(item) is not None
     }
     return "reasoning" in sections and "disposition" not in sections
+
+
+def judicial_disposition_gap(originals: Sequence[EvidenceItem]) -> int | None:
+    """Locate a canonical hole before a disposition's connected section boundary."""
+    gaps: list[int] = []
+    for item in originals:
+        position = _canonical_position(item)
+        if position is None or not canonical_disposition_witness(
+            item, 0, len(item.text), source_context=originals
+        ):
+            continue
+        role, parent = _preceding_sections(item, originals)
+        for line in item.text.splitlines():
+            role, parent = _section_transition(line, role, parent)
+        if role != "disposition":
+            continue
+        by_position: dict[int, list[EvidenceItem]] = {}
+        for original in originals:
+            candidate = _canonical_position(original)
+            if (
+                original.source_id == item.source_id
+                and candidate is not None
+                and candidate > position
+                and all(
+                    original.metadata.get(key) == item.metadata.get(key)
+                    for key in ("read_as_of_date", "validity_start", "validity_end")
+                )
+            ):
+                by_position.setdefault(candidate, []).append(original)
+        next_position = position + 1
+        while role == "disposition":
+            candidates = by_position.get(next_position, [])
+            if not candidates:
+                if any(later > next_position for later in by_position):
+                    gaps.append(next_position)
+                break
+            if len({candidate.identity for candidate in candidates}) != 1:
+                break
+            for line in candidates[0].text.splitlines():
+                role, parent = _section_transition(line, role, parent)
+            next_position += 1
+    return min(gaps) if gaps else None

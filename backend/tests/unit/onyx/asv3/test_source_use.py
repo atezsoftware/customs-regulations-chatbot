@@ -41,6 +41,98 @@ def coordinator_delivery(
     )
 
 
+@pytest.mark.parametrize("kind", ["kanun", "yönetmelik", "tebliğ"])
+@pytest.mark.parametrize("barrier", [None, "article", "qualifier", "date", "derived"])
+def test_uncited_sibling_navigation_requires_the_same_canonical_provision(
+    kind: str, barrier: str | None
+) -> None:
+    initial, context, model = setup_review()
+    originals = [initial.get(number) for number in (1, 2, 3)]
+    for number in (1, 2):
+        original = originals[number - 1]
+        assert original is not None
+        assert original.search_doc is not None
+        assert original.chunk_id is not None
+        original.search_doc.metadata["regulatory_chunk_id"] = original.chunk_id
+        original.metadata.update(
+            document_type=kind, heading_path=["Source title", "MADDE 17"]
+        )
+    second = originals[1]
+    assert second is not None
+    if barrier == "article":
+        second.metadata["heading_path"] = ["Source title", "MADDE 18"]
+    elif barrier == "qualifier":
+        second.metadata["heading_path"] = ["Source title", "GEÇİCİ MADDE 17"]
+    elif barrier == "date":
+        second.metadata["read_as_of_date"] = "2025-01-01"
+    elif barrier == "derived":
+        second.metadata["derived"] = True
+    ledger = EvidenceLedger()
+    for original in originals:
+        assert original is not None
+        ledger.add([original], context)
+    context.services["evidence"] = ledger
+    coordinator_delivery(ledger, [1, 2, 3])
+    scripted_reviews(model)
+    SourceUseReviewer(model, ledger).publication_gap(
+        "The primary rule applies [2].\n\nA different provision [3].",
+        "Unknown qualifying fact",
+        "coordinator",
+    )
+    payload = model_payload(cast(MagicMock, model.llm).invoke.call_args_list[-1].kwargs)
+    candidates = payload["application_candidates"]
+    if barrier is None:
+        assert candidates[0]["answer_unit_ids"] == [
+            payload["answer_units"][0]["unit_id"]
+        ]
+    else:
+        assert candidates == []
+
+
+def test_a_correct_detail_does_not_allow_an_unchecked_summary() -> None:
+    ledger, _context, model = setup_review()
+
+    def omit_summary(result: dict[str, Any], _payload: dict[str, Any]) -> None:
+        row = result["resolutions"][0]
+        row["coverage"] = row["coverage"][1:]
+        row["answer_unit_ids"] = row["answer_unit_ids"][1:]
+
+    counts = scripted_reviews(model, review_mutator=omit_summary)
+    gap = SourceUseReviewer(model, ledger).publication_gap(
+        "Unconditional summary [1].\n\nConditional detail [1].",
+        "Decisive fact unknown",
+        "coordinator",
+    )
+    assert gap and gap.status == OutcomeStatus.UNAVAILABLE
+    assert counts == {"inventory": 1, "review": 2}
+
+
+def test_local_misapplication_survives_an_aggregate_positive_resolution_without_retry() -> (
+    None
+):
+    ledger, _context, model = setup_review()
+
+    def negative_summary(result: dict[str, Any], _payload: dict[str, Any]) -> None:
+        binding = result["resolutions"][0]["coverage"][0]
+        binding.update(
+            status="misapplied",
+            explanation="This summary applies the effect without its unknown qualifying fact.",
+        )
+
+    counts = scripted_reviews(model, review_mutator=negative_summary)
+    gap = SourceUseReviewer(model, ledger).publication_gap(
+        "Unconditional summary [1].\n\nConditional detail [1].",
+        "Decisive fact unknown",
+        "coordinator",
+    )
+    assert gap and gap.status == OutcomeStatus.PARTIAL
+    issues = cast(list[dict[str, Any]], gap.data["source_use_gaps"])
+    assert len(issues) == 1 and issues[0]["kind"] == "inconsistent_application"
+    payload = model_payload(cast(MagicMock, model.llm).invoke.call_args_list[-1].kwargs)
+    assert issues[0]["answer_unit_ids"] == [payload["answer_units"][0]["unit_id"]]
+    assert counts == {"inventory": 1, "review": 1}
+
+
 def setup_review() -> tuple[EvidenceLedger, RunContext, ResearchModel]:
     originals, context = original_ledger()
     ledger = EvidenceLedger()
@@ -90,15 +182,37 @@ def resolutions_for(payload: dict[str, Any]) -> list[dict[str, Any]]:
     for req in payload["retained_requirements"]:
         numbers = {w["citation"] for w in req["witnesses"]}
         bound = [u["unit_id"] for u in units if numbers <= set(u["evidence_numbers"])]
+        candidates = next(
+            (
+                r["answer_unit_ids"]
+                for r in payload["application_candidates"]
+                if r["requirement_id"] == req["requirement_id"]
+            ),
+            [],
+        )
+        affected = bound or [units[0]["unit_id"]]
         rows.append(
             {
                 "requirement_id": req["requirement_id"],
                 "status": "covered" if bound else "omitted",
-                "answer_unit_ids": bound or [units[0]["unit_id"]],
+                "answer_unit_ids": affected,
                 "explanation": "" if bound else "The operative detail is absent.",
                 "coverage": [
-                    {"answer_unit_id": unit_id, "witnesses": req["witnesses"]}
-                    for unit_id in bound
+                    {
+                        "answer_unit_id": unit_id,
+                        "status": "covered"
+                        if unit_id in bound
+                        else "omitted"
+                        if unit_id in affected
+                        else "unaffected",
+                        "explanation": ""
+                        if unit_id in bound
+                        else "The operative qualification is absent."
+                        if unit_id in affected
+                        else "This unit asserts a different effect.",
+                        "witnesses": req["witnesses"],
+                    }
+                    for unit_id in dict.fromkeys([*candidates, *affected])
                 ],
             }
         )
@@ -307,7 +421,14 @@ def test_literal_user_exclusion_is_not_inferred_from_assistant_context() -> None
             if payload["scenario"] == "Excluded status"
             else ["assistant-fact"],
             answer_unit_ids=[],
-            coverage=[],
+            coverage=[
+                {
+                    **binding,
+                    "status": "unaffected",
+                    "explanation": "The supplied fact excludes this application.",
+                }
+                for binding in result["resolutions"][0]["coverage"]
+            ],
         )
 
     counts = scripted_reviews(model, review_mutator=mutate)
@@ -485,7 +606,7 @@ def test_omission_uses_retained_detail_without_repeating_explanation(
             if has_location
             else [],
             explanation="",
-            coverage=[],
+            coverage=result["resolutions"][0]["coverage"] if has_location else [],
         )
 
     counts = scripted_reviews(model, review_mutator=mutate)
@@ -497,7 +618,7 @@ def test_omission_uses_retained_detail_without_repeating_explanation(
         cast(list[Any], gap.data["source_use_gaps"])[0]
     )
     retained = cast(list[Any], gap.data["retained_source_requirements"])[0]
-    assert issue.detail == retained["detail"]
+    assert retained["detail"] in issue.detail
     assert issue.witnesses[0].citation == 1
     assert bool(issue.answer_unit_ids) is has_location
     assert counts == {"inventory": 1, "review": 1}
@@ -824,6 +945,7 @@ def test_coverage_can_use_the_resolved_governing_original() -> None:
             coverage=[
                 {
                     "answer_unit_id": unit["unit_id"],
+                    "status": "covered",
                     "witnesses": [
                         {
                             "citation": governing["citation"],
@@ -850,12 +972,14 @@ def test_missing_inline_support_is_a_targeted_gap_without_paid_format_retry() ->
     def mutate(result: dict[str, Any], payload: dict[str, Any]) -> None:
         unit = payload["answer_units"][-1]
         result["resolutions"][0].update(
-            answer_unit_ids=[unit["unit_id"]],
+            answer_unit_ids=[u["unit_id"] for u in payload["answer_units"]],
             coverage=[
+                *result["resolutions"][0]["coverage"],
                 {
                     "answer_unit_id": unit["unit_id"],
+                    "status": "covered",
                     "witnesses": payload["retained_requirements"][0]["witnesses"],
-                }
+                },
             ],
         )
 

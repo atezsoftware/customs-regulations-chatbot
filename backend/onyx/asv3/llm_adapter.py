@@ -35,7 +35,10 @@ from onyx.asv3.authority_reference_diagnostics import (
 from onyx.asv3.authority_requirements import AuthorityRequirements
 from onyx.asv3.citation_numbers import extract_citation_numbers
 from onyx.asv3.evidence import EvidenceLedger
-from onyx.asv3.judicial_sections import judicial_disposition_missing
+from onyx.asv3.judicial_sections import (
+    judicial_disposition_gap,
+    judicial_disposition_missing,
+)
 from onyx.asv3.legal_source_navigation import derive_provision_navigation_anchor
 from onyx.asv3.legal_source_reviews import LegalSourceReviews, annotate_navigation
 from onyx.asv3.models import (
@@ -3799,6 +3802,29 @@ class ResearchModel:
                     for item in (ledger.get(number),)
                     if item is not None and item.source_id == source_id
                 ]
+                gap = row.get("disposition_gap_position")
+                if (
+                    row.get("candidate_role") == "judicial_candidate"
+                    and type(gap) is int
+                    and gap >= 0
+                    and judicial_disposition_gap(originals) == gap
+                ):
+                    actions.append(
+                        {
+                            "lead_id": row.get("lead_id"),
+                            "source_id": source_id,
+                            "reason": "disposition_continuation_gap",
+                            "suggested_acquisition": {
+                                "name": "read_source_range",
+                                "arguments": {
+                                    "source_id": source_id,
+                                    "start": gap,
+                                    "limit": 2,
+                                },
+                            },
+                        }
+                    )
+                    continue
                 if (
                     row.get("candidate_role") == "judicial_candidate"
                     and isinstance(cursor, dict)

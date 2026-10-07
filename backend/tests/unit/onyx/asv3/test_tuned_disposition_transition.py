@@ -11,6 +11,7 @@ from onyx.asv3 import runtime
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.harness import Harness
 from onyx.asv3.judicial_sections import (
+    judicial_disposition_gap,
     judicial_disposition_missing,
     judicial_witness_section,
 )
@@ -42,6 +43,81 @@ from tests.unit.onyx.asv3.test_runtime import response, setup_run, user_payload
 from tests.unit.onyx.asv3.test_shared_originals import full_record
 from tests.unit.onyx.asv3.test_tuned_focused_reads import judicial_chunk
 from tests.unit.onyx.asv3.test_tuned_source_followthrough import tuned_context
+
+
+def test_missing_connected_disposition_uses_its_canonical_hole_not_an_old_cursor() -> (
+    None
+):
+    context, ledger, reviews = tuned_context()
+    seen(context, ledger, reviews)
+    originals = [
+        judicial_chunk("V. HÜKÜM\nA. The challenged phrase is annulled,", 0),
+        judicial_chunk("**T.C.**\nThe attached application follows.", 2),
+    ]
+    numbers = ledger.add(originals, context)
+    deliver(ledger, "current-call", [1, *numbers])
+    assert judicial_disposition_gap(originals) == 1
+    assessment = review(
+        witnesses=[
+            {
+                "citation": numbers[0],
+                "start_char": 9,
+                "end_char": len(originals[0].text),
+            }
+        ]
+    )
+    with pytest.raises(ValueError, match="complete connected disposition"):
+        reviews.apply([assessment], "current-call", context, ledger)
+    state = reviews.view(context, ledger, {1, *numbers})
+    row = cast(list[dict[str, JsonValue]], state["reviews"])[0]
+    assert row["disposition_gap_position"] == 1
+    row["source_range_read"] = {"has_more": True, "next_position": 20}
+    actions = ResearchModel._related_source_acquisition_state(state, ledger)
+    assert len(actions) == 1
+    assert cast(dict[str, Any], actions[0])["suggested_acquisition"] == {
+        "name": "read_source_range",
+        "arguments": {"source_id": "decision", "start": 1, "limit": 2},
+    }
+    middle = judicial_chunk("B. The connected qualification is annulled.\n**T.C.**", 1)
+    new_number = ledger.add([middle], context)[0]
+    assert judicial_disposition_gap([*originals, middle]) is None
+    deliver(ledger, "complete-call", [1, *numbers, new_number])
+    reviews.apply([assessment], "complete-call", context, ledger)
+    assert (
+        reviews.view(context, ledger, {1, *numbers, new_number})["pending_lead_ids"]
+        == []
+    )
+
+
+@pytest.mark.parametrize(
+    "barrier", ["date", "source", "derived", "ambiguous", "unknown"]
+)
+def test_disposition_gap_cannot_cross_unverified_source_structure(barrier: str) -> None:
+    first = judicial_chunk("V. HÜKÜM\nThe request is granted.", 0)
+    later = judicial_chunk("**T.C.**\nAn attachment begins.", 2)
+    originals = [first, later]
+    if barrier == "date":
+        later.metadata["read_as_of_date"] = "2025-01-01"
+    elif barrier == "source":
+        later.source_id = "another-source"
+    elif barrier == "derived":
+        later.metadata["derived"] = True
+    elif barrier == "ambiguous":
+        originals.extend(
+            [
+                judicial_chunk("A different body.", 1),
+                judicial_chunk("A conflicting body.", 1),
+            ]
+        )
+    else:
+        first.text = "Unstructured passage with no known section."
+    assert judicial_disposition_gap(originals) is None
+
+
+def test_recognized_boundary_stops_disposition_gap_navigation() -> None:
+    first = judicial_chunk("V. HÜKÜM\nThe request is granted.\n**T.C.**", 0)
+    later = judicial_chunk("An unrelated attachment later in the source.", 3)
+    assert judicial_disposition_gap([first, later]) is None
 
 
 def reasoning_originals() -> list[EvidenceItem]:
