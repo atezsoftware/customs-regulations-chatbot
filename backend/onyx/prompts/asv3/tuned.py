@@ -6,7 +6,7 @@ from onyx.prompts.asv3.coordinator_reference import (
 )
 from onyx.prompts.asv3.research import LEGAL_DEPARTMENT_RESEARCH
 
-TUNED_PROMPT_VERSION = "asv3-tuned-2026-10-07.25"
+TUNED_PROMPT_VERSION = "asv3-tuned-2026-10-08.26"
 
 TUNED_SOURCE_ANSWER_PROMPT = """Write Atez Customs Assistant's complete answer in the question's language or the explicitly
 requested language, directly from the actual request, supplied facts and numbered source
@@ -112,7 +112,7 @@ _old_support, _support_boundary, _remaining_application = _application.partition
 if not _boundary or not _support_boundary:
     raise ValueError("The coordinator reference has no source-support paragraph")
 
-TUNED_SOURCE_RESEARCH_PROMPT = (
+_source_research = (
     _governing
     + "For each requested effect, obtain the passages that establish its actual conditions and\n"
     "consequence. A delivered implementing or judicial passage can establish its stated rule;\n"
@@ -122,6 +122,39 @@ TUNED_SOURCE_RESEARCH_PROMPT = (
     "Titles and references alone establish no unseen holding, tax treatment, rate or base.\n"
     + _support_boundary
     + _remaining_application
+)
+
+_before_communication, _communication_boundary, _communication = (
+    _source_research.partition("Begin with a short localized 'Quick answer'")
+)
+_old_communication, _public_boundary, _public_metadata = _communication.partition(
+    "PUBLIC METADATA AND TRUST"
+)
+if not _communication_boundary or not _public_boundary:
+    raise ValueError("The source research reference has no communication boundary")
+
+TUNED_SOURCE_RESEARCH_PROMPT = (
+    _before_communication
+    + """RESEARCH HANDOFF
+When numbered passages support a legal response, a separate writer receives the actual
+request, facts, ALL retained passages and your findings. In this same decision, continue
+focused research for material gaps or use submit_answer/submit_partial_answer to hand off
+concise cited findings in answer; do not write the full user-facing answer first.
+Keep every material outcome, decisive factual application, cumulative/alternative condition,
+exception, favorable or contested ground, procedural stage and remaining gap in those
+findings. Link each to its own global originals. Preserve verified instrument/provision
+identities and decisive wording; summaries and references cannot supply unseen law.
+Complete applicable metadata yourself, with effect/limitations copied from your cited
+findings. The writer independently checks them; this is not publication approval.
+Read concrete material source leads before handing off. Do not repeatedly write polished
+drafts while their support is still missing. Research proportionately and reuse supplied
+passages; no fixed source, word or call quota. Do not defer a material requested issue to
+a follow-up. Social dialogue, facts-only arithmetic, clarification and a wholly unsupported
+request still receive their direct appropriate response rather than a research handoff.
+
+"""
+    + _public_boundary
+    + _public_metadata
 )
 
 _RELATED_SOURCE_POLICY = """Before a definitive conclusion, examine concrete leads changing validity, scope or application.

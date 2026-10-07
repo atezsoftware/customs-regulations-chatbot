@@ -80,6 +80,7 @@ from onyx.asv3.shared_originals import (
 from onyx.asv3.source_answer_transport import (
     bind_source_answer_body,
     source_answer_wire_tools,
+    source_research_handoff_tools,
 )
 from onyx.asv3.source_metadata_transport import (
     expand_source_metadata,
@@ -2954,6 +2955,8 @@ class ResearchModel:
         has_reference_catalogue = False
         ceiling, output = self._limits(self._native_output_limit())
         selected = copy.deepcopy(view.tools) if native_original_cache else view.tools
+        if self.answer_llm is not None and not self._writing_answer:
+            selected = source_research_handoff_tools(selected)
         if retained_answer_enabled(self.context):
             selected, retained_answer = bind_retained_answer(
                 selected,
@@ -4274,11 +4277,15 @@ class ResearchModel:
     @staticmethod
     def _source_answer_ready(decision: Decision) -> bool:
         if decision.calls:
-            return len(decision.calls) == 1 and (
-                decision.calls[0].name == "submit_partial_answer"
-                or (
-                    decision.calls[0].name == "submit_answer"
-                    and decision.calls[0].arguments.get("basis") == "originals"
+            return (
+                len(decision.calls) == 1
+                and not decision.calls[0].argument_error
+                and (
+                    decision.calls[0].name == "submit_partial_answer"
+                    or (
+                        decision.calls[0].name == "submit_answer"
+                        and decision.calls[0].arguments.get("basis") == "originals"
+                    )
                 )
             )
         return bool(decision.answer)

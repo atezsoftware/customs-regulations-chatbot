@@ -12,6 +12,7 @@ from onyx.asv3.harness import Harness
 from onyx.asv3.llm_adapter import ResearchModel
 from onyx.asv3.models import (
     CapabilityCall,
+    Decision,
     EvidenceItem,
     HarnessView,
     OutcomeStatus,
@@ -263,6 +264,67 @@ def test_source_answer_does_not_replace_research_calls_with_a_prose_handoff() ->
     research.invoke.return_value = response
     decision = adapter.decide(adaptive_tool_view(original_evidence=[record]))
     assert decision.calls[0].name == "read_provision"
+    writer.invoke.assert_not_called()
+
+
+def test_research_handoff_changes_role_without_changing_terminal_validation() -> None:
+    from onyx.asv3.source_answer_transport import source_research_handoff_tools
+
+    tools: list[dict[str, JsonValue]] = [
+        {
+            "type": "function",
+            "function": {
+                "name": "submit_answer",
+                "description": "Publish a complete answer.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "answer": {"type": "string", "minLength": 1},
+                        "basis": {"type": "string", "enum": ["originals"]},
+                    },
+                    "required": ["answer", "basis"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {"type": "function", "function": {"name": "read_provision"}},
+    ]
+    before = json.dumps(tools)
+    projected = source_research_handoff_tools(tools)
+    assert json.dumps(tools) == before
+    assert projected[1] == tools[1]
+    projected_function = projected[0]["function"]
+    assert isinstance(projected_function, dict)
+    assert "separate answer writer" in str(projected_function["description"])
+    parameters = projected_function["parameters"]
+    assert isinstance(parameters, dict)
+    properties = parameters["properties"]
+    assert isinstance(properties, dict) and isinstance(properties["answer"], dict)
+    properties["answer"].pop("description")
+    original_function = tools[0]["function"]
+    assert isinstance(original_function, dict)
+    assert parameters == original_function["parameters"]
+
+
+def test_invalid_source_handoff_cannot_trigger_the_answer_writer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter, context, _research, writer = source_answer_adapter()
+    record = original(
+        cast(EvidenceLedger, context.services["evidence"]), context, "Rule."
+    )
+    invalid = Decision(
+        calls=[
+            CapabilityCall(
+                name="submit_answer",
+                arguments={"answer": "Rule [1].", "basis": "originals"},
+                argument_error="Tool arguments violate the exposed schema",
+            )
+        ]
+    )
+    monkeypatch.setattr(adapter, "_invoke_decision", lambda *_args, **_kwargs: invalid)
+    result = adapter.decide(adaptive_tool_view(original_evidence=[record]))
+    assert result.calls[0].argument_error
     writer.invoke.assert_not_called()
 
 
