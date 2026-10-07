@@ -16,3 +16,8 @@ def extract_citation_numbers(text: str) -> tuple[int, ...]:
             for number in re.findall(r"\d+", match.group())
         )
     )
+
+
+def strip_citation_markers(text: str) -> str:
+    """Remove only renderer-supported source markers, preserving all other wording."""
+    return _CITATION_PATTERN.sub("", text)

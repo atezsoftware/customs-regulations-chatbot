@@ -7,6 +7,7 @@ import hashlib
 import json
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from typing import Annotated, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
@@ -16,7 +17,7 @@ from onyx.asv3.assertions import (
     assertion_inventory,
     assertion_witness_valid,
 )
-from onyx.asv3.citation_numbers import extract_citation_numbers
+from onyx.asv3.citation_numbers import extract_citation_numbers, strip_citation_markers
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.judicial_sections import canonical_disposition_witness
 from onyx.asv3.legal_source_reviews import LegalSourceReviews
@@ -84,6 +85,10 @@ class SourceUseCoverage(BaseModel):
     )
     status: Literal["covered", "omitted", "misapplied", "unaffected"]
     explanation: str = ""
+    compatible_counterexample: str = Field(
+        default="",
+        description="A source-supported branch compatible with explicit user facts that changes this unit's asserted effect. Give only the decisive condition and changed consequence; empty only when none exists.",
+    )
     witnesses: list[AssertionWitness] = Field(
         default_factory=list,
         description="Covered needs its actual inline originals, including a resolved governing original. Other checks may reuse the immutable requirement's witnesses with [] rather than copy them; select different delivered witnesses when needed.",
@@ -148,6 +153,58 @@ class SourceUseReview(BaseModel):
     reviewed_answer_unit_ids: list[str]
     resolutions: list[SourceUseResolution]
     issues: list[SourceUseIssue]
+
+
+@dataclass(frozen=True)
+class _CitationOnlyReview:
+    call_id: str
+    review: SourceUseReview
+    unit_ids: tuple[str, ...]
+    evidence_numbers: tuple[tuple[int, ...], ...]
+
+
+def _citation_only_identity(payload: dict[str, JsonValue]) -> str:
+    mechanical = {
+        key: value
+        for key, value in payload.items()
+        if key not in {"application_candidates", "inline_support_catalogue"}
+    }
+    mechanical["answer_units"] = [
+        {
+            "unit_id": index,
+            "text": strip_citation_markers(str(unit["text"])),
+            "presentation_only": unit["presentation_only"],
+        }
+        for index, unit in enumerate(
+            cast(list[dict[str, JsonValue]], payload["answer_units"])
+        )
+    ]
+    data = json.dumps(mechanical, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(data.encode()).hexdigest()
+
+
+def _rebase_review(
+    cached: _CitationOnlyReview, unit_ids: tuple[str, ...]
+) -> SourceUseReview:
+    identities = dict(zip(cached.unit_ids, unit_ids, strict=True))
+    review = cached.review.model_copy(deep=True)
+    review.reviewed_answer_unit_ids = [
+        identities[identity] for identity in review.reviewed_answer_unit_ids
+    ]
+    for resolution in review.resolutions:
+        resolution.answer_unit_ids = [
+            identities[identity] for identity in resolution.answer_unit_ids
+        ]
+        for binding in resolution.coverage:
+            binding.answer_unit_id = identities[binding.answer_unit_id]
+            binding.additional_answer_unit_ids = [
+                identities[identity] for identity in binding.additional_answer_unit_ids
+            ]
+    for issue in review.issues:
+        issue.answer_unit_ids = [
+            identities[identity] for identity in issue.answer_unit_ids
+        ]
+    return review
 
 
 def source_use_review_enabled(context: RunContext) -> bool:
@@ -228,6 +285,7 @@ class SourceUseReviewer:
         self.ledger = ledger
         self._inventories: dict[str, tuple[str, SourceUseInventory]] = {}
         self._cache: dict[str, tuple[str, SourceUseReview]] = {}
+        self._citation_cache: dict[str, _CitationOnlyReview] = {}
         self._failures: dict[tuple[LLMFlow, str], tuple[str, str]] = {}
         self._source_reviewers: dict[str, SourceUseReviewer] = {}
         self._application_reviewers: dict[tuple[str, ...], SourceUseReviewer] = {}
@@ -821,167 +879,233 @@ class SourceUseReviewer:
             if candidates
         ]
         # Stable original/fact prefix permits provider cache reuse after draft-only edits.
+        records = cast(list[dict[str, JsonValue]], blind_payload["original_evidence"])
+        inline_support: list[JsonValue] = [
+            {
+                "answer_unit_id": unit["unit_id"],
+                "originals": [
+                    {
+                        "citation": record["citation"],
+                        "witness_ids": [
+                            span["witness_id"]
+                            for span in cast(
+                                list[dict[str, JsonValue]], record["witness_spans"]
+                            )
+                        ],
+                    }
+                    for record in records
+                    if record["citation"] in unit["evidence_numbers"]
+                ],
+            }
+            for unit in units
+        ]
         payload = {
             **blind_payload,
             "retained_requirements": retained,
             "answer_units": units,
             "application_candidates": application_candidates,
+            "inline_support_catalogue": inline_support,
         }
         data = json.dumps(payload, ensure_ascii=False)
         identity = hashlib.sha256(data.encode()).hexdigest()
-        cached = self._cache.get(identity)
-        if cached and self._receipt_matches(
-            cached[0], LLMFlow.ASV3_SOURCE_USE_REVIEW, numbers
-        ):
-            review = cached[1]
-        else:
-            originals = {
-                int(cast(int, row["citation"])): str(row["text"])
-                for row in cast(
-                    list[dict[str, JsonValue]], blind_payload["original_evidence"]
-                )
-            }
-            units_by_id = {unit["unit_id"]: unit for unit in units}
-            unit_ids = set(units_by_id)
-            fact_ids = {
-                str(row["witness_id"])
-                for row in cast(
-                    list[dict[str, JsonValue]], blind_payload["user_fact_spans"]
-                )
-            }
+        originals = {
+            int(cast(int, row["citation"])): str(row["text"])
+            for row in cast(
+                list[dict[str, JsonValue]], blind_payload["original_evidence"]
+            )
+        }
+        units_by_id = {unit["unit_id"]: unit for unit in units}
+        unit_ids = set(units_by_id)
+        fact_ids = {
+            str(row["witness_id"])
+            for row in cast(
+                list[dict[str, JsonValue]], blind_payload["user_fact_spans"]
+            )
+        }
 
-            def validate(text: str) -> None:
-                result = SourceUseReview.model_validate_json(text)
-                if (
-                    not self.model.last_call_id
-                    or not self._receipt_matches(
-                        self.model.last_call_id, LLMFlow.ASV3_SOURCE_USE_REVIEW, numbers
+        def validate(text: str, receipt_id: str | None = None) -> None:
+            result = SourceUseReview.model_validate_json(text)
+            call_id = receipt_id or self.model.last_call_id
+            if (
+                not call_id
+                or not self._receipt_matches(
+                    call_id, LLMFlow.ASV3_SOURCE_USE_REVIEW, numbers
+                )
+                or set(result.examined_citations) != numbers
+                or len(result.examined_citations) != len(numbers)
+                or set(result.reviewed_answer_unit_ids) != unit_ids
+                or len(result.reviewed_answer_unit_ids) != len(unit_ids)
+            ):
+                raise ValueError(
+                    "Review every exact delivered original and current answer unit"
+                )
+            resolved = [row.requirement_id for row in result.resolutions]
+            if set(resolved) != requirements.keys() or len(resolved) != len(
+                requirements
+            ):
+                raise ValueError(
+                    "Resolve every exact retained requirement once; do not replace or drop IDs"
+                )
+            for row in result.resolutions:
+                if set(row.answer_unit_ids) - unit_ids or len(
+                    row.answer_unit_ids
+                ) != len(set(row.answer_unit_ids)):
+                    raise ValueError(
+                        f"Resolution {row.requirement_id} needs exact current answer-unit IDs"
                     )
-                    or set(result.examined_citations) != numbers
-                    or len(result.examined_citations) != len(numbers)
-                    or set(result.reviewed_answer_unit_ids) != unit_ids
-                    or len(result.reviewed_answer_unit_ids) != len(unit_ids)
+                checked = [
+                    identity
+                    for binding in row.coverage
+                    for identity in binding.unit_ids
+                ]
+                required_units = candidate_units[row.requirement_id] | set(
+                    row.answer_unit_ids
+                )
+                if set(checked) != required_units or len(checked) != len(set(checked)):
+                    raise ValueError(
+                        f"Resolution {row.requirement_id} must classify every application candidate once, including unaffected units; do not approve only a neighboring block"
+                    )
+                if any(
+                    not assertion_witness_valid(witness, originals)
+                    for binding in row.coverage
+                    for witness in binding.witnesses
                 ):
                     raise ValueError(
-                        "Review every exact delivered original and current answer unit"
+                        "Application checks need actual delivered witnesses"
                     )
-                resolved = [row.requirement_id for row in result.resolutions]
-                if set(resolved) != requirements.keys() or len(resolved) != len(
-                    requirements
+                if any(
+                    binding.status != "covered"
+                    and not (
+                        binding.explanation.strip()
+                        or binding.compatible_counterexample.strip()
+                    )
+                    for binding in row.coverage
                 ):
                     raise ValueError(
-                        "Resolve every exact retained requirement once; do not replace or drop IDs"
+                        "A negative or unaffected application needs its exact scope or logic distinction"
                     )
-                for row in result.resolutions:
-                    if set(row.answer_unit_ids) - unit_ids or len(
-                        row.answer_unit_ids
-                    ) != len(set(row.answer_unit_ids)):
-                        raise ValueError(
-                            f"Resolution {row.requirement_id} needs exact current answer-unit IDs"
+                if row.status == "not_applicable":
+                    if (
+                        not row.scenario_witness_ids
+                        or any(
+                            binding.status != "unaffected" for binding in row.coverage
                         )
-                    checked = [
-                        identity
-                        for binding in row.coverage
-                        for identity in binding.unit_ids
-                    ]
-                    required_units = candidate_units[row.requirement_id] | set(
-                        row.answer_unit_ids
-                    )
-                    if set(checked) != required_units or len(checked) != len(
-                        set(checked)
+                        or set(row.scenario_witness_ids) - fact_ids
+                        or len(row.scenario_witness_ids)
+                        != len(set(row.scenario_witness_ids))
                     ):
                         raise ValueError(
-                            f"Resolution {row.requirement_id} must classify every application candidate once, including unaffected units; do not approve only a neighboring block"
+                            f"Resolution {row.requirement_id} needs exact supplied user-fact witnesses establishing exclusion"
+                        )
+                    continue
+                if row.status == "outside_request":
+                    if (
+                        row.answer_unit_ids
+                        or any(
+                            binding.status != "unaffected" for binding in row.coverage
+                        )
+                        or not row.explanation.strip()
+                        or not row.scenario_witness_ids
+                        or set(row.scenario_witness_ids) - fact_ids
+                        or len(row.scenario_witness_ids)
+                        != len(set(row.scenario_witness_ids))
+                    ):
+                        raise ValueError(
+                            f"Resolution {row.requirement_id} needs its actual request-scope witness and explanation; an asserted application cannot be outside the request"
+                        )
+                    continue
+                if not row.answer_unit_ids and row.status != "omitted":
+                    raise ValueError(
+                        f"Resolution {row.requirement_id} needs affected answer-unit IDs"
+                    )
+                if row.status == "covered":
+                    covered_ids = [
+                        identity
+                        for b in row.coverage
+                        if b.status != "unaffected"
+                        for identity in b.unit_ids
+                    ]
+                    if set(covered_ids) != set(row.answer_unit_ids) or len(
+                        covered_ids
+                    ) != len(row.answer_unit_ids):
+                        raise ValueError(
+                            f"Resolution {row.requirement_id} needs one operative coverage binding per affected unit"
                         )
                     if any(
                         not assertion_witness_valid(witness, originals)
                         for binding in row.coverage
                         for witness in binding.witnesses
                     ):
-                        raise ValueError(
-                            "Application checks need actual delivered witnesses"
-                        )
-                    if any(
-                        binding.status != "covered" and not binding.explanation.strip()
+                        raise ValueError("Coverage needs actual delivered witnesses")
+                elif (
+                    row.status == "misapplied"
+                    and not row.explanation.strip()
+                    and not any(
+                        binding.compatible_counterexample.strip()
                         for binding in row.coverage
-                    ):
-                        raise ValueError(
-                            "A negative or unaffected application needs its exact scope or logic distinction"
-                        )
-                    if row.status == "not_applicable":
-                        if (
-                            not row.scenario_witness_ids
-                            or any(
-                                binding.status != "unaffected"
-                                for binding in row.coverage
-                            )
-                            or set(row.scenario_witness_ids) - fact_ids
-                            or len(row.scenario_witness_ids)
-                            != len(set(row.scenario_witness_ids))
-                        ):
-                            raise ValueError(
-                                f"Resolution {row.requirement_id} needs exact supplied user-fact witnesses establishing exclusion"
-                            )
-                        continue
-                    if row.status == "outside_request":
-                        if (
-                            row.answer_unit_ids
-                            or any(
-                                binding.status != "unaffected"
-                                for binding in row.coverage
-                            )
-                            or not row.explanation.strip()
-                            or not row.scenario_witness_ids
-                            or set(row.scenario_witness_ids) - fact_ids
-                            or len(row.scenario_witness_ids)
-                            != len(set(row.scenario_witness_ids))
-                        ):
-                            raise ValueError(
-                                f"Resolution {row.requirement_id} needs its actual request-scope witness and explanation; an asserted application cannot be outside the request"
-                            )
-                        continue
-                    if not row.answer_unit_ids and row.status != "omitted":
-                        raise ValueError(
-                            f"Resolution {row.requirement_id} needs affected answer-unit IDs"
-                        )
-                    if row.status == "covered":
-                        covered_ids = [
-                            identity
-                            for b in row.coverage
-                            if b.status != "unaffected"
-                            for identity in b.unit_ids
-                        ]
-                        if set(covered_ids) != set(row.answer_unit_ids) or len(
-                            covered_ids
-                        ) != len(row.answer_unit_ids):
-                            raise ValueError(
-                                f"Resolution {row.requirement_id} needs one operative coverage binding per affected unit"
-                            )
-                        if any(
-                            not assertion_witness_valid(witness, originals)
-                            for binding in row.coverage
-                            for witness in binding.witnesses
-                        ):
-                            raise ValueError(
-                                "Coverage needs actual delivered witnesses"
-                            )
-                    elif row.status == "misapplied" and not row.explanation.strip():
-                        raise ValueError(
-                            f"Resolution {row.requirement_id} needs its exact actionable defect"
-                        )
-                for issue in result.issues:
-                    if (
-                        set(issue.answer_unit_ids) - unit_ids
-                        or len(issue.answer_unit_ids) != len(set(issue.answer_unit_ids))
-                        or any(
-                            not assertion_witness_valid(witness, originals)
-                            for witness in issue.witnesses
-                        )
-                    ):
-                        raise ValueError(
-                            "Issues need current answer units and actual delivered witnesses"
-                        )
+                    )
+                ):
+                    raise ValueError(
+                        f"Resolution {row.requirement_id} needs its exact actionable defect"
+                    )
+            for issue in result.issues:
+                if (
+                    set(issue.answer_unit_ids) - unit_ids
+                    or len(issue.answer_unit_ids) != len(set(issue.answer_unit_ids))
+                    or any(
+                        not assertion_witness_valid(witness, originals)
+                        for witness in issue.witnesses
+                    )
+                ):
+                    raise ValueError(
+                        "Issues need current answer units and actual delivered witnesses"
+                    )
 
+        cached = self._cache.get(identity)
+        mechanical_identity = _citation_only_identity(
+            cast(dict[str, JsonValue], payload)
+        )
+        ordered_ids = tuple(unit["unit_id"] for unit in units)
+        inline_numbers = tuple(tuple(unit["evidence_numbers"]) for unit in units)
+        review: SourceUseReview | None = None
+        if cached and self._receipt_matches(
+            cached[0], LLMFlow.ASV3_SOURCE_USE_REVIEW, numbers
+        ):
+            review = cached[1]
+        else:
+            citation_cached = self._citation_cache.get(mechanical_identity)
+            if (
+                citation_cached
+                and self._receipt_matches(
+                    citation_cached.call_id, LLMFlow.ASV3_SOURCE_USE_REVIEW, numbers
+                )
+                and not (
+                    inline_numbers != citation_cached.evidence_numbers
+                    and (
+                        any(
+                            issue.kind in {"unsupported_claim", "missing_original"}
+                            for issue in citation_cached.review.issues
+                        )
+                        or any(
+                            resolution.status == "omitted"
+                            or any(
+                                binding.status == "omitted"
+                                for binding in resolution.coverage
+                            )
+                            for resolution in citation_cached.review.resolutions
+                        )
+                    )
+                )
+            ):
+                candidate = _rebase_review(citation_cached, ordered_ids)
+                try:
+                    validate(candidate.model_dump_json(), citation_cached.call_id)
+                except ValueError:
+                    pass
+                else:
+                    review = candidate
+                    self._cache[identity] = (citation_cached.call_id, review)
+        if review is None:
             text = self._invoke_assessment(
                 SOURCE_USE_PROMPT,
                 data,
@@ -996,6 +1120,12 @@ class SourceUseReviewer:
                 raise ValueError("Source-use review has no delivery receipt")
             self.ledger.pin_delivery(call_id)
             self._cache[identity] = (call_id, review)
+            self._citation_cache[mechanical_identity] = _CitationOnlyReview(
+                call_id=call_id,
+                review=review,
+                unit_ids=ordered_ids,
+                evidence_numbers=inline_numbers,
+            )
         issues = [*review.issues]
         for resolution in review.resolutions:
             requirement = requirements[resolution.requirement_id]
@@ -1003,23 +1133,33 @@ class SourceUseReviewer:
                 binding
                 for binding in resolution.coverage
                 if binding.status in {"omitted", "misapplied"}
+                or binding.compatible_counterexample.strip()
             ]
             for binding in negative_bindings:
                 issues.append(
                     SourceUseIssue(
                         kind="omitted_condition"
                         if binding.status == "omitted"
+                        and not binding.compatible_counterexample.strip()
                         else "inconsistent_application",
                         answer_unit_ids=binding.unit_ids,
                         witnesses=binding.witnesses or requirement.witnesses,
-                        detail=requirement.detail + " " + binding.explanation.strip(),
+                        detail=requirement.detail
+                        + " "
+                        + (
+                            binding.compatible_counterexample.strip()
+                            or binding.explanation.strip()
+                        ),
                         applicability=requirement.applicability,
                     )
                 )
             if resolution.status == "covered":
                 units_by_id = {unit["unit_id"]: unit for unit in units}
                 for binding in resolution.coverage:
-                    if binding.status != "covered":
+                    if (
+                        binding.status != "covered"
+                        or binding.compatible_counterexample.strip()
+                    ):
                         continue
                     for identity in binding.unit_ids:
                         missing = {w.citation for w in binding.witnesses} - set(

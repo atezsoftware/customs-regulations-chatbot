@@ -43,8 +43,15 @@ actual interaction. No other review's approval is supplied or assumed.
 Read each requirement's operative effect and scope before classifying the actual claims.
 Resolve EVERY exact requirement_id once; do not replace, rename, merge or drop it. Compare
 the entire current answer, including summaries, tables, actions and alternative outcomes.
-Test every asserted effect in a unit, not just whether its citation contains a general rule.
-A unit explaining a rule and then applying it to these facts needs support for BOTH.
+For every asserted effect, test source-supported branches compatible with explicit USER
+facts. One compatible branch changing that effect defeats an unconditional application.
+Test the assertion's stated conditions too; a branch correctly qualified in that unit is
+not a counterexample, and a branch excluded by explicit user facts is not compatible.
+Record its decisive condition and changed consequence in compatible_counterexample; do
+not approve the unit as covered or unaffected while that counterexample remains. Empty
+means no such branch exists, not that the draft omits it. A general rule and its application
+need separate support. A legal prerequisite does not prove that the user satisfies it;
+another supplied fact does not prove it without an operative rule establishing that implication.
 A qualification, relief or counter-authority discussed elsewhere cannot approve an affected
 unconditional application. Calling that application the general rule or quoting a lower
 instrument does not make it unaffected. Assess its legal interaction with the supplied
@@ -61,9 +68,13 @@ Use answer_unit_ids for all affected units, excluding unaffected checks. Coverag
 assessment of actual applications, not just positive approval. Return [] only when there is
 no candidate or affected unit. Keep supported applications independent of defects elsewhere.
 
-Covered needs its actual supporting inline originals. Select witnesses by entailment of the
-entire asserted application, not vocabulary or source count. Use a resolved governing
-original when appropriate; do not copy discovery witnesses as required extra citations.
+inline_support_catalogue addresses each unit's actual cited originals and witness selectors;
+their full texts remain supplied. Covered selects from those originals by entailment of
+the entire application. Prefer its operative governing original when sufficient; a discovery
+paraphrase or introduction is not an extra citation requirement for the same supported effect.
+If actual inline originals cannot support the effect, report that local support defect;
+do not label it covered with an uncited navigation witness. Counterexamples may use any
+delivered operative original. Do not confuse vocabulary or source count with entailment.
 Noncovered bindings may use [] to reuse the immutable requirement's witnesses, or select
 different supplied witnesses. Keep positive results to IDs, status and witnesses. Never
 recopy the source, requirement, answer, user text or analysis.
@@ -74,7 +85,8 @@ related block when present, otherwise use []. Empty locations never approve asse
 Preserve cumulative/alternative logic, actor, regime, trigger, proof, calculation, timing,
 exceptions and subsequent stages. Preserve stated boundaries and qualifications in EACH
 application; an unstated procedural convention cannot replace original wording. Unknown
-decisive facts require conditional branches. A remedy not yet invoked can remain available.
+decisive facts require conditional branches, not invented fulfillment or denial. A remedy
+not yet invoked can remain available; absence of invocation does not make its branch irrelevant.
 Not_applicable needs a literal supplied USER fact establishing exclusion. Select actual
 user_fact_spans IDs in scenario_witness_ids; their text_ref and ranges address unchanged
 user text. Draft silence, a missing fact and a legal inference do not establish exclusion.

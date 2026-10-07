@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from onyx.asv3.citation_numbers import strip_citation_markers
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.llm_adapter import ResearchModel
 from onyx.asv3.models import OutcomeStatus, RunContext
@@ -345,6 +346,169 @@ def scripted_reviews(
 
     cast(MagicMock, model.llm).invoke.side_effect = script
     return counts
+
+
+def test_citation_removal_preserves_all_other_wording() -> None:
+    assert (
+        strip_citation_markers(
+            "Effect [1, 2]. [[3]] 【4】 ［5］ [unknown] Article 17 (2025)."
+        )
+        == "Effect .    [unknown] Article 17 (2025)."
+    )
+
+
+def test_citation_only_reuse_rebases_units_and_rechecks_inline_support() -> None:
+    ledger, _context, model = setup_review()
+    counts = scripted_reviews(model)
+    reviewer = SourceUseReviewer(model, ledger)
+    assert reviewer.publication_gap("Allowed [1].", "facts", "coordinator") is None
+    assert reviewer.publication_gap("Allowed [1,2].", "facts", "coordinator") is None
+    gap = reviewer.publication_gap("Allowed [2].", "facts", "coordinator")
+    assert gap and gap.status == OutcomeStatus.PARTIAL
+    issues = cast(list[dict[str, Any]], gap.data["source_use_gaps"])
+    assert len(issues) == 1 and issues[0]["kind"] == "unsupported_claim"
+    assert issues[0]["witnesses"][0]["citation"] == 1
+    current = cast(list[dict[str, Any]], gap.data["affected_answer_units"])
+    assert issues[0]["answer_unit_ids"] == [current[0]["unit_id"]]
+    assert current[0]["text"] == "Allowed [2]."
+    assert counts == {"inventory": 1, "review": 1}
+
+
+@pytest.mark.parametrize("change", ["meaning", "facts", "metadata"])
+def test_citation_only_cache_never_reuses_changed_meaning_or_context(
+    change: str,
+) -> None:
+    ledger, context, model = setup_review()
+    counts = scripted_reviews(model)
+    reviewer = SourceUseReviewer(model, ledger)
+    assert reviewer.publication_gap("Allowed [1].", "facts", "coordinator") is None
+    if change == "metadata":
+        updated = EvidenceLedger()
+        for number in ledger.citation_numbers():
+            original = ledger.get(number)
+            assert original is not None
+            original.metadata["read_as_of_date"] = "2025-01-01"
+            updated.add([original], context)
+        context.services["evidence"] = updated
+        reviewer.ledger = updated
+        coordinator_delivery(updated, [1, 2, 3], "next")
+    reviewer.publication_gap(
+        "Prohibited [1,2]." if change == "meaning" else "Allowed [1,2].",
+        "different facts" if change == "facts" else "facts",
+        "next" if change == "metadata" else "coordinator",
+    )
+    assert counts["review"] == 2
+
+
+def test_citation_only_cache_requires_every_new_application_edge() -> None:
+    ledger, _context, model = setup_review()
+    counts = scripted_reviews(model)
+    reviewer = SourceUseReviewer(model, ledger)
+    first = "Allowed [1].\n\nA separate effect [2]."
+    assert reviewer.publication_gap(first, "facts", "coordinator") is None
+    second = "Allowed [1].\n\nA separate effect [1,2]."
+    reviewer.publication_gap(second, "facts", "coordinator")
+    assert counts == {"inventory": 1, "review": 2}
+
+
+@pytest.mark.parametrize("kind", ["unsupported_claim", "missing_original"])
+def test_explicit_support_defects_are_reassessed_after_citation_changes(
+    kind: str,
+) -> None:
+    ledger, _context, model = setup_review()
+
+    def unsupported(result: dict[str, Any], payload: dict[str, Any]) -> None:
+        result["issues"] = [
+            {
+                "kind": kind,
+                "answer_unit_ids": [payload["answer_units"][0]["unit_id"]],
+                "witnesses": payload["retained_requirements"][0]["witnesses"],
+                "detail": "The asserted effect lacks operative support.",
+                "applicability": "The asserted application.",
+            }
+        ]
+
+    counts = scripted_reviews(model, review_mutator=unsupported)
+    reviewer = SourceUseReviewer(model, ledger)
+    assert reviewer.publication_gap("Allowed [1].", "facts", "coordinator")
+    assert reviewer.publication_gap("Allowed [1,2].", "facts", "coordinator")
+    assert counts == {"inventory": 1, "review": 2}
+
+
+def test_omitted_support_is_not_retained_after_new_inline_originals() -> None:
+    ledger, _context, model = setup_review()
+    counts = scripted_reviews(model)
+    reviewer = SourceUseReviewer(model, ledger)
+    assert reviewer.publication_gap("Allowed [2].", "facts", "coordinator")
+    assert reviewer.publication_gap("Allowed [1,2].", "facts", "coordinator") is None
+    assert counts == {"inventory": 1, "review": 2}
+
+
+@pytest.mark.parametrize("status", ["covered", "unaffected"])
+def test_compatible_counterexample_cannot_be_approved_or_lost_in_grouping(
+    status: str,
+) -> None:
+    ledger, _context, model = setup_review()
+
+    def counterexample(result: dict[str, Any], payload: dict[str, Any]) -> None:
+        row = result["resolutions"][0]
+        ids = [unit["unit_id"] for unit in payload["answer_units"]]
+        row["answer_unit_ids"] = ids if status == "covered" else []
+        if status == "unaffected":
+            row.update(status="omitted", explanation="Unknown decisive qualification.")
+        row["coverage"] = [
+            {
+                "answer_unit_id": ids[0],
+                "additional_answer_unit_ids": ids[1:],
+                "status": status,
+                "explanation": "The asserted broad effect needs its qualification."
+                if status == "unaffected"
+                else "",
+                "compatible_counterexample": "If the unknown qualification holds, the source gives a different consequence.",
+                "witnesses": row["coverage"][0]["witnesses"],
+            }
+        ]
+
+    counts = scripted_reviews(model, review_mutator=counterexample)
+    reviewer = SourceUseReviewer(model, ledger)
+    gap = reviewer.publication_gap(
+        "Unconditional summary [1].\n\nUnconditional application [1].",
+        "The decisive fact is unknown.",
+        "coordinator",
+    )
+    assert gap and gap.status == OutcomeStatus.PARTIAL
+    issues = cast(list[dict[str, Any]], gap.data["source_use_gaps"])
+    assert len(issues) == 1 and issues[0]["kind"] == "inconsistent_application"
+    assert len(issues[0]["answer_unit_ids"]) == 2
+    assert issues[0]["witnesses"][0]["citation"] == 1
+    assert "different consequence" in issues[0]["detail"]
+    assert counts == {"inventory": 1, "review": 1}
+
+
+def test_inline_support_catalogue_addresses_only_each_units_actual_originals() -> None:
+    ledger, _context, model = setup_review()
+    scripted_reviews(model)
+    SourceUseReviewer(model, ledger).publication_gap(
+        "First application [1].\n\nDifferent application [2,3].", "facts", "coordinator"
+    )
+    payload = model_payload(cast(MagicMock, model.llm).invoke.call_args_list[-1].kwargs)
+    assert {record["citation"] for record in payload["original_evidence"]} == {1, 2, 3}
+    for unit, catalogue in zip(
+        payload["answer_units"], payload["inline_support_catalogue"], strict=True
+    ):
+        assert catalogue["answer_unit_id"] == unit["unit_id"]
+        assert {row["citation"] for row in catalogue["originals"]} == set(
+            unit["evidence_numbers"]
+        )
+        for row in catalogue["originals"]:
+            original = next(
+                r
+                for r in payload["original_evidence"]
+                if r["citation"] == row["citation"]
+            )
+            assert row["witness_ids"] == [
+                span["witness_id"] for span in original["witness_spans"]
+            ]
 
 
 @pytest.mark.parametrize("provider", ["vertex_ai", "openai", "anthropic"])
