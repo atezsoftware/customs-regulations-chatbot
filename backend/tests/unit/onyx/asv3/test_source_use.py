@@ -20,6 +20,11 @@ from onyx.asv3.source_use import (
 from onyx.asv3.workflow_variant import ASV3_TUNED_VARIANT
 from onyx.tracing.flows import LLMFlow
 from tests.unit.onyx.asv3.test_citation_contract import original_ledger
+from tests.unit.onyx.asv3.test_legal_source_reviews import (
+    deliver,
+    seen,
+    setup_reviews,
+)
 from tests.unit.onyx.asv3.test_model_adapter import scripted_model, text_response
 from tests.unit.onyx.asv3.test_runtime import delivered_originals, response, setup_run
 
@@ -461,6 +466,53 @@ def test_witnessed_omission_without_existing_block_is_repaired_without_review_re
     assert counts == {"inventory": 1, "review": 1}
 
 
+@pytest.mark.parametrize("has_location", [True, False])
+def test_omission_uses_retained_detail_without_repeating_explanation(
+    has_location: bool,
+) -> None:
+    ledger, _context, model = setup_review()
+
+    def mutate(result: dict[str, Any], payload: dict[str, Any]) -> None:
+        result["resolutions"][0].update(
+            status="omitted",
+            answer_unit_ids=[payload["answer_units"][0]["unit_id"]]
+            if has_location
+            else [],
+            explanation="",
+            coverage=[],
+        )
+
+    counts = scripted_reviews(model, review_mutator=mutate)
+    gap = SourceUseReviewer(model, ledger).publication_gap(
+        "Another supported result [2].", "Actual facts", "coordinator"
+    )
+    assert gap and gap.status == OutcomeStatus.PARTIAL
+    issue = SourceUseIssue.model_validate(
+        cast(list[Any], gap.data["source_use_gaps"])[0]
+    )
+    retained = cast(list[Any], gap.data["retained_source_requirements"])[0]
+    assert issue.detail == retained["detail"]
+    assert issue.witnesses[0].citation == 1
+    assert bool(issue.answer_unit_ids) is has_location
+    assert counts == {"inventory": 1, "review": 1}
+
+
+def test_misapplication_still_needs_its_changed_logic() -> None:
+    ledger, _context, model = setup_review()
+
+    def mutate(result: dict[str, Any], _payload: dict[str, Any]) -> None:
+        result["resolutions"][0].update(
+            status="misapplied", explanation="", coverage=[]
+        )
+
+    counts = scripted_reviews(model, review_mutator=mutate)
+    gap = SourceUseReviewer(model, ledger).publication_gap(
+        "An asserted effect [1].", "Actual facts", "coordinator"
+    )
+    assert gap and gap.status == OutcomeStatus.UNAVAILABLE
+    assert counts == {"inventory": 1, "review": 2}
+
+
 @pytest.mark.parametrize(
     "kind", ["unsupported_claim", "inconsistent_application", "missing_original"]
 )
@@ -537,6 +589,110 @@ def test_source_partition_keeps_every_original_and_reuses_unchanged_sources() ->
     assert reviewer.publication_gap("Result [1, 2].", "facts", "next") is None
     assert counts == {"inventory": 3, "review": 2}
     assert context.services["last_model_call_id"] == "coordinator"
+
+
+def test_source_inventory_receives_only_its_recorded_anchor_context() -> None:
+    context, ledger, reviews = setup_reviews()
+    context.services.update(
+        evidence=ledger,
+        asv3_workflow_variant=ASV3_TUNED_VARIANT,
+        research_profile="normal",
+        legal_source_reviews=reviews,
+    )
+    seen(context, ledger, reviews)
+    deliver(ledger, "coordinator", [1, 2, 3])
+    model = ResearchModel(scripted_model(), context)
+    counts = scripted_reviews(model)
+    reviewer = SourceUseReviewer(model, ledger)
+    assert reviewer.publication_gap("Result [1, 2, 3].", "facts", "coordinator") is None
+    payloads = [
+        model_payload(call.kwargs)
+        for call in cast(MagicMock, model.llm).invoke.call_args_list
+    ]
+    blind = [p for p in payloads if "inventory_source_id" in p]
+    linked = next(p for p in blind if p["inventory_source_id"] == "decision")
+    assert linked["required_owned_evidence_numbers"] == [2]
+    assert linked["required_evidence_numbers"] == [1, 2]
+    assert {r["citation"] for r in linked["original_evidence"]} == {1, 2}
+    for row in linked["original_evidence"]:
+        original = ledger.get(row["citation"])
+        assert original is not None and row["text"] == original.text
+    assert linked["source_links"][0]["anchor_evidence_numbers"] == [1]
+    assert not {"review", "effect", "limitations", "status"}.intersection(
+        linked["source_links"][0]
+    )
+    unrelated = next(p for p in blind if p["inventory_source_id"] == "other-decision")
+    assert unrelated["required_evidence_numbers"] == [3]
+    assert unrelated["source_links"] == []
+    assert counts == {"inventory": 3, "review": 1}
+    assert (
+        reviewer.publication_gap("Changed result [1, 2, 3].", "facts", "coordinator")
+        is None
+    )
+    assert counts == {"inventory": 3, "review": 2}
+
+
+def test_linked_anchor_cannot_replace_target_inventory_witness() -> None:
+    context, ledger, reviews = setup_reviews()
+    context.services.update(
+        evidence=ledger,
+        asv3_workflow_variant=ASV3_TUNED_VARIANT,
+        research_profile="normal",
+        legal_source_reviews=reviews,
+    )
+    seen(context, ledger, reviews)
+    deliver(ledger, "coordinator", [1, 2, 3])
+    model = ResearchModel(scripted_model(), context)
+
+    def mutate(result: dict[str, Any], payload: dict[str, Any]) -> None:
+        if payload.get("inventory_source_id") == "decision":
+            anchor = next(r for r in payload["original_evidence"] if r["citation"] == 1)
+            result["requirements"][0]["witnesses"] = [
+                {"citation": 1, "witness_id": anchor["witness_spans"][0]["witness_id"]}
+            ]
+
+    scripted_reviews(model, inventory_mutator=mutate)
+    gap = SourceUseReviewer(model, ledger).publication_gap(
+        "Result [1, 2, 3].", "facts", "coordinator"
+    )
+    assert gap and gap.status == OutcomeStatus.UNAVAILABLE
+
+
+@pytest.mark.parametrize(
+    "defect", [None, "asserted_unit", "missing_scope", "invented_fact"]
+)
+def test_unrelated_background_needs_request_scope_without_claiming_legal_exclusion(
+    defect: str | None,
+) -> None:
+    ledger, _context, model = setup_review()
+
+    def mutate(result: dict[str, Any], payload: dict[str, Any]) -> None:
+        result["resolutions"][0].update(
+            status="outside_request",
+            answer_unit_ids=[payload["answer_units"][0]["unit_id"]]
+            if defect == "asserted_unit"
+            else [],
+            coverage=[],
+            explanation=""
+            if defect == "missing_scope"
+            else "The request concerns storage permission; this original's ownership tax has no operative interaction with it.",
+            scenario_witness_ids=["invented"]
+            if defect == "invented_fact"
+            else [payload["user_fact_spans"][0]["witness_id"]],
+        )
+
+    counts = scripted_reviews(model, review_mutator=mutate)
+    gap = SourceUseReviewer(model, ledger).publication_gap(
+        "Storage permission [2].",
+        "Explain the storage permission procedure.",
+        "coordinator",
+    )
+    if defect:
+        assert gap and gap.status == OutcomeStatus.UNAVAILABLE
+        assert counts == {"inventory": 1, "review": 2}
+    else:
+        assert gap is None
+        assert counts == {"inventory": 1, "review": 1}
 
 
 def test_coverage_can_use_the_resolved_governing_original() -> None:

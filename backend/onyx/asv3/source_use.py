@@ -18,6 +18,7 @@ from onyx.asv3.assertions import (
 )
 from onyx.asv3.citation_numbers import extract_citation_numbers
 from onyx.asv3.evidence import EvidenceLedger
+from onyx.asv3.legal_source_reviews import LegalSourceReviews
 from onyx.asv3.llm_adapter import ResearchModel, StructuredOutputError
 from onyx.asv3.models import OutcomeStatus, RunContext, ToolOutcome
 from onyx.asv3.source_metadata_transport import share_source_metadata
@@ -72,12 +73,17 @@ class SourceUseCoverage(BaseModel):
 class SourceUseResolution(BaseModel):
     model_config = ConfigDict(extra="forbid")
     requirement_id: str
-    status: Literal["covered", "omitted", "misapplied", "not_applicable"]
+    status: Literal[
+        "covered", "omitted", "misapplied", "not_applicable", "outside_request"
+    ]
     answer_unit_ids: list[str]
-    explanation: str = ""
+    explanation: str = Field(
+        default="",
+        description="For misapplied, describe the changed logic or scope. An omitted requirement already supplies its exact missing detail; do not repeat it.",
+    )
     scenario_witness_ids: list[str] = Field(
         default_factory=list,
-        description="Select supplied user_fact_spans IDs proving actual exclusion; never recopy user text or select assistant statements.",
+        description="Select supplied user_fact_spans IDs for factual exclusion or the actual request scope; never recopy user text or select assistant statements.",
     )
     coverage: list[SourceUseCoverage]
 
@@ -165,14 +171,42 @@ class SourceUseReviewer:
                     self.ledger,
                 )
                 self._source_reviewers[source] = reviewer
-            selected = {int(cast(int, row["citation"])) for row in rows}
+            owned = {int(cast(int, row["citation"])) for row in rows}
+            links = [
+                row
+                for row in cast(list[dict[str, JsonValue]], payload["source_links"])
+                if row["source_id"] == source
+            ]
+            anchors = {
+                int(cast(int, n))
+                for link in links
+                for n in cast(list[JsonValue], link["anchor_evidence_numbers"])
+            }
+            linked_rows = [row for row in records if row["citation"] in anchors]
+            originals = {
+                int(cast(int, row["citation"])): row for row in [*rows, *linked_rows]
+            }
+            selected = set(originals)
+            sources = {str(row["source_id"]) for row in originals.values()}
             scoped = {
                 **payload,
-                "original_evidence": cast(list[JsonValue], rows),
-                "original_source_metadata": {source: shared[source]}
-                if source in shared
-                else {},
-                "source_groups": {source: sorted(selected)},
+                "original_evidence": cast(list[JsonValue], list(originals.values())),
+                "original_source_metadata": {
+                    identity: shared[identity]
+                    for identity in sorted(sources)
+                    if identity in shared
+                },
+                "source_groups": {
+                    identity: [
+                        n
+                        for n, row in originals.items()
+                        if row["source_id"] == identity
+                    ]
+                    for identity in sorted(sources)
+                },
+                "inventory_source_id": source,
+                "required_owned_evidence_numbers": sorted(owned),
+                "source_links": cast(list[JsonValue], links),
                 "required_evidence_numbers": sorted(selected),
             }
             jobs.append((reviewer, scoped, selected))
@@ -189,13 +223,44 @@ class SourceUseReviewer:
             ]
             for future in futures:
                 inventories.append(cast(SourceUseInventory, future.result()))
-        examined = [n for item in inventories for n in item.examined_citations]
-        if set(examined) != numbers or len(examined) != len(numbers):
-            raise ValueError("Source inventories must cover each exact original once")
+        examined = {n for item in inventories for n in item.examined_citations}
+        if examined != numbers:
+            raise ValueError("Source inventories must cover every exact original")
         return SourceUseInventory(
             examined_citations=sorted(examined),
             requirements=[r for item in inventories for r in item.requirements],
         )
+
+    def _source_links(self, numbers: set[int]) -> list[dict[str, JsonValue]]:
+        reviews = self.model.context.services.get("legal_source_reviews")
+        if not isinstance(reviews, LegalSourceReviews):
+            return []
+        view = reviews.view(self.model.context, self.ledger, numbers)
+        links: list[dict[str, JsonValue]] = []
+        for raw in cast(list[JsonValue], view["reviews"]):
+            if not isinstance(raw, dict):
+                continue
+            anchors = raw.get("anchor_evidence_numbers")
+            selected = (
+                sorted(n for n in anchors if type(n) is int and n in numbers)
+                if isinstance(anchors, list)
+                else []
+            )
+            if selected:
+                links.append(
+                    {
+                        key: raw[key]
+                        for key in (
+                            "lead_id",
+                            "anchor_source_id",
+                            "article_no",
+                            "qualifier",
+                            "source_id",
+                        )
+                    }
+                    | {"anchor_evidence_numbers": selected}
+                )
+        return links
 
     def _receipt_matches(self, call_id: str, flow: LLMFlow, numbers: set[int]) -> bool:
         return (
@@ -279,6 +344,13 @@ class SourceUseReviewer:
                     raise ValueError(
                         f"Requirement {index} needs its actual delivered operative witness"
                     )
+                owned = payload.get("required_owned_evidence_numbers")
+                if isinstance(owned, list) and not any(
+                    witness.citation in owned for witness in item.witnesses
+                ):
+                    raise ValueError(
+                        f"Requirement {index} needs the target source's own operative witness; linked context is not a separate inventory target"
+                    )
 
         text = self._invoke_assessment(
             SOURCE_USE_INVENTORY_PROMPT,
@@ -349,6 +421,7 @@ class SourceUseReviewer:
                 "original_evidence": records,
                 "original_source_metadata": shared,
                 "source_groups": source_groups,
+                "source_links": self._source_links(numbers),
                 "required_evidence_numbers": sorted(numbers),
             },
         )
@@ -452,6 +525,20 @@ class SourceUseReviewer:
                                 f"Resolution {row.requirement_id} needs exact supplied user-fact witnesses establishing exclusion"
                             )
                         continue
+                    if row.status == "outside_request":
+                        if (
+                            row.answer_unit_ids
+                            or row.coverage
+                            or not row.explanation.strip()
+                            or not row.scenario_witness_ids
+                            or set(row.scenario_witness_ids) - fact_ids
+                            or len(row.scenario_witness_ids)
+                            != len(set(row.scenario_witness_ids))
+                        ):
+                            raise ValueError(
+                                f"Resolution {row.requirement_id} needs its actual request-scope witness and explanation; an asserted application cannot be outside the request"
+                            )
+                        continue
                     if not row.answer_unit_ids and row.status != "omitted":
                         raise ValueError(
                             f"Resolution {row.requirement_id} needs affected answer-unit IDs"
@@ -472,7 +559,7 @@ class SourceUseReviewer:
                             raise ValueError(
                                 "Coverage needs actual delivered witnesses"
                             )
-                    elif not row.explanation.strip():
+                    elif row.status == "misapplied" and not row.explanation.strip():
                         raise ValueError(
                             f"Resolution {row.requirement_id} needs its exact actionable defect"
                         )
@@ -535,7 +622,11 @@ class SourceUseReviewer:
                     else "inconsistent_application",
                     answer_unit_ids=resolution.answer_unit_ids,
                     witnesses=requirement.witnesses,
-                    detail=requirement.detail + " " + resolution.explanation,
+                    detail=" ".join(
+                        part
+                        for part in (requirement.detail, resolution.explanation.strip())
+                        if part
+                    ),
                     applicability=requirement.applicability,
                 )
             )
