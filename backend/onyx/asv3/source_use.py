@@ -78,6 +78,10 @@ class SourceUseInventory(BaseModel):
 class SourceUseCoverage(BaseModel):
     model_config = ConfigDict(extra="forbid")
     answer_unit_id: str
+    additional_answer_unit_ids: list[str] = Field(
+        default_factory=list,
+        description="Other units with this same assessment and operative witnesses; different applications need separate bindings.",
+    )
     status: Literal["covered", "omitted", "misapplied", "unaffected"]
     explanation: str = ""
     witnesses: list[AssertionWitness] = Field(
@@ -90,6 +94,10 @@ class SourceUseCoverage(BaseModel):
         if self.status == "covered" and not self.witnesses:
             raise ValueError("A covered application needs its operative inline witness")
         return self
+
+    @property
+    def unit_ids(self) -> list[str]:
+        return [self.answer_unit_id, *self.additional_answer_unit_ids]
 
 
 class SourceUseResolution(BaseModel):
@@ -159,6 +167,11 @@ def source_requirement_id(requirement: SourceUseRequirement) -> str:
 
 def _provision_context(item: EvidenceItem) -> tuple[str, str, str | None, str] | None:
     metadata = model_evidence_metadata(item.metadata)
+    metadata_levels = [item.metadata]
+    for name in ("canonical_metadata", "publication", "index", "provenance"):
+        value = item.metadata.get(name)
+        if isinstance(value, dict):
+            metadata_levels.append(value)
     doc = item.search_doc
     if (
         not item.chunk_id
@@ -166,7 +179,8 @@ def _provision_context(item: EvidenceItem) -> tuple[str, str, str | None, str] |
         or doc.document_id != item.source_id
         or doc.metadata.get("regulatory_chunk_id") != item.chunk_id
         or any(
-            metadata.get(key)
+            level.get(key)
+            for level in metadata_levels
             for key in ("derived", "external", "untrusted", "truncated")
         )
         or metadata.get("document_type")
@@ -216,6 +230,20 @@ class SourceUseReviewer:
         self._cache: dict[str, tuple[str, SourceUseReview]] = {}
         self._failures: dict[tuple[LLMFlow, str], tuple[str, str]] = {}
         self._source_reviewers: dict[str, SourceUseReviewer] = {}
+        self._application_reviewers: dict[tuple[str, ...], SourceUseReviewer] = {}
+
+    def _child_reviewer(self) -> SourceUseReviewer:
+        return SourceUseReviewer(
+            ResearchModel(
+                self.model.llm,
+                self.model.context.child(),
+                user_identity=self.model.user_identity,
+                reasoning_effort=self.model.reasoning_effort,
+                token_counter=self.model.token_counter,
+                research_llm=self.model.research_llm,
+            ),
+            self.ledger,
+        )
 
     def _source_inventories(
         self, payload: dict[str, JsonValue], numbers: set[int]
@@ -231,18 +259,7 @@ class SourceUseReviewer:
         for source, rows in groups.items():
             reviewer = self._source_reviewers.get(source)
             if reviewer is None:
-                child = self.model.context.child()
-                reviewer = SourceUseReviewer(
-                    ResearchModel(
-                        self.model.llm,
-                        child,
-                        user_identity=self.model.user_identity,
-                        reasoning_effort=self.model.reasoning_effort,
-                        token_counter=self.model.token_counter,
-                        research_llm=self.model.research_llm,
-                    ),
-                    self.ledger,
-                )
+                reviewer = self._child_reviewer()
                 self._source_reviewers[source] = reviewer
             owned = {int(cast(int, row["citation"])) for row in rows}
             links = [
@@ -571,7 +588,7 @@ class SourceUseReviewer:
         previous_call = context.services.get("last_model_call_id")
         try:
             inventory = self._source_inventories(blind_payload, numbers)
-            return self._assess_answer(answer, blind_payload, inventory, numbers)
+            return self._assess_sources(answer, blind_payload, inventory, numbers)
         except StructuredOutputError:
             return ToolOutcome(
                 status=OutcomeStatus.UNAVAILABLE,
@@ -583,6 +600,150 @@ class SourceUseReviewer:
                 context.services.pop("last_model_call_id", None)
             else:
                 context.services["last_model_call_id"] = previous_call
+
+    def _assess_sources(
+        self,
+        answer: str,
+        payload: dict[str, JsonValue],
+        inventory: SourceUseInventory,
+        numbers: set[int],
+    ) -> ToolOutcome | None:
+        records = cast(list[dict[str, JsonValue]], payload["original_evidence"])
+        sources = {
+            int(cast(int, row["citation"])): str(row["source_id"]) for row in records
+        }
+        groups: dict[tuple[str, ...], list[SourceUseRequirement]] = {}
+        for requirement in inventory.requirements:
+            key = tuple(
+                sorted({sources[witness.citation] for witness in requirement.witnesses})
+            )
+            groups.setdefault(key, []).append(requirement)
+        assigned_sources = {source for key in groups for source in key}
+        for source in sorted(set(sources.values()) - assigned_sources):
+            groups[(source,)] = []
+        if len(groups) <= 1:
+            return self._assess_answer(answer, payload, inventory, numbers)
+        inline = set(extract_citation_numbers(answer)) & numbers
+        shared = cast(dict[str, JsonValue], payload["original_source_metadata"])
+        links = cast(list[dict[str, JsonValue]], payload["source_links"])
+        jobs: list[
+            tuple[SourceUseReviewer, dict[str, JsonValue], SourceUseInventory, set[int]]
+        ] = []
+        for key, requirements in groups.items():
+            reviewer = self._application_reviewers.get(key)
+            if reviewer is None:
+                reviewer = self._child_reviewer()
+                self._application_reviewers[key] = reviewer
+            owned = {number for number, source in sources.items() if source in key}
+            inbound = {
+                int(cast(int, number))
+                for link in links
+                if link["source_id"] in key
+                for number in cast(list[JsonValue], link["anchor_evidence_numbers"])
+            }
+            selected = owned | inline | (inbound & numbers)
+            originals = [row for row in records if row["citation"] in selected]
+            selected_sources = {sources[number] for number in selected}
+            scoped = {
+                **payload,
+                "assessment_source_ids": list(key),
+                "original_evidence": cast(list[JsonValue], originals),
+                "original_source_metadata": {
+                    source: shared[source]
+                    for source in sorted(selected_sources)
+                    if source in shared
+                },
+                "source_groups": {
+                    source: [
+                        number
+                        for number in sorted(selected)
+                        if sources[number] == source
+                    ]
+                    for source in sorted(selected_sources)
+                },
+                "source_links": cast(
+                    list[JsonValue],
+                    [link for link in links if link["source_id"] in selected_sources],
+                ),
+                "required_evidence_numbers": sorted(selected),
+            }
+            jobs.append(
+                (
+                    reviewer,
+                    scoped,
+                    SourceUseInventory(
+                        examined_citations=sorted(selected), requirements=requirements
+                    ),
+                    selected,
+                )
+            )
+        if set().union(*(job[3] for job in jobs)) != numbers:
+            raise ValueError("Scoped assessments must retain every delivered original")
+        gaps: list[ToolOutcome] = []
+        unavailable: list[JsonValue] = []
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = [
+                executor.submit(
+                    contextvars.copy_context().run,
+                    reviewer._assess_answer,
+                    answer,
+                    scoped,
+                    source_inventory,
+                    selected,
+                )
+                for reviewer, scoped, source_inventory, selected in jobs
+            ]
+            for job, future in zip(jobs, futures):
+                try:
+                    gap = cast(ToolOutcome | None, future.result())
+                except StructuredOutputError:
+                    unavailable.append(job[1]["assessment_source_ids"])
+                    continue
+                if gap is not None:
+                    gaps.append(gap)
+        if not gaps and not unavailable:
+            return None
+        issues = [
+            issue
+            for gap in gaps
+            for issue in cast(list[JsonValue], gap.data["source_use_gaps"])
+        ]
+        affected = {
+            identity
+            for issue in issues
+            if isinstance(issue, dict)
+            for identity in cast(list[str], issue["answer_unit_ids"])
+        }
+        return ToolOutcome(
+            status=OutcomeStatus.PARTIAL if gaps else OutcomeStatus.UNAVAILABLE,
+            summary="Repair all witnessed source-use defects in their actual answer blocks; retain supported detail and resolve only missing evidence or incomplete assessments.",
+            data={
+                "source_use_gaps": issues,
+                "retained_source_requirements": [
+                    {
+                        "requirement_id": source_requirement_id(item),
+                        **item.model_dump(mode="json"),
+                    }
+                    for item in inventory.requirements
+                ],
+                "affected_answer_units": cast(
+                    list[JsonValue],
+                    [
+                        unit
+                        for unit in assertion_inventory(answer)
+                        if unit["unit_id"] in affected
+                    ],
+                ),
+                **(
+                    {
+                        "source_use_review_unavailable": True,
+                        "incomplete_assessment_source_ids": unavailable,
+                    }
+                    if unavailable
+                    else {}
+                ),
+            },
+        )
 
     def _assess_answer(
         self,
@@ -718,7 +879,11 @@ class SourceUseReviewer:
                         raise ValueError(
                             f"Resolution {row.requirement_id} needs exact current answer-unit IDs"
                         )
-                    checked = [binding.answer_unit_id for binding in row.coverage]
+                    checked = [
+                        identity
+                        for binding in row.coverage
+                        for identity in binding.unit_ids
+                    ]
                     required_units = candidate_units[row.requirement_id] | set(
                         row.answer_unit_ids
                     )
@@ -781,9 +946,10 @@ class SourceUseReviewer:
                         )
                     if row.status == "covered":
                         covered_ids = [
-                            b.answer_unit_id
+                            identity
                             for b in row.coverage
                             if b.status != "unaffected"
+                            for identity in b.unit_ids
                         ]
                         if set(covered_ids) != set(row.answer_unit_ids) or len(
                             covered_ids
@@ -844,7 +1010,7 @@ class SourceUseReviewer:
                         kind="omitted_condition"
                         if binding.status == "omitted"
                         else "inconsistent_application",
-                        answer_unit_ids=[binding.answer_unit_id],
+                        answer_unit_ids=binding.unit_ids,
                         witnesses=binding.witnesses or requirement.witnesses,
                         detail=requirement.detail + " " + binding.explanation.strip(),
                         applicability=requirement.applicability,
@@ -855,22 +1021,23 @@ class SourceUseReviewer:
                 for binding in resolution.coverage:
                     if binding.status != "covered":
                         continue
-                    missing = {w.citation for w in binding.witnesses} - set(
-                        units_by_id[binding.answer_unit_id]["evidence_numbers"]
-                    )
-                    if missing:
-                        requirement = requirements[resolution.requirement_id]
-                        issues.append(
-                            SourceUseIssue(
-                                kind="unsupported_claim",
-                                answer_unit_ids=[binding.answer_unit_id],
-                                witnesses=binding.witnesses,
-                                detail=requirement.detail
-                                + " Operative inline support is absent: "
-                                + ", ".join(f"[{n}]" for n in sorted(missing)),
-                                applicability=requirement.applicability,
-                            )
+                    for identity in binding.unit_ids:
+                        missing = {w.citation for w in binding.witnesses} - set(
+                            units_by_id[identity]["evidence_numbers"]
                         )
+                        if missing:
+                            requirement = requirements[resolution.requirement_id]
+                            issues.append(
+                                SourceUseIssue(
+                                    kind="unsupported_claim",
+                                    answer_unit_ids=[identity],
+                                    witnesses=binding.witnesses,
+                                    detail=requirement.detail
+                                    + " Operative inline support is absent: "
+                                    + ", ".join(f"[{n}]" for n in sorted(missing)),
+                                    applicability=requirement.applicability,
+                                )
+                            )
                 continue
             if resolution.status not in {"omitted", "misapplied"}:
                 continue

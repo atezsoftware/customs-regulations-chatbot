@@ -42,7 +42,9 @@ def coordinator_delivery(
 
 
 @pytest.mark.parametrize("kind", ["kanun", "yönetmelik", "tebliğ"])
-@pytest.mark.parametrize("barrier", [None, "article", "qualifier", "date", "derived"])
+@pytest.mark.parametrize(
+    "barrier", [None, "article", "qualifier", "date", "derived", "truncated"]
+)
 def test_uncited_sibling_navigation_requires_the_same_canonical_provision(
     kind: str, barrier: str | None
 ) -> None:
@@ -67,6 +69,8 @@ def test_uncited_sibling_navigation_requires_the_same_canonical_provision(
         second.metadata["read_as_of_date"] = "2025-01-01"
     elif barrier == "derived":
         second.metadata["derived"] = True
+    elif barrier == "truncated":
+        second.metadata["truncated"] = True
     ledger = EvidenceLedger()
     for original in originals:
         assert original is not None
@@ -131,6 +135,89 @@ def test_local_misapplication_survives_an_aggregate_positive_resolution_without_
     payload = model_payload(cast(MagicMock, model.llm).invoke.call_args_list[-1].kwargs)
     assert issues[0]["answer_unit_ids"] == [payload["answer_units"][0]["unit_id"]]
     assert counts == {"inventory": 1, "review": 1}
+
+
+@pytest.mark.parametrize("status", ["covered", "misapplied"])
+def test_grouped_bindings_keep_every_actual_application(status: str) -> None:
+    ledger, _context, model = setup_review()
+
+    def group(result: dict[str, Any], _payload: dict[str, Any]) -> None:
+        row = result["resolutions"][0]
+        bindings = row["coverage"]
+        binding = bindings[0]
+        binding["additional_answer_unit_ids"] = [
+            b["answer_unit_id"] for b in bindings[1:]
+        ]
+        binding["status"] = status
+        if status == "misapplied":
+            binding.update(
+                explanation="Both applications omit the same decisive qualification.",
+                witnesses=[],
+            )
+        row["coverage"] = [binding]
+
+    counts = scripted_reviews(model, review_mutator=group)
+    reviewer = SourceUseReviewer(model, ledger)
+    gap = reviewer.publication_gap(
+        "First application [1].\n\nSecond application [1].",
+        "Unknown qualification",
+        "coordinator",
+    )
+    if status == "covered":
+        assert gap is None
+    else:
+        assert gap and gap.status == OutcomeStatus.PARTIAL
+        issues = cast(list[dict[str, Any]], gap.data["source_use_gaps"])
+        assert len(issues) == 1
+        assert len(issues[0]["answer_unit_ids"]) == 2
+        assert issues[0]["kind"] == "inconsistent_application"
+    assert counts == {"inventory": 1, "review": 1}
+
+
+def test_grouped_binding_checks_each_units_inline_support() -> None:
+    ledger, _context, model = setup_review()
+
+    def group(result: dict[str, Any], payload: dict[str, Any]) -> None:
+        row = result["resolutions"][0]
+        identities = [u["unit_id"] for u in payload["answer_units"]]
+        row["answer_unit_ids"] = identities
+        row["coverage"] = [
+            {
+                "answer_unit_id": identities[0],
+                "additional_answer_unit_ids": identities[1:],
+                "status": "covered",
+                "witnesses": row["coverage"][0]["witnesses"],
+            }
+        ]
+
+    counts = scripted_reviews(model, review_mutator=group)
+    gap = SourceUseReviewer(model, ledger).publication_gap(
+        "Supported application [1].\n\nApplication citing a different original [2].",
+        "facts",
+        "coordinator",
+    )
+    assert gap and gap.status == OutcomeStatus.PARTIAL
+    issues = cast(list[dict[str, Any]], gap.data["source_use_gaps"])
+    assert len(issues) == 1 and issues[0]["kind"] == "unsupported_claim"
+    assert len(issues[0]["answer_unit_ids"]) == 1
+    affected = cast(list[dict[str, Any]], gap.data["affected_answer_units"])
+    assert issues[0]["answer_unit_ids"][0] == affected[0]["unit_id"]
+    assert counts == {"inventory": 1, "review": 1}
+
+
+def test_grouped_binding_cannot_count_an_application_twice() -> None:
+    ledger, _context, model = setup_review()
+
+    def duplicate(result: dict[str, Any], _payload: dict[str, Any]) -> None:
+        binding = result["resolutions"][0]["coverage"][0]
+        binding["additional_answer_unit_ids"] = [binding["answer_unit_id"]]
+
+    counts = scripted_reviews(model, review_mutator=duplicate)
+    gap = SourceUseReviewer(model, ledger).publication_gap(
+        "Result [1].", "facts", "coordinator"
+    )
+    assert gap and gap.status == OutcomeStatus.UNAVAILABLE
+    assert counts == {"inventory": 1, "review": 2}
 
 
 def setup_review() -> tuple[EvidenceLedger, RunContext, ResearchModel]:
@@ -690,7 +777,7 @@ def test_source_partition_keeps_every_original_and_reuses_unchanged_sources() ->
     counts = scripted_reviews(model)
     reviewer = SourceUseReviewer(model, ledger)
     assert reviewer.publication_gap("Result [1, 2, 3].", "facts", "coordinator") is None
-    assert counts == {"inventory": 3, "review": 1}
+    assert counts == {"inventory": 3, "review": 3}
     calls = cast(MagicMock, model.llm).invoke.call_args_list
     blind = [
         model_payload(c.kwargs)
@@ -714,8 +801,102 @@ def test_source_partition_keeps_every_original_and_reuses_unchanged_sources() ->
     assert all(len(ledger.completely_delivered(receipt)) == 1 for receipt in receipts)
     coordinator_delivery(ledger, [1, 2], "next")
     assert reviewer.publication_gap("Result [1, 2].", "facts", "next") is None
-    assert counts == {"inventory": 3, "review": 2}
+    assert counts == {"inventory": 3, "review": 5}
     assert context.services["last_model_call_id"] == "coordinator"
+
+
+def test_application_scopes_keep_full_originals_zero_effect_sources_and_exact_reuse() -> (
+    None
+):
+    ledger, context = original_ledger()
+    context.services.update(
+        asv3_workflow_variant=ASV3_TUNED_VARIANT,
+        research_profile="normal",
+        last_model_call_id="coordinator",
+    )
+    coordinator_delivery(ledger, [1, 2, 3])
+    model = ResearchModel(scripted_model(), context)
+    third = ledger.get(3)
+    assert third is not None
+
+    def empty_background(result: dict[str, Any], payload: dict[str, Any]) -> None:
+        if payload.get("inventory_source_id") == third.source_id:
+            result["requirements"] = []
+
+    counts = scripted_reviews(model, inventory_mutator=empty_background)
+    reviewer = SourceUseReviewer(model, ledger)
+    gap = reviewer.publication_gap(
+        "Actual application [1].", "Unknown qualification", "coordinator"
+    )
+    assert gap and gap.status == OutcomeStatus.PARTIAL
+    payloads = [
+        model_payload(call.kwargs)
+        for call in cast(MagicMock, model.llm).invoke.call_args_list
+    ]
+    scoped = [p for p in payloads if "assessment_source_ids" in p]
+    assert len(scoped) == 3
+    assert {r["citation"] for p in scoped for r in p["original_evidence"]} == {1, 2, 3}
+    owned_requirements = [
+        r["requirement_id"] for p in scoped for r in p["retained_requirements"]
+    ]
+    assert len(owned_requirements) == len(set(owned_requirements)) == 2
+    for payload in scoped:
+        own = payload["assessment_source_ids"]
+        assert len(own) == 1
+        originals = expand_source_metadata(
+            {
+                "original_metadata_catalogue": payload["original_evidence"],
+                "original_source_metadata": payload["original_source_metadata"],
+            }
+        )
+        assert {r["citation"] for r in originals} == {
+            1,
+            *[
+                n
+                for n in (1, 2, 3)
+                if (item := ledger.get(n)) is not None and item.source_id in own
+            ],
+        }
+        for row in originals:
+            item = ledger.get(cast(int, row["citation"]))
+            assert item is not None and row["text"] == item.text
+        assert payload["scenario"] == "Unknown qualification"
+        assert [u["text"] for u in payload["answer_units"]] == [
+            "Actual application [1]."
+        ]
+    assert counts == {"inventory": 3, "review": 3}
+    repeated = reviewer.publication_gap(
+        "Actual application [1].", "Unknown qualification", "coordinator"
+    )
+    assert repeated and repeated.data == gap.data
+    assert counts == {"inventory": 3, "review": 3}
+    assert context.services["last_model_call_id"] == "coordinator"
+
+
+def test_incomplete_source_check_does_not_erase_other_witnessed_defects() -> None:
+    ledger, context = original_ledger()
+    context.services.update(
+        asv3_workflow_variant=ASV3_TUNED_VARIANT, research_profile="normal"
+    )
+    coordinator_delivery(ledger, [1, 2, 3])
+    model = ResearchModel(scripted_model(), context)
+    missing = ledger.get(3)
+    assert missing is not None
+
+    def incomplete(result: dict[str, Any], payload: dict[str, Any]) -> None:
+        if payload["assessment_source_ids"] == [missing.source_id]:
+            result["resolutions"] = []
+
+    counts = scripted_reviews(model, review_mutator=incomplete)
+    gap = SourceUseReviewer(model, ledger).publication_gap(
+        "Unqualified application [1].", "Unknown qualification", "coordinator"
+    )
+    assert gap and gap.status == OutcomeStatus.PARTIAL
+    assert gap.data["source_use_review_unavailable"] is True
+    assert gap.data["incomplete_assessment_source_ids"] == [[missing.source_id]]
+    issues = cast(list[dict[str, Any]], gap.data["source_use_gaps"])
+    assert any(w["citation"] == 2 for issue in issues for w in issue["witnesses"])
+    assert counts == {"inventory": 3, "review": 4}
 
 
 def test_source_inventory_receives_only_its_recorded_anchor_context() -> None:
@@ -751,7 +932,9 @@ def test_source_inventory_receives_only_its_recorded_anchor_context() -> None:
     unrelated = next(p for p in blind if p["inventory_source_id"] == "other-decision")
     assert unrelated["required_evidence_numbers"] == [3]
     assert unrelated["source_links"] == []
-    assessment = next(p for p in payloads if "answer_units" in p)
+    assessment = next(
+        p for p in payloads if p.get("assessment_source_ids") == ["decision"]
+    )
     court_requirements = {
         r["requirement_id"]
         for r in assessment["retained_requirements"]
@@ -766,12 +949,12 @@ def test_source_inventory_receives_only_its_recorded_anchor_context() -> None:
         r["answer_unit_ids"] == [assessment["answer_units"][0]["unit_id"]]
         for r in candidates
     )
-    assert counts == {"inventory": 3, "review": 1}
+    assert counts == {"inventory": 3, "review": 3}
     assert (
         reviewer.publication_gap("Changed result [1, 2, 3].", "facts", "coordinator")
         is None
     )
-    assert counts == {"inventory": 3, "review": 2}
+    assert counts == {"inventory": 3, "review": 6}
 
 
 def test_linked_anchor_cannot_replace_target_inventory_witness() -> None:
@@ -1202,7 +1385,7 @@ def test_runtime_repairs_a_witnessed_omission_without_repeating_source_acquisiti
 
     selected.invoke.side_effect = script
     runtime.run_asv3_loop(**kwargs)
-    assert counts == {"native": 3, "inventory": 2, "review": 2}
+    assert counts == {"native": 3, "inventory": 2, "review": 4}
     assert page.call_count == 2
     assert (
         kwargs["state_container"].answer_tokens
