@@ -274,12 +274,14 @@ def _examined_answer_omission(
     *,
     delivered: set[int] | None,
     include_repair_text: bool = False,
+    include_exclusions: bool = False,
 ) -> dict[str, JsonValue] | None:
     """Retain copied passages and their provenance, without assessing legal entailment."""
     review = record.review
     if (
         review is None
-        or review.status != "examined"
+        or review.status
+        not in ({"examined", "not_material"} if include_exclusions else {"examined"})
         or review.source_role != "operative_text"
     ):
         return None
@@ -319,6 +321,7 @@ def _examined_answer_omission(
     return {
         "lead_id": record.lead_id,
         "source_id": record.source_id,
+        **({"assessment_status": review.status} if include_exclusions else {}),
         "missing_answer_passages": omitted,
         "required_inline_citations": sorted(numbers),
         "undelivered_evidence_numbers": undelivered,
@@ -1061,7 +1064,11 @@ class LegalSourceReviews:
                     )
                 elif retain_examined:
                     omission = _examined_answer_omission(
-                        record, answer, delivered=delivered, include_repair_text=tuned
+                        record,
+                        answer,
+                        delivered=delivered,
+                        include_repair_text=tuned,
+                        include_exclusions=tuned,
                     )
                     if omission is not None:
                         unretained.append(omission)
@@ -1126,6 +1133,7 @@ class LegalSourceReviews:
         undisclosed: list[JsonValue] = []
         unretained: list[JsonValue] = []
         retain_examined = operative_review_retention_enabled(context)
+        tuned = context.services.get("asv3_workflow_variant") == ASV3_TUNED_VARIANT
         with self._lock:
             for (owner, lead), record in self._records.items():
                 if owner != "coordinator":
@@ -1136,7 +1144,7 @@ class LegalSourceReviews:
                 ):
                     if retain_examined:
                         omission = _examined_answer_omission(
-                            record, answer, delivered=None
+                            record, answer, delivered=None, include_exclusions=tuned
                         )
                         if omission is not None:
                             unretained.append(omission)
@@ -1169,7 +1177,10 @@ class LegalSourceReviews:
                         for child_owner, child_record in child_records.items()
                         if (
                             omission := _examined_answer_omission(
-                                child_record, answer, delivered=None
+                                child_record,
+                                answer,
+                                delivered=None,
+                                include_exclusions=tuned,
                             )
                         )
                         is not None

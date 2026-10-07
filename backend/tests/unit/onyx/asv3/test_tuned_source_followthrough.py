@@ -128,11 +128,14 @@ def test_a_title_cannot_be_used_to_close_or_exclude_the_candidate(status: str) -
     assert reviews.view(context, ledger, {1})["pending_lead_ids"]
 
 
-def test_examined_effect_and_limitations_need_their_own_substantive_citations() -> None:
+@pytest.mark.parametrize("status", ["examined", "not_material"])
+def test_operative_effect_and_exclusion_need_their_own_substantive_citations(
+    status: str,
+) -> None:
     context, ledger, reviews = tuned_context()
     seen(context, ledger, reviews)
     deliver(ledger, "answer-call", [1, 2])
-    reviews.apply([review()], "answer-call", context, ledger)
+    reviews.apply([review(status=status)], "answer-call", context, ledger)
     for answer in ("Ordinary rule [1].", "Ordinary rule [1].\n\n## Decision [2]"):
         gap = reviews.publication_gap(answer, "answer-call", context, ledger)
         assert gap is not None
@@ -141,7 +144,8 @@ def test_examined_effect_and_limitations_need_their_own_substantive_citations() 
         )
         assert missing[0]["missing_answer_passages"] == ["effect", "limitations"]
         assert missing[0]["unbound_evidence_numbers"] == [2]
-    assessment = review()
+        assert missing[0]["assessment_status"] == status
+    assessment = review(status=status)
     retained = f"{assessment['effect']} {assessment['limitations']}"
     assert (
         reviews.publication_gap(
@@ -153,6 +157,22 @@ def test_examined_effect_and_limitations_need_their_own_substantive_citations() 
         is None
     )
     assert reviews.publication_gap("Merhaba!", "answer-call", context, ledger) is None
+
+
+def test_plain_experimental_exclusion_retention_remains_unchanged() -> None:
+    context, ledger, reviews = tuned_context()
+    context.services.update(
+        research_profile="experimental",
+        asv3_workflow_variant="standard",
+        experimental_parallel=True,
+    )
+    seen(context, ledger, reviews)
+    deliver(ledger, "answer-call", [1, 2])
+    reviews.apply([review(status="not_material")], "answer-call", context, ledger)
+    assert (
+        reviews.publication_gap("Ordinary rule [1].", "answer-call", context, ledger)
+        is None
+    )
 
 
 @pytest.mark.parametrize("retained", [False, True])
@@ -275,8 +295,11 @@ def test_runtime_tuned_statute_binding_does_not_consume_a_neighboring_circular_n
 
 
 @pytest.mark.parametrize("omit_examined_source", [False, True])
+@pytest.mark.parametrize("assessment_status", ["examined", "not_material"])
 def test_runtime_rejects_premature_answer_then_reuses_read_originals(
-    monkeypatch: pytest.MonkeyPatch, omit_examined_source: bool
+    monkeypatch: pytest.MonkeyPatch,
+    omit_examined_source: bool,
+    assessment_status: str,
 ) -> None:
     kwargs, broker, selected, checkpoints, _queue = setup_run(monkeypatch)
     kwargs.pop("test_language")
@@ -351,7 +374,7 @@ def test_runtime_rejects_premature_answer_then_reuses_read_originals(
             )
             assessment = {
                 "lead_id": state[0]["lead_id"],
-                "status": "examined",
+                "status": assessment_status,
                 "source_role": "operative_text",
                 "effect": "The judgment has restricted scope.",
                 "limitations": "Approval is decisive.",

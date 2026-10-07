@@ -6,7 +6,7 @@ from onyx.prompts.asv3.coordinator_reference import (
 )
 from onyx.prompts.asv3.research import LEGAL_DEPARTMENT_RESEARCH
 
-TUNED_PROMPT_VERSION = "asv3-tuned-2026-10-07.14"
+TUNED_PROMPT_VERSION = "asv3-tuned-2026-10-07.15"
 
 _SOURCE_ACTIONS = """For a known instrument and article, read_provision uses the supplied source_id;
 otherwise read_named_provision resolves its own title and reads that article in one action.
@@ -45,23 +45,24 @@ TUNED_RESEARCHER_REFERENCE_PROMPT = (
     _focused_reference(RESEARCHER_REFERENCE_PROMPT) + _METADATA_DELTAS
 )
 
-_RELATED_SOURCE_POLICY = """Before a definitive conclusion, examine concrete related-source leads changing the rule's
-validity, scope or application. The user need not know the dispute. Read the candidate's
-operative holding, connected qualifications and dates. Distinguish these from party arguments,
-requested relief and preliminary scope; separate administrative practice from a sourced challenge.
-Use the SAME answer action's _related_source_reviews to assess those leads: examined for an
-operative effect, not_material for a reasoned exclusion based on that candidate's own text,
-or unresolved for a precise missing interaction. source_role describes the selected original,
-not whether it favors this case: a disposition remains operative_text even if not_material.
+_RELATED_SOURCE_POLICY = """Before a definitive conclusion, examine concrete related leads changing validity, scope
+or application. Read their holding, qualifications and dates; distinguish party arguments
+and preliminary scope.
+Assess bound leads in the SAME answer action's _related_source_reviews: examined for
+an operative effect, not_material for a sourced exclusion, unresolved for a precise gap.
+source_role describes the original, not favorability; an excluded disposition is operative_text.
 Copy lead_id and ranges from navigation and original_evidence_ranges.
-Apply each material examined effect and its limitations to every affected conclusion,
-including summaries, with its own adjacent original citations. Copy effect and limitations
-into the review as exact sentences from those answer blocks. Preserve other blocks when
-repairing metadata. An unread title does not establish exclusion. If its
-operative text cannot be obtained, use submit_partial_answer and disclose that exact gap
-in a separate uncited paragraph; do not still assert the unresolved effect as certain.
-Reuse delivered originals; avoid universal court sweeps, whole-source rereading and deferring
-a material check to an optional follow-up.
+State the operative effect and applicability limits with adjacent originals in affected
+answer blocks, including a concise explanation for exclusions. Copy those exact sentences
+into effect/limitations; summaries must retain relevant qualifications. A surviving general
+duty does not establish authority for a disputed sanction or procedural step. Test the exact
+violated duty, governing consequence, stage and dates against each original; do not substitute
+a related obligation or assume unknown facts. Separate settled effects from supported challenges.
+An unread title cannot establish exclusion. If operative text or its decisive interaction
+remains unavailable, use submit_partial_answer and disclose that precise gap in its own
+uncited paragraph; do not assert that effect as certain.
+Reuse delivered originals, repair affected blocks and avoid whole-source rereads, universal
+sweeps or deferring a material check to a follow-up.
 """
 
 _before, _separator, _remaining = LEGAL_DEPARTMENT_RESEARCH.partition(
@@ -75,14 +76,14 @@ if not _separator or not _end:
         "The shared legal instruction has no related-source policy section"
     )
 
-_FAVORABLE_APPLICATION = """Assess the strongest original-supported favorable ground and counterargument; distinguish
-ordinary application, an arguable challenge and an established exception. For relief,
-remedies or alternatives, availability differs from prior invocation. Non-invocation or
-an unknown eligibility fact does not exclude the option: explain its relevant conditional
-branch, decisive fact and changed consequence beside each affected outcome. Exclusion needs
-supplied facts and the original's actual scope. Never assume fulfillment, a factual bar or
-success. Keep these conditions and uncertainty in summaries, tables and detail with adjacent
-originals. Explain the specific disputed ground and next step.
+_FAVORABLE_APPLICATION = """Assess original-supported favorable grounds and counterarguments; distinguish ordinary
+application, an arguable challenge and an established exception. Availability of relief
+differs from prior invocation. Apply it to the CURRENT requested outcome, conditionally
+when eligibility is unknown; neither another transaction nor a follow-up replaces this
+application. State the decisive fact, changed consequence and scope beside the outcome.
+Non-invocation or an unknown fact does not prove exclusion; use supplied facts and operative
+scope. Never assume fulfillment or success. Keep qualifications in summaries, tables
+and detail with adjacent originals. Explain the disputed ground and next step.
 """
 
 _old_application, _application_end, _rest = _after.partition(
