@@ -170,6 +170,9 @@ def related_provision_originals(
 
 def delivered_provision_navigation(
     complete_originals: Sequence[dict[str, JsonValue]],
+    *,
+    draft_units: Sequence[dict[str, JsonValue]] = (),
+    related_reviews: Sequence[dict[str, JsonValue]] = (),
 ) -> list[dict[str, JsonValue]]:
     """Index fitted full chunks by their own structural provision and version.
 
@@ -184,7 +187,7 @@ def delivered_provision_navigation(
             numbers = grouped.setdefault(identity, [])
             if citation not in numbers:
                 numbers.append(citation)
-    return [
+    navigation: list[dict[str, JsonValue]] = [
         {
             "source_id": identity.source_id,
             "enclosing_scope": list(identity.enclosing_scope),
@@ -195,3 +198,57 @@ def delivered_provision_navigation(
         }
         for identity, numbers in grouped.items()
     ]
+    if not draft_units:
+        return navigation
+
+    from onyx.asv3.assertions import presentation_block
+    from onyx.asv3.citation_numbers import extract_citation_numbers
+
+    units: list[tuple[str, set[int]]] = []
+    for unit in draft_units:
+        unit_id, text = unit.get("unit_id"), unit.get("text")
+        if not isinstance(unit_id, str) or not isinstance(text, str):
+            continue
+        numbers = {
+            number
+            for line in text.splitlines()
+            if not presentation_block(line)
+            for number in extract_citation_numbers(line)
+        }
+        if numbers:
+            units.append((unit_id, numbers))
+    cited = {number for _, numbers in units for number in numbers}
+    for row, (identity, numbers) in zip(navigation, grouped.items(), strict=True):
+        family = set(numbers)
+        used = family & cited
+        if not used:
+            continue
+        application: dict[str, JsonValue] = {
+            "cited_original_citations": sorted(used),
+            "uncited_full_original_citations": sorted(family - cited),
+            "answer_unit_ids": [
+                unit_id
+                for unit_id, citations in units
+                if family.intersection(citations)
+            ],
+        }
+        related_leads: list[str] = []
+        for review in related_reviews:
+            anchors, lead_id = (
+                review.get("anchor_evidence_numbers"),
+                review.get("lead_id"),
+            )
+            if (
+                review.get("anchor_source_id") == identity.source_id
+                and review.get("article_no") == identity.article_no
+                and review.get("qualifier") == identity.qualifier
+                and isinstance(anchors, list)
+                and any(type(number) is int and number in family for number in anchors)
+                and isinstance(lead_id, str)
+                and lead_id
+            ):
+                related_leads.append(lead_id)
+        if related_leads:
+            application["related_lead_ids"] = list(dict.fromkeys(related_leads))
+        row["draft_application"] = application
+    return navigation

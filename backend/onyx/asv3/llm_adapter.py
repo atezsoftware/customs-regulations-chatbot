@@ -3202,8 +3202,35 @@ class ResearchModel:
                     current["source_contained_references"] = reference_catalogue
                     has_reference_catalogue = True
             if native_original_cache:
+                tuned_application = (
+                    self.context.services.get("asv3_workflow_variant")
+                    == ASV3_TUNED_VARIANT
+                )
+                review_rows = source_review_state.get("reviews")
+                owned_draft = current.get("draft_to_repair")
+                draft_units = (
+                    owned_draft.get("units") if isinstance(owned_draft, dict) else None
+                )
                 provision_navigation = delivered_provision_navigation(
-                    complete_originals
+                    complete_originals,
+                    draft_units=[
+                        row
+                        for row in (
+                            draft_units if isinstance(draft_units, list) else []
+                        )
+                        if isinstance(row, dict)
+                    ]
+                    if tuned_application
+                    else (),
+                    related_reviews=[
+                        row
+                        for row in (
+                            review_rows if isinstance(review_rows, list) else []
+                        )
+                        if isinstance(row, dict)
+                    ]
+                    if tuned_application
+                    else (),
                 )
                 if provision_navigation:
                     current["delivered_provisions"] = provision_navigation
@@ -3309,7 +3336,19 @@ class ResearchModel:
                     self.context.services.get("asv3_workflow_variant")
                     == ASV3_TUNED_VARIANT
                 ):
-                    current["evidence_note"] = str(current["evidence_note"]) + (
+                    current["evidence_note"] = (
+                        "Evaluate the actual requested outcomes against the delivered originals. "
+                        "delivered_provisions.draft_application links each cited provision to "
+                        "ALL citing answer units and its delivered uncited clauses. Examine those "
+                        "clauses for material conditions, exceptions, alternatives and later steps; "
+                        "uncited does not mean relevant or mandatory. Related leads can change the "
+                        "specific application, including a sourced exclusion. Reassess every linked "
+                        "summary, detail and table unit against the same scope, qualifications and "
+                        "unknown facts; adding a separate discussion does not correct an unchanged "
+                        "categorical application. Use retained edits for affected units and preserve "
+                        "independently supported detail. These links are navigation, not support "
+                        "or legal approval. Research genuinely missing operative text; do not reread "
+                        "delivered clauses just because the draft has not used them."
                         " Retained tool metadata_ref addresses the corresponding current "
                         "original_evidence citation and hash. Its metadata is supplied once "
                         "there; full provenance remains in the evidence ledger."
