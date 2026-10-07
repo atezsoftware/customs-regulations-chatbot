@@ -57,6 +57,7 @@ from onyx.asv3.progress import (
     official_corpus_source_name,
     report_source_deliveries,
 )
+from onyx.asv3.publication_gaps import combine_source_publication_gaps
 from onyx.asv3.question_research import QuestionResearch
 from onyx.asv3.registry import CapabilityRegistry, build_core_specs
 from onyx.asv3.research_state import ResearchState, build_research_specs
@@ -76,7 +77,6 @@ from onyx.asv3.session_research import (
 )
 from onyx.asv3.shared_reads import SharedReads
 from onyx.asv3.source_tools import build_source_specs
-from onyx.asv3.source_use import SourceUseReviewer, combine_source_publication_gaps
 from onyx.asv3.supplemental_tools import (
     ScenarioState,
     build_supplemental_specs,
@@ -1483,17 +1483,6 @@ def run_asv3_loop(
         )
     )
 
-    source_use_reviewer = SourceUseReviewer(
-        ResearchModel(
-            llm,
-            context,
-            user_identity=user_identity,
-            reasoning_effort=reasoning_effort,
-            token_counter=token_counter,
-        ),
-        ledger,
-    )
-
     def source_publication_gap(
         answer: str,
         model_call_id: str | None,
@@ -1555,21 +1544,7 @@ def run_asv3_loop(
                 if not tuned:
                     return review_gap
                 gaps.append(review_gap)
-        combined = combine_source_publication_gaps(gaps)
-        if combined is not None:
-            return combined
-        if run_context is not None and run_context.depth:
-            return None
-        return source_use_reviewer.publication_gap(
-            answer,
-            question,
-            model_call_id,
-            conversation=[
-                {"role": m.message_type.value, "content": m.message}
-                for m in simple_chat_history[-8:]
-                if m.message_type in (MessageType.USER, MessageType.ASSISTANT)
-            ],
-        )
+        return combine_source_publication_gaps(gaps)
 
     def publication_guard(
         answer: str,

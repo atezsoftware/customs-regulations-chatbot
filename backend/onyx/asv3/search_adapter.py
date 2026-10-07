@@ -49,9 +49,9 @@ from onyx.tools.tool_implementations.search.search_tool import SearchTool
 from onyx.tools.tool_runner import run_tool_calls
 
 _TUNED_RETRIEVAL_OVERRIDES = SearchToolRetrievalOverrides(
-    per_lane_num_hits=192,
-    rerank_candidate_limit=192,
-    regulatory_rerank_candidate_limit=192,
+    per_lane_num_hits=256,
+    rerank_candidate_limit=256,
+    regulatory_rerank_candidate_limit=256,
     max_llm_chunks=50,
     preserve_source_diversity=True,
 )

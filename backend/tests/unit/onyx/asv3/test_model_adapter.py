@@ -1100,8 +1100,7 @@ def test_output_policy_cap_does_not_repeat_impossible_identical_capacity_review(
 def test_source_assessment_truncation_cannot_approve_or_repeat_equal_capacity(
     flow: LLMFlow, finish_reason: str
 ) -> None:
-    from onyx.asv3.llm_adapter import StructuredOutputError
-    from onyx.asv3.source_use import SourceUseInventory
+    from onyx.asv3.llm_adapter import SourceRequirementInventory, StructuredOutputError
 
     llm = scripted_model(limit=12000)
     truncated = text_response({"examined_citations": [], "requirements": []})
@@ -1113,7 +1112,7 @@ def test_source_assessment_truncation_cannot_approve_or_repeat_equal_capacity(
             "{}",
             flow,
             max_tokens=3000,
-            response_model_override=SourceUseInventory,
+            response_model_override=SourceRequirementInventory,
         )
     assert llm.invoke.call_count == 1
 

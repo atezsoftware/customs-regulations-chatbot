@@ -37,7 +37,7 @@ def candidate_chunks() -> list[InferenceChunk]:
             semantic_identifier=f"Source {index}",
             title=f"Source {index}",
             boost=1,
-            score=1 - index / 220,
+            score=1 - index / 320,
             hidden=False,
             metadata={},
             match_highlights=[],
@@ -52,16 +52,16 @@ def candidate_chunks() -> list[InferenceChunk]:
             regulatory_chunk_id=f"rc-{index}",
             heading_path=[f"MADDE {index + 1}"],
         )
-        for index in range(220)
+        for index in range(320)
     ]
 
 
 @pytest.mark.parametrize(
     "variant,profile,qualifying,candidate_count,delivered_count",
     [
-        (ASV3_TUNED_VARIANT, "normal", 20, 192, 50),
-        (ASV3_TUNED_VARIANT, "normal", 60, 192, 60),
-        (ASV3_TUNED_VARIANT, "normal", 150, 192, 150),
+        (ASV3_TUNED_VARIANT, "normal", 20, 256, 50),
+        (ASV3_TUNED_VARIANT, "normal", 60, 256, 60),
+        (ASV3_TUNED_VARIANT, "normal", 150, 256, 150),
         (None, "normal", 20, 96, 25),
         (None, "deep", 20, 96, 25),
         (None, "experimental", 20, 96, 25),

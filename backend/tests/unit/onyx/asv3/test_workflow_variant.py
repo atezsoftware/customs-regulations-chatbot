@@ -84,7 +84,6 @@ def test_standard_keeps_historical_checkpoints_but_rejects_tuned() -> None:
         )
 
 
-@pytest.mark.usefixtures("source_use_review_not_under_test")
 def test_tuned_runtime_uses_normal_tools_and_selected_model_everywhere(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

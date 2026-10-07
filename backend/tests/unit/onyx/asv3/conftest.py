@@ -1,4 +1,4 @@
-"""Isolate answer-comparison tests from the separately tested source inventory stage."""
+"""Fixtures for explicit legacy source-condition evaluations."""
 
 from typing import cast
 
@@ -9,16 +9,7 @@ from onyx.asv3 import source_conditions
 from onyx.asv3.condition_memory import SourceConditionMemory
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.llm_adapter import ResearchModel
-from onyx.asv3.source_use import SourceUseReviewer
 from onyx.tracing.flows import LLMFlow
-
-
-@pytest.fixture
-def source_use_review_not_under_test(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Acquisition/metadata contract tests isolate the separately tested semantic review."""
-    monkeypatch.setattr(
-        SourceUseReviewer, "publication_gap", lambda *_args, **_kwargs: None
-    )
 
 
 @pytest.fixture

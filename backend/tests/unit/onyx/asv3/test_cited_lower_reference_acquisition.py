@@ -237,7 +237,6 @@ def test_host_reads_known_provision_without_an_extra_generation_or_review() -> N
 
 
 @pytest.mark.parametrize("variant", [None, ASV3_TUNED_VARIANT])
-@pytest.mark.usefixtures("source_use_review_not_under_test")
 def test_runtime_closes_implicit_referral_before_publication_and_preserves_normal(
     monkeypatch: pytest.MonkeyPatch,
     variant: str | None,

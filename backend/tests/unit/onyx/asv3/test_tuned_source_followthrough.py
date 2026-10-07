@@ -225,7 +225,7 @@ def test_unavailable_original_needs_its_precise_standalone_gap() -> None:
     )
 
 
-def test_tuned_policy_replaces_one_section_without_case_specific_direction() -> None:
+def test_tuned_policy_replaces_sections_without_case_specific_direction() -> None:
     context, _, _ = tuned_context()
     instruction = ResearchModel(
         model(), context, lean_native_mode=True
@@ -234,9 +234,11 @@ def test_tuned_policy_replaces_one_section_without_case_specific_direction() -> 
     before, _, rest = LEGAL_DEPARTMENT_RESEARCH.partition(
         "related_source_navigation contains"
     )
-    _, _, after = rest.partition("Assess the strongest source-supported argument")
+    _, boundary, after = rest.partition(
+        "If authoritative decisions or governing text are unavailable"
+    )
     assert TUNED_LEGAL_DEPARTMENT_RESEARCH.startswith(before)
-    assert TUNED_LEGAL_DEPARTMENT_RESEARCH.endswith(after)
+    assert TUNED_LEGAL_DEPARTMENT_RESEARCH.endswith(boundary + after)
     assert instruction.count("Act as a careful legal department") == 1
     assert "_related_source_reviews" in TUNED_LEGAL_DEPARTMENT_RESEARCH
     assert len(TUNED_LEGAL_DEPARTMENT_RESEARCH) < len(LEGAL_DEPARTMENT_RESEARCH) + 400
@@ -245,7 +247,6 @@ def test_tuned_policy_replaces_one_section_without_case_specific_direction() -> 
         assert forbidden not in policy
 
 
-@pytest.mark.usefixtures("source_use_review_not_under_test")
 def test_runtime_tuned_statute_binding_does_not_consume_a_neighboring_circular_number(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -274,7 +275,6 @@ def test_runtime_tuned_statute_binding_does_not_consume_a_neighboring_circular_n
 
 
 @pytest.mark.parametrize("omit_examined_source", [False, True])
-@pytest.mark.usefixtures("source_use_review_not_under_test")
 def test_runtime_rejects_premature_answer_then_reuses_read_originals(
     monkeypatch: pytest.MonkeyPatch, omit_examined_source: bool
 ) -> None:

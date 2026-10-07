@@ -6,7 +6,7 @@ from onyx.prompts.asv3.coordinator_reference import (
 )
 from onyx.prompts.asv3.research import LEGAL_DEPARTMENT_RESEARCH
 
-TUNED_PROMPT_VERSION = "asv3-tuned-2026-10-07.13"
+TUNED_PROMPT_VERSION = "asv3-tuned-2026-10-07.14"
 
 _SOURCE_ACTIONS = """For a known instrument and article, read_provision uses the supplied source_id;
 otherwise read_named_provision resolves its own title and reads that article in one action.
@@ -75,9 +75,24 @@ if not _separator or not _end:
         "The shared legal instruction has no related-source policy section"
     )
 
+_FAVORABLE_APPLICATION = """Assess the strongest original-supported favorable ground and counterargument; distinguish
+ordinary application, an arguable challenge and an established exception. For relief,
+remedies or alternatives, availability differs from prior invocation. Non-invocation or
+an unknown eligibility fact does not exclude the option: explain its relevant conditional
+branch, decisive fact and changed consequence beside each affected outcome. Exclusion needs
+supplied facts and the original's actual scope. Never assume fulfillment, a factual bar or
+success. Keep these conditions and uncertainty in summaries, tables and detail with adjacent
+originals. Explain the specific disputed ground and next step.
+"""
+
+_old_application, _application_end, _rest = _after.partition(
+    "If authoritative decisions or governing text are unavailable"
+)
+if not _application_end:
+    raise ValueError(
+        "The shared legal instruction has no application paragraph boundary"
+    )
+
 TUNED_LEGAL_DEPARTMENT_RESEARCH = (
-    _before
-    + _RELATED_SOURCE_POLICY
-    + "Assess the strongest source-supported argument"
-    + _after
+    _before + _RELATED_SOURCE_POLICY + _FAVORABLE_APPLICATION + _application_end + _rest
 )
