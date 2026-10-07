@@ -30,7 +30,15 @@ def coordinator_delivery(
 
 
 def setup_review() -> tuple[EvidenceLedger, RunContext, ResearchModel]:
-    ledger, context = original_ledger()
+    originals, context = original_ledger()
+    ledger = EvidenceLedger()
+    context.services["evidence"] = ledger
+    for number in originals.citation_numbers():
+        original = originals.get(number)
+        assert original is not None and original.search_doc is not None
+        original.source_id = "shared-source"
+        original.search_doc.document_id = "shared-source"
+        ledger.add([original], context)
     context.services.update(
         asv3_workflow_variant="asv3_tuned",
         research_profile="normal",
@@ -76,6 +84,10 @@ def resolutions_for(payload: dict[str, Any]) -> list[dict[str, Any]]:
                 "status": "covered" if bound else "omitted",
                 "answer_unit_ids": bound or [units[0]["unit_id"]],
                 "explanation": "" if bound else "The operative detail is absent.",
+                "coverage": [
+                    {"answer_unit_id": unit_id, "witnesses": req["witnesses"]}
+                    for unit_id in bound
+                ],
             }
         )
     return rows
@@ -231,7 +243,6 @@ def test_inventory_failures_cannot_be_cached_or_approve(defect: str) -> None:
         "duplicate_resolution",
         "invented_unit",
         "missing_unit",
-        "borrowed_citation",
         "missing_original",
         "assumed_exclusion",
     ],
@@ -241,7 +252,7 @@ def test_review_cannot_drop_retained_rules_or_borrow_neighboring_citations(
 ) -> None:
     ledger, context, model = setup_review()
 
-    def mutate(result: dict[str, Any], payload: dict[str, Any]) -> None:
+    def mutate(result: dict[str, Any], _payload: dict[str, Any]) -> None:
         row = result["resolutions"][0]
         if defect == "missing_resolution":
             result["resolutions"] = []
@@ -255,8 +266,6 @@ def test_review_cannot_drop_retained_rules_or_borrow_neighboring_citations(
             result["reviewed_answer_unit_ids"].pop()
         elif defect == "missing_original":
             result["examined_citations"].pop()
-        elif defect == "borrowed_citation":
-            row["answer_unit_ids"] = [payload["answer_units"][-1]["unit_id"]]
         else:
             row.update(
                 status="not_applicable",
@@ -342,6 +351,131 @@ def test_failed_review_is_reused_without_approval_and_changed_answers_are_rechec
     assert context.services["last_model_call_id"] == "coordinator"
 
 
+def test_source_partition_keeps_every_original_and_reuses_unchanged_sources() -> None:
+    ledger, context = original_ledger()
+    context.services.update(
+        asv3_workflow_variant=ASV3_TUNED_VARIANT,
+        research_profile="normal",
+        last_model_call_id="coordinator",
+    )
+    coordinator_delivery(ledger, [1, 2, 3])
+    model = ResearchModel(scripted_model(), context)
+    counts = scripted_reviews(model)
+    reviewer = SourceUseReviewer(model, ledger)
+    assert reviewer.publication_gap("Result [1, 2, 3].", "facts", "coordinator") is None
+    assert counts == {"inventory": 3, "review": 1}
+    calls = cast(MagicMock, model.llm).invoke.call_args_list
+    blind = [
+        model_payload(c.kwargs)
+        for c in calls
+        if "answer_units" not in model_payload(c.kwargs)
+    ]
+    assert len(blind) == 3
+    assert {r["citation"] for data in blind for r in data["original_evidence"]} == {
+        1,
+        2,
+        3,
+    }
+    assert all(
+        len({r["source_id"] for r in data["original_evidence"]}) == 1 for data in blind
+    )
+    receipts = [
+        next(iter(child._inventories.values()))[0]
+        for child in reviewer._source_reviewers.values()
+    ]
+    assert len(set(receipts)) == 3
+    assert all(len(ledger.completely_delivered(receipt)) == 1 for receipt in receipts)
+    coordinator_delivery(ledger, [1, 2], "next")
+    assert reviewer.publication_gap("Result [1, 2].", "facts", "next") is None
+    assert counts == {"inventory": 3, "review": 2}
+    assert context.services["last_model_call_id"] == "coordinator"
+
+
+def test_coverage_can_use_the_resolved_governing_original() -> None:
+    ledger, _context, model = setup_review()
+
+    def mutate(result: dict[str, Any], payload: dict[str, Any]) -> None:
+        unit = payload["answer_units"][0]
+        governing = payload["original_evidence"][1]
+        result["resolutions"][0].update(
+            status="covered",
+            answer_unit_ids=[unit["unit_id"]],
+            coverage=[
+                {
+                    "answer_unit_id": unit["unit_id"],
+                    "witnesses": [
+                        {
+                            "citation": governing["citation"],
+                            "witness_id": governing["witness_spans"][0]["witness_id"],
+                        }
+                    ],
+                }
+            ],
+        )
+
+    counts = scripted_reviews(model, review_mutator=mutate)
+    assert (
+        SourceUseReviewer(model, ledger).publication_gap(
+            "Governing result [2].", "facts", "coordinator"
+        )
+        is None
+    )
+    assert counts == {"inventory": 1, "review": 1}
+
+
+def test_missing_inline_support_is_a_targeted_gap_without_paid_format_retry() -> None:
+    ledger, _context, model = setup_review()
+
+    def mutate(result: dict[str, Any], payload: dict[str, Any]) -> None:
+        unit = payload["answer_units"][-1]
+        result["resolutions"][0].update(
+            answer_unit_ids=[unit["unit_id"]],
+            coverage=[
+                {
+                    "answer_unit_id": unit["unit_id"],
+                    "witnesses": payload["retained_requirements"][0]["witnesses"],
+                }
+            ],
+        )
+
+    counts = scripted_reviews(model, review_mutator=mutate)
+    reviewer = SourceUseReviewer(model, ledger)
+    answer = "Rule [1].\n\nApplication [2]."
+    gap = reviewer.publication_gap(answer, "facts", "coordinator")
+    assert gap and gap.status == OutcomeStatus.PARTIAL
+    issue = SourceUseIssue.model_validate(
+        cast(list[Any], gap.data["source_use_gaps"])[0]
+    )
+    assert issue.kind == "unsupported_claim" and issue.witnesses[0].citation == 1
+    assert "[1]" in issue.detail
+    assert counts == {"inventory": 1, "review": 1}
+    assert reviewer.publication_gap(answer, "facts", "coordinator") == gap
+    assert counts == {"inventory": 1, "review": 1}
+
+
+@pytest.mark.parametrize(
+    "defect", ["unknown_witness", "missing_binding", "duplicate_binding"]
+)
+def test_coverage_bindings_cannot_forge_or_drop_unit_support(defect: str) -> None:
+    ledger, _context, model = setup_review()
+
+    def mutate(result: dict[str, Any], _payload: dict[str, Any]) -> None:
+        coverage = result["resolutions"][0]["coverage"]
+        if defect == "unknown_witness":
+            coverage[0]["witnesses"][0]["witness_id"] = "forged"
+        elif defect == "missing_binding":
+            coverage.clear()
+        else:
+            coverage.append(coverage[0])
+
+    counts = scripted_reviews(model, review_mutator=mutate)
+    gap = SourceUseReviewer(model, ledger).publication_gap(
+        "Result [1].", "facts", "coordinator"
+    )
+    assert gap and gap.status == OutcomeStatus.UNAVAILABLE
+    assert counts == {"inventory": 1, "review": 2}
+
+
 def test_shared_metadata_and_full_text_survive_both_independent_phases() -> None:
     ledger, context, model = setup_review()
     item = ledger.get(2)
@@ -375,9 +509,11 @@ def test_shared_metadata_and_full_text_survive_both_independent_phases() -> None
             original = ledger.get(citation)
             assert original is not None
             assert original.text == record["text"]
-        metadata = next(row for row in records if row["citation"] == 4)["metadata"]
-        assert isinstance(metadata, dict)
-        assert metadata["legal_dates"] == {"effective_start": "2025-01-01"}
+        for record in records:
+            if record["citation"] == 4:
+                metadata = record["metadata"]
+                assert isinstance(metadata, dict)
+                assert metadata["legal_dates"] == {"effective_start": "2025-01-01"}
 
 
 @pytest.mark.parametrize(
@@ -521,7 +657,7 @@ def test_runtime_repairs_a_witnessed_omission_without_repeating_source_acquisiti
 
     selected.invoke.side_effect = script
     runtime.run_asv3_loop(**kwargs)
-    assert counts == {"native": 3, "inventory": 1, "review": 2}
+    assert counts == {"native": 3, "inventory": 2, "review": 2}
     assert page.call_count == 2
     assert (
         kwargs["state_container"].answer_tokens

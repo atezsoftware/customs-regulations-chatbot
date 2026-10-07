@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import contextvars
 import hashlib
 import json
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from typing import Annotated, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
@@ -58,6 +60,12 @@ class SourceUseInventory(BaseModel):
     requirements: list[SourceUseRequirement]
 
 
+class SourceUseCoverage(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    answer_unit_id: str
+    witnesses: list[AssertionWitness] = Field(min_length=1)
+
+
 class SourceUseResolution(BaseModel):
     model_config = ConfigDict(extra="forbid")
     requirement_id: str
@@ -65,6 +73,7 @@ class SourceUseResolution(BaseModel):
     answer_unit_ids: list[str]
     explanation: str = ""
     scenario_quote: str = ""
+    coverage: list[SourceUseCoverage] = Field(default_factory=list)
 
 
 class SourceUseReview(BaseModel):
@@ -97,6 +106,66 @@ class SourceUseReviewer:
         self._inventories: dict[str, tuple[str, SourceUseInventory]] = {}
         self._cache: dict[str, tuple[str, SourceUseReview]] = {}
         self._failures: dict[tuple[LLMFlow, str], tuple[str, str]] = {}
+        self._source_reviewers: dict[str, SourceUseReviewer] = {}
+
+    def _source_inventories(
+        self, payload: dict[str, JsonValue], numbers: set[int]
+    ) -> SourceUseInventory:
+        records = cast(list[dict[str, JsonValue]], payload["original_evidence"])
+        groups: dict[str, list[dict[str, JsonValue]]] = {}
+        for row in records:
+            groups.setdefault(str(row["source_id"]), []).append(row)
+        if len(groups) == 1:
+            return self._complete_inventory(payload, numbers)
+        shared = cast(dict[str, JsonValue], payload["original_source_metadata"])
+        jobs: list[tuple[SourceUseReviewer, dict[str, JsonValue], set[int]]] = []
+        for source, rows in groups.items():
+            reviewer = self._source_reviewers.get(source)
+            if reviewer is None:
+                child = self.model.context.child()
+                reviewer = SourceUseReviewer(
+                    ResearchModel(
+                        self.model.llm,
+                        child,
+                        user_identity=self.model.user_identity,
+                        reasoning_effort=self.model.reasoning_effort,
+                        token_counter=self.model.token_counter,
+                        research_llm=self.model.research_llm,
+                    ),
+                    self.ledger,
+                )
+                self._source_reviewers[source] = reviewer
+            selected = {int(cast(int, row["citation"])) for row in rows}
+            scoped = {
+                **payload,
+                "original_evidence": cast(list[JsonValue], rows),
+                "original_source_metadata": {source: shared[source]}
+                if source in shared
+                else {},
+                "source_groups": {source: sorted(selected)},
+                "required_evidence_numbers": sorted(selected),
+            }
+            jobs.append((reviewer, scoped, selected))
+        inventories: list[SourceUseInventory] = []
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = [
+                executor.submit(
+                    contextvars.copy_context().run,
+                    reviewer._complete_inventory,
+                    scoped,
+                    selected,
+                )
+                for reviewer, scoped, selected in jobs
+            ]
+            for future in futures:
+                inventories.append(cast(SourceUseInventory, future.result()))
+        examined = [n for item in inventories for n in item.examined_citations]
+        if set(examined) != numbers or len(examined) != len(numbers):
+            raise ValueError("Source inventories must cover each exact original once")
+        return SourceUseInventory(
+            examined_citations=sorted(examined),
+            requirements=[r for item in inventories for r in item.requirements],
+        )
 
     def _receipt_matches(self, call_id: str, flow: LLMFlow, numbers: set[int]) -> bool:
         return (
@@ -251,7 +320,7 @@ class SourceUseReviewer:
         )
         previous_call = context.services.get("last_model_call_id")
         try:
-            inventory = self._complete_inventory(blind_payload, numbers)
+            inventory = self._source_inventories(blind_payload, numbers)
             return self._assess_answer(answer, blind_payload, inventory, numbers)
         except StructuredOutputError:
             return ToolOutcome(
@@ -351,22 +420,20 @@ class SourceUseReviewer:
                             f"Resolution {row.requirement_id} needs affected answer-unit IDs"
                         )
                     if row.status == "covered":
-                        required = {
-                            w.citation
-                            for w in requirements[row.requirement_id].witnesses
-                        }
-                        missing = {
-                            unit_id: sorted(
-                                required - set(units_by_id[unit_id]["evidence_numbers"])
-                            )
-                            for unit_id in row.answer_unit_ids
-                        }
-                        missing = {
-                            key: value for key, value in missing.items() if value
-                        }
-                        if missing:
+                        covered_ids = [b.answer_unit_id for b in row.coverage]
+                        if set(covered_ids) != set(row.answer_unit_ids) or len(
+                            covered_ids
+                        ) != len(row.answer_unit_ids):
                             raise ValueError(
-                                f"Resolution {row.requirement_id} is not covered: operative inline citations missing from units {missing}"
+                                f"Resolution {row.requirement_id} needs one operative coverage binding per affected unit"
+                            )
+                        if any(
+                            not assertion_witness_valid(witness, originals)
+                            for binding in row.coverage
+                            for witness in binding.witnesses
+                        ):
+                            raise ValueError(
+                                "Coverage needs actual delivered witnesses"
                             )
                     elif not row.explanation.strip():
                         raise ValueError(
@@ -401,6 +468,26 @@ class SourceUseReviewer:
             self._cache[identity] = (call_id, review)
         issues = [*review.issues]
         for resolution in review.resolutions:
+            if resolution.status == "covered":
+                units_by_id = {unit["unit_id"]: unit for unit in units}
+                for binding in resolution.coverage:
+                    missing = {w.citation for w in binding.witnesses} - set(
+                        units_by_id[binding.answer_unit_id]["evidence_numbers"]
+                    )
+                    if missing:
+                        requirement = requirements[resolution.requirement_id]
+                        issues.append(
+                            SourceUseIssue(
+                                kind="unsupported_claim",
+                                answer_unit_ids=[binding.answer_unit_id],
+                                witnesses=binding.witnesses,
+                                detail=requirement.detail
+                                + " Operative inline support is absent: "
+                                + ", ".join(f"[{n}]" for n in sorted(missing)),
+                                applicability=requirement.applicability,
+                            )
+                        )
+                continue
             if resolution.status not in {"omitted", "misapplied"}:
                 continue
             requirement = requirements[resolution.requirement_id]
