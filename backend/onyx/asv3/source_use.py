@@ -456,10 +456,33 @@ class SourceUseReviewer:
             {"requirement_id": identity, **item.model_dump(mode="json")}
             for identity, item in requirements.items()
         ]
+        application_candidates: list[dict[str, JsonValue]] = []
+        for link in cast(list[dict[str, JsonValue]], blind_payload["source_links"]):
+            anchors = cast(list[JsonValue], link["anchor_evidence_numbers"])
+            affected = [
+                unit["unit_id"]
+                for unit in units
+                if any(n in anchors for n in unit["evidence_numbers"])
+            ]
+            if not affected:
+                continue
+            for requirement_id, requirement in requirements.items():
+                if any(
+                    (item := self.ledger.get(witness.citation)) is not None
+                    and item.source_id == link["source_id"]
+                    for witness in requirement.witnesses
+                ):
+                    application_candidates.append(
+                        {
+                            "requirement_id": requirement_id,
+                            "answer_unit_ids": affected,
+                        }
+                    )
         # Stable original/fact prefix permits provider cache reuse after draft-only edits.
         payload = {
             **blind_payload,
             "retained_requirements": retained,
+            "related_application_candidates": application_candidates,
             "answer_units": units,
         }
         data = json.dumps(payload, ensure_ascii=False)

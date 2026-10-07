@@ -624,6 +624,18 @@ def test_source_inventory_receives_only_its_recorded_anchor_context() -> None:
     unrelated = next(p for p in blind if p["inventory_source_id"] == "other-decision")
     assert unrelated["required_evidence_numbers"] == [3]
     assert unrelated["source_links"] == []
+    assessment = next(p for p in payloads if "answer_units" in p)
+    court_requirements = {
+        r["requirement_id"]
+        for r in assessment["retained_requirements"]
+        if any(w["citation"] == 2 for w in r["witnesses"])
+    }
+    candidates = assessment["related_application_candidates"]
+    assert {r["requirement_id"] for r in candidates} == court_requirements
+    assert all(
+        r["answer_unit_ids"] == [assessment["answer_units"][0]["unit_id"]]
+        for r in candidates
+    )
     assert counts == {"inventory": 3, "review": 1}
     assert (
         reviewer.publication_gap("Changed result [1, 2, 3].", "facts", "coordinator")
