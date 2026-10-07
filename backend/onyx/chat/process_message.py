@@ -719,12 +719,16 @@ def _global_regulatory_search_filters(setup: ChatTurnSetup) -> BaseFilters | Non
     atez_search_v3 = (
         getattr(setup.new_msg_req, "atez_search_v3", False) is True
     ) or _uses_deep_asv3(setup)
+    legal_composite = getattr(setup.new_msg_req, "legal_composite", False) is True
     regulatory_search_enabled = (
-        setup.new_msg_req.atez_search or atez_search_v2 or atez_search_v3
+        setup.new_msg_req.atez_search
+        or atez_search_v2
+        or atez_search_v3
+        or legal_composite
     )
     source_question = not _is_social_only_message(setup.new_msg_req.message)
     native_labels = (
-        atez_search_v3
+        (atez_search_v3 or legal_composite)
         and source_question
         and not (
             filters is not None
@@ -890,6 +894,7 @@ def build_chat_turn(
             "atez_search_v2": new_msg_req.atez_search_v2,
             "atez_search_v2_labels": new_msg_req.atez_search_v2_labels,
             "atez_search_v3": new_msg_req.atez_search_v3,
+            **({"legal_composite": True} if new_msg_req.legal_composite else {}),
             "asv3_research_profile": new_msg_req.asv3_research_profile
             if new_msg_req.atez_search_v3
             else None,
@@ -1579,7 +1584,66 @@ def _run_models(
                 # Per-thread copy: run_llm_loop mutates simple_chat_history in-place.
                 # Deep Research receives the same internal-only, global regulatory
                 # SearchTool as the standard loop.
-                if setup.new_msg_req.atez_search_v3 or _uses_deep_asv3(setup):
+                if getattr(setup.new_msg_req, "legal_composite", False) is True:
+                    from onyx.legal_composite.runtime import run_legal_composite_loop
+
+                    if setup.persona.id != DEFAULT_PERSONA_ID:
+                        raise ValueError(
+                            "Legal Composite requires the default assistant"
+                        )
+                    if setup.search_params.project_id_filter is not None:
+                        raise ValueError(
+                            "Legal Composite is unavailable inside a project"
+                        )
+                    try:
+                        research_llm = get_llm_for_persona(
+                            persona=setup.persona,
+                            user=user,
+                            llm_override=LLMOverride(
+                                model_provider_type="vertex_ai",
+                                model_version="gemini-3.5-flash-lite",
+                            ),
+                        )
+                    except OnyxError as error:
+                        if error.error_code is not OnyxErrorCode.INVALID_INPUT:
+                            raise
+                        raise OnyxError(
+                            OnyxErrorCode.INVALID_INPUT,
+                            "Legal Composite requires access to the configured "
+                            "gemini-3.5-flash-lite research model.",
+                        ) from error
+                    if research_llm.config.api_key != model_llm.config.api_key:
+                        with get_session_with_current_tenant() as cost_db_session:
+                            check_llm_cost_limit_for_provider(
+                                db_session=cost_db_session,
+                                tenant_id=get_current_tenant_id(),
+                                llm_provider_api_key=research_llm.config.api_key,
+                            )
+                    run_legal_composite_loop(
+                        emitter=model_emitter,
+                        state_container=sc,
+                        simple_chat_history=list(setup.simple_chat_history),
+                        tools=model_tools,
+                        llm=model_llm,
+                        research_llm=research_llm,
+                        token_counter=get_llm_token_counter(model_llm),
+                        user=user,
+                        filters=_global_regulatory_search_filters(setup),
+                        document_set_names_override=_benchmark_document_set_names_override(
+                            setup
+                        ),
+                        user_identity=setup.user_identity,
+                        chat_session_id=setup.chat_session.id,
+                        user_message_id=setup.user_message.id,
+                        assistant_message_id=setup.reserved_messages[model_idx].id,
+                        reasoning_effort=setup.reasoning_effort,
+                        include_citations=setup.new_msg_req.include_citations,
+                        cache=setup.cache,
+                        custom_agent_prompt=setup.custom_agent_prompt,
+                        user_memory_context=setup.user_memory_context,
+                        inject_memories_in_prompt=user.use_memories,
+                    )
+                elif setup.new_msg_req.atez_search_v3 or _uses_deep_asv3(setup):
                     from onyx.asv3.runtime import run_asv3_loop
                     from onyx.asv3.workflow_variant import resolve_asv3_workflow
 
@@ -1699,9 +1763,18 @@ def _run_models(
 
             except Exception as e:
                 model_errored[model_idx] = True
-                model_error_info[model_idx] = litellm_exception_to_safe_error(
-                    e, model_llm, fallback_to_error_msg=True
-                )
+                if getattr(
+                    setup.new_msg_req, "legal_composite", False
+                ) is True and isinstance(e, OnyxError):
+                    model_error_info[model_idx] = LLMErrorInfo(
+                        message=e.detail,
+                        error_code=e.error_code.code,
+                        is_retryable=e.status_code >= 500 or e.status_code == 429,
+                    )
+                else:
+                    model_error_info[model_idx] = litellm_exception_to_safe_error(
+                        e, model_llm, fallback_to_error_msg=True
+                    )
                 merged_queue.put((model_idx, e))
 
             finally:
@@ -2276,6 +2349,13 @@ def handle_multi_model_stream(
     if new_msg_req.deep_research:
         yield StreamingError(
             error="Multi-model is not supported with deep research",
+            error_code="VALIDATION_ERROR",
+            is_retryable=False,
+        )
+        return
+    if new_msg_req.legal_composite:
+        yield StreamingError(
+            error="Multi-model is not supported with Legal Composite",
             error_code="VALIDATION_ERROR",
             is_retryable=False,
         )

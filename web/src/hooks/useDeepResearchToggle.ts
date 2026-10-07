@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useEffect, useRef, useCallback } from "react";
+import type { WorkflowSelection } from "@/lib/chat/interfaces";
 
 interface UseDeepResearchToggleProps {
   chatSessionId: string | null;
@@ -12,9 +13,7 @@ export default function useDeepResearchToggle({
   chatSessionId,
   agentId,
 }: UseDeepResearchToggleProps) {
-  const [mode, setMode] = useState<
-    "normal" | "deep" | "experimental" | "experimental_parallel" | null
-  >(null);
+  const [mode, setMode] = useState<WorkflowSelection | null>(null);
   const previousChatSessionId = useRef<string | null>(chatSessionId);
 
   useEffect(() => {
@@ -40,7 +39,15 @@ export default function useDeepResearchToggle({
     );
   }, []);
 
+  const toggleLegalComposite = useCallback(() => {
+    setMode((current) =>
+      current === "legal_composite" ? null : "legal_composite"
+    );
+  }, []);
+
   return {
+    legalCompositeEnabled: mode === "legal_composite",
+    toggleLegalComposite,
     deepResearchEnabled: mode === "deep",
     toggleDeepResearch,
     atezSearchV3Enabled: mode === "normal",

@@ -129,6 +129,8 @@ class SendMessageRequest(BaseModel):
     )
     # ASv3 owns an independent adaptive research harness.
     atez_search_v3: bool = False
+    # Independent bounded research with evidence review before publication.
+    legal_composite: bool = False
     asv3_research_profile: Literal["normal", "deep", "experimental"] = "deep"
     asv3_parallel_research: bool = False
     asv3_allow_external: bool = False
@@ -168,6 +170,19 @@ class SendMessageRequest(BaseModel):
 
     @model_validator(mode="after")
     def check_chat_session_id_or_info(self) -> "SendMessageRequest":
+        if self.legal_composite and any(
+            (
+                self.atez_search,
+                self.atez_search_v2,
+                self.atez_search_v3,
+                self.deep_research,
+            )
+        ):
+            raise ValueError(
+                "Legal Composite and other workflows are mutually exclusive"
+            )
+        if self.legal_composite and self.llm_overrides and len(self.llm_overrides) > 1:
+            raise ValueError("Legal Composite uses one answering model per request")
         if self.atez_search and self.atez_search_v2:
             raise ValueError("atez_search and atez_search_v2 are mutually exclusive")
         if self.atez_search_v2_labels and not self.atez_search_v2:
