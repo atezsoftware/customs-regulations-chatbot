@@ -42,6 +42,9 @@ a correct headline, related citation or conditional rule elsewhere cannot suppor
 unconditional summary. Keep positive resolutions compact: ID, status and affected units,
 without copying the requirement, source text, answer or analysis.
 Mark omitted for absent material detail and misapplied for changed scope, logic or conditions.
+An omitted detail may have no existing answer unit: bind a related block when present,
+otherwise use [] and return its witnessed omission. Covered or misapplied assertions must
+bind their actual current units; an empty location never approves an existing assertion.
 Explain the precise defect briefly. Conditional rules with unknown decisive facts need their
 conditional application; unknown does not establish exclusion. Not_applicable needs a literal
 USER fact proving the actual exclusion, not draft silence or an assumed fact. Select its

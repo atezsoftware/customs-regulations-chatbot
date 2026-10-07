@@ -434,6 +434,49 @@ def test_new_issues_need_delivered_witnesses_and_current_units() -> None:
     assert counts == {"inventory": 1, "review": 2}
 
 
+def test_witnessed_omission_without_existing_block_is_repaired_without_review_retry() -> (
+    None
+):
+    ledger, _context, model = setup_review()
+
+    def mutate(result: dict[str, Any], _payload: dict[str, Any]) -> None:
+        result["resolutions"][0].update(
+            status="omitted",
+            answer_unit_ids=[],
+            coverage=[],
+            explanation="A material conditional branch needs its own new paragraph.",
+        )
+
+    counts = scripted_reviews(model, review_mutator=mutate)
+    gap = SourceUseReviewer(model, ledger).publication_gap(
+        "Another supported result [2].", "Actual facts", "coordinator"
+    )
+    assert gap and gap.status == OutcomeStatus.PARTIAL
+    issue = SourceUseIssue.model_validate(
+        cast(list[Any], gap.data["source_use_gaps"])[0]
+    )
+    assert issue.kind == "omitted_condition" and not issue.answer_unit_ids
+    assert issue.witnesses[0].citation == 1
+    assert gap.data["affected_answer_units"] == []
+    assert counts == {"inventory": 1, "review": 1}
+
+
+@pytest.mark.parametrize(
+    "kind", ["unsupported_claim", "inconsistent_application", "missing_original"]
+)
+def test_asserted_defects_still_require_their_actual_answer_unit(kind: str) -> None:
+    with pytest.raises(ValueError, match="actual answer unit"):
+        SourceUseIssue.model_validate(
+            {
+                "kind": kind,
+                "answer_unit_ids": [],
+                "witnesses": [{"citation": 1, "source_quote": "An original condition"}],
+                "detail": "An actual asserted defect",
+                "applicability": "Current facts",
+            }
+        )
+
+
 def test_failed_review_is_reused_without_approval_and_changed_answers_are_rechecked() -> (
     None
 ):

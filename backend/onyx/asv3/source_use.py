@@ -36,13 +36,15 @@ class SourceUseIssue(BaseModel):
         "unsupported_claim",
         "missing_original",
     ]
-    answer_unit_ids: list[str] = Field(min_length=1)
+    answer_unit_ids: list[str]
     witnesses: list[AssertionWitness]
     detail: str = Field(min_length=1)
     applicability: str = Field(min_length=1)
 
     @model_validator(mode="after")
     def require_operative_witness(self) -> SourceUseIssue:
+        if self.kind != "omitted_condition" and not self.answer_unit_ids:
+            raise ValueError("An asserted defect needs its actual answer unit")
         if self.kind != "missing_original" and not self.witnesses:
             raise ValueError("A source-use issue needs its delivered original witness")
         return self
@@ -450,7 +452,7 @@ class SourceUseReviewer:
                                 f"Resolution {row.requirement_id} needs exact supplied user-fact witnesses establishing exclusion"
                             )
                         continue
-                    if not row.answer_unit_ids:
+                    if not row.answer_unit_ids and row.status != "omitted":
                         raise ValueError(
                             f"Resolution {row.requirement_id} needs affected answer-unit IDs"
                         )
