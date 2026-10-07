@@ -236,6 +236,58 @@ def test_host_reads_known_provision_without_an_extra_generation_or_review() -> N
     assert selected.invoke.call_count == 0
 
 
+def test_host_preserves_formal_name_when_referred_statute_identity_is_unknown() -> None:
+    context, _, _reviews = tuned_context()
+    ledger = EvidenceLedger()
+    ledger.add(
+        [
+            opaque_original(
+                "İzin Tebliği",
+                "4",
+                kind="tebliğ",
+                text="8917 sayılı Faaliyet Kanununun 27 inci maddesi uyarınca izin gerekir.",
+            )
+        ],
+        context,
+    )
+    context.services["evidence"] = ledger
+    selected = model()
+    view = adaptive_tool_view().model_copy(
+        update={
+            "draft_to_repair": "İzin gerekir [1].",
+            "publication_gap": {"unread_cited_statute_references": []},
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "read_named_provision",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+        }
+    )
+    decision = ResearchModel(selected, context)._publication_source_acquisition(view)
+    assert decision is not None
+    assert [(c.name, c.arguments) for c in decision.calls] == [
+        (
+            "read_named_provision",
+            {"source_name": "8917 sayılı faaliyet kanun", "article": "27"},
+        )
+    ]
+    selected.invoke.assert_not_called()
+    view.receipts.append(
+        ToolReceipt(
+            call=decision.calls[0],
+            outcome=ToolOutcome(status=OutcomeStatus.NOT_FOUND, summary="Not found"),
+            elapsed_seconds=0,
+        )
+    )
+    assert (
+        ResearchModel(selected, context)._publication_source_acquisition(view) is None
+    )
+
+
 @pytest.mark.parametrize("variant", [None, ASV3_TUNED_VARIANT])
 def test_runtime_closes_implicit_referral_before_publication_and_preserves_normal(
     monkeypatch: pytest.MonkeyPatch,
@@ -264,7 +316,10 @@ def test_runtime_closes_implicit_referral_before_publication_and_preserves_norma
         result = build(*args, **options)
 
         def read(arguments: dict[str, Any], child: RunContext) -> ToolOutcome:
-            assert arguments == {"source_name": "8917 sayılı Kanun", "article": "27"}
+            assert arguments == {
+                "source_name": "8917 sayılı faaliyet kanun",
+                "article": "27",
+            }
             child.check_active()
             reads.append(law_id)
             return ToolOutcome(
