@@ -17,6 +17,20 @@ jobs:
           aws eks update-kubeconfig --name atez-dev-cluster --region eu-central-1
           mkdir -p evidence
           ns=customs-regulations-test
+          kubectl get deploy test-v1-customs-regulations-api-deployment -n "$ns" -o json > /tmp/test-api-deployment.json
+          python3 - <<'PYIN'
+          import json
+          d=json.load(open('/tmp/test-api-deployment.json'))
+          c=d['spec']['template']['spec']['containers'][0]
+          print(json.dumps({'image':c['image'],'command':c.get('command'),'args':c.get('args')}))
+          assert c['image'].endswith(':95e4d6aada8a2ea8381f26f4dc2be366971c2671'), 'Normal TEST image is not deployed yet'
+          if c.get('command')==['bash','-c'] and c.get('args',[])[:2]==['bash','-c']:
+              json.dump({'spec':{'template':{'spec':{'containers':[{'name':c['name'],'command':None}]}}}},open('/tmp/test-command-normalization.json','w'))
+              print('Removing the recovery command override now that Helm has restored the original bash arguments')
+          PYIN
+          if [[ -f /tmp/test-command-normalization.json ]]; then
+            kubectl patch deployment test-v1-customs-regulations-api-deployment -n "$ns" --type=strategic --patch-file=/tmp/test-command-normalization.json
+          fi
           kubectl rollout status deployment/test-v1-customs-regulations-api-deployment -n "$ns" --timeout=180s
           kubectl rollout status deployment/test-v1-customs-regulations-background-deployment -n "$ns" --timeout=180s
           kubectl get deploy,pods -n "$ns" -o json | jq '[.items[] | {kind,name:.metadata.name,images:[.spec.template.spec.containers[]?.image,.spec.containers[]?.image],ready:.status.readyReplicas,available:.status.availableReplicas,containers:[.status.containerStatuses[]? | {name,ready,restartCount,imageID,state}]}]' > evidence/test-workloads.json
