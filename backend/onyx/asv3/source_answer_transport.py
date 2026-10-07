@@ -32,7 +32,8 @@ def source_research_handoff_tools(
             "grounds, procedural stages and exact gaps. All original passages and current "
             "metadata also go to that writer, which may request more research. This is not "
             "publication approval. Without source-supported findings, use this action's "
-            "ordinary direct-response behavior. " + str(function.get("description", ""))
+            "ordinary direct-response behavior. Call on its own. All ordinary source, "
+            "metadata and publication validation still apply after the writer's decision."
         )
         parameters = function.get("parameters")
         properties = (

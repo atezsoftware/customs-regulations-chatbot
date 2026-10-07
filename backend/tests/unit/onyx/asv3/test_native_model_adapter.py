@@ -157,6 +157,31 @@ def test_source_answer_publication_repair_does_not_repeat_research_model() -> No
     assert "Conditional rule" in json.dumps(last_payload(writer), ensure_ascii=False)
 
 
+def test_research_and_writer_get_distinct_communication_defaults() -> None:
+    from onyx.prompts.asv3.research import DEFAULT_RESPONSE_PREFERENCES
+    from onyx.prompts.asv3.tuned import TUNED_RESEARCH_HANDOFF_PREFERENCES
+
+    adapter, context, research, writer = source_answer_adapter()
+    context.services["assistant_instructions"] = "Preserve relevant legal exceptions."
+    record = original(
+        cast(EvidenceLedger, context.services["evidence"]), context, "Rule."
+    )
+    adapter.decide(adaptive_tool_view(original_evidence=[record]))
+    research_question = research.invoke.call_args.kwargs["prompt"][1].content
+    writer_question = writer.invoke.call_args.kwargs["prompt"][1].content
+    assert TUNED_RESEARCH_HANDOFF_PREFERENCES in research_question
+    assert DEFAULT_RESPONSE_PREFERENCES not in research_question
+    assert DEFAULT_RESPONSE_PREFERENCES in writer_question
+    assert "Preserve relevant legal exceptions." in research_question
+    assert "Preserve relevant legal exceptions." in writer_question
+
+    ordinary = model()
+    ResearchModel(ordinary, RunContext(), lean_native_mode=True).decide(view())
+    ordinary_question = ordinary.invoke.call_args.kwargs["prompt"][1].content
+    assert DEFAULT_RESPONSE_PREFERENCES in ordinary_question
+    assert TUNED_RESEARCH_HANDOFF_PREFERENCES not in ordinary_question
+
+
 def test_source_answer_can_request_missing_evidence_then_return_to_research() -> None:
     adapter, context, research, writer = source_answer_adapter()
     record = original(

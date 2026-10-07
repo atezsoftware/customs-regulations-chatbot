@@ -147,6 +147,7 @@ from onyx.prompts.asv3.research import (
 from onyx.prompts.asv3.tuned import (
     TUNED_COORDINATOR_REFERENCE_PROMPT,
     TUNED_LEGAL_DEPARTMENT_RESEARCH,
+    TUNED_RESEARCH_HANDOFF_PREFERENCES,
     TUNED_RESEARCHER_REFERENCE_PROMPT,
     TUNED_SOURCE_ANSWER_PROMPT,
     TUNED_SOURCE_RESEARCH_PROMPT,
@@ -2707,11 +2708,14 @@ class ResearchModel:
         ) and isinstance(assistant_instructions, str):
             question["assistant_instructions"] = assistant_instructions
         question_content = json.dumps(question, ensure_ascii=False)
+        response_preferences = (
+            TUNED_RESEARCH_HANDOFF_PREFERENCES
+            if self.answer_llm is not None and not self._writing_answer
+            else DEFAULT_RESPONSE_PREFERENCES
+        )
         prefix: list[ChatCompletionMessage] = [
             SystemMessage(content=instruction),
-            UserMessage(
-                content=f"{question_content}\n\n{DEFAULT_RESPONSE_PREFERENCES}"
-            ),
+            UserMessage(content=f"{question_content}\n\n{response_preferences}"),
         ]
         context: dict[str, JsonValue] = {
             "language": self.context.language,
@@ -3172,6 +3176,15 @@ class ResearchModel:
                         "arguments must match its actual schema and contain your own "
                         "_related_source_reviews. No prose, fences or copied approval."
                     )
+                    if self._writing_answer:
+                        current["related_source_terminal_transport"] = (
+                            "Assess the delivered sources against every legal result in your "
+                            "actual answer. Research actions remain available for missing "
+                            "material text. Supply your own _related_source_reviews in the "
+                            "native terminal call's metadata, and the complete answer in "
+                            "the same response's assistant text. Do not return the terminal "
+                            "call as JSON content or duplicate the answer."
+                        )
                     if (
                         self.context.services.get("asv3_workflow_variant")
                         == ASV3_TUNED_VARIANT

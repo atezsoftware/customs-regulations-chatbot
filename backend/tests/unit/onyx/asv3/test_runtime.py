@@ -116,7 +116,11 @@ def user_payload(message: UserMessage) -> dict[str, Any]:
         return cast(dict[str, Any], json.loads(content))
     assert isinstance(content, str)
     payload, offset = json.JSONDecoder().raw_decode(content)
-    assert content[offset:] in ("", "\n\n" + llm_adapter.DEFAULT_RESPONSE_PREFERENCES)
+    assert content[offset:] in (
+        "",
+        "\n\n" + llm_adapter.DEFAULT_RESPONSE_PREFERENCES,
+        "\n\n" + llm_adapter.TUNED_RESEARCH_HANDOFF_PREFERENCES,
+    )
     return cast(dict[str, Any], payload)
 
 
