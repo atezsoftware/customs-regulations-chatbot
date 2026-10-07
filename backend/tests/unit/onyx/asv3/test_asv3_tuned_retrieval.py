@@ -13,6 +13,7 @@ from onyx.asv3.workflow_variant import ASV3_TUNED_VARIANT
 from onyx.configs.constants import DocumentSource
 from onyx.context.search.models import InferenceChunk, SearchDoc, SearchDocsResponse
 from onyx.db.reranking import RerankerRuntimeConfig
+from onyx.reranking.diversity import apply_soft_diversity
 from onyx.reranking.models import RerankOutcome, RerankResult
 from onyx.reranking.staged import STAGED_BATCH_SIZE
 from onyx.tools.models import ParallelToolCallResponse, SearchToolRetrievalOverrides
@@ -146,6 +147,9 @@ def test_real_adapter_retains_scoped_candidate_pool_and_canonical_delivery(
         patch(
             "onyx.asv3.search_adapter.run_tool_calls", side_effect=execute
         ) as dispatch,
+        patch(
+            f"{MODULE}.apply_soft_diversity", wraps=apply_soft_diversity
+        ) as diversity,
     ):
 
         def lane_candidates(**kwargs: Any) -> list[InferenceChunk]:
@@ -190,6 +194,10 @@ def test_real_adapter_retains_scoped_candidate_pool_and_canonical_delivery(
     assert (override is not None) is (variant == ASV3_TUNED_VARIANT)
     if override is not None:
         assert override.preserve_source_diversity is True
+        assert override.reuse_diversity_comparisons is True
+    assert any(
+        call.kwargs.get("reuse_comparisons", False) for call in diversity.call_args_list
+    ) is (variant == ASV3_TUNED_VARIANT)
     rich = responses[0].tool_responses[0].rich_response
     assert isinstance(rich, SearchDocsResponse)
     assert len(rich.search_docs) == delivered_count

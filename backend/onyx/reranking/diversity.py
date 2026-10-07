@@ -69,6 +69,7 @@ def apply_soft_diversity(
     chunks: Sequence[InferenceChunk],
     scores: Mapping[tuple[str, int], float],
     limit: int,
+    reuse_comparisons: bool = False,
 ) -> list[InferenceChunk]:
     """Keep relevance primary while softly suppressing textual repetition."""
 
@@ -76,6 +77,12 @@ def apply_soft_diversity(
         return []
 
     normalized_bodies = [_normalize_body(chunk) for chunk in chunks]
+    shingles = (
+        [_word_shingles(body) for body in normalized_bodies]
+        if reuse_comparisons
+        else []
+    )
+    prior_duplicates = [False] * len(chunks)
     canonical_sources = [canonical_chunk_source(chunk) for chunk in chunks]
     raw_relevance = _raw_relevance_scores(chunks, scores)
     remaining_indices = list(range(len(chunks)))
@@ -96,11 +103,15 @@ def apply_soft_diversity(
         def adjusted_rank(index: int) -> tuple[float, int]:
             duplicate_penalty = (
                 NEAR_DUPLICATE_PENALTY
-                if any(
-                    _is_near_duplicate(
-                        normalized_bodies[index], normalized_bodies[selected_index]
+                if (
+                    prior_duplicates[index]
+                    if reuse_comparisons
+                    else any(
+                        _is_near_duplicate(
+                            normalized_bodies[index], normalized_bodies[selected_index]
+                        )
+                        for selected_index in selected_indices
                     )
-                    for selected_index in selected_indices
                 )
                 else 0.0
             )
@@ -118,5 +129,19 @@ def apply_soft_diversity(
         selected_indices.append(selected_index)
         selected_source_counts[canonical_sources[selected_index]] += 1
         remaining_indices.remove(selected_index)
+        if reuse_comparisons and normalized_bodies[selected_index]:
+            selected_shingles = shingles[selected_index]
+            for index in remaining_indices:
+                if prior_duplicates[index] or not normalized_bodies[index]:
+                    continue
+                prior_duplicates[index] = normalized_bodies[index] == normalized_bodies[
+                    selected_index
+                ] or (
+                    bool(shingles[index])
+                    and bool(selected_shingles)
+                    and len(shingles[index] & selected_shingles)
+                    / len(shingles[index] | selected_shingles)
+                    >= NEAR_DUPLICATE_SHINGLE_SIMILARITY
+                )
 
     return [chunks[index] for index in selected_indices]

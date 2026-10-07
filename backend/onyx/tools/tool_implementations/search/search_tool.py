@@ -2685,11 +2685,31 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
                         for chunk in rerank_result.ordered_chunks
                     ],
                 }
-        diverse_candidate_chunks = apply_soft_diversity(
-            chunks=rerank_result.ordered_chunks,
-            scores=rerank_result.scores_by_chunk,
-            limit=override_kwargs.rerank_candidate_limit,
+        reuse_diversity_comparisons = (
+            asv3_regulatory_search
+            and isinstance(override_kwargs, SearchToolRetrievalOverrideKwargs)
+            and override_kwargs.reuse_diversity_comparisons
         )
+        if reuse_diversity_comparisons:
+            with graph_step(
+                "search.rerank_diversity",
+                {"candidate_count": len(rerank_result.ordered_chunks)},
+            ) as diversity_step:
+                diverse_candidate_chunks = apply_soft_diversity(
+                    chunks=rerank_result.ordered_chunks,
+                    scores=rerank_result.scores_by_chunk,
+                    limit=override_kwargs.rerank_candidate_limit,
+                    reuse_comparisons=True,
+                )
+                diversity_step.output_value = {
+                    "selected_count": len(diverse_candidate_chunks)
+                }
+        else:
+            diverse_candidate_chunks = apply_soft_diversity(
+                chunks=rerank_result.ordered_chunks,
+                scores=rerank_result.scores_by_chunk,
+                limit=override_kwargs.rerank_candidate_limit,
+            )
         if rerank_result.used_external and rerank_packets is not None:
             diverse_candidate_chunks, atomic_scores = (
                 expand_ranked_regulatory_rerank_packets(

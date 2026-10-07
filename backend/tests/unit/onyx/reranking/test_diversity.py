@@ -1,7 +1,12 @@
 from datetime import datetime, timezone
+from random import Random
+from unittest.mock import patch
+
+import pytest
 
 from onyx.configs.constants import DocumentSource
 from onyx.context.search.models import InferenceChunk
+from onyx.reranking import diversity
 from onyx.reranking.diversity import apply_soft_diversity
 from onyx.reranking.payload import canonical_chunk_source
 
@@ -124,3 +129,58 @@ def test_canonical_source_normalizes_lowest_nonempty_url_or_uses_document_id() -
 
     assert canonical_chunk_source(linked) == "https://mevzuat.example/kanun/5"
     assert canonical_chunk_source(unlinked) == "fallback-doc"
+
+
+@pytest.mark.parametrize("limit", [0, 1, 9, 28, 40])
+def test_reused_comparisons_preserve_complete_legacy_ranking(limit: int) -> None:
+    rng = Random(17)
+    bodies = [
+        "",
+        "   ",
+        "!!!",
+        "tek",
+        "iki kelime",
+        "İŞLEM ŞARTLARI ve BELGELER",
+        "islem sartlari ve belgeler",
+        "farklı kapsam ve sonraki aşama",
+        "kapsam koşul başvuru belge süre merci sonuç istisna",
+        "kapsam koşul başvuru belge süre merci sonuç istisna ek",
+    ]
+    for iteration in range(12):
+        chunks = [
+            _chunk(
+                f"source-{rng.randrange(4)}",
+                index,
+                rng.choice(bodies),
+                source=("HTTPS://SOURCE.TEST/shared/#part" if index % 3 == 0 else None),
+            )
+            for index in range(28)
+        ]
+        scores = {
+            (chunk.document_id, chunk.chunk_id): rng.choice(
+                [0.0, 0.01, 0.03, 0.05, 0.5, 1.0]
+            )
+            for chunk in chunks
+            if iteration % 3 != 0 and rng.randrange(4) != 0
+        }
+        assert apply_soft_diversity(
+            chunks=chunks,
+            scores=scores,
+            limit=limit,
+            reuse_comparisons=True,
+        ) == apply_soft_diversity(chunks=chunks, scores=scores, limit=limit)
+
+
+def test_reused_comparisons_build_each_body_shingles_once() -> None:
+    chunks = [
+        _chunk("source", index, f"independent text with condition {index}")
+        for index in range(32)
+    ]
+    with patch.object(
+        diversity, "_word_shingles", wraps=diversity._word_shingles
+    ) as shingles:
+        selected = apply_soft_diversity(
+            chunks=chunks, scores={}, limit=32, reuse_comparisons=True
+        )
+    assert selected == chunks
+    assert shingles.call_count == len(chunks)
