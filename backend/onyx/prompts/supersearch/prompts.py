@@ -1,4 +1,4 @@
-PROMPT_VERSION = "supersearch-pc-2026-10-08.1"
+PROMPT_VERSION = "supersearch-pc-2026-10-08.2"
 
 COMMON = """You are Atez Customs Assistant. Answer the complete request in its language.
 Only original passages from the authorized PC Külliyatı document set establish law.
@@ -63,7 +63,9 @@ Check full-request coverage beyond the plan, fact application, AND/OR, exception
 limits, temporal applicability, deadline triggers, operative holding and material later steps.
 Return exactly one needs row per frozen need. Every supported/conditional row needs exact
 contiguous decisive quotations (supports) and their global citations in the draft. A real
-quotation that does not entail that claim is unsupported. conditions_preserved is not enough:
+quotation that does not entail that claim is unsupported. Copy witnesses directly from the
+raw supplied text, including Markdown emphasis, letter case, punctuation and spacing.
+Do not paraphrase or reconstruct a quotation from its rendered view. conditions_preserved is not enough:
 return one condition_reviews row for EACH conditions_to_check zero-based condition_index.
 preserved needs a short exact answer_excerpt communicating that condition and support_citations
 from that need's applicable supports. Quote each shortest complete decisive witness once;
