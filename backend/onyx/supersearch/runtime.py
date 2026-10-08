@@ -53,6 +53,9 @@ from onyx.supersearch.gateway import SelectedModelGateway
 from onyx.tools.interface import Tool
 from onyx.tools.tool_implementations.search.search_tool import SearchTool
 from onyx.tracing.framework.create import ChatTraceMetadata, ensure_trace
+from onyx.utils.logger import setup_logger
+
+logger = setup_logger()
 
 
 def _progress_reporter(
@@ -383,7 +386,34 @@ def _run_supersearch_loop(
         report=report,
     )
     report("tools", "tr")
-    result = engine.run(question, history, custom_agent_prompt)
+    try:
+        result = engine.run(question, history, custom_agent_prompt)
+    except Exception:
+        try:
+            progress.report(
+                "failed",
+                status="failed",
+                title="Supersearch tamamlanamadı",
+                message="Model yanıtı veya kaynak işlemi tamamlanamadı.",
+            )
+            save_asv3_checkpoint(
+                message_id=assistant_message_id,
+                user_id=user.id,
+                snapshot={
+                    "run_id": context.run_id,
+                    "sequence": 1,
+                    "request": question,
+                    "scope": context.scope,
+                    "asv3_workflow_variant": "supersearch",
+                    "prompt_version": PROMPT_VERSION,
+                    "publication_status": "unavailable",
+                    "processing_seconds": time.monotonic() - started,
+                    "progress": emitted,
+                },
+            )
+        except Exception:
+            logger.exception("Could not persist Supersearch failure progress")
+        raise
     snapshot: dict[str, JsonValue] = {
         "run_id": context.run_id,
         "sequence": 1,

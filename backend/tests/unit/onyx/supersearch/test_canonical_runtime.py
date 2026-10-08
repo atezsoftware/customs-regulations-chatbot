@@ -23,9 +23,15 @@ from onyx.chat.emitter import BufferedEmitter
 from onyx.chat.models import ChatMessageSimple
 from onyx.configs.constants import MessageType
 from onyx.context.search.models import IndexFilters
+from onyx.db.asv3_runs import checkpoint_progress_packets, encode_asv3_checkpoint
 from onyx.db.models import User
 from onyx.llm.interfaces import LLM, LLMConfig
-from onyx.server.query_and_chat.streaming_models import ASv3Progress, CitationInfo
+from onyx.server.query_and_chat.streaming_models import (
+    AgentResponseDelta,
+    AgentResponseStart,
+    ASv3Progress,
+    CitationInfo,
+)
 from onyx.supersearch import corpus, gateway, runtime
 from onyx.supersearch.models import WriterDecision
 from onyx.tracing.flows import LLMFlow
@@ -275,3 +281,132 @@ def test_source_to_streaming_publication_preserves_pc_fence_and_selected_model(
     assert len(citations) == 1 and citations[0].preview_url == "/api/asv3/citation/3/1"
     answer = state.get_answer_tokens()
     assert answer is not None and "bildirim tarihinden itibaren bir yıl" in answer
+
+
+@pytest.mark.parametrize("checkpoint_fails", [False, True])
+def test_provider_failure_preserves_native_history_without_publishing_draft(
+    monkeypatch: pytest.MonkeyPatch,
+    checkpoint_fails: bool,
+) -> None:
+    state, emitter = ChatStateContainer(), BufferedEmitter()
+    llm = selected_llm()
+    user = User(id=uuid4(), email="fixture@example.com")
+    failure = TimeoutError("fixture provider timeout")
+    snapshots: list[dict[str, Any]] = []
+    broker = MagicMock()
+    broker.shared_read_fence.return_value = "authorized-pc-snapshot"
+    dependencies = MagicMock()
+    dependencies.receipts = []
+    dependencies.expand.return_value = []
+
+    def bind(**kwargs: Any) -> IndexFilters:
+        return kwargs["filters"].model_copy(
+            update={
+                "asv3_document_set_id": 442,
+                "forced_document_set": ["PC Külliyatı"],
+                "access_control_list": ["authorized"],
+            }
+        )
+
+    def fixture_gateway(**kwargs: Any) -> FixtureGateway:
+        fixture = FixtureGateway(
+            kwargs["ledger"],
+            [plan(), WriterDecision(answer=ANSWER, unresolved_need_ids=[], actions=[])],
+        )
+        complete = fixture.complete
+
+        def fail_review(*args: Any, **options: Any) -> Any:
+            if args[3] == LLMFlow.SUPERSEARCH_REVIEW:
+                assert kwargs["ledger"].citation_numbers() == (1,)
+                raise failure
+            return complete(*args, **options)
+
+        monkeypatch.setattr(fixture, "complete", fail_review)
+        return fixture
+
+    def checkpoint(**kwargs: Any) -> None:
+        assert kwargs["message_id"] == 3 and kwargs["user_id"] == user.id
+        snapshots.append(deepcopy(kwargs["snapshot"]))
+        if checkpoint_fails:
+            raise RuntimeError("fixture checkpoint failure")
+
+    monkeypatch.setattr(runtime, "bind_supersearch_pc_scope", bind)
+    monkeypatch.setattr(
+        runtime, "SupersearchCorpusBroker", lambda *_args, **_kwargs: broker
+    )
+    monkeypatch.setattr(
+        runtime, "SupersearchDependencyExpander", lambda **_kwargs: dependencies
+    )
+    monkeypatch.setattr(runtime, "build_search_adapter", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        runtime,
+        "corpus_specs",
+        lambda _broker: [
+            ToolSpec(
+                name="read_named_provision",
+                description="Canonical fixture read",
+                parameters={"type": "object"},
+                handler=lambda _arguments, _context: ToolOutcome(
+                    status=OutcomeStatus.FOUND,
+                    summary="Original",
+                    evidence=[original()],
+                ),
+            )
+        ],
+    )
+    monkeypatch.setattr(runtime, "SelectedModelGateway", fixture_gateway)
+    monkeypatch.setattr(runtime, "save_asv3_checkpoint", checkpoint)
+    monkeypatch.setattr(runtime, "is_connected", lambda *_args: True)
+    monkeypatch.setattr(
+        runtime, "ensure_trace", lambda *_args, **_kwargs: nullcontext()
+    )
+    with pytest.raises(TimeoutError) as raised:
+        runtime.run_supersearch_loop(
+            emitter=emitter,
+            state_container=state,
+            simple_chat_history=[
+                ChatMessageSimple(
+                    message="Başvuru süresi nedir?",
+                    token_count=8,
+                    message_type=MessageType.USER,
+                )
+            ],
+            tools=[],
+            llm=llm,
+            user=user,
+            chat_session_id=uuid4(),
+            user_message_id=2,
+            assistant_message_id=3,
+            cache=MagicMock(),
+            filters=IndexFilters(access_control_list=[]),
+            document_set_names_override=["PC Külliyatı"],
+        )
+    assert raised.value is failure
+    assert len(snapshots) == 1
+    snapshot = snapshots[0]
+    assert set(snapshot) == {
+        "run_id",
+        "sequence",
+        "request",
+        "scope",
+        "asv3_workflow_variant",
+        "prompt_version",
+        "publication_status",
+        "processing_seconds",
+        "progress",
+    }
+    assert snapshot["asv3_workflow_variant"] == "supersearch"
+    assert snapshot["publication_status"] == "unavailable"
+    assert snapshot["scope"]["asv3_document_set_id"] == 442
+    assert snapshot["processing_seconds"] >= 0
+    replay = checkpoint_progress_packets(encode_asv3_checkpoint(snapshot))
+    assert replay[-1]["workflow"] == "supersearch"
+    assert replay[-1]["phase"] == replay[-1]["status"] == "failed"
+    assert ANSWER not in json.dumps(snapshot, ensure_ascii=False)
+    packets = list(emitter.get_packets())
+    assert not any(
+        isinstance(packet.obj, (CitationInfo, AgentResponseStart, AgentResponseDelta))
+        for packet in packets
+    )
+    assert state.get_answer_tokens() is None
+    broker.revalidate_evidence.assert_not_called()
