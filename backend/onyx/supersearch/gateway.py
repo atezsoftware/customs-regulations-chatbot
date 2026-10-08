@@ -22,6 +22,10 @@ from onyx.llm.models import (
 from onyx.llm.utils import check_number_of_tokens
 from onyx.regulatory.structured_llm import _portable_structured_output_schema
 from onyx.supersearch.payload import METADATA_DECODER, compact_original_evidence_payload
+from onyx.supersearch.receipts import (
+    RECEIPT_DATA_DECODER,
+    compact_receipt_data_payload,
+)
 from onyx.tracing.flows import LLMFlow
 from onyx.tracing.llm_utils import llm_generation_span, record_llm_response
 
@@ -81,10 +85,16 @@ class SelectedModelGateway:
             },
         }
         provider_payload, metadata_pooled = compact_original_evidence_payload(payload)
+        receipts_pooled = False
+        if flow == LLMFlow.SUPERSEARCH_REVIEW:
+            provider_payload, receipts_pooled = compact_receipt_data_payload(
+                provider_payload
+            )
         messages: list[ChatCompletionMessage] = [
             SystemMessage(
                 content=system
                 + ("\n" + METADATA_DECODER if metadata_pooled else "")
+                + ("\n" + RECEIPT_DATA_DECODER if receipts_pooled else "")
                 + "\nJSON schema:\n"
                 + json.dumps(schema, separators=(",", ":"))
             ),
@@ -134,9 +144,12 @@ class SelectedModelGateway:
                 response = self.llm.invoke(
                     messages,
                     structured_response_format=response_format,
+                    timeout_override=120 if finalizing else None,
                     reasoning_effort=self.reasoning_effort,
                     user_identity=self.user_identity,
-                    use_streaming=False,
+                    # Invoke assembles the provider stream before strict validation;
+                    # an active long review must not hit a whole-response read timeout.
+                    use_streaming=True,
                 )
                 record_llm_response(span, response)
         self.context.check_active()

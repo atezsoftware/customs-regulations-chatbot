@@ -677,6 +677,9 @@ export default function useChatController({
       }
 
       if (!isMultiModel) {
+        if (supersearch) {
+          initialAgentNode.supersearch = true;
+        }
         initialAgentNode.asv3 =
           atezSearchV3 ||
           experimentalResearch ||
@@ -1341,6 +1344,13 @@ export default function useChatController({
           : [
               {
                 nodeId: initialAgentNode.nodeId,
+                ...(supersearch
+                  ? {
+                      supersearch: true,
+                      overridden_model: initialAgentNode.overridden_model,
+                      modelDisplayName: initialAgentNode.modelDisplayName,
+                    }
+                  : {}),
                 message: errorMsg,
                 type: "error" as const,
                 files: aiMessageImages || [],

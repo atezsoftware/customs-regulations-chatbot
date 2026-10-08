@@ -430,11 +430,18 @@ const ChatUI = React.memo(
           {(((error !== null || loadError !== null) &&
             messages[messages.length - 1]?.type === "user") ||
             (messages[messages.length - 1]?.type === "error" &&
-              !messages[messages.length - 1]?.modelDisplayName)) && (
+              (!messages[messages.length - 1]?.modelDisplayName ||
+                messages[messages.length - 1]?.supersearch))) && (
             <div className={cn("p-4 w-full self-center", msgWidth)}>
               <ErrorBanner
                 resubmit={onResubmit}
-                error={error || loadError || ""}
+                error={
+                  error ||
+                  loadError ||
+                  (messages[messages.length - 1]?.supersearch
+                    ? messages[messages.length - 1]?.message || ""
+                    : "")
+                }
                 errorCode={
                   messages[messages.length - 1]?.errorCode || undefined
                 }
