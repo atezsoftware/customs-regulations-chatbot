@@ -193,6 +193,7 @@ class LegalCompositeEngine:
         draft: DraftAnswer | None = None,
         gaps: list[str] | None = None,
         instructions: str | None = None,
+        source_phase: bool = True,
     ) -> dict[str, JsonValue]:
         # Whole originals are selected atomically; omitted IDs remain explicit navigation.
         recent_numbers = [
@@ -216,7 +217,7 @@ class LegalCompositeEngine:
             for record in records
             if isinstance(record, dict) and isinstance(record.get("citation"), int)
         }
-        return {
+        payload: dict[str, JsonValue] = {
             "request": request,
             "conversation": history,
             "assistant_instructions": instructions,
@@ -250,11 +251,23 @@ class LegalCompositeEngine:
                 if isinstance(metadata := row.get("metadata"), dict)
             ],
             "receipts": self.receipts[-8:],
-            "tools": self.acquirer.definitions(),
             "draft": draft.model_dump(mode="json") if draft else None,
             "defects": gaps or [],
             "limits": self.policy.model_dump(mode="json"),
         }
+        if source_phase:
+            payload["tools"] = self.acquirer.definitions()
+        else:
+            payload.pop("original_catalogue")
+            payload["receipts"] = [
+                {
+                    key: receipt[key]
+                    for key in ("need_ids", "status", "citations")
+                    if key in receipt
+                }
+                for receipt in self.receipts[-8:]
+            ]
+        return payload
 
     def _acquire(self, actions: list[SourceAction], plan: ResearchPlan) -> bool:
         try:
@@ -327,7 +340,12 @@ class LegalCompositeEngine:
         for attempt in range(self.policy.max_reviews):
             self.check_active()
             payload = self._payload(
-                request, history, draft=draft, gaps=gaps, instructions=instructions
+                request,
+                history,
+                draft=draft,
+                gaps=gaps,
+                instructions=instructions,
+                source_phase=False,
             )
             try:
                 draft = self.gateway.complete(
@@ -354,7 +372,11 @@ class LegalCompositeEngine:
             )
             answer_delivered &= actual_delivery
             review_payload = self._payload(
-                request, history, draft=draft, instructions=instructions
+                request,
+                history,
+                draft=draft,
+                instructions=instructions,
+                source_phase=False,
             )
             # No extra originals may silently make an unsupported writer draft acceptable.
             review_payload["original_evidence"] = answer_records

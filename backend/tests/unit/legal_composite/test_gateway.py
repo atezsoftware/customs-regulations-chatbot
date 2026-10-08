@@ -1,5 +1,8 @@
+import hashlib
+import json
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event, current_thread
+from typing import cast
 from unittest.mock import Mock
 
 import pytest
@@ -8,6 +11,7 @@ from pydantic import JsonValue
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.models import RunStopped
 from onyx.legal_composite.budget import WorkflowBudget
+from onyx.legal_composite.engine import LegalCompositeEngine, SourceAcquirer
 from onyx.legal_composite.gateway import BudgetedGateway
 from onyx.legal_composite.models import DraftAnswer, WorkflowPolicy
 from onyx.llm.cost import ModelPrice
@@ -19,7 +23,9 @@ from onyx.llm.models import (
     ReasoningEffort,
     UserMessage,
 )
+from onyx.llm.utils import check_number_of_tokens
 from onyx.tracing.flows import LLMFlow
+from tests.unit.onyx.legal_composite.test_review_assessment import original
 
 
 @pytest.fixture
@@ -120,6 +126,98 @@ def test_context_fit_preserves_required_originals_and_marks_omitted_ids(
         [{"citation": 1, "text": "required complete original"}],
     )
     assert len(payload["original_evidence"]) == 2
+
+
+def test_final_phase_navigation_cannot_crowd_out_whole_originals_under_same_cap(
+    model: Mock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from onyx.asv3.models import RunContext
+
+    monkeypatch.setattr(
+        "onyx.legal_composite.gateway.check_number_of_tokens", check_number_of_tokens
+    )
+    ledger = EvidenceLedger()
+    ledger.add(
+        [
+            original(
+                f"Complete operative provision {index}. "
+                "Its condition, exception and legal scope remain unchanged. " * 4,
+                f"canonical-chunk-{index}",
+                metadata={
+                    "title": "Source navigation title " + "jurisdiction " * 40,
+                    "heading_path": [
+                        f"control-{part}-jurisdiction-navigational-reference"
+                        for part in range(20)
+                    ],
+                },
+            )
+            for index in range(63)
+        ],
+        RunContext(),
+    )
+    policy = WorkflowPolicy()
+    budget = WorkflowBudget(policy)
+    gateway = BudgetedGateway(
+        selected_llm=model, research_llm=model, budget=budget, ledger=ledger
+    )
+    acquirer = Mock(spec=SourceAcquirer)
+    acquirer.definitions.return_value = [
+        {"name": "read_evidence", "description": "Navigation control " * 2_000}
+    ]
+    engine = LegalCompositeEngine(
+        gateway=gateway,
+        acquirer=acquirer,
+        ledger=ledger,
+        policy=policy,
+        check_active=lambda: None,
+        research_available=lambda: False,
+    )
+    receipt: dict[str, JsonValue] = {
+        "need_ids": ["general-need"],
+        "status": "completed",
+        "citations": cast(JsonValue, ledger.citation_numbers()),
+        "data": {"navigation": "Source lookup control " * 2_000},
+        "summary": "Navigation is not legal authority",
+    }
+    engine.receipts = [receipt]
+    research = engine._payload("Apply complete original provisions", "")
+    final = engine._payload(
+        "Apply complete original provisions", "", source_phase=False
+    )
+    catalogue = research["original_catalogue"]
+    assert isinstance(catalogue, list) and len(catalogue) == 63
+    assert research["original_evidence"] == final["original_evidence"]
+    assert "original_catalogue" not in final and "tools" not in final
+    assert policy.max_context_tokens == 32_000
+    try:
+        gateway.complete(
+            "Answer", research, DraftAnswer, LLMFlow.LEGAL_COMPOSITE_ANSWER, True
+        )
+        baseline = json.loads(model.invoke.call_args.args[0][1].content)[
+            "original_evidence"
+        ]
+    except RunStopped as error:
+        assert "protocol exceed" in str(error)
+        baseline = []
+    gateway.complete("Answer", final, DraftAnswer, LLMFlow.LEGAL_COMPOSITE_ANSWER, True)
+    sent = json.loads(model.invoke.call_args.args[0][1].content)
+    records = sent["original_evidence"]
+    assert len(records) > max(1, len(baseline))
+    final_records = cast(list[dict[str, JsonValue]], final["original_evidence"])
+    expected = {cast(int, row["citation"]): row for row in final_records}
+    for row in records:
+        assert row == expected[row["citation"]]
+        canonical = ledger.get(row["citation"])
+        assert canonical is not None
+        assert (
+            hashlib.sha256(row["text"].encode()).hexdigest()
+            == hashlib.sha256(canonical.text.encode()).hexdigest()
+        )
+        assert "Navigation" not in row["text"]
+    assert set(sent["omitted_original_ids"]) == set(ledger.citation_numbers()) - {
+        row["citation"] for row in records
+    }
+    assert gateway.last_delivered_citations == {row["citation"] for row in records}
 
 
 def test_oversized_required_original_cannot_be_clipped_or_dropped(model: Mock) -> None:
@@ -223,6 +321,26 @@ def test_invalid_schema_is_not_retried(model: Mock) -> None:
             "Answer", {}, DraftAnswer, LLMFlow.LEGAL_COMPOSITE_ANSWER, True
         )
     assert model.invoke.call_count == 1
+
+
+def test_raw_provider_output_limit_cannot_deliver_a_valid_json_prefix(
+    model: Mock,
+) -> None:
+    model.invoke.return_value.choice.finish_reason = "MAX_OUTPUT_TOKENS"
+    ledger = Mock(spec=EvidenceLedger)
+    gateway = BudgetedGateway(
+        selected_llm=model,
+        research_llm=model,
+        budget=WorkflowBudget(WorkflowPolicy()),
+        ledger=ledger,
+    )
+    with pytest.raises(RunStopped, match="truncated"):
+        gateway.complete(
+            "Answer", {}, DraftAnswer, LLMFlow.LEGAL_COMPOSITE_ANSWER, True
+        )
+    model.invoke.assert_called_once()
+    ledger.record_delivery.assert_not_called()
+    assert gateway.last_call_id is None
 
 
 def test_late_provider_result_cannot_publish_evidence_or_start_more_calls(

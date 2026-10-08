@@ -32,6 +32,7 @@ from onyx.llm.models import (
 )
 from onyx.llm.multi_llm import LLMTimeoutError
 from onyx.llm.utils import check_number_of_tokens
+from onyx.regulatory.structured_llm import _portable_structured_output_schema
 from onyx.tracing.answer_graph import redact_graph_value
 from onyx.tracing.flows import LLMFlow
 from onyx.tracing.framework.create import get_current_span
@@ -254,7 +255,12 @@ class BudgetedGateway:
         return self._prices[(config.model_provider, config.model_name)]
 
     def _fit_messages(
-        self, system: str, payload: dict[str, JsonValue], schema: str, llm: LLM
+        self,
+        system: str,
+        payload: dict[str, JsonValue],
+        schema: str,
+        llm: LLM,
+        response_format: dict[str, JsonValue],
     ) -> tuple[list[ChatCompletionMessage], int, list[dict[str, JsonValue]]]:
         body = cast(dict[str, JsonValue], json.loads(json.dumps(payload)))
         raw_records = body.get("original_evidence", [])
@@ -301,7 +307,7 @@ class BudgetedGateway:
                     "messages": [
                         message.model_dump(mode="json") for message in messages
                     ],
-                    "response_format": {"type": "json_object"},
+                    "response_format": response_format,
                 },
                 ensure_ascii=False,
             )
@@ -595,9 +601,18 @@ class BudgetedGateway:
         llm = self.research_llm if research else self.selected_llm
         if finalizing == research:
             raise ValueError("Generation flow and phase must agree")
-        schema = json.dumps(response_type.model_json_schema(), ensure_ascii=False)
+        full_schema = response_type.model_json_schema()
+        schema = json.dumps(full_schema, ensure_ascii=False)
+        response_format: dict[str, JsonValue] = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": response_type.__name__,
+                "schema": _portable_structured_output_schema(full_schema),
+                "strict": False,
+            },
+        }
         messages, input_tokens, records = self._fit_messages(
-            system, payload, schema, llm
+            system, payload, schema, llm, response_format
         )
         output_tokens = (
             _RESEARCH_OUTPUT_TOKENS if research else self._final_output_tokens
@@ -609,9 +624,17 @@ class BudgetedGateway:
             input_tokens,
             output_tokens,
             finalizing,
-            {"type": "json_object"},
+            response_format,
             self.user_identity,
         )
+        finish_reason = (response.choice.finish_reason or "").lower()
+        if response.choice.message.tool_calls or finish_reason == "tool_calls":
+            raise RunStopped("The typed model returned an undeclared tool call")
+        if finish_reason in {"length", "max_tokens", "max_output_tokens"}:
+            raise RunStopped("The typed model response was truncated")
+        content = response.choice.message.content
+        if content is None:
+            raise RunStopped("The model returned no structured answer")
         self.ledger.record_delivery(reservation.call_id, flow.value, records)
         self.last_call_id = reservation.call_id
         self.last_delivered_citations = self.ledger.completely_delivered(
@@ -619,9 +642,6 @@ class BudgetedGateway:
         )
         self.check_active()
         self.budget.check_active(finalizing)
-        content = response.choice.message.content
-        if content is None:
-            raise RunStopped("The model returned no structured answer")
         try:
             return response_type.model_validate_json(content, strict=True)
         except ValidationError as error:

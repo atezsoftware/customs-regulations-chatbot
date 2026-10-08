@@ -17,6 +17,7 @@ from onyx.legal_composite.models import (
     PassageSupport,
     ResearchNeed,
     ResearchPlan,
+    ResearchStep,
     SourceAction,
     WorkflowPolicy,
 )
@@ -367,6 +368,67 @@ def test_known_incorrect_draft_cannot_be_exposed_as_partial_answer(
     ]
 
 
+def test_source_controls_stay_in_research_and_out_of_writer_review(
+    plan: ResearchPlan, draft: DraftAnswer, review: AnswerReview, ledger: EvidenceLedger
+) -> None:
+    definitions: list[dict[str, JsonValue]] = [
+        {"name": "read_evidence", "description": "Read a canonical original"}
+    ]
+
+    class Acquirer(FakeAcquirer):
+        def definitions(self) -> list[dict[str, JsonValue]]:
+            return definitions
+
+    gateway = FakeGateway(
+        [
+            plan,
+            ResearchStep(actions=[], ready_to_answer=True, remaining_gaps=[]),
+            draft,
+            review,
+        ]
+    )
+    workflow = LegalCompositeEngine(
+        gateway=gateway,
+        acquirer=Acquirer(),
+        ledger=ledger,
+        policy=WorkflowPolicy(max_reviews=1),
+        check_active=lambda: None,
+        research_available=lambda: True,
+    )
+    receipt: dict[str, JsonValue] = {
+        "need_ids": ["repair", "refund"],
+        "status": "completed",
+        "citations": [1, 2],
+        "summary": "Navigation summary cannot support a legal claim",
+        "data": {"navigation": "source-control-only"},
+    }
+    workflow.receipts = [receipt]
+    result = workflow.run("Kaynaklı hukuki sonucu açıkla.")
+    assert result.status == "verified" and result.answer == draft.answer
+    assert gateway.calls == [
+        LLMFlow.LEGAL_COMPOSITE_RESEARCH,
+        LLMFlow.LEGAL_COMPOSITE_RESEARCH,
+        LLMFlow.LEGAL_COMPOSITE_ANSWER,
+        LLMFlow.LEGAL_COMPOSITE_REVIEW,
+    ]
+    for _, payload, finalizing in gateway.requests:
+        if finalizing:
+            assert "tools" not in payload and "original_catalogue" not in payload
+            assert payload["receipts"] == [
+                {
+                    "need_ids": ["repair", "refund"],
+                    "status": "completed",
+                    "citations": [1, 2],
+                }
+            ]
+            assert payload["original_evidence"]
+            assert payload["plan"] == plan.model_dump(mode="json")
+        else:
+            assert payload["tools"] == definitions
+            assert payload["original_catalogue"]
+            assert payload["receipts"] == [receipt]
+
+
 @pytest.mark.parametrize("clipped_stage", ["answer", "review"])
 def test_provider_context_fit_cannot_silently_drop_a_cited_original(
     plan: ResearchPlan,
@@ -467,7 +529,10 @@ def test_completed_receipts_survive_research_phase_interruption(
     result = instance.run("Ücretli tamirin şartları ve iade süresi?")
     assert result.status == "verified"
     assert instance.receipts == acquirer.last_receipts
-    assert gateway.requests[1][1]["receipts"] == acquirer.last_receipts
+    assert gateway.requests[1][1]["receipts"] == [
+        {"status": "found", "citations": [1]},
+        {"status": "truncated", "citations": []},
+    ]
 
 
 def test_acquisition_cancellation_does_not_spend_finalization_reserve(

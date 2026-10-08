@@ -7,13 +7,24 @@ from unittest.mock import Mock
 import litellm
 import pytest
 from litellm.exceptions import Timeout as LiteLLMTimeout
+from litellm.llms.vertex_ai.gemini.vertex_and_google_ai_studio_gemini import (
+    VertexGeminiConfig,
+)
+from litellm.types.utils import ChatCompletionMessageToolCall, Function
+from pydantic import BaseModel
 
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.models import RunStopped
 from onyx.legal_composite.budget import WorkflowBudget
 from onyx.legal_composite.engine import LegalCompositeEngine, SourceAcquirer
 from onyx.legal_composite.gateway import BudgetedGateway
-from onyx.legal_composite.models import DraftAnswer, WorkflowPolicy
+from onyx.legal_composite.models import (
+    AnswerReview,
+    DraftAnswer,
+    ResearchPlan,
+    ResearchStep,
+    WorkflowPolicy,
+)
 from onyx.llm.cost import ModelPrice
 from onyx.llm.models import UserMessage
 from onyx.llm.multi_llm import LitellmLLM, LLMTimeoutError
@@ -201,3 +212,185 @@ def test_writer_timeout_ends_engine_without_review_or_repair(
     acquirer.acquire.assert_not_called()
     assert workflow.budget.snapshot()["model_calls"] == 2
     assert workflow.budget.snapshot()["unsettled_calls"] == 1
+
+
+@pytest.mark.parametrize(
+    "response_type,content,required",
+    [
+        (
+            DraftAnswer,
+            '{"answer":"supported","unresolved_need_ids":[]}',
+            ["answer", "unresolved_need_ids"],
+        ),
+        (
+            ResearchPlan,
+            '{"language":"tr","requires_sources":true,"needs":[{"need_id":"generic",'
+            '"question":"Which rule applies?","governing_source":"Applicable law",'
+            '"conditions_to_check":[]}],"initial_actions":[],"missing_user_facts":[]}',
+            [
+                "language",
+                "requires_sources",
+                "needs",
+                "initial_actions",
+                "missing_user_facts",
+            ],
+        ),
+        (
+            ResearchStep,
+            '{"actions":[{"need_ids":["generic"],"tool":"read_evidence",'
+            '"arguments":{"citations":[1],"options":{"value":null}}}],'
+            '"ready_to_answer":false,"remaining_gaps":[]}',
+            ["actions", "ready_to_answer", "remaining_gaps"],
+        ),
+        (
+            AnswerReview,
+            '{"request_coverage_complete":false,"material_claims_supported":false,'
+            '"counter_authority_checked":false,"needs":[],"defects":["Original missing"],'
+            '"repair_actions":[{"need_ids":["generic"],"tool":"read_evidence",'
+            '"arguments":{"citations":[1]}}]}',
+            [
+                "request_coverage_complete",
+                "material_claims_supported",
+                "counter_authority_checked",
+                "needs",
+                "defects",
+                "repair_actions",
+            ],
+        ),
+    ],
+)
+def test_canonical_typed_schema_maps_to_native_vertex_json_grammar(
+    model: LitellmLLM,
+    monkeypatch: pytest.MonkeyPatch,
+    response_type: type[BaseModel],
+    content: str,
+    required: list[str],
+) -> None:
+    def complete(**kwargs: Any) -> litellm.ModelResponse:
+        native: dict[str, Any] = {}
+        VertexGeminiConfig().apply_response_schema_transformation(
+            kwargs["response_format"], native, "gemini-3.8-flash"
+        )
+        assert native["response_mime_type"] == "application/json"
+        grammar = native["response_json_schema"]
+        assert grammar["required"] == required
+        assert grammar["additionalProperties"] is False
+        if response_type is DraftAnswer:
+            assert grammar["properties"]["answer"]["type"] == "string"
+            assert grammar["properties"]["unresolved_need_ids"]["type"] == "array"
+        else:
+            assert "SourceAction" in grammar["$defs"]
+            assert "JsonValue" in grammar["$defs"]
+        assert kwargs["tools"] is None
+        return response(content)
+
+    completion = Mock(side_effect=complete)
+    monkeypatch.setattr("litellm.completion", completion)
+    workflow = gateway(model, EvidenceLedger())
+    research = response_type in {ResearchPlan, ResearchStep}
+    result = workflow.complete(
+        "Return the typed result",
+        {},
+        response_type,
+        LLMFlow.LEGAL_COMPOSITE_RESEARCH
+        if research
+        else LLMFlow.LEGAL_COMPOSITE_REVIEW
+        if response_type is AnswerReview
+        else LLMFlow.LEGAL_COMPOSITE_ANSWER,
+        not research,
+    )
+    assert isinstance(result, response_type)
+    assert result == response_type.model_validate_json(content, strict=True)
+    completion.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "content", [None, '{"answer":"supported","unresolved_need_ids":[]}']
+)
+def test_canonical_undeclared_tool_result_never_becomes_a_typed_answer(
+    model: LitellmLLM, monkeypatch: pytest.MonkeyPatch, content: str | None
+) -> None:
+    returned = litellm.ModelResponse(
+        id="undeclared-tool-result",
+        created=1,
+        model="gemini-3.8-flash",
+        choices=[
+            litellm.Choices(
+                message=litellm.Message(
+                    role="assistant",
+                    content=content,
+                    tool_calls=[
+                        ChatCompletionMessageToolCall(
+                            id="undeclared",
+                            type="function",
+                            function=Function(
+                                name="read_evidence", arguments='{"citation":1}'
+                            ),
+                        )
+                    ],
+                ),
+                finish_reason="tool_calls",
+                index=0,
+            )
+        ],
+    )
+    completion = Mock(return_value=returned)
+    monkeypatch.setattr("litellm.completion", completion)
+    ledger = Mock(spec=EvidenceLedger)
+    workflow = gateway(model, ledger)
+    with pytest.raises(RunStopped, match="undeclared tool call"):
+        workflow.complete(
+            "Answer", {}, DraftAnswer, LLMFlow.LEGAL_COMPOSITE_ANSWER, True
+        )
+    completion.assert_called_once()
+    assert completion.call_args.kwargs["tools"] is None
+    ledger.record_delivery.assert_not_called()
+    assert workflow.last_call_id is None and not workflow.last_delivered_citations
+    assert workflow.budget.snapshot()["model_calls"] == 1
+
+
+@pytest.mark.parametrize("finish_reason", ["length", "max_tokens"])
+def test_valid_json_from_truncated_canonical_response_cannot_publish(
+    model: LitellmLLM, monkeypatch: pytest.MonkeyPatch, finish_reason: str
+) -> None:
+    returned = litellm.ModelResponse(
+        id="truncated-result",
+        created=1,
+        model="gemini-3.8-flash",
+        choices=[
+            litellm.Choices(
+                message=litellm.Message(
+                    role="assistant",
+                    content='{"answer":"valid JSON but incomplete generation","unresolved_need_ids":[]}',
+                ),
+                finish_reason=finish_reason,
+                index=0,
+            )
+        ],
+    )
+    completion = Mock(return_value=returned)
+    monkeypatch.setattr("litellm.completion", completion)
+    ledger = Mock(spec=EvidenceLedger)
+    workflow = gateway(model, ledger)
+    with pytest.raises(RunStopped, match="truncated"):
+        workflow.complete(
+            "Answer", {}, DraftAnswer, LLMFlow.LEGAL_COMPOSITE_ANSWER, True
+        )
+    completion.assert_called_once()
+    ledger.record_delivery.assert_not_called()
+    assert workflow.last_call_id is None
+
+
+def test_portable_native_schema_keeps_strict_host_validation(
+    model: LitellmLLM, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    completion = Mock(return_value=response('{"answer":"","unresolved_need_ids":[]}'))
+    monkeypatch.setattr("litellm.completion", completion)
+    workflow = gateway(model, EvidenceLedger())
+    with pytest.raises(RunStopped, match="workflow schema"):
+        workflow.complete(
+            "Answer", {}, DraftAnswer, LLMFlow.LEGAL_COMPOSITE_ANSWER, True
+        )
+    completion.assert_called_once()
+    portable = completion.call_args.kwargs["response_format"]["json_schema"]["schema"]
+    assert "minLength" not in portable["properties"]["answer"]
