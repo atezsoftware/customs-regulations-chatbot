@@ -26,6 +26,41 @@ import { cn } from "@opal/utils";
 /** Width constraint for normal (non-multi-model) messages. */
 const MSG_MAX_W = "max-w-[720px] min-w-[400px]";
 
+interface RegenerationResearchModeInput {
+  asv3ResumeMessageId?: number;
+  atezSearchEnabled: boolean;
+  atezSearchV2Enabled: boolean;
+  atezSearchV3Enabled: boolean;
+  legalCompositeEnabled?: boolean;
+  experimentalResearchEnabled: boolean;
+  experimentalParallelResearchEnabled: boolean;
+  experimentalGuardrailsEnabled: boolean;
+}
+
+export function getRegenerationResearchMode({
+  asv3ResumeMessageId,
+  atezSearchEnabled,
+  atezSearchV2Enabled,
+  atezSearchV3Enabled,
+  legalCompositeEnabled = false,
+  experimentalResearchEnabled,
+  experimentalParallelResearchEnabled,
+  experimentalGuardrailsEnabled,
+}: RegenerationResearchModeInput) {
+  const resumingAsv3 = Boolean(asv3ResumeMessageId);
+  return {
+    atezSearch: resumingAsv3 ? false : atezSearchEnabled,
+    atezSearchV2: resumingAsv3 ? false : atezSearchV2Enabled,
+    atezSearchV3: resumingAsv3 || atezSearchV3Enabled,
+    legalComposite: !resumingAsv3 && legalCompositeEnabled,
+    experimentalResearch: resumingAsv3 ? false : experimentalResearchEnabled,
+    experimentalParallelResearch: resumingAsv3
+      ? false
+      : experimentalParallelResearchEnabled,
+    experimentalGuardrails: experimentalGuardrailsEnabled,
+  };
+}
+
 export interface ChatUIProps {
   liveAgent: MinimalAgent;
   llmManager: LlmManager;
@@ -45,6 +80,7 @@ export interface ChatUIProps {
     legalComposite?: boolean;
     experimentalResearch?: boolean;
     experimentalParallelResearch?: boolean;
+    experimentalGuardrails?: boolean;
     asv3ResumeMessageId?: number;
     asv3AllowExternal?: boolean;
     modelOverride?: LlmDescriptor;
@@ -64,6 +100,7 @@ export interface ChatUIProps {
   legalCompositeEnabled?: boolean;
   experimentalResearchEnabled?: boolean;
   experimentalParallelResearchEnabled?: boolean;
+  experimentalGuardrailsEnabled?: boolean;
   currentMessageFiles: any[];
 
   onResubmit: () => void;
@@ -96,6 +133,7 @@ const ChatUI = React.memo(
     legalCompositeEnabled = false,
     experimentalResearchEnabled = false,
     experimentalParallelResearchEnabled = false,
+    experimentalGuardrailsEnabled = false,
     currentMessageFiles,
     onResubmit,
     anchorNodeId,
@@ -131,6 +169,9 @@ const ChatUI = React.memo(
     const experimentalParallelResearchEnabledRef = useRef(
       experimentalParallelResearchEnabled
     );
+    const experimentalGuardrailsEnabledRef = useRef(
+      experimentalGuardrailsEnabled
+    );
     const currentMessageFilesRef = useRef(currentMessageFiles);
     const selectedModelsRef = useRef(selectedModels);
     onSubmitRef.current = onSubmit;
@@ -142,6 +183,7 @@ const ChatUI = React.memo(
     experimentalResearchEnabledRef.current = experimentalResearchEnabled;
     experimentalParallelResearchEnabledRef.current =
       experimentalParallelResearchEnabled;
+    experimentalGuardrailsEnabledRef.current = experimentalGuardrailsEnabled;
     currentMessageFilesRef.current = currentMessageFiles;
     selectedModelsRef.current = selectedModels;
 
@@ -153,30 +195,25 @@ const ChatUI = React.memo(
         asv3ResumeMessageId?: number;
       }) => {
         return async function (modelOverride: LlmDescriptor) {
+          const researchMode = getRegenerationResearchMode({
+            asv3ResumeMessageId: regenerationRequest.asv3ResumeMessageId,
+            atezSearchEnabled: atezSearchEnabledRef.current,
+            atezSearchV2Enabled: atezSearchV2EnabledRef.current,
+            atezSearchV3Enabled: atezSearchV3EnabledRef.current,
+            legalCompositeEnabled: legalCompositeEnabledRef.current,
+            experimentalResearchEnabled: experimentalResearchEnabledRef.current,
+            experimentalParallelResearchEnabled:
+              experimentalParallelResearchEnabledRef.current,
+            experimentalGuardrailsEnabled:
+              experimentalGuardrailsEnabledRef.current,
+          });
           return await onSubmitRef.current({
             message: regenerationRequest.parentMessage.message,
             currentMessageFiles: currentMessageFilesRef.current,
             deepResearch: regenerationRequest.asv3ResumeMessageId
               ? false
               : deepResearchEnabledRef.current,
-            atezSearch: regenerationRequest.asv3ResumeMessageId
-              ? false
-              : atezSearchEnabledRef.current,
-            atezSearchV2: regenerationRequest.asv3ResumeMessageId
-              ? false
-              : atezSearchV2EnabledRef.current,
-            atezSearchV3:
-              Boolean(regenerationRequest.asv3ResumeMessageId) ||
-              atezSearchV3EnabledRef.current,
-            legalComposite:
-              !regenerationRequest.asv3ResumeMessageId &&
-              legalCompositeEnabledRef.current,
-            experimentalResearch:
-              !regenerationRequest.asv3ResumeMessageId &&
-              experimentalResearchEnabledRef.current,
-            experimentalParallelResearch:
-              !regenerationRequest.asv3ResumeMessageId &&
-              experimentalParallelResearchEnabledRef.current,
+            ...researchMode,
             asv3ResumeMessageId: regenerationRequest.asv3ResumeMessageId,
             modelOverride,
             messageIdToResend: regenerationRequest.parentMessage.messageId,
@@ -207,6 +244,9 @@ const ChatUI = React.memo(
             !(models && models.length >= 2),
           experimentalParallelResearch:
             experimentalParallelResearchEnabledRef.current &&
+            !(models && models.length >= 2),
+          experimentalGuardrails:
+            experimentalGuardrailsEnabledRef.current &&
             !(models && models.length >= 2),
           selectedModels: models && models.length >= 2 ? models : undefined,
         });

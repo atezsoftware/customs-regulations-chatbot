@@ -32,6 +32,7 @@ class BudgetedResearchLLM(LLM):
         reasoning_effort: ReasoningEffort = ReasoningEffort.AUTO,
         user_identity: LLMUserIdentity | None = None,
         use_streaming: bool = True,
+        provider_compatibility_attempts: int | None = None,
     ) -> ModelResponse:
         del reasoning_effort, use_streaming
         if tools or tool_choice is not None:
@@ -43,6 +44,7 @@ class BudgetedResearchLLM(LLM):
             timeout_override=timeout_override,
             max_tokens=max_tokens,
             user_identity=user_identity,
+            provider_compatibility_attempts=provider_compatibility_attempts,
         )
 
     def stream(

@@ -30,6 +30,7 @@ from onyx.legal_composite.selection import (
     SourceSelector,
     selection_request_from_ledger,
 )
+from onyx.tools.constants import REGULATORY_MAX_SEARCH_QUERY_CHARS
 from onyx.tracing.flows import LLMFlow
 
 ResponseModel = TypeVar("ResponseModel", bound=BaseModel)
@@ -99,6 +100,40 @@ def source_free_social_request(request: str) -> bool:
         "tesekkurler",
         "teşekkür ederim",
     }
+
+
+def initial_discovery_actions(plan: ResearchPlan, request: str) -> list[SourceAction]:
+    actions = list(plan.initial_actions)
+    if not plan.requires_sources:
+        return actions
+    searched_needs = {
+        need_id
+        for action in actions
+        if action.tool == "search_corpus"
+        for need_id in action.need_ids
+    }
+    missing = [need for need in plan.needs if need.need_id not in searched_needs]
+    if len(missing) == len(plan.needs):
+        queries = [
+            (plan.discovery_query or request, [need.need_id for need in missing])
+        ]
+    else:
+        queries = [(need.question, [need.need_id]) for need in missing]
+    for query, need_ids in queries:
+        actions.append(
+            SourceAction(
+                need_ids=need_ids,
+                tool="search_corpus",
+                arguments={
+                    "query": query.strip()[:REGULATORY_MAX_SEARCH_QUERY_CHARS],
+                    "mode": "hybrid",
+                    "coverage_item": ", ".join(need_ids),
+                    "evidence_target": "Operative governing, implementing, limiting and contrary original passages for the requested outcomes",
+                    "expand_query": False,
+                },
+            )
+        )
+    return actions
 
 
 class ModelGateway(Protocol):
@@ -485,9 +520,8 @@ class LegalCompositeEngine:
             self.plan = self.plan.model_copy(update={"requires_sources": True})
         plan = self.plan
         self.report("tools", plan.language)
-        source_phase_open = not plan.initial_actions or self._acquire(
-            plan.initial_actions, plan
-        )
+        initial_actions = initial_discovery_actions(plan, request)
+        source_phase_open = not initial_actions or self._acquire(initial_actions, plan)
         for _round in range(self.policy.max_research_rounds):
             if (
                 not source_phase_open

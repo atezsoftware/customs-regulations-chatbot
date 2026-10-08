@@ -19,7 +19,8 @@ from litellm.types.utils import ChatCompletionMessageToolCall, Function
 from pydantic import BaseModel
 
 from onyx.asv3.evidence import EvidenceLedger
-from onyx.asv3.models import RunStopped
+from onyx.asv3.models import RunContext, RunStopped
+from onyx.asv3.search_adapter import ScopedSearchLLM
 from onyx.legal_composite.budget import WorkflowBudget
 from onyx.legal_composite.engine import LegalCompositeEngine, SourceAcquirer
 from onyx.legal_composite.gateway import BudgetedGateway
@@ -100,6 +101,44 @@ def gateway(
         ledger=ledger,
         reasoning_effort=reasoning_effort,
     )
+
+
+@pytest.mark.parametrize("compatibility_attempts", [None, 1])
+def test_scoped_search_proxy_honors_canonical_compatibility_attempt_bound(
+    model: LitellmLLM,
+    monkeypatch: pytest.MonkeyPatch,
+    compatibility_attempts: int | None,
+) -> None:
+    def complete(**kwargs: Any) -> litellm.ModelResponse:
+        if "reasoning_effort" in kwargs:
+            raise BadRequestError(
+                "reasoning_effort unsupported", "gemini-3.8-flash", "vertex_ai"
+            )
+        return response("Selected relevant section")
+
+    completion = Mock(side_effect=complete)
+    monkeypatch.setattr("litellm.completion", completion)
+    workflow = gateway(model, EvidenceLedger())
+    helper = ScopedSearchLLM(
+        workflow.research_proxy(), RunContext(timeout_seconds=float("inf")), None
+    )
+    if compatibility_attempts == 1:
+        with pytest.raises(RunStopped, match="invocation failed"):
+            helper.invoke(
+                UserMessage(content="Select a relevant original"),
+                provider_compatibility_attempts=compatibility_attempts,
+            )
+        completion.assert_called_once()
+        assert workflow.budget.snapshot()["unsettled_calls"] == 1
+    else:
+        result = helper.invoke(
+            UserMessage(content="Select a relevant original"),
+            provider_compatibility_attempts=compatibility_attempts,
+        )
+        assert result.choice.message.content == "Selected relevant section"
+        assert completion.call_count == 2
+        assert workflow.budget.snapshot()["unsettled_calls"] == 0
+    assert workflow.budget.snapshot()["model_calls"] == 1
 
 
 def test_full_transport_window_allows_answer_rejected_by_ten_second_timeout(

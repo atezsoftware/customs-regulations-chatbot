@@ -699,6 +699,7 @@ class LitellmLLM(LLM):
         max_tokens: int | None = None,
         user_identity: LLMUserIdentity | None = None,
         client: "HTTPHandler | None" = None,
+        provider_compatibility_attempts: int | None = None,
     ) -> Union["ModelResponse", Iterator["LiteLLMModelResponseStream"]]:
         # Lazy loading to avoid memory bloat for non-inference flows
         from litellm.exceptions import BadRequestError, RateLimitError, Timeout
@@ -1126,6 +1127,12 @@ class LitellmLLM(LLM):
                 }
                 if len(stripped) < len(attempts[-1]):
                     attempts.append(stripped)
+            if provider_compatibility_attempts is not None:
+                if provider_compatibility_attempts < 1:
+                    raise ValueError(
+                        "provider_compatibility_attempts must be positive"
+                    )
+                attempts = attempts[:provider_compatibility_attempts]
 
             for i, opts in enumerate(attempts):
                 sampling = _sampling_snapshot(opts, passthrough_kwargs, self._seed)
@@ -1280,6 +1287,7 @@ class LitellmLLM(LLM):
         reasoning_effort: ReasoningEffort = ReasoningEffort.AUTO,
         user_identity: LLMUserIdentity | None = None,
         use_streaming: bool = True,
+        provider_compatibility_attempts: int | None = None,
     ) -> ModelResponse:
         from litellm import HTTPHandler
         from litellm import ModelResponse as LiteLLMModelResponse
@@ -1342,6 +1350,7 @@ class LitellmLLM(LLM):
                 reasoning_effort=reasoning_effort,
                 user_identity=user_identity,
                 client=client,
+                provider_compatibility_attempts=provider_compatibility_attempts,
             )
             if use_streaming:
                 # When env-only custom_config keys are injected (self-hosted

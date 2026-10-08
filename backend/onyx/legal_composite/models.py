@@ -5,6 +5,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
 from onyx.db.legal_composite_sources import SourceKind
+from onyx.tools.constants import REGULATORY_MAX_SEARCH_QUERY_CHARS
 
 
 class WorkflowPolicy(BaseModel):
@@ -59,6 +60,9 @@ class ResearchPlan(StrictModel):
     language: str = Field(min_length=2, max_length=35)
     requires_sources: bool
     needs: list[ResearchNeed] = Field(min_length=1)
+    discovery_query: str = Field(
+        default="", max_length=REGULATORY_MAX_SEARCH_QUERY_CHARS
+    )
     initial_actions: list[SourceAction]
     missing_user_facts: list[str]
 

@@ -19,7 +19,10 @@ from onyx.asv3.models import (
     ToolOutcome,
 )
 from onyx.asv3.parallel_execution import parallel_execution_enabled
-from onyx.asv3.workflow_variant import ASV3_TUNED_VARIANT
+from onyx.asv3.workflow_variant import (
+    ASV3_GUARDED_EXPERIMENTAL_VARIANT,
+    ASV3_TUNED_VARIANT,
+)
 from onyx.chat.emitter import NullEmitter
 from onyx.chat.models import ChatMessageSimple
 from onyx.configs.constants import MessageType
@@ -57,6 +60,26 @@ _TUNED_RETRIEVAL_OVERRIDES = SearchToolRetrievalOverrides(
     reuse_diversity_comparisons=True,
 )
 
+_GUARDED_RETRIEVAL_OVERRIDES = SearchToolRetrievalOverrides(
+    per_lane_num_hits=192,
+    rerank_candidate_limit=256,
+    regulatory_rerank_candidate_limit=256,
+    max_llm_chunks=32,
+    preserve_source_diversity=True,
+    reuse_diversity_comparisons=True,
+    guarded_decisions_advisory=True,
+)
+
+
+def guarded_retrieval_overrides(
+    workflow_variant: str | None,
+) -> SearchToolRetrievalOverrides | None:
+    if workflow_variant == ASV3_GUARDED_EXPERIMENTAL_VARIANT:
+        return _GUARDED_RETRIEVAL_OVERRIDES
+    if workflow_variant == ASV3_TUNED_VARIANT:
+        return _TUNED_RETRIEVAL_OVERRIDES
+    return None
+
 
 class ScopedSearchLLM(LLM):
     """Retain the selected model while accounting for secondary search generations."""
@@ -91,6 +114,22 @@ class ScopedSearchLLM(LLM):
             self.context.check_research_active()
             time.sleep(min(0.05, max(0, retry_at - time.monotonic())))
 
+    def provider_max_attempts(self) -> int:
+        configured = self.context.services.get("provider_max_attempts", 3)
+        if isinstance(configured, int) and not isinstance(configured, bool):
+            return max(1, configured)
+        return 3
+
+    def provider_compatibility_attempts(
+        self, requested: int | None
+    ) -> int | None:
+        if requested is not None:
+            return requested
+        configured = self.context.services.get("provider_compatibility_attempts")
+        if isinstance(configured, int) and not isinstance(configured, bool):
+            return max(1, configured)
+        return None
+
     def invoke(
         self,
         prompt: LanguageModelInput,
@@ -102,8 +141,13 @@ class ScopedSearchLLM(LLM):
         reasoning_effort: ReasoningEffort = ReasoningEffort.AUTO,
         user_identity: LLMUserIdentity | None = None,
         use_streaming: bool = True,
+        provider_compatibility_attempts: int | None = None,
     ) -> ModelResponse:
-        for attempt in range(3):
+        max_attempts = self.provider_max_attempts()
+        compatibility_attempts = self.provider_compatibility_attempts(
+            provider_compatibility_attempts
+        )
+        for attempt in range(max_attempts):
             try:
                 with model_slot(self.context, research=True):
                     self.context.consume_research_decision()
@@ -117,11 +161,12 @@ class ScopedSearchLLM(LLM):
                         reasoning_effort=reasoning_effort,
                         user_identity=user_identity or self.user_identity,
                         use_streaming=use_streaming,
+                        provider_compatibility_attempts=compatibility_attempts,
                     )
                     self.context.check_research_active()
                     return result
             except Exception as error:
-                if attempt == 2 or not is_retryable_provider_error(error):
+                if attempt == max_attempts - 1 or not is_retryable_provider_error(error):
                     raise
                 self.wait_to_retry(error, attempt)
         raise AssertionError("Selected-provider retry loop did not terminate")
@@ -137,7 +182,8 @@ class ScopedSearchLLM(LLM):
         reasoning_effort: ReasoningEffort = ReasoningEffort.AUTO,
         user_identity: LLMUserIdentity | None = None,
     ) -> Iterator[ModelResponseStream]:
-        for attempt in range(3):
+        max_attempts = self.provider_max_attempts()
+        for attempt in range(max_attempts):
             emitted = False
             try:
                 with model_slot(self.context, research=True):
@@ -158,7 +204,11 @@ class ScopedSearchLLM(LLM):
                     self.context.check_research_active()
                     return
             except Exception as error:
-                if emitted or attempt == 2 or not is_retryable_provider_error(error):
+                if (
+                    emitted
+                    or attempt == max_attempts - 1
+                    or not is_retryable_provider_error(error)
+                ):
                     raise
                 self.wait_to_retry(error, attempt)
 
@@ -328,10 +378,11 @@ def build_search_adapter(
                 inject_memories_in_prompt=inject_memories_in_prompt,
                 tool_execution_timeout_seconds=None,
                 search_rerank_context=original_query,
-                search_retrieval_overrides=(
-                    _TUNED_RETRIEVAL_OVERRIDES
-                    if context.services.get("asv3_workflow_variant")
-                    == ASV3_TUNED_VARIANT
+                search_retrieval_overrides=guarded_retrieval_overrides(
+                    context.services.get("asv3_workflow_variant")
+                    if isinstance(
+                        context.services.get("asv3_workflow_variant"), str
+                    )
                     else None
                 ),
             )
@@ -417,6 +468,9 @@ def build_search_adapter(
             data={
                 "source_count": len(evidence),
                 "retrieved_result_count": len(results),
+                "mapped_result_count": len(mapped_docs),
+                "hydrated_center_count": len(mapped_docs) - len(unhydrated_centers),
+                "retained_evidence_count": len(evidence),
                 "unmapped_result_count": unmapped_results,
                 "incomplete_closure_count": incomplete_closures,
                 "context_policy": "harness_controlled",

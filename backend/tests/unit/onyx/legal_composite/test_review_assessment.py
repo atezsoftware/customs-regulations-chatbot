@@ -555,15 +555,26 @@ class FakeGateway:
 
 
 class FakeAcquirer:
+    def __init__(self) -> None:
+        self.calls: list[list[SourceAction]] = []
+
     def definitions(self) -> list[dict[str, JsonValue]]:
         return []
 
     def acquire(
         self, actions: list[SourceAction], plan: ResearchPlan
     ) -> list[dict[str, JsonValue]]:
-        raise AssertionError(
-            f"No new acquisition expected for {len(plan.needs)} needs: {len(actions)} actions"
-        )
+        assert plan.requires_sources
+        assert len(actions) == 1
+        discovery = actions[0]
+        assert discovery.tool == "search_corpus"
+        assert discovery.need_ids == [need.need_id for need in plan.needs]
+        assert isinstance(discovery.arguments["query"], str)
+        assert discovery.arguments["query"].strip()
+        assert discovery.arguments["mode"] == "hybrid"
+        assert discovery.arguments["expand_query"] is False
+        self.calls.append([action.model_copy(deep=True) for action in actions])
+        return []
 
 
 def engine(gateway: FakeGateway, ledger: EvidenceLedger) -> LegalCompositeEngine:
@@ -598,9 +609,12 @@ def test_known_incorrect_draft_cannot_be_exposed_as_partial_answer(
 ) -> None:
     review.needs[0].status = "incorrect"
     gateway = FakeGateway([plan, draft, review])
-    result = engine(gateway, ledger).run("Ücretli tamirin şartları ve iade süresi?")
+    instance = engine(gateway, ledger)
+    result = instance.run("Ücretli tamirin şartları ve iade süresi?")
     assert result.status == "unavailable"
     assert result.answer is None
+    assert isinstance(instance.acquirer, FakeAcquirer)
+    assert len(instance.acquirer.calls) == 1
     assert gateway.calls == [
         LLMFlow.LEGAL_COMPOSITE_RESEARCH,
         LLMFlow.LEGAL_COMPOSITE_ANSWER,
@@ -759,7 +773,9 @@ def test_completed_receipts_survive_research_phase_interruption(
         def acquire(
             self, actions: list[SourceAction], plan: ResearchPlan
         ) -> list[dict[str, JsonValue]]:
-            assert actions == plan.initial_actions
+            assert actions[:-1] == plan.initial_actions
+            assert actions[-1].tool == "search_corpus"
+            assert actions[-1].need_ids == [need.need_id for need in plan.needs]
             raise RunStopped("Research deadline; finalization retained")
 
     gateway = FakeGateway([plan, draft, review])
@@ -788,7 +804,9 @@ def test_acquisition_cancellation_does_not_spend_finalization_reserve(
             self, actions: list[SourceAction], plan: ResearchPlan
         ) -> list[dict[str, JsonValue]]:
             nonlocal cancelled
-            assert actions == plan.initial_actions
+            assert actions[:-1] == plan.initial_actions
+            assert actions[-1].tool == "search_corpus"
+            assert actions[-1].need_ids == [need.need_id for need in plan.needs]
             cancelled = True
             raise RunStopped("Research cancelled")
 

@@ -93,6 +93,7 @@ export interface AppInputBarProps {
   legalCompositeEnabled?: boolean;
   experimentalResearchEnabled?: boolean;
   experimentalParallelResearchEnabled?: boolean;
+  experimentalGuardrailsEnabled?: boolean;
   setPresentingDocument?: (document: MinimalOnyxDocument) => void;
   toggleDeepResearch: () => void;
   toggleAtezSearch?: () => void;
@@ -101,6 +102,7 @@ export interface AppInputBarProps {
   toggleLegalComposite?: () => void;
   toggleExperimentalResearch?: () => void;
   toggleExperimentalParallelResearch?: () => void;
+  toggleExperimentalGuardrails?: () => void;
   isMultiModelActive?: boolean;
   disabled: boolean;
   awaitingPreferredSelection?: boolean;
@@ -129,11 +131,13 @@ const AppInputBar = React.memo(
     legalCompositeEnabled = false,
     experimentalResearchEnabled = false,
     experimentalParallelResearchEnabled = false,
+    experimentalGuardrailsEnabled = false,
     toggleDeepResearch,
     toggleAtezSearchV3,
     toggleLegalComposite,
     toggleExperimentalResearch,
     toggleExperimentalParallelResearch,
+    toggleExperimentalGuardrails,
     isMultiModelActive,
     setPresentingDocument,
     disabled,
@@ -797,6 +801,23 @@ const AppInputBar = React.memo(
                     }
                   >
                     Experimental ASv3
+                  </SelectButton>
+                )}
+                {showAtezSearch && toggleExperimentalGuardrails && (
+                  <SelectButton
+                    disabled={disabled || isMultiModelActive}
+                    variant="select-light"
+                    icon={SvgSparkle}
+                    onClick={toggleExperimentalGuardrails}
+                    state={experimentalGuardrailsEnabled ? "selected" : "empty"}
+                    foldable={false}
+                    tooltip={
+                      isMultiModelActive
+                        ? "Experimental Guardrails runs with one model. Remove extra models to use it."
+                        : "Süre, maliyet ve yeniden deneme sınırları olan deneysel ASv3 akışı"
+                    }
+                  >
+                    Experimental Guardrails
                   </SelectButton>
                 )}
               </>

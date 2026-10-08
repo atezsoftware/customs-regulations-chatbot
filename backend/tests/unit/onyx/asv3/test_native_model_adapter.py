@@ -1449,6 +1449,60 @@ def test_native_provider_retries_keep_the_same_first_seed_fork(
     assert llm.config.seed is None
 
 
+def test_guarded_provider_retry_stops_after_two_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    llm = model()
+    llm.config = llm.config.model_copy(
+        update={"model_provider": "vertex_ai", "model_name": "gemini-3.8-flash"}
+    )
+    llm.invoke.side_effect = [
+        RuntimeError("retryable provider failure"),
+        RuntimeError("retryable provider failure"),
+        llm.invoke.return_value,
+    ]
+    monkeypatch.setattr(llm_adapter, "is_retryable_provider_error", lambda _error: True)
+    monkeypatch.setattr(llm_adapter, "provider_retry_delay", lambda _error, _attempt: 0)
+    forks = seed_forks(llm)
+    adapter = ResearchModel(
+        llm,
+        RunContext(services={"provider_max_attempts": 2}),
+        lean_native_mode=True,
+    )
+    adapter._native_output_capacity = 65536
+
+    with pytest.raises(RuntimeError, match="retryable provider failure"):
+        adapter.decide(view())
+
+    assert len(forks) == 1
+    assert forks[0].invoke.call_count == 2
+
+
+def test_default_provider_retry_allows_the_third_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    llm = model()
+    llm.config = llm.config.model_copy(
+        update={"model_provider": "vertex_ai", "model_name": "gemini-3.8-flash"}
+    )
+    successful = llm.invoke.return_value
+    llm.invoke.side_effect = [
+        RuntimeError("retryable provider failure"),
+        RuntimeError("retryable provider failure"),
+        successful,
+    ]
+    monkeypatch.setattr(llm_adapter, "is_retryable_provider_error", lambda _error: True)
+    monkeypatch.setattr(llm_adapter, "provider_retry_delay", lambda _error, _attempt: 0)
+    forks = seed_forks(llm)
+    adapter = ResearchModel(llm, RunContext(), lean_native_mode=True)
+    adapter._native_output_capacity = 65536
+
+    adapter.decide(view())
+
+    assert len(forks) == 1
+    assert forks[0].invoke.call_count == 3
+
+
 @pytest.mark.parametrize(
     "progress",
     [

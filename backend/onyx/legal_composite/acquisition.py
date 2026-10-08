@@ -59,6 +59,25 @@ class CanonicalAcquirer:
                 retained.append(item)
         self.ledger.add(retained, self.context)
 
+    def _dispatch_action(
+        self, action: SourceAction, call: CapabilityCall, child: RunContext
+    ) -> ToolOutcome:
+        with graph_step(
+            "legal_composite.source_task",
+            {
+                "tool": call.name,
+                "source_kind": action.source_kind,
+                "need_ids": action.need_ids,
+                "query": call.arguments.get("query"),
+            },
+        ) as step:
+            outcome = self.registry_for_action(action).dispatch(call, child)
+            step.output_value = {
+                "status": outcome.status.value,
+                "original_count": len(outcome.evidence),
+            }
+            return outcome
+
     def acquire(
         self, actions: list[SourceAction], plan: ResearchPlan
     ) -> list[dict[str, JsonValue]]:
@@ -168,7 +187,8 @@ class CanonicalAcquirer:
                     Future[ToolOutcome],
                     executor.submit(
                         captured.run,
-                        self.registry_for_action(action).dispatch,
+                        self._dispatch_action,
+                        action,
                         call,
                         child,
                     ),

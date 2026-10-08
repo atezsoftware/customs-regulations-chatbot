@@ -741,9 +741,13 @@ def test_secondary_search_llm_preserves_selected_config_identity_and_budget() ->
     scoped = ScopedSearchLLM(selected, context, identity)
     assert scoped.config is selected.config
     scoped.invoke(
-        [UserMessage(content="actual prompt")], max_tokens=512, timeout_override=99
+        [UserMessage(content="actual prompt")],
+        max_tokens=512,
+        timeout_override=99,
+        provider_compatibility_attempts=1,
     )
     assert selected.invoke.call_args.kwargs["user_identity"] == identity
+    assert selected.invoke.call_args.kwargs["provider_compatibility_attempts"] == 1
     assert 1 <= selected.invoke.call_args.kwargs["timeout_override"] <= 10
     assert context.budget.snapshot()["decisions"] == 1
     assert context.budget.model_slots.acquire(blocking=False)
@@ -773,6 +777,46 @@ def test_secondary_search_retry_is_budgeted_and_final_reserve_is_not_spent() -> 
     with pytest.raises(RunStopped, match="finalization reserve"):
         scoped.invoke([UserMessage(content="reserve protected")], max_tokens=512)
     assert selected.invoke.call_count == 2
+
+
+def test_secondary_search_obeys_guarded_provider_retry_limits() -> None:
+    _, _, selected = tool_and_broker()
+    response = selected.invoke(max_tokens=512)
+    selected.invoke.reset_mock()
+    selected.invoke.side_effect = [RuntimeError("retryable failure"), response]
+    context = RunContext(
+        services={"provider_max_attempts": 2, "provider_compatibility_attempts": 1}
+    )
+    scoped = ScopedSearchLLM(selected, context, None)
+
+    with (
+        patch(
+            "onyx.asv3.search_adapter.is_retryable_provider_error", return_value=True
+        ),
+        patch("onyx.asv3.search_adapter.provider_retry_delay", return_value=0),
+    ):
+        assert scoped.invoke([UserMessage(content="retry")], max_tokens=512) == response
+
+    assert selected.invoke.call_count == 2
+    assert selected.invoke.call_args.kwargs["provider_compatibility_attempts"] == 1
+
+
+def test_secondary_search_stream_obeys_guarded_provider_retry_limits() -> None:
+    _, _, selected = tool_and_broker()
+    selected.stream.side_effect = [RuntimeError("retryable failure")] * 3
+    context = RunContext(services={"provider_max_attempts": 2})
+    scoped = ScopedSearchLLM(selected, context, None)
+
+    with (
+        patch(
+            "onyx.asv3.search_adapter.is_retryable_provider_error", return_value=True
+        ),
+        patch("onyx.asv3.search_adapter.provider_retry_delay", return_value=0),
+        pytest.raises(RuntimeError, match="retryable failure"),
+    ):
+        list(scoped.stream([UserMessage(content="retry")], max_tokens=512))
+
+    assert selected.stream.call_count == 2
 
 
 def test_real_search_results_are_canonically_hydrated_once_without_payload_text_duplication() -> (

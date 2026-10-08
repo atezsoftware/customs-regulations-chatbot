@@ -1,6 +1,7 @@
 """Exercise the replacement selection and checkpoint fences at their real boundaries."""
 
 import copy
+import math
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -13,6 +14,7 @@ from onyx.asv3.llm_adapter import ResearchModel
 from onyx.asv3.models import ASv3WorkflowSelection
 from onyx.asv3.shared_reads import SharedReads
 from onyx.asv3.workflow_variant import (
+    ASV3_GUARDED_EXPERIMENTAL_VARIANT,
     ASV3_STANDARD_VARIANT,
     ASV3_TUNED_POLICY,
     ASV3_TUNED_VARIANT,
@@ -52,6 +54,36 @@ def test_workflow_selection_is_strict_and_immutable() -> None:
     with pytest.raises(ValidationError):
         ASv3WorkflowSelection.model_validate(
             {"research_profile": "normal", "parallel_research": 0}
+        )
+
+
+def test_guarded_experimental_requires_its_explicit_selection() -> None:
+    guarded = resolve_asv3_workflow("normal", False, guarded_experimental=True)
+    assert guarded.research_profile == "normal"
+    assert guarded.parallel_research is False
+    assert guarded.workflow_variant == ASV3_GUARDED_EXPERIMENTAL_VARIANT
+    assert guarded.uses_guardrails
+    assert not guarded.selected_model_only
+
+    with pytest.raises(ValueError, match="normal profile"):
+        resolve_asv3_workflow("experimental", False, guarded_experimental=True)
+    with pytest.raises(ValueError, match="without parallel"):
+        resolve_asv3_workflow("normal", True, guarded_experimental=True)
+
+
+def test_guarded_checkpoint_cannot_cross_resume_legacy_variants() -> None:
+    guarded = {
+        **checkpoint_variant_fields(ASV3_GUARDED_EXPERIMENTAL_VARIANT),
+        "research_profile": "normal",
+        "parallel_research": False,
+    }
+    validate_asv3_variant_resume(ASV3_GUARDED_EXPERIMENTAL_VARIANT, guarded)
+    with pytest.raises(ValueError, match="same workflow variant"):
+        validate_asv3_variant_resume(ASV3_STANDARD_VARIANT, guarded)
+    with pytest.raises(ValueError, match="same workflow variant"):
+        validate_asv3_variant_resume(
+            ASV3_GUARDED_EXPERIMENTAL_VARIANT,
+            checkpoint_variant_fields(ASV3_TUNED_VARIANT),
         )
 
 
@@ -148,6 +180,70 @@ def test_tuned_runtime_uses_normal_tools_and_selected_model_everywhere(
     assert checkpoints[-1]["parallel_research"] is False
     assert checkpoints[-1]["asv3_workflow_variant"] == ASV3_TUNED_VARIANT
     assert checkpoints[-1]["asv3_workflow_policy"] == ASV3_TUNED_POLICY
+
+
+def test_guarded_runtime_has_finite_cost_and_latency_limits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kwargs, _broker, _selected, _checkpoints, _queue = setup_run(monkeypatch)
+    kwargs.pop("test_language")
+    contexts = []
+    original_model = runtime.ResearchModel
+
+    def make_model(llm: LLM, context: Any, **options: Any) -> ResearchModel:
+        contexts.append(context)
+        return original_model(llm, context, **options)
+
+    monkeypatch.setattr(runtime, "ResearchModel", make_model)
+    kwargs.update(
+        research_profile="normal",
+        parallel_research=False,
+        workflow_variant=ASV3_GUARDED_EXPERIMENTAL_VARIANT,
+    )
+    runtime.run_asv3_loop(**kwargs)
+
+    context = contexts[0]
+    assert math.isfinite(context.deadline)
+    assert context.budget.unlimited_execution is False
+    assert context.budget.limits["tools"] == 24
+    assert context.budget.limits["decisions"] == 32
+    assert context.services["provider_max_attempts"] == 2
+    assert context.services["asv3_workflow_variant"] == (
+        ASV3_GUARDED_EXPERIMENTAL_VARIANT
+    )
+
+
+def test_guarded_runtime_keeps_source_tools_cheap_and_coordinator_selected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kwargs, _broker, selected, _checkpoints, _queue = setup_run(monkeypatch)
+    kwargs.pop("test_language")
+    secondary = MagicMock(spec=LLM)
+    secondary.invoke.side_effect = AssertionError("Coordinator must not use Lite")
+    search = MagicMock(spec=SearchTool)
+    fork = MagicMock(spec=SearchTool)
+    search.llm = secondary
+    search.fork_for_independent_context.return_value = fork
+    original_model = runtime.ResearchModel
+
+    def make_model(llm: LLM, context: Any, **options: Any) -> ResearchModel:
+        assert llm is selected
+        assert options.get("research_llm") is None
+        return original_model(llm, context, **options)
+
+    monkeypatch.setattr(runtime, "ResearchModel", make_model)
+    kwargs.update(
+        research_profile="normal",
+        parallel_research=False,
+        workflow_variant=ASV3_GUARDED_EXPERIMENTAL_VARIANT,
+        research_llm=secondary,
+        tools=[search],
+    )
+    runtime.run_asv3_loop(**kwargs)
+
+    assert selected.invoke.call_count == 2
+    secondary.invoke.assert_not_called()
+    assert fork.llm is secondary
 
 
 def test_actual_runtime_resume_fences_before_saved_mode_override(

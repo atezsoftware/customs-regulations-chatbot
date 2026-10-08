@@ -390,6 +390,7 @@ class BudgetedGateway:
         flow: LLMFlow,
         response_format: dict[str, JsonValue] | None,
         user_identity: LLMUserIdentity | None,
+        provider_compatibility_attempts: int | None = None,
     ) -> ModelResponse:
         self.check_active()
         self.budget.check_active(flow is not LLMFlow.LEGAL_COMPOSITE_RESEARCH)
@@ -404,6 +405,7 @@ class BudgetedGateway:
             else self.reasoning_effort,
             user_identity=user_identity,
             use_streaming=False,
+            provider_compatibility_attempts=provider_compatibility_attempts,
         )
 
     def _generate(
@@ -419,6 +421,7 @@ class BudgetedGateway:
         invocation_output_tokens: int | None = None,
         requested_seconds: int | None = None,
         auxiliary: bool = False,
+        provider_compatibility_attempts: int | None = None,
     ) -> tuple[CallReservation, ModelResponse]:
         while True:
             self.check_active()
@@ -438,6 +441,7 @@ class BudgetedGateway:
                 invocation_output_tokens,
                 requested_seconds,
                 auxiliary,
+                provider_compatibility_attempts,
             )
         finally:
             self._model_slot.release()
@@ -455,6 +459,7 @@ class BudgetedGateway:
         invocation_output_tokens: int | None,
         requested_seconds: int | None,
         auxiliary: bool,
+        provider_compatibility_attempts: int | None,
     ) -> tuple[CallReservation, ModelResponse]:
         self.check_active()
         self.budget.check_active(finalizing)
@@ -487,7 +492,11 @@ class BudgetedGateway:
                 legal_composite_call_id=reservation.call_id,
                 legal_composite_allocated_call_seconds=str(call_seconds),
                 legal_composite_transport_timeout_seconds=str(timeout),
-                legal_composite_compat_attempt_bound=str(_COMPATIBILITY_ATTEMPTS),
+                legal_composite_compat_attempt_bound=str(
+                    min(provider_compatibility_attempts, _COMPATIBILITY_ATTEMPTS)
+                    if provider_compatibility_attempts is not None
+                    else _COMPATIBILITY_ATTEMPTS
+                ),
                 legal_composite_reserved_input_tokens=str(reservation.input_tokens),
                 legal_composite_reserved_output_tokens=str(reservation.output_tokens),
                 legal_composite_reserved_estimated_cost_usd=str(
@@ -522,6 +531,7 @@ class BudgetedGateway:
                         flow,
                         response_format,
                         user_identity,
+                        provider_compatibility_attempts,
                     )
                     wait_seconds = min(
                         call_seconds, self.budget.remaining_seconds(finalizing)
@@ -567,8 +577,14 @@ class BudgetedGateway:
         max_tokens: int | None = None,
         timeout_override: int | None = None,
         user_identity: LLMUserIdentity | None = None,
+        provider_compatibility_attempts: int | None = None,
     ) -> ModelResponse:
         """Admit auxiliary search generations through the same research allocation."""
+        if provider_compatibility_attempts is not None and (
+            isinstance(provider_compatibility_attempts, bool)
+            or provider_compatibility_attempts < 1
+        ):
+            raise ValueError("Invalid auxiliary provider compatibility attempt bound")
         if max_tokens is not None and (isinstance(max_tokens, bool) or max_tokens < 1):
             raise ValueError("Invalid auxiliary output limit")
         if timeout_override is not None and (
@@ -614,6 +630,7 @@ class BudgetedGateway:
             ),
             requested_seconds=timeout_override,
             auxiliary=True,
+            provider_compatibility_attempts=provider_compatibility_attempts,
         )
         return response
 

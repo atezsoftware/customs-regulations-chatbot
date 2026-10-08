@@ -180,6 +180,7 @@ class SearchToolRetrievalOverrides(BaseModel):
     max_llm_chunks: int = Field(gt=0, strict=True)
     preserve_source_diversity: bool = Field(default=False, strict=True)
     reuse_diversity_comparisons: bool = Field(default=False, strict=True)
+    guarded_decisions_advisory: bool = Field(default=False, strict=True)
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -221,6 +222,7 @@ class SearchToolRetrievalOverrideKwargs(SearchToolOverrideKwargs):
     regulatory_rerank_candidate_limit: int = Field(gt=0, strict=True)
     preserve_source_diversity: bool = Field(default=False, strict=True)
     reuse_diversity_comparisons: bool = Field(default=False, strict=True)
+    guarded_decisions_advisory: bool = Field(default=False, strict=True)
 
 
 class ChatFile(BaseModel):

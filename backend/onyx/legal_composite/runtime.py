@@ -95,9 +95,9 @@ def run_legal_composite_loop(
         max_input_tokens=2_000_000,
         max_output_tokens=256_000,
         max_model_calls=32,
-        max_tools=96,
+        max_tools=512,
         max_parallel_tools=len(SourceKind),
-        max_search_calls=32,
+        max_search_calls=384,
         selection_reserve_seconds=12,
     )
     started = time.monotonic()
@@ -173,6 +173,7 @@ def run_legal_composite_loop(
             user=user,
             filters=scope,
             check_active=context.check_research_active,
+            opening_workers=4,
         )
     search = next((tool for tool in tools if isinstance(tool, SearchTool)), None)
     if search is not None:
@@ -226,14 +227,16 @@ def run_legal_composite_loop(
                 ]
             )
         lane = build_lane_broker(broker, catalogue, kind)
-        lane.search_adapter = build_search_adapter(
-            search,
-            question,
-            lane,
-            message_history=lambda _context: list(simple_chat_history),
-            user_memory_context=user_memory_context,
-            inject_memories_in_prompt=inject_memories_in_prompt,
-            user_identity=user_identity,
+        lane.search_adapter = lane.guard_search_adapter(
+            build_search_adapter(
+                search,
+                question,
+                lane,
+                message_history=lambda _context: list(simple_chat_history),
+                user_memory_context=user_memory_context,
+                inject_memories_in_prompt=inject_memories_in_prompt,
+                user_identity=user_identity,
+            )
         )
         scoped_registry = CapabilityRegistry(
             build_corpus_specs(

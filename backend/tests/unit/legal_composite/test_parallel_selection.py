@@ -21,6 +21,7 @@ from onyx.legal_composite.engine import (
     LegalCompositeEngine,
     ModelGateway,
     SourceAcquirer,
+    initial_discovery_actions,
 )
 from onyx.legal_composite.models import (
     ResearchNeed,
@@ -51,23 +52,43 @@ def plan() -> ResearchPlan:
     )
 
 
-def test_unknown_discovery_runs_beside_each_requested_kind() -> None:
+def test_discovery_searches_every_kind_despite_planner_type_restrictions() -> None:
     catalogue = SourceLaneCatalogue(
         user_id=uuid4(), scope_sha256="scope", records=(), complete=True
     )
     router = SourceLaneRouter(catalogue, lambda _kind: CapabilityRegistry([]))
     actions = router.expand(
-        [SourceAction(need_ids=["n1"], tool="search_corpus", arguments={})], plan()
+        [
+            SourceAction(
+                need_ids=["n1"],
+                tool="search_corpus",
+                arguments={},
+                source_kind=SourceKind.STATUTE,
+            )
+        ],
+        plan(),
     )
-    assert [action.source_kind for action in actions] == [
-        SourceKind.STATUTE,
-        SourceKind.PRESIDENTIAL_DECREE,
-        SourceKind.UNKNOWN,
-    ]
+    assert [action.source_kind for action in actions] == list(SourceKind)
+
+
+def test_direct_read_plan_cannot_skip_all_kind_discovery() -> None:
+    frozen_plan = plan().model_copy(update={"discovery_query": "Focused legal issue"})
+    actions = initial_discovery_actions(frozen_plan, "Complete user request")
+    assert len(actions) == 1 and actions[0].tool == "search_corpus"
+    assert actions[0].need_ids == ["n1"]
+    assert actions[0].arguments["query"] == "Focused legal issue"
+
+
+def test_existing_discovery_is_not_repeated() -> None:
+    search = SourceAction(
+        need_ids=["n1"], tool="search_corpus", arguments={"query": "issue"}
+    )
+    frozen_plan = plan().model_copy(update={"initial_actions": [search]})
+    assert initial_discovery_actions(frozen_plan, "request") == [search]
 
 
 def test_independent_kind_registries_actually_overlap_and_report_progress() -> None:
-    barrier = Barrier(2)
+    barrier = Barrier(len(SourceKind))
 
     def search(_arguments: dict[str, JsonValue], context: RunContext) -> ToolOutcome:
         context.check_research_active()
@@ -86,10 +107,7 @@ def test_independent_kind_registries_actually_overlap_and_report_progress() -> N
             ]
         )
 
-    registries = {
-        SourceKind.STATUTE: registry(),
-        SourceKind.PRESIDENTIAL_DECREE: registry(),
-    }
+    registries = {kind: registry() for kind in SourceKind}
     progress: list[tuple[int, int]] = []
 
     def choose_registry(action: SourceAction) -> CapabilityRegistry:
@@ -100,7 +118,9 @@ def test_independent_kind_registries_actually_overlap_and_report_progress() -> N
         registry(),
         RunContext(),
         EvidenceLedger(),
-        WorkflowPolicy(),
+        WorkflowPolicy(
+            max_parallel_tools=len(SourceKind), max_search_calls=len(SourceKind)
+        ),
         registry_for_action=choose_registry,
         on_batch_progress=lambda _actions, pending, completed: progress.append(
             (pending, completed)
@@ -114,8 +134,8 @@ def test_independent_kind_registries_actually_overlap_and_report_progress() -> N
     ]
     receipts = acquirer.acquire(actions, plan())
     assert {row["source_kind"] for row in receipts} == set(registries)
-    assert progress[0] == (2, 0) and progress[-1] == (0, 2)
-    assert acquirer.search_calls == 2
+    assert progress[0] == (len(SourceKind), 0) and progress[-1] == (0, len(SourceKind))
+    assert acquirer.search_calls == len(SourceKind)
 
 
 def test_selected_uncited_exception_is_required_before_the_first_draft() -> None:

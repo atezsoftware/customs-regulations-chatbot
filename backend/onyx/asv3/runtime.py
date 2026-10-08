@@ -85,6 +85,7 @@ from onyx.asv3.supplemental_tools import (
 )
 from onyx.asv3.workers import WorkerPool
 from onyx.asv3.workflow_variant import (
+    ASV3_GUARDED_EXPERIMENTAL_VARIANT,
     ASV3_STANDARD_VARIANT,
     ASV3_TUNED_VARIANT,
     checkpoint_variant_fields,
@@ -276,12 +277,27 @@ def run_asv3_loop(
         ),
         "",
     )
+    guarded_experimental = workflow_variant == ASV3_GUARDED_EXPERIMENTAL_VARIANT
     context = RunContext(
         language="und",
-        timeout_seconds=float("inf"),
-        budget=SharedBudget(unlimited_execution=True),
+        timeout_seconds=150 if guarded_experimental else float("inf"),
+        budget=(
+            SharedBudget(max_tools=24, max_decisions=32)
+            if guarded_experimental
+            else SharedBudget(unlimited_execution=True)
+        ),
         cancelled=lambda: not is_connected(chat_session_id, cache),
-        services={"lean_native_mode": True},
+        services={
+            "lean_native_mode": True,
+            **(
+                {
+                    "provider_max_attempts": 2,
+                    "provider_compatibility_attempts": 1,
+                }
+                if guarded_experimental
+                else {}
+            ),
+        },
     )
     if custom_agent_prompt:
         context.services["assistant_instructions"] = custom_agent_prompt
@@ -366,7 +382,10 @@ def run_asv3_loop(
     context.language = profile.language
     context.services["research_profile"] = research_profile
     context.services["experimental_parallel"] = parallel_research
-    if workflow_variant == ASV3_TUNED_VARIANT:
+    if workflow_variant in {
+        ASV3_TUNED_VARIANT,
+        ASV3_GUARDED_EXPERIMENTAL_VARIANT,
+    }:
         context.services["asv3_workflow_variant"] = workflow_variant
     context.services["independent_question_mode"] = (
         research_profile == "deep" or parallel_research
@@ -473,7 +492,7 @@ def run_asv3_loop(
         history=history,
         token_counter=token_counter,
         lean_native_mode=True,
-        research_llm=research_llm,
+        research_llm=None if guarded_experimental else research_llm,
         answer_llm=answer_llm,
     )
     if previous is not None:

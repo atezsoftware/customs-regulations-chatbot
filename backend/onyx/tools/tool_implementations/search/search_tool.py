@@ -47,6 +47,7 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy.orm import Session
 
+from onyx.asv3.decisions_reranker import promote_guarded_boundary_candidates
 from onyx.chat.emitter import Emitter
 from onyx.configs.chat_configs import MAX_CHUNKS_FED_TO_CHAT, MAX_SEARCH_QUERY_LANES
 from onyx.configs.constants import DocumentSource, FederatedConnectorSource
@@ -2813,12 +2814,43 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
                     scores=rerank_result.scores_by_chunk,
                     baseline_limit=max_selected_sections,
                 )
-                selected_sections = _reorder_sections_by_chunk_ranking(
-                    candidate_sections, normalized_selection.ordered_chunks
+                guarded_decisions_advisory = (
+                    isinstance(override_kwargs, SearchToolRetrievalOverrideKwargs)
+                    and override_kwargs.guarded_decisions_advisory
                 )
-                max_selected_sections = max(
-                    max_selected_sections, len(selected_sections)
-                )
+                if guarded_decisions_advisory:
+                    deterministic_chunks = normalized_selection.ordered_chunks
+                    selected_identities = {
+                        (chunk.document_id, chunk.chunk_id)
+                        for chunk in deterministic_chunks
+                    }
+                    deterministic_order = [
+                        *deterministic_chunks,
+                        *[
+                            section.center_chunk
+                            for section in candidate_sections
+                            if (
+                                section.center_chunk.document_id,
+                                section.center_chunk.chunk_id,
+                            )
+                            not in selected_identities
+                        ],
+                    ]
+                    advisory_order = promote_guarded_boundary_candidates(
+                        query=rerank_query,
+                        ordered_chunks=deterministic_order,
+                        baseline_limit=max(1, max_selected_sections - 4),
+                    )
+                    selected_sections = _reorder_sections_by_chunk_ranking(
+                        candidate_sections, advisory_order
+                    )[:max_selected_sections]
+                else:
+                    selected_sections = _reorder_sections_by_chunk_ranking(
+                        candidate_sections, normalized_selection.ordered_chunks
+                    )
+                    max_selected_sections = max(
+                        max_selected_sections, len(selected_sections)
+                    )
             else:
                 selected_sections = candidate_sections[:max_selected_sections]
             if regulatory_chunks_only:

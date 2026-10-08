@@ -168,6 +168,7 @@ export interface SendMessageParams {
   legalComposite?: boolean;
   experimentalResearch?: boolean;
   experimentalParallelResearch?: boolean;
+  experimentalGuardrails?: boolean;
   asv3ResumeMessageId?: number;
   asv3AllowExternal?: boolean;
   enabledToolIds?: number[];
@@ -199,6 +200,7 @@ export async function* sendMessage({
   legalComposite,
   experimentalResearch,
   experimentalParallelResearch,
+  experimentalGuardrails,
   asv3ResumeMessageId,
   asv3AllowExternal,
   enabledToolIds,
@@ -223,24 +225,31 @@ export async function* sendMessage({
     atez_search_v2: false,
     ...(legalComposite ? { legal_composite: true } : {}),
     atez_search_v3: Boolean(
-      (atezSearchV3 || experimentalResearch || experimentalParallelResearch) &&
+      (atezSearchV3 ||
+        experimentalResearch ||
+        experimentalParallelResearch ||
+        experimentalGuardrails) &&
       !deepResearch
     ),
     asv3_research_profile: deepResearch
       ? "deep"
       : experimentalResearch || experimentalParallelResearch
         ? "experimental"
-        : atezSearchV3
+        : atezSearchV3 || experimentalGuardrails
           ? "normal"
           : "deep",
     ...(experimentalParallelResearch && !deepResearch
       ? { asv3_parallel_research: true }
+      : {}),
+    ...(experimentalGuardrails && !deepResearch
+      ? { asv3_guarded_experimental: true }
       : {}),
     asv3_resume_message_id: asv3ResumeMessageId,
     asv3_allow_external: Boolean(
       (atezSearchV3 ||
         experimentalResearch ||
         experimentalParallelResearch ||
+        experimentalGuardrails ||
         deepResearch) &&
       asv3AllowExternal
     ),

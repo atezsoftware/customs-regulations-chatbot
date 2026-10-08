@@ -23,7 +23,9 @@ Source kinds are separate retrieval lanes, not a flat legal authority ranking. J
 decisions and executive decisions are different; private rulings require their own scope.
 source_lane_inventory describes available authorized categories and classification limits.
 Unknown classification is a discovery lane, never evidence that a legal category is absent.
-For each action specify source_kind; only that authorized category is searched/read.
+Every search_corpus query runs in ALL source-kind lanes concurrently, including unknown.
+The host guarantees this coverage; source_kind and source_kinds cannot exclude search lanes.
+Use source_kind only to route targeted identity/provision reads to their observed category.
 Independent actions in different lanes execute concurrently within one shared budget.
 Do not guess IDs or turn an article-number query into corpus-wide unrelated matches.
 Stay within the supplied jurisdiction, date and ACL scope. External tools are unavailable.
@@ -43,8 +45,9 @@ Make conditions_to_check an inventory of separate material prerequisites and leg
 including each effect's own operative basis and any applicable limit or procedural stage.
 Split a broad topic into needs or condition entries that can be checked individually.
 Include only dependencies that can change this request's answer, not an unrelated checklist.
-Set each need's source_kinds to the legal categories that can establish, qualify or contradict
-its outcome. Cover material governing and implementing categories, without unrelated work.
+Provide discovery_query as one focused query covering the complete requested outcomes.
+All source categories are always searched; do not decide which categories to omit.
+source_kinds may describe targeted reading leads, never limit discovery coverage.
 Give known-instrument actions the appropriate source_kind. Do not confuse a court judgment
 with an executive decision or a private ruling with a generally applicable legal rule.
 Retain the applicable governing rule AND material implementing details for each effect.

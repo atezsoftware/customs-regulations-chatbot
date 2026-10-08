@@ -14,16 +14,24 @@ from pydantic import JsonValue
 from onyx.asv3.corpus_tools import build_corpus_specs
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.models import EvidenceItem, RunContext, ToolSpec
+from onyx.asv3.registry import CapabilityRegistry
 from onyx.cache.interface import CacheBackend
 from onyx.chat.chat_state import ChatStateContainer
 from onyx.chat.emitter import BufferedEmitter
 from onyx.chat.models import ChatMessageSimple
 from onyx.configs.constants import MessageType
 from onyx.context.search.models import BaseFilters, IndexFilters
-from onyx.db.legal_composite_sources import SourceLaneCatalogue, source_scope_sha256
+from onyx.db.asv3_corpus import CorpusSource
+from onyx.db.legal_composite_sources import (
+    SourceKind,
+    SourceLaneCatalogue,
+    classify_source,
+    source_scope_sha256,
+)
 from onyx.db.models import User
 from onyx.legal_composite import runtime
 from onyx.legal_composite.models import WorkflowResult
+from onyx.legal_composite.routing import SourceLaneRouter
 from onyx.llm.interfaces import LLM, LLMConfig
 from onyx.server.query_and_chat.streaming_models import (
     AgentResponseDelta,
@@ -163,7 +171,9 @@ def harness(monkeypatch: pytest.MonkeyPatch) -> RuntimeHarness:
         user: User,
         filters: IndexFilters,
         check_active: Callable[[], None],
+        opening_workers: int = 1,
     ) -> SourceLaneCatalogue:
+        assert opening_workers == 4
         check_active()
         return SourceLaneCatalogue(
             user_id=user.id,
@@ -217,6 +227,50 @@ def harness(monkeypatch: pytest.MonkeyPatch) -> RuntimeHarness:
     return RuntimeHarness(
         state, emitter, snapshots, events, broker, search, gateway, binding_scopes, run
     )
+
+
+def test_runtime_wraps_typed_search_with_captured_lane_guard(
+    harness: RuntimeHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lane = MagicMock()
+    adapter = object()
+    guarded = object()
+    lane.guard_search_adapter.return_value = guarded
+    monkeypatch.setattr(runtime, "build_lane_broker", lambda *_args: lane)
+    monkeypatch.setattr(
+        runtime, "build_search_adapter", lambda *_args, **_kwargs: adapter
+    )
+
+    def catalogue_factory(
+        _session: Any,
+        *,
+        user: User,
+        filters: IndexFilters,
+        check_active: Callable[[], None],
+        opening_workers: int = 1,
+    ) -> SourceLaneCatalogue:
+        assert opening_workers == 4
+        check_active()
+        source = CorpusSource(uuid4(), "own-source.md", "file")
+        return SourceLaneCatalogue(
+            user_id=user.id,
+            scope_sha256=source_scope_sha256(user, filters),
+            records=(classify_source(source, (), opening_texts=("ÖRNEK KANUNU",)),),
+            complete=True,
+        )
+
+    def router_factory(
+        catalogue: SourceLaneCatalogue,
+        build_registry: Callable[[SourceKind], CapabilityRegistry],
+    ) -> SourceLaneRouter:
+        build_registry(SourceKind.STATUTE)
+        return SourceLaneRouter(catalogue, build_registry)
+
+    monkeypatch.setattr(runtime, "load_source_lane_catalogue", catalogue_factory)
+    monkeypatch.setattr(runtime, "SourceLaneRouter", router_factory)
+    harness.run(None)
+    lane.guard_search_adapter.assert_called_once_with(adapter)
+    assert lane.search_adapter is guarded
 
 
 @pytest.mark.parametrize(

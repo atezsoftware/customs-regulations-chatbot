@@ -47,7 +47,10 @@ class SourceLaneRouter:
             if set(action.need_ids) - planned.keys():
                 raise InvalidSourceAction("Source action refers to an unknown need")
             source_id = action.arguments.get("source_id")
-            if isinstance(source_id, str):
+            if action.tool == "search_corpus":
+                # Discovery coverage is fixed by the host, never the planner.
+                kinds = list(SourceKind)
+            elif isinstance(source_id, str):
                 observed_kind = self._source_kinds.get(source_id)
                 if observed_kind is None:
                     raise InvalidSourceAction(
@@ -64,7 +67,7 @@ class SourceLaneRouter:
                         for kind in planned[need_id].source_kinds
                     )
                 ) or [SourceKind.STATUTE, SourceKind.REGULATION]
-            if action.tool in {"search_corpus", "resolve_source", "query_corpus"}:
+            if action.tool in {"resolve_source", "query_corpus"}:
                 # Ambiguous identities are searchable without contaminating typed lanes.
                 kinds = list(dict.fromkeys([*kinds, SourceKind.UNKNOWN]))
             expanded.extend(

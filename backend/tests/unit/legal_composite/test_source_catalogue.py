@@ -1,8 +1,11 @@
+from collections.abc import Generator
+from contextlib import contextmanager
 from datetime import date
+from threading import Barrier, Event, Lock
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import MagicMock
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy.dialects import postgresql
@@ -13,6 +16,7 @@ from onyx.db import legal_composite_sources as sources
 from onyx.db.asv3_corpus import CorpusChunk, CorpusScopeUnavailable, CorpusSource
 from onyx.db.legal_composite_sources import SourceKind, classify_source
 from onyx.db.models import User
+from shared_configs.contextvars import CURRENT_TENANT_ID_CONTEXTVAR
 
 READ_ORIGINAL_OPENING = sources._opening_texts
 HEADINGS = {
@@ -270,6 +274,131 @@ def test_partial_inventory_reports_unsearched_sources(
     )
     assert not catalogue.complete and catalogue.limitations
     assert len(catalogue.records) == 1
+
+
+def test_parallel_opening_reads_overlap_with_owned_sessions_and_tenant_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_page = [
+        CorpusSource(uuid4(), f"source-{index}.md", "file") for index in range(8)
+    ]
+    positions = {source.id: index for index, source in enumerate(source_page)}
+    user = cast(User, SimpleNamespace(id=uuid4()))
+    filters = IndexFilters(
+        access_control_list=["authorized-user"],
+        asv3_document_set_id=15,
+        forced_document_set=["PC Külliyatı"],
+        as_of_date=date(2020, 1, 1),
+    )
+    inventory = MagicMock(spec=Session)
+    inventory.execute.return_value.all.return_value = [
+        (source.id, "kanun") for source in source_page
+    ]
+    monkeypatch.setattr(
+        sources, "find_sources", lambda *_args, **_kwargs: (source_page, False)
+    )
+    sessions: list[MagicMock] = []
+    closed: list[MagicMock] = []
+    completion_order: list[int] = []
+    lock, barrier, fourth_complete = Lock(), Barrier(4), Event()
+    active, peak = [0], [0]
+
+    @contextmanager
+    def opening_session() -> Generator[Session, None, None]:
+        assert CURRENT_TENANT_ID_CONTEXTVAR.get() == "opening-test-tenant"
+        own_session = MagicMock(spec=Session)
+        with lock:
+            sessions.append(own_session)
+        try:
+            yield cast(Session, own_session)
+        finally:
+            with lock:
+                closed.append(own_session)
+
+    def read(
+        session: Session, **kwargs: object
+    ) -> tuple[CorpusSource, list[CorpusChunk], bool]:
+        assert session is not inventory
+        assert CURRENT_TENANT_ID_CONTEXTVAR.get() == "opening-test-tenant"
+        assert kwargs["user"] is user and kwargs["filters"] is filters
+        assert kwargs["start"] == 0 and kwargs["limit"] == 3
+        assert kwargs["query_indexes"] == {}
+        source = source_page[positions[cast(UUID, kwargs["source_id"])]]
+        index = positions[source.id]
+        with lock:
+            active[0] += 1
+            peak[0] = max(peak[0], active[0])
+        try:
+            barrier.wait(timeout=3)
+            if index == 0:
+                assert fourth_complete.wait(timeout=3)
+            with lock:
+                completion_order.append(index)
+            if index == 3:
+                fourth_complete.set()
+            if index == 6:
+                raise CorpusScopeUnavailable("Original publication unavailable")
+            chunk = CorpusChunk(
+                f"chunk-{index}",
+                source.id,
+                "ÖRNEK KANUNU\nMADDE 1- İlk hüküm.",
+                0,
+                0,
+                (),
+                {},
+                None,
+                None,
+                "active",
+            )
+            return source, [chunk], False
+        finally:
+            with lock:
+                active[0] -= 1
+
+    def check_active() -> None:
+        assert CURRENT_TENANT_ID_CONTEXTVAR.get() == "opening-test-tenant"
+
+    monkeypatch.setattr(sources, "_opening_texts", READ_ORIGINAL_OPENING)
+    monkeypatch.setattr(sources, "get_session_with_current_tenant", opening_session)
+    monkeypatch.setattr(sources, "resolve_source_query_index", lambda *_args: None)
+    monkeypatch.setattr(sources, "read_source_chunks", read)
+    token = CURRENT_TENANT_ID_CONTEXTVAR.set("opening-test-tenant")
+    try:
+        catalogue = sources.load_source_lane_catalogue(
+            cast(Session, inventory),
+            user=user,
+            filters=filters,
+            check_active=check_active,
+            opening_workers=4,
+        )
+    finally:
+        CURRENT_TENANT_ID_CONTEXTVAR.reset(token)
+    assert peak == [4] and active == [0]
+    assert completion_order.index(3) < completion_order.index(0)
+    assert [row.source_id for row in catalogue.records] == [
+        source.id for source in source_page
+    ]
+    assert catalogue.records[6].kind is SourceKind.UNKNOWN
+    assert not catalogue.complete and catalogue.limitations
+    assert len(sessions) == len(closed) == len({id(item) for item in sessions}) == 8
+    assert {id(item) for item in closed} == {id(item) for item in sessions}
+    for session in sessions:
+        session.add.assert_not_called()
+        session.commit.assert_not_called()
+
+
+@pytest.mark.parametrize("workers", [0, 5, True])
+def test_invalid_opening_concurrency_fails_before_inventory(workers: int) -> None:
+    session = MagicMock(spec=Session)
+    with pytest.raises(ValueError, match="Opening workers"):
+        sources.load_source_lane_catalogue(
+            cast(Session, session),
+            user=cast(User, SimpleNamespace(id=uuid4())),
+            filters=IndexFilters(access_control_list=[]),
+            check_active=lambda: None,
+            opening_workers=workers,
+        )
+    session.execute.assert_not_called()
 
 
 def test_metadata_type_query_uses_the_original_temporal_boundary(

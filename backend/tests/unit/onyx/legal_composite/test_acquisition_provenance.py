@@ -176,6 +176,31 @@ def test_invalid_planned_action_becomes_unavailable_without_tool_execution(
     invalid: str,
 ) -> None:
     instance, handler = acquirer()
+    search_handler = Mock(
+        return_value=ToolOutcome(
+            status=OutcomeStatus.NOT_FOUND,
+            summary="Authorized discovery completed without new originals.",
+        )
+    )
+    instance.registry.register(
+        ToolSpec(
+            name="search_corpus",
+            description="Authorized discovery in the frozen scope.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "mode": {"type": "string"},
+                    "coverage_item": {"type": "string"},
+                    "evidence_target": {"type": "string"},
+                    "expand_query": {"type": "boolean"},
+                },
+                "required": ["query", "mode", "coverage_item", "evidence_target"],
+                "additionalProperties": False,
+            },
+            handler=search_handler,
+        )
+    )
     request_plan = plan()
     action = SourceAction(
         need_ids=["unknown"] if invalid == "unknown_need" else ["first"],
@@ -212,7 +237,15 @@ def test_invalid_planned_action_becomes_unavailable_without_tool_execution(
         for call in gateway.complete.call_args_list
     )
     handler.assert_not_called()
-    assert instance.context.budget.snapshot()["tools"] == 0
+    if invalid == "unknown_need":
+        search_handler.assert_called_once()
+        assert search_handler.call_args.args[0]["expand_query"] is False
+        assert instance.context.budget.snapshot()["tools"] == 1
+        assert "unknown frozen need" in result.gaps[0]
+    else:
+        search_handler.assert_not_called()
+        assert instance.context.budget.snapshot()["tools"] == 0
+    assert instance.ledger.citation_numbers() == ()
 
 
 def test_programming_error_is_not_swallowed(monkeypatch: pytest.MonkeyPatch) -> None:

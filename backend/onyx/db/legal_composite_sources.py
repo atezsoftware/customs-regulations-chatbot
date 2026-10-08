@@ -4,9 +4,13 @@ import json
 import re
 import unicodedata
 from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeout
+from contextvars import copy_context
 from datetime import date
 from enum import StrEnum
 from hashlib import sha256
+from typing import cast
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, JsonValue
@@ -22,6 +26,7 @@ from onyx.db.asv3_corpus import (
     require_source,
     resolve_source_query_index,
 )
+from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.db.models import RegulatoryChunk, User
 
 SOURCE_PAGE_SIZE = 100
@@ -374,6 +379,62 @@ def _document_types(
     ) <= MAX_METADATA_TYPES_PER_PAGE
 
 
+def _source_openings(
+    session: Session,
+    source_page: list[CorpusSource],
+    *,
+    user: User,
+    filters: IndexFilters,
+    check_active: Callable[[], None],
+    opening_workers: int,
+) -> list[tuple[str, ...] | None]:
+    def read(source: CorpusSource) -> tuple[str, ...] | None:
+        try:
+            if opening_workers == 1:
+                return _opening_texts(
+                    session,
+                    user=user,
+                    filters=filters,
+                    source=source,
+                    check_active=check_active,
+                )
+            # SQLAlchemy sessions never cross concurrent worker boundaries.
+            with get_session_with_current_tenant() as opening_session:
+                return _opening_texts(
+                    opening_session,
+                    user=user,
+                    filters=filters,
+                    source=source,
+                    check_active=check_active,
+                )
+        except CorpusScopeUnavailable:
+            return None
+
+    if opening_workers == 1:
+        return [read(source) for source in source_page]
+    executor = ThreadPoolExecutor(max_workers=opening_workers)
+    try:
+        futures = [
+            cast(
+                Future[tuple[str, ...] | None],
+                executor.submit(copy_context().run, read, source),
+            )
+            for source in source_page
+        ]
+        result: list[tuple[str, ...] | None] = []
+        for future in futures:
+            while True:
+                check_active()
+                try:
+                    result.append(future.result(timeout=0.05))
+                    break
+                except FutureTimeout:
+                    continue
+        return result
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
 def load_source_lane_catalogue(
     session: Session,
     *,
@@ -381,9 +442,16 @@ def load_source_lane_catalogue(
     filters: IndexFilters,
     check_active: Callable[[], None],
     max_sources: int = MAX_SOURCE_INVENTORY,
+    opening_workers: int = 1,
 ) -> SourceLaneCatalogue:
     if max_sources < 1:
         raise ValueError("Source inventory must have a positive bound")
+    if (
+        not isinstance(opening_workers, int)
+        or isinstance(opening_workers, bool)
+        or not 1 <= opening_workers <= 4
+    ):
+        raise ValueError("Opening workers must be an integer between one and four")
     records: list[SourceClassification] = []
     limitations: list[str] = []
     offset = 0
@@ -402,17 +470,16 @@ def load_source_lane_catalogue(
             and "Metadata type inventory was partial." not in limitations
         ):
             limitations.append("Metadata type inventory was partial.")
-        for source in sources:
-            try:
-                openings = _opening_texts(
-                    session,
-                    user=user,
-                    filters=filters,
-                    source=source,
-                    check_active=check_active,
-                )
-            except CorpusScopeUnavailable:
-                openings = ()
+        openings_page = _source_openings(
+            session,
+            sources,
+            user=user,
+            filters=filters,
+            check_active=check_active,
+            opening_workers=opening_workers,
+        )
+        for source, openings in zip(sources, openings_page, strict=True):
+            if openings is None:
                 if (
                     "Some original opening identities were unavailable."
                     not in limitations
@@ -425,7 +492,7 @@ def load_source_lane_catalogue(
                     source,
                     types.get(source.id, ()),
                     metadata_complete=metadata_complete,
-                    opening_texts=openings,
+                    opening_texts=openings or (),
                 )
             )
         offset += page_limit
