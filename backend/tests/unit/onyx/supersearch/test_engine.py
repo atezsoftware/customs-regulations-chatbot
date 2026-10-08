@@ -224,6 +224,38 @@ def test_exact_provision_path_has_three_calls_and_no_broad_discovery() -> None:
     assert workflow.ledger.completely_delivered("2") == {1}
 
 
+def test_display_witnesses_do_not_trigger_a_provider_repair(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = "**MADDE 10-** Başvuru, bildirim tarihinden itibaren bir yıl içerisinde yapılır."
+    answer = "**Başvuru**, bildirim tarihinden itibaren bir yıl içerisinde yapılır. [1]"
+    monkeypatch.setattr(sys.modules[__name__], "ORIGINAL", source)
+    semantic_review = review(
+        excerpt="başvuru, bildirim tarihinden itibaren bir yıl içerisinde yapılır."
+    )
+    semantic_review.needs[0].supports[0].quotation = source.replace("**", "")
+    workflow, gateway, _ = engine(
+        [
+            plan(),
+            WriterDecision(answer=answer, unresolved_need_ids=[], actions=[]),
+            semantic_review,
+        ]
+    )
+    result = workflow.run("Başvuru süresi nedir?")
+    assert result.status == "verified" and result.answer == answer
+    assert gateway.flows == [
+        LLMFlow.SUPERSEARCH_PLAN,
+        LLMFlow.SUPERSEARCH_ANSWER,
+        LLMFlow.SUPERSEARCH_REVIEW,
+    ]
+    assert result.review is not None
+    assert result.review.needs[0].supports[0].quotation == source
+    assert result.review.needs[0].condition_reviews[0].answer_excerpt in answer
+    assert semantic_review.needs[0].supports[0].quotation == source.replace("**", "")
+    assert (item := workflow.ledger.get(1)) is not None
+    assert item.text == source
+
+
 def test_targeted_correction_changes_the_published_body_and_is_rechecked() -> None:
     wrong = "Başvuru, ödeme tarihinden itibaren bir yıl içerisinde yapılır. [1]"
     workflow, gateway, _ = engine(

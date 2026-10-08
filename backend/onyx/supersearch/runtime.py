@@ -365,7 +365,8 @@ def _run_supersearch_loop(
     ) -> None:
         progress.report(
             "tools",
-            status="running" if pending else "completed",
+            # An unscoped terminal event closes the entire frontend run.
+            status="running",
             title="Supersearch: özgün kaynaklar",
             message=f"{completed}/{len(actions)} kaynak işlemi tamamlandı.",
             active_workers=min(pending, 4),

@@ -251,6 +251,24 @@ def test_source_to_streaming_publication_preserves_pc_fence_and_selected_model(
         packet.obj for packet in packets if isinstance(packet.obj, ASv3Progress)
     ]
     assert progress and all(packet.workflow == "supersearch" for packet in progress)
+    completed_batch = next(
+        packet
+        for packet in progress
+        if packet.title == "Supersearch: özgün kaynaklar" and packet.active_tasks == 0
+    )
+    assert completed_batch.status == "running"
+    assert {
+        packet.phase
+        for packet in progress
+        if packet.sequence > completed_batch.sequence
+    } >= {"final", "verification", "completed"}
+    # The frontend ignores every later packet after an unscoped terminal status.
+    assert [
+        packet
+        for packet in progress
+        if not packet.task_id and packet.status in {"completed", "failed", "cancelled"}
+    ] == [progress[-1]]
+    assert progress[-1].phase == "completed"
     citations = [
         packet.obj for packet in packets if isinstance(packet.obj, CitationInfo)
     ]

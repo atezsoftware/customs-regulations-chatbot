@@ -31,6 +31,7 @@ from onyx.prompts.supersearch.prompts import (
     REVIEW_PROMPT,
 )
 from onyx.supersearch.models import AnswerRepair, WriterDecision
+from onyx.supersearch.witnesses import bind_review_witnesses
 from onyx.tools.constants import REGULATORY_MAX_SEARCH_QUERY_CHARS
 from onyx.tracing.flows import LLMFlow
 
@@ -264,6 +265,7 @@ class SupersearchEngine:
                 LLMFlow.SUPERSEARCH_REVIEW,
                 True,
             )
+            review = bind_review_witnesses(review, draft, self.ledger)
             self.last_review = review
             delivered = answer_delivered & set(
                 getattr(self.gateway, "last_delivered_citations", answer_delivered)

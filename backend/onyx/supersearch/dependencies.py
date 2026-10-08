@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+import unicodedata
 from typing import cast
 from uuid import UUID
 
@@ -9,18 +11,90 @@ from pydantic import JsonValue
 
 from onyx.asv3.corpus_tools import CorpusBroker
 from onyx.asv3.evidence import EvidenceLedger
-from onyx.asv3.models import RunContext, model_evidence_metadata
+from onyx.asv3.models import EvidenceItem, RunContext, model_evidence_metadata
 from onyx.db.asv3_corpus import CorpusSource
 from onyx.db.legal_composite_sources import SourceKind, classify_source
 from onyx.legal_composite.acquisition import CanonicalAcquirer
 from onyx.legal_composite.dependencies import DependencyExpander
 from onyx.legal_composite.models import AuthorityDependency, ResearchPlan, SourceAction
 from onyx.regulatory.heading_path import parse_regulatory_article_heading
+from onyx.regulatory.source_identity import named_law_number
 
 
 def _source_id(arguments: JsonValue) -> str | None:
     value = arguments.get("source_id") if isinstance(arguments, dict) else None
     return value if isinstance(value, str) else None
+
+
+def _identity_words(value: str) -> set[str]:
+    folded = unicodedata.normalize(
+        "NFKD", value.casefold().translate(str.maketrans("ışçğöü", "iscgou"))
+    )
+    folded = "".join(char for char in folded if not unicodedata.combining(char))
+    folded = re.sub(r"^\d{2,7}\s+sayili\s+", "", folded)
+    return set(re.findall(r"[a-z0-9]+", folded))
+
+
+def _canonical_opening_kind(
+    source: CorpusSource, openings: list[EvidenceItem]
+) -> SourceKind:
+    """A source's omitted body title may remain in its canonical opening heading."""
+    if not openings or not any(
+        type(item.metadata.get("position")) is int
+        and item.metadata.get("position") == 0
+        for item in openings
+    ):
+        return SourceKind.UNKNOWN
+    for item in openings:
+        doc = item.search_doc
+        metadata = model_evidence_metadata(item.metadata)
+        if (
+            item.source_id != str(source.id)
+            or item.chunk_id is None
+            or doc is None
+            or doc.document_id != str(source.id)
+            or doc.metadata.get("regulatory_chunk_id") != item.chunk_id
+            or any(
+                metadata.get(flag) or item.metadata.get(flag)
+                for flag in ("derived", "external", "untrusted", "truncated")
+            )
+        ):
+            return SourceKind.UNKNOWN
+    body_kind = classify_source(
+        source, (), opening_texts=tuple(item.text for item in openings)
+    ).kind
+    if body_kind != SourceKind.UNKNOWN:
+        return body_kind
+    roots: set[str] = set()
+    for item in openings:
+        headings = item.metadata.get("heading_path")
+        assert item.search_doc is not None
+        if (
+            not isinstance(headings, list)
+            or not headings
+            or not isinstance(headings[0], str)
+            or item.search_doc.metadata.get("regulatory_heading_path") != headings
+        ):
+            return SourceKind.UNKNOWN
+        roots.add(headings[0])
+    if len(roots) != 1:
+        return SourceKind.UNKNOWN
+    root = next(iter(roots))
+    filename = re.sub(
+        r"\.(?:md|docx?|pdf|txt|html?)$",
+        "",
+        source.name.replace("\\", "/").rsplit("/", 1)[-1],
+        flags=re.I,
+    )
+    # Filenames corroborate an original root; filenames and labels never supply it.
+    words = _identity_words(root)
+    if len(words) < 2 or not words <= _identity_words(filename):
+        return SourceKind.UNKNOWN
+    root_number, file_number = named_law_number(root), named_law_number(source.name)
+    if root_number and file_number and root_number != file_number:
+        return SourceKind.UNKNOWN
+    identity = classify_source(source, (), opening_texts=(root,))
+    return identity.kind if not identity.uncertain else SourceKind.UNKNOWN
 
 
 class SupersearchDependencyExpander(DependencyExpander):
@@ -101,18 +175,13 @@ class SupersearchDependencyExpander(DependencyExpander):
             openings.sort(key=lambda item: cast(int, item.metadata.get("position", -1)))
             example = observed[source_id]
             assert example.search_doc is not None
-            kind = (
-                classify_source(
-                    CorpusSource(
-                        UUID(source_id),
-                        example.search_doc.semantic_identifier,
-                        example.search_doc.file_id or "",
-                    ),
-                    (),
-                    opening_texts=tuple(item.text for item in openings),
-                ).kind
-                if openings
-                else SourceKind.UNKNOWN
+            kind = _canonical_opening_kind(
+                CorpusSource(
+                    UUID(source_id),
+                    example.search_doc.semantic_identifier,
+                    example.search_doc.file_id or "",
+                ),
+                openings,
             )
             self.source_kinds[source_id] = self.verified_kinds[source_id] = kind
             self._identified_sources.add(source_id)

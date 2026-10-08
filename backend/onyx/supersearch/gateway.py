@@ -21,6 +21,7 @@ from onyx.llm.models import (
 )
 from onyx.llm.utils import check_number_of_tokens
 from onyx.regulatory.structured_llm import _portable_structured_output_schema
+from onyx.supersearch.payload import METADATA_DECODER, compact_original_evidence_payload
 from onyx.tracing.flows import LLMFlow
 from onyx.tracing.llm_utils import llm_generation_span, record_llm_response
 
@@ -79,14 +80,18 @@ class SelectedModelGateway:
                 "strict": False,
             },
         }
+        provider_payload, metadata_pooled = compact_original_evidence_payload(payload)
         messages: list[ChatCompletionMessage] = [
             SystemMessage(
                 content=system
+                + ("\n" + METADATA_DECODER if metadata_pooled else "")
                 + "\nJSON schema:\n"
                 + json.dumps(schema, separators=(",", ":"))
             ),
             UserMessage(
-                content=json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+                content=json.dumps(
+                    provider_payload, ensure_ascii=False, separators=(",", ":")
+                )
             ),
         ]
         protocol = json.dumps(
