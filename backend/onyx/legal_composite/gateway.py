@@ -42,7 +42,6 @@ from onyx.tracing.llm_utils import llm_generation_span, record_llm_response
 
 ResponseModel = TypeVar("ResponseModel", bound=BaseModel)
 _RESEARCH_OUTPUT_TOKENS = 2_048
-_FINAL_OUTPUT_TOKENS = 4_096
 _PROTOCOL_TOKEN_MARGIN = 256
 _TOKEN_ESTIMATE_MARGIN = 1.25
 _COMPATIBILITY_ATTEMPTS = 3
@@ -218,7 +217,7 @@ class BudgetedGateway:
             ).hexdigest()
         self.last_call_id: str | None = None
         self.last_delivered_citations: set[int] = set()
-        self._final_output_tokens = _FINAL_OUTPUT_TOKENS
+        self._final_output_tokens = budget.policy.final_output_tokens
         if "claude" in selected_llm.config.model_name.lower():
             self._final_output_tokens = max(
                 self._final_output_tokens,

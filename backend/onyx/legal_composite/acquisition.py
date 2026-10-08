@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextvars
 import json
+from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from typing import cast
 
@@ -25,11 +26,23 @@ class CanonicalAcquirer:
         context: RunContext,
         ledger: EvidenceLedger,
         policy: WorkflowPolicy,
+        *,
+        registry_for_action: Callable[[SourceAction], CapabilityRegistry] | None = None,
+        expand_actions: Callable[[list[SourceAction], ResearchPlan], list[SourceAction]]
+        | None = None,
+        lane_inventory: dict[str, JsonValue] | None = None,
+        on_batch_progress: Callable[[list[SourceAction], int, int], None] | None = None,
     ) -> None:
         self.registry = registry
         self.context = context
         self.ledger = ledger
         self.policy = policy
+        self.registry_for_action = registry_for_action or (lambda _action: registry)
+        self.expand_actions = expand_actions or (lambda actions, _plan: actions)
+        self.lane_inventory = lane_inventory or {}
+        self.on_batch_progress = on_batch_progress or (
+            lambda _actions, _pending, _completed: None
+        )
         self.search_calls = 0
         self.last_receipts: list[dict[str, JsonValue]] = []
         self._completed: dict[str, dict[str, JsonValue]] = {}
@@ -54,12 +67,13 @@ class CanonicalAcquirer:
         self.context.check_research_active()
         need_ids = {need.need_id for need in plan.needs}
         calls: list[tuple[SourceAction, CapabilityCall, str]] = []
-        for action in actions:
+        for action in self.expand_actions(actions, plan):
             if set(action.need_ids) - need_ids:
                 raise InvalidSourceAction(
                     "Source action refers to an unknown frozen need"
                 )
-            spec = self.registry.get(action.tool)
+            selected_registry = self.registry_for_action(action)
+            spec = selected_registry.get(action.tool)
             if spec is None or spec.external or spec.orchestrates:
                 raise InvalidSourceAction(
                     "Source action is outside the canonical capability allowlist"
@@ -71,6 +85,7 @@ class CanonicalAcquirer:
             signature = json.dumps(
                 {
                     "tool": action.tool,
+                    "source_kind": action.source_kind,
                     "arguments": {
                         key: value
                         for key, value in arguments.items()
@@ -142,6 +157,8 @@ class CanonicalAcquirer:
         pending: dict[
             Future[ToolOutcome], tuple[SourceAction, CapabilityCall, str, RunContext]
         ] = {}
+        batch_actions = [action for action, _call, _signature in calls]
+        completed_count = 0
         try:
             for action, call, signature in calls:
                 child = self.context.child()
@@ -149,9 +166,16 @@ class CanonicalAcquirer:
                 captured = contextvars.copy_context()
                 future = cast(
                     Future[ToolOutcome],
-                    executor.submit(captured.run, self.registry.dispatch, call, child),
+                    executor.submit(
+                        captured.run,
+                        self.registry_for_action(action).dispatch,
+                        call,
+                        child,
+                    ),
                 )
                 pending[future] = action, call, signature, child
+            if pending:
+                self.on_batch_progress(batch_actions, len(pending), completed_count)
             while pending:
                 self.context.check_research_active()
                 completed, _ = wait(pending, timeout=0.05, return_when=FIRST_COMPLETED)
@@ -160,6 +184,10 @@ class CanonicalAcquirer:
                     outcome = future.result()
                     for item in outcome.evidence:
                         item.question_ids = list(action.need_ids)
+                        if action.source_kind is not None:
+                            item.metadata["legal_composite_source_kind"] = (
+                                action.source_kind.value
+                            )
                     numbers = self.ledger.add(outcome.evidence, self.context)
                     numbers.extend(
                         read.citation
@@ -169,6 +197,7 @@ class CanonicalAcquirer:
                     self._bind_originals(numbers, action.need_ids)
                     row: dict[str, JsonValue] = {
                         "tool": call.name,
+                        "source_kind": action.source_kind,
                         "need_ids": list(action.need_ids),
                         "status": outcome.status.value,
                         "summary": outcome.summary,
@@ -183,9 +212,15 @@ class CanonicalAcquirer:
                         }
                     self._completed[signature] = row
                     result.append(row)
+                    completed_count += 1
+                    self.on_batch_progress(batch_actions, len(pending), completed_count)
                     with graph_step(
                         "legal_composite.acquisition",
-                        {"tool": call.name, "need_ids": action.need_ids},
+                        {
+                            "tool": call.name,
+                            "need_ids": action.need_ids,
+                            "source_kind": action.source_kind,
+                        },
                     ) as step:
                         step.output_value = {
                             "status": outcome.status.value,

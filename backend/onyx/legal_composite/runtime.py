@@ -2,16 +2,23 @@
 
 from __future__ import annotations
 
+import math
 import time
 from collections.abc import Callable
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from pydantic import JsonValue
 
 from onyx.asv3.citation_numbers import extract_citation_numbers
 from onyx.asv3.corpus_tools import CorpusBroker, build_corpus_specs
 from onyx.asv3.evidence import EvidenceLedger
-from onyx.asv3.models import RunContext, RunStopped, SharedBudget
+from onyx.asv3.models import (
+    OutcomeStatus,
+    RunContext,
+    RunStopped,
+    SharedBudget,
+    ToolOutcome,
+)
 from onyx.asv3.progress import ProgressEvent, ProgressReporter, localized_notifications
 from onyx.asv3.registry import CapabilityRegistry, build_core_specs
 from onyx.asv3.search_adapter import build_search_adapter
@@ -26,6 +33,7 @@ from onyx.context.search.models import BaseFilters, IndexFilters
 from onyx.db.asv3_corpus import bind_pc_corpus_scope
 from onyx.db.asv3_runs import save_asv3_checkpoint
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
+from onyx.db.legal_composite_sources import SourceKind, load_source_lane_catalogue
 from onyx.db.memory import UserMemoryContext
 from onyx.db.models import User
 from onyx.error_handling.error_codes import OnyxErrorCode
@@ -34,8 +42,12 @@ from onyx.legal_composite.acquisition import CanonicalAcquirer
 from onyx.legal_composite.budget import WorkflowBudget
 from onyx.legal_composite.engine import LegalCompositeEngine
 from onyx.legal_composite.gateway import BudgetedGateway
-from onyx.legal_composite.models import WorkflowPolicy
+from onyx.legal_composite.models import SourceAction, WorkflowPolicy
 from onyx.legal_composite.prompts import PROMPT_VERSION
+from onyx.legal_composite.providers import build_source_selector
+from onyx.legal_composite.routing import SourceLaneRouter
+from onyx.legal_composite.search import CompositeSearchTool
+from onyx.legal_composite.source_lanes import build_lane_broker
 from onyx.llm.interfaces import LLM, LLMUserIdentity
 from onyx.llm.models import ReasoningEffort
 from onyx.server.query_and_chat.placement import Placement
@@ -75,7 +87,19 @@ def run_legal_composite_loop(
     user_memory_context: UserMemoryContext | None = None,
     inject_memories_in_prompt: bool = True,
 ) -> None:
-    policy = WorkflowPolicy()
+    policy = WorkflowPolicy(
+        timeout_seconds=math.inf,
+        max_cost_usd=math.inf,
+        max_context_tokens=128_000,
+        final_output_tokens=8_192,
+        max_input_tokens=2_000_000,
+        max_output_tokens=256_000,
+        max_model_calls=32,
+        max_tools=96,
+        max_parallel_tools=len(SourceKind),
+        max_search_calls=32,
+        selection_reserve_seconds=12,
+    )
     started = time.monotonic()
 
     def cancelled() -> bool:
@@ -84,7 +108,9 @@ def run_legal_composite_loop(
     context = RunContext(
         language="und",
         timeout_seconds=policy.timeout_seconds,
-        research_reserve_seconds=policy.finalization_reserve_seconds,
+        research_reserve_seconds=(
+            policy.finalization_reserve_seconds + policy.selection_reserve_seconds
+        ),
         budget=SharedBudget(
             max_tools=policy.max_tools,
             max_decisions=policy.max_model_calls,
@@ -122,9 +148,35 @@ def run_legal_composite_loop(
     ledger = EvidenceLedger()
     context.services["evidence"] = ledger
     broker = CorpusBroker(user, scope)
+    emitter.emit(
+        Packet(
+            placement=Placement(turn_index=0),
+            obj=ASv3Progress(
+                run_id=context.run_id,
+                event_id=str(uuid4()),
+                sequence=0,
+                language="tr",
+                phase="tools",
+                status="running",
+                title="Kaynak türleri doğrulanıyor",
+                message="Arama kollarını özgün kaynak başlıklarından hazırlıyorum.",
+                task_id=None,
+                parent_task_id=None,
+                active_tasks=0,
+                completed_tasks=0,
+            ),
+        )
+    )
+    with get_session_with_current_tenant() as inventory_session:
+        catalogue = load_source_lane_catalogue(
+            inventory_session,
+            user=user,
+            filters=scope,
+            check_active=context.check_research_active,
+        )
     search = next((tool for tool in tools if isinstance(tool, SearchTool)), None)
     if search is not None:
-        search = search.fork_for_independent_context()
+        search = CompositeSearchTool.from_fork(search.fork_for_independent_context())
         search.auto_detect_filters = False
         search.enable_slack_search = False
         search.bypass_acl = False
@@ -147,8 +199,66 @@ def run_legal_composite_loop(
     for spec in build_core_specs(registry, ledger, state_provider=lambda: {}):
         if spec.name == "read_evidence":
             registry.register(spec)
-    acquirer = CanonicalAcquirer(registry, context, ledger, policy)
+
+    def build_lane_registry(kind: SourceKind) -> CapabilityRegistry:
+        if not catalogue.source_ids(kind):
+
+            def empty_lane(
+                _arguments: dict[str, JsonValue], child: RunContext
+            ) -> ToolOutcome:
+                child.check_research_active()
+                return ToolOutcome(
+                    status=OutcomeStatus.NOT_FOUND
+                    if catalogue.complete
+                    else OutcomeStatus.UNAVAILABLE,
+                    summary="No authorized source is classified in this lane; this is not proof that no applicable law exists.",
+                    data={**catalogue.provenance(), "source_kind": kind.value},
+                )
+
+            return CapabilityRegistry(
+                [
+                    spec.model_copy(update={"handler": empty_lane})
+                    for spec in build_corpus_specs(
+                        broker,
+                        require_search_targets=True,
+                        source_identity_guidance=True,
+                    )
+                ]
+            )
+        lane = build_lane_broker(broker, catalogue, kind)
+        lane.search_adapter = build_search_adapter(
+            search,
+            question,
+            lane,
+            message_history=lambda _context: list(simple_chat_history),
+            user_memory_context=user_memory_context,
+            inject_memories_in_prompt=inject_memories_in_prompt,
+            user_identity=user_identity,
+        )
+        scoped_registry = CapabilityRegistry(
+            build_corpus_specs(
+                lane, require_search_targets=True, source_identity_guidance=True
+            )
+        )
+        for spec in build_core_specs(
+            scoped_registry, ledger, state_provider=lambda: {}
+        ):
+            if spec.name == "read_evidence":
+                scoped_registry.register(spec)
+        return scoped_registry
+
+    router = SourceLaneRouter(catalogue, build_lane_registry)
+    acquirer = CanonicalAcquirer(
+        registry,
+        context,
+        ledger,
+        policy,
+        registry_for_action=router.registry,
+        expand_actions=router.expand,
+        lane_inventory=router.inventory(),
+    )
     budget = WorkflowBudget(policy, deadline=context.deadline)
+    budget.retain_selection_time(policy.selection_reserve_seconds)
     try:
         with get_session_with_current_tenant() as price_session:
             gateway = BudgetedGateway(
@@ -161,6 +271,17 @@ def run_legal_composite_loop(
                 check_active=context.check_active,
                 token_counter=token_counter,
                 reasoning_effort=reasoning_effort,
+                run_id=context.run_id,
+                scope=context.scope,
+            )
+            selector = build_source_selector(
+                session=price_session,
+                user=user,
+                gateway=gateway,
+                budget=budget,
+                ledger=ledger,
+                check_active=context.check_active,
+                token_counter=token_counter,
                 run_id=context.run_id,
                 scope=context.scope,
             )
@@ -181,7 +302,11 @@ def run_legal_composite_loop(
 
     def emit_progress(event: ProgressEvent) -> None:
         words = localized_notifications(context.language)
-        title, message = words.get(event.phase, words["tools"])
+        title, message = (
+            (event.title, event.message)
+            if event.public_narration
+            else words.get(event.phase, words["tools"])
+        )
         packet = ASv3Progress.model_validate(
             dict(
                 run_id=event.run_id,
@@ -192,10 +317,10 @@ def run_legal_composite_loop(
                 status=event.status,
                 title=title,
                 message=message,
-                task_id=None,
-                parent_task_id=None,
-                active_tasks=0,
-                completed_tasks=0,
+                task_id=event.task_id,
+                parent_task_id=event.parent_task_id,
+                active_tasks=event.active_workers,
+                completed_tasks=event.completed_workers,
             )
         )
         emitted.append(packet.model_dump(mode="json"))
@@ -203,12 +328,73 @@ def run_legal_composite_loop(
 
     progress = ProgressReporter(context.run_id, "und", emit_progress)
 
+    def report_batch(actions: list[SourceAction], pending: int, completed: int) -> None:
+        names = {
+            SourceKind.CONSTITUTION: "Anayasa",
+            SourceKind.STATUTE: "Kanun",
+            SourceKind.TREATY: "Uluslararası antlaşma",
+            SourceKind.PRESIDENTIAL_DECREE: "Cumhurbaşkanlığı kararnamesi",
+            SourceKind.REGULATION: "Yönetmelik",
+            SourceKind.COMMUNIQUE: "Tebliğ",
+            SourceKind.CIRCULAR: "Genelge",
+            SourceKind.JUDICIAL_DECISION: "Yargı kararı",
+            SourceKind.EXECUTIVE_DECISION: "İdari karar",
+            SourceKind.PRIVATE_RULING: "Özelge",
+            SourceKind.OTHER: "Diğer kaynak",
+            SourceKind.UNKNOWN: "Türü doğrulanmamış kaynak",
+        }
+        kinds = list(dict.fromkeys(action.source_kind for action in actions))
+        turkish = context.language.startswith("tr")
+        labels = [
+            names[kind] if turkish else kind.value.replace("_", " ")
+            for kind in kinds
+            if kind is not None
+        ]
+        parallel = len(actions) > 1
+        title = (
+            ("Paralel kaynak araştırması" if parallel else "Kaynak araştırması")
+            if turkish
+            else ("Parallel source research" if parallel else "Source research")
+        )
+        message = (
+            (
+                f"{', '.join(labels)}: {completed}/{len(actions)} işlem tamamlandı; "
+                f"en fazla {policy.max_parallel_tools} arama aynı anda yürütülüyor."
+            )
+            if turkish
+            else (
+                f"{', '.join(labels)}: {completed}/{len(actions)} actions complete; "
+                f"up to {policy.max_parallel_tools} searches run concurrently."
+            )
+        )
+        progress.report(
+            "tools",
+            status="running" if pending else "completed",
+            active_workers=min(pending, policy.max_parallel_tools),
+            completed_workers=completed,
+            title=title,
+            message=message,
+        )
+
+    acquirer.on_batch_progress = report_batch
+
     def report(phase: str, language: str) -> None:
         context.language = progress.language = language
         state_container.set_stop_notice(
             localized_notifications(language)["cancelled"][1]
         )
-        progress.report(phase)
+        if phase == "selection":
+            progress.report(
+                "tools",
+                title="Kaynak uygunluğu denetleniyor"
+                if language.startswith("tr")
+                else "Checking source relevance",
+                message="Bulunan özgün kaynakları sorularınıza göre birlikte değerlendiriyorum."
+                if language.startswith("tr")
+                else "Evaluating the original sources together against your questions.",
+            )
+        else:
+            progress.report(phase)
 
     def research_available() -> bool:
         context.check_active()
@@ -224,6 +410,7 @@ def run_legal_composite_loop(
         check_active=context.check_active,
         research_available=research_available,
         report=report,
+        selector=selector,
     )
     metadata = ChatTraceMetadata(
         chat_session_id=str(chat_session_id),
@@ -247,6 +434,10 @@ def run_legal_composite_loop(
             "publication_status": result.status,
             "legal_composite": result.model_dump(mode="json"),
             "legal_composite_budget": budget.snapshot(),
+            "source_lane_inventory": router.inventory(),
+            "source_selection": engine.selection.model_dump(mode="json")
+            if engine.selection is not None
+            else None,
             "acquisition_counts": {
                 "searches": acquirer.search_calls,
                 **context.budget.snapshot(),

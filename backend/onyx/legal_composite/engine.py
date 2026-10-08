@@ -25,6 +25,11 @@ from onyx.legal_composite.prompts import (
     RESEARCH_PROMPT,
     REVIEW_PROMPT,
 )
+from onyx.legal_composite.selection import (
+    SourceSelectionResult,
+    SourceSelector,
+    selection_request_from_ledger,
+)
 from onyx.tracing.flows import LLMFlow
 
 ResponseModel = TypeVar("ResponseModel", bound=BaseModel)
@@ -293,6 +298,7 @@ class LegalCompositeEngine:
         check_active: Callable[[], None],
         research_available: Callable[[], bool],
         report: Callable[[str, str], None] = lambda _phase, _language: None,
+        selector: SourceSelector | None = None,
     ) -> None:
         self.gateway = gateway
         self.acquirer = acquirer
@@ -301,6 +307,8 @@ class LegalCompositeEngine:
         self.check_active = check_active
         self.research_available = research_available
         self.report = report
+        self.selector = selector
+        self.selection: SourceSelectionResult | None = None
         self.plan: ResearchPlan | None = None
         self.receipts: list[dict[str, JsonValue]] = []
         self.last_review: AnswerReview | None = None
@@ -324,11 +332,36 @@ class LegalCompositeEngine:
             if isinstance(number, int)
         ]
         required = list(extract_citation_numbers(draft.answer)) if draft else []
+        if self.selection is not None:
+            classified = {row.citation for row in self.selection.identities}
+            required = list(
+                dict.fromkeys(
+                    [
+                        *self.selection.protected_citations,
+                        *(
+                            number
+                            for number in self.ledger.citation_numbers()
+                            if number not in classified
+                        ),
+                        *required,
+                    ]
+                )
+            )
+            recent_numbers = [
+                number
+                for number in recent_numbers
+                if number not in self.selection.rejected_citations
+            ]
+        available = [
+            number
+            for number in reversed(self.ledger.citation_numbers())
+            if self.selection is None or number not in self.selection.rejected_citations
+        ]
         records: JsonValue = json.loads(
             self.ledger.serialize_records(
-                [*required, *recent_numbers, *reversed(self.ledger.citation_numbers())],
+                [*required, *recent_numbers, *available],
                 required=required,
-                max_chars=50_000,
+                max_chars=None if required else 50_000,
             )
         )
         assert isinstance(records, list)
@@ -353,7 +386,29 @@ class LegalCompositeEngine:
             "draft": draft.model_dump(mode="json") if draft else None,
             "defects": gaps or [],
             "limits": self.policy.model_dump(mode="json"),
+            "source_lane_inventory": getattr(self.acquirer, "lane_inventory", {}),
         }
+        if self.selection is not None:
+            payload["source_selection"] = {
+                "selection_complete": self.selection.selection_complete,
+                "protected": self.selection.protected_citations,
+                "background": self.selection.background_citations,
+                "rejected": self.selection.rejected_citations,
+                "uncertain_count": sum(
+                    "uncertain" in row.roles for row in self.selection.receipts
+                ),
+                "uncertain_by_need": {
+                    need.need_id: [
+                        row.citation
+                        for row in self.selection.receipts
+                        if row.need_id == need.need_id and "uncertain" in row.roles
+                    ]
+                    for need in self.plan.needs
+                }
+                if self.plan
+                else {},
+                "instruction": "Inspect retained uncertainty from full originals; relevance alone does not prove applicability.",
+            }
         if source_phase:
             catalogue: list[dict[str, JsonValue]] = [
                 {
@@ -453,6 +508,37 @@ class LegalCompositeEngine:
             if step.ready_to_answer or not step.actions:
                 break
             source_phase_open = self._acquire(step.actions, plan)
+        if self.selector is not None and plan.requires_sources:
+            budget = getattr(self.gateway, "budget", None)
+            if budget is not None:
+                budget.begin_selection()
+            self.report("selection", plan.language)
+            selection_request = selection_request_from_ledger(
+                request, plan, self.ledger
+            )
+            lane_kinds = {
+                number: kind
+                for receipt in self.receipts
+                if isinstance(kind := receipt.get("source_kind"), str)
+                if isinstance(numbers := receipt.get("citations"), list)
+                for number in numbers
+                if isinstance(number, int)
+            }
+            selection_request = selection_request.model_copy(
+                update={
+                    "candidates": [
+                        candidate.model_copy(
+                            update={
+                                "source_kind": lane_kinds.get(
+                                    candidate.citation, "unknown"
+                                )
+                            }
+                        )
+                        for candidate in selection_request.candidates
+                    ]
+                }
+            )
+            self.selection = self.selector.select(selection_request)
         self.report("final", plan.language)
         gaps: list[str] = []
         draft: DraftAnswer | None = None
@@ -500,8 +586,15 @@ class LegalCompositeEngine:
             )
             # No extra originals may silently make an unsupported writer draft acceptable.
             review_payload["original_evidence"] = answer_records
+            protected_numbers = payload["required_evidence_numbers"]
+            assert isinstance(protected_numbers, list)
             review_payload["required_evidence_numbers"] = list(
-                extract_citation_numbers(draft.answer)
+                dict.fromkeys(
+                    [
+                        *protected_numbers,
+                        *extract_citation_numbers(draft.answer),
+                    ]
+                )
             )
             try:
                 review = self.gateway.complete(
@@ -524,6 +617,15 @@ class LegalCompositeEngine:
             passed, safe, gaps = review_assessment(
                 plan, draft, review, self.ledger, answer_delivered
             )
+            if (
+                self.selection is not None
+                and not self.selection.selection_complete
+                and not review.selection_uncertainty_resolved
+            ):
+                passed = safe = False
+                gaps.append(
+                    "Retained source relevance uncertainty was not independently resolved against the originals."
+                )
             if passed:
                 return WorkflowResult(
                     answer=draft.answer,

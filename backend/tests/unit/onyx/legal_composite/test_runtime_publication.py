@@ -20,6 +20,7 @@ from onyx.chat.emitter import BufferedEmitter
 from onyx.chat.models import ChatMessageSimple
 from onyx.configs.constants import MessageType
 from onyx.context.search.models import BaseFilters, IndexFilters
+from onyx.db.legal_composite_sources import SourceLaneCatalogue, source_scope_sha256
 from onyx.db.models import User
 from onyx.legal_composite import runtime
 from onyx.legal_composite.models import WorkflowResult
@@ -70,6 +71,8 @@ def harness(monkeypatch: pytest.MonkeyPatch) -> RuntimeHarness:
     search.llm = llm_mock
 
     class FakeEngine:
+        selection = None
+
         def __init__(
             self, ledger: EvidenceLedger, report: Callable[[str, str], None]
         ) -> None:
@@ -153,6 +156,25 @@ def harness(monkeypatch: pytest.MonkeyPatch) -> RuntimeHarness:
 
     monkeypatch.setattr(runtime, "is_connected", lambda _session, _cache: True)
     monkeypatch.setattr(runtime, "bind_pc_corpus_scope", bind_scope)
+
+    def catalogue_factory(
+        _session: Any,
+        *,
+        user: User,
+        filters: IndexFilters,
+        check_active: Callable[[], None],
+    ) -> SourceLaneCatalogue:
+        check_active()
+        return SourceLaneCatalogue(
+            user_id=user.id,
+            scope_sha256=source_scope_sha256(user, filters),
+            records=(),
+            complete=True,
+        )
+
+    monkeypatch.setattr(runtime, "load_source_lane_catalogue", catalogue_factory)
+    monkeypatch.setattr(runtime, "build_source_selector", lambda **_kwargs: None)
+    monkeypatch.setattr(runtime.CompositeSearchTool, "from_fork", lambda _fork: _fork)
     monkeypatch.setattr(runtime, "CorpusBroker", lambda _user, _scope: broker)
     monkeypatch.setattr(
         runtime, "build_search_adapter", lambda *_args, **_kwargs: object()

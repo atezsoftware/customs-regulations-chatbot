@@ -34,7 +34,11 @@ class WorkflowBudget:
         *,
         deadline: float | None = None,
     ) -> None:
-        if deadline is not None and not math.isfinite(deadline):
+        if deadline is not None and (
+            math.isnan(deadline)
+            or deadline == -math.inf
+            or (deadline == math.inf and math.isfinite(policy.timeout_seconds))
+        ):
             raise ValueError("Invalid workflow deadline")
         self.policy = policy
         self._clock = clock
@@ -42,7 +46,11 @@ class WorkflowBudget:
         self.deadline = (
             latest_deadline if deadline is None else min(deadline, latest_deadline)
         )
-        self._started = self.deadline - policy.timeout_seconds
+        self._started = (
+            self.deadline - policy.timeout_seconds
+            if math.isfinite(self.deadline)
+            else clock()
+        )
         self._lock = threading.RLock()
         self._calls = 0
         self._input = 0
@@ -56,6 +64,19 @@ class WorkflowBudget:
         self._settled: set[str] = set()
         self._usage_overrun = False
         self._stop_reason: str | None = None
+        self._selection_reserve_seconds = 0.0
+
+    def retain_selection_time(self, seconds: float) -> None:
+        if not math.isfinite(seconds) or seconds < 0:
+            raise ValueError("Invalid selection time reserve")
+        with self._lock:
+            if self._calls:
+                raise ValueError("Selection time must be retained before generations")
+            self._selection_reserve_seconds = seconds
+
+    def begin_selection(self) -> None:
+        with self._lock:
+            self._selection_reserve_seconds = 0.0
 
     def configure_finalization(
         self,
@@ -86,7 +107,12 @@ class WorkflowBudget:
             self._final_cost = cost_per_call_usd
 
     def remaining_seconds(self, finalizing: bool = False) -> float:
-        retained = 0 if finalizing else self.policy.finalization_reserve_seconds
+        retained = (
+            0
+            if finalizing
+            else self.policy.finalization_reserve_seconds
+            + self._selection_reserve_seconds
+        )
         return max(0.0, self.deadline - self._clock() - retained)
 
     def check_active(self, finalizing: bool = False) -> None:
