@@ -159,6 +159,7 @@ export interface Message {
   usage?: import("@/sections/chat/usage/interfaces").ResponseUsage | null;
   is_generating?: boolean;
   asv3?: boolean;
+  supersearch?: boolean;
   messageId?: number;
   nodeId: number; // Unique identifier for tree structure (can be negative for temp messages)
   message: string;

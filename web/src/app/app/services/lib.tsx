@@ -495,6 +495,12 @@ export function processRawChatHistory(
 
   rawMessages.forEach((messageInfo, _ind) => {
     const packetsForMessage = packets[agentMessageInd];
+    const isSupersearch =
+      messageInfo.message_type === "assistant" &&
+      packetsForMessage?.some(
+        ({ obj }) =>
+          obj.type === "asv3_progress" && obj.workflow === "supersearch"
+      );
     if (messageInfo.message_type === "assistant") {
       agentMessageInd++;
     }
@@ -516,7 +522,8 @@ export function processRawChatHistory(
       // all that matters is that the nodeId is unique for a given chat session
       nodeId: messageInfo.message_id,
       messageId: messageInfo.message_id,
-      message: messageInfo.message,
+      message:
+        messageInfo.message || (isSupersearch ? messageInfo.error || "" : ""),
       type: messageInfo.error
         ? "error"
         : (messageInfo.message_type as "user" | "assistant"),
@@ -529,6 +536,7 @@ export function processRawChatHistory(
       // this is identical to what is computed at streaming time
       ...(messageInfo.message_type === "assistant"
         ? {
+            ...(isSupersearch ? { supersearch: true } : {}),
             retrievalType: retrievalType,
             researchType: messageInfo.research_type as ResearchType | undefined,
             query: messageInfo.rephrased_query,

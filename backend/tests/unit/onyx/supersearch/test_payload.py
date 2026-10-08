@@ -21,6 +21,11 @@ from onyx.supersearch.payload import (
     compact_original_evidence_payload,
     expand_original_evidence_payload,
 )
+from onyx.supersearch.receipts import (
+    RECEIPT_DATA_DECODER,
+    RECEIPT_DATA_POOL_KEY,
+    expand_receipt_data_payload,
+)
 from onyx.tracing.flows import LLMFlow
 from tests.unit.onyx.supersearch.test_canonical_runtime import selected_llm
 from tests.unit.onyx.supersearch.test_engine import original
@@ -120,8 +125,12 @@ def test_malformed_metadata_references_cannot_silently_decode_other_fields() -> 
         expand_original_evidence_payload(projection)
 
 
+@pytest.mark.parametrize(
+    "flow", [LLMFlow.SUPERSEARCH_ANSWER, LLMFlow.SUPERSEARCH_REVIEW]
+)
 def test_gateway_preserves_actual_complete_original_delivery_when_metadata_is_pooled(
     monkeypatch: pytest.MonkeyPatch,
+    flow: LLMFlow,
 ) -> None:
     llm = selected_llm()
     context = RunContext(
@@ -149,7 +158,14 @@ def test_gateway_preserves_actual_complete_original_delivery_when_metadata_is_po
     payload = {
         "original_evidence": json.loads(
             ledger.serialize_records(numbers, max_chars=None)
-        )
+        ),
+        "receipts": [
+            {
+                "status": "ambiguous",
+                "data": {"sources": ["PC kaynak başlığı " * 20] * 20},
+            }
+            for _ in range(4)
+        ],
     }
     before = deepcopy(payload)
     span = SimpleNamespace(span_data=SimpleNamespace(model_config={}))
@@ -173,14 +189,23 @@ def test_gateway_preserves_actual_complete_original_delivery_when_metadata_is_po
         )
     )
     selected = gateway.SelectedModelGateway(llm=llm, ledger=ledger, context=context)
-    selected.complete(
-        "PC originals only", payload, WriterDecision, LLMFlow.SUPERSEARCH_ANSWER, True
-    )
+    selected.complete("PC originals only", payload, WriterDecision, flow, True)
     messages = cast(MagicMock, llm).invoke.call_args.args[0]
+    assert cast(MagicMock, llm).invoke.call_args.kwargs["use_streaming"] is True
+    assert cast(MagicMock, llm).invoke.call_args.kwargs["timeout_override"] == 120
     provider_payload = json.loads(messages[1].content)
     assert METADATA_POOL_KEY in provider_payload
     assert METADATA_DECODER in messages[0].content
-    assert expand_original_evidence_payload(provider_payload) == before
+    assert (RECEIPT_DATA_POOL_KEY in provider_payload) == (
+        flow == LLMFlow.SUPERSEARCH_REVIEW
+    )
+    assert (RECEIPT_DATA_DECODER in messages[0].content) == (
+        flow == LLMFlow.SUPERSEARCH_REVIEW
+    )
+    assert (
+        expand_original_evidence_payload(expand_receipt_data_payload(provider_payload))
+        == before
+    )
     assert payload == before
     assert selected.last_call_id is not None
     assert ledger.completely_delivered(selected.last_call_id) == set(numbers)
