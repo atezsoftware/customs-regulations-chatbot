@@ -76,8 +76,10 @@ def gateway(
     model: LitellmLLM,
     ledger: EvidenceLedger | Mock,
     clock: Callable[[], float] | None = None,
+    *,
+    policy: WorkflowPolicy | None = None,
 ) -> BudgetedGateway:
-    policy = WorkflowPolicy()
+    policy = policy or WorkflowPolicy()
     budget = WorkflowBudget(policy) if clock is None else WorkflowBudget(policy, clock)
     return BudgetedGateway(
         selected_llm=model, research_llm=model, budget=budget, ledger=ledger
@@ -98,7 +100,7 @@ def test_full_transport_window_allows_answer_rejected_by_ten_second_timeout(
     monkeypatch.setattr("litellm.completion", completion)
     ledger = Mock(spec=EvidenceLedger)
     ledger.completely_delivered.return_value = {1}
-    workflow = gateway(model, ledger)
+    workflow = gateway(model, ledger, policy=WorkflowPolicy(max_call_seconds=30))
     result = workflow.complete(
         "Use full original law",
         {"original_evidence": [{"citation": 1, "text": "complete original"}]},
@@ -112,6 +114,42 @@ def test_full_transport_window_allows_answer_rejected_by_ten_second_timeout(
     assert completion.call_args.kwargs["client"] is not None
     ledger.record_delivery.assert_called_once()
     assert workflow.budget.snapshot()["unsettled_calls"] == 0
+
+
+def test_admitted_window_accepts_thirty_seven_second_canonical_transport(
+    model: LitellmLLM, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = [0.0]
+    ledger = Mock(spec=EvidenceLedger)
+    ledger.completely_delivered.return_value = {1}
+    workflow = gateway(model, ledger, lambda: now[0])
+    now[0] = 46.0
+
+    def complete(**kwargs: Any) -> litellm.ModelResponse:
+        if kwargs["timeout"] < 37:
+            raise LiteLLMTimeout(
+                "inference needs 37 seconds", "gemini-3.8-flash", "vertex_ai"
+            )
+        now[0] += 37
+        return response('{"answer":"supported","unresolved_need_ids":[]}')
+
+    completion = Mock(side_effect=complete)
+    monkeypatch.setattr("litellm.completion", completion)
+    result = workflow.complete(
+        "Use full original law",
+        {"original_evidence": [{"citation": 1, "text": "complete original"}]},
+        DraftAnswer,
+        LLMFlow.LEGAL_COMPOSITE_ANSWER,
+        True,
+    )
+    assert result.answer == "supported"
+    completion.assert_called_once()
+    assert completion.call_args.kwargs["timeout"] == 45
+    assert completion.call_args.kwargs["max_tokens"] == 4_096
+    assert workflow.budget.remaining_seconds(finalizing=True) == 37
+    assert workflow.budget.deadline == 120
+    assert workflow.budget.snapshot()["unsettled_calls"] == 0
+    ledger.record_delivery.assert_called_once()
 
 
 def test_canonical_timeout_has_no_compatibility_retry_or_followup_spend(
@@ -141,6 +179,7 @@ def test_canonical_timeout_has_no_compatibility_retry_or_followup_spend(
         )
     completion.assert_called_once()
     assert completion.call_args.kwargs["stream"] is False
+    assert completion.call_args.kwargs["timeout"] == 45
     ledger.record_delivery.assert_not_called()
     assert workflow.last_call_id is None
     assert (

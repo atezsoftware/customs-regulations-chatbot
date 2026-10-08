@@ -333,8 +333,8 @@ def test_provider_failure_marks_generation_and_redacts_private_error(
         else LLMFlow.LEGAL_COMPOSITE_RESEARCH.value
     )
     config = captured["model_config"]
-    assert float(config["legal_composite_allocated_call_seconds"]) == 30
-    assert config["legal_composite_transport_timeout_seconds"] == "30"
+    assert float(config["legal_composite_allocated_call_seconds"]) == 45
+    assert config["legal_composite_transport_timeout_seconds"] == "45"
     assert config["legal_composite_compat_attempt_bound"] == "3"
     assert config["legal_composite_call_id"]
     assert "legal_composite_response_id" not in config

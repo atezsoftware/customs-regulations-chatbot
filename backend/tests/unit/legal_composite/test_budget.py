@@ -76,10 +76,38 @@ def test_research_deadline_leaves_finalization_time() -> None:
     with pytest.raises(RunStopped, match="deadline"):
         budget.request(1, 1, 1, 5)
     final = budget.request(100, 100, 1, 5, finalizing=True)
-    assert final.timeout_seconds == 30
+    assert final.timeout_seconds == 40
     now[0] = 118
     with pytest.raises(RunStopped, match="deadline"):
         budget.request(1, 1, 1, 5, finalizing=True)
+
+
+def test_longer_writer_window_preserves_total_deadline_and_other_limits() -> None:
+    now = [0.0]
+    policy = WorkflowPolicy()
+    budget = WorkflowBudget(policy, clock=lambda: now[0])
+    budget.configure_finalization(100, 100, 0.0001)
+    assert (
+        policy.timeout_seconds,
+        policy.finalization_reserve_seconds,
+        policy.max_model_calls,
+        policy.max_context_tokens,
+        policy.max_input_tokens,
+        policy.max_output_tokens,
+        policy.max_cost_usd,
+    ) == (120, 40, 8, 32_000, 120_000, 24_000, 0.10)
+    now[0] = 46
+    writer = budget.request(100, 100, 0.1, 0.5, finalizing=True)
+    assert writer.timeout_seconds == 45
+    now[0] += writer.timeout_seconds
+    review = budget.request(100, 100, 0.1, 0.5, finalizing=True)
+    assert review.timeout_seconds == 29
+    assert now[0] + review.timeout_seconds == budget.deadline == 120
+    now[0] = 120
+    retained = budget.snapshot()
+    with pytest.raises(RunStopped, match="deadline"):
+        budget.request(1, 1, 0.1, 0.5, finalizing=True)
+    assert budget.snapshot() == retained
 
 
 def test_expensive_model_reserve_is_rejected_before_generation() -> None:

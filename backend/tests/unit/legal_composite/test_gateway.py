@@ -90,7 +90,7 @@ def test_gateway_records_exact_delivered_originals_and_bounds_invocation(
         gateway.last_call_id, LLMFlow.LEGAL_COMPOSITE_ANSWER.value, records
     )
     kwargs = model.invoke.call_args.kwargs
-    assert kwargs["timeout_override"] == 30
+    assert kwargs["timeout_override"] == 45
     assert kwargs["max_tokens"] == 4_096
     assert kwargs["use_streaming"] is False
     assert budget.snapshot()["model_calls"] == 1

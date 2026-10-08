@@ -14,7 +14,7 @@ class WorkflowPolicy(BaseModel):
     max_input_tokens: int = Field(default=120_000, gt=0)
     max_output_tokens: int = Field(default=24_000, gt=0)
     max_cost_usd: float = Field(default=0.10, gt=0)
-    max_call_seconds: float = Field(default=30, gt=0)
+    max_call_seconds: float = Field(default=45, gt=0)
     max_context_tokens: int = Field(default=32_000, gt=0)
     max_tools: int = Field(default=24, gt=0)
     max_parallel_tools: int = Field(default=4, ge=1, le=4)
