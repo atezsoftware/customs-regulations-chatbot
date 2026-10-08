@@ -77,6 +77,10 @@ def _invalidate_trigger(table: str, operation: str, schema: str) -> None:
               SET revision = state.revision + 1, updated_at = now();
             RETURN NULL;
         END $$;
+    """)
+    )
+    op.execute(
+        sa.text(f"""
         CREATE TRIGGER {name} AFTER {operation.upper()} ON {schema}.{table}
         {references} FOR EACH STATEMENT EXECUTE FUNCTION {schema}.{name}();
     """)
