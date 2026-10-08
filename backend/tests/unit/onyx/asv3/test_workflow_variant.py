@@ -14,8 +14,8 @@ from onyx.asv3.llm_adapter import ResearchModel
 from onyx.asv3.models import ASv3WorkflowSelection
 from onyx.asv3.shared_reads import SharedReads
 from onyx.asv3.workflow_variant import (
-    ASV3_STANDARD_VARIANT,
     ASV3_GUARDED_EXPERIMENTAL_VARIANT,
+    ASV3_STANDARD_VARIANT,
     ASV3_TUNED_POLICY,
     ASV3_TUNED_VARIANT,
     checkpoint_variant_fields,
