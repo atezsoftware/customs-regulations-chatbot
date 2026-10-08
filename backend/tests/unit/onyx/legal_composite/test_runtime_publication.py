@@ -11,8 +11,9 @@ from uuid import uuid4
 import pytest
 from pydantic import JsonValue
 
+from onyx.asv3.corpus_tools import build_corpus_specs
 from onyx.asv3.evidence import EvidenceLedger
-from onyx.asv3.models import EvidenceItem, RunContext
+from onyx.asv3.models import EvidenceItem, RunContext, ToolSpec
 from onyx.cache.interface import CacheBackend
 from onyx.chat.chat_state import ChatStateContainer
 from onyx.chat.emitter import BufferedEmitter
@@ -120,13 +121,43 @@ def harness(monkeypatch: pytest.MonkeyPatch) -> RuntimeHarness:
         snapshots.append(deepcopy(snapshot))
 
     broker.revalidate_evidence.side_effect = revalidate
+
+    def corpus_specs(
+        _broker: Any,
+        *,
+        require_search_targets: bool,
+        source_identity_guidance: bool,
+    ) -> list[ToolSpec]:
+        assert require_search_targets and source_identity_guidance
+        specs = build_corpus_specs(
+            _broker,
+            require_search_targets=require_search_targets,
+            source_identity_guidance=source_identity_guidance,
+        )
+        assert {spec.name for spec in specs} == {
+            "resolve_source",
+            "read_source_range",
+            "read_chunk",
+            "read_chunk_context",
+            "read_provision",
+            "search_source_text",
+            "query_corpus",
+            "follow_reference",
+            "diagnose_source",
+            "compare_versions",
+            "search_corpus",
+        }
+        assert all(not spec.external and not spec.orchestrates for spec in specs)
+        assert "own title/name" in specs[0].description
+        return specs
+
     monkeypatch.setattr(runtime, "is_connected", lambda _session, _cache: True)
     monkeypatch.setattr(runtime, "bind_pc_corpus_scope", bind_scope)
     monkeypatch.setattr(runtime, "CorpusBroker", lambda _user, _scope: broker)
     monkeypatch.setattr(
         runtime, "build_search_adapter", lambda *_args, **_kwargs: object()
     )
-    monkeypatch.setattr(runtime, "build_corpus_specs", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(runtime, "build_corpus_specs", corpus_specs)
     monkeypatch.setattr(runtime, "build_core_specs", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(
         runtime, "get_session_with_current_tenant", lambda: nullcontext(MagicMock())

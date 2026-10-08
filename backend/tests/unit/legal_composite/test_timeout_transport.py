@@ -31,7 +31,7 @@ from onyx.legal_composite.models import (
     WorkflowPolicy,
 )
 from onyx.llm.cost import ModelPrice
-from onyx.llm.models import UserMessage
+from onyx.llm.models import ReasoningEffort, UserMessage
 from onyx.llm.multi_llm import LitellmLLM, LLMTimeoutError
 from onyx.tracing.answer_graph import _span_contents
 from onyx.tracing.flows import LLMFlow
@@ -89,11 +89,16 @@ def gateway(
     clock: Callable[[], float] | None = None,
     *,
     policy: WorkflowPolicy | None = None,
+    reasoning_effort: ReasoningEffort = ReasoningEffort.AUTO,
 ) -> BudgetedGateway:
     policy = policy or WorkflowPolicy()
     budget = WorkflowBudget(policy) if clock is None else WorkflowBudget(policy, clock)
     return BudgetedGateway(
-        selected_llm=model, research_llm=model, budget=budget, ledger=ledger
+        selected_llm=model,
+        research_llm=model,
+        budget=budget,
+        ledger=ledger,
+        reasoning_effort=reasoning_effort,
     )
 
 
@@ -385,6 +390,9 @@ def test_late_canonical_compatibility_retry_cannot_republish_closed_capture(
 
 
 @pytest.mark.parametrize(
+    "selected_effort", [ReasoningEffort.AUTO, ReasoningEffort.HIGH]
+)
+@pytest.mark.parametrize(
     "response_type,content,required",
     [
         (
@@ -429,12 +437,13 @@ def test_late_canonical_compatibility_retry_cannot_republish_closed_capture(
         ),
     ],
 )
-def test_canonical_typed_schema_maps_to_native_vertex_json_grammar(
+def test_canonical_typed_schema_and_phase_reasoning_map_to_native_vertex(
     model: LitellmLLM,
     monkeypatch: pytest.MonkeyPatch,
     response_type: type[BaseModel],
     content: str,
     required: list[str],
+    selected_effort: ReasoningEffort,
 ) -> None:
     def complete(**kwargs: Any) -> litellm.ModelResponse:
         native: dict[str, Any] = {}
@@ -452,11 +461,20 @@ def test_canonical_typed_schema_maps_to_native_vertex_json_grammar(
             assert "SourceAction" in grammar["$defs"]
             assert "JsonValue" in grammar["$defs"]
         assert kwargs["tools"] is None
+        expected_effort = (
+            ("medium" if selected_effort is ReasoningEffort.AUTO else "high")
+            if response_type is DraftAnswer
+            else "low"
+        )
+        assert kwargs["reasoning_effort"] == expected_effort
+        assert kwargs["max_tokens"] == (
+            2_048 if response_type in {ResearchPlan, ResearchStep} else 4_096
+        )
         return response(content)
 
     completion = Mock(side_effect=complete)
     monkeypatch.setattr("litellm.completion", completion)
-    workflow = gateway(model, EvidenceLedger())
+    workflow = gateway(model, EvidenceLedger(), reasoning_effort=selected_effort)
     research = response_type in {ResearchPlan, ResearchStep}
     result = workflow.complete(
         "Return the typed result",

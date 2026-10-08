@@ -140,7 +140,9 @@ def run_legal_composite_loop(
     )
     broker.search_adapter = adapter
     registry = CapabilityRegistry(
-        build_corpus_specs(broker, require_search_targets=True)
+        build_corpus_specs(
+            broker, require_search_targets=True, source_identity_guidance=True
+        )
     )
     for spec in build_core_specs(registry, ledger, state_provider=lambda: {}):
         if spec.name == "read_evidence":

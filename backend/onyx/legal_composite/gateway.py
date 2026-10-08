@@ -368,18 +368,21 @@ class BudgetedGateway:
         messages: list[ChatCompletionMessage],
         timeout: int,
         output_tokens: int,
-        research: bool,
+        flow: LLMFlow,
         response_format: dict[str, JsonValue] | None,
         user_identity: LLMUserIdentity | None,
     ) -> ModelResponse:
         self.check_active()
-        self.budget.check_active(not research)
+        self.budget.check_active(flow is not LLMFlow.LEGAL_COMPOSITE_RESEARCH)
         return llm.invoke(
             messages,
             structured_response_format=response_format,
             timeout_override=timeout,
             max_tokens=output_tokens,
-            reasoning_effort=ReasoningEffort.LOW if research else self.reasoning_effort,
+            reasoning_effort=ReasoningEffort.LOW
+            if flow
+            in {LLMFlow.LEGAL_COMPOSITE_RESEARCH, LLMFlow.LEGAL_COMPOSITE_REVIEW}
+            else self.reasoning_effort,
             user_identity=user_identity,
             use_streaming=False,
         )
@@ -497,7 +500,7 @@ class BudgetedGateway:
                         messages,
                         timeout,
                         invocation_output_tokens or output_tokens,
-                        not finalizing,
+                        flow,
                         response_format,
                         user_identity,
                     )
