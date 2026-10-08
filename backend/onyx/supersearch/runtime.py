@@ -46,6 +46,7 @@ from onyx.server.query_and_chat.streaming_models import (
     SectionEnd,
 )
 from onyx.supersearch.acquisition import SupersearchAcquirer, corpus_specs
+from onyx.supersearch.cancellation import CancellationProbe
 from onyx.supersearch.corpus import SupersearchCorpusBroker
 from onyx.supersearch.dependencies import SupersearchDependencyExpander
 from onyx.supersearch.engine import SupersearchEngine
@@ -254,6 +255,7 @@ def _run_supersearch_loop(
         filters=scope,
         document_set_names_override=document_set_names_override,
     )
+    cancellation = CancellationProbe(lambda: not is_connected(chat_session_id, cache))
     context = RunContext(
         language="tr",
         scope=scope.model_dump(mode="json"),
@@ -269,7 +271,7 @@ def _run_supersearch_loop(
             coordinator_decision_reserve=0,
             unlimited_execution=True,
         ),
-        cancelled=lambda: not is_connected(chat_session_id, cache),
+        cancelled=cancellation,
         corpus_only=True,
     )
     ledger = EvidenceLedger()
@@ -436,11 +438,11 @@ def _run_supersearch_loop(
         "progress": emitted,
     }
     if result.answer is None or result.status == "cancelled":
-        save_asv3_checkpoint(
-            message_id=assistant_message_id, user_id=user.id, snapshot=snapshot
-        )
         progress.report(
             "cancelled" if result.status == "cancelled" else "failed", status="failed"
+        )
+        save_asv3_checkpoint(
+            message_id=assistant_message_id, user_id=user.id, snapshot=snapshot
         )
         raise OnyxError(
             OnyxErrorCode.LLM_PROVIDER_ERROR,
@@ -452,6 +454,9 @@ def _run_supersearch_loop(
         save_asv3_checkpoint(
             message_id=assistant_message_id, user_id=user.id, snapshot=snapshot
         )
+        if cancellation(force=True):
+            context.cancel()
+        context.check_active()
 
     _publish_answer(
         result=result,

@@ -3,9 +3,6 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
-from contextvars import copy_context
-from typing import cast
 from uuid import UUID
 
 from onyx.asv3.corpus_tools import CorpusBroker
@@ -89,16 +86,9 @@ class SupersearchCorpusBroker(CorpusBroker):
                 result[doc.document_id, doc.chunk_ind] = list(retained.values())
             return result
 
-        with ThreadPoolExecutor(
-            max_workers=4, thread_name_prefix="supersearch-original"
-        ) as executor:
-            futures = [
-                executor.submit(copy_context().run, hydrate, source_id, centers)
-                for source_id, centers in grouped.items()
-            ]
-            hydrated: dict[tuple[str, int], list[EvidenceItem]] = {}
-            for future in futures:
-                hydrated.update(
-                    cast(dict[tuple[str, int], list[EvidenceItem]], future.result())
-                )
-            return hydrated
+        # Acquisition workers already bound concurrent searches. Keep each search's
+        # canonical reads in its owning worker instead of multiplying DB readers.
+        hydrated: dict[tuple[str, int], list[EvidenceItem]] = {}
+        for source_id, centers in grouped.items():
+            hydrated.update(hydrate(source_id, centers))
+        return hydrated
