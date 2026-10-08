@@ -166,6 +166,7 @@ export interface SendMessageParams {
   atezSearchV2?: boolean;
   atezSearchV3?: boolean;
   legalComposite?: boolean;
+  supersearch?: boolean;
   experimentalResearch?: boolean;
   experimentalParallelResearch?: boolean;
   experimentalGuardrails?: boolean;
@@ -198,6 +199,7 @@ export async function* sendMessage({
   deepResearch,
   atezSearchV3,
   legalComposite,
+  supersearch,
   experimentalResearch,
   experimentalParallelResearch,
   experimentalGuardrails,
@@ -213,48 +215,56 @@ export async function* sendMessage({
   origin,
   additionalContext,
 }: SendMessageParams): AsyncGenerator<PacketType, void, unknown> {
+  if (supersearch && (llmOverrides?.length ?? 0) > 1) {
+    throw new Error("Supersearch tek modelle çalışır.");
+  }
+
   // Build payload for new send-chat-message API
   const payload = {
     message: message,
     chat_session_id: chatSessionId,
     parent_message_id: parentMessageId,
-    file_descriptors: fileDescriptors,
+    file_descriptors: supersearch ? undefined : fileDescriptors,
     internal_search_filters: filters,
-    deep_research: deepResearch ?? false,
+    deep_research: !supersearch && (deepResearch ?? false),
     atez_search: false,
     atez_search_v2: false,
-    ...(legalComposite ? { legal_composite: true } : {}),
+    ...(legalComposite && !supersearch ? { legal_composite: true } : {}),
+    ...(supersearch ? { supersearch: true } : {}),
     atez_search_v3: Boolean(
       (atezSearchV3 ||
         experimentalResearch ||
         experimentalParallelResearch ||
         experimentalGuardrails) &&
-      !deepResearch
+      !deepResearch &&
+      !supersearch
     ),
-    asv3_research_profile: deepResearch
-      ? "deep"
-      : experimentalResearch || experimentalParallelResearch
-        ? "experimental"
-        : atezSearchV3 || experimentalGuardrails
-          ? "normal"
-          : "deep",
-    ...(experimentalParallelResearch && !deepResearch
+    asv3_research_profile:
+      supersearch || deepResearch
+        ? "deep"
+        : experimentalResearch || experimentalParallelResearch
+          ? "experimental"
+          : atezSearchV3 || experimentalGuardrails
+            ? "normal"
+            : "deep",
+    ...(experimentalParallelResearch && !deepResearch && !supersearch
       ? { asv3_parallel_research: true }
       : {}),
-    ...(experimentalGuardrails && !deepResearch
+    ...(experimentalGuardrails && !deepResearch && !supersearch
       ? { asv3_guarded_experimental: true }
       : {}),
-    asv3_resume_message_id: asv3ResumeMessageId,
+    asv3_resume_message_id: supersearch ? undefined : asv3ResumeMessageId,
     asv3_allow_external: Boolean(
       (atezSearchV3 ||
         experimentalResearch ||
         experimentalParallelResearch ||
         experimentalGuardrails ||
         deepResearch) &&
-      asv3AllowExternal
+      asv3AllowExternal &&
+      !supersearch
     ),
-    allowed_tool_ids: enabledToolIds,
-    forced_tool_id: forcedToolId ?? null,
+    allowed_tool_ids: supersearch ? [] : enabledToolIds,
+    forced_tool_id: supersearch ? null : (forcedToolId ?? null),
     llm_override:
       temperature || modelVersion
         ? {
@@ -268,7 +278,7 @@ export async function* sendMessage({
     llm_overrides: llmOverrides ?? null,
     // Default to "unknown" for consistency with backend; callers should set explicitly
     origin: origin ?? "unknown",
-    additional_context: additionalContext ?? null,
+    additional_context: supersearch ? null : (additionalContext ?? null),
   };
 
   const body = JSON.stringify(payload);

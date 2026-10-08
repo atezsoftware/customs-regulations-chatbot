@@ -327,7 +327,11 @@ const AgentMessage = React.memo(function AgentMessage({
           state={asv3Progress}
           stopped={stopPacketSeen}
           onResume={
-            messageId && parentMessage && onRegenerate && llmManager
+            asv3Progress.header?.workflow !== "supersearch" &&
+            messageId &&
+            parentMessage &&
+            onRegenerate &&
+            llmManager
               ? () => {
                   void onRegenerate({
                     messageId,

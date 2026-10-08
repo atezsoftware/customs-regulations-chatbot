@@ -550,17 +550,28 @@ def create_asv3_progress_packets(
         logger.warning("Invalid ASv3 checkpoint progress; preserving answer replay")
         return packets
     progress_events: list[ASv3Progress] = []
+    supersearch_checkpoint = checkpoint.get("asv3_workflow_variant") == "supersearch"
     for event in events:
         try:
             progress = ASv3Progress.model_validate(event)
         except ValidationError:
             logger.warning("Invalid ASv3 public progress event skipped")
             continue
+        if supersearch_checkpoint or progress.workflow == "supersearch":
+            progress = progress.model_copy(
+                update={"workflow": "supersearch", "resume_label": None}
+            )
         progress_events.append(progress)
         packets.append(Packet(placement=Placement(turn_index=turn_index), obj=progress))
     terminal = any(
         event.task_id is None and event.status in {"completed", "failed", "cancelled"}
         for event in progress_events
+    )
+    workflow: Literal["asv3", "supersearch"] = (
+        "supersearch"
+        if supersearch_checkpoint
+        or any(event.workflow == "supersearch" for event in progress_events)
+        else "asv3"
     )
     if not interrupted or terminal:
         return packets
@@ -605,6 +616,7 @@ def create_asv3_progress_packets(
         Packet(
             placement=Placement(turn_index=turn_index),
             obj=ASv3Progress(
+                workflow=workflow,
                 run_id=run_id,
                 event_id=f"{run_id}:interrupted:{sequence}",
                 sequence=sequence,
@@ -613,7 +625,9 @@ def create_asv3_progress_packets(
                 status="failed",
                 title=cast(str, notice[0]),
                 message=cast(str, notice[1]),
-                resume_label=None if has_citable_external else resume[0],
+                resume_label=None
+                if has_citable_external or workflow == "supersearch"
+                else resume[0],
             ),
         )
     )

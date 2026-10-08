@@ -4,6 +4,37 @@ import useDeepResearchToggle from "@/hooks/useDeepResearchToggle";
 describe("research mode selection", () => {
   afterEach(cleanup);
 
+  it("selects Supersearch exclusively, preserves it on creation and resets on navigation", () => {
+    const { result, rerender } = renderHook(
+      ({ chatSessionId, agentId }) =>
+        useDeepResearchToggle({ chatSessionId, agentId }),
+      { initialProps: { chatSessionId: null as string | null, agentId: 0 } }
+    );
+    act(() => result.current.toggleLegalComposite());
+    act(() => result.current.toggleSupersearch());
+    expect(result.current.supersearchEnabled).toBe(true);
+    expect(result.current.legalCompositeEnabled).toBe(false);
+    expect(result.current.atezSearchV3Enabled).toBe(false);
+    expect(result.current.deepResearchEnabled).toBe(false);
+    expect(result.current.experimentalResearchEnabled).toBe(false);
+    expect(result.current.experimentalParallelResearchEnabled).toBe(false);
+    expect(result.current.experimentalGuardrailsEnabled).toBe(false);
+    rerender({ chatSessionId: "session-1", agentId: 0 });
+    expect(result.current.supersearchEnabled).toBe(true);
+    act(() => result.current.toggleSupersearch());
+    expect(result.current.supersearchEnabled).toBe(false);
+    act(() => result.current.toggleSupersearch());
+    rerender({ chatSessionId: "session-2", agentId: 0 });
+    expect(result.current.supersearchEnabled).toBe(false);
+    act(() => result.current.toggleSupersearch());
+    rerender({ chatSessionId: "session-2", agentId: 1 });
+    expect(result.current.supersearchEnabled).toBe(false);
+    act(() => result.current.toggleSupersearch());
+    act(() => result.current.toggleExperimentalGuardrails());
+    expect(result.current.supersearchEnabled).toBe(false);
+    expect(result.current.experimentalGuardrailsEnabled).toBe(true);
+  });
+
   it("selects Legal Composite exclusively and resets on session changes", () => {
     const { result, rerender } = renderHook(
       ({ chatSessionId }) =>

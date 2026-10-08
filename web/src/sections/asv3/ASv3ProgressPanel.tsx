@@ -365,6 +365,7 @@ export default function ASv3ProgressPanel({
           </div>
         )}
         {onResume &&
+          header?.workflow !== "supersearch" &&
           header?.phase === "interrupted" &&
           header.status === "failed" &&
           header.resume_label && (

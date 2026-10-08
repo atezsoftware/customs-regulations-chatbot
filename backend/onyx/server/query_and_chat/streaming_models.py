@@ -381,6 +381,7 @@ class ASv3Progress(BaseObj):
     """Public operational updates, separate from private model reasoning."""
 
     type: Literal["asv3_progress"] = StreamingType.ASV3_PROGRESS.value
+    workflow: Literal["asv3", "supersearch"] = "asv3"
     run_id: str
     event_id: str
     sequence: int = Field(ge=0)

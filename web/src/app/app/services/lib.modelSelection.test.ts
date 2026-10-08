@@ -4,6 +4,8 @@ import {
   type SendMessageParams,
 } from "@/app/app/services/lib";
 
+import { ChatFileType } from "@/app/app/interfaces";
+
 const originalFetch = global.fetch;
 
 afterEach(() => {
@@ -383,5 +385,146 @@ it.each([undefined, 101])(
       model_version: "gemini-3.8-pro",
     });
     expect(payload.asv3_resume_message_id).toBe(asv3ResumeMessageId);
+  }
+);
+
+it.each([false, true])(
+  "sends Supersearch only when selected (%s)",
+  async (selected) => {
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: false,
+      status: 400,
+      json: async () => ({ detail: "captured" }),
+    });
+    await expect(
+      sendMessage({
+        message: "Antrepo rejiminde teminat koşulları nelerdir?",
+        chatSessionId: "session-1",
+        parentMessageId: null,
+        filters: null,
+        supersearch: selected,
+        modelProvider: "Vertex",
+        modelProviderType: "vertex_ai",
+        modelVersion: "gemini-flash",
+      }).next()
+    ).rejects.toThrow("captured");
+    const payload = JSON.parse(
+      String(jest.mocked(global.fetch).mock.calls[0]![1]?.body)
+    );
+    if (selected) {
+      expect(payload.supersearch).toBe(true);
+    } else {
+      expect(payload).not.toHaveProperty("supersearch");
+    }
+    expect(payload.atez_search_v3).toBe(false);
+    expect(payload.deep_research).toBe(false);
+    expect(payload.asv3_allow_external).toBe(false);
+    expect(payload).not.toHaveProperty("legal_composite");
+    expect(payload.llm_override.model_version).toBe("gemini-flash");
+  }
+);
+
+it.each([false, true])(
+  "prevents stale tool and research settings from escaping Supersearch (%s)",
+  async (deepResearch) => {
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: false,
+      status: 400,
+      json: async () => ({ detail: "captured" }),
+    });
+    await expect(
+      sendMessage({
+        message: "Soru",
+        chatSessionId: "session-1",
+        parentMessageId: null,
+        filters: null,
+        supersearch: true,
+        legalComposite: true,
+        atezSearchV3: true,
+        deepResearch,
+        experimentalResearch: true,
+        experimentalParallelResearch: true,
+        experimentalGuardrails: true,
+        asv3AllowExternal: true,
+        asv3ResumeMessageId: 41,
+        forcedToolId: 9,
+      }).next()
+    ).rejects.toThrow("captured");
+    const payload = JSON.parse(
+      String(jest.mocked(global.fetch).mock.calls[0]![1]?.body)
+    );
+    expect(payload.supersearch).toBe(true);
+    expect(payload.atez_search_v3).toBe(false);
+    expect(payload.deep_research).toBe(false);
+    expect(payload.asv3_research_profile).toBe("deep");
+    expect(payload.asv3_allow_external).toBe(false);
+    expect(payload.allowed_tool_ids).toEqual([]);
+    expect(payload.forced_tool_id).toBeNull();
+    expect(payload).not.toHaveProperty("legal_composite");
+    expect(payload).not.toHaveProperty("asv3_parallel_research");
+    expect(payload).not.toHaveProperty("asv3_guarded_experimental");
+    expect(payload).not.toHaveProperty("asv3_resume_message_id");
+  }
+);
+
+it("rejects Supersearch with multiple answer models", async () => {
+  global.fetch = jest.fn();
+  await expect(
+    sendMessage({
+      message: "Soru",
+      chatSessionId: "session-1",
+      parentMessageId: null,
+      filters: null,
+      supersearch: true,
+      llmOverrides: [
+        { model_provider: "provider", model_version: "model-1" },
+        { model_provider: "provider", model_version: "model-2" },
+      ],
+    }).next()
+  ).rejects.toThrow("Supersearch tek modelle çalışır.");
+  expect(global.fetch).not.toHaveBeenCalled();
+});
+
+it.each([false, true])(
+  "includes attached files and extra context only outside Supersearch (%s)",
+  async (selected) => {
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: false,
+      status: 400,
+      json: async () => ({ detail: "captured" }),
+    });
+    const fileDescriptors = [
+      { id: "user-file-id", type: ChatFileType.DOCUMENT },
+    ];
+    const filters = {
+      source_type: ["file"],
+      document_set: ["PC Külliyatı"],
+      updated_at_range: { start: "2025-01-01", end: null },
+    };
+    await expect(
+      sendMessage({
+        message: "Soru",
+        chatSessionId: "session-1",
+        parentMessageId: null,
+        filters,
+        supersearch: selected,
+        fileDescriptors,
+        enabledToolIds: [1, 9],
+        additionalContext: "Browser tab text",
+      }).next()
+    ).rejects.toThrow("captured");
+    const payload = JSON.parse(
+      String(jest.mocked(global.fetch).mock.calls[0]![1]?.body)
+    );
+    expect(payload.internal_search_filters).toEqual(filters);
+    if (selected) {
+      expect(payload).not.toHaveProperty("file_descriptors");
+      expect(payload.additional_context).toBeNull();
+      expect(payload.allowed_tool_ids).toEqual([]);
+    } else {
+      expect(payload.file_descriptors).toEqual(fileDescriptors);
+      expect(payload.additional_context).toBe("Browser tab text");
+      expect(payload.allowed_tool_ids).toEqual([1, 9]);
+    }
   }
 );

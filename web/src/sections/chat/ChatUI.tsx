@@ -32,6 +32,7 @@ interface RegenerationResearchModeInput {
   atezSearchV2Enabled: boolean;
   atezSearchV3Enabled: boolean;
   legalCompositeEnabled?: boolean;
+  supersearchEnabled?: boolean;
   experimentalResearchEnabled: boolean;
   experimentalParallelResearchEnabled: boolean;
   experimentalGuardrailsEnabled: boolean;
@@ -43,6 +44,7 @@ export function getRegenerationResearchMode({
   atezSearchV2Enabled,
   atezSearchV3Enabled,
   legalCompositeEnabled = false,
+  supersearchEnabled = false,
   experimentalResearchEnabled,
   experimentalParallelResearchEnabled,
   experimentalGuardrailsEnabled,
@@ -53,6 +55,7 @@ export function getRegenerationResearchMode({
     atezSearchV2: resumingAsv3 ? false : atezSearchV2Enabled,
     atezSearchV3: resumingAsv3 || atezSearchV3Enabled,
     legalComposite: !resumingAsv3 && legalCompositeEnabled,
+    supersearch: !resumingAsv3 && supersearchEnabled,
     experimentalResearch: resumingAsv3 ? false : experimentalResearchEnabled,
     experimentalParallelResearch: resumingAsv3
       ? false
@@ -78,6 +81,7 @@ export interface ChatUIProps {
     atezSearchV2?: boolean;
     atezSearchV3?: boolean;
     legalComposite?: boolean;
+    supersearch?: boolean;
     experimentalResearch?: boolean;
     experimentalParallelResearch?: boolean;
     experimentalGuardrails?: boolean;
@@ -98,6 +102,7 @@ export interface ChatUIProps {
   atezSearchV2Enabled?: boolean;
   atezSearchV3Enabled?: boolean;
   legalCompositeEnabled?: boolean;
+  supersearchEnabled?: boolean;
   experimentalResearchEnabled?: boolean;
   experimentalParallelResearchEnabled?: boolean;
   experimentalGuardrailsEnabled?: boolean;
@@ -131,6 +136,7 @@ const ChatUI = React.memo(
     atezSearchV2Enabled = false,
     atezSearchV3Enabled = false,
     legalCompositeEnabled = false,
+    supersearchEnabled = false,
     experimentalResearchEnabled = false,
     experimentalParallelResearchEnabled = false,
     experimentalGuardrailsEnabled = false,
@@ -165,6 +171,7 @@ const ChatUI = React.memo(
     const atezSearchV2EnabledRef = useRef(atezSearchV2Enabled);
     const atezSearchV3EnabledRef = useRef(atezSearchV3Enabled);
     const legalCompositeEnabledRef = useRef(legalCompositeEnabled);
+    const supersearchEnabledRef = useRef(supersearchEnabled);
     const experimentalResearchEnabledRef = useRef(experimentalResearchEnabled);
     const experimentalParallelResearchEnabledRef = useRef(
       experimentalParallelResearchEnabled
@@ -180,6 +187,7 @@ const ChatUI = React.memo(
     atezSearchV2EnabledRef.current = atezSearchV2Enabled;
     atezSearchV3EnabledRef.current = atezSearchV3Enabled;
     legalCompositeEnabledRef.current = legalCompositeEnabled;
+    supersearchEnabledRef.current = supersearchEnabled;
     experimentalResearchEnabledRef.current = experimentalResearchEnabled;
     experimentalParallelResearchEnabledRef.current =
       experimentalParallelResearchEnabled;
@@ -201,6 +209,7 @@ const ChatUI = React.memo(
             atezSearchV2Enabled: atezSearchV2EnabledRef.current,
             atezSearchV3Enabled: atezSearchV3EnabledRef.current,
             legalCompositeEnabled: legalCompositeEnabledRef.current,
+            supersearchEnabled: supersearchEnabledRef.current,
             experimentalResearchEnabled: experimentalResearchEnabledRef.current,
             experimentalParallelResearchEnabled:
               experimentalParallelResearchEnabledRef.current,
@@ -239,6 +248,7 @@ const ChatUI = React.memo(
             atezSearchV3EnabledRef.current && !(models && models.length >= 2),
           legalComposite:
             legalCompositeEnabledRef.current && !(models && models.length >= 2),
+          supersearch: supersearchEnabledRef.current,
           experimentalResearch:
             experimentalResearchEnabledRef.current &&
             !(models && models.length >= 2),
