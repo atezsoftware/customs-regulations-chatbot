@@ -741,9 +741,13 @@ def test_secondary_search_llm_preserves_selected_config_identity_and_budget() ->
     scoped = ScopedSearchLLM(selected, context, identity)
     assert scoped.config is selected.config
     scoped.invoke(
-        [UserMessage(content="actual prompt")], max_tokens=512, timeout_override=99
+        [UserMessage(content="actual prompt")],
+        max_tokens=512,
+        timeout_override=99,
+        provider_compatibility_attempts=1,
     )
     assert selected.invoke.call_args.kwargs["user_identity"] == identity
+    assert selected.invoke.call_args.kwargs["provider_compatibility_attempts"] == 1
     assert 1 <= selected.invoke.call_args.kwargs["timeout_override"] <= 10
     assert context.budget.snapshot()["decisions"] == 1
     assert context.budget.model_slots.acquire(blocking=False)

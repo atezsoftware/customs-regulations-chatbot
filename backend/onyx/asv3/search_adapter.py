@@ -67,6 +67,7 @@ _GUARDED_RETRIEVAL_OVERRIDES = SearchToolRetrievalOverrides(
     max_llm_chunks=32,
     preserve_source_diversity=True,
     reuse_diversity_comparisons=True,
+    guarded_decisions_advisory=True,
 )
 
 
@@ -124,6 +125,7 @@ class ScopedSearchLLM(LLM):
         reasoning_effort: ReasoningEffort = ReasoningEffort.AUTO,
         user_identity: LLMUserIdentity | None = None,
         use_streaming: bool = True,
+        provider_compatibility_attempts: int | None = None,
     ) -> ModelResponse:
         for attempt in range(3):
             try:
@@ -139,6 +141,7 @@ class ScopedSearchLLM(LLM):
                         reasoning_effort=reasoning_effort,
                         user_identity=user_identity or self.user_identity,
                         use_streaming=use_streaming,
+                        provider_compatibility_attempts=provider_compatibility_attempts,
                     )
                     self.context.check_research_active()
                     return result

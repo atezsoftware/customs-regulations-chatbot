@@ -35,9 +35,11 @@ remain bounded in latency and cost.
    Guardrails delivery window; it cannot remove deterministic top results or
    invent citations. It is therefore a recall guard, not an authority or answer
    generator.
-5. Upgrade the pinned OpenAI SDK to the documented Decisions-capable minimum.
-   The integration is direct SDK usage, is tagged with a dedicated tracing flow,
-   and never logs the API key or passage text.
+5. Call the documented Decisions endpoint through the existing `httpx` runtime
+   dependency. The pinned LiteLLM version excludes OpenAI SDK 3.x, so a direct
+   request avoids a broad model-stack upgrade while retaining the endpoint
+   contract. The call is tagged with a dedicated tracing flow and never logs
+   the API key or passage text.
 
 ## Isolation and Performance Constraints
 

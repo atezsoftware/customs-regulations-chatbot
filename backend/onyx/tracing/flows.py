@@ -27,6 +27,7 @@ class LLMFlow(StrEnum):
     ASV3_ANSWER_REPAIR = "asv3_answer_repair"
     ASV3_LANGUAGE = "asv3_language"
     ASV3_SOURCE_VISION = "asv3_source_vision"
+    ASV3_GUARDED_DECISIONS = "asv3_guarded_decisions"
 
     # Secondary LLM flows
     SEMANTIC_QUERY_REPHRASE = "semantic_query_rephrase"
