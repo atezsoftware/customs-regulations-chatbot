@@ -72,6 +72,7 @@ from onyx.configs.constants import (
     MilestoneRecordType,
 )
 from onyx.context.search.models import BaseFilters, SearchDoc
+from onyx.db.asv3_runs import load_asv3_checkpoint
 from onyx.db.chat import (
     create_new_chat_message,
     get_chat_session_by_id,
@@ -1587,12 +1588,27 @@ def _run_models(
                         raise ValueError("ASv3 requires the default assistant")
                     if setup.search_params.project_id_filter is not None:
                         raise ValueError("ASv3 is unavailable inside a project")
+                    guarded_resume = False
+                    if setup.new_msg_req.asv3_resume_message_id is not None:
+                        from onyx.asv3.workflow_variant import (
+                            ASV3_GUARDED_EXPERIMENTAL_VARIANT,
+                        )
+
+                        resume_checkpoint = load_asv3_checkpoint(
+                            message_id=setup.new_msg_req.asv3_resume_message_id,
+                            user_id=user.id,
+                        )
+                        guarded_resume = (
+                            resume_checkpoint is not None
+                            and resume_checkpoint.get("asv3_workflow_variant")
+                            == ASV3_GUARDED_EXPERIMENTAL_VARIANT
+                        )
                     workflow = resolve_asv3_workflow(
                         "deep"
                         if _uses_deep_asv3(setup)
                         else setup.new_msg_req.asv3_research_profile,
                         setup.new_msg_req.asv3_parallel_research,
-                        setup.new_msg_req.asv3_guarded_experimental,
+                        setup.new_msg_req.asv3_guarded_experimental or guarded_resume,
                     )
                     research_profile = workflow.research_profile
                     research_llm = (

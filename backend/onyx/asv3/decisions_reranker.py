@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from math import isfinite
 from typing import Any, cast
 
 import httpx
@@ -65,33 +66,41 @@ def _questions(candidates: list[InferenceChunk]) -> list[dict[str, str]]:
     ]
 
 
-def _qualifying_boundary_indexes(response: object, candidate_count: int) -> list[int]:
+def _qualifying_boundary_indexes(
+    response: object, candidate_count: int
+) -> list[int] | None:
     answers = (
         cast(Mapping[str, object], response).get("answers")
         if isinstance(response, Mapping)
         else None
     )
     if not isinstance(answers, list):
-        return []
+        return None
+    if len(answers) != candidate_count:
+        return None
     probabilities: dict[int, float] = {}
     for answer in answers:
         if _answer_field(answer, "type") != "predicate":
-            continue
+            return None
         name = _answer_field(answer, "name")
         probability = _answer_field(answer, "probability")
         if not isinstance(name, str) or not name.startswith("candidate_"):
-            continue
-        if not isinstance(probability, (float, int)):
-            continue
+            return None
+        if type(probability) not in {float, int}:
+            return None
         try:
             index = int(name.removeprefix("candidate_"))
         except ValueError:
-            continue
+            return None
+        normalized_probability = float(cast(int | float, probability))
         if (
-            0 <= index < candidate_count
-            and probability >= _MIN_RELEVANCE_PROBABILITY
+            not 0 <= index < candidate_count
+            or index in probabilities
+            or not isfinite(normalized_probability)
+            or not 0 <= normalized_probability <= 1
         ):
-            probabilities[index] = float(probability)
+            return None
+        probabilities[index] = normalized_probability
     return [
         index
         for index, _ in sorted(
@@ -141,7 +150,7 @@ def promote_guarded_boundary_candidates(
     except Exception:
         logger.info("Guarded Decisions advisory unavailable; retaining deterministic ranking")
         return ordered_chunks
-    if not indexes:
+    if indexes is None or not indexes:
         return ordered_chunks
     promoted = [boundary[index] for index in indexes]
     promoted_identities = {(chunk.document_id, chunk.chunk_id) for chunk in promoted}

@@ -67,6 +67,7 @@ def candidate_chunks() -> list[InferenceChunk]:
         (ASV3_TUNED_VARIANT, "normal", 60, 256, 384, 60, False),
         (ASV3_TUNED_VARIANT, "normal", 150, 256, 384, 150, False),
         (ASV3_GUARDED_EXPERIMENTAL_VARIANT, "normal", 20, 192, 256, 32, True),
+        (ASV3_GUARDED_EXPERIMENTAL_VARIANT, "normal", 256, 192, 256, 32, True),
         (None, "normal", 20, 96, 96, 25, False),
         (None, "deep", 20, 96, 96, 25, False),
         (None, "experimental", 20, 96, 96, 25, False),

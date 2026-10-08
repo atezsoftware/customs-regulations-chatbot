@@ -62,12 +62,19 @@ def test_decisions_promotes_bounded_boundary_candidates_without_demoting_baselin
     client.__enter__.return_value = client
     client.post.return_value.json.return_value = {
         "answers": [
-            {"name": "candidate_0", "type": "predicate", "probability": 0.1},
-            {"name": "candidate_2", "type": "predicate", "probability": 0.95},
-            {"name": "candidate_4", "type": "predicate", "probability": 0.9},
-            {"name": "candidate_6", "type": "predicate", "probability": 0.85},
-            {"name": "candidate_8", "type": "predicate", "probability": 0.8},
-            {"name": "candidate_10", "type": "predicate", "probability": 0.75},
+            {
+                "name": f"candidate_{index}",
+                "type": "predicate",
+                "probability": {
+                    0: 0.1,
+                    2: 0.95,
+                    4: 0.9,
+                    6: 0.85,
+                    8: 0.8,
+                    10: 0.75,
+                }.get(index, 0.0),
+            }
+            for index in range(12)
         ]
     }
     with (
@@ -109,6 +116,59 @@ def test_decisions_failures_keep_deterministic_order(response: object) -> None:
         client.post.side_effect = response
     else:
         client.post.return_value.json.return_value = response
+    with (
+        patch(f"{MODULE}.guarded_decisions_enabled", return_value=True),
+        patch(f"{MODULE}._create_client", return_value=client),
+    ):
+        result = promote_guarded_boundary_candidates(
+            query="Which source governs the exception?",
+            ordered_chunks=chunks,
+            baseline_limit=4,
+        )
+
+    assert result == chunks
+
+
+@pytest.mark.parametrize(
+    "answers",
+    [
+        [
+            {"name": "candidate_0", "type": "refusal"},
+            *[
+                {"name": f"candidate_{index}", "type": "predicate", "probability": 0.0}
+                for index in range(1, 12)
+            ],
+        ],
+        [
+            {
+                "name": f"candidate_{index}",
+                "type": "predicate",
+                "probability": True if index == 2 else 0.0,
+            }
+            for index in range(12)
+        ],
+        [
+            {
+                "name": f"candidate_{index}",
+                "type": "predicate",
+                "probability": 1.1 if index == 2 else 0.0,
+            }
+            for index in range(12)
+        ],
+        [
+            {"name": "candidate_0", "type": "predicate", "probability": 0.95},
+        ],
+    ],
+)
+def test_invalid_decisions_answer_sets_keep_deterministic_order(
+    answers: list[dict[str, object]],
+) -> None:
+    from onyx.asv3.decisions_reranker import promote_guarded_boundary_candidates
+
+    chunks = _chunks()
+    client = MagicMock()
+    client.__enter__.return_value = client
+    client.post.return_value.json.return_value = {"answers": answers}
     with (
         patch(f"{MODULE}.guarded_decisions_enabled", return_value=True),
         patch(f"{MODULE}._create_client", return_value=client),

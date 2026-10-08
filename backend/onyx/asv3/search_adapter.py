@@ -114,6 +114,22 @@ class ScopedSearchLLM(LLM):
             self.context.check_research_active()
             time.sleep(min(0.05, max(0, retry_at - time.monotonic())))
 
+    def provider_max_attempts(self) -> int:
+        configured = self.context.services.get("provider_max_attempts", 3)
+        if isinstance(configured, int) and not isinstance(configured, bool):
+            return max(1, configured)
+        return 3
+
+    def provider_compatibility_attempts(
+        self, requested: int | None
+    ) -> int | None:
+        if requested is not None:
+            return requested
+        configured = self.context.services.get("provider_compatibility_attempts")
+        if isinstance(configured, int) and not isinstance(configured, bool):
+            return max(1, configured)
+        return None
+
     def invoke(
         self,
         prompt: LanguageModelInput,
@@ -127,7 +143,11 @@ class ScopedSearchLLM(LLM):
         use_streaming: bool = True,
         provider_compatibility_attempts: int | None = None,
     ) -> ModelResponse:
-        for attempt in range(3):
+        max_attempts = self.provider_max_attempts()
+        compatibility_attempts = self.provider_compatibility_attempts(
+            provider_compatibility_attempts
+        )
+        for attempt in range(max_attempts):
             try:
                 with model_slot(self.context, research=True):
                     self.context.consume_research_decision()
@@ -141,12 +161,12 @@ class ScopedSearchLLM(LLM):
                         reasoning_effort=reasoning_effort,
                         user_identity=user_identity or self.user_identity,
                         use_streaming=use_streaming,
-                        provider_compatibility_attempts=provider_compatibility_attempts,
+                        provider_compatibility_attempts=compatibility_attempts,
                     )
                     self.context.check_research_active()
                     return result
             except Exception as error:
-                if attempt == 2 or not is_retryable_provider_error(error):
+                if attempt == max_attempts - 1 or not is_retryable_provider_error(error):
                     raise
                 self.wait_to_retry(error, attempt)
         raise AssertionError("Selected-provider retry loop did not terminate")
@@ -162,7 +182,8 @@ class ScopedSearchLLM(LLM):
         reasoning_effort: ReasoningEffort = ReasoningEffort.AUTO,
         user_identity: LLMUserIdentity | None = None,
     ) -> Iterator[ModelResponseStream]:
-        for attempt in range(3):
+        max_attempts = self.provider_max_attempts()
+        for attempt in range(max_attempts):
             emitted = False
             try:
                 with model_slot(self.context, research=True):
@@ -183,7 +204,11 @@ class ScopedSearchLLM(LLM):
                     self.context.check_research_active()
                     return
             except Exception as error:
-                if emitted or attempt == 2 or not is_retryable_provider_error(error):
+                if (
+                    emitted
+                    or attempt == max_attempts - 1
+                    or not is_retryable_provider_error(error)
+                ):
                     raise
                 self.wait_to_retry(error, attempt)
 

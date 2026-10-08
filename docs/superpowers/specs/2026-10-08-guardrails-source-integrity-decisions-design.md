@@ -32,9 +32,10 @@ remain bounded in latency and cost.
    1.5-second timeout, no retries, and leaves the deterministic ordering intact
    on any refusal, timeout, malformed response, or provider error.
 4. The advisory can only promote already retrieved candidates into the
-   Guardrails delivery window; it cannot remove deterministic top results or
-   invent citations. It is therefore a recall guard, not an authority or answer
-   generator.
+   Guardrails delivery window. It reserves the first 28 deterministic results
+   and uses at most four of the 32 fixed delivery slots for qualified boundary
+   candidates; it cannot invent citations. It is therefore a recall guard, not
+   an authority or answer generator.
 5. Call the documented Decisions endpoint through the existing `httpx` runtime
    dependency. The pinned LiteLLM version excludes OpenAI SDK 3.x, so a direct
    request avoids a broad model-stack upgrade while retaining the endpoint
@@ -46,7 +47,8 @@ remain bounded in latency and cost.
 - Existing workflow variants receive the exact prior retrieval overrides and
   never invoke Decisions.
 - The default Guardrails path makes no extra provider call.
-- Decisions evaluates at most 12 boundary candidates and may promote at most 4.
+- Decisions evaluates at most 12 boundary candidates and may promote at most 4
+  into the four reserved advisory slots; delivery never exceeds 32 sources.
 - A failure adds no retry and no delay beyond the 1.5-second local timeout.
 - Search source identity, citation numbering, and evidence-ledger publication
   remain host controlled.
