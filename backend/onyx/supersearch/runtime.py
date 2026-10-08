@@ -46,6 +46,7 @@ from onyx.server.query_and_chat.streaming_models import (
     SectionEnd,
 )
 from onyx.supersearch.acquisition import SupersearchAcquirer, corpus_specs
+from onyx.supersearch.cancellation import CancellationProbe
 from onyx.supersearch.corpus import SupersearchCorpusBroker
 from onyx.supersearch.dependencies import SupersearchDependencyExpander
 from onyx.supersearch.engine import SupersearchEngine
@@ -53,6 +54,9 @@ from onyx.supersearch.gateway import SelectedModelGateway
 from onyx.tools.interface import Tool
 from onyx.tools.tool_implementations.search.search_tool import SearchTool
 from onyx.tracing.framework.create import ChatTraceMetadata, ensure_trace
+from onyx.utils.logger import setup_logger
+
+logger = setup_logger()
 
 
 def _progress_reporter(
@@ -251,6 +255,7 @@ def _run_supersearch_loop(
         filters=scope,
         document_set_names_override=document_set_names_override,
     )
+    cancellation = CancellationProbe(lambda: not is_connected(chat_session_id, cache))
     context = RunContext(
         language="tr",
         scope=scope.model_dump(mode="json"),
@@ -266,7 +271,7 @@ def _run_supersearch_loop(
             coordinator_decision_reserve=0,
             unlimited_execution=True,
         ),
-        cancelled=lambda: not is_connected(chat_session_id, cache),
+        cancelled=cancellation,
         corpus_only=True,
     )
     ledger = EvidenceLedger()
@@ -383,7 +388,34 @@ def _run_supersearch_loop(
         report=report,
     )
     report("tools", "tr")
-    result = engine.run(question, history, custom_agent_prompt)
+    try:
+        result = engine.run(question, history, custom_agent_prompt)
+    except Exception:
+        try:
+            progress.report(
+                "failed",
+                status="failed",
+                title="Supersearch tamamlanamadı",
+                message="Model yanıtı veya kaynak işlemi tamamlanamadı.",
+            )
+            save_asv3_checkpoint(
+                message_id=assistant_message_id,
+                user_id=user.id,
+                snapshot={
+                    "run_id": context.run_id,
+                    "sequence": 1,
+                    "request": question,
+                    "scope": context.scope,
+                    "asv3_workflow_variant": "supersearch",
+                    "prompt_version": PROMPT_VERSION,
+                    "publication_status": "unavailable",
+                    "processing_seconds": time.monotonic() - started,
+                    "progress": emitted,
+                },
+            )
+        except Exception:
+            logger.exception("Could not persist Supersearch failure progress")
+        raise
     snapshot: dict[str, JsonValue] = {
         "run_id": context.run_id,
         "sequence": 1,
@@ -406,11 +438,11 @@ def _run_supersearch_loop(
         "progress": emitted,
     }
     if result.answer is None or result.status == "cancelled":
-        save_asv3_checkpoint(
-            message_id=assistant_message_id, user_id=user.id, snapshot=snapshot
-        )
         progress.report(
             "cancelled" if result.status == "cancelled" else "failed", status="failed"
+        )
+        save_asv3_checkpoint(
+            message_id=assistant_message_id, user_id=user.id, snapshot=snapshot
         )
         raise OnyxError(
             OnyxErrorCode.LLM_PROVIDER_ERROR,
@@ -422,6 +454,9 @@ def _run_supersearch_loop(
         save_asv3_checkpoint(
             message_id=assistant_message_id, user_id=user.id, snapshot=snapshot
         )
+        if cancellation(force=True):
+            context.cancel()
+        context.check_active()
 
     _publish_answer(
         result=result,
