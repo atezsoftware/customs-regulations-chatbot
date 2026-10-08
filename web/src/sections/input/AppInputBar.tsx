@@ -50,7 +50,7 @@ import {
   SvgSparkle,
 } from "@opal/icons";
 import { DEFAULT_AGENT_ID } from "@/lib/constants";
-import { Button, SelectButton } from "@opal/components";
+import { Button, SelectButton, Text } from "@opal/components";
 import { Popover } from "@opal/components";
 import { useQueryController } from "@/providers/QueryControllerProvider";
 import { Section } from "@/layouts/general-layouts";
@@ -91,6 +91,7 @@ export interface AppInputBarProps {
   atezSearchV2Enabled?: boolean;
   atezSearchV3Enabled?: boolean;
   legalCompositeEnabled?: boolean;
+  supersearchEnabled?: boolean;
   experimentalResearchEnabled?: boolean;
   experimentalParallelResearchEnabled?: boolean;
   experimentalGuardrailsEnabled?: boolean;
@@ -100,6 +101,7 @@ export interface AppInputBarProps {
   toggleAtezSearchV2?: () => void;
   toggleAtezSearchV3?: () => void;
   toggleLegalComposite?: () => void;
+  toggleSupersearch?: () => void;
   toggleExperimentalResearch?: () => void;
   toggleExperimentalParallelResearch?: () => void;
   toggleExperimentalGuardrails?: () => void;
@@ -129,12 +131,14 @@ const AppInputBar = React.memo(
     deepResearchEnabled,
     atezSearchV3Enabled = false,
     legalCompositeEnabled = false,
+    supersearchEnabled = false,
     experimentalResearchEnabled = false,
     experimentalParallelResearchEnabled = false,
     experimentalGuardrailsEnabled = false,
     toggleDeepResearch,
     toggleAtezSearchV3,
     toggleLegalComposite,
+    toggleSupersearch,
     toggleExperimentalResearch,
     toggleExperimentalParallelResearch,
     toggleExperimentalGuardrails,
@@ -350,13 +354,17 @@ const AppInputBar = React.memo(
     }, [currentMessageFiles]);
 
     const hasUploadingFiles = useMemo(() => {
-      return currentMessageFiles.some(
-        (file) => file.status === UserFileStatus.UPLOADING
+      return (
+        !supersearchEnabled &&
+        currentMessageFiles.some(
+          (file) => file.status === UserFileStatus.UPLOADING
+        )
       );
-    }, [currentMessageFiles]);
+    }, [currentMessageFiles, supersearchEnabled]);
 
     // A file isn't queryable until indexing completes, so gate send on it.
-    const hasIndexingFiles = currentIndexingFiles.length > 0;
+    const hasIndexingFiles =
+      !supersearchEnabled && currentIndexingFiles.length > 0;
 
     // Convert ProjectFile to MinimalOnyxDocument format for viewing
     const handleFileClick = useCallback(
@@ -428,7 +436,8 @@ const AppInputBar = React.memo(
 
     // Animate attached files wrapper to its content height so CSS transitions
     // can interpolate between concrete pixel values (0px ↔ Npx).
-    const showFiles = !isSearchMode && currentMessageFiles.length > 0;
+    const showFiles =
+      !isSearchMode && !supersearchEnabled && currentMessageFiles.length > 0;
     useEffect(() => {
       const wrapper = filesWrapperRef.current;
       const content = filesContentRef.current;
@@ -445,9 +454,10 @@ const AppInputBar = React.memo(
 
     function handlePaste(event: React.ClipboardEvent) {
       if (disabled) return;
-      const pastedFiles = isAdmin
-        ? getPastedFilesIfNoText(event.clipboardData)
-        : [];
+      const pastedFiles =
+        isAdmin && !supersearchEnabled
+          ? getPastedFilesIfNoText(event.clipboardData)
+          : [];
       if (pastedFiles.length > 0) {
         event.preventDefault();
         handleFileUpload(pastedFiles);
@@ -645,7 +655,7 @@ const AppInputBar = React.memo(
       >
         {/* Bottom left controls */}
         <div className="flex flex-row flex-1 min-w-0 items-center">
-          {isAdmin && (
+          {isAdmin && !supersearchEnabled && (
             <FilePickerPopover
               onFileClick={handleFileClick}
               onPickRecent={(file: ProjectFile) => {
@@ -687,15 +697,17 @@ const AppInputBar = React.memo(
               controlsLoading && "invisible"
             )}
           >
-            {selectedAgent && selectedAgent.tools.length > 0 && (
-              <ActionsPopover
-                selectedAgent={selectedAgent}
-                filterManager={filterManager}
-                availableSources={memoizedAvailableSources}
-                disabled={disabled}
-              />
-            )}
-            {onToggleTabReading ? (
+            {!supersearchEnabled &&
+              selectedAgent &&
+              selectedAgent.tools.length > 0 && (
+                <ActionsPopover
+                  selectedAgent={selectedAgent}
+                  filterManager={filterManager}
+                  availableSources={memoizedAvailableSources}
+                  disabled={disabled}
+                />
+              )}
+            {onToggleTabReading && !supersearchEnabled ? (
               <SelectButton
                 disabled={disabled}
                 icon={SvgGlobe}
@@ -716,6 +728,23 @@ const AppInputBar = React.memo(
               </SelectButton>
             ) : (
               <>
+                {showAtezSearch && toggleSupersearch && (
+                  <SelectButton
+                    disabled={disabled || isMultiModelActive}
+                    variant="select-light"
+                    icon={SvgSearch}
+                    onClick={toggleSupersearch}
+                    state={supersearchEnabled ? "selected" : "empty"}
+                    foldable={false}
+                    tooltip={
+                      isMultiModelActive
+                        ? "Supersearch tek modelle çalışır. Ek modelleri kaldırın."
+                        : "PC Külliyatı içinde hızlı ve kapsamlı araştırma"
+                    }
+                  >
+                    Supersearch
+                  </SelectButton>
+                )}
                 {showAtezSearch && toggleLegalComposite && (
                   <SelectButton
                     disabled={disabled || isMultiModelActive}
@@ -823,7 +852,8 @@ const AppInputBar = React.memo(
               </>
             )}
 
-            {selectedAgent &&
+            {!supersearchEnabled &&
+              selectedAgent &&
               forcedToolIds.length > 0 &&
               forcedToolIds.map((toolId) => {
                 const tool = selectedAgent.tools.find(
@@ -986,6 +1016,16 @@ const AppInputBar = React.memo(
                 />
               </div>
             ) : null}
+
+            {supersearchEnabled && (
+              <div className="px-3 pt-2">
+                <Text font="secondary-body" color="text-03">
+                  {currentMessageFiles.length > 0
+                    ? "PC Külliyatı · Ekli dosyalar kullanılmaz; seçiminiz korunur."
+                    : "PC Külliyatı"}
+                </Text>
+              </div>
+            )}
 
             {/* Attached Files */}
             <div

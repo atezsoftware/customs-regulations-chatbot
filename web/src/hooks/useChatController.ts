@@ -92,6 +92,7 @@ export interface OnSubmitProps {
   atezSearchV2?: boolean;
   atezSearchV3?: boolean;
   legalComposite?: boolean;
+  supersearch?: boolean;
   experimentalResearch?: boolean;
   experimentalParallelResearch?: boolean;
   experimentalGuardrails?: boolean;
@@ -387,6 +388,7 @@ export default function useChatController({
       atezSearchV2 = false,
       atezSearchV3 = false,
       legalComposite = false,
+      supersearch = false,
       experimentalResearch = false,
       experimentalParallelResearch = false,
       experimentalGuardrails = false,
@@ -601,13 +603,14 @@ export default function useChatController({
         ? messageToResend?.message || message
         : message;
 
-      // When editing a message that had files attached, preserve the original files.
-      // Skip for regeneration — the regeneration path reuses the existing user node
-      // (and its files), so merging here would send duplicates.
-      const effectiveFileDescriptors = [
-        ...projectFilesToFileDescriptors(currentMessageFiles),
-        ...(!regenerationRequest ? (messageToResend?.files ?? []) : []),
-      ];
+      // PC-only requests omit attachments while retaining draft files in the input.
+      // Edits preserve original files; regeneration already reuses its user node.
+      const effectiveFileDescriptors = supersearch
+        ? []
+        : [
+            ...projectFilesToFileDescriptors(currentMessageFiles),
+            ...(!regenerationRequest ? (messageToResend?.files ?? []) : []),
+          ];
 
       updateChatStateAction(frozenSessionId, "loading");
       setLatestMessageRenderComplete(frozenSessionId, false);
@@ -707,10 +710,10 @@ export default function useChatController({
       const stopReason: StreamStopReason | null = null;
       let query: string | null = null;
       let retrievalType: RetrievalType =
-        selectedDocuments.length > 0
+        !supersearch && selectedDocuments.length > 0
           ? RetrievalType.SelectedDocs
           : RetrievalType.None;
-      let documents: OnyxDocument[] = selectedDocuments;
+      let documents: OnyxDocument[] = supersearch ? [] : selectedDocuments;
       let citations: CitationMap = {};
       let aiMessageImages: FileDescriptor[] | null = null;
       let error: string | null = null;
@@ -983,6 +986,7 @@ export default function useChatController({
           atezSearchV2,
           atezSearchV3,
           legalComposite,
+          supersearch,
           experimentalResearch,
           experimentalParallelResearch,
           experimentalGuardrails,

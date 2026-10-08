@@ -354,6 +354,92 @@ def test_idle_incomplete_asv3_replay_gets_localized_resume_only_from_saved_profi
     assert canonical[-1].obj.resume_label == "Araştırmaya devam et"
 
 
+@pytest.mark.parametrize(
+    ("checkpoint_variant", "event_workflow", "expected_workflow"),
+    [
+        ("supersearch", None, "supersearch"),
+        ("supersearch", "asv3", "supersearch"),
+        (None, "supersearch", "supersearch"),
+        (None, None, "asv3"),
+        ("legal_composite", None, "asv3"),
+    ],
+)
+def test_reloaded_supersearch_progress_preserves_workflow_and_never_offers_asv3_resume(
+    checkpoint_variant: str | None,
+    event_workflow: str | None,
+    expected_workflow: str,
+) -> None:
+    import json
+
+    from onyx.server.query_and_chat.session_loading import create_asv3_progress_packets
+    from onyx.server.query_and_chat.streaming_models import ASv3Progress
+
+    event: dict[str, JsonValue] = {
+        "run_id": "native-run",
+        "event_id": "native-event",
+        "sequence": 2,
+        "language": "tr",
+        "phase": "research",
+        "status": "running",
+        "title": "Kaynaklar inceleniyor",
+    }
+    if event_workflow is not None:
+        event["workflow"] = event_workflow
+    checkpoint: dict[str, JsonValue] = {
+        "version": 1,
+        "run_id": "native-run",
+        "asv3_workflow_variant": checkpoint_variant,
+        "public_profile": {
+            "language": "tr",
+            "notifications": {
+                "interrupted": ["Araştırma yarıda kaldı", "Kaynaklar kaydedildi"],
+                "resume": ["Araştırmaya devam et", ""],
+            },
+        },
+        "progress": [event],
+    }
+    packets = create_asv3_progress_packets(json.dumps(checkpoint), interrupted=True)
+    assert len(packets) == 2
+    for packet in packets:
+        assert isinstance(packet.obj, ASv3Progress)
+        assert packet.obj.workflow == expected_workflow
+    notice = packets[-1].obj
+    assert isinstance(notice, ASv3Progress)
+    assert notice.resume_label == (
+        None if expected_workflow == "supersearch" else "Araştırmaya devam et"
+    )
+
+
+def test_supersearch_replay_revokes_any_saved_asv3_resume_label() -> None:
+    import json
+
+    from onyx.server.query_and_chat.session_loading import create_asv3_progress_packets
+    from onyx.server.query_and_chat.streaming_models import ASv3Progress
+
+    event = ASv3Progress(
+        run_id="native-run",
+        event_id="interrupted",
+        sequence=3,
+        language="tr",
+        phase="interrupted",
+        status="failed",
+        title="Araştırma yarıda kaldı",
+        resume_label="Araştırmaya devam et",
+    )
+    packets = create_asv3_progress_packets(
+        json.dumps(
+            {
+                "version": 1,
+                "asv3_workflow_variant": "supersearch",
+                "progress": [event.model_dump(mode="json")],
+            }
+        )
+    )
+    assert len(packets) == 1 and isinstance(packets[0].obj, ASv3Progress)
+    assert packets[0].obj.workflow == "supersearch"
+    assert packets[0].obj.resume_label is None
+
+
 def test_actual_terminal_asv3_replay_never_becomes_resumable() -> None:
     import json
 

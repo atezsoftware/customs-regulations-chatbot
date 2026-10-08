@@ -50,7 +50,13 @@ export default function useDeepResearchToggle({
     );
   }, []);
 
+  const toggleSupersearch = useCallback(() => {
+    setMode((current) => (current === "supersearch" ? null : "supersearch"));
+  }, []);
+
   return {
+    supersearchEnabled: mode === "supersearch",
+    toggleSupersearch,
     legalCompositeEnabled: mode === "legal_composite",
     toggleLegalComposite,
     deepResearchEnabled: mode === "deep",

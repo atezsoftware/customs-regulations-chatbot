@@ -40,6 +40,7 @@ export interface MultiModelSelectorProps {
   onAdd: (model: SelectedModel) => void;
   onRemove: (index: number) => void;
   onReplace: (index: number, model: SelectedModel) => void;
+  maxModels?: 1 | 2 | 3;
   /** See ModelSelectorProps. Powers the per-model detail pane. */
   temperatureManager?: TemperatureManager;
   reasoningManager?: ReasoningManager;
@@ -50,6 +51,7 @@ export default function MultiModelSelector({
   onAdd,
   onRemove,
   onReplace,
+  maxModels = MAX_MODELS,
   temperatureManager,
   reasoningManager,
 }: MultiModelSelectorProps) {
@@ -74,7 +76,7 @@ export default function MultiModelSelector({
   );
 
   const isMultiModel = selectedModels.length > 1;
-  const atMax = selectedModels.length >= MAX_MODELS || !multiModelAllowed;
+  const atMax = selectedModels.length >= maxModels || !multiModelAllowed;
 
   // Container-level tooltip carries only the disabled reason. The add button
   // labels itself, so an enabled row shows no tooltip outside the button.
@@ -138,7 +140,7 @@ export default function MultiModelSelector({
       onRemove(existingIndex);
     } else if (!atMax) {
       onAdd(model);
-      if (selectedModels.length + 1 >= MAX_MODELS) {
+      if (selectedModels.length + 1 >= maxModels) {
         setOpen(false);
       }
     }

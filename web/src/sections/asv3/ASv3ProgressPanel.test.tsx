@@ -537,6 +537,28 @@ it("offers only a backend-localized explicit interrupted-run resume action", () 
   ).not.toBeInTheDocument();
 });
 
+it("never offers an ASv3 resume action for native Supersearch progress", () => {
+  const onResume = jest.fn();
+  const state = applyASv3Progress(createASv3ProgressState(), {
+    type: "asv3_progress",
+    workflow: "supersearch",
+    run_id: "supersearch-run",
+    event_id: "interrupted",
+    sequence: 3,
+    language: "tr",
+    phase: "interrupted",
+    status: "failed",
+    title: "Supersearch yarıda kaldı",
+    resume_label: "Araştırmaya devam et",
+  });
+  render(<ASv3ProgressPanel state={state} stopped onResume={onResume} />);
+  expect(screen.getByText("Supersearch yarıda kaldı")).toBeInTheDocument();
+  expect(
+    screen.queryByRole("button", { name: "Araştırmaya devam et" })
+  ).not.toBeInTheDocument();
+  expect(onResume).not.toHaveBeenCalled();
+});
+
 it("opens the current description and real past steps with keyboard even with zero researchers", async () => {
   const user = setupUser();
   let state = applyASv3Progress(createASv3ProgressState(), {

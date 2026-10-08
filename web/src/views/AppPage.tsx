@@ -207,6 +207,7 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
         atezSearchV2: atezSearchV2EnabledForCurrentWorkflow,
         atezSearchV3: atezSearchV3EnabledForCurrentWorkflow,
         legalComposite: legalCompositeEnabledForCurrentWorkflow,
+        supersearch: supersearchEnabledForCurrentWorkflow,
         experimentalResearch: experimentalResearchEnabledForCurrentWorkflow,
         experimentalParallelResearch:
           experimentalParallelResearchEnabledForCurrentWorkflow,
@@ -239,6 +240,8 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
     toggleAtezSearchV3,
     legalCompositeEnabled,
     toggleLegalComposite,
+    supersearchEnabled,
+    toggleSupersearch,
     experimentalResearchEnabled,
     toggleExperimentalResearch,
     experimentalParallelResearchEnabled,
@@ -264,6 +267,10 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
     currentProjectId === null &&
     (selectedAgent ?? liveAgent)?.id === 0 &&
     atezSearchV3Enabled;
+  const supersearchEnabledForCurrentWorkflow =
+    currentProjectId === null &&
+    (selectedAgent ?? liveAgent)?.id === 0 &&
+    supersearchEnabled;
   const legalCompositeEnabledForCurrentWorkflow =
     currentProjectId === null &&
     (selectedAgent ?? liveAgent)?.id === 0 &&
@@ -374,8 +381,8 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
 
   const resetInputBar = useCallback(() => {
     chatInputBarRef.current?.reset();
-    setCurrentMessageFiles([]);
-  }, [setCurrentMessageFiles]);
+    if (!supersearchEnabledForCurrentWorkflow) setCurrentMessageFiles([]);
+  }, [setCurrentMessageFiles, supersearchEnabledForCurrentWorkflow]);
 
   // Add refs needed by useChatSessionController
   const chatSessionIdRef = useRef<string | null>(currentChatSessionId);
@@ -578,6 +585,10 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
   }, [currentChatSessionId]);
 
   const handleResubmitLastMessage = useCallback(() => {
+    if (supersearchEnabledForCurrentWorkflow && multiModel.isMultiModelActive) {
+      toast.error("Supersearch tek modelle çalışır. Ek modelleri kaldırın.");
+      return;
+    }
     // Grab the last user-type message
     const lastUserMsg = messageHistory
       .slice()
@@ -603,6 +614,7 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
       legalComposite:
         legalCompositeEnabledForCurrentWorkflow &&
         !multiModel.isMultiModelActive,
+      supersearch: supersearchEnabledForCurrentWorkflow,
       experimentalResearch:
         experimentalResearchEnabledForCurrentWorkflow &&
         !multiModel.isMultiModelActive,
@@ -623,6 +635,7 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
     atezSearchV2EnabledForCurrentWorkflow,
     atezSearchV3EnabledForCurrentWorkflow,
     legalCompositeEnabledForCurrentWorkflow,
+    supersearchEnabledForCurrentWorkflow,
     experimentalResearchEnabledForCurrentWorkflow,
     experimentalParallelResearchEnabledForCurrentWorkflow,
     experimentalGuardrailsEnabledForCurrentWorkflow,
@@ -635,6 +648,13 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
 
   const onChat = useCallback(
     (message: string) => {
+      if (
+        supersearchEnabledForCurrentWorkflow &&
+        multiModel.isMultiModelActive
+      ) {
+        toast.error("Supersearch tek modelle çalışır. Ek modelleri kaldırın.");
+        return;
+      }
       if (multiModel.isMultiModelActive) {
         foldSidebarForMultiModel();
       }
@@ -656,6 +676,7 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
         legalComposite:
           legalCompositeEnabledForCurrentWorkflow &&
           !multiModel.isMultiModelActive,
+        supersearch: supersearchEnabledForCurrentWorkflow,
         experimentalResearch:
           experimentalResearchEnabledForCurrentWorkflow &&
           !multiModel.isMultiModelActive,
@@ -682,6 +703,7 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
       atezSearchV2EnabledForCurrentWorkflow,
       atezSearchV3EnabledForCurrentWorkflow,
       legalCompositeEnabledForCurrentWorkflow,
+      supersearchEnabledForCurrentWorkflow,
       experimentalResearchEnabledForCurrentWorkflow,
       experimentalParallelResearchEnabledForCurrentWorkflow,
       experimentalGuardrailsEnabledForCurrentWorkflow,
@@ -718,6 +740,13 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
 
   const handleAppInputBarSubmit = useCallback(
     async (message: string) => {
+      if (
+        supersearchEnabledForCurrentWorkflow &&
+        multiModel.isMultiModelActive
+      ) {
+        toast.error("Supersearch tek modelle çalışır. Ek modelleri kaldırın.");
+        return;
+      }
       // If we're in an existing chat session, always use chat mode
       // (appMode only applies to new sessions)
       if (currentChatSessionId) {
@@ -740,6 +769,7 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
           legalComposite:
             legalCompositeEnabledForCurrentWorkflow &&
             !multiModel.isMultiModelActive,
+          supersearch: supersearchEnabledForCurrentWorkflow,
           experimentalResearch:
             experimentalResearchEnabledForCurrentWorkflow &&
             !multiModel.isMultiModelActive,
@@ -777,6 +807,7 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
       atezSearchV2EnabledForCurrentWorkflow,
       atezSearchV3EnabledForCurrentWorkflow,
       legalCompositeEnabledForCurrentWorkflow,
+      supersearchEnabledForCurrentWorkflow,
       experimentalResearchEnabledForCurrentWorkflow,
       experimentalParallelResearchEnabledForCurrentWorkflow,
       experimentalGuardrailsEnabledForCurrentWorkflow,
@@ -924,6 +955,7 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
 
       <div className="w-full h-full overflow-hidden">
         <Dropzone
+          disabled={supersearchEnabledForCurrentWorkflow}
           onDrop={(acceptedFiles) =>
             handleMessageSpecificFileUpload(acceptedFiles)
           }
@@ -977,6 +1009,9 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
                         }
                         legalCompositeEnabled={
                           legalCompositeEnabledForCurrentWorkflow
+                        }
+                        supersearchEnabled={
+                          supersearchEnabledForCurrentWorkflow
                         }
                         experimentalResearchEnabled={
                           experimentalResearchEnabledForCurrentWorkflow
@@ -1074,6 +1109,11 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
                           <MultiModelSelector
                             selectedModels={multiModel.selectedModels}
                             onAdd={multiModel.addModel}
+                            maxModels={
+                              supersearchEnabledForCurrentWorkflow
+                                ? 1
+                                : undefined
+                            }
                             onRemove={multiModel.removeModel}
                             onReplace={multiModel.replaceModel}
                             temperatureManager={llmManager}
@@ -1156,6 +1196,11 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
                           <MultiModelSelector
                             selectedModels={multiModel.selectedModels}
                             onAdd={multiModel.addModel}
+                            maxModels={
+                              supersearchEnabledForCurrentWorkflow
+                                ? 1
+                                : undefined
+                            }
                             onRemove={multiModel.removeModel}
                             onReplace={multiModel.replaceModel}
                             temperatureManager={llmManager}
@@ -1180,6 +1225,9 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
                         legalCompositeEnabled={
                           legalCompositeEnabledForCurrentWorkflow
                         }
+                        supersearchEnabled={
+                          supersearchEnabledForCurrentWorkflow
+                        }
                         experimentalResearchEnabled={
                           experimentalResearchEnabledForCurrentWorkflow
                         }
@@ -1192,6 +1240,7 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
                         toggleAtezSearchV2={toggleAtezSearchV2}
                         toggleAtezSearchV3={toggleAtezSearchV3}
                         toggleLegalComposite={toggleLegalComposite}
+                        toggleSupersearch={toggleSupersearch}
                         toggleExperimentalResearch={toggleExperimentalResearch}
                         toggleExperimentalParallelResearch={
                           toggleExperimentalParallelResearch
