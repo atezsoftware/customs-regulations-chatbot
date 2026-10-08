@@ -25,8 +25,11 @@ from onyx.db.models import (
 )
 from onyx.document_index.publication_models import (
     PublicationIndexSnapshot,
+    PublicationScope,
+    ReadObservation,
     publication_digest,
 )
+from onyx.regulatory import publication_reads
 from onyx.regulatory.amendments.annexes.context_dependencies import context_hash
 from onyx.regulatory.amendments.annexes.publication_evidence import _encoder_receipt
 from onyx.regulatory.publication_baseline import (
@@ -505,7 +508,7 @@ def inventory_boundary(monkeypatch: pytest.MonkeyPatch) -> tuple[MagicMock, Magi
         monkeypatch.setattr(
             module,
             "filter_publication_read",
-            lambda _observation, rows, _identity: rows,
+            lambda _observation, rows, _identity, **_kwargs: rows,
         )
     return validation, access
 
@@ -576,7 +579,7 @@ def test_thousand_source_page_retains_acl_publication_and_lookahead_guards(
         permissions[str(record.id)] = permission
     access.return_value = permissions
     publication = MagicMock(
-        side_effect=lambda _observation, rows, _identity: [
+        side_effect=lambda _observation, rows, _identity, **_kwargs: [
             row for row in rows if row.id.int != 3
         ]
     )
@@ -601,6 +604,78 @@ def test_thousand_source_page_retains_acl_publication_and_lookahead_guards(
             filters=IndexFilters(access_control_list=[]),
             limit=1000,
         )
+
+
+def test_metadata_inventory_does_not_enroll_unused_publication_dependencies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, access = inventory_boundary(monkeypatch)
+    used, unused, unavailable, denied = (uuid4() for _ in range(4))
+    records = [
+        SimpleNamespace(id=identifier, name="source.md", file_id="file")
+        for identifier in (used, unused, unavailable, denied)
+    ]
+    permissions = {}
+    for record in records:
+        permission = MagicMock()
+        permission.to_acl.return_value = (
+            {"denied"} if record.id == denied else {"visible"}
+        )
+        permissions[str(record.id)] = permission
+    access.return_value = permissions
+    observation = ReadObservation(
+        scope=PublicationScope(
+            tenant_id="public", environment="test", database_identity="test-db"
+        ),
+        committed_epoch=7,
+    )
+    closed_gates = {unavailable}
+
+    def hidden(
+        observed: ReadObservation, identifiers: tuple[UUID, ...]
+    ) -> frozenset[UUID]:
+        assert observed == observation
+        return frozenset(closed_gates.intersection(identifiers))
+
+    store = MagicMock()
+    store.observe.return_value = observation
+    store.unavailable.side_effect = hidden
+    monkeypatch.setattr(publication_reads, "public_read_store", lambda: store)
+    for module in (sources, asv3_corpus):
+        monkeypatch.setattr(
+            module,
+            "observe_publication_read",
+            publication_reads.observe_publication_read,
+        )
+        monkeypatch.setattr(
+            module, "filter_publication_read", publication_reads.filter_publication_read
+        )
+    session = MagicMock(spec=Session)
+    session.execute.return_value.all.return_value = records
+    user = cast(User, object())
+    filters = IndexFilters(access_control_list=[], as_of_date=date(2020, 1, 1))
+    tracker = publication_reads.PublicationReadTracker()
+    with publication_reads.track_publication_reads(tracker):
+        inventory, more = sources.find_source_inventory_page(
+            cast(Session, session), user=user, filters=filters
+        )
+        assert {row.id for row in inventory} == {used, unused} and not more
+        assert tracker.observe() == observation
+        assert tracker.evidence() is None
+
+        session.execute.return_value.all.return_value = [records[0]]
+        original = asv3_corpus.require_source(
+            cast(Session, session), user=user, filters=filters, source_id=used
+        )
+        assert original.id == used
+        evidence = tracker.evidence()
+        assert evidence is not None and evidence.user_file_ids == (used,)
+
+        closed_gates.add(unused)
+        tracker.validate()
+        closed_gates.add(used)
+        with pytest.raises(publication_reads.PublicationReadChanged):
+            tracker.validate()
 
 
 def test_inventory_scope_rejection_happens_before_any_file_query(
