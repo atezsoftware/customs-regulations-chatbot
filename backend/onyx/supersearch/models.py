@@ -1,8 +1,39 @@
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import Field, model_validator
 
-from onyx.legal_composite.models import SourceAction, StrictModel
+from onyx.legal_composite.models import (
+    AnswerReview,
+    PassageSupport,
+    SourceAction,
+    StrictModel,
+)
+
+
+class NeedFocusAssessment(StrictModel):
+    subject_id: str
+    need_id: str
+    status: Literal["material", "incidental", "pending"]
+    explanation: str = Field(min_length=1)
+    witnesses: list[PassageSupport]
+
+
+class NeedFocusDecision(StrictModel):
+    assessments: list[NeedFocusAssessment]
+
+
+class FocusReviewAssessment(StrictModel):
+    subject_id: str
+    need_id: str
+    status: Literal["nonmaterial", "reopen", "unresolved"]
+    explanation: str = Field(min_length=1)
+    witnesses: list[PassageSupport]
+
+
+class FocusAnswerReview(AnswerReview):
+    focus_reviews: list[FocusReviewAssessment]
 
 
 class WriterDecision(StrictModel):

@@ -15,10 +15,11 @@ from onyx.asv3.models import EvidenceItem, RunContext, model_evidence_metadata
 from onyx.db.asv3_corpus import CorpusSource
 from onyx.db.legal_composite_sources import SourceKind, classify_source
 from onyx.legal_composite.acquisition import CanonicalAcquirer
-from onyx.legal_composite.dependencies import DependencyExpander
+from onyx.legal_composite.dependencies import DependencyExpander, _entity_key
 from onyx.legal_composite.models import AuthorityDependency, ResearchPlan, SourceAction
 from onyx.regulatory.heading_path import parse_regulatory_article_heading
 from onyx.regulatory.source_identity import named_law_number
+from onyx.supersearch.focus import FocusSelection
 
 
 def _source_id(arguments: JsonValue) -> str | None:
@@ -122,6 +123,71 @@ class SupersearchDependencyExpander(DependencyExpander):
         self._incomplete_reads: set[str] = set()
         self._incomplete_needs: set[str] = set()
         self._closed_provisions: set[tuple[str, str]] = set()
+        self._identity_frontier: set[int] = set()
+        self._focus: FocusSelection | None = None
+
+    def configure_focus(self, focus: FocusSelection) -> None:
+        self._focus = focus
+
+    def _collect(
+        self,
+        plan: ResearchPlan,
+        frontier: set[int] | None = None,
+        need_bindings: dict[int, set[str]] | None = None,
+    ) -> None:
+        super()._collect(plan, frontier, need_bindings)
+        if self._focus is None:
+            return
+        known_needs = {need.need_id for need in plan.needs}
+        for key, edge in list(self.edges.items()):
+            active_needs: set[str] = set()
+            active_origins = []
+            edge_key = _entity_key(
+                edge.instrument_name,
+                edge.instrument_number,
+                edge.article,
+                edge.qualifier,
+            )
+            for origin in edge.origins:
+                item = self.ledger.get(origin.citation)
+                if item is None:
+                    continue
+                bindings = (
+                    need_bindings.get(origin.citation, set(item.question_ids))
+                    if need_bindings is not None
+                    else set(item.question_ids)
+                ) & known_needs
+                # A retrieved original can govern another outcome. Search need
+                # labels cannot veto a grounded material or unresolved binding.
+                if self._focus.covers(origin.citation):
+                    bindings = known_needs
+                allowed = {
+                    need_id
+                    for need_id in bindings or known_needs
+                    if self._focus.allows(origin.citation, need_id, edge_key)
+                }
+                if allowed:
+                    active_origins.append(origin)
+                    active_needs.update(allowed)
+            if active_origins:
+                edge.origins = active_origins
+                edge.need_ids = sorted(active_needs)
+            else:
+                del self.edges[key]
+                self._expanded.pop(key, None)
+
+    def _wave(
+        self, actions: list[SourceAction], plan: ResearchPlan
+    ) -> list[dict[str, JsonValue]]:
+        receipts = super()._wave(actions, plan)
+        self._identity_frontier.update(
+            number
+            for receipt in receipts
+            if isinstance(numbers := receipt.get("citations"), list)
+            for number in numbers
+            if type(number) is int
+        )
+        return receipts
 
     def expand(
         self,
@@ -133,6 +199,7 @@ class SupersearchDependencyExpander(DependencyExpander):
         material_frontier = (
             set(self.ledger.citation_numbers()) if frontier is None else set(frontier)
         )
+        self._identity_frontier.update(material_frontier)
         for receipt in self.acquirer.last_receipts:
             key = self._provision_key(receipt)
             if (
@@ -170,10 +237,14 @@ class SupersearchDependencyExpander(DependencyExpander):
             key=lambda item: cast(int, item.metadata.get("position", -1)),
         )
 
-    def _identify_sources(self, plan: ResearchPlan) -> None:
+    def _identify_sources(
+        self, plan: ResearchPlan, *, frontier: set[int] | None = None
+    ) -> None:
+        if frontier is not None:
+            self._identity_frontier.update(frontier)
         observed = {
             item.source_id: item
-            for number in self.ledger.citation_numbers()
+            for number in self._identity_frontier
             if (item := self.ledger.get(number)) is not None
             and item.search_doc is not None
         }
@@ -264,6 +335,28 @@ class SupersearchDependencyExpander(DependencyExpander):
     def _read_own_governing(
         self, edges: list[AuthorityDependency], plan: ResearchPlan
     ) -> None:
+        # Existing exact-root candidates can make a primary ambiguous even when
+        # their unrelated provisions were excluded from the research frontier.
+        identity_candidates: set[int] = set()
+        for row in self.ledger.provision_metadata():
+            metadata = row.get("metadata")
+            headings = (
+                metadata.get("heading_path") if isinstance(metadata, dict) else None
+            )
+            root = headings[0] if isinstance(headings, list) and headings else None
+            citation = row.get("citation")
+            if not isinstance(root, str) or type(citation) is not int:
+                continue
+            if any(
+                _identity_words(root) == _identity_words(edge.instrument_name)
+                and (
+                    not edge.instrument_number
+                    or named_law_number(root) == edge.instrument_number
+                )
+                for edge in edges
+            ):
+                identity_candidates.add(citation)
+        self._identify_sources(plan, frontier=identity_candidates)
         self._bind_governing()
         actions: list[SourceAction] = []
         for edge in edges:

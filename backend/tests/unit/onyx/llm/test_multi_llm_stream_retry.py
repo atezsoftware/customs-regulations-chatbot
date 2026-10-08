@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from litellm.exceptions import Timeout as LiteLLMTimeout
 
+from onyx.asv3.models import RunContext, RunStopped, SharedBudget
 from onyx.llm.interfaces import LanguageModelInput
 from onyx.llm.model_response import Delta, ModelResponseStream, StreamingChoice
 from onyx.llm.models import UserMessage
@@ -16,6 +17,7 @@ def _make_fake_llm() -> MagicMock:
     llm.config.model_provider = "openai"
     llm._timeout = 30
     llm._track_llm_cost = MagicMock()
+    llm._stream_cancellation_check = None
     return llm
 
 
@@ -138,3 +140,43 @@ def test_real_llm_retries_timeout_deferred_until_first_chunk(seed: int | None) -
         else:
             assert call.kwargs["seed"] == seed
         assert "top_p" not in call.kwargs
+
+
+@pytest.mark.parametrize("stopped_before_call", [False, True])
+def test_run_bound_stream_never_retries_a_provider_after_owner_stop(
+    stopped_before_call: bool,
+) -> None:
+    original_llm = LitellmLLM(
+        api_key="test-key",
+        model_provider="vertex_ai",
+        model_name="gemini-3.8-flash",
+        max_input_tokens=100000,
+    )
+    stopped = stopped_before_call
+    context = RunContext(
+        cancelled=lambda: stopped, budget=SharedBudget(unlimited_execution=True)
+    )
+    bound = original_llm.with_stream_cancellation_check(context.check_active)
+
+    def timed_out_without_chunks(**_kwargs: object) -> Iterator[object]:
+        nonlocal stopped
+        stopped = True
+        raise LiteLLMTimeout("timed out", "gemini-3.8-flash", "vertex_ai")
+        yield  # pragma: no cover
+
+    with (
+        patch(
+            "onyx.llm.litellm_singleton.litellm.completion",
+            side_effect=timed_out_without_chunks,
+        ) as provider,
+        patch("onyx.llm.multi_llm.LLM_FIRST_CHUNK_MAX_RETRIES", 2),
+        patch("onyx.llm.multi_llm.time.sleep") as sleep,
+    ):
+        with pytest.raises(RunStopped, match="cancel"):
+            list(bound.stream(prompt=_make_prompt()))
+
+    assert provider.call_count == (0 if stopped_before_call else 1)
+    sleep.assert_not_called()
+    assert bound is not original_llm
+    assert bound.config == original_llm.config
+    assert original_llm._stream_cancellation_check is None

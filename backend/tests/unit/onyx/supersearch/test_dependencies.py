@@ -395,7 +395,7 @@ def test_primary_recovery_keeps_conflicting_original_identity_unresolved(
         origins=[],
     )
     expander.edges[edge.edge_id] = edge
-    expander._identify_sources(plan())
+    expander._identify_sources(plan(), frontier=set(ledger.citation_numbers()))
     expander._read_own_governing([edge], plan())
     assert not edge.governing_citations
     assert all(receipt["tool"] == "read_source_range" for receipt in expander.receipts)

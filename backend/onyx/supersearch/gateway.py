@@ -13,6 +13,7 @@ from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.llm_adapter import model_slot
 from onyx.asv3.models import RunContext, RunStopped
 from onyx.llm.interfaces import LLM, LLMUserIdentity
+from onyx.llm.model_response import Choice, Message, ModelResponse, Usage
 from onyx.llm.models import (
     ChatCompletionMessage,
     ReasoningEffort,
@@ -28,8 +29,10 @@ from onyx.supersearch.receipts import (
 )
 from onyx.tracing.flows import LLMFlow
 from onyx.tracing.llm_utils import llm_generation_span, record_llm_response
+from onyx.utils.logger import setup_logger
 
 ResponseModel = TypeVar("ResponseModel", bound=BaseModel)
+logger = setup_logger()
 
 
 def compact_schema(value: JsonValue) -> JsonValue:
@@ -55,7 +58,7 @@ class SelectedModelGateway:
         token_counter: Callable[[str], int] | None = None,
         reasoning_effort: ReasoningEffort = ReasoningEffort.AUTO,
     ) -> None:
-        self.llm = llm
+        self.llm = llm.with_stream_cancellation_check(context.check_active)
         self.ledger = ledger
         self.context = context
         self.user_identity = user_identity
@@ -63,6 +66,74 @@ class SelectedModelGateway:
         self.reasoning_effort = reasoning_effort
         self.last_call_id: str | None = None
         self.last_delivered_citations: set[int] = set()
+
+    def _complete_stream(
+        self,
+        messages: list[ChatCompletionMessage],
+        response_format: dict[str, JsonValue],
+        finalizing: bool,
+    ) -> ModelResponse:
+        stream = self.llm.stream(
+            messages,
+            structured_response_format=response_format,
+            timeout_override=120 if finalizing else None,
+            reasoning_effort=self.reasoning_effort,
+            user_identity=self.user_identity,
+        )
+        content: list[str] = []
+        reasoning: list[str] = []
+        response_id, created = "", ""
+        finish_reason: str | None = None
+        usage: Usage | None = None
+        stream_failed = False
+        try:
+            for chunk in stream:
+                self.context.check_active()
+                if chunk.choice.index != 0 or chunk.choice.delta.tool_calls:
+                    raise RunStopped(
+                        "Supersearch returned an undeclared provider choice or tool call"
+                    )
+                response_id, created = chunk.id, chunk.created
+                if chunk.choice.delta.content is not None:
+                    content.append(chunk.choice.delta.content)
+                if chunk.choice.delta.reasoning_content is not None:
+                    reasoning.append(chunk.choice.delta.reasoning_content)
+                if chunk.choice.finish_reason is not None:
+                    finish_reason = chunk.choice.finish_reason
+                if chunk.usage is not None:
+                    usage = chunk.usage
+        except BaseException:
+            stream_failed = True
+            raise
+        finally:
+            close = getattr(stream, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception as error:
+                    if not stream_failed:
+                        raise
+                    logger.warning(
+                        "Supersearch provider stream cleanup failed after interruption: %s",
+                        type(error).__name__,
+                    )
+        self.context.check_active()
+        if not response_id or finish_reason is None:
+            raise RunStopped(
+                "Supersearch provider stream ended without a completion marker"
+            )
+        return ModelResponse(
+            id=response_id,
+            created=created,
+            choice=Choice(
+                finish_reason=finish_reason,
+                message=Message(
+                    content="".join(content),
+                    reasoning_content="".join(reasoning) or None,
+                ),
+            ),
+            usage=usage,
+        )
 
     def complete(
         self,
@@ -141,16 +212,9 @@ class SelectedModelGateway:
                         self.context.scope.get("asv3_document_set_id")
                     ),
                 }
-                response = self.llm.invoke(
-                    messages,
-                    structured_response_format=response_format,
-                    timeout_override=120 if finalizing else None,
-                    reasoning_effort=self.reasoning_effort,
-                    user_identity=self.user_identity,
-                    # Invoke assembles the provider stream before strict validation;
-                    # an active long review must not hit a whole-response read timeout.
-                    use_streaming=True,
-                )
+                # Consume privately and check cancellation on every provider chunk;
+                # only the complete validated JSON can authorize publication.
+                response = self._complete_stream(messages, response_format, finalizing)
                 record_llm_response(span, response)
         self.context.check_active()
         finish_reason = (response.choice.finish_reason or "").lower()

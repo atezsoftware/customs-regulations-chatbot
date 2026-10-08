@@ -349,6 +349,10 @@ def _run_supersearch_loop(
                 "Supersearch: PC külliyatında paralel arama",
                 "İlgili özgün kaynakları ve bağlı hükümleri birlikte okuyorum.",
             ),
+            "focus": (
+                "Supersearch: gerekli kaynaklar belirleniyor",
+                "Tüm bulunan özgün metinleri sorunun koşullarıyla karşılaştırıyorum.",
+            ),
             "final": (
                 "Supersearch: yanıt hazırlanıyor",
                 "Okunan PC kaynaklarından koşulları ve dayanakları koruyarak yanıtı hazırlıyorum.",
@@ -429,6 +433,7 @@ def _run_supersearch_loop(
         "authority_dependencies": [
             edge.model_dump(mode="json") for edge in engine.dependencies
         ],
+        "expansion_focus_audit": engine.focus.audit(),
         "source_receipts": engine.receipts,
         "acquisition_counts": {
             "searches": acquirer.search_calls,

@@ -4,7 +4,7 @@ import os
 import random
 import re
 import time
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from functools import lru_cache
 from itertools import chain
@@ -512,6 +512,8 @@ def _warn_dropped_env_only_keys(
 class LitellmLLM(LLM):
     """Uses Litellm library to allow easy configuration to use a multitude of LLMs
     See https://python.langchain.com/docs/integrations/chat/litellm"""
+
+    _stream_cancellation_check: Callable[[], None] | None = None
 
     def __init__(
         self,
@@ -1129,9 +1131,7 @@ class LitellmLLM(LLM):
                     attempts.append(stripped)
             if provider_compatibility_attempts is not None:
                 if provider_compatibility_attempts < 1:
-                    raise ValueError(
-                        "provider_compatibility_attempts must be positive"
-                    )
+                    raise ValueError("provider_compatibility_attempts must be positive")
                 attempts = attempts[:provider_compatibility_attempts]
 
             for i, opts in enumerate(attempts):
@@ -1219,6 +1219,13 @@ class LitellmLLM(LLM):
         validated_seed = TypeAdapter(LLMSeed).validate_python(seed)
         bound = copy.copy(self)
         bound._seed = validated_seed
+        return bound
+
+    def with_stream_cancellation_check(
+        self, check_active: Callable[[], None]
+    ) -> "LitellmLLM":
+        bound = copy.copy(self)
+        bound._stream_cancellation_check = check_active
         return bound
 
     def with_temperature(self, temperature: float) -> "LitellmLLM":
@@ -1451,6 +1458,9 @@ class LitellmLLM(LLM):
         #    - Shared pools can have connections corrupted by other threads
         #    - Per-request HTTPHandler eliminates cross-thread interference
         for attempt in range(max_attempts):
+            check_active = self._stream_cancellation_check
+            if check_active is not None:
+                check_active()
             client = None
             retry_delay_s: float | None = None
             if self._uses_isolated_client(timeout_override):
@@ -1487,6 +1497,8 @@ class LitellmLLM(LLM):
             except retryable_exceptions as e:
                 if yielded_any or attempt >= max_attempts - 1:
                     raise
+                if check_active is not None:
+                    check_active()
                 scheduled_delay_s = min(
                     LLM_FIRST_CHUNK_RETRY_MAX_DELAY_S,
                     LLM_FIRST_CHUNK_RETRY_BASE_DELAY_S * (2**attempt),

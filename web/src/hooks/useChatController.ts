@@ -71,6 +71,7 @@ import {
 } from "@/app/app/stores/useChatSessionStore";
 import { explicitASv3ExternalConsent } from "@/lib/asv3/consent";
 import { compactASv3ProgressPackets } from "@/lib/asv3/retention";
+import { requestSupersearchStop } from "@/lib/chat/supersearchRecovery";
 import { Packet, MessageStart } from "@/app/app/services/streamingModels";
 import { SelectedModel } from "@/sections/model-selector/MultiModelSelector";
 import { useAgentPreferences } from "@/lib/agents/hooks";
@@ -421,6 +422,21 @@ export default function useChatController({
 
       navigatingAway.current = false;
       let frozenSessionId = getCurrentSessionId();
+      const pendingHistory = getLatestMessageChain(
+        currentMessageTree || new Map<number, Message>()
+      );
+      const pendingRecovery = pendingHistory[pendingHistory.length - 1];
+      if (
+        pendingRecovery?.supersearch &&
+        pendingRecovery.errorDetails?.chat_session_id === frozenSessionId &&
+        typeof pendingRecovery.errorDetails?.run_id === "number" &&
+        pendingRecovery.messageId === pendingRecovery.errorDetails?.run_id &&
+        pendingRecovery.errorDetails?.stop_status &&
+        !pendingRecovery.errorDetails.stop_confirmed
+      ) {
+        toast.error("Supersearch çalışmasının bitmesini önce doğrulayın.");
+        return;
+      }
       updateCanContinue(false, frozenSessionId);
       setUncaughtError(frozenSessionId, null);
       setLoadingError(frozenSessionId, null);
@@ -914,6 +930,10 @@ export default function useChatController({
       }
 
       let streamSucceeded = false;
+      let supersearchTerminalReceived = false;
+      let supersearchCompleted = false;
+      let supersearchTransportFailure = false;
+      const stack = new CurrentMessageFIFO();
 
       try {
         // Selection-time override writes are best-effort. Await confirmation
@@ -948,7 +968,6 @@ export default function useChatController({
           getExtensionContext();
         const messageOrigin = isExtension ? "chrome_extension" : "webapp";
 
-        const stack = new CurrentMessageFIFO();
         updateCurrentMessageFIFO(stack, {
           signal: controller.signal,
           message: currMessage,
@@ -1206,6 +1225,21 @@ export default function useChatController({
             } else if (Object.hasOwn(packet, "obj")) {
               const typedPacket = packet as Packet;
               const packetObj = typedPacket.obj;
+              if (supersearch) {
+                if (
+                  packetObj.type === "asv3_progress" &&
+                  packetObj.workflow === "supersearch" &&
+                  packetObj.task_id == null &&
+                  ["completed", "failed", "cancelled"].includes(
+                    packetObj.status
+                  )
+                ) {
+                  supersearchTerminalReceived = true;
+                  supersearchCompleted = packetObj.status === "completed";
+                } else if (packetObj.type === "stop") {
+                  supersearchTerminalReceived = true;
+                }
+              }
 
               if (isMultiModel) {
                 // Multi-model: route packet by placement.model_index.
@@ -1308,15 +1342,55 @@ export default function useChatController({
 
         // Surface FIFO errors (e.g. 429 before any packets arrive) so the
         // catch block replaces the thinking placeholder with an error message.
-        if (stack.error) {
+        if (stack.error && !(supersearch && supersearchCompleted)) {
+          supersearchTransportFailure = stack.supersearchTransportFailure;
           throw new Error(stack.error);
+        }
+        if (
+          supersearch &&
+          newAgentMessageId !== null &&
+          !supersearchTerminalReceived &&
+          !controller.signal.aborted
+        ) {
+          supersearchTransportFailure = true;
+          throw new Error(
+            "Supersearch bağlantısı yanıt tamamlanmadan kesildi."
+          );
         }
         streamSucceeded = true;
       } catch (e: any) {
         console.log("Error:", e);
         const errorMsg = e.message;
+        if (supersearch) {
+          errorCode ||= supersearchTransportFailure
+            ? "CONNECTION_ERROR"
+            : "SUPERSEARCH_ERROR";
+          errorDetails = {
+            ...errorDetails,
+            workflow: "supersearch",
+            model: errorDetails?.model || initialAgentNode.modelDisplayName,
+            provider: errorDetails?.provider || finalLLM.provider,
+          };
+          if (
+            supersearchTransportFailure &&
+            newAgentMessageId !== null &&
+            !supersearchTerminalReceived &&
+            !controller.signal.aborted
+          ) {
+            errorDetails.chat_session_id = frozenSessionId;
+            errorDetails.run_id = newAgentMessageId;
+            isRetryable = false;
+            try {
+              await requestSupersearchStop(frozenSessionId);
+              errorDetails.stop_status = "requested";
+            } catch {
+              errorDetails.stop_status = "failed";
+            }
+          }
+        }
         const userErrorNode: Message = {
           nodeId: initialUserNode.nodeId,
+          ...(supersearch ? { messageId: newUserMessageId ?? undefined } : {}),
           message: currMessage,
           type: "user",
           files: effectiveFileDescriptors,
@@ -1349,6 +1423,7 @@ export default function useChatController({
                       supersearch: true,
                       overridden_model: initialAgentNode.overridden_model,
                       modelDisplayName: initialAgentNode.modelDisplayName,
+                      messageId: newAgentMessageId ?? undefined,
                     }
                   : {}),
                 message: errorMsg,
@@ -1391,7 +1466,10 @@ export default function useChatController({
       // never flips the queue gate back to true. Reset it here so queued
       // follow-ups aren't silently dropped after a stream failure.
       if (!streamSucceeded) {
-        setLatestMessageRenderComplete(frozenSessionId, true);
+        setLatestMessageRenderComplete(
+          frozenSessionId,
+          !(supersearch && errorDetails?.stop_status)
+        );
       }
 
       // Name the chat now that we have the first AI response (navigation already happened before streaming)

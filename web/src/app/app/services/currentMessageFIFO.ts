@@ -4,6 +4,7 @@ export class CurrentMessageFIFO {
   private stack: PacketType[] = [];
   isComplete: boolean = false;
   error: string | null = null;
+  supersearchTransportFailure = false;
 
   push(packetBunch: PacketType) {
     this.stack.push(packetBunch);
@@ -35,6 +36,10 @@ export async function updateCurrentMessageFIFO(
         console.debug("Stream aborted");
       } else {
         stack.error = error.message;
+        if (params.supersearch && !params.signal?.aborted) {
+          stack.supersearchTransportFailure =
+            error instanceof TypeError || error.name === "NetworkError";
+        }
       }
     } else {
       stack.error = String(error);

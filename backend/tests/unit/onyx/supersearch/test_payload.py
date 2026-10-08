@@ -27,7 +27,10 @@ from onyx.supersearch.receipts import (
     expand_receipt_data_payload,
 )
 from onyx.tracing.flows import LLMFlow
-from tests.unit.onyx.supersearch.test_canonical_runtime import selected_llm
+from tests.unit.onyx.supersearch.test_canonical_runtime import (
+    selected_llm,
+    structured_stream,
+)
 from tests.unit.onyx.supersearch.test_engine import original
 
 
@@ -173,26 +176,22 @@ def test_gateway_preserves_actual_complete_original_delivery_when_metadata_is_po
         gateway, "llm_generation_span", lambda **_kwargs: nullcontext(span)
     )
     monkeypatch.setattr(gateway, "record_llm_response", lambda *_args: None)
-    cast(MagicMock, llm).invoke.return_value = SimpleNamespace(
-        choice=SimpleNamespace(
-            finish_reason="stop",
-            message=SimpleNamespace(
-                tool_calls=None,
-                content=json.dumps(
-                    {
-                        "answer": "Kaynaklı sonuç [1]",
-                        "unresolved_need_ids": [],
-                        "actions": [],
-                    }
-                ),
-            ),
+    cast(MagicMock, llm).stream.return_value = iter(
+        structured_stream(
+            json.dumps(
+                {
+                    "answer": "Kaynaklı sonuç [1]",
+                    "unresolved_need_ids": [],
+                    "actions": [],
+                }
+            )
         )
     )
     selected = gateway.SelectedModelGateway(llm=llm, ledger=ledger, context=context)
     selected.complete("PC originals only", payload, WriterDecision, flow, True)
-    messages = cast(MagicMock, llm).invoke.call_args.args[0]
-    assert cast(MagicMock, llm).invoke.call_args.kwargs["use_streaming"] is True
-    assert cast(MagicMock, llm).invoke.call_args.kwargs["timeout_override"] == 120
+    messages = cast(MagicMock, llm).stream.call_args.args[0]
+    cast(MagicMock, llm).invoke.assert_not_called()
+    assert cast(MagicMock, llm).stream.call_args.kwargs["timeout_override"] == 120
     provider_payload = json.loads(messages[1].content)
     assert METADATA_POOL_KEY in provider_payload
     assert METADATA_DECODER in messages[0].content

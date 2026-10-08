@@ -22,6 +22,7 @@ class LLMFlow(StrEnum):
     LEGAL_COMPOSITE_ANSWER = "legal_composite_answer"
     LEGAL_COMPOSITE_REVIEW = "legal_composite_review"
     SUPERSEARCH_PLAN = "supersearch_plan"
+    SUPERSEARCH_SOURCE_FOCUS = "supersearch_source_focus"
     SUPERSEARCH_ANSWER = "supersearch_answer"
     SUPERSEARCH_REVIEW = "supersearch_review"
     SUPERSEARCH_REPAIR = "supersearch_repair"
