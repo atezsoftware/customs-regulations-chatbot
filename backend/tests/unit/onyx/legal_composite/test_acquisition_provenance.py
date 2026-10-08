@@ -75,8 +75,10 @@ def acquirer() -> tuple[CanonicalAcquirer, Mock]:
 
 
 @pytest.mark.parametrize("cached", [False, True])
+@pytest.mark.parametrize("different_public_update", [False, True])
 def test_duplicate_or_cached_action_merges_every_need_without_extra_work(
     cached: bool,
+    different_public_update: bool,
 ) -> None:
     instance, handler = acquirer()
     request_plan = plan()
@@ -84,6 +86,9 @@ def test_duplicate_or_cached_action_merges_every_need_without_extra_work(
     second = SourceAction(
         need_ids=["second", "first"], tool="read_original", arguments={}
     )
+    if different_public_update:
+        first.arguments["_public_update"] = ["Original read", "Read the original"]
+        second.arguments["_public_update"] = ["Original reuse", "Reuse the original"]
     if cached:
         instance.acquire([first], request_plan)
         bytes_before = instance.context.budget.snapshot()["evidence_bytes"]
@@ -94,6 +99,7 @@ def test_duplicate_or_cached_action_merges_every_need_without_extra_work(
         receipts = instance.acquire([first, second], request_plan)
         assert receipts[0]["need_ids"] == ["first", "second"]
     handler.assert_called_once()
+    assert "_public_update" not in handler.call_args.args[0]
     assert len(receipts) == 1 and receipts[0]["citations"] == [1]
     assert instance.context.budget.snapshot()["tools"] == 1
     assert instance.ledger.citation_numbers() == (1,)
@@ -101,6 +107,41 @@ def test_duplicate_or_cached_action_merges_every_need_without_extra_work(
     assert item is not None
     assert item.question_ids == ["first", "second"]
     assert item.text == "Immutable original text." and item.chunk_id == "shared"
+
+
+def test_different_source_queries_are_not_collapsed_with_same_public_update() -> None:
+    instance, handler = acquirer()
+    instance.registry.register(
+        ToolSpec(
+            name="resolve_source",
+            description="Resolve an authorized source identity.",
+            parameters={
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+            handler=handler,
+        )
+    )
+    actions = [
+        SourceAction(
+            need_ids=[need_id],
+            tool="resolve_source",
+            arguments={"query": query, "_public_update": ["Resolve", "Resolve source"]},
+        )
+        for need_id, query in [
+            ("first", "Governing instrument"),
+            ("second", "Implementing instrument"),
+        ]
+    ]
+    receipts = instance.acquire(actions, plan())
+    assert handler.call_count == 2 and len(receipts) == 2
+    assert {call.args[0]["query"] for call in handler.call_args_list} == {
+        "Governing instrument",
+        "Implementing instrument",
+    }
+    assert instance.context.budget.snapshot()["tools"] == 2
 
 
 def test_reopened_original_binds_new_need_without_new_text_or_identity() -> None:

@@ -117,6 +117,60 @@ class WorkflowBudget:
                 and self._cost < self.policy.max_cost_usd - pending * self._final_cost
             )
 
+    def affordable_input_tokens(
+        self,
+        output_tokens: int,
+        input_price_per_million: float,
+        output_price_per_million: float,
+        finalizing: bool = False,
+    ) -> int:
+        """Preview a call's input limit; request remains the atomic admission fence."""
+        if output_tokens < 1 or any(
+            not math.isfinite(rate) or rate < 0
+            for rate in (input_price_per_million, output_price_per_million)
+        ):
+            raise ValueError("Invalid generation allocation")
+        with self._lock:
+            self.check_active(finalizing)
+            if self._usage_overrun:
+                raise RunStopped(
+                    "Provider usage exceeded the estimate; no further spend authorized"
+                )
+            pending = (
+                max(0, self._pending_final_calls - 1)
+                if finalizing
+                else self._pending_final_calls
+            )
+            available_input = (
+                self.policy.max_input_tokens - pending * self._final_input - self._input
+            )
+            available_cost = (
+                self.policy.max_cost_usd
+                - pending * self._final_cost
+                - self._cost
+                - output_tokens * output_price_per_million / 1_000_000
+            )
+            if (
+                self._calls + 1 > self.policy.max_model_calls - pending
+                or self._output + output_tokens
+                > self.policy.max_output_tokens - pending * self._final_output
+                or available_input < 0
+                or available_cost < 0
+            ):
+                raise RunStopped(
+                    "Workflow model budget exhausted; finalization allocation retained"
+                )
+            if (
+                input_price_per_million == 0
+                or available_cost
+                >= available_input * input_price_per_million / 1_000_000
+            ):
+                return available_input
+            return min(
+                available_input,
+                math.floor(available_cost * 1_000_000 / input_price_per_million),
+            )
+
     def request(
         self,
         input_tokens: int,

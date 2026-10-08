@@ -261,6 +261,8 @@ class BudgetedGateway:
         schema: str,
         llm: LLM,
         response_format: dict[str, JsonValue],
+        *,
+        finalizing: bool = False,
     ) -> tuple[list[ChatCompletionMessage], int, list[dict[str, JsonValue]]]:
         body = cast(dict[str, JsonValue], json.loads(json.dumps(payload)))
         raw_records = body.get("original_evidence", [])
@@ -290,7 +292,23 @@ class BudgetedGateway:
         if not isinstance(omitted_raw, list):
             raise ValueError("Omitted evidence identities must be a list")
         omitted = list(omitted_raw)
-        cap = min(self.budget.policy.max_context_tokens, llm.config.max_input_tokens)
+        context_cap = min(
+            self.budget.policy.max_context_tokens, llm.config.max_input_tokens
+        )
+        cap = context_cap
+        if not finalizing:
+            price = self._price(llm)
+            assert (
+                price.input_per_mtok is not None and price.output_per_mtok is not None
+            )
+            cap = min(
+                cap,
+                self.budget.affordable_input_tokens(
+                    _RESEARCH_OUTPUT_TOKENS,
+                    price.input_per_mtok,
+                    price.output_per_mtok,
+                ),
+            )
         while True:
             body["original_evidence"] = cast(list[JsonValue], records)
             body["omitted_original_ids"] = omitted
@@ -324,7 +342,9 @@ class BudgetedGateway:
             )
             if removable is None:
                 raise RunStopped(
-                    "Required originals and protocol exceed the model context budget"
+                    "Required originals and protocol exceed the remaining research budget"
+                    if cap < context_cap
+                    else "Required originals and protocol exceed the model context budget"
                 )
             removed = records.pop(removable)
             number = removed.get("citation")
@@ -630,7 +650,7 @@ class BudgetedGateway:
             },
         }
         messages, input_tokens, records = self._fit_messages(
-            system, payload, schema, llm, response_format
+            system, payload, schema, llm, response_format, finalizing=finalizing
         )
         output_tokens = (
             _RESEARCH_OUTPUT_TOKENS if research else self._final_output_tokens

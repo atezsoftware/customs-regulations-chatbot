@@ -69,7 +69,15 @@ class CanonicalAcquirer:
                 # The planner already supplies focused queries without query expansion.
                 arguments["expand_query"] = False
             signature = json.dumps(
-                {"tool": action.tool, "arguments": arguments}, sort_keys=True
+                {
+                    "tool": action.tool,
+                    "arguments": {
+                        key: value
+                        for key, value in arguments.items()
+                        if key != "_public_update"
+                    },
+                },
+                sort_keys=True,
             )
             if signature in self._completed:
                 recorded = self._completed[signature].get("citations", [])

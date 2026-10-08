@@ -13,7 +13,7 @@ from onyx.asv3.models import RunStopped
 from onyx.legal_composite.budget import WorkflowBudget
 from onyx.legal_composite.engine import LegalCompositeEngine, SourceAcquirer
 from onyx.legal_composite.gateway import BudgetedGateway
-from onyx.legal_composite.models import DraftAnswer, WorkflowPolicy
+from onyx.legal_composite.models import DraftAnswer, ResearchStep, WorkflowPolicy
 from onyx.llm.cost import ModelPrice
 from onyx.llm.interfaces import LLM, LLMConfig
 from onyx.llm.model_response import Choice, Message, ModelResponse, Usage
@@ -24,6 +24,7 @@ from onyx.llm.models import (
     UserMessage,
 )
 from onyx.llm.utils import check_number_of_tokens
+from onyx.regulatory.structured_llm import _portable_structured_output_schema
 from onyx.tracing.flows import LLMFlow
 from tests.unit.onyx.legal_composite.test_review_assessment import original
 
@@ -224,6 +225,130 @@ def test_final_phase_navigation_cannot_crowd_out_whole_originals_under_same_cap(
         row["citation"] for row in records
     }
     assert gateway.last_delivered_citations == {row["citation"] for row in records}
+
+
+@pytest.fixture
+def constrained_research_model(model: Mock, monkeypatch: pytest.MonkeyPatch) -> Mock:
+    monkeypatch.setattr(
+        "onyx.legal_composite.gateway.get_model_price_per_million",
+        lambda *_args: ModelPrice(
+            model="price-test-model",
+            provider="price-test",
+            input_per_mtok=1,
+            output_per_mtok=1,
+            cache_per_mtok=None,
+        ),
+    )
+    monkeypatch.setattr("litellm.get_model_info", lambda **_kwargs: {})
+    model.invoke.return_value.choice.message.content = (
+        '{"actions":[],"ready_to_answer":false,"remaining_gaps":["Unread original"]}'
+    )
+    return model
+
+
+def test_research_fits_remaining_cost_with_whole_originals_and_complete_navigation(
+    constrained_research_model: Mock,
+) -> None:
+    from onyx.asv3.models import RunContext
+
+    model = constrained_research_model
+    ledger = EvidenceLedger()
+    ledger.add(
+        [
+            original("Complete operative condition. " * 300, f"chunk-{index}")
+            for index in range(10)
+        ],
+        RunContext(),
+    )
+    records = json.loads(ledger.serialize_records(list(ledger.citation_numbers())))
+    catalogue = [
+        {key: row[key] for key in ("citation", "source_id", "chunk_id", "metadata")}
+        for row in records
+    ]
+    payload: dict[str, JsonValue] = {
+        "original_evidence": records,
+        "required_evidence_numbers": [1],
+        "original_catalogue": catalogue,
+    }
+    budget = WorkflowBudget(WorkflowPolicy())
+    gateway = BudgetedGateway(
+        selected_llm=model, research_llm=model, budget=budget, ledger=ledger
+    )
+    full_schema = ResearchStep.model_json_schema()
+    response_format: dict[str, JsonValue] = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "ResearchStep",
+            "schema": _portable_structured_output_schema(full_schema),
+            "strict": False,
+        },
+    }
+    _, context_only_tokens, _ = gateway._fit_messages(
+        "Select a missing original",
+        payload,
+        json.dumps(full_schema, ensure_ascii=False),
+        model,
+        response_format,
+        finalizing=True,
+    )
+    affordable = budget.affordable_input_tokens(2_048, 1, 1)
+    assert affordable < context_only_tokens <= budget.policy.max_context_tokens
+    with pytest.raises(RunStopped, match="finalization allocation"):
+        budget.request(context_only_tokens, 2_048, 1, 1)
+    gateway.complete(
+        "Select a missing original",
+        payload,
+        ResearchStep,
+        LLMFlow.LEGAL_COMPOSITE_RESEARCH,
+    )
+    sent = json.loads(model.invoke.call_args.args[0][1].content)
+    delivered = sent["original_evidence"]
+    assert 0 < len(delivered) < len(records)
+    assert 1 in {row["citation"] for row in delivered}
+    expected = {row["citation"]: row for row in records}
+    assert all(row == expected[row["citation"]] for row in delivered)
+    assert sent["original_catalogue"] == catalogue
+    assert set(sent["omitted_original_ids"]) == set(expected) - {
+        row["citation"] for row in delivered
+    }
+    assert payload["original_evidence"] == records
+    assert ledger.citation_numbers() == tuple(range(1, 11))
+    assert gateway.last_delivered_citations == {row["citation"] for row in delivered}
+    assert budget.snapshot()["pending_final_calls"] == 2
+    model.invoke.assert_called_once()
+
+
+@pytest.mark.parametrize("required", [False, True])
+def test_unaffordable_research_protocol_or_required_original_fails_without_spend(
+    constrained_research_model: Mock, required: bool
+) -> None:
+    model = constrained_research_model
+    budget = WorkflowBudget(WorkflowPolicy())
+    ledger = Mock(spec=EvidenceLedger)
+    gateway = BudgetedGateway(
+        selected_llm=model, research_llm=model, budget=budget, ledger=ledger
+    )
+    payload: dict[str, JsonValue] = (
+        {
+            "original_evidence": [
+                {"citation": 1, "text": "Original condition. " * 8_000}
+            ],
+            "required_evidence_numbers": [1],
+        }
+        if required
+        else {"original_catalogue": {"navigation": "Source identity. " * 8_000}}
+    )
+    before = budget.snapshot()
+    with pytest.raises(RunStopped, match="remaining research budget"):
+        gateway.complete(
+            "Select a missing original",
+            payload,
+            ResearchStep,
+            LLMFlow.LEGAL_COMPOSITE_RESEARCH,
+        )
+    assert budget.snapshot()["model_calls"] == before["model_calls"] == 0
+    ledger.record_delivery.assert_not_called()
+    model.invoke.assert_not_called()
 
 
 def test_oversized_required_original_cannot_be_clipped_or_dropped(model: Mock) -> None:
