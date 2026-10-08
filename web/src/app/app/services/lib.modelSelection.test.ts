@@ -10,6 +10,39 @@ afterEach(() => {
   global.fetch = originalFetch;
 });
 
+it.each([false, true])(
+  "serializes Legal Composite only when selected (%s)",
+  async (selected) => {
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: false,
+      status: 400,
+      json: async () => ({ detail: "captured" }),
+    });
+    await expect(
+      sendMessage({
+        message: "Antrepo nedir?",
+        parentMessageId: null,
+        chatSessionId: "session-1",
+        filters: null,
+        legalComposite: selected,
+      }).next()
+    ).rejects.toThrow("captured");
+    const payload = JSON.parse(
+      String(jest.mocked(global.fetch).mock.calls[0]![1]?.body)
+    );
+    if (selected) {
+      expect(payload.legal_composite).toBe(true);
+    } else {
+      expect(payload).not.toHaveProperty("legal_composite");
+    }
+    expect(payload.atez_search).toBe(false);
+    expect(payload.atez_search_v2).toBe(false);
+    expect(payload.atez_search_v3).toBe(false);
+    expect(payload.deep_research).toBe(false);
+    expect(payload).not.toHaveProperty("asv3_parallel_research");
+  }
+);
+
 it("serializes provider type with a named model override", async () => {
   global.fetch = jest.fn().mockResolvedValue({
     ok: false,

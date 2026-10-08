@@ -165,6 +165,7 @@ export interface SendMessageParams {
   atezSearch?: boolean;
   atezSearchV2?: boolean;
   atezSearchV3?: boolean;
+  legalComposite?: boolean;
   experimentalResearch?: boolean;
   experimentalParallelResearch?: boolean;
   experimentalGuardrails?: boolean;
@@ -196,6 +197,7 @@ export async function* sendMessage({
   signal,
   deepResearch,
   atezSearchV3,
+  legalComposite,
   experimentalResearch,
   experimentalParallelResearch,
   experimentalGuardrails,
@@ -221,13 +223,12 @@ export async function* sendMessage({
     deep_research: deepResearch ?? false,
     atez_search: false,
     atez_search_v2: false,
+    ...(legalComposite ? { legal_composite: true } : {}),
     atez_search_v3: Boolean(
-      (
-        atezSearchV3 ||
+      (atezSearchV3 ||
         experimentalResearch ||
         experimentalParallelResearch ||
-        experimentalGuardrails
-      ) &&
+        experimentalGuardrails) &&
       !deepResearch
     ),
     asv3_research_profile: deepResearch

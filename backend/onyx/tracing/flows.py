@@ -17,6 +17,10 @@ class LLMFlow(StrEnum):
     # Chat / agent
     CHAT_RESPONSE = "chat_response"
     CHAT_HISTORY_SUMMARIZATION = "chat_history_summarization"
+    LEGAL_COMPOSITE_RESEARCH = "legal_composite_research"
+    LEGAL_COMPOSITE_SELECTION = "legal_composite_selection"
+    LEGAL_COMPOSITE_ANSWER = "legal_composite_answer"
+    LEGAL_COMPOSITE_REVIEW = "legal_composite_review"
     ASV3_COORDINATOR = "asv3_coordinator"
     ASV3_RESEARCHER = "asv3_researcher"
     ASV3_VERIFICATION = "asv3_verification"

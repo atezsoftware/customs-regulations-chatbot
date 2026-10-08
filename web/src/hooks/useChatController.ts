@@ -91,6 +91,7 @@ export interface OnSubmitProps {
   atezSearch?: boolean;
   atezSearchV2?: boolean;
   atezSearchV3?: boolean;
+  legalComposite?: boolean;
   experimentalResearch?: boolean;
   experimentalParallelResearch?: boolean;
   experimentalGuardrails?: boolean;
@@ -385,6 +386,7 @@ export default function useChatController({
       atezSearch = false,
       atezSearchV2 = false,
       atezSearchV3 = false,
+      legalComposite = false,
       experimentalResearch = false,
       experimentalParallelResearch = false,
       experimentalGuardrails = false,
@@ -980,6 +982,7 @@ export default function useChatController({
           atezSearch,
           atezSearchV2,
           atezSearchV3,
+          legalComposite,
           experimentalResearch,
           experimentalParallelResearch,
           experimentalGuardrails,

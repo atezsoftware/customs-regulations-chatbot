@@ -90,6 +90,7 @@ export interface AppInputBarProps {
   atezSearchEnabled?: boolean;
   atezSearchV2Enabled?: boolean;
   atezSearchV3Enabled?: boolean;
+  legalCompositeEnabled?: boolean;
   experimentalResearchEnabled?: boolean;
   experimentalParallelResearchEnabled?: boolean;
   experimentalGuardrailsEnabled?: boolean;
@@ -98,6 +99,7 @@ export interface AppInputBarProps {
   toggleAtezSearch?: () => void;
   toggleAtezSearchV2?: () => void;
   toggleAtezSearchV3?: () => void;
+  toggleLegalComposite?: () => void;
   toggleExperimentalResearch?: () => void;
   toggleExperimentalParallelResearch?: () => void;
   toggleExperimentalGuardrails?: () => void;
@@ -126,11 +128,13 @@ const AppInputBar = React.memo(
     llmManager,
     deepResearchEnabled,
     atezSearchV3Enabled = false,
+    legalCompositeEnabled = false,
     experimentalResearchEnabled = false,
     experimentalParallelResearchEnabled = false,
     experimentalGuardrailsEnabled = false,
     toggleDeepResearch,
     toggleAtezSearchV3,
+    toggleLegalComposite,
     toggleExperimentalResearch,
     toggleExperimentalParallelResearch,
     toggleExperimentalGuardrails,
@@ -712,6 +716,23 @@ const AppInputBar = React.memo(
               </SelectButton>
             ) : (
               <>
+                {showAtezSearch && toggleLegalComposite && (
+                  <SelectButton
+                    disabled={disabled || isMultiModelActive}
+                    variant="select-light"
+                    icon={SvgSearch}
+                    onClick={toggleLegalComposite}
+                    state={legalCompositeEnabled ? "selected" : "empty"}
+                    foldable={false}
+                    tooltip={
+                      isMultiModelActive
+                        ? "Legal Composite runs with one model. Remove extra models to use it."
+                        : "Süre ve maliyet sınırlarıyla kaynak araştırması ve hukuki kanıt kontrolü"
+                    }
+                  >
+                    Legal Composite
+                  </SelectButton>
+                )}
                 {showAtezSearch && toggleAtezSearchV3 && (
                   <SelectButton
                     disabled={disabled || isMultiModelActive}
@@ -788,9 +809,7 @@ const AppInputBar = React.memo(
                     variant="select-light"
                     icon={SvgSparkle}
                     onClick={toggleExperimentalGuardrails}
-                    state={
-                      experimentalGuardrailsEnabled ? "selected" : "empty"
-                    }
+                    state={experimentalGuardrailsEnabled ? "selected" : "empty"}
                     foldable={false}
                     tooltip={
                       isMultiModelActive

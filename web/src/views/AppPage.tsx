@@ -206,6 +206,7 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
         atezSearch: atezSearchEnabledForCurrentWorkflow,
         atezSearchV2: atezSearchV2EnabledForCurrentWorkflow,
         atezSearchV3: atezSearchV3EnabledForCurrentWorkflow,
+        legalComposite: legalCompositeEnabledForCurrentWorkflow,
         experimentalResearch: experimentalResearchEnabledForCurrentWorkflow,
         experimentalParallelResearch:
           experimentalParallelResearchEnabledForCurrentWorkflow,
@@ -236,6 +237,8 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
     toggleAtezSearchV2,
     atezSearchV3Enabled,
     toggleAtezSearchV3,
+    legalCompositeEnabled,
+    toggleLegalComposite,
     experimentalResearchEnabled,
     toggleExperimentalResearch,
     experimentalParallelResearchEnabled,
@@ -261,6 +264,10 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
     currentProjectId === null &&
     (selectedAgent ?? liveAgent)?.id === 0 &&
     atezSearchV3Enabled;
+  const legalCompositeEnabledForCurrentWorkflow =
+    currentProjectId === null &&
+    (selectedAgent ?? liveAgent)?.id === 0 &&
+    legalCompositeEnabled;
   const experimentalResearchEnabledForCurrentWorkflow =
     currentProjectId === null &&
     (selectedAgent ?? liveAgent)?.id === 0 &&
@@ -593,6 +600,9 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
         atezSearchV2EnabledForCurrentWorkflow && !multiModel.isMultiModelActive,
       atezSearchV3:
         atezSearchV3EnabledForCurrentWorkflow && !multiModel.isMultiModelActive,
+      legalComposite:
+        legalCompositeEnabledForCurrentWorkflow &&
+        !multiModel.isMultiModelActive,
       experimentalResearch:
         experimentalResearchEnabledForCurrentWorkflow &&
         !multiModel.isMultiModelActive,
@@ -612,6 +622,7 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
     atezSearchEnabledForCurrentWorkflow,
     atezSearchV2EnabledForCurrentWorkflow,
     atezSearchV3EnabledForCurrentWorkflow,
+    legalCompositeEnabledForCurrentWorkflow,
     experimentalResearchEnabledForCurrentWorkflow,
     experimentalParallelResearchEnabledForCurrentWorkflow,
     experimentalGuardrailsEnabledForCurrentWorkflow,
@@ -642,6 +653,9 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
         atezSearchV3:
           atezSearchV3EnabledForCurrentWorkflow &&
           !multiModel.isMultiModelActive,
+        legalComposite:
+          legalCompositeEnabledForCurrentWorkflow &&
+          !multiModel.isMultiModelActive,
         experimentalResearch:
           experimentalResearchEnabledForCurrentWorkflow &&
           !multiModel.isMultiModelActive,
@@ -667,6 +681,7 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
       atezSearchEnabledForCurrentWorkflow,
       atezSearchV2EnabledForCurrentWorkflow,
       atezSearchV3EnabledForCurrentWorkflow,
+      legalCompositeEnabledForCurrentWorkflow,
       experimentalResearchEnabledForCurrentWorkflow,
       experimentalParallelResearchEnabledForCurrentWorkflow,
       experimentalGuardrailsEnabledForCurrentWorkflow,
@@ -722,6 +737,9 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
           atezSearchV3:
             atezSearchV3EnabledForCurrentWorkflow &&
             !multiModel.isMultiModelActive,
+          legalComposite:
+            legalCompositeEnabledForCurrentWorkflow &&
+            !multiModel.isMultiModelActive,
           experimentalResearch:
             experimentalResearchEnabledForCurrentWorkflow &&
             !multiModel.isMultiModelActive,
@@ -758,6 +776,7 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
       atezSearchEnabledForCurrentWorkflow,
       atezSearchV2EnabledForCurrentWorkflow,
       atezSearchV3EnabledForCurrentWorkflow,
+      legalCompositeEnabledForCurrentWorkflow,
       experimentalResearchEnabledForCurrentWorkflow,
       experimentalParallelResearchEnabledForCurrentWorkflow,
       experimentalGuardrailsEnabledForCurrentWorkflow,
@@ -955,6 +974,9 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
                         }
                         atezSearchV3Enabled={
                           atezSearchV3EnabledForCurrentWorkflow
+                        }
+                        legalCompositeEnabled={
+                          legalCompositeEnabledForCurrentWorkflow
                         }
                         experimentalResearchEnabled={
                           experimentalResearchEnabledForCurrentWorkflow
@@ -1155,6 +1177,9 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
                         atezSearchV3Enabled={
                           atezSearchV3EnabledForCurrentWorkflow
                         }
+                        legalCompositeEnabled={
+                          legalCompositeEnabledForCurrentWorkflow
+                        }
                         experimentalResearchEnabled={
                           experimentalResearchEnabledForCurrentWorkflow
                         }
@@ -1166,6 +1191,7 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
                         }
                         toggleAtezSearchV2={toggleAtezSearchV2}
                         toggleAtezSearchV3={toggleAtezSearchV3}
+                        toggleLegalComposite={toggleLegalComposite}
                         toggleExperimentalResearch={toggleExperimentalResearch}
                         toggleExperimentalParallelResearch={
                           toggleExperimentalParallelResearch
