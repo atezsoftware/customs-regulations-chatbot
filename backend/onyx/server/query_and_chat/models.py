@@ -131,6 +131,7 @@ class SendMessageRequest(BaseModel):
     atez_search_v3: bool = False
     asv3_research_profile: Literal["normal", "deep", "experimental"] = "deep"
     asv3_parallel_research: bool = False
+    asv3_guarded_experimental: bool = False
     asv3_allow_external: bool = False
     asv3_resume_message_id: int | None = None
 
@@ -195,6 +196,14 @@ class SendMessageRequest(BaseModel):
         ):
             raise ValueError(
                 "Parallel experimental research requires the experimental ASv3 profile"
+            )
+        if self.asv3_guarded_experimental and not (
+            self.atez_search_v3
+            and self.asv3_research_profile == "normal"
+            and not self.asv3_parallel_research
+        ):
+            raise ValueError(
+                "Experimental Guardrails requires the normal non-parallel ASv3 profile"
             )
         if self.asv3_resume_message_id is not None and not (
             self.atez_search_v3 or self.deep_research

@@ -6,7 +6,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from onyx.asv3.workflow_variant import ASV3_TUNED_VARIANT
+from onyx.asv3.workflow_variant import (
+    ASV3_GUARDED_EXPERIMENTAL_VARIANT,
+    ASV3_TUNED_VARIANT,
+)
 from onyx.chat import process_message
 from onyx.chat.chat_state import ChatTurnSetup
 from onyx.chat.models import StreamingError
@@ -16,17 +19,27 @@ from tests.unit.onyx.chat.test_multi_model_streaming import _make_setup
 
 
 @pytest.mark.parametrize(
-    "requested_profile,parallel,deep,effective_profile,variant,lite",
+    "requested_profile,parallel,guarded,deep,effective_profile,variant,lite",
     [
-        ("experimental", True, False, "normal", ASV3_TUNED_VARIANT, False),
-        ("experimental", False, False, "experimental", "standard", False),
-        ("normal", False, False, "normal", "standard", True),
-        ("deep", False, True, "deep", "standard", True),
+        ("experimental", True, False, False, "normal", ASV3_TUNED_VARIANT, False),
+        ("experimental", False, False, False, "experimental", "standard", False),
+        (
+            "normal",
+            False,
+            True,
+            False,
+            "normal",
+            ASV3_GUARDED_EXPERIMENTAL_VARIANT,
+            True,
+        ),
+        ("normal", False, False, False, "normal", "standard", True),
+        ("deep", False, False, True, "deep", "standard", True),
     ],
 )
 def test_actual_chat_worker_maps_variant_before_lite_construction(
     requested_profile: Literal["normal", "deep", "experimental"],
     parallel: bool,
+    guarded: bool,
     deep: bool,
     effective_profile: str,
     variant: str,
@@ -41,6 +54,7 @@ def test_actual_chat_worker_maps_variant_before_lite_construction(
             "deep_research": deep,
             "asv3_research_profile": requested_profile,
             "asv3_parallel_research": parallel,
+            "asv3_guarded_experimental": guarded,
         }
     )
     selected = setup.llms[0]

@@ -83,3 +83,32 @@ def test_experimental_profile_is_not_activated_by_deep_research_alone() -> None:
                 "asv3_research_profile": "experimental",
             }
         )
+
+
+def test_guarded_experimental_requires_explicit_normal_asv3_selection() -> None:
+    selected = SendMessageRequest.model_validate(
+        {
+            "message": "Question",
+            "atez_search_v3": True,
+            "asv3_research_profile": "normal",
+            "asv3_guarded_experimental": True,
+        }
+    )
+    assert selected.asv3_guarded_experimental is True
+
+    for invalid in (
+        {"asv3_research_profile": "experimental"},
+        {"asv3_parallel_research": True},
+        {"deep_research": True},
+        {"atez_search_v3": False},
+    ):
+        with pytest.raises(ValidationError):
+            SendMessageRequest.model_validate(
+                {
+                    "message": "Question",
+                    "atez_search_v3": True,
+                    "asv3_research_profile": "normal",
+                    "asv3_guarded_experimental": True,
+                    **invalid,
+                }
+            )

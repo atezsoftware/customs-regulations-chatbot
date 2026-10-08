@@ -1592,6 +1592,7 @@ def _run_models(
                         if _uses_deep_asv3(setup)
                         else setup.new_msg_req.asv3_research_profile,
                         setup.new_msg_req.asv3_parallel_research,
+                        setup.new_msg_req.asv3_guarded_experimental,
                     )
                     research_profile = workflow.research_profile
                     research_llm = (

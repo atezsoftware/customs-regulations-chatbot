@@ -13,7 +13,12 @@ export default function useDeepResearchToggle({
   agentId,
 }: UseDeepResearchToggleProps) {
   const [mode, setMode] = useState<
-    "normal" | "deep" | "experimental" | "experimental_parallel" | null
+    | "normal"
+    | "deep"
+    | "experimental"
+    | "experimental_parallel"
+    | "experimental_guardrails"
+    | null
   >(null);
   const previousChatSessionId = useRef<string | null>(chatSessionId);
 
@@ -39,6 +44,11 @@ export default function useDeepResearchToggle({
       current === "experimental_parallel" ? null : "experimental_parallel"
     );
   }, []);
+  const toggleExperimentalGuardrails = useCallback(() => {
+    setMode((current) =>
+      current === "experimental_guardrails" ? null : "experimental_guardrails"
+    );
+  }, []);
 
   return {
     deepResearchEnabled: mode === "deep",
@@ -49,6 +59,8 @@ export default function useDeepResearchToggle({
     toggleExperimentalResearch,
     experimentalParallelResearchEnabled: mode === "experimental_parallel",
     toggleExperimentalParallelResearch,
+    experimentalGuardrailsEnabled: mode === "experimental_guardrails",
+    toggleExperimentalGuardrails,
     atezSearchEnabled: false,
     atezSearchV2Enabled: false,
     toggleAtezSearch: undefined,

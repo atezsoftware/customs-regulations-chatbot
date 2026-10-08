@@ -56,6 +56,23 @@ describe("research mode selection", () => {
     expect(result.current.experimentalParallelResearchEnabled).toBe(false);
   });
 
+  it("keeps Experimental Guardrails exclusive with existing ASv3 selections", () => {
+    const { result } = renderHook(() =>
+      useDeepResearchToggle({ chatSessionId: null, agentId: 0 })
+    );
+
+    act(() => result.current.toggleExperimentalParallelResearch());
+    expect(result.current.experimentalParallelResearchEnabled).toBe(true);
+
+    act(() => result.current.toggleExperimentalGuardrails());
+    expect(result.current.experimentalGuardrailsEnabled).toBe(true);
+    expect(result.current.experimentalParallelResearchEnabled).toBe(false);
+
+    act(() => result.current.toggleExperimentalResearch());
+    expect(result.current.experimentalGuardrailsEnabled).toBe(false);
+    expect(result.current.experimentalResearchEnabled).toBe(true);
+  });
+
   it("preserves selection for a new session and resets on session or agent switch", () => {
     const { result, rerender } = renderHook(
       ({ chatSessionId, agentId }) =>

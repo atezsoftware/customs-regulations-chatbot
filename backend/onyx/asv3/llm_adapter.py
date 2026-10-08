@@ -1317,7 +1317,14 @@ class ResearchModel:
             else self.context.check_active
         )
         deadline = self.context.research_deadline if research else self.context.deadline
-        for attempt in range(3):
+        configured_attempts = self.context.services.get("provider_max_attempts", 3)
+        if (
+            not isinstance(configured_attempts, int)
+            or isinstance(configured_attempts, bool)
+            or configured_attempts < 1
+        ):
+            raise ValueError("provider_max_attempts must be a positive integer")
+        for attempt in range(configured_attempts):
             check()
             try:
                 return self._invoke_once(
@@ -1334,7 +1341,7 @@ class ResearchModel:
             except Exception as error:
                 if (
                     native_protocol_rejection(error)
-                    or attempt == 2
+                    or attempt == configured_attempts - 1
                     or not is_retryable_provider_error(error)
                 ):
                     raise
