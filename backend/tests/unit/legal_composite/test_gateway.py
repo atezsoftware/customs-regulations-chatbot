@@ -185,7 +185,12 @@ def test_final_phase_navigation_cannot_crowd_out_whole_originals_under_same_cap(
         "Apply complete original provisions", "", source_phase=False
     )
     catalogue = research["original_catalogue"]
-    assert isinstance(catalogue, list) and len(catalogue) == 63
+    if isinstance(catalogue, dict):
+        assert catalogue["codec"] == "shared_metadata_v1"
+        rows = catalogue["rows"]
+        assert isinstance(rows, list) and len(rows) == 63
+    else:
+        assert isinstance(catalogue, list) and len(catalogue) == 63
     assert research["original_evidence"] == final["original_evidence"]
     assert "original_catalogue" not in final and "tools" not in final
     assert policy.max_context_tokens == 32_000
@@ -202,7 +207,8 @@ def test_final_phase_navigation_cannot_crowd_out_whole_originals_under_same_cap(
     gateway.complete("Answer", final, DraftAnswer, LLMFlow.LEGAL_COMPOSITE_ANSWER, True)
     sent = json.loads(model.invoke.call_args.args[0][1].content)
     records = sent["original_evidence"]
-    assert len(records) > max(1, len(baseline))
+    assert len(records) >= max(1, len(baseline))
+    assert records == final["original_evidence"]
     final_records = cast(list[dict[str, JsonValue]], final["original_evidence"])
     expected = {cast(int, row["citation"]): row for row in final_records}
     for row in records:
@@ -377,6 +383,47 @@ def test_late_provider_result_cannot_publish_evidence_or_start_more_calls(
             "Answer", {}, DraftAnswer, LLMFlow.LEGAL_COMPOSITE_ANSWER, True
         )
     assert model.invoke.call_count == 1
+
+
+@pytest.mark.parametrize("setup_seconds", [7, 8])
+def test_executor_setup_consumes_reserved_time_before_any_provider_admission(
+    model: Mock, monkeypatch: pytest.MonkeyPatch, setup_seconds: int
+) -> None:
+    now = [0.0]
+    ledger = Mock(spec=EvidenceLedger)
+    ledger.completely_delivered.return_value = {1}
+    budget = WorkflowBudget(WorkflowPolicy(), clock=lambda: now[0], deadline=120)
+    gateway = BudgetedGateway(
+        selected_llm=model, research_llm=model, budget=budget, ledger=ledger
+    )
+    response = model.invoke.return_value
+
+    def prepare(*, max_workers: int) -> ThreadPoolExecutor:
+        now[0] += setup_seconds
+        return ThreadPoolExecutor(max_workers=max_workers)
+
+    def finish(*_args: object, **_kwargs: object) -> ModelResponse:
+        now[0] = 119
+        return response
+
+    monkeypatch.setattr("onyx.legal_composite.gateway.ThreadPoolExecutor", prepare)
+    model.invoke.side_effect = finish
+    now[0] = 110
+    if setup_seconds == 7:
+        result = gateway.complete(
+            "Answer", {}, DraftAnswer, LLMFlow.LEGAL_COMPOSITE_ANSWER, True
+        )
+        assert result.answer == "supported"
+        assert model.invoke.call_args.kwargs["timeout_override"] == 3
+        ledger.record_delivery.assert_called_once()
+    else:
+        with pytest.raises(RunStopped, match="deadline"):
+            gateway.complete(
+                "Answer", {}, DraftAnswer, LLMFlow.LEGAL_COMPOSITE_ANSWER, True
+            )
+        model.invoke.assert_not_called()
+        ledger.record_delivery.assert_not_called()
+    assert budget.deadline == 120
 
 
 def test_final_generation_preserves_the_selected_reasoning_effort(model: Mock) -> None:

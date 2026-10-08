@@ -146,7 +146,7 @@ def run_legal_composite_loop(
         if spec.name == "read_evidence":
             registry.register(spec)
     acquirer = CanonicalAcquirer(registry, context, ledger, policy)
-    budget = WorkflowBudget(policy)
+    budget = WorkflowBudget(policy, deadline=context.deadline)
     try:
         with get_session_with_current_tenant() as price_session:
             gateway = BudgetedGateway(

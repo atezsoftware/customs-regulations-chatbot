@@ -1,11 +1,16 @@
 """Exercise the canonical non-streaming adapter without provider network calls."""
 
 from collections.abc import Callable
+from concurrent.futures import Future
+from concurrent.futures import TimeoutError as FutureTimeout
+from copy import deepcopy
+from threading import Event
 from typing import Any
 from unittest.mock import Mock
 
 import litellm
 import pytest
+from litellm.exceptions import BadRequestError
 from litellm.exceptions import Timeout as LiteLLMTimeout
 from litellm.llms.vertex_ai.gemini.vertex_and_google_ai_studio_gemini import (
     VertexGeminiConfig,
@@ -28,7 +33,13 @@ from onyx.legal_composite.models import (
 from onyx.llm.cost import ModelPrice
 from onyx.llm.models import UserMessage
 from onyx.llm.multi_llm import LitellmLLM, LLMTimeoutError
+from onyx.tracing.answer_graph import _span_contents
 from onyx.tracing.flows import LLMFlow
+from onyx.tracing.framework.create import trace
+from onyx.tracing.framework.processor_interface import TracingProcessor
+from onyx.tracing.framework.provider import DefaultTraceProvider
+from onyx.tracing.framework.span_data import GenerationSpanData
+from onyx.tracing.framework.spans import Span
 
 
 @pytest.fixture
@@ -188,8 +199,47 @@ def test_canonical_timeout_has_no_compatibility_retry_or_followup_spend(
     )
 
 
-def test_remaining_workflow_deadline_rejects_late_original_delivery(
+def test_returned_canonical_review_keeps_the_last_seconds_for_validation(
     model: LitellmLLM, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = [0.0]
+    ledger = Mock(spec=EvidenceLedger)
+    ledger.completely_delivered.return_value = {1}
+    workflow = gateway(model, ledger, lambda: now[0])
+    now[0] = 93.15252
+    content = (
+        '{"request_coverage_complete":true,"material_claims_supported":true,'
+        '"counter_authority_checked":true,"needs":[],"defects":[],"repair_actions":[]}'
+    )
+
+    def complete(**_kwargs: Any) -> litellm.ModelResponse:
+        now[0] += 25.1789
+        return response(content)
+
+    completion = Mock(side_effect=complete)
+    monkeypatch.setattr("litellm.completion", completion)
+    result = workflow.complete(
+        "Review exact originals",
+        {"original_evidence": [{"citation": 1, "text": "complete original"}]},
+        AnswerReview,
+        LLMFlow.LEGAL_COMPOSITE_REVIEW,
+        True,
+    )
+    assert result == AnswerReview.model_validate_json(content, strict=True)
+    assert workflow.budget.remaining_seconds(finalizing=True) == pytest.approx(1.66858)
+    ledger.record_delivery.assert_called_once()
+    retained = workflow.budget.snapshot()
+    with pytest.raises(RunStopped, match="deadline"):
+        workflow.complete(
+            "New answer", {}, DraftAnswer, LLMFlow.LEGAL_COMPOSITE_ANSWER, True
+        )
+    completion.assert_called_once()
+    assert workflow.budget.snapshot() == retained
+
+
+@pytest.mark.parametrize("returned_at", [120.0, 120.1])
+def test_remaining_workflow_deadline_rejects_late_original_delivery(
+    model: LitellmLLM, monkeypatch: pytest.MonkeyPatch, returned_at: float
 ) -> None:
     now = [0.0]
     ledger = Mock(spec=EvidenceLedger)
@@ -197,7 +247,7 @@ def test_remaining_workflow_deadline_rejects_late_original_delivery(
     now[0] = 116.0
 
     def late(**_kwargs: Any) -> litellm.ModelResponse:
-        now[0] = 120.1
+        now[0] = returned_at
         return response('{"answer":"late","unresolved_need_ids":[]}')
 
     completion = Mock(side_effect=late)
@@ -251,6 +301,87 @@ def test_writer_timeout_ends_engine_without_review_or_repair(
     acquirer.acquire.assert_not_called()
     assert workflow.budget.snapshot()["model_calls"] == 2
     assert workflow.budget.snapshot()["unsettled_calls"] == 1
+
+
+def test_late_canonical_compatibility_retry_cannot_republish_closed_capture(
+    model: LitellmLLM, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    started, released, finished = Event(), Event(), Event()
+    futures: list[Future[Any]] = []
+    captures: list[Any] = []
+    closed: list[Span[GenerationSpanData]] = []
+    processor = Mock(spec=TracingProcessor)
+
+    def capture(span: Span[Any]) -> None:
+        if isinstance(span.span_data, GenerationSpanData):
+            captures.append(deepcopy(_span_contents(span)))
+            closed.append(span)
+
+    processor.on_span_end.side_effect = capture
+    provider = DefaultTraceProvider()
+    provider.register_processor(processor)
+    monkeypatch.setattr("onyx.tracing.framework.setup.GLOBAL_TRACE_PROVIDER", provider)
+    attempts: list[dict[str, Any]] = []
+
+    def complete(**kwargs: Any) -> litellm.ModelResponse:
+        attempts.append(kwargs)
+        if len(attempts) == 1:
+            started.set()
+            assert released.wait(timeout=5)
+            raise BadRequestError(
+                "reasoning_effort unsupported", "gemini-3.8-flash", "vertex_ai"
+            )
+        assert "reasoning_effort" not in kwargs
+        return response('{"answer":"late","unresolved_need_ids":[]}')
+
+    def host_timeout(future: Future[Any], timeout: float | None = None) -> Any:
+        assert timeout is not None and 0 < timeout <= 45
+        assert started.wait(timeout=2)
+        futures.append(future)
+        raise FutureTimeout()
+
+    completion = Mock(side_effect=complete)
+    monkeypatch.setattr("litellm.completion", completion)
+    monkeypatch.setattr(Future, "result", host_timeout)
+    ledger = Mock(spec=EvidenceLedger)
+    workflow = gateway(model, ledger)
+    try:
+        with trace("late-canonical-compatibility"):
+            with pytest.raises(RunStopped, match="timed out"):
+                workflow.complete(
+                    "Answer", {}, DraftAnswer, LLMFlow.LEGAL_COMPOSITE_ANSWER, True
+                )
+            assert len(captures) == 1 and closed[0].ended_at is not None
+        recorded = deepcopy(captures[0])
+        assert recorded[0]["request_params"]["sent_kwargs"]["reasoning_effort"] == (
+            "medium"
+        )
+        assert recorded[1] is None and recorded[3]["usage"] is None
+        retained = workflow.budget.snapshot()
+        error = deepcopy(closed[0].error)
+        futures[0].add_done_callback(lambda _future: finished.set())
+    finally:
+        released.set()
+        if futures:
+            assert finished.wait(timeout=2)
+    completion.assert_called()
+    assert completion.call_count == 2
+    assert captures == [recorded]
+    processor.on_span_end.assert_called_once()
+    # Canonical request-parameter writes may mutate the live object after capture.
+    assert (
+        "reasoning_effort"
+        not in (closed[0].span_data.request_params or {})["sent_kwargs"]
+    )
+    assert closed[0].span_data.output is None and closed[0].span_data.usage is None
+    assert closed[0].error == error
+    assert "legal_composite_response_id" not in (closed[0].span_data.model_config or {})
+    assert (
+        workflow.budget.snapshot()["estimated_cost_usd"]
+        == retained["estimated_cost_usd"]
+    )
+    assert workflow.budget.snapshot()["unsettled_calls"] == 1
+    ledger.record_delivery.assert_not_called()
 
 
 @pytest.mark.parametrize(

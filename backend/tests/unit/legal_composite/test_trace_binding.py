@@ -2,7 +2,11 @@
 
 import hashlib
 import json
+from concurrent.futures import Future
+from concurrent.futures import TimeoutError as FutureTimeout
+from copy import deepcopy
 from datetime import datetime, timezone
+from threading import Event
 from typing import Any
 from unittest.mock import Mock
 from uuid import uuid4
@@ -340,3 +344,142 @@ def test_provider_failure_marks_generation_and_redacts_private_error(
     assert "legal_composite_response_id" not in config
     ledger.record_delivery.assert_not_called()
     assert workflow.budget.snapshot()["unsettled_calls"] == 1
+
+
+@pytest.mark.parametrize("invocation", ["typed", "fallback", "explicit"])
+@pytest.mark.parametrize("late_failure", [False, True])
+def test_host_timeout_finishes_one_bound_generation_before_late_provider(
+    model: Mock,
+    spans: list[Span[GenerationSpanData]],
+    monkeypatch: pytest.MonkeyPatch,
+    invocation: str,
+    late_failure: bool,
+) -> None:
+    started, released, finished = Event(), Event(), Event()
+    futures: list[Future[Any]] = []
+    response = model.invoke.return_value
+
+    def delayed(*_args: object, **_kwargs: object) -> ModelResponse:
+        started.set()
+        assert released.wait(timeout=5)
+        if late_failure:
+            raise RuntimeError("late provider failure")
+        return response
+
+    def host_timeout(future: Future[Any], timeout: float | None = None) -> Any:
+        assert timeout == 45
+        assert started.wait(timeout=2)
+        futures.append(future)
+        raise FutureTimeout()
+
+    model.invoke.side_effect = delayed
+    monkeypatch.setattr(Future, "result", host_timeout)
+    ledger = Mock(spec=EvidenceLedger)
+    workflow = gateway(model, ledger)
+    prompt = UserMessage(content="Select a legal section")
+    try:
+        with trace("host-times-out-before-provider"):
+            if invocation == "explicit":
+                helper = ScopedSearchLLM(
+                    workflow.research_proxy(), RunContext(timeout_seconds=120), None
+                )
+                with llm_generation_span(
+                    helper,
+                    LLMFlow.CLASSIFY_SECTION_RELEVANCE,
+                    input_messages=[prompt],
+                ) as borrowed:
+                    with pytest.raises(RunStopped, match="timed out"):
+                        helper.invoke(prompt)
+                    assert borrowed.ended_at is None
+                    assert not spans
+            else:
+                with pytest.raises(RunStopped, match="timed out"):
+                    if invocation == "typed":
+                        workflow.complete(
+                            "Use original authority",
+                            {"original_evidence": [{"citation": 1, "text": "whole"}]},
+                            DraftAnswer,
+                            LLMFlow.LEGAL_COMPOSITE_ANSWER,
+                            True,
+                        )
+                    else:
+                        workflow.research_proxy().invoke(prompt)
+            assert len(spans) == 1 and spans[0].ended_at is not None
+        span = spans[0]
+        captured = deepcopy(_span_contents(span))
+        config = captured[0]["model_config"]
+        assert span.error is not None
+        assert config["legal_composite_call_id"]
+        assert config["legal_composite_run_id"] == "canonical-run-id"
+        assert (
+            config["legal_composite_scope_sha256"]
+            == hashlib.sha256(config["legal_composite_scope"].encode()).hexdigest()
+        )
+        assert float(config["legal_composite_reserved_estimated_cost_usd"]) > 0
+        assert int(config["legal_composite_reserved_output_tokens"]) == (
+            4_096 if invocation == "typed" else 2_048
+        )
+        assert "legal_composite_response_id" not in config
+        assert span.span_data.output is None and span.span_data.usage is None
+        unknown_cost = price_generation(
+            "price-test-model", "price-test", span.span_data.usage, Mock()
+        )
+        assert unknown_cost.complete is False
+        monkeypatch.setattr(
+            "onyx.llm.cost_overrides.get_override",
+            lambda *_args: Mock(
+                input_cost_per_mtok=0.1,
+                output_cost_per_mtok=0.5,
+                cache_read_cost_per_mtok=None,
+            ),
+        )
+        session = Mock()
+        known_cost = price_generation(
+            "price-test-model",
+            "price-test",
+            {"input_tokens": 100, "output_tokens": 10},
+            session,
+        )
+        run_id, now = uuid4(), datetime.now(timezone.utc)
+        session.execute.side_effect = [
+            [(12, 0, run_id, "COMPLETE", "COMPLETE", now, now)],
+            [
+                (
+                    run_id,
+                    {"usage_cost": known_cost.model_dump(mode="json")},
+                    "COMPLETE",
+                    LLMFlow.LEGAL_COMPOSITE_RESEARCH.value,
+                ),
+                (
+                    run_id,
+                    {"usage_cost": unknown_cost.model_dump(mode="json")},
+                    "COMPLETE",
+                    captured[4],
+                ),
+            ],
+        ]
+        public_usage = get_response_usage(session, [12], admin=True)[12]
+        assert public_usage.status == "partial"
+        assert public_usage.calls == 2 and public_usage.unpriced_calls == 1
+        assert public_usage.total_cost_usd is None
+        assert public_usage.known_cost_usd == pytest.approx(0.000015)
+        retained = workflow.budget.snapshot()
+        assert retained["unsettled_calls"] == 1
+        assert retained["model_calls"] == 1
+        futures[0].add_done_callback(lambda _future: finished.set())
+    finally:
+        released.set()
+        if futures:
+            assert finished.wait(timeout=2)
+    assert len(spans) == 1
+    assert _span_contents(span) == captured
+    assert (
+        workflow.budget.snapshot()["estimated_cost_usd"]
+        == retained["estimated_cost_usd"]
+    )
+    assert workflow.budget.snapshot()["unsettled_calls"] == 1
+    ledger.record_delivery.assert_not_called()
+    assert workflow.last_call_id is None
+    with pytest.raises(RunStopped, match="no further spend"):
+        workflow.research_proxy().invoke(prompt)
+    model.invoke.assert_called_once()

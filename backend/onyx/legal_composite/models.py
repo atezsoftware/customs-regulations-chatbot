@@ -80,11 +80,19 @@ class PassageSupport(StrictModel):
     quotation: str = Field(min_length=1)
 
 
+class ConditionReview(StrictModel):
+    condition_index: int = Field(ge=0)
+    status: Literal["preserved", "unresolved", "missing", "incorrect"]
+    answer_excerpt: str
+    support_citations: list[int]
+
+
 class NeedReview(StrictModel):
     need_id: str
     status: Literal["supported", "conditional", "unresolved", "incorrect"]
     supports: list[PassageSupport]
     conditions_preserved: bool
+    condition_reviews: list[ConditionReview]
     explanation: str
     gap_disclosure: str | None = None
 

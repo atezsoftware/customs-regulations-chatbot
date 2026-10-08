@@ -28,12 +28,21 @@ class WorkflowBudget:
     """Atomically allocate estimated spend, retaining a draft and a review."""
 
     def __init__(
-        self, policy: WorkflowPolicy, clock: Callable[[], float] = time.monotonic
+        self,
+        policy: WorkflowPolicy,
+        clock: Callable[[], float] = time.monotonic,
+        *,
+        deadline: float | None = None,
     ) -> None:
+        if deadline is not None and not math.isfinite(deadline):
+            raise ValueError("Invalid workflow deadline")
         self.policy = policy
         self._clock = clock
-        self._started = clock()
-        self.deadline = self._started + policy.timeout_seconds
+        latest_deadline = clock() + policy.timeout_seconds
+        self.deadline = (
+            latest_deadline if deadline is None else min(deadline, latest_deadline)
+        )
+        self._started = self.deadline - policy.timeout_seconds
         self._lock = threading.RLock()
         self._calls = 0
         self._input = 0
@@ -81,10 +90,16 @@ class WorkflowBudget:
         return max(0.0, self.deadline - self._clock() - retained)
 
     def check_active(self, finalizing: bool = False) -> None:
+        self.check_response_active(finalizing)
+        if self.remaining_seconds(finalizing) < 3:
+            raise RunStopped("Workflow deadline reached; finalization time retained")
+
+    def check_response_active(self, finalizing: bool = False) -> None:
+        """Completed calls need a live deadline, without a new-call time reserve."""
         with self._lock:
             if self._stop_reason:
                 raise RunStopped(self._stop_reason)
-        if self.remaining_seconds(finalizing) < 3:
+        if self.remaining_seconds(finalizing) <= 0:
             raise RunStopped("Workflow deadline reached; finalization time retained")
 
     def research_available(self) -> bool:

@@ -366,58 +366,23 @@ class BudgetedGateway:
         self,
         llm: LLM,
         messages: list[ChatCompletionMessage],
-        flow: LLMFlow,
         timeout: int,
-        allocated_seconds: float,
         output_tokens: int,
         research: bool,
         response_format: dict[str, JsonValue] | None,
         user_identity: LLMUserIdentity | None,
-        call_id: str,
-        auxiliary: bool,
     ) -> ModelResponse:
         self.check_active()
         self.budget.check_active(not research)
-        reused = self._auxiliary_span(llm, messages) if auxiliary else None
-        span_context = (
-            nullcontext(reused)
-            if reused is not None
-            else llm_generation_span(llm=llm, flow=flow, input_messages=messages)
+        return llm.invoke(
+            messages,
+            structured_response_format=response_format,
+            timeout_override=timeout,
+            max_tokens=output_tokens,
+            reasoning_effort=ReasoningEffort.LOW if research else self.reasoning_effort,
+            user_identity=user_identity,
+            use_streaming=False,
         )
-        with span_context as span:
-            model_config = dict(span.span_data.model_config or {})
-            if reused is not None:
-                model_config["legal_composite_helper_flow"] = model_config["flow"]
-                model_config["flow"] = flow.value
-            model_config.update(
-                self._trace_binding,
-                legal_composite_call_id=call_id,
-                legal_composite_allocated_call_seconds=str(allocated_seconds),
-                legal_composite_transport_timeout_seconds=str(timeout),
-                legal_composite_compat_attempt_bound=str(_COMPATIBILITY_ATTEMPTS),
-            )
-            span.span_data.model_config = model_config
-            try:
-                response = llm.invoke(
-                    messages,
-                    structured_response_format=response_format,
-                    timeout_override=timeout,
-                    max_tokens=output_tokens,
-                    reasoning_effort=ReasoningEffort.LOW
-                    if research
-                    else self.reasoning_effort,
-                    user_identity=user_identity,
-                    use_streaming=False,
-                )
-            except Exception as error:
-                message = str(redact_graph_value(str(error)))[:512]
-                span.set_error(
-                    {"message": f"{type(error).__name__}: {message}", "data": None}
-                )
-                raise
-            model_config["legal_composite_response_id"] = response.id
-            record_llm_response(span, response)
-            return response
 
     def _generate(
         self,
@@ -483,44 +448,94 @@ class BudgetedGateway:
         timeout = math.floor(call_seconds)
         if timeout < 1:
             raise RunStopped("Insufficient time remains for a bounded model invocation")
-        executor = ThreadPoolExecutor(max_workers=1)
-        context = copy_context()
-        future = executor.submit(
-            context.run,
-            self._invoke,
-            llm,
-            messages,
-            flow,
-            timeout,
-            call_seconds,
-            invocation_output_tokens or output_tokens,
-            not finalizing,
-            response_format,
-            user_identity,
-            reservation.call_id,
-            auxiliary,
+        reused = self._auxiliary_span(llm, messages) if auxiliary else None
+        span_context = (
+            nullcontext(reused)
+            if reused is not None
+            else llm_generation_span(llm=llm, flow=flow, input_messages=messages)
         )
-        try:
-            response = cast(ModelResponse, future.result(timeout=call_seconds))
-        except (FutureTimeout, LLMTimeoutError) as error:
-            self.budget.stop(
-                "Provider call exceeded its deadline; no further spend authorized"
+        # The host ends owned spans before returning, even if transport outlives it.
+        with span_context as span:
+            model_config = dict(span.span_data.model_config or {})
+            if reused is not None:
+                model_config["legal_composite_helper_flow"] = model_config["flow"]
+                model_config["flow"] = flow.value
+            model_config.update(
+                self._trace_binding,
+                legal_composite_call_id=reservation.call_id,
+                legal_composite_allocated_call_seconds=str(call_seconds),
+                legal_composite_transport_timeout_seconds=str(timeout),
+                legal_composite_compat_attempt_bound=str(_COMPATIBILITY_ATTEMPTS),
+                legal_composite_reserved_input_tokens=str(reservation.input_tokens),
+                legal_composite_reserved_output_tokens=str(reservation.output_tokens),
+                legal_composite_reserved_estimated_cost_usd=str(
+                    reservation.estimated_cost_usd
+                ),
             )
-            raise RunStopped("The bounded model invocation timed out") from error
-        except RunStopped:
-            raise
-        except Exception as error:
-            raise RunStopped("The bounded model invocation failed") from error
-        finally:
-            executor.shutdown(wait=False, cancel_futures=True)
-        if response.usage is not None:
-            usage = response.usage
-            self.budget.settle(
-                reservation, usage.prompt_tokens, usage.completion_tokens
-            )
-        self.check_active()
-        self.budget.check_active(finalizing)
-        return reservation, response
+            span.span_data.model_config = model_config
+            executor: ThreadPoolExecutor | None = None
+            try:
+                try:
+                    executor = ThreadPoolExecutor(max_workers=1)
+                    self.check_active()
+                    self.budget.check_active(finalizing)
+                    call_seconds = min(
+                        call_seconds, self.budget.remaining_seconds(finalizing)
+                    )
+                    timeout = math.floor(call_seconds)
+                    model_config["legal_composite_allocated_call_seconds"] = str(
+                        call_seconds
+                    )
+                    model_config["legal_composite_transport_timeout_seconds"] = str(
+                        timeout
+                    )
+                    context = copy_context()
+                    future = executor.submit(
+                        context.run,
+                        self._invoke,
+                        llm,
+                        messages,
+                        timeout,
+                        invocation_output_tokens or output_tokens,
+                        not finalizing,
+                        response_format,
+                        user_identity,
+                    )
+                    wait_seconds = min(
+                        call_seconds, self.budget.remaining_seconds(finalizing)
+                    )
+                    response = cast(ModelResponse, future.result(timeout=wait_seconds))
+                except (FutureTimeout, LLMTimeoutError) as error:
+                    self.budget.stop(
+                        "Provider call exceeded its deadline; no further spend authorized"
+                    )
+                    raise RunStopped(
+                        "The bounded model invocation timed out"
+                    ) from error
+                except RunStopped:
+                    raise
+                except Exception as error:
+                    raise RunStopped("The bounded model invocation failed") from error
+                model_config["legal_composite_response_id"] = response.id
+                record_llm_response(span, response)
+                if response.usage is not None:
+                    usage = response.usage
+                    self.budget.settle(
+                        reservation, usage.prompt_tokens, usage.completion_tokens
+                    )
+                self.check_active()
+                self.budget.check_response_active(finalizing)
+                return reservation, response
+            except Exception as error:
+                cause = error.__cause__ or error
+                message = str(redact_graph_value(str(cause)))[:512]
+                span.set_error(
+                    {"message": f"{type(cause).__name__}: {message}", "data": None}
+                )
+                raise
+            finally:
+                if executor is not None:
+                    executor.shutdown(wait=False, cancel_futures=True)
 
     def research_invoke(
         self,
@@ -635,14 +650,19 @@ class BudgetedGateway:
         content = response.choice.message.content
         if content is None:
             raise RunStopped("The model returned no structured answer")
+        self.check_active()
+        self.budget.check_response_active(finalizing)
         self.ledger.record_delivery(reservation.call_id, flow.value, records)
         self.last_call_id = reservation.call_id
         self.last_delivered_citations = self.ledger.completely_delivered(
             reservation.call_id
         )
         self.check_active()
-        self.budget.check_active(finalizing)
+        self.budget.check_response_active(finalizing)
         try:
-            return response_type.model_validate_json(content, strict=True)
+            result = response_type.model_validate_json(content, strict=True)
         except ValidationError as error:
             raise RunStopped("The model response failed the workflow schema") from error
+        self.check_active()
+        self.budget.check_response_active(finalizing)
+        return result

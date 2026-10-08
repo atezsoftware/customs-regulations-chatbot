@@ -12,6 +12,7 @@ from onyx.context.search.models import SearchDoc
 from onyx.legal_composite.engine import LegalCompositeEngine, review_assessment
 from onyx.legal_composite.models import (
     AnswerReview,
+    ConditionReview,
     DraftAnswer,
     NeedReview,
     PassageSupport,
@@ -84,7 +85,10 @@ def plan() -> ResearchPlan:
                 need_id="repair",
                 question="Ücretli tamir hesabının şartları nelerdir?",
                 governing_source="Uygulanabilir tamir hükmü",
-                conditions_to_check=["Başka ödeme ve ilişkiden etkilenme"],
+                conditions_to_check=[
+                    "Başka ödeme yapılmaması",
+                    "İlişkiden etkilenmeyen bedel",
+                ],
             ),
             ResearchNeed(
                 need_id="refund",
@@ -118,6 +122,20 @@ def review() -> AnswerReview:
                 status="supported",
                 supports=[PassageSupport(citation=1, quotation=PAID_REPAIR)],
                 conditions_preserved=True,
+                condition_reviews=[
+                    ConditionReview(
+                        condition_index=0,
+                        status="preserved",
+                        answer_excerpt="tamir masrafları dışında başka bir ödeme yapmamış",
+                        support_citations=[1],
+                    ),
+                    ConditionReview(
+                        condition_index=1,
+                        status="preserved",
+                        answer_excerpt="ilişkiden etkilenmemesi gerekir.",
+                        support_citations=[1],
+                    ),
+                ],
                 explanation="Her iki koşul korunmuştur.",
             ),
             NeedReview(
@@ -125,6 +143,14 @@ def review() -> AnswerReview:
                 status="supported",
                 supports=[PassageSupport(citation=2, quotation=REFUND_CLOCK)],
                 conditions_preserved=True,
+                condition_reviews=[
+                    ConditionReview(
+                        condition_index=0,
+                        status="preserved",
+                        answer_excerpt="vergilerin yükümlüye tebliği tarihinden itibaren bir yıl",
+                        support_citations=[2],
+                    )
+                ],
                 explanation="Başlangıç tebliğ tarihidir.",
             ),
         ],
@@ -137,6 +163,220 @@ def test_complete_matching_witnesses_pass_structural_gate(
     plan: ResearchPlan, draft: DraftAnswer, review: AnswerReview, ledger: EvidenceLedger
 ) -> None:
     assert review_assessment(plan, draft, review, ledger, {1, 2}) == (True, True, [])
+
+
+@pytest.mark.parametrize("partial", [False, True])
+def test_whitespace_substring_is_not_a_decisive_original_quotation(
+    plan: ResearchPlan,
+    draft: DraftAnswer,
+    review: AnswerReview,
+    ledger: EvidenceLedger,
+    partial: bool,
+) -> None:
+    need = review.needs[1]
+    need.supports[0].quotation = " "
+    assert " " in REFUND_CLOCK
+    if partial:
+        disclosure = (
+            "Bu süre hükmünün somut olaya uygulanabilirliği henüz doğrulanmadı."
+        )
+        draft.answer += f"\n{disclosure}"
+        draft.unresolved_need_ids = ["refund"]
+        need.status = "unresolved"
+        need.gap_disclosure = disclosure
+        need.condition_reviews[0] = ConditionReview(
+            condition_index=0,
+            status="unresolved",
+            answer_excerpt=disclosure,
+            support_citations=[],
+        )
+    passed, safe, gaps = review_assessment(plan, draft, review, ledger, {1, 2})
+    assert not passed and not safe
+    assert any("quotation does not match" in gap for gap in gaps)
+
+
+def test_genuine_full_source_quote_cannot_hide_an_omitted_answer_qualifier(
+    plan: ResearchPlan, draft: DraftAnswer, review: AnswerReview, ledger: EvidenceLedger
+) -> None:
+    draft.answer = (
+        "İzin hak sahibi tamir masrafları dışında başka bir ödeme yapmamış "
+        f"olmalıdır. [1]\n{REFUND_CLOCK} [2]"
+    )
+    assert review.needs[0].conditions_preserved
+    assert review.needs[0].supports[0].quotation == PAID_REPAIR
+    passed, safe, gaps = review_assessment(plan, draft, review, ledger, {1, 2})
+    assert not passed and not safe
+    assert any("exact answer witness" in gap for gap in gaps)
+
+
+@pytest.mark.parametrize("change", ["missing", "duplicate", "extra", "boolean"])
+def test_every_planned_condition_has_exactly_one_own_index(
+    plan: ResearchPlan,
+    draft: DraftAnswer,
+    review: AnswerReview,
+    ledger: EvidenceLedger,
+    change: str,
+) -> None:
+    conditions = review.needs[0].condition_reviews
+    if change == "missing":
+        conditions.pop()
+    elif change == "duplicate":
+        conditions[1].condition_index = 0
+    elif change == "extra":
+        conditions.append(conditions[0].model_copy(update={"condition_index": 2}))
+    else:
+        conditions[0].condition_index = False
+    passed, safe, gaps = review_assessment(plan, draft, review, ledger, {1, 2})
+    assert not passed and not safe
+    assert any("every planned condition exactly once" in gap for gap in gaps)
+
+
+@pytest.mark.parametrize("excerpt", ["", "  ", "İlişki bedeli etkilemez."])
+def test_condition_witness_must_be_a_nonempty_verbatim_answer_excerpt(
+    plan: ResearchPlan,
+    draft: DraftAnswer,
+    review: AnswerReview,
+    ledger: EvidenceLedger,
+    excerpt: str,
+) -> None:
+    review.needs[0].condition_reviews[1].answer_excerpt = excerpt
+    assert review_assessment(plan, draft, review, ledger, {1, 2})[:2] == (False, False)
+
+
+@pytest.mark.parametrize("references", [[], [2], [1, 1], [3], [True]])
+def test_condition_support_must_bind_its_own_need_and_delivered_citation(
+    plan: ResearchPlan,
+    draft: DraftAnswer,
+    review: AnswerReview,
+    ledger: EvidenceLedger,
+    references: list[int],
+) -> None:
+    review.needs[0].condition_reviews[0].support_citations = references
+    assert review_assessment(plan, draft, review, ledger, {1, 2})[:2] == (False, False)
+
+
+@pytest.mark.parametrize("need_status", ["supported", "conditional"])
+@pytest.mark.parametrize("condition_status", ["missing", "incorrect", "unresolved"])
+def test_supported_need_cannot_override_an_unpreserved_condition(
+    plan: ResearchPlan,
+    draft: DraftAnswer,
+    review: AnswerReview,
+    ledger: EvidenceLedger,
+    need_status: str,
+    condition_status: str,
+) -> None:
+    need = review.needs[0]
+    updated = need.model_dump(mode="json")
+    updated["status"] = need_status
+    condition_rows = updated["condition_reviews"]
+    assert isinstance(condition_rows, list) and isinstance(condition_rows[1], dict)
+    condition_rows[1]["status"] = condition_status
+    review.needs[0] = NeedReview.model_validate(updated)
+    assert review.needs[0].conditions_preserved
+    assert review_assessment(plan, draft, review, ledger, {1, 2})[:2] == (False, False)
+
+
+def test_unresolved_condition_preserves_a_precisely_disclosed_safe_partial(
+    plan: ResearchPlan, draft: DraftAnswer, review: AnswerReview, ledger: EvidenceLedger
+) -> None:
+    disclosure = "Bu süre hükmünün somut olaya uygulanabilirliği henüz doğrulanmadı."
+    draft.answer += f"\n{disclosure}"
+    draft.unresolved_need_ids = ["refund"]
+    need = review.needs[1]
+    need.status = "unresolved"
+    need.gap_disclosure = disclosure
+    need.condition_reviews[0] = ConditionReview(
+        condition_index=0,
+        status="unresolved",
+        answer_excerpt=disclosure,
+        support_citations=[],
+    )
+    passed, safe, gaps = review_assessment(plan, draft, review, ledger, {1, 2})
+    assert not passed and safe and gaps
+
+
+@pytest.mark.parametrize(
+    "change", ["undeclared_need", "unrelated_excerpt", "fake_quote"]
+)
+def test_unresolved_condition_cannot_bypass_declared_gap_or_source_checks(
+    plan: ResearchPlan,
+    draft: DraftAnswer,
+    review: AnswerReview,
+    ledger: EvidenceLedger,
+    change: str,
+) -> None:
+    disclosure = "Bu süre hükmünün somut olaya uygulanabilirliği henüz doğrulanmadı."
+    draft.answer += f"\n{disclosure}"
+    draft.unresolved_need_ids = (
+        ["repair"] if change == "undeclared_need" else ["refund"]
+    )
+    need = review.needs[1]
+    need.status = "unresolved"
+    need.gap_disclosure = disclosure
+    need.condition_reviews[0] = ConditionReview(
+        condition_index=0,
+        status="unresolved",
+        answer_excerpt=REFUND_CLOCK if change == "unrelated_excerpt" else disclosure,
+        support_citations=[],
+    )
+    if change == "fake_quote":
+        need.supports[0].quotation = "Başvuru süresi bulunmamaktadır."
+    assert review_assessment(plan, draft, review, ledger, {1, 2})[:2] == (False, False)
+
+
+def test_legal_plan_with_no_conditions_cannot_pass_vacuously(
+    plan: ResearchPlan, draft: DraftAnswer, review: AnswerReview, ledger: EvidenceLedger
+) -> None:
+    plan.needs[0].conditions_to_check = []
+    review.needs[0].condition_reviews = []
+    assert review_assessment(plan, draft, review, ledger, {1, 2})[:2] == (False, False)
+
+
+def test_source_free_social_condition_needs_no_original_support() -> None:
+    plan = ResearchPlan(
+        language="tr",
+        requires_sources=False,
+        needs=[
+            ResearchNeed(
+                need_id="greeting",
+                question="Kullanıcıya Türkçe selam ver.",
+                governing_source="",
+                conditions_to_check=["Türkçe selamlama"],
+            )
+        ],
+        initial_actions=[],
+        missing_user_facts=[],
+    )
+    draft = DraftAnswer(answer="Merhaba!", unresolved_need_ids=[])
+    review = AnswerReview(
+        request_coverage_complete=True,
+        material_claims_supported=True,
+        counter_authority_checked=True,
+        needs=[
+            NeedReview(
+                need_id="greeting",
+                status="supported",
+                supports=[],
+                conditions_preserved=True,
+                condition_reviews=[
+                    ConditionReview(
+                        condition_index=0,
+                        status="preserved",
+                        answer_excerpt="Merhaba!",
+                        support_citations=[],
+                    )
+                ],
+                explanation="Türkçe selamlama korunmuştur.",
+            )
+        ],
+        defects=[],
+        repair_actions=[],
+    )
+    assert review_assessment(plan, draft, review, EvidenceLedger(), set()) == (
+        True,
+        True,
+        [],
+    )
 
 
 @pytest.mark.parametrize("delivered", [set(), {1}])

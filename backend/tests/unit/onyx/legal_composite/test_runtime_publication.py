@@ -92,8 +92,13 @@ def harness(monkeypatch: pytest.MonkeyPatch) -> RuntimeHarness:
 
     def engine_factory(**kwargs: Any) -> FakeEngine:
         assert kwargs["gateway"] is gateway
+        assert gateway.budget.deadline == kwargs["acquirer"].context.deadline
         assert fork.llm is gateway.research_proxy.return_value
         return FakeEngine(kwargs["ledger"], kwargs["report"])
+
+    def gateway_factory(**kwargs: Any) -> MagicMock:
+        gateway.budget = kwargs["budget"]
+        return gateway
 
     def bind_scope(*, user: User, filters: IndexFilters) -> IndexFilters:
         assert user.id
@@ -126,7 +131,7 @@ def harness(monkeypatch: pytest.MonkeyPatch) -> RuntimeHarness:
     monkeypatch.setattr(
         runtime, "get_session_with_current_tenant", lambda: nullcontext(MagicMock())
     )
-    monkeypatch.setattr(runtime, "BudgetedGateway", lambda **_kwargs: gateway)
+    monkeypatch.setattr(runtime, "BudgetedGateway", gateway_factory)
     monkeypatch.setattr(runtime, "LegalCompositeEngine", engine_factory)
     monkeypatch.setattr(
         runtime, "ensure_trace", lambda *_args, **_kwargs: nullcontext()

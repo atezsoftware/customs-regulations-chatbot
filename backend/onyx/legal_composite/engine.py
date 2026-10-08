@@ -30,6 +30,56 @@ from onyx.tracing.flows import LLMFlow
 ResponseModel = TypeVar("ResponseModel", bound=BaseModel)
 
 
+def _compact_original_catalogue(
+    catalogue: list[dict[str, JsonValue]],
+) -> JsonValue:
+    """Share exact navigation values without changing row identities or metadata."""
+    values: list[JsonValue] = []
+    value_indices: dict[str, int] = {}
+    metadata_pool: list[JsonValue] = []
+    metadata_indices: dict[str, int] = {}
+    rows: list[JsonValue] = []
+
+    def intern(value: JsonValue) -> int:
+        # Serialized keys distinguish bool/int/float, null/empty, and object order.
+        key = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        if key not in value_indices:
+            value_indices[key] = len(values)
+            values.append(json.loads(key))
+        return value_indices[key]
+
+    for row in catalogue:
+        metadata = row["metadata"]
+        assert isinstance(metadata, dict)
+        pooled_metadata: dict[str, JsonValue] = {
+            key: intern(value) for key, value in metadata.items()
+        }
+        signature = json.dumps(pooled_metadata, separators=(",", ":"))
+        if signature not in metadata_indices:
+            metadata_indices[signature] = len(metadata_pool)
+            metadata_pool.append(pooled_metadata)
+        rows.append(
+            [
+                row["citation"],
+                intern(row["source_id"]),
+                row["chunk_id"],
+                metadata_indices[signature],
+            ]
+        )
+    compact: dict[str, JsonValue] = {
+        "codec": "shared_metadata_v1",
+        "row_fields": ["citation", "source_id_ref", "chunk_id", "metadata_ref"],
+        "values": values,
+        "metadata": metadata_pool,
+        "rows": rows,
+    }
+    if len(json.dumps(compact, ensure_ascii=False)) < len(
+        json.dumps(catalogue, ensure_ascii=False)
+    ):
+        return compact
+    return catalogue
+
+
 def source_free_social_request(request: str) -> bool:
     return request.strip().casefold().rstrip(".!?").strip() in {
         "merhaba",
@@ -75,7 +125,8 @@ def review_assessment(
     delivered: set[int],
 ) -> tuple[bool, bool, list[str]]:
     """A semantic review cannot authorize invented IDs, quotes or omitted needs."""
-    expected = {need.need_id for need in plan.needs}
+    planned = {need.need_id: need for need in plan.needs}
+    expected = set(planned)
     reviewed = [need.need_id for need in review.needs]
     gaps = list(review.defects)
     structurally_valid = (
@@ -111,6 +162,74 @@ def review_assessment(
                 )
     complete = not draft.unresolved_need_ids
     for need in review.needs:
+        planned_need = planned.get(need.need_id)
+        if planned_need is None:
+            continue
+        condition_indices = [row.condition_index for row in need.condition_reviews]
+        expected_indices = set(range(len(planned_need.conditions_to_check)))
+        if (
+            any(isinstance(index, bool) for index in condition_indices)
+            or len(condition_indices) != len(set(condition_indices))
+            or set(condition_indices) != expected_indices
+            or (plan.requires_sources and not expected_indices)
+        ):
+            structurally_valid = False
+            gaps.append(
+                f"{need.need_id}: the review does not cover every planned condition exactly once."
+            )
+        support_numbers = {support.citation for support in need.supports}
+        for condition in need.condition_reviews:
+            references = condition.support_citations
+            if (
+                any(isinstance(number, bool) for number in references)
+                or len(references) != len(set(references))
+                or set(references) - support_numbers
+                or set(references) - cited
+                or set(references) - delivered
+            ):
+                structurally_valid = False
+                gaps.append(
+                    f"{need.need_id}: a condition refers to missing or unrelated original support."
+                )
+            excerpt = condition.answer_excerpt
+            if condition.status == "preserved":
+                if (
+                    not excerpt.strip()
+                    or excerpt not in draft.answer
+                    or (plan.requires_sources and not references)
+                ):
+                    structurally_valid = False
+                    gaps.append(
+                        f"{need.need_id}: a preserved condition lacks an exact answer witness and original support."
+                    )
+            elif condition.status == "unresolved":
+                complete = False
+                if (
+                    need.status != "unresolved"
+                    or need.need_id not in draft.unresolved_need_ids
+                    or not excerpt.strip()
+                    or excerpt not in draft.answer
+                    or not need.gap_disclosure
+                    or excerpt not in need.gap_disclosure
+                ):
+                    structurally_valid = False
+                    gaps.append(
+                        f"{need.need_id}: an unresolved condition is not bound to its declared gap."
+                    )
+            else:
+                complete = False
+                structurally_valid = False
+                gaps.append(
+                    f"{need.need_id}: a planned condition is {condition.status}."
+                )
+            if (
+                need.status in {"supported", "conditional"}
+                and condition.status != "preserved"
+            ):
+                structurally_valid = False
+                gaps.append(
+                    f"{need.need_id}: a supported outcome has an unpreserved condition."
+                )
         if need.status in {"unresolved", "incorrect"}:
             complete = False
             gaps.append(f"{need.need_id}: {need.explanation}")
@@ -133,18 +252,19 @@ def review_assessment(
                 gaps.append(
                     f"{need.need_id}: decisive conditions or original support are missing."
                 )
-            for support in need.supports:
-                item = ledger.get(support.citation)
-                if (
-                    item is None
-                    or support.citation not in cited
-                    or support.citation not in delivered
-                    or support.quotation not in item.text
-                ):
-                    structurally_valid = False
-                    gaps.append(
-                        f"{need.need_id}: a decisive quotation does not match its cited original."
-                    )
+        for support in need.supports:
+            item = ledger.get(support.citation)
+            if (
+                item is None
+                or not support.quotation.strip()
+                or support.citation not in cited
+                or support.citation not in delivered
+                or support.quotation not in item.text
+            ):
+                structurally_valid = False
+                gaps.append(
+                    f"{need.need_id}: a decisive quotation does not match its cited original."
+                )
     safe = structurally_valid and review.material_claims_supported
     passed = (
         safe
@@ -229,7 +349,13 @@ class LegalCompositeEngine:
                 for number in self.ledger.citation_numbers()
                 if number not in delivered
             ],
-            "original_catalogue": [
+            "receipts": self.receipts[-8:],
+            "draft": draft.model_dump(mode="json") if draft else None,
+            "defects": gaps or [],
+            "limits": self.policy.model_dump(mode="json"),
+        }
+        if source_phase:
+            catalogue: list[dict[str, JsonValue]] = [
                 {
                     "citation": row["citation"],
                     "source_id": row["source_id"],
@@ -249,16 +375,10 @@ class LegalCompositeEngine:
                 }
                 for row in self.ledger.provision_metadata()
                 if isinstance(metadata := row.get("metadata"), dict)
-            ],
-            "receipts": self.receipts[-8:],
-            "draft": draft.model_dump(mode="json") if draft else None,
-            "defects": gaps or [],
-            "limits": self.policy.model_dump(mode="json"),
-        }
-        if source_phase:
+            ]
+            payload["original_catalogue"] = _compact_original_catalogue(catalogue)
             payload["tools"] = self.acquirer.definitions()
         else:
-            payload.pop("original_catalogue")
             payload["receipts"] = [
                 {
                     key: receipt[key]

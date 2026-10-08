@@ -82,6 +82,45 @@ def test_research_deadline_leaves_finalization_time() -> None:
         budget.request(1, 1, 1, 5, finalizing=True)
 
 
+@pytest.mark.parametrize("finalizing,deadline", [(False, 80), (True, 120)])
+def test_returned_response_uses_exact_deadline_without_admitting_another_call(
+    finalizing: bool, deadline: int
+) -> None:
+    now = [0.0]
+    budget = WorkflowBudget(WorkflowPolicy(), clock=lambda: now[0])
+    budget.configure_finalization(100, 100, 0.0001)
+    now[0] = deadline - 1.6686
+    budget.check_response_active(finalizing)
+    retained = budget.snapshot()
+    with pytest.raises(RunStopped, match="deadline"):
+        budget.request(100, 100, 0.1, 0.5, finalizing)
+    assert budget.snapshot() == retained
+    now[0] = deadline
+    with pytest.raises(RunStopped, match="deadline"):
+        budget.check_response_active(finalizing)
+
+
+def test_returned_response_cannot_ignore_persistent_provider_stop() -> None:
+    budget = WorkflowBudget(WorkflowPolicy(), clock=lambda: 0.0)
+    budget.stop("Provider outcome unknown; no further spend")
+    with pytest.raises(RunStopped, match="Provider outcome unknown"):
+        budget.check_response_active(finalizing=True)
+
+
+def test_delayed_budget_setup_keeps_the_runtime_absolute_deadline() -> None:
+    now = [10.0]
+    budget = WorkflowBudget(WorkflowPolicy(), clock=lambda: now[0], deadline=120.0)
+    budget.configure_finalization(100, 100, 0.0001)
+    assert budget.snapshot()["elapsed_seconds"] == 10
+    assert budget.deadline == 120
+    now[0] = 110
+    call = budget.request(100, 100, 0.1, 0.5, finalizing=True)
+    assert call.timeout_seconds == 10
+    now[0] = 120
+    with pytest.raises(RunStopped, match="deadline"):
+        budget.check_response_active(finalizing=True)
+
+
 def test_longer_writer_window_preserves_total_deadline_and_other_limits() -> None:
     now = [0.0]
     policy = WorkflowPolicy()
