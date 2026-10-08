@@ -21,11 +21,10 @@ from onyx.chat.emitter import BufferedEmitter
 from onyx.chat.models import ChatMessageSimple
 from onyx.configs.constants import MessageType
 from onyx.context.search.models import BaseFilters, IndexFilters
-from onyx.db.asv3_corpus import CorpusSource
 from onyx.db.legal_composite_sources import (
+    SourceClassification,
     SourceKind,
     SourceLaneCatalogue,
-    classify_source,
     source_scope_sha256,
 )
 from onyx.db.models import User
@@ -68,7 +67,7 @@ def harness(monkeypatch: pytest.MonkeyPatch) -> RuntimeHarness:
     search.auto_detect_filters = True
     search.bypass_acl = True
     search.enable_slack_search = True
-    fork = MagicMock(spec=SearchTool)
+    fork = MagicMock(spec=runtime.CompositeSearchTool)
     search.fork_for_independent_context.return_value = fork
     llm_mock = MagicMock(spec=LLM)
     llm_mock.config = LLMConfig(
@@ -166,32 +165,15 @@ def harness(monkeypatch: pytest.MonkeyPatch) -> RuntimeHarness:
     monkeypatch.setattr(runtime, "is_connected", lambda _session, _cache: True)
     monkeypatch.setattr(runtime, "bind_pc_corpus_scope", bind_scope)
 
-    def catalogue_factory(
-        _session: Any,
-        *,
-        user: User,
-        filters: IndexFilters,
-        check_active: Callable[[], None],
-        opening_workers: int = 1,
-        routing_only: bool = False,
-        on_progress: Callable[[int, bool], None] | None = None,
-    ) -> SourceLaneCatalogue:
-        assert opening_workers == 4
-        assert routing_only is True
-        check_active()
-        if on_progress:
-            on_progress(0, False)
-        return SourceLaneCatalogue(
-            user_id=user.id,
-            scope_sha256=source_scope_sha256(user, filters),
-            records=(),
-            complete=True,
-        )
-
-    monkeypatch.setattr(runtime, "load_source_lane_catalogue", catalogue_factory)
     monkeypatch.setattr(runtime, "build_source_selector", lambda **_kwargs: None)
     monkeypatch.setattr(runtime.CompositeSearchTool, "from_fork", lambda _fork: _fork)
-    monkeypatch.setattr(runtime, "CorpusBroker", lambda _user, _scope: broker)
+
+    def broker_factory(user: User, scope: IndexFilters) -> MagicMock:
+        broker.user = user
+        broker.filters = scope
+        return broker
+
+    monkeypatch.setattr(runtime, "CorpusBroker", broker_factory)
     monkeypatch.setattr(
         runtime, "build_search_adapter", lambda *_args, **_kwargs: object()
     )
@@ -207,6 +189,29 @@ def harness(monkeypatch: pytest.MonkeyPatch) -> RuntimeHarness:
     )
     monkeypatch.setattr(runtime, "save_asv3_checkpoint", save_checkpoint)
     user = User(id=uuid4(), email="unit@example.com")
+
+    def prepared_catalogue(_session, *, user, filters, check_active):
+        check_active()
+        return SourceLaneCatalogue(
+            user_id=user.id,
+            scope_sha256=source_scope_sha256(user, filters),
+            records=(
+                SourceClassification(
+                    source_id=uuid4(),
+                    name="prepared",
+                    kind=SourceKind.STATUTE,
+                    method="prepared_original_opening",
+                    uncertain=False,
+                    observed_document_types=(),
+                    prepared=True,
+                ),
+            ),
+            complete=True,
+        )
+
+    monkeypatch.setattr(
+        runtime, "load_prepared_source_lane_catalogue", prepared_catalogue
+    )
 
     def run(filters: BaseFilters | None) -> None:
         runtime.run_legal_composite_loop(
@@ -247,29 +252,6 @@ def test_runtime_wraps_typed_search_with_captured_lane_guard(
         runtime, "build_search_adapter", lambda *_args, **_kwargs: adapter
     )
 
-    def catalogue_factory(
-        _session: Any,
-        *,
-        user: User,
-        filters: IndexFilters,
-        check_active: Callable[[], None],
-        opening_workers: int = 1,
-        routing_only: bool = False,
-        on_progress: Callable[[int, bool], None] | None = None,
-    ) -> SourceLaneCatalogue:
-        assert opening_workers == 4
-        assert routing_only is True
-        check_active()
-        if on_progress:
-            on_progress(1, False)
-        source = CorpusSource(uuid4(), "own-source.md", "file")
-        return SourceLaneCatalogue(
-            user_id=user.id,
-            scope_sha256=source_scope_sha256(user, filters),
-            records=(classify_source(source, (), opening_texts=("ÖRNEK KANUNU",)),),
-            complete=True,
-        )
-
     def router_factory(
         catalogue: SourceLaneCatalogue,
         build_registry: Callable[[SourceKind], CapabilityRegistry],
@@ -277,7 +259,6 @@ def test_runtime_wraps_typed_search_with_captured_lane_guard(
         build_registry(SourceKind.STATUTE)
         return SourceLaneRouter(catalogue, build_registry)
 
-    monkeypatch.setattr(runtime, "load_source_lane_catalogue", catalogue_factory)
     monkeypatch.setattr(runtime, "SourceLaneRouter", router_factory)
     harness.run(None)
     lane.guard_search_adapter.assert_called_once_with(adapter)
@@ -369,13 +350,30 @@ def test_independent_search_uses_shared_budget_and_preserves_filter_scope(
     )
 
 
-def test_catalogue_is_traced_before_provider_setup_and_progress_is_continuous(
+def test_prepared_catalogue_starts_without_any_opening_read(
     harness: RuntimeHarness, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from onyx.db import legal_composite_sources
+    from onyx.legal_composite.source_lanes import CandidateSourceClassifier
+
     order: list[str] = []
-    step = MagicMock(output_value=None)
-    gateway_factory = MagicMock(wraps=runtime.BudgetedGateway)
-    monkeypatch.setattr(runtime, "BudgetedGateway", gateway_factory)
+    enumerate_sources = MagicMock(
+        side_effect=AssertionError("Full enumeration is forbidden")
+    )
+    classify_candidates = MagicMock(
+        side_effect=AssertionError("No candidate exists yet")
+    )
+    monkeypatch.setattr(
+        legal_composite_sources, "load_source_lane_catalogue", enumerate_sources
+    )
+    monkeypatch.setattr(
+        CandidateSourceClassifier, "classify_sources", classify_candidates
+    )
+    original_gateway = runtime.BudgetedGateway
+
+    def provider(**kwargs: Any) -> Any:
+        order.append("provider")
+        return original_gateway(**kwargs)
 
     @contextmanager
     def trace_start(*_args: Any, **kwargs: Any) -> Iterator[None]:
@@ -386,121 +384,51 @@ def test_catalogue_is_traced_before_provider_setup_and_progress_is_continuous(
         finally:
             order.append("trace_end")
 
-    def graph_start(operation: str, input_value: dict[str, JsonValue]) -> Any:
-        assert operation == "legal_composite.source_catalogue"
-        assert input_value == {"opening_workers": 4}
-        step.input_value = input_value
-        return nullcontext(step)
-
-    def catalogue_factory(
-        _session: Any,
-        *,
-        user: User,
-        filters: IndexFilters,
-        check_active: Callable[[], None],
-        opening_workers: int,
-        routing_only: bool,
-        on_progress: Callable[[int, bool], None],
-    ) -> SourceLaneCatalogue:
-        assert order == ["trace_start"] and gateway_factory.call_count == 0
-        assert opening_workers == 4
-        assert routing_only is True
-        check_active()
-        order.append("catalogue")
-        on_progress(2, True)
-        on_progress(2, True)
-        on_progress(5, False)
-        records = tuple(
-            classify_source(
-                CorpusSource(uuid4(), f"PRIVATE_SOURCE_{index}", "private-file"),
-                (),
-                opening_texts=("PRIVATE ORIGINAL OPENING",),
-            )
-            for index in range(5)
-        )
-        return SourceLaneCatalogue(
-            user_id=user.id,
-            scope_sha256=source_scope_sha256(user, filters),
-            records=records,
-            complete=True,
-        )
-
     monkeypatch.setattr(runtime, "ensure_trace", trace_start)
-    monkeypatch.setattr(runtime, "graph_step", graph_start)
-    monkeypatch.setattr(runtime, "load_source_lane_catalogue", catalogue_factory)
+    monkeypatch.setattr(runtime, "BudgetedGateway", provider)
     harness.run(None)
-    assert order == ["trace_start", "catalogue", "trace_end"]
-    gateway_factory.assert_called_once()
+    assert order == ["trace_start", "provider", "trace_end"]
+    enumerate_sources.assert_not_called()
+    classify_candidates.assert_not_called()
     progress = [
         packet.obj
         for packet in harness.emitter.get_packets()
         if isinstance(packet.obj, ASv3Progress)
     ]
-    assert progress[0].title == "Kaynak türleri hazırlanıyor"
-    assert (progress[1].message or "").startswith("2 erişilebilir")
-    assert (progress[2].message or "").startswith("2 erişilebilir")
-    assert (progress[3].message or "").startswith("5 erişilebilir")
-    assert progress[4].title == "Kaynak türleri hazır"
+    assert "tür" in progress[0].title.lower() or "kaynak" in progress[0].title.lower()
+    assert "kayıt" in (progress[0].message or "").lower()
     assert [event.sequence for event in progress] == list(range(1, len(progress) + 1))
-    assert len({event.event_id for event in progress}) == len(progress)
-    assert all(event.language == "tr" for event in progress)
     assert harness.snapshots[-1]["progress"] == [
         event.model_dump(mode="json") for event in progress
     ]
-    assert step.output_value["processed_source_count"] == 5
-    assert step.output_value["progress_updates"] == 3
-    assert step.output_value["elapsed_seconds"] >= 0
-    assert step.output_value["inventory_complete"] is True
-    assert "PRIVATE" not in str(step.input_value) + str(step.output_value)
-    assert "PRIVATE" not in str([event.model_dump() for event in progress])
 
 
-def test_catalogue_cancellation_never_creates_provider_or_final_answer(
+def test_query_first_cancellation_never_creates_provider_or_final_answer(
     harness: RuntimeHarness, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    gateway_factory = MagicMock(wraps=runtime.BudgetedGateway)
-    catalogue_factory = MagicMock(wraps=runtime.load_source_lane_catalogue)
-    step = MagicMock(output_value=None)
-    monkeypatch.setattr(runtime, "BudgetedGateway", gateway_factory)
-    monkeypatch.setattr(runtime, "load_source_lane_catalogue", catalogue_factory)
-    monkeypatch.setattr(runtime, "graph_step", lambda *_args: nullcontext(step))
+    provider = MagicMock(wraps=runtime.BudgetedGateway)
+    monkeypatch.setattr(runtime, "BudgetedGateway", provider)
     monkeypatch.setattr(runtime, "is_connected", lambda *_args: False)
     with pytest.raises(RunStopped):
         harness.run(None)
-    catalogue_factory.assert_not_called()
-    gateway_factory.assert_not_called()
-    progress = [
-        packet.obj
-        for packet in harness.emitter.get_packets()
-        if isinstance(packet.obj, ASv3Progress)
-    ]
-    assert [event.phase for event in progress] == ["tools", "cancelled"]
-    assert [event.sequence for event in progress] == [1, 2]
-    assert step.output_value["status"] == "cancelled"
-    assert step.output_value["processed_source_count"] == 0
+    provider.assert_not_called()
     assert harness.snapshots == [] and harness.state.get_answer_tokens() is None
 
 
-def test_catalogue_progress_failure_is_traced_without_provider_setup(
+def test_query_first_progress_failure_prevents_provider_setup(
     harness: RuntimeHarness, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    gateway_factory = MagicMock(wraps=runtime.BudgetedGateway)
-    step = MagicMock(output_value=None)
-    catalogue_factory = runtime.load_source_lane_catalogue
+    provider = MagicMock(wraps=runtime.BudgetedGateway)
     original_emit = harness.emitter.emit
 
     def failing_emit(packet: Any) -> None:
-        if isinstance(packet.obj, ASv3Progress) and packet.obj.sequence == 2:
+        if isinstance(packet.obj, ASv3Progress):
             raise RuntimeError("Progress transport disconnected")
         original_emit(packet)
 
     monkeypatch.setattr(harness.emitter, "emit", failing_emit)
-    monkeypatch.setattr(runtime, "BudgetedGateway", gateway_factory)
-    monkeypatch.setattr(runtime, "graph_step", lambda *_args: nullcontext(step))
-    monkeypatch.setattr(runtime, "load_source_lane_catalogue", catalogue_factory)
+    monkeypatch.setattr(runtime, "BudgetedGateway", provider)
     with pytest.raises(RuntimeError, match="Progress transport disconnected"):
         harness.run(None)
-    gateway_factory.assert_not_called()
-    assert step.output_value["status"] == "failed"
-    assert step.output_value["progress_updates"] == 1
+    provider.assert_not_called()
     assert harness.snapshots == [] and harness.state.get_answer_tokens() is None

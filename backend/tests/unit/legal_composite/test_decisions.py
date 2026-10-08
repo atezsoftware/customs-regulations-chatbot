@@ -603,3 +603,122 @@ def test_completed_provider_attempt_records_native_payload_and_usage_without_hea
     assert graph.output_value["usage"] == {"input_tokens": 100, "output_tokens": 0}
     assert "test-secret" not in json.dumps(captured)
     assert "headers" not in captured
+
+
+def test_native_choices_keep_background_out_of_operative_roles() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        answers = []
+        for question in body["questions"]:
+            assert question["type"] == "choice"
+            roles = {choice["value"] for choice in question["choices"]}
+            assert roles == {
+                "direct",
+                "condition",
+                "exception",
+                "contrary",
+                "relevant",
+                "background",
+                "irrelevant",
+                "uncertain",
+            }
+            answers.append(
+                {
+                    "name": question["name"],
+                    "type": "choice",
+                    "choice": "background",
+                    "confidence": 1.0,
+                    "probabilities": [
+                        {
+                            "value": role,
+                            "probability": 1.0 if role == "background" else 0.0,
+                        }
+                        for role in roles
+                    ],
+                }
+            )
+        return httpx.Response(
+            200,
+            json={
+                "model": "gpt-6-luna",
+                "answers": answers,
+                "usage": {"input_tokens": 10, "output_tokens": 0},
+            },
+        )
+
+    instance = classifier(handler, operative_roles=True)
+    result = instance.classify(selection_request())
+    assert result.failure is None and result.decision is not None
+    assert result.decision.needs[0].background == [1]
+    assert result.decision.needs[0].relevant == []
+
+
+def test_native_batches_overlap_and_one_failed_batch_does_not_erase_others() -> None:
+    from threading import Barrier, Lock
+
+    from onyx.legal_composite.selection import SourceSelector
+
+    overlap, lock = Barrier(2), Lock()
+    attempts: list[list[int]] = []
+    failed: set[int] = set()
+    candidates = [candidate(index) for index in range(1, 181)]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        ids = [int(key) for key in json.loads(body["input"])["candidates"]]
+        with lock:
+            attempts.append(ids)
+            ordinal = len(attempts)
+        if ordinal <= 2:
+            overlap.wait(timeout=3)
+        if ordinal == 1:
+            failed.update(ids)
+            return httpx.Response(503)
+        return httpx.Response(
+            200,
+            json={
+                "model": "gpt-6-luna",
+                "answers": [
+                    {"name": question["name"], "type": "predicate", "probability": 0.0}
+                    for question in body["questions"]
+                ],
+                "usage": {"input_tokens": 10, "output_tokens": 0},
+            },
+        )
+
+    instance = classifier(
+        handler,
+        candidates=candidates,
+        max_parallel_batches=2,
+        policy=WorkflowPolicy(
+            max_model_calls=32, max_input_tokens=1_000_000, max_cost_usd=10
+        ),
+    )
+    result = SourceSelector(instance).select(selection_request(*candidates))
+    assert len(attempts) >= 2
+    assert failed and set(result.protected_citations) == failed
+    assert set(result.rejected_citations) == set(range(1, 181)) - failed
+    assert not result.selection_complete
+
+
+def test_optional_selection_timeout_keeps_writer_reserve_and_unsettled_charge() -> None:
+    release = Event()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        release.wait(2)
+        return httpx.Response(200, json=response_body(json.loads(request.content)))
+
+    workflow = classifier(
+        handler,
+        policy=WorkflowPolicy(max_call_seconds=0.02),
+        preserve_finalization_on_timeout=True,
+    )
+    try:
+        result = workflow.classify(selection_request())
+        assert result.decision is None
+        snapshot = workflow.budget.snapshot()
+        assert snapshot["stop_reason"] is None
+        assert snapshot["unsettled_calls"] == 1
+        workflow.budget.check_active(finalizing=True)
+    finally:
+        release.set()

@@ -81,6 +81,7 @@ class ResearchStep(StrictModel):
     actions: list[SourceAction]
     ready_to_answer: bool
     remaining_gaps: list[str]
+    related_citations: list[int] = Field(default_factory=list)
 
 
 class DraftAnswer(StrictModel):
@@ -127,9 +128,11 @@ class AuthorityDependency(StrictModel):
     origins: list[DependencyOrigin]
     governing_citations: list[int] = Field(default_factory=list)
     candidate_citations: list[int] = Field(default_factory=list)
+    candidate_source_ids: list[str] = Field(default_factory=list)
     judicial_source_ids: list[str] = Field(default_factory=list)
     incomplete_source_ids: list[str] = Field(default_factory=list)
     discovery_gaps: list[str] = Field(default_factory=list)
+    discovery_limits: list[str] = Field(default_factory=list)
 
 
 class DependencyWitness(PassageSupport):

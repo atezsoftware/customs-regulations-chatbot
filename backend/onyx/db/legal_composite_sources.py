@@ -159,11 +159,13 @@ class SourceClassification(BaseModel):
     original_kind: SourceKind | None = None
     routing_only: bool = False
     opening_witnesses: tuple[SourceOpeningWitness, ...] = ()
+    prepared: bool = False
+    prepared_revision: int | None = None
+    prepared_window: str | None = None
+    preparation_id: UUID | None = None
 
     def admits(self, kind: SourceKind) -> bool:
-        return self.kind == kind or (
-            kind == SourceKind.UNKNOWN and (self.uncertain or self.routing_only)
-        )
+        return self.kind == kind or self.kind == SourceKind.UNKNOWN or self.uncertain
 
 
 class SourceLaneCatalogue(BaseModel):
@@ -202,6 +204,72 @@ def source_scope_sha256(user: User, filters: IndexFilters) -> str:
             body, sort_keys=True, ensure_ascii=False, separators=(",", ":")
         ).encode()
     ).hexdigest()
+
+
+def classify_candidate_sources(
+    session: Session,
+    *,
+    user: User,
+    filters: IndexFilters,
+    source_ids: tuple[UUID, ...],
+    check_active: Callable[[], None],
+) -> dict[UUID, SourceClassification]:
+    """Classify only authorized retrieval candidates; full read proof remains separate."""
+    identifiers = tuple(dict.fromkeys(source_ids))
+    if not identifiers:
+        return {}
+    if len(identifiers) > MAX_OPENING_BATCH_SOURCES:
+        raise ValueError("Candidate opening batches cannot exceed 100 sources.")
+    check_active()
+    sources, more = find_source_inventory_page(
+        session,
+        user=user,
+        filters=filters,
+        source_ids=identifiers,
+        limit=MAX_OPENING_BATCH_SOURCES,
+    )
+    if more:
+        raise CorpusScopeUnavailable("Candidate authorization page was incomplete.")
+    authorized = tuple(source.id for source in sources)
+    if not authorized:
+        return {}
+    try:
+        openings = _routing_opening_batch(session, authorized, filters, check_active)
+    except CorpusScopeUnavailable:
+        # Authorization is rechecked below before an unavailable identity becomes UNKNOWN.
+        openings = {}
+    current, more = find_source_inventory_page(
+        session,
+        user=user,
+        filters=filters,
+        source_ids=identifiers,
+        limit=MAX_OPENING_BATCH_SOURCES,
+    )
+    if more:
+        raise CorpusScopeUnavailable("Candidate authorization recheck was incomplete.")
+    current_by_id = {source.id: source for source in current}
+    check_active()
+    records: dict[UUID, SourceClassification] = {}
+    for source in sources:
+        if current_by_id.get(source.id) != source:
+            continue
+        opening = openings.get(source.id)
+        record = classify_source(
+            source,
+            (),
+            metadata_complete=False,
+            opening_texts=opening.texts
+            if opening and opening.identity_available
+            else (),
+        )
+        records[source.id] = record.model_copy(
+            update={
+                "routing_only": True,
+                "opening_witnesses": opening.witnesses if opening else (),
+                "method": "candidate_" + record.method,
+            }
+        )
+    return records
 
 
 def _fold(value: str) -> str:

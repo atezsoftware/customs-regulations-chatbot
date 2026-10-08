@@ -9,6 +9,7 @@ from pydantic import BaseModel, JsonValue
 from onyx.asv3.citation_numbers import extract_citation_numbers
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.models import RunStopped
+from onyx.db.legal_composite_sources import SourceKind
 from onyx.legal_composite.acquisition import InvalidSourceAction
 from onyx.legal_composite.dependencies import (
     DependencyExpander,
@@ -347,6 +348,7 @@ class LegalCompositeEngine:
         report: Callable[[str, str], None] = lambda _phase, _language: None,
         selector: SourceSelector | None = None,
         dependency_expander: DependencyExpander | None = None,
+        source_kinds: dict[str, SourceKind] | None = None,
     ) -> None:
         self.gateway = gateway
         self.acquirer = acquirer
@@ -357,6 +359,7 @@ class LegalCompositeEngine:
         self.report = report
         self.selector = selector
         self.dependency_expander = dependency_expander
+        self.source_kinds = dict(source_kinds or {})
         self.dependencies: list[AuthorityDependency] = []
         self.selection: SourceSelectionResult | None = None
         self.plan: ResearchPlan | None = None
@@ -423,6 +426,14 @@ class LegalCompositeEngine:
             )
         )
         assert isinstance(records, list)
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            source_id = record.get("source_id")
+            if isinstance(source_id, str):
+                record["source_kind"] = self.source_kinds.get(
+                    source_id, SourceKind.UNKNOWN
+                ).value
         delivered = {
             int(record["citation"])
             for record in records
@@ -541,29 +552,7 @@ class LegalCompositeEngine:
                 budget.begin_selection()
             self.report("selection", plan.language)
             selection_request = selection_request_from_ledger(
-                request, plan, self.ledger
-            )
-            lane_kinds = {
-                number: kind
-                for receipt in self.receipts
-                if isinstance(kind := receipt.get("source_kind"), str)
-                if isinstance(receipt_citations := receipt.get("citations"), list)
-                for number in receipt_citations
-                if isinstance(number, int)
-            }
-            selection_request = selection_request.model_copy(
-                update={
-                    "candidates": [
-                        candidate.model_copy(
-                            update={
-                                "source_kind": lane_kinds.get(
-                                    candidate.citation, "unknown"
-                                )
-                            }
-                        )
-                        for candidate in selection_request.candidates
-                    ]
-                }
+                request, plan, self.ledger, source_kinds=self.source_kinds
             )
             if numbers is not None:
                 selection_request = selection_request.model_copy(
@@ -575,6 +564,8 @@ class LegalCompositeEngine:
                         ]
                     }
                 )
+            if not selection_request.candidates:
+                return
             selected = self.selector.select(selection_request)
             if self.selection is None or numbers is None:
                 self.selection = selected
@@ -602,25 +593,29 @@ class LegalCompositeEngine:
                     }
                 )
 
-    def _refresh_dependencies(self, request: str, plan: ResearchPlan) -> None:
+    def _refresh_dependencies(
+        self, request: str, plan: ResearchPlan, targets: list[int] | None = None
+    ) -> None:
         if self.dependency_expander is not None and plan.requires_sources:
+            if not targets:
+                self.dependencies = self.dependency_expander.synchronize()
+                return
             before = set(self.ledger.citation_numbers())
-            frontier = None
-            need_bindings = None
-            if self.selection is not None:
-                classified = {row.citation for row in self.selection.identities}
-                frontier = set(self.selection.protected_citations) | (
-                    before - classified
+            frontier = set(targets)
+            delivered = getattr(self.gateway, "last_delivered_citations", before)
+            if not frontier <= before or not frontier <= delivered:
+                raise InvalidSourceAction(
+                    "Related-source target was not a delivered original"
                 )
-                need_bindings = {}
+            need_bindings: dict[int, set[str]] = {}
+            if self.selection is not None:
                 for row in self.selection.receipts:
-                    if set(row.roles) & {
+                    if row.citation in frontier and set(row.roles) & {
                         "relevant",
                         "direct",
                         "condition",
                         "exception",
                         "contrary",
-                        "uncertain",
                     }:
                         need_bindings.setdefault(row.citation, set()).add(row.need_id)
             self.report("tools", plan.language)
@@ -649,6 +644,7 @@ class LegalCompositeEngine:
         self.report("tools", plan.language)
         initial_actions = initial_discovery_actions(plan, request)
         source_phase_open = not initial_actions or self._acquire(initial_actions, plan)
+        self._select_sources(request, plan)
         for _round in range(self.policy.max_research_rounds):
             if (
                 not source_phase_open
@@ -666,10 +662,15 @@ class LegalCompositeEngine:
             except RunStopped:
                 self.check_active()
                 break
-            if step.ready_to_answer or not step.actions:
+            if not step.actions and not step.related_citations:
                 break
-            source_phase_open = self._acquire(step.actions, plan)
-        self._select_sources(request, plan)
+            self._refresh_dependencies(request, plan, step.related_citations)
+            before = set(self.ledger.citation_numbers())
+            source_phase_open = not step.actions or self._acquire(step.actions, plan)
+            added = set(self.ledger.citation_numbers()) - before
+            if added:
+                self._select_sources(request, plan, added)
+            self._refresh_dependencies(request, plan)
         self._refresh_dependencies(request, plan)
         self.report("final", plan.language)
         gaps: list[str] = []

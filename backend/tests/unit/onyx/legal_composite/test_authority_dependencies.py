@@ -73,7 +73,12 @@ def chunk(
 
 
 def setup_expander(
-    *, name="Faaliyet Kanunu", number="8917", article="27", numberless=False
+    *,
+    name="Faaliyet Kanunu",
+    number="8917",
+    article="27",
+    numberless=False,
+    full_context=True,
 ):
     law = CorpusSource(uuid4(), f"{number} sayılı {name}.md", "law")
     lower = CorpusSource(uuid4(), "Faaliyet Tebliği.md", "lower")
@@ -119,7 +124,7 @@ def setup_expander(
     broker.chunk.return_value = (law, law_chunk)
     broker.related_catalog_sources.return_value = ([court], False)
     calls: list[tuple[str, dict[str, JsonValue]]] = []
-    overlap = Barrier(2)
+    overlap = Barrier(1 if numberless else 2)
 
     def resolve(args, _context):
         calls.append(("resolve_source", dict(args)))
@@ -142,12 +147,15 @@ def setup_expander(
 
     def search(args, _context):
         calls.append(("search_corpus", dict(args)))
-        # Each pair of explicitly targeted lanes must overlap; no 12-lane expansion.
+        # Independent identity variants overlap in the host search, without a court-kind gate.
         overlap.wait(timeout=3)
         return ToolOutcome(
             status=OutcomeStatus.FOUND,
             summary="Candidate body, not holding.",
-            evidence=[evidence_for_chunk(court, court_chunks[1])],
+            evidence=[
+                evidence_for_chunk(court, row)
+                for row in (court_chunks if full_context else court_chunks[1:2])
+            ],
         )
 
     def read_range(args, _context):
@@ -166,7 +174,13 @@ def setup_expander(
             name=name, description=name, parameters={"type": "object"}, handler=handler
         )
 
-    host = CapabilityRegistry([spec("resolve_source", resolve)])
+    host = CapabilityRegistry(
+        [
+            spec("resolve_source", resolve),
+            spec("search_corpus", search),
+            spec("read_provision", provision),
+        ]
+    )
     typed = CapabilityRegistry(
         [
             spec("read_provision", provision),
@@ -196,13 +210,13 @@ def setup_expander(
         source_kinds={
             str(law.id): SourceKind.STATUTE,
             str(lower.id): SourceKind.COMMUNIQUE,
-            str(court.id): SourceKind.UNKNOWN,
+            str(court.id): SourceKind.JUDICIAL_DECISION,
         },
     )
     return expander, ledger, calls, broker, court, law, expand
 
 
-def test_literal_reference_reads_own_law_and_cross_kind_full_court_with_shared_dedup() -> (
+def test_reference_search_reuses_original_hits_without_whole_candidate_file_reads() -> (
     None
 ):
     expander, ledger, calls, broker, court, law, expand = setup_expander()
@@ -214,27 +228,19 @@ def test_literal_reference_reads_own_law_and_cross_kind_full_court_with_shared_d
     assert edge.governing_citations and len(edge.candidate_citations) == 4
     assert edge.judicial_source_ids == [str(court.id)]
     assert not edge.incomplete_source_ids and not edge.discovery_gaps
-    assert [args["start"] for name, args in calls if name == "read_source_range"] == [
-        0,
-        2,
-    ]
+    assert not any(name == "read_source_range" for name, _args in calls)
     assert sum(name == "read_provision" for name, _args in calls) == 1
-    assert sum(name == "search_corpus" for name, _args in calls) == 4
+    assert sum(name == "search_corpus" for name, _args in calls) == 2
     assert any(
-        args["query"] == "8917 sayılı Kanun 27"
-        for name, args in calls
-        if name == "search_corpus"
+        args["query"] == "8917 27" for name, args in calls if name == "search_corpus"
     )
     for citation in edge.candidate_citations + edge.governing_citations:
         assert set(ledger.get(citation).question_ids) == {"permit", "scope"}
     broker.related_catalog_sources.assert_called_once()
-    assert broker.related_catalog_sources.call_args.args[0] == (
-        "Faaliyet Kanunu 27",
-        "8917 sayılı Kanun 27",
-    )
-    assert len(calls) == 9
+    broker.chunk.assert_not_called()
+    assert len(calls) == 4
     expander.expand(plan(), frontier={origin.citation for origin in edge.origins})
-    assert len(calls) == 9
+    assert len(calls) == 4
     expand.assert_not_called()
     protected = dependency_required_citations(edges, ledger)
     assert set(edge.governing_citations) <= set(protected)
@@ -631,8 +637,35 @@ def test_numberless_lower_reference_resolves_numbered_own_original_then_cross_ki
     assert edge.judicial_source_ids == [str(court.id)]
     assert len(edge.candidate_citations) == 4
     assert not edge.discovery_gaps and not edge.incomplete_source_ids
-    assert broker.related_catalog_sources.call_args.args[0] == (
-        "Gümrük Kanunu 241",
-        "4458 sayılı Kanun 241",
+    broker.related_catalog_sources.assert_called_once()
+    assert any(
+        args.get("query") == "Gümrük Kanunu 241"
+        for name, args in calls
+        if name == "search_corpus"
     )
     assert sum(name == "read_provision" for name, _args in calls) == 1
+
+
+def test_search_argument_is_not_enough_but_only_targeted_context_is_read() -> None:
+    expander, ledger, calls, _broker, court, _law, _expand = setup_expander(
+        full_context=False
+    )
+    edge = expander.expand(plan())[0]
+    assert len(edge.candidate_citations) == 1
+    assert not any(name == "read_source_range" for name, _ in calls)
+    assert "iddiaları" in ledger.get(edge.candidate_citations[0]).text
+    # A known missing disposition is read directly; the preceding file is never paged.
+    expander.acquirer.acquire_host_actions(
+        [
+            SourceAction(
+                need_ids=edge.need_ids,
+                tool="read_source_range",
+                source_kind=SourceKind.JUDICIAL_DECISION,
+                arguments={"source_id": str(court.id), "start": 2, "limit": 2},
+            )
+        ],
+        plan(),
+    )
+    expander.synchronize()
+    assert [args["start"] for name, args in calls if name == "read_source_range"] == [2]
+    assert any("HÜKÜM" in ledger.get(n).text for n in edge.candidate_citations)
