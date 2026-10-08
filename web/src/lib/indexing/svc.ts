@@ -132,7 +132,7 @@ export async function fetchOpenRouterEmbeddingModels(
   return (await response.json()) as OpenRouterEmbeddingModelResponse[];
 }
 
-/** Reads the secret-free persisted OpenRouter reranker configuration. */
+/** Reads the secret-free persisted reranker configuration. */
 export async function getRerankingConfig(): Promise<RerankingConfigView> {
   const response = await fetch(SWR_KEYS.rerankingConfig);
   if (!response.ok) {
@@ -190,7 +190,7 @@ export async function deleteRerankingConfig(): Promise<void> {
   }
 }
 
-/** Tests persisted or unsaved OpenRouter credentials without storing overrides. */
+/** Tests persisted or unsaved reranker credentials without storing overrides. */
 export async function testRerankingConfig(
   request: RerankingTestRequest
 ): Promise<RerankingTestResponse> {

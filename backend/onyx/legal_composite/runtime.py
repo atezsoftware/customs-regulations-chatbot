@@ -43,6 +43,7 @@ from onyx.error_handling.error_codes import OnyxErrorCode
 from onyx.error_handling.exceptions import OnyxError
 from onyx.legal_composite.acquisition import CanonicalAcquirer
 from onyx.legal_composite.budget import WorkflowBudget
+from onyx.legal_composite.cancellation import PollingCancellation
 from onyx.legal_composite.dependencies import DependencyExpander
 from onyx.legal_composite.engine import LegalCompositeEngine
 from onyx.legal_composite.gateway import BudgetedGateway
@@ -200,6 +201,7 @@ def _run_legal_composite_loop(
     def cancelled() -> bool:
         return not is_connected(chat_session_id, cache)
 
+    cancellation_probe = PollingCancellation(cancelled)
     context = RunContext(
         language="und",
         timeout_seconds=policy.timeout_seconds,
@@ -214,7 +216,7 @@ def _run_legal_composite_loop(
             max_inflight_models=1,
             final_decision_reserve=2,
         ),
-        cancelled=cancelled,
+        cancelled=cancellation_probe,
         corpus_only=True,
     )
     question = next(
@@ -267,6 +269,7 @@ def _run_legal_composite_loop(
     search = next((tool for tool in tools if isinstance(tool, SearchTool)), None)
     if search is not None:
         search = CompositeSearchTool.from_fork(search.fork_for_independent_context())
+        search.enable_shared_prepared_work()
         search.auto_detect_filters = False
         search.enable_slack_search = False
         search.bypass_acl = False
@@ -479,7 +482,7 @@ def _run_legal_composite_loop(
         )
         progress.report(
             "tools",
-            status="running" if pending else "completed",
+            status="running",
             active_workers=min(pending, policy.max_parallel_tools),
             completed_workers=completed,
             title=title,
@@ -547,6 +550,7 @@ def _run_legal_composite_loop(
             "searches": acquirer.search_calls,
             **context.budget.snapshot(),
         },
+        "cancellation_observations": cancellation_probe.snapshot(),
         "processing_seconds": time.monotonic() - started,
         "progress": emitted,
     }
@@ -628,6 +632,7 @@ def _run_legal_composite_loop(
     snapshot.update(
         sequence=2, progress=emitted, processing_seconds=time.monotonic() - started
     )
+    snapshot["cancellation_observations"] = cancellation_probe.snapshot()
     save_asv3_checkpoint(
         message_id=assistant_message_id, user_id=user.id, snapshot=snapshot
     )

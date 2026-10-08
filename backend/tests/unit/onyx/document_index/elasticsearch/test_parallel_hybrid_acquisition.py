@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import copy
 import json
+from collections.abc import Iterator
+from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
 from threading import Barrier, Event
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -178,3 +182,97 @@ def test_nested_binding_restores_the_outer_scope() -> None:
         assert parallel_retrieval_enabled()
     assert calls == ["outer", "inner"]
     assert not parallel_retrieval_enabled()
+
+
+@pytest.mark.parametrize("parallel", [False, True])
+@pytest.mark.parametrize("native_response", [False, True])
+def test_transport_timing_is_scoped_and_preserves_raw_receipts(
+    monkeypatch: pytest.MonkeyPatch, parallel: bool, native_response: bool
+) -> None:
+    @dataclass
+    class Step:
+        operation: str
+        input_value: Any
+        output_value: Any = None
+        summary: str | None = None
+        node_id: str | None = None
+
+    captured: list[Step] = []
+
+    @contextmanager
+    def capture(operation: str, input_value: Any) -> Iterator[Step]:
+        step = Step(operation, input_value)
+        captured.append(step)
+        yield step
+
+    monkeypatch.setattr("onyx.tracing.answer_graph.graph_step", capture)
+    monkeypatch.setattr(
+        "onyx.document_index.elasticsearch.client.time.perf_counter", lambda: 10.0
+    )
+    selected, physical = client()
+    selected_body = body("minmax")
+    original_body = copy.deepcopy(selected_body)
+
+    def acquire(**kwargs: Any) -> Any:
+        raw = response("knn" in kwargs)
+        raw["additional_provider_field"] = {"opaque": "preserved"}
+        return (
+            SimpleNamespace(body=raw, meta=SimpleNamespace(duration=0.125))
+            if native_response
+            else raw
+        )
+
+    physical.search.side_effect = acquire
+    with (
+        experimental_parallel_retrieval(check_active=lambda: None)
+        if parallel
+        else nullcontext()
+    ):
+        result = selected._search_hybrid_fusion(selected_body)
+
+    assert result["took"] == 32
+    assert selected_body == original_body
+    queries = [step for step in captured if step.operation != "search.fusion"]
+    assert len(queries) == 2
+    for step in queries:
+        assert step.output_value["additional_provider_field"] == {"opaque": "preserved"}
+        assert len(step.output_value["hits"]["hits"]) == 3
+        assert step.input_value["body"]["size"] == 9
+        assert step.input_value["body"]["_source"] == selected_body["_source"]
+        if not parallel:
+            assert step.summary is None
+            continue
+        assert step.summary is not None and len(step.summary) <= 160
+        assert "search_call_seconds=0" in step.summary
+        assert "server_took_ms=" in step.summary
+        assert ("native_http_seconds=0.125" in step.summary) is native_response
+        assert "authorized-user" not in step.summary
+        assert "operative condition" not in step.summary
+
+
+@pytest.mark.parametrize("duration", [None, True, -1, float("nan"), float("inf")])
+def test_unavailable_native_duration_does_not_fail_parallel_search(
+    monkeypatch: pytest.MonkeyPatch, duration: Any
+) -> None:
+    captured: list[Any] = []
+
+    @contextmanager
+    def capture(operation: str, _input_value: Any) -> Iterator[Any]:
+        step = SimpleNamespace(
+            operation=operation, node_id=None, summary=None, output_value=None
+        )
+        captured.append(step)
+        yield step
+
+    monkeypatch.setattr("onyx.tracing.answer_graph.graph_step", capture)
+    selected, physical = client()
+    physical.search.side_effect = lambda **kwargs: SimpleNamespace(
+        body=response("knn" in kwargs), meta=SimpleNamespace(duration=duration)
+    )
+    with experimental_parallel_retrieval(check_active=lambda: None):
+        result = selected._search_hybrid_fusion(body("minmax"))
+    assert result["took"] == 32
+    for step in captured:
+        if step.operation != "search.fusion":
+            assert step.summary is not None
+            assert "native_http_seconds" not in step.summary

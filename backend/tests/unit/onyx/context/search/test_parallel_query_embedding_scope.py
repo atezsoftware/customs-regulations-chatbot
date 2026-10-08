@@ -12,9 +12,13 @@ from onyx.context.search.retrieval import search_runner
 from onyx.context.search.retrieval.query_embedding_scope import (
     ParallelQueryEmbeddingScope,
     current_parallel_query_embedding_scope,
+    embedding_model_key,
     experimental_parallel_query_embeddings,
 )
+from onyx.natural_language_processing import search_nlp_models
+from onyx.natural_language_processing.search_nlp_models import EmbeddingModel
 from onyx.utils.threadpool_concurrency import run_functions_tuples_in_parallel
+from shared_configs.enums import EmbeddingProvider
 from shared_configs.model_server_models import Embedding
 
 
@@ -42,10 +46,11 @@ def scoped_embedding(
     query: str,
     scope: ParallelQueryEmbeddingScope,
     check_active: Callable[[], None] = no_cancellation,
+    embedding_model: EmbeddingModel | None = None,
 ) -> Embedding | None:
     with experimental_parallel_query_embeddings(scope, check_active=check_active):
         return search_runner._get_regulatory_query_embedding(
-            request(query), db_session=None, embedding_model=None
+            request(query), db_session=None, embedding_model=embedding_model
         )
 
 
@@ -359,3 +364,229 @@ def test_nested_explicit_scopes_restore_binding_and_clear_on_exception() -> None
                 raise ValueError("leave inner")
         assert current_parallel_query_embedding_scope() is outer_binding
     assert current_parallel_query_embedding_scope() is None
+
+
+@pytest.fixture
+def embedding_model(monkeypatch: MonkeyPatch) -> EmbeddingModel:
+    monkeypatch.setattr(
+        search_nlp_models, "get_tokenizer", lambda **_kwargs: MagicMock()
+    )
+    return EmbeddingModel(
+        server_host="unit-model-server",
+        server_port=9000,
+        model_name="text-embedding-3-small",
+        normalize=True,
+        query_prefix=None,
+        passage_prefix=None,
+        api_key="unit-private-credential",
+        api_url="https://unit-provider.invalid",
+        provider_type=EmbeddingProvider.OPENAI,
+        reduced_dimension=3,
+        search_settings_id=17,
+    )
+
+
+def test_cached_scope_coalesces_24_lanes_into_two_exact_embeddings(
+    monkeypatch: MonkeyPatch, embedding_model: EmbeddingModel
+) -> None:
+    scope = ParallelQueryEmbeddingScope(cache_queries=True)
+    start = threading.Barrier(24)
+    owners = threading.Barrier(2)
+    calls: list[str] = []
+    lock = threading.Lock()
+
+    def embed(query: str, **_kwargs: object) -> Embedding:
+        with lock:
+            calls.append(query)
+        owners.wait(timeout=5)
+        return [float(query), 2.0, 3.0]
+
+    def lane(index: int) -> Embedding | None:
+        start.wait(timeout=5)
+        return scoped_embedding(str(index % 2), scope, embedding_model=embedding_model)
+
+    monkeypatch.setattr(search_runner, "get_query_embedding", embed)
+    with ThreadPoolExecutor(max_workers=24) as executor:
+        results = list(executor.map(lane, range(24)))
+    assert sorted(calls) == ["0", "1"]
+    assert results == [[float(index % 2), 2.0, 3.0] for index in range(24)]
+    assert len({id(vector) for vector in results}) == 24
+    assert results[0] is not None
+    results[0][0] = 99.0
+    assert scoped_embedding("0", scope, embedding_model=embedding_model) == [
+        0.0,
+        2.0,
+        3.0,
+    ]
+    assert sorted(calls) == ["0", "1"]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("provider_type", EmbeddingProvider.VOYAGE),
+        ("model_name", "another-encoder"),
+        ("embed_server_endpoint", "https://another-model-server.invalid/embed"),
+        ("api_url", "https://another-provider.invalid"),
+        ("api_version", "different-version"),
+        ("deployment_name", "different-deployment"),
+        ("reduced_dimension", 4),
+        ("normalize", False),
+        ("query_prefix", "query: "),
+        ("passage_prefix", "passage: "),
+        ("retrim_content", True),
+        ("search_settings_id", 18),
+        ("api_key", "different-unit-credential"),
+    ],
+)
+def test_cached_scope_separates_every_encoder_configuration_field(
+    embedding_model: EmbeddingModel, field: str, value: object
+) -> None:
+    scope = ParallelQueryEmbeddingScope(cache_queries=True)
+    execute = MagicMock(side_effect=[[1.0], [2.0]])
+    before = embedding_model_key(embedding_model)
+    assert scope.embed("same query", embedding_model, execute, no_cancellation) == [1.0]
+    setattr(embedding_model, field, value)
+    assert embedding_model_key(embedding_model) != before
+    assert scope.embed("same query", embedding_model, execute, no_cancellation) == [2.0]
+    assert execute.call_count == 2
+
+
+def test_cached_scope_separates_retrimming_tokenizers(
+    embedding_model: EmbeddingModel,
+) -> None:
+    embedding_model.retrim_content = True
+    scope = ParallelQueryEmbeddingScope(cache_queries=True)
+    execute = MagicMock(side_effect=[[1.0], [2.0]])
+    assert scope.embed("same query", embedding_model, execute, no_cancellation) == [1.0]
+    embedding_model.tokenizer = MagicMock()
+    assert scope.embed("same query", embedding_model, execute, no_cancellation) == [2.0]
+
+
+def test_embedding_cache_retains_digest_keys_only_and_keeps_query_text_exact(
+    embedding_model: EmbeddingModel,
+) -> None:
+    scope = ParallelQueryEmbeddingScope(cache_queries=True)
+    execute = MagicMock(return_value=[1.0])
+    for query in ("Private Query", "private query", " Private Query"):
+        assert scope.embed(query, embedding_model, execute, no_cancellation) == [1.0]
+    assert execute.call_count == 3
+    keys = str(scope._embeddings.keys())
+    assert "Private Query" not in keys
+    assert "unit-private-credential" not in keys
+    assert embedding_model_key(embedding_model) != embedding_model.api_key
+
+
+def test_default_scope_and_unknown_encoders_keep_embeddings_uncached(
+    embedding_model: EmbeddingModel,
+) -> None:
+    execute = MagicMock(return_value=[1.0])
+    for scope, model in (
+        (ParallelQueryEmbeddingScope(), embedding_model),
+        (ParallelQueryEmbeddingScope(cache_queries=True), None),
+    ):
+        for _ in range(2):
+            assert scope.embed("same", model, execute, no_cancellation) == [1.0]
+    assert execute.call_count == 4
+
+
+def test_embedding_cache_does_not_cross_request_scopes(
+    embedding_model: EmbeddingModel,
+) -> None:
+    execute = MagicMock(side_effect=[[1.0], [2.0]])
+    scopes = [ParallelQueryEmbeddingScope(cache_queries=True) for _ in range(2)]
+    assert scopes[0].embed("same", embedding_model, execute, no_cancellation) == [1.0]
+    assert scopes[1].embed("same", embedding_model, execute, no_cancellation) == [2.0]
+    assert execute.call_count == 2
+
+
+@pytest.mark.parametrize("error", [RuntimeError("failed"), TimeoutError("failed")])
+def test_failed_embedding_is_evicted_for_a_later_attempt(
+    embedding_model: EmbeddingModel, error: Exception
+) -> None:
+    scope = ParallelQueryEmbeddingScope(cache_queries=True)
+    execute = MagicMock(side_effect=[error, [2.0]])
+    with pytest.raises(type(error), match="failed"):
+        scope.embed("same", embedding_model, execute, no_cancellation)
+    assert scope.embed("same", embedding_model, execute, no_cancellation) == [2.0]
+    assert scope.embed("same", embedding_model, execute, no_cancellation) == [2.0]
+    assert execute.call_count == 2
+
+
+def test_embedding_circuit_none_is_not_cached(embedding_model: EmbeddingModel) -> None:
+    scope = ParallelQueryEmbeddingScope(cache_queries=True)
+    execute = MagicMock(side_effect=[None, [2.0]])
+    assert scope.embed("same", embedding_model, execute, no_cancellation) is None
+    assert scope.embed("same", embedding_model, execute, no_cancellation) == [2.0]
+    assert execute.call_count == 2
+
+
+def test_cache_capacity_bypasses_new_keys_without_dropping_embeddings(
+    embedding_model: EmbeddingModel,
+) -> None:
+    scope = ParallelQueryEmbeddingScope(cache_queries=True, max_cached_queries=1)
+    execute = MagicMock(side_effect=[[1.0], [2.0], [3.0]])
+    assert scope.embed("first", embedding_model, execute, no_cancellation) == [1.0]
+    assert scope.embed("second", embedding_model, execute, no_cancellation) == [2.0]
+    assert scope.embed("second", embedding_model, execute, no_cancellation) == [3.0]
+    assert scope.embed("first", embedding_model, execute, no_cancellation) == [1.0]
+    assert len(scope._embeddings) == 1
+    assert execute.call_count == 3
+
+
+def test_cached_embedding_waiter_cancellation_does_not_cancel_owner(
+    embedding_model: EmbeddingModel,
+) -> None:
+    scope = ParallelQueryEmbeddingScope(cache_queries=True)
+    entered, release, waiting, cancelled = (threading.Event() for _ in range(4))
+    calls = 0
+
+    def execute() -> Embedding:
+        nonlocal calls
+        calls += 1
+        entered.set()
+        assert release.wait(timeout=5)
+        return [1.0]
+
+    checks = 0
+
+    def waiter_check() -> None:
+        nonlocal checks
+        checks += 1
+        if cancelled.is_set():
+            raise RunStopped("cancelled while sharing embedding")
+        if checks >= 3:
+            waiting.set()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        owner = executor.submit(
+            scope.embed, "same", embedding_model, execute, no_cancellation
+        )
+        try:
+            assert entered.wait(timeout=5)
+            waiter = executor.submit(
+                scope.embed, "same", embedding_model, execute, waiter_check
+            )
+            assert waiting.wait(timeout=5)
+            cancelled.set()
+            with pytest.raises(RunStopped, match="cancelled while sharing embedding"):
+                waiter.result(timeout=5)
+        finally:
+            release.set()
+        assert owner.result(timeout=5) == [1.0]
+    assert scope.embed("same", embedding_model, execute, no_cancellation) == [1.0]
+    assert calls == 1
+
+
+def test_encoder_change_during_execution_cannot_reuse_the_old_identity(
+    embedding_model: EmbeddingModel,
+) -> None:
+    scope = ParallelQueryEmbeddingScope(cache_queries=True)
+
+    def execute() -> Embedding:
+        embedding_model.query_prefix = "changed: "
+        return [1.0]
+
+    with pytest.raises(ValueError, match="configuration changed"):
+        scope.embed("same", embedding_model, execute, no_cancellation)
+    assert not scope._embeddings

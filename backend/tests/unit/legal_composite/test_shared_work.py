@@ -70,3 +70,30 @@ def test_failed_reader_does_not_poison_later_requests_or_spin_on_timeout() -> No
         [doc], RunContext(), lambda *_: {pair: [item]}, {doc.document_id: 1}
     )
     assert result[pair][0].identity == item.identity
+
+
+def test_independent_original_sources_are_read_concurrently() -> None:
+    doc, item = sample()
+    other_item = original("Another immutable original.", "other-source")
+    assert other_item.search_doc is not None
+    other_doc = other_item.search_doc.model_copy(
+        update={"document_id": "another-authorized-source"}
+    )
+    other_item = other_item.model_copy(
+        update={"source_id": other_doc.document_id, "search_doc": other_doc}
+    )
+    barrier = Barrier(2)
+
+    def execute(docs: list[SearchDoc], _context: RunContext) -> HydratedCenters:
+        assert len(docs) == 1
+        barrier.wait(timeout=3)
+        selected = item if docs[0].document_id == doc.document_id else other_item
+        return {(docs[0].document_id, docs[0].chunk_ind): [selected]}
+
+    result = SharedCanonicalCenters().read(
+        [doc, other_doc],
+        RunContext(),
+        execute,
+        {doc.document_id: 1, other_doc.document_id: 1},
+    )
+    assert len(result) == 2
