@@ -228,7 +228,7 @@ def test_inventory_pages_only_authorized_sources_and_selects_metadata_without_te
         page_calls.append(cast(int, kwargs["offset"]))
         return ([first], True) if kwargs["offset"] == 0 else ([second], False)
 
-    monkeypatch.setattr(sources, "find_sources", find)
+    monkeypatch.setattr(sources, "find_source_inventory_page", find)
     session = MagicMock()
     session.execute.return_value.all.side_effect = [
         [(first.id, "kanun")],
@@ -237,7 +237,7 @@ def test_inventory_pages_only_authorized_sources_and_selects_metadata_without_te
     catalogue = sources.load_source_lane_catalogue(
         cast(Session, session), user=user, filters=filters, check_active=lambda: None
     )
-    assert page_calls == [0, 100]
+    assert page_calls == [0, 1000]
     assert catalogue.complete and catalogue.source_ids(SourceKind.STATUTE) == (
         first.id,
     )
@@ -261,7 +261,9 @@ def test_partial_inventory_reports_unsearched_sources(
 ) -> None:
     record = CorpusSource(uuid4(), "kanun.md", "file")
     monkeypatch.setattr(
-        sources, "find_sources", lambda *_args, **_kwargs: ([record], True)
+        sources,
+        "find_source_inventory_page",
+        lambda *_args, **_kwargs: ([record], True),
     )
     session = MagicMock()
     session.execute.return_value.all.return_value = [(record.id, "kanun")]
@@ -295,7 +297,9 @@ def test_parallel_opening_reads_overlap_with_owned_sessions_and_tenant_context(
         (source.id, "kanun") for source in source_page
     ]
     monkeypatch.setattr(
-        sources, "find_sources", lambda *_args, **_kwargs: (source_page, False)
+        sources,
+        "find_source_inventory_page",
+        lambda *_args, **_kwargs: (source_page, False),
     )
     sessions: list[MagicMock] = []
     closed: list[MagicMock] = []
@@ -397,7 +401,9 @@ def test_metadata_type_query_uses_the_original_temporal_boundary(
 ) -> None:
     record = CorpusSource(uuid4(), "kanun.md", "file")
     monkeypatch.setattr(
-        sources, "find_sources", lambda *_args, **_kwargs: ([record], False)
+        sources,
+        "find_source_inventory_page",
+        lambda *_args, **_kwargs: ([record], False),
     )
     session = MagicMock()
     session.execute.return_value.all.return_value = [(record.id, "kanun")]

@@ -10,8 +10,14 @@ from onyx.asv3.citation_numbers import extract_citation_numbers
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.models import RunStopped
 from onyx.legal_composite.acquisition import InvalidSourceAction
+from onyx.legal_composite.dependencies import (
+    DependencyExpander,
+    assess_dependencies,
+    dependency_required_citations,
+)
 from onyx.legal_composite.models import (
     AnswerReview,
+    AuthorityDependency,
     DraftAnswer,
     ResearchPlan,
     ResearchStep,
@@ -163,6 +169,7 @@ def review_assessment(
     review: AnswerReview,
     ledger: EvidenceLedger,
     delivered: set[int],
+    dependencies: list[AuthorityDependency] | None = None,
 ) -> tuple[bool, bool, list[str]]:
     """A semantic review cannot authorize invented IDs, quotes or omitted needs."""
     planned = {need.need_id: need for need in plan.needs}
@@ -305,13 +312,18 @@ def review_assessment(
                 gaps.append(
                     f"{need.need_id}: a decisive quotation does not match its cited original."
                 )
-    safe = structurally_valid and review.material_claims_supported
+    dependency_complete, dependency_safe, dependency_gaps = assess_dependencies(
+        dependencies or [], plan, draft, review, ledger, delivered
+    )
+    gaps.extend(dependency_gaps)
+    safe = structurally_valid and review.material_claims_supported and dependency_safe
     passed = (
         safe
         and complete
         and review.request_coverage_complete
         and review.counter_authority_checked
         and not review.defects
+        and dependency_complete
     )
     if not review.request_coverage_complete:
         gaps.append("The full user request has an uncovered outcome or alternative.")
@@ -334,6 +346,7 @@ class LegalCompositeEngine:
         research_available: Callable[[], bool],
         report: Callable[[str, str], None] = lambda _phase, _language: None,
         selector: SourceSelector | None = None,
+        dependency_expander: DependencyExpander | None = None,
     ) -> None:
         self.gateway = gateway
         self.acquirer = acquirer
@@ -343,6 +356,8 @@ class LegalCompositeEngine:
         self.research_available = research_available
         self.report = report
         self.selector = selector
+        self.dependency_expander = dependency_expander
+        self.dependencies: list[AuthorityDependency] = []
         self.selection: SourceSelectionResult | None = None
         self.plan: ResearchPlan | None = None
         self.receipts: list[dict[str, JsonValue]] = []
@@ -367,6 +382,14 @@ class LegalCompositeEngine:
             if isinstance(number, int)
         ]
         required = list(extract_citation_numbers(draft.answer)) if draft else []
+        required = list(
+            dict.fromkeys(
+                [
+                    *required,
+                    *dependency_required_citations(self.dependencies, self.ledger),
+                ]
+            )
+        )
         if self.selection is not None:
             classified = {row.citation for row in self.selection.identities}
             required = list(
@@ -422,6 +445,9 @@ class LegalCompositeEngine:
             "defects": gaps or [],
             "limits": self.policy.model_dump(mode="json"),
             "source_lane_inventory": getattr(self.acquirer, "lane_inventory", {}),
+            "authority_dependencies": [
+                edge.model_dump(mode="json") for edge in self.dependencies
+            ],
         }
         if self.selection is not None:
             payload["source_selection"] = {
@@ -506,6 +532,107 @@ class LegalCompositeEngine:
                 review=self.last_review,
             )
 
+    def _select_sources(
+        self, request: str, plan: ResearchPlan, numbers: set[int] | None = None
+    ) -> None:
+        if self.selector is not None and plan.requires_sources:
+            budget = getattr(self.gateway, "budget", None)
+            if budget is not None:
+                budget.begin_selection()
+            self.report("selection", plan.language)
+            selection_request = selection_request_from_ledger(
+                request, plan, self.ledger
+            )
+            lane_kinds = {
+                number: kind
+                for receipt in self.receipts
+                if isinstance(kind := receipt.get("source_kind"), str)
+                if isinstance(receipt_citations := receipt.get("citations"), list)
+                for number in receipt_citations
+                if isinstance(number, int)
+            }
+            selection_request = selection_request.model_copy(
+                update={
+                    "candidates": [
+                        candidate.model_copy(
+                            update={
+                                "source_kind": lane_kinds.get(
+                                    candidate.citation, "unknown"
+                                )
+                            }
+                        )
+                        for candidate in selection_request.candidates
+                    ]
+                }
+            )
+            if numbers is not None:
+                selection_request = selection_request.model_copy(
+                    update={
+                        "candidates": [
+                            row
+                            for row in selection_request.candidates
+                            if row.citation in numbers
+                        ]
+                    }
+                )
+            selected = self.selector.select(selection_request)
+            if self.selection is None or numbers is None:
+                self.selection = selected
+            else:
+                previous = self.selection
+                self.selection = selected.model_copy(
+                    update={
+                        **{
+                            key: sorted(
+                                set(getattr(previous, key))
+                                | set(getattr(selected, key))
+                            )
+                            for key in (
+                                "protected_citations",
+                                "background_citations",
+                                "rejected_citations",
+                                "retained_citations",
+                            )
+                        },
+                        "identities": [*previous.identities, *selected.identities],
+                        "receipts": [*previous.receipts, *selected.receipts],
+                        "selection_complete": previous.selection_complete
+                        and selected.selection_complete,
+                        "gaps": list(dict.fromkeys(previous.gaps + selected.gaps)),
+                    }
+                )
+
+    def _refresh_dependencies(self, request: str, plan: ResearchPlan) -> None:
+        if self.dependency_expander is not None and plan.requires_sources:
+            before = set(self.ledger.citation_numbers())
+            frontier = None
+            need_bindings = None
+            if self.selection is not None:
+                classified = {row.citation for row in self.selection.identities}
+                frontier = set(self.selection.protected_citations) | (
+                    before - classified
+                )
+                need_bindings = {}
+                for row in self.selection.receipts:
+                    if set(row.roles) & {
+                        "relevant",
+                        "direct",
+                        "condition",
+                        "exception",
+                        "contrary",
+                        "uncertain",
+                    }:
+                        need_bindings.setdefault(row.citation, set()).add(row.need_id)
+            self.report("tools", plan.language)
+            receipt_start = len(self.dependency_expander.receipts)
+            self.dependencies = self.dependency_expander.expand(
+                plan, frontier=frontier, need_bindings=need_bindings
+            )
+            self.receipts.extend(self.dependency_expander.receipts[receipt_start:])
+            added = set(self.ledger.citation_numbers()) - before
+            if added:
+                self._select_sources(request, plan, added)
+
     def _run(
         self, request: str, history: str, instructions: str | None
     ) -> WorkflowResult:
@@ -542,37 +669,8 @@ class LegalCompositeEngine:
             if step.ready_to_answer or not step.actions:
                 break
             source_phase_open = self._acquire(step.actions, plan)
-        if self.selector is not None and plan.requires_sources:
-            budget = getattr(self.gateway, "budget", None)
-            if budget is not None:
-                budget.begin_selection()
-            self.report("selection", plan.language)
-            selection_request = selection_request_from_ledger(
-                request, plan, self.ledger
-            )
-            lane_kinds = {
-                number: kind
-                for receipt in self.receipts
-                if isinstance(kind := receipt.get("source_kind"), str)
-                if isinstance(numbers := receipt.get("citations"), list)
-                for number in numbers
-                if isinstance(number, int)
-            }
-            selection_request = selection_request.model_copy(
-                update={
-                    "candidates": [
-                        candidate.model_copy(
-                            update={
-                                "source_kind": lane_kinds.get(
-                                    candidate.citation, "unknown"
-                                )
-                            }
-                        )
-                        for candidate in selection_request.candidates
-                    ]
-                }
-            )
-            self.selection = self.selector.select(selection_request)
+        self._select_sources(request, plan)
+        self._refresh_dependencies(request, plan)
         self.report("final", plan.language)
         gaps: list[str] = []
         draft: DraftAnswer | None = None
@@ -649,7 +747,7 @@ class LegalCompositeEngine:
             )
             answer_delivered &= actual_delivery
             passed, safe, gaps = review_assessment(
-                plan, draft, review, self.ledger, answer_delivered
+                plan, draft, review, self.ledger, answer_delivered, self.dependencies
             )
             if (
                 self.selection is not None
@@ -685,5 +783,11 @@ class LegalCompositeEngine:
                     review=review,
                 )
             if review.repair_actions and self.research_available():
+                before = set(self.ledger.citation_numbers())
                 self._acquire(review.repair_actions, plan)
+                added = set(self.ledger.citation_numbers()) - before
+                if added:
+                    safe_partial = None
+                    self._select_sources(request, plan, added)
+                self._refresh_dependencies(request, plan)
         raise AssertionError("At least one review is required")

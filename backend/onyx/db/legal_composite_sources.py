@@ -15,15 +15,18 @@ from typing import cast
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, JsonValue
-from sqlalchemy import Integer, func, or_, select, tuple_
+from sqlalchemy import Integer, and_, func, or_, select
 from sqlalchemy import cast as sql_cast
 from sqlalchemy.orm import Session
+from sqlalchemy.sql.selectable import Subquery
 
+from onyx.access.access import get_access_for_user_files, get_acl_for_user
 from onyx.context.search.models import IndexFilters
 from onyx.db.asv3_corpus import (
     CorpusScopeUnavailable,
     CorpusSource,
-    find_sources,
+    _source_statement,
+    _validate_filters,
     read_source_chunks,
     require_source,
     resolve_source_query_index,
@@ -34,8 +37,12 @@ from onyx.db.models import (
     RegulatoryTemporalProjection,
     SearchSettings,
     User,
+    UserFile,
 )
-from onyx.db.regulatory_canonical_revisions import validate_temporal_canonical_revisions
+from onyx.db.regulatory_canonical_revisions import (
+    get_canonical_revisions,
+    validate_temporal_canonical_revisions,
+)
 from onyx.db.regulatory_public_reads import qualified_file_ids
 from onyx.db.search_settings import get_current_search_settings
 from onyx.document_index.encoder_authority import effective_runtime_authority
@@ -49,14 +56,16 @@ from onyx.regulatory.amendments.annexes.context_dependencies import context_hash
 from onyx.regulatory.amendments.annexes.models import AnnexTemporalProjection
 from onyx.regulatory.publication_baseline import observed_index_snapshot
 from onyx.regulatory.publication_reads import (
+    filter_publication_read,
     observe_publication_read,
     require_publication_files,
 )
 from shared_configs.configs import MULTI_TENANT
 
-SOURCE_PAGE_SIZE = 100
+SOURCE_PAGE_SIZE = 1_000
+MAX_OPENING_BATCH_SOURCES = 100
 MAX_SOURCE_INVENTORY = 10_000
-MAX_METADATA_TYPES_PER_PAGE = 1_600
+MAX_METADATA_TYPES_PER_PAGE = 16 * SOURCE_PAGE_SIZE
 MAX_OPENING_CHUNKS = 3
 MAX_OPENING_CHARS = 4_096
 MAX_OPENING_LINES = 12
@@ -77,6 +86,66 @@ class SourceKind(StrEnum):
     UNKNOWN = "unknown"
 
 
+def find_source_inventory_page(
+    session: Session,
+    *,
+    user: User,
+    filters: IndexFilters,
+    source_ids: tuple[UUID, ...] | None = None,
+    offset: int = 0,
+    limit: int = SOURCE_PAGE_SIZE,
+) -> tuple[list[CorpusSource], bool]:
+    """Page authorized inventory using canonical scope, ACL and publication guards."""
+    if (
+        isinstance(limit, bool)
+        or not isinstance(limit, int)
+        or not 1 <= limit <= SOURCE_PAGE_SIZE
+        or offset < 0
+    ):
+        raise ValueError("Inventory pages require offset >= 0 and limit 1..1000.")
+    _validate_filters(session, user, filters)
+    statement = _source_statement(filters)
+    if source_ids is not None:
+        statement = statement.where(UserFile.id.in_(source_ids))
+    records = session.execute(
+        statement.order_by(UserFile.id).offset(offset).limit(limit + 1)
+    ).all()
+    access = get_access_for_user_files([str(row.id) for row in records], session)
+    user_acl = get_acl_for_user(user, session)
+    candidates = [
+        CorpusSource(row.id, row.name, row.file_id)
+        for row in records[:limit]
+        if row.id and str(row.id) in access and access[str(row.id)].to_acl() & user_acl
+    ]
+    retained = filter_publication_read(
+        observe_publication_read(), candidates, lambda row: str(row.id)
+    )
+    return retained, len(records) > limit
+
+
+class SourceOpeningWitness(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    chunk_id: str
+    text_sha256: str
+    binding_id: UUID | None = None
+    index_uuid: str | None = None
+    payload_sha256: str | None = None
+    canonical_revision_id: UUID | None = None
+    revision_sha256: str | None = None
+    canonical_base_sha256: str | None = None
+    effective_start: date | None = None
+    effective_end: date | None = None
+
+
+class RoutingOpening(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    texts: tuple[str, ...] = ()
+    witnesses: tuple[SourceOpeningWitness, ...] = ()
+    identity_available: bool = False
+
+
 class SourceClassification(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -88,9 +157,13 @@ class SourceClassification(BaseModel):
     observed_document_types: tuple[str, ...]
     opening_identity_sha256: str | None = None
     original_kind: SourceKind | None = None
+    routing_only: bool = False
+    opening_witnesses: tuple[SourceOpeningWitness, ...] = ()
 
     def admits(self, kind: SourceKind) -> bool:
-        return self.kind == kind or (kind == SourceKind.UNKNOWN and self.uncertain)
+        return self.kind == kind or (
+            kind == SourceKind.UNKNOWN and (self.uncertain or self.routing_only)
+        )
 
 
 class SourceLaneCatalogue(BaseModel):
@@ -111,6 +184,10 @@ class SourceLaneCatalogue(BaseModel):
             "inventory_complete": self.complete,
             "source_count": len(self.records),
             "uncertain_source_count": sum(row.uncertain for row in self.records),
+            "provisional_routing_source_count": sum(
+                row.routing_only for row in self.records
+            ),
+            "classification_is_full_source_proof": False,
             "limitations": list(self.limitations),
         }
 
@@ -488,67 +565,79 @@ def _opening_query_indexes(
     return result
 
 
+def _ranked_temporal_openings(
+    indexes: dict[UUID, str], filters: IndexFilters
+) -> Subquery:
+    as_of = filters.as_of_date or date.today()
+    sources_by_index: dict[str, list[UUID]] = {}
+    for source_id, index_uuid in indexes.items():
+        sources_by_index.setdefault(index_uuid, []).append(source_id)
+    position = sql_cast(
+        RegulatoryTemporalProjection.payload["semantic_position"].astext, Integer
+    )
+    return (
+        select(
+            RegulatoryTemporalProjection.id.label("id"),
+            func.row_number()
+            .over(
+                partition_by=RegulatoryTemporalProjection.user_file_id,
+                order_by=(
+                    position,
+                    RegulatoryTemporalProjection.projection_ordinal,
+                ),
+            )
+            .label("opening_rank"),
+        )
+        .join(
+            RegulatoryChunk,
+            RegulatoryChunk.id == RegulatoryTemporalProjection.canonical_chunk_id,
+        )
+        .where(
+            or_(
+                *(
+                    and_(
+                        RegulatoryTemporalProjection.index_uuid == index_uuid,
+                        RegulatoryTemporalProjection.user_file_id.in_(source_ids),
+                    )
+                    for index_uuid, source_ids in sources_by_index.items()
+                )
+            ),
+            RegulatoryTemporalProjection.retired_at.is_(None),
+            RegulatoryTemporalProjection.payload["derived_role"].astext == "canonical",
+            position >= 0,
+            or_(
+                RegulatoryTemporalProjection.effective_start.is_(None),
+                RegulatoryTemporalProjection.effective_start <= as_of,
+            ),
+            or_(
+                RegulatoryTemporalProjection.effective_end.is_(None),
+                RegulatoryTemporalProjection.effective_end > as_of,
+            ),
+            or_(
+                RegulatoryChunk.validity_start_date.is_(None),
+                RegulatoryChunk.validity_start_date <= as_of,
+            ),
+            or_(
+                RegulatoryChunk.validity_end_date.is_(None),
+                RegulatoryChunk.validity_end_date > as_of,
+            ),
+        )
+        .subquery()
+    )
+
+
 def _opening_rows(
     session: Session,
     source_ids: tuple[UUID, ...],
     filters: IndexFilters,
     indexes: dict[UUID, PublicationIndexSnapshot],
+    witnesses: dict[UUID, tuple[SourceOpeningWitness, ...]] | None = None,
 ) -> dict[UUID, list[str]]:
     result: dict[UUID, list[str]] = {source_id: [] for source_id in source_ids}
     if indexes:
-        as_of = filters.as_of_date or date.today()
-        position = sql_cast(
-            RegulatoryTemporalProjection.payload["semantic_position"].astext, Integer
-        )
-        ranked = (
-            select(
-                RegulatoryTemporalProjection.id.label("id"),
-                func.row_number()
-                .over(
-                    partition_by=RegulatoryTemporalProjection.user_file_id,
-                    order_by=(
-                        position,
-                        RegulatoryTemporalProjection.projection_ordinal,
-                    ),
-                )
-                .label("opening_rank"),
-            )
-            .join(
-                RegulatoryChunk,
-                RegulatoryChunk.id == RegulatoryTemporalProjection.canonical_chunk_id,
-            )
-            .where(
-                tuple_(
-                    RegulatoryTemporalProjection.user_file_id,
-                    RegulatoryTemporalProjection.index_uuid,
-                ).in_(
-                    [
-                        (source_id, index.index_uuid)
-                        for source_id, index in indexes.items()
-                    ]
-                ),
-                RegulatoryTemporalProjection.retired_at.is_(None),
-                RegulatoryTemporalProjection.payload["derived_role"].astext
-                == "canonical",
-                position >= 0,
-                or_(
-                    RegulatoryTemporalProjection.effective_start.is_(None),
-                    RegulatoryTemporalProjection.effective_start <= as_of,
-                ),
-                or_(
-                    RegulatoryTemporalProjection.effective_end.is_(None),
-                    RegulatoryTemporalProjection.effective_end > as_of,
-                ),
-                or_(
-                    RegulatoryChunk.validity_start_date.is_(None),
-                    RegulatoryChunk.validity_start_date <= as_of,
-                ),
-                or_(
-                    RegulatoryChunk.validity_end_date.is_(None),
-                    RegulatoryChunk.validity_end_date > as_of,
-                ),
-            )
-            .subquery()
+        ranked = _ranked_temporal_openings(
+            {source_id: index.index_uuid for source_id, index in indexes.items()},
+            filters,
         )
         rows = list(
             session.scalars(
@@ -562,6 +651,18 @@ def _opening_rows(
             )
         )
         validate_temporal_canonical_revisions(session, rows)
+        revisions = (
+            get_canonical_revisions(
+                session,
+                [
+                    row.canonical_revision_id
+                    for row in rows
+                    if row.canonical_revision_id
+                ],
+            )
+            if witnesses is not None
+            else {}
+        )
         bindings: dict[UUID, list[AnnexTemporalProjection]] = {}
         for row in rows:
             if publication_digest(row.payload) != row.payload_sha256:
@@ -586,6 +687,34 @@ def _opening_rows(
                     ),
                 )[:MAX_OPENING_CHUNKS]
             ]
+            if witnesses is not None:
+                own_rows = sorted(
+                    (row for row in rows if row.user_file_id == source_id),
+                    key=lambda row: (
+                        int(row.payload["semantic_position"]),
+                        row.projection_ordinal,
+                    ),
+                )
+                # Full payload/revision validation above is the authority gate.
+                witnesses[source_id] = tuple(
+                    SourceOpeningWitness(
+                        chunk_id=row.canonical_chunk_id,
+                        text_sha256=context_hash(
+                            str(row.payload["representation_text"])
+                        ),
+                        binding_id=row.id,
+                        index_uuid=row.index_uuid,
+                        payload_sha256=row.payload_sha256,
+                        canonical_revision_id=row.canonical_revision_id,
+                        revision_sha256=revisions[row.canonical_revision_id].sha256
+                        if row.canonical_revision_id is not None
+                        else None,
+                        canonical_base_sha256=str(row.payload["canonical_base_sha256"]),
+                        effective_start=row.effective_start,
+                        effective_end=row.effective_end,
+                    )
+                    for row in own_rows[:MAX_OPENING_CHUNKS]
+                )
     timeless = tuple(source_id for source_id in source_ids if source_id not in indexes)
     if timeless:
         statement = select(
@@ -631,6 +760,13 @@ def _opening_rows(
         ):
             if len(result[row.user_file_id]) < MAX_OPENING_CHUNKS:
                 result[row.user_file_id].append(row.text)
+                if witnesses is not None:
+                    witnesses[row.user_file_id] = (
+                        *witnesses.get(row.user_file_id, ()),
+                        SourceOpeningWitness(
+                            chunk_id=row.id, text_sha256=context_hash(row.text)
+                        ),
+                    )
     return result
 
 
@@ -673,6 +809,216 @@ def _opening_batch(
     return result
 
 
+def _bounded_opening_texts(texts: list[str]) -> tuple[str, ...]:
+    retained: list[str] = []
+    remaining = MAX_OPENING_CHARS
+    for text in texts[:MAX_OPENING_CHUNKS]:
+        if remaining <= 0:
+            break
+        retained.append(text[:remaining])
+        remaining -= len(retained[-1])
+    return tuple(retained)
+
+
+def _routing_opening_batch(
+    session: Session,
+    source_ids: tuple[UUID, ...],
+    filters: IndexFilters,
+    check_active: Callable[[], None],
+) -> dict[UUID, RoutingOpening]:
+    """Read provisional headings without hydrating search payloads or encoder receipts."""
+    check_active()
+    observation = observe_publication_read()
+    require_publication_files(observation, source_ids)
+    qualified = qualified_file_ids(session, source_ids)
+    result = {source_id: RoutingOpening() for source_id in source_ids}
+    if qualified:
+        name = get_current_search_settings(session).index_name
+        physical: dict[UUID, set[str]] = {}
+        for source_id, index_uuid in session.execute(
+            select(
+                RegulatoryTemporalProjection.user_file_id,
+                RegulatoryTemporalProjection.index_uuid,
+            )
+            .where(
+                RegulatoryTemporalProjection.user_file_id.in_(qualified),
+                RegulatoryTemporalProjection.retired_at.is_(None),
+            )
+            .distinct()
+        ):
+            physical.setdefault(source_id, set()).add(index_uuid)
+        indexes = {
+            source_id: next(iter(values))
+            for source_id, values in physical.items()
+            if len(values) == 1
+        }
+        if indexes:
+            ranked = _ranked_temporal_openings(indexes, filters)
+            rows = list(
+                session.execute(
+                    select(
+                        RegulatoryTemporalProjection.id,
+                        RegulatoryTemporalProjection.user_file_id,
+                        RegulatoryTemporalProjection.canonical_chunk_id,
+                        RegulatoryTemporalProjection.canonical_revision_id,
+                        RegulatoryTemporalProjection.index_uuid,
+                        RegulatoryTemporalProjection.projection_ordinal,
+                        RegulatoryTemporalProjection.payload_sha256,
+                        RegulatoryTemporalProjection.effective_start,
+                        RegulatoryTemporalProjection.effective_end,
+                        RegulatoryTemporalProjection.payload["index"][
+                            "index_name"
+                        ].astext.label("index_name"),
+                        RegulatoryTemporalProjection.payload[
+                            "semantic_position"
+                        ].astext.label("semantic_position"),
+                        RegulatoryTemporalProjection.payload[
+                            "canonical_base_sha256"
+                        ].astext.label("canonical_base_sha256"),
+                        RegulatoryTemporalProjection.payload[
+                            "representation_text"
+                        ].astext.label("representation_text"),
+                    ).where(
+                        RegulatoryTemporalProjection.id.in_(
+                            select(ranked.c.id).where(
+                                ranked.c.opening_rank <= MAX_OPENING_CHUNKS + 1
+                            )
+                        )
+                    )
+                ).all()
+            )
+            try:
+                revisions = get_canonical_revisions(
+                    session,
+                    [
+                        row.canonical_revision_id
+                        for row in rows
+                        if row.canonical_revision_id
+                    ],
+                )
+            except ValueError:
+                revisions = {}
+            for source_id in indexes:
+                check_active()
+                own = sorted(
+                    (row for row in rows if row.user_file_id == source_id),
+                    key=lambda row: (
+                        int(row.semantic_position),
+                        row.projection_ordinal,
+                    ),
+                )
+                if not own or any(
+                    row.index_name != name
+                    or not isinstance(row.representation_text, str)
+                    or not isinstance(row.canonical_base_sha256, str)
+                    for row in own
+                ):
+                    continue
+                witnesses: list[SourceOpeningWitness] = []
+                valid = True
+                for row in own:
+                    revision = revisions.get(row.canonical_revision_id)
+                    if revision is None or (
+                        revision.snapshot.id != row.canonical_chunk_id
+                        or UUID(revision.snapshot.user_file_id) != source_id
+                        or context_hash(revision.snapshot.text)
+                        != row.canonical_base_sha256
+                    ):
+                        valid = False
+                    witnesses.append(
+                        SourceOpeningWitness(
+                            chunk_id=row.canonical_chunk_id,
+                            text_sha256=context_hash(row.representation_text),
+                            binding_id=row.id,
+                            index_uuid=row.index_uuid,
+                            payload_sha256=row.payload_sha256,
+                            canonical_revision_id=row.canonical_revision_id,
+                            revision_sha256=revision.sha256 if revision else None,
+                            canonical_base_sha256=row.canonical_base_sha256,
+                            effective_start=row.effective_start,
+                            effective_end=row.effective_end,
+                        )
+                    )
+                result[source_id] = RoutingOpening(
+                    texts=_bounded_opening_texts(
+                        [row.representation_text for row in own]
+                    ),
+                    witnesses=tuple(witnesses[:MAX_OPENING_CHUNKS]),
+                    identity_available=valid,
+                )
+    timeless = tuple(
+        source_id for source_id in source_ids if source_id not in qualified
+    )
+    if timeless:
+        statement = select(
+            RegulatoryChunk.id.label("id"),
+            func.row_number()
+            .over(
+                partition_by=RegulatoryChunk.user_file_id,
+                order_by=(RegulatoryChunk.position, RegulatoryChunk.id),
+            )
+            .label("opening_rank"),
+        ).where(
+            RegulatoryChunk.user_file_id.in_(timeless),
+            RegulatoryChunk.position >= 0,
+            RegulatoryChunk.chunk_type.is_distinct_from("hierarchical_aggregate"),
+        )
+        if filters.as_of_date is None:
+            statement = statement.where(RegulatoryChunk.status == "active")
+        else:
+            statement = statement.where(
+                or_(
+                    RegulatoryChunk.validity_start_date.is_(None),
+                    RegulatoryChunk.validity_start_date <= filters.as_of_date,
+                ),
+                or_(
+                    RegulatoryChunk.validity_end_date.is_(None),
+                    RegulatoryChunk.validity_end_date > filters.as_of_date,
+                ),
+            )
+        ranked = statement.subquery()
+        texts: dict[UUID, list[str]] = {}
+        witnesses_by_source: dict[UUID, list[SourceOpeningWitness]] = {}
+        for row in session.execute(
+            select(
+                RegulatoryChunk.user_file_id, RegulatoryChunk.id, RegulatoryChunk.text
+            )
+            .where(
+                RegulatoryChunk.id.in_(
+                    select(ranked.c.id).where(
+                        ranked.c.opening_rank <= MAX_OPENING_CHUNKS
+                    )
+                )
+            )
+            .order_by(
+                RegulatoryChunk.user_file_id,
+                RegulatoryChunk.position,
+                RegulatoryChunk.id,
+            )
+        ):
+            texts.setdefault(row.user_file_id, []).append(row.text)
+            witnesses_by_source.setdefault(row.user_file_id, []).append(
+                SourceOpeningWitness(
+                    chunk_id=row.id, text_sha256=context_hash(row.text)
+                )
+            )
+        for source_id, values in texts.items():
+            result[source_id] = RoutingOpening(
+                texts=_bounded_opening_texts(values),
+                witnesses=tuple(witnesses_by_source[source_id]),
+                identity_available=True,
+            )
+    current_qualified = qualified_file_ids(session, source_ids)
+    require_publication_files(observation, source_ids)
+    check_active()
+    return {
+        source_id: value
+        if (source_id in qualified) == (source_id in current_qualified)
+        else RoutingOpening()
+        for source_id, value in result.items()
+    }
+
+
 def _source_openings(
     session: Session,
     source_page: list[CorpusSource],
@@ -682,7 +1028,8 @@ def _source_openings(
     check_active: Callable[[], None],
     opening_workers: int,
     heartbeat: Callable[[], None] | None = None,
-) -> list[tuple[str, ...] | None]:
+    routing_only: bool = False,
+) -> list[tuple[str, ...] | RoutingOpening | None]:
     def read(source: CorpusSource) -> tuple[str, ...] | None:
         try:
             if opening_workers == 1:
@@ -705,12 +1052,12 @@ def _source_openings(
         except CorpusScopeUnavailable:
             return None
 
-    if opening_workers == 1:
+    if opening_workers == 1 and not routing_only:
         return [read(source) for source in source_page]
     if not source_page:
         return []
     identifiers = tuple(source.id for source in source_page)
-    authorized, _ = find_sources(
+    authorized, _ = find_source_inventory_page(
         session,
         user=user,
         filters=filters,
@@ -722,26 +1069,39 @@ def _source_openings(
         source.id for source in authorized if captured.get(source.id) == source
     )
 
-    def read_batch(group: tuple[UUID, ...]) -> dict[UUID, tuple[str, ...] | None]:
+    def read_batch(
+        group: tuple[UUID, ...],
+    ) -> dict[UUID, tuple[str, ...] | RoutingOpening | None]:
         try:
             with get_session_with_current_tenant() as opening_session:
-                return _opening_batch(opening_session, group, filters, check_active)
+                if routing_only:
+                    return dict(
+                        _routing_opening_batch(
+                            opening_session, group, filters, check_active
+                        )
+                    )
+                return dict(
+                    _opening_batch(opening_session, group, filters, check_active)
+                )
         except CorpusScopeUnavailable:
             return {source_id: None for source_id in group}
 
-    width = max(1, (len(admitted) + opening_workers - 1) // opening_workers)
+    width = min(
+        MAX_OPENING_BATCH_SOURCES,
+        max(1, (len(admitted) + opening_workers - 1) // opening_workers),
+    )
     executor = ThreadPoolExecutor(max_workers=opening_workers)
     try:
         futures = [
             cast(
-                Future[dict[UUID, tuple[str, ...] | None]],
+                Future[dict[UUID, tuple[str, ...] | RoutingOpening | None]],
                 executor.submit(
                     copy_context().run, read_batch, admitted[offset : offset + width]
                 ),
             )
             for offset in range(0, len(admitted), width)
         ]
-        result: dict[UUID, tuple[str, ...] | None] = {}
+        result: dict[UUID, tuple[str, ...] | RoutingOpening | None] = {}
         last_heartbeat = time.monotonic()
         for future in futures:
             while True:
@@ -754,7 +1114,7 @@ def _source_openings(
                     break
                 except FutureTimeout:
                     continue
-        current, _ = find_sources(
+        current, _ = find_source_inventory_page(
             session,
             user=user,
             filters=filters,
@@ -781,7 +1141,10 @@ def load_source_lane_catalogue(
     max_sources: int | None = None,
     opening_workers: int = 1,
     on_progress: Callable[[int, bool], None] | None = None,
+    routing_only: bool = False,
 ) -> SourceLaneCatalogue:
+    if not isinstance(routing_only, bool):
+        raise ValueError("Routing-only inventory mode must be boolean")
     if max_sources is not None and (
         not isinstance(max_sources, int)
         or isinstance(max_sources, bool)
@@ -805,7 +1168,7 @@ def load_source_lane_catalogue(
             if max_sources is None
             else min(SOURCE_PAGE_SIZE, max_sources - offset)
         )
-        sources, more = find_sources(
+        sources, more = find_source_inventory_page(
             session, user=user, filters=filters, offset=offset, limit=page_limit
         )
         types, metadata_complete = _document_types(
@@ -826,6 +1189,7 @@ def load_source_lane_catalogue(
             heartbeat=(lambda: on_progress(len(records), True))
             if on_progress
             else None,
+            routing_only=routing_only,
         )
         for source, openings in zip(sources, openings_page, strict=True):
             if openings is None:
@@ -836,14 +1200,27 @@ def load_source_lane_catalogue(
                     limitations.append(
                         "Some original opening identities were unavailable."
                     )
-            records.append(
-                classify_source(
-                    source,
-                    types.get(source.id, ()),
-                    metadata_complete=metadata_complete,
-                    opening_texts=openings or (),
-                )
+            routing = openings if isinstance(openings, RoutingOpening) else None
+            texts = (
+                (routing.texts if routing and routing.identity_available else ())
+                if routing is not None
+                else (openings or ())
             )
+            record = classify_source(
+                source,
+                types.get(source.id, ()),
+                metadata_complete=metadata_complete,
+                opening_texts=cast(tuple[str, ...], texts),
+            )
+            if routing_only:
+                record = record.model_copy(
+                    update={
+                        "routing_only": True,
+                        "opening_witnesses": routing.witnesses if routing else (),
+                        "method": "provisional_" + record.method,
+                    }
+                )
+            records.append(record)
         offset += page_limit
         if on_progress is not None:
             on_progress(len(records), more)
@@ -873,20 +1250,47 @@ def revalidate_source_classification(
     source = require_source(
         session, user=user, filters=filters, source_id=recorded.source_id
     )
-    types, complete = _document_types(session, (source.id,), filters, check_active)
-    current = classify_source(
-        source,
-        types.get(source.id, ()),
-        metadata_complete=complete,
-        opening_texts=_opening_texts(
+    if recorded.routing_only:
+        observation = observe_publication_read()
+        qualified = qualified_file_ids(session, (source.id,))
+        indexes = _opening_query_indexes(session, tuple(qualified))
+        if qualified and source.id not in indexes:
+            raise CorpusScopeUnavailable(
+                "Source has no verified query index authority."
+            )
+        witnesses: dict[UUID, tuple[SourceOpeningWitness, ...]] = {}
+        texts = _opening_rows(
+            session, (source.id,), filters, indexes, witnesses=witnesses
+        ).get(source.id, [])
+        if (
+            recorded.opening_witnesses
+            and witnesses.get(source.id, ()) != recorded.opening_witnesses
+        ) or (recorded.kind != SourceKind.UNKNOWN and not recorded.opening_witnesses):
+            raise CorpusScopeUnavailable(
+                "Source opening witness changed after inventory."
+            )
+        if qualified != qualified_file_ids(session, (source.id,)):
+            raise CorpusScopeUnavailable(
+                "Source qualification changed during validation."
+            )
+        require_publication_files(observation, (source.id,))
+        opening_texts = _bounded_opening_texts(texts)
+    else:
+        opening_texts = _opening_texts(
             session,
             user=user,
             filters=filters,
             source=source,
             check_active=check_active,
-        ),
+        )
+    types, complete = _document_types(session, (source.id,), filters, check_active)
+    current = classify_source(
+        source,
+        types.get(source.id, ()),
+        metadata_complete=complete,
+        opening_texts=opening_texts,
     )
-    if (
+    if not (recorded.routing_only and recorded.kind == SourceKind.UNKNOWN) and (
         current.kind != recorded.kind
         or current.opening_identity_sha256 != recorded.opening_identity_sha256
     ):

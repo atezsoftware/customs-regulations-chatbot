@@ -173,9 +173,11 @@ def harness(monkeypatch: pytest.MonkeyPatch) -> RuntimeHarness:
         filters: IndexFilters,
         check_active: Callable[[], None],
         opening_workers: int = 1,
+        routing_only: bool = False,
         on_progress: Callable[[int, bool], None] | None = None,
     ) -> SourceLaneCatalogue:
         assert opening_workers == 4
+        assert routing_only is True
         check_active()
         if on_progress:
             on_progress(0, False)
@@ -252,9 +254,11 @@ def test_runtime_wraps_typed_search_with_captured_lane_guard(
         filters: IndexFilters,
         check_active: Callable[[], None],
         opening_workers: int = 1,
+        routing_only: bool = False,
         on_progress: Callable[[int, bool], None] | None = None,
     ) -> SourceLaneCatalogue:
         assert opening_workers == 4
+        assert routing_only is True
         check_active()
         if on_progress:
             on_progress(1, False)
@@ -395,10 +399,12 @@ def test_catalogue_is_traced_before_provider_setup_and_progress_is_continuous(
         filters: IndexFilters,
         check_active: Callable[[], None],
         opening_workers: int,
+        routing_only: bool,
         on_progress: Callable[[int, bool], None],
     ) -> SourceLaneCatalogue:
         assert order == ["trace_start"] and gateway_factory.call_count == 0
         assert opening_workers == 4
+        assert routing_only is True
         check_active()
         order.append("catalogue")
         on_progress(2, True)
@@ -430,7 +436,7 @@ def test_catalogue_is_traced_before_provider_setup_and_progress_is_continuous(
         for packet in harness.emitter.get_packets()
         if isinstance(packet.obj, ASv3Progress)
     ]
-    assert progress[0].title == "Kaynak türleri doğrulanıyor"
+    assert progress[0].title == "Kaynak türleri hazırlanıyor"
     assert (progress[1].message or "").startswith("2 erişilebilir")
     assert (progress[2].message or "").startswith("2 erişilebilir")
     assert (progress[3].message or "").startswith("5 erişilebilir")

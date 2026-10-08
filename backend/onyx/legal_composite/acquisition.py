@@ -32,8 +32,10 @@ class CanonicalAcquirer:
         | None = None,
         lane_inventory: dict[str, JsonValue] | None = None,
         on_batch_progress: Callable[[list[SourceAction], int, int], None] | None = None,
+        host_registry: CapabilityRegistry | None = None,
     ) -> None:
         self.registry = registry
+        self.host_registry = host_registry or registry
         self.context = context
         self.ledger = ledger
         self.policy = policy
@@ -60,7 +62,11 @@ class CanonicalAcquirer:
         self.ledger.add(retained, self.context)
 
     def _dispatch_action(
-        self, action: SourceAction, call: CapabilityCall, child: RunContext
+        self,
+        action: SourceAction,
+        call: CapabilityCall,
+        child: RunContext,
+        host_actions: bool = False,
     ) -> ToolOutcome:
         with graph_step(
             "legal_composite.source_task",
@@ -71,7 +77,12 @@ class CanonicalAcquirer:
                 "query": call.arguments.get("query"),
             },
         ) as step:
-            outcome = self.registry_for_action(action).dispatch(call, child)
+            registry = (
+                self.host_registry
+                if host_actions and action.source_kind is None
+                else self.registry_for_action(action)
+            )
+            outcome = registry.dispatch(call, child)
             step.output_value = {
                 "status": outcome.status.value,
                 "original_count": len(outcome.evidence),
@@ -81,17 +92,36 @@ class CanonicalAcquirer:
     def acquire(
         self, actions: list[SourceAction], plan: ResearchPlan
     ) -> list[dict[str, JsonValue]]:
+        return self._acquire(self.expand_actions(actions, plan), plan)
+
+    def acquire_host_actions(
+        self, actions: list[SourceAction], plan: ResearchPlan
+    ) -> list[dict[str, JsonValue]]:
+        """Run observed dependency targets without expanding each query to every lane."""
+        return self._acquire(actions, plan, host_actions=True)
+
+    def _acquire(
+        self,
+        actions: list[SourceAction],
+        plan: ResearchPlan,
+        *,
+        host_actions: bool = False,
+    ) -> list[dict[str, JsonValue]]:
         result: list[dict[str, JsonValue]] = []
         self.last_receipts = result
         self.context.check_research_active()
         need_ids = {need.need_id for need in plan.needs}
         calls: list[tuple[SourceAction, CapabilityCall, str]] = []
-        for action in self.expand_actions(actions, plan):
+        for action in actions:
             if set(action.need_ids) - need_ids:
                 raise InvalidSourceAction(
                     "Source action refers to an unknown frozen need"
                 )
-            selected_registry = self.registry_for_action(action)
+            selected_registry = (
+                self.host_registry
+                if host_actions and action.source_kind is None
+                else self.registry_for_action(action)
+            )
             spec = selected_registry.get(action.tool)
             if spec is None or spec.external or spec.orchestrates:
                 raise InvalidSourceAction(
@@ -125,6 +155,7 @@ class CanonicalAcquirer:
                         **self._completed[signature],
                         "need_ids": list(action.need_ids),
                         "reused": True,
+                        **({"host_arguments": arguments} if host_actions else {}),
                     }
                 )
                 continue
@@ -191,6 +222,7 @@ class CanonicalAcquirer:
                         action,
                         call,
                         child,
+                        host_actions,
                     ),
                 )
                 pending[future] = action, call, signature, child
@@ -223,12 +255,35 @@ class CanonicalAcquirer:
                         "summary": outcome.summary,
                         "data": outcome.data,
                         "citations": numbers,
+                        **({"host_arguments": call.arguments} if host_actions else {}),
                     }
                     # A bounded receipt is navigation only; full originals stay in the ledger.
                     if len(json.dumps(row, ensure_ascii=False)) > 10_000:
                         row["data"] = {
                             "receipt_omitted": True,
                             "instruction": "Use recorded originals or a focused source read.",
+                            **(
+                                {
+                                    key: value
+                                    for key, value in outcome.data.items()
+                                    if key
+                                    in {
+                                        "has_more",
+                                        "next_position",
+                                        "evidence_next_position",
+                                        "scan_truncated",
+                                        "evidence_truncated",
+                                        "next_offset",
+                                        "sources",
+                                        "candidates",
+                                        "edge_id",
+                                        "navigation_only",
+                                        "absence_proven",
+                                    }
+                                }
+                                if host_actions
+                                else {}
+                            ),
                         }
                     self._completed[signature] = row
                     result.append(row)
@@ -259,6 +314,7 @@ class CanonicalAcquirer:
                         "status": "truncated",
                         "summary": "Acquisition stopped before a complete result; this is not evidence of corpus absence.",
                         "citations": [],
+                        **({"host_arguments": call.arguments} if host_actions else {}),
                     }
                 )
             executor.shutdown(wait=False, cancel_futures=True)

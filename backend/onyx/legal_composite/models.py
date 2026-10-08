@@ -110,6 +110,45 @@ class NeedReview(StrictModel):
     gap_disclosure: str | None = None
 
 
+class DependencyOrigin(StrictModel):
+    citation: int = Field(gt=0, strict=True)
+    source_id: str
+    chunk_id: str | None
+    text_hash: str
+
+
+class AuthorityDependency(StrictModel):
+    edge_id: str
+    need_ids: list[str]
+    instrument_name: str
+    instrument_number: str | None = None
+    article: str
+    qualifier: str | None = None
+    origins: list[DependencyOrigin]
+    governing_citations: list[int] = Field(default_factory=list)
+    candidate_citations: list[int] = Field(default_factory=list)
+    judicial_source_ids: list[str] = Field(default_factory=list)
+    incomplete_source_ids: list[str] = Field(default_factory=list)
+    discovery_gaps: list[str] = Field(default_factory=list)
+
+
+class DependencyWitness(PassageSupport):
+    citation: int = Field(gt=0, strict=True)
+    role: Literal["governing", "operative", "scope", "date", "nonmaterial"]
+
+
+class DependencyAssessment(StrictModel):
+    edge_id: str
+    need_ids: list[str]
+    status: Literal["examined_applicable", "examined_nonmaterial", "unresolved"]
+    witnesses: list[DependencyWitness]
+    explanation: str = Field(min_length=1)
+    scope_and_date: str = Field(min_length=1)
+    temporal_status: Literal["established", "conditional", "unresolved"]
+    conditional_excerpt: str | None = None
+    gap_disclosure: str | None = None
+
+
 class AnswerReview(StrictModel):
     request_coverage_complete: bool
     material_claims_supported: bool
@@ -118,6 +157,7 @@ class AnswerReview(StrictModel):
     needs: list[NeedReview]
     defects: list[str]
     repair_actions: list[SourceAction]
+    dependency_assessments: list[DependencyAssessment] | None = None
 
 
 class WorkflowResult(StrictModel):
