@@ -2,6 +2,7 @@
 
 import copy
 import math
+import time
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -204,6 +205,10 @@ def test_guarded_runtime_has_finite_cost_and_latency_limits(
 
     context = contexts[0]
     assert math.isfinite(context.deadline)
+    remaining_total_seconds = context.deadline - time.monotonic()
+    remaining_research_seconds = context.research_deadline - time.monotonic()
+    assert 628 <= remaining_total_seconds <= 630
+    assert 598 <= remaining_research_seconds <= 600
     assert context.budget.unlimited_execution is False
     assert context.budget.limits["tools"] == 24
     assert context.budget.limits["decisions"] == 32
