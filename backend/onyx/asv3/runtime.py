@@ -280,7 +280,7 @@ def run_asv3_loop(
     guarded_experimental = workflow_variant == ASV3_GUARDED_EXPERIMENTAL_VARIANT
     context = RunContext(
         language="und",
-        timeout_seconds=630 if guarded_experimental else float("inf"),
+        timeout_seconds=1800 if guarded_experimental else float("inf"),
         research_reserve_seconds=30 if guarded_experimental else 0,
         budget=(
             SharedBudget(max_tools=24, max_decisions=32)
