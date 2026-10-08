@@ -289,7 +289,14 @@ def run_asv3_loop(
         cancelled=lambda: not is_connected(chat_session_id, cache),
         services={
             "lean_native_mode": True,
-            **({"provider_max_attempts": 2} if guarded_experimental else {}),
+            **(
+                {
+                    "provider_max_attempts": 2,
+                    "provider_compatibility_attempts": 1,
+                }
+                if guarded_experimental
+                else {}
+            ),
         },
     )
     if custom_agent_prompt:
@@ -485,7 +492,7 @@ def run_asv3_loop(
         history=history,
         token_counter=token_counter,
         lean_native_mode=True,
-        research_llm=research_llm,
+        research_llm=None if guarded_experimental else research_llm,
         answer_llm=answer_llm,
     )
     if previous is not None:

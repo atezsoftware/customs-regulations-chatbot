@@ -60,6 +60,28 @@ def test_rejected_reasoning_params_are_stripped_and_retried() -> None:
         assert key not in calls[1]
 
 
+def test_provider_compatibility_limit_disables_the_bad_request_ladder() -> None:
+    calls: list[dict[str, Any]] = []
+
+    def completion(**kwargs: Any) -> Any:
+        calls.append(kwargs)
+        raise _bad_request()
+
+    with patch("onyx.llm.litellm_singleton.litellm.completion", side_effect=completion):
+        with pytest.raises(BadRequestError):
+            _make_llm()._completion(
+                prompt=[UserMessage(content="hello")],
+                tools=None,
+                tool_choice=None,
+                stream=False,
+                parallel_tool_calls=False,
+                reasoning_effort=ReasoningEffort.XHIGH,
+                provider_compatibility_attempts=1,
+            )
+
+    assert len(calls) == 1
+
+
 @pytest.mark.parametrize("stream", [False, True])
 @pytest.mark.parametrize(
     "message",

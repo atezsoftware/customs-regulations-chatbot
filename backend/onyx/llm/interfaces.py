@@ -97,6 +97,7 @@ class LLM(abc.ABC):
         reasoning_effort: ReasoningEffort = ReasoningEffort.AUTO,
         user_identity: LLMUserIdentity | None = None,
         use_streaming: bool = True,
+        provider_compatibility_attempts: int | None = None,
     ) -> "ModelResponse":
         raise NotImplementedError
 

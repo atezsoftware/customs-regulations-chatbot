@@ -213,6 +213,39 @@ def test_guarded_runtime_has_finite_cost_and_latency_limits(
     )
 
 
+def test_guarded_runtime_keeps_source_tools_cheap_and_coordinator_selected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kwargs, _broker, selected, _checkpoints, _queue = setup_run(monkeypatch)
+    kwargs.pop("test_language")
+    secondary = MagicMock(spec=LLM)
+    secondary.invoke.side_effect = AssertionError("Coordinator must not use Lite")
+    search = MagicMock(spec=SearchTool)
+    fork = MagicMock(spec=SearchTool)
+    search.llm = secondary
+    search.fork_for_independent_context.return_value = fork
+    original_model = runtime.ResearchModel
+
+    def make_model(llm: LLM, context: Any, **options: Any) -> ResearchModel:
+        assert llm is selected
+        assert options.get("research_llm") is None
+        return original_model(llm, context, **options)
+
+    monkeypatch.setattr(runtime, "ResearchModel", make_model)
+    kwargs.update(
+        research_profile="normal",
+        parallel_research=False,
+        workflow_variant=ASV3_GUARDED_EXPERIMENTAL_VARIANT,
+        research_llm=secondary,
+        tools=[search],
+    )
+    runtime.run_asv3_loop(**kwargs)
+
+    assert selected.invoke.call_count == 2
+    secondary.invoke.assert_not_called()
+    assert fork.llm is secondary
+
+
 def test_actual_runtime_resume_fences_before_saved_mode_override(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

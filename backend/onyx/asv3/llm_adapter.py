@@ -1485,6 +1485,17 @@ class ResearchModel:
                     1, int(remaining if self.lean_native_mode else min(remaining, 120))
                 )
             )
+            provider_compatibility_attempts = self.context.services.get(
+                "provider_compatibility_attempts"
+            )
+            if provider_compatibility_attempts is not None and (
+                not isinstance(provider_compatibility_attempts, int)
+                or isinstance(provider_compatibility_attempts, bool)
+                or provider_compatibility_attempts < 1
+            ):
+                raise ValueError(
+                    "provider_compatibility_attempts must be a positive integer"
+                )
             response = selected_llm.invoke(
                 prompt=prompt,
                 # Provider normalization must not rewrite canonical validation schemas.
@@ -1533,6 +1544,13 @@ class ResearchModel:
                 timeout_override=timeout,
                 reasoning_effort=self.reasoning_effort,
                 user_identity=self.user_identity,
+                **(
+                    {
+                        "provider_compatibility_attempts": provider_compatibility_attempts
+                    }
+                    if provider_compatibility_attempts is not None
+                    else {}
+                ),
             )
             record_llm_response(span, response)
             self.last_finish_reason = response.choice.finish_reason
