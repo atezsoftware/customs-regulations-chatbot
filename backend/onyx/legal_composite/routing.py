@@ -8,20 +8,35 @@ from onyx.asv3.registry import CapabilityRegistry
 from onyx.db.legal_composite_sources import SourceKind, SourceLaneCatalogue
 from onyx.legal_composite.acquisition import InvalidSourceAction
 from onyx.legal_composite.models import ResearchPlan, SourceAction
+from onyx.legal_composite.source_lanes import CandidateSourceClassifier
 
 
 class SourceLaneRouter:
     def __init__(
         self,
-        catalogue: SourceLaneCatalogue,
+        catalogue: SourceLaneCatalogue | CandidateSourceClassifier,
         build_registry: Callable[[SourceKind], CapabilityRegistry],
     ) -> None:
         self.catalogue = catalogue
         self._build_registry = build_registry
         self._registries: dict[SourceKind, CapabilityRegistry] = {}
-        self._source_kinds = {str(row.source_id): row.kind for row in catalogue.records}
+        self._source_kinds = (
+            {str(row.source_id): row.kind for row in catalogue.records}
+            if isinstance(catalogue, SourceLaneCatalogue)
+            else catalogue.source_kinds
+        )
 
     def inventory(self) -> dict[str, JsonValue]:
+        if isinstance(self.catalogue, CandidateSourceClassifier):
+            records = self.catalogue.snapshot()
+            return {
+                **self.catalogue.provenance(records),
+                "kinds": {
+                    kind.value: sum(row.admits(kind) for row in records.values())
+                    for kind in SourceKind
+                },
+                "classification_is_legal_authority": False,
+            }
         return {
             **self.catalogue.provenance(),
             "kinds": {
@@ -51,10 +66,12 @@ class SourceLaneRouter:
                 # Discovery coverage is fixed by the host, never the planner.
                 kinds = list(SourceKind)
             elif isinstance(source_id, str):
+                if isinstance(self.catalogue, CandidateSourceClassifier):
+                    self.catalogue.classify_sources((source_id,))
                 observed_kind = self._source_kinds.get(source_id)
                 if observed_kind is None:
                     raise InvalidSourceAction(
-                        "Source identity is outside the inventory"
+                        "Source identity is outside the authorized candidate scope"
                     )
                 kinds = [action.source_kind or observed_kind]
             elif action.source_kind is not None:

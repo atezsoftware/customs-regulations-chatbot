@@ -6,7 +6,7 @@ import hashlib
 import json
 import math
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
 from contextvars import copy_context
 from typing import Literal, cast
@@ -36,6 +36,16 @@ _ROLES = {
     "relevant": "Useful to this need.",
     "irrelevant": "No useful connection to this need.",
     "uncertain": "Cannot determine usefulness.",
+}
+_OPERATIVE_ROLES = {
+    "direct": "An operative rule needed to answer this need under the user's facts.",
+    "condition": "A prerequisite or scope condition of that operative rule.",
+    "exception": "An exception or qualification that could change the answer.",
+    "contrary": "A ruling or rule that could displace or contradict the answer.",
+    "relevant": "A governing or implementing rule referenced by a needed authority.",
+    "background": "Topical context without an operative rule needed for this need.",
+    "irrelevant": "No useful legal connection to this need.",
+    "uncertain": "The complete original does not allow this role to be determined.",
 }
 _POLICY = (
     "Evaluate each complete original's usefulness to the referenced frozen research need. "
@@ -70,6 +80,24 @@ class _Predicate(BaseModel):
     model_config = ConfigDict(strict=True)
     type: Literal["predicate"]
     probability: float = Field(ge=0, le=1, allow_inf_nan=False)
+
+
+class _NativeProbability(BaseModel):
+    model_config = ConfigDict(strict=True)
+    value: str
+    probability: float = Field(ge=0, le=1, allow_inf_nan=False)
+
+
+class _NativeChoice(BaseModel):
+    model_config = ConfigDict(strict=True)
+    type: Literal["choice"]
+    choice: str
+    confidence: float = Field(ge=0, le=1, allow_inf_nan=False)
+    probabilities: list[_NativeProbability]
+
+
+class DecisionsTransportError(RuntimeError):
+    """A safe transport status, without credentials or provider response bodies."""
 
 
 def _estimated_decision_input_tokens(
@@ -132,6 +160,9 @@ class DecisionsClassifier:
         scope: dict[str, JsonValue] | None = None,
         flow: LLMFlow = LLMFlow.LEGAL_COMPOSITE_SELECTION,
         transport: httpx.BaseTransport | None = None,
+        operative_roles: bool = False,
+        max_parallel_batches: int = 1,
+        preserve_finalization_on_timeout: bool = False,
     ) -> None:
         self.endpoint, self.input_rate = _route(config)
         self.config = config.model_copy(deep=True)
@@ -141,6 +172,11 @@ class DecisionsClassifier:
         self.token_counter = token_counter
         self.flow = flow
         self.transport = transport
+        self.operative_roles = operative_roles
+        if not 1 <= max_parallel_batches <= 4:
+            raise ValueError("Decisions batch concurrency must be between one and four")
+        self.max_parallel_batches = max_parallel_batches
+        self.preserve_finalization_on_timeout = preserve_finalization_on_timeout
         self._binding: dict[str, str] = {}
         if run_id is not None:
             self._binding["legal_composite_run_id"] = run_id
@@ -181,11 +217,27 @@ class DecisionsClassifier:
                         "criteria": dict(_ROLES),
                     }
                 else:
-                    questions[name] = {
-                        "type": "predicate",
-                        "name": name,
-                        "instructions": instructions,
-                    }
+                    questions[name] = (
+                        {
+                            "type": "choice",
+                            "name": name,
+                            "instructions": (
+                                f"Classify candidates['{candidate.citation}'] against plan.needs[{need_index}]. "
+                                "Apply selection_policy and the user's facts. Merely discussing the same topic is background. "
+                                "Choose an operative role only for a rule needed to resolve this need."
+                            ),
+                            "choices": [
+                                {"value": role, "description": description}
+                                for role, description in _OPERATIVE_ROLES.items()
+                            ],
+                        }
+                        if self.operative_roles
+                        else {
+                            "type": "predicate",
+                            "name": name,
+                            "instructions": instructions,
+                        }
+                    )
         payload: dict[str, JsonValue] = {"model": self.config.model_name}
         if self.config.model_provider == "openrouter":
             payload.update(state=state, questions=questions)
@@ -255,8 +307,14 @@ class DecisionsClassifier:
                 response, request_id = self._http_send(payload, timeout)
             except httpx.TimeoutException:
                 raise
-            except Exception:
-                raise RunStopped("Decisions transport failed") from None
+            except DecisionsTransportError as error:
+                graph_call.summary = str(error)
+                graph_call.output_value = {"transport_error": str(error)}
+                raise
+            except Exception as error:
+                raise DecisionsTransportError(
+                    f"Decisions transport failed ({type(error).__name__})"
+                ) from None
             recorded = dict(response)
             if "id" not in recorded and request_id:
                 recorded.update(
@@ -284,7 +342,7 @@ class DecisionsClassifier:
                 json=payload,
             ) as response:
                 if response.status_code != 200:
-                    raise RunStopped(
+                    raise DecisionsTransportError(
                         f"Decisions provider returned HTTP {response.status_code}"
                     )
                 chunks = bytearray()
@@ -330,7 +388,30 @@ class DecisionsClassifier:
         for name, (need_id, citation) in pairs.items():
             row = rows[need_id]
             try:
-                if self.config.model_provider == "openai":
+                if self.config.model_provider == "openai" and self.operative_roles:
+                    choice = _NativeChoice.model_validate(answers.get(name))
+                    probabilities = {
+                        entry.value: entry.probability for entry in choice.probabilities
+                    }
+                    probability = probabilities.get(choice.choice, 0)
+                    valid = (
+                        len(probabilities) == len(choice.probabilities)
+                        and set(probabilities) == set(_OPERATIVE_ROLES)
+                        and choice.choice in probabilities
+                        and abs(sum(probabilities.values()) - 1) <= 0.001
+                        and probability >= max(probabilities.values())
+                    )
+                    threshold = (
+                        _REJECT_THRESHOLD
+                        if choice.choice == "irrelevant"
+                        else _ROLE_THRESHOLD
+                    )
+                    role = (
+                        choice.choice
+                        if valid and min(probability, choice.confidence) >= threshold
+                        else "uncertain"
+                    )
+                elif self.config.model_provider == "openai":
                     predicate = _Predicate.model_validate(answers.get(name))
                     probability = 1 - predicate.probability
                     role = (
@@ -381,6 +462,70 @@ class DecisionsClassifier:
         return SourceSelectionDecision(needs=list(rows.values()))
 
     def classify(self, request: SourceSelectionRequest) -> SelectionObservation:
+        if self.max_parallel_batches == 1:
+            return self._classify_batch(request)
+        batches: list[SourceSelectionRequest] = []
+        current: list[SourceCandidate] = []
+        for candidate in request.candidates:
+            trial, pairs = self._payload(request, [*current, candidate])
+            if current and (
+                len(pairs) > 128
+                or _estimated_decision_input_tokens(trial, self.token_counter) > 24_000
+            ):
+                batches.append(request.model_copy(update={"candidates": current}))
+                current = []
+            current.append(candidate)
+        if current:
+            batches.append(request.model_copy(update={"candidates": current}))
+        if len(batches) <= 1:
+            return self._classify_batch(request)
+        executor = ThreadPoolExecutor(max_workers=self.max_parallel_batches)
+        try:
+            futures = [
+                cast(
+                    Future[SelectionObservation],
+                    executor.submit(copy_context().run, self._classify_batch, batch),
+                )
+                for batch in batches
+            ]
+            observations = [future.result() for future in futures]
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+        merged = {
+            need.need_id: NeedSourceSelection(need_id=need.need_id)
+            for need in request.plan.needs
+        }
+        delivered: list[int] = []
+        successful = 0
+        for observation in observations:
+            if observation.decision is None or observation.failure:
+                continue
+            successful += 1
+            delivered.extend(observation.delivered_citations)
+            for row in observation.decision.needs:
+                for role in _OPERATIVE_ROLES:
+                    getattr(merged[row.need_id], role).extend(getattr(row, role))
+        with graph_step("legal_composite.selection_batches", {}) as step:
+            step.output_value = {
+                "batch_count": len(batches),
+                "successful_batches": successful,
+                "delivered_original_count": len(delivered),
+                "failures": [row.failure for row in observations if row.failure],
+            }
+        return SelectionObservation(
+            decision=SourceSelectionDecision(needs=list(merged.values()))
+            if successful
+            else None,
+            delivered_citations=delivered,
+            call_id=next(
+                (row.call_id for row in reversed(observations) if row.call_id), None
+            ),
+            failure=None
+            if successful
+            else "Decisions batches failed; source decisions remain uncertain",
+        )
+
+    def _classify_batch(self, request: SourceSelectionRequest) -> SelectionObservation:
         delivered: list[int] = []
         reservation: CallReservation | None = None
         try:
@@ -486,9 +631,12 @@ class DecisionsClassifier:
                         call_id=reservation.call_id,
                     )
                 except (FutureTimeout, httpx.TimeoutException):
-                    self.budget.stop(
-                        "Decisions call exceeded its deadline; no further spend authorized"
-                    )
+                    if not self.preserve_finalization_on_timeout:
+                        self.budget.stop(
+                            "Decisions call exceeded its deadline; no further spend authorized"
+                        )
+                    # The unresolved reservation remains charged. An optional
+                    # relevance filter cannot consume the writer's time reserve.
                     span.set_error(
                         {"message": "Decisions call timed out", "data": None}
                     )
@@ -500,10 +648,14 @@ class DecisionsClassifier:
                     raise
                 finally:
                     executor.shutdown(wait=False, cancel_futures=True)
-        except Exception:
+        except Exception as error:
             return SelectionObservation(
                 decision=None,
                 delivered_citations=delivered,
                 call_id=reservation.call_id if reservation is not None else None,
-                failure="Decisions unavailable; source decisions remain uncertain",
+                failure=(
+                    str(error)
+                    if isinstance(error, DecisionsTransportError)
+                    else "Decisions unavailable; source decisions remain uncertain"
+                ),
             )

@@ -33,10 +33,9 @@ from onyx.context.search.models import BaseFilters, IndexFilters
 from onyx.db.asv3_corpus import bind_pc_corpus_scope
 from onyx.db.asv3_runs import save_asv3_checkpoint
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
+from onyx.db.legal_composite_preparation import load_prepared_source_lane_catalogue
 from onyx.db.legal_composite_sources import (
     SourceKind,
-    SourceLaneCatalogue,
-    load_source_lane_catalogue,
 )
 from onyx.db.memory import UserMemoryContext
 from onyx.db.models import User
@@ -52,6 +51,7 @@ from onyx.legal_composite.prompts import PROMPT_VERSION
 from onyx.legal_composite.providers import build_source_selector
 from onyx.legal_composite.routing import SourceLaneRouter
 from onyx.legal_composite.search import CompositeSearchTool
+from onyx.legal_composite.shared_work import SharedCanonicalCenters
 from onyx.legal_composite.source_lanes import build_lane_broker
 from onyx.llm.interfaces import LLM, LLMUserIdentity
 from onyx.llm.models import ReasoningEffort
@@ -158,87 +158,6 @@ def _progress_reporter(
     return ProgressReporter(context.run_id, "tr", emit_progress)
 
 
-def _load_source_catalogue(
-    *, user: User, scope: IndexFilters, context: RunContext, progress: ProgressReporter
-) -> SourceLaneCatalogue:
-    started = time.monotonic()
-    processed_sources = 0
-    progress_updates = 0
-    status = "running"
-    progress.report(
-        "tools",
-        title="Kaynak türleri hazırlanıyor",
-        message="Arama kolları için özgün açılışları inceliyorum; bulunan kaynaklar okunurken tam doğrulanacak.",
-    )
-    with graph_step("legal_composite.source_catalogue", {"opening_workers": 4}) as step:
-
-        def on_progress(processed: int, has_more: bool) -> None:
-            nonlocal processed_sources, progress_updates
-            context.check_research_active()
-            processed_sources = processed
-            progress_updates += 1
-            progress.report(
-                "tools",
-                title="Kaynak türleri hazırlanıyor",
-                message=(
-                    f"{processed} erişilebilir kaynağın özgün açılışı incelendi; "
-                    f"{time.monotonic() - started:.1f} saniye geçti."
-                    + (" Diğer kaynaklar inceleniyor." if has_more else "")
-                ),
-            )
-
-        try:
-            context.check_research_active()
-            with get_session_with_current_tenant() as inventory_session:
-                catalogue = load_source_lane_catalogue(
-                    inventory_session,
-                    user=user,
-                    filters=scope,
-                    check_active=context.check_research_active,
-                    opening_workers=4,
-                    on_progress=on_progress,
-                    routing_only=True,
-                )
-            context.check_research_active()
-            status = "completed" if catalogue.complete else "partial"
-            processed_sources = len(catalogue.records)
-            step.output_value = {
-                "source_count": processed_sources,
-                "uncertain_source_count": sum(
-                    row.uncertain for row in catalogue.records
-                ),
-                "inventory_complete": catalogue.complete,
-                "routing_only": True,
-            }
-        except RunStopped:
-            status = "cancelled" if context.is_cancelled() else "failed"
-            progress.report(status, status="failed")
-            raise
-        except Exception:
-            status = "failed"
-            raise
-        finally:
-            step.output_value = {
-                **(step.output_value or {}),
-                "status": status,
-                "processed_source_count": processed_sources,
-                "progress_updates": progress_updates,
-                "elapsed_seconds": time.monotonic() - started,
-            }
-    progress.report(
-        "tools",
-        status="completed",
-        title="Kaynak türleri hazır"
-        if catalogue.complete
-        else "Kaynak türleri kısmen hazır",
-        message=(
-            f"{processed_sources} erişilebilir kaynak incelendi; "
-            "tür belirsizliği korunuyor; bulunan özgün metinler okunurken tam doğrulanacak."
-        ),
-    )
-    return catalogue
-
-
 def _run_legal_composite_loop(
     *,
     emitter: Emitter,
@@ -262,16 +181,18 @@ def _run_legal_composite_loop(
     inject_memories_in_prompt: bool,
 ) -> None:
     policy = WorkflowPolicy(
-        timeout_seconds=math.inf,
+        timeout_seconds=420,
+        finalization_reserve_seconds=100,
         max_cost_usd=math.inf,
         max_context_tokens=128_000,
         final_output_tokens=8_192,
         max_input_tokens=2_000_000,
         max_output_tokens=256_000,
-        max_model_calls=32,
+        max_model_calls=128,
         max_tools=512,
         max_parallel_tools=len(SourceKind),
         max_search_calls=384,
+        max_research_rounds=2,
         selection_reserve_seconds=12,
     )
     started = time.monotonic()
@@ -324,9 +245,25 @@ def _run_legal_composite_loop(
     broker = CorpusBroker(user, scope)
     emitted: list[JsonValue] = []
     progress = _progress_reporter(context, emitter, emitted)
-    catalogue = _load_source_catalogue(
-        user=user, scope=scope, context=context, progress=progress
+    progress.report(
+        "tools",
+        title="Paralel kaynak araştırması hazırlanıyor",
+        message="Kayıtlı kaynak türleri yükleniyor; on iki türün aramaları paralel başlayacak.",
     )
+    context.check_research_active()
+    with graph_step("legal_composite.prepared_catalogue", {}) as catalogue_step:
+        with get_session_with_current_tenant() as session:
+            catalogue = load_prepared_source_lane_catalogue(
+                session,
+                user=user,
+                filters=scope,
+                check_active=context.check_research_active,
+            )
+        catalogue_step.output_value = {
+            **catalogue.provenance(),
+            "runtime_opening_reads": 0,
+            "runtime_classifications": 0,
+        }
     search = next((tool for tool in tools if isinstance(tool, SearchTool)), None)
     if search is not None:
         search = CompositeSearchTool.from_fork(search.fork_for_independent_context())
@@ -353,19 +290,24 @@ def _run_legal_composite_loop(
         if spec.name == "read_evidence":
             registry.register(spec)
 
+    shared_centers = SharedCanonicalCenters()
+
     def build_lane_registry(kind: SourceKind) -> CapabilityRegistry:
         if not catalogue.source_ids(kind):
 
             def empty_lane(
                 _arguments: dict[str, JsonValue], child: RunContext
             ) -> ToolOutcome:
-                child.check_research_active()
+                child.check_active()
                 return ToolOutcome(
-                    status=OutcomeStatus.NOT_FOUND
-                    if catalogue.complete
-                    else OutcomeStatus.UNAVAILABLE,
-                    summary="No authorized source is classified in this lane; this is not proof that no applicable law exists.",
-                    data={**catalogue.provenance(), "source_kind": kind.value},
+                    status=OutcomeStatus.NOT_FOUND,
+                    summary="No accessible prepared sources in this source-kind lane.",
+                    data={
+                        "source_kind": kind.value,
+                        "lane_source_count": 0,
+                        "source_type_preparation_complete": catalogue.complete,
+                        "corpus_absence_verified": False,
+                    },
                 )
 
             return CapabilityRegistry(
@@ -378,10 +320,19 @@ def _run_legal_composite_loop(
                     )
                 ]
             )
-        lane = build_lane_broker(broker, catalogue, kind)
+        lane = build_lane_broker(broker, catalogue, kind, shared_centers)
+        lane_search = (
+            search.fork_for_independent_context() if search is not None else None
+        )
+        if lane_search is not None:
+            lane_search.configure_prepared_source_lane(
+                kind,
+                lane.record_search,
+                context.check_research_active,
+            )
         lane.search_adapter = lane.guard_search_adapter(
             build_search_adapter(
-                search,
+                lane_search,
                 question,
                 lane,
                 message_history=lambda _context: list(simple_chat_history),
@@ -411,6 +362,7 @@ def _run_legal_composite_loop(
         registry_for_action=router.registry,
         expand_actions=router.expand,
         lane_inventory=router.inventory(),
+        source_kinds={str(row.source_id): row.kind for row in catalogue.records},
         host_registry=CapabilityRegistry(
             build_corpus_specs(
                 broker, require_search_targets=True, source_identity_guidance=True
@@ -519,6 +471,12 @@ def _run_legal_composite_loop(
                 if turkish
                 else f"Original source relationships: {completed}/{len(actions)} actions complete."
             )
+        elapsed = int(time.monotonic() - started)
+        message += (
+            f" Toplam geçen süre: {elapsed} saniye."
+            if turkish
+            else f" Total elapsed: {elapsed} seconds."
+        )
         progress.report(
             "tools",
             status="running" if pending else "completed",
@@ -564,6 +522,7 @@ def _run_legal_composite_loop(
         report=report,
         selector=selector,
         dependency_expander=dependency_expander,
+        source_kinds={str(row.source_id): row.kind for row in catalogue.records},
     )
     result = engine.run(question, history, custom_agent_prompt)
     snapshot: dict[str, JsonValue] = {

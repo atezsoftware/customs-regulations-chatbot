@@ -211,7 +211,7 @@ def test_provisional_type_also_retains_unknown_and_wrong_metadata_cannot_gate(
     source, recorded, session = revalidation_case(monkeypatch)
     assert recorded.kind is sources.SourceKind.PRESIDENTIAL_DECREE
     assert recorded.admits(sources.SourceKind.UNKNOWN)
-    assert not recorded.admits(sources.SourceKind.REGULATION)
+    assert recorded.admits(sources.SourceKind.REGULATION)
     assert (
         sources.revalidate_source_classification(
             cast(Session, session),
@@ -394,7 +394,7 @@ def test_routing_catalogue_mode_carries_provisional_witnesses(
     assert catalogue.records[0].kind is sources.SourceKind.STATUTE
     assert catalogue.records[0].routing_only
     assert catalogue.records[0].opening_witnesses == opening.witnesses
-    assert catalogue.source_ids(sources.SourceKind.UNKNOWN) == (source.id,)
+    assert catalogue.source_ids(sources.SourceKind.UNKNOWN) == ()
     assert catalogue.provenance()["provisional_routing_source_count"] == 1
     assert catalogue.provenance()["classification_is_full_source_proof"] is False
     assert reader.call_args.kwargs["routing_only"] is True

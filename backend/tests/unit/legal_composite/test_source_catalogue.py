@@ -92,12 +92,12 @@ def test_conflicting_or_unrecognized_types_remain_unknown(
     assert record.kind is SourceKind.UNKNOWN and record.uncertain
 
 
-def test_name_metadata_conflict_is_not_routed_as_either_known_type() -> None:
+def test_unknown_identity_participates_in_every_type_without_changing_its_kind() -> (
+    None
+):
     record = classify_source(CorpusSource(uuid4(), "yonetmelik.md", "file"), ("kanun",))
     assert record.kind is SourceKind.UNKNOWN
-    assert not record.admits(SourceKind.STATUTE) and not record.admits(
-        SourceKind.REGULATION
-    )
+    assert record.admits(SourceKind.STATUTE) and record.admits(SourceKind.REGULATION)
     assert record.method == "original_identity_unverified"
 
 
@@ -112,7 +112,7 @@ def test_wrong_metadata_cannot_hide_actual_presidential_decree() -> None:
     assert record.admits(SourceKind.PRESIDENTIAL_DECREE) and record.admits(
         SourceKind.UNKNOWN
     )
-    assert not record.admits(SourceKind.REGULATION)
+    assert record.admits(SourceKind.REGULATION)
     assert record.opening_identity_sha256 and record.uncertain
 
 
@@ -120,7 +120,7 @@ def test_metadata_and_name_without_original_identity_stay_unknown() -> None:
     source = CorpusSource(uuid4(), "cumhurbaskanligi_kararnamesi.md", "file")
     record = classify_source(source, ("cumhurbaskanligi_kararnamesi",))
     assert record.kind is SourceKind.UNKNOWN
-    assert not record.admits(SourceKind.PRESIDENTIAL_DECREE)
+    assert record.admits(SourceKind.PRESIDENTIAL_DECREE)
     assert record.opening_identity_sha256 is None
 
 

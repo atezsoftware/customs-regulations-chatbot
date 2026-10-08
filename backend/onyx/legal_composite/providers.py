@@ -75,6 +75,9 @@ def build_source_selector(
                         run_id=run_id,
                         scope=scope,
                         flow=LLMFlow.LEGAL_COMPOSITE_SELECTION,
+                        operative_roles=True,
+                        max_parallel_batches=4,
+                        preserve_finalization_on_timeout=True,
                     )
                     return SourceSelector(classifier, irrelevance_threshold=0.98)
                 except ValueError:

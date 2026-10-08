@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextvars
 import json
+import time
 from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from typing import cast
@@ -11,6 +12,7 @@ from pydantic import JsonValue
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.models import CapabilityCall, RunContext, RunStopped, ToolOutcome
 from onyx.asv3.registry import CapabilityRegistry
+from onyx.db.legal_composite_sources import SourceKind
 from onyx.legal_composite.models import ResearchPlan, SourceAction, WorkflowPolicy
 from onyx.tracing.answer_graph import graph_step
 
@@ -33,9 +35,11 @@ class CanonicalAcquirer:
         lane_inventory: dict[str, JsonValue] | None = None,
         on_batch_progress: Callable[[list[SourceAction], int, int], None] | None = None,
         host_registry: CapabilityRegistry | None = None,
+        source_kinds: dict[str, SourceKind] | None = None,
     ) -> None:
         self.registry = registry
         self.host_registry = host_registry or registry
+        self.source_kinds = dict(source_kinds or {})
         self.context = context
         self.ledger = ledger
         self.policy = policy
@@ -209,6 +213,7 @@ class CanonicalAcquirer:
         ] = {}
         batch_actions = [action for action, _call, _signature in calls]
         completed_count = 0
+        last_progress = time.monotonic()
         try:
             for action, call, signature in calls:
                 child = self.context.child()
@@ -231,15 +236,14 @@ class CanonicalAcquirer:
             while pending:
                 self.context.check_research_active()
                 completed, _ = wait(pending, timeout=0.05, return_when=FIRST_COMPLETED)
+                if not completed and time.monotonic() - last_progress >= 5:
+                    self.on_batch_progress(batch_actions, len(pending), completed_count)
+                    last_progress = time.monotonic()
                 for future in completed:
                     action, call, signature, _child = pending.pop(future)
                     outcome = future.result()
                     for item in outcome.evidence:
                         item.question_ids = list(action.need_ids)
-                        if action.source_kind is not None:
-                            item.metadata["legal_composite_source_kind"] = (
-                                action.source_kind.value
-                            )
                     numbers = self.ledger.add(outcome.evidence, self.context)
                     numbers.extend(
                         read.citation
@@ -250,6 +254,13 @@ class CanonicalAcquirer:
                     row: dict[str, JsonValue] = {
                         "tool": call.name,
                         "source_kind": action.source_kind,
+                        "original_source_kinds": {
+                            item.source_id: self.source_kinds.get(
+                                item.source_id, SourceKind.UNKNOWN
+                            ).value
+                            for number in numbers
+                            if (item := self.ledger.get(number)) is not None
+                        },
                         "need_ids": list(action.need_ids),
                         "status": outcome.status.value,
                         "summary": outcome.summary,
@@ -289,6 +300,7 @@ class CanonicalAcquirer:
                     result.append(row)
                     completed_count += 1
                     self.on_batch_progress(batch_actions, len(pending), completed_count)
+                    last_progress = time.monotonic()
                     with graph_step(
                         "legal_composite.acquisition",
                         {

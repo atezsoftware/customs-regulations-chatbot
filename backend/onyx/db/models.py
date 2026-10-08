@@ -9307,6 +9307,64 @@ class RegulatoryPhysicalIndexOperation(Base):
     )
 
 
+class LegalCompositeSourceState(Base):
+    """Transactional invalidation for prepared source identities, without source rewrites."""
+
+    __tablename__ = "legal_composite_source_state"
+    user_file_id: Mapped[UUID] = mapped_column(
+        ForeignKey("user_file.id", ondelete="CASCADE"), primary_key=True
+    )
+    revision: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, server_default="1"
+    )
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class LegalCompositeSourceKind(Base):
+    """Tenant-local original-opening classification; never grants file access."""
+
+    __tablename__ = "legal_composite_source_kind"
+    id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True)
+    user_file_id: Mapped[UUID] = mapped_column(
+        ForeignKey("user_file.id", ondelete="CASCADE"), nullable=False
+    )
+    source_revision: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    algorithm_version: Mapped[str] = mapped_column(Text, nullable=False)
+    window_key: Mapped[str] = mapped_column(Text, nullable=False)
+    effective_start: Mapped[datetime.date | None] = mapped_column(Date, nullable=True)
+    effective_end: Mapped[datetime.date | None] = mapped_column(Date, nullable=True)
+    source_kind: Mapped[str] = mapped_column(Text, nullable=False)
+    classification: Mapped[dict[str, Any]] = mapped_column(PGJSONB, nullable=False)
+    prepared_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    __table_args__ = (
+        UniqueConstraint(
+            "user_file_id",
+            "source_revision",
+            "algorithm_version",
+            "window_key",
+            name="uq_legal_composite_kind_version_window",
+        ),
+        Index(
+            "ix_legal_composite_kind_lookup",
+            "user_file_id",
+            "algorithm_version",
+            "source_revision",
+        ),
+        CheckConstraint(
+            "source_kind IN ('constitution','statute','treaty','presidential_decree','regulation','communique','circular','judicial_decision','executive_decision','private_ruling','other','unknown')",
+            name="legal_composite_source_kind_check",
+        ),
+        CheckConstraint(
+            "effective_end IS NULL OR effective_start IS NULL OR effective_end > effective_start",
+            name="legal_composite_kind_window_check",
+        ),
+    )
+
+
 class RegulatoryFilePublication(Base):
     """Retained after file deletion so ownership and read epochs never reset."""
 

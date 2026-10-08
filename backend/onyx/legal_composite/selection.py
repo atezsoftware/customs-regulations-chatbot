@@ -15,6 +15,7 @@ from pydantic import (
 )
 
 from onyx.asv3.evidence import EvidenceLedger
+from onyx.db.legal_composite_sources import SourceKind
 from onyx.legal_composite.models import ResearchPlan
 from onyx.tracing.flows import LLMFlow
 
@@ -218,7 +219,11 @@ class GatewaySourceClassifier:
 
 
 def selection_request_from_ledger(
-    question: str, plan: ResearchPlan, ledger: EvidenceLedger
+    question: str,
+    plan: ResearchPlan,
+    ledger: EvidenceLedger,
+    *,
+    source_kinds: dict[str, SourceKind] | None = None,
 ) -> SourceSelectionRequest:
     """Snapshot every whole original without a serialization clip or renumbering."""
     records = json.loads(
@@ -231,7 +236,7 @@ def selection_request_from_ledger(
         item = ledger.get(citation)
         if item is None:
             raise ValueError("Selection original disappeared during snapshot")
-        kind = item.metadata.get("legal_composite_source_kind")
+        kind = (source_kinds or {}).get(item.source_id, SourceKind.UNKNOWN).value
         candidates.append(
             SourceCandidate(
                 **record,

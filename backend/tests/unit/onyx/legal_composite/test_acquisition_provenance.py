@@ -260,3 +260,48 @@ def test_programming_error_is_not_swallowed(monkeypatch: pytest.MonkeyPatch) -> 
             [SourceAction(need_ids=["first"], tool="read_original", arguments={})],
             request_plan,
         )
+
+
+def test_search_lane_never_relabels_an_uncertain_original_as_its_type() -> None:
+    from onyx.db.legal_composite_sources import SourceKind
+
+    instance, _handler = acquirer()
+    receipts = instance.acquire(
+        [
+            SourceAction(
+                need_ids=["first"],
+                tool="read_original",
+                arguments={},
+                source_kind=SourceKind.STATUTE,
+            )
+        ],
+        plan(),
+    )
+    item = instance.ledger.get(1)
+    assert item is not None
+    assert receipts[0]["source_kind"] == "statute"
+    assert receipts[0]["original_source_kinds"] == {item.source_id: "unknown"}
+    assert "legal_composite_source_kind" not in item.metadata
+
+
+def test_retained_originals_do_not_automatically_launch_related_source_research() -> (
+    None
+):
+    instance, _handler = acquirer()
+    instance.acquire(
+        [SourceAction(need_ids=["first"], tool="read_original", arguments={})], plan()
+    )
+    dependency = Mock()
+    dependency.synchronize.return_value = []
+    engine = LegalCompositeEngine(
+        gateway=Mock(),
+        acquirer=instance,
+        ledger=instance.ledger,
+        policy=WorkflowPolicy(),
+        check_active=lambda: None,
+        research_available=lambda: True,
+        dependency_expander=dependency,
+    )
+    engine._refresh_dependencies("Question", plan())
+    dependency.expand.assert_not_called()
+    dependency.synchronize.assert_called_once()
