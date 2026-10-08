@@ -1,5 +1,7 @@
+import math
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
+from typing import cast
 
 import pytest
 
@@ -66,6 +68,72 @@ def test_usage_above_estimate_blocks_further_spend() -> None:
     assert budget.snapshot()["usage_overrun"] is True
     with pytest.raises(RunStopped, match="usage exceeded"):
         budget.request(1, 1, 1, 5, finalizing=True)
+
+
+def test_unlimited_business_spend_accepts_actual_usage_and_retains_final_capacity() -> (
+    None
+):
+    budget = WorkflowBudget(
+        WorkflowPolicy(
+            max_cost_usd=math.inf,
+            timeout_seconds=math.inf,
+            max_input_tokens=300_000,
+            max_output_tokens=6_000,
+        )
+    )
+    budget.configure_finalization(64_000, 1_000, 0.06)
+    reservation = budget.request(39_809, 1, 0.10, 0)
+    budget.settle(reservation, 46_413, 0)
+    snapshot = budget.snapshot()
+    assert snapshot["usage_overrun"] is True
+    assert snapshot["estimate_overrun_blocks_calls"] is False
+    assert snapshot["input_tokens"] == 46_413
+    assert snapshot["output_tokens"] == 0
+    assert snapshot["estimated_cost_usd"] == 0.0046413
+    assert snapshot["unsettled_calls"] == 0
+    assert budget.research_available()
+    budget.check_response_active()
+    assert budget.affordable_input_tokens(1_000, 0.75, 3.75, finalizing=True) == 189_587
+    budget.request(64_000, 1_000, 0.75, 3.75, finalizing=True)
+    budget.request(64_000, 1_000, 0.75, 3.75, finalizing=True)
+    assert budget.snapshot()["model_calls"] == 3
+    assert budget.snapshot()["input_tokens"] == 174_413
+
+
+@pytest.mark.parametrize("capacity", ["input", "output"])
+def test_unlimited_business_spend_cannot_ignore_actual_token_capacity(
+    capacity: str,
+) -> None:
+    budget = WorkflowBudget(
+        WorkflowPolicy(
+            max_cost_usd=math.inf, max_input_tokens=300, max_output_tokens=300
+        )
+    )
+    reservation = budget.request(100, 100, 1, 5)
+    budget.settle(
+        reservation,
+        301 if capacity == "input" else 100,
+        301 if capacity == "output" else 100,
+    )
+    assert budget.snapshot()["usage_overrun"] is True
+    assert budget.snapshot()["unsettled_calls"] == 0
+    assert not budget.research_available()
+    with pytest.raises(RunStopped, match="workflow capacity"):
+        budget.check_response_active(finalizing=True)
+    with pytest.raises(RunStopped, match="workflow capacity"):
+        budget.request(1, 1, 1, 5, finalizing=True)
+
+
+@pytest.mark.parametrize("invalid", [True, 1.5, "100", None, -1])
+def test_invalid_actual_usage_never_settles_or_refunds(invalid: object) -> None:
+    budget = WorkflowBudget(WorkflowPolicy(max_cost_usd=math.inf))
+    reservation = budget.request(100, 100, 1, 5)
+    before = budget.snapshot()
+    with pytest.raises(ValueError, match="Invalid provider usage"):
+        budget.settle(reservation, cast(int, invalid), 0)
+    assert budget.snapshot()["input_tokens"] == before["input_tokens"]
+    assert budget.snapshot()["estimated_cost_usd"] == before["estimated_cost_usd"]
+    assert budget.snapshot()["unsettled_calls"] == 1
 
 
 def test_research_deadline_leaves_finalization_time() -> None:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from collections.abc import Callable
 from contextlib import contextmanager
 from threading import Event
@@ -17,6 +18,7 @@ from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.models import EvidenceItem, RunContext
 from onyx.legal_composite.budget import WorkflowBudget
 from onyx.legal_composite.decisions import DecisionsClassifier
+from onyx.legal_composite.gateway import _estimated_input_tokens
 from onyx.legal_composite.models import ResearchNeed, ResearchPlan, WorkflowPolicy
 from onyx.legal_composite.selection import SourceCandidate, SourceSelectionRequest
 from onyx.llm.interfaces import LLMConfig
@@ -340,6 +342,45 @@ def test_high_usage_overrun_settles_then_blocks_future_spend() -> None:
     assert workflow.budget.snapshot()["usage_overrun"] is True
     assert workflow.classify(selection_request()).call_id is None
     assert workflow.budget.snapshot()["model_calls"] == 1
+
+
+def test_native_question_protocol_allowance_is_reserved_without_repeating_shared_text() -> (
+    None
+):
+    candidates = [candidate(1), candidate(2)]
+    workflow = classifier(Mock(), candidates=candidates)
+    request = selection_request(*candidates, needs=3)
+    payload, pairs, delivered, tokens = workflow._pack(request)
+    assert len(pairs) == 6 and delivered == [1, 2]
+    assert (
+        tokens
+        == _estimated_input_tokens(json.dumps(payload, ensure_ascii=False)) + 6 * 128
+    )
+    assert isinstance(payload["input"], str)
+    assert len(json.loads(payload["input"])["candidates"]) == 2
+
+
+def test_unlimited_decisions_actual_usage_over_estimate_remains_accounted_and_usable() -> (
+    None
+):
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = response_body(json.loads(request.content))
+        body["usage"]["input_tokens"] = 46_413
+        return httpx.Response(200, json=body)
+
+    workflow = classifier(handler, policy=WorkflowPolicy(max_cost_usd=math.inf))
+    result = workflow.classify(selection_request())
+    assert result.failure is None and result.decision is not None
+    snapshot = workflow.budget.snapshot()
+    assert snapshot["usage_overrun"] is True
+    assert snapshot["estimate_overrun_blocks_calls"] is False
+    assert snapshot["input_tokens"] == 46_413 and snapshot["output_tokens"] == 0
+    assert snapshot["estimated_cost_usd"] == 0.0046413
+    assert workflow.budget.research_available()
+    assert workflow.classify(selection_request()).failure is None
+    assert workflow.budget.snapshot()["input_tokens"] == 92_826
+    assert workflow.budget.snapshot()["estimated_cost_usd"] == 0.0092826
+    assert workflow.budget.snapshot()["unsettled_calls"] == 0
 
 
 def test_typed_jev_output_is_preserved_as_nonbillable_metadata() -> None:

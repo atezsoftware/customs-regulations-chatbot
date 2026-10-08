@@ -49,6 +49,7 @@ _REJECT_THRESHOLD = 0.98
 _ROLE_THRESHOLD = 0.80
 _MAX_BATCH_QUESTIONS = 1024
 _MAX_RESPONSE_BYTES = 1_000_000
+_QUESTION_PROTOCOL_TOKEN_MARGIN = 128
 
 
 class _Usage(BaseModel):
@@ -69,6 +70,17 @@ class _Predicate(BaseModel):
     model_config = ConfigDict(strict=True)
     type: Literal["predicate"]
     probability: float = Field(ge=0, le=1, allow_inf_nan=False)
+
+
+def _estimated_decision_input_tokens(
+    payload: dict[str, JsonValue], token_counter: Callable[[str], int] | None
+) -> int:
+    questions = payload.get("questions")
+    question_count = len(questions) if isinstance(questions, (dict, list)) else 0
+    # Typed predicates have provider protocol overhead beyond their serialized instructions.
+    return _estimated_input_tokens(
+        json.dumps(payload, ensure_ascii=False), token_counter
+    ) + (question_count * _QUESTION_PROTOCOL_TOKEN_MARGIN)
 
 
 def _route(config: LLMConfig) -> tuple[str, float]:
@@ -214,15 +226,11 @@ class DecisionsClassifier:
             if hashlib.sha256(item.text.encode()).hexdigest() != item.text_hash:
                 continue
             trial, _ = self._payload(request, [*candidates, item])
-            tokens = _estimated_input_tokens(
-                json.dumps(trial, ensure_ascii=False), self.token_counter
-            )
+            tokens = _estimated_decision_input_tokens(trial, self.token_counter)
             if tokens <= cap:
                 candidates.append(item)
         payload, pairs = self._payload(request, candidates)
-        tokens = _estimated_input_tokens(
-            json.dumps(payload, ensure_ascii=False), self.token_counter
-        )
+        tokens = _estimated_decision_input_tokens(payload, self.token_counter)
         if not candidates or tokens > cap:
             raise RunStopped("No complete originals fit the Decisions allocation")
         return payload, pairs, [item.citation for item in candidates], tokens
@@ -389,6 +397,11 @@ class DecisionsClassifier:
                     reservation.estimated_cost_usd
                 ),
                 legal_composite_compat_attempt_bound="1",
+                legal_composite_decisions_question_count=str(len(pairs)),
+                legal_composite_decisions_question_protocol_tokens=str(
+                    _QUESTION_PROTOCOL_TOKEN_MARGIN
+                ),
+                legal_composite_decisions_input_estimate_basis="serialized shared evidence and all questions, with per-question protocol allowance",
                 legal_composite_delivered_originals=json.dumps(
                     [
                         {

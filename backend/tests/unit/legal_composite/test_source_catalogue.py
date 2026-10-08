@@ -315,16 +315,17 @@ def test_parallel_opening_reads_overlap_with_owned_sessions_and_tenant_context(
             with lock:
                 closed.append(own_session)
 
-    def read(
-        session: Session, **kwargs: object
-    ) -> tuple[CorpusSource, list[CorpusChunk], bool]:
+    def read_batch(
+        session: Session,
+        source_ids: tuple[UUID, ...],
+        captured_filters: IndexFilters,
+        check_active: object,
+    ) -> dict[UUID, tuple[str, ...] | None]:
         assert session is not inventory
         assert CURRENT_TENANT_ID_CONTEXTVAR.get() == "opening-test-tenant"
-        assert kwargs["user"] is user and kwargs["filters"] is filters
-        assert kwargs["start"] == 0 and kwargs["limit"] == 3
-        assert kwargs["query_indexes"] == {}
-        source = source_page[positions[cast(UUID, kwargs["source_id"])]]
-        index = positions[source.id]
+        assert captured_filters is filters and callable(check_active)
+        assert len(source_ids) == 2
+        index = positions[source_ids[0]]
         with lock:
             active[0] += 1
             peak[0] = max(peak[0], active[0])
@@ -334,23 +335,14 @@ def test_parallel_opening_reads_overlap_with_owned_sessions_and_tenant_context(
                 assert fourth_complete.wait(timeout=3)
             with lock:
                 completion_order.append(index)
-            if index == 3:
-                fourth_complete.set()
             if index == 6:
-                raise CorpusScopeUnavailable("Original publication unavailable")
-            chunk = CorpusChunk(
-                f"chunk-{index}",
-                source.id,
-                "ÖRNEK KANUNU\nMADDE 1- İlk hüküm.",
-                0,
-                0,
-                (),
-                {},
-                None,
-                None,
-                "active",
-            )
-            return source, [chunk], False
+                fourth_complete.set()
+            return {
+                source_id: None
+                if positions[source_id] == 6
+                else ("ÖRNEK KANUNU\nMADDE 1- İlk hüküm.",)
+                for source_id in source_ids
+            }
         finally:
             with lock:
                 active[0] -= 1
@@ -360,8 +352,7 @@ def test_parallel_opening_reads_overlap_with_owned_sessions_and_tenant_context(
 
     monkeypatch.setattr(sources, "_opening_texts", READ_ORIGINAL_OPENING)
     monkeypatch.setattr(sources, "get_session_with_current_tenant", opening_session)
-    monkeypatch.setattr(sources, "resolve_source_query_index", lambda *_args: None)
-    monkeypatch.setattr(sources, "read_source_chunks", read)
+    monkeypatch.setattr(sources, "_opening_batch", read_batch)
     token = CURRENT_TENANT_ID_CONTEXTVAR.set("opening-test-tenant")
     try:
         catalogue = sources.load_source_lane_catalogue(
@@ -374,13 +365,13 @@ def test_parallel_opening_reads_overlap_with_owned_sessions_and_tenant_context(
     finally:
         CURRENT_TENANT_ID_CONTEXTVAR.reset(token)
     assert peak == [4] and active == [0]
-    assert completion_order.index(3) < completion_order.index(0)
+    assert completion_order.index(6) < completion_order.index(0)
     assert [row.source_id for row in catalogue.records] == [
         source.id for source in source_page
     ]
     assert catalogue.records[6].kind is SourceKind.UNKNOWN
     assert not catalogue.complete and catalogue.limitations
-    assert len(sessions) == len(closed) == len({id(item) for item in sessions}) == 8
+    assert len(sessions) == len(closed) == len({id(item) for item in sessions}) == 4
     assert {id(item) for item in closed} == {id(item) for item in sessions}
     for session in sessions:
         session.add.assert_not_called()

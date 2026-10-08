@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import time
 from collections.abc import Callable
-from uuid import UUID, uuid4
+from uuid import UUID
 
 from pydantic import JsonValue
 
@@ -33,7 +33,11 @@ from onyx.context.search.models import BaseFilters, IndexFilters
 from onyx.db.asv3_corpus import bind_pc_corpus_scope
 from onyx.db.asv3_runs import save_asv3_checkpoint
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
-from onyx.db.legal_composite_sources import SourceKind, load_source_lane_catalogue
+from onyx.db.legal_composite_sources import (
+    SourceKind,
+    SourceLaneCatalogue,
+    load_source_lane_catalogue,
+)
 from onyx.db.memory import UserMemoryContext
 from onyx.db.models import User
 from onyx.error_handling.error_codes import OnyxErrorCode
@@ -61,6 +65,7 @@ from onyx.server.query_and_chat.streaming_models import (
 )
 from onyx.tools.interface import Tool
 from onyx.tools.tool_implementations.search.search_tool import SearchTool
+from onyx.tracing.answer_graph import graph_step
 from onyx.tracing.framework.create import ChatTraceMetadata, ensure_trace
 
 
@@ -86,6 +91,172 @@ def run_legal_composite_loop(
     custom_agent_prompt: str | None = None,
     user_memory_context: UserMemoryContext | None = None,
     inject_memories_in_prompt: bool = True,
+) -> None:
+    metadata = ChatTraceMetadata(
+        chat_session_id=str(chat_session_id),
+        user_id=str(user.id),
+        user_message_id=user_message_id,
+        assistant_message_id=assistant_message_id,
+        model_name=llm.config.model_name,
+    ).model_dump()
+    with ensure_trace(
+        "legal_composite", group_id=str(chat_session_id), metadata=metadata
+    ):
+        _run_legal_composite_loop(
+            emitter=emitter,
+            state_container=state_container,
+            simple_chat_history=simple_chat_history,
+            tools=tools,
+            llm=llm,
+            user=user,
+            chat_session_id=chat_session_id,
+            assistant_message_id=assistant_message_id,
+            cache=cache,
+            filters=filters,
+            document_set_names_override=document_set_names_override,
+            user_identity=user_identity,
+            research_llm=research_llm,
+            token_counter=token_counter,
+            reasoning_effort=reasoning_effort,
+            include_citations=include_citations,
+            custom_agent_prompt=custom_agent_prompt,
+            user_memory_context=user_memory_context,
+            inject_memories_in_prompt=inject_memories_in_prompt,
+        )
+
+
+def _progress_reporter(
+    context: RunContext, emitter: Emitter, emitted: list[JsonValue]
+) -> ProgressReporter:
+    def emit_progress(event: ProgressEvent) -> None:
+        words = localized_notifications(event.language)
+        title, message = (
+            (event.title, event.message)
+            if event.public_narration
+            else words.get(event.phase, words["tools"])
+        )
+        packet = ASv3Progress.model_validate(
+            dict(
+                run_id=event.run_id,
+                event_id=event.event_id,
+                sequence=event.sequence,
+                language=event.language,
+                phase=event.phase,
+                status=event.status,
+                title=title,
+                message=message,
+                task_id=event.task_id,
+                parent_task_id=event.parent_task_id,
+                active_tasks=event.active_workers,
+                completed_tasks=event.completed_workers,
+            )
+        )
+        emitted.append(packet.model_dump(mode="json"))
+        emitter.emit(Packet(placement=Placement(turn_index=0), obj=packet))
+
+    return ProgressReporter(context.run_id, "tr", emit_progress)
+
+
+def _load_source_catalogue(
+    *, user: User, scope: IndexFilters, context: RunContext, progress: ProgressReporter
+) -> SourceLaneCatalogue:
+    started = time.monotonic()
+    processed_sources = 0
+    progress_updates = 0
+    status = "running"
+    progress.report(
+        "tools",
+        title="Kaynak türleri doğrulanıyor",
+        message="Arama kollarını özgün kaynak açılışlarından hazırlıyorum.",
+    )
+    with graph_step("legal_composite.source_catalogue", {"opening_workers": 4}) as step:
+
+        def on_progress(processed: int, has_more: bool) -> None:
+            nonlocal processed_sources, progress_updates
+            context.check_research_active()
+            processed_sources = processed
+            progress_updates += 1
+            progress.report(
+                "tools",
+                title="Kaynak türleri doğrulanıyor",
+                message=(
+                    f"{processed} erişilebilir kaynağın özgün açılışı incelendi; "
+                    f"{time.monotonic() - started:.1f} saniye geçti."
+                    + (" Diğer kaynaklar inceleniyor." if has_more else "")
+                ),
+            )
+
+        try:
+            context.check_research_active()
+            with get_session_with_current_tenant() as inventory_session:
+                catalogue = load_source_lane_catalogue(
+                    inventory_session,
+                    user=user,
+                    filters=scope,
+                    check_active=context.check_research_active,
+                    opening_workers=4,
+                    on_progress=on_progress,
+                )
+            context.check_research_active()
+            status = "completed" if catalogue.complete else "partial"
+            processed_sources = len(catalogue.records)
+            step.output_value = {
+                "source_count": processed_sources,
+                "uncertain_source_count": sum(
+                    row.uncertain for row in catalogue.records
+                ),
+                "inventory_complete": catalogue.complete,
+            }
+        except RunStopped:
+            status = "cancelled" if context.is_cancelled() else "failed"
+            progress.report(status, status="failed")
+            raise
+        except Exception:
+            status = "failed"
+            raise
+        finally:
+            step.output_value = {
+                **(step.output_value or {}),
+                "status": status,
+                "processed_source_count": processed_sources,
+                "progress_updates": progress_updates,
+                "elapsed_seconds": time.monotonic() - started,
+            }
+    progress.report(
+        "tools",
+        status="completed",
+        title="Kaynak türleri hazır"
+        if catalogue.complete
+        else "Kaynak türleri kısmen doğrulandı",
+        message=(
+            f"{processed_sources} erişilebilir kaynak incelendi; "
+            "doğrulanmayan kaynak türleri belirsiz tutuluyor."
+        ),
+    )
+    return catalogue
+
+
+def _run_legal_composite_loop(
+    *,
+    emitter: Emitter,
+    state_container: ChatStateContainer,
+    simple_chat_history: list[ChatMessageSimple],
+    tools: list[Tool],
+    llm: LLM,
+    user: User,
+    chat_session_id: UUID,
+    assistant_message_id: int,
+    cache: CacheBackend,
+    filters: BaseFilters | None,
+    document_set_names_override: list[str] | None,
+    user_identity: LLMUserIdentity | None,
+    research_llm: LLM | None,
+    token_counter: Callable[[str], int] | None,
+    reasoning_effort: ReasoningEffort,
+    include_citations: bool,
+    custom_agent_prompt: str | None,
+    user_memory_context: UserMemoryContext | None,
+    inject_memories_in_prompt: bool,
 ) -> None:
     policy = WorkflowPolicy(
         timeout_seconds=math.inf,
@@ -148,33 +319,11 @@ def run_legal_composite_loop(
     ledger = EvidenceLedger()
     context.services["evidence"] = ledger
     broker = CorpusBroker(user, scope)
-    emitter.emit(
-        Packet(
-            placement=Placement(turn_index=0),
-            obj=ASv3Progress(
-                run_id=context.run_id,
-                event_id=str(uuid4()),
-                sequence=0,
-                language="tr",
-                phase="tools",
-                status="running",
-                title="Kaynak türleri doğrulanıyor",
-                message="Arama kollarını özgün kaynak başlıklarından hazırlıyorum.",
-                task_id=None,
-                parent_task_id=None,
-                active_tasks=0,
-                completed_tasks=0,
-            ),
-        )
+    emitted: list[JsonValue] = []
+    progress = _progress_reporter(context, emitter, emitted)
+    catalogue = _load_source_catalogue(
+        user=user, scope=scope, context=context, progress=progress
     )
-    with get_session_with_current_tenant() as inventory_session:
-        catalogue = load_source_lane_catalogue(
-            inventory_session,
-            user=user,
-            filters=scope,
-            check_active=context.check_research_active,
-            opening_workers=4,
-        )
     search = next((tool for tool in tools if isinstance(tool, SearchTool)), None)
     if search is not None:
         search = CompositeSearchTool.from_fork(search.fork_for_independent_context())
@@ -301,36 +450,6 @@ def run_legal_composite_loop(
         if message.message_type in {MessageType.USER, MessageType.ASSISTANT}
     )
 
-    emitted: list[JsonValue] = []
-
-    def emit_progress(event: ProgressEvent) -> None:
-        words = localized_notifications(context.language)
-        title, message = (
-            (event.title, event.message)
-            if event.public_narration
-            else words.get(event.phase, words["tools"])
-        )
-        packet = ASv3Progress.model_validate(
-            dict(
-                run_id=event.run_id,
-                event_id=event.event_id,
-                sequence=event.sequence,
-                language=context.language,
-                phase=event.phase,
-                status=event.status,
-                title=title,
-                message=message,
-                task_id=event.task_id,
-                parent_task_id=event.parent_task_id,
-                active_tasks=event.active_workers,
-                completed_tasks=event.completed_workers,
-            )
-        )
-        emitted.append(packet.model_dump(mode="json"))
-        emitter.emit(Packet(placement=Placement(turn_index=0), obj=packet))
-
-    progress = ProgressReporter(context.run_id, "und", emit_progress)
-
     def report_batch(actions: list[SourceAction], pending: int, completed: int) -> None:
         names = {
             SourceKind.CONSTITUTION: "Anayasa",
@@ -415,115 +534,107 @@ def run_legal_composite_loop(
         report=report,
         selector=selector,
     )
-    metadata = ChatTraceMetadata(
-        chat_session_id=str(chat_session_id),
-        user_id=str(user.id),
-        user_message_id=user_message_id,
-        assistant_message_id=assistant_message_id,
-        model_name=llm.config.model_name,
-    ).model_dump()
-    with ensure_trace(
-        "legal_composite", group_id=str(chat_session_id), metadata=metadata
-    ):
-        result = engine.run(question, history, custom_agent_prompt)
-        snapshot: dict[str, JsonValue] = {
-            "run_id": context.run_id,
-            "sequence": 1,
-            "request": question,
-            "scope": context.scope,
-            "evidence": ledger.export(),
-            "asv3_workflow_variant": "legal_composite",
-            "prompt_version": PROMPT_VERSION,
-            "publication_status": result.status,
-            "legal_composite": result.model_dump(mode="json"),
-            "legal_composite_budget": budget.snapshot(),
-            "source_lane_inventory": router.inventory(),
-            "source_selection": engine.selection.model_dump(mode="json")
-            if engine.selection is not None
-            else None,
-            "acquisition_counts": {
-                "searches": acquirer.search_calls,
-                **context.budget.snapshot(),
-            },
-            "processing_seconds": time.monotonic() - started,
-            "progress": emitted,
-        }
-        if result.answer is None or result.status == "cancelled":
-            save_asv3_checkpoint(
-                message_id=assistant_message_id, user_id=user.id, snapshot=snapshot
-            )
-            words = localized_notifications(context.language)
-            progress.report(
-                "cancelled" if result.status == "cancelled" else "failed",
-                status="failed",
-            )
-            raise OnyxError(OnyxErrorCode.LLM_PROVIDER_ERROR, words["failed"][1])
-        context.check_active()
-        final = result.answer.strip()
-        if result.status == "partial":
-            prefix = (
-                "Kısmi yanıt — bazı belirleyici noktalar doğrulanamadı.\n\n"
-                if context.language.startswith("tr")
-                else "Partial answer — some decisive points remain unverified.\n\n"
-            )
-            final = prefix + final
-        numbers = extract_citation_numbers(final)
-        items = [item for number in numbers if (item := ledger.get(number)) is not None]
-        broker.revalidate_evidence(items, context)
-        allowed = {
-            number: document
-            for number, document in ledger.citation_mapping().items()
-            if number in numbers
-        }
-        if set(numbers) - allowed.keys():
-            raise ValueError("A final citation has no authorized original target")
-        ledger.include(numbers)
-        snapshot["evidence"] = ledger.export()
-        snapshot["processing_seconds"] = time.monotonic() - started
+    result = engine.run(question, history, custom_agent_prompt)
+    snapshot: dict[str, JsonValue] = {
+        "run_id": context.run_id,
+        "sequence": 1,
+        "request": question,
+        "scope": context.scope,
+        "evidence": ledger.export(),
+        "asv3_workflow_variant": "legal_composite",
+        "prompt_version": PROMPT_VERSION,
+        "publication_status": result.status,
+        "legal_composite": result.model_dump(mode="json"),
+        "legal_composite_budget": budget.snapshot(),
+        "source_lane_inventory": router.inventory(),
+        "source_selection": engine.selection.model_dump(mode="json")
+        if engine.selection is not None
+        else None,
+        "acquisition_counts": {
+            "searches": acquirer.search_calls,
+            **context.budget.snapshot(),
+        },
+        "processing_seconds": time.monotonic() - started,
+        "progress": emitted,
+    }
+    if result.answer is None or result.status == "cancelled":
         save_asv3_checkpoint(
             message_id=assistant_message_id, user_id=user.id, snapshot=snapshot
         )
-        state_container.add_search_docs(list(allowed.values()))
-        elapsed = time.monotonic() - started
-        state_container.set_pre_answer_processing_time(elapsed)
-        processor = DynamicCitationProcessor(
-            citation_mode=CitationMode.HYPERLINK
-            if include_citations
-            else CitationMode.REMOVE
+        words = localized_notifications(context.language)
+        progress.report(
+            "cancelled" if result.status == "cancelled" else "failed",
+            status="failed",
         )
-        processor.update_citation_mapping(allowed)
-        emitter.emit(
-            Packet(
-                placement=Placement(turn_index=0),
-                obj=AgentResponseStart(
-                    final_documents=list(allowed.values()),
-                    pre_answer_processing_seconds=elapsed,
-                ),
-            )
+        raise OnyxError(OnyxErrorCode.LLM_PROVIDER_ERROR, words["failed"][1])
+    context.check_active()
+    final = result.answer.strip()
+    if result.status == "partial":
+        prefix = (
+            "Kısmi yanıt — bazı belirleyici noktalar doğrulanamadı.\n\n"
+            if context.language.startswith("tr")
+            else "Partial answer — some decisive points remain unverified.\n\n"
         )
-        parts: list[str] = []
-        for token in (final, None):
-            for part in processor.process_token(token):
-                context.check_active()
-                if isinstance(part, CitationInfo):
-                    part.preview_url = f"/api/asv3/citation/{assistant_message_id}/{part.citation_number}"
-                    state_container.add_emitted_citation(part.citation_number)
-                    emitter.emit(Packet(placement=Placement(turn_index=0), obj=part))
-                else:
-                    parts.append(part)
-                    emitter.emit(
-                        Packet(
-                            placement=Placement(turn_index=0),
-                            obj=AgentResponseDelta(content=part),
-                        )
+        final = prefix + final
+    numbers = extract_citation_numbers(final)
+    items = [item for number in numbers if (item := ledger.get(number)) is not None]
+    broker.revalidate_evidence(items, context)
+    allowed = {
+        number: document
+        for number, document in ledger.citation_mapping().items()
+        if number in numbers
+    }
+    if set(numbers) - allowed.keys():
+        raise ValueError("A final citation has no authorized original target")
+    ledger.include(numbers)
+    snapshot["evidence"] = ledger.export()
+    snapshot["processing_seconds"] = time.monotonic() - started
+    save_asv3_checkpoint(
+        message_id=assistant_message_id, user_id=user.id, snapshot=snapshot
+    )
+    state_container.add_search_docs(list(allowed.values()))
+    elapsed = time.monotonic() - started
+    state_container.set_pre_answer_processing_time(elapsed)
+    processor = DynamicCitationProcessor(
+        citation_mode=CitationMode.HYPERLINK
+        if include_citations
+        else CitationMode.REMOVE
+    )
+    processor.update_citation_mapping(allowed)
+    emitter.emit(
+        Packet(
+            placement=Placement(turn_index=0),
+            obj=AgentResponseStart(
+                final_documents=list(allowed.values()),
+                pre_answer_processing_seconds=elapsed,
+            ),
+        )
+    )
+    parts: list[str] = []
+    for token in (final, None):
+        for part in processor.process_token(token):
+            context.check_active()
+            if isinstance(part, CitationInfo):
+                part.preview_url = (
+                    f"/api/asv3/citation/{assistant_message_id}/{part.citation_number}"
+                )
+                state_container.add_emitted_citation(part.citation_number)
+                emitter.emit(Packet(placement=Placement(turn_index=0), obj=part))
+            else:
+                parts.append(part)
+                emitter.emit(
+                    Packet(
+                        placement=Placement(turn_index=0),
+                        obj=AgentResponseDelta(content=part),
                     )
-        state_container.set_citation_mapping(processor.citation_to_doc)
-        state_container.set_answer_tokens("".join(parts))
-        emitter.emit(Packet(placement=Placement(turn_index=0), obj=SectionEnd()))
-        progress.report("completed", status="completed")
-        snapshot.update(
-            sequence=2, progress=emitted, processing_seconds=time.monotonic() - started
-        )
-        save_asv3_checkpoint(
-            message_id=assistant_message_id, user_id=user.id, snapshot=snapshot
-        )
+                )
+    state_container.set_citation_mapping(processor.citation_to_doc)
+    state_container.set_answer_tokens("".join(parts))
+    emitter.emit(Packet(placement=Placement(turn_index=0), obj=SectionEnd()))
+    progress.report("completed", status="completed")
+    snapshot.update(
+        sequence=2, progress=emitted, processing_seconds=time.monotonic() - started
+    )
+    save_asv3_checkpoint(
+        message_id=assistant_message_id, user_id=user.id, snapshot=snapshot
+    )
