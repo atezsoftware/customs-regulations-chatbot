@@ -9,7 +9,10 @@ import pytest
 
 from onyx.asv3.models import EvidenceItem, OutcomeStatus, RunContext
 from onyx.asv3.search_adapter import build_search_adapter
-from onyx.asv3.workflow_variant import ASV3_TUNED_VARIANT
+from onyx.asv3.workflow_variant import (
+    ASV3_GUARDED_EXPERIMENTAL_VARIANT,
+    ASV3_TUNED_VARIANT,
+)
 from onyx.configs.constants import DocumentSource
 from onyx.context.search.models import InferenceChunk, SearchDoc, SearchDocsResponse
 from onyx.db.reranking import RerankerRuntimeConfig
@@ -207,11 +210,20 @@ def test_real_adapter_retains_scoped_candidate_pool_and_canonical_delivery(
 
 
 @pytest.mark.parametrize(
-    "tuned,diversity,target_score",
-    [(True, True, 1.0), (True, True, 0.0), (True, False, 1.0), (False, False, 1.0)],
+    "workflow_variant,diversity,target_score,submitted_count",
+    [
+        (ASV3_TUNED_VARIANT, True, 1.0, 192),
+        (ASV3_TUNED_VARIANT, True, 0.0, 192),
+        (ASV3_TUNED_VARIANT, False, 1.0, 192),
+        (ASV3_GUARDED_EXPERIMENTAL_VARIANT, True, 1.0, 234),
+        (None, False, 1.0, 96),
+    ],
 )
 def test_late_source_is_scored_and_delivered_only_with_source_diversity(
-    tuned: bool, diversity: bool, target_score: float
+    workflow_variant: str | None,
+    diversity: bool,
+    target_score: float,
+    submitted_count: int,
 ) -> None:
     tool, broker, _ = tool_and_broker()
     source_id = str(uuid4())
@@ -225,8 +237,8 @@ def test_late_source_is_scored_and_delivered_only_with_source_diversity(
     ]
     target = independent[25]
     context = RunContext(services={"research_profile": "normal"})
-    if tuned:
-        context.services["asv3_workflow_variant"] = ASV3_TUNED_VARIANT
+    if workflow_variant is not None:
+        context.services["asv3_workflow_variant"] = workflow_variant
     adapter = build_search_adapter(
         tool,
         "Fixed factual scenario",
@@ -312,7 +324,7 @@ def test_late_source_is_scored_and_delivered_only_with_source_diversity(
             context,
         )
 
-    assert len(submitted) == (192 if tuned else 96)
+    assert len(submitted) == submitted_count
     assert (target.unique_id in {chunk.unique_id for chunk in submitted}) is diversity
     assert (target.document_id in {item.source_id for item in outcome.evidence}) is (
         diversity and target_score > 0

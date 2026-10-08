@@ -19,7 +19,10 @@ from onyx.asv3.models import (
     ToolOutcome,
 )
 from onyx.asv3.parallel_execution import parallel_execution_enabled
-from onyx.asv3.workflow_variant import ASV3_TUNED_VARIANT
+from onyx.asv3.workflow_variant import (
+    ASV3_GUARDED_EXPERIMENTAL_VARIANT,
+    ASV3_TUNED_VARIANT,
+)
 from onyx.chat.emitter import NullEmitter
 from onyx.chat.models import ChatMessageSimple
 from onyx.configs.constants import MessageType
@@ -56,6 +59,25 @@ _TUNED_RETRIEVAL_OVERRIDES = SearchToolRetrievalOverrides(
     preserve_source_diversity=True,
     reuse_diversity_comparisons=True,
 )
+
+_GUARDED_RETRIEVAL_OVERRIDES = SearchToolRetrievalOverrides(
+    per_lane_num_hits=192,
+    rerank_candidate_limit=256,
+    regulatory_rerank_candidate_limit=256,
+    max_llm_chunks=32,
+    preserve_source_diversity=True,
+    reuse_diversity_comparisons=True,
+)
+
+
+def guarded_retrieval_overrides(
+    workflow_variant: str | None,
+) -> SearchToolRetrievalOverrides | None:
+    if workflow_variant == ASV3_GUARDED_EXPERIMENTAL_VARIANT:
+        return _GUARDED_RETRIEVAL_OVERRIDES
+    if workflow_variant == ASV3_TUNED_VARIANT:
+        return _TUNED_RETRIEVAL_OVERRIDES
+    return None
 
 
 class ScopedSearchLLM(LLM):
@@ -328,10 +350,11 @@ def build_search_adapter(
                 inject_memories_in_prompt=inject_memories_in_prompt,
                 tool_execution_timeout_seconds=None,
                 search_rerank_context=original_query,
-                search_retrieval_overrides=(
-                    _TUNED_RETRIEVAL_OVERRIDES
-                    if context.services.get("asv3_workflow_variant")
-                    == ASV3_TUNED_VARIANT
+                search_retrieval_overrides=guarded_retrieval_overrides(
+                    context.services.get("asv3_workflow_variant")
+                    if isinstance(
+                        context.services.get("asv3_workflow_variant"), str
+                    )
                     else None
                 ),
             )
@@ -417,6 +440,9 @@ def build_search_adapter(
             data={
                 "source_count": len(evidence),
                 "retrieved_result_count": len(results),
+                "mapped_result_count": len(mapped_docs),
+                "hydrated_center_count": len(mapped_docs) - len(unhydrated_centers),
+                "retained_evidence_count": len(evidence),
                 "unmapped_result_count": unmapped_results,
                 "incomplete_closure_count": incomplete_closures,
                 "context_policy": "harness_controlled",
