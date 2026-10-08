@@ -779,6 +779,71 @@ def test_secondary_search_retry_is_budgeted_and_final_reserve_is_not_spent() -> 
     assert selected.invoke.call_count == 2
 
 
+@pytest.mark.parametrize("max_attempts", [None, 2])
+def test_secondary_search_retains_legacy_three_attempts_and_guarded_bound(
+    max_attempts: int | None,
+) -> None:
+    _, _, selected = tool_and_broker()
+    selected.invoke.side_effect = RuntimeError("retryable failure")
+    context = RunContext()
+    if max_attempts is not None:
+        context.services["provider_max_attempts"] = max_attempts
+    scoped = ScopedSearchLLM(selected, context, None)
+    with (
+        patch(
+            "onyx.asv3.search_adapter.is_retryable_provider_error", return_value=True
+        ),
+        patch("onyx.asv3.search_adapter.provider_retry_delay", return_value=0),
+        pytest.raises(RuntimeError, match="retryable failure"),
+    ):
+        scoped.invoke([UserMessage(content="retry")], max_tokens=512)
+
+    expected = 3 if max_attempts is None else max_attempts
+    assert selected.invoke.call_count == expected
+    assert context.budget.snapshot()["decisions"] == expected
+    assert all(
+        "provider_compatibility_attempts" not in call.kwargs
+        for call in selected.invoke.call_args_list
+    )
+
+
+@pytest.mark.parametrize(
+    "configured,requested,expected",
+    [(None, None, None), (1, None, 1), (1, 3, 3), (None, 2, 2)],
+)
+def test_secondary_search_omits_unconfigured_compatibility_option_and_preserves_explicit_bounds(
+    configured: int | None, requested: int | None, expected: int | None
+) -> None:
+    _, _, selected = tool_and_broker()
+    context = RunContext()
+    if configured is not None:
+        context.services["provider_compatibility_attempts"] = configured
+    scoped = ScopedSearchLLM(selected, context, None)
+    scoped.invoke(
+        [UserMessage(content="query expansion")],
+        max_tokens=512,
+        provider_compatibility_attempts=requested,
+    )
+
+    legacy_keys = {
+        "prompt",
+        "tools",
+        "tool_choice",
+        "structured_response_format",
+        "timeout_override",
+        "max_tokens",
+        "reasoning_effort",
+        "user_identity",
+        "use_streaming",
+    }
+    options = selected.invoke.call_args.kwargs
+    if expected is None:
+        assert set(options) == legacy_keys
+    else:
+        assert set(options) == legacy_keys | {"provider_compatibility_attempts"}
+        assert options["provider_compatibility_attempts"] == expected
+
+
 def test_secondary_search_obeys_guarded_provider_retry_limits() -> None:
     _, _, selected = tool_and_broker()
     response = selected.invoke(max_tokens=512)

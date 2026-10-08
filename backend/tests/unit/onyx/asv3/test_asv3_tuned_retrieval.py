@@ -1,16 +1,28 @@
 """Exercise variant settings through the real dispatcher and search selection."""
 
+import json
 from datetime import date
 from typing import Any
 from unittest.mock import patch
 from uuid import uuid4
 
 import pytest
+from pydantic import JsonValue
 
-from onyx.asv3.models import EvidenceItem, OutcomeStatus, RunContext
+from onyx.asv3.harness import Harness
+from onyx.asv3.models import (
+    CapabilityCall,
+    Decision,
+    EvidenceItem,
+    OutcomeStatus,
+    RunContext,
+    ToolReceipt,
+)
+from onyx.asv3.registry import CapabilityRegistry
 from onyx.asv3.search_adapter import build_search_adapter
 from onyx.asv3.workflow_variant import (
     ASV3_GUARDED_EXPERIMENTAL_VARIANT,
+    ASV3_STANDARD_VARIANT,
     ASV3_TUNED_VARIANT,
 )
 from onyx.configs.constants import DocumentSource
@@ -68,9 +80,12 @@ def candidate_chunks() -> list[InferenceChunk]:
         (ASV3_TUNED_VARIANT, "normal", 150, 256, 384, 150, False),
         (ASV3_GUARDED_EXPERIMENTAL_VARIANT, "normal", 20, 192, 256, 32, True),
         (ASV3_GUARDED_EXPERIMENTAL_VARIANT, "normal", 256, 192, 256, 32, True),
+        (ASV3_STANDARD_VARIANT, "normal", 20, 96, 96, 25, False),
+        (ASV3_STANDARD_VARIANT, "deep", 20, 96, 96, 25, False),
+        (ASV3_STANDARD_VARIANT, "experimental", 20, 96, 96, 25, False),
         (None, "normal", 20, 96, 96, 25, False),
-        (None, "deep", 20, 96, 96, 25, False),
-        (None, "experimental", 20, 96, 96, 25, False),
+        ("legal_composite", "normal", 20, 96, 96, 25, False),
+        ("supersearch", "normal", 20, 96, 96, 25, False),
     ],
 )
 def test_real_adapter_retains_scoped_candidate_pool_and_canonical_delivery(
@@ -86,6 +101,9 @@ def test_real_adapter_retains_scoped_candidate_pool_and_canonical_delivery(
     broker.filters.as_of_date = date(2025, 1, 1)
     chunks = candidate_chunks()
     context = RunContext(services={"research_profile": profile})
+    legacy_payload = variant in {ASV3_STANDARD_VARIANT, ASV3_TUNED_VARIANT}
+    if legacy_payload:
+        context.services["asv3_legacy_search_payload"] = True
     if variant is not None:
         context.services["asv3_workflow_variant"] = variant
     scenario = "Actual fixed scenario and requested independent outcome"
@@ -213,6 +231,45 @@ def test_real_adapter_retains_scoped_candidate_pool_and_canonical_delivery(
     assert rich.displayed_docs is not None
     assert len(rich.displayed_docs) == min(delivered_count, 50)
     assert len(rich.citation_mapping) == delivered_count
+    search_payload = json.loads(responses[0].tool_responses[0].llm_facing_response)
+    expected_data: dict[str, JsonValue] = {
+        "source_count": delivered_count,
+        "retrieved_result_count": len(search_payload["results"]),
+        "unmapped_result_count": 0,
+        "incomplete_closure_count": 0,
+        "context_policy": "harness_controlled",
+        "unhydrated_centers": [],
+        "query": "Focused source conditions",
+        "mode": "hybrid",
+        "original_question": scenario,
+        "search_receipt": {
+            key: value for key, value in search_payload.items() if key != "results"
+        },
+    }
+    if not legacy_payload:
+        expected_data.update(
+            mapped_result_count=delivered_count,
+            hydrated_center_count=delivered_count,
+            retained_evidence_count=delivered_count,
+        )
+    assert outcome.model_dump(mode="json")["data"] == expected_data
+    harness = Harness(
+        request=scenario,
+        context=context,
+        registry=CapabilityRegistry(),
+        decide=lambda _: Decision(answer="Complete"),
+    )
+    receipt = ToolReceipt(
+        call=CapabilityCall(name="search_corpus"),
+        outcome=outcome,
+        elapsed_seconds=0,
+        evidence_ids=harness.evidence.add(outcome.evidence, context),
+    )
+    delivered = json.loads(harness._model_tool_result(receipt).content)
+    assert delivered["outcome"]["data"] == expected_data
+    assert [row["text"] for row in delivered["original_evidence"]] == [
+        item.text for item in outcome.evidence
+    ]
 
 
 @pytest.mark.parametrize(

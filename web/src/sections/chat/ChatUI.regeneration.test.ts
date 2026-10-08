@@ -1,6 +1,6 @@
 import { getRegenerationResearchMode } from "@/sections/chat/ChatUI";
 
-it("preserves Experimental Guardrails when regenerating from its checkpoint", () => {
+it("lets the saved ASv3 checkpoint determine its variant when Guardrails is selected", () => {
   expect(
     getRegenerationResearchMode({
       asv3ResumeMessageId: 41,
@@ -19,6 +19,22 @@ it("preserves Experimental Guardrails when regenerating from its checkpoint", ()
     supersearch: false,
     experimentalResearch: false,
     experimentalParallelResearch: false,
+    experimentalGuardrails: false,
+  });
+});
+
+it("keeps Guardrails selected for a new generation without a checkpoint", () => {
+  expect(
+    getRegenerationResearchMode({
+      atezSearchEnabled: false,
+      atezSearchV2Enabled: false,
+      atezSearchV3Enabled: true,
+      experimentalResearchEnabled: false,
+      experimentalParallelResearchEnabled: false,
+      experimentalGuardrailsEnabled: true,
+    })
+  ).toMatchObject({
+    atezSearchV3: true,
     experimentalGuardrails: true,
   });
 });

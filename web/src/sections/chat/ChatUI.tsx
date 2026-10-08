@@ -60,7 +60,9 @@ export function getRegenerationResearchMode({
     experimentalParallelResearch: resumingAsv3
       ? false
       : experimentalParallelResearchEnabled,
-    experimentalGuardrails: experimentalGuardrailsEnabled,
+    experimentalGuardrails: resumingAsv3
+      ? false
+      : experimentalGuardrailsEnabled,
   };
 }
 

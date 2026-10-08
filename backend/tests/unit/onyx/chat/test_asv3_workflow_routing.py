@@ -114,7 +114,12 @@ def test_actual_chat_worker_maps_variant_before_lite_construction(
     assert setup.new_msg_req.asv3_parallel_research is parallel
 
 
-def test_actual_chat_worker_restores_guarded_variant_from_resume_checkpoint() -> None:
+@pytest.mark.parametrize(
+    "saved_variant", ["standard", ASV3_GUARDED_EXPERIMENTAL_VARIANT]
+)
+def test_actual_chat_worker_restores_variant_from_resume_checkpoint(
+    saved_variant: str,
+) -> None:
     setup = _make_setup()
     setup.persona.id = process_message.DEFAULT_PERSONA_ID
     setup.new_msg_req = SendMessageRequest.model_validate(
@@ -146,7 +151,7 @@ def test_actual_chat_worker_restores_guarded_variant_from_resume_checkpoint() ->
     with (
         patch(
             "onyx.chat.process_message.load_asv3_checkpoint",
-            return_value={"asv3_workflow_variant": ASV3_GUARDED_EXPERIMENTAL_VARIANT},
+            return_value={"asv3_workflow_variant": saved_variant},
         ),
         patch(
             "onyx.asv3.runtime.run_asv3_loop",
@@ -165,10 +170,13 @@ def test_actual_chat_worker_restores_guarded_variant_from_resume_checkpoint() ->
         patch("onyx.chat.process_message.record_final_answer_message"),
         patch("onyx.chat.process_message.set_processing_status"),
     ):
-        result = list(process_message._run_models(cast(ChatTurnSetup, setup), MagicMock()))
+        result = list(
+            process_message._run_models(cast(ChatTurnSetup, setup), MagicMock())
+        )
 
     assert not any(isinstance(item, StreamingError) for item in result)
-    assert invocations[0]["workflow_variant"] == ASV3_GUARDED_EXPERIMENTAL_VARIANT
+    assert setup.new_msg_req.asv3_guarded_experimental is False
+    assert invocations[0]["workflow_variant"] == saved_variant
     assert invocations[0]["research_profile"] == "normal"
     assert invocations[0]["parallel_research"] is False
     assert invocations[0]["research_llm"] is secondary
