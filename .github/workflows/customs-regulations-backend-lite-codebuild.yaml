@@ -176,7 +176,10 @@ jobs:
         run: |
           set -euo pipefail
           pod=$(kubectl get pods -n "${namespace}" -l app=dev-customs-regulations-api -o json |
-            jq -r '.items[] | select(.metadata.deletionTimestamp == null and .status.phase == "Running") | .metadata.name' | head -n 1)
+            jq -r '.items[]
+              | select(.metadata.deletionTimestamp == null and .status.phase == "Running")
+              | select(any(.status.conditions[]?; .type == "Ready" and .status == "True"))
+              | .metadata.name' | head -n 1)
           [[ -n "$pod" ]]
           container=$(kubectl get pod "$pod" -n "${namespace}" -o json | jq -r '.spec.containers[0].name')
           kubectl exec "$pod" -n "${namespace}" -c "$container" -- sh -ec '
