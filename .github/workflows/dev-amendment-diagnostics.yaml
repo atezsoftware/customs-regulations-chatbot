@@ -32,7 +32,7 @@ jobs:
           set -euo pipefail
           python3 - <<'PY_IDENTITY'
           from __future__ import annotations
-          
+
           import ipaddress
           import json
           import os
@@ -43,7 +43,7 @@ jobs:
           import time
           from pathlib import Path
           from typing import cast
-          
+
           PREFIX = "LEGAL_COMPOSITE_FRONTEND_IDENTITY "
           REGION = "eu-central-1"
           ACCOUNT = "255114580789"
@@ -62,55 +62,55 @@ jobs:
           MAX_OUTPUT_BYTES = 2 * 1024 * 1024
           TOTAL_SECONDS = 240
           DNS_NAME = re.compile(r"[a-z0-9](?:[-a-z0-9.]{0,251}[a-z0-9])?\Z")
-          
-          
+
+
           class IdentityFailure(Exception):
               pass
-          
-          
+
+
           def require(condition: bool, reason: str) -> None:
               if not condition:
                   raise IdentityFailure(reason)
-          
-          
+
+
           def object_value(value: object, reason: str) -> dict[str, object]:
               require(isinstance(value, dict), reason)
               result = cast(dict[str, object], value)
               require(all(isinstance(key, str) for key in result), reason)
               return result
-          
-          
+
+
           def list_value(value: object, reason: str) -> list[object]:
               require(isinstance(value, list), reason)
               return cast(list[object], value)
-          
-          
+
+
           def string_value(value: object, reason: str) -> str:
               require(isinstance(value, str), reason)
               return cast(str, value)
-          
-          
+
+
           def name_value(value: object) -> str:
               name = string_value(value, "invalid_resource_name")
               require(DNS_NAME.fullmatch(name) is not None, "invalid_resource_name")
               return name
-          
-          
+
+
           def integer_value(value: object, reason: str) -> int:
               require(isinstance(value, int) and not isinstance(value, bool), reason)
               return cast(int, value)
-          
-          
+
+
           def metadata(resource: dict[str, object]) -> dict[str, object]:
               return object_value(resource.get("metadata"), "missing_metadata")
-          
-          
+
+
           def items(resource: dict[str, object], bound: int) -> list[dict[str, object]]:
               values = list_value(resource.get("items"), "invalid_resource_list")
               require(len(values) <= bound, "resource_count_bound_exceeded")
               return [object_value(value, "invalid_resource_item") for value in values]
-          
-          
+
+
           def stable_list_snapshot(resource: dict[str, object]) -> dict[str, object]:
               envelope = dict(resource)
               envelope_metadata = dict(
@@ -122,13 +122,13 @@ jobs:
               envelope_metadata.pop("resourceVersion", None)
               envelope["metadata"] = envelope_metadata
               return envelope
-          
-          
+
+
           class Reader:
               def __init__(self, kubeconfig: Path) -> None:
                   self.kubeconfig = kubeconfig
                   self.deadline = time.monotonic() + TOTAL_SECONDS
-          
+
               def command(self, args: list[str], timeout_seconds: int = 20) -> str:
                   remaining = self.deadline - time.monotonic()
                   require(remaining > 0, "global_timeout")
@@ -152,14 +152,14 @@ jobs:
                   )
                   require(result.returncode == 0, "read_command_failed")
                   return result.stdout
-          
+
               def json_command(self, args: list[str]) -> dict[str, object]:
                   try:
                       value: object = json.loads(self.command(args))
                   except json.JSONDecodeError as error:
                       raise IdentityFailure("invalid_command_json") from error
                   return object_value(value, "invalid_command_json_object")
-          
+
               def aws(self, *args: str) -> list[str]:
                   return [
                       "aws",
@@ -172,7 +172,7 @@ jobs:
                       "15",
                       *args,
                   ]
-          
+
               def kubectl(self, *args: str) -> list[str]:
                   return [
                       "kubectl",
@@ -181,13 +181,13 @@ jobs:
                       "--request-timeout=15s",
                       *args,
                   ]
-          
+
               def get(self, resource: str, *args: str) -> dict[str, object]:
                   return self.json_command(
                       self.kubectl("get", resource, "-n", NAMESPACE, *args, "-o", "json")
                   )
-          
-          
+
+
           def verify_deployment(
               deployment: dict[str, object], expected_image: str
           ) -> tuple[int, str]:
@@ -216,8 +216,8 @@ jobs:
               require(len(matched) == 1, "template_candidate_container_not_unique")
               container = name_value(matched[0].get("name"))
               return desired, container
-          
-          
+
+
           def verify_pod(
               pod: dict[str, object], expected_image: str, digest: str, container: str
           ) -> dict[str, object]:
@@ -265,8 +265,8 @@ jobs:
                   "serving_pod_digest_mismatch",
               )
               return {"pod": name, "container": container, "image_digest": digest}
-          
-          
+
+
           def inspect(reader: Reader, expected_sha: str) -> dict[str, object]:
               expected_image = f"{IMAGE_REPOSITORY}:{expected_sha}"
               reader.command(
@@ -525,8 +525,8 @@ jobs:
                   "verified_pods": verified,
                   "limitation": "Point-in-time service endpoint proof; ingress/CDN/browser-cache routing is not inspected.",
               }
-          
-          
+
+
           def main() -> int:
               expected_sha = os.environ.get("EXPECTED_SHA", "")
               try:
@@ -570,8 +570,8 @@ jobs:
                   code = 1
               print(PREFIX + json.dumps(result, sort_keys=True, separators=(",", ":")))
               return code
-          
-          
+
+
           if __name__ == "__main__":
               sys.exit(main())
           PY_IDENTITY
