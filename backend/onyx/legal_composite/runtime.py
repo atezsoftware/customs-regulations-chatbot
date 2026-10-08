@@ -44,6 +44,7 @@ from onyx.error_handling.error_codes import OnyxErrorCode
 from onyx.error_handling.exceptions import OnyxError
 from onyx.legal_composite.acquisition import CanonicalAcquirer
 from onyx.legal_composite.budget import WorkflowBudget
+from onyx.legal_composite.dependencies import DependencyExpander
 from onyx.legal_composite.engine import LegalCompositeEngine
 from onyx.legal_composite.gateway import BudgetedGateway
 from onyx.legal_composite.models import SourceAction, WorkflowPolicy
@@ -166,8 +167,8 @@ def _load_source_catalogue(
     status = "running"
     progress.report(
         "tools",
-        title="Kaynak türleri doğrulanıyor",
-        message="Arama kollarını özgün kaynak açılışlarından hazırlıyorum.",
+        title="Kaynak türleri hazırlanıyor",
+        message="Arama kolları için özgün açılışları inceliyorum; bulunan kaynaklar okunurken tam doğrulanacak.",
     )
     with graph_step("legal_composite.source_catalogue", {"opening_workers": 4}) as step:
 
@@ -178,7 +179,7 @@ def _load_source_catalogue(
             progress_updates += 1
             progress.report(
                 "tools",
-                title="Kaynak türleri doğrulanıyor",
+                title="Kaynak türleri hazırlanıyor",
                 message=(
                     f"{processed} erişilebilir kaynağın özgün açılışı incelendi; "
                     f"{time.monotonic() - started:.1f} saniye geçti."
@@ -196,6 +197,7 @@ def _load_source_catalogue(
                     check_active=context.check_research_active,
                     opening_workers=4,
                     on_progress=on_progress,
+                    routing_only=True,
                 )
             context.check_research_active()
             status = "completed" if catalogue.complete else "partial"
@@ -206,6 +208,7 @@ def _load_source_catalogue(
                     row.uncertain for row in catalogue.records
                 ),
                 "inventory_complete": catalogue.complete,
+                "routing_only": True,
             }
         except RunStopped:
             status = "cancelled" if context.is_cancelled() else "failed"
@@ -227,10 +230,10 @@ def _load_source_catalogue(
         status="completed",
         title="Kaynak türleri hazır"
         if catalogue.complete
-        else "Kaynak türleri kısmen doğrulandı",
+        else "Kaynak türleri kısmen hazır",
         message=(
             f"{processed_sources} erişilebilir kaynak incelendi; "
-            "doğrulanmayan kaynak türleri belirsiz tutuluyor."
+            "tür belirsizliği korunuyor; bulunan özgün metinler okunurken tam doğrulanacak."
         ),
     )
     return catalogue
@@ -408,6 +411,18 @@ def _run_legal_composite_loop(
         registry_for_action=router.registry,
         expand_actions=router.expand,
         lane_inventory=router.inventory(),
+        host_registry=CapabilityRegistry(
+            build_corpus_specs(
+                broker, require_search_targets=True, source_identity_guidance=True
+            )
+        ),
+    )
+    dependency_expander = DependencyExpander(
+        broker=broker,
+        acquirer=acquirer,
+        ledger=ledger,
+        context=context,
+        source_kinds={str(row.source_id): row.kind for row in catalogue.records},
     )
     budget = WorkflowBudget(policy, deadline=context.deadline)
     budget.retain_selection_time(policy.selection_reserve_seconds)
@@ -473,6 +488,10 @@ def _run_legal_composite_loop(
             if kind is not None
         ]
         parallel = len(actions) > 1
+        dependency_batch = (
+            any(action.tool == "dependency_related_sources" for action in actions)
+            or not labels
+        )
         title = (
             ("Paralel kaynak araştırması" if parallel else "Kaynak araştırması")
             if turkish
@@ -489,6 +508,17 @@ def _run_legal_composite_loop(
                 f"up to {policy.max_parallel_tools} searches run concurrently."
             )
         )
+        if dependency_batch:
+            title = (
+                "Kaynak atıfları ve bağlı hükümler araştırılıyor"
+                if turkish
+                else "Researching source references and dependent authority"
+            )
+            message = (
+                f"Özgün kaynak ilişkileri: {completed}/{len(actions)} işlem tamamlandı."
+                if turkish
+                else f"Original source relationships: {completed}/{len(actions)} actions complete."
+            )
         progress.report(
             "tools",
             status="running" if pending else "completed",
@@ -533,6 +563,7 @@ def _run_legal_composite_loop(
         research_available=research_available,
         report=report,
         selector=selector,
+        dependency_expander=dependency_expander,
     )
     result = engine.run(question, history, custom_agent_prompt)
     snapshot: dict[str, JsonValue] = {
@@ -541,6 +572,9 @@ def _run_legal_composite_loop(
         "request": question,
         "scope": context.scope,
         "evidence": ledger.export(),
+        "authority_dependencies": [
+            edge.model_dump(mode="json") for edge in getattr(engine, "dependencies", [])
+        ],
         "asv3_workflow_variant": "legal_composite",
         "prompt_version": PROMPT_VERSION,
         "publication_status": result.status,

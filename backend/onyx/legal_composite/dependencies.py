@@ -1,0 +1,1015 @@
+"""Acquire source-triggered authority relationships without another model planner."""
+
+from __future__ import annotations
+
+import json
+import re
+import unicodedata
+from hashlib import sha256
+from typing import cast
+
+from pydantic import JsonValue
+
+from onyx.asv3.authority import _named_native_references, explicit_reference_leads
+from onyx.asv3.corpus_tools import CorpusBroker, evidence_for_chunk, guarded
+from onyx.asv3.evidence import EvidenceLedger
+from onyx.asv3.legal_source_navigation import (
+    ProvisionNavigationAnchor,
+    derive_provision_navigation_anchor,
+    match_related_source_name,
+)
+from onyx.asv3.models import (
+    EvidenceItem,
+    OutcomeStatus,
+    RunContext,
+    RunStopped,
+    ToolOutcome,
+    ToolSpec,
+    model_evidence_metadata,
+)
+from onyx.db.asv3_corpus import CorpusSource
+from onyx.db.legal_composite_sources import SourceKind, classify_source
+from onyx.legal_composite.acquisition import CanonicalAcquirer
+from onyx.legal_composite.models import (
+    AnswerReview,
+    AuthorityDependency,
+    DependencyOrigin,
+    DraftAnswer,
+    ResearchPlan,
+    SourceAction,
+)
+from onyx.tracing.answer_graph import graph_step
+
+
+def _normalized_name(value: str) -> str:
+    folded = unicodedata.normalize("NFKD", value.casefold().replace("ı", "i"))
+    folded = "".join(char for char in folded if not unicodedata.combining(char))
+    return re.sub(r"\bkanun(?:u|un|unun)?$", "kanun", " ".join(folded.split()))
+
+
+def _literal_names(text: str) -> dict[str, str]:
+    # Only literal formal names supply aliases; inherited labels and filenames cannot.
+    pattern = r"(?<!\w)((?:[A-ZÇĞİÖŞÜ][\w’'-]*\s+){1,12}(?i:Kanunu|Kanun|Law|Act|Statute))(?i:(?:['’]?(?:nun|nın|nin|nün|un|ın|in|ün))?)(?!\w)"
+    aliases: dict[str, str] = {}
+    for match in re.finditer(pattern, text):
+        terms = match[1].split()
+        while terms and _normalized_name(terms[0]) in {
+            "bu",
+            "isbu",
+            "ilgili",
+            "anilan",
+            "sozkonusu",
+            "the",
+            "this",
+            "that",
+            "said",
+        }:
+            terms.pop(0)
+        if len(terms) >= 2:
+            name = " ".join(terms)
+            aliases[_normalized_name(name)] = name
+    return aliases
+
+
+def _entity_key(
+    name: str, number: str | None, article: str, qualifier: str | None
+) -> str:
+    identity = [number or _normalized_name(name), article, qualifier]
+    return sha256(json.dumps(identity, ensure_ascii=False).encode()).hexdigest()
+
+
+class DependencyExpander:
+    def __init__(
+        self,
+        *,
+        broker: CorpusBroker,
+        acquirer: CanonicalAcquirer,
+        ledger: EvidenceLedger,
+        context: RunContext,
+        source_kinds: dict[str, SourceKind],
+    ) -> None:
+        self.broker = broker
+        self.acquirer = acquirer
+        self.ledger = ledger
+        self.context = context
+        self.source_kinds = source_kinds
+        self.verified_kinds = dict(source_kinds)
+        self.edges: dict[str, AuthorityDependency] = {}
+        self.receipts: list[dict[str, JsonValue]] = []
+        self._expanded: dict[str, str] = {}
+        acquirer.host_registry.register(
+            ToolSpec(
+                name="dependency_related_sources",
+                description="Host-only scoped navigation from a read governing original.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "edge_id": {"type": "string"},
+                        "offset": {"type": "integer", "minimum": 0},
+                    },
+                    "required": ["edge_id"],
+                    "additionalProperties": False,
+                },
+                handler=guarded(self._related),
+            )
+        )
+
+    def _navigation_item(self, item: EvidenceItem) -> EvidenceItem:
+        # Verified opening identity can correct a label in a navigation-only copy.
+        if self.verified_kinds.get(item.source_id) != SourceKind.STATUTE:
+            return item
+        copied = item.model_copy(deep=True)
+        canonical = copied.metadata.get("canonical_metadata")
+        copied.metadata["document_type"] = "statute"
+        if isinstance(canonical, dict):
+            canonical["document_type"] = "statute"
+        return copied
+
+    def _anchor(self, item: EvidenceItem) -> ProvisionNavigationAnchor | None:
+        if self.verified_kinds.get(item.source_id) != SourceKind.STATUTE:
+            return None
+        return derive_provision_navigation_anchor(
+            item.source_id, [self._navigation_item(item)]
+        )
+
+    def _collect(
+        self,
+        plan: ResearchPlan,
+        frontier: set[int] | None = None,
+        need_bindings: dict[int, set[str]] | None = None,
+    ) -> None:
+        selected_numbers = (
+            set(self.ledger.citation_numbers()) if frontier is None else frontier
+        )
+        records = cast(
+            list[dict[str, JsonValue]],
+            json.loads(self.ledger.serialize_records(selected_numbers, max_chars=None)),
+        )
+        leads = explicit_reference_leads(
+            self.ledger, records, syntactic_reference_binding=True
+        )
+        for citation in selected_numbers:
+            item = self.ledger.get(citation)
+            if (
+                item is None
+                or item.search_doc is None
+                or item.search_doc.document_id != item.source_id
+                or item.search_doc.metadata.get("regulatory_chunk_id") != item.chunk_id
+                or any(
+                    model_evidence_metadata(item.metadata).get(flag)
+                    for flag in ("derived", "external", "untrusted", "truncated")
+                )
+            ):
+                continue
+            aliases = _literal_names(item.text)
+            for reference, name in _named_native_references(
+                item.text,
+                {alias: set() for alias in aliases},
+                strict_reference_boundaries=True,
+                syntactic_reference_binding=True,
+                unicode_ordinals=True,
+            ):
+                if reference.article is not None and name in aliases:
+                    leads.append(
+                        {
+                            "formal_name": aliases[name],
+                            "instrument_number": reference.number or None,
+                            "article": reference.article,
+                            "qualifier": reference.qualifier,
+                            "origin_citations": [citation],
+                        }
+                    )
+        for number in self.ledger.citation_numbers():
+            if number not in selected_numbers:
+                continue
+            item = self.ledger.get(number)
+            assert item is not None
+            anchor = self._anchor(item)
+            if anchor is not None:
+                leads.append(
+                    {
+                        "formal_name": anchor.instrument_name,
+                        "instrument_number": anchor.instrument_number,
+                        "article": anchor.article_no,
+                        "qualifier": anchor.qualifier,
+                        "origin_citations": [number],
+                    }
+                )
+        known_needs = {need.need_id for need in plan.needs}
+        for lead in leads:
+            name, article = lead.get("formal_name"), lead.get("article")
+            if not isinstance(name, str) or not isinstance(article, str):
+                continue
+            number = lead.get("instrument_number")
+            qualifier = lead.get("qualifier")
+            number = number if isinstance(number, str) else None
+            qualifier = qualifier if isinstance(qualifier, str) else None
+            key = _entity_key(name, number, article, qualifier)
+            edge = self._matching_edge(name, number, article, qualifier)
+            if edge is None:
+                edge = AuthorityDependency(
+                    edge_id=key,
+                    need_ids=[],
+                    instrument_name=name,
+                    instrument_number=number,
+                    article=article,
+                    qualifier=qualifier,
+                    origins=[],
+                )
+                self.edges[key] = edge
+            elif edge.instrument_number is None and number:
+                edge.instrument_number = number
+            origins = lead.get("origin_citations", [])
+            if not isinstance(origins, list):
+                continue
+            for citation in origins:
+                if type(citation) is not int:
+                    continue
+                item = self.ledger.get(citation)
+                if item is None:
+                    continue
+                if citation not in {origin.citation for origin in edge.origins}:
+                    edge.origins.append(
+                        DependencyOrigin(
+                            citation=citation,
+                            source_id=item.source_id,
+                            chunk_id=item.chunk_id,
+                            text_hash=item.text_hash,
+                        )
+                    )
+                bindings = (
+                    need_bindings.get(citation, set(item.question_ids))
+                    if need_bindings is not None
+                    else set(item.question_ids)
+                ) & known_needs
+                edge.need_ids = sorted(set(edge.need_ids) | (bindings or known_needs))
+        self._bind_governing()
+
+    def _bind_governing(self) -> None:
+        for number in self.ledger.citation_numbers():
+            item = self.ledger.get(number)
+            assert item is not None
+            anchor = self._anchor(item)
+            if anchor is None:
+                continue
+            edge = self._matching_edge(
+                anchor.instrument_name,
+                anchor.instrument_number,
+                anchor.article_no,
+                anchor.qualifier,
+            )
+            if edge is not None and number not in edge.governing_citations:
+                if edge.instrument_number is None:
+                    edge.instrument_number = anchor.instrument_number
+                edge.governing_citations.append(number)
+                self.acquirer._bind_originals([number], edge.need_ids)
+
+    def _matching_edge(
+        self, name: str, number: str | None, article: str, qualifier: str | None
+    ) -> AuthorityDependency | None:
+        matches = [
+            edge
+            for edge in self.edges.values()
+            if edge.article == article
+            and edge.qualifier == qualifier
+            and not (
+                edge.instrument_number and number and edge.instrument_number != number
+            )
+            and (
+                (edge.instrument_number and number and edge.instrument_number == number)
+                or _normalized_name(edge.instrument_name) == _normalized_name(name)
+            )
+        ]
+        return matches[0] if len(matches) == 1 else None
+
+    def _related(
+        self, arguments: dict[str, JsonValue], context: RunContext
+    ) -> ToolOutcome:
+        edge = self.edges[str(arguments["edge_id"])]
+        if not edge.governing_citations:
+            return ToolOutcome(
+                status=OutcomeStatus.NOT_FOUND,
+                summary="Own governing original is unresolved.",
+            )
+        item = self.ledger.get(edge.governing_citations[0])
+        assert item is not None and item.chunk_id is not None
+        source, chunk = self.broker.chunk(item.source_id, item.chunk_id, context)
+        if chunk is None:
+            return ToolOutcome(
+                status=OutcomeStatus.UNAVAILABLE,
+                summary="Governing original is no longer visible.",
+            )
+        current = evidence_for_chunk(source, chunk)
+        if current.identity != item.identity:
+            return ToolOutcome(
+                status=OutcomeStatus.UNAVAILABLE,
+                summary="Governing original identity changed.",
+            )
+        anchor = self._anchor(current)
+        if anchor is None:
+            return ToolOutcome(
+                status=OutcomeStatus.UNAVAILABLE,
+                summary="Own governing identity remains ambiguous.",
+            )
+        query = " ".join(
+            part
+            for part in (anchor.instrument_name, anchor.qualifier, anchor.article_no)
+            if part
+        )
+        variants = (query,)
+        if anchor.instrument_number:
+            variants += (
+                " ".join(
+                    part
+                    for part in (
+                        anchor.instrument_number,
+                        "sayılı Kanun",
+                        anchor.qualifier,
+                        anchor.article_no,
+                    )
+                    if part
+                ),
+            )
+        offset = int(cast(int, arguments.get("offset", 0)))
+        sources, more = self.broker.related_catalog_sources(
+            variants, context, offset=offset, limit=50
+        )
+        candidates: list[JsonValue] = []
+        for candidate in sources:
+            role = match_related_source_name(anchor, candidate.name)
+            if candidate.id != source.id and role is not None:
+                candidates.append(
+                    {
+                        "source_id": str(candidate.id),
+                        "name": candidate.name,
+                        "candidate_role": role,
+                    }
+                )
+        result: dict[str, JsonValue] = {
+            "edge_id": edge.edge_id,
+            "query_variants": list(variants),
+            "navigation_only": True,
+            "absence_proven": False,
+            "has_more": more,
+            "next_offset": offset + 50 if more else None,
+            "candidates": candidates,
+        }
+        return ToolOutcome(
+            status=OutcomeStatus.FOUND,
+            summary="Scoped title relationships are uncitable reading leads, never holdings or absence proof.",
+            data=result,
+        )
+
+    def _wave(
+        self, actions: list[SourceAction], plan: ResearchPlan
+    ) -> list[dict[str, JsonValue]]:
+        if not actions:
+            return []
+        try:
+            receipts = self.acquirer.acquire_host_actions(actions, plan)
+        except RunStopped:
+            self.context.check_active()
+            receipts = self.acquirer.last_receipts
+            for edge in self.edges.values():
+                edge.discovery_gaps.append(
+                    "Dependency acquisition stopped before closure."
+                )
+        self.receipts.extend(receipts)
+        return receipts
+
+    def _kind(self, source_id: str) -> SourceKind:
+        return self.source_kinds.get(source_id, SourceKind.UNKNOWN)
+
+    def expand(
+        self,
+        plan: ResearchPlan,
+        *,
+        frontier: set[int] | None = None,
+        need_bindings: dict[int, set[str]] | None = None,
+    ) -> list[AuthorityDependency]:
+        self._collect(plan, frontier, need_bindings)
+        fresh = [
+            edge
+            for edge in self.edges.values()
+            if self._expanded.get(edge.edge_id) != self._edge_state(edge)
+        ]
+        for edge in fresh:
+            edge.discovery_gaps = []
+            edge.incomplete_source_ids = []
+        with graph_step(
+            "legal_composite.authority_dependencies", {"edge_count": len(fresh)}
+        ) as step:
+            self._expand(fresh, plan)
+            self._expanded.update(
+                {edge.edge_id: self._edge_state(edge) for edge in fresh}
+            )
+            step.output_value = {
+                "edge_count": len(self.edges),
+                "governing_original_count": sum(
+                    len(edge.governing_citations) for edge in self.edges.values()
+                ),
+                "candidate_original_count": sum(
+                    len(edge.candidate_citations) for edge in self.edges.values()
+                ),
+            }
+        return list(self.edges.values())
+
+    @staticmethod
+    def _edge_state(edge: AuthorityDependency) -> str:
+        return json.dumps(
+            [
+                edge.need_ids,
+                [origin.model_dump() for origin in edge.origins],
+                edge.governing_citations,
+            ],
+            sort_keys=True,
+        )
+
+    def _expand(self, edges: list[AuthorityDependency], plan: ResearchPlan) -> None:
+        resolves: list[SourceAction] = []
+        resolution_queries: dict[str, set[str]] = {}
+        for edge in edges:
+            if not edge.governing_citations:
+                variants = [edge.instrument_name]
+                if edge.instrument_number:
+                    variants.append(edge.instrument_number + " sayılı Kanun")
+                resolution_queries[edge.edge_id] = set(variants)
+                for query in variants:
+                    resolves.append(
+                        SourceAction(
+                            need_ids=edge.need_ids,
+                            tool="resolve_source",
+                            arguments={"query": query, "limit": 100},
+                        )
+                    )
+        resolved = self._wave(resolves, plan)
+        pages = resolved
+        while pages:
+            next_actions: list[SourceAction] = []
+            for receipt in pages:
+                data, arguments = (
+                    receipt.get("data", {}),
+                    receipt.get("host_arguments", {}),
+                )
+                if not isinstance(data, dict) or not isinstance(arguments, dict):
+                    continue
+                offset = data.get("next_offset")
+                if (
+                    data.get("has_more") is True
+                    and type(offset) is int
+                    and offset > cast(int, arguments.get("offset", -1))
+                ):
+                    next_actions.append(
+                        SourceAction(
+                            need_ids=cast(list[str], receipt["need_ids"]),
+                            tool="resolve_source",
+                            arguments={**arguments, "offset": offset},
+                        )
+                    )
+            pages = self._wave(next_actions, plan)
+            resolved.extend(pages)
+        opening_reads: list[SourceAction] = []
+        for receipt in resolved:
+            data = receipt.get("data", {})
+            sources = data.get("sources") if isinstance(data, dict) else None
+            if isinstance(sources, list):
+                for candidate in sources:
+                    sid = (
+                        candidate.get("source_id")
+                        if isinstance(candidate, dict)
+                        else None
+                    )
+                    if (
+                        isinstance(candidate, dict)
+                        and isinstance(sid, str)
+                        and self._kind(sid) == SourceKind.UNKNOWN
+                    ):
+                        opening_reads.append(
+                            SourceAction(
+                                need_ids=cast(list[str], receipt["need_ids"]),
+                                tool="read_source_range",
+                                source_kind=SourceKind.UNKNOWN,
+                                arguments={"source_id": sid, "start": 0, "limit": 3},
+                            )
+                        )
+        self._wave(opening_reads, plan)
+        for action in opening_reads:
+            sid = str(action.arguments["source_id"])
+            self.verified_kinds[sid] = self._original_kind(sid)
+        reads: list[SourceAction] = []
+        for edge in edges:
+            if edge.governing_citations:
+                continue
+            for receipt in resolved:
+                arguments = receipt.get("host_arguments", {})
+                if not isinstance(arguments, dict) or arguments.get(
+                    "query"
+                ) not in resolution_queries.get(edge.edge_id, set()):
+                    continue
+                data = receipt.get("data", {})
+                if not isinstance(data, dict):
+                    continue
+                if data.get("has_more") and not any(
+                    isinstance(follow := row.get("host_arguments"), dict)
+                    and follow.get("query") == arguments.get("query")
+                    and follow.get("offset") == data.get("next_offset")
+                    for row in resolved
+                ):
+                    edge.discovery_gaps.append(
+                        "Governing identity resolution remains partial."
+                    )
+                for source in (
+                    data.get("sources", [])
+                    if isinstance(data.get("sources"), list)
+                    else []
+                ):
+                    if isinstance(source, dict) and isinstance(
+                        source.get("source_id"), str
+                    ):
+                        sid = source["source_id"]
+                        if self.verified_kinds.get(sid) != SourceKind.STATUTE:
+                            continue
+                        reads.append(
+                            SourceAction(
+                                need_ids=edge.need_ids,
+                                tool="read_provision",
+                                source_kind=self._kind(sid),
+                                arguments={
+                                    "source_id": sid,
+                                    "article": " ".join(
+                                        part
+                                        for part in (edge.qualifier, edge.article)
+                                        if part
+                                    ),
+                                },
+                            )
+                        )
+        while reads:
+            read_receipts = self._wave(reads, plan)
+            continuation: list[SourceAction] = []
+            for receipt in read_receipts:
+                data, arguments = (
+                    receipt.get("data", {}),
+                    receipt.get("host_arguments", {}),
+                )
+                if not isinstance(data, dict) or not isinstance(arguments, dict):
+                    continue
+                if receipt.get("status") == "partial":
+                    position = (
+                        data.get("evidence_next_position")
+                        if data.get("evidence_truncated")
+                        else data.get("next_position")
+                    )
+                    if type(position) is int and position > cast(
+                        int, arguments.get("start", 0)
+                    ):
+                        continuation.append(
+                            SourceAction(
+                                need_ids=cast(list[str], receipt["need_ids"]),
+                                tool="read_provision",
+                                source_kind=self._kind(str(arguments["source_id"])),
+                                arguments={**arguments, "start": position},
+                            )
+                        )
+                    else:
+                        for edge in edges:
+                            edge.discovery_gaps.append(
+                                "Governing continuation remains incomplete."
+                            )
+            reads = continuation
+        self._bind_governing()
+        navigation = [
+            SourceAction(
+                need_ids=edge.need_ids,
+                tool="dependency_related_sources",
+                arguments={"edge_id": edge.edge_id},
+            )
+            for edge in edges
+            if edge.governing_citations
+        ]
+        searches: list[SourceAction] = []
+        query_edges: dict[str, str] = {}
+        for edge in edges:
+            query = " ".join(
+                part
+                for part in (
+                    edge.instrument_name,
+                    edge.qualifier,
+                    edge.article,
+                    "iptal sınırlama uygulama yürürlük",
+                )
+                if part
+            )
+            variants = [query]
+            if edge.instrument_number:
+                variants.append(
+                    " ".join(
+                        part
+                        for part in (
+                            edge.instrument_number,
+                            "sayılı Kanun",
+                            edge.qualifier,
+                            edge.article,
+                        )
+                        if part
+                    )
+                )
+            for query in variants:
+                query_edges[query] = edge.edge_id
+                for kind in (SourceKind.JUDICIAL_DECISION, SourceKind.UNKNOWN):
+                    searches.append(
+                        SourceAction(
+                            need_ids=edge.need_ids,
+                            tool="search_corpus",
+                            source_kind=kind,
+                            arguments={
+                                "query": query,
+                                "mode": "hybrid",
+                                "expand_query": False,
+                                "coverage_item": ", ".join(edge.need_ids),
+                                "evidence_target": "Operative limiting authority and its scope, dates and continuation",
+                            },
+                        )
+                    )
+        results = self._wave([*navigation, *searches], plan)
+        pages = results
+        while pages:
+            more_actions: list[SourceAction] = []
+            for receipt in pages:
+                data, arguments = (
+                    receipt.get("data", {}),
+                    receipt.get("host_arguments", {}),
+                )
+                if (
+                    receipt.get("tool") != "dependency_related_sources"
+                    or not isinstance(data, dict)
+                    or not isinstance(arguments, dict)
+                ):
+                    continue
+                offset = data.get("next_offset")
+                if (
+                    data.get("has_more") is True
+                    and type(offset) is int
+                    and offset > cast(int, arguments.get("offset", -1))
+                ):
+                    more_actions.append(
+                        SourceAction(
+                            need_ids=cast(list[str], receipt["need_ids"]),
+                            tool="dependency_related_sources",
+                            arguments={**arguments, "offset": offset},
+                        )
+                    )
+            pages = self._wave(more_actions, plan)
+            results.extend(pages)
+        candidate_edges: dict[str, set[str]] = {}
+        # Receipts carry canonical need bindings; title results retain explicit edge IDs.
+        for receipt in results:
+            arguments = receipt.get("host_arguments", {})
+            if not isinstance(arguments, dict):
+                continue
+            key = arguments.get("edge_id") or query_edges.get(
+                str(arguments.get("query", ""))
+            )
+            relevant = (
+                [self.edges[key]] if isinstance(key, str) and key in self.edges else []
+            )
+            data = receipt.get("data", {})
+            if isinstance(data, dict):
+                for edge in relevant:
+                    if (
+                        data.get("has_more")
+                        and receipt.get("tool") != "dependency_related_sources"
+                    ) or receipt.get("status") in {
+                        "denied",
+                        "unavailable",
+                        "truncated",
+                    }:
+                        edge.discovery_gaps.append(
+                            "Related-source navigation or discovery remains incomplete."
+                        )
+                candidates = data.get("candidates", [])
+                for candidate in candidates if isinstance(candidates, list) else []:
+                    if isinstance(candidate, dict) and isinstance(
+                        candidate.get("source_id"), str
+                    ):
+                        candidate_edges.setdefault(
+                            candidate["source_id"], set()
+                        ).update(edge.edge_id for edge in relevant)
+            for citation in cast(list[int], receipt.get("citations", [])):
+                item = self.ledger.get(citation)
+                if item is not None:
+                    candidate_edges.setdefault(item.source_id, set()).update(
+                        edge.edge_id for edge in relevant
+                    )
+        governing_ids = {
+            item.source_id
+            for edge in edges
+            for citation in edge.governing_citations
+            if (item := self.ledger.get(citation)) is not None
+        }
+        for sid in governing_ids:
+            candidate_edges.pop(sid, None)
+        pending = {sid: 0 for sid in candidate_edges}
+        while pending:
+            actions = [
+                SourceAction(
+                    need_ids=sorted(
+                        {
+                            need
+                            for edge_id in candidate_edges[sid]
+                            for need in self.edges[edge_id].need_ids
+                        }
+                    ),
+                    tool="read_source_range",
+                    source_kind=self._kind(sid),
+                    arguments={"source_id": sid, "start": start, "limit": 100},
+                )
+                for sid, start in pending.items()
+            ]
+            receipts = self._wave(actions, plan)
+            next_pending: dict[str, int] = {}
+            for receipt in receipts:
+                numbers = cast(list[int], receipt.get("citations", []))
+                arguments = receipt.get("host_arguments", {})
+                sid = (
+                    arguments.get("source_id") if isinstance(arguments, dict) else None
+                )
+                source_ids = {sid} if isinstance(sid, str) and sid in pending else set()
+                for sid in source_ids:
+                    for edge_id in candidate_edges.get(sid, ()):
+                        edge = self.edges[edge_id]
+                        edge.candidate_citations = sorted(
+                            set(edge.candidate_citations) | set(numbers)
+                        )
+                        if (
+                            self._original_kind(sid) == SourceKind.JUDICIAL_DECISION
+                            and sid not in edge.judicial_source_ids
+                        ):
+                            edge.judicial_source_ids.append(sid)
+                    data = receipt.get("data", {})
+                    if isinstance(data, dict) and data.get("has_more") is True:
+                        position = data.get("next_position")
+                        if type(position) is int and position > pending[sid]:
+                            next_pending[sid] = position
+                    elif receipt.get("status") == "found":
+                        pending.pop(sid, None)
+            for sid in pending.keys() - next_pending.keys():
+                for edge_id in candidate_edges[sid]:
+                    edge = self.edges[edge_id]
+                    if sid not in edge.incomplete_source_ids:
+                        edge.incomplete_source_ids.append(sid)
+            if not receipts:
+                break
+            pending = next_pending
+        for edge in edges:
+            if not edge.governing_citations:
+                edge.discovery_gaps.append(
+                    "Own governing provision has not been acquired."
+                )
+            edge.discovery_gaps = list(dict.fromkeys(edge.discovery_gaps))
+
+    def _original_kind(self, source_id: str) -> SourceKind:
+        originals = [
+            item
+            for number in self.ledger.citation_numbers()
+            if (item := self.ledger.get(number)) is not None
+            and item.source_id == source_id
+        ]
+        originals.sort(key=lambda item: cast(int, item.metadata.get("position", -1)))
+        opening_read = any(
+            receipt.get("tool") == "read_source_range"
+            and isinstance(arguments := receipt.get("host_arguments"), dict)
+            and arguments.get("source_id") == source_id
+            and arguments.get("start", 0) == 0
+            and bool(receipt.get("citations"))
+            for receipt in self.receipts
+        )
+        if not originals or not opening_read:
+            return SourceKind.UNKNOWN
+        item = originals[0]
+        if item.search_doc is None:
+            return SourceKind.UNKNOWN
+        from uuid import UUID
+
+        source = CorpusSource(
+            UUID(source_id),
+            item.search_doc.semantic_identifier,
+            item.search_doc.file_id or "",
+        )
+        return classify_source(
+            source, (), opening_texts=tuple(row.text for row in originals[:3])
+        ).kind
+
+
+def assess_dependencies(
+    edges: list[AuthorityDependency],
+    plan: ResearchPlan,
+    draft: DraftAnswer,
+    review: AnswerReview,
+    ledger: EvidenceLedger,
+    delivered: set[int],
+) -> tuple[bool, bool, list[str]]:
+    """Require closed original witnesses or an exact disclosed material source gap."""
+    from onyx.asv3.citation_numbers import extract_citation_numbers
+    from onyx.asv3.judicial_sections import canonical_disposition_witness
+    from onyx.asv3.models import model_evidence_metadata
+
+    if not edges:
+        return True, True, []
+    assessments = review.dependency_assessments or []
+    edge_map = {edge.edge_id: edge for edge in edges}
+    ids = [row.edge_id for row in assessments]
+    if len(ids) != len(set(ids)) or set(ids) != set(edge_map):
+        return (
+            False,
+            False,
+            [
+                "Every host-discovered authority dependency needs exactly one original-grounded assessment."
+            ],
+        )
+    safe = complete = True
+    gaps: list[str] = []
+    cited = set(extract_citation_numbers(draft.answer))
+    originals = [
+        item for number in delivered if (item := ledger.get(number)) is not None
+    ]
+    need_reviews = {row.need_id: row for row in review.needs}
+    for row in assessments:
+        edge = edge_map[row.edge_id]
+        valid = (
+            len(row.need_ids) == len(set(row.need_ids))
+            and set(row.need_ids) == set(edge.need_ids)
+            and set(row.need_ids) <= {need.need_id for need in plan.needs}
+            and bool(row.explanation.strip())
+            and bool(row.scope_and_date.strip())
+        )
+        for origin in edge.origins:
+            item = ledger.get(origin.citation)
+            if item is None or (item.source_id, item.chunk_id, item.text_hash) != (
+                origin.source_id,
+                origin.chunk_id,
+                origin.text_hash,
+            ):
+                valid = False
+        if row.temporal_status == "conditional":
+            if (
+                not row.conditional_excerpt
+                or not row.conditional_excerpt.strip()
+                or row.conditional_excerpt not in draft.answer
+                or any(
+                    need_reviews.get(need) is None
+                    or need_reviews[need].status not in {"conditional", "unresolved"}
+                    for need in edge.need_ids
+                )
+            ):
+                valid = False
+        elif row.temporal_status == "unresolved" and row.status != "unresolved":
+            valid = False
+        allowed = set(
+            edge.governing_citations
+            + edge.candidate_citations
+            + [origin.citation for origin in edge.origins]
+        )
+        witnesses: set[int] = set()
+        operative_sources: set[str] = set()
+        for witness in row.witnesses:
+            item = ledger.get(witness.citation)
+            if (
+                item is None
+                or item.search_doc is None
+                or witness.citation not in delivered
+                or witness.citation not in allowed
+                or not witness.quotation.strip()
+                or witness.quotation not in item.text
+                or any(
+                    model_evidence_metadata(item.metadata).get(flag)
+                    for flag in ("derived", "external", "untrusted", "truncated")
+                )
+            ):
+                valid = False
+                continue
+            witnesses.add(witness.citation)
+            if (
+                witness.role == "operative"
+                and item.source_id in edge.judicial_source_ids
+            ):
+                start = item.text.index(witness.quotation)
+                # Section identity follows only delivered, contiguous original body text.
+                body = item.model_copy(deep=True)
+                body.metadata["heading_path"] = []
+                context = [
+                    original.model_copy(deep=True)
+                    for original in originals
+                    if original.source_id == item.source_id
+                ]
+                for original in context:
+                    original.metadata["heading_path"] = []
+                if canonical_disposition_witness(
+                    body, start, start + len(witness.quotation), source_context=context
+                ):
+                    operative_sources.add(item.source_id)
+                else:
+                    valid = False
+            elif (
+                witness.role == "operative"
+                and item.source_id not in edge.judicial_source_ids
+            ):
+                valid = False
+        if row.status == "unresolved":
+            complete = False
+            if (
+                not row.gap_disclosure
+                or not row.gap_disclosure.strip()
+                or row.gap_disclosure not in draft.answer
+                or any(
+                    need not in draft.unresolved_need_ids
+                    or need_reviews.get(need) is None
+                    or need_reviews[need].status != "unresolved"
+                    for need in edge.need_ids
+                )
+            ):
+                valid = False
+        else:
+            source_witnesses = {
+                item.source_id
+                for citation in witnesses
+                if (item := ledger.get(citation)) is not None
+            }
+            candidate_sources = {
+                item.source_id
+                for citation in edge.candidate_citations
+                if (item := ledger.get(citation)) is not None
+            }
+            if (
+                not set(edge.governing_citations) & witnesses
+                or not candidate_sources <= source_witnesses
+                or not set(edge.judicial_source_ids) <= operative_sources
+                or edge.incomplete_source_ids
+                or edge.discovery_gaps
+            ):
+                valid = False
+            if row.status == "examined_applicable" and not witnesses <= cited:
+                valid = False
+        if not valid:
+            safe = complete = False
+            gaps.append(
+                f"Authority dependency {edge.edge_id}: missing, stale, unread or non-operative original witness, or undisclosed gap."
+            )
+    return complete and safe, safe, gaps
+
+
+def dependency_required_citations(
+    edges: list[AuthorityDependency], ledger: EvidenceLedger
+) -> list[int]:
+    """Keep governing originals and actual disposition boundaries through relevance packing."""
+    from onyx.asv3.judicial_sections import canonical_disposition_witness
+
+    numbers = {citation for edge in edges for citation in edge.governing_citations}
+    judicial_ids = {sid for edge in edges for sid in edge.judicial_source_ids}
+    rows = {
+        number: item
+        for number in ledger.citation_numbers()
+        if (item := ledger.get(number)) is not None
+    }
+    for edge in edges:
+        by_source: dict[str, list[int]] = {}
+        for number in edge.candidate_citations:
+            if number in rows:
+                by_source.setdefault(rows[number].source_id, []).append(number)
+        for source_numbers in by_source.values():
+            numbers.add(
+                min(
+                    source_numbers,
+                    key=lambda number: cast(
+                        int, rows[number].metadata.get("position", -1)
+                    ),
+                )
+            )
+    originals = [item.model_copy(deep=True) for item in rows.values()]
+    for item in originals:
+        item.metadata["heading_path"] = []
+    for number, recorded in rows.items():
+        if recorded.source_id not in judicial_ids:
+            continue
+        item = recorded.model_copy(deep=True)
+        item.metadata["heading_path"] = []
+        cursor = 0
+        disposition = False
+        for line in item.text.splitlines(keepends=True):
+            if line.strip() and canonical_disposition_witness(
+                item, cursor, cursor + len(line), source_context=originals
+            ):
+                disposition = True
+            cursor += len(line)
+        if disposition:
+            numbers.add(number)
+            # Preserve the immediately preceding body boundary, independently of labels.
+            position = item.metadata.get("position")
+            for previous, context in rows.items():
+                if (
+                    type(position) is int
+                    and context.source_id == item.source_id
+                    and context.metadata.get("position") == position - 1
+                ):
+                    numbers.add(previous)
+    return sorted(numbers)
