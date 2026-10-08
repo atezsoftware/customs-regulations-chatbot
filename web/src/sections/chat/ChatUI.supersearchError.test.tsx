@@ -1,6 +1,7 @@
 import React from "react";
 import { cleanup, render, screen, setupUser } from "@tests/setup/test-utils";
 import { BackendMessage, Message } from "@/app/app/interfaces";
+import { ErrorBanner } from "@/app/app/message/Resubmit";
 import { processRawChatHistory } from "@/app/app/services/lib";
 import { Packet } from "@/app/app/services/streamingModels";
 import { useChatSessionStore } from "@/app/app/stores/useChatSessionStore";
@@ -197,3 +198,59 @@ it.each(["asv3", undefined] as const)(
     ).not.toBeInTheDocument();
   }
 );
+
+it("keeps a second failed run fenced after confirming the previous run finished", async () => {
+  const fetchMock = jest.spyOn(global, "fetch").mockResolvedValue({
+    ok: true,
+    json: async () => ({
+      chat_session_id: SESSION_ID,
+      current_run: null,
+      messages: [
+        { message_type: "assistant", message_id: 4485, error: "interrupted" },
+      ],
+    }),
+  } as Response);
+  const props = {
+    error: "Supersearch bağlantısı kesildi.",
+    errorCode: "CONNECTION_ERROR",
+    resubmit: jest.fn(),
+    details: {
+      workflow: "supersearch",
+      chat_session_id: SESSION_ID,
+      run_id: 4485,
+      stop_status: "requested",
+    },
+  };
+  try {
+    const { rerender } = render(<ErrorBanner {...props} />);
+    await setupUser().click(
+      screen.getByRole("button", { name: "Durumu yenile" })
+    );
+    expect(
+      await screen.findByRole("button", { name: "Regenerate" })
+    ).toBeEnabled();
+
+    rerender(
+      <ErrorBanner
+        {...props}
+        details={{
+          ...props.details,
+          chat_session_id: "another-supersearch-failure",
+          run_id: 4503,
+          stop_status: "failed",
+        }}
+      />
+    );
+    expect(
+      screen.queryByRole("button", { name: "Regenerate" })
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Çalışmayı durdur" })
+    ).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Durumu yenile" })).toBeEnabled();
+    expect(props.resubmit).not.toHaveBeenCalled();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  } finally {
+    fetchMock.mockRestore();
+  }
+});

@@ -29,8 +29,15 @@ from onyx.prompts.supersearch.prompts import (
     PLAN_PROMPT,
     REPAIR_PROMPT,
     REVIEW_PROMPT,
+    SOURCE_FOCUS_PROMPT,
 )
-from onyx.supersearch.models import AnswerRepair, WriterDecision
+from onyx.supersearch.focus import FocusSelection, focus_subjects
+from onyx.supersearch.models import (
+    AnswerRepair,
+    FocusAnswerReview,
+    NeedFocusDecision,
+    WriterDecision,
+)
 from onyx.supersearch.witnesses import bind_review_witnesses
 from onyx.tools.constants import REGULATORY_MAX_SEARCH_QUERY_CHARS
 from onyx.tracing.flows import LLMFlow
@@ -105,6 +112,9 @@ class SupersearchEngine:
         self.receipts: list[dict[str, JsonValue]] = []
         self.last_review: AnswerReview | None = None
         self._source_frontier: set[int] = set()
+        self._protected_frontier: set[int] = set()
+        self._unfocused_frontier: set[int] = set()
+        self.focus = FocusSelection(ledger)
 
     def _payload(
         self,
@@ -135,6 +145,7 @@ class SupersearchEngine:
             ],
             "draft": draft.model_dump(mode="json") if draft else None,
             "defects": defects or [],
+            "expansion_focus_audit": self.focus.audit(),
         }
         if tools:
             payload["tools"] = self.acquirer.definitions()
@@ -147,15 +158,68 @@ class SupersearchEngine:
         self.report("tools", self.plan.language)
         receipts = self.acquirer.acquire(actions, self.plan)
         self.receipts.extend(receipts)
-        self._source_frontier.update(
+        acquired = {
             number
             for receipt in receipts
             if isinstance(numbers := receipt.get("citations"), list)
             for number in numbers
             if isinstance(number, int)
+        }
+        self._source_frontier.update(acquired)
+        searched = any(
+            receipt.get("tool") in {"search_corpus", "search_source_text"}
+            and receipt.get("reused") is not True
+            for receipt in receipts
         )
+        if searched:
+            self._unfocused_frontier.update(acquired)
+        previously_protected = set(self._protected_frontier)
+        for receipt in receipts:
+            numbers = receipt.get("citations")
+            if receipt.get("tool") in {
+                "read_provision",
+                "read_named_provision",
+                "read_source_range",
+                "read_chunk",
+            } and isinstance(numbers, list):
+                self._protected_frontier.update(
+                    number for number in numbers if type(number) is int
+                )
+        self.focus.protect(self._protected_frontier)
         # A cached receipt can bind a new need but cannot restart the same failed frontier.
-        return any(row.get("reused") is not True for row in receipts)
+        return any(row.get("reused") is not True for row in receipts) or any(
+            self.focus.covers(number)
+            for number in self._protected_frontier - previously_protected
+        )
+
+    def _focus_sources(
+        self, request: str, history: str, instructions: str | None
+    ) -> None:
+        if not self._unfocused_frontier or self.dependency_expander is None:
+            return
+        assert self.plan is not None
+        subjects = focus_subjects(self.ledger, self._unfocused_frontier)
+        if not subjects:
+            self._unfocused_frontier.clear()
+            return
+        self.report("focus", self.plan.language)
+        payload = self._payload(request, history, instructions)
+        payload["focus_subjects"] = [subject.payload() for subject in subjects]
+        decision = self.gateway.complete(
+            SOURCE_FOCUS_PROMPT,
+            payload,
+            NeedFocusDecision,
+            LLMFlow.SUPERSEARCH_SOURCE_FOCUS,
+            True,
+        )
+        self.focus.apply(
+            subjects,
+            self.plan,
+            decision,
+            set(getattr(self.gateway, "last_delivered_citations", set())),
+            self._protected_frontier,
+        )
+        self._unfocused_frontier.clear()
 
     def _close_dependencies(self) -> None:
         if (
@@ -169,8 +233,11 @@ class SupersearchEngine:
         # Only explicit planner/writer/reviewer acquisitions enter the material
         # frontier. Identity openings and incidental candidate references do not
         # recursively turn a focused question into a crawl of the whole corpus.
+        configure_focus = getattr(self.dependency_expander, "configure_focus", None)
+        if configure_focus is not None:
+            configure_focus(self.focus)
         self.dependencies = self.dependency_expander.expand(
-            self.plan, frontier=set(self._source_frontier)
+            self.plan, frontier=self.focus.frontier(self._source_frontier, self.plan)
         )
         self.receipts.extend(self.dependency_expander.receipts[receipt_start:])
 
@@ -208,6 +275,7 @@ class SupersearchEngine:
                 "A material legal need omitted its decisive conditions from the frozen plan"
             )
         self._acquire(initial_source_actions(plan, request))
+        self._focus_sources(request, history, instructions)
         self._close_dependencies()
         if plan.requires_sources and not self.ledger.citation_numbers():
             return WorkflowResult(
@@ -253,6 +321,7 @@ class SupersearchEngine:
                     "The writer requested an unchanged source frontier; unresolved law cannot be guessed"
                 )
             seen_actions.add(signature)
+            self._focus_sources(request, history, instructions)
             self._close_dependencies()
         seen_repairs: set[str] = set()
         while True:
@@ -261,7 +330,7 @@ class SupersearchEngine:
             review = self.gateway.complete(
                 REVIEW_PROMPT,
                 self._payload(request, history, instructions, draft=draft),
-                AnswerReview,
+                FocusAnswerReview if self.focus.subjects else AnswerReview,
                 LLMFlow.SUPERSEARCH_REVIEW,
                 True,
             )
@@ -273,6 +342,22 @@ class SupersearchEngine:
             passed, safe, defects = review_assessment(
                 plan, draft, review, self.ledger, delivered, self.dependencies
             )
+            focus_progress = False
+            if isinstance(review, FocusAnswerReview):
+                focus_defects, reopened = self.focus.review(review, delivered)
+                if focus_defects:
+                    passed = safe = False
+                    defects.extend(focus_defects)
+                    self._source_frontier.update(reopened)
+                    before = (
+                        self.ledger.citation_numbers(),
+                        [edge.model_dump() for edge in self.dependencies],
+                    )
+                    self._close_dependencies()
+                    focus_progress = before != (
+                        self.ledger.citation_numbers(),
+                        [edge.model_dump() for edge in self.dependencies],
+                    )
             if passed:
                 return WorkflowResult(
                     answer=draft.answer,
@@ -308,6 +393,7 @@ class SupersearchEngine:
             seen_repairs.add(signature)
             new_sources = self._acquire(review.repair_actions)
             if new_sources:
+                self._focus_sources(request, history, instructions)
                 self._close_dependencies()
             repair = self.gateway.complete(
                 REPAIR_PROMPT,
@@ -322,7 +408,7 @@ class SupersearchEngine:
             updated = DraftAnswer(
                 answer=patched, unresolved_need_ids=repair.unresolved_need_ids
             )
-            if updated == draft and not new_sources:
+            if updated == draft and not (new_sources or focus_progress):
                 return WorkflowResult(
                     answer=draft.answer if safe else None,
                     status="partial" if safe else "unavailable",

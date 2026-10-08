@@ -33,6 +33,7 @@ from onyx.db.models import User
 from onyx.error_handling.error_codes import OnyxErrorCode
 from onyx.error_handling.exceptions import OnyxError
 from onyx.llm.interfaces import LLM, LLMConfig
+from onyx.llm.model_response import Delta, ModelResponseStream, StreamingChoice
 from onyx.server.query_and_chat.streaming_models import (
     AgentResponseDelta,
     AgentResponseStart,
@@ -60,25 +61,36 @@ def selected_llm() -> LLM:
         temperature=0,
         max_input_tokens=128_000,
     )
+    llm.with_stream_cancellation_check.return_value = llm
     return cast(LLM, llm)
+
+
+def structured_stream(content: str) -> list[ModelResponseStream]:
+    midpoint = len(content) // 2
+    return [
+        ModelResponseStream(
+            id="fixture-response",
+            created="2026-10-09",
+            choice=StreamingChoice(delta=Delta(content=content[:midpoint])),
+        ),
+        ModelResponseStream(
+            id="fixture-response",
+            created="2026-10-09",
+            choice=StreamingChoice(
+                delta=Delta(content=content[midpoint:]), finish_reason="stop"
+            ),
+        ),
+    ]
 
 
 def test_gateway_uses_only_selected_model_and_records_delivered_originals(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     llm = selected_llm()
-    response = SimpleNamespace(
-        choice=SimpleNamespace(
-            finish_reason="stop",
-            message=SimpleNamespace(
-                tool_calls=None,
-                content=json.dumps(
-                    {"answer": ANSWER, "unresolved_need_ids": [], "actions": []}
-                ),
-            ),
-        )
+    response = structured_stream(
+        json.dumps({"answer": ANSWER, "unresolved_need_ids": [], "actions": []})
     )
-    cast(MagicMock, llm).invoke.return_value = response
+    cast(MagicMock, llm).stream.return_value = iter(response)
     span = SimpleNamespace(span_data=SimpleNamespace(model_config={}))
     monkeypatch.setattr(
         gateway, "llm_generation_span", lambda **_kwargs: nullcontext(span)
@@ -100,10 +112,11 @@ def test_gateway_uses_only_selected_model_and_records_delivered_originals(
         True,
     )
     assert decision.answer == ANSWER
-    assert cast(MagicMock, llm).invoke.call_count == 1
+    cast(MagicMock, llm).invoke.assert_not_called()
+    assert cast(MagicMock, llm).stream.call_count == 1
     assert generation.last_delivered_citations == {1}
     assert span.span_data.model_config["supersearch_document_set_id"] == "442"
-    assert "max_tokens" not in cast(MagicMock, llm).invoke.call_args.kwargs
+    assert "max_tokens" not in cast(MagicMock, llm).stream.call_args.kwargs
 
 
 def test_aggregate_projection_metadata_cannot_supply_original_membership(
@@ -566,10 +579,12 @@ def test_failure_preserves_native_history_without_publishing_draft(
             "evidence",
             "supersearch",
             "authority_dependencies",
+            "expansion_focus_audit",
             "source_receipts",
             "acquisition_counts",
         }
         assert snapshot["supersearch"]["answer"] is None
+        assert snapshot["expansion_focus_audit"] == []
     assert snapshot["asv3_workflow_variant"] == "supersearch"
     assert snapshot["publication_status"] == (
         "cancelled" if failure_kind == "cancelled" else "unavailable"

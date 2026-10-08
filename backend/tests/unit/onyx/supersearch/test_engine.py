@@ -2,6 +2,8 @@
 
 import sys
 from typing import TypeVar, cast
+from unittest.mock import Mock
+from uuid import uuid4
 
 import pytest
 from pydantic import BaseModel, JsonValue
@@ -21,6 +23,7 @@ from onyx.configs.constants import DocumentSource
 from onyx.context.search.models import SearchDoc
 from onyx.legal_composite.models import (
     AnswerReview,
+    AuthorityDependency,
     ConditionReview,
     NeedReview,
     PassageSupport,
@@ -30,12 +33,22 @@ from onyx.legal_composite.models import (
     WorkflowPolicy,
 )
 from onyx.supersearch.acquisition import SupersearchAcquirer, corpus_specs
+from onyx.supersearch.dependencies import SupersearchDependencyExpander
 from onyx.supersearch.engine import (
     SupersearchEngine,
     apply_passage_patches,
     initial_source_actions,
 )
-from onyx.supersearch.models import AnswerRepair, PassagePatch, WriterDecision
+from onyx.supersearch.focus import focus_subjects
+from onyx.supersearch.models import (
+    AnswerRepair,
+    FocusAnswerReview,
+    FocusReviewAssessment,
+    NeedFocusAssessment,
+    NeedFocusDecision,
+    PassagePatch,
+    WriterDecision,
+)
 from onyx.tracing.flows import LLMFlow
 
 ResponseModel = TypeVar("ResponseModel", bound=BaseModel)
@@ -222,6 +235,180 @@ def test_exact_provision_path_has_three_calls_and_no_broad_discovery() -> None:
         == gateway.payloads[2]["original_evidence"]
     )
     assert workflow.ledger.completely_delivered("2") == {1}
+
+
+@pytest.mark.parametrize("reopen", [False, True])
+def test_broad_discovery_focus_limits_expansion_and_delivers_every_raw_original(
+    reopen: bool,
+) -> None:
+    context = RunContext(
+        timeout_seconds=float("inf"), budget=SharedBudget(unlimited_execution=True)
+    )
+    ledger = EvidenceLedger()
+    material = original()
+    material.metadata.update(
+        {
+            "article_no": "10",
+            "document_type": "kanun",
+            "heading_path": ["4458 SAYILI GÜMRÜK KANUNU", "MADDE 10"],
+        }
+    )
+    incidental = material.model_copy(deep=True)
+    incidental.source_id = str(uuid4())
+    incidental.chunk_id = "atomic-transit"
+    incidental.text = "Bu hüküm yalnız transit taşımaya uygulanır."
+    incidental.text_hash = ""
+    incidental.metadata.update(
+        {"article_no": "77", "heading_path": ["8917 SAYILI TAŞIMA KANUNU", "MADDE 77"]}
+    )
+    assert incidental.search_doc is not None
+    incidental.search_doc.document_id = incidental.source_id
+    incidental.search_doc.metadata["regulatory_chunk_id"] = incidental.chunk_id
+    preview = EvidenceLedger()
+    preview.add([material, incidental], context)
+    subjects = focus_subjects(preview, {1, 2})
+    focus = NeedFocusDecision(
+        assessments=[
+            NeedFocusAssessment(
+                subject_id=subject.subject_id,
+                need_id="clock",
+                status="material"
+                if subject.source_id == material.source_id
+                else "incidental",
+                explanation="Tam özgün hükmün başvuru/transit kapsamı denetlendi.",
+                witnesses=[
+                    PassageSupport(
+                        citation=subject.citations[0],
+                        quotation=material.text
+                        if subject.source_id == material.source_id
+                        else incidental.text,
+                    )
+                ],
+            )
+            for subject in subjects
+        ]
+    )
+    checked = FocusAnswerReview(
+        **review().model_dump(),
+        focus_reviews=[
+            FocusReviewAssessment(
+                subject_id=row.subject_id,
+                need_id=row.need_id,
+                status="reopen" if reopen else "nonmaterial",
+                explanation="Tam özgün transit kapsamı başvuru ihtiyacına uygulanmaz.",
+                witnesses=row.witnesses,
+            )
+            for row in focus.assessments
+            if row.status == "incidental"
+        ],
+    )
+    discovered = plan().model_copy(
+        update={
+            "initial_actions": [
+                SourceAction(
+                    need_ids=["clock"],
+                    tool="search_corpus",
+                    arguments={"query": "Başvuru süresi", "mode": "hybrid"},
+                )
+            ]
+        }
+    )
+    gateway = FixtureGateway(
+        ledger,
+        [
+            discovered,
+            focus,
+            WriterDecision(answer=ANSWER, unresolved_need_ids=[], actions=[]),
+            checked,
+        ],
+    )
+    if reopen:
+        gateway.responses.extend(
+            [
+                AnswerRepair(patches=[], unresolved_need_ids=[]),
+                FocusAnswerReview(
+                    **review()
+                    .model_copy(update={"selection_uncertainty_resolved": True})
+                    .model_dump(),
+                    focus_reviews=[],
+                ),
+            ]
+        )
+
+    def search(_arguments: dict[str, JsonValue], _context: RunContext) -> ToolOutcome:
+        return ToolOutcome(
+            status=OutcomeStatus.FOUND,
+            summary="All scoped originals",
+            evidence=[material, incidental],
+        )
+
+    registry = CapabilityRegistry(
+        [
+            ToolSpec(
+                name="search_corpus",
+                description="Native scoped search",
+                parameters={"type": "object"},
+                handler=search,
+            )
+        ]
+    )
+    acquirer = SupersearchAcquirer(registry, context, ledger, WorkflowPolicy())
+    dependencies = Mock(spec=SupersearchDependencyExpander)
+    dependencies.receipts = []
+    dependencies.expand.return_value = []
+    if reopen:
+        closed = incidental.model_copy(deep=True)
+        closed.chunk_id = "atomic-completed-scope"
+        closed.text = "Bu transit usulü, başvuru süresi hükmünü değiştirmez."
+        closed.text_hash = ""
+        assert closed.search_doc is not None
+        closed.search_doc.metadata["regulatory_chunk_id"] = closed.chunk_id
+
+        def close(
+            _plan: ResearchPlan, *, frontier: set[int]
+        ) -> list[AuthorityDependency]:
+            if frontier == {1, 2}:
+                ledger.add([closed], context)
+            return []
+
+        dependencies.expand.side_effect = close
+    workflow = SupersearchEngine(
+        gateway=gateway,
+        acquirer=acquirer,
+        ledger=ledger,
+        check_active=context.check_active,
+        dependency_expander=dependencies,
+    )
+    result = workflow.run("Başvuru süresi nedir?")
+    assert result.status == "verified" and result.answer == ANSWER
+    assert gateway.flows == [
+        LLMFlow.SUPERSEARCH_PLAN,
+        LLMFlow.SUPERSEARCH_SOURCE_FOCUS,
+        LLMFlow.SUPERSEARCH_ANSWER,
+        LLMFlow.SUPERSEARCH_REVIEW,
+    ] + ([LLMFlow.SUPERSEARCH_REPAIR, LLMFlow.SUPERSEARCH_REVIEW] if reopen else [])
+    if reopen:
+        assert [
+            call.kwargs["frontier"] for call in dependencies.expand.call_args_list
+        ] == [{1}, {1, 2}]
+        assert gateway.payloads[-1]["required_evidence_numbers"] == [1, 2, 3]
+        assert (
+            ledger.completely_delivered("5")
+            == ledger.completely_delivered("6")
+            == {1, 2, 3}
+        )
+    else:
+        dependencies.expand.assert_called_once_with(discovered, frontier={1})
+    assert (
+        gateway.payloads[1]["original_evidence"]
+        == gateway.payloads[2]["original_evidence"]
+        == gateway.payloads[3]["original_evidence"]
+    )
+    assert gateway.payloads[2]["required_evidence_numbers"] == [1, 2]
+    assert (
+        ledger.completely_delivered("3") == ledger.completely_delivered("4") == {1, 2}
+    )
+    assert gateway.payloads[3]["expansion_focus_audit"]
 
 
 def test_display_witnesses_do_not_trigger_a_provider_repair(

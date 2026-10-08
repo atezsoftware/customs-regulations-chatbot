@@ -1,13 +1,17 @@
 import { useEffect, useMemo, useState } from "react";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { SvgChevronDown, SvgChevronRight } from "@opal/icons";
-import { Button } from "@opal/components";
-import { CopyButton } from "@opal/components";
-import { getErrorIcon, getErrorTitle } from "./errorHelpers";
+import { Button, CopyButton, Text } from "@opal/components";
+import { getErrorIcon, getErrorTitle } from "@/app/app/message/errorHelpers";
 import {
   RateLimitDetails,
   RATE_LIMITED_ERROR_CODE,
 } from "@/app/app/interfaces";
+import {
+  requestSupersearchStop,
+  supersearchRunFinished,
+} from "@/lib/chat/supersearchRecovery";
+import { useChatSessionStore } from "@/app/app/stores/useChatSessionStore";
 
 const COUNTDOWN_TICK_MS = 1_000;
 
@@ -112,6 +116,95 @@ export const Resubmit: React.FC<ResubmitProps> = ({ resubmit }) => {
   );
 };
 
+interface SupersearchRunRecoveryProps {
+  sessionId: string;
+  runId: number;
+  stopFailed: boolean;
+  resubmit?: () => void;
+}
+
+function SupersearchRunRecovery({
+  sessionId,
+  runId,
+  stopFailed,
+  resubmit,
+}: SupersearchRunRecoveryProps) {
+  const [requested, setRequested] = useState(!stopFailed);
+  const [pending, setPending] = useState(false);
+  const [finished, setFinished] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
+
+  async function stopRun() {
+    setPending(true);
+    try {
+      await requestSupersearchStop(sessionId);
+      setRequested(true);
+      setNotice(null);
+    } catch {
+      setNotice("Durdurma isteği gönderilemedi. Yeniden deneyebilirsiniz.");
+    } finally {
+      setPending(false);
+    }
+  }
+
+  async function refreshStatus() {
+    setPending(true);
+    try {
+      const terminal = await supersearchRunFinished(sessionId, runId);
+      setFinished(terminal);
+      setNotice(terminal ? null : "Çalışmanın bittiği henüz doğrulanmadı.");
+      if (terminal) {
+        const store = useChatSessionStore.getState();
+        const session = store.sessions.get(sessionId);
+        if (session) {
+          const messageTree = new Map(session.messageTree);
+          for (const [nodeId, message] of messageTree) {
+            if (message.supersearch && message.messageId === runId) {
+              messageTree.set(nodeId, {
+                ...message,
+                errorDetails: { ...message.errorDetails, stop_confirmed: true },
+                isRetryable: true,
+              });
+            }
+          }
+          store.updateSessionMessageTree(sessionId, messageTree);
+          store.setLatestMessageRenderComplete(sessionId, true);
+        }
+      }
+    } catch {
+      setNotice("Çalışma durumu alınamadı. Yeniden deneyebilirsiniz.");
+    } finally {
+      setPending(false);
+    }
+  }
+
+  if (finished) {
+    return resubmit ? <Resubmit resubmit={resubmit} /> : null;
+  }
+  return (
+    <div className="flex flex-col items-center gap-2 pt-4">
+      <Text as="p" font="main-ui-body">
+        {requested
+          ? "Durdurma isteği gönderildi; çalışmanın bitmesi henüz doğrulanmadı."
+          : "Bağlantı kesildi; Supersearch sunucuda çalışmaya devam ediyor olabilir."}
+      </Text>
+      {notice && (
+        <Text as="p" font="main-ui-body" role="status">
+          {notice}
+        </Text>
+      )}
+      {!requested && (
+        <Button disabled={pending} onClick={stopRun}>
+          Çalışmayı durdur
+        </Button>
+      )}
+      <Button disabled={pending} onClick={refreshStatus}>
+        Durumu yenile
+      </Button>
+    </div>
+  );
+}
+
 export const ErrorBanner = ({
   error,
   errorCode,
@@ -128,6 +221,11 @@ export const ErrorBanner = ({
   resubmit?: () => void;
 }) => {
   const [isStackTraceExpanded, setIsStackTraceExpanded] = useState(false);
+  const nativeRecovery =
+    details?.workflow === "supersearch" &&
+    typeof details.chat_session_id === "string" &&
+    typeof details.run_id === "number" &&
+    (details.stop_status === "failed" || details.stop_status === "requested");
 
   if (errorCode === RATE_LIMITED_ERROR_CODE) {
     return (
@@ -143,7 +241,13 @@ export const ErrorBanner = ({
     <div className="text-red-700 mt-4 text-sm my-auto">
       <Alert variant="broken">
         {getErrorIcon(errorCode)}
-        <AlertTitle>{getErrorTitle(errorCode)}</AlertTitle>
+        <AlertTitle>
+          {details?.workflow === "supersearch"
+            ? errorCode === "CONNECTION_ERROR"
+              ? "Supersearch bağlantı hatası"
+              : "Supersearch hatası"
+            : getErrorTitle(errorCode)}
+        </AlertTitle>
         <AlertDescription className="flex flex-col gap-y-1">
           <span>{error}</span>
           {details?.model && (
@@ -181,7 +285,17 @@ export const ErrorBanner = ({
           )}
         </AlertDescription>
       </Alert>
-      {isRetryable && resubmit && <Resubmit resubmit={resubmit} />}
+      {nativeRecovery ? (
+        <SupersearchRunRecovery
+          key={`${details.chat_session_id}:${details.run_id}`}
+          sessionId={details.chat_session_id}
+          runId={details.run_id}
+          stopFailed={details.stop_status === "failed"}
+          resubmit={resubmit}
+        />
+      ) : (
+        isRetryable && resubmit && <Resubmit resubmit={resubmit} />
+      )}
     </div>
   );
 };

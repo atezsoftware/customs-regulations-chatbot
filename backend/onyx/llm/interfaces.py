@@ -86,6 +86,12 @@ class LLM(abc.ABC):
         """Bind another model on this authorized provider without changing this LLM."""
         raise NotImplementedError("This LLM does not support an isolated model binding")
 
+    def with_stream_cancellation_check(self, check_active: Callable[[], None]) -> "LLM":
+        """Bind a run's stop check without changing another caller's provider."""
+        raise NotImplementedError(
+            "This LLM does not support an isolated stream cancellation binding"
+        )
+
     def invoke(
         self,
         prompt: LanguageModelInput,
