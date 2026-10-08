@@ -118,7 +118,10 @@ def find_source_inventory_page(
         if row.id and str(row.id) in access and access[str(row.id)].to_acl() & user_acl
     ]
     retained = filter_publication_read(
-        observe_publication_read(), candidates, lambda row: str(row.id)
+        observe_publication_read(),
+        candidates,
+        lambda row: str(row.id),
+        record_evidence=False,
     )
     return retained, len(records) > limit
 
