@@ -145,6 +145,7 @@ from onyx.tools.tool_constructor import (
     CustomToolConfig,
     FileReaderToolConfig,
     SearchToolConfig,
+    construct_internal_search_tool,
     construct_tools,
 )
 from onyx.tools.tool_implementations.search.search_tool import SearchTool
@@ -721,15 +722,17 @@ def _global_regulatory_search_filters(setup: ChatTurnSetup) -> BaseFilters | Non
         getattr(setup.new_msg_req, "atez_search_v3", False) is True
     ) or _uses_deep_asv3(setup)
     legal_composite = getattr(setup.new_msg_req, "legal_composite", False) is True
+    supersearch = getattr(setup.new_msg_req, "supersearch", False) is True
     regulatory_search_enabled = (
         setup.new_msg_req.atez_search
         or atez_search_v2
         or atez_search_v3
         or legal_composite
+        or supersearch
     )
     source_question = not _is_social_only_message(setup.new_msg_req.message)
     native_labels = (
-        (atez_search_v3 or legal_composite)
+        (atez_search_v3 or legal_composite or supersearch)
         and source_question
         and not (
             filters is not None
@@ -738,7 +741,11 @@ def _global_regulatory_search_filters(setup: ChatTurnSetup) -> BaseFilters | Non
         )
     )
     updates: dict[str, object] = {
-        "source_type": [DocumentSource.USER_FILE],
+        "source_type": (
+            filters.source_type
+            if supersearch and filters is not None and filters.source_type is not None
+            else [DocumentSource.USER_FILE]
+        ),
         "regulatory_chunks_only": regulatory_search_enabled and source_question,
         "regulatory_workflow_mode": "fast" if atez_search_v2 else "standard",
         "regulatory_label_search_enabled": (
@@ -896,6 +903,7 @@ def build_chat_turn(
             "atez_search_v2_labels": new_msg_req.atez_search_v2_labels,
             "atez_search_v3": new_msg_req.atez_search_v3,
             **({"legal_composite": True} if new_msg_req.legal_composite else {}),
+            **({"supersearch": True} if new_msg_req.supersearch else {}),
             "asv3_research_profile": new_msg_req.asv3_research_profile
             if new_msg_req.atez_search_v3
             else None,
@@ -909,7 +917,15 @@ def build_chat_turn(
     selected_overrides: list[LLMOverride | None] = (
         list(llm_overrides or [])
         if is_multi
-        else [new_msg_req.llm_override or chat_session.llm_override]
+        else [
+            new_msg_req.llm_override
+            or (
+                new_msg_req.llm_overrides[0]
+                if new_msg_req.supersearch and new_msg_req.llm_overrides
+                else None
+            )
+            or chat_session.llm_override
+        ]
     )
     for override in selected_overrides:
         llm = get_llm_for_persona(
@@ -1523,49 +1539,81 @@ def _run_models(
 
         with track_publication_reads(sc.publication_reads):
             try:
+                supersearch_selected = (
+                    getattr(setup.new_msg_req, "supersearch", False) is True
+                )
+                if supersearch_selected:
+                    if setup.persona.id != DEFAULT_PERSONA_ID:
+                        raise OnyxError(
+                            OnyxErrorCode.INVALID_INPUT,
+                            "Supersearch requires the default assistant",
+                        )
+                    if setup.search_params.project_id_filter is not None:
+                        raise OnyxError(
+                            OnyxErrorCode.INVALID_INPUT,
+                            "Supersearch searches PC Külliyatı outside projects",
+                        )
+                    if n_models != 1:
+                        raise OnyxError(
+                            OnyxErrorCode.INVALID_INPUT,
+                            "Supersearch uses one selected model per request",
+                        )
                 # Each function opens short-lived DB sessions on demand.
                 # Do NOT pass a long-lived session here — it would hold a
                 # connection for the entire LLM loop (minutes), and cloud
                 # infrastructure may drop idle connections.
-                thread_tool_dict = construct_tools(
-                    persona=setup.persona,
-                    emitter=model_emitter,
-                    user=user,
-                    llm=model_llm,
-                    search_tool_config=SearchToolConfig(
-                        user_selected_filters=_global_regulatory_search_filters(setup),
-                        document_set_names_override=(
-                            _benchmark_document_set_names_override(setup)
-                        ),
-                        project_id_filter=setup.search_params.project_id_filter,
-                        persona_id_filter=setup.search_params.persona_id_filter,
-                        bypass_acl=setup.bypass_acl,
-                        slack_context=setup.slack_context,
-                        enable_slack_search=(
-                            setup.persona.id != DEFAULT_PERSONA_ID
-                            and _should_enable_slack_search(
-                                setup.persona,
-                                setup.new_msg_req.internal_search_filters,
-                            )
-                        ),
-                        auto_detect_filters=_should_auto_detect_search_filters(
-                            persona_id=setup.persona.id,
-                            workspace_setting_enabled=auto_detect_search_filters,
-                        ),
+                search_tool_config = SearchToolConfig(
+                    user_selected_filters=_global_regulatory_search_filters(setup),
+                    document_set_names_override=(
+                        _benchmark_document_set_names_override(setup)
                     ),
-                    custom_tool_config=CustomToolConfig(
-                        chat_session_id=setup.chat_session.id,
-                        message_id=setup.user_message.id,
-                        additional_headers=setup.custom_tool_additional_headers,
-                        mcp_headers=setup.mcp_headers,
+                    project_id_filter=setup.search_params.project_id_filter,
+                    persona_id_filter=setup.search_params.persona_id_filter,
+                    bypass_acl=setup.bypass_acl,
+                    slack_context=setup.slack_context,
+                    enable_slack_search=(
+                        setup.persona.id != DEFAULT_PERSONA_ID
+                        and _should_enable_slack_search(
+                            setup.persona,
+                            setup.new_msg_req.internal_search_filters,
+                        )
                     ),
-                    file_reader_tool_config=FileReaderToolConfig(
-                        user_file_ids=setup.available_files.user_file_ids,
-                        chat_file_ids=setup.available_files.chat_file_ids,
+                    auto_detect_filters=_should_auto_detect_search_filters(
+                        persona_id=setup.persona.id,
+                        workspace_setting_enabled=auto_detect_search_filters,
                     ),
-                    allowed_tool_ids=setup.new_msg_req.allowed_tool_ids,
-                    search_usage_forcing_setting=setup.search_params.search_usage,
                 )
+                if supersearch_selected:
+                    internal_search = construct_internal_search_tool(
+                        persona=setup.persona,
+                        emitter=model_emitter,
+                        user=user,
+                        llm=model_llm,
+                        search_tool_config=search_tool_config,
+                    )
+                    thread_tool_dict: dict[int, list[Tool]] = {
+                        internal_search.id: [internal_search]
+                    }
+                else:
+                    thread_tool_dict = construct_tools(
+                        persona=setup.persona,
+                        emitter=model_emitter,
+                        user=user,
+                        llm=model_llm,
+                        search_tool_config=search_tool_config,
+                        custom_tool_config=CustomToolConfig(
+                            chat_session_id=setup.chat_session.id,
+                            message_id=setup.user_message.id,
+                            additional_headers=setup.custom_tool_additional_headers,
+                            mcp_headers=setup.mcp_headers,
+                        ),
+                        file_reader_tool_config=FileReaderToolConfig(
+                            user_file_ids=setup.available_files.user_file_ids,
+                            chat_file_ids=setup.available_files.chat_file_ids,
+                        ),
+                        allowed_tool_ids=setup.new_msg_req.allowed_tool_ids,
+                        search_usage_forcing_setting=setup.search_params.search_usage,
+                    )
                 model_tools = _filter_global_regulatory_chat_tools(
                     [
                         tool
@@ -1585,7 +1633,33 @@ def _run_models(
                 # Per-thread copy: run_llm_loop mutates simple_chat_history in-place.
                 # Deep Research receives the same internal-only, global regulatory
                 # SearchTool as the standard loop.
-                if getattr(setup.new_msg_req, "legal_composite", False) is True:
+                if supersearch_selected:
+                    from onyx.supersearch.runtime import run_supersearch_loop
+
+                    run_supersearch_loop(
+                        emitter=model_emitter,
+                        state_container=sc,
+                        simple_chat_history=list(setup.simple_chat_history),
+                        tools=model_tools,
+                        llm=model_llm,
+                        token_counter=get_llm_token_counter(model_llm),
+                        user=user,
+                        filters=_global_regulatory_search_filters(setup),
+                        document_set_names_override=_benchmark_document_set_names_override(
+                            setup
+                        ),
+                        user_identity=setup.user_identity,
+                        chat_session_id=setup.chat_session.id,
+                        user_message_id=setup.user_message.id,
+                        assistant_message_id=setup.reserved_messages[model_idx].id,
+                        reasoning_effort=setup.reasoning_effort,
+                        include_citations=setup.new_msg_req.include_citations,
+                        cache=setup.cache,
+                        custom_agent_prompt=setup.custom_agent_prompt,
+                        user_memory_context=setup.user_memory_context,
+                        inject_memories_in_prompt=user.use_memories,
+                    )
+                elif getattr(setup.new_msg_req, "legal_composite", False) is True:
                     from onyx.legal_composite.runtime import run_legal_composite_loop
 
                     if setup.persona.id != DEFAULT_PERSONA_ID:
@@ -1780,9 +1854,10 @@ def _run_models(
 
             except Exception as e:
                 model_errored[model_idx] = True
-                if getattr(
-                    setup.new_msg_req, "legal_composite", False
-                ) is True and isinstance(e, OnyxError):
+                if (
+                    getattr(setup.new_msg_req, "legal_composite", False) is True
+                    or getattr(setup.new_msg_req, "supersearch", False) is True
+                ) and isinstance(e, OnyxError):
                     model_error_info[model_idx] = LLMErrorInfo(
                         message=e.detail,
                         error_code=e.error_code.code,
@@ -2373,6 +2448,13 @@ def handle_multi_model_stream(
     if new_msg_req.legal_composite:
         yield StreamingError(
             error="Multi-model is not supported with Legal Composite",
+            error_code="VALIDATION_ERROR",
+            is_retryable=False,
+        )
+        return
+    if new_msg_req.supersearch:
+        yield StreamingError(
+            error="Multi-model is not supported with Supersearch",
             error_code="VALIDATION_ERROR",
             is_retryable=False,
         )

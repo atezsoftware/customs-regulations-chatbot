@@ -216,6 +216,47 @@ def construct_tools(
         )
 
 
+def construct_internal_search_tool(
+    *,
+    persona: Persona,
+    emitter: Emitter,
+    user: User,
+    llm: LLM,
+    search_tool_config: SearchToolConfig,
+    db_session: Session | None = None,
+) -> SearchTool:
+    """Build the mandatory internal search tool without custom or external tools."""
+    with get_session_with_current_tenant_if_none(db_session) as session:
+        canonical_search = get_builtin_tool(session, SearchTool)
+        configured = _construct_tools_impl(
+            persona=persona,
+            db_session=session,
+            emitter=emitter,
+            user=user,
+            llm=llm,
+            search_tool_config=search_tool_config.model_copy(
+                update={
+                    "auto_detect_filters": False,
+                    "enable_slack_search": False,
+                    "slack_context": None,
+                    "bypass_acl": False,
+                    "document_set_names_override": None,
+                }
+            ),
+            allowed_tool_ids=[canonical_search.id],
+            search_usage_forcing_setting=SearchToolUsage.ENABLED,
+            persona_tools=[canonical_search],
+            include_memory_tool=False,
+        )
+        tools = configured.get(canonical_search.id, [])
+        if len(tools) != 1 or not isinstance(tools[0], SearchTool):
+            raise OnyxError(
+                OnyxErrorCode.INVALID_INPUT,
+                "Supersearch requires the configured internal Elasticsearch search tool.",
+            )
+        return tools[0]
+
+
 def _construct_tools_impl(
     persona: Persona,
     db_session: Session,
@@ -228,6 +269,7 @@ def _construct_tools_impl(
     allowed_tool_ids: list[int] | None = None,
     search_usage_forcing_setting: SearchToolUsage = SearchToolUsage.AUTO,
     persona_tools: Sequence[DbTool] | None = None,
+    include_memory_tool: bool = True,
 ) -> dict[int, list[Tool]]:
     tool_dict: dict[int, list[Tool]] = {}
 
@@ -618,7 +660,7 @@ def _construct_tools_impl(
 
     # Always inject MemoryTool when the user has the memory tool enabled,
     # bypassing persona tool associations and allowed_tool_ids filtering
-    if user.enable_memory_tool:
+    if include_memory_tool and user.enable_memory_tool:
         try:
             memory_tool_db_model = get_builtin_tool(db_session, MemoryTool)
             memory_tool = MemoryTool(

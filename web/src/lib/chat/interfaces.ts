@@ -4,4 +4,5 @@ export type WorkflowSelection =
   | "experimental"
   | "experimental_parallel"
   | "experimental_guardrails"
-  | "legal_composite";
+  | "legal_composite"
+  | "supersearch";
