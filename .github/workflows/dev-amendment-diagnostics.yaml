@@ -1,99 +1,577 @@
-name: DEV amendment approval diagnostics
+name: DEV frontend identity read-only diagnostic
+run-name: DEV frontend identity diagnostic ${{ github.run_id }}
+
 on:
   workflow_dispatch:
     inputs:
-      operation:
-        type: choice
-        options: [inspect, approve_462, approve_465, approve_470]
-        default: inspect
+      expected_sha:
+        type: string
+        required: true
+        description: Exact lowercase 40-hex frontend candidate commit
+
 permissions:
   contents: read
+
 jobs:
   inspect:
+    if: github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/heads/diagnostics/')
     runs-on: codebuild-customs-regulations-runner-${{ github.run_id }}-${{ github.run_attempt }}
-    timeout-minutes: 10
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+      - name: Checkout isolated diagnostic branch
+        uses: actions/checkout@v5
         with:
           persist-credentials: false
-      - name: Read only batch inventory
-        shell: bash
-        run: |
-          set -euo pipefail
-          aws eks update-kubeconfig --name atez-dev-cluster --region eu-central-1
-          kubectl get pods -n customs-regulations-dev -o json > /tmp/amendment-pods.json
-          python - <<'PY'
-          import json
-          from pathlib import Path
-          pods=json.loads(Path('/tmp/amendment-pods.json').read_text())['items']
-          ready=[]
-          for pod in pods:
-              if pod['status']['phase']!='Running' or pod['metadata'].get('deletionTimestamp'):
-                  continue
-              statuses={item['name']:item for item in pod['status'].get('containerStatuses',[])}
-              for container in pod['spec']['containers']:
-                  image=container['image']
-                  if 'customs-regulations-backend-lite-dev:' in image and statuses.get(container['name'],{}).get('ready'):
-                      ready.append((pod['metadata']['name'],container['name'],image))
-          if not ready:
-              raise SystemExit('No ready DEV backend container')
-          ready.sort()
-          pod,container,image=ready[0]
-          print('TARGET',pod,container,image)
-          Path('/tmp/amendment-target').write_text(pod+'\t'+container+'\n')
-          PY
-          IFS=$'\t' read -r pod container < /tmp/amendment-target
-          kubectl exec -i "$pod" -n customs-regulations-dev -c "$container" -- \
-            sh -ec '. /vault/secrets/config; export PYTHONPATH=/app; exec python -' < \
-            backend/onyx/db/diagnose_amendment_batches_299_310.py
-      - name: Filter amendment approval worker errors
-        if: inputs.operation == 'inspect'
-        shell: bash
-        run: |
-          set -euo pipefail
-          python - <<'PY'
-          import json
-          import re
-          import subprocess
-          from pathlib import Path
-
-          pods = json.loads(Path('/tmp/amendment-pods.json').read_text())['items']
-          needles = re.compile(r'Amendment proposal (460|462|465|470) approval failed|amendment_(prepared|approved) proposal_id=(460|462|465|470)')
-          for pod in pods:
-              name = pod['metadata']['name']
-              if pod['status']['phase'] != 'Running' or 'background' not in name:
-                  continue
-              for container in pod['spec']['containers']:
-                  result = subprocess.run(
-                      ['kubectl', 'logs', name, '-n', 'customs-regulations-dev',
-                       '-c', container['name'], '--since=36h', '--tail=30000'],
-                      capture_output=True, text=True, check=False,
-                  )
-                  if result.returncode:
-                      print('LOG_READ_FAILED', name, container['name'], result.returncode)
-                      continue
-                  lines = result.stdout.splitlines()
-                  print('LOG_SCAN', name, container['name'], len(lines))
-                  for index, line in enumerate(lines):
-                      if needles.search(line):
-                          print('LOG_MATCH', name, container['name'])
-                          for excerpt in lines[index:index + 45]:
-                              print(excerpt[:500])
-          PY
-      - name: Resume one existing reviewed proposal
-        if: inputs.operation != 'inspect'
+          fetch-depth: 1
+      - name: Prove DEV frontend endpoint pod identity
         shell: bash
         env:
-          OPERATION: ${{ inputs.operation }}
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+          DIAGNOSTIC_REF: ${{ github.ref }}
         run: |
           set -euo pipefail
-          case "$OPERATION" in
-            approve_462) proposal_id=462 ;;
-            approve_465) proposal_id=465 ;;
-            approve_470) proposal_id=470 ;;
-            *) exit 2 ;;
-          esac
-          IFS=$'\t' read -r pod container < /tmp/amendment-target
-          kubectl exec -i "$pod" -n customs-regulations-dev -c "$container" -- \
-            sh -ec '. /vault/secrets/config; export PYTHONPATH=/app; exec python - "$1"' sh "$proposal_id" < \
-            backend/onyx/db/resume_amendment_approvals_309_310.py
+          python3 - <<'PY_IDENTITY'
+          from __future__ import annotations
+          
+          import ipaddress
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+          import tempfile
+          import time
+          from pathlib import Path
+          from typing import cast
+          
+          PREFIX = "LEGAL_COMPOSITE_FRONTEND_IDENTITY "
+          REGION = "eu-central-1"
+          ACCOUNT = "255114580789"
+          CLUSTER = "atez-dev-cluster"
+          NAMESPACE = "customs-regulations-dev"
+          DEPLOYMENT = "dev-customs-regulations-web-deployment"
+          APP = "dev-customs-regulations-web"
+          REPOSITORY = "customs-regulations-web-dev"
+          IMAGE_REPOSITORY = f"{ACCOUNT}.dkr.ecr.{REGION}.amazonaws.com/{REPOSITORY}"
+          MAX_REPLICAS = 4
+          MAX_PODS = 8
+          MAX_NAMESPACE_SERVICES = 32
+          MAX_WEB_SERVICES = 4
+          MAX_SLICES_PER_SERVICE = 16
+          MAX_ENDPOINTS = 64
+          MAX_OUTPUT_BYTES = 2 * 1024 * 1024
+          TOTAL_SECONDS = 240
+          DNS_NAME = re.compile(r"[a-z0-9](?:[-a-z0-9.]{0,251}[a-z0-9])?\Z")
+          
+          
+          class IdentityFailure(Exception):
+              pass
+          
+          
+          def require(condition: bool, reason: str) -> None:
+              if not condition:
+                  raise IdentityFailure(reason)
+          
+          
+          def object_value(value: object, reason: str) -> dict[str, object]:
+              require(isinstance(value, dict), reason)
+              result = cast(dict[str, object], value)
+              require(all(isinstance(key, str) for key in result), reason)
+              return result
+          
+          
+          def list_value(value: object, reason: str) -> list[object]:
+              require(isinstance(value, list), reason)
+              return cast(list[object], value)
+          
+          
+          def string_value(value: object, reason: str) -> str:
+              require(isinstance(value, str), reason)
+              return cast(str, value)
+          
+          
+          def name_value(value: object) -> str:
+              name = string_value(value, "invalid_resource_name")
+              require(DNS_NAME.fullmatch(name) is not None, "invalid_resource_name")
+              return name
+          
+          
+          def integer_value(value: object, reason: str) -> int:
+              require(isinstance(value, int) and not isinstance(value, bool), reason)
+              return cast(int, value)
+          
+          
+          def metadata(resource: dict[str, object]) -> dict[str, object]:
+              return object_value(resource.get("metadata"), "missing_metadata")
+          
+          
+          def items(resource: dict[str, object], bound: int) -> list[dict[str, object]]:
+              values = list_value(resource.get("items"), "invalid_resource_list")
+              require(len(values) <= bound, "resource_count_bound_exceeded")
+              return [object_value(value, "invalid_resource_item") for value in values]
+          
+          
+          def stable_list_snapshot(resource: dict[str, object]) -> dict[str, object]:
+              envelope = dict(resource)
+              envelope_metadata = dict(
+                  object_value(resource.get("metadata", {}), "invalid_list_metadata")
+              )
+              require(
+                  envelope_metadata.get("continue", "") in (None, ""), "partial_list_not_allowed"
+              )
+              envelope_metadata.pop("resourceVersion", None)
+              envelope["metadata"] = envelope_metadata
+              return envelope
+          
+          
+          class Reader:
+              def __init__(self, kubeconfig: Path) -> None:
+                  self.kubeconfig = kubeconfig
+                  self.deadline = time.monotonic() + TOTAL_SECONDS
+          
+              def command(self, args: list[str], timeout_seconds: int = 20) -> str:
+                  remaining = self.deadline - time.monotonic()
+                  require(remaining > 0, "global_timeout")
+                  try:
+                      result = subprocess.run(
+                          args,
+                          capture_output=True,
+                          text=True,
+                          timeout=min(timeout_seconds, remaining),
+                          check=False,
+                          stdin=subprocess.DEVNULL,
+                      )
+                  except subprocess.TimeoutExpired as error:
+                      raise IdentityFailure("command_timeout") from error
+                  except OSError as error:
+                      raise IdentityFailure("command_unavailable") from error
+                  require(
+                      len(result.stdout.encode("utf-8")) <= MAX_OUTPUT_BYTES
+                      and len(result.stderr.encode("utf-8")) <= MAX_OUTPUT_BYTES,
+                      "command_output_bound_exceeded",
+                  )
+                  require(result.returncode == 0, "read_command_failed")
+                  return result.stdout
+          
+              def json_command(self, args: list[str]) -> dict[str, object]:
+                  try:
+                      value: object = json.loads(self.command(args))
+                  except json.JSONDecodeError as error:
+                      raise IdentityFailure("invalid_command_json") from error
+                  return object_value(value, "invalid_command_json_object")
+          
+              def aws(self, *args: str) -> list[str]:
+                  return [
+                      "aws",
+                      "--region",
+                      REGION,
+                      "--no-cli-pager",
+                      "--cli-connect-timeout",
+                      "5",
+                      "--cli-read-timeout",
+                      "15",
+                      *args,
+                  ]
+          
+              def kubectl(self, *args: str) -> list[str]:
+                  return [
+                      "kubectl",
+                      "--kubeconfig",
+                      str(self.kubeconfig),
+                      "--request-timeout=15s",
+                      *args,
+                  ]
+          
+              def get(self, resource: str, *args: str) -> dict[str, object]:
+                  return self.json_command(
+                      self.kubectl("get", resource, "-n", NAMESPACE, *args, "-o", "json")
+                  )
+          
+          
+          def verify_deployment(
+              deployment: dict[str, object], expected_image: str
+          ) -> tuple[int, str]:
+              meta = metadata(deployment)
+              require(meta.get("name") == DEPLOYMENT, "wrong_deployment")
+              require(meta.get("namespace") == NAMESPACE, "wrong_namespace")
+              require(meta.get("deletionTimestamp") is None, "deployment_terminating")
+              spec = object_value(deployment.get("spec"), "missing_deployment_spec")
+              status = object_value(deployment.get("status"), "missing_deployment_status")
+              desired = integer_value(spec.get("replicas"), "invalid_desired_replicas")
+              require(1 <= desired <= MAX_REPLICAS, "desired_replica_bound_exceeded")
+              require(spec.get("paused", False) is False, "deployment_paused")
+              generation = integer_value(meta.get("generation"), "invalid_generation")
+              require(status.get("observedGeneration") == generation, "generation_unobserved")
+              for key in ("replicas", "updatedReplicas", "readyReplicas", "availableReplicas"):
+                  require(status.get(key) == desired, f"deployment_{key}_not_complete")
+              require(status.get("unavailableReplicas", 0) == 0, "unavailable_replicas")
+              template = object_value(spec.get("template"), "missing_pod_template")
+              pod_spec = object_value(template.get("spec"), "missing_template_spec")
+              containers = list_value(pod_spec.get("containers"), "missing_template_containers")
+              matched = [
+                  object_value(value, "invalid_container")
+                  for value in containers
+                  if object_value(value, "invalid_container").get("image") == expected_image
+              ]
+              require(len(matched) == 1, "template_candidate_container_not_unique")
+              container = name_value(matched[0].get("name"))
+              return desired, container
+          
+          
+          def verify_pod(
+              pod: dict[str, object], expected_image: str, digest: str, container: str
+          ) -> dict[str, object]:
+              meta = metadata(pod)
+              name = name_value(meta.get("name"))
+              require(meta.get("namespace") == NAMESPACE, "wrong_pod_namespace")
+              require(meta.get("deletionTimestamp") is None, "serving_pod_terminating")
+              status = object_value(pod.get("status"), "missing_pod_status")
+              require(status.get("phase") == "Running", "serving_pod_not_running")
+              conditions = list_value(status.get("conditions"), "missing_pod_conditions")
+              require(
+                  any(
+                      object_value(value, "invalid_condition").get("type") == "Ready"
+                      and object_value(value, "invalid_condition").get("status") == "True"
+                      for value in conditions
+                  ),
+                  "serving_pod_not_ready",
+              )
+              spec = object_value(pod.get("spec"), "missing_pod_spec")
+              containers = list_value(spec.get("containers"), "missing_pod_containers")
+              matched = [
+                  object_value(value, "invalid_container")
+                  for value in containers
+                  if object_value(value, "invalid_container").get("name") == container
+              ]
+              require(
+                  len(matched) == 1 and matched[0].get("image") == expected_image,
+                  "serving_pod_tag_mismatch",
+              )
+              statuses = list_value(status.get("containerStatuses"), "missing_container_statuses")
+              matched_status = [
+                  object_value(value, "invalid_container_status")
+                  for value in statuses
+                  if object_value(value, "invalid_container_status").get("name") == container
+              ]
+              require(len(matched_status) == 1, "web_container_status_not_unique")
+              require(matched_status[0].get("ready") is True, "web_container_not_ready")
+              image_id = string_value(matched_status[0].get("imageID"), "missing_image_id")
+              require(
+                  image_id
+                  in {
+                      f"{IMAGE_REPOSITORY}@{digest}",
+                      f"docker-pullable://{IMAGE_REPOSITORY}@{digest}",
+                  },
+                  "serving_pod_digest_mismatch",
+              )
+              return {"pod": name, "container": container, "image_digest": digest}
+          
+          
+          def inspect(reader: Reader, expected_sha: str) -> dict[str, object]:
+              expected_image = f"{IMAGE_REPOSITORY}:{expected_sha}"
+              reader.command(
+                  reader.aws(
+                      "eks",
+                      "update-kubeconfig",
+                      "--name",
+                      CLUSTER,
+                      "--kubeconfig",
+                      str(reader.kubeconfig),
+                  )
+              )
+              config = reader.json_command(
+                  reader.kubectl("config", "view", "--minify", "-o", "json")
+              )
+              clusters = list_value(config.get("clusters"), "missing_config_cluster")
+              require(len(clusters) == 1, "config_cluster_not_unique")
+              require(
+                  object_value(clusters[0], "invalid_config_cluster").get("name")
+                  == f"arn:aws:eks:{REGION}:{ACCOUNT}:cluster/{CLUSTER}",
+                  "wrong_cluster",
+              )
+              ecr = reader.json_command(
+                  reader.aws(
+                      "ecr",
+                      "describe-images",
+                      "--repository-name",
+                      REPOSITORY,
+                      "--image-ids",
+                      f"imageTag={expected_sha}",
+                      "--output",
+                      "json",
+                  )
+              )
+              images = list_value(ecr.get("imageDetails"), "missing_ecr_image_details")
+              require(len(images) == 1, "ecr_image_not_unique")
+              image = object_value(images[0], "invalid_ecr_image")
+              digest = string_value(image.get("imageDigest"), "missing_ecr_digest")
+              require(
+                  re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is not None, "invalid_ecr_digest"
+              )
+              require(
+                  expected_sha in list_value(image.get("imageTags"), "missing_image_tags"),
+                  "ecr_expected_tag_absent",
+              )
+              require(
+                  image.get("registryId") == ACCOUNT
+                  and image.get("repositoryName") == REPOSITORY,
+                  "wrong_ecr_repository",
+              )
+              deployment_before = reader.get("deployment", DEPLOYMENT)
+              desired, container = verify_deployment(deployment_before, expected_image)
+              pods_before = reader.get("pods", "-l", f"app={APP}")
+              pod_list = items(pods_before, MAX_PODS)
+              pods: dict[str, dict[str, object]] = {}
+              for pod in pod_list:
+                  name = name_value(metadata(pod).get("name"))
+                  require(name not in pods, "duplicate_pod_name")
+                  pods[name] = pod
+              require(len(pods) >= desired, "too_few_web_pods")
+              services_before = reader.get("services")
+              services = items(services_before, MAX_NAMESPACE_SERVICES)
+              web_services: list[dict[str, object]] = []
+              for service in services:
+                  spec = object_value(service.get("spec"), "missing_service_spec")
+                  selector = object_value(spec.get("selector", {}), "invalid_service_selector")
+                  if selector.get("app") == APP:
+                      require(
+                          metadata(service).get("namespace") == NAMESPACE,
+                          "wrong_service_namespace",
+                      )
+                      require(
+                          metadata(service).get("deletionTimestamp") is None,
+                          "web_service_terminating",
+                      )
+                      web_services.append(service)
+              require(1 <= len(web_services) <= MAX_WEB_SERVICES, "web_service_count_invalid")
+              serving: set[str] = set()
+              service_summary: list[dict[str, object]] = []
+              endpoint_total = 0
+              slices_before: dict[str, dict[str, object]] = {}
+              for service in web_services:
+                  service_name = name_value(metadata(service).get("name"))
+                  service_spec = object_value(service.get("spec"), "missing_service_spec")
+                  selector = object_value(
+                      service_spec.get("selector"), "invalid_service_selector"
+                  )
+                  slices_before[service_name] = reader.get(
+                      "endpointslices", "-l", f"kubernetes.io/service-name={service_name}"
+                  )
+                  slices = items(slices_before[service_name], MAX_SLICES_PER_SERVICE)
+                  require(bool(slices), "web_service_has_no_endpoint_slices")
+                  service_serving: set[str] = set()
+                  for endpoint_slice in slices:
+                      require(
+                          metadata(endpoint_slice).get("namespace") == NAMESPACE,
+                          "wrong_endpoint_slice_namespace",
+                      )
+                      labels = object_value(
+                          metadata(endpoint_slice).get("labels"), "missing_slice_labels"
+                      )
+                      require(
+                          labels.get("kubernetes.io/service-name") == service_name,
+                          "wrong_slice_service",
+                      )
+                      endpoints = list_value(endpoint_slice.get("endpoints"), "missing_endpoints")
+                      endpoint_total += len(endpoints)
+                      require(endpoint_total <= MAX_ENDPOINTS, "endpoint_count_bound_exceeded")
+                      for raw_endpoint in endpoints:
+                          endpoint = object_value(raw_endpoint, "invalid_endpoint")
+                          conditions = object_value(
+                              endpoint.get("conditions"), "missing_endpoint_conditions"
+                          )
+                          # An unknown Ready value can be interpreted as ready by service consumers.
+                          active = (
+                              conditions.get("ready") is not False
+                              or conditions.get("serving") is True
+                          )
+                          if not active:
+                              continue
+                          require(
+                              conditions.get("terminating", False) is not True,
+                              "serving_endpoint_terminating",
+                          )
+                          target = object_value(
+                              endpoint.get("targetRef"), "missing_endpoint_target"
+                          )
+                          require(
+                              target.get("kind") == "Pod"
+                              and target.get("namespace") == NAMESPACE,
+                              "endpoint_target_not_dev_pod",
+                          )
+                          name = name_value(target.get("name"))
+                          require(name in pods, "endpoint_pod_outside_web_selector")
+                          pod_meta = metadata(pods[name])
+                          require(
+                              isinstance(target.get("uid"), str)
+                              and bool(target.get("uid"))
+                              and target.get("uid") == pod_meta.get("uid"),
+                              "endpoint_pod_uid_mismatch",
+                          )
+                          pod_status = object_value(
+                              pods[name].get("status"), "missing_pod_status"
+                          )
+                          pod_ips = list_value(pod_status.get("podIPs"), "missing_pod_ips")
+                          known_ips = {
+                              str(
+                                  ipaddress.ip_address(
+                                      string_value(
+                                          object_value(value, "invalid_pod_ip").get("ip"),
+                                          "invalid_pod_ip",
+                                      )
+                                  )
+                              )
+                              for value in pod_ips
+                          }
+                          addresses = list_value(
+                              endpoint.get("addresses"), "missing_endpoint_addresses"
+                          )
+                          require(
+                              bool(addresses) and len(addresses) <= 2,
+                              "endpoint_address_count_invalid",
+                          )
+                          require(
+                              all(
+                                  str(
+                                      ipaddress.ip_address(
+                                          string_value(value, "invalid_endpoint_ip")
+                                      )
+                                  )
+                                  in known_ips
+                                  for value in addresses
+                              ),
+                              "endpoint_pod_ip_mismatch",
+                          )
+                          labels = object_value(pod_meta.get("labels"), "missing_pod_labels")
+                          require(
+                              all(labels.get(key) == value for key, value in selector.items()),
+                              "endpoint_service_selector_mismatch",
+                          )
+                          verify_pod(pods[name], expected_image, digest, container)
+                          service_serving.add(name)
+                          serving.add(name)
+                  require(
+                      len(service_serving) == desired, "service_serving_replica_count_mismatch"
+                  )
+                  service_summary.append(
+                      {
+                          "service": service_name,
+                          "serving_pods": sorted(service_serving),
+                          "endpoint_slice_count": len(slices),
+                      }
+                  )
+              require(len(serving) == desired, "distinct_serving_replica_count_mismatch")
+              verified: list[dict[str, object]] = []
+              for name in sorted(serving):
+                  proof = verify_pod(pods[name], expected_image, digest, container)
+                  version = reader.command(
+                      reader.kubectl(
+                          "exec",
+                          "-n",
+                          NAMESPACE,
+                          name,
+                          "-c",
+                          container,
+                          "--",
+                          "node",
+                          "-e",
+                          "console.log(process.env.ONYX_VERSION)",
+                      ),
+                      10,
+                  )
+                  require(version.strip() == expected_sha, "serving_pod_env_version_mismatch")
+                  proof["onyx_version"] = expected_sha
+                  verified.append(proof)
+              # Fence evidence against changes while the exec reads were being collected.
+              deployment_after = reader.get("deployment", DEPLOYMENT)
+              final_desired, final_container = verify_deployment(deployment_after, expected_image)
+              require(
+                  (final_desired, final_container) == (desired, container),
+                  "deployment_changed_during_read",
+              )
+              require(deployment_before == deployment_after, "deployment_changed_during_read")
+              require(
+                  stable_list_snapshot(pods_before)
+                  == stable_list_snapshot(reader.get("pods", "-l", f"app={APP}")),
+                  "pods_changed_during_read",
+              )
+              require(
+                  stable_list_snapshot(services_before)
+                  == stable_list_snapshot(reader.get("services")),
+                  "services_changed_during_read",
+              )
+              for service_name, previous_slices in slices_before.items():
+                  require(
+                      stable_list_snapshot(previous_slices)
+                      == stable_list_snapshot(
+                          reader.get(
+                              "endpointslices", "-l", f"kubernetes.io/service-name={service_name}"
+                          )
+                      ),
+                      "endpoints_changed_during_read",
+                  )
+              return {
+                  "ok": True,
+                  "scope": "DEV frontend service endpoints and runtime identity",
+                  "expected_sha": expected_sha,
+                  "cluster": CLUSTER,
+                  "namespace": NAMESPACE,
+                  "deployment": DEPLOYMENT,
+                  "desired_replicas": desired,
+                  "ecr_digest": digest,
+                  "web_pod_count": len(pods),
+                  "serving_pod_count": len(serving),
+                  "services": service_summary,
+                  "verified_pods": verified,
+                  "limitation": "Point-in-time service endpoint proof; ingress/CDN/browser-cache routing is not inspected.",
+              }
+          
+          
+          def main() -> int:
+              expected_sha = os.environ.get("EXPECTED_SHA", "")
+              try:
+                  require(
+                      re.fullmatch(r"[0-9a-f]{40}", expected_sha) is not None,
+                      "invalid_expected_sha",
+                  )
+                  diagnostic_ref = os.environ.get("DIAGNOSTIC_REF", "")
+                  require(
+                      re.fullmatch(
+                          r"refs/heads/diagnostics/[a-z0-9][a-z0-9._/-]{0,180}", diagnostic_ref
+                      )
+                      is not None,
+                      "not_isolated_diagnostics_branch",
+                  )
+                  with tempfile.TemporaryDirectory(
+                      prefix="legal-frontend-identity-"
+                  ) as directory:
+                      result = inspect(Reader(Path(directory) / "kubeconfig"), expected_sha)
+                  result["diagnostic_ref"] = diagnostic_ref
+                  result["paid_calls"] = 0
+                  result["cluster_mutations"] = 0
+                  code = 0
+              except IdentityFailure as error:
+                  result = {
+                      "ok": False,
+                      "reason": str(error),
+                      "paid_calls": 0,
+                      "cluster_mutations": 0,
+                  }
+                  if re.fullmatch(r"[0-9a-f]{40}", expected_sha):
+                      result["expected_sha"] = expected_sha
+                  code = 1
+              except Exception:
+                  result = {
+                      "ok": False,
+                      "reason": "unexpected_failure",
+                      "paid_calls": 0,
+                      "cluster_mutations": 0,
+                  }
+                  code = 1
+              print(PREFIX + json.dumps(result, sort_keys=True, separators=(",", ":")))
+              return code
+          
+          
+          if __name__ == "__main__":
+              sys.exit(main())
+          PY_IDENTITY
