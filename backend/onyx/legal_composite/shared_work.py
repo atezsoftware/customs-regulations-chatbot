@@ -10,6 +10,7 @@ from threading import BoundedSemaphore, Lock
 
 from onyx.asv3.models import EvidenceItem, RunContext
 from onyx.context.search.models import SearchDoc
+from onyx.utils.threadpool_concurrency import run_functions_tuples_in_parallel
 
 CenterKey = tuple[str, int]
 HydratedCenters = dict[CenterKey, list[EvidenceItem]]
@@ -57,7 +58,8 @@ class SharedCanonicalCenters:
             groups: dict[str, list[SearchDoc]] = {}
             for doc in owned:
                 groups.setdefault(doc.document_id, []).append(doc)
-            for originals in groups.values():
+
+            def read_group(originals: list[SearchDoc]) -> None:
                 while not self._slots.acquire(timeout=0.05):
                     context.check_active()
                 try:
@@ -73,6 +75,11 @@ class SharedCanonicalCenters:
                         )
                 finally:
                     self._slots.release()
+
+            run_functions_tuples_in_parallel(
+                [(read_group, (originals,)) for originals in groups.values()],
+                max_workers=4,
+            )
         except BaseException as error:
             with self._lock:
                 for doc in owned:

@@ -53,6 +53,57 @@ def tool() -> CompositeSearchTool:
     )
 
 
+def test_shared_search_keeps_type_steps_and_isolates_changed_filters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owned = tool()
+    owned.enable_shared_prepared_work()
+    source_id = str(uuid4())
+    assert owned.user_selected_filters is not None
+    owned.user_selected_filters = owned.user_selected_filters.model_copy(
+        update={"attached_document_ids": [source_id]}
+    )
+    model = EmbeddingModel.__new__(EmbeddingModel)
+    monkeypatch.setattr(search, "embedding_model_key", lambda _: "fixed-test-encoder")
+    calls = 0
+
+    def pipeline(**_kwargs: Any) -> list[InferenceChunk]:
+        nonlocal calls
+        calls += 1
+        return [chunk(source_id)]
+
+    monkeypatch.setattr(search, "search_pipeline", pipeline)
+    receipts: list[dict[str, Any]] = []
+
+    def retrieve(lane: CompositeSearchTool) -> list[InferenceChunk]:
+        return lane._run_search_for_query(
+            "same question",
+            0.5,
+            False,
+            100,
+            ["fresh-acl"],
+            model,
+            [],
+            lane.user_selected_filters,
+        )
+
+    first = owned.fork_for_independent_context()
+    first.configure_prepared_source_lane(SourceKind.STATUTE, receipts.append)
+    second = owned.fork_for_independent_context()
+    second.configure_prepared_source_lane(SourceKind.COMMUNIQUE, receipts.append)
+    assert retrieve(first)[0].document_id == source_id
+    assert retrieve(second)[0].document_id == source_id
+    assert calls == 1
+    assert [r["source_kind"] for r in receipts] == ["statute", "communique"]
+    assert [r["shared_exact_retrieval"] for r in receipts] == [False, True]
+    assert second.user_selected_filters is not None
+    second.user_selected_filters = second.user_selected_filters.model_copy(
+        update={"as_of_date": date(2020, 1, 1)}
+    )
+    assert retrieve(second)[0].document_id == source_id
+    assert calls == 2
+
+
 def chunk(source_id: str, position: int = 0) -> InferenceChunk:
     return InferenceChunk(
         chunk_id=position,

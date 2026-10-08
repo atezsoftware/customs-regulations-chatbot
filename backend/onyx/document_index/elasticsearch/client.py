@@ -2,6 +2,7 @@ import copy
 import datetime
 import json
 import logging
+import math
 import statistics
 import time
 from collections import Counter
@@ -2102,15 +2103,44 @@ class ElasticsearchIndexClient(ElasticsearchClient):
                 operation,
                 {"index": self._index_name, "body": request_body, "weight": weight},
             ) as query_step:
+                call_started = (
+                    time.perf_counter() if parallel_retrieval_enabled() else None
+                )
                 raw_response = self._client.search(
                     index=self._index_name,
                     **self._search_kwargs_from_body(request_body),
+                )
+                call_seconds = (
+                    time.perf_counter() - call_started
+                    if call_started is not None
+                    else None
                 )
                 query_step.output_value = (
                     raw_response
                     if isinstance(raw_response, dict)
                     else dict(raw_response.body)
                 )
+                if call_seconds is not None:
+                    timings = [f"search_call_seconds={call_seconds:.6g}"]
+                    http_seconds = getattr(
+                        getattr(raw_response, "meta", None), "duration", None
+                    )
+                    if (
+                        isinstance(http_seconds, (int, float))
+                        and not isinstance(http_seconds, bool)
+                        and math.isfinite(http_seconds)
+                        and http_seconds >= 0
+                    ):
+                        timings.append(f"native_http_seconds={http_seconds:.6g}")
+                    took_ms = query_step.output_value.get("took")
+                    if (
+                        isinstance(took_ms, (int, float))
+                        and not isinstance(took_ms, bool)
+                        and math.isfinite(took_ms)
+                        and took_ms >= 0
+                    ):
+                        timings.append(f"server_took_ms={took_ms:.6g}")
+                    query_step.summary = "; ".join(timings)[:160]
             response = (
                 raw_response
                 if isinstance(raw_response, dict)

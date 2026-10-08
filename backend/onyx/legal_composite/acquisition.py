@@ -5,12 +5,19 @@ import json
 import time
 from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from threading import Lock
 from typing import cast
 
 from pydantic import JsonValue
 
 from onyx.asv3.evidence import EvidenceLedger
-from onyx.asv3.models import CapabilityCall, RunContext, RunStopped, ToolOutcome
+from onyx.asv3.models import (
+    CapabilityCall,
+    EvidenceItem,
+    RunContext,
+    RunStopped,
+    ToolOutcome,
+)
 from onyx.asv3.registry import CapabilityRegistry
 from onyx.db.legal_composite_sources import SourceKind
 from onyx.legal_composite.models import ResearchPlan, SourceAction, WorkflowPolicy
@@ -19,6 +26,60 @@ from onyx.tracing.answer_graph import graph_step
 
 class InvalidSourceAction(RunStopped):
     pass
+
+
+class CanonicalEvidenceStage:
+    """Retain verified originals while the owning source action is still active."""
+
+    def __init__(
+        self, ledger: EvidenceLedger, context: RunContext, need_ids: list[str]
+    ) -> None:
+        self.ledger = ledger
+        self.context = context
+        self.need_ids = tuple(need_ids)
+        self._lock = Lock()
+        self._active = True
+        self._citations: list[int] = []
+
+    def retain(
+        self, items: list[EvidenceItem], existing_citations: list[int] | None = None
+    ) -> list[int]:
+        with self._lock:
+            if not self._active:
+                raise RunStopped("Canonical acquisition is closed")
+            self.context.check_research_active()
+            originals = list(items)
+            for number in existing_citations or []:
+                item = self.ledger.get(number)
+                if item is not None:
+                    originals.append(item)
+            bound = [
+                item.model_copy(
+                    deep=True,
+                    update={
+                        "question_ids": list(
+                            dict.fromkeys([*item.question_ids, *self.need_ids])
+                        )
+                    },
+                )
+                for item in originals
+            ]
+            numbers: list[int] = []
+            for item in bound:
+                self.context.check_research_active()
+                recorded = self.ledger.add([item], self.context)
+                numbers.extend(recorded)
+                self._citations = list(dict.fromkeys([*self._citations, *recorded]))
+            return numbers
+
+    def citations(self) -> list[int]:
+        with self._lock:
+            return list(self._citations)
+
+    def close(self) -> None:
+        with self._lock:
+            self._active = False
+            self.context.cancel()
 
 
 class CanonicalAcquirer:
@@ -86,7 +147,16 @@ class CanonicalAcquirer:
                 if host_actions and action.source_kind is None
                 else self.registry_for_action(action)
             )
-            outcome = registry.dispatch(call, child)
+            stage = child.services.get("legal_composite_original_stage")
+            assert isinstance(stage, CanonicalEvidenceStage)
+            try:
+                outcome = registry.dispatch(call, child)
+                stage.retain(
+                    outcome.evidence,
+                    [read.citation for read in outcome.original_reads],
+                )
+            finally:
+                stage.close()
             step.output_value = {
                 "status": outcome.status.value,
                 "original_count": len(outcome.evidence),
@@ -214,10 +284,14 @@ class CanonicalAcquirer:
         batch_actions = [action for action, _call, _signature in calls]
         completed_count = 0
         last_progress = time.monotonic()
+        stages: list[CanonicalEvidenceStage] = []
         try:
             for action, call, signature in calls:
                 child = self.context.child()
                 child.depth = self.context.depth
+                stage = CanonicalEvidenceStage(self.ledger, child, action.need_ids)
+                child.services["legal_composite_original_stage"] = stage
+                stages.append(stage)
                 captured = contextvars.copy_context()
                 future = cast(
                     Future[ToolOutcome],
@@ -234,23 +308,41 @@ class CanonicalAcquirer:
             if pending:
                 self.on_batch_progress(batch_actions, len(pending), completed_count)
             while pending:
-                self.context.check_research_active()
-                completed, _ = wait(pending, timeout=0.05, return_when=FIRST_COMPLETED)
+                completed = {future for future in pending if future.done()}
+                if not completed:
+                    self.context.check_research_active()
+                    completed, _ = wait(
+                        pending, timeout=0.05, return_when=FIRST_COMPLETED
+                    )
                 if not completed and time.monotonic() - last_progress >= 5:
                     self.on_batch_progress(batch_actions, len(pending), completed_count)
                     last_progress = time.monotonic()
+                stopped: RunStopped | None = None
                 for future in completed:
-                    action, call, signature, _child = pending.pop(future)
-                    outcome = future.result()
-                    for item in outcome.evidence:
-                        item.question_ids = list(action.need_ids)
-                    numbers = self.ledger.add(outcome.evidence, self.context)
-                    numbers.extend(
-                        read.citation
-                        for read in outcome.original_reads
-                        if read.citation not in numbers
-                    )
-                    self._bind_originals(numbers, action.need_ids)
+                    action, call, signature, child = pending.pop(future)
+                    stage = child.services.get("legal_composite_original_stage")
+                    assert isinstance(stage, CanonicalEvidenceStage)
+                    try:
+                        outcome = future.result()
+                    except RunStopped as error:
+                        result.append(
+                            {
+                                "tool": call.name,
+                                "source_kind": action.source_kind,
+                                "need_ids": list(action.need_ids),
+                                "status": "truncated",
+                                "summary": "Acquisition stopped before a complete result; retained originals are partial evidence, not proof of corpus absence.",
+                                "citations": stage.citations(),
+                                **(
+                                    {"host_arguments": call.arguments}
+                                    if host_actions
+                                    else {}
+                                ),
+                            }
+                        )
+                        stopped = error
+                        continue
+                    numbers = stage.citations()
                     row: dict[str, JsonValue] = {
                         "tool": call.name,
                         "source_kind": action.source_kind,
@@ -313,19 +405,26 @@ class CanonicalAcquirer:
                             "status": outcome.status.value,
                             "citations": numbers,
                         }
+                if stopped is not None:
+                    raise stopped
             return result
         finally:
             # SDK/DB operations may finish later; they cannot commit late evidence to the ledger.
+            for stage in stages:
+                stage.close()
             for future, (action, call, _, child) in pending.items():
                 child.cancel()
                 future.cancel()
+                stage = child.services.get("legal_composite_original_stage")
+                assert isinstance(stage, CanonicalEvidenceStage)
                 result.append(
                     {
                         "tool": call.name,
+                        "source_kind": action.source_kind,
                         "need_ids": list(action.need_ids),
                         "status": "truncated",
-                        "summary": "Acquisition stopped before a complete result; this is not evidence of corpus absence.",
-                        "citations": [],
+                        "summary": "Acquisition stopped before a complete result; retained originals are partial evidence, not proof of corpus absence.",
+                        "citations": stage.citations(),
                         **({"host_arguments": call.arguments} if host_actions else {}),
                     }
                 )

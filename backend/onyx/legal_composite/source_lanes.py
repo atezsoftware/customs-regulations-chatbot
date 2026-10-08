@@ -29,6 +29,7 @@ from onyx.db.legal_composite_sources import (
     revalidate_source_classification,
     source_scope_sha256,
 )
+from onyx.legal_composite.acquisition import CanonicalEvidenceStage
 from onyx.legal_composite.shared_work import SharedCanonicalCenters
 from onyx.utils.threadpool_concurrency import run_functions_tuples_in_parallel
 
@@ -453,11 +454,29 @@ class SourceLaneBroker(CorpusBroker):
         if self.candidate_classifier is not None:
             return self._hydrate_candidate_sources(docs, context, centers_only=True)
         docs = self._admitted_search_docs(docs, context)
+
+        def hydrate_verified_group(
+            originals: list[SearchDoc], child: RunContext
+        ) -> dict[tuple[str, int], list[EvidenceItem]]:
+            child.check_research_active()
+            result = super(SourceLaneBroker, self).hydrate_search_centers(
+                originals, child
+            )
+            admitted = {
+                (doc.document_id, doc.chunk_ind)
+                for doc in self._admitted_search_docs(originals, child)
+            }
+            verified = self._check_search_originals(
+                {key: value for key, value in result.items() if key in admitted}
+            )
+            self._stage_search_originals(verified, child)
+            return verified
+
         if self.shared_centers is not None:
             result = self.shared_centers.read(
                 docs,
                 context,
-                super().hydrate_search_centers,
+                hydrate_verified_group,
                 {
                     str(key): value.prepared_revision
                     for key, value in self.classifications.items()
@@ -467,12 +486,33 @@ class SourceLaneBroker(CorpusBroker):
                 (doc.document_id, doc.chunk_ind)
                 for doc in self._admitted_search_docs(docs, context)
             }
-            return self._check_search_originals(
+            verified = self._check_search_originals(
                 {key: value for key, value in result.items() if key in admitted}
             )
-        return self._check_search_originals(
-            super().hydrate_search_centers(docs, context)
+            self._stage_search_originals(verified, context)
+            return verified
+        grouped: dict[str, list[SearchDoc]] = {}
+        for doc in docs:
+            grouped.setdefault(doc.document_id, []).append(doc)
+        groups = run_functions_tuples_in_parallel(
+            [
+                (hydrate_verified_group, (originals, context))
+                for originals in grouped.values()
+            ],
+            max_workers=4,
         )
+        retained: dict[tuple[str, int], list[EvidenceItem]] = {}
+        for result in groups:
+            retained.update(result)
+        return retained
+
+    @staticmethod
+    def _stage_search_originals(
+        result: dict[tuple[str, int], list[EvidenceItem]], context: RunContext
+    ) -> None:
+        stage = context.services.get("legal_composite_original_stage")
+        if isinstance(stage, CanonicalEvidenceStage):
+            stage.retain([item for group in result.values() for item in group])
 
     def hydrate_search_results(
         self, docs: list[SearchDoc], context: RunContext

@@ -80,6 +80,26 @@ def _get_scoped_regulatory_query_embedding(
     db_session: Session | None,
     embedding_model: EmbeddingModel | None,
 ) -> Embedding | None:
+    return binding.scope.embed(
+        query_request.query,
+        embedding_model,
+        lambda: _compute_scoped_regulatory_query_embedding(
+            query_request,
+            binding,
+            db_session=db_session,
+            embedding_model=embedding_model,
+        ),
+        binding.check_active,
+    )
+
+
+def _compute_scoped_regulatory_query_embedding(
+    query_request: ChunkIndexRequest,
+    binding: QueryEmbeddingScopeBinding,
+    *,
+    db_session: Session | None,
+    embedding_model: EmbeddingModel | None,
+) -> Embedding | None:
     binding.check_active()
     with _regulatory_embedding_circuit_lock:
         if time.monotonic() < _regulatory_embedding_circuit_open_until:

@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Callable
+from contextlib import nullcontext
 from typing import Any
 
 from pydantic import JsonValue
@@ -18,8 +21,14 @@ from onyx.context.search.pipeline import search_pipeline
 from onyx.context.search.retrieval.parallel_retrieval_scope import (
     experimental_parallel_retrieval,
 )
+from onyx.context.search.retrieval.query_embedding_scope import (
+    ParallelQueryEmbeddingScope,
+    embedding_model_key,
+    experimental_parallel_query_embeddings,
+)
 from onyx.db.legal_composite_sources import SourceKind
 from onyx.federated_connectors.federated_retrieval import FederatedRetrievalInfo
+from onyx.legal_composite.shared_search import SharedPreparedRetrieval
 from onyx.natural_language_processing.search_nlp_models import EmbeddingModel
 from onyx.regulatory.heading_path import RegulatoryProvisionReference
 from onyx.server.query_and_chat.placement import Placement
@@ -36,6 +45,12 @@ class CompositeSearchTool(SearchTool):
     _prepared_source_kind: SourceKind | None = None
     _record_prepared_search: Callable[[dict[str, JsonValue]], None] | None = None
     _check_prepared_search: Callable[[], None] | None = None
+    _shared_prepared_retrieval: SharedPreparedRetrieval | None = None
+    _shared_query_embeddings: ParallelQueryEmbeddingScope | None = None
+
+    def enable_shared_prepared_work(self) -> None:
+        self._shared_prepared_retrieval = SharedPreparedRetrieval()
+        self._shared_query_embeddings = ParallelQueryEmbeddingScope(cache_queries=True)
 
     @classmethod
     def from_fork(cls, fork: SearchTool) -> CompositeSearchTool:
@@ -63,6 +78,8 @@ class CompositeSearchTool(SearchTool):
         instance._prepared_source_kind = self._prepared_source_kind
         instance._record_prepared_search = self._record_prepared_search
         instance._check_prepared_search = self._check_prepared_search
+        instance._shared_prepared_retrieval = self._shared_prepared_retrieval
+        instance._shared_query_embeddings = self._shared_query_embeddings
         return instance
 
     def fork_for_independent_context(
@@ -123,24 +140,64 @@ class CompositeSearchTool(SearchTool):
             "legal_composite.prepared_source_search",
             {"source_kind": kind.value, "source_count": len(captured)},
         ) as step:
-            hits = search_pipeline(
-                chunk_search_request=ChunkSearchRequest(
-                    query=query,
-                    hybrid_alpha=hybrid_alpha,
-                    high_term_coverage=high_term_coverage,
-                    user_selected_filters=effective_filters,
-                    bypass_acl=False,
-                    limit=num_hits,
-                ),
-                project_id_filter=self.project_id_filter,
-                persona_id_filter=self.persona_id_filter,
-                document_index=self.document_index,
-                user=self.user,
-                persona_search_info=self.persona_search_info,
-                acl_filters=acl_filters,
-                embedding_model=embedding_model,
-                prefetched_federated_retrieval_infos=federated_retrieval_infos,
-            )
+
+            def retrieve() -> list[InferenceChunk]:
+                return search_pipeline(
+                    chunk_search_request=ChunkSearchRequest(
+                        query=query,
+                        hybrid_alpha=hybrid_alpha,
+                        high_term_coverage=high_term_coverage,
+                        user_selected_filters=effective_filters,
+                        bypass_acl=False,
+                        limit=num_hits,
+                    ),
+                    project_id_filter=self.project_id_filter,
+                    persona_id_filter=self.persona_id_filter,
+                    document_index=self.document_index,
+                    user=self.user,
+                    persona_search_info=self.persona_search_info,
+                    acl_filters=acl_filters,
+                    embedding_model=embedding_model,
+                    prefetched_federated_retrieval_infos=federated_retrieval_infos,
+                )
+
+            shared = False
+            if (
+                self._shared_prepared_retrieval is None
+                or type(embedding_model) is not EmbeddingModel
+            ):
+                hits = retrieve()
+            else:
+                filters = effective_filters.model_dump(mode="json")
+                filters["attached_document_ids"] = sorted(captured)
+                key = hashlib.sha256(
+                    json.dumps(
+                        {
+                            "query": query,
+                            "hybrid_alpha": hybrid_alpha,
+                            "high_term_coverage": high_term_coverage,
+                            "limit": num_hits,
+                            "filters": filters,
+                            "acl": sorted(acl_filters),
+                            "user_id": str(self.user.id),
+                            "index_instance": id(self.document_index),
+                            "encoder": embedding_model_key(embedding_model),
+                            "project_id": self.project_id_filter,
+                            "persona_id": self.persona_id_filter,
+                            "persona_search_info": self.persona_search_info.model_dump(
+                                mode="json"
+                            ),
+                        },
+                        sort_keys=True,
+                    ).encode()
+                ).hexdigest()
+                # Federated scopes have additional remote authorization contracts.
+                if federated_retrieval_infos:
+                    hits = retrieve()
+                else:
+                    hits, shared = self._shared_prepared_retrieval.run(
+                        key, retrieve, self._check_prepared_search or (lambda: None)
+                    )
             if self._check_prepared_search is not None:
                 self._check_prepared_search()
             retained = [hit for hit in hits if hit.document_id in captured]
@@ -154,6 +211,7 @@ class CompositeSearchTool(SearchTool):
                 "source_kind_filter_before_retrieval": True,
                 "runtime_opening_reads": 0,
                 "runtime_classifications": 0,
+                "shared_exact_retrieval": shared,
                 "captured_source_count": len(captured),
                 "raw_hit_count": len(hits),
                 "requested_hits": num_hits,
@@ -217,7 +275,18 @@ class CompositeSearchTool(SearchTool):
                 "reuse_diversity_comparisons": True,
             }
         )
-        with experimental_parallel_retrieval(
-            check_active=self._check_prepared_search or (lambda: None)
+        check_active = self._check_prepared_search or (lambda: None)
+        embeddings = (
+            experimental_parallel_query_embeddings(
+                self._shared_query_embeddings, check_active=check_active
+            )
+            if self._shared_query_embeddings is not None
+            else nullcontext()
+        )
+        with (
+            embeddings,
+            experimental_parallel_retrieval(
+                check_active=self._check_prepared_search or (lambda: None)
+            ),
         ):
             return super().run(placement, wider, **llm_kwargs)

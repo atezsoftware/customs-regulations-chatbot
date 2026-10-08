@@ -29,7 +29,8 @@ from onyx.db.legal_composite_sources import (
 )
 from onyx.db.models import User
 from onyx.legal_composite import runtime
-from onyx.legal_composite.models import WorkflowResult
+from onyx.legal_composite.acquisition import CanonicalAcquirer
+from onyx.legal_composite.models import SourceAction, WorkflowResult
 from onyx.legal_composite.routing import SourceLaneRouter
 from onyx.llm.interfaces import LLM, LLMConfig
 from onyx.server.query_and_chat.streaming_models import (
@@ -413,6 +414,59 @@ def test_query_first_cancellation_never_creates_provider_or_final_answer(
         harness.run(None)
     provider.assert_not_called()
     assert harness.snapshots == [] and harness.state.get_answer_tokens() is None
+
+
+def test_completed_source_batch_keeps_coordinator_open_for_selection_and_answer(
+    harness: RuntimeHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_factory = runtime.LegalCompositeEngine
+    actions = [
+        SourceAction(
+            tool="search_corpus",
+            need_ids=["need-1"],
+            arguments={"query": "Kaynaklı sonuç"},
+            source_kind=kind,
+        )
+        for kind in SourceKind
+    ]
+
+    def engine_factory(**kwargs: Any) -> Any:
+        acquirer = cast(CanonicalAcquirer, kwargs["acquirer"])
+        report = cast(Callable[[str, str], None], kwargs["report"])
+        acquirer.on_batch_progress(actions, len(actions), 0)
+        acquirer.on_batch_progress(actions, 0, len(actions))
+        report("selection", "tr")
+        report("final", "tr")
+        return original_factory(**kwargs)
+
+    monkeypatch.setattr(runtime, "LegalCompositeEngine", engine_factory)
+    harness.run(None)
+    progress = [
+        packet.obj
+        for packet in harness.emitter.get_packets()
+        if isinstance(packet.obj, ASv3Progress)
+    ]
+    batch_finished = next(
+        event for event in progress if event.completed_tasks == len(SourceKind)
+    )
+    assert batch_finished.active_tasks == 0
+    assert batch_finished.status == "running" and batch_finished.task_id is None
+    assert "12/12" in (batch_finished.message or "")
+    assert any(
+        event.sequence > batch_finished.sequence
+        and event.title == "Kaynak uygunluğu denetleniyor"
+        for event in progress
+    )
+    assert any(
+        event.sequence > batch_finished.sequence and event.phase == "final"
+        for event in progress
+    )
+    assert all(
+        event.status not in {"completed", "failed", "cancelled"}
+        for event in progress[:-1]
+    )
+    assert progress[-1].phase == "completed"
+    assert progress[-1].status == "completed"
 
 
 def test_query_first_progress_failure_prevents_provider_setup(
