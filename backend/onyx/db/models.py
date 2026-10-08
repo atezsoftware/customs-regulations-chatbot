@@ -9410,6 +9410,18 @@ class RegulatoryTemporalProjection(Base):
             ),
             postgresql_where=text("retired_at IS NULL"),
         ),
+        Index("ix_temporal_projection_file_qualification", "user_file_id"),
+        Index(
+            "ix_temporal_projection_canonical_opening",
+            "user_file_id",
+            "index_uuid",
+            text("((payload ->> 'semantic_position')::integer)"),
+            "projection_ordinal",
+            postgresql_where=text(
+                "retired_at IS NULL AND (payload ->> 'derived_role') = 'canonical' "
+                "AND ((payload ->> 'semantic_position')::integer) >= 0"
+            ),
+        ),
         CheckConstraint(
             "effective_end IS NULL OR effective_start IS NULL OR effective_end > effective_start "
             "OR (effective_end = effective_start AND COALESCE("

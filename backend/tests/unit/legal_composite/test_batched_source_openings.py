@@ -1,6 +1,8 @@
 import json
 from contextlib import nullcontext
 from datetime import date
+from threading import Barrier, Lock
+from types import SimpleNamespace
 from typing import cast
 from unittest.mock import MagicMock
 from uuid import UUID, uuid4
@@ -148,9 +150,38 @@ def test_temporal_batch_matches_canonical_reads_with_constant_row_revision_queri
         assert fence in sql
     assert filters.as_of_date in query.params.values()
     assert 4 in query.params.values()
-    assert set(query.params["param_1"]) == {
-        (identifier, index.index_uuid) for identifier in identifiers
-    }
+    assert set(query.params["user_file_id_1"]) == set(identifiers)
+    assert query.params["index_uuid_1"] == index.index_uuid
+
+
+def test_grouped_temporal_scope_keeps_each_sources_own_physical_index() -> None:
+    identifiers = (uuid4(), uuid4(), uuid4())
+    first = observed_index_snapshot(settings(), "first-physical")
+    second = observed_index_snapshot(settings(), "second-physical")
+    indexes = {identifiers[0]: first, identifiers[1]: first, identifiers[2]: second}
+    pairs = [
+        temporal_row(identifier, 0, index) for identifier, index in indexes.items()
+    ]
+    session = MagicMock(spec=Session)
+    session.scalars.side_effect = [
+        [row for row, _ in pairs],
+        [revision for _, revision in pairs],
+    ]
+    actual = sources._opening_rows(
+        cast(Session, session),
+        identifiers,
+        IndexFilters(access_control_list=[]),
+        indexes,
+    )
+    assert set(actual) == set(identifiers)
+    query = (
+        session.scalars.call_args_list[0].args[0].compile(dialect=postgresql.dialect())
+    )
+    assert query.params["index_uuid_1"] == first.index_uuid
+    assert set(query.params["user_file_id_1"]) == set(identifiers[:2])
+    assert query.params["index_uuid_2"] == second.index_uuid
+    assert query.params["user_file_id_2"] == [identifiers[2]]
+    assert " OR " in str(query) and " AND " in str(query)
 
 
 @pytest.mark.parametrize(
@@ -356,7 +387,7 @@ def test_page_reauthorization_rejects_revoked_or_renamed_source(
 ) -> None:
     page = [CorpusSource(uuid4(), "Original source.md", "file") for _ in range(3)]
     find = MagicMock(side_effect=[(page[:2], False), ([page[0]], False)])
-    monkeypatch.setattr(sources, "find_sources", find)
+    monkeypatch.setattr(sources, "find_source_inventory_page", find)
     monkeypatch.setattr(
         sources,
         "get_session_with_current_tenant",
@@ -395,7 +426,7 @@ def test_page_progress_reports_authorized_count_without_invented_total(
     )
     monkeypatch.setattr(
         sources,
-        "find_sources",
+        "find_source_inventory_page",
         MagicMock(side_effect=[([first], True), ([second], False)]),
     )
     monkeypatch.setattr(sources, "_document_types", lambda *_args: ({}, True))
@@ -421,7 +452,7 @@ def test_default_inventory_exhausts_scoped_pages_beyond_ten_thousand(
 
     def find(_session: Session, **kwargs: object) -> tuple[list[CorpusSource], bool]:
         offset, limit = cast(int, kwargs["offset"]), cast(int, kwargs["limit"])
-        assert 1 <= limit <= 100
+        assert 1 <= limit <= 1000
         pages.append(offset)
         count = min(limit, total - offset)
         return [
@@ -429,7 +460,7 @@ def test_default_inventory_exhausts_scoped_pages_beyond_ten_thousand(
             for n in range(count)
         ], offset + count < total
 
-    monkeypatch.setattr(sources, "find_sources", find)
+    monkeypatch.setattr(sources, "find_source_inventory_page", find)
     monkeypatch.setattr(sources, "_document_types", lambda *_args: ({}, True))
     monkeypatch.setattr(
         sources,
@@ -443,7 +474,7 @@ def test_default_inventory_exhausts_scoped_pages_beyond_ten_thousand(
         check_active=lambda: None,
     )
     assert len(catalogue.records) == total and catalogue.complete
-    assert pages[-1] == 10_000 and len(pages) == 101
+    assert pages[-1] == 10_000 and len(pages) == 11
     assert catalogue.records[-1].source_id == UUID(int=total)
 
 
@@ -459,3 +490,183 @@ def test_invalid_inventory_bound_is_rejected_before_sql(bound: int) -> None:
             max_sources=bound,
         )
     session.execute.assert_not_called()
+
+
+def inventory_boundary(monkeypatch: pytest.MonkeyPatch) -> tuple[MagicMock, MagicMock]:
+    validation = MagicMock()
+    monkeypatch.setattr(sources, "_validate_filters", validation)
+    monkeypatch.setattr(asv3_corpus, "_validate_filters", validation)
+    access = MagicMock()
+    acl = MagicMock(return_value={"visible"})
+    for module in (sources, asv3_corpus):
+        monkeypatch.setattr(module, "get_access_for_user_files", access)
+        monkeypatch.setattr(module, "get_acl_for_user", acl)
+        monkeypatch.setattr(module, "observe_publication_read", lambda: object())
+        monkeypatch.setattr(
+            module,
+            "filter_publication_read",
+            lambda _observation, rows, _identity: rows,
+        )
+    return validation, access
+
+
+def test_inventory_reader_matches_canonical_empty_title_source_predicate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    validation, access = inventory_boundary(monkeypatch)
+    identifiers = (uuid4(), uuid4())
+    filters = IndexFilters(
+        access_control_list=[],
+        asv3_document_set_id=15,
+        forced_document_set=["PC Külliyatı"],
+        attached_document_ids=[str(identifiers[0])],
+        document_set=["secondary"],
+        project_id_filter=3,
+        persona_id_filter=4,
+    )
+    record = SimpleNamespace(id=identifiers[0], name="source.md", file_id="file")
+    permission = MagicMock()
+    permission.to_acl.return_value = {"visible"}
+    access.return_value = {str(record.id): permission}
+    legacy, batch = MagicMock(spec=Session), MagicMock(spec=Session)
+    for session in (legacy, batch):
+        session.execute.return_value.all.return_value = [record]
+    user = cast(User, object())
+    expected = asv3_corpus.find_sources(
+        cast(Session, legacy),
+        user=user,
+        filters=filters,
+        source_ids=identifiers,
+        offset=2,
+        limit=100,
+    )
+    actual = sources.find_source_inventory_page(
+        cast(Session, batch),
+        user=user,
+        filters=filters,
+        source_ids=identifiers,
+        offset=2,
+        limit=100,
+    )
+    assert actual == expected
+    old_query = legacy.execute.call_args.args[0].compile(dialect=postgresql.dialect())
+    new_query = batch.execute.call_args.args[0].compile(dialect=postgresql.dialect())
+    assert str(new_query) == str(old_query) and new_query.params == old_query.params
+    assert validation.call_count == 2
+    assert all(
+        call.args == (session, user, filters)
+        for call, session in zip(
+            validation.call_args_list, (legacy, batch), strict=True
+        )
+    )
+
+
+def test_thousand_source_page_retains_acl_publication_and_lookahead_guards(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, access = inventory_boundary(monkeypatch)
+    records = [
+        SimpleNamespace(id=UUID(int=n), name=f"source-{n}.md", file_id="file")
+        for n in range(1, 1002)
+    ]
+    permissions = {}
+    for record in records:
+        permission = MagicMock()
+        permission.to_acl.return_value = {"denied" if record.id.int == 2 else "visible"}
+        permissions[str(record.id)] = permission
+    access.return_value = permissions
+    publication = MagicMock(
+        side_effect=lambda _observation, rows, _identity: [
+            row for row in rows if row.id.int != 3
+        ]
+    )
+    monkeypatch.setattr(sources, "filter_publication_read", publication)
+    session = MagicMock(spec=Session)
+    session.execute.return_value.all.return_value = records
+    result, more = sources.find_source_inventory_page(
+        cast(Session, session),
+        user=cast(User, object()),
+        filters=IndexFilters(access_control_list=[]),
+    )
+    assert more and len(result) == 998
+    assert {row.id.int for row in result} == set(range(1, 1001)) - {2, 3}
+    assert access.call_args.args[0] == [str(record.id) for record in records]
+    assert publication.call_count == 1
+    query = session.execute.call_args.args[0].compile(dialect=postgresql.dialect())
+    assert 1001 in query.params.values() and session.execute.call_count == 1
+    with pytest.raises(ValueError, match="1..100"):
+        asv3_corpus.find_sources(
+            cast(Session, session),
+            user=cast(User, object()),
+            filters=IndexFilters(access_control_list=[]),
+            limit=1000,
+        )
+
+
+def test_inventory_scope_rejection_happens_before_any_file_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    validation = MagicMock(side_effect=PermissionError("Pinned PC is inaccessible"))
+    monkeypatch.setattr(sources, "_validate_filters", validation)
+    session = MagicMock(spec=Session)
+    with pytest.raises(PermissionError, match="Pinned PC"):
+        sources.find_source_inventory_page(
+            cast(Session, session),
+            user=cast(User, object()),
+            filters=IndexFilters(access_control_list=[]),
+        )
+    session.execute.assert_not_called()
+
+
+def test_thousand_openings_queue_bounded_batches_on_four_workers_with_page_guards(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page = [CorpusSource(UUID(int=n), "source.md", "file") for n in range(1, 1001)]
+    authorization = MagicMock(return_value=(page, False))
+    monkeypatch.setattr(sources, "find_source_inventory_page", authorization)
+    monkeypatch.setattr(
+        sources,
+        "get_session_with_current_tenant",
+        lambda: nullcontext(cast(Session, MagicMock())),
+    )
+    lock, first_wave = Lock(), Barrier(4)
+    active, peak = 0, 0
+
+    def read_batch(
+        _session: Session,
+        identifiers: tuple[UUID, ...],
+        _filters: IndexFilters,
+        _active: object,
+    ) -> dict[UUID, tuple[str, ...] | None]:
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+        try:
+            if identifiers[0].int <= 301:
+                first_wave.wait(timeout=3)
+            return {identifier: (str(identifier),) for identifier in identifiers}
+        finally:
+            with lock:
+                active -= 1
+
+    read = MagicMock(side_effect=read_batch)
+    monkeypatch.setattr(sources, "_opening_batch", read)
+    actual = sources._source_openings(
+        cast(Session, object()),
+        page,
+        user=cast(User, object()),
+        filters=IndexFilters(access_control_list=[]),
+        check_active=lambda: None,
+        opening_workers=4,
+    )
+    assert actual == [(str(source.id),) for source in page]
+    assert peak == 4 and active == 0
+    assert read.call_count == 10 and all(
+        len(call.args[1]) == 100 for call in read.call_args_list
+    )
+    assert {
+        identifier for call in read.call_args_list for identifier in call.args[1]
+    } == {source.id for source in page}
+    assert authorization.call_count == 2
+    assert all(call.kwargs["limit"] == 1000 for call in authorization.call_args_list)

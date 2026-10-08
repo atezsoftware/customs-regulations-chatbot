@@ -15,15 +15,17 @@ from typing import cast
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, JsonValue
-from sqlalchemy import Integer, func, or_, select, tuple_
+from sqlalchemy import Integer, and_, func, or_, select
 from sqlalchemy import cast as sql_cast
 from sqlalchemy.orm import Session
 
+from onyx.access.access import get_access_for_user_files, get_acl_for_user
 from onyx.context.search.models import IndexFilters
 from onyx.db.asv3_corpus import (
     CorpusScopeUnavailable,
     CorpusSource,
-    find_sources,
+    _source_statement,
+    _validate_filters,
     read_source_chunks,
     require_source,
     resolve_source_query_index,
@@ -34,6 +36,7 @@ from onyx.db.models import (
     RegulatoryTemporalProjection,
     SearchSettings,
     User,
+    UserFile,
 )
 from onyx.db.regulatory_canonical_revisions import validate_temporal_canonical_revisions
 from onyx.db.regulatory_public_reads import qualified_file_ids
@@ -49,14 +52,16 @@ from onyx.regulatory.amendments.annexes.context_dependencies import context_hash
 from onyx.regulatory.amendments.annexes.models import AnnexTemporalProjection
 from onyx.regulatory.publication_baseline import observed_index_snapshot
 from onyx.regulatory.publication_reads import (
+    filter_publication_read,
     observe_publication_read,
     require_publication_files,
 )
 from shared_configs.configs import MULTI_TENANT
 
-SOURCE_PAGE_SIZE = 100
+SOURCE_PAGE_SIZE = 1_000
+MAX_OPENING_BATCH_SOURCES = 100
 MAX_SOURCE_INVENTORY = 10_000
-MAX_METADATA_TYPES_PER_PAGE = 1_600
+MAX_METADATA_TYPES_PER_PAGE = 16 * SOURCE_PAGE_SIZE
 MAX_OPENING_CHUNKS = 3
 MAX_OPENING_CHARS = 4_096
 MAX_OPENING_LINES = 12
@@ -75,6 +80,43 @@ class SourceKind(StrEnum):
     PRIVATE_RULING = "private_ruling"
     OTHER = "other"
     UNKNOWN = "unknown"
+
+
+def find_source_inventory_page(
+    session: Session,
+    *,
+    user: User,
+    filters: IndexFilters,
+    source_ids: tuple[UUID, ...] | None = None,
+    offset: int = 0,
+    limit: int = SOURCE_PAGE_SIZE,
+) -> tuple[list[CorpusSource], bool]:
+    """Page authorized inventory using canonical scope, ACL and publication guards."""
+    if (
+        isinstance(limit, bool)
+        or not isinstance(limit, int)
+        or not 1 <= limit <= SOURCE_PAGE_SIZE
+        or offset < 0
+    ):
+        raise ValueError("Inventory pages require offset >= 0 and limit 1..1000.")
+    _validate_filters(session, user, filters)
+    statement = _source_statement(filters)
+    if source_ids is not None:
+        statement = statement.where(UserFile.id.in_(source_ids))
+    records = session.execute(
+        statement.order_by(UserFile.id).offset(offset).limit(limit + 1)
+    ).all()
+    access = get_access_for_user_files([str(row.id) for row in records], session)
+    user_acl = get_acl_for_user(user, session)
+    candidates = [
+        CorpusSource(row.id, row.name, row.file_id)
+        for row in records[:limit]
+        if row.id and str(row.id) in access and access[str(row.id)].to_acl() & user_acl
+    ]
+    retained = filter_publication_read(
+        observe_publication_read(), candidates, lambda row: str(row.id)
+    )
+    return retained, len(records) > limit
 
 
 class SourceClassification(BaseModel):
@@ -497,6 +539,9 @@ def _opening_rows(
     result: dict[UUID, list[str]] = {source_id: [] for source_id in source_ids}
     if indexes:
         as_of = filters.as_of_date or date.today()
+        sources_by_index: dict[str, list[UUID]] = {}
+        for source_id, index in indexes.items():
+            sources_by_index.setdefault(index.index_uuid, []).append(source_id)
         position = sql_cast(
             RegulatoryTemporalProjection.payload["semantic_position"].astext, Integer
         )
@@ -518,14 +563,14 @@ def _opening_rows(
                 RegulatoryChunk.id == RegulatoryTemporalProjection.canonical_chunk_id,
             )
             .where(
-                tuple_(
-                    RegulatoryTemporalProjection.user_file_id,
-                    RegulatoryTemporalProjection.index_uuid,
-                ).in_(
-                    [
-                        (source_id, index.index_uuid)
-                        for source_id, index in indexes.items()
-                    ]
+                or_(
+                    *(
+                        and_(
+                            RegulatoryTemporalProjection.index_uuid == index_uuid,
+                            RegulatoryTemporalProjection.user_file_id.in_(source_ids),
+                        )
+                        for index_uuid, source_ids in sources_by_index.items()
+                    )
                 ),
                 RegulatoryTemporalProjection.retired_at.is_(None),
                 RegulatoryTemporalProjection.payload["derived_role"].astext
@@ -710,7 +755,7 @@ def _source_openings(
     if not source_page:
         return []
     identifiers = tuple(source.id for source in source_page)
-    authorized, _ = find_sources(
+    authorized, _ = find_source_inventory_page(
         session,
         user=user,
         filters=filters,
@@ -729,7 +774,10 @@ def _source_openings(
         except CorpusScopeUnavailable:
             return {source_id: None for source_id in group}
 
-    width = max(1, (len(admitted) + opening_workers - 1) // opening_workers)
+    width = min(
+        MAX_OPENING_BATCH_SOURCES,
+        max(1, (len(admitted) + opening_workers - 1) // opening_workers),
+    )
     executor = ThreadPoolExecutor(max_workers=opening_workers)
     try:
         futures = [
@@ -754,7 +802,7 @@ def _source_openings(
                     break
                 except FutureTimeout:
                     continue
-        current, _ = find_sources(
+        current, _ = find_source_inventory_page(
             session,
             user=user,
             filters=filters,
@@ -805,7 +853,7 @@ def load_source_lane_catalogue(
             if max_sources is None
             else min(SOURCE_PAGE_SIZE, max_sources - offset)
         )
-        sources, more = find_sources(
+        sources, more = find_source_inventory_page(
             session, user=user, filters=filters, offset=offset, limit=page_limit
         )
         types, metadata_complete = _document_types(

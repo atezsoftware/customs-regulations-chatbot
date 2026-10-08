@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from onyx.chat.emitter import Emitter
+from onyx.context.search.models import IndexFilters
 from onyx.server.query_and_chat.placement import Placement
 from onyx.tools.models import (
     SearchToolOverrideKwargs,
@@ -38,6 +39,35 @@ class CompositeSearchTool(SearchTool):
         override_kwargs: SearchToolOverrideKwargs,
         **llm_kwargs: Any,
     ) -> ToolResponse:
+        filters = self.user_selected_filters
+        if (
+            isinstance(filters, IndexFilters)
+            and filters.attached_document_ids is not None
+        ):
+            if not filters.attached_document_ids or self.bypass_acl:
+                raise PermissionError(
+                    "Source lane search requires captured IDs and ACLs."
+                )
+            self.user_selected_filters = filters.model_copy(
+                deep=True,
+                update={
+                    "document_set": None,
+                    "hierarchy_node_ids": None,
+                    "project_id_filter": None,
+                    "persona_id_filter": None,
+                },
+            )
+            # The pipeline reads knowledge attachments from the persona snapshot.
+            self.persona_search_info = self.persona_search_info.model_copy(
+                deep=True,
+                update={
+                    "document_set_names": [],
+                    "hierarchy_node_ids": [],
+                    "attached_document_ids": list(filters.attached_document_ids),
+                },
+            )
+            self.project_id_filter = None
+            self.persona_id_filter = None
         wider = SearchToolRetrievalOverrideKwargs.model_validate(
             {
                 **override_kwargs.model_dump(),
