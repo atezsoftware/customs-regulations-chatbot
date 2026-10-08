@@ -1,10 +1,10 @@
 """Final chat publication is fenced by fresh original authorization."""
 
 from collections.abc import Callable
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from datetime import date
-from typing import Any, NamedTuple, cast
+from typing import Any, Iterator, NamedTuple, cast
 from unittest.mock import MagicMock
 from uuid import uuid4
 
@@ -13,7 +13,7 @@ from pydantic import JsonValue
 
 from onyx.asv3.corpus_tools import build_corpus_specs
 from onyx.asv3.evidence import EvidenceLedger
-from onyx.asv3.models import EvidenceItem, RunContext, ToolSpec
+from onyx.asv3.models import EvidenceItem, RunContext, RunStopped, ToolSpec
 from onyx.asv3.registry import CapabilityRegistry
 from onyx.cache.interface import CacheBackend
 from onyx.chat.chat_state import ChatStateContainer
@@ -36,6 +36,7 @@ from onyx.llm.interfaces import LLM, LLMConfig
 from onyx.server.query_and_chat.streaming_models import (
     AgentResponseDelta,
     AgentResponseStart,
+    ASv3Progress,
 )
 from onyx.tools.interface import Tool
 from onyx.tools.tool_implementations.search.search_tool import SearchTool
@@ -172,9 +173,12 @@ def harness(monkeypatch: pytest.MonkeyPatch) -> RuntimeHarness:
         filters: IndexFilters,
         check_active: Callable[[], None],
         opening_workers: int = 1,
+        on_progress: Callable[[int, bool], None] | None = None,
     ) -> SourceLaneCatalogue:
         assert opening_workers == 4
         check_active()
+        if on_progress:
+            on_progress(0, False)
         return SourceLaneCatalogue(
             user_id=user.id,
             scope_sha256=source_scope_sha256(user, filters),
@@ -248,9 +252,12 @@ def test_runtime_wraps_typed_search_with_captured_lane_guard(
         filters: IndexFilters,
         check_active: Callable[[], None],
         opening_workers: int = 1,
+        on_progress: Callable[[int, bool], None] | None = None,
     ) -> SourceLaneCatalogue:
         assert opening_workers == 4
         check_active()
+        if on_progress:
+            on_progress(1, False)
         source = CorpusSource(uuid4(), "own-source.md", "file")
         return SourceLaneCatalogue(
             user_id=user.id,
@@ -356,3 +363,138 @@ def test_independent_search_uses_shared_budget_and_preserves_filter_scope(
     assert (
         harness.search.bypass_acl is True and harness.search.auto_detect_filters is True
     )
+
+
+def test_catalogue_is_traced_before_provider_setup_and_progress_is_continuous(
+    harness: RuntimeHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    order: list[str] = []
+    step = MagicMock(output_value=None)
+    gateway_factory = MagicMock(wraps=runtime.BudgetedGateway)
+    monkeypatch.setattr(runtime, "BudgetedGateway", gateway_factory)
+
+    @contextmanager
+    def trace_start(*_args: Any, **kwargs: Any) -> Iterator[None]:
+        assert kwargs["metadata"]["assistant_message_id"] == 3
+        order.append("trace_start")
+        try:
+            yield
+        finally:
+            order.append("trace_end")
+
+    def graph_start(operation: str, input_value: dict[str, JsonValue]) -> Any:
+        assert operation == "legal_composite.source_catalogue"
+        assert input_value == {"opening_workers": 4}
+        step.input_value = input_value
+        return nullcontext(step)
+
+    def catalogue_factory(
+        _session: Any,
+        *,
+        user: User,
+        filters: IndexFilters,
+        check_active: Callable[[], None],
+        opening_workers: int,
+        on_progress: Callable[[int, bool], None],
+    ) -> SourceLaneCatalogue:
+        assert order == ["trace_start"] and gateway_factory.call_count == 0
+        assert opening_workers == 4
+        check_active()
+        order.append("catalogue")
+        on_progress(2, True)
+        on_progress(2, True)
+        on_progress(5, False)
+        records = tuple(
+            classify_source(
+                CorpusSource(uuid4(), f"PRIVATE_SOURCE_{index}", "private-file"),
+                (),
+                opening_texts=("PRIVATE ORIGINAL OPENING",),
+            )
+            for index in range(5)
+        )
+        return SourceLaneCatalogue(
+            user_id=user.id,
+            scope_sha256=source_scope_sha256(user, filters),
+            records=records,
+            complete=True,
+        )
+
+    monkeypatch.setattr(runtime, "ensure_trace", trace_start)
+    monkeypatch.setattr(runtime, "graph_step", graph_start)
+    monkeypatch.setattr(runtime, "load_source_lane_catalogue", catalogue_factory)
+    harness.run(None)
+    assert order == ["trace_start", "catalogue", "trace_end"]
+    gateway_factory.assert_called_once()
+    progress = [
+        packet.obj
+        for packet in harness.emitter.get_packets()
+        if isinstance(packet.obj, ASv3Progress)
+    ]
+    assert progress[0].title == "Kaynak türleri doğrulanıyor"
+    assert (progress[1].message or "").startswith("2 erişilebilir")
+    assert (progress[2].message or "").startswith("2 erişilebilir")
+    assert (progress[3].message or "").startswith("5 erişilebilir")
+    assert progress[4].title == "Kaynak türleri hazır"
+    assert [event.sequence for event in progress] == list(range(1, len(progress) + 1))
+    assert len({event.event_id for event in progress}) == len(progress)
+    assert all(event.language == "tr" for event in progress)
+    assert harness.snapshots[-1]["progress"] == [
+        event.model_dump(mode="json") for event in progress
+    ]
+    assert step.output_value["processed_source_count"] == 5
+    assert step.output_value["progress_updates"] == 3
+    assert step.output_value["elapsed_seconds"] >= 0
+    assert step.output_value["inventory_complete"] is True
+    assert "PRIVATE" not in str(step.input_value) + str(step.output_value)
+    assert "PRIVATE" not in str([event.model_dump() for event in progress])
+
+
+def test_catalogue_cancellation_never_creates_provider_or_final_answer(
+    harness: RuntimeHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gateway_factory = MagicMock(wraps=runtime.BudgetedGateway)
+    catalogue_factory = MagicMock(wraps=runtime.load_source_lane_catalogue)
+    step = MagicMock(output_value=None)
+    monkeypatch.setattr(runtime, "BudgetedGateway", gateway_factory)
+    monkeypatch.setattr(runtime, "load_source_lane_catalogue", catalogue_factory)
+    monkeypatch.setattr(runtime, "graph_step", lambda *_args: nullcontext(step))
+    monkeypatch.setattr(runtime, "is_connected", lambda *_args: False)
+    with pytest.raises(RunStopped):
+        harness.run(None)
+    catalogue_factory.assert_not_called()
+    gateway_factory.assert_not_called()
+    progress = [
+        packet.obj
+        for packet in harness.emitter.get_packets()
+        if isinstance(packet.obj, ASv3Progress)
+    ]
+    assert [event.phase for event in progress] == ["tools", "cancelled"]
+    assert [event.sequence for event in progress] == [1, 2]
+    assert step.output_value["status"] == "cancelled"
+    assert step.output_value["processed_source_count"] == 0
+    assert harness.snapshots == [] and harness.state.get_answer_tokens() is None
+
+
+def test_catalogue_progress_failure_is_traced_without_provider_setup(
+    harness: RuntimeHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gateway_factory = MagicMock(wraps=runtime.BudgetedGateway)
+    step = MagicMock(output_value=None)
+    catalogue_factory = runtime.load_source_lane_catalogue
+    original_emit = harness.emitter.emit
+
+    def failing_emit(packet: Any) -> None:
+        if isinstance(packet.obj, ASv3Progress) and packet.obj.sequence == 2:
+            raise RuntimeError("Progress transport disconnected")
+        original_emit(packet)
+
+    monkeypatch.setattr(harness.emitter, "emit", failing_emit)
+    monkeypatch.setattr(runtime, "BudgetedGateway", gateway_factory)
+    monkeypatch.setattr(runtime, "graph_step", lambda *_args: nullcontext(step))
+    monkeypatch.setattr(runtime, "load_source_lane_catalogue", catalogue_factory)
+    with pytest.raises(RuntimeError, match="Progress transport disconnected"):
+        harness.run(None)
+    gateway_factory.assert_not_called()
+    assert step.output_value["status"] == "failed"
+    assert step.output_value["progress_updates"] == 1
+    assert harness.snapshots == [] and harness.state.get_answer_tokens() is None

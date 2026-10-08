@@ -132,7 +132,7 @@ class WorkflowBudget:
         with self._lock:
             pending = self._pending_final_calls
             return (
-                not self._usage_overrun
+                not self._usage_overrun_blocks_calls()
                 and self._stop_reason is None
                 and self.remaining_seconds() >= 3
                 and self._calls < self.policy.max_model_calls - pending
@@ -142,6 +142,10 @@ class WorkflowBudget:
                 < self.policy.max_output_tokens - pending * self._final_output
                 and self._cost < self.policy.max_cost_usd - pending * self._final_cost
             )
+
+    def _usage_overrun_blocks_calls(self) -> bool:
+        # Estimates are accounting hints when no business spending ceiling is configured.
+        return self._usage_overrun and math.isfinite(self.policy.max_cost_usd)
 
     def affordable_input_tokens(
         self,
@@ -158,7 +162,7 @@ class WorkflowBudget:
             raise ValueError("Invalid generation allocation")
         with self._lock:
             self.check_active(finalizing)
-            if self._usage_overrun:
+            if self._usage_overrun_blocks_calls():
                 raise RunStopped(
                     "Provider usage exceeded the estimate; no further spend authorized"
                 )
@@ -220,7 +224,7 @@ class WorkflowBudget:
         ) / 1_000_000
         with self._lock:
             self.check_active(finalizing)
-            if self._usage_overrun:
+            if self._usage_overrun_blocks_calls():
                 raise RunStopped(
                     "Provider usage exceeded the estimate; no further spend authorized"
                 )
@@ -271,7 +275,10 @@ class WorkflowBudget:
         actual_input_tokens: int,
         actual_output_tokens: int,
     ) -> None:
-        if actual_input_tokens < 0 or actual_output_tokens < 0:
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+            for value in (actual_input_tokens, actual_output_tokens)
+        ):
             raise ValueError("Invalid provider usage")
         with self._lock:
             if (
@@ -294,6 +301,14 @@ class WorkflowBudget:
                 or actual_output_tokens > reservation.output_tokens
                 or self._cost > self.policy.max_cost_usd
             )
+            if (
+                self._input > self.policy.max_input_tokens
+                or self._output > self.policy.max_output_tokens
+                or self._cost > self.policy.max_cost_usd
+            ):
+                self._stop_reason = self._stop_reason or (
+                    "Provider actual usage exceeded workflow capacity; no further generations allowed"
+                )
 
     def snapshot(self) -> dict[str, JsonValue]:
         with self._lock:
@@ -305,6 +320,7 @@ class WorkflowBudget:
                 "elapsed_seconds": round(self._clock() - self._started, 3),
                 "pending_final_calls": self._pending_final_calls,
                 "usage_overrun": self._usage_overrun,
+                "estimate_overrun_blocks_calls": self._usage_overrun_blocks_calls(),
                 "stop_reason": self._stop_reason,
                 "unsettled_calls": len(self._reservations) - len(self._settled),
                 "cost_basis": "uncached upper-rate estimate; failed calls retain their allocation",
