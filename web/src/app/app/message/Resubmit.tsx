@@ -158,7 +158,7 @@ function SupersearchRunRecovery({
         const session = store.sessions.get(sessionId);
         if (session) {
           const messageTree = new Map(session.messageTree);
-          for (const [nodeId, message] of messageTree) {
+          messageTree.forEach((message, nodeId) => {
             if (message.supersearch && message.messageId === runId) {
               messageTree.set(nodeId, {
                 ...message,
@@ -166,7 +166,7 @@ function SupersearchRunRecovery({
                 isRetryable: true,
               });
             }
-          }
+          });
           store.updateSessionMessageTree(sessionId, messageTree);
           store.setLatestMessageRenderComplete(sessionId, true);
         }
