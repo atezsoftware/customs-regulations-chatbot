@@ -20,6 +20,7 @@ from onyx.llm.cost import ModelPrice
 from onyx.llm.interfaces import LLM, LLMConfig
 from onyx.llm.model_response import Choice, Message, ModelResponse, Usage
 from onyx.llm.models import UserMessage
+from onyx.llm.multi_llm import LLMTimeoutError
 from onyx.llm.usage_cost import price_generation
 from onyx.tracing.answer_graph import _span_contents
 from onyx.tracing.flows import LLMFlow
@@ -269,3 +270,73 @@ def test_rejected_auxiliary_request_has_no_reservation_binding_or_usage(
     assert len(spans) == 1
     assert spans[0].span_data.usage is None
     assert "legal_composite_call_id" not in (spans[0].span_data.model_config or {})
+
+
+@pytest.mark.parametrize("invocation", ["typed", "fallback", "explicit"])
+@pytest.mark.parametrize("exception_type", [RuntimeError, LLMTimeoutError])
+def test_provider_failure_marks_generation_and_redacts_private_error(
+    model: Mock,
+    spans: list[Span[GenerationSpanData]],
+    invocation: str,
+    exception_type: type[Exception],
+) -> None:
+    failure = exception_type(
+        "provider failed api_key='private-value' Bearer private-bearer " + "x" * 600
+    )
+    model.invoke.side_effect = failure
+    ledger = Mock(spec=EvidenceLedger)
+    workflow = gateway(model, ledger)
+    prompt = UserMessage(content="Select a legal section")
+    with trace("failed-provider"):
+        with pytest.raises(
+            RunStopped,
+            match="timed out"
+            if exception_type is LLMTimeoutError
+            else "invocation failed",
+        ) as stopped:
+            if invocation == "typed":
+                workflow.complete(
+                    "Use original authority",
+                    {},
+                    DraftAnswer,
+                    LLMFlow.LEGAL_COMPOSITE_ANSWER,
+                    True,
+                )
+            elif invocation == "fallback":
+                workflow.research_proxy().invoke(prompt)
+            else:
+                helper = ScopedSearchLLM(
+                    workflow.research_proxy(), RunContext(timeout_seconds=120), None
+                )
+                with llm_generation_span(
+                    helper,
+                    LLMFlow.CLASSIFY_SECTION_RELEVANCE,
+                    input_messages=[prompt],
+                ):
+                    helper.invoke(prompt)
+    assert stopped.value.__cause__ is failure
+    assert model.invoke.call_count == 1
+    assert len(spans) == 1
+    span = spans[0]
+    assert span.error is not None
+    message = span.error["message"]
+    assert "private-value" not in message and "private-bearer" not in message
+    assert len(message) <= 550
+    if invocation != "fallback":
+        assert message.startswith(f"{exception_type.__name__}: provider failed")
+        assert "[REDACTED]" in message
+    assert span.span_data.output is None and span.span_data.usage is None
+    captured, _, _, _, operation = _span_contents(span)
+    assert operation == (
+        LLMFlow.LEGAL_COMPOSITE_ANSWER.value
+        if invocation == "typed"
+        else LLMFlow.LEGAL_COMPOSITE_RESEARCH.value
+    )
+    config = captured["model_config"]
+    assert float(config["legal_composite_allocated_call_seconds"]) == 30
+    assert config["legal_composite_transport_timeout_seconds"] == "30"
+    assert config["legal_composite_compat_attempt_bound"] == "3"
+    assert config["legal_composite_call_id"]
+    assert "legal_composite_response_id" not in config
+    ledger.record_delivery.assert_not_called()
+    assert workflow.budget.snapshot()["unsettled_calls"] == 1

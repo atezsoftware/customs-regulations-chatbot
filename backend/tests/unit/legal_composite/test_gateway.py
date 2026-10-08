@@ -84,7 +84,7 @@ def test_gateway_records_exact_delivered_originals_and_bounds_invocation(
         gateway.last_call_id, LLMFlow.LEGAL_COMPOSITE_ANSWER.value, records
     )
     kwargs = model.invoke.call_args.kwargs
-    assert kwargs["timeout_override"] == 10
+    assert kwargs["timeout_override"] == 30
     assert kwargs["max_tokens"] == 4_096
     assert kwargs["use_streaming"] is False
     assert budget.snapshot()["model_calls"] == 1
@@ -321,9 +321,22 @@ def test_search_helper_clamps_output_and_forces_low_collected_generation(
     kwargs = model.invoke.call_args.kwargs
     assert kwargs["max_tokens"] == 2_048
     assert kwargs["reasoning_effort"] is ReasoningEffort.LOW
-    assert kwargs["timeout_override"] == 2
+    assert kwargs["timeout_override"] == 6
     assert kwargs["use_streaming"] is False
     assert kwargs["structured_response_format"] == {"type": "json_object"}
+
+
+def test_auxiliary_one_second_transport_is_admitted_as_one_call(model: Mock) -> None:
+    budget = WorkflowBudget(WorkflowPolicy())
+    gateway = BudgetedGateway(
+        selected_llm=model, research_llm=model, budget=budget, ledger=EvidenceLedger()
+    )
+    gateway.research_proxy().invoke(
+        UserMessage(content="Select section"), timeout_override=1
+    )
+    model.invoke.assert_called_once()
+    assert model.invoke.call_args.kwargs["timeout_override"] == 1
+    assert budget.snapshot()["model_calls"] == 1
 
 
 def test_unsupported_auxiliary_calls_fail_before_spend(model: Mock) -> None:
@@ -340,7 +353,9 @@ def test_unsupported_auxiliary_calls_fail_before_spend(model: Mock) -> None:
     with pytest.raises(RunStopped, match="context budget"):
         proxy.invoke(UserMessage(content="x" * 20_000))
     with pytest.raises(ValueError, match="timeout"):
-        proxy.invoke(prompt, timeout_override=1)
+        proxy.invoke(prompt, timeout_override=0)
+    with pytest.raises(ValueError, match="timeout"):
+        proxy.invoke(prompt, timeout_override=True)
     with pytest.raises(ValueError, match="output limit"):
         proxy.invoke(prompt, max_tokens=0)
     with pytest.raises(RunStopped, match="Multimodal"):

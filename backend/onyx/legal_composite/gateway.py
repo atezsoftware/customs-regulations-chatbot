@@ -30,7 +30,9 @@ from onyx.llm.models import (
     SystemMessage,
     UserMessage,
 )
+from onyx.llm.multi_llm import LLMTimeoutError
 from onyx.llm.utils import check_number_of_tokens
+from onyx.tracing.answer_graph import redact_graph_value
 from onyx.tracing.flows import LLMFlow
 from onyx.tracing.framework.create import get_current_span
 from onyx.tracing.framework.span_data import GenerationSpanData
@@ -172,9 +174,11 @@ def _priced_model(
 class BudgetedGateway:
     """Typed generations with estimated spend and bounded provider timeouts.
 
-    Invoke bypasses transient stream retries. Existing compatibility retries handle
-    rejected 400s, assumed nonbillable, and share a conservatively divided timeout.
-    Provider tokenizer/pricing drift and transport behavior preclude an invoice SLA.
+    Invoke bypasses transient stream retries; only named unsupported-parameter 400s
+    allow canonical compatibility retries, assumed nonbillable. Each transport gets
+    the admitted call time. The host deadline stops further allocations but cannot
+    cancel an in-flight transport or its compatibility ladder. Provider behavior
+    and token/pricing drift preclude a hard latency or invoice guarantee.
     """
 
     def __init__(
@@ -358,6 +362,7 @@ class BudgetedGateway:
         messages: list[ChatCompletionMessage],
         flow: LLMFlow,
         timeout: int,
+        allocated_seconds: float,
         output_tokens: int,
         research: bool,
         response_format: dict[str, JsonValue] | None,
@@ -378,19 +383,32 @@ class BudgetedGateway:
             if reused is not None:
                 model_config["legal_composite_helper_flow"] = model_config["flow"]
                 model_config["flow"] = flow.value
-            model_config.update(self._trace_binding, legal_composite_call_id=call_id)
-            span.span_data.model_config = model_config
-            response = llm.invoke(
-                messages,
-                structured_response_format=response_format,
-                timeout_override=timeout,
-                max_tokens=output_tokens,
-                reasoning_effort=ReasoningEffort.LOW
-                if research
-                else self.reasoning_effort,
-                user_identity=user_identity,
-                use_streaming=False,
+            model_config.update(
+                self._trace_binding,
+                legal_composite_call_id=call_id,
+                legal_composite_allocated_call_seconds=str(allocated_seconds),
+                legal_composite_transport_timeout_seconds=str(timeout),
+                legal_composite_compat_attempt_bound=str(_COMPATIBILITY_ATTEMPTS),
             )
+            span.span_data.model_config = model_config
+            try:
+                response = llm.invoke(
+                    messages,
+                    structured_response_format=response_format,
+                    timeout_override=timeout,
+                    max_tokens=output_tokens,
+                    reasoning_effort=ReasoningEffort.LOW
+                    if research
+                    else self.reasoning_effort,
+                    user_identity=user_identity,
+                    use_streaming=False,
+                )
+            except Exception as error:
+                message = str(redact_graph_value(str(error)))[:512]
+                span.set_error(
+                    {"message": f"{type(error).__name__}: {message}", "data": None}
+                )
+                raise
             model_config["legal_composite_response_id"] = response.id
             record_llm_response(span, response)
             return response
@@ -456,7 +474,7 @@ class BudgetedGateway:
         call_seconds = reservation.timeout_seconds
         if requested_seconds is not None:
             call_seconds = min(call_seconds, requested_seconds)
-        timeout = math.floor(call_seconds / _COMPATIBILITY_ATTEMPTS)
+        timeout = math.floor(call_seconds)
         if timeout < 1:
             raise RunStopped("Insufficient time remains for a bounded model invocation")
         executor = ThreadPoolExecutor(max_workers=1)
@@ -468,6 +486,7 @@ class BudgetedGateway:
             messages,
             flow,
             timeout,
+            call_seconds,
             invocation_output_tokens or output_tokens,
             not finalizing,
             response_format,
@@ -477,7 +496,7 @@ class BudgetedGateway:
         )
         try:
             response = cast(ModelResponse, future.result(timeout=call_seconds))
-        except FutureTimeout as error:
+        except (FutureTimeout, LLMTimeoutError) as error:
             self.budget.stop(
                 "Provider call exceeded its deadline; no further spend authorized"
             )
@@ -510,8 +529,7 @@ class BudgetedGateway:
         if max_tokens is not None and (isinstance(max_tokens, bool) or max_tokens < 1):
             raise ValueError("Invalid auxiliary output limit")
         if timeout_override is not None and (
-            isinstance(timeout_override, bool)
-            or timeout_override < _COMPATIBILITY_ATTEMPTS
+            isinstance(timeout_override, bool) or timeout_override < 1
         ):
             raise ValueError("Invalid auxiliary timeout")
         messages = prompt if isinstance(prompt, list) else [prompt]
