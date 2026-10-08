@@ -12,7 +12,7 @@ from pydantic import ValidationError
 from onyx.asv3 import runtime
 from onyx.asv3.legal_source_reviews import LegalSourceReviews
 from onyx.asv3.llm_adapter import ResearchModel
-from onyx.asv3.models import ASv3WorkflowSelection
+from onyx.asv3.models import ASv3WorkflowSelection, RunContext
 from onyx.asv3.shared_reads import SharedReads
 from onyx.asv3.workflow_variant import (
     ASV3_GUARDED_EXPERIMENTAL_VARIANT,
@@ -86,6 +86,59 @@ def test_guarded_checkpoint_cannot_cross_resume_legacy_variants() -> None:
             ASV3_GUARDED_EXPERIMENTAL_VARIANT,
             checkpoint_variant_fields(ASV3_TUNED_VARIANT),
         )
+
+
+@pytest.mark.parametrize(
+    "variant,profile,legacy_payload",
+    [
+        (ASV3_STANDARD_VARIANT, "normal", True),
+        (ASV3_STANDARD_VARIANT, "deep", True),
+        (ASV3_STANDARD_VARIANT, "experimental", True),
+        (ASV3_TUNED_VARIANT, "normal", True),
+        (ASV3_GUARDED_EXPERIMENTAL_VARIANT, "normal", False),
+    ],
+)
+def test_native_runtime_marks_only_legacy_search_payloads(
+    monkeypatch: pytest.MonkeyPatch,
+    variant: str,
+    profile: str,
+    legacy_payload: bool,
+) -> None:
+    kwargs, _broker, selected, _checkpoints, _queue = setup_run(monkeypatch)
+    kwargs.pop("test_language")
+    kwargs.update(research_profile=profile, workflow_variant=variant)
+    contexts: list[RunContext] = []
+
+    class SetupObserved(Exception):
+        pass
+
+    def observe_model(_llm: LLM, context: RunContext, **_options: Any) -> ResearchModel:
+        contexts.append(context)
+        raise SetupObserved
+
+    monkeypatch.setattr(runtime, "ResearchModel", observe_model)
+    with pytest.raises(SetupObserved):
+        runtime.run_asv3_loop(**kwargs)
+
+    context = contexts[0]
+    assert context.services["asv3_legacy_search_payload"] is legacy_payload
+    assert context.child().services["asv3_legacy_search_payload"] is legacy_payload
+    assert context.services["research_profile"] == profile
+    if variant == ASV3_STANDARD_VARIANT:
+        assert "asv3_workflow_variant" not in context.services
+    else:
+        assert context.services["asv3_workflow_variant"] == variant
+    if legacy_payload:
+        assert context.budget.unlimited_execution is True
+        assert math.isinf(context.deadline)
+        assert "provider_max_attempts" not in context.services
+        assert "provider_compatibility_attempts" not in context.services
+    else:
+        assert context.budget.unlimited_execution is False
+        assert math.isfinite(context.deadline)
+        assert context.services["provider_max_attempts"] == 2
+        assert context.services["provider_compatibility_attempts"] == 1
+    selected.invoke.assert_not_called()
 
 
 @pytest.mark.parametrize(

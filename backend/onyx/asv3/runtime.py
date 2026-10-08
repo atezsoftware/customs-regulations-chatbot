@@ -382,6 +382,10 @@ def run_asv3_loop(
         context.services["explicit_research_temperature"] = True
     context.language = profile.language
     context.services["research_profile"] = research_profile
+    context.services["asv3_legacy_search_payload"] = workflow_variant in {
+        ASV3_STANDARD_VARIANT,
+        ASV3_TUNED_VARIANT,
+    }
     context.services["experimental_parallel"] = parallel_research
     if workflow_variant in {
         ASV3_TUNED_VARIANT,

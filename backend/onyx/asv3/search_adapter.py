@@ -4,6 +4,7 @@ import json
 import time
 from collections.abc import Callable, Iterator
 from contextlib import nullcontext
+from typing import TypedDict
 from uuid import uuid4
 
 from pydantic import JsonValue
@@ -71,6 +72,10 @@ _GUARDED_RETRIEVAL_OVERRIDES = SearchToolRetrievalOverrides(
 )
 
 
+class _ProviderCompatibilityOptions(TypedDict, total=False):
+    provider_compatibility_attempts: int
+
+
 def guarded_retrieval_overrides(
     workflow_variant: str | None,
 ) -> SearchToolRetrievalOverrides | None:
@@ -120,9 +125,7 @@ class ScopedSearchLLM(LLM):
             return max(1, configured)
         return 3
 
-    def provider_compatibility_attempts(
-        self, requested: int | None
-    ) -> int | None:
+    def provider_compatibility_attempts(self, requested: int | None) -> int | None:
         if requested is not None:
             return requested
         configured = self.context.services.get("provider_compatibility_attempts")
@@ -147,6 +150,11 @@ class ScopedSearchLLM(LLM):
         compatibility_attempts = self.provider_compatibility_attempts(
             provider_compatibility_attempts
         )
+        compatibility_options: _ProviderCompatibilityOptions = {}
+        if compatibility_attempts is not None:
+            compatibility_options["provider_compatibility_attempts"] = (
+                compatibility_attempts
+            )
         for attempt in range(max_attempts):
             try:
                 with model_slot(self.context, research=True):
@@ -161,12 +169,14 @@ class ScopedSearchLLM(LLM):
                         reasoning_effort=reasoning_effort,
                         user_identity=user_identity or self.user_identity,
                         use_streaming=use_streaming,
-                        provider_compatibility_attempts=compatibility_attempts,
+                        **compatibility_options,
                     )
                     self.context.check_research_active()
                     return result
             except Exception as error:
-                if attempt == max_attempts - 1 or not is_retryable_provider_error(error):
+                if attempt == max_attempts - 1 or not is_retryable_provider_error(
+                    error
+                ):
                     raise
                 self.wait_to_retry(error, attempt)
         raise AssertionError("Selected-provider retry loop did not terminate")
@@ -380,9 +390,7 @@ def build_search_adapter(
                 search_rerank_context=original_query,
                 search_retrieval_overrides=guarded_retrieval_overrides(
                     context.services.get("asv3_workflow_variant")
-                    if isinstance(
-                        context.services.get("asv3_workflow_variant"), str
-                    )
+                    if isinstance(context.services.get("asv3_workflow_variant"), str)
                     else None
                 ),
             )
@@ -468,9 +476,16 @@ def build_search_adapter(
             data={
                 "source_count": len(evidence),
                 "retrieved_result_count": len(results),
-                "mapped_result_count": len(mapped_docs),
-                "hydrated_center_count": len(mapped_docs) - len(unhydrated_centers),
-                "retained_evidence_count": len(evidence),
+                **(
+                    {}
+                    if context.services.get("asv3_legacy_search_payload") is True
+                    else {
+                        "mapped_result_count": len(mapped_docs),
+                        "hydrated_center_count": len(mapped_docs)
+                        - len(unhydrated_centers),
+                        "retained_evidence_count": len(evidence),
+                    }
+                ),
                 "unmapped_result_count": unmapped_results,
                 "incomplete_closure_count": incomplete_closures,
                 "context_policy": "harness_controlled",
