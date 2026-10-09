@@ -17,6 +17,7 @@ from onyx.asv3.models import RunContext, RunStopped
 from onyx.legal_review.models import (
     DimensionAssessment,
     DraftAnswer,
+    InitialDiscoveryPlan,
     Issue,
     IssueClosure,
     IssuePlan,
@@ -37,6 +38,7 @@ from onyx.prompts.legal_review.prompts import (
     READING_PROMPT,
     REPAIR_PROMPT,
 )
+from onyx.regulatory.structured_llm import StructuredOutputValidationError
 from onyx.tracing.answer_graph import graph_step
 from onyx.tracing.flows import LLMFlow
 
@@ -761,11 +763,28 @@ class LegalReviewEngine:
 
     def _run(self, request: str, history: str) -> WorkflowResult:
         self.report("planning", "tr")
-        self.plan = self.gateway.complete(
-            PLAN_PROMPT,
-            self.state(request, history),
-            IssuePlan,
-            LLMFlow.LEGAL_REVIEW_PLANNER,
+        planning_state = self.state(request, history)
+        try:
+            initial_plan = self.gateway.complete(
+                PLAN_PROMPT,
+                planning_state,
+                InitialDiscoveryPlan,
+                LLMFlow.LEGAL_REVIEW_PLANNER,
+            )
+        except StructuredOutputValidationError:
+            # A separate admission preserves accounting for the sole schema correction.
+            initial_plan = self.gateway.complete(
+                PLAN_PROMPT
+                + "\nThe previous initial plan did not satisfy its schema. Return a complete "
+                "replacement including the required nonempty discovery_queries array with "
+                "query text and known issue_ids. Preserve every requested outcome. "
+                "Do not invent source identities or require a query per issue.",
+                {**self.state(request, history), "planning_schema_correction": True},
+                InitialDiscoveryPlan,
+                LLMFlow.LEGAL_REVIEW_PLANNER,
+            )
+        self.plan = IssuePlan.model_validate(
+            initial_plan.model_dump(mode="python", exclude={"discovery_queries"})
         )
         self.context.language = self.plan.language
         if any(issue.origin != "question" for issue in self.plan.issues):
@@ -775,11 +794,11 @@ class LegalReviewEngine:
             )
         self.report("tools", self.plan.language)
         shared_queries: dict[str, list[str]] = {}
-        for issue in self.plan.issues:
-            for query in issue.research_queries:
-                identities = shared_queries.setdefault(query, [])
-                if issue.issue_id not in identities:
-                    identities.append(issue.issue_id)
+        for query in initial_plan.discovery_queries:
+            identities = shared_queries.setdefault(query.query, [])
+            for identity in query.issue_ids:
+                if identity not in identities:
+                    identities.append(identity)
         initial = [
             SourceAction(
                 issue_ids=identities,

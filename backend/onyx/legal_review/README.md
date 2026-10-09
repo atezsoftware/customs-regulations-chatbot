@@ -43,8 +43,9 @@ ingest, relabel, reindex or change publication metadata.
    simple conversation history is retained. Earlier user messages can supply facts;
    earlier assistant legal statements are not independent legal evidence.
 2. **Planner — Gemini:** identify requested outcomes, supplied facts and missing
-   facts. Assign stable issue IDs and zero to two discovery queries per issue. Related
-   issues can share a query; the initial plan needs at least one query overall. Code
+   facts. Return stable issue IDs and a required nonempty plan-wide `discovery_queries`
+   list with query text and covered `issue_ids`. Related issues share searches; no
+   per-issue query is required. Code
    attaches the twelve dimensions; issue identification does not assume unseen law.
 3. **Discovery and canonical acquisition:** run bounded, parallel hybrid searches,
    rank candidates and hydrate authorized originals into the shared evidence ledger.
@@ -110,6 +111,9 @@ path four Gemini generations and two JEV
 requests. A flagged early review can add a diagnostic reader call. Post-draft repair
 adds its diagnostic reader, an optional reader after acquisition, one replacement
 writer and one JEV request. These are bounded paths, not a fixed per-answer bill.
+An invalid initial structured plan permits one separately admitted Flash schema
+correction. It preserves the request and uses the same remaining deadline and call
+budget; provider failures do not trigger this correction.
 
 Planner, reader, writer and repair use Gemini 3.8 Flash with low reasoning effort.
 The fixed override has temperature zero. JEV uses either the real TypeSafe SystemOne
