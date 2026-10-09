@@ -20,6 +20,7 @@ from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.models import RunStopped
 from onyx.legal_composite.budget import CallReservation, WorkflowBudget
 from onyx.legal_composite.claim_edits import ClaimRepairEdits
+from onyx.legal_composite.draft_composition import DraftComposition
 from onyx.legal_composite.draft_context import encode_draft_context
 from onyx.legal_composite.draft_repair import ClaimDeltaPatch
 from onyx.legal_composite.models import (
@@ -145,6 +146,7 @@ def _record_typed_validation(
         DiscoveryQuery: "query_compression",
         IssueResearchStep: "research_step",
         StructuredDraftAnswer: "draft_answer",
+        DraftComposition: "draft_answer",
         ClaimDeltaPatch: "claim_delta",
         ClaimRepairEdits: "claim_delta",
     }
@@ -908,6 +910,7 @@ class BudgetedGateway:
             IssueResearchPlan,
             IssueResearchStep,
             StructuredDraftAnswer,
+            DraftComposition,
             ClaimDeltaPatch,
             ClaimRepairEdits,
         }:

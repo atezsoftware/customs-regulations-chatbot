@@ -12,6 +12,7 @@ from pydantic import BaseModel, JsonValue, ValidationError
 
 from onyx.legal_composite import reviewer as reviewer_module
 from onyx.legal_composite.claim_edits import ClaimRepairEdits
+from onyx.legal_composite.draft_composition import DraftComposition
 from onyx.legal_composite.engine import LegalCompositeEngine, SourceAcquirer
 from onyx.legal_composite.models import (
     AnswerSection,
@@ -34,6 +35,7 @@ from tests.unit.legal_composite.test_semantic_reviewer import (
     response,
     reviewer,
 )
+from tests.unit.onyx.legal_composite.draft_composition_fixture import composition_for
 
 T = TypeVar("T", bound=BaseModel)
 FINDING = "claim:c1 omits the controlled-goods condition in original citation 1."
@@ -208,8 +210,8 @@ def test_actual_generated_finding_reaches_engine_patch_without_public_text_or_ne
             finalizing: bool = False,
         ) -> T:
             del system, flow, finalizing
-            if response_type is DraftAnswer:
-                return response_type.model_validate(draft.model_dump())
+            if response_type is DraftComposition:
+                return response_type.model_validate(composition_for(draft).model_dump())
             assert response_type is ClaimRepairEdits
             patch_inputs.append(payload)
             return response_type.model_validate(

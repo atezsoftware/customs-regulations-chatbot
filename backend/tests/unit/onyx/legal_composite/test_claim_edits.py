@@ -15,6 +15,7 @@ from onyx.legal_composite.claim_edits import (
     HeadingEdit,
     claim_edits_to_delta,
 )
+from onyx.legal_composite.draft_composition import DraftComposition
 from onyx.legal_composite.draft_repair import (
     apply_claim_delta,
     canonicalize_delta_supports,
@@ -33,6 +34,7 @@ from onyx.legal_composite.models import (
 from onyx.legal_composite.requirements import draft_binding_gaps
 from onyx.legal_composite.reviewer import build_checks
 from onyx.tracing.flows import LLMFlow
+from tests.unit.onyx.legal_composite.draft_composition_fixture import composition_for
 from tests.unit.onyx.legal_composite.test_claim_delta_repair import _claim, _draft
 from tests.unit.onyx.legal_composite.test_source_requirements import fixture
 
@@ -596,8 +598,10 @@ def test_actual_engine_adapter_canonicalization_and_full_recheck_preserve_atomic
         ) -> T:
             del system, flow, finalizing
             requests.append(response_type)
-            if response_type is StructuredDraftAnswer:
-                return response_type.model_validate(initial.model_dump())
+            if response_type is DraftComposition:
+                return response_type.model_validate(
+                    composition_for(initial).model_dump()
+                )
             assert response_type is ClaimRepairEdits
             assert payload["repair_targets"] == [
                 {"section_id": "s_a", "need_ids": ["a"], "existing_claim_ids": ["c_a"]}
@@ -646,7 +650,7 @@ def test_actual_engine_adapter_canonicalization_and_full_recheck_preserve_atomic
     engine.requirements.update(requirements, plan, {1, 2})
     originals_before, records_before = ledger.export(), engine.requirements.export()
     result = engine._finalize_semantic("A ve B işlemlerini açıklayın.", "", None, plan)
-    assert requests == [StructuredDraftAnswer, ClaimRepairEdits]
+    assert requests == [DraftComposition, ClaimRepairEdits]
     assert len(reviewed) == 2
     assert reviewed[0].model_dump_json() == initial.model_dump_json()
     assert (

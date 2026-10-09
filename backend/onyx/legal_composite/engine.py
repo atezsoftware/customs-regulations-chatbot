@@ -23,6 +23,11 @@ from onyx.legal_composite.dependencies import (
     dependency_required_citations,
     material_dependency_gaps,
 )
+from onyx.legal_composite.draft_composition import (
+    DRAFT_COMPOSITION_PROMPT,
+    DraftComposition,
+    compose_draft,
+)
 from onyx.legal_composite.draft_repair import (
     apply_claim_delta,
     canonicalize_delta_supports,
@@ -135,6 +140,11 @@ def _admission_reason(error: InvalidSourceAction) -> str:
         "Frozen claim issue bindings exceed the target section": "existing_claim_issue",
         "Frozen section must name every own claim exactly once": "existing_claim_order",
         "Claim edits do not form a valid repair delta": "patch_recomposition",
+        "Draft composition failed the transport schema": "draft_composition_schema",
+        "Draft composition identities must be unique": "draft_composition_identity",
+        "Draft composition section issue bindings must be unique": "draft_composition_issue",
+        "Draft composition claim exceeds its section issue scope": "draft_composition_claim",
+        "Draft composition cannot form a valid answer": "draft_composition_render",
     }.get(str(error), "source_action")
 
 
@@ -1292,13 +1302,31 @@ class LegalCompositeEngine:
         payload = self._payload(
             request, history, instructions=instructions, source_phase=False
         )
-        draft = self.gateway.complete(
-            ANSWER_PROMPT,
+        composition = self.gateway.complete(
+            DRAFT_COMPOSITION_PROMPT,
             payload,
-            StructuredDraftAnswer,
+            DraftComposition,
             LLMFlow.LEGAL_COMPOSITE_ANSWER,
             True,
         )
+        try:
+            draft = compose_draft(composition)
+        except InvalidSourceAction as error:
+            self._trace_admission("draft", "scope", False, _admission_reason(error))
+            raise
+        with graph_step(
+            "legal_composite.draft_composition",
+            {},
+            summary=(
+                f"sections={len(draft.sections)} claims={len(draft.claims)} "
+                f"characters={len(draft.answer)}"
+            ),
+        ) as composition_step:
+            composition_step.output_value = {
+                "sections": len(draft.sections),
+                "claims": len(draft.claims),
+                "characters": len(draft.answer),
+            }
         delivered = set(getattr(self.gateway, "last_delivered_citations", set()))
         pending_binding_gaps: list[str] = []
         admission_stage = "supports"

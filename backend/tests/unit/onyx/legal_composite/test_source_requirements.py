@@ -9,6 +9,7 @@ from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.models import RunContext
 from onyx.legal_composite.acquisition import InvalidSourceAction
 from onyx.legal_composite.claim_edits import ClaimEdit, ClaimRepairEdits
+from onyx.legal_composite.draft_composition import DraftComposition
 from onyx.legal_composite.engine import LegalCompositeEngine
 from onyx.legal_composite.models import (
     AnswerSection,
@@ -44,6 +45,7 @@ from onyx.legal_composite.requirements import (
 )
 from onyx.legal_composite.reviewer import ReviewQuestion, build_checks
 from onyx.tracing.flows import LLMFlow
+from tests.unit.onyx.legal_composite.draft_composition_fixture import composition_for
 from tests.unit.onyx.legal_composite.test_review_assessment import original
 
 T = TypeVar("T", bound=BaseModel)
@@ -312,6 +314,7 @@ def test_engine_repairs_only_missing_requirement_section_and_rechecks(
     retain_additional_claim: bool,
 ) -> None:
     ledger, plan, requirements, draft = fixture()
+    draft.claims[0].answer_excerpt = draft.sections[0].text
     draft.claims[1].answer_excerpt = draft.sections[1].text
     if retain_additional_claim:
         draft.claims.append(
@@ -328,7 +331,7 @@ def test_engine_repairs_only_missing_requirement_section_and_rechecks(
     ]
     draft = DraftAnswer(
         sections=[
-            draft.sections[0],
+            AnswerSection(section_id="s_a", need_ids=["a"], claim_ids=["c_a"]),
             AnswerSection(
                 section_id="s_b", need_ids=["b"], text="", claim_ids=claim_order
             ),
@@ -373,8 +376,8 @@ def test_engine_repairs_only_missing_requirement_section_and_rechecks(
                     remaining_gaps=[],
                     requirements=requirements,
                 )
-            elif response_type is DraftAnswer:
-                value = initial
+            elif response_type is DraftComposition:
+                value = composition_for(initial)
             else:
                 assert response_type is ClaimRepairEdits
                 patch_inputs.append(payload)
