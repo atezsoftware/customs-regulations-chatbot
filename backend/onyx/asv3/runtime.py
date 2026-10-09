@@ -26,9 +26,11 @@ from onyx.asv3.corpus_tools import CorpusBroker, build_corpus_specs
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.external_tools import build_external_specs
 from onyx.asv3.guardrails_v3 import (
+    GuardrailsV3ReviewOutcome,
     build_frozen_review_packet,
     review_frozen_packet,
 )
+from onyx.asv3.guardrails_v3_controller import finalize_guardrails_v3
 from onyx.asv3.harness import Harness
 from onyx.asv3.jev_answer_review import ReviewEvidence, review_and_repair_answer
 from onyx.asv3.legal_source_reviews import (
@@ -2031,9 +2033,38 @@ def run_asv3_loop(
                 }
             else:
                 review_outcome = review_frozen_packet(packet_build.packet)
-                context.services["guardrails_v3_review"] = review_outcome.model_dump(
-                    mode="json"
+
+                def recheck(
+                    repaired: str, _findings: object
+                ) -> GuardrailsV3ReviewOutcome:
+                    rebuilt = build_frozen_review_packet(
+                        question=question,
+                        candidate_answer=repaired,
+                        outcome_map=outcome_map,
+                        ledger=ledger,
+                        candidate_audit=(
+                            audit if isinstance(audit, CandidateAudit) else None
+                        ),
+                    )
+                    if rebuilt.packet is None:
+                        return GuardrailsV3ReviewOutcome(
+                            failure_reason="recheck_packet_unavailable"
+                        )
+                    return review_frozen_packet(rebuilt.packet)
+
+                finalization = finalize_guardrails_v3(
+                    candidate_answer=final,
+                    initial_review=review_outcome,
+                    ledger=ledger,
+                    context=context,
+                    repair_llm=repair_llm,
+                    recheck=recheck,
                 )
+                final = finalization.answer
+                context.services["guardrails_v3_review"] = {
+                    **review_outcome.model_dump(mode="json"),
+                    "finalization": finalization.model_dump(mode="json"),
+                }
         publication_status = (
             result.status
             if result.answer and not clarification and not partial
