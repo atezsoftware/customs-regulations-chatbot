@@ -318,7 +318,7 @@ export interface DeepResearchPlanDelta extends BaseObj {
 
 export interface ASv3Progress extends BaseObj {
   type: "asv3_progress";
-  workflow?: "asv3" | "supersearch";
+  workflow?: "asv3" | "supersearch" | "legal_review";
   run_id: string;
   event_id: string;
   sequence: number;

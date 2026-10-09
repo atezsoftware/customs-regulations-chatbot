@@ -91,6 +91,7 @@ export interface AppInputBarProps {
   atezSearchV2Enabled?: boolean;
   atezSearchV3Enabled?: boolean;
   legalCompositeEnabled?: boolean;
+  legalReviewEnabled?: boolean;
   supersearchEnabled?: boolean;
   experimentalResearchEnabled?: boolean;
   experimentalParallelResearchEnabled?: boolean;
@@ -103,6 +104,7 @@ export interface AppInputBarProps {
   toggleAtezSearchV2?: () => void;
   toggleAtezSearchV3?: () => void;
   toggleLegalComposite?: () => void;
+  toggleLegalReview?: () => void;
   toggleSupersearch?: () => void;
   toggleExperimentalResearch?: () => void;
   toggleExperimentalParallelResearch?: () => void;
@@ -135,6 +137,7 @@ const AppInputBar = React.memo(
     deepResearchEnabled,
     atezSearchV3Enabled = false,
     legalCompositeEnabled = false,
+    legalReviewEnabled = false,
     supersearchEnabled = false,
     experimentalResearchEnabled = false,
     experimentalParallelResearchEnabled = false,
@@ -144,6 +147,7 @@ const AppInputBar = React.memo(
     toggleDeepResearch,
     toggleAtezSearchV3,
     toggleLegalComposite,
+    toggleLegalReview,
     toggleSupersearch,
     toggleExperimentalResearch,
     toggleExperimentalParallelResearch,
@@ -364,15 +368,18 @@ const AppInputBar = React.memo(
     const hasUploadingFiles = useMemo(() => {
       return (
         !supersearchEnabled &&
+        !legalReviewEnabled &&
         currentMessageFiles.some(
           (file) => file.status === UserFileStatus.UPLOADING
         )
       );
-    }, [currentMessageFiles, supersearchEnabled]);
+    }, [currentMessageFiles, supersearchEnabled, legalReviewEnabled]);
 
     // A file isn't queryable until indexing completes, so gate send on it.
     const hasIndexingFiles =
-      !supersearchEnabled && currentIndexingFiles.length > 0;
+      !supersearchEnabled &&
+      !legalReviewEnabled &&
+      currentIndexingFiles.length > 0;
 
     // Convert ProjectFile to MinimalOnyxDocument format for viewing
     const handleFileClick = useCallback(
@@ -445,7 +452,10 @@ const AppInputBar = React.memo(
     // Animate attached files wrapper to its content height so CSS transitions
     // can interpolate between concrete pixel values (0px ↔ Npx).
     const showFiles =
-      !isSearchMode && !supersearchEnabled && currentMessageFiles.length > 0;
+      !isSearchMode &&
+      !supersearchEnabled &&
+      !legalReviewEnabled &&
+      currentMessageFiles.length > 0;
     useEffect(() => {
       const wrapper = filesWrapperRef.current;
       const content = filesContentRef.current;
@@ -463,7 +473,7 @@ const AppInputBar = React.memo(
     function handlePaste(event: React.ClipboardEvent) {
       if (disabled) return;
       const pastedFiles =
-        isAdmin && !supersearchEnabled
+        isAdmin && !supersearchEnabled && !legalReviewEnabled
           ? getPastedFilesIfNoText(event.clipboardData)
           : [];
       if (pastedFiles.length > 0) {
@@ -663,7 +673,7 @@ const AppInputBar = React.memo(
       >
         {/* Bottom left controls */}
         <div className="flex flex-row flex-1 min-w-0 items-center">
-          {isAdmin && !supersearchEnabled && (
+          {isAdmin && !supersearchEnabled && !legalReviewEnabled && (
             <FilePickerPopover
               onFileClick={handleFileClick}
               onPickRecent={(file: ProjectFile) => {
@@ -706,6 +716,7 @@ const AppInputBar = React.memo(
             )}
           >
             {!supersearchEnabled &&
+              !legalReviewEnabled &&
               selectedAgent &&
               selectedAgent.tools.length > 0 && (
                 <ActionsPopover
@@ -715,7 +726,9 @@ const AppInputBar = React.memo(
                   disabled={disabled}
                 />
               )}
-            {onToggleTabReading && !supersearchEnabled ? (
+            {onToggleTabReading &&
+            !supersearchEnabled &&
+            !legalReviewEnabled ? (
               <SelectButton
                 disabled={disabled}
                 icon={SvgGlobe}
@@ -751,6 +764,23 @@ const AppInputBar = React.memo(
                     }
                   >
                     Supersearch
+                  </SelectButton>
+                )}
+                {showAtezSearch && toggleLegalReview && (
+                  <SelectButton
+                    disabled={disabled || isMultiModelActive}
+                    variant="select-light"
+                    icon={SvgSearch}
+                    onClick={toggleLegalReview}
+                    state={legalReviewEnabled ? "selected" : "empty"}
+                    foldable={false}
+                    tooltip={
+                      isMultiModelActive
+                        ? "Hukuki İnceleme (Flash) tek modelle çalışır. Ek modelleri kaldırın."
+                        : "Gemini 3.8 Flash ile hukuki meseleler, kaynak araştırması ve 12 boyutta son kontrol"
+                    }
+                  >
+                    Hukuki İnceleme (Flash)
                   </SelectButton>
                 )}
                 {showAtezSearch && toggleLegalComposite && (
@@ -899,6 +929,7 @@ const AppInputBar = React.memo(
             )}
 
             {!supersearchEnabled &&
+              !legalReviewEnabled &&
               selectedAgent &&
               forcedToolIds.length > 0 &&
               forcedToolIds.map((toolId) => {
@@ -1062,6 +1093,16 @@ const AppInputBar = React.memo(
                 />
               </div>
             ) : null}
+
+            {legalReviewEnabled && (
+              <div className="px-3 pt-2">
+                <Text font="secondary-body" color="text-03">
+                  {currentMessageFiles.length > 0
+                    ? "Gemini 3.8 Flash · Ekli dosyalar kullanılmaz; seçiminiz korunur."
+                    : "Gemini 3.8 Flash · Hukuki meseleler ve 12 boyutta kontrol"}
+                </Text>
+              </div>
+            )}
 
             {supersearchEnabled && (
               <div className="px-3 pt-2">

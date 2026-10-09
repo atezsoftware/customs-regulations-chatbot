@@ -160,6 +160,7 @@ export interface Message {
   is_generating?: boolean;
   asv3?: boolean;
   supersearch?: boolean;
+  legalReview?: boolean;
   messageId?: number;
   nodeId: number; // Unique identifier for tree structure (can be negative for temp messages)
   message: string;

@@ -6,5 +6,6 @@ export type WorkflowSelection =
   | "experimental_guardrails"
   | "experimental_guardrails_v2"
   | "experimental_guardrails_v3"
+  | "legal_review"
   | "legal_composite"
   | "supersearch";

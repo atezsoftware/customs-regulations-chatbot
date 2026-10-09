@@ -32,6 +32,7 @@ interface RegenerationResearchModeInput {
   atezSearchV2Enabled: boolean;
   atezSearchV3Enabled: boolean;
   legalCompositeEnabled?: boolean;
+  legalReviewEnabled?: boolean;
   supersearchEnabled?: boolean;
   experimentalResearchEnabled: boolean;
   experimentalParallelResearchEnabled: boolean;
@@ -46,6 +47,7 @@ export function getRegenerationResearchMode({
   atezSearchV2Enabled,
   atezSearchV3Enabled,
   legalCompositeEnabled = false,
+  legalReviewEnabled = false,
   supersearchEnabled = false,
   experimentalResearchEnabled,
   experimentalParallelResearchEnabled,
@@ -59,6 +61,7 @@ export function getRegenerationResearchMode({
     atezSearchV2: resumingAsv3 ? false : atezSearchV2Enabled,
     atezSearchV3: resumingAsv3 || atezSearchV3Enabled,
     legalComposite: !resumingAsv3 && legalCompositeEnabled,
+    ...(!resumingAsv3 && legalReviewEnabled ? { legalReview: true } : {}),
     supersearch: !resumingAsv3 && supersearchEnabled,
     experimentalResearch: resumingAsv3 ? false : experimentalResearchEnabled,
     experimentalParallelResearch: resumingAsv3
@@ -93,6 +96,7 @@ export interface ChatUIProps {
     atezSearchV2?: boolean;
     atezSearchV3?: boolean;
     legalComposite?: boolean;
+    legalReview?: boolean;
     supersearch?: boolean;
     experimentalResearch?: boolean;
     experimentalParallelResearch?: boolean;
@@ -116,6 +120,7 @@ export interface ChatUIProps {
   atezSearchV2Enabled?: boolean;
   atezSearchV3Enabled?: boolean;
   legalCompositeEnabled?: boolean;
+  legalReviewEnabled?: boolean;
   supersearchEnabled?: boolean;
   experimentalResearchEnabled?: boolean;
   experimentalParallelResearchEnabled?: boolean;
@@ -152,6 +157,7 @@ const ChatUI = React.memo(
     atezSearchV2Enabled = false,
     atezSearchV3Enabled = false,
     legalCompositeEnabled = false,
+    legalReviewEnabled = false,
     supersearchEnabled = false,
     experimentalResearchEnabled = false,
     experimentalParallelResearchEnabled = false,
@@ -188,6 +194,7 @@ const ChatUI = React.memo(
     const atezSearchEnabledRef = useRef(atezSearchEnabled);
     const atezSearchV2EnabledRef = useRef(atezSearchV2Enabled);
     const atezSearchV3EnabledRef = useRef(atezSearchV3Enabled);
+    const legalReviewEnabledRef = useRef(legalReviewEnabled);
     const legalCompositeEnabledRef = useRef(legalCompositeEnabled);
     const supersearchEnabledRef = useRef(supersearchEnabled);
     const experimentalResearchEnabledRef = useRef(experimentalResearchEnabled);
@@ -210,6 +217,7 @@ const ChatUI = React.memo(
     atezSearchEnabledRef.current = atezSearchEnabled;
     atezSearchV2EnabledRef.current = atezSearchV2Enabled;
     atezSearchV3EnabledRef.current = atezSearchV3Enabled;
+    legalReviewEnabledRef.current = legalReviewEnabled;
     legalCompositeEnabledRef.current = legalCompositeEnabled;
     supersearchEnabledRef.current = supersearchEnabled;
     experimentalResearchEnabledRef.current = experimentalResearchEnabled;
@@ -237,6 +245,7 @@ const ChatUI = React.memo(
             atezSearchV2Enabled: atezSearchV2EnabledRef.current,
             atezSearchV3Enabled: atezSearchV3EnabledRef.current,
             legalCompositeEnabled: legalCompositeEnabledRef.current,
+            legalReviewEnabled: legalReviewEnabledRef.current,
             supersearchEnabled: supersearchEnabledRef.current,
             experimentalResearchEnabled: experimentalResearchEnabledRef.current,
             experimentalParallelResearchEnabled:
@@ -278,6 +287,7 @@ const ChatUI = React.memo(
           atezSearchV2: atezSearchV2EnabledRef.current,
           atezSearchV3:
             atezSearchV3EnabledRef.current && !(models && models.length >= 2),
+          legalReview: legalReviewEnabledRef.current,
           legalComposite:
             legalCompositeEnabledRef.current && !(models && models.length >= 2),
           supersearch: supersearchEnabledRef.current,
@@ -437,6 +447,7 @@ const ChatUI = React.memo(
                 >
                   <AgentMessage
                     asv3={message.asv3}
+                    legalReview={message.legalReview}
                     fullWidthChat={fullWidthChat}
                     rawPackets={message.packets}
                     packetCount={message.packetCount}
