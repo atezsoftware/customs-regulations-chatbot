@@ -19,6 +19,8 @@ from onyx.context.search.models import SearchDoc
 from onyx.llm.interfaces import LLM
 from onyx.llm.models import ReasoningEffort, UserMessage
 
+_REPAIR_MODEL = "gemini-3.8-flash"
+
 
 class GuardrailsV3Finalization(BaseModel):
     model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
@@ -45,14 +47,21 @@ def finalize_guardrails_v3(
     if not initial_review.review_completed or not initial_review.repair_requested:
         return GuardrailsV3Finalization(answer=candidate_answer, action="none")
     remaining_seconds = max(0.0, context.deadline - time.monotonic())
-    if repair_llm is None or remaining_seconds < 10:
+    if (
+        repair_llm is None
+        or remaining_seconds < 10
+        or repair_llm.config.model_provider not in {"vertex_ai", "gemini"}
+        or repair_llm.config.model_name != _REPAIR_MODEL
+    ):
         return GuardrailsV3Finalization(
             answer=candidate_answer,
             action="disclose_gap",
             failure_reason="repair_unavailable",
         )
     citations = list(ledger.citation_numbers())
-    delivered = [number for number in citations if ledger.inspect(number)["deliveries"]]
+    delivered = [
+        number for number in citations if _has_complete_delivery(ledger, number)
+    ]
     action = "patch_delivered_evidence"
     if not delivered and candidate_audit is not None and broker is not None:
         recovered = _recover_audited_candidate(candidate_audit, broker, ledger, context)
@@ -101,7 +110,10 @@ def finalize_guardrails_v3(
             action=action,
             failure_reason="repair_unchanged",
         )
-    if set(extract_citation_numbers(repaired)) - set(delivered):
+    repaired_citations = set(extract_citation_numbers(repaired))
+    if repaired_citations - set(delivered) or (
+        extract_citation_numbers(candidate_answer) and not repaired_citations
+    ):
         return GuardrailsV3Finalization(
             answer=candidate_answer,
             action=action,
@@ -119,6 +131,23 @@ def finalize_guardrails_v3(
         action=action,
         repair_applied=True,
         recheck_completed=True,
+    )
+
+
+def _has_complete_delivery(ledger: EvidenceLedger, citation: int) -> bool:
+    deliveries = ledger.inspect(citation)["deliveries"]
+    if not isinstance(deliveries, list):
+        return False
+    return any(
+        isinstance(delivery, dict)
+        and isinstance(records := delivery.get("records"), list)
+        and any(
+            isinstance(record, dict)
+            and record.get("citation") == citation
+            and record.get("complete") is True
+            for record in records
+        )
+        for delivery in deliveries
     )
 
 

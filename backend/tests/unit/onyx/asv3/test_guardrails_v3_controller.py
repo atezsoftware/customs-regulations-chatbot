@@ -115,6 +115,91 @@ def test_failed_recheck_keeps_original_answer_after_only_one_repair_attempt() ->
     llm.invoke.assert_called_once()
 
 
+def test_partial_evidence_is_not_sufficient_for_a_repair() -> None:
+    context, ledger = RunContext(timeout_seconds=120), EvidenceLedger()
+    ledger.add(
+        [EvidenceItem(source_id="law", chunk_id="1", text="A ve B şarttır.")], context
+    )
+    ledger.record_delivery(
+        "candidate", "asv3_coordinator", [{"citation": 1, "text": "A ve"}]
+    )
+    llm = _llm("A ve B şarttır [1].")
+
+    outcome = _controller().finalize_guardrails_v3(
+        candidate_answer="A şarttır [1].",
+        initial_review=GuardrailsV3ReviewOutcome(
+            review_completed=True, repair_requested=True, findings=[_finding()]
+        ),
+        ledger=ledger,
+        context=context,
+        repair_llm=llm,
+        recheck=lambda *_args, **_kwargs: GuardrailsV3ReviewOutcome(
+            review_completed=True
+        ),
+    )
+
+    assert outcome.answer == "A şarttır [1]."
+    assert outcome.action == "disclose_gap"
+    assert outcome.failure_reason == "repair_evidence_undelivered"
+    llm.invoke.assert_not_called()
+
+
+def test_repair_cannot_remove_every_original_citation() -> None:
+    context, ledger = RunContext(timeout_seconds=120), EvidenceLedger()
+    ledger.add(
+        [EvidenceItem(source_id="law", chunk_id="1", text="A ve B şarttır.")], context
+    )
+    ledger.record_delivery(
+        "candidate", "asv3_coordinator", [{"citation": 1, "text": "A ve B şarttır."}]
+    )
+    llm = _llm("A ve B şarttır.")
+
+    outcome = _controller().finalize_guardrails_v3(
+        candidate_answer="A şarttır [1].",
+        initial_review=GuardrailsV3ReviewOutcome(
+            review_completed=True, repair_requested=True, findings=[_finding()]
+        ),
+        ledger=ledger,
+        context=context,
+        repair_llm=llm,
+        recheck=lambda *_args, **_kwargs: GuardrailsV3ReviewOutcome(
+            review_completed=True
+        ),
+    )
+
+    assert outcome.answer == "A şarttır [1]."
+    assert outcome.failure_reason == "invalid_repair_citations"
+
+
+def test_repair_uses_only_the_configured_gemini_flash_model() -> None:
+    context, ledger = RunContext(timeout_seconds=120), EvidenceLedger()
+    ledger.add(
+        [EvidenceItem(source_id="law", chunk_id="1", text="A ve B şarttır.")], context
+    )
+    ledger.record_delivery(
+        "candidate", "asv3_coordinator", [{"citation": 1, "text": "A ve B şarttır."}]
+    )
+    llm = _llm("A ve B şarttır [1].")
+    llm.config = llm.config.model_copy(update={"model_name": "gemini-3-pro"})
+
+    outcome = _controller().finalize_guardrails_v3(
+        candidate_answer="A şarttır [1].",
+        initial_review=GuardrailsV3ReviewOutcome(
+            review_completed=True, repair_requested=True, findings=[_finding()]
+        ),
+        ledger=ledger,
+        context=context,
+        repair_llm=llm,
+        recheck=lambda *_args, **_kwargs: GuardrailsV3ReviewOutcome(
+            review_completed=True
+        ),
+    )
+
+    assert outcome.answer == "A şarttır [1]."
+    assert outcome.failure_reason == "repair_unavailable"
+    llm.invoke.assert_not_called()
+
+
 def test_excluded_candidate_is_hydrated_and_delivered_before_one_repair() -> None:
     context, ledger = RunContext(timeout_seconds=120), EvidenceLedger()
     audit = CandidateAudit(context, request="Kapsam?")
