@@ -181,6 +181,7 @@ class SearchToolRetrievalOverrides(BaseModel):
     preserve_source_diversity: bool = Field(default=False, strict=True)
     reuse_diversity_comparisons: bool = Field(default=False, strict=True)
     guarded_decisions_advisory: bool = Field(default=False, strict=True)
+    capture_candidate_audit: bool = Field(default=False, strict=True)
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -188,6 +189,10 @@ class SearchToolRetrievalOverrides(BaseModel):
 class SearchToolOverrideKwargs(BaseModel):
     # To know what citation number to start at for constructing the string to the LLM
     starting_citation_num: int
+    # Stable per-call identifier used only by opt-in provenance sidecars.
+    candidate_audit_run_id: str | None = Field(
+        default=None, min_length=1, max_length=128
+    )
     # This is needed because the LLM won't be able to do a really detailed semantic query well
     # without help and a specific custom prompt for this
     original_query: str | None = None
@@ -223,6 +228,7 @@ class SearchToolRetrievalOverrideKwargs(SearchToolOverrideKwargs):
     preserve_source_diversity: bool = Field(default=False, strict=True)
     reuse_diversity_comparisons: bool = Field(default=False, strict=True)
     guarded_decisions_advisory: bool = Field(default=False, strict=True)
+    capture_candidate_audit: bool = Field(default=False, strict=True)
 
 
 class ChatFile(BaseModel):

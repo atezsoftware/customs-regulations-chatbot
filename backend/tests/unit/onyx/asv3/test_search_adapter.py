@@ -11,6 +11,7 @@ from uuid import uuid4
 import pytest
 from pydantic import JsonValue
 
+from onyx.asv3.candidate_audit import CandidateAudit
 from onyx.asv3.corpus_tools import CorpusBroker, build_corpus_specs
 from onyx.asv3.models import (
     CapabilityCall,
@@ -27,6 +28,7 @@ from onyx.asv3.search_adapter import (
     ScopedSearchLLM,
     build_search_adapter,
 )
+from onyx.asv3.workflow_variant import ASV3_GUARDRAILS_V3_VARIANT
 from onyx.chat.emitter import NullEmitter
 from onyx.chat.models import ChatMessageSimple
 from onyx.configs.constants import DocumentSource, MessageType
@@ -35,6 +37,8 @@ from onyx.context.search.models import (
     ChunkSearchRequest,
     IndexFilters,
     InferenceChunk,
+    SearchDoc,
+    SearchDocsResponse,
 )
 from onyx.context.search.pipeline import search_pipeline
 from onyx.db.memory import UserInfo, UserMemoryContext
@@ -44,6 +48,7 @@ from onyx.llm.interfaces import LLM, LLMUserIdentity
 from onyx.llm.model_response import Choice, Message, ModelResponse
 from onyx.llm.models import UserMessage
 from onyx.reranking.models import RerankOutcome, RerankResult
+from onyx.tools.models import ParallelToolCallResponse, ToolResponse
 from onyx.tools.tool_implementations.search.search_tool import SearchTool
 
 MODULE = "onyx.tools.tool_implementations.search.search_tool"
@@ -927,6 +932,11 @@ def test_real_search_results_are_canonically_hydrated_once_without_payload_text_
         broker,
         message_history=lambda _: [user_message("actual request")],
     )
+    context = RunContext()
+    context.services["asv3_workflow_variant"] = ASV3_GUARDRAILS_V3_VARIANT
+    context.services["task_outcome_ids"] = ["outcome-repair"]
+    audit = CandidateAudit(context, request="actual request")
+    context.services["candidate_audit"] = audit
     with (
         search_boundaries(chunks),
         ExitStack() as expansion_checks,
@@ -955,7 +965,7 @@ def test_real_search_results_are_canonically_hydrated_once_without_payload_text_
             )
         ]
         outcome = adapter(
-            {"query": "named repair mechanism", "mode": "keyword"}, RunContext()
+            {"query": "named repair mechanism", "mode": "keyword"}, context
         )
     assert outcome.status == OutcomeStatus.FOUND
     assert hydrate.call_count == 1
@@ -964,6 +974,93 @@ def test_real_search_results_are_canonically_hydrated_once_without_payload_text_
         item.identity for item in originals
     ]
     assert "canonical paragraph" not in str(outcome.data)
+    assert [record.status for record in audit.records()] == ["delivered", "delivered"]
+    assert all(record.search_run_id for record in audit.records())
+    assert all(record.outcome_ids == ["outcome-repair"] for record in audit.records())
+
+
+def test_candidate_audit_marks_selected_candidates_without_result_mapping_unmapped() -> (
+    None
+):
+    tool, broker, _ = tool_and_broker()
+    source_id = str(uuid4())
+    chunk = InferenceChunk(
+        document_id=source_id,
+        chunk_id=7,
+        content="canonical paragraph",
+        source_type=DocumentSource.USER_FILE,
+        semantic_identifier="Named source",
+        title="Named source",
+        boost=1,
+        score=0.9,
+        hidden=False,
+        metadata={},
+        match_highlights=[],
+        doc_summary="",
+        chunk_context="",
+        updated_at=None,
+        image_file_id=None,
+        source_links=None,
+        section_continuation=False,
+        blurb="source paragraph",
+        file_id=source_id,
+        regulatory_chunk_id="rc-7",
+        heading_path=["MADDE 142"],
+    )
+    doc = SearchDoc.from_chunks_or_sections([chunk])[0]
+    adapter = build_search_adapter(
+        tool,
+        "actual request",
+        broker,
+        message_history=lambda _: [user_message("actual request")],
+    )
+    context = RunContext()
+    context.services["asv3_workflow_variant"] = ASV3_GUARDRAILS_V3_VARIANT
+    context.services["task_outcome_ids"] = ["outcome-repair"]
+    audit = CandidateAudit(context, request="actual request")
+    context.services["candidate_audit"] = audit
+    response = ToolResponse(
+        rich_response=SearchDocsResponse(
+            search_docs=[doc],
+            citation_mapping={1: source_id},
+            citation_chunk_mapping={1: 7},
+            retrieval_audit=[
+                {
+                    "search_run_id": "1",
+                    "candidate_id": f"{source_id}:7",
+                    "source_id": source_id,
+                    "chunk_id": "7",
+                    "lane": "regulatory",
+                    "mode": "keyword",
+                    "status": "selected",
+                    "reason": "selected_for_llm_delivery",
+                    "raw_score": 0.9,
+                    "normalized_score": 1.0,
+                    "rerank_position": 0,
+                    "outcome_ids": [],
+                    "scope_version": None,
+                }
+            ],
+        ),
+        llm_facing_response='{"results": []}',
+    )
+    with (
+        search_boundaries(),
+        patch(
+            "onyx.asv3.search_adapter.run_tool_calls",
+            return_value=ParallelToolCallResponse(
+                tool_responses=[response], updated_citation_mapping={}
+            ),
+        ),
+    ):
+        outcome = adapter(
+            {"query": "named repair mechanism", "mode": "keyword"}, context
+        )
+
+    assert outcome.status == OutcomeStatus.NOT_FOUND
+    assert [record.status for record in audit.records()] == ["unmapped"]
+    assert audit.records()[0].reason == "llm_result_mapping_absent"
+    assert audit.records()[0].outcome_ids == ["outcome-repair"]
 
 
 @pytest.mark.parametrize("expand_query,expected_helpers", [(False, 0), (True, 2)])

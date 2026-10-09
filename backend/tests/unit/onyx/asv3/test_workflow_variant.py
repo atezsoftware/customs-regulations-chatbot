@@ -407,7 +407,7 @@ def test_guarded_runtime_has_finite_cost_and_latency_limits(
 def test_guardrails_v3_runtime_reserves_time_for_final_review(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    kwargs, _broker, _selected, _checkpoints, _queue = setup_run(monkeypatch)
+    kwargs, _broker, _selected, checkpoints, _queue = setup_run(monkeypatch)
     kwargs.pop("test_language")
     contexts = []
     original_model = runtime.ResearchModel
@@ -433,6 +433,8 @@ def test_guardrails_v3_runtime_reserves_time_for_final_review(
     assert context.budget.limits["tools"] == 24
     assert context.budget.limits["decisions"] == 32
     assert context.services["asv3_workflow_variant"] == ASV3_GUARDRAILS_V3_VARIANT
+    assert checkpoints[-1]["candidate_audit"]["version"] == 1
+    assert checkpoints[-1]["candidate_audit"]["records"] == []
 
 
 def test_guarded_runtime_keeps_source_tools_cheap_and_coordinator_selected(

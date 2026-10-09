@@ -601,6 +601,7 @@ def run_tool_calls(
             )
             override_kwargs = SearchToolOverrideKwargs(
                 starting_citation_num=starting_citation_num,
+                candidate_audit_run_id=tool_call.tool_call_id,
                 original_query=search_original_query,
                 rerank_context=search_rerank_context,
                 message_history=search_message_history,

@@ -9,6 +9,7 @@ from uuid import uuid4
 
 from pydantic import JsonValue
 
+from onyx.asv3.candidate_audit import CandidateAudit, CandidateAuditRecord
 from onyx.asv3.corpus_tools import CorpusBroker
 from onyx.asv3.llm_adapter import model_slot, provider_retry_delay
 from onyx.asv3.models import (
@@ -22,6 +23,7 @@ from onyx.asv3.models import (
 from onyx.asv3.parallel_execution import parallel_execution_enabled
 from onyx.asv3.workflow_variant import (
     ASV3_GUARDED_EXPERIMENTAL_VARIANT,
+    ASV3_GUARDRAILS_V3_VARIANT,
     ASV3_TUNED_VARIANT,
 )
 from onyx.chat.emitter import NullEmitter
@@ -71,6 +73,16 @@ _GUARDED_RETRIEVAL_OVERRIDES = SearchToolRetrievalOverrides(
     guarded_decisions_advisory=True,
 )
 
+_GUARDRAILS_V3_RETRIEVAL_OVERRIDES = SearchToolRetrievalOverrides(
+    per_lane_num_hits=192,
+    rerank_candidate_limit=256,
+    regulatory_rerank_candidate_limit=256,
+    max_llm_chunks=32,
+    preserve_source_diversity=True,
+    reuse_diversity_comparisons=True,
+    capture_candidate_audit=True,
+)
+
 
 class _ProviderCompatibilityOptions(TypedDict, total=False):
     provider_compatibility_attempts: int
@@ -79,6 +91,8 @@ class _ProviderCompatibilityOptions(TypedDict, total=False):
 def guarded_retrieval_overrides(
     workflow_variant: str | None,
 ) -> SearchToolRetrievalOverrides | None:
+    if workflow_variant == ASV3_GUARDRAILS_V3_VARIANT:
+        return _GUARDRAILS_V3_RETRIEVAL_OVERRIDES
     if workflow_variant == ASV3_GUARDED_EXPERIMENTAL_VARIANT:
         return _GUARDED_RETRIEVAL_OVERRIDES
     if workflow_variant == ASV3_TUNED_VARIANT:
@@ -414,6 +428,19 @@ def build_search_adapter(
         seen_evidence: set[tuple[str, str | None, str]] = set()
         unmapped_results = 0
         docs = {(doc.document_id, doc.chunk_ind): doc for doc in rich.search_docs}
+        candidate_audit = context.services.get("candidate_audit")
+        captured_candidate_records: set[tuple[str, str]] = set()
+        outcome_ids = _candidate_audit_outcome_ids(context)
+        if isinstance(candidate_audit, CandidateAudit):
+            for raw in rich.retrieval_audit or []:
+                try:
+                    record = CandidateAuditRecord.model_validate(raw)
+                    if outcome_ids:
+                        record = record.model_copy(update={"outcome_ids": outcome_ids})
+                    candidate_audit.record(record)
+                    captured_candidate_records.add(record.identity)
+                except ValueError:
+                    continue
         mapped_docs = []
         for result in results:
             if not isinstance(result, dict):
@@ -437,6 +464,12 @@ def build_search_adapter(
                 unmapped_results += 1
                 continue
             mapped_docs.append(doc)
+        if isinstance(candidate_audit, CandidateAudit):
+            _mark_unmapped_candidate_records(
+                candidate_audit,
+                captured_candidate_records,
+                mapped_docs,
+            )
         hydrated_results = broker.hydrate_search_centers(mapped_docs, context)
         incomplete_closures = 0
         unhydrated_centers: list[JsonValue] = []
@@ -452,6 +485,13 @@ def build_search_adapter(
                         "instruction": "The center was not delivered as original evidence. Read its authorized source directly or report the exact gap; do not infer absence.",
                     }
                 )
+                if isinstance(candidate_audit, CandidateAudit):
+                    _record_audit_status(
+                        candidate_audit,
+                        doc,
+                        status="hydration_failed",
+                        reason="authorized_hydration_empty",
+                    )
             elif any(
                 item.metadata.get("article_closure_complete") is False
                 for item in hydrated
@@ -461,6 +501,13 @@ def build_search_adapter(
                 if item.identity not in seen_evidence:
                     seen_evidence.add(item.identity)
                     evidence.append(item)
+            if hydrated and isinstance(candidate_audit, CandidateAudit):
+                _record_audit_status(
+                    candidate_audit,
+                    doc,
+                    status="delivered",
+                    reason="hydrated_and_delivered",
+                )
         status = (
             OutcomeStatus.PARTIAL
             if evidence and unmapped_results
@@ -518,3 +565,55 @@ def build_search_adapter(
             return search_in_scope(args, context)
 
     return ScopedSearchAdapter(search, prepare_batch)
+
+
+def _record_audit_status(
+    audit: CandidateAudit,
+    doc: object,
+    *,
+    status: str,
+    reason: str,
+) -> None:
+    if not hasattr(doc, "document_id") or not hasattr(doc, "chunk_ind"):
+        return
+    source_id = str(doc.document_id)
+    chunk_id = str(doc.chunk_ind)
+    for record in audit.records():
+        if record.source_id != source_id or record.chunk_id != chunk_id:
+            continue
+        audit.record(record.model_copy(update={"status": status, "reason": reason}))
+        return
+
+
+def _mark_unmapped_candidate_records(
+    audit: CandidateAudit,
+    captured_candidate_records: set[tuple[str, str]],
+    mapped_docs: list[object],
+) -> None:
+    mapped_identities = {
+        (str(doc.document_id), str(doc.chunk_ind))
+        for doc in mapped_docs
+        if hasattr(doc, "document_id") and hasattr(doc, "chunk_ind")
+    }
+    for record in audit.records():
+        if (
+            record.identity not in captured_candidate_records
+            or record.status != "selected"
+            or (record.source_id, record.chunk_id) in mapped_identities
+        ):
+            continue
+        audit.record(
+            record.model_copy(
+                update={
+                    "status": "unmapped",
+                    "reason": "llm_result_mapping_absent",
+                }
+            )
+        )
+
+
+def _candidate_audit_outcome_ids(context: RunContext) -> list[str]:
+    assigned = context.services.get("task_outcome_ids")
+    if not isinstance(assigned, list):
+        return []
+    return [outcome_id for outcome_id in assigned if isinstance(outcome_id, str)][:32]

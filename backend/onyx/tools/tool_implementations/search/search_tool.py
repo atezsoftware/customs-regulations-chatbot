@@ -44,7 +44,7 @@ from datetime import date
 from typing import Any, Generic, TypeVar, cast
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, JsonValue
 from sqlalchemy.orm import Session
 
 from onyx.asv3.decisions_reranker import promote_guarded_boundary_candidates
@@ -3189,6 +3189,55 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
             if regulatory_chunks_only
             else docs_str
         )
+        retrieval_audit: list[dict[str, JsonValue]] | None = None
+        if (
+            isinstance(override_kwargs, SearchToolRetrievalOverrideKwargs)
+            and override_kwargs.capture_candidate_audit
+        ):
+            selected = {
+                (section.center_chunk.document_id, section.center_chunk.chunk_id)
+                for section in selected_sections[:max_selected_sections]
+            }
+            retrieval_audit = []
+            for position, section in enumerate(candidate_sections):
+                chunk = section.center_chunk
+                identity = (chunk.document_id, chunk.chunk_id)
+                selected_for_delivery = identity in selected
+                retrieval_audit.append(
+                    {
+                        "search_run_id": (
+                            override_kwargs.candidate_audit_run_id
+                            or str(override_kwargs.starting_citation_num)
+                        ),
+                        "candidate_id": f"{chunk.document_id}:{chunk.chunk_id}",
+                        "source_id": chunk.document_id,
+                        "chunk_id": str(chunk.chunk_id),
+                        "lane": "regulatory" if regulatory_chunks_only else "search",
+                        "mode": str(llm_kwargs.get("search_mode", "hybrid")),
+                        "status": "selected" if selected_for_delivery else "excluded",
+                        "reason": (
+                            "selected_for_llm_delivery"
+                            if selected_for_delivery
+                            else "rerank_below_selection"
+                        ),
+                        "raw_score": rerank_result.scores_by_chunk.get(identity),
+                        "normalized_score": (
+                            normalized_selection.normalized_scores_by_chunk.get(
+                                identity
+                            )
+                            if normalized_selection
+                            else None
+                        ),
+                        "rerank_position": position,
+                        "outcome_ids": [],
+                        "scope_version": str(
+                            chunk.metadata.get("publication_revision")
+                            or chunk.metadata.get("version")
+                            or ""
+                        )
+                        or None,
+                    }
+                )
 
         return ToolResponse(
             # Typically the rich response will give more docs in case it needs to be displayed in the UI
@@ -3197,6 +3246,7 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
                 citation_mapping=citation_mapping,
                 citation_chunk_mapping=citation_chunk_mapping,
                 displayed_docs=final_ui_docs,
+                retrieval_audit=retrieval_audit,
             ),
             # The LLM facing response typically includes less docs to cut down on noise and token usage
             llm_facing_response=llm_facing_response,

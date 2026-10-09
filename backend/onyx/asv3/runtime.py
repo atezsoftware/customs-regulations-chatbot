@@ -20,6 +20,7 @@ from pydantic import JsonValue
 from onyx.asv3.answer_model import source_answer_model, uses_source_answer_model
 from onyx.asv3.authority import cited_lower_statute_gap, native_named_authority_gap
 from onyx.asv3.authority_requirements import AuthorityRequirements
+from onyx.asv3.candidate_audit import CandidateAudit
 from onyx.asv3.citation_numbers import extract_citation_numbers
 from onyx.asv3.corpus_tools import CorpusBroker, build_corpus_specs
 from onyx.asv3.evidence import EvidenceLedger
@@ -561,6 +562,13 @@ def run_asv3_loop(
         reuse_retained_conditions=workflow_variant == ASV3_TUNED_VARIANT,
     )
     context.services["outcome_map"] = outcome_map
+    candidate_audit = (
+        CandidateAudit(context, request=question)
+        if workflow_variant == ASV3_GUARDRAILS_V3_VARIANT
+        else None
+    )
+    if candidate_audit is not None:
+        context.services["candidate_audit"] = candidate_audit
     emitted: list[dict[str, JsonValue]] = []
     checkpoint_lock = threading.RLock()
     progress_lock = threading.RLock()
@@ -958,6 +966,9 @@ def run_asv3_loop(
                     snapshot["guardrails_v2_review"] = cast(
                         dict[str, JsonValue], copy.deepcopy(guardrails_v2_review)
                     )
+                audit = context.services.get("candidate_audit")
+                if isinstance(audit, CandidateAudit):
+                    snapshot["candidate_audit"] = audit.export()
                 if parallel_answers is not None:
                     snapshot["parallel_research_policy"] = SERIAL_SESSION_POLICY
                     receipts = parallel_answers.export()
@@ -1887,6 +1898,9 @@ def run_asv3_loop(
             saved_outcomes = previous.get("outcome_map")
             if isinstance(saved_outcomes, dict):
                 outcome_map.restore(saved_outcomes, ledger)
+            saved_audit = previous.get("candidate_audit")
+            if candidate_audit is not None and isinstance(saved_audit, dict):
+                candidate_audit.restore(saved_audit)
             saved_reviews = previous.get("legal_source_reviews")
             if source_reviews is not None and isinstance(saved_reviews, dict):
                 source_reviews.restore(saved_reviews, context, question, ledger)
