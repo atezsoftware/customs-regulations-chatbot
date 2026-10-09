@@ -115,9 +115,15 @@ ingest, relabel, reindex or change publication metadata.
    predicates add no per-source calls or extra review rounds. Reviewer scores are
    defect probabilities; scores at or above `0.5` flag the bound question. A flag is
    a suspicion to investigate, not a legal finding.
-9. **Optional repair:** permit one post-draft evidence-directed repair. The reader
-   sees the actual draft and flags, can obtain missing originals, and the writer
-   produces a complete replacement. One Decisions recheck follows. Remaining flags
+9. **Optional repair:** permit one post-draft evidence-directed repair. The existing
+   batched reader call sees the actual draft and flags and returns grouped diagnoses
+   and concrete corrections covering each code-owned flagged check exactly once.
+   It distinguishes research corrections, prose/claim corrections, unresolved effects
+   and source-backed rebuttals. Code validates check identities and passage selectors;
+   correcting a finding requires an actual research update. Findings and all affected
+   assessment uses are corrected before the writer receives the repair plan. The
+   reader can obtain missing originals, and the writer produces a complete replacement.
+   The diagnosis itself never marks review passed. One Decisions recheck follows. Remaining flags
    or incomplete review withhold publication; they do not start another repair.
 10. **Publication:** revalidate cited evidence against current authorization and
     publication state, persist its checkpoint, and then emit the standard answer and
@@ -190,6 +196,16 @@ correction. It preserves the request and uses the same remaining deadline and ca
 budget; provider failures do not trigger this correction.
 
 Planner, reader, writer and repair use Gemini 3.8 Flash with low reasoning effort.
+Their model transport shares repeated source metadata and heading prefixes in a
+document registry. Citation numbers, chunk identities, complete passage text and all
+temporal/closure metadata remain recoverable without truncation. Canonical hash checks
+remain in the host ledger; digest strings are not repeated in the model-facing view.
+Raw acquisition receipts are replaced by query/status and discovery-limitation
+diagnostics, and writer stages omit tools. Post-draft repair receives the current
+review rather than duplicate obsolete early-review predicates. The full prompt,
+structured schema and provider response format are included in context admission.
+Vertex timeout exceptions follow the workflow's controlled failure/checkpoint path;
+they do not escape as an unhandled provider stack trace. Call deadlines remain bounded.
 The fixed override has temperature zero. The independent reviewer uses the native
 `https://api.openai.com/v1/decisions` endpoint with pinned `gpt-6-luna` and named
 defect predicates. Predicate names map back to code-owned checks; the provider does

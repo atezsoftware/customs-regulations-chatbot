@@ -27,12 +27,15 @@ from onyx.legal_review.models import (
     LegalDimension,
     PassageSupport,
     ReadingDecision,
+    RepairReadingDecision,
+    RepairResolution,
     Requirement,
     ReviewCheck,
     ReviewResult,
     SourceAction,
     WorkflowPolicy,
 )
+from onyx.prompts.legal_review.prompts import READING_PROMPT, REPAIR_READING_PROMPT
 from onyx.tracing.flows import LLMFlow
 
 T = TypeVar("T", bound=BaseModel)
@@ -125,11 +128,28 @@ def draft() -> DraftAnswer:
     )
 
 
+def repair_reading(check_id: str = "claim:c1") -> RepairReadingDecision:
+    return RepairReadingDecision(
+        dimensions=[],
+        repair_resolutions=[
+            RepairResolution(
+                check_ids=[check_id],
+                diagnosis="The literal conclusion needs the original document condition.",
+                correction="Preserve that condition in the repaired answer.",
+                disposition="correct",
+                scope="draft",
+                supports=[PassageSupport(citation=1, span_number=1)],
+            )
+        ],
+    )
+
+
 class FakeGateway:
     def __init__(self, results: list[BaseModel]) -> None:
         self.results = list(results)
         self.calls: list[tuple[LLMFlow, dict[str, JsonValue]]] = []
         self.response_models: list[type[BaseModel]] = []
+        self.prompts: list[str] = []
 
     def complete(
         self,
@@ -140,7 +160,8 @@ class FakeGateway:
         *,
         finalizing: bool = False,
     ) -> T:
-        del prompt, finalizing
+        del finalizing
+        self.prompts.append(prompt)
         self.calls.append((flow, state))
         self.response_models.append(response_model)
         result = self.results.pop(0)
@@ -269,7 +290,8 @@ def test_missing_review_never_publishes_an_unchecked_draft() -> None:
 
 def test_one_repair_uses_literal_draft_then_stops_on_remaining_flags() -> None:
     workflow, gateway, reviewer = engine(
-        [plan(), reading(), draft(), reading(), draft()], ["pass", "flag", "flag"]
+        [plan(), reading(), draft(), repair_reading(), draft()],
+        ["pass", "flag", "flag"],
     )
     result = workflow.run("Başvuru şartı nedir?", "")
     assert result.status == "unavailable" and result.answer is None
@@ -1056,9 +1078,7 @@ def test_claimless_positive_assertion_can_be_withheld_by_independent_review() ->
             plan(),
             unresolved_reading(),
             unsupported,
-            ReadingDecision(
-                dimensions=[],
-            ),
+            repair_reading("answer_consistency"),
             unsupported,
         ],
         ["pass", "flag", "flag"],
@@ -1319,3 +1339,155 @@ def test_review_flag_must_retain_exact_host_owned_finding_binding(tamper: str) -
     ):
         result = workflow._review("Soru", "", None)
     assert not result.completed and result.failure_reason == "review_inventory_invalid"
+
+
+def prepare_repair(*flag_ids: str) -> LegalReviewEngine:
+    workflow = prepared_engine()
+    workflow._accept_reading(reading())
+    checks = workflow._checks(draft=True, answer=draft())
+    flags = [check for check in checks if check.id in flag_ids]
+    assert len(flags) == len(flag_ids)
+    workflow.final_review = ReviewResult(
+        completed=True,
+        scores={check.id: 0.9 if check in flags else 0.1 for check in checks},
+        flags=flags,
+    )
+    workflow._start_repair(draft())
+    return workflow
+
+
+def test_repair_schema_requires_explicit_diagnosis_contract() -> None:
+    with pytest.raises(ValidationError, match="repair_resolutions"):
+        RepairReadingDecision.model_validate({"dimensions": []})
+    assert "repair_resolutions" not in ReadingDecision.model_json_schema()["properties"]
+
+
+@pytest.mark.parametrize(
+    "check_ids", [["claim:c1"], ["claim:c1", "unknown"], ["claim:c1", "claim:c1"]]
+)
+def test_repair_resolution_inventory_is_exact_and_atomic(check_ids: list[str]) -> None:
+    workflow = prepare_repair("claim:c1", "source_conditions")
+    decision = repair_reading()
+    decision.repair_resolutions[0].check_ids = check_ids
+    replacement = requirement("r2")
+    replacement.supersedes_requirement_ids = ["r1"]
+    decision.requirements = [replacement]
+    with pytest.raises(ValueError, match="every flagged check exactly once"):
+        workflow._accept_reading(decision)
+    assert set(workflow.requirements) == {"r1"}
+    assert workflow.requirement_history == {} and workflow.repair_resolutions == []
+
+
+def test_grouped_draft_resolution_is_canonical_and_not_an_automatic_pass() -> None:
+    workflow = prepare_repair("claim:c1", "source_conditions")
+    decision = repair_reading()
+    decision.repair_resolutions[0].check_ids.append("source_conditions")
+    workflow._accept_reading(decision)
+    assert len(workflow.repair_resolutions) == 1
+    assert set(workflow.requirements) == {"r1"}
+    result = workflow._result("unavailable", gap="Final legal review did not pass")
+    assert result.answer is None
+    assert {check.id for check in result.repair_checks} == {
+        "claim:c1",
+        "source_conditions",
+    }
+    assert result.repair_resolutions[0].check_ids == ["claim:c1", "source_conditions"]
+
+
+def test_repair_support_cannot_invent_a_canonical_passage() -> None:
+    workflow = prepare_repair("claim:c1")
+    decision = repair_reading()
+    decision.repair_resolutions[0].supports = [
+        PassageSupport(citation=1, span_number=999)
+    ]
+    with pytest.raises(ValueError):
+        workflow._accept_reading(decision)
+    assert workflow.repair_resolutions == []
+
+
+@pytest.mark.parametrize("scope", ["research", "draft"])
+def test_finding_correction_cannot_leave_research_unchanged(scope: str) -> None:
+    workflow = prepare_repair("finding:r1")
+    decision = repair_reading("finding:r1")
+    decision.repair_resolutions[0] = decision.repair_resolutions[0].model_copy(
+        update={"scope": scope}
+    )
+    with pytest.raises(ValueError, match="changed finding or linked assessment"):
+        workflow._accept_reading(decision)
+    assert workflow.repair_resolutions == []
+
+
+def test_finding_correction_and_affected_assessment_are_persistent_across_source_return() -> (
+    None
+):
+    workflow = prepare_repair("finding:r1", "draft:i1:legal_basis_and_hierarchy")
+    decision = repair_reading("finding:r1")
+    decision.repair_resolutions[0].scope = "research"
+    decision.repair_resolutions[0].check_ids.append(
+        "draft:i1:legal_basis_and_hierarchy"
+    )
+    replacement = requirement("r2")
+    replacement.rule = "The document condition must be satisfied before acceptance."
+    replacement.supersedes_requirement_ids = ["r1"]
+    decision.requirements = [replacement]
+    decision.dimensions = [assessment("i1", LegalDimension.LEGAL_BASIS, ["r2"])]
+    workflow._accept_reading(decision)
+    followup = RepairReadingDecision(
+        dimensions=[], repair_resolutions=decision.repair_resolutions
+    )
+    workflow._accept_reading(followup)
+    assert set(workflow.requirements) == {"r2"}
+    assert "r1" in workflow.requirement_history
+    assert workflow.dimensions[0].requirement_ids == ["r2"]
+    assert workflow.repair_resolutions[0].scope == "research"
+
+
+def test_disputed_flag_retains_grounded_rebuttal_without_changing_the_gate() -> None:
+    workflow = prepare_repair("finding:r1")
+    decision = repair_reading("finding:r1")
+    decision.repair_resolutions[0].disposition = "disputed"
+    workflow._accept_reading(decision)
+    assert set(workflow.requirements) == {"r1"}
+    assert workflow.final_review is not None and workflow.final_review.flags
+    assert workflow._result("unavailable").answer is None
+
+
+def test_unresolved_repair_gap_keeps_issue_open_and_must_be_disclosed() -> None:
+    workflow = prepare_repair("claim:c1")
+    decision = repair_reading()
+    decision.repair_resolutions[0].disposition = "unresolved"
+    decision.repair_resolutions[0].supports = []
+    decision.repair_resolutions[
+        0
+    ].correction = "The operative document requirement could not be established."
+    workflow._accept_reading(decision)
+    assert workflow.issue_closures()[0].status == "open"
+    assert decision.repair_resolutions[0].correction in workflow.gaps
+    with pytest.raises(ValueError, match="all unresolved"):
+        workflow._validate_draft(draft())
+    disclosed = workflow._disclose_validity(draft())
+    workflow._validate_draft(disclosed)
+    assert disclosed.unresolved_issue_ids == ["i1"]
+
+
+def test_repair_diagnostics_reach_writer_but_not_independent_review_input() -> None:
+    workflow, gateway, reviewer = engine(
+        [plan(), reading(), draft(), repair_reading(), draft()],
+        ["pass", "flag", "pass"],
+    )
+    result = workflow.run("Soru", "")
+    assert result.status == "partial" and result.repair_used
+    assert gateway.response_models[3] is RepairReadingDecision
+    assert gateway.prompts[1] == READING_PROMPT
+    assert gateway.prompts[3] == REPAIR_READING_PROMPT
+    assert gateway.calls[3][1]["repair_contract"] == {
+        "required_check_ids": ["claim:c1"],
+        "grouped_check_ids_allowed": True,
+    }
+    assert gateway.calls[4][1]["repair_resolutions"]
+    assert len(gateway.calls) == 5 and len(reviewer.states) == 3
+    assert all(
+        "repair_resolutions" not in state and "repair_contract" not in state
+        for state in reviewer.states
+    )
+    assert result.repair_resolutions and result.repair_checks

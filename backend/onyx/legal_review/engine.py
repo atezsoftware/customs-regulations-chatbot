@@ -24,6 +24,8 @@ from onyx.legal_review.models import (
     LegalDimension,
     PassageSupport,
     ReadingDecision,
+    RepairReadingDecision,
+    RepairResolution,
     Requirement,
     RequirementRecord,
     ReviewCheck,
@@ -42,6 +44,7 @@ from onyx.prompts.legal_review.prompts import (
     PLAN_PROMPT,
     READING_PROMPT,
     REPAIR_PROMPT,
+    REPAIR_READING_PROMPT,
 )
 from onyx.regulatory.structured_llm import StructuredOutputValidationError
 from onyx.tracing.answer_graph import graph_step
@@ -177,6 +180,13 @@ class LegalReviewEngine:
         self.final_review: ReviewResult | None = None
         self.repair_used = False
         self.pending_actions: list[SourceAction] = []
+        self.repair_checks: dict[str, ReviewCheck] = {}
+        self.repair_resolutions: list[RepairResolution] = []
+        self._repair_requirements: dict[str, RequirementRecord] = {}
+        self._repair_dimensions: dict[
+            tuple[str, LegalDimension], DimensionAssessment
+        ] = {}
+        self._repair_check_issues: dict[str, set[str]] = {}
 
     def state(
         self, request: str, history: str, draft: DraftAnswer | None = None
@@ -241,6 +251,13 @@ class LegalReviewEngine:
             "final_review": self.final_review.model_dump(mode="json")
             if self.final_review
             else None,
+            "repair_contract": {
+                "required_check_ids": list(self.repair_checks),
+                "grouped_check_ids_allowed": True,
+            },
+            "repair_resolutions": [
+                row.model_dump(mode="json") for row in self.repair_resolutions
+            ],
         }
 
     def _stage_requirements(
@@ -424,6 +441,8 @@ class LegalReviewEngine:
             proposed, decision.dimensions, pending, history
         )
         triggers = self._validate_source_issues(proposed, pending, history, dimensions)
+        if isinstance(decision, RepairReadingDecision):
+            self._validate_repair_resolutions(decision, pending, dimensions)
         associations = dict(self.requirement_associations)
         for row in dimensions:
             for identity in row.requirement_ids:
@@ -462,10 +481,124 @@ class LegalReviewEngine:
         self.dimensions = dimensions
         self.requirement_associations = associations
         self.source_issue_triggers = triggers
-        self.gaps = list(decision.evidence_gaps)
+        if isinstance(decision, RepairReadingDecision):
+            self.repair_resolutions = [
+                row.model_copy(deep=True) for row in decision.repair_resolutions
+            ]
+        self.gaps = list(
+            dict.fromkeys(
+                [
+                    *decision.evidence_gaps,
+                    *(
+                        row.correction
+                        for row in self.repair_resolutions
+                        if row.disposition == "unresolved"
+                    ),
+                ]
+            )
+        )
         self.plan = proposed
         decision.actions = list(combined.values())
         self.pending_actions = list(decision.actions)
+
+    def _start_repair(self, draft: DraftAnswer) -> None:
+        if self.repair_checks:
+            return
+        assert self.plan is not None and self.final_review is not None
+        self.repair_checks = {check.id: check for check in self.final_review.flags}
+        self._repair_requirements = {
+            identity: record.model_copy(deep=True)
+            for identity, record in self.requirements.items()
+        }
+        self._repair_dimensions = {
+            (row.issue_id, row.dimension): row.model_copy(deep=True)
+            for row in self.dimensions
+        }
+        claims = {claim.claim_id: claim for claim in draft.claims}
+        for check in self.repair_checks.values():
+            if check.issue_id is not None:
+                issues = {check.issue_id}
+            elif check.requirement_id is not None:
+                issues = {
+                    row.issue_id
+                    for row in self.dimensions
+                    if check.requirement_id in row.requirement_ids
+                }
+            elif check.claim_id is not None and check.claim_id in claims:
+                issues = set(claims[check.claim_id].issue_ids)
+            else:
+                issues = {issue.issue_id for issue in self.plan.issues}
+            self._repair_check_issues[check.id] = issues
+
+    def _validate_repair_resolutions(
+        self,
+        decision: RepairReadingDecision,
+        requirements: dict[str, RequirementRecord],
+        dimensions: list[DimensionAssessment],
+    ) -> None:
+        identities = [
+            identity
+            for resolution in decision.repair_resolutions
+            for identity in resolution.check_ids
+        ]
+        if (
+            not self.repair_checks
+            or len(identities) != len(set(identities))
+            or set(identities) != set(self.repair_checks)
+        ):
+            raise ValueError(
+                "Repair resolutions must cover every flagged check exactly once"
+            )
+        rows = {(row.issue_id, row.dimension): row for row in dimensions}
+        changed_rows = {
+            key for key, row in rows.items() if self._repair_dimensions.get(key) != row
+        }
+        research_changed = requirements != self._repair_requirements or bool(
+            changed_rows
+        )
+        for resolution in decision.repair_resolutions:
+            for support in resolution.supports:
+                validate_support(support, self.ledger)
+            if resolution.disposition != "correct":
+                continue
+            for identity in resolution.check_ids:
+                check = self.repair_checks[identity]
+                if check.requirement_id is not None:
+                    bound_rows = {
+                        key
+                        for key, row in self._repair_dimensions.items()
+                        if check.requirement_id in row.requirement_ids
+                    }
+                    finding_changed = requirements.get(
+                        check.requirement_id
+                    ) != self._repair_requirements.get(check.requirement_id)
+                    if resolution.scope != "research" or not (
+                        finding_changed or changed_rows & bound_rows
+                    ):
+                        raise ValueError(
+                            "A corrected finding flag requires a changed finding or linked assessment"
+                        )
+                elif resolution.scope == "research":
+                    if check.issue_id is not None and check.dimension is not None:
+                        changed = (
+                            check.issue_id,
+                            LegalDimension(check.dimension),
+                        ) in changed_rows
+                    else:
+                        changed = research_changed
+                    if not changed:
+                        raise ValueError(
+                            "A research correction must change its bound research state"
+                        )
+
+    def _unresolved_repair_issue_ids(self) -> set[str]:
+        return {
+            issue_id
+            for resolution in self.repair_resolutions
+            if resolution.disposition == "unresolved"
+            for identity in resolution.check_ids
+            for issue_id in self._repair_check_issues.get(identity, ())
+        }
 
     def _acquire(
         self, actions: list[SourceAction], *, finalizing: bool = False
@@ -595,6 +728,7 @@ class LegalReviewEngine:
             return []
         closures: dict[str, IssueClosure] = {}
         children: dict[str, list[str]] = {}
+        unresolved_repairs = self._unresolved_repair_issue_ids()
         for issue in self.plan.issues:
             if issue.parent_issue_id is not None:
                 children.setdefault(issue.parent_issue_id, []).append(issue.issue_id)
@@ -616,6 +750,11 @@ class LegalReviewEngine:
             ):
                 status = "open"
                 reasons.append("Requested source operations remain unexecuted")
+            if issue.issue_id in unresolved_repairs:
+                status = "open"
+                reasons.append(
+                    "A material legal limitation identified during repair remains unresolved"
+                )
             if status == "closed" and any(
                 row.validity == "unknown" or row.legal_status in {"unknown", "annulled"}
                 for row in requirements
@@ -657,10 +796,21 @@ class LegalReviewEngine:
     ) -> ReadingDecision:
         assert self.plan is not None
         self.report("reading", self.plan.language)
+        repairing = (
+            draft is not None
+            and self.final_review is not None
+            and bool(self.final_review.flags)
+        )
+        if repairing and draft is not None:
+            self._start_repair(draft)
         decision = self.gateway.complete(
-            READING_PROMPT,
+            REPAIR_READING_PROMPT if repairing else READING_PROMPT,
             self.state(request, history, draft),
-            InitialReadingDecision if not self.dimensions else ReadingDecision,
+            RepairReadingDecision
+            if repairing
+            else InitialReadingDecision
+            if not self.dimensions
+            else ReadingDecision,
             LLMFlow.LEGAL_REVIEW_READING,
             finalizing=finalizing,
         )
@@ -794,6 +944,8 @@ class LegalReviewEngine:
                 "source_operations",
                 "early_review",
                 "final_review",
+                "repair_contract",
+                "repair_resolutions",
             }
         }
         diagnostic_keys = {
@@ -979,6 +1131,8 @@ class LegalReviewEngine:
                 "early_review": self.early_review,
                 "final_review": self.final_review,
                 "repair_used": self.repair_used,
+                "repair_checks": list(self.repair_checks.values()),
+                "repair_resolutions": self.repair_resolutions,
             }
         )
 
