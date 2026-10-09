@@ -1,99 +1,97 @@
-name: DEV amendment approval diagnostics
+name: DEV legal review read-only preflight
+
 on:
   workflow_dispatch:
     inputs:
       operation:
+        description: Read-only inspection only
         type: choice
-        options: [inspect, approve_462, approve_465, approve_470]
+        options: [inspect]
+        required: true
         default: inspect
+      expected_backend_commit:
+        description: Exact deployed backend commit SHA
+        type: string
+        required: true
+
 permissions:
   contents: read
+
 jobs:
   inspect:
     runs-on: codebuild-customs-regulations-runner-${{ github.run_id }}-${{ github.run_attempt }}
-    timeout-minutes: 10
+    timeout-minutes: 8
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
           persist-credentials: false
-      - name: Read only batch inventory
-        shell: bash
-        run: |
-          set -euo pipefail
-          aws eks update-kubeconfig --name atez-dev-cluster --region eu-central-1
-          kubectl get pods -n customs-regulations-dev -o json > /tmp/amendment-pods.json
-          python - <<'PY'
-          import json
-          from pathlib import Path
-          pods=json.loads(Path('/tmp/amendment-pods.json').read_text())['items']
-          ready=[]
-          for pod in pods:
-              if pod['status']['phase']!='Running' or pod['metadata'].get('deletionTimestamp'):
-                  continue
-              statuses={item['name']:item for item in pod['status'].get('containerStatuses',[])}
-              for container in pod['spec']['containers']:
-                  image=container['image']
-                  if 'customs-regulations-backend-lite-dev:' in image and statuses.get(container['name'],{}).get('ready'):
-                      ready.append((pod['metadata']['name'],container['name'],image))
-          if not ready:
-              raise SystemExit('No ready DEV backend container')
-          ready.sort()
-          pod,container,image=ready[0]
-          print('TARGET',pod,container,image)
-          Path('/tmp/amendment-target').write_text(pod+'\t'+container+'\n')
-          PY
-          IFS=$'\t' read -r pod container < /tmp/amendment-target
-          kubectl exec -i "$pod" -n customs-regulations-dev -c "$container" -- \
-            sh -ec '. /vault/secrets/config; export PYTHONPATH=/app; exec python -' < \
-            backend/onyx/db/diagnose_amendment_batches_299_310.py
-      - name: Filter amendment approval worker errors
-        if: inputs.operation == 'inspect'
-        shell: bash
-        run: |
-          set -euo pipefail
-          python - <<'PY'
-          import json
-          import re
-          import subprocess
-          from pathlib import Path
-
-          pods = json.loads(Path('/tmp/amendment-pods.json').read_text())['items']
-          needles = re.compile(r'Amendment proposal (460|462|465|470) approval failed|amendment_(prepared|approved) proposal_id=(460|462|465|470)')
-          for pod in pods:
-              name = pod['metadata']['name']
-              if pod['status']['phase'] != 'Running' or 'background' not in name:
-                  continue
-              for container in pod['spec']['containers']:
-                  result = subprocess.run(
-                      ['kubectl', 'logs', name, '-n', 'customs-regulations-dev',
-                       '-c', container['name'], '--since=36h', '--tail=30000'],
-                      capture_output=True, text=True, check=False,
-                  )
-                  if result.returncode:
-                      print('LOG_READ_FAILED', name, container['name'], result.returncode)
-                      continue
-                  lines = result.stdout.splitlines()
-                  print('LOG_SCAN', name, container['name'], len(lines))
-                  for index, line in enumerate(lines):
-                      if needles.search(line):
-                          print('LOG_MATCH', name, container['name'])
-                          for excerpt in lines[index:index + 45]:
-                              print(excerpt[:500])
-          PY
-      - name: Resume one existing reviewed proposal
-        if: inputs.operation != 'inspect'
+      - name: Select the exact Ready DEV API deployment
+        id: target
         shell: bash
         env:
           OPERATION: ${{ inputs.operation }}
+          EXPECTED_BACKEND_COMMIT: ${{ inputs.expected_backend_commit }}
         run: |
           set -euo pipefail
-          case "$OPERATION" in
-            approve_462) proposal_id=462 ;;
-            approve_465) proposal_id=465 ;;
-            approve_470) proposal_id=470 ;;
-            *) exit 2 ;;
-          esac
-          IFS=$'\t' read -r pod container < /tmp/amendment-target
+          [[ "$OPERATION" == "inspect" ]]
+          [[ "$EXPECTED_BACKEND_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          aws eks update-kubeconfig --name atez-dev-cluster --region eu-central-1
+          kubectl get pods -n customs-regulations-dev -l app=dev-customs-regulations-api -o json > /tmp/legal-review-pods.json
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          expected = os.environ['EXPECTED_BACKEND_COMMIT']
+          pods = json.loads(Path('/tmp/legal-review-pods.json').read_text())['items']
+          ready = [
+              pod for pod in pods
+              if pod['status'].get('phase') == 'Running'
+              and not pod['metadata'].get('deletionTimestamp')
+              and any(condition.get('type') == 'Ready' and condition.get('status') == 'True'
+                      for condition in pod['status'].get('conditions', []))
+          ]
+          if len(ready) != 1:
+              raise SystemExit('Expected exactly one Ready DEV API pod')
+          pod = ready[0]
+          statuses = {item['name']: item for item in pod['status'].get('containerStatuses', [])}
+          targets = [
+              container for container in pod['spec']['containers']
+              if container['image'].rsplit('/', 1)[-1] == 'customs-regulations-backend-lite-dev:' + expected
+              and statuses.get(container['name'], {}).get('ready') is True
+          ]
+          if len(targets) != 1:
+              raise SystemExit('Expected exactly one Ready API container at the requested image SHA')
+          container = targets[0]
+          print(json.dumps({'pod': pod['metadata']['name'], 'container': container['name'],
+                            'image': container['image']}, sort_keys=True))
+          Path('/tmp/legal-review-target').write_text(pod['metadata']['name'] + '\t' + container['name'] + '\n')
+          PY
+      - name: Inspect DEV database, Redis isolation and configured model
+        shell: bash
+        run: |
+          set -euo pipefail
+          IFS=$'\t' read -r pod container < /tmp/legal-review-target
           kubectl exec -i "$pod" -n customs-regulations-dev -c "$container" -- \
-            sh -ec '. /vault/secrets/config; export PYTHONPATH=/app; exec python - "$1"' sh "$proposal_id" < \
-            backend/onyx/db/resume_amendment_approvals_309_310.py
+            sh -ec '. /vault/secrets/config; export PYTHONPATH=/app; exec python -' < \
+            backend/onyx/db/legal_review_dev_preflight.py
+      - name: Verify the public frontend API reports the requested backend SHA
+        if: always() && steps.target.outcome == 'success'
+        shell: bash
+        env:
+          EXPECTED_BACKEND_COMMIT: ${{ inputs.expected_backend_commit }}
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --max-time 20 --proto '=https' \
+            https://dev-customs-regulations.singlewindow.io/api/version > /tmp/legal-review-public-version.json
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          result = json.loads(Path('/tmp/legal-review-public-version.json').read_text())
+          version = result.get('backend_version')
+          if version != os.environ['EXPECTED_BACKEND_COMMIT']:
+              raise SystemExit('Public frontend API backend SHA mismatch')
+          print(json.dumps({'public_backend_commit': version, 'frontend_api_verified': True}, sort_keys=True))
+          PY
