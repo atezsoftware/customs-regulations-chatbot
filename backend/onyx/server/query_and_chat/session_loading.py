@@ -551,13 +551,18 @@ def create_asv3_progress_packets(
         return packets
     progress_events: list[ASv3Progress] = []
     supersearch_checkpoint = checkpoint.get("asv3_workflow_variant") == "supersearch"
+    legal_review_checkpoint = checkpoint.get("asv3_workflow_variant") == "legal_review"
     for event in events:
         try:
             progress = ASv3Progress.model_validate(event)
         except ValidationError:
             logger.warning("Invalid ASv3 public progress event skipped")
             continue
-        if supersearch_checkpoint or progress.workflow == "supersearch":
+        if legal_review_checkpoint or progress.workflow == "legal_review":
+            progress = progress.model_copy(
+                update={"workflow": "legal_review", "resume_label": None}
+            )
+        elif supersearch_checkpoint or progress.workflow == "supersearch":
             progress = progress.model_copy(
                 update={"workflow": "supersearch", "resume_label": None}
             )
@@ -567,8 +572,11 @@ def create_asv3_progress_packets(
         event.task_id is None and event.status in {"completed", "failed", "cancelled"}
         for event in progress_events
     )
-    workflow: Literal["asv3", "supersearch"] = (
-        "supersearch"
+    workflow: Literal["asv3", "supersearch", "legal_review"] = (
+        "legal_review"
+        if legal_review_checkpoint
+        or any(event.workflow == "legal_review" for event in progress_events)
+        else "supersearch"
         if supersearch_checkpoint
         or any(event.workflow == "supersearch" for event in progress_events)
         else "asv3"
@@ -626,7 +634,7 @@ def create_asv3_progress_packets(
                 title=cast(str, notice[0]),
                 message=cast(str, notice[1]),
                 resume_label=None
-                if has_citable_external or workflow == "supersearch"
+                if has_citable_external or workflow in {"supersearch", "legal_review"}
                 else resume[0],
             ),
         )

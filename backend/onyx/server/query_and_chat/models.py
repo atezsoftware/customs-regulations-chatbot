@@ -133,6 +133,8 @@ class SendMessageRequest(BaseModel):
     legal_composite: bool = False
     # Independent, selected-model research confined to the PC Külliyatı corpus.
     supersearch: bool = False
+    # Independent Gemini Flash discovery with evidence and answer JEV checks.
+    legal_review: bool = False
     asv3_research_profile: Literal["normal", "deep", "experimental"] = "deep"
     asv3_parallel_research: bool = False
     asv3_guarded_experimental: bool = False
@@ -174,6 +176,37 @@ class SendMessageRequest(BaseModel):
 
     @model_validator(mode="after")
     def check_chat_session_id_or_info(self) -> "SendMessageRequest":
+        if self.legal_review and any(
+            (
+                self.atez_search,
+                self.atez_search_v2,
+                self.atez_search_v3,
+                self.legal_composite,
+                self.supersearch,
+                self.deep_research,
+                self.atez_search_v2_labels,
+                bool(self.atez_search_v2_label_run_ids),
+                self.asv3_allow_external,
+                self.asv3_parallel_research,
+                self.asv3_guarded_experimental,
+                self.asv3_guardrails_v2,
+                self.asv3_resume_message_id is not None,
+                self.asv3_research_profile != "deep",
+            )
+        ):
+            raise ValueError(
+                "Legal Review is mutually exclusive with other workflows and research options"
+            )
+        if self.legal_review and self.llm_overrides and len(self.llm_overrides) > 1:
+            raise ValueError("Legal Review uses one Gemini 3.8 Flash model")
+        if self.legal_review and (
+            self.file_descriptors
+            or self.additional_context
+            or self.forced_tool_id is not None
+        ):
+            raise ValueError(
+                "Legal Review accepts indexed corpus sources only; attachments, additional context and forced tools are unavailable"
+            )
         if self.supersearch and any(
             (
                 self.atez_search,

@@ -93,6 +93,7 @@ export interface OnSubmitProps {
   atezSearchV2?: boolean;
   atezSearchV3?: boolean;
   legalComposite?: boolean;
+  legalReview?: boolean;
   supersearch?: boolean;
   experimentalResearch?: boolean;
   experimentalParallelResearch?: boolean;
@@ -390,6 +391,7 @@ export default function useChatController({
       atezSearchV2 = false,
       atezSearchV3 = false,
       legalComposite = false,
+      legalReview = false,
       supersearch = false,
       experimentalResearch = false,
       experimentalParallelResearch = false,
@@ -408,6 +410,12 @@ export default function useChatController({
     }: OnSubmitProps) => {
       const isMultiModel =
         !regenerationRequest && (selectedModels?.length ?? 0) >= 2;
+      if (legalReview && isMultiModel) {
+        toast.error(
+          "Hukuki İnceleme (Flash) tek modelle çalışır. Ek modelleri kaldırın."
+        );
+        return;
+      }
       const projectId = params(SEARCH_PARAM_NAMES.PROJECT_ID);
       {
         const params = new URLSearchParams(searchParams?.toString() || "");
@@ -623,12 +631,13 @@ export default function useChatController({
 
       // PC-only requests omit attachments while retaining draft files in the input.
       // Edits preserve original files; regeneration already reuses its user node.
-      const effectiveFileDescriptors = supersearch
-        ? []
-        : [
-            ...projectFilesToFileDescriptors(currentMessageFiles),
-            ...(!regenerationRequest ? (messageToResend?.files ?? []) : []),
-          ];
+      const effectiveFileDescriptors =
+        supersearch || legalReview
+          ? []
+          : [
+              ...projectFilesToFileDescriptors(currentMessageFiles),
+              ...(!regenerationRequest ? (messageToResend?.files ?? []) : []),
+            ];
 
       updateChatStateAction(frozenSessionId, "loading");
       setLatestMessageRenderComplete(frozenSessionId, false);
@@ -698,6 +707,7 @@ export default function useChatController({
         if (supersearch) {
           initialAgentNode.supersearch = true;
         }
+        if (legalReview) initialAgentNode.legalReview = true;
         initialAgentNode.asv3 =
           atezSearchV3 ||
           experimentalResearch ||
@@ -707,8 +717,12 @@ export default function useChatController({
           Boolean(deepResearch && liveAgent?.id === 0 && !projectId);
         // Freeze provenance on the answer itself; changing the input selector
         // later must not relabel historical assistant messages.
-        initialAgentNode.overridden_model = finalLLM.modelName;
-        initialAgentNode.modelDisplayName = finalLLM.modelName;
+        initialAgentNode.overridden_model = legalReview
+          ? "gemini-3.8-flash"
+          : finalLLM.modelName;
+        initialAgentNode.modelDisplayName = legalReview
+          ? "Gemini 3.8 Flash"
+          : finalLLM.modelName;
       }
 
       // make messages appear + clear input bar
@@ -732,10 +746,11 @@ export default function useChatController({
       const stopReason: StreamStopReason | null = null;
       let query: string | null = null;
       let retrievalType: RetrievalType =
-        !supersearch && selectedDocuments.length > 0
+        !supersearch && !legalReview && selectedDocuments.length > 0
           ? RetrievalType.SelectedDocs
           : RetrievalType.None;
-      let documents: OnyxDocument[] = supersearch ? [] : selectedDocuments;
+      let documents: OnyxDocument[] =
+        supersearch || legalReview ? [] : selectedDocuments;
       let citations: CitationMap = {};
       let aiMessageImages: FileDescriptor[] | null = null;
       let error: string | null = null;
@@ -1011,6 +1026,7 @@ export default function useChatController({
           atezSearchV2,
           atezSearchV3,
           legalComposite,
+          legalReview,
           supersearch,
           experimentalResearch,
           experimentalParallelResearch,
@@ -1423,6 +1439,7 @@ export default function useChatController({
           : [
               {
                 nodeId: initialAgentNode.nodeId,
+                ...(legalReview ? { legalReview: true } : {}),
                 ...(supersearch
                   ? {
                       supersearch: true,

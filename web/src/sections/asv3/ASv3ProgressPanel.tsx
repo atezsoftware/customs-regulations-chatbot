@@ -31,6 +31,7 @@ interface ASv3ProgressPanelProps {
   pending?: boolean;
   agent?: MinimalAgent;
   hasDisplayContent?: boolean;
+  workflowLabel?: string;
 }
 
 interface TaskStatusIconProps {
@@ -230,6 +231,7 @@ export default function ASv3ProgressPanel({
   pending = false,
   agent,
   hasDisplayContent = false,
+  workflowLabel = "ASv3",
 }: ASv3ProgressPanelProps) {
   const detailsId = useId();
   const [expanded, setExpanded] = useState(false);
@@ -270,7 +272,7 @@ export default function ASv3ProgressPanel({
   const pastSteps = [...history, ...actions]
     .filter((step) => step.event_id !== header?.event_id)
     .sort((left, right) => left.sequence - right.sequence);
-  const title = header ? progressTitle(header) : "ASv3";
+  const title = header ? progressTitle(header) : workflowLabel;
   const hasHeaderMessage = Boolean(
     header?.message?.trim() && header.message.trim() !== "…"
   );
@@ -279,7 +281,7 @@ export default function ASv3ProgressPanel({
   );
   return (
     <section
-      aria-label="ASv3"
+      aria-label={workflowLabel}
       aria-live="polite"
       aria-busy={active}
       lang={header?.language}

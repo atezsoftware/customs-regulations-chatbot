@@ -51,6 +51,10 @@ export default function useDeepResearchToggle({
     );
   }, []);
 
+  const toggleLegalReview = useCallback(() => {
+    setMode((current) => (current === "legal_review" ? null : "legal_review"));
+  }, []);
+
   const toggleLegalComposite = useCallback(() => {
     setMode((current) =>
       current === "legal_composite" ? null : "legal_composite"
@@ -62,6 +66,8 @@ export default function useDeepResearchToggle({
   }, []);
 
   return {
+    legalReviewEnabled: mode === "legal_review",
+    toggleLegalReview,
     supersearchEnabled: mode === "supersearch",
     toggleSupersearch,
     legalCompositeEnabled: mode === "legal_composite",

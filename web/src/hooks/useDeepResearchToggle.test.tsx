@@ -4,6 +4,50 @@ import useDeepResearchToggle from "@/hooks/useDeepResearchToggle";
 describe("research mode selection", () => {
   afterEach(cleanup);
 
+  it.each([
+    ["toggleAtezSearchV3", "atezSearchV3Enabled"],
+    ["toggleDeepResearch", "deepResearchEnabled"],
+    ["toggleExperimentalResearch", "experimentalResearchEnabled"],
+    [
+      "toggleExperimentalParallelResearch",
+      "experimentalParallelResearchEnabled",
+    ],
+    ["toggleExperimentalGuardrails", "experimentalGuardrailsEnabled"],
+    ["toggleExperimentalGuardrailsV2", "experimentalGuardrailsV2Enabled"],
+    ["toggleLegalComposite", "legalCompositeEnabled"],
+    ["toggleSupersearch", "supersearchEnabled"],
+  ] as const)(
+    "switches Legal Review exclusively with %s in both directions",
+    (toggle, enabled) => {
+      const { result } = renderHook(() =>
+        useDeepResearchToggle({ chatSessionId: null, agentId: 0 })
+      );
+      act(() => result.current[toggle]());
+      act(() => result.current.toggleLegalReview());
+      expect(result.current.legalReviewEnabled).toBe(true);
+      expect(result.current[enabled]).toBe(false);
+      act(() => result.current[toggle]());
+      expect(result.current[enabled]).toBe(true);
+      expect(result.current.legalReviewEnabled).toBe(false);
+    }
+  );
+
+  it("keeps Legal Review through chat creation and resets on navigation or agent changes", () => {
+    const { result, rerender } = renderHook(
+      ({ chatSessionId, agentId }) =>
+        useDeepResearchToggle({ chatSessionId, agentId }),
+      { initialProps: { chatSessionId: null as string | null, agentId: 0 } }
+    );
+    act(() => result.current.toggleLegalReview());
+    rerender({ chatSessionId: "session-1", agentId: 0 });
+    expect(result.current.legalReviewEnabled).toBe(true);
+    rerender({ chatSessionId: "session-2", agentId: 0 });
+    expect(result.current.legalReviewEnabled).toBe(false);
+    act(() => result.current.toggleLegalReview());
+    rerender({ chatSessionId: "session-2", agentId: 1 });
+    expect(result.current.legalReviewEnabled).toBe(false);
+  });
+
   it("selects Supersearch exclusively, preserves it on creation and resets on navigation", () => {
     const { result, rerender } = renderHook(
       ({ chatSessionId, agentId }) =>

@@ -66,6 +66,7 @@ export interface AgentMessageProps {
   /** When on, drop the message's reading-width padding so it sits flush with the chat edge. */
   fullWidthChat?: boolean;
   asv3?: boolean;
+  legalReview?: boolean;
 }
 
 // TODO: Consider more robust comparisons:
@@ -100,6 +101,7 @@ function arePropsEqual(
     prev.usage === next.usage &&
     prev.hideFooter === next.hideFooter &&
     prev.asv3 === next.asv3 &&
+    prev.legalReview === next.legalReview &&
     prev.fullWidthChat === next.fullWidthChat
     // Skip: chatState.regenerate, chatState.setPresentingDocument,
     //       most of llmManager, onMessageSelection (function/object props)
@@ -124,9 +126,10 @@ const AgentMessage = React.memo(function AgentMessage({
   disableTTS,
   fullWidthChat,
   asv3,
+  legalReview,
 }: AgentMessageProps) {
   const asv3Progress = useASv3Progress(rawPackets, nodeId);
-  const isASv3 = Boolean(asv3) || asv3Progress.runId !== null;
+  const isASv3 = Boolean(asv3 || legalReview) || asv3Progress.runId !== null;
   const markdownRef = useRef<HTMLDivElement>(null);
   const finalAnswerRef = useRef<HTMLDivElement>(null);
   useEffect(() => registerMarkdownCopyHandler(markdownRef), []);
@@ -321,12 +324,19 @@ const AgentMessage = React.memo(function AgentMessage({
 
       {isASv3 ? (
         <ASv3ProgressPanel
+          workflowLabel={
+            legalReview || asv3Progress.header?.workflow === "legal_review"
+              ? "Hukuki İnceleme (Flash)"
+              : undefined
+          }
           agent={effectiveChatState.agent}
           hasDisplayContent={pacedDisplayGroups.length > 0}
-          pending={Boolean(asv3) && !asv3Progress.header}
+          pending={Boolean(asv3 || legalReview) && !asv3Progress.header}
           state={asv3Progress}
           stopped={stopPacketSeen}
           onResume={
+            !legalReview &&
+            asv3Progress.header?.workflow !== "legal_review" &&
             asv3Progress.header?.workflow !== "supersearch" &&
             messageId &&
             parentMessage &&

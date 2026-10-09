@@ -207,6 +207,7 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
         atezSearchV2: atezSearchV2EnabledForCurrentWorkflow,
         atezSearchV3: atezSearchV3EnabledForCurrentWorkflow,
         legalComposite: legalCompositeEnabledForCurrentWorkflow,
+        legalReview: legalReviewEnabledForCurrentWorkflow,
         supersearch: supersearchEnabledForCurrentWorkflow,
         experimentalResearch: experimentalResearchEnabledForCurrentWorkflow,
         experimentalParallelResearch:
@@ -241,6 +242,8 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
     atezSearchV3Enabled,
     toggleAtezSearchV3,
     legalCompositeEnabled,
+    legalReviewEnabled,
+    toggleLegalReview,
     toggleLegalComposite,
     supersearchEnabled,
     toggleSupersearch,
@@ -275,6 +278,10 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
     currentProjectId === null &&
     (selectedAgent ?? liveAgent)?.id === 0 &&
     supersearchEnabled;
+  const legalReviewEnabledForCurrentWorkflow =
+    currentProjectId === null &&
+    (selectedAgent ?? liveAgent)?.id === 0 &&
+    legalReviewEnabled;
   const legalCompositeEnabledForCurrentWorkflow =
     currentProjectId === null &&
     (selectedAgent ?? liveAgent)?.id === 0 &&
@@ -389,8 +396,16 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
 
   const resetInputBar = useCallback(() => {
     chatInputBarRef.current?.reset();
-    if (!supersearchEnabledForCurrentWorkflow) setCurrentMessageFiles([]);
-  }, [setCurrentMessageFiles, supersearchEnabledForCurrentWorkflow]);
+    if (
+      !supersearchEnabledForCurrentWorkflow &&
+      !legalReviewEnabledForCurrentWorkflow
+    )
+      setCurrentMessageFiles([]);
+  }, [
+    setCurrentMessageFiles,
+    supersearchEnabledForCurrentWorkflow,
+    legalReviewEnabledForCurrentWorkflow,
+  ]);
 
   // Add refs needed by useChatSessionController
   const chatSessionIdRef = useRef<string | null>(currentChatSessionId);
@@ -593,6 +608,12 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
   }, [currentChatSessionId]);
 
   const handleResubmitLastMessage = useCallback(() => {
+    if (legalReviewEnabledForCurrentWorkflow && multiModel.isMultiModelActive) {
+      toast.error(
+        "Hukuki İnceleme (Flash) tek modelle çalışır. Ek modelleri kaldırın."
+      );
+      return;
+    }
     if (supersearchEnabledForCurrentWorkflow && multiModel.isMultiModelActive) {
       toast.error("Supersearch tek modelle çalışır. Ek modelleri kaldırın.");
       return;
@@ -622,6 +643,7 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
       legalComposite:
         legalCompositeEnabledForCurrentWorkflow &&
         !multiModel.isMultiModelActive,
+      legalReview: legalReviewEnabledForCurrentWorkflow,
       supersearch: supersearchEnabledForCurrentWorkflow,
       experimentalResearch:
         experimentalResearchEnabledForCurrentWorkflow &&
@@ -646,6 +668,7 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
     atezSearchV2EnabledForCurrentWorkflow,
     atezSearchV3EnabledForCurrentWorkflow,
     legalCompositeEnabledForCurrentWorkflow,
+    legalReviewEnabledForCurrentWorkflow,
     supersearchEnabledForCurrentWorkflow,
     experimentalResearchEnabledForCurrentWorkflow,
     experimentalParallelResearchEnabledForCurrentWorkflow,
@@ -660,6 +683,15 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
 
   const onChat = useCallback(
     (message: string) => {
+      if (
+        legalReviewEnabledForCurrentWorkflow &&
+        multiModel.isMultiModelActive
+      ) {
+        toast.error(
+          "Hukuki İnceleme (Flash) tek modelle çalışır. Ek modelleri kaldırın."
+        );
+        return;
+      }
       if (
         supersearchEnabledForCurrentWorkflow &&
         multiModel.isMultiModelActive
@@ -688,6 +720,7 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
         legalComposite:
           legalCompositeEnabledForCurrentWorkflow &&
           !multiModel.isMultiModelActive,
+        legalReview: legalReviewEnabledForCurrentWorkflow,
         supersearch: supersearchEnabledForCurrentWorkflow,
         experimentalResearch:
           experimentalResearchEnabledForCurrentWorkflow &&
@@ -718,6 +751,7 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
       atezSearchV2EnabledForCurrentWorkflow,
       atezSearchV3EnabledForCurrentWorkflow,
       legalCompositeEnabledForCurrentWorkflow,
+      legalReviewEnabledForCurrentWorkflow,
       supersearchEnabledForCurrentWorkflow,
       experimentalResearchEnabledForCurrentWorkflow,
       experimentalParallelResearchEnabledForCurrentWorkflow,
@@ -757,6 +791,15 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
   const handleAppInputBarSubmit = useCallback(
     async (message: string) => {
       if (
+        legalReviewEnabledForCurrentWorkflow &&
+        multiModel.isMultiModelActive
+      ) {
+        toast.error(
+          "Hukuki İnceleme (Flash) tek modelle çalışır. Ek modelleri kaldırın."
+        );
+        return;
+      }
+      if (
         supersearchEnabledForCurrentWorkflow &&
         multiModel.isMultiModelActive
       ) {
@@ -785,6 +828,7 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
           legalComposite:
             legalCompositeEnabledForCurrentWorkflow &&
             !multiModel.isMultiModelActive,
+          legalReview: legalReviewEnabledForCurrentWorkflow,
           supersearch: supersearchEnabledForCurrentWorkflow,
           experimentalResearch:
             experimentalResearchEnabledForCurrentWorkflow &&
@@ -826,6 +870,7 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
       atezSearchV2EnabledForCurrentWorkflow,
       atezSearchV3EnabledForCurrentWorkflow,
       legalCompositeEnabledForCurrentWorkflow,
+      legalReviewEnabledForCurrentWorkflow,
       supersearchEnabledForCurrentWorkflow,
       experimentalResearchEnabledForCurrentWorkflow,
       experimentalParallelResearchEnabledForCurrentWorkflow,
@@ -975,7 +1020,10 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
 
       <div className="w-full h-full overflow-hidden">
         <Dropzone
-          disabled={supersearchEnabledForCurrentWorkflow}
+          disabled={
+            supersearchEnabledForCurrentWorkflow ||
+            legalReviewEnabledForCurrentWorkflow
+          }
           onDrop={(acceptedFiles) =>
             handleMessageSpecificFileUpload(acceptedFiles)
           }
@@ -1026,6 +1074,9 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
                         }
                         atezSearchV3Enabled={
                           atezSearchV3EnabledForCurrentWorkflow
+                        }
+                        legalReviewEnabled={
+                          legalReviewEnabledForCurrentWorkflow
                         }
                         legalCompositeEnabled={
                           legalCompositeEnabledForCurrentWorkflow
@@ -1133,7 +1184,8 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
                             selectedModels={multiModel.selectedModels}
                             onAdd={multiModel.addModel}
                             maxModels={
-                              supersearchEnabledForCurrentWorkflow
+                              supersearchEnabledForCurrentWorkflow ||
+                              legalReviewEnabledForCurrentWorkflow
                                 ? 1
                                 : undefined
                             }
@@ -1220,7 +1272,8 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
                             selectedModels={multiModel.selectedModels}
                             onAdd={multiModel.addModel}
                             maxModels={
-                              supersearchEnabledForCurrentWorkflow
+                              supersearchEnabledForCurrentWorkflow ||
+                              legalReviewEnabledForCurrentWorkflow
                                 ? 1
                                 : undefined
                             }
@@ -1245,6 +1298,9 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
                         atezSearchV3Enabled={
                           atezSearchV3EnabledForCurrentWorkflow
                         }
+                        legalReviewEnabled={
+                          legalReviewEnabledForCurrentWorkflow
+                        }
                         legalCompositeEnabled={
                           legalCompositeEnabledForCurrentWorkflow
                         }
@@ -1265,6 +1321,7 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
                         }
                         toggleAtezSearchV2={toggleAtezSearchV2}
                         toggleAtezSearchV3={toggleAtezSearchV3}
+                        toggleLegalReview={toggleLegalReview}
                         toggleLegalComposite={toggleLegalComposite}
                         toggleSupersearch={toggleSupersearch}
                         toggleExperimentalResearch={toggleExperimentalResearch}

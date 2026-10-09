@@ -12,6 +12,31 @@ import {
 } from "@/lib/asv3/progress";
 import type { ASv3Progress } from "@/app/app/services/streamingModels";
 
+it("labels the new workflow before its first progress event without changing the ASv3 default", () => {
+  const { rerender } = render(
+    <ASv3ProgressPanel
+      state={createASv3ProgressState()}
+      stopped={false}
+      pending
+      workflowLabel="Hukuki İnceleme (Flash)"
+    />
+  );
+  expect(
+    screen.getByRole("region", { name: "Hukuki İnceleme (Flash)" })
+  ).toBeInTheDocument();
+  expect(screen.getByTestId("asv3-progress-title")).toHaveTextContent(
+    "Hukuki İnceleme (Flash)"
+  );
+  rerender(
+    <ASv3ProgressPanel
+      state={createASv3ProgressState()}
+      stopped={false}
+      pending
+    />
+  );
+  expect(screen.getByRole("region", { name: "ASv3" })).toBeInTheDocument();
+});
+
 it.each([
   [
     "tr-TR",

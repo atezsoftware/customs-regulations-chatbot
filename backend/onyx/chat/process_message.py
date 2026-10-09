@@ -723,16 +723,18 @@ def _global_regulatory_search_filters(setup: ChatTurnSetup) -> BaseFilters | Non
     ) or _uses_deep_asv3(setup)
     legal_composite = getattr(setup.new_msg_req, "legal_composite", False) is True
     supersearch = getattr(setup.new_msg_req, "supersearch", False) is True
+    legal_review = getattr(setup.new_msg_req, "legal_review", False) is True
     regulatory_search_enabled = (
         setup.new_msg_req.atez_search
         or atez_search_v2
         or atez_search_v3
         or legal_composite
         or supersearch
+        or legal_review
     )
     source_question = not _is_social_only_message(setup.new_msg_req.message)
     native_labels = (
-        (atez_search_v3 or legal_composite or supersearch)
+        (atez_search_v3 or legal_composite or supersearch or legal_review)
         and source_question
         and not (
             filters is not None
@@ -743,7 +745,9 @@ def _global_regulatory_search_filters(setup: ChatTurnSetup) -> BaseFilters | Non
     updates: dict[str, object] = {
         "source_type": (
             filters.source_type
-            if supersearch and filters is not None and filters.source_type is not None
+            if (supersearch or legal_review)
+            and filters is not None
+            and filters.source_type is not None
             else [DocumentSource.USER_FILE]
         ),
         "regulatory_chunks_only": regulatory_search_enabled and source_question,
@@ -875,6 +879,13 @@ def build_chat_turn(
         )
 
     persona = chat_session.persona
+    if new_msg_req.legal_review and (
+        persona.id != DEFAULT_PERSONA_ID or chat_session.project_id is not None
+    ):
+        raise OnyxError(
+            OnyxErrorCode.INVALID_INPUT,
+            "Hukuki İnceleme requires the default assistant outside projects",
+        )
     is_global_regulatory_chat = persona.id == DEFAULT_PERSONA_ID
     message_text = new_msg_req.message
 
@@ -904,6 +915,7 @@ def build_chat_turn(
             "atez_search_v3": new_msg_req.atez_search_v3,
             **({"legal_composite": True} if new_msg_req.legal_composite else {}),
             **({"supersearch": True} if new_msg_req.supersearch else {}),
+            **({"legal_review": True} if new_msg_req.legal_review else {}),
             "asv3_research_profile": new_msg_req.asv3_research_profile
             if new_msg_req.atez_search_v3
             else None,
@@ -927,6 +939,10 @@ def build_chat_turn(
             or chat_session.llm_override
         ]
     )
+    if new_msg_req.legal_review:
+        from onyx.legal_review.provider import legal_review_override
+
+        selected_overrides = [legal_review_override()]
     for override in selected_overrides:
         llm = get_llm_for_persona(
             persona=persona,
@@ -934,6 +950,10 @@ def build_chat_turn(
             llm_override=override,
             additional_headers=litellm_additional_headers,
         )
+        if new_msg_req.legal_review:
+            from onyx.legal_review.provider import require_legal_review_model
+
+            require_legal_review_model(llm)
         check_llm_cost_limit_for_provider(
             db_session=db_session,
             tenant_id=tenant_id,
@@ -1542,6 +1562,27 @@ def _run_models(
                 supersearch_selected = (
                     getattr(setup.new_msg_req, "supersearch", False) is True
                 )
+                legal_review_selected = (
+                    getattr(setup.new_msg_req, "legal_review", False) is True
+                )
+                if legal_review_selected:
+                    from onyx.legal_review.provider import require_legal_review_model
+
+                    if (
+                        setup.persona.id != DEFAULT_PERSONA_ID
+                        or setup.search_params.project_id_filter is not None
+                        or setup.chat_session.project_id is not None
+                    ):
+                        raise OnyxError(
+                            OnyxErrorCode.INVALID_INPUT,
+                            "Hukuki İnceleme requires the default assistant outside projects",
+                        )
+                    if n_models != 1:
+                        raise OnyxError(
+                            OnyxErrorCode.INVALID_INPUT,
+                            "Hukuki İnceleme uses one Gemini 3.8 Flash model",
+                        )
+                    require_legal_review_model(model_llm)
                 if supersearch_selected:
                     if setup.persona.id != DEFAULT_PERSONA_ID:
                         raise OnyxError(
@@ -1583,7 +1624,7 @@ def _run_models(
                         workspace_setting_enabled=auto_detect_search_filters,
                     ),
                 )
-                if supersearch_selected:
+                if supersearch_selected or legal_review_selected:
                     internal_search = construct_internal_search_tool(
                         persona=setup.persona,
                         emitter=model_emitter,
@@ -1633,7 +1674,33 @@ def _run_models(
                 # Per-thread copy: run_llm_loop mutates simple_chat_history in-place.
                 # Deep Research receives the same internal-only, global regulatory
                 # SearchTool as the standard loop.
-                if supersearch_selected:
+                if legal_review_selected:
+                    from onyx.legal_review.runtime import run_legal_review_loop
+
+                    run_legal_review_loop(
+                        emitter=model_emitter,
+                        state_container=sc,
+                        simple_chat_history=list(setup.simple_chat_history),
+                        tools=model_tools,
+                        llm=model_llm,
+                        token_counter=get_llm_token_counter(model_llm),
+                        user=user,
+                        filters=_global_regulatory_search_filters(setup),
+                        document_set_names_override=_benchmark_document_set_names_override(
+                            setup
+                        ),
+                        user_identity=setup.user_identity,
+                        chat_session_id=setup.chat_session.id,
+                        user_message_id=setup.user_message.id,
+                        assistant_message_id=setup.reserved_messages[model_idx].id,
+                        reasoning_effort=ReasoningEffort.LOW,
+                        include_citations=setup.new_msg_req.include_citations,
+                        cache=setup.cache,
+                        custom_agent_prompt=setup.custom_agent_prompt,
+                        user_memory_context=setup.user_memory_context,
+                        inject_memories_in_prompt=user.use_memories,
+                    )
+                elif supersearch_selected:
                     from onyx.supersearch.runtime import run_supersearch_loop
 
                     run_supersearch_loop(
@@ -1914,6 +1981,7 @@ def _run_models(
                 if (
                     getattr(setup.new_msg_req, "legal_composite", False) is True
                     or getattr(setup.new_msg_req, "supersearch", False) is True
+                    or getattr(setup.new_msg_req, "legal_review", False) is True
                 ) and isinstance(e, OnyxError):
                     model_error_info[model_idx] = LLMErrorInfo(
                         message=e.detail,
@@ -2512,6 +2580,13 @@ def handle_multi_model_stream(
     if new_msg_req.supersearch:
         yield StreamingError(
             error="Multi-model is not supported with Supersearch",
+            error_code="VALIDATION_ERROR",
+            is_retryable=False,
+        )
+        return
+    if new_msg_req.legal_review:
+        yield StreamingError(
+            error="Multi-model is not supported with Hukuki İnceleme",
             error_code="VALIDATION_ERROR",
             is_retryable=False,
         )

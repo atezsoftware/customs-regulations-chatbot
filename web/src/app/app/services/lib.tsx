@@ -166,6 +166,7 @@ export interface SendMessageParams {
   atezSearchV2?: boolean;
   atezSearchV3?: boolean;
   legalComposite?: boolean;
+  legalReview?: boolean;
   supersearch?: boolean;
   experimentalResearch?: boolean;
   experimentalParallelResearch?: boolean;
@@ -200,6 +201,7 @@ export async function* sendMessage({
   deepResearch,
   atezSearchV3,
   legalComposite,
+  legalReview,
   supersearch,
   experimentalResearch,
   experimentalParallelResearch,
@@ -217,6 +219,26 @@ export async function* sendMessage({
   origin,
   additionalContext,
 }: SendMessageParams): AsyncGenerator<PacketType, void, unknown> {
+  if (legalReview && (llmOverrides?.length ?? 0) > 1) {
+    throw new Error("Hukuki İnceleme (Flash) tek modelle çalışır.");
+  }
+  if (
+    legalReview &&
+    (deepResearch ||
+      atezSearchV3 ||
+      legalComposite ||
+      supersearch ||
+      experimentalResearch ||
+      experimentalParallelResearch ||
+      experimentalGuardrails ||
+      experimentalGuardrailsV2 ||
+      asv3ResumeMessageId != null)
+  ) {
+    throw new Error(
+      "Hukuki İnceleme (Flash) başka araştırma modlarıyla birleştirilemez."
+    );
+  }
+
   if (supersearch && (llmOverrides?.length ?? 0) > 1) {
     throw new Error("Supersearch tek modelle çalışır.");
   }
@@ -226,12 +248,13 @@ export async function* sendMessage({
     message: message,
     chat_session_id: chatSessionId,
     parent_message_id: parentMessageId,
-    file_descriptors: supersearch ? undefined : fileDescriptors,
+    file_descriptors: supersearch || legalReview ? undefined : fileDescriptors,
     internal_search_filters: filters,
     deep_research: !supersearch && (deepResearch ?? false),
     atez_search: false,
     atez_search_v2: false,
     ...(legalComposite && !supersearch ? { legal_composite: true } : {}),
+    ...(legalReview ? { legal_review: true } : {}),
     ...(supersearch ? { supersearch: true } : {}),
     atez_search_v3: Boolean(
       (atezSearchV3 ||
@@ -259,7 +282,8 @@ export async function* sendMessage({
     ...(experimentalGuardrailsV2 && !deepResearch && !supersearch
       ? { asv3_guardrails_v2: true }
       : {}),
-    asv3_resume_message_id: supersearch ? undefined : asv3ResumeMessageId,
+    asv3_resume_message_id:
+      supersearch || legalReview ? undefined : asv3ResumeMessageId,
     asv3_allow_external: Boolean(
       (atezSearchV3 ||
         experimentalResearch ||
@@ -270,10 +294,10 @@ export async function* sendMessage({
       asv3AllowExternal &&
       !supersearch
     ),
-    allowed_tool_ids: supersearch ? [] : enabledToolIds,
-    forced_tool_id: supersearch ? null : (forcedToolId ?? null),
+    allowed_tool_ids: supersearch || legalReview ? [] : enabledToolIds,
+    forced_tool_id: supersearch || legalReview ? null : (forcedToolId ?? null),
     llm_override:
-      temperature || modelVersion
+      !legalReview && (temperature || modelVersion)
         ? {
             temperature,
             model_provider: modelProvider,
@@ -282,10 +306,11 @@ export async function* sendMessage({
           }
         : null,
     // Multi-model: list of LLM overrides for parallel generation
-    llm_overrides: llmOverrides ?? null,
+    llm_overrides: legalReview ? null : (llmOverrides ?? null),
     // Default to "unknown" for consistency with backend; callers should set explicitly
     origin: origin ?? "unknown",
-    additional_context: supersearch ? null : (additionalContext ?? null),
+    additional_context:
+      supersearch || legalReview ? null : (additionalContext ?? null),
   };
 
   const body = JSON.stringify(payload);
@@ -512,6 +537,13 @@ export function processRawChatHistory(
       agentMessageInd++;
     }
 
+    const isLegalReview =
+      messageInfo.message_type === "assistant" &&
+      packetsForMessage?.some(
+        ({ obj }) =>
+          obj.type === "asv3_progress" && obj.workflow === "legal_review"
+      );
+
     const hasContextDocs = (messageInfo?.context_docs || []).length > 0;
     let retrievalType;
     if (hasContextDocs) {
@@ -544,6 +576,7 @@ export function processRawChatHistory(
       ...(messageInfo.message_type === "assistant"
         ? {
             ...(isSupersearch ? { supersearch: true } : {}),
+            ...(isLegalReview ? { legalReview: true } : {}),
             retrievalType: retrievalType,
             researchType: messageInfo.research_type as ResearchType | undefined,
             query: messageInfo.rephrased_query,

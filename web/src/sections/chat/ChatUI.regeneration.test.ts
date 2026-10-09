@@ -1,5 +1,27 @@
 import { getRegenerationResearchMode } from "@/sections/chat/ChatUI";
 
+it("preserves Legal Review for a new generation and keeps ASv3 checkpoints in ASv3", () => {
+  const input = {
+    atezSearchEnabled: false,
+    atezSearchV2Enabled: false,
+    atezSearchV3Enabled: false,
+    legalReviewEnabled: true,
+    experimentalResearchEnabled: false,
+    experimentalParallelResearchEnabled: false,
+    experimentalGuardrailsEnabled: false,
+  };
+  expect(getRegenerationResearchMode(input)).toMatchObject({
+    legalReview: true,
+    atezSearchV3: false,
+  });
+  const resumed = getRegenerationResearchMode({
+    ...input,
+    asv3ResumeMessageId: 41,
+  });
+  expect(resumed.atezSearchV3).toBe(true);
+  expect(resumed).not.toHaveProperty("legalReview");
+});
+
 it("lets the saved ASv3 checkpoint determine its variant when Guardrails is selected", () => {
   expect(
     getRegenerationResearchMode({
