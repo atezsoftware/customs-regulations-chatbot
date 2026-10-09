@@ -45,6 +45,7 @@ class LLMFlow(StrEnum):
     ASV3_GUARDED_DECISIONS = "asv3_guarded_decisions"
     ASV3_GUARDRAILS_V2_REVIEW = "asv3_guardrails_v2_review"
     ASV3_GUARDRAILS_V2_REPAIR = "asv3_guardrails_v2_repair"
+    ASV3_GUARDRAILS_V3_REVIEW = "asv3_guardrails_v3_review"
 
     # Secondary LLM flows
     SEMANTIC_QUERY_REPHRASE = "semantic_query_rephrase"

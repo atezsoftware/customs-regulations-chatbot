@@ -435,6 +435,14 @@ def test_guardrails_v3_runtime_reserves_time_for_final_review(
     assert context.services["asv3_workflow_variant"] == ASV3_GUARDRAILS_V3_VARIANT
     assert checkpoints[-1]["candidate_audit"]["version"] == 1
     assert checkpoints[-1]["candidate_audit"]["records"] == []
+    review = context.services["guardrails_v3_review"]
+    assert review["review_completed"] is False
+    assert review["failure_reason"] in {
+        "jev_credential_unavailable",
+        "outcome_map_missing",
+        "review_packet_too_large",
+    }
+    assert checkpoints[-1]["guardrails_v3_review"] == review
 
 
 def test_guarded_runtime_keeps_source_tools_cheap_and_coordinator_selected(

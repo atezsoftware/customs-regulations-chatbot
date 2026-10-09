@@ -25,6 +25,10 @@ from onyx.asv3.citation_numbers import extract_citation_numbers
 from onyx.asv3.corpus_tools import CorpusBroker, build_corpus_specs
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.external_tools import build_external_specs
+from onyx.asv3.guardrails_v3 import (
+    build_frozen_review_packet,
+    review_frozen_packet,
+)
 from onyx.asv3.harness import Harness
 from onyx.asv3.jev_answer_review import ReviewEvidence, review_and_repair_answer
 from onyx.asv3.legal_source_reviews import (
@@ -965,6 +969,11 @@ def run_asv3_loop(
                 if isinstance(guardrails_v2_review, dict):
                     snapshot["guardrails_v2_review"] = cast(
                         dict[str, JsonValue], copy.deepcopy(guardrails_v2_review)
+                    )
+                guardrails_v3_review = context.services.get("guardrails_v3_review")
+                if isinstance(guardrails_v3_review, dict):
+                    snapshot["guardrails_v3_review"] = cast(
+                        dict[str, JsonValue], copy.deepcopy(guardrails_v3_review)
                     )
                 audit = context.services.get("candidate_audit")
                 if isinstance(audit, CandidateAudit):
@@ -1999,6 +2008,32 @@ def run_asv3_loop(
             context.services["guardrails_v2_review"] = review_outcome.model_dump(
                 mode="json", exclude={"answer"}
             )
+        if (
+            workflow_variant == ASV3_GUARDRAILS_V3_VARIANT
+            and result.answer
+            and not clarification
+            and not partial
+        ):
+            audit = context.services.get("candidate_audit")
+            packet_build = build_frozen_review_packet(
+                question=question,
+                candidate_answer=final,
+                outcome_map=outcome_map,
+                ledger=ledger,
+                candidate_audit=audit if isinstance(audit, CandidateAudit) else None,
+            )
+            if packet_build.packet is None:
+                context.services["guardrails_v3_review"] = {
+                    "review_completed": False,
+                    "repair_requested": False,
+                    "repair_applied": False,
+                    "failure_reason": packet_build.failure_reason,
+                }
+            else:
+                review_outcome = review_frozen_packet(packet_build.packet)
+                context.services["guardrails_v3_review"] = review_outcome.model_dump(
+                    mode="json"
+                )
         publication_status = (
             result.status
             if result.answer and not clarification and not partial

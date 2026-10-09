@@ -2275,6 +2275,13 @@ ASV3_GUARDRAILS_V2_REPAIR_TIMEOUT_SECONDS = min(
         int(os.environ.get("ASV3_GUARDRAILS_V2_REPAIR_TIMEOUT_SECONDS") or 45),
     ),
 )
+ASV3_GUARDRAILS_V3_JEV_TIMEOUT_SECONDS = min(
+    90.0,
+    max(
+        3.0,
+        float(os.environ.get("ASV3_GUARDRAILS_V3_JEV_TIMEOUT_SECONDS") or 35.0),
+    ),
+)
 ASV3_GUARDED_DECISIONS_ENABLED = (
     os.environ.get("ASV3_GUARDED_DECISIONS_ENABLED", "false").lower() == "true"
 )
