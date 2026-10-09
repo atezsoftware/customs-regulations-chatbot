@@ -853,13 +853,13 @@ class CompositeDependencyExpander(DependencyExpander):
             item.source_id, name, number, article.article_no, article.qualifier
         )
 
-    def _collect_material(
+    def _validated_material_leads(
         self,
         plan: ResearchPlan,
         frontier: set[int] | None = None,
-        need_bindings: dict[int, set[str]] | None = None,
+        _need_bindings: dict[int, set[str]] | None = None,
         material_targets: list[MaterialDependencyRequest] | None = None,
-    ) -> set[str]:
+    ) -> list[dict[str, JsonValue]]:
         selected_numbers = (
             set(self.ledger.citation_numbers()) if frontier is None else frontier
         )
@@ -871,6 +871,11 @@ class CompositeDependencyExpander(DependencyExpander):
                 )
             for citation in requested_origins:
                 item = self.ledger.get(citation)
+                canonical = (
+                    item.metadata.get("canonical_metadata")
+                    if item is not None
+                    else None
+                )
                 if (
                     item is None
                     or item.search_doc is None
@@ -878,6 +883,8 @@ class CompositeDependencyExpander(DependencyExpander):
                     or item.search_doc.metadata.get("regulatory_chunk_id")
                     != item.chunk_id
                     or sha256(item.text.encode()).hexdigest() != item.text_hash
+                    or item.metadata.get("truncated")
+                    or (isinstance(canonical, dict) and canonical.get("truncated"))
                     or any(
                         model_evidence_metadata(item.metadata).get(flag)
                         for flag in ("derived", "external", "untrusted", "truncated")
@@ -956,6 +963,19 @@ class CompositeDependencyExpander(DependencyExpander):
                     raise InvalidSourceAction(
                         "Material dependency does not match an observed original reference"
                     )
+        return leads
+
+    def _collect_material(
+        self,
+        plan: ResearchPlan,
+        frontier: set[int] | None = None,
+        need_bindings: dict[int, set[str]] | None = None,
+        material_targets: list[MaterialDependencyRequest] | None = None,
+    ) -> set[str]:
+        leads = self._validated_material_leads(
+            plan, frontier, need_bindings, material_targets
+        )
+        known_needs = {need.need_id for need in plan.needs}
         collected: set[str] = set()
         for lead in leads:
             targets = (
@@ -1152,6 +1172,18 @@ class CompositeDependencyExpander(DependencyExpander):
             summary="Scoped title relationships are uncitable reading leads, never holdings or absence proof.",
             data=result,
         )
+
+    def validate_material(
+        self,
+        plan: ResearchPlan,
+        *,
+        frontier: set[int],
+        material_targets: list[MaterialDependencyRequest],
+        need_bindings: dict[int, set[str]] | None = None,
+    ) -> None:
+        """Validate proposed relations without registering or binding originals."""
+
+        self._validated_material_leads(plan, frontier, need_bindings, material_targets)
 
     def register_material(
         self,

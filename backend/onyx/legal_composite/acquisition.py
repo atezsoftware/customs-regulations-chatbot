@@ -286,6 +286,22 @@ class CanonicalAcquirer:
         if not targets:
             return calls
         from onyx.asv3.corpus_tools import article_references
+        from onyx.asv3.legal_source_reviews import related_source_reviews_enabled
+
+        metadata_keys = {
+            "_public_update",
+            "_need_id",
+            "_language",
+            "_notifications",
+            "_external_requested",
+            "_outcomes",
+            "_coverage",
+            *(
+                {"_related_source_reviews"}
+                if related_source_reviews_enabled(self.context)
+                else set()
+            ),
+        }
 
         observed: dict[str, set[str]] = {}
         for row in self.ledger.provision_metadata():
@@ -332,7 +348,13 @@ class CanonicalAcquirer:
             spec = registry.get(action.tool)
             if spec is None or not jsonschema.Draft202012Validator(
                 spec.parameters
-            ).is_valid(call.arguments):
+            ).is_valid(
+                {
+                    key: value
+                    for key, value in call.arguments.items()
+                    if key not in metadata_keys
+                }
+            ):
                 return 1
             if action.tool == "read_provision":
                 article = action.arguments.get("article")
