@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.models import RunStopped
 from onyx.legal_composite.budget import CallReservation, WorkflowBudget
-from onyx.legal_composite.models import IssueResearchStep
+from onyx.legal_composite.models import IssueResearchPlan, IssueResearchStep
 from onyx.llm.cost import ModelPrice, get_model_price_per_million
 from onyx.llm.cost_overrides import get_override
 from onyx.llm.interfaces import LLM, LLMUserIdentity
@@ -34,7 +34,7 @@ from onyx.llm.models import (
 from onyx.llm.multi_llm import LLMTimeoutError
 from onyx.llm.utils import check_number_of_tokens
 from onyx.regulatory.structured_llm import _portable_structured_output_schema
-from onyx.tracing.answer_graph import redact_graph_value
+from onyx.tracing.answer_graph import graph_step, redact_graph_value
 from onyx.tracing.flows import LLMFlow
 from onyx.tracing.framework.create import get_current_span
 from onyx.tracing.framework.span_data import GenerationSpanData
@@ -678,7 +678,7 @@ class BudgetedGateway:
         }
         output_tokens = (
             _REQUIREMENTS_OUTPUT_TOKENS
-            if response_type is IssueResearchStep
+            if response_type in {IssueResearchPlan, IssueResearchStep}
             else _RESEARCH_OUTPUT_TOKENS
             if research
             else self._final_output_tokens
@@ -703,6 +703,25 @@ class BudgetedGateway:
             self.user_identity,
         )
         finish_reason = (response.choice.finish_reason or "").lower()
+        if response_type is IssueResearchPlan:
+            reason = (
+                finish_reason
+                if finish_reason
+                in {"stop", "length", "max_tokens", "max_output_tokens", "tool_calls"}
+                else "other"
+            )
+            characters = len(response.choice.message.content or "")
+            with graph_step(
+                "legal_composite.plan_response",
+                {"response_type": response_type.__name__},
+                summary=f"finish_reason={reason} characters={characters} tool_calls={bool(response.choice.message.tool_calls)}",
+            ) as step:
+                step.output_value = {
+                    "finish_reason": reason,
+                    "response_characters": characters,
+                    "declared_tool_calls": bool(response.choice.message.tool_calls),
+                    "validation_pending": True,
+                }
         if response.choice.message.tool_calls or finish_reason == "tool_calls":
             raise RunStopped("The typed model returned an undeclared tool call")
         if finish_reason in {"length", "max_tokens", "max_output_tokens"}:
