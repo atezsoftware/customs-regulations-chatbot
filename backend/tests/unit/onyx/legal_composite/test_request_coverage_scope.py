@@ -21,6 +21,7 @@ from onyx.legal_composite.reviewer import (
 )
 from onyx.llm.interfaces import LLMConfig
 from tests.unit.legal_composite.test_semantic_reviewer import inputs, reviewer
+from tests.unit.onyx.legal_composite.draft_composition_fixture import composition_for
 
 
 def coverage_state(body: dict[str, JsonValue]) -> dict[str, JsonValue]:
@@ -238,7 +239,7 @@ def test_missing_requested_alternative_still_reaches_coverage_when_plan_omits_it
     assert len(observed) == len(set(observed)) and set(observed) == set(expected)
     gateway = Mock()
     gateway.last_delivered_citations = {1}
-    gateway.complete.return_value = draft
+    gateway.complete.return_value = composition_for(draft)
     engine = LegalCompositeEngine(
         gateway=gateway,
         acquirer=Mock(),
@@ -276,7 +277,7 @@ def test_positive_coverage_cannot_waive_a_separate_legal_gap(
     )
     gateway = Mock()
     gateway.last_delivered_citations = {1}
-    gateway.complete.return_value = draft
+    gateway.complete.return_value = composition_for(draft)
     engine = LegalCompositeEngine(
         gateway=gateway,
         acquirer=Mock(),

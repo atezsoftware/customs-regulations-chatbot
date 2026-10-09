@@ -6,6 +6,7 @@ import pytest
 from pydantic import BaseModel, JsonValue
 
 from onyx.legal_composite.acquisition import InvalidSourceAction
+from onyx.legal_composite.draft_composition import DraftComposition
 from onyx.legal_composite.engine import LegalCompositeEngine
 from onyx.legal_composite.models import (
     AuthorityDependency,
@@ -23,6 +24,7 @@ from onyx.legal_composite.requirements import RequirementLedger
 from onyx.legal_composite.reviewer import ReviewQuestion, build_checks
 from onyx.tracing.flows import LLMFlow
 from tests.unit.legal_composite.test_semantic_reviewer import inputs
+from tests.unit.onyx.legal_composite.draft_composition_fixture import composition_for
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -83,8 +85,8 @@ def test_partial_dependency_status_never_waives_stale_origin(unresolved: bool) -
             finalizing: bool = False,
         ) -> T:
             del system, payload, flow, finalizing
-            assert response_type is DraftAnswer
-            return response_type.model_validate(draft.model_dump())
+            assert response_type is DraftComposition
+            return response_type.model_validate(composition_for(draft).model_dump())
 
     class Acquirer:
         def definitions(self) -> list[dict[str, JsonValue]]:

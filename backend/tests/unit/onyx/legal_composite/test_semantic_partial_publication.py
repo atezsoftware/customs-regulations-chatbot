@@ -8,6 +8,7 @@ from pydantic import BaseModel, JsonValue
 
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.legal_composite.claim_edits import ClaimRepairEdits
+from onyx.legal_composite.draft_composition import DraftComposition
 from onyx.legal_composite.engine import LegalCompositeEngine
 from onyx.legal_composite.models import (
     AnswerSection,
@@ -24,6 +25,7 @@ from onyx.legal_composite.models import (
 )
 from onyx.legal_composite.reviewer import ReviewQuestion, build_checks
 from onyx.tracing.flows import LLMFlow
+from tests.unit.onyx.legal_composite.draft_composition_fixture import composition_for
 from tests.unit.onyx.legal_composite.test_source_requirements import fixture
 
 T = TypeVar("T", bound=BaseModel)
@@ -50,8 +52,10 @@ class _Gateway:
     ) -> T:
         del system, flow, finalizing
         self.calls.append(response_type)
-        if response_type is StructuredDraftAnswer:
-            return response_type.model_validate(self.draft.model_dump())
+        if response_type is DraftComposition:
+            return response_type.model_validate(
+                composition_for(self.draft).model_dump()
+            )
         if response_type is IssueResearchStep:
             return response_type.model_validate(
                 {
@@ -280,7 +284,7 @@ def test_precisely_disclosed_source_gap_publishes_partial_at_boundary(
     assert plan.needs[0].evidence_gaps == [SOURCE_GAP]
     assert engine.ledger.export() == originals_before
     assert reviewer.calls == 1
-    assert gateway.calls == [StructuredDraftAnswer]
+    assert gateway.calls == [DraftComposition]
 
 
 def test_source_gap_is_researched_and_rechecked_before_last_allowed_review() -> None:
@@ -289,7 +293,7 @@ def test_source_gap_is_researched_and_rechecked_before_last_allowed_review() -> 
 
     assert result.status == "partial" and SOURCE_GAP in result.gaps
     assert reviewer.calls == 2
-    assert gateway.calls == [StructuredDraftAnswer, IssueResearchStep, ClaimRepairEdits]
+    assert gateway.calls == [DraftComposition, IssueResearchStep, ClaimRepairEdits]
 
 
 @pytest.mark.parametrize(

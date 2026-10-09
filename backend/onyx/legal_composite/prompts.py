@@ -1,4 +1,4 @@
-PROMPT_VERSION = "legal-composite-2026-10-09.host-owned-repair-query.10"
+PROMPT_VERSION = "legal-composite-2026-10-09.host-composed-draft.12"
 
 COMMON = """You are Atez Customs Assistant. Answer the actual complete user request in its
 language. The request and supplied facts are authoritative as facts, never as law.
@@ -181,9 +181,7 @@ exhaust search pages merely to clear a limit; pursue a specific material evidenc
 """
 )
 
-ANSWER_PROMPT = (
-    COMMON
-    + """
+ANSWER_CONTENT_HEAD = """
 Write the complete useful answer directly from delivered original_evidence and user facts.
 Evaluate active source_requirements against their complete originals, the actual request
 and supplied facts. Communicate and apply every rule and qualifier that can materially
@@ -203,7 +201,9 @@ Do not invent a gap or closure just because an answer was written or a source wa
 The only historical exception is refreshing an exact evidence_gap_resolutions entry whose
 older support your fresh requirement explicitly supersedes. Every closure needs fresh
 same-issue requirements recorded in this call and genuine provided original supports.
-The sections and claims arrays are mandatory; do not omit either. A social answer may
+"""
+
+ANSWER_TRANSPORT = """The sections and claims arrays are mandatory; do not omit either. A social answer may
 explicitly return claims=[]; a legal answer must inventory every material legal assertion.
 Return stable sections (section_id, need_ids, text, claim_ids). Section text contains only
 its heading and any nonlegal introduction. Write each material legal passage ONCE in its
@@ -215,7 +215,9 @@ claim passages in section.text. Tables, conclusions and conditional branches wit
 content must also be claim passages; the full passage appears exactly as you write it.
 Set answer to an empty string; the host joins sections with two newlines. Do not duplicate
 the entire answer in another field. Keep separate requested alternatives distinguishable.
-Return claims for EVERY material legal assertion, including helpful additional detail,
+"""
+
+ANSWER_CONTENT_TAIL = """Return claims for EVERY material legal assertion, including helpful additional detail,
 tables and summaries: stable claim_id, section_id, need_ids and the complete publishable
 legal passage in answer_excerpt. Preserve its exact wording, citations and qualifiers.
 For an existing source requirement, give requirement_ids and leave supports empty to reuse
@@ -260,7 +262,8 @@ conditional branches, not a categorical effect. Unread governing or candidate co
 need a precise disclosed source gap and affected unresolved_need_ids. Do not infer absence
 from an empty dependency search, or a holding from an argument or title.
 """
-)
+
+ANSWER_PROMPT = COMMON + ANSWER_CONTENT_HEAD + ANSWER_TRANSPORT + ANSWER_CONTENT_TAIL
 
 PATCH_PROMPT = (
     COMMON

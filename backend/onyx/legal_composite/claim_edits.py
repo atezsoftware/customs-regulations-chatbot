@@ -25,9 +25,20 @@ Identity = Annotated[str, Field(min_length=1)]
 class ClaimEdit(StrictModel):
     claim_id: Identity
     section_id: Identity
+    need_ids: list[Identity] | None = None
     answer_excerpt: str = Field(min_length=1)
     supports: list[SpanSupport] = Field(default_factory=list)
     requirement_ids: list[Identity] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def unique_issue_scope(self) -> ClaimEdit:
+        if self.need_ids is not None and (
+            not self.need_ids or len(self.need_ids) != len(set(self.need_ids))
+        ):
+            raise ValueError(
+                "Explicit claim issue bindings must be nonempty and unique"
+            )
+        return self
 
 
 class HeadingEdit(StrictModel):
@@ -64,13 +75,17 @@ CLAIM_REPAIR_EDITS_PROMPT = (
     + """
 Repair only the fixed repair_targets using sparse claim edits. Return only changed or new
 claims, explicit deleted_claim_ids, optional heading_edits, and the COMPLETE updated
-unresolved_need_ids. Do not return sections, need_ids, claim order or unchanged claims.
-The host owns those bindings and retains every unedited claim exactly in its existing slot.
+unresolved_need_ids. Do not return sections, section bindings, claim order or unchanged
+claims. The host retains every unedited claim exactly in its existing slot.
 Reuse an existing claim_id when correcting its full passage; keep its existing section_id.
+For an existing claim, omit need_ids or reproduce its frozen need_ids exactly, in the same
+order. Never add, remove, reorder or duplicate an existing claim's issue bindings.
 New claim IDs must be unused; name an affected target section_id and the host appends new
-claims in your returned order within that section. Existing claim issue bindings remain
-unchanged; new claims use the target section's frozen issue bindings. Never move an existing
-claim or edit/delete an unaffected claim. Remove a claim only by its explicit existing ID.
+claims in your returned order within that section. Every NEW claim must explicitly give
+nonempty unique need_ids containing only the actual issues its passage addresses, as a
+subset of that target section's frozen need_ids. Sharing a section does not make a rule
+applicable to every issue in it. Never move an existing claim or edit/delete an unaffected
+claim. Remove a claim only by its explicit existing ID.
 Write each changed legal passage ONCE in answer_excerpt with its citations and complete
 operative qualifiers. Preserve all supported conditions, exceptions and material steps.
 Each positive assertion needs existing active requirement_ids or provided original span_id
@@ -127,14 +142,29 @@ def claim_edits_to_delta(
         prior = existing.get(edit.claim_id)
         if prior is not None and prior.section_id != edit.section_id:
             raise InvalidSourceAction("Claim edits cannot move an existing claim")
-        need_ids = (
-            prior.need_ids if prior is not None else sections[edit.section_id].need_ids
-        )
-        if not need_ids or set(need_ids) - set(sections[edit.section_id].need_ids):
+        if prior is not None:
+            if edit.need_ids is not None and edit.need_ids != prior.need_ids:
+                raise InvalidSourceAction(
+                    "Claim edits cannot change existing issue bindings"
+                )
+            need_ids = prior.need_ids
+        else:
+            if edit.need_ids is None:
+                raise InvalidSourceAction(
+                    "New claim edits need an explicit issue subset"
+                )
+            need_ids = edit.need_ids
+        if (
+            not need_ids
+            or len(need_ids) != len(set(need_ids))
+            or set(need_ids) - set(sections[edit.section_id].need_ids)
+        ):
             raise InvalidSourceAction(
                 "Frozen claim issue bindings exceed the target section"
             )
-        changed.append(DraftClaim(**edit.model_dump(), need_ids=list(need_ids)))
+        changed.append(
+            DraftClaim(**edit.model_dump(exclude={"need_ids"}), need_ids=list(need_ids))
+        )
     synthesized: list[AnswerSection] = []
     for section in draft.sections:
         if section.section_id not in affected_sections:

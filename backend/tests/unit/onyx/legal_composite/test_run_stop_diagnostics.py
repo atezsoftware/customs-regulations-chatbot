@@ -86,6 +86,19 @@ def test_legacy_consumer_does_not_emit_new_diagnostics(
         ("Support quotation conflicts with its original span", "span_quotation"),
         ("Repair cannot change a section's issue bindings", "patch_section_issue"),
         ("Claim edits cannot move an existing claim", "patch_claim_move"),
+        ("Claim edits cannot change existing issue bindings", "patch_claim_issue"),
+        ("New claim edits need an explicit issue subset", "patch_claim_issue"),
+        ("Draft composition failed the transport schema", "draft_composition_schema"),
+        ("Draft composition identities must be unique", "draft_composition_identity"),
+        (
+            "Draft composition section issue bindings must be unique",
+            "draft_composition_issue",
+        ),
+        (
+            "Draft composition claim exceeds its section issue scope",
+            "draft_composition_claim",
+        ),
+        ("Draft composition cannot form a valid answer", "draft_composition_render"),
         ("Source requirement identities are immutable", "requirement_immutable"),
         (
             "Gap closure lacks a fresh same-issue requirement binding",

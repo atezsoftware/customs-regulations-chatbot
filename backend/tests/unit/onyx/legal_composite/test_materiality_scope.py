@@ -28,6 +28,7 @@ from tests.unit.legal_composite.test_semantic_reviewer import (
     _compact_mock_reviewer,
     inputs,
 )
+from tests.unit.onyx.legal_composite.draft_composition_fixture import composition_for
 from tests.unit.onyx.legal_composite.test_semantic_partial_publication import _engine
 
 PERMIT = (
@@ -122,7 +123,7 @@ def prepared_engine(
     )
     gateway = Mock()
     gateway.last_delivered_citations = {1, 2}
-    gateway.complete.return_value = draft
+    gateway.complete.return_value = composition_for(draft)
     acquirer = Mock()
     acquirer.definitions.return_value = []
     engine = LegalCompositeEngine(
@@ -148,10 +149,7 @@ def test_unreferenced_incidental_judgment_is_admitted_with_complete_originals_an
     result = engine._finalize_semantic("What permit is required?", "", None, plan)
     assert isinstance(result, CompositeWorkflowResult)
     # These are assumed synthetic legal judgments, not a correctness certificate.
-    assert (
-        result.status == "verified"
-        and result.answer == gateway.complete.return_value.answer
-    )
+    assert result.status == "verified" and result.answer == PERMIT + " [1]"
     assert result.semantic_review is not None
     check = next(
         row for row in result.semantic_review.checks if row.check_id == INCIDENTAL_ID

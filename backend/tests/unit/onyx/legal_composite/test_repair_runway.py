@@ -8,6 +8,7 @@ from pydantic import BaseModel, JsonValue
 
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.legal_composite.claim_edits import ClaimRepairEdits
+from onyx.legal_composite.draft_composition import DraftComposition
 from onyx.legal_composite.engine import LegalCompositeEngine
 from onyx.legal_composite.models import (
     AuthorityDependency,
@@ -22,6 +23,7 @@ from onyx.legal_composite.models import (
 )
 from onyx.legal_composite.reviewer import ReviewQuestion, build_checks
 from onyx.tracing.flows import LLMFlow
+from tests.unit.onyx.legal_composite.draft_composition_fixture import composition_for
 from tests.unit.onyx.legal_composite.test_source_requirements import fixture
 
 T = TypeVar("T", bound=BaseModel)
@@ -142,8 +144,8 @@ def test_unrecorded_requirement_uses_existing_evidence_without_research() -> Non
         ) -> T:
             del system, payload, flow, finalizing
             calls.append(response_type)
-            if response_type is StructuredDraftAnswer:
-                return response_type.model_validate(draft.model_dump())
+            if response_type is DraftComposition:
+                return response_type.model_validate(composition_for(draft).model_dump())
             assert response_type is ClaimRepairEdits
             return response_type.model_validate(
                 {
@@ -226,7 +228,7 @@ def test_unrecorded_requirement_uses_existing_evidence_without_research() -> Non
     value.plan = plan
     result = value._finalize_semantic("Generic issues a and b", "", None, plan)
     assert result.status == "verified", result.gaps
-    assert calls == [StructuredDraftAnswer, ClaimRepairEdits]
+    assert calls == [DraftComposition, ClaimRepairEdits]
     assert set(row.requirement_id for row in value.requirements.records()) == {
         "r_a",
         "r_b",
