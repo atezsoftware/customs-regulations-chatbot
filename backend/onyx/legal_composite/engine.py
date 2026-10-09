@@ -22,6 +22,7 @@ from onyx.legal_composite.claim_edits import (
 from onyx.legal_composite.dependencies import (
     CompositeDependencyExpander,
     DependencyExpander,
+    HostDependencyStage,
     assess_dependencies,
     dependency_required_citations,
     material_dependency_gaps,
@@ -531,12 +532,14 @@ class LegalCompositeEngine:
         allow_terminal_observed_reads: bool = False,
         recover_invalid_navigation: bool = False,
         use_observed_read_runway: bool = False,
+        use_physical_dependency_runway: bool = False,
     ) -> None:
         if (
             type(use_numbered_reading_supports) is not bool
             or type(allow_terminal_observed_reads) is not bool
             or type(recover_invalid_navigation) is not bool
             or type(use_observed_read_runway) is not bool
+            or type(use_physical_dependency_runway) is not bool
         ):
             raise ValueError("Reading behavior must use explicit boolean opt-ins")
         self.gateway = gateway
@@ -555,6 +558,17 @@ class LegalCompositeEngine:
         self.allow_terminal_observed_reads = allow_terminal_observed_reads
         self.recover_invalid_navigation = recover_invalid_navigation
         self.use_observed_read_runway = use_observed_read_runway
+        self.use_physical_dependency_runway = use_physical_dependency_runway
+        self._dependency_reserved_actions: list[SourceAction] = []
+        self._dependency_reading_after = True
+        if use_physical_dependency_runway:
+            if not isinstance(acquirer, CanonicalAcquirer) or not isinstance(
+                dependency_expander, CompositeDependencyExpander
+            ):
+                raise ValueError(
+                    "Physical dependency admission requires canonical Composite acquisition"
+                )
+            dependency_expander.host_stage_admission = self._admit_dependency_stage
         self.requirements = RequirementLedger(ledger)
         self.research_gaps: list[str] = []
         self.protocol_defects: list[str] = []
@@ -592,6 +606,10 @@ class LegalCompositeEngine:
                 default=0.0,
             )
         pending = self.acquirer.pending_call_counts(actions, self.plan)
+        return self._pending_tool_estimate(pending)
+
+    def _pending_tool_estimate(self, pending: dict[str, int]) -> float:
+        assert isinstance(self.acquirer, CanonicalAcquirer)
         measured = self.acquirer.task_timing_snapshot().completed
         return max(
             (
@@ -602,6 +620,76 @@ class LegalCompositeEngine:
             ),
             default=0.0,
         ) * ceil(sum(pending.values()) / self.policy.max_parallel_tools)
+
+    def _admit_dependency_stage(
+        self,
+        actions: list[SourceAction],
+        plan: ResearchPlan,
+        stage: HostDependencyStage,
+    ) -> bool:
+        """Admit the complete physical stage while retaining subsequent work."""
+        self.check_active()
+        assert isinstance(self.acquirer, CanonicalAcquirer)
+        pending = self.acquirer.pending_host_call_counts(actions, plan)
+        reserved = self.acquirer.expand_actions(self._dependency_reserved_actions, plan)
+        combined = self.acquirer.pending_host_call_counts([*actions, *reserved], plan)
+        following = {
+            tool: count - pending.get(tool, 0)
+            for tool, count in combined.items()
+            if count > pending.get(tool, 0)
+        }
+        unknown_reads = (
+            self._pending_tool_estimate({"read_provision": 1})
+            if stage == "discovery"
+            and bool(pending)
+            and any(action.tool == "resolve_source" for action in actions)
+            else 0.0
+        )
+        inspection = self._reading_estimate() if self._dependency_reading_after else 0.0
+        estimate = (
+            self._pending_tool_estimate(pending)
+            + self._pending_tool_estimate(following)
+            + unknown_reads
+            + inspection
+            + self.policy.selection_reserve_seconds
+        )
+        remaining = self._repair_runway()
+        reason = (
+            "search_budget"
+            if self.acquirer.search_calls + combined.get("search_corpus", 0)
+            > self.policy.max_search_calls
+            else "tool_budget"
+            if self.acquirer.context.budget.snapshot()["tools"] + sum(combined.values())
+            > self.policy.max_tools
+            else "research_runway"
+            if remaining <= estimate
+            else "accepted"
+        )
+        accepted = reason == "accepted"
+        with graph_step(
+            "legal_composite.dependency_stage_admission",
+            {},
+            summary=(
+                f"stage={stage} accepted={int(accepted)} reason={reason} "
+                f"pending_calls={sum(pending.values())} "
+                f"worker_waves={ceil(sum(pending.values()) / self.policy.max_parallel_tools)}"
+            ),
+        ) as admission:
+            admission.output_value = {
+                "stage": stage,
+                "accepted": accepted,
+                "reason": reason,
+                "pending_tools": pending,
+                "pending_calls": sum(pending.values()),
+                "worker_waves": ceil(
+                    sum(pending.values()) / self.policy.max_parallel_tools
+                ),
+                "reserved_calls": sum(following.values()),
+                "unresolved_reads_reserved": bool(unknown_reads),
+                "navigation_only": True,
+                "absence_proven": False,
+            }
+        return accepted
 
     def _bounded_observed_reads_have_runway(
         self, actions: list[SourceAction], *, reading_after: bool
@@ -653,7 +741,7 @@ class LegalCompositeEngine:
             ) * ceil(sum(pending.values()) / self.policy.max_parallel_tools)
         dependencies = (
             max(self._dependency_seconds, default=self.policy.max_call_seconds)
-            if step.material_dependencies
+            if step.material_dependencies and not self.use_physical_dependency_runway
             else 0.0
         )
         forecast_fits = remaining > (
@@ -987,7 +1075,7 @@ class LegalCompositeEngine:
     def _repair_actions_have_runway(self, step: IssueResearchStep) -> bool:
         if self.use_observed_read_runway:
             acquisition = self._acquisition_estimate(step.actions)
-            if step.material_dependencies:
+            if step.material_dependencies and not self.use_physical_dependency_runway:
                 acquisition += max(
                     self._dependency_seconds, default=self.policy.max_call_seconds
                 ) * len(step.material_dependencies)
@@ -1505,6 +1593,9 @@ class LegalCompositeEngine:
         plan: ResearchPlan,
         targets: list[int] | None = None,
         material_targets: list[MaterialDependencyRequest] | None = None,
+        *,
+        reserved_actions: list[SourceAction] | None = None,
+        reading_after: bool = True,
     ) -> None:
         if self.dependency_expander is not None and plan.requires_sources:
             if not targets and not material_targets:
@@ -1533,16 +1624,22 @@ class LegalCompositeEngine:
             self.report("tools", plan.language)
             receipt_start = len(self.dependency_expander.receipts)
             dependency_started = time.monotonic()
-            self.dependencies = self.dependency_expander.expand(
-                plan,
-                frontier=frontier,
-                need_bindings=need_bindings,
-                **(
-                    {"material_targets": material_targets}
-                    if material_targets is not None
-                    else {}
-                ),
-            )
+            self._dependency_reserved_actions = list(reserved_actions or [])
+            self._dependency_reading_after = reading_after
+            try:
+                self.dependencies = self.dependency_expander.expand(
+                    plan,
+                    frontier=frontier,
+                    need_bindings=need_bindings,
+                    **(
+                        {"material_targets": material_targets}
+                        if material_targets is not None
+                        else {}
+                    ),
+                )
+            finally:
+                self._dependency_reserved_actions = []
+                self._dependency_reading_after = True
             self.receipts.extend(self.dependency_expander.receipts[receipt_start:])
             self._dependency_seconds.append(time.monotonic() - dependency_started)
             added = set(self.ledger.citation_numbers()) - before
@@ -1687,6 +1784,7 @@ class LegalCompositeEngine:
                 step.material_dependencies
                 if isinstance(step, IssueResearchStep)
                 else None,
+                reserved_actions=step.actions,
             )
             before = set(self.ledger.citation_numbers())
             source_phase_open = not step.actions or self._acquire(step.actions, plan)
@@ -2173,7 +2271,12 @@ class LegalCompositeEngine:
                         )
                         if self._repair_actions_have_runway(step):
                             self._refresh_dependencies(
-                                request, plan, [], step.material_dependencies
+                                request,
+                                plan,
+                                [],
+                                step.material_dependencies,
+                                reserved_actions=step.actions,
+                                reading_after=False,
                             )
                             before = set(self.ledger.citation_numbers())
                             self._acquire(step.actions, plan)
@@ -2328,6 +2431,8 @@ class LegalCompositeEngine:
         )
         assert isinstance(records, list)
         _add_span_previews(records)
+        if self.reviewer is not None and self.use_numbered_reading_supports:
+            records = number_reading_witnesses(records)
         payload["original_evidence"] = records
         payload["required_evidence_numbers"] = sorted(required)
         payload["omitted_original_ids"] = [
