@@ -7,11 +7,12 @@ import pytest
 from pydantic import BaseModel, JsonValue
 
 from onyx.asv3.evidence import EvidenceLedger
+from onyx.legal_composite.draft_repair import ClaimDeltaPatch
 from onyx.legal_composite.engine import LegalCompositeEngine
 from onyx.legal_composite.models import (
+    AnswerSection,
     AuthorityDependency,
     DependencyOrigin,
-    DraftPatch,
     GapResolution,
     IssueResearchPlan,
     IssueResearchStep,
@@ -60,21 +61,17 @@ class _Gateway:
                     "issue_gaps": {"a": [SOURCE_GAP]},
                 }
             )
-        assert response_type is DraftPatch
+        assert response_type is ClaimDeltaPatch
         affected = payload["affected_section_ids"]
         assert isinstance(affected, list)
         return response_type.model_validate(
             {
                 "sections": [
-                    section.model_dump()
+                    section.model_copy(deep=True, update={"text": ""}).model_dump()
                     for section in self.draft.sections
                     if section.section_id in affected
                 ],
-                "claims": [
-                    claim.model_dump()
-                    for claim in self.draft.claims
-                    if claim.section_id in affected
-                ],
+                "claims": [],
                 "unresolved_need_ids": self.draft.unresolved_need_ids,
             }
         )
@@ -188,8 +185,32 @@ def _engine(
     plan.needs[0].evidence_gaps = [SOURCE_GAP]
     draft.sections[0].text += f" Bu konuda kesin sonuç verilemiyor: {SOURCE_GAP}"
     draft = StructuredDraftAnswer(
-        sections=draft.sections,
-        claims=draft.claims,
+        sections=[
+            AnswerSection(
+                section_id=section.section_id,
+                need_ids=section.need_ids,
+                text="",
+                claim_ids=[
+                    claim.claim_id
+                    for claim in draft.claims
+                    if claim.section_id == section.section_id
+                ],
+            )
+            for section in draft.sections
+        ],
+        claims=[
+            claim.model_copy(
+                deep=True,
+                update={
+                    "answer_excerpt": next(
+                        section.text
+                        for section in draft.sections
+                        if section.section_id == claim.section_id
+                    )
+                },
+            )
+            for claim in draft.claims
+        ],
         unresolved_need_ids=["a"],
     )
     if fault == "unresolved_missing":
@@ -273,7 +294,7 @@ def test_source_gap_is_researched_and_rechecked_before_last_allowed_review() -> 
 
     assert result.status == "partial" and SOURCE_GAP in result.gaps
     assert reviewer.calls == 2
-    assert gateway.calls == [StructuredDraftAnswer, IssueResearchStep, DraftPatch]
+    assert gateway.calls == [StructuredDraftAnswer, IssueResearchStep, ClaimDeltaPatch]
 
 
 @pytest.mark.parametrize(

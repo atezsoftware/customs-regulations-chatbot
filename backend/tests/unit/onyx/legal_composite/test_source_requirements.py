@@ -8,6 +8,7 @@ from pydantic import BaseModel, JsonValue
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.models import RunContext
 from onyx.legal_composite.acquisition import InvalidSourceAction
+from onyx.legal_composite.draft_repair import ClaimDeltaPatch
 from onyx.legal_composite.engine import LegalCompositeEngine
 from onyx.legal_composite.models import (
     AnswerSection,
@@ -20,6 +21,7 @@ from onyx.legal_composite.models import (
     SemanticReview,
     SourceAction,
     SourceRequirement,
+    SpanSupport,
     WorkflowPolicy,
 )
 from onyx.legal_composite.models import (
@@ -77,7 +79,7 @@ def fixture() -> tuple[
             dimension="procedure_and_deadlines",
             rule=rule,
             application="Kullanıcı olgularına koşullu uygulanır.",
-            supports=[PassageSupport(citation=citation, quotation=rule)],
+            supports=[SpanSupport(citation=citation, quotation=rule)],
         )
         for need, citation, rule in (("a", 1, RULE_A), ("b", 2, RULE_B))
     ]
@@ -305,14 +307,49 @@ def test_patch_cannot_rewrite_unaffected_section_or_claim() -> None:
     assert result.answer == "\n\n".join(section.text for section in result.sections)
 
 
-def test_engine_repairs_only_missing_requirement_section_and_rechecks() -> None:
+@pytest.mark.parametrize("retain_additional_claim", [False, True])
+def test_engine_repairs_only_missing_requirement_section_and_rechecks(
+    retain_additional_claim: bool,
+) -> None:
     ledger, plan, requirements, draft = fixture()
+    draft.claims[1].answer_excerpt = draft.sections[1].text
+    if retain_additional_claim:
+        draft.claims.append(
+            DraftClaim(
+                claim_id="c_b_retained",
+                section_id="s_b",
+                need_ids=["b"],
+                answer_excerpt="Sürenin başlangıcı bildirim tarihidir. [2]",
+                requirement_ids=["r_b"],
+            )
+        )
+    claim_order = [
+        claim.claim_id for claim in draft.claims if claim.section_id == "s_b"
+    ]
+    draft = DraftAnswer(
+        sections=[
+            draft.sections[0],
+            AnswerSection(
+                section_id="s_b", need_ids=["b"], text="", claim_ids=claim_order
+            ),
+        ],
+        claims=draft.claims,
+        unresolved_need_ids=[],
+    )
     initial = draft.model_copy(deep=True)
-    initial.sections[1].text = "Başvurulabilir [2]."
-    initial.claims[1].answer_excerpt = "Başvurulabilir"
+    initial.claims[1].answer_excerpt = "Başvurulabilir [2]."
+    initial.sections[1].text = "\n\n".join(
+        claim.answer_excerpt for claim in initial.claims if claim.section_id == "s_b"
+    )
     initial.answer = "\n\n".join(s.text for s in initial.sections)
-    patch = DraftPatch(
-        sections=[draft.sections[1]], claims=[draft.claims[1]], unresolved_need_ids=[]
+    patch = ClaimDeltaPatch(
+        sections=[
+            AnswerSection(
+                section_id="s_b", need_ids=["b"], text="", claim_ids=claim_order
+            )
+        ],
+        claims=[draft.claims[1]],
+        unresolved_need_ids=[],
     )
     patch_inputs: list[dict[str, JsonValue]] = []
 
@@ -342,7 +379,7 @@ def test_engine_repairs_only_missing_requirement_section_and_rechecks() -> None:
             elif response_type is DraftAnswer:
                 value = initial
             else:
-                assert response_type is DraftPatch
+                assert response_type is ClaimDeltaPatch
                 patch_inputs.append(payload)
                 value = patch
             return response_type.model_validate(value.model_dump())
@@ -359,6 +396,9 @@ def test_engine_repairs_only_missing_requirement_section_and_rechecks() -> None:
 
     class Reviewer:
         calls = 0
+
+        def __init__(self) -> None:
+            self.reviewed_drafts: list[DraftAnswer] = []
 
         def expected_checks(
             self,
@@ -395,6 +435,7 @@ def test_engine_repairs_only_missing_requirement_section_and_rechecks() -> None:
         ) -> SemanticReview:
             del previous, affected_sections
             self.calls += 1
+            self.reviewed_drafts.append(draft.model_copy(deep=True))
             questions = self.expected_checks(
                 request, plan, draft, requirements, dependencies, delivered
             )
@@ -429,3 +470,13 @@ def test_engine_repairs_only_missing_requirement_section_and_rechecks() -> None:
     assert reviewer.calls == 2 and len(patch_inputs) == 1
     assert patch_inputs[0]["affected_section_ids"] == ["s_b"]
     assert len(result.source_requirements) == 2
+    assert reviewer.reviewed_drafts[-1].sections[1].text == draft.sections[1].text
+    assert reviewer.reviewed_drafts[-1].sections[0] == initial.sections[0]
+    if retain_additional_claim:
+        retained = [
+            next(claim for claim in reviewed.claims if claim.claim_id == "c_b_retained")
+            for reviewed in reviewer.reviewed_drafts
+        ]
+        assert retained[0].model_dump_json() == retained[1].model_dump_json()
+        assert retained[0] is not retained[1]
+        assert len(patch.claims) == 1 and patch.claims[0].claim_id == "c_b"

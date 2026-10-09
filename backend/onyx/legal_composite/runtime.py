@@ -189,7 +189,7 @@ def _run_legal_composite_loop(
         finalization_reserve_seconds=140,
         max_cost_usd=1.50,
         max_call_seconds=75,
-        max_context_tokens=128_000,
+        max_context_tokens=192_000,
         final_output_tokens=16_384,
         max_input_tokens=2_000_000,
         max_output_tokens=128_000,
@@ -416,6 +416,7 @@ def _run_legal_composite_loop(
             )
             gateway = BudgetedGateway(
                 max_parallel_generations=4,
+                share_draft_context=True,
                 selected_llm=llm,
                 research_llm=typed_research_llm,
                 budget=budget,

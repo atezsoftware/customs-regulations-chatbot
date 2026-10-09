@@ -14,7 +14,12 @@ from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.models import RunStopped
 from onyx.legal_composite import reviewer as reviewer_module
 from onyx.legal_composite.budget import WorkflowBudget
-from onyx.legal_composite.gateway import BudgetedGateway
+from onyx.legal_composite.gateway import (
+    BudgetedGateway,
+    MissingRequiredOriginal,
+    ModelContextLimit,
+    ResearchContextBudgetLimit,
+)
 from onyx.legal_composite.models import WorkflowPolicy
 from onyx.legal_composite.reviewer import (
     GatewayAnswerReviewer,
@@ -224,6 +229,7 @@ def test_codec_rescues_context_cap_without_removing_required_originals() -> None
     baseline = context()
     selected, before, after = _select_review_context(baseline, "{}", {}, None)
     gateway = object.__new__(BudgetedGateway)
+    gateway.share_draft_context = False
     gateway.token_counter = None
     gateway.budget = WorkflowBudget(WorkflowPolicy(max_context_tokens=after))
     llm = Mock(config=Mock(max_input_tokens=before))
@@ -259,6 +265,9 @@ def test_wire_mutation_cannot_mutate_source_metadata_or_quotes() -> None:
         (ValueError("private-source-text"), "invalid_or_unavailable_context"),
         (TypeError("private-source-text"), "invalid_or_unavailable_context"),
         (RunStopped("private-source-text"), "context_or_budget_limit"),
+        (MissingRequiredOriginal("private-source-text"), "context_or_budget_limit"),
+        (ModelContextLimit("private-source-text"), "context_or_budget_limit"),
+        (ResearchContextBudgetLimit("private-source-text"), "context_or_budget_limit"),
     ],
 )
 def test_singleton_fit_diagnostic_is_safe_and_never_certifies_the_check(
@@ -317,3 +326,23 @@ def test_singleton_fit_diagnostic_is_safe_and_never_certifies_the_check(
     assert "saved_tokens=0" in fit.summary and len(fit.summary) <= 160
     assert "private-source-text" not in json.dumps(fit.output_value)
     assert "private-source-text" not in fit.summary
+    details = next(
+        step
+        for operation, step in observations
+        if operation.endswith("review_context_failures")
+    )
+    expected = (
+        "required_missing"
+        if isinstance(error, MissingRequiredOriginal)
+        else "model_capacity"
+        if isinstance(error, ModelContextLimit)
+        else "priced_allocation"
+        if isinstance(error, ResearchContextBudgetLimit)
+        else "other_stop"
+        if isinstance(error, RunStopped)
+        else "invalid_context"
+    )
+    assert details.output_value[expected] == 1
+    assert sum(details.output_value.values()) == 1
+    assert "private-source-text" not in json.dumps(details.output_value)
+    assert "private-source-text" not in details.summary
