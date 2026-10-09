@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 from unittest.mock import MagicMock
 
 from onyx.asv3.candidate_audit import CandidateAudit, CandidateAuditRecord
@@ -9,7 +10,7 @@ from onyx.asv3.guardrails_v3 import (
     GuardrailsV3ReviewOutcome,
     NormalizedFinding,
 )
-from onyx.asv3.models import EvidenceItem, RunContext
+from onyx.asv3.models import EvidenceItem, OutcomeStatus, RunContext, ToolOutcome
 from onyx.llm.interfaces import LLM, LLMConfig
 from onyx.llm.model_response import Choice, Message, ModelResponse, Usage
 
@@ -198,6 +199,93 @@ def test_repair_uses_only_the_configured_gemini_flash_model() -> None:
     assert outcome.answer == "A şarttır [1]."
     assert outcome.failure_reason == "repair_unavailable"
     llm.invoke.assert_not_called()
+
+
+def test_material_method_two_gap_runs_one_scoped_search_before_repair() -> None:
+    context, ledger = RunContext(timeout_seconds=120), EvidenceLedger()
+    ledger.add(
+        [EvidenceItem(source_id="law", chunk_id="1", text="Ceza uygulanır.")],
+        context,
+    )
+    ledger.record_delivery(
+        "candidate", "asv3_coordinator", [{"citation": 1, "text": "Ceza uygulanır."}]
+    )
+    calls: list[dict[str, object]] = []
+
+    def search(args: dict[str, object], _context: RunContext) -> ToolOutcome:
+        calls.append(args)
+        return ToolOutcome(
+            status=OutcomeStatus.FOUND,
+            summary="Scoped authority search completed",
+            evidence=[
+                EvidenceItem(
+                    source_id="court",
+                    chunk_id="2",
+                    text="Mahkeme kararı ceza dayanağını iptal eder.",
+                )
+            ],
+        )
+
+    broker = MagicMock()
+    broker.search_adapter = search
+    llm = _llm("Ceza uygulanır; kararın etkisi ayrıca değerlendirilir [1][2].")
+    initial = GuardrailsV3ReviewOutcome(
+        review_completed=True,
+        repair_requested=True,
+        findings=[
+            NormalizedFinding(
+                finding_id="finding-court",
+                outcome_ids=[],
+                dimensions=["d1"],
+                reason="missing",
+                review_question_ids=["m2.d1.applicability", "m2.d1.treatment"],
+                affected_answer_unit_ids=["s1"],
+                draft_hash="a" * 64,
+            )
+        ],
+    )
+
+    outcome = _controller().finalize_guardrails_v3(
+        question="Usulsüzlük cezasına ilişkin güncel hukukî sonucu nedir?",
+        candidate_answer="Ceza uygulanır [1].",
+        initial_review=initial,
+        ledger=ledger,
+        context=context,
+        repair_llm=llm,
+        broker=broker,
+        recheck=lambda *_args, **_kwargs: GuardrailsV3ReviewOutcome(
+            review_completed=True
+        ),
+    )
+
+    assert outcome.action == "focused_search"
+    assert outcome.repair_applied is True
+    assert ledger.completely_delivered("guardrails-v3-focused-search") == {2}
+    assert ledger.completely_delivered("guardrails-v3-repair") == {1, 2}
+    repair_payload = json.loads(llm.invoke.call_args.args[0][0].content)
+    assert repair_payload["evidence"] == [
+        {
+            "citation": 1,
+            "source_id": "law",
+            "chunk_id": "1",
+            "text": "Ceza uygulanır.",
+        },
+        {
+            "citation": 2,
+            "source_id": "court",
+            "chunk_id": "2",
+            "text": "Mahkeme kararı ceza dayanağını iptal eder.",
+        },
+    ]
+    assert calls == [
+        {
+            "query": "Usulsüzlük cezasına ilişkin güncel hukukî sonucu nedir?",
+            "mode": "hybrid",
+            "coverage_item": "m2.d1",
+            "evidence_target": "review_gap:m2.d1",
+            "expand_query": True,
+        }
+    ]
 
 
 def test_excluded_candidate_is_hydrated_and_delivered_before_one_repair() -> None:

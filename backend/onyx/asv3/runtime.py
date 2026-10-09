@@ -2053,6 +2053,7 @@ def run_asv3_loop(
                     return review_frozen_packet(rebuilt.packet)
 
                 finalization = finalize_guardrails_v3(
+                    question=question,
                     candidate_answer=final,
                     initial_review=review_outcome,
                     ledger=ledger,
