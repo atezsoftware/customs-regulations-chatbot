@@ -180,6 +180,38 @@ def initial_discovery_actions(plan: ResearchPlan, request: str) -> list[SourceAc
     return actions
 
 
+def initial_issue_discovery_actions(
+    plan: IssueResearchPlan, request: str
+) -> list[SourceAction]:
+    """Acquire one cross-issue frontier before further gap-directed discovery."""
+    if not plan.requires_sources:
+        return list(plan.initial_actions)
+    need_ids = [need.need_id for need in plan.needs]
+    query = plan.discovery_query.strip() or request.strip()
+    return [
+        SourceAction(
+            need_ids=need_ids,
+            tool="search_corpus",
+            arguments={
+                "query": query[:REGULATORY_MAX_SEARCH_QUERY_CHARS],
+                "mode": "hybrid",
+                "coverage_item": ", ".join(need_ids),
+                "evidence_target": "Operative governing, implementing, limiting and contrary original passages for the requested outcomes",
+                "expand_query": False,
+            },
+        ),
+        *(action for action in plan.initial_actions if action.tool != "search_corpus"),
+    ]
+
+
+def _search_action_identity(action: SourceAction) -> str:
+    arguments = {
+        key: value for key, value in action.arguments.items() if key != "_public_update"
+    }
+    arguments["expand_query"] = False
+    return json.dumps(arguments, sort_keys=True)
+
+
 class ModelGateway(Protocol):
     last_call_id: str | None
 
@@ -405,6 +437,7 @@ class LegalCompositeEngine:
         self.research_gaps: list[str] = []
         self.protocol_defects: list[str] = []
         self.source_requests: list[JsonValue] = []
+        self.deferred_initial_actions: list[tuple[SourceAction, str]] = []
         self.semantic_review: SemanticReview | None = None
         self.dependencies: list[AuthorityDependency] = []
         self.selection: SourceSelectionResult | None = None
@@ -541,6 +574,14 @@ class LegalCompositeEngine:
             }
         if self.reviewer is not None:
             payload["coordinator_source_requests"] = self.source_requests
+            payload["deferred_initial_source_actions"] = [
+                {
+                    "action": action.model_dump(mode="json"),
+                    "status": status,
+                    "navigation_only": True,
+                }
+                for action, status in self.deferred_initial_actions
+            ]
             sources: dict[str, dict[str, JsonValue]] = {}
             for row in self.ledger.provision_metadata():
                 source_id, metadata = row.get("source_id"), row.get("metadata")
@@ -595,6 +636,25 @@ class LegalCompositeEngine:
             ]
         return payload
 
+    def _mark_deferred_initial_attempts(
+        self, actions: list[SourceAction], status: str
+    ) -> None:
+        self.deferred_initial_actions = [
+            (
+                deferred,
+                status
+                if any(
+                    action.tool == "search_corpus"
+                    and set(deferred.need_ids) <= set(action.need_ids)
+                    and _search_action_identity(deferred)
+                    == _search_action_identity(action)
+                    for action in actions
+                )
+                else previous_status,
+            )
+            for deferred, previous_status in self.deferred_initial_actions
+        ]
+
     def _acquire(self, actions: list[SourceAction], plan: ResearchPlan) -> bool:
         request: dict[str, JsonValue] | None = None
         if self.reviewer is not None:
@@ -604,18 +664,22 @@ class LegalCompositeEngine:
                 "navigation_only": True,
             }
             self.source_requests.append(request)
+            self._mark_deferred_initial_attempts(actions, "requested")
         try:
             self.receipts.extend(self.acquirer.acquire(actions, plan))
             if request is not None:
                 request["status"] = "completed"
+                self._mark_deferred_initial_attempts(actions, "attempted")
             return True
         except InvalidSourceAction:
             if request is not None:
                 request["status"] = "invalid"
+                self._mark_deferred_initial_attempts(actions, "invalid_attempt")
             raise
         except RunStopped:
             if request is not None:
                 request["status"] = "source_phase_stopped"
+                self._mark_deferred_initial_attempts(actions, "partially_attempted")
             # The finite source phase cannot spend the writer/reviewer reserve.
             self.check_active()
             retained = getattr(self.acquirer, "last_receipts", [])
@@ -823,7 +887,16 @@ class LegalCompositeEngine:
             self.plan = self.plan.model_copy(update={"requires_sources": True})
         plan = self.plan
         self.report("tools", plan.language)
-        initial_actions = initial_discovery_actions(plan, request)
+        if self.reviewer is not None:
+            assert isinstance(plan, IssueResearchPlan)
+            self.deferred_initial_actions = [
+                (action, "unexecuted_navigation")
+                for action in plan.initial_actions
+                if action.tool == "search_corpus" and plan.requires_sources
+            ]
+            initial_actions = initial_issue_discovery_actions(plan, request)
+        else:
+            initial_actions = initial_discovery_actions(plan, request)
         source_phase_open = not initial_actions or self._acquire(initial_actions, plan)
         self._select_sources(request, plan)
         for _round in range(self.policy.max_research_rounds):
@@ -834,6 +907,8 @@ class LegalCompositeEngine:
             ):
                 break
             try:
+                if self.reviewer is not None:
+                    self.report("reading", plan.language)
                 step = self.gateway.complete(
                     RESEARCH_PROMPT,
                     self._payload(request, history, instructions=instructions),

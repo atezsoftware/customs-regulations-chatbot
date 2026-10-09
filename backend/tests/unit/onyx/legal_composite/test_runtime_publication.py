@@ -196,8 +196,9 @@ def harness(monkeypatch: pytest.MonkeyPatch) -> RuntimeHarness:
     monkeypatch.setattr(runtime, "save_asv3_checkpoint", save_checkpoint)
     user = User(id=uuid4(), email="unit@example.com")
 
-    def prepared_catalogue(_session, *, user, filters, check_active):
+    def prepared_catalogue(_session, *, user, filters, check_active, timings):
         check_active()
+        assert isinstance(timings, runtime.CatalogueTimings)
         return SourceLaneCatalogue(
             user_id=user.id,
             scope_sha256=source_scope_sha256(user, filters),
@@ -309,6 +310,47 @@ def test_revalidated_cited_documents_only_are_published(
     assert len(harness.state.get_all_search_docs()) == 1
     assert "Uncited" not in str(harness.state.get_citation_to_doc())
     assert harness.state.get_answer_tokens()
+
+
+@pytest.mark.parametrize(
+    "language,title,message",
+    [
+        (
+            "tr",
+            "Kaynak hükümleri okunuyor",
+            "Bulunan özgün hükümleri her sorunuz için değerlendirip koşulları, süreleri ve gerekli diğer kaynakları belirliyorum.",
+        ),
+        (
+            "en",
+            "Reading source provisions",
+            "Evaluating the original provisions for each question to identify conditions, deadlines and other required sources.",
+        ),
+    ],
+)
+def test_lc_reading_phase_emits_localized_public_progress(
+    harness: RuntimeHarness,
+    monkeypatch: pytest.MonkeyPatch,
+    language: str,
+    title: str,
+    message: str,
+) -> None:
+    factory = runtime.LegalCompositeEngine
+
+    def engine(**kwargs: Any) -> Any:
+        instance = factory(**kwargs)
+        kwargs["report"]("reading", language)
+        return instance
+
+    monkeypatch.setattr(runtime, "LegalCompositeEngine", engine)
+    harness.run(None)
+    events = [
+        packet.obj
+        for packet in harness.emitter.get_packets()
+        if isinstance(packet.obj, ASv3Progress) and packet.obj.phase == "reading"
+    ]
+    assert len(events) == 1
+    assert events[0].language == language
+    assert events[0].title == title and events[0].message == message
 
 
 @pytest.mark.parametrize("prebound", [False, True])

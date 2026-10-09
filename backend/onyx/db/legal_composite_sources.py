@@ -11,7 +11,7 @@ from contextvars import copy_context
 from datetime import date
 from enum import StrEnum
 from hashlib import sha256
-from typing import cast
+from typing import TYPE_CHECKING, cast
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, JsonValue
@@ -62,6 +62,9 @@ from onyx.regulatory.publication_reads import (
 )
 from shared_configs.configs import MULTI_TENANT
 
+if TYPE_CHECKING:
+    from onyx.db.regulatory_publication import PublicationStore
+
 SOURCE_PAGE_SIZE = 1_000
 MAX_OPENING_BATCH_SOURCES = 100
 MAX_SOURCE_INVENTORY = 10_000
@@ -94,6 +97,8 @@ def find_source_inventory_page(
     source_ids: tuple[UUID, ...] | None = None,
     offset: int = 0,
     limit: int = SOURCE_PAGE_SIZE,
+    publication_store: "PublicationStore | None" = None,
+    record_timing: Callable[[str, float], None] | None = None,
 ) -> tuple[list[CorpusSource], bool]:
     """Page authorized inventory using canonical scope, ACL and publication guards."""
     if (
@@ -103,26 +108,52 @@ def find_source_inventory_page(
         or offset < 0
     ):
         raise ValueError("Inventory pages require offset >= 0 and limit 1..1000.")
+    started = time.perf_counter()
     _validate_filters(session, user, filters)
+    if record_timing is not None:
+        record_timing("scope_validation_seconds", time.perf_counter() - started)
     statement = _source_statement(filters)
     if source_ids is not None:
         statement = statement.where(UserFile.id.in_(source_ids))
+    started = time.perf_counter()
     records = session.execute(
         statement.order_by(UserFile.id).offset(offset).limit(limit + 1)
     ).all()
+    if record_timing is not None:
+        record_timing("inventory_query_seconds", time.perf_counter() - started)
+    started = time.perf_counter()
     access = get_access_for_user_files([str(row.id) for row in records], session)
+    if record_timing is not None:
+        record_timing("file_acl_seconds", time.perf_counter() - started)
+    started = time.perf_counter()
     user_acl = get_acl_for_user(user, session)
+    if record_timing is not None:
+        record_timing("user_acl_seconds", time.perf_counter() - started)
     candidates = [
         CorpusSource(row.id, row.name, row.file_id)
         for row in records[:limit]
         if row.id and str(row.id) in access and access[str(row.id)].to_acl() & user_acl
     ]
-    retained = filter_publication_read(
-        observe_publication_read(),
-        candidates,
-        lambda row: str(row.id),
-        record_evidence=False,
-    )
+    started = time.perf_counter()
+    observation = observe_publication_read()
+    if record_timing is not None:
+        record_timing("publication_observation_seconds", time.perf_counter() - started)
+    started = time.perf_counter()
+    if publication_store is None:
+        retained = filter_publication_read(
+            observation,
+            candidates,
+            lambda row: str(row.id),
+            record_evidence=False,
+        )
+    else:
+        files = tuple({source.id for source in candidates})
+        unavailable = (
+            publication_store.unavailable(observation, files) if files else frozenset()
+        )
+        retained = [source for source in candidates if source.id not in unavailable]
+    if record_timing is not None:
+        record_timing("publication_guard_seconds", time.perf_counter() - started)
     return retained, len(records) > limit
 
 
