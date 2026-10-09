@@ -404,6 +404,7 @@ class LegalCompositeEngine:
         self.requirements = RequirementLedger(ledger)
         self.research_gaps: list[str] = []
         self.protocol_defects: list[str] = []
+        self.source_requests: list[JsonValue] = []
         self.semantic_review: SemanticReview | None = None
         self.dependencies: list[AuthorityDependency] = []
         self.selection: SourceSelectionResult | None = None
@@ -538,6 +539,27 @@ class LegalCompositeEngine:
                 else {},
                 "instruction": "Inspect retained uncertainty from full originals; relevance alone does not prove applicability.",
             }
+        if self.reviewer is not None:
+            payload["coordinator_source_requests"] = self.source_requests
+            sources: dict[str, dict[str, JsonValue]] = {}
+            for row in self.ledger.provision_metadata():
+                source_id, metadata = row.get("source_id"), row.get("metadata")
+                if not isinstance(source_id, str) or not isinstance(metadata, dict):
+                    continue
+                source = sources.setdefault(
+                    source_id,
+                    {"source_id": source_id, "titles": [], "observed_articles": []},
+                )
+                for field, target in (
+                    ("title", "titles"),
+                    ("article_no", "observed_articles"),
+                ):
+                    values = source[target]
+                    assert isinstance(values, list)
+                    value = metadata.get(field)
+                    if value is not None and value not in values:
+                        values.append(value)
+            payload["observed_source_directory"] = list(sources.values())
         if source_phase:
             catalogue: list[dict[str, JsonValue]] = [
                 {
@@ -574,12 +596,26 @@ class LegalCompositeEngine:
         return payload
 
     def _acquire(self, actions: list[SourceAction], plan: ResearchPlan) -> bool:
+        request: dict[str, JsonValue] | None = None
+        if self.reviewer is not None:
+            request = {
+                "actions": [action.model_dump(mode="json") for action in actions],
+                "status": "requested",
+                "navigation_only": True,
+            }
+            self.source_requests.append(request)
         try:
             self.receipts.extend(self.acquirer.acquire(actions, plan))
+            if request is not None:
+                request["status"] = "completed"
             return True
         except InvalidSourceAction:
+            if request is not None:
+                request["status"] = "invalid"
             raise
         except RunStopped:
+            if request is not None:
+                request["status"] = "source_phase_stopped"
             # The finite source phase cannot spend the writer/reviewer reserve.
             self.check_active()
             retained = getattr(self.acquirer, "last_receipts", [])
