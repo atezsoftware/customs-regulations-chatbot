@@ -4,12 +4,32 @@ import math
 import threading
 import time
 from collections.abc import Callable
+from typing import Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, JsonValue
 
 from onyx.asv3.models import RunStopped
 from onyx.legal_composite.models import WorkflowPolicy
+
+ResearchStopReason = Literal[
+    "host_research_deadline", "host_call_timeout", "provider_timeout"
+]
+_RESEARCH_STOP_REASONS = frozenset(
+    {"host_research_deadline", "host_call_timeout", "provider_timeout"}
+)
+
+
+class ResearchPhaseClosed(RunStopped):
+    """Research ended without revoking the reserved finalization allocation."""
+
+    def __init__(self, reason: ResearchStopReason) -> None:
+        if reason not in _RESEARCH_STOP_REASONS:
+            raise ValueError("Unknown research closure reason")
+        self.reason = reason
+        super().__init__(
+            f"Research phase closed ({reason}); finalization allocation retained"
+        )
 
 
 class CallReservation(BaseModel):
@@ -64,6 +84,7 @@ class WorkflowBudget:
         self._settled: set[str] = set()
         self._usage_overrun = False
         self._stop_reason: str | None = None
+        self._research_stop_reason: ResearchStopReason | None = None
         self._selection_reserve_seconds = 0.0
 
     def retain_selection_time(self, seconds: float) -> None:
@@ -125,6 +146,8 @@ class WorkflowBudget:
         with self._lock:
             if self._stop_reason:
                 raise RunStopped(self._stop_reason)
+            if not finalizing and self._research_stop_reason is not None:
+                raise ResearchPhaseClosed(self._research_stop_reason)
         if self.remaining_seconds(finalizing) <= 0:
             raise RunStopped("Workflow deadline reached; finalization time retained")
 
@@ -134,6 +157,7 @@ class WorkflowBudget:
             return (
                 not self._usage_overrun_blocks_calls()
                 and self._stop_reason is None
+                and self._research_stop_reason is None
                 and self.remaining_seconds() >= 3
                 and self._calls < self.policy.max_model_calls - pending
                 and self._input
@@ -269,6 +293,12 @@ class WorkflowBudget:
         with self._lock:
             self._stop_reason = reason
 
+    def close_research(self, reason: ResearchStopReason) -> None:
+        if reason not in _RESEARCH_STOP_REASONS:
+            raise ValueError("Unknown research closure reason")
+        with self._lock:
+            self._research_stop_reason = self._research_stop_reason or reason
+
     def settle(
         self,
         reservation: CallReservation,
@@ -312,7 +342,7 @@ class WorkflowBudget:
 
     def snapshot(self) -> dict[str, JsonValue]:
         with self._lock:
-            return {
+            snapshot: dict[str, JsonValue] = {
                 "model_calls": self._calls,
                 "input_tokens": self._input,
                 "output_tokens": self._output,
@@ -325,3 +355,6 @@ class WorkflowBudget:
                 "unsettled_calls": len(self._reservations) - len(self._settled),
                 "cost_basis": "uncached upper-rate estimate; failed calls retain their allocation",
             }
+            if self._research_stop_reason is not None:
+                snapshot["research_stop_reason"] = self._research_stop_reason
+            return snapshot
