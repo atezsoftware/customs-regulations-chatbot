@@ -3,17 +3,17 @@ from typing import TypeVar
 from unittest.mock import patch
 
 import pytest
-from pydantic import BaseModel, JsonValue
+from pydantic import BaseModel, JsonValue, ValidationError
 
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.models import EvidenceItem, RunContext, SharedBudget
 from onyx.configs.constants import DocumentSource
 from onyx.context.search.models import SearchDoc
+from onyx.legal_review.drafting import GeneratedDraft
 from onyx.legal_review.engine import (
     LegalReviewEngine,
     recorded_legal_status,
     recorded_validity,
-    validate_support,
 )
 from onyx.legal_review.models import (
     AnswerClaim,
@@ -76,10 +76,9 @@ def requirement(identity: str = "r1") -> Requirement:
     return Requirement(
         requirement_id=identity,
         issue_id="i1",
-        dimension=LegalDimension.LEGAL_BASIS,
         rule=RULE,
         application="Belgenin ibrazı koşuldur.",
-        supports=[PassageSupport(citation=1, quotation=RULE)],
+        supports=[PassageSupport(citation=1, span_number=1)],
     )
 
 
@@ -121,7 +120,7 @@ def draft() -> DraftAnswer:
                 claim_id="c1",
                 issue_ids=["i1"],
                 answer_excerpt=text,
-                supports=[PassageSupport(citation=1, quotation=RULE)],
+                supports=[PassageSupport(citation=1, span_number=1)],
             )
         ],
     )
@@ -154,6 +153,20 @@ class FakeGateway:
                 {"query": query, "issue_ids": identities}
                 for query, identities in shared.items()
             ]
+        if response_model is GeneratedDraft and isinstance(result, DraftAnswer):
+            payload = {
+                "blocks": [
+                    {
+                        "block_id": "b1",
+                        "text": result.answer,
+                        "claims": [
+                            claim.model_dump(exclude={"answer_excerpt"})
+                            for claim in result.claims
+                        ],
+                    }
+                ],
+                "unresolved_issue_ids": result.unresolved_issue_ids,
+            }
         return response_model.model_validate(payload)
 
 
@@ -267,9 +280,9 @@ def test_one_repair_uses_literal_draft_then_stops_on_remaining_flags() -> None:
     assert len(gateway.calls) == 5
 
 
-def test_nonliteral_support_is_rejected_before_jev() -> None:
+def test_unknown_passage_support_is_rejected_before_jev() -> None:
     bad = reading()
-    bad.requirements[0].supports[0].quotation = "Bu şart aranmamaktadır."
+    bad.requirements[0].supports = [PassageSupport(citation=1, span_number=999)]
     workflow, _, reviewer = engine([plan(), bad], [])
     result = workflow.run("Başvuru şartı nedir?", "")
     assert result.status == "unavailable" and result.answer is None
@@ -281,7 +294,12 @@ def test_source_text_is_not_truncated_to_fit_review() -> None:
     workflow.run("Başvuru şartı nedir?", "")
     originals = reviewer.states[0]["original_evidence"]
     assert isinstance(originals, list) and isinstance(originals[0], dict)
-    assert originals[0]["text"] == RULE
+    passages = originals[0]["passages"]
+    assert isinstance(passages, list)
+    assert (
+        "".join(str(row["text"]) for row in passages if isinstance(row, dict)) == RULE
+    )
+    assert "text" not in originals[0]
 
 
 def test_dimension_inventory_must_cover_all_twelve() -> None:
@@ -291,14 +309,34 @@ def test_dimension_inventory_must_cover_all_twelve() -> None:
     assert workflow.run("Soru", "").status == "unavailable"
 
 
-def test_dimension_cannot_close_using_another_dimensions_requirement() -> None:
-    bad = reading()
-    bad.dimensions[1].requirement_ids = ["r1"]
-    bad.dimensions[1].status = "addressed"
-    workflow, _, _ = engine([plan(), bad], [])
+def test_finding_can_support_multiple_dimensions_without_duplicate_extraction() -> None:
+    extracted = reading()
+    extracted.dimensions[1].requirement_ids = ["r1"]
+    extracted.dimensions[1].status = "addressed"
+    extracted.dimensions[
+        1
+    ].reason = "Aynı hükmün uygulama zamanı ayrıca değerlendirilir."
+    workflow, _, reviewer = engine([plan(), extracted, draft()], ["pass", "pass"])
     result = workflow.run("Soru", "")
-    assert result.status == "unavailable"
-    assert "match the assessed dimension" in result.gaps[-1]
+    assert result.status == "partial"
+    assert len(result.requirements) == 1
+    assert len(reviewer.states) == 2
+    assert result.dimensions[1].requirement_ids == ["r1"]
+
+
+def test_known_finding_id_does_not_bypass_semantic_review() -> None:
+    extracted = reading()
+    extracted.dimensions[1].requirement_ids = ["r1"]
+    extracted.dimensions[1].status = "addressed"
+    workflow, _, reviewer = engine([plan(), extracted], ["incomplete"])
+    result = workflow.run("Soru", "")
+    assert result.status == "unavailable" and result.answer is None
+    assert len(reviewer.states) == 1
+    checks = workflow._checks(draft=False)
+    assert all(
+        "ID link alone proves no entailment" in check.instructions
+        for check in checks[:12]
+    )
 
 
 def test_requirement_supersession_preserves_audit_and_removes_obsolete_rule() -> None:
@@ -646,9 +684,14 @@ def test_child_canonical_trigger_survives_same_round_parent_supersession() -> No
     assert workflow.plan.issues[1].supporting_requirement_ids == ["r1"]
 
 
-@pytest.mark.parametrize("quotation", [" ", "benzer ama kaynakta olmayan ifade"])
-def test_empty_or_fabricated_quotation_cannot_bind_original(quotation: str) -> None:
-    ledger = EvidenceLedger()
-    ledger.add([original()], RunContext())
-    with pytest.raises(ValueError):
-        validate_support(PassageSupport(citation=1, quotation=quotation), ledger)
+@pytest.mark.parametrize("span_number", [0, -1, "1", True])
+def test_invalid_passage_selector_cannot_bind_original(span_number: object) -> None:
+    with pytest.raises(ValidationError):
+        PassageSupport.model_validate({"citation": 1, "span_number": span_number})
+
+
+def test_model_cannot_supply_or_paraphrase_the_source_quotation() -> None:
+    with pytest.raises(ValidationError):
+        PassageSupport.model_validate(
+            {"citation": 1, "span_number": 1, "quotation": "fabricated"}
+        )
