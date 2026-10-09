@@ -168,8 +168,8 @@ those limits. Provider rejection produces an explicit incomplete review.
 There is no numeric issue-count limit. Materiality, reuse of existing issues and
 global time, call, search, tool and context budgets control growth. Every explicit
 requested outcome must remain represented; the planner must not compress outcomes to
-fit an artificial issue cap. Identical initial queries are executed once with their
-issue IDs combined. A decisive question that cannot be resolved within the remaining
+fit an artificial issue cap. Identical initial queries and identical source operations
+within a reading batch are executed once with their issue IDs combined. A decisive question that cannot be resolved within the remaining
 budget stays open and disclosed instead of being forcibly closed.
 
 Stop checks propagate through research, selected provider calls, JEV response

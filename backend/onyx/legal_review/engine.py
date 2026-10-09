@@ -333,6 +333,20 @@ class LegalReviewEngine:
                 )
                 for query in issue.research_queries
             )
+        combined: dict[tuple[str, str], SourceAction] = {}
+        for action in decision.actions:
+            key = (
+                action.tool,
+                json.dumps(action.arguments, sort_keys=True, ensure_ascii=False),
+            )
+            previous = combined.get(key)
+            if previous is None:
+                combined[key] = action.model_copy(deep=True)
+            else:
+                previous.issue_ids = list(
+                    dict.fromkeys([*previous.issue_ids, *action.issue_ids])
+                )
+        decision.actions = list(combined.values())
         self.pending_actions = list(decision.actions)
 
     def _acquire(

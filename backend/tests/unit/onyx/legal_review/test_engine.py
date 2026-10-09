@@ -478,6 +478,38 @@ def test_duplicate_source_dependency_reuses_existing_issue() -> None:
         workflow._accept_reading(duplicate)
 
 
+@pytest.mark.parametrize("tool", ["search_corpus", "read_provision"])
+def test_distinct_dependencies_can_share_one_source_operation(tool: str) -> None:
+    workflow, _, _ = engine([], [])
+    workflow.plan = plan()
+    workflow.ledger.add([original()], workflow.context)
+    chosen = reading_child(
+        additional=True, resolved=False, query=tool == "search_corpus"
+    )
+    second = source_issue(
+        "s2", query=tool == "search_corpus", dimension=LegalDimension.PROCEDURE
+    )
+    chosen.additional_issues.append(second)
+    chosen.dimensions.extend(
+        row.model_copy(update={"issue_id": "s2"})
+        for row in list(chosen.dimensions)
+        if row.issue_id == "s1"
+    )
+    if tool == "read_provision":
+        chosen.actions = [
+            SourceAction(
+                issue_ids=[identity],
+                tool=tool,
+                arguments={"source_id": "source-1", "article": "2"},
+            )
+            for identity in ["s1", "s2"]
+        ]
+    workflow._accept_reading(chosen)
+    assert len(chosen.actions) == 1
+    assert chosen.actions[0].issue_ids == ["s1", "s2"]
+    assert chosen.actions[0].tool == tool
+
+
 def test_issue_count_has_no_arbitrary_cap_and_dependencies_remain_acyclic() -> None:
     issues = [
         plan().issues[0].model_copy(update={"issue_id": f"i{index}"})
