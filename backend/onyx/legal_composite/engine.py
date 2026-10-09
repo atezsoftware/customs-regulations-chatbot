@@ -67,6 +67,41 @@ from onyx.tracing.flows import LLMFlow
 
 ResponseModel = TypeVar("ResponseModel", bound=BaseModel)
 
+_STOP_REASONS = {
+    "The model response failed the workflow schema": "output_schema",
+    "The typed model response was truncated": "output_truncated",
+    "The model returned no structured answer": "output_missing",
+    "The typed model returned an undeclared tool call": "output_tool_call",
+    "The bounded model invocation timed out": "provider_timeout",
+    "Provider call exceeded its deadline; no further spend authorized": "provider_timeout",
+    "The bounded model invocation failed": "provider_failure",
+    "Provider usage exceeded the estimate; no further spend authorized": "usage_estimate_overrun",
+    "Provider actual usage exceeded workflow capacity; no further generations allowed": "usage_capacity",
+    "Workflow model budget exhausted; finalization allocation retained": "model_allocation",
+    "Workflow deadline reached; finalization time retained": "deadline",
+    "Research deadline exceeded; finalization time retained": "research_deadline",
+    "Research deadline exceeded": "deadline",
+    "Research cancelled": "cancelled",
+    "A required original is absent from the generation payload": "required_original",
+    "Required originals and protocol exceed the remaining research budget": "model_allocation",
+    "Required originals and protocol exceed the model context budget": "model_capacity",
+}
+
+
+def _stop_reason(error: RunStopped | InvalidSourceAction) -> str:
+    if isinstance(error, InvalidSourceAction):
+        return "source_action"
+    return _STOP_REASONS.get(str(error), "other_stop")
+
+
+def _admission_reason(error: InvalidSourceAction) -> str:
+    return {
+        "Support is not an exact delivered original: canonical original binding failed": "original_binding",
+        "Support span ID is not in this exact original": "span_identity",
+        "Support quotation conflicts with its original span": "span_quotation",
+        "Support quotation is not an exact delivered original passage": "literal_quotation",
+    }.get(str(error), "source_action")
+
 
 def _add_span_previews(records: list[JsonValue]) -> None:
     """Expose short navigation labels while preserving the whole original text."""
@@ -736,8 +771,13 @@ class LegalCompositeEngine:
         self, request: str, history: str = "", instructions: str | None = None
     ) -> WorkflowResult:
         try:
-            return self._run(request, history, instructions)
+            result = self._run(request, history, instructions)
+            if self.reviewer is not None and result.status == "unavailable":
+                self._trace_stop("semantic_rejection")
+            return result
         except (RunStopped, InvalidSourceAction) as error:
+            if self.reviewer is not None:
+                self._trace_stop(_stop_reason(error))
             status = "cancelled" if "cancel" in str(error).lower() else "unavailable"
             if self.reviewer is not None:
                 assert self.plan is None or isinstance(self.plan, IssueResearchPlan)
@@ -756,6 +796,42 @@ class LegalCompositeEngine:
                 plan=self.plan,
                 review=self.last_review,
             )
+        except Exception:
+            if self.reviewer is not None:
+                self._trace_stop("unhandled_exception")
+            raise
+
+    def _trace_stop(self, reason: str) -> None:
+        with graph_step(
+            "legal_composite.run_stop", {}, summary=f"reason={reason}"
+        ) as step:
+            step.output_value = {"reason": reason}
+
+    def _trace_admission(
+        self,
+        kind: str,
+        stage: str,
+        accepted: bool,
+        reason: str = "none",
+        changed_claims: int = 0,
+        changed_sections: int = 0,
+    ) -> None:
+        with graph_step(
+            "legal_composite.draft_admission",
+            {},
+            summary=(
+                f"kind={kind} accepted={int(accepted)} stage={stage} reason={reason} "
+                f"changed_claims={changed_claims} changed_sections={changed_sections}"
+            ),
+        ) as step:
+            step.output_value = {
+                "kind": kind,
+                "stage": stage,
+                "accepted": accepted,
+                "reason": reason,
+                "changed_claims": changed_claims,
+                "changed_sections": changed_sections,
+            }
 
     def _select_sources(
         self, request: str, plan: ResearchPlan, numbers: set[int] | None = None
@@ -1170,12 +1246,18 @@ class LegalCompositeEngine:
         )
         delivered = set(getattr(self.gateway, "last_delivered_citations", set()))
         pending_binding_gaps: list[str] = []
+        admission_stage = "supports"
         try:
             draft = canonicalize_draft_supports(draft, self.ledger, delivered)
+            admission_stage = "reading"
             self._accept_draft_reading(
                 draft.requirements, draft.gap_resolutions, plan, delivered
             )
+            self._trace_admission("draft", admission_stage, True)
         except InvalidSourceAction as error:
+            self._trace_admission(
+                "draft", admission_stage, False, _admission_reason(error)
+            )
             pending_binding_gaps.append(str(error))
         gaps: list[str] = []
         previous: SemanticReview | None = None
@@ -1475,13 +1557,16 @@ class LegalCompositeEngine:
                 LLMFlow.LEGAL_COMPOSITE_ANSWER,
                 True,
             )
+            admission_stage = "supports"
             try:
                 patch = canonicalize_delta_supports(
                     patch,
                     self.ledger,
                     set(getattr(self.gateway, "last_delivered_citations", set())),
                 )
+                admission_stage = "scope"
                 candidate_draft = apply_claim_delta(draft, patch, affected)
+                admission_stage = "reading"
                 self._accept_draft_reading(
                     patch.requirements,
                     patch.gap_resolutions,
@@ -1489,8 +1574,29 @@ class LegalCompositeEngine:
                     set(getattr(self.gateway, "last_delivered_citations", set())),
                     affected_needs,
                 )
+                prior_claims = {claim.claim_id: claim for claim in draft.claims}
+                prior_sections = {
+                    section.section_id: section for section in draft.sections
+                }
+                self._trace_admission(
+                    "patch",
+                    admission_stage,
+                    True,
+                    changed_claims=sum(
+                        prior_claims.get(claim.claim_id) != claim
+                        for claim in candidate_draft.claims
+                    )
+                    + len(patch.deleted_claim_ids),
+                    changed_sections=sum(
+                        prior_sections.get(section.section_id) != section
+                        for section in candidate_draft.sections
+                    ),
+                )
                 draft = candidate_draft
             except InvalidSourceAction as error:
+                self._trace_admission(
+                    "patch", admission_stage, False, _admission_reason(error)
+                )
                 pending_binding_gaps.append(str(error))
             delivered |= set(getattr(self.gateway, "last_delivered_citations", set()))
             previous = review
