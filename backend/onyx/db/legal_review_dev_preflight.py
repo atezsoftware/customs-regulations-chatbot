@@ -72,6 +72,10 @@ def inspect_dev() -> dict[str, JsonValue]:
     from onyx.llm.factory import get_llm_for_persona
     from onyx.llm.override_models import LLMOverride
     from onyx.redis.redis_pool import RedisPool
+    from onyx.utils.variable_functionality import set_is_ee_based_on_env_variable
+
+    # Standalone inspection must use the API's configured credential codec.
+    set_is_ee_based_on_env_variable()
 
     if (
         app_configs.POSTGRES_DB != _DEV_DATABASE
@@ -133,8 +137,7 @@ def inspect_dev() -> dict[str, JsonValue]:
                         for model in provider.model_configurations
                         if model.is_visible
                     ],
-                    "api_key_configured": provider.api_key is not None
-                    and bool(provider.api_key.get_value(apply_mask=False).strip()),
+                    "api_key_configured": provider.api_key is not None,
                     "custom_config_configured": bool(provider.custom_config),
                 }
             )
