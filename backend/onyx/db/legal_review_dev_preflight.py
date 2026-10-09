@@ -7,6 +7,8 @@ import json
 import logging
 import os
 import signal
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import cast
 from uuid import UUID
 
@@ -21,6 +23,27 @@ _PROVIDER_TYPE = "vertex_ai"
 
 class PreflightRefusal(RuntimeError):
     """Only fixed operational codes may be printed."""
+
+
+@contextmanager
+def _inspection_engine() -> Iterator[None]:
+    from onyx.db.engine.sql_engine import SqlEngine
+
+    try:
+        # The model resolver opens a second session while inspection retains one.
+        with SqlEngine.scoped_engine(
+            pool_size=2,
+            max_overflow=0,
+            pool_timeout=5,
+            connect_args={"connect_timeout": 5, "options": os.environ["PGOPTIONS"]},
+        ):
+            yield
+    except PreflightRefusal:
+        raise
+    except Exception as error:
+        raise PreflightRefusal(
+            f"database_inspection_failed_{type(error).__name__}"
+        ) from None
 
 
 def inspect_dev() -> dict[str, JsonValue]:
@@ -49,6 +72,10 @@ def inspect_dev() -> dict[str, JsonValue]:
     from onyx.llm.factory import get_llm_for_persona
     from onyx.llm.override_models import LLMOverride
     from onyx.redis.redis_pool import RedisPool
+    from onyx.utils.variable_functionality import set_is_ee_based_on_env_variable
+
+    # Standalone inspection must use the API's configured credential codec.
+    set_is_ee_based_on_env_variable()
 
     if (
         app_configs.POSTGRES_DB != _DEV_DATABASE
@@ -88,7 +115,7 @@ def inspect_dev() -> dict[str, JsonValue]:
             (app_configs.TYPESAFE_API_KEY or "").strip()
         ),
     }
-    with get_session_with_current_tenant() as session:
+    with _inspection_engine(), get_session_with_current_tenant() as session:
         if session.scalar(text("SHOW default_transaction_read_only")) != "on":
             raise PreflightRefusal("database_read_only_fence_missing")
         if session.scalar(text("SELECT current_database()")) != _DEV_DATABASE:
@@ -110,8 +137,7 @@ def inspect_dev() -> dict[str, JsonValue]:
                         for model in provider.model_configurations
                         if model.is_visible
                     ],
-                    "api_key_configured": provider.api_key is not None
-                    and bool(provider.api_key.get_value(apply_mask=False).strip()),
+                    "api_key_configured": provider.api_key is not None,
                     "custom_config_configured": bool(provider.custom_config),
                 }
             )

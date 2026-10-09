@@ -143,6 +143,35 @@ class IssuePlan(StrictModel):
         return self
 
 
+class DiscoveryQuery(StrictModel):
+    query: str = Field(min_length=1, max_length=REGULATORY_MAX_SEARCH_QUERY_CHARS)
+    issue_ids: list[str] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def bounded_query(self) -> DiscoveryQuery:
+        if not self.query.strip() or any(
+            not identity.strip() for identity in self.issue_ids
+        ):
+            raise ValueError(
+                "Discovery queries need nonempty text and issue identities"
+            )
+        return self
+
+
+class InitialDiscoveryPlan(IssuePlan):
+    discovery_queries: list[DiscoveryQuery] = Field(
+        min_length=1,
+        description="Required shared initial searches, each bound to the covered issue IDs.",
+    )
+
+    @model_validator(mode="after")
+    def known_query_issues(self) -> InitialDiscoveryPlan:
+        known = {issue.issue_id for issue in self.issues}
+        if any(set(query.issue_ids) - known for query in self.discovery_queries):
+            raise ValueError("Discovery queries must refer to known issue identities")
+        return self
+
+
 class SourceAction(StrictModel):
     issue_ids: list[str] = Field(min_length=1)
     tool: str = Field(min_length=1)

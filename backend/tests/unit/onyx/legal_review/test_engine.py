@@ -18,7 +18,9 @@ from onyx.legal_review.engine import (
 from onyx.legal_review.models import (
     AnswerClaim,
     DimensionAssessment,
+    DiscoveryQuery,
     DraftAnswer,
+    InitialDiscoveryPlan,
     Issue,
     IssuePlan,
     LegalDimension,
@@ -141,7 +143,18 @@ class FakeGateway:
     ) -> T:
         del prompt, finalizing
         self.calls.append((flow, state))
-        return response_model.model_validate(self.results.pop(0).model_dump())
+        result = self.results.pop(0)
+        payload = result.model_dump()
+        if response_model is InitialDiscoveryPlan and type(result) is IssuePlan:
+            shared: dict[str, list[str]] = {}
+            for issue in result.issues:
+                for query in issue.research_queries:
+                    shared.setdefault(query, []).append(issue.issue_id)
+            payload["discovery_queries"] = [
+                {"query": query, "issue_ids": identities}
+                for query, identities in shared.items()
+            ]
+        return response_model.model_validate(payload)
 
 
 class FakeAcquirer:
@@ -564,8 +577,18 @@ def test_related_issues_share_initial_search_without_losing_requested_outcomes()
         )
         for index in range(31)
     ]
-    issues[-1].research_queries = []
-    grouped = IssuePlan(language="tr", issues=issues)
+    for issue in issues:
+        issue.research_queries = []
+    grouped = InitialDiscoveryPlan(
+        language="tr",
+        issues=issues,
+        discovery_queries=[
+            DiscoveryQuery(
+                query="Başvuru kabul belgenin ibrazı",
+                issue_ids=[issue.issue_id for issue in issues],
+            )
+        ],
+    )
     extracted = reading()
     extracted.requirements[0].issue_id = "i0"
     extracted.dimensions = [
@@ -589,7 +612,7 @@ def test_related_issues_share_initial_search_without_losing_requested_outcomes()
         isinstance(workflow.acquirer, FakeAcquirer)
         and len(workflow.acquirer.actions) == 1
     )
-    assert len(workflow.acquirer.actions[0].issue_ids) == 30
+    assert len(workflow.acquirer.actions[0].issue_ids) == 31
     assert result.plan is not None and len(result.plan.issues) == 31
     assert result.plan.issues[-1].requested_outcome == "Explicit requested outcome 30"
 
