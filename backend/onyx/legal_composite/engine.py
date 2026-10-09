@@ -60,6 +60,13 @@ from onyx.legal_composite.prompts import (
     RESEARCH_PROMPT,
     REVIEW_PROMPT,
 )
+from onyx.legal_composite.reading_evidence import (
+    IssueReadingResponse,
+    ReadingWitnessManifest,
+    number_reading_witnesses,
+    resolve_issue_reading,
+)
+from onyx.legal_composite.reading_prompt import NUMBERED_READING_PROMPT
 from onyx.legal_composite.requirements import (
     RequirementLedger,
     canonicalize_draft_supports,
@@ -109,6 +116,10 @@ def _admission_reason(error: InvalidSourceAction) -> str:
     return {
         "Support is not an exact delivered original: canonical original binding failed": "original_binding",
         "Support span ID is not in this exact original": "span_identity",
+        "Reading support does not identify a provided delivered witness": "span_identity",
+        "Reading witness manifest does not match the active delivery": "original_binding",
+        "Reading witness manifest no longer matches its original": "original_binding",
+        "Reading witness catalogue is not an exact original": "original_binding",
         "Support quotation conflicts with its original span": "span_quotation",
         "Support quotation is not an exact delivered original passage": "literal_quotation",
         "Repair must name exactly the affected sections": "patch_sections",
@@ -508,7 +519,14 @@ class LegalCompositeEngine:
         source_kinds: dict[str, SourceKind] | None = None,
         reviewer: AnswerReviewer | None = None,
         evidence_context: RunContext | None = None,
+        use_numbered_reading_supports: bool = False,
+        allow_terminal_observed_reads: bool = False,
     ) -> None:
+        if (
+            type(use_numbered_reading_supports) is not bool
+            or type(allow_terminal_observed_reads) is not bool
+        ):
+            raise ValueError("Reading behavior must use explicit boolean opt-ins")
         self.gateway = gateway
         self.acquirer = acquirer
         self.ledger = ledger
@@ -521,6 +539,8 @@ class LegalCompositeEngine:
         self.source_kinds = dict(source_kinds or {})
         self.reviewer = reviewer
         self.evidence_context = evidence_context
+        self.use_numbered_reading_supports = use_numbered_reading_supports
+        self.allow_terminal_observed_reads = allow_terminal_observed_reads
         self.requirements = RequirementLedger(ledger)
         self.research_gaps: list[str] = []
         self.protocol_defects: list[str] = []
@@ -621,6 +641,95 @@ class LegalCompositeEngine:
                 "accepted": False,
                 "reason": "research_runway",
             }
+
+    def _terminal_reads_have_runway(self, actions: list[SourceAction]) -> bool:
+        if not isinstance(self.acquirer, CanonicalAcquirer) or self.plan is None:
+            return False
+        remaining = self._repair_runway()
+        pending = self.acquirer.pending_call_counts(actions, self.plan)
+        acquisition = max(
+            (
+                self._source_seconds.get(tool, self.policy.max_call_seconds)
+                for tool in pending
+            ),
+            default=0.0,
+        ) * ceil(sum(pending.values()) / self.policy.max_parallel_tools)
+        return remaining > acquisition + self.policy.selection_reserve_seconds
+
+    def _try_terminal_observed_reads(
+        self, step: IssueResearchStep, plan: IssueResearchPlan, request: str
+    ) -> bool:
+        if not self.allow_terminal_observed_reads or not isinstance(
+            self.acquirer, CanonicalAcquirer
+        ):
+            return False
+        self.check_active()
+        selected, remaining = self.acquirer.safe_observed_read_actions(
+            step.actions,
+            plan,
+            set(getattr(self.gateway, "last_delivered_citations", set())),
+        )
+        if not selected or not self._terminal_reads_have_runway(selected):
+            return False
+        if remaining or step.material_dependencies:
+            self._defer_followup(step.model_copy(update={"actions": remaining}), plan)
+        with graph_step(
+            "legal_composite.research_admission",
+            {},
+            summary="work_kind=sources accepted=1 reason=terminal_observed_reads",
+        ) as admission:
+            admission.output_value = {
+                "operation": "sources",
+                "accepted": True,
+                "reason": "terminal_observed_reads",
+                "selected_actions": len(selected),
+                "deferred_actions": len(remaining),
+            }
+        self.report("tools", plan.language)
+        before = set(self.ledger.citation_numbers())
+        self._acquire(selected, plan)
+        added = set(self.ledger.citation_numbers()) - before
+        if added:
+            self._select_sources(request, plan, added)
+        return True
+
+    def _complete_source_reading(
+        self, payload: dict[str, JsonValue]
+    ) -> ResearchStep | IssueResearchStep | IssueReadingResponse:
+        if self.reviewer is not None and self.use_numbered_reading_supports:
+            return self.gateway.complete(
+                NUMBERED_READING_PROMPT,
+                payload,
+                IssueReadingResponse,
+                LLMFlow.LEGAL_COMPOSITE_RESEARCH,
+            )
+        return self.gateway.complete(
+            RESEARCH_PROMPT,
+            payload,
+            IssueResearchStep if self.reviewer is not None else ResearchStep,
+            LLMFlow.LEGAL_COMPOSITE_RESEARCH,
+        )
+
+    def _resolve_source_reading(
+        self, step: ResearchStep | IssueResearchStep | IssueReadingResponse
+    ) -> ResearchStep | IssueResearchStep:
+        if not isinstance(step, IssueReadingResponse):
+            return step
+        manifest = getattr(self.gateway, "last_reading_manifest", None)
+        call_id = getattr(self.gateway, "last_call_id", None)
+        if not isinstance(manifest, ReadingWitnessManifest) or not isinstance(
+            call_id, str
+        ):
+            raise InvalidSourceAction(
+                "Reading witness manifest does not match the active delivery"
+            )
+        return resolve_issue_reading(
+            step,
+            self.ledger,
+            set(getattr(self.gateway, "last_delivered_citations", set())),
+            manifest,
+            call_id=call_id,
+        )
 
     def _repair_runway(self) -> float:
         if not self.research_available():
@@ -723,6 +832,8 @@ class LegalCompositeEngine:
         )
         assert isinstance(records, list)
         _add_span_previews(records)
+        if self.reviewer is not None and self.use_numbered_reading_supports:
+            records = number_reading_witnesses(records)
         for record in records:
             if not isinstance(record, dict):
                 continue
@@ -1229,11 +1340,8 @@ class LegalCompositeEngine:
                         break
                     self.report("reading", plan.language)
                 reading_started = time.monotonic()
-                step = self.gateway.complete(
-                    RESEARCH_PROMPT,
+                response = self._complete_source_reading(
                     self._payload(request, history, instructions=instructions),
-                    IssueResearchStep if self.reviewer is not None else ResearchStep,
-                    LLMFlow.LEGAL_COMPOSITE_RESEARCH,
                 )
                 if self.reviewer is not None:
                     self._research_seconds.append(time.monotonic() - reading_started)
@@ -1253,13 +1361,14 @@ class LegalCompositeEngine:
             except RunStopped:
                 self.check_active()
                 break
-            new_requirement_ids = (
-                {row.requirement_id for row in step.requirements}
-                - {row.requirement_id for row in self.requirements.records()}
-                if isinstance(step, IssueResearchStep)
-                else set()
-            )
             try:
+                step = self._resolve_source_reading(response)
+                new_requirement_ids = (
+                    {row.requirement_id for row in step.requirements}
+                    - {row.requirement_id for row in self.requirements.records()}
+                    if isinstance(step, IssueResearchStep)
+                    else set()
+                )
                 if isinstance(step, IssueResearchStep):
                     assert isinstance(plan, IssueResearchPlan)
                     self._validate_gap_scope(step, plan)
@@ -1318,7 +1427,8 @@ class LegalCompositeEngine:
                 step
             ):
                 assert isinstance(plan, IssueResearchPlan)
-                self._defer_followup(step, plan)
+                if not self._try_terminal_observed_reads(step, plan, request):
+                    self._defer_followup(step, plan)
                 break
             self._refresh_dependencies(
                 request,
@@ -1781,12 +1891,10 @@ class LegalCompositeEngine:
                     if check.check_id in questions
                 ]
                 try:
-                    step = self.gateway.complete(
-                        RESEARCH_PROMPT,
-                        repair_research,
-                        IssueResearchStep,
-                        LLMFlow.LEGAL_COMPOSITE_RESEARCH,
+                    step = self._resolve_source_reading(
+                        self._complete_source_reading(repair_research)
                     )
+                    assert isinstance(step, IssueResearchStep)
                     self._validate_gap_scope(step, plan, affected_needs)
                     new_requirement_ids = {
                         row.requirement_id for row in step.requirements
