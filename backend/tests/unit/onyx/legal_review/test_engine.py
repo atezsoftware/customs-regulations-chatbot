@@ -1,5 +1,6 @@
 from collections.abc import Sequence
 from typing import TypeVar
+from unittest.mock import patch
 
 import pytest
 from pydantic import BaseModel, JsonValue
@@ -11,6 +12,7 @@ from onyx.context.search.models import SearchDoc
 from onyx.legal_review.engine import (
     LegalReviewEngine,
     recorded_legal_status,
+    recorded_validity,
     validate_support,
 )
 from onyx.legal_review.models import (
@@ -137,6 +139,7 @@ class FakeGateway:
         *,
         finalizing: bool = False,
     ) -> T:
+        del prompt, finalizing
         self.calls.append((flow, state))
         return response_model.model_validate(self.results.pop(0).model_dump())
 
@@ -147,6 +150,8 @@ class FakeAcquirer:
         self.context = context
         self.receipts: list[dict[str, JsonValue]] = []
         self.actions: list[SourceAction] = []
+        self.searches = 0
+        self.original = original()
 
     def definitions(self) -> list[dict[str, JsonValue]]:
         return []
@@ -154,8 +159,10 @@ class FakeAcquirer:
     def acquire(
         self, actions: list[SourceAction], plan: IssuePlan, *, finalizing: bool = False
     ) -> None:
+        del plan, finalizing
+        self.searches += sum(action.tool == "search_corpus" for action in actions)
         self.actions.extend(actions)
-        self.ledger.add([original()], self.context)
+        self.ledger.add([self.original], self.context)
 
 
 class FakeReviewer:
@@ -169,6 +176,7 @@ class FakeReviewer:
         checks: Sequence[ReviewCheck],
         timeout_seconds: float,
     ) -> ReviewResult:
+        del timeout_seconds
         self.states.append(state)
         outcome = self.outcomes.pop(0)
         if outcome == "incomplete":
@@ -228,7 +236,7 @@ def test_missing_review_never_publishes_an_unchecked_draft() -> None:
     workflow, gateway, reviewer = engine([plan(), reading()], ["incomplete"])
     result = workflow.run("Başvuru şartı nedir?", "")
     assert result.status == "unavailable" and result.answer is None
-    assert result.gaps == ["jev_review_timeout"]
+    assert "jev_review_timeout" in result.gaps
     assert len(gateway.calls) == 2 and len(reviewer.states) == 1
 
 
@@ -300,10 +308,10 @@ def test_cancellation_terminates_without_review_or_publication() -> None:
     workflow, _, reviewer = engine([plan()], [])
     workflow.context.cancel()
     # A real gateway checks cancellation before every provider call.
-    workflow.context.check_active = lambda: (_ for _ in ()).throw(
-        TimeoutError("cancelled")
-    )
-    result = workflow.run("Soru", "")
+    with patch.object(
+        workflow.context, "check_active", side_effect=TimeoutError("cancelled")
+    ):
+        result = workflow.run("Soru", "")
     assert result.status == "cancelled" and result.answer is None
     assert reviewer.states == []
 
@@ -316,6 +324,271 @@ def test_lifecycle_active_does_not_prove_legal_in_force() -> None:
     item.metadata["legal_status_verified"] = True
     ledger.add([item], RunContext())
     assert recorded_legal_status(requirement(), ledger) == "unknown"
+
+
+def test_read_date_does_not_silently_become_the_event_date() -> None:
+    ledger = EvidenceLedger()
+    ledger.add([original()], RunContext())
+    assert recorded_validity(requirement(), ledger) == "unknown"
+    assert recorded_validity(requirement(), ledger, "2024-10-09") == "unknown"
+    assert (
+        recorded_validity(requirement(), ledger, "2026-10-09")
+        == "within_recorded_window"
+    )
+
+
+def source_issue(
+    identity: str = "s1",
+    *,
+    query: bool = True,
+    dimension: LegalDimension = LegalDimension.EXCEPTIONS,
+) -> Issue:
+    return Issue(
+        issue_id=identity,
+        question="Bu belge şartının olaya uygulanmasını değiştiren bir istisna var mı?",
+        requested_outcome="Belge şartının maddi kapsamını çözmek",
+        origin="source",
+        parent_issue_id="i1",
+        trigger_dimension=dimension,
+        supporting_citations=[1],
+        supporting_requirement_ids=["r1"],
+        material_reason="Bir istisna başvuru şartının sonucunu değiştirebilir.",
+        closure_criteria=[
+            "Özgün metne göre şartın kapsamını ve maddi istisnayı belirle."
+        ],
+        research_queries=["Belge ibrazı başvuru şartı istisna"] if query else [],
+    )
+
+
+def reading_child(
+    *,
+    additional: bool,
+    resolved: bool,
+    query: bool = True,
+    dimension: LegalDimension = LegalDimension.EXCEPTIONS,
+) -> ReadingDecision:
+    decision = reading()
+    child = source_issue(query=query, dimension=dimension)
+    decision.additional_issues = [child] if additional else []
+    if resolved:
+        child_requirement = requirement("r2")
+        child_requirement.issue_id = child.issue_id
+        decision.requirements.append(child_requirement)
+    decision.dimensions.extend(
+        DimensionAssessment(
+            issue_id=child.issue_id,
+            dimension=dimension,
+            status="addressed"
+            if resolved and dimension is LegalDimension.LEGAL_BASIS
+            else "unresolved"
+            if not resolved and dimension is LegalDimension.EXCEPTIONS
+            else "not_applicable",
+            reason="Kaynak istisnasının maddi kapsamı henüz incelenmedi."
+            if not resolved
+            else "Özgün metindeki belge ibrazı şartı bu dar kapsamlı meselede belirleyicidir.",
+            requirement_ids=["r2"]
+            if resolved and dimension is LegalDimension.LEGAL_BASIS
+            else [],
+        )
+        for dimension in LegalDimension
+    )
+    return decision
+
+
+def test_discovered_norm_does_not_automatically_force_search_or_child_issue() -> None:
+    workflow, gateway, reviewer = engine([plan(), reading(), draft()], ["pass", "pass"])
+    assert isinstance(workflow.acquirer, FakeAcquirer)
+    workflow.acquirer.original.metadata.update(
+        {
+            "regulation_name": "Gümrük Kanunu",
+            "regulation_number": "4458",
+            "article_no": "241",
+        }
+    )
+    result = workflow.run("Başvuru şartı nedir?", "")
+    assert result.status == "partial"
+    assert len(workflow.acquirer.actions) == 1
+    assert result.plan is not None and len(result.plan.issues) == 1
+    assert len(gateway.calls) == 3 and len(reviewer.states) == 2
+
+
+@pytest.mark.parametrize(
+    "dimension",
+    [LegalDimension.EXCEPTIONS, LegalDimension.TAX, LegalDimension.PROCEDURE],
+)
+def test_model_opens_material_source_dependency_and_researches_it_once(
+    dimension: LegalDimension,
+) -> None:
+    workflow, gateway, reviewer = engine(
+        [
+            plan(),
+            reading_child(additional=True, resolved=False, dimension=dimension),
+            reading_child(additional=False, resolved=True, dimension=dimension),
+            draft(),
+        ],
+        ["pass", "pass"],
+    )
+    result = workflow.run("Başvuru şartı nedir?", "")
+    assert isinstance(workflow.acquirer, FakeAcquirer)
+    assert len(workflow.acquirer.actions) == 2
+    assert workflow.acquirer.actions[-1].issue_ids == ["s1"]
+    assert result.plan is not None and len(result.plan.issues) == 2
+    assert len(result.dimensions) == 24
+    assert [row.status for row in result.issue_closures] == ["partial", "partial"]
+    assert result.issue_closures[0].blocking_child_ids == ["s1"]
+    assert len(gateway.calls) == 4 and len(reviewer.states) == 2
+    assert result.status == "partial"
+
+
+def test_parent_stays_open_and_disclosed_while_material_child_is_open() -> None:
+    workflow, _, reviewer = engine(
+        [plan(), reading_child(additional=True, resolved=False, query=False), draft()],
+        ["pass", "pass"],
+    )
+    result = workflow.run("Başvuru şartı nedir?", "")
+    assert [row.status for row in result.issue_closures] == ["open", "open"]
+    assert result.answer is not None and "İnceleme sınırı" in result.answer
+    assert "İnceleme sınırı" in str(reviewer.states[-1]["draft"])
+    assert result.status == "partial"
+
+
+def test_source_issue_cannot_bind_unobserved_parent_requirement() -> None:
+    bad = reading_child(additional=True, resolved=False, query=False)
+    bad.additional_issues[0].supporting_requirement_ids = ["invented"]
+    workflow, _, reviewer = engine([plan(), bad], [])
+    result = workflow.run("Soru", "")
+    assert result.status == "unavailable" and reviewer.states == []
+    assert "parent-backed requirement" in result.gaps[-1]
+
+
+def test_duplicate_source_dependency_reuses_existing_issue() -> None:
+    workflow, _, _ = engine([], [])
+    workflow.plan = plan()
+    workflow.ledger.add([original()], workflow.context)
+    first = reading_child(additional=True, resolved=False, query=False)
+    workflow._accept_reading(first)
+    duplicate = reading_child(additional=False, resolved=False, query=False)
+    duplicate.additional_issues = [source_issue("s2", query=False)]
+    duplicate.dimensions.extend(
+        row.model_copy(update={"issue_id": "s2"})
+        for row in list(duplicate.dimensions)
+        if row.issue_id == "s1"
+    )
+    with pytest.raises(ValueError, match="Duplicate parent/source/dimension"):
+        workflow._accept_reading(duplicate)
+
+
+def test_issue_count_has_no_arbitrary_cap_and_dependencies_remain_acyclic() -> None:
+    issues = [
+        plan().issues[0].model_copy(update={"issue_id": f"i{index}"})
+        for index in range(31)
+    ]
+    assert len(IssuePlan(language="tr", issues=issues).issues) == 31
+    assert (
+        Issue.model_validate(
+            {**issues[0].model_dump(), "research_queries": []}
+        ).research_queries
+        == []
+    )
+    child = source_issue(query=False)
+    child.parent_issue_id = "s1"
+    with pytest.raises(ValueError, match="acyclic"):
+        IssuePlan(language="tr", issues=[plan().issues[0], child])
+
+
+def test_distinct_initial_queries_respect_global_search_budget_before_dispatch() -> (
+    None
+):
+    issues = [
+        plan()
+        .issues[0]
+        .model_copy(
+            update={
+                "issue_id": f"i{index}",
+                "research_queries": [f"Focused query {index}"],
+            }
+        )
+        for index in range(25)
+    ]
+    workflow, _, _ = engine([IssuePlan(language="tr", issues=issues)], [])
+    result = workflow.run("Soru", "")
+    assert (
+        isinstance(workflow.acquirer, FakeAcquirer) and workflow.acquirer.actions == []
+    )
+    assert result.status == "unavailable" and "total search budget" in result.gaps[-1]
+
+
+def test_related_issues_share_initial_search_without_losing_requested_outcomes() -> (
+    None
+):
+    issues = [
+        plan()
+        .issues[0]
+        .model_copy(
+            update={
+                "issue_id": f"i{index}",
+                "requested_outcome": f"Explicit requested outcome {index}",
+            }
+        )
+        for index in range(31)
+    ]
+    issues[-1].research_queries = []
+    grouped = IssuePlan(language="tr", issues=issues)
+    extracted = reading()
+    extracted.requirements[0].issue_id = "i0"
+    extracted.dimensions = [
+        row.model_copy(
+            update={
+                "issue_id": issue.issue_id,
+                "status": row.status if issue.issue_id == "i0" else "not_applicable",
+                "requirement_ids": row.requirement_ids
+                if issue.issue_id == "i0"
+                else [],
+            }
+        )
+        for issue in issues
+        for row in reading().dimensions
+    ]
+    written = draft()
+    written.claims[0].issue_ids = ["i0"]
+    workflow, _, _ = engine([grouped, extracted, written], ["pass", "pass"])
+    result = workflow.run("Soru", "")
+    assert (
+        isinstance(workflow.acquirer, FakeAcquirer)
+        and len(workflow.acquirer.actions) == 1
+    )
+    assert len(workflow.acquirer.actions[0].issue_ids) == 30
+    assert result.plan is not None and len(result.plan.issues) == 31
+    assert result.plan.issues[-1].requested_outcome == "Explicit requested outcome 30"
+
+
+def test_initial_planner_cannot_invent_source_issues_before_retrieval() -> None:
+    premature = IssuePlan(
+        language="tr", issues=[plan().issues[0], source_issue(query=False)]
+    )
+    workflow, _, _ = engine([premature], [])
+    result = workflow.run("Soru", "")
+    assert result.status == "unavailable" and "initial plan" in result.gaps[-1]
+    assert (
+        isinstance(workflow.acquirer, FakeAcquirer) and workflow.acquirer.actions == []
+    )
+
+
+def test_child_canonical_trigger_survives_same_round_parent_supersession() -> None:
+    workflow, _, _ = engine([], [])
+    workflow.plan = plan()
+    workflow.ledger.add([original()], workflow.context)
+    workflow._accept_reading(
+        reading_child(additional=True, resolved=False, query=False)
+    )
+    revised = reading_child(additional=False, resolved=False, query=False)
+    revised.requirements[0].requirement_id = "r3"
+    revised.requirements[0].supersedes_requirement_ids = ["r1"]
+    revised.requirements[0].application = "Kaynağın kapsamı düzeltildi."
+    revised.dimensions[0].requirement_ids = ["r3"]
+    workflow._accept_reading(revised)
+    assert "r1" in workflow.requirement_history and "r1" not in workflow.requirements
+    assert workflow.plan.issues[1].supporting_requirement_ids == ["r1"]
 
 
 @pytest.mark.parametrize("quotation", [" ", "benzer ama kaynakta olmayan ifade"])

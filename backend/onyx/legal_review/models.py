@@ -3,7 +3,7 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, SecretStr, model_validator
 
 from onyx.tools.constants import REGULATORY_MAX_SEARCH_QUERY_CHARS
 
@@ -45,6 +45,13 @@ class ReviewResult(BaseModel):
     output_tokens: int = Field(default=0, ge=0)
 
 
+class JevProviderConfig(BaseModel):
+    model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
+    route: Literal["typesafe", "openrouter"]
+    api_key: SecretStr = Field(exclude=True, repr=False)
+    provider_name: str | None = None
+
+
 class WorkflowPolicy(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
     timeout_seconds: float = Field(default=240, gt=0)
@@ -73,10 +80,39 @@ class Issue(StrictModel):
     question: str = Field(min_length=1)
     requested_outcome: str = Field(min_length=1)
     supplied_facts: list[str] = Field(default_factory=list)
-    research_queries: list[str] = Field(min_length=1, max_length=2)
+    research_queries: list[str] = Field(default_factory=list, max_length=2)
+    origin: Literal["question", "source"] = "question"
+    parent_issue_id: str | None = None
+    trigger_dimension: LegalDimension | None = None
+    supporting_citations: list[int] = Field(default_factory=list)
+    supporting_requirement_ids: list[str] = Field(default_factory=list)
+    material_reason: str | None = None
+    closure_criteria: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def bounded_queries(self) -> Issue:
+        if self.origin == "source" and not (
+            self.parent_issue_id
+            and self.trigger_dimension is not None
+            and self.supporting_citations
+            and self.supporting_requirement_ids
+            and self.material_reason
+            and self.material_reason.strip()
+            and self.closure_criteria
+            and all(criterion.strip() for criterion in self.closure_criteria)
+        ):
+            raise ValueError(
+                "Source issues need a parent, canonical triggers, material reason and closure criteria"
+            )
+        if self.origin == "question" and self.parent_issue_id is not None:
+            raise ValueError("Question issues cannot have a source dependency parent")
+        if any(
+            type(citation) is not int or citation <= 0
+            for citation in self.supporting_citations
+        ):
+            raise ValueError(
+                "Source triggers must be positive canonical citation numbers"
+            )
         if any(
             not query.strip() or len(query) > REGULATORY_MAX_SEARCH_QUERY_CHARS
             for query in self.research_queries
@@ -87,7 +123,7 @@ class Issue(StrictModel):
 
 class IssuePlan(StrictModel):
     language: str = Field(min_length=2, max_length=35)
-    issues: list[Issue] = Field(min_length=1, max_length=24)
+    issues: list[Issue] = Field(min_length=1)
     missing_user_facts: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
@@ -95,6 +131,15 @@ class IssuePlan(StrictModel):
         ids = [issue.issue_id for issue in self.issues]
         if len(ids) != len(set(ids)):
             raise ValueError("Issue identities must be unique")
+        by_id = {issue.issue_id: issue for issue in self.issues}
+        for issue in self.issues:
+            seen = {issue.issue_id}
+            parent = issue.parent_issue_id
+            while parent is not None:
+                if parent in seen or parent not in by_id:
+                    raise ValueError("Issue dependencies must be known and acyclic")
+                seen.add(parent)
+                parent = by_id[parent].parent_issue_id
         return self
 
 
@@ -135,7 +180,7 @@ class DimensionAssessment(StrictModel):
 
 
 class ReadingDecision(StrictModel):
-    additional_issues: list[Issue] = Field(default_factory=list, max_length=8)
+    additional_issues: list[Issue] = Field(default_factory=list)
     requirements: list[Requirement] = Field(default_factory=list)
     dimensions: list[DimensionAssessment]
     actions: list[SourceAction] = Field(default_factory=list, max_length=16)
@@ -155,12 +200,20 @@ class DraftAnswer(StrictModel):
     unresolved_issue_ids: list[str] = Field(default_factory=list)
 
 
+class IssueClosure(StrictModel):
+    issue_id: str
+    status: Literal["open", "partial", "closed"]
+    blocking_child_ids: list[str] = Field(default_factory=list)
+    reasons: list[str] = Field(default_factory=list)
+
+
 class WorkflowResult(StrictModel):
     status: Literal["verified", "partial", "unavailable", "cancelled"]
     answer: str | None = None
     plan: IssuePlan | None = None
     requirements: list[RequirementRecord] = Field(default_factory=list)
     dimensions: list[DimensionAssessment] = Field(default_factory=list)
+    issue_closures: list[IssueClosure] = Field(default_factory=list)
     gaps: list[str] = Field(default_factory=list)
     early_review: ReviewResult | None = None
     final_review: ReviewResult | None = None

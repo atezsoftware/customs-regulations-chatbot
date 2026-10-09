@@ -1,0 +1,273 @@
+"""Provider-free canonical acquisition, publication and persisted chat state."""
+
+import copy
+from contextlib import nullcontext
+from types import SimpleNamespace
+from typing import cast
+from unittest.mock import MagicMock
+from uuid import uuid4
+
+import pytest
+from pydantic import JsonValue, SecretStr
+
+from onyx.asv3.models import (
+    EvidenceItem,
+    OutcomeStatus,
+    RunContext,
+    ToolOutcome,
+    ToolSpec,
+)
+from onyx.cache.interface import CacheBackend
+from onyx.chat.chat_state import ChatStateContainer
+from onyx.chat.emitter import Emitter
+from onyx.chat.models import ChatMessageSimple
+from onyx.configs.constants import MessageType
+from onyx.context.search.models import IndexFilters
+from onyx.db.models import User
+from onyx.error_handling.exceptions import OnyxError
+from onyx.legal_review import runtime
+from onyx.legal_review.models import JevProviderConfig
+from onyx.llm.interfaces import LLM, LLMConfig
+from onyx.server.query_and_chat.streaming_models import (
+    AgentResponseDelta,
+    AgentResponseStart,
+    ASv3Progress,
+    CitationInfo,
+    Packet,
+)
+from onyx.tools.tool_implementations.search.search_tool import SearchTool
+from tests.unit.onyx.legal_review.test_engine import (
+    RULE,
+    FakeGateway,
+    FakeReviewer,
+    draft,
+    original,
+    plan,
+    reading,
+)
+
+
+class CanonicalBrokerFixture:
+    def __init__(self) -> None:
+        self.search_adapter: object | None = None
+        self.calls: list[dict[str, JsonValue]] = []
+        self.revalidated: list[EvidenceItem] = []
+        self.reject_publication = False
+
+    def search_originals(
+        self, arguments: dict[str, JsonValue], context: RunContext
+    ) -> ToolOutcome:
+        context.check_active()
+        self.calls.append(arguments)
+        return ToolOutcome(
+            status=OutcomeStatus.FOUND,
+            summary="Authorized canonical full original",
+            data={"unmapped_chunk_count": 0, "evidence_truncated": False},
+            evidence=[original()],
+        )
+
+    def revalidate_evidence(
+        self, evidence: list[EvidenceItem], context: RunContext
+    ) -> None:
+        context.check_active()
+        if self.reject_publication:
+            raise ValueError("Source publication was revoked")
+        assert all(
+            item.text == RULE and item.search_doc is not None for item in evidence
+        )
+        self.revalidated = list(evidence)
+
+
+@pytest.fixture
+def runtime_fixture(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+    broker = CanonicalBrokerFixture()
+    gateway = FakeGateway([plan(), reading(), draft()])
+    reviewer = FakeReviewer(["pass", "pass"])
+    checkpoints: list[dict[str, JsonValue]] = []
+    packets: list[Packet] = []
+    emitter = MagicMock(spec=Emitter)
+    emitter.emit.side_effect = packets.append
+    llm = MagicMock(spec=LLM)
+    llm.config = LLMConfig(
+        model_provider="vertex_ai",
+        model_name="gemini-3.8-flash",
+        temperature=0,
+        max_input_tokens=200000,
+    )
+    llm.with_stream_cancellation_check.return_value = llm
+    search = MagicMock(spec=SearchTool)
+    search.user_selected_filters = None
+    search.fork_for_independent_context.return_value = search
+    adapter = MagicMock()
+    adapter.prepare_batch.return_value = {}
+    monkeypatch.setattr(
+        runtime,
+        "resolve_legal_review_jev",
+        lambda _user: JevProviderConfig(
+            route="typesafe", api_key=SecretStr("fixture-only-key")
+        ),
+    )
+    monkeypatch.setattr(
+        runtime, "ensure_trace", lambda *_args, **_kwargs: nullcontext()
+    )
+    monkeypatch.setattr(runtime, "is_connected", lambda *_args: True)
+    monkeypatch.setattr(
+        runtime, "bind_pc_corpus_scope", lambda **kwargs: kwargs["filters"]
+    )
+    monkeypatch.setattr(runtime, "CorpusBroker", lambda *_args: broker)
+    monkeypatch.setattr(
+        runtime, "build_search_adapter", lambda *_args, **_kwargs: adapter
+    )
+    monkeypatch.setattr(runtime, "GeminiGateway", lambda **_kwargs: gateway)
+    monkeypatch.setattr(runtime, "JevReviewer", lambda **_kwargs: reviewer)
+    monkeypatch.setattr(runtime, "build_core_specs", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        runtime,
+        "build_corpus_specs",
+        lambda *_args, **_kwargs: [
+            ToolSpec(
+                name="search_corpus",
+                description="Discover and hydrate authorized originals",
+                parameters={"type": "object", "additionalProperties": True},
+                handler=broker.search_originals,
+            )
+        ],
+    )
+
+    def save(**kwargs: object) -> None:
+        checkpoints.append(
+            copy.deepcopy(cast(dict[str, JsonValue], kwargs["snapshot"]))
+        )
+
+    monkeypatch.setattr(runtime, "save_asv3_checkpoint", save)
+    user = MagicMock(spec=User)
+    user.id = uuid4()
+    history = [
+        ChatMessageSimple(
+            message=f"Olayın verilen {index}. olgusu",
+            token_count=8,
+            message_type=MessageType.USER,
+        )
+        for index in range(10)
+    ]
+    history.append(
+        ChatMessageSimple(
+            message="Başvuru şartı nedir?", token_count=8, message_type=MessageType.USER
+        )
+    )
+    state = ChatStateContainer()
+    arguments = dict(
+        emitter=emitter,
+        state_container=state,
+        simple_chat_history=history,
+        tools=[search],
+        llm=llm,
+        user=user,
+        chat_session_id=uuid4(),
+        user_message_id=1,
+        assistant_message_id=2,
+        cache=MagicMock(spec=CacheBackend),
+        filters=IndexFilters(access_control_list=[]),
+        token_counter=len,
+    )
+    return SimpleNamespace(
+        broker=broker,
+        gateway=gateway,
+        reviewer=reviewer,
+        checkpoints=checkpoints,
+        packets=packets,
+        state=state,
+        llm=llm,
+        arguments=arguments,
+    )
+
+
+@pytest.mark.parametrize("include_citations", [False, True])
+def test_published_answer_and_canonical_checkpoint_persist_for_both_citation_modes(
+    runtime_fixture: SimpleNamespace, include_citations: bool
+) -> None:
+    fixture = runtime_fixture
+    runtime.run_legal_review_loop(
+        **fixture.arguments, include_citations=include_citations
+    )
+    rendered = "".join(
+        packet.obj.content
+        for packet in fixture.packets
+        if isinstance(packet.obj, AgentResponseDelta)
+    )
+    assert fixture.state.get_answer_tokens() == rendered
+    assert RULE in rendered and "Yürürlük sınırı" in rendered
+    assert fixture.state.get_citation_to_doc()[1].document_id == "source-1"
+    assert fixture.broker.revalidated[0].text == RULE
+    assert len(fixture.broker.calls) == 1
+    assert [snapshot["sequence"] for snapshot in fixture.checkpoints] == [1, 2]
+    checkpoint = fixture.checkpoints[-1]
+    assert checkpoint["publication_status"] == "partial"
+    assert checkpoint["asv3_workflow_variant"] == "legal_review"
+    assert isinstance(checkpoint["evidence"], dict)
+    assert "Olayın verilen 0. olgusu" in fixture.gateway.calls[0][1]["history"]
+    assert "Olayın verilen 0. olgusu" in fixture.reviewer.states[0]["history"]
+    research_record = fixture.reviewer.states[0]["research_record"]
+    assert isinstance(research_record, list) and research_record[0]["status"] == "found"
+    citations = [p.obj for p in fixture.packets if isinstance(p.obj, CitationInfo)]
+    assert bool(citations) is include_citations
+    if citations:
+        assert citations[0].preview_url == "/api/asv3/citation/2/1"
+    assert not fixture.llm.invoke.called and not fixture.llm.stream.called
+    assert isinstance(fixture.packets[-1].obj, ASv3Progress)
+    assert fixture.packets[-1].obj.phase == "completed"
+
+
+def test_publication_revalidation_failure_does_not_emit_answer_or_completed(
+    runtime_fixture: SimpleNamespace,
+) -> None:
+    fixture = runtime_fixture
+    fixture.broker.reject_publication = True
+    with pytest.raises(ValueError, match="revoked"):
+        runtime.run_legal_review_loop(**fixture.arguments)
+    assert fixture.state.get_answer_tokens() is None
+    assert not any(isinstance(p.obj, AgentResponseStart) for p in fixture.packets)
+    assert not any(
+        isinstance(p.obj, ASv3Progress) and p.obj.phase == "completed"
+        for p in fixture.packets
+    )
+    assert fixture.checkpoints[-1]["publication_status"] == "unavailable"
+    assert fixture.checkpoints[-1]["legal_review"]["answer"] is None
+
+
+def test_missing_jev_credential_fails_before_any_provider_or_source_work(
+    runtime_fixture: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = runtime_fixture
+    monkeypatch.setattr(runtime, "resolve_legal_review_jev", lambda _user: None)
+    with pytest.raises(OnyxError, match="OpenRouter JEV credential"):
+        runtime.run_legal_review_loop(**fixture.arguments)
+    assert not fixture.gateway.calls and not fixture.broker.calls
+    assert fixture.checkpoints == []
+
+
+def test_resolved_openrouter_jev_config_reaches_reviewer_before_any_work(
+    runtime_fixture: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = runtime_fixture
+    monkeypatch.setattr(
+        runtime,
+        "resolve_legal_review_jev",
+        lambda _user: JevProviderConfig(
+            route="openrouter",
+            api_key=SecretStr("openrouter-fixture-key"),
+            provider_name="Existing OpenRouter",
+        ),
+    )
+    factory = MagicMock(return_value=fixture.reviewer)
+    monkeypatch.setattr(runtime, "JevReviewer", factory)
+    runtime.run_legal_review_loop(**fixture.arguments)
+    assert factory.call_args.kwargs["route"] == "openrouter"
+    assert factory.call_args.kwargs["api_key"] == "openrouter-fixture-key"
+    assert callable(factory.call_args.kwargs["before_request"])
+    assert callable(factory.call_args.kwargs["check_active"])
+    assert fixture.checkpoints[-1]["jev_provider"] == {
+        "route": "openrouter",
+        "provider_name": "Existing OpenRouter",
+    }
+    assert "openrouter-fixture-key" not in str(fixture.checkpoints)

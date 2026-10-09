@@ -17,6 +17,8 @@ from onyx.asv3.models import RunContext, RunStopped
 from onyx.legal_review.models import (
     DimensionAssessment,
     DraftAnswer,
+    Issue,
+    IssueClosure,
     IssuePlan,
     LegalDimension,
     PassageSupport,
@@ -55,6 +57,7 @@ class ModelGateway(Protocol):
 
 class Acquirer(Protocol):
     receipts: list[dict[str, JsonValue]]
+    searches: int
 
     def definitions(self) -> list[dict[str, JsonValue]]: ...
 
@@ -204,11 +207,17 @@ class LegalReviewEngine:
             "original_evidence": originals,
             "source_operations": list(self.acquirer.receipts),
             "evidence_gaps": list(self.gaps),
+            "issue_closures": [
+                row.model_dump(mode="json") for row in self.issue_closures()
+            ],
             "pending_source_operations": [
                 action.model_dump(mode="json") for action in self.pending_actions
             ],
             "limits": {
                 "total_search_budget": self.policy.max_searches,
+                "remaining_search_budget": max(
+                    0, self.policy.max_searches - self.acquirer.searches
+                ),
                 "remaining_research_seconds": max(
                     0, self.context.research_deadline - time.monotonic()
                 ),
@@ -227,6 +236,10 @@ class LegalReviewEngine:
 
     def _accept_reading(self, decision: ReadingDecision) -> None:
         assert self.plan is not None
+        if any(issue.origin != "source" for issue in decision.additional_issues):
+            raise ValueError(
+                "Additional issues must be material source-derived dependencies"
+            )
         proposed = IssuePlan.model_validate(
             {
                 **self.plan.model_dump(mode="python"),
@@ -277,6 +290,7 @@ class LegalReviewEngine:
                     )
                 history[identity] = pending.pop(identity)
             pending[record.requirement_id] = record
+        self._validate_source_issues(proposed, pending, history)
         expected = {
             (issue_id, dimension) for issue_id in known for dimension in LegalDimension
         }
@@ -320,6 +334,120 @@ class LegalReviewEngine:
                 for query in issue.research_queries
             )
         self.pending_actions = list(decision.actions)
+
+    def _acquire(
+        self, actions: list[SourceAction], *, finalizing: bool = False
+    ) -> None:
+        assert self.plan is not None
+        self.pending_actions = list(actions)
+        self.acquirer.acquire(actions, self.plan, finalizing=finalizing)
+        self.pending_actions = []
+
+    def _source_key(
+        self, issue: Issue
+    ) -> tuple[str | None, LegalDimension | None, tuple[tuple[str, str], ...]]:
+        triggers: set[tuple[str, str]] = set()
+        for citation in issue.supporting_citations:
+            item = self.ledger.get(citation)
+            if item is None or item.chunk_id is None or item.search_doc is None:
+                raise ValueError("Source issue trigger is not a canonical original")
+            article = item.metadata.get("article_no") or item.search_doc.metadata.get(
+                "article_no"
+            )
+            triggers.add((item.source_id, str(article or item.chunk_id)))
+        return issue.parent_issue_id, issue.trigger_dimension, tuple(sorted(triggers))
+
+    def _validate_source_issues(
+        self,
+        proposed: IssuePlan,
+        requirements: dict[str, RequirementRecord],
+        history: dict[str, RequirementRecord],
+    ) -> None:
+        identities: set[
+            tuple[str | None, LegalDimension | None, tuple[tuple[str, str], ...]]
+        ] = set()
+        for issue in proposed.issues:
+            if issue.origin != "source":
+                continue
+            key = self._source_key(issue)
+            if key in identities:
+                raise ValueError(
+                    "Duplicate parent/source/dimension dependency; resolve the existing issue"
+                )
+            identities.add(key)
+            supported: set[int] = set()
+            for identity in issue.supporting_requirement_ids:
+                requirement = requirements.get(identity) or history.get(identity)
+                if requirement is None or requirement.issue_id != issue.parent_issue_id:
+                    raise ValueError(
+                        "Source issue must be triggered by an exact parent-backed requirement"
+                    )
+                supported.update(support.citation for support in requirement.supports)
+            if set(issue.supporting_citations) - supported:
+                raise ValueError(
+                    "Source issue citations must bind to its parent requirement supports"
+                )
+
+    def issue_closures(self) -> list[IssueClosure]:
+        if self.plan is None:
+            return []
+        closures: dict[str, IssueClosure] = {}
+        children: dict[str, list[str]] = {}
+        for issue in self.plan.issues:
+            if issue.parent_issue_id is not None:
+                children.setdefault(issue.parent_issue_id, []).append(issue.issue_id)
+            rows = [row for row in self.dimensions if row.issue_id == issue.issue_id]
+            requirements = [
+                row
+                for row in self.requirements.values()
+                if row.issue_id == issue.issue_id
+            ]
+            reasons = [row.reason for row in rows if row.status == "unresolved"]
+            status = "closed"
+            if len(rows) != len(LegalDimension) or reasons:
+                status = "open"
+                if len(rows) != len(LegalDimension):
+                    reasons.append("The complete issue assessment is pending")
+            if issue.origin == "source" and not requirements:
+                status = "open"
+                reasons.append(
+                    "The material source-derived question has no extracted supported resolution"
+                )
+            if any(
+                issue.issue_id in action.issue_ids for action in self.pending_actions
+            ):
+                status = "open"
+                reasons.append("Requested source operations remain unexecuted")
+            if status == "closed" and any(
+                row.validity == "unknown" or row.legal_status in {"unknown", "annulled"}
+                for row in requirements
+            ):
+                status = "partial"
+                reasons.append("The recorded legal validity remains uncertain")
+            closures[issue.issue_id] = IssueClosure.model_validate(
+                {"issue_id": issue.issue_id, "status": status, "reasons": reasons}
+            )
+        # IssuePlan rejects cycles, so bottom-up dependency propagation is bounded.
+        for _ in self.plan.issues:
+            for parent_id, child_ids in children.items():
+                blocked = [
+                    identity
+                    for identity in child_ids
+                    if closures[identity].status != "closed"
+                ]
+                if blocked:
+                    parent = closures[parent_id]
+                    parent.blocking_child_ids = blocked
+                    if parent.status != "open":
+                        parent.status = (
+                            "open"
+                            if any(
+                                closures[identity].status == "open"
+                                for identity in blocked
+                            )
+                            else "partial"
+                        )
+        return [closures[issue.issue_id] for issue in self.plan.issues]
 
     def _reading(
         self,
@@ -379,6 +507,10 @@ class LegalReviewEngine:
                     id="source_conditions",
                     instructions="Does the research or literal answer materially contradict or omit a decisive condition, exception, qualification or contrary effect of the complete original evidence, or conceal a partial/unread provision or temporal-law gap? No search result or JEV score proves absence of other law.",
                 ),
+                ReviewCheck(
+                    id="issue_dependencies",
+                    instructions="Does any source-derived issue lack a material connection to its parent's requested outcome or its exact canonical trigger, or does an issue claimed resolved fail its explicit closure criteria? Does the answer treat a parent conclusion as complete while a material dependent child remains open or partial? Review all issue_closures and dependencies against the originals, supplied facts and literal answer; do not demand new issues for incidental references or every category.",
+                ),
             ]
         )
         if draft:
@@ -417,26 +549,39 @@ class LegalReviewEngine:
             }
         }
         diagnostic_keys = {
-            "unmapped_chunk_count", "unmapped_count", "evidence_truncated",
-            "scan_truncated", "outline_truncated", "has_more", "truncated",
-            "degraded", "error", "reason", "missing", "access_denied",
-            "continuation", "next_cursor", "total_hits", "matched_count",
+            "unmapped_chunk_count",
+            "unmapped_count",
+            "evidence_truncated",
+            "scan_truncated",
+            "outline_truncated",
+            "has_more",
+            "truncated",
+            "degraded",
+            "error",
+            "reason",
+            "missing",
+            "access_denied",
+            "continuation",
+            "next_cursor",
+            "total_hits",
+            "matched_count",
         }
-        review_state["research_record"] = [
-            {
-                **{key: value for key, value in receipt.items() if key != "data"},
-                "result_limitations": {
-                    key: value
-                    for key, value in (
-                        receipt["data"].items()
-                        if isinstance(receipt.get("data"), dict)
-                        else []
-                    )
-                    if key in diagnostic_keys
-                },
-            }
-            for receipt in self.acquirer.receipts
-        ]
+        research_record: list[JsonValue] = []
+        for receipt in self.acquirer.receipts:
+            data = receipt.get("data")
+            research_record.append(
+                {
+                    **{key: value for key, value in receipt.items() if key != "data"},
+                    "result_limitations": {
+                        key: value
+                        for key, value in (
+                            data.items() if isinstance(data, dict) else []
+                        )
+                        if key in diagnostic_keys
+                    },
+                }
+            )
+        review_state["research_record"] = research_record
         deadline = self.context.deadline if draft else self.context.research_deadline
         result = self.reviewer.review(
             review_state,
@@ -489,13 +634,16 @@ class LegalReviewEngine:
                 supported_citations.add(support.citation)
         if not cited or cited - supported_citations:
             raise ValueError("Published citations must bind to supported answer claims")
-        unresolved = {
-            row.issue_id for row in self.dimensions if row.status == "unresolved"
-        } | {
-            row.issue_id
-            for row in self.requirements.values()
-            if row.validity == "unknown" or row.legal_status in {"unknown", "annulled"}
-        }
+        unresolved = (
+            {row.issue_id for row in self.dimensions if row.status == "unresolved"}
+            | {
+                row.issue_id
+                for row in self.requirements.values()
+                if row.validity == "unknown"
+                or row.legal_status in {"unknown", "annulled"}
+            }
+            | {row.issue_id for row in self.issue_closures() if row.status != "closed"}
+        )
         if unresolved - set(draft.unresolved_issue_ids):
             raise ValueError(
                 "Draft must disclose all unresolved evidence/validity issues"
@@ -508,27 +656,51 @@ class LegalReviewEngine:
             for row in self.requirements.values()
             if row.validity == "unknown" or row.legal_status in {"unknown", "annulled"}
         }
-        if not affected:
-            return draft
+        dependencies = [
+            row
+            for row in self.issue_closures()
+            if row.status == "open" or row.blocking_child_ids
+        ]
+        unresolved = affected | {row.issue_id for row in dependencies}
         questions = "; ".join(
             issue.question for issue in self.plan.issues if issue.issue_id in affected
         )
         disclosure = (
-            "Yürürlük sınırı: Şu meselelerde dayanılan kaynakların olay tarihi itibarıyla "
-            f"yürürlük ve iptal durumu kesinleştirilemedi: {questions}. "
-            "Bu meselelerin sonuçları yürürlük ve iptal durumu teyidine bağlıdır."
-            if self.plan.language.startswith("tr")
-            else f"Validity limitation: The operative and annulment status of sources for {questions} "
-            "on the event date could not be established. These conclusions remain conditional "
-            "on verification of their operative and annulment status."
+            (
+                "Yürürlük sınırı: Şu meselelerde dayanılan kaynakların olay tarihi itibarıyla "
+                f"yürürlük ve iptal durumu kesinleştirilemedi: {questions}. "
+                "Bu meselelerin sonuçları yürürlük ve iptal durumu teyidine bağlıdır."
+                if self.plan.language.startswith("tr")
+                else f"Validity limitation: The operative and annulment status of sources for {questions} "
+                "on the event date could not be established. These conclusions remain conditional "
+                "on verification of their operative and annulment status."
+            )
+            if affected
+            else ""
         )
+        if dependencies:
+            dependency_questions = "; ".join(
+                issue.question
+                for issue in self.plan.issues
+                if issue.issue_id in {row.issue_id for row in dependencies}
+            )
+            dependency_disclosure = (
+                f"İnceleme sınırı: Şu sonucu etkileyen meseleler veya bağlı alt meseleleri tamamlanamadı: {dependency_questions}. İlgili sonuçlar bu açık meselelerin çözümüne bağlıdır."
+                if self.plan.language.startswith("tr")
+                else f"Research limitation: These material issues or their dependent questions remain unresolved: {dependency_questions}. The affected conclusions remain conditional on resolving these questions."
+            )
+            disclosure = "\n\n".join(
+                part for part in (disclosure, dependency_disclosure) if part
+            )
+        if not disclosure:
+            return draft
         return draft.model_copy(
             update={
                 "answer": draft.answer
                 if disclosure in draft.answer
                 else draft.answer + "\n\n" + disclosure,
                 "unresolved_issue_ids": list(
-                    dict.fromkeys([*draft.unresolved_issue_ids, *sorted(affected)])
+                    dict.fromkeys([*draft.unresolved_issue_ids, *sorted(unresolved)])
                 ),
             }
         )
@@ -546,6 +718,7 @@ class LegalReviewEngine:
                 "plan": self.plan,
                 "requirements": list(self.requirements.values()),
                 "dimensions": self.dimensions,
+                "issue_closures": self.issue_closures(),
                 "gaps": [
                     *self.gaps,
                     *(
@@ -581,27 +754,43 @@ class LegalReviewEngine:
             LLMFlow.LEGAL_REVIEW_PLANNER,
         )
         self.context.language = self.plan.language
+        if any(issue.origin != "question" for issue in self.plan.issues):
+            return self._result(
+                "unavailable",
+                gap="The initial plan must come from the question, before source-derived issues exist",
+            )
         self.report("tools", self.plan.language)
+        shared_queries: dict[str, list[str]] = {}
+        for issue in self.plan.issues:
+            for query in issue.research_queries:
+                identities = shared_queries.setdefault(query, [])
+                if issue.issue_id not in identities:
+                    identities.append(issue.issue_id)
         initial = [
             SourceAction(
-                issue_ids=[issue.issue_id],
+                issue_ids=identities,
                 tool="search_corpus",
                 arguments={"query": query, "mode": "hybrid"},
             )
-            for issue in self.plan.issues
-            for query in issue.research_queries
+            for query, identities in shared_queries.items()
         ]
+        if not initial:
+            return self._result(
+                "unavailable",
+                gap="The initial plan supplied no discovery query for authorized original research",
+            )
         if len(initial) > self.policy.max_searches:
             return self._result(
                 "unavailable",
                 gap="Planner discovery queries exceed the explicit total search budget",
             )
-        self.acquirer.acquire(initial, self.plan)
+        self._acquire(initial)
         if not self.ledger.citation_numbers():
             return self._result(
                 "unavailable", gap="No authorized original evidence was read"
             )
         decision = ReadingDecision(dimensions=[])
+        early_return_used = False
         for round_number in range(self.policy.max_research_rounds):
             self.context.check_research_active()
             decision = self._reading(request, history)
@@ -611,20 +800,25 @@ class LegalReviewEngine:
             ):
                 break
             self.report("tools", self.plan.language)
-            self.acquirer.acquire(decision.actions, self.plan)
-            self.pending_actions = []
+            self._acquire(decision.actions)
+        if decision.actions and time.monotonic() < self.context.research_deadline:
+            self.report("tools", self.plan.language)
+            self._acquire(decision.actions)
+            early_return_used = True
+            decision = self._reading(request, history)
         self.early_review = self._review(request, history, None)
         if not self.early_review.completed:
             return self._result("unavailable", gap=self.early_review.failure_reason)
         if (
-            self.early_review.flags or decision.actions
-        ) and time.monotonic() < self.context.research_deadline:
+            (self.early_review.flags or decision.actions)
+            and not early_return_used
+            and time.monotonic() < self.context.research_deadline
+        ):
             # One evidence-directed response to the early batched review.
             if self.early_review.flags:
                 decision = self._reading(request, history)
             if decision.actions:
-                self.acquirer.acquire(decision.actions, self.plan)
-                self.pending_actions = []
+                self._acquire(decision.actions)
                 self._reading(request, history)
         self.report("final", self.plan.language)
         draft = self.gateway.complete(
@@ -644,8 +838,7 @@ class LegalReviewEngine:
             self.report("repair", self.plan.language)
             decision = self._reading(request, history, finalizing=True, draft=draft)
             if decision.actions:
-                self.acquirer.acquire(decision.actions, self.plan, finalizing=True)
-                self.pending_actions = []
+                self._acquire(decision.actions, finalizing=True)
                 self._reading(request, history, finalizing=True, draft=draft)
             draft = self.gateway.complete(
                 REPAIR_PROMPT,

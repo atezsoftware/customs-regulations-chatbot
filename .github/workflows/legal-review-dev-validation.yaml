@@ -1,0 +1,97 @@
+name: DEV legal review read-only preflight
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Read-only inspection only
+        type: choice
+        options: [inspect]
+        required: true
+        default: inspect
+      expected_backend_commit:
+        description: Exact deployed backend commit SHA
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: codebuild-customs-regulations-runner-${{ github.run_id }}-${{ github.run_attempt }}
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          persist-credentials: false
+      - name: Select the exact Ready DEV API deployment
+        id: target
+        shell: bash
+        env:
+          OPERATION: ${{ inputs.operation }}
+          EXPECTED_BACKEND_COMMIT: ${{ inputs.expected_backend_commit }}
+        run: |
+          set -euo pipefail
+          [[ "$OPERATION" == "inspect" ]]
+          [[ "$EXPECTED_BACKEND_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          aws eks update-kubeconfig --name atez-dev-cluster --region eu-central-1
+          kubectl get pods -n customs-regulations-dev -l app=dev-customs-regulations-api -o json > /tmp/legal-review-pods.json
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          expected = os.environ['EXPECTED_BACKEND_COMMIT']
+          pods = json.loads(Path('/tmp/legal-review-pods.json').read_text())['items']
+          ready = [
+              pod for pod in pods
+              if pod['status'].get('phase') == 'Running'
+              and not pod['metadata'].get('deletionTimestamp')
+              and any(condition.get('type') == 'Ready' and condition.get('status') == 'True'
+                      for condition in pod['status'].get('conditions', []))
+          ]
+          if len(ready) != 1:
+              raise SystemExit('Expected exactly one Ready DEV API pod')
+          pod = ready[0]
+          statuses = {item['name']: item for item in pod['status'].get('containerStatuses', [])}
+          targets = [
+              container for container in pod['spec']['containers']
+              if container['image'].rsplit('/', 1)[-1] == 'customs-regulations-backend-lite-dev:' + expected
+              and statuses.get(container['name'], {}).get('ready') is True
+          ]
+          if len(targets) != 1:
+              raise SystemExit('Expected exactly one Ready API container at the requested image SHA')
+          container = targets[0]
+          print(json.dumps({'pod': pod['metadata']['name'], 'container': container['name'],
+                            'image': container['image']}, sort_keys=True))
+          Path('/tmp/legal-review-target').write_text(pod['metadata']['name'] + '\t' + container['name'] + '\n')
+          PY
+      - name: Inspect DEV database, Redis isolation and configured model
+        shell: bash
+        run: |
+          set -euo pipefail
+          IFS=$'\t' read -r pod container < /tmp/legal-review-target
+          kubectl exec -i "$pod" -n customs-regulations-dev -c "$container" -- \
+            sh -ec '. /vault/secrets/config; export PYTHONPATH=/app; exec python -' < \
+            backend/onyx/db/legal_review_dev_preflight.py
+      - name: Verify the public frontend API reports the requested backend SHA
+        if: always() && steps.target.outcome == 'success'
+        shell: bash
+        env:
+          EXPECTED_BACKEND_COMMIT: ${{ inputs.expected_backend_commit }}
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --max-time 20 --proto '=https' \
+            https://dev-customs-regulations.singlewindow.io/api/version > /tmp/legal-review-public-version.json
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          result = json.loads(Path('/tmp/legal-review-public-version.json').read_text())
+          version = result.get('backend_version')
+          if version != os.environ['EXPECTED_BACKEND_COMMIT']:
+              raise SystemExit('Public frontend API backend SHA mismatch')
+          print(json.dumps({'public_backend_commit': version, 'frontend_api_verified': True}, sort_keys=True))
+          PY

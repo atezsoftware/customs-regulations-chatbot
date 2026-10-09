@@ -20,11 +20,11 @@ from onyx.chat.citation_processor import CitationMode, DynamicCitationProcessor
 from onyx.chat.emitter import Emitter
 from onyx.chat.models import ChatMessageSimple
 from onyx.chat.stop_signal_checker import is_connected
-from onyx.configs import app_configs
 from onyx.configs.constants import MessageType
 from onyx.context.search.models import BaseFilters, IndexFilters
 from onyx.db.asv3_corpus import bind_pc_corpus_scope
 from onyx.db.asv3_runs import save_asv3_checkpoint
+from onyx.db.legal_review_providers import resolve_legal_review_jev
 from onyx.db.memory import UserMemoryContext
 from onyx.db.models import User
 from onyx.error_handling.error_codes import OnyxErrorCode
@@ -33,7 +33,7 @@ from onyx.legal_review.acquisition import SourceAcquirer
 from onyx.legal_review.engine import LegalReviewEngine
 from onyx.legal_review.gateway import GeminiGateway, MeteredLLM, UsageMeter
 from onyx.legal_review.jev import JevReviewer
-from onyx.legal_review.models import WorkflowPolicy
+from onyx.legal_review.models import JevProviderConfig, WorkflowPolicy
 from onyx.legal_review.provider import require_legal_review_model
 from onyx.legal_review.search import DiscoverySearchTool
 from onyx.llm.factory import get_llm_token_counter
@@ -79,10 +79,11 @@ def run_legal_review_loop(
 ) -> None:
     del research_llm, custom_agent_prompt
     require_legal_review_model(llm)
-    if not (app_configs.TYPESAFE_API_KEY or "").strip():
+    jev_provider = resolve_legal_review_jev(user)
+    if jev_provider is None:
         raise OnyxError(
             OnyxErrorCode.INVALID_INPUT,
-            "Legal Review requires a configured TypeSafe JEV credential.",
+            "Legal Review requires a TypeSafe key or an accessible official OpenRouter JEV credential.",
         )
     metadata = ChatTraceMetadata(
         chat_session_id=str(chat_session_id),
@@ -98,6 +99,7 @@ def run_legal_review_loop(
             simple_chat_history=simple_chat_history,
             tools=tools,
             llm=llm,
+            jev_provider=jev_provider,
             user=user,
             chat_session_id=chat_session_id,
             assistant_message_id=assistant_message_id,
@@ -120,6 +122,7 @@ def _run(
     simple_chat_history: list[ChatMessageSimple],
     tools: list[Tool],
     llm: LLM,
+    jev_provider: JevProviderConfig,
     user: User,
     chat_session_id: UUID,
     assistant_message_id: int,
@@ -256,7 +259,10 @@ def _run(
         ),
         acquirer=acquirer,
         reviewer=JevReviewer(
-            before_request=admit_review, check_active=context.check_active
+            route=jev_provider.route,
+            api_key=jev_provider.api_key.get_secret_value(),
+            before_request=admit_review,
+            check_active=context.check_active,
         ),
         ledger=ledger,
         context=context,
@@ -276,6 +282,7 @@ def _run(
         "request": question,
         "scope": context.scope,
         "asv3_workflow_variant": "legal_review",
+        "jev_provider": jev_provider.model_dump(mode="json"),
         "prompt_version": PROMPT_VERSION,
         "publication_status": result.status,
         "legal_review": result.model_dump(mode="json"),
@@ -307,22 +314,46 @@ def _run(
             "Legal Review could not verify a publishable answer. "
             + (result.gaps[-1] if result.gaps else "Review incomplete."),
         )
-    context.check_active()
     final = result.answer
     if result.status == "partial":
-        final = "Kısmi yanıt — bazı belirleyici noktalar doğrulanamadı.\n\n" + final
-    numbers = extract_citation_numbers(final)
-    items = [item for number in numbers if (item := ledger.get(number)) is not None]
-    broker.revalidate_evidence(items, context)
-    mapping = {
-        number: doc
-        for number, doc in ledger.citation_mapping().items()
-        if number in numbers
-    }
-    if set(numbers) - mapping.keys():
-        raise OnyxError(
-            OnyxErrorCode.VALIDATION_ERROR, "An answer citation has no original target."
+        prefix = (
+            "Kısmi yanıt — bazı belirleyici noktalar doğrulanamadı."
+            if context.language.startswith("tr")
+            else "Partial answer — some decisive points could not be verified."
         )
+        final = prefix + "\n\n" + final
+    try:
+        context.check_active()
+        numbers = extract_citation_numbers(final)
+        items = [item for number in numbers if (item := ledger.get(number)) is not None]
+        broker.revalidate_evidence(items, context)
+        mapping = {
+            number: doc
+            for number, doc in ledger.citation_mapping().items()
+            if number in numbers
+        }
+        if set(numbers) - mapping.keys():
+            raise OnyxError(
+                OnyxErrorCode.VALIDATION_ERROR,
+                "An answer citation has no original target.",
+            )
+    except Exception as error:
+        failed_status = "cancelled" if context.is_cancelled() else "unavailable"
+        report(
+            "cancelled" if failed_status == "cancelled" else "failed", context.language
+        )
+        snapshot["publication_status"] = failed_status
+        snapshot["legal_review"] = result.model_copy(
+            update={
+                "status": failed_status,
+                "answer": None,
+                "gaps": [*result.gaps, str(error)],
+            }
+        ).model_dump(mode="json")
+        save_asv3_checkpoint(
+            message_id=assistant_message_id, user_id=user.id, snapshot=snapshot
+        )
+        raise
     ledger.include(numbers)
     snapshot["evidence"] = ledger.export()
     save_asv3_checkpoint(
@@ -336,6 +367,7 @@ def _run(
         else CitationMode.REMOVE
     )
     processor.update_citation_mapping(mapping)
+    state_container.set_citation_mapping(processor.citation_to_doc)
     emitter.emit(
         Packet(
             placement=Placement(turn_index=0),
@@ -357,6 +389,7 @@ def _run(
                 emitter.emit(Packet(placement=Placement(turn_index=0), obj=part))
             else:
                 parts.append(part)
+                state_container.set_answer_tokens("".join(parts))
                 emitter.emit(
                     Packet(
                         placement=Placement(turn_index=0),

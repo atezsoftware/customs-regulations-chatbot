@@ -177,6 +177,65 @@ def test_resolved_jev_identity_and_optional_output_usage_follow_protocol() -> No
     assert result.output_tokens == 0
 
 
+@pytest.mark.parametrize(
+    "model", ["typesafe/jev-1.13", "typesafe/jev-1.13-20260917", "typesafe/jev-1.13.0"]
+)
+def test_official_openrouter_route_uses_actual_jev_systemone(model: str) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert request.url == httpx.URL("https://openrouter.ai/api/v1/systemone")
+        assert request.headers["authorization"] == "Bearer test-openrouter-key"
+        assert json.loads(request.content)["model"] == "typesafe/jev-1.13"
+        response = _response()
+        response["model"] = model
+        response["provider"] = "TypeSafe"
+        response["id"] = "gen-dec-example"
+        response["usage"] = {"input_tokens": 120, "output_tokens": 5, "cost": 0.00003}
+        return httpx.Response(200, json=response)
+
+    result = JevReviewer(
+        route="openrouter",
+        api_key="test-openrouter-key",
+        transport=httpx.MockTransport(handler),
+    ).review({}, _checks(), 5.0)
+    assert result.completed is True
+    assert result.flags == [_checks()[0]]
+    assert len(requests) == 1
+
+
+@pytest.mark.parametrize(
+    "model",
+    ["openai/gpt-5-mini", "typesafe/jev-router", "jev-1.13", "typesafe/jev-1.12"],
+)
+def test_openrouter_never_accepts_non_jev_or_other_model_identity(model: str) -> None:
+    response = _response()
+    response["model"] = model
+    result = JevReviewer(
+        route="openrouter",
+        api_key="test-openrouter-key",
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(200, json=response)
+        ),
+    ).review({}, _checks(), 5.0)
+    assert result.completed is False
+    assert result.failure_reason == "jev_invalid_review_response"
+
+
+def test_openrouter_never_uses_direct_typesafe_credential(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(app_configs, "TYPESAFE_API_KEY", "typesafe-only-key")
+    handler = MagicMock()
+    result = JevReviewer(
+        route="openrouter", transport=httpx.MockTransport(handler)
+    ).review({}, _checks(), 5.0)
+    assert result.completed is False
+    assert result.failure_reason == "jev_credential_unavailable"
+    handler.assert_not_called()
+
+
 def test_unknown_check_keeps_actual_usage_but_review_remains_incomplete() -> None:
     response = _response()
     response["answers"] = {"unknown": {"type": "noul", "noul": 0.0}}

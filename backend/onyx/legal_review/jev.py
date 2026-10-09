@@ -21,8 +21,10 @@ from onyx.utils.logger import setup_logger
 
 logger = setup_logger()
 
-_JEV_ENDPOINT = "https://api.typesafe.ai/v1/systemone"
-_JEV_MODEL = "jev-latest"
+_JEV_ROUTES = {
+    "typesafe": ("https://api.typesafe.ai/v1/systemone", "jev-latest"),
+    "openrouter": ("https://openrouter.ai/api/v1/systemone", "typesafe/jev-1.13"),
+}
 _DEFECT_THRESHOLD = 0.5
 _MAX_REQUEST_BYTES = 256_000
 _MAX_RESPONSE_BYTES = 256_000
@@ -61,11 +63,16 @@ class JevReviewer:
     def __init__(
         self,
         *,
+        route: Literal["typesafe", "openrouter"] = "typesafe",
         api_key: str | None = None,
         transport: httpx.BaseTransport | None = None,
         before_request: Callable[[], None] | None = None,
         check_active: Callable[[], None] | None = None,
     ) -> None:
+        if route not in _JEV_ROUTES:
+            raise ValueError("Unsupported JEV provider route")
+        self._route = route
+        self._endpoint, self._model = _JEV_ROUTES[route]
         self._api_key = api_key
         self._transport = transport
         self._before_request = before_request
@@ -84,15 +91,15 @@ class JevReviewer:
         if not checks or len(expected_ids) != len(checks):
             return ReviewResult(completed=False, failure_reason="jev_invalid_checks")
 
-        credential = (
-            self._api_key if self._api_key is not None else app_configs.TYPESAFE_API_KEY
-        )
+        credential = self._api_key
+        if credential is None and self._route == "typesafe":
+            credential = app_configs.TYPESAFE_API_KEY
         if not credential or not credential.strip():
             return ReviewResult(
                 completed=False, failure_reason="jev_credential_unavailable"
             )
         payload: dict[str, JsonValue] = {
-            "model": _JEV_MODEL,
+            "model": self._model,
             "state": state,
             "questions": {
                 check.id: {
@@ -130,14 +137,14 @@ class JevReviewer:
         try:
             with traced_llm_call(
                 flow=LLMFlow.LEGAL_REVIEW_JEV,
-                model=_JEV_MODEL,
-                provider="typesafe",
-                extra_config={"endpoint": _JEV_ENDPOINT, "transport_attempts": "1"},
+                model=self._model,
+                provider=self._route,
+                extra_config={"endpoint": self._endpoint, "transport_attempts": "1"},
                 input_messages=[{"role": "user", "content": encoded.decode("utf-8")}],
             ) as span:
                 span.span_data.request_params = {
-                    "model": _JEV_MODEL,
-                    "endpoint": _JEV_ENDPOINT,
+                    "model": self._model,
+                    "endpoint": self._endpoint,
                     "transport_attempts": 1,
                     "review_check_ids": [check.id for check in checks],
                 }
@@ -155,9 +162,8 @@ class JevReviewer:
                         "output_tokens": response.usage.output_tokens,
                     },
                 )
-                if set(response.answers) != expected_ids or not re.fullmatch(
-                    r"jev(?:-[A-Za-z0-9][A-Za-z0-9._-]*|[0-9][A-Za-z0-9._-]*)",
-                    response.model,
+                if set(response.answers) != expected_ids or not self._is_jev_model(
+                    response.model
                 ):
                     raise ValueError("JEV response identity does not match the review")
                 self._check_request_active(deadline)
@@ -199,6 +205,16 @@ class JevReviewer:
         if self._check_active is not None:
             self._check_active()
 
+    def _is_jev_model(self, model: str) -> bool:
+        if self._route == "openrouter":
+            return bool(
+                re.fullmatch(r"typesafe/jev-1\.13(?:\.0)?(?:-[0-9]{8})?", model)
+            )
+        return bool(
+            re.fullmatch(r"jev(?:-latest|-?[0-9]+(?:\.[0-9]+)*)(?:-[0-9]{8})?", model)
+            or re.fullmatch(r"jev-[0-9]{4}-[0-9]{2}-[0-9]{2}", model)
+        )
+
     def _send_review(
         self, *, encoded: bytes, credential: str, deadline: float
     ) -> _JevResponse:
@@ -211,7 +227,7 @@ class JevReviewer:
         ) as client:
             with client.stream(
                 "POST",
-                _JEV_ENDPOINT,
+                self._endpoint,
                 headers={
                     "Authorization": f"Bearer {credential}",
                     "Content-Type": "application/json",

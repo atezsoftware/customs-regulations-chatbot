@@ -36,6 +36,11 @@ from onyx.server.query_and_chat.streaming_models import ASv3Progress
             "asv3_research_profile": "normal",
             "asv3_guardrails_v2": True,
         },
+        {
+            "atez_search_v3": True,
+            "asv3_research_profile": "normal",
+            "asv3_guardrails_v3": True,
+        },
     ],
 )
 def test_old_requests_leave_new_workflow_disabled(options: dict[str, object]) -> None:
@@ -55,6 +60,7 @@ def test_old_requests_leave_new_workflow_disabled(options: dict[str, object]) ->
         {"atez_search_v3": True},
         {"asv3_resume_message_id": 42},
         {"asv3_guardrails_v2": True},
+        {"asv3_guardrails_v3": True},
         {"asv3_allow_external": True},
         {"asv3_research_profile": "normal"},
     ],
@@ -116,6 +122,31 @@ def test_chat_setup_resolves_flash_before_using_stale_session_or_request_models(
     selected = factory.call_args.kwargs["llm_override"]
     assert selected.model_version == "gemini-3.8-flash"
     assert selected.model_provider_type == "vertex_ai"
+
+
+@pytest.mark.parametrize("custom_persona,project", [(True, False), (False, True)])
+def test_actual_session_context_is_rejected_before_provider_resolution(
+    custom_persona: bool, project: bool
+) -> None:
+    session_id = uuid4()
+    request = SendMessageRequest(
+        message="Antrepo şartları", chat_session_id=session_id, legal_review=True
+    )
+    session = SimpleNamespace(
+        id=session_id,
+        persona=SimpleNamespace(
+            id=123 if custom_persona else process_message.DEFAULT_PERSONA_ID
+        ),
+        project_id=uuid4() if project else None,
+    )
+    user = SimpleNamespace(id=uuid4(), email="test@example.com", is_anonymous=False)
+    with (
+        patch.object(process_message, "get_chat_session_by_id", return_value=session),
+        patch.object(process_message, "get_llm_for_persona") as factory,
+    ):
+        with pytest.raises(OnyxError, match="default assistant outside projects"):
+            next(process_message.build_chat_turn(request, user, MagicMock(), None))
+    factory.assert_not_called()
 
 
 @pytest.mark.parametrize(
