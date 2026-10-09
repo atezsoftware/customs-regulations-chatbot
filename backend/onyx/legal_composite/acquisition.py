@@ -124,6 +124,82 @@ class CanonicalAcquirer:
     def definitions(self) -> list[dict[str, JsonValue]]:
         return self.registry.definitions(self.context)
 
+    def pending_call_counts(
+        self, actions: list[SourceAction], plan: ResearchPlan
+    ) -> dict[str, int]:
+        """Count expanded pending calls without executing or rebinding originals."""
+        from onyx.asv3.legal_source_reviews import related_source_reviews_enabled
+
+        known_needs = {need.need_id for need in plan.needs}
+        pending: dict[str, SourceAction] = {}
+        metadata_keys = {
+            "_public_update",
+            "_need_id",
+            "_language",
+            "_notifications",
+            "_external_requested",
+            "_outcomes",
+            "_coverage",
+            *(
+                {"_related_source_reviews"}
+                if related_source_reviews_enabled(self.context)
+                else set()
+            ),
+        }
+        for action in self.expand_actions(actions, plan):
+            if set(action.need_ids) - known_needs:
+                raise InvalidSourceAction(
+                    "Source action refers to an unknown frozen need"
+                )
+            spec = self.registry_for_action(action).get(action.tool)
+            if spec is None or spec.external or spec.orchestrates:
+                raise InvalidSourceAction(
+                    "Source action is outside the canonical capability allowlist"
+                )
+            arguments = dict(action.arguments)
+            if action.tool == "search_corpus":
+                arguments["expand_query"] = False
+            if not jsonschema.Draft202012Validator(spec.parameters).is_valid(
+                {
+                    key: value
+                    for key, value in arguments.items()
+                    if key not in metadata_keys
+                }
+            ):
+                raise InvalidSourceAction(
+                    "Source action arguments do not match the canonical capability schema"
+                )
+            signature = json.dumps(
+                {
+                    "tool": action.tool,
+                    "source_kind": action.source_kind,
+                    "arguments": {
+                        key: value
+                        for key, value in arguments.items()
+                        if key != "_public_update"
+                    },
+                },
+                sort_keys=True,
+            )
+            if signature in self._completed:
+                continue
+            previous = pending.get(signature)
+            pending[signature] = (
+                previous.model_copy(
+                    update={
+                        "need_ids": list(
+                            dict.fromkeys(previous.need_ids + action.need_ids)
+                        )
+                    }
+                )
+                if previous is not None
+                else action
+            )
+        counts: dict[str, int] = {}
+        for action in pending.values():
+            counts[action.tool] = counts.get(action.tool, 0) + 1
+        return counts
+
     def _scheduled_calls(
         self, calls: list[AcquisitionCall], *, host_actions: bool = False
     ) -> list[AcquisitionCall]:

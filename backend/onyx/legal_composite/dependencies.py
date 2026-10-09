@@ -1153,6 +1153,32 @@ class CompositeDependencyExpander(DependencyExpander):
             data=result,
         )
 
+    def register_material(
+        self,
+        plan: ResearchPlan,
+        *,
+        frontier: set[int],
+        material_targets: list[MaterialDependencyRequest],
+        need_bindings: dict[int, set[str]] | None = None,
+    ) -> list[AuthorityDependency]:
+        """Keep validated unexamined relations visible without acquiring new sources."""
+        selected = self._collect_material(
+            plan, frontier, need_bindings, material_targets
+        )
+        for edge in self.edges.values():
+            if edge.edge_id in selected and self._expanded.get(
+                edge.edge_id
+            ) != self._edge_state(edge):
+                edge.discovery_gaps = list(
+                    dict.fromkeys(
+                        [
+                            *edge.discovery_gaps,
+                            "Material dependency acquisition was deferred before examination.",
+                        ]
+                    )
+                )
+        return self.synchronize()
+
     def expand(
         self,
         plan: ResearchPlan,

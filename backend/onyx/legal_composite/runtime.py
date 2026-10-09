@@ -418,6 +418,7 @@ def _run_legal_composite_loop(
             gateway = BudgetedGateway(
                 max_parallel_generations=4,
                 share_draft_context=True,
+                preserve_research_finalization_on_timeout=True,
                 selected_llm=llm,
                 research_llm=typed_research_llm,
                 budget=budget,

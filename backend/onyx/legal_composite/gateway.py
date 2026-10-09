@@ -18,7 +18,12 @@ from sqlalchemy.orm import Session
 
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.models import RunStopped
-from onyx.legal_composite.budget import CallReservation, WorkflowBudget
+from onyx.legal_composite.budget import (
+    CallReservation,
+    ResearchPhaseClosed,
+    ResearchStopReason,
+    WorkflowBudget,
+)
 from onyx.legal_composite.claim_edits import ClaimRepairEdits
 from onyx.legal_composite.draft_composition import DraftComposition
 from onyx.legal_composite.draft_context import encode_draft_context
@@ -353,6 +358,7 @@ class BudgetedGateway:
         reserve_finalization: bool = True,
         max_parallel_generations: int = 1,
         share_draft_context: bool = False,
+        preserve_research_finalization_on_timeout: bool = False,
     ) -> None:
         self.selected_llm = selected_llm
         self.research_llm = research_llm
@@ -365,6 +371,13 @@ class BudgetedGateway:
         if not isinstance(share_draft_context, bool):
             raise ValueError("Draft context sharing must be an explicit boolean")
         self.share_draft_context = share_draft_context
+        if not isinstance(preserve_research_finalization_on_timeout, bool):
+            raise ValueError(
+                "Research timeout preservation must be an explicit boolean"
+            )
+        self.preserve_research_finalization_on_timeout = (
+            preserve_research_finalization_on_timeout
+        )
         self._trace_binding: dict[str, str] = {}
         if run_id is not None:
             self._trace_binding["legal_composite_run_id"] = run_id
@@ -748,6 +761,19 @@ class BudgetedGateway:
                     )
                     response = cast(ModelResponse, future.result(timeout=wait_seconds))
                 except (FutureTimeout, LLMTimeoutError) as error:
+                    if (
+                        self.preserve_research_finalization_on_timeout
+                        and not finalizing
+                    ):
+                        reason: ResearchStopReason = (
+                            "provider_timeout"
+                            if isinstance(error, LLMTimeoutError)
+                            else "host_research_deadline"
+                            if self.budget.remaining_seconds() <= 0
+                            else "host_call_timeout"
+                        )
+                        self.budget.close_research(reason)
+                        raise ResearchPhaseClosed(reason) from error
                     self.budget.stop(
                         "Provider call exceeded its deadline; no further spend authorized"
                     )

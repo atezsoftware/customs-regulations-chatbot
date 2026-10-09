@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import Callable
+from math import ceil
 from typing import Protocol, TypeVar
 
 from pydantic import BaseModel, JsonValue
@@ -11,13 +12,15 @@ from onyx.asv3.citation_numbers import extract_citation_numbers
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.models import RunContext, RunStopped
 from onyx.db.legal_composite_sources import SourceKind
-from onyx.legal_composite.acquisition import InvalidSourceAction
+from onyx.legal_composite.acquisition import CanonicalAcquirer, InvalidSourceAction
+from onyx.legal_composite.budget import ResearchPhaseClosed
 from onyx.legal_composite.claim_edits import (
     CLAIM_REPAIR_EDITS_PROMPT,
     ClaimRepairEdits,
     claim_edits_to_delta,
 )
 from onyx.legal_composite.dependencies import (
+    CompositeDependencyExpander,
     DependencyExpander,
     assess_dependencies,
     dependency_required_citations,
@@ -523,15 +526,101 @@ class LegalCompositeEngine:
         self.protocol_defects: list[str] = []
         self.source_requests: list[JsonValue] = []
         self.deferred_initial_actions: list[tuple[SourceAction, str]] = []
+        self.deferred_followup_steps: list[JsonValue] = []
         self.semantic_review: SemanticReview | None = None
         self.dependencies: list[AuthorityDependency] = []
         self.selection: SourceSelectionResult | None = None
         self.pending_reconsidered: set[int] = set()
+        self.pending_selection_citations: set[int] = set()
         self.plan: ResearchPlan | None = None
         self.receipts: list[dict[str, JsonValue]] = []
         self.last_review: AnswerReview | None = None
         self._research_seconds: list[float] = []
         self._source_seconds: dict[str, float] = {}
+        self._dependency_seconds: list[float] = []
+
+    def _reading_estimate(self) -> float:
+        return max(self._research_seconds, default=self.policy.max_call_seconds)
+
+    def _reading_has_runway(self) -> bool:
+        return (
+            self._repair_runway()
+            > self._reading_estimate() + self.policy.selection_reserve_seconds
+        )
+
+    def _followup_has_runway(self, step: IssueResearchStep) -> bool:
+        remaining = self._repair_runway()
+        if remaining <= 0:
+            return False
+        acquisition = max(
+            (
+                self._source_seconds.get(action.tool, self.policy.max_call_seconds)
+                for action in step.actions
+            ),
+            default=0.0,
+        )
+        if isinstance(self.acquirer, CanonicalAcquirer) and self.plan is not None:
+            pending = self.acquirer.pending_call_counts(step.actions, self.plan)
+            acquisition = max(
+                (
+                    self._source_seconds.get(tool, self.policy.max_call_seconds)
+                    for tool in pending
+                ),
+                default=0.0,
+            ) * ceil(sum(pending.values()) / self.policy.max_parallel_tools)
+        dependencies = (
+            max(self._dependency_seconds, default=self.policy.max_call_seconds)
+            if step.material_dependencies
+            else 0.0
+        )
+        return remaining > (
+            acquisition
+            + dependencies
+            + self._reading_estimate()
+            + self.policy.selection_reserve_seconds
+        )
+
+    def _defer_followup(self, step: IssueResearchStep, plan: IssueResearchPlan) -> None:
+        known = {need.need_id for need in plan.needs}
+        if any(set(action.need_ids) - known for action in step.actions):
+            raise InvalidSourceAction("Action refers to an unknown research need")
+        if step.material_dependencies:
+            frontier = {target.origin_citation for target in step.material_dependencies}
+            before = set(self.ledger.citation_numbers())
+            delivered = getattr(self.gateway, "last_delivered_citations", before)
+            if not frontier <= before or not frontier <= delivered:
+                raise InvalidSourceAction(
+                    "Related-source target was not a delivered original"
+                )
+            if not isinstance(self.dependency_expander, CompositeDependencyExpander):
+                raise InvalidSourceAction(
+                    "Material dependency deferral requires an issue-aware collector"
+                )
+            self.dependencies = self.dependency_expander.register_material(
+                plan, frontier=frontier, material_targets=step.material_dependencies
+            )
+        self.deferred_followup_steps.append(
+            {
+                "actions": [action.model_dump(mode="json") for action in step.actions],
+                "material_dependencies": [
+                    target.model_dump(mode="json")
+                    for target in step.material_dependencies
+                ],
+                "status": "unexecuted_navigation",
+                "reason": "research_runway",
+                "navigation_only": True,
+            }
+        )
+        with graph_step(
+            "legal_composite.research_admission",
+            {},
+            summary="work_kind=sources accepted=0 reason=research_runway",
+        ) as admission:
+            admission.output_value = {
+                "operation": "sources",
+                "accepted": False,
+                "reason": "research_runway",
+            }
 
     def _repair_runway(self) -> float:
         if not self.research_available():
@@ -590,6 +679,7 @@ class LegalCompositeEngine:
             )
             required.extend(self.requirements.citations())
             required.extend(sorted(self.pending_reconsidered))
+            required.extend(sorted(self.pending_selection_citations))
         required = list(
             dict.fromkeys(
                 [
@@ -693,6 +783,7 @@ class LegalCompositeEngine:
             }
         if self.reviewer is not None:
             payload["coordinator_source_requests"] = self.source_requests
+            payload["deferred_followup_source_actions"] = self.deferred_followup_steps
             payload["deferred_initial_source_actions"] = [
                 {
                     "action": action.model_dump(mode="json"),
@@ -901,7 +992,51 @@ class LegalCompositeEngine:
                 )
             if not selection_request.candidates:
                 return
-            selected = self.selector.select(selection_request)
+            try:
+                selected = self.selector.select(selection_request)
+            except RunStopped as error:
+                if isinstance(error, ResearchPhaseClosed):
+                    reason = error.reason
+                elif (
+                    getattr(
+                        self.gateway, "preserve_research_finalization_on_timeout", False
+                    )
+                    is True
+                    and budget is not None
+                    and str(error)
+                    == "Workflow deadline reached; finalization time retained"
+                    and budget.remaining_seconds() < 3
+                ):
+                    self.check_active()
+                    budget.close_research("host_research_deadline")
+                    reason = "host_research_deadline"
+                else:
+                    raise
+                self.check_active()
+                self.pending_selection_citations.update(
+                    row.citation for row in selection_request.candidates
+                )
+                self.receipts.append(
+                    {
+                        "status": "selection_stopped",
+                        "reason": reason,
+                        "citations": [
+                            row.citation for row in selection_request.candidates
+                        ],
+                        "navigation_only": True,
+                    }
+                )
+                with graph_step(
+                    "legal_composite.research_admission",
+                    {},
+                    summary=f"work_kind=selection accepted=0 reason={reason}",
+                ) as admission:
+                    admission.output_value = {
+                        "operation": "selection",
+                        "accepted": False,
+                        "reason": reason,
+                    }
+                return
             if self.selection is None or numbers is None:
                 self.selection = selected
             else:
@@ -1025,6 +1160,7 @@ class LegalCompositeEngine:
                         need_bindings.setdefault(row.citation, set()).add(row.need_id)
             self.report("tools", plan.language)
             receipt_start = len(self.dependency_expander.receipts)
+            dependency_started = time.monotonic()
             self.dependencies = self.dependency_expander.expand(
                 plan,
                 frontier=frontier,
@@ -1036,6 +1172,7 @@ class LegalCompositeEngine:
                 ),
             )
             self.receipts.extend(self.dependency_expander.receipts[receipt_start:])
+            self._dependency_seconds.append(time.monotonic() - dependency_started)
             added = set(self.ledger.citation_numbers()) - before
             if added:
                 self._select_sources(request, plan, added)
@@ -1078,6 +1215,18 @@ class LegalCompositeEngine:
                 break
             try:
                 if self.reviewer is not None:
+                    if not self._reading_has_runway():
+                        with graph_step(
+                            "legal_composite.research_admission",
+                            {},
+                            summary="work_kind=reading accepted=0 reason=research_runway",
+                        ) as admission:
+                            admission.output_value = {
+                                "operation": "reading",
+                                "accepted": False,
+                                "reason": "research_runway",
+                            }
+                        break
                     self.report("reading", plan.language)
                 reading_started = time.monotonic()
                 step = self.gateway.complete(
@@ -1088,6 +1237,19 @@ class LegalCompositeEngine:
                 )
                 if self.reviewer is not None:
                     self._research_seconds.append(time.monotonic() - reading_started)
+            except ResearchPhaseClosed as error:
+                self.check_active()
+                with graph_step(
+                    "legal_composite.research_admission",
+                    {},
+                    summary=f"work_kind=reading accepted=0 reason={error.reason}",
+                ) as admission:
+                    admission.output_value = {
+                        "operation": "reading",
+                        "accepted": False,
+                        "reason": error.reason,
+                    }
+                break
             except RunStopped:
                 self.check_active()
                 break
@@ -1151,6 +1313,12 @@ class LegalCompositeEngine:
                     self.research_gaps.append(
                         "Research did not establish readiness for the requested outcomes."
                     )
+                break
+            if isinstance(step, IssueResearchStep) and not self._followup_has_runway(
+                step
+            ):
+                assert isinstance(plan, IssueResearchPlan)
+                self._defer_followup(step, plan)
                 break
             self._refresh_dependencies(
                 request,
