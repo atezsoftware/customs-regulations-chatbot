@@ -3236,6 +3236,15 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
                             or ""
                         )
                         or None,
+                        "hydration_locator": {
+                            "document_id": chunk.document_id,
+                            "chunk_ind": chunk.chunk_id,
+                            "regulatory_chunk_id": chunk.regulatory_chunk_id,
+                            "source_type": chunk.source_type.value,
+                            "semantic_identifier": chunk.semantic_identifier
+                            or "Unknown",
+                            "blurb": chunk.blurb[:512],
+                        },
                     }
                 )
 

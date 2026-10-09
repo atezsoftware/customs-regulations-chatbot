@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 from unittest.mock import MagicMock
 
+from onyx.asv3.candidate_audit import CandidateAudit, CandidateAuditRecord
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.guardrails_v3 import (
     GuardrailsV3ReviewOutcome,
@@ -112,3 +113,53 @@ def test_failed_recheck_keeps_original_answer_after_only_one_repair_attempt() ->
     assert outcome.repair_applied is False
     assert outcome.failure_reason == "recheck_failed"
     llm.invoke.assert_called_once()
+
+
+def test_excluded_candidate_is_hydrated_and_delivered_before_one_repair() -> None:
+    context, ledger = RunContext(timeout_seconds=120), EvidenceLedger()
+    audit = CandidateAudit(context, request="Kapsam?")
+    audit.record(
+        CandidateAuditRecord(
+            search_run_id="search-1",
+            candidate_id="law:7",
+            source_id="law",
+            chunk_id="7",
+            lane="regulatory",
+            mode="keyword",
+            status="excluded",
+            reason="rerank_below_selection",
+            hydration_locator={
+                "document_id": "law",
+                "chunk_ind": 7,
+                "regulatory_chunk_id": "canonical-7",
+                "source_type": "user_file",
+                "semantic_identifier": "Kanun",
+                "blurb": "Madde 7",
+            },
+        )
+    )
+    broker = MagicMock()
+    broker.hydrate_search_evidence.return_value = [
+        EvidenceItem(source_id="law", chunk_id="7", text="A ve B şarttır.")
+    ]
+    llm = _llm("A ve B şarttır [1].")
+
+    outcome = _controller().finalize_guardrails_v3(
+        candidate_answer="A şarttır.",
+        initial_review=GuardrailsV3ReviewOutcome(
+            review_completed=True, repair_requested=True, findings=[_finding()]
+        ),
+        ledger=ledger,
+        context=context,
+        repair_llm=llm,
+        candidate_audit=audit,
+        broker=broker,
+        recheck=lambda *_args, **_kwargs: GuardrailsV3ReviewOutcome(
+            review_completed=True
+        ),
+    )
+
+    assert outcome.action == "recover_audited_candidate"
+    assert outcome.repair_applied is True
+    assert broker.hydrate_search_evidence.call_args.args[0].document_id == "law"
+    assert ledger.completely_delivered("guardrails-v3-recovery") == {1}

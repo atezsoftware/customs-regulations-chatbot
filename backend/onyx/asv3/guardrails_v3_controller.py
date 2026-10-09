@@ -8,10 +8,14 @@ from collections.abc import Callable
 
 from pydantic import BaseModel, ConfigDict
 
+from onyx.asv3.candidate_audit import CandidateAudit
 from onyx.asv3.citation_numbers import extract_citation_numbers
+from onyx.asv3.corpus_tools import CorpusBroker
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.guardrails_v3 import GuardrailsV3ReviewOutcome
 from onyx.asv3.models import RunContext
+from onyx.configs.constants import DocumentSource
+from onyx.context.search.models import SearchDoc
 from onyx.llm.interfaces import LLM
 from onyx.llm.models import ReasoningEffort, UserMessage
 
@@ -34,6 +38,8 @@ def finalize_guardrails_v3(
     context: RunContext,
     repair_llm: LLM | None,
     recheck: Callable[..., GuardrailsV3ReviewOutcome],
+    candidate_audit: CandidateAudit | None = None,
+    broker: CorpusBroker | None = None,
 ) -> GuardrailsV3Finalization:
     """Use delivered evidence first and accept only one clean, changed recheck."""
     if not initial_review.review_completed or not initial_review.repair_requested:
@@ -47,6 +53,12 @@ def finalize_guardrails_v3(
         )
     citations = list(ledger.citation_numbers())
     delivered = [number for number in citations if ledger.inspect(number)["deliveries"]]
+    action = "patch_delivered_evidence"
+    if not delivered and candidate_audit is not None and broker is not None:
+        recovered = _recover_audited_candidate(candidate_audit, broker, ledger, context)
+        if recovered:
+            delivered = recovered
+            action = "recover_audited_candidate"
     if not delivered:
         return GuardrailsV3Finalization(
             answer=candidate_answer,
@@ -80,31 +92,73 @@ def finalize_guardrails_v3(
     except Exception:
         return GuardrailsV3Finalization(
             answer=candidate_answer,
-            action="patch_delivered_evidence",
+            action=action,
             failure_reason="repair_failed",
         )
     if not repaired or repaired == candidate_answer:
         return GuardrailsV3Finalization(
             answer=candidate_answer,
-            action="patch_delivered_evidence",
+            action=action,
             failure_reason="repair_unchanged",
         )
     if set(extract_citation_numbers(repaired)) - set(delivered):
         return GuardrailsV3Finalization(
             answer=candidate_answer,
-            action="patch_delivered_evidence",
+            action=action,
             failure_reason="invalid_repair_citations",
         )
     review = recheck(repaired, initial_review.findings)
     if not review.review_completed or review.findings:
         return GuardrailsV3Finalization(
             answer=candidate_answer,
-            action="patch_delivered_evidence",
+            action=action,
             failure_reason="recheck_failed",
         )
     return GuardrailsV3Finalization(
         answer=repaired,
-        action="patch_delivered_evidence",
+        action=action,
         repair_applied=True,
         recheck_completed=True,
     )
+
+
+def _recover_audited_candidate(
+    audit: CandidateAudit,
+    broker: CorpusBroker,
+    ledger: EvidenceLedger,
+    context: RunContext,
+) -> list[int]:
+    for record in audit.records():
+        locator = record.hydration_locator
+        if record.status != "excluded" or locator is None:
+            continue
+        try:
+            doc = SearchDoc(
+                document_id=locator.document_id,
+                chunk_ind=locator.chunk_ind,
+                semantic_identifier=locator.semantic_identifier,
+                blurb=locator.blurb,
+                source_type=DocumentSource(locator.source_type),
+                boost=0,
+                hidden=False,
+                metadata={"regulatory_chunk_id": locator.regulatory_chunk_id},
+                match_highlights=[],
+            )
+            evidence = broker.hydrate_search_evidence(doc, context)
+            if not evidence:
+                continue
+            numbers = ledger.add(evidence, context)
+            ledger.record_delivery(
+                "guardrails-v3-recovery",
+                "asv3_guardrails_v3_repair",
+                [
+                    {"citation": number, "text": item.text}
+                    for number, item in zip(numbers, evidence, strict=True)
+                ],
+            )
+            delivered = ledger.completely_delivered("guardrails-v3-recovery")
+            if set(numbers).issubset(delivered):
+                return numbers
+        except Exception:
+            continue
+    return []

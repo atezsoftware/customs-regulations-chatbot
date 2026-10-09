@@ -2058,6 +2058,10 @@ def run_asv3_loop(
                     ledger=ledger,
                     context=context,
                     repair_llm=repair_llm,
+                    candidate_audit=(
+                        audit if isinstance(audit, CandidateAudit) else None
+                    ),
+                    broker=broker,
                     recheck=recheck,
                 )
                 final = finalization.answer

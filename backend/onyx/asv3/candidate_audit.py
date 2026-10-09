@@ -20,6 +20,19 @@ CandidateAuditStatus = Literal[
 ]
 
 
+class CandidateHydrationLocator(BaseModel):
+    """Bounded identity metadata required for an authorized exact-source re-read."""
+
+    model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
+
+    document_id: str = Field(min_length=1, max_length=512)
+    chunk_ind: int = Field(ge=0)
+    regulatory_chunk_id: str = Field(min_length=1, max_length=512)
+    source_type: str = Field(min_length=1, max_length=64)
+    semantic_identifier: str = Field(min_length=1, max_length=512)
+    blurb: str = Field(default="", max_length=512)
+
+
 class CandidateAuditRecord(BaseModel):
     """Metadata-only lifecycle record; passage text remains in the evidence ledger."""
 
@@ -38,6 +51,7 @@ class CandidateAuditRecord(BaseModel):
     rerank_position: int | None = Field(default=None, ge=0)
     outcome_ids: list[str] = Field(default_factory=list, max_length=32)
     scope_version: str | None = Field(default=None, max_length=256)
+    hydration_locator: CandidateHydrationLocator | None = None
 
     @property
     def identity(self) -> tuple[str, str]:

@@ -104,3 +104,27 @@ def test_candidate_audit_rejects_capacity_and_scope_mismatch() -> None:
     )
     with pytest.raises(ValueError, match="scope"):
         foreign.restore(exported)
+
+
+def test_candidate_audit_keeps_a_bounded_hydration_locator_without_source_text() -> (
+    None
+):
+    audit = _audit()
+    audit.record(
+        _record(
+            hydration_locator={
+                "document_id": "source-1",
+                "chunk_ind": 7,
+                "regulatory_chunk_id": "canonical-7",
+                "source_type": "user_file",
+                "semantic_identifier": "Kanun",
+                "blurb": "Madde 7",
+            }
+        )
+    )
+
+    record = audit.records()[0]
+
+    assert record.hydration_locator is not None
+    assert record.hydration_locator.regulatory_chunk_id == "canonical-7"
+    assert "text" not in audit.export()["records"][0]
