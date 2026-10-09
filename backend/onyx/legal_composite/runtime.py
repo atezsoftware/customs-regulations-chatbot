@@ -371,6 +371,7 @@ def _run_legal_composite_loop(
         ledger,
         policy,
         coalesce_progress=True,
+        prioritize_observed_reads=True,
         registry_for_action=router.registry,
         expand_actions=router.expand,
         lane_inventory=router.inventory(),

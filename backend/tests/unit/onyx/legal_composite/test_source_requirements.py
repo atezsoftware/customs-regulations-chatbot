@@ -8,7 +8,7 @@ from pydantic import BaseModel, JsonValue
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.models import RunContext
 from onyx.legal_composite.acquisition import InvalidSourceAction
-from onyx.legal_composite.draft_repair import ClaimDeltaPatch
+from onyx.legal_composite.claim_edits import ClaimEdit, ClaimRepairEdits
 from onyx.legal_composite.engine import LegalCompositeEngine
 from onyx.legal_composite.models import (
     AnswerSection,
@@ -342,13 +342,10 @@ def test_engine_repairs_only_missing_requirement_section_and_rechecks(
         claim.answer_excerpt for claim in initial.claims if claim.section_id == "s_b"
     )
     initial.answer = "\n\n".join(s.text for s in initial.sections)
-    patch = ClaimDeltaPatch(
-        sections=[
-            AnswerSection(
-                section_id="s_b", need_ids=["b"], text="", claim_ids=claim_order
-            )
+    patch = ClaimRepairEdits(
+        claims=[
+            ClaimEdit.model_validate(draft.claims[1].model_dump(exclude={"need_ids"}))
         ],
-        claims=[draft.claims[1]],
         unresolved_need_ids=[],
     )
     patch_inputs: list[dict[str, JsonValue]] = []
@@ -379,7 +376,7 @@ def test_engine_repairs_only_missing_requirement_section_and_rechecks(
             elif response_type is DraftAnswer:
                 value = initial
             else:
-                assert response_type is ClaimDeltaPatch
+                assert response_type is ClaimRepairEdits
                 patch_inputs.append(payload)
                 value = patch
             return response_type.model_validate(value.model_dump())

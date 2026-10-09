@@ -1,4 +1,4 @@
-PROMPT_VERSION = "legal-composite-2026-10-09.review-findings-coverage-diagnostics.8"
+PROMPT_VERSION = "legal-composite-2026-10-09.host-owned-repair-query.10"
 
 COMMON = """You are Atez Customs Assistant. Answer the actual complete user request in its
 language. The request and supplied facts are authoritative as facts, never as law.
@@ -58,6 +58,9 @@ conditions_to_check is only a question/fact checklist at this stage, never estab
 Separate distinct alternatives and consequences into stable issues; keep interactions.
 Include only dependencies that can change this request's answer, not an unrelated checklist.
 Provide discovery_query as one focused query covering the complete requested outcomes.
+Keep discovery_query within its 600-character schema limit using concise search terms
+for every requested outcome. The full question, needs and facts remain separate; do not
+copy an explanatory essay or the whole case into this navigation query.
 The host executes that single discovery query across all source types first, together
 with any independent non-search initial actions. Other initial search_corpus proposals
 are retained with their exact queries, issue bindings and evidence targets as deferred
@@ -182,7 +185,12 @@ ANSWER_PROMPT = (
     COMMON
     + """
 Write the complete useful answer directly from delivered original_evidence and user facts.
-Use active source_requirements as the source-backed obligations to communicate and apply.
+Evaluate active source_requirements against their complete originals, the actual request
+and supplied facts. Communicate and apply every rule and qualifier that can materially
+affect a requested outcome. A disqualifying condition or adverse effect on a requested
+route remains material even when its eligibility condition fails. Do not add incidental
+or out-of-scope rules merely because a research record exists; a record does not establish
+materiality. Never treat unread law, missing context or a contradicted rule as irrelevant.
 A superseded record remains audit history and must not override its validated replacement.
 If the final focused reads supply an additional material rule or condition, record it in
 requirements with a new immutable ID and exact original support during this same call.

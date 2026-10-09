@@ -323,5 +323,5 @@ def test_coverage_policy_is_only_selected_for_the_declared_singleton() -> None:
     assert "explicit task coverage only" in _review_generation_policy(only)
     mixed = deepcopy(only)
     cast(list[JsonValue], mixed["expected_checks"]).append({"check_id": "original:1"})
-    assert "Treat missing decisive evidence" in _review_generation_policy(mixed)
+    assert "Never mark missing decisive law" in _review_generation_policy(mixed)
     assert "explicit task coverage only" not in _review_generation_policy(mixed)

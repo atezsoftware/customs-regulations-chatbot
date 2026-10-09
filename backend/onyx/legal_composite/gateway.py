@@ -11,7 +11,7 @@ from concurrent.futures import TimeoutError as FutureTimeout
 from contextlib import nullcontext
 from contextvars import copy_context
 from threading import BoundedSemaphore
-from typing import TypeVar, cast
+from typing import TypedDict, TypeVar, cast
 
 from pydantic import BaseModel, JsonValue, ValidationError
 from sqlalchemy.orm import Session
@@ -19,12 +19,19 @@ from sqlalchemy.orm import Session
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.models import RunStopped
 from onyx.legal_composite.budget import CallReservation, WorkflowBudget
+from onyx.legal_composite.claim_edits import ClaimRepairEdits
 from onyx.legal_composite.draft_context import encode_draft_context
 from onyx.legal_composite.draft_repair import ClaimDeltaPatch
 from onyx.legal_composite.models import (
     IssueResearchPlan,
     IssueResearchStep,
     StructuredDraftAnswer,
+)
+from onyx.legal_composite.query_repair import (
+    QUERY_REPAIR_PROMPT,
+    DiscoveryQuery,
+    plan_with_only_oversized_query,
+    restore_plan_query,
 )
 from onyx.llm.cost import ModelPrice, get_model_price_per_million
 from onyx.llm.cost_overrides import get_override
@@ -49,6 +56,12 @@ from onyx.tracing.framework.spans import Span
 from onyx.tracing.llm_utils import llm_generation_span, record_llm_response
 
 ResponseModel = TypeVar("ResponseModel", bound=BaseModel)
+
+
+class _GenerationOptions(TypedDict, total=False):
+    provider_compatibility_attempts: int
+
+
 _RESEARCH_OUTPUT_TOKENS = 2_048
 _REQUIREMENTS_OUTPUT_TOKENS = 6_144
 _PROTOCOL_TOKEN_MARGIN = 256
@@ -101,13 +114,16 @@ _VALIDATION_FIELDS = frozenset(
         "checks",
         "claims",
         "deleted_claim_ids",
+        "discovery_query",
         "gap_resolutions",
+        "heading_edits",
         "initial_actions",
         "issue_gaps",
         "language",
         "material_dependencies",
         "missing_user_facts",
         "needs",
+        "query",
         "ready_to_answer",
         "reconsider_citations",
         "related_citations",
@@ -126,9 +142,11 @@ def _record_typed_validation(
     """Expose only fixed schema categories, never model values or arbitrary locations."""
     kinds: dict[type[BaseModel], str] = {
         IssueResearchPlan: "research_plan",
+        DiscoveryQuery: "query_compression",
         IssueResearchStep: "research_step",
         StructuredDraftAnswer: "draft_answer",
         ClaimDeltaPatch: "claim_delta",
+        ClaimRepairEdits: "claim_delta",
     }
     kind = kinds.get(response_type, "other")
     types: Counter[str] = Counter()
@@ -871,6 +889,9 @@ class BudgetedGateway:
             finalizing=finalizing,
             output_tokens=output_tokens,
         )
+        generation_options: _GenerationOptions = {}
+        if self.share_draft_context and response_type is DiscoveryQuery:
+            generation_options["provider_compatibility_attempts"] = 1
         reservation, response = self._generate(
             llm,
             messages,
@@ -880,6 +901,7 @@ class BudgetedGateway:
             finalizing,
             response_format,
             self.user_identity,
+            **generation_options,
         )
         finish_reason = (response.choice.finish_reason or "").lower()
         if response_type in {
@@ -887,6 +909,7 @@ class BudgetedGateway:
             IssueResearchStep,
             StructuredDraftAnswer,
             ClaimDeltaPatch,
+            ClaimRepairEdits,
         }:
             reason = (
                 finish_reason
@@ -929,6 +952,47 @@ class BudgetedGateway:
         except ValidationError as error:
             if self.share_draft_context:
                 _record_typed_validation(response_type, error)
+                if response_type is IssueResearchPlan and research:
+                    repair = plan_with_only_oversized_query(content, error)
+                    if repair is not None:
+                        frozen, overlong_query = repair
+                        parent_call_id = self.last_call_id
+                        parent_delivered = set(self.last_delivered_citations)
+                        try:
+                            query = self.complete(
+                                QUERY_REPAIR_PROMPT,
+                                {
+                                    "request": payload.get("request"),
+                                    "frozen_needs": frozen.model_dump(mode="json")[
+                                        "needs"
+                                    ],
+                                    "overlong_discovery_query": overlong_query,
+                                },
+                                DiscoveryQuery,
+                                flow,
+                            )
+                        finally:
+                            self.last_call_id = parent_call_id
+                            self.last_delivered_citations = parent_delivered
+                        repaired = restore_plan_query(frozen, query)
+                        with graph_step(
+                            "legal_composite.query_compression",
+                            {},
+                            summary=(
+                                f"before_characters={len(overlong_query)} "
+                                f"after_characters={len(query.query)} "
+                                f"preserved_needs={len(frozen.needs)}"
+                            ),
+                        ) as query_step:
+                            query_step.output_value = {
+                                "before_characters": len(overlong_query),
+                                "after_characters": len(query.query),
+                                "preserved_needs": len(frozen.needs),
+                            }
+                        _record_typed_validation(IssueResearchPlan)
+                        self.check_active()
+                        self.budget.check_response_active(finalizing)
+                        return cast(ResponseModel, repaired)
             raise RunStopped("The model response failed the workflow schema") from error
         if self.share_draft_context:
             _record_typed_validation(response_type)

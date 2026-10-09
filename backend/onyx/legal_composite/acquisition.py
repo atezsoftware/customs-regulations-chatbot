@@ -8,6 +8,7 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from threading import Lock
 from typing import cast
 
+import jsonschema
 from pydantic import JsonValue
 
 from onyx.asv3.evidence import EvidenceLedger
@@ -22,6 +23,8 @@ from onyx.asv3.registry import CapabilityRegistry
 from onyx.db.legal_composite_sources import SourceKind
 from onyx.legal_composite.models import ResearchPlan, SourceAction, WorkflowPolicy
 from onyx.tracing.answer_graph import graph_step
+
+AcquisitionCall = tuple[SourceAction, CapabilityCall, str]
 
 
 class InvalidSourceAction(RunStopped):
@@ -98,6 +101,7 @@ class CanonicalAcquirer:
         coalesce_progress: bool = False,
         host_registry: CapabilityRegistry | None = None,
         source_kinds: dict[str, SourceKind] | None = None,
+        prioritize_observed_reads: bool = False,
     ) -> None:
         self.registry = registry
         self.host_registry = host_registry or registry
@@ -112,12 +116,91 @@ class CanonicalAcquirer:
             lambda _actions, _pending, _completed: None
         )
         self.coalesce_progress = coalesce_progress
+        self.prioritize_observed_reads = prioritize_observed_reads
         self.search_calls = 0
         self.last_receipts: list[dict[str, JsonValue]] = []
         self._completed: dict[str, dict[str, JsonValue]] = {}
 
     def definitions(self) -> list[dict[str, JsonValue]]:
         return self.registry.definitions(self.context)
+
+    def _scheduled_calls(
+        self, calls: list[AcquisitionCall], *, host_actions: bool = False
+    ) -> list[AcquisitionCall]:
+        if not self.prioritize_observed_reads:
+            return calls
+        targets: set[str] = set()
+        for action, _call, _signature in calls:
+            source_id = action.arguments.get("source_id")
+            if action.tool in {
+                "read_provision",
+                "read_chunk",
+                "read_chunk_context",
+            } and isinstance(source_id, str):
+                targets.add(source_id)
+        if not targets:
+            return calls
+        from onyx.asv3.corpus_tools import article_references
+
+        observed: dict[str, set[str]] = {}
+        for row in self.ledger.provision_metadata():
+            row_source = row["source_id"]
+            if (
+                not isinstance(row_source, str)
+                or row_source not in targets
+                or row["citable"] is not True
+            ):
+                continue
+            number = row["citation"]
+            assert isinstance(number, int)
+            item = self.ledger.get(number)
+            if item is None or item.search_doc is None or not item.chunk_id:
+                continue
+            canonical = item.metadata.get("canonical_metadata")
+            layers = (
+                item.metadata,
+                item.search_doc.metadata,
+                canonical if isinstance(canonical, dict) else {},
+            )
+            if (
+                item.search_doc.document_id != item.source_id
+                or item.search_doc.metadata.get("regulatory_chunk_id") != item.chunk_id
+                or any(
+                    layer.get(key) is True
+                    for layer in layers
+                    for key in ("external", "derived", "untrusted", "truncated")
+                )
+            ):
+                continue
+            observed.setdefault(item.source_id, set()).add(item.chunk_id)
+
+        def priority(entry: AcquisitionCall) -> int:
+            action, call, _signature = entry
+            source_id = action.arguments.get("source_id")
+            if not isinstance(source_id, str) or source_id not in observed:
+                return 1
+            registry = (
+                self.host_registry
+                if host_actions and action.source_kind is None
+                else self.registry_for_action(action)
+            )
+            spec = registry.get(action.tool)
+            if spec is None or not jsonschema.Draft202012Validator(
+                spec.parameters
+            ).is_valid(call.arguments):
+                return 1
+            if action.tool == "read_provision":
+                article = action.arguments.get("article")
+                if isinstance(article, str) and len(article_references(article)) == 1:
+                    return 0
+            if action.tool in {"read_chunk", "read_chunk_context"}:
+                chunk_id = action.arguments.get("chunk_id")
+                if isinstance(chunk_id, str) and chunk_id in observed[source_id]:
+                    return 0
+            return 1
+
+        # Queue priority does not authorize a read or change any search's identity.
+        return sorted(calls, key=priority)
 
     def _bind_originals(self, numbers: list[int], need_ids: list[str]) -> None:
         retained = []
@@ -187,7 +270,7 @@ class CanonicalAcquirer:
         self.last_receipts = result
         self.context.check_research_active()
         need_ids = {need.need_id for need in plan.needs}
-        calls: list[tuple[SourceAction, CapabilityCall, str]] = []
+        calls: list[AcquisitionCall] = []
         for action in actions:
             if set(action.need_ids) - need_ids:
                 raise InvalidSourceAction(
@@ -276,6 +359,7 @@ class CanonicalAcquirer:
                 "Canonical acquisition budget exhausted; unresolved needs remain open"
             )
         self.search_calls += requested_searches
+        scheduled_calls = self._scheduled_calls(calls, host_actions=host_actions)
         executor = ThreadPoolExecutor(
             max_workers=self.policy.max_parallel_tools,
             thread_name_prefix="legal-composite-source",
@@ -288,7 +372,7 @@ class CanonicalAcquirer:
         last_progress = time.monotonic()
         stages: list[CanonicalEvidenceStage] = []
         try:
-            for action, call, signature in calls:
+            for action, call, signature in scheduled_calls:
                 child = self.context.child()
                 child.depth = self.context.depth
                 stage = CanonicalEvidenceStage(self.ledger, child, action.need_ids)

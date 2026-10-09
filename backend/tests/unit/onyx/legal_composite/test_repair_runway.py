@@ -7,7 +7,7 @@ import pytest
 from pydantic import BaseModel, JsonValue
 
 from onyx.asv3.evidence import EvidenceLedger
-from onyx.legal_composite.draft_repair import ClaimDeltaPatch
+from onyx.legal_composite.claim_edits import ClaimRepairEdits
 from onyx.legal_composite.engine import LegalCompositeEngine
 from onyx.legal_composite.models import (
     AuthorityDependency,
@@ -144,22 +144,9 @@ def test_unrecorded_requirement_uses_existing_evidence_without_research() -> Non
             calls.append(response_type)
             if response_type is StructuredDraftAnswer:
                 return response_type.model_validate(draft.model_dump())
-            assert response_type is ClaimDeltaPatch
+            assert response_type is ClaimRepairEdits
             return response_type.model_validate(
                 {
-                    "sections": [
-                        {
-                            "section_id": section.section_id,
-                            "need_ids": section.need_ids,
-                            "text": "",
-                            "claim_ids": [
-                                claim.claim_id
-                                for claim in draft.claims
-                                if claim.section_id == section.section_id
-                            ],
-                        }
-                        for section in draft.sections
-                    ],
                     "claims": [],
                     "unresolved_need_ids": [],
                     "requirements": [
@@ -239,7 +226,7 @@ def test_unrecorded_requirement_uses_existing_evidence_without_research() -> Non
     value.plan = plan
     result = value._finalize_semantic("Generic issues a and b", "", None, plan)
     assert result.status == "verified", result.gaps
-    assert calls == [StructuredDraftAnswer, ClaimDeltaPatch]
+    assert calls == [StructuredDraftAnswer, ClaimRepairEdits]
     assert set(row.requirement_id for row in value.requirements.records()) == {
         "r_a",
         "r_b",

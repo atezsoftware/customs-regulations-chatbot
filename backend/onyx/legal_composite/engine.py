@@ -12,6 +12,11 @@ from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.models import RunContext, RunStopped
 from onyx.db.legal_composite_sources import SourceKind
 from onyx.legal_composite.acquisition import InvalidSourceAction
+from onyx.legal_composite.claim_edits import (
+    CLAIM_REPAIR_EDITS_PROMPT,
+    ClaimRepairEdits,
+    claim_edits_to_delta,
+)
 from onyx.legal_composite.dependencies import (
     DependencyExpander,
     assess_dependencies,
@@ -19,8 +24,6 @@ from onyx.legal_composite.dependencies import (
     material_dependency_gaps,
 )
 from onyx.legal_composite.draft_repair import (
-    CLAIM_DELTA_PATCH_PROMPT,
-    ClaimDeltaPatch,
     apply_claim_delta,
     canonicalize_delta_supports,
 )
@@ -100,6 +103,36 @@ def _admission_reason(error: InvalidSourceAction) -> str:
         "Support span ID is not in this exact original": "span_identity",
         "Support quotation conflicts with its original span": "span_quotation",
         "Support quotation is not an exact delivered original passage": "literal_quotation",
+        "Repair must name exactly the affected sections": "patch_sections",
+        "Repair cannot add readings or closures for an unaffected issue": "patch_reading_scope",
+        "Repair cannot change an unaffected issue's unresolved status": "patch_unresolved_scope",
+        "Repair can delete only existing affected claims": "patch_delete_scope",
+        "Repair cannot upsert an unaffected claim": "patch_claim_scope",
+        "Repair cannot move an existing claim": "patch_claim_move",
+        "Repair claim cannot reference another section's issue": "patch_claim_issue",
+        "Repair cannot change a section's issue bindings": "patch_section_issue",
+        "Repair order must retain every section claim exactly once": "patch_claim_order",
+        "Repair heading cannot repeat its legal claim prose": "patch_heading_prose",
+        "Repair cannot rewrite an existing requirement": "patch_requirement_rewrite",
+        "Repair does not recompose a valid complete structured draft": "patch_recomposition",
+        "Existing section is not its exact rendered claim body": "existing_section_render",
+        "A literal section needs an explicit repair heading": "existing_section_heading",
+        "Claim repair identities must be unique and disjoint": "patch_duplicate_identity",
+        "Duplicate source requirement identity": "requirement_duplicate",
+        "Source requirement refers to an unknown issue": "requirement_issue",
+        "Source requirement identities are immutable": "requirement_immutable",
+        "Research gaps refer to an unknown or unaffected issue": "gap_issue_scope",
+        "Gap closure lacks a fresh same-issue requirement binding": "gap_requirement_binding",
+        "Claim edits failed the repair schema": "patch_schema",
+        "Frozen repair identities must be unique": "existing_duplicate_identity",
+        "Claim edits target an unknown section": "patch_sections",
+        "Heading edits must target affected sections": "patch_heading_scope",
+        "Claim edits can delete only existing affected claims": "patch_delete_scope",
+        "Claim edits can upsert only affected claims": "patch_claim_scope",
+        "Claim edits cannot move an existing claim": "patch_claim_move",
+        "Frozen claim issue bindings exceed the target section": "existing_claim_issue",
+        "Frozen section must name every own claim exactly once": "existing_claim_order",
+        "Claim edits do not form a valid repair delta": "patch_recomposition",
     }.get(str(error), "source_action")
 
 
@@ -1066,8 +1099,28 @@ class LegalCompositeEngine:
                     ),
                 )
             except InvalidSourceAction as error:
+                if self.reviewer is not None:
+                    with graph_step(
+                        "legal_composite.reading_admission",
+                        {},
+                        summary=f"accepted=0 reason={_admission_reason(error)}",
+                    ) as reading_step:
+                        reading_step.output_value = {
+                            "accepted": False,
+                            "reason": _admission_reason(error),
+                        }
                 self.protocol_defects.append(str(error))
                 continue
+            if self.reviewer is not None:
+                with graph_step(
+                    "legal_composite.reading_admission",
+                    {},
+                    summary=f"accepted=1 new_requirements={len(new_requirement_ids)}",
+                ) as reading_step:
+                    reading_step.output_value = {
+                        "accepted": True,
+                        "new_requirements": len(new_requirement_ids),
+                    }
             if isinstance(step, IssueResearchStep):
                 assert isinstance(plan, IssueResearchPlan)
                 self._record_research_gaps(
@@ -1270,6 +1323,35 @@ class LegalCompositeEngine:
             )
             binding_gaps.extend(pending_binding_gaps)
             pending_binding_gaps = []
+            categories = {
+                "invalid_answer_binding",
+                "invalid_original_binding",
+                "invalid_requirement_binding",
+                "not_delivered_original",
+                "no_stable_sections",
+                "unknown_unresolved_issue",
+                "unknown_section_issue",
+                "issue_without_section",
+                "missing_original_claim_bindings",
+            }
+            binding_counts: dict[str, int] = {}
+            for gap in binding_gaps:
+                category = gap.rsplit(":", 1)[-1]
+                if category not in categories:
+                    category = "other"
+                binding_counts[category] = binding_counts.get(category, 0) + 1
+            summary_parts: list[str] = []
+            for key, value in sorted(binding_counts.items()):
+                part = f"{key}={value}"
+                if len(" ".join([*summary_parts, part])) > 180:
+                    break
+                summary_parts.append(part)
+            with graph_step(
+                "legal_composite.binding_diagnostics",
+                {},
+                summary=" ".join(summary_parts),
+            ) as binding_step:
+                binding_step.output_value = binding_counts
             questions = self.reviewer.expected_checks(
                 request,
                 plan,
@@ -1541,6 +1623,18 @@ class LegalCompositeEngine:
                 request, history, draft, gaps, instructions, affected_needs, False
             )
             patch_payload["affected_section_ids"] = sorted(affected)
+            patch_payload["repair_targets"] = [
+                {
+                    "section_id": section.section_id,
+                    "need_ids": list(section.need_ids),
+                    "existing_claim_ids": list(section.claim_ids),
+                }
+                for section in draft.sections
+                if section.section_id in affected
+            ]
+            patch_payload["active_requirement_ids"] = [
+                row.requirement_id for row in self.requirements.records()
+            ]
             patch_payload["review_findings"] = [
                 {
                     "check": check.model_dump(mode="json"),
@@ -1550,15 +1644,17 @@ class LegalCompositeEngine:
                 if check.check_id in questions
             ]
             self.report("repair", plan.language)
-            patch = self.gateway.complete(
-                CLAIM_DELTA_PATCH_PROMPT,
+            edits = self.gateway.complete(
+                CLAIM_REPAIR_EDITS_PROMPT,
                 patch_payload,
-                ClaimDeltaPatch,
+                ClaimRepairEdits,
                 LLMFlow.LEGAL_COMPOSITE_ANSWER,
                 True,
             )
-            admission_stage = "supports"
+            admission_stage = "scope"
             try:
+                patch = claim_edits_to_delta(draft, edits, affected)
+                admission_stage = "supports"
                 patch = canonicalize_delta_supports(
                     patch,
                     self.ledger,

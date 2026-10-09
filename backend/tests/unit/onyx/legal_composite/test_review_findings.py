@@ -11,9 +11,14 @@ import pytest
 from pydantic import BaseModel, JsonValue, ValidationError
 
 from onyx.legal_composite import reviewer as reviewer_module
-from onyx.legal_composite.draft_repair import ClaimDeltaPatch
+from onyx.legal_composite.claim_edits import ClaimRepairEdits
 from onyx.legal_composite.engine import LegalCompositeEngine, SourceAcquirer
-from onyx.legal_composite.models import ReviewCheck, SemanticReview, WorkflowPolicy
+from onyx.legal_composite.models import (
+    AnswerSection,
+    ReviewCheck,
+    SemanticReview,
+    WorkflowPolicy,
+)
 from onyx.legal_composite.models import StructuredDraftAnswer as DraftAnswer
 from onyx.legal_composite.reviewer import (
     ReviewQuestion,
@@ -130,6 +135,23 @@ def test_actual_generated_finding_reaches_engine_patch_without_public_text_or_ne
     max_reviews: int,
 ) -> None:
     ledger, plan, draft, requirements = inputs()
+    draft = DraftAnswer(
+        sections=[
+            AnswerSection(
+                section_id=section.section_id,
+                need_ids=section.need_ids,
+                text="",
+                claim_ids=[
+                    claim.claim_id
+                    for claim in draft.claims
+                    if claim.section_id == section.section_id
+                ],
+            )
+            for section in draft.sections
+        ],
+        claims=draft.claims,
+        unresolved_need_ids=[],
+    )
     original = ledger.get(1)
     assert original is not None
     original_before = (original.text, original.text_hash, original.source_id)
@@ -188,23 +210,13 @@ def test_actual_generated_finding_reaches_engine_patch_without_public_text_or_ne
             del system, flow, finalizing
             if response_type is DraftAnswer:
                 return response_type.model_validate(draft.model_dump())
-            assert response_type is ClaimDeltaPatch
+            assert response_type is ClaimRepairEdits
             patch_inputs.append(payload)
             return response_type.model_validate(
                 {
-                    "sections": [
-                        {
-                            **section.model_dump(),
-                            "text": "",
-                            "claim_ids": [
-                                claim.claim_id
-                                for claim in draft.claims
-                                if claim.section_id == section.section_id
-                            ],
-                        }
-                        for section in draft.sections
+                    "claims": [
+                        claim.model_dump(exclude={"need_ids"}) for claim in draft.claims
                     ],
-                    "claims": [claim.model_dump() for claim in draft.claims],
                     "unresolved_need_ids": [],
                 }
             )
