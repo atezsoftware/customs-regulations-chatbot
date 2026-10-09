@@ -95,6 +95,7 @@ export interface AppInputBarProps {
   experimentalResearchEnabled?: boolean;
   experimentalParallelResearchEnabled?: boolean;
   experimentalGuardrailsEnabled?: boolean;
+  experimentalGuardrailsV2Enabled?: boolean;
   setPresentingDocument?: (document: MinimalOnyxDocument) => void;
   toggleDeepResearch: () => void;
   toggleAtezSearch?: () => void;
@@ -105,6 +106,7 @@ export interface AppInputBarProps {
   toggleExperimentalResearch?: () => void;
   toggleExperimentalParallelResearch?: () => void;
   toggleExperimentalGuardrails?: () => void;
+  toggleExperimentalGuardrailsV2?: () => void;
   isMultiModelActive?: boolean;
   disabled: boolean;
   awaitingPreferredSelection?: boolean;
@@ -135,6 +137,7 @@ const AppInputBar = React.memo(
     experimentalResearchEnabled = false,
     experimentalParallelResearchEnabled = false,
     experimentalGuardrailsEnabled = false,
+    experimentalGuardrailsV2Enabled = false,
     toggleDeepResearch,
     toggleAtezSearchV3,
     toggleLegalComposite,
@@ -142,6 +145,7 @@ const AppInputBar = React.memo(
     toggleExperimentalResearch,
     toggleExperimentalParallelResearch,
     toggleExperimentalGuardrails,
+    toggleExperimentalGuardrailsV2,
     isMultiModelActive,
     setPresentingDocument,
     disabled,
@@ -847,6 +851,25 @@ const AppInputBar = React.memo(
                     }
                   >
                     Experimental Guardrails
+                  </SelectButton>
+                )}
+                {showAtezSearch && toggleExperimentalGuardrailsV2 && (
+                  <SelectButton
+                    disabled={disabled || isMultiModelActive}
+                    variant="select-light"
+                    icon={SvgSparkle}
+                    onClick={toggleExperimentalGuardrailsV2}
+                    state={
+                      experimentalGuardrailsV2Enabled ? "selected" : "empty"
+                    }
+                    foldable={false}
+                    tooltip={
+                      isMultiModelActive
+                        ? "Experimental Guardrails v2 runs with one model. Remove extra models to use it."
+                        : "ASv3 Tek Araştırma, JEV kontrolü ve gerektiğinde tek Gemini onarımı"
+                    }
+                  >
+                    Experimental Guardrails v2
                   </SelectButton>
                 )}
               </>

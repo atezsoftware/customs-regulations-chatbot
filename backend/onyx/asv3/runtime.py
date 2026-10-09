@@ -25,6 +25,7 @@ from onyx.asv3.corpus_tools import CorpusBroker, build_corpus_specs
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.external_tools import build_external_specs
 from onyx.asv3.harness import Harness
+from onyx.asv3.jev_answer_review import ReviewEvidence, review_and_repair_answer
 from onyx.asv3.legal_source_reviews import (
     LegalSourceReviews,
     related_source_reviews_enabled,
@@ -86,6 +87,7 @@ from onyx.asv3.supplemental_tools import (
 from onyx.asv3.workers import WorkerPool
 from onyx.asv3.workflow_variant import (
     ASV3_GUARDED_EXPERIMENTAL_VARIANT,
+    ASV3_GUARDRAILS_V2_VARIANT,
     ASV3_STANDARD_VARIANT,
     ASV3_TUNED_VARIANT,
     checkpoint_variant_fields,
@@ -261,6 +263,7 @@ def run_asv3_loop(
     parallel_research: bool = False,
     workflow_variant: str = ASV3_STANDARD_VARIANT,
     research_llm: LLM | None = None,
+    repair_llm: LLM | None = None,
     resume_message_id: int | None = None,
     custom_agent_prompt: str | None = None,
     allow_external: bool = False,
@@ -390,6 +393,7 @@ def run_asv3_loop(
     if workflow_variant in {
         ASV3_TUNED_VARIANT,
         ASV3_GUARDED_EXPERIMENTAL_VARIANT,
+        ASV3_GUARDRAILS_V2_VARIANT,
     }:
         context.services["asv3_workflow_variant"] = workflow_variant
     context.services["independent_question_mode"] = (
@@ -939,6 +943,11 @@ def run_asv3_loop(
                     snapshot["legal_source_reviews"] = source_reviews.export()
                 if authority_requirements is not None:
                     snapshot["authority_requirements"] = authority_requirements.export()
+                guardrails_v2_review = context.services.get("guardrails_v2_review")
+                if isinstance(guardrails_v2_review, dict):
+                    snapshot["guardrails_v2_review"] = cast(
+                        dict[str, JsonValue], copy.deepcopy(guardrails_v2_review)
+                    )
                 if parallel_answers is not None:
                     snapshot["parallel_research_policy"] = SERIAL_SESSION_POLICY
                     receipts = parallel_answers.export()
@@ -1930,6 +1939,42 @@ def run_asv3_loop(
         )
         if not parallel_research:
             final = final.strip()
+        if (
+            workflow_variant == ASV3_GUARDRAILS_V2_VARIANT
+            and result.answer
+            and not clarification
+            and not partial
+        ):
+            cited_first = list(extract_citation_numbers(final))
+            review_numbers = list(
+                dict.fromkeys([*cited_first, *ledger.citation_numbers()])
+            )
+            review_evidence: list[ReviewEvidence] = []
+            for number in review_numbers:
+                item = ledger.get(number)
+                if item is None or item.search_doc is None:
+                    continue
+                review_evidence.append(
+                    ReviewEvidence(
+                        citation=number,
+                        source_id=item.source_id,
+                        text=item.text,
+                        metadata=item.metadata,
+                    )
+                )
+                if len(review_evidence) == 40:
+                    break
+            review_outcome = review_and_repair_answer(
+                question=question,
+                candidate_answer=final,
+                evidence=review_evidence,
+                repair_llm=repair_llm,
+                user_identity=user_identity,
+            )
+            final = review_outcome.answer
+            context.services["guardrails_v2_review"] = review_outcome.model_dump(
+                mode="json", exclude={"answer"}
+            )
         publication_status = (
             result.status
             if result.answer and not clarification and not partial

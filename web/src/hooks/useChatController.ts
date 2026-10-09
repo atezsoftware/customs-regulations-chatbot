@@ -97,6 +97,7 @@ export interface OnSubmitProps {
   experimentalResearch?: boolean;
   experimentalParallelResearch?: boolean;
   experimentalGuardrails?: boolean;
+  experimentalGuardrailsV2?: boolean;
   asv3ResumeMessageId?: number;
   asv3AllowExternal?: boolean;
 
@@ -393,6 +394,7 @@ export default function useChatController({
       experimentalResearch = false,
       experimentalParallelResearch = false,
       experimentalGuardrails = false,
+      experimentalGuardrailsV2 = false,
       asv3ResumeMessageId,
       asv3AllowExternal,
       messageIdToResend,
@@ -701,6 +703,7 @@ export default function useChatController({
           experimentalResearch ||
           experimentalParallelResearch ||
           experimentalGuardrails ||
+          experimentalGuardrailsV2 ||
           Boolean(deepResearch && liveAgent?.id === 0 && !projectId);
         // Freeze provenance on the answer itself; changing the input selector
         // later must not relabel historical assistant messages.
@@ -1012,6 +1015,7 @@ export default function useChatController({
           experimentalResearch,
           experimentalParallelResearch,
           experimentalGuardrails,
+          experimentalGuardrailsV2,
           asv3ResumeMessageId,
           asv3AllowExternal:
             asv3AllowExternal ??
@@ -1019,7 +1023,8 @@ export default function useChatController({
               atezSearchV3 ||
                 experimentalResearch ||
                 experimentalParallelResearch ||
-                experimentalGuardrails,
+                experimentalGuardrails ||
+                experimentalGuardrailsV2,
               forcedToolIds,
               liveAgent?.tools ?? [],
               disabledToolIds ?? []

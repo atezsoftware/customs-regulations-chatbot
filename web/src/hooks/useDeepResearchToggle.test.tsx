@@ -126,6 +126,32 @@ describe("research mode selection", () => {
     expect(result.current.experimentalResearchEnabled).toBe(true);
   });
 
+  it("keeps Experimental Guardrails v2 exclusive from every existing workflow", () => {
+    const { result } = renderHook(() =>
+      useDeepResearchToggle({ chatSessionId: null, agentId: 0 })
+    );
+
+    act(() => result.current.toggleExperimentalGuardrails());
+    act(() => result.current.toggleExperimentalGuardrailsV2());
+    expect(result.current.experimentalGuardrailsV2Enabled).toBe(true);
+    expect(result.current.experimentalGuardrailsEnabled).toBe(false);
+
+    act(() => result.current.toggleLegalComposite());
+    expect(result.current.legalCompositeEnabled).toBe(true);
+    expect(result.current.experimentalGuardrailsV2Enabled).toBe(false);
+
+    act(() => result.current.toggleExperimentalGuardrailsV2());
+    expect(result.current.experimentalGuardrailsV2Enabled).toBe(true);
+    expect(result.current.legalCompositeEnabled).toBe(false);
+    expect(result.current.atezSearchV3Enabled).toBe(false);
+    expect(result.current.deepResearchEnabled).toBe(false);
+    expect(result.current.experimentalResearchEnabled).toBe(false);
+    expect(result.current.experimentalParallelResearchEnabled).toBe(false);
+
+    act(() => result.current.toggleExperimentalGuardrailsV2());
+    expect(result.current.experimentalGuardrailsV2Enabled).toBe(false);
+  });
+
   it("switches between Guardrails and Legal Composite exclusively and toggles off", () => {
     const { result } = renderHook(() =>
       useDeepResearchToggle({ chatSessionId: null, agentId: 0 })

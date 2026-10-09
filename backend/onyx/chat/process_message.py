@@ -1727,9 +1727,11 @@ def _run_models(
                     if setup.search_params.project_id_filter is not None:
                         raise ValueError("ASv3 is unavailable inside a project")
                     guarded_resume = False
+                    guardrails_v2_resume = False
                     if setup.new_msg_req.asv3_resume_message_id is not None:
                         from onyx.asv3.workflow_variant import (
                             ASV3_GUARDED_EXPERIMENTAL_VARIANT,
+                            ASV3_GUARDRAILS_V2_VARIANT,
                         )
 
                         resume_checkpoint = load_asv3_checkpoint(
@@ -1741,12 +1743,29 @@ def _run_models(
                             and resume_checkpoint.get("asv3_workflow_variant")
                             == ASV3_GUARDED_EXPERIMENTAL_VARIANT
                         )
+                        guardrails_v2_resume = (
+                            resume_checkpoint is not None
+                            and resume_checkpoint.get("asv3_workflow_variant")
+                            == ASV3_GUARDRAILS_V2_VARIANT
+                        )
+                    checkpoint_selects_guardrails = (
+                        guarded_resume or guardrails_v2_resume
+                    )
                     workflow = resolve_asv3_workflow(
                         "deep"
                         if _uses_deep_asv3(setup)
                         else setup.new_msg_req.asv3_research_profile,
                         setup.new_msg_req.asv3_parallel_research,
-                        setup.new_msg_req.asv3_guarded_experimental or guarded_resume,
+                        guarded_experimental=(
+                            guarded_resume
+                            if checkpoint_selects_guardrails
+                            else setup.new_msg_req.asv3_guarded_experimental
+                        ),
+                        guardrails_v2=(
+                            guardrails_v2_resume
+                            if checkpoint_selects_guardrails
+                            else setup.new_msg_req.asv3_guardrails_v2
+                        ),
                     )
                     research_profile = workflow.research_profile
                     research_llm = (
@@ -1779,6 +1798,43 @@ def _run_models(
                                 tenant_id=get_current_tenant_id(),
                                 llm_provider_api_key=research_llm.config.api_key,
                             )
+                    repair_llm = None
+                    if workflow.uses_guardrails_v2:
+                        try:
+                            repair_llm = (
+                                model_llm.with_model(
+                                    "gemini-3.8-flash",
+                                    max_input_tokens=min(
+                                        model_llm.config.max_input_tokens, 1048576
+                                    ),
+                                )
+                                if model_llm.config.model_provider
+                                in {"vertex_ai", "gemini"}
+                                else get_llm_for_persona(
+                                    persona=setup.persona,
+                                    user=user,
+                                    llm_override=LLMOverride(
+                                        model_provider_type="vertex_ai",
+                                        model_version="gemini-3.8-flash",
+                                    ),
+                                )
+                            )
+                            if repair_llm.config.api_key != model_llm.config.api_key:
+                                with (
+                                    get_session_with_current_tenant() as cost_db_session
+                                ):
+                                    check_llm_cost_limit_for_provider(
+                                        db_session=cost_db_session,
+                                        tenant_id=get_current_tenant_id(),
+                                        llm_provider_api_key=repair_llm.config.api_key,
+                                    )
+                        except Exception:
+                            logger.warning(
+                                "Experimental Guardrails v2 repair model unavailable; "
+                                "the original ASv3 answer will be retained",
+                                exc_info=True,
+                            )
+                            repair_llm = None
                     run_asv3_loop(
                         emitter=model_emitter,
                         state_container=sc,
@@ -1786,6 +1842,7 @@ def _run_models(
                         tools=model_tools,
                         llm=model_llm,
                         research_llm=research_llm,
+                        repair_llm=repair_llm,
                         token_counter=get_llm_token_counter(model_llm),
                         user=user,
                         filters=_global_regulatory_search_filters(setup),

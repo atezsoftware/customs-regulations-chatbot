@@ -10,6 +10,7 @@ import pytest
 from pydantic import ValidationError
 
 from onyx.asv3 import runtime
+from onyx.asv3.jev_answer_review import GuardrailsV2ReviewOutcome
 from onyx.asv3.legal_source_reviews import LegalSourceReviews
 from onyx.asv3.llm_adapter import ResearchModel
 from onyx.asv3.models import ASv3WorkflowSelection, RunContext
@@ -27,6 +28,7 @@ from onyx.chat.models import ChatMessageSimple
 from onyx.configs.constants import MessageType
 from onyx.llm.interfaces import LLM
 from onyx.prompts.asv3.tuned import TUNED_PROMPT_VERSION
+from onyx.server.query_and_chat.models import SendMessageRequest
 from onyx.tools.tool_implementations.search.search_tool import SearchTool
 from tests.unit.onyx.asv3.test_runtime import response, setup_run
 
@@ -85,6 +87,68 @@ def test_guarded_checkpoint_cannot_cross_resume_legacy_variants() -> None:
         validate_asv3_variant_resume(
             ASV3_GUARDED_EXPERIMENTAL_VARIANT,
             checkpoint_variant_fields(ASV3_TUNED_VARIANT),
+        )
+
+
+def test_guardrails_v2_has_an_isolated_variant_and_checkpoint_policy() -> None:
+    selected = resolve_asv3_workflow("normal", False, guardrails_v2=True)
+
+    assert selected.research_profile == "normal"
+    assert selected.parallel_research is False
+    assert selected.workflow_variant == "asv3_guardrails_v2"
+    assert selected.uses_guardrails_v2
+    assert not selected.uses_guardrails
+    checkpoint = {
+        **checkpoint_variant_fields(selected.workflow_variant),
+        "research_profile": "normal",
+        "parallel_research": False,
+    }
+    assert checkpoint["asv3_workflow_policy"] == "jev-gemini-review-v1"
+    validate_asv3_variant_resume(selected.workflow_variant, checkpoint)
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        resolve_asv3_workflow(
+            "normal",
+            False,
+            guarded_experimental=True,
+            guardrails_v2=True,
+        )
+    with pytest.raises(ValueError, match="normal profile"):
+        resolve_asv3_workflow("experimental", False, guardrails_v2=True)
+    with pytest.raises(ValueError, match="without parallel"):
+        resolve_asv3_workflow("normal", True, guardrails_v2=True)
+
+
+def test_guardrails_v2_request_validation_is_independent_from_v1() -> None:
+    request = SendMessageRequest.model_validate(
+        {
+            "message": "İlgili mevzuat nedir?",
+            "atez_search_v3": True,
+            "asv3_research_profile": "normal",
+            "asv3_guardrails_v2": True,
+        }
+    )
+    assert request.asv3_guardrails_v2 is True
+    assert request.asv3_guarded_experimental is False
+
+    with pytest.raises(ValidationError, match="mutually exclusive"):
+        SendMessageRequest.model_validate(
+            {
+                "message": "İlgili mevzuat nedir?",
+                "atez_search_v3": True,
+                "asv3_research_profile": "normal",
+                "asv3_guarded_experimental": True,
+                "asv3_guardrails_v2": True,
+            }
+        )
+    with pytest.raises(ValidationError, match="normal non-parallel"):
+        SendMessageRequest.model_validate(
+            {
+                "message": "İlgili mevzuat nedir?",
+                "atez_search_v3": True,
+                "asv3_research_profile": "experimental",
+                "asv3_guardrails_v2": True,
+            }
         )
 
 
@@ -302,6 +366,62 @@ def test_guarded_runtime_keeps_source_tools_cheap_and_coordinator_selected(
     assert selected.invoke.call_count == 2
     secondary.invoke.assert_not_called()
     assert fork.llm is secondary
+
+
+def test_guardrails_v2_runtime_reviews_only_the_final_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kwargs, _broker, _selected, checkpoints, _queue = setup_run(monkeypatch)
+    kwargs.pop("test_language")
+    contexts = []
+    review_calls: list[dict[str, Any]] = []
+    original_model = runtime.ResearchModel
+
+    def make_model(llm: LLM, context: Any, **options: Any) -> ResearchModel:
+        contexts.append(context)
+        return original_model(llm, context, **options)
+
+    def review(**options: Any) -> GuardrailsV2ReviewOutcome:
+        review_calls.append(options)
+        return GuardrailsV2ReviewOutcome(
+            answer="JEV sonrası düzeltilmiş tamir [1] ve değiştirme [2].",
+            review_completed=True,
+            repair_requested=True,
+            repair_applied=True,
+            defects=["condition_loss"],
+            review_input_tokens=120,
+            review_output_tokens=5,
+            repair_input_tokens=80,
+            repair_output_tokens=12,
+        )
+
+    monkeypatch.setattr(runtime, "ResearchModel", make_model)
+    monkeypatch.setattr(runtime, "review_and_repair_answer", review)
+    repair_llm = MagicMock(spec=LLM)
+    kwargs.update(
+        research_profile="normal",
+        parallel_research=False,
+        workflow_variant="asv3_guardrails_v2",
+        repair_llm=repair_llm,
+    )
+
+    runtime.run_asv3_loop(**kwargs)
+
+    assert len(review_calls) == 1
+    call = review_calls[0]
+    assert call["repair_llm"] is repair_llm
+    assert call["candidate_answer"].startswith("Tamir sonucu [")
+    assert set(item.citation for item in call["evidence"]) == {1, 2}
+    published = kwargs["state_container"].get_answer_tokens()
+    assert published is not None
+    assert published.startswith("JEV sonrası düzeltilmiş tamir")
+    assert "https://example.test/law-0" in published
+    assert "https://example.test/law-1" in published
+    assert contexts[0].services["guardrails_v2_review"]["repair_applied"] is True
+    assert checkpoints[-1]["guardrails_v2_review"]["repair_requested"] is True
+    assert checkpoints[-1]["guardrails_v2_review"]["repair_applied"] is True
+    assert checkpoints[-1]["guardrails_v2_review"]["review_input_tokens"] == 120
+    assert checkpoints[-1]["guardrails_v2_review"]["repair_output_tokens"] == 12
 
 
 def test_actual_runtime_resume_fences_before_saved_mode_override(

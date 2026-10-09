@@ -2260,6 +2260,21 @@ VESPA_LANGUAGE_OVERRIDE = os.environ.get("VESPA_LANGUAGE_OVERRIDE")
 # These are Onyx-managed API keys provided to tenants by default
 #####
 OPENAI_DEFAULT_API_KEY = os.environ.get("OPENAI_DEFAULT_API_KEY")
+TYPESAFE_API_KEY = os.environ.get("TYPESAFE_API_KEY")
+ASV3_GUARDRAILS_V2_JEV_TIMEOUT_SECONDS = min(
+    10.0,
+    max(
+        1.0,
+        float(os.environ.get("ASV3_GUARDRAILS_V2_JEV_TIMEOUT_SECONDS") or 5.0),
+    ),
+)
+ASV3_GUARDRAILS_V2_REPAIR_TIMEOUT_SECONDS = min(
+    120,
+    max(
+        5,
+        int(os.environ.get("ASV3_GUARDRAILS_V2_REPAIR_TIMEOUT_SECONDS") or 45),
+    ),
+)
 ASV3_GUARDED_DECISIONS_ENABLED = (
     os.environ.get("ASV3_GUARDED_DECISIONS_ENABLED", "false").lower() == "true"
 )

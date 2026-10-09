@@ -43,6 +43,13 @@ export default function useDeepResearchToggle({
       current === "experimental_guardrails" ? null : "experimental_guardrails"
     );
   }, []);
+  const toggleExperimentalGuardrailsV2 = useCallback(() => {
+    setMode((current) =>
+      current === "experimental_guardrails_v2"
+        ? null
+        : "experimental_guardrails_v2"
+    );
+  }, []);
 
   const toggleLegalComposite = useCallback(() => {
     setMode((current) =>
@@ -69,6 +76,8 @@ export default function useDeepResearchToggle({
     toggleExperimentalParallelResearch,
     experimentalGuardrailsEnabled: mode === "experimental_guardrails",
     toggleExperimentalGuardrails,
+    experimentalGuardrailsV2Enabled: mode === "experimental_guardrails_v2",
+    toggleExperimentalGuardrailsV2,
     atezSearchEnabled: false,
     atezSearchV2Enabled: false,
     toggleAtezSearch: undefined,

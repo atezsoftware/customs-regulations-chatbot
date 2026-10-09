@@ -18,7 +18,10 @@ class ASv3WorkflowSelection(BaseModel):
     research_profile: Literal["normal", "deep", "experimental"]
     parallel_research: bool
     workflow_variant: Literal[
-        "standard", "asv3_tuned", "asv3_guarded_experimental"
+        "standard",
+        "asv3_tuned",
+        "asv3_guarded_experimental",
+        "asv3_guardrails_v2",
     ] = "standard"
 
     @property
@@ -28,6 +31,10 @@ class ASv3WorkflowSelection(BaseModel):
     @property
     def uses_guardrails(self) -> bool:
         return self.workflow_variant == "asv3_guarded_experimental"
+
+    @property
+    def uses_guardrails_v2(self) -> bool:
+        return self.workflow_variant == "asv3_guardrails_v2"
 
 
 class OutcomeStatus(StrEnum):
