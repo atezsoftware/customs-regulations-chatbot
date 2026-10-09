@@ -12,10 +12,16 @@ from pydantic import BaseModel, JsonValue
 
 from onyx.asv3.models import RunContext, RunStopped
 from onyx.legal_review.models import WorkflowPolicy
+from onyx.legal_review.transport import model_state
 from onyx.llm.interfaces import LLM, LLMConfig, LLMUserIdentity
 from onyx.llm.model_response import ModelResponse, ModelResponseStream
 from onyx.llm.models import LanguageModelInput, ReasoningEffort, ToolChoiceOptions
-from onyx.regulatory.structured_llm import generate_structured
+from onyx.llm.multi_llm import LLMTimeoutError
+from onyx.regulatory.structured_llm import (
+    _JSON_ONLY_REMINDER,
+    _portable_structured_output_schema,
+    generate_structured,
+)
 from onyx.tracing.flows import LLMFlow
 
 ResponseModel = TypeVar("ResponseModel", bound=BaseModel)
@@ -163,24 +169,41 @@ class GeminiGateway:
             self.context.check_research_active()
             deadline = self.context.research_deadline
             self.context.consume_research_decision()
-        serialized = json.dumps(state, ensure_ascii=False)
-        if self.token_counter(prompt + serialized) > min(
+        serialized = json.dumps(model_state(state, flow), ensure_ascii=False)
+        validation_schema = response_model.model_json_schema()
+        system_prompt = prompt + _JSON_ONLY_REMINDER.format(schema=validation_schema)
+        provider_format = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": response_model.__name__,
+                "schema": _portable_structured_output_schema(validation_schema),
+                "strict": False,
+            },
+        }
+        complete_context = (
+            system_prompt + serialized + json.dumps(provider_format, ensure_ascii=False)
+        )
+        if self.token_counter(complete_context) > min(
             self.policy.max_context_tokens, self.llm.config.max_input_tokens
         ):
             raise RunStopped("Complete legal review context exceeds model capacity")
-        return generate_structured(
-            self.llm,
-            flow=flow,
-            system_prompt=prompt,
-            user_prompt=serialized,
-            response_model=response_model,
-            timeout_override=max(
-                1, min(self.policy.max_call_seconds, int(deadline - time.monotonic()))
-            ),
-            max_tokens=self.policy.max_generation_output_tokens,
-            reasoning_effort=self.reasoning_effort,
-            max_attempts=1,
-            provider_max_attempts=1,
-            deadline=deadline,
-            use_streaming=False,
-        )
+        try:
+            return generate_structured(
+                self.llm,
+                flow=flow,
+                system_prompt=prompt,
+                user_prompt=serialized,
+                response_model=response_model,
+                timeout_override=max(
+                    1,
+                    min(self.policy.max_call_seconds, int(deadline - time.monotonic())),
+                ),
+                max_tokens=self.policy.max_generation_output_tokens,
+                reasoning_effort=self.reasoning_effort,
+                max_attempts=1,
+                provider_max_attempts=1,
+                deadline=deadline,
+                use_streaming=False,
+            )
+        except LLMTimeoutError as error:
+            raise TimeoutError("Legal Review Gemini provider timeout") from error

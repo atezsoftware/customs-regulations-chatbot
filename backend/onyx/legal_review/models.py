@@ -222,6 +222,19 @@ class InitialReadingDecision(ReadingDecision):
     )
 
 
+class RepairResolution(StrictModel):
+    check_ids: list[str] = Field(min_length=1)
+    diagnosis: str = Field(min_length=1)
+    correction: str = Field(min_length=1)
+    disposition: Literal["correct", "unresolved", "disputed"]
+    scope: Literal["research", "draft"]
+    supports: list[PassageSupport]
+
+
+class RepairReadingDecision(ReadingDecision):
+    repair_resolutions: list[RepairResolution] = Field(min_length=1)
+
+
 class AnswerClaim(StrictModel):
     claim_id: str = Field(min_length=1)
     issue_ids: list[str] = Field(min_length=1)
@@ -254,3 +267,5 @@ class WorkflowResult(StrictModel):
     early_review: ReviewResult | None = None
     final_review: ReviewResult | None = None
     repair_used: bool = False
+    repair_checks: list[ReviewCheck] = Field(default_factory=list)
+    repair_resolutions: list[RepairResolution] = Field(default_factory=list)
