@@ -65,7 +65,7 @@ def inspect_dev() -> dict[str, JsonValue]:
     from onyx.auth.schemas import UserRole
     from onyx.configs import app_configs
     from onyx.db.engine.sql_engine import get_session_with_current_tenant
-    from onyx.db.legal_review_providers import resolve_legal_review_jev
+    from onyx.db.legal_review_providers import resolve_legal_review_decision
     from onyx.db.llm import fetch_llm_provider_for_model_selection
     from onyx.db.models import LLMProvider, User
     from onyx.db.persona import get_default_behavior_persona
@@ -158,23 +158,21 @@ def inspect_dev() -> dict[str, JsonValue]:
         persona = get_default_behavior_persona(session)
         report["active_admin_available"] = admin is not None
         report["default_persona_available"] = persona is not None
-        report["jev_resolution"] = {"available": False}
+        report["decision_resolution"] = {"available": False}
         if admin is None or persona is None:
             report["gemini_resolution"] = {
                 "available": False,
                 "failure_code": "existing_admin_or_default_persona_missing",
             }
         else:
-            jev = resolve_legal_review_jev(admin, persona=persona, db_session=session)
-            report["jev_resolution"] = {
-                "available": jev is not None,
-                "route": jev.route if jev else None,
-                "provider_name": jev.provider_name if jev else None,
-                "model_name": (
-                    "typesafe/jev-1.13" if jev.route == "openrouter" else "jev-latest"
-                )
-                if jev
-                else None,
+            decision = resolve_legal_review_decision(
+                admin, persona=persona, db_session=session
+            )
+            report["decision_resolution"] = {
+                "available": decision is not None,
+                "route": decision.route if decision else None,
+                "provider_name": decision.provider_name if decision else None,
+                "model_name": "gpt-6-luna" if decision else None,
             }
             provider = fetch_llm_provider_for_model_selection(
                 None, _PROVIDER_TYPE, _MODEL, session
@@ -207,12 +205,12 @@ def inspect_dev() -> dict[str, JsonValue]:
                     "model_name": llm.config.model_name,
                 }
     resolution = report["gemini_resolution"]
-    jev_resolution = report["jev_resolution"]
+    decision_resolution = report["decision_resolution"]
     report["ready"] = (
         isinstance(resolution, dict)
         and resolution.get("available") is True
-        and isinstance(jev_resolution, dict)
-        and jev_resolution.get("available") is True
+        and isinstance(decision_resolution, dict)
+        and decision_resolution.get("available") is True
     )
     return report
 

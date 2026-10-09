@@ -36,11 +36,12 @@ ingest, relabel, reindex or change publication metadata.
 ## Runtime
 
 1. **Preflight:** select the `vertex_ai` override and require the exact model name
-   `gemini-3.8-flash`. Resolve a real JEV credential before research begins: prefer
-   `TYPESAFE_API_KEY`, otherwise use an existing authorized provider with the official
-   OpenRouter base URL and a configured key. Existing provider cost limits also apply.
-   This does not require registering JEV as a chat model. All available
-   simple conversation history is retained. Earlier user messages can supply facts;
+   `gemini-3.8-flash` for research and drafting. Resolve an accessible configured
+   `openai` provider with visible `gpt-6-luna` and an official OpenAI base URL for
+   the native Decisions reviewer before research begins. Existing group, persona
+   and provider cost limits also apply; provider rows and model visibility are not
+   changed. All available simple conversation history is retained. Earlier user
+   messages can supply facts;
    earlier assistant legal statements are not independent legal evidence.
 2. **Planner — Gemini:** identify requested outcomes, supplied facts and missing
    facts. Return stable issue IDs and a required nonempty plan-wide `discovery_queries`
@@ -54,28 +55,32 @@ ingest, relabel, reindex or change publication metadata.
    conditions. Complete canonical originals appear as ordered, numbered passages;
    the model selects `citation` and `span_number` instead of rewriting quotations,
    hashes or offsets. Code resolves each selector to the exact original passage and
-   validates canonical identity and integrity. Requirements retain an issue-owned
-   rule and application, without a `Requirement.dimension` field. Every issue needs
-   exactly one assessment for every dimension. Those assessments are the sole
-   dimension relations: the same supported finding can serve several dimensions
-   when each assessment explains its relevance. An addressed dimension references
-   requirements belonging to that issue. Corrections use explicit supersession;
-   obsolete interpretations remain in audit history and leave the drafting state.
+   validates canonical identity and integrity. Requirements are global source
+   findings without an issue owner, application or dimension field. Assessments
+   alone bind findings to issues and dimensions; their reasons explain the specific
+   application. One finding can serve several issues and dimensions. The model
+   returns sparse assessment updates, and code maintains the complete twelve-row
+   matrix per issue. Unassessed rows remain unresolved and unchanged rows are
+   retained. Corrections use explicit supersession; obsolete findings remain in
+   audit history, and affected assessment links become unresolved until reassessed.
 5. **Source-derived issues — Gemini:** the reader actively resolves existing issues.
    It can open a linked child when a question discovered in the originals could
    materially change the parent's outcome and cannot be handled adequately inside
    that issue. This judgment applies across all twelve dimensions. An exception,
    tax consequence, procedural condition or judicial effect can be a dependency;
    merely citing a provision never automatically creates a child or an article search.
-   A child needs a stable ID, parent, dimension, exact canonical trigger citations,
-   parent-backed requirement IDs, a material reason and explicit closure criteria.
-   Code validates those bindings, rejects cycles and deduplicates the same
-   parent/canonical-trigger/dimension dependency. The model can use existing originals,
+   A child needs a stable ID, parent, trigger dimension, finding IDs associated with
+   the parent, a material reason and explicit closure criteria. Code derives exact
+   trigger passages and citations and snapshots the parent assessments and findings.
+   Accepted triggers retain that provenance after supersession. Code rejects cycles;
+   distinct material questions can share a source and dimension. The model reuses
+   an existing dependency for the same unresolved question and can use existing originals,
    request a canonical read or choose a focused search. One early source return can
-   execute its requested operations and reread the originals before the early JEV review.
+   execute its requested operations and reread the originals before the early review.
    Missing evidence and unexecuted operations remain gaps; a zero-result search never
    proves absence of law or continued legal validity.
-6. **Early review — JEV:** one HTTP request checks all issue/dimension combinations
+6. **Early review — OpenAI Decisions:** one native Decisions HTTP request using
+   `gpt-6-luna` checks all issue/dimension combinations
    together, requested-outcome coverage and decisive source conditions. It receives
    complete retained originals, actual conversation facts and compact research
    receipts with query, status and access/truncation limitations. If the early source
@@ -83,20 +88,24 @@ ingest, relabel, reindex or change publication metadata.
    prevents drafting a publishable answer.
 7. **Integrated draft — Gemini:** produce a `GeneratedDraft` of ordered Markdown
    blocks with claim bindings, passage selectors, conditions and unresolved issues.
-   Code compiles the actual block text into one literal answer and derives claim
-   excerpts from their containing blocks. The model does not recopy an answer or
-   `answer_excerpt` field. Issues serve as a private checklist; blocks do not force
+   Code adds missing selected source markers as separate paragraphs within their
+   containing blocks, preserving Markdown fences and tables. It compiles the actual
+   rendered block text into one literal answer and derives claim excerpts from it.
+   Foreign model-written markers are retained for rejection by validation. The model
+   does not recopy an answer or `answer_excerpt` field. Issues serve as a private
+   checklist; blocks do not force
    repeated per-issue sections. Code validates passage selectors, literal claim
    bindings and citation targets, then inserts required scoped validity disclosure
-   before review.
-8. **Draft review — JEV:** independently check all dimensions, the entire answer's
-   coverage, every material legal assertion (including assertions absent from the
-   planned issues), source conditions and consistency across issues. JEV scores are
+   before review. A limitation-only answer can have no claims only with explicit
+   unresolved issue IDs; it still undergoes complete independent review.
+8. **Draft review — OpenAI Decisions:** independently check all dimensions, the
+   entire answer's coverage, every material legal assertion (including assertions absent from the
+   planned issues), source conditions and consistency across issues. Reviewer scores are
    defect probabilities; scores at or above `0.5` flag the bound question. A flag is
    a suspicion to investigate, not a legal finding.
 9. **Optional repair:** permit one post-draft evidence-directed repair. The reader
    sees the actual draft and flags, can obtain missing originals, and the writer
-   produces a complete replacement. One final JEV recheck follows. Remaining flags
+   produces a complete replacement. One Decisions recheck follows. Remaining flags
    or incomplete review withhold publication; they do not start another repair.
 10. **Publication:** revalidate cited evidence against current authorization and
     publication state, persist its checkpoint, and then emit the standard answer and
@@ -130,39 +139,53 @@ source/chunk targets, changed hashes, external/derived/untrusted/truncated origi
 and whitespace-only support. Canonical integrity establishes source binding; it does
 not establish a finding's legal truth, relevance, applicability or in-force status.
 
-The model records each issue-owned finding once, then links it through
-`DimensionAssessment.requirement_ids`. Code checks complete and unique matrix rows,
-known same-issue findings, supersession and dependent issue integrity. JEV evaluates
-whether each assessment's reason and linked finding actually support that dimension's
-result. Reusing one finding across dimensions is valid when its legal content supports
-each relationship; a valid ID link alone is insufficient.
+The model records each global source finding once, then links it through
+`DimensionAssessment.requirement_ids`. Findings have no `issue_id`, `application` or
+`dimension`; each assessment's `reason` explains the application to that issue and
+dimension. Code merges sparse updates into the full matrix, rejects duplicate or
+unknown issue/dimension/finding identities, and leaves missing cells unresolved. The
+same finding can serve multiple issues and dimensions without duplicating its rule
+or evidence. Supersession is atomic and invalidates obsolete active assessment links.
+The independent reviewer evaluates each relationship's relevance and entailment;
+a valid ID link alone is insufficient.
+
+Source-derived child triggers must reference a finding associated with their parent.
+Code preserves the adopted finding and parent-assessment snapshots, with canonical
+passage provenance derived from the ledger. These historical trigger snapshots do
+not make a superseded finding active evidence for a current conclusion. Issue
+closure and validity limitations follow each issue's current assessment links, so
+an unused global finding does not affect unrelated issues.
 
 Writer claims bind to their containing block and select the same canonical passages.
-The compiler joins blocks in order and derives literal claim excerpts; it does not
-infer legal support. JEV still examines the entire published draft, including claimless
+The compiler joins blocks in order, adds missing selected markers in a separate
+paragraph after each block, and derives literal claim excerpts. This preserves closed
+Markdown fences and table rows; it does not infer legal support.
+The independent reviewer still examines the entire published draft, including claimless
 headings or connective blocks that might contain an unrecorded legal assertion,
 qualifying conditions, and contradictions across blocks and issues.
 
 ## Calls, retrieval width and cost accounting
 
-The shortest path is three Gemini generations (planner, reader, writer) and two JEV
-requests. A model-requested early source return adds a reader generation, making that
-path four Gemini generations and two JEV
+There is one early review and one first-draft review, with at most one recheck after
+the sole post-draft repair. The shortest path is three Gemini generations (planner,
+reader, writer) and two Decisions requests. A model-requested early source return
+adds a reader generation, making that path four Gemini generations and two Decisions
 requests. A flagged early review can add a diagnostic reader call. Post-draft repair
 adds its diagnostic reader, an optional reader after acquisition, one replacement
-writer and one JEV request. These are bounded paths, not a fixed per-answer bill.
+writer and one Decisions request. These are bounded paths, not a fixed per-answer bill.
 An invalid initial structured plan permits one separately admitted Flash schema
 correction. It preserves the request and uses the same remaining deadline and call
 budget; provider failures do not trigger this correction.
 
 Planner, reader, writer and repair use Gemini 3.8 Flash with low reasoning effort.
-The fixed override has temperature zero. JEV uses either the real TypeSafe SystemOne
-endpoint with `jev-latest`, or the official OpenRouter SystemOne endpoint with
-`typesafe/jev-1.13`. Both routes make one physical request per invocation, without internal retries or
-partitions. Missing credentials, invalid responses, deadline failures and oversized
-packets never become a successful review.
-There is no GPT/native reviewer substitute and no fallback to another provider after a
-review failure. Checkpoints retain only JEV route/provider-name provenance, never keys.
+The fixed override has temperature zero. The independent reviewer uses the native
+`https://api.openai.com/v1/decisions` endpoint with pinned `gpt-6-luna` and named
+defect predicates. Predicate names map back to code-owned checks; the provider does
+not generate queries or workflow actions. Each invocation makes one physical
+request without internal retries or partitions. Missing credentials, refusals,
+invalid responses, deadline failures and oversized packets prevent review completion.
+There is no TypeSafe, OpenRouter, chat-completion or alternate-model fallback.
+Checkpoints retain only the `openai_decisions` route and provider name, never keys.
 
 Search retains the broad retrieval contract: 256 hits per lane, 384 rerank candidates
 (including regulatory candidates), 50 model chunks and source diversity. Automatic
@@ -176,7 +199,7 @@ completion ranker; the latter is a separate model call, potentially a model othe
 than Gemini. Search's selected secondary LLM calls use the public `ScopedSearchLLM`
 and are counted in the shared generation budget and Gemini usage meter. Embedding
 and external reranker calls retain their own provider traces and usage accounting;
-they are **not** included in the Gemini/JEV token totals or the 32-admission counter.
+they are **not** included in the Gemini/Decisions token totals or the 32-admission counter.
 No total dollar-price or live latency guarantee follows from the stage counts.
 
 ## Default limits and cancellation
@@ -185,8 +208,8 @@ No total dollar-price or live latency guarantee follows from the stage counts.
 | --- | ---: |
 | Overall cooperative deadline | 240 seconds |
 | Finalization reserve | 110 seconds |
-| Planner/reader/writer/repair or JEV call timeout | 45 seconds |
-| Shared Gemini/secondary-LLM/JEV admissions | 32 |
+| Planner/reader/writer/repair or Decisions call timeout | 45 seconds |
+| Shared Gemini/secondary-LLM/Decisions admissions | 32 |
 | Admissions reserved for finalization | 8 |
 | Source operations | 96 |
 | Discovery queries across all issues and rounds | 24 |
@@ -198,25 +221,26 @@ No total dollar-price or live latency guarantee follows from the stage counts.
 | Gemini context ceiling | 192,000 tokens, or the smaller provider limit |
 | Maximum generated output per Gemini call | 16,384 tokens |
 | Evidence budget | 2,000,000 bytes |
-| Serialized JEV request/response cap | 256,000 bytes each |
+| Serialized Decisions request/response cap | 256,000 bytes each |
 
-Actual provider usage is recorded after each response, including a failed JEV
+Actual provider usage is recorded after each response, including a failed Decisions
 validation with reported usage. Token thresholds are admission checks against usage
 already observed; they are not an exact advance estimate of the next response's
 bill. There is one provider attempt and one compatibility attempt for selected LLM
 calls. Secondary search generations use the remaining research deadline; external
-embedding/reranker providers retain their own timeout behavior. The smaller JEV
-provider token limits also apply: the byte cap alone does not guarantee a packet fits
-those limits. Provider rejection produces an explicit incomplete review.
+embedding/reranker providers retain their own timeout behavior. The reviewer provider's
+token limits also apply: the byte cap alone does not guarantee a packet fits those
+limits. Provider rejection produces an explicit incomplete review.
 
 There is no numeric issue-count limit. Materiality, reuse of existing issues and
 global time, call, search, tool and context budgets control growth. Every explicit
 requested outcome must remain represented; the planner must not compress outcomes to
 fit an artificial issue cap. Identical initial queries and identical source operations
-within a reading batch are executed once with their issue IDs combined. A decisive question that cannot be resolved within the remaining
-budget stays open and disclosed instead of being forcibly closed.
+within a reading batch are executed once with their issue IDs combined. A decisive
+question that cannot be resolved within the remaining budget stays open and disclosed
+instead of being forcibly closed.
 
-Stop checks propagate through research, selected provider calls, JEV response
+Stop checks propagate through research, selected provider calls, Decisions response
 handling and publication. Pending pooled operations are cancelled when possible;
 an already running provider/read may finish after cancellation. Its result cannot
 bypass the stop/deadline and publication fences. Unexecuted requested source
@@ -229,7 +253,8 @@ assessment matrix, supported resolution, pending operations and validity limits.
 The model cannot declare closure directly. An open or partial material child prevents
 its parent being closed. A newly discovered unresolved dependency is preserved in the
 writer/reviewer state, result and checkpoint, and code inserts a scoped research
-limitation into the literal draft before final review when needed.
+limitation into the literal draft before final review when needed. Validity and
+supported resolution use the issue's linked global findings, not finding ownership.
 
 Recorded version windows, read dates and a chunk lifecycle value such as `active`
 do not prove legal in-force or annulment status. A recorded window is checked only
@@ -241,8 +266,8 @@ The current shared evidence metadata whitelist does not transport verified legal
 status fields. This workflow does not change that shared contract or fabricate a
 sidecar. Ordinary corpus evidence therefore retains `legal_status="unknown"` even
 after a targeted validity search. Any affected result is `partial`, and code adds a
-scoped, user-visible validity limitation to the literal draft before its final JEV
-review. A clean JEV score cannot promote unknown status to in-force status.
+scoped, user-visible validity limitation to the literal draft before its final Decisions
+review. A clean reviewer score cannot promote unknown status to in-force status.
 
 `verified` requires passed complete reviews and no remaining evidence, validity or
 pending-operation gaps. `partial` requires passed complete reviews with accurately
@@ -254,11 +279,13 @@ that the corpus contains every potentially relevant legal source.
 
 Provider-free tests cover review failure, complete numbered canonical source views,
 strict passage selectors, source identity/hash/trust checks, Unicode and whitespace
-preservation, compiled literal claim bindings, shared findings across dimensions, dimension closure,
-supersession, model-chosen dependencies across dimensions, canonical child triggers,
-dependent parent closure, shared searches without losing outcomes, cancellation, both citation
-display modes, persisted answer/citation state, publication revocation and missing
-JEV credentials. Run them with:
+preservation, Markdown-safe host citation rendering, compiled literal claim bindings,
+shared global findings across issues and dimensions, sparse assessment updates,
+dimension closure, supersession, model-chosen dependencies across dimensions,
+historical canonical child triggers, dependent parent closure, shared searches without
+losing outcomes, cancellation, both citation display modes, persisted answer/citation
+state, publication revocation and missing
+Decisions credentials and provider group/persona access. Run them with:
 
 ```bash
 uv run --no-sync pytest -q backend/tests/unit/onyx/legal_review \

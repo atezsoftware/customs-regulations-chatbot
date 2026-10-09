@@ -21,12 +21,13 @@ from onyx.cache.interface import CacheBackend
 from onyx.chat.chat_state import ChatStateContainer
 from onyx.chat.emitter import Emitter
 from onyx.chat.models import ChatMessageSimple
+from onyx.configs import app_configs
 from onyx.configs.constants import MessageType
 from onyx.context.search.models import IndexFilters
 from onyx.db.models import User
 from onyx.error_handling.exceptions import OnyxError
 from onyx.legal_review import runtime
-from onyx.legal_review.models import JevProviderConfig
+from onyx.legal_review.models import DecisionProviderConfig
 from onyx.llm.interfaces import LLM, LLMConfig
 from onyx.server.query_and_chat.streaming_models import (
     AgentResponseDelta,
@@ -102,10 +103,8 @@ def runtime_fixture(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     adapter.prepare_batch.return_value = {}
     monkeypatch.setattr(
         runtime,
-        "resolve_legal_review_jev",
-        lambda _user: JevProviderConfig(
-            route="typesafe", api_key=SecretStr("fixture-only-key")
-        ),
+        "resolve_legal_review_decision",
+        lambda _user: DecisionProviderConfig(api_key=SecretStr("fixture-only-key")),
     )
     monkeypatch.setattr(
         runtime, "ensure_trace", lambda *_args, **_kwargs: nullcontext()
@@ -119,7 +118,7 @@ def runtime_fixture(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         runtime, "build_search_adapter", lambda *_args, **_kwargs: adapter
     )
     monkeypatch.setattr(runtime, "GeminiGateway", lambda **_kwargs: gateway)
-    monkeypatch.setattr(runtime, "JevReviewer", lambda **_kwargs: reviewer)
+    monkeypatch.setattr(runtime, "DecisionsReviewer", lambda **_kwargs: reviewer)
     monkeypatch.setattr(runtime, "build_core_specs", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(
         runtime,
@@ -235,39 +234,42 @@ def test_publication_revalidation_failure_does_not_emit_answer_or_completed(
     assert fixture.checkpoints[-1]["legal_review"]["answer"] is None
 
 
-def test_missing_jev_credential_fails_before_any_provider_or_source_work(
+def test_missing_decision_provider_fails_before_work_without_legacy_key_fallback(
     runtime_fixture: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     fixture = runtime_fixture
-    monkeypatch.setattr(runtime, "resolve_legal_review_jev", lambda _user: None)
-    with pytest.raises(OnyxError, match="OpenRouter JEV credential"):
+    monkeypatch.setattr(app_configs, "TYPESAFE_API_KEY", "legacy-key-fixture")
+    monkeypatch.setattr(runtime, "resolve_legal_review_decision", lambda _user: None)
+    with pytest.raises(OnyxError, match="OpenAI gpt-6-luna provider"):
         runtime.run_legal_review_loop(**fixture.arguments)
     assert not fixture.gateway.calls and not fixture.broker.calls
     assert fixture.checkpoints == []
+    assert not fixture.llm.invoke.called and not fixture.llm.stream.called
 
 
-def test_resolved_openrouter_jev_config_reaches_reviewer_before_any_work(
+def test_resolved_openai_decision_config_reaches_reviewer_before_any_work(
     runtime_fixture: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     fixture = runtime_fixture
     monkeypatch.setattr(
         runtime,
-        "resolve_legal_review_jev",
-        lambda _user: JevProviderConfig(
-            route="openrouter",
-            api_key=SecretStr("openrouter-fixture-key"),
-            provider_name="Existing OpenRouter",
+        "resolve_legal_review_decision",
+        lambda _user: DecisionProviderConfig(
+            api_key=SecretStr("openai-fixture-key"),
+            provider_name="Existing OpenAI",
         ),
     )
     factory = MagicMock(return_value=fixture.reviewer)
-    monkeypatch.setattr(runtime, "JevReviewer", factory)
+    monkeypatch.setattr(runtime, "DecisionsReviewer", factory)
     runtime.run_legal_review_loop(**fixture.arguments)
-    assert factory.call_args.kwargs["route"] == "openrouter"
-    assert factory.call_args.kwargs["api_key"] == "openrouter-fixture-key"
+    factory.assert_called_once()
+    assert "route" not in factory.call_args.kwargs
+    assert factory.call_args.kwargs["api_key"] == "openai-fixture-key"
     assert callable(factory.call_args.kwargs["before_request"])
     assert callable(factory.call_args.kwargs["check_active"])
-    assert fixture.checkpoints[-1]["jev_provider"] == {
-        "route": "openrouter",
-        "provider_name": "Existing OpenRouter",
+    assert fixture.checkpoints[-1]["review_provider"] == {
+        "route": "openai_decisions",
+        "provider_name": "Existing OpenAI",
     }
-    assert "openrouter-fixture-key" not in str(fixture.checkpoints)
+    assert "jev_provider" not in fixture.checkpoints[-1]
+    assert "openai-fixture-key" not in str(fixture.checkpoints)
