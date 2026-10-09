@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import time
 from collections.abc import Callable, Sequence
@@ -14,6 +13,7 @@ from pydantic import BaseModel, JsonValue
 from onyx.asv3.citation_numbers import extract_citation_numbers
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.models import RunContext, RunStopped
+from onyx.legal_review.drafting import GeneratedDraft, compile_draft
 from onyx.legal_review.models import (
     DimensionAssessment,
     DraftAnswer,
@@ -32,6 +32,7 @@ from onyx.legal_review.models import (
     WorkflowPolicy,
     WorkflowResult,
 )
+from onyx.legal_review.passages import canonical_evidence_view, resolve_passage
 from onyx.prompts.legal_review.prompts import (
     DRAFT_PROMPT,
     PLAN_PROMPT,
@@ -78,28 +79,7 @@ class Reviewer(Protocol):
 
 
 def validate_support(support: PassageSupport, ledger: EvidenceLedger) -> None:
-    item = ledger.get(support.citation)
-    if item is None or item.search_doc is None or item.chunk_id is None:
-        raise ValueError("Support has no canonical original citation")
-    canonical = item.metadata.get("canonical_metadata")
-    layers = (
-        item.metadata,
-        item.search_doc.metadata,
-        canonical if isinstance(canonical, dict) else {},
-    )
-    if (
-        not support.quotation.strip()
-        or support.quotation not in item.text
-        or hashlib.sha256(item.text.encode()).hexdigest() != item.text_hash
-        or item.search_doc.document_id != item.source_id
-        or item.search_doc.metadata.get("regulatory_chunk_id") != item.chunk_id
-        or any(
-            layer.get(flag) is True
-            for layer in layers
-            for flag in ("external", "derived", "untrusted", "truncated")
-        )
-    ):
-        raise ValueError("Support is not an exact authorized original passage")
+    resolve_passage(support, ledger)
 
 
 def recorded_validity(
@@ -190,10 +170,7 @@ class LegalReviewEngine:
     def state(
         self, request: str, history: str, draft: DraftAnswer | None = None
     ) -> dict[str, JsonValue]:
-        numbers = self.ledger.citation_numbers()
-        originals: list[JsonValue] = json.loads(
-            self.ledger.serialize_records(numbers, required=numbers, max_chars=None)
-        )
+        originals: list[JsonValue] = list(canonical_evidence_view(self.ledger))
         return {
             "request": request,
             "history": history,
@@ -309,10 +286,6 @@ class LegalReviewEngine:
                 if requirement is None or requirement.issue_id != assessment.issue_id:
                     raise ValueError(
                         "Dimension requirements must belong to the same issue"
-                    )
-                if requirement.dimension != assessment.dimension:
-                    raise ValueError(
-                        "Dimension requirement must match the assessed dimension"
                     )
                 if (
                     assessment.status == "addressed"
@@ -502,6 +475,9 @@ class LegalReviewEngine:
                     "reason; absent evidence cannot establish non-applicability. Precisely "
                     "disclosed unresolved law is acceptable only without an unsupported "
                     "positive conclusion. Unknown chunk dates do not prove legal validity."
+                    " Assess whether each dimension's reason and linked findings actually "
+                    "establish its relevance and result from the originals; a finding can "
+                    "support multiple dimensions, but an ID link alone proves no entailment."
                 ),
                 issue_id=issue.issue_id,
                 dimension=dimension.value,
@@ -581,6 +557,9 @@ class LegalReviewEngine:
             "next_cursor",
             "total_hits",
             "matched_count",
+            "unmapped_result_count",
+            "incomplete_closure_count",
+            "unhydrated_centers",
         }
         research_record: list[JsonValue] = []
         for receipt in self.acquirer.receipts:
@@ -854,12 +833,14 @@ class LegalReviewEngine:
                 self._acquire(decision.actions)
                 self._reading(request, history)
         self.report("final", self.plan.language)
-        draft = self.gateway.complete(
-            DRAFT_PROMPT,
-            self.state(request, history),
-            DraftAnswer,
-            LLMFlow.LEGAL_REVIEW_DRAFT,
-            finalizing=True,
+        draft = compile_draft(
+            self.gateway.complete(
+                DRAFT_PROMPT,
+                self.state(request, history),
+                GeneratedDraft,
+                LLMFlow.LEGAL_REVIEW_DRAFT,
+                finalizing=True,
+            )
         )
         draft = self._disclose_validity(draft)
         self._validate_draft(draft)
@@ -873,12 +854,14 @@ class LegalReviewEngine:
             if decision.actions:
                 self._acquire(decision.actions, finalizing=True)
                 self._reading(request, history, finalizing=True, draft=draft)
-            draft = self.gateway.complete(
-                REPAIR_PROMPT,
-                self.state(request, history, draft),
-                DraftAnswer,
-                LLMFlow.LEGAL_REVIEW_REPAIR,
-                finalizing=True,
+            draft = compile_draft(
+                self.gateway.complete(
+                    REPAIR_PROMPT,
+                    self.state(request, history, draft),
+                    GeneratedDraft,
+                    LLMFlow.LEGAL_REVIEW_REPAIR,
+                    finalizing=True,
+                )
             )
             draft = self._disclose_validity(draft)
             self._validate_draft(draft)

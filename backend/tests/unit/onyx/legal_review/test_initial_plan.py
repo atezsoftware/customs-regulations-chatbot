@@ -10,6 +10,7 @@ import pytest
 from pydantic import JsonValue, ValidationError
 
 from onyx.asv3.models import RunContext, SharedBudget
+from onyx.legal_review.drafting import GeneratedBlock, GeneratedClaim, GeneratedDraft
 from onyx.legal_review.gateway import GeminiGateway
 from onyx.legal_review.models import InitialDiscoveryPlan, WorkflowPolicy
 from onyx.llm.interfaces import LLM, LLMConfig
@@ -50,6 +51,27 @@ def response(value: dict[str, JsonValue]) -> ModelResponse:
         id="fixture-response",
         created="2026-10-09T00:00:00Z",
         choice=Choice(message=Message(content=json.dumps(value, ensure_ascii=False))),
+    )
+
+
+def generated_draft() -> GeneratedDraft:
+    fixture = draft()
+    return GeneratedDraft(
+        blocks=[
+            GeneratedBlock(
+                block_id="answer",
+                text=fixture.answer,
+                claims=[
+                    GeneratedClaim(
+                        claim_id=claim.claim_id,
+                        issue_ids=claim.issue_ids,
+                        supports=claim.supports,
+                    )
+                    for claim in fixture.claims
+                ],
+            )
+        ],
+        unresolved_issue_ids=fixture.unresolved_issue_ids,
     )
 
 
@@ -147,7 +169,7 @@ def test_initial_schema_correction_is_separately_metered_and_can_resume_research
         response(omitted_queries()),
         response(valid_plan().model_dump(mode="json")),
         response(reading().model_dump(mode="json")),
-        response(draft().model_dump(mode="json")),
+        response(generated_draft().model_dump(mode="json")),
     ]
     workflow.gateway = gateway(llm, workflow.context)
     result = workflow.run("Başvuru şartı nedir?", "Verilen olgular")
@@ -157,6 +179,11 @@ def test_initial_schema_correction_is_separately_metered_and_can_resume_research
     corrected_state = json.loads(llm.invoke.call_args_list[1].args[0][1].content)
     assert corrected_state["planning_schema_correction"] is True
     assert corrected_state["request"] == "Başvuru şartı nedir?"
+    writer_schema = llm.invoke.call_args.kwargs["structured_response_format"][
+        "json_schema"
+    ]["schema"]
+    assert "blocks" in writer_schema["required"]
+    assert "answer" not in writer_schema["properties"]
 
 
 def test_repeated_initial_schema_failure_stops_after_two_admitted_calls() -> None:

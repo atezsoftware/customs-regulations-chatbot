@@ -51,11 +51,16 @@ ingest, relabel, reindex or change publication metadata.
    rank candidates and hydrate authorized originals into the shared evidence ledger.
    Search hits, labels and rank scores provide navigation, rather than legal proof.
 4. **Reading — Gemini:** extract source-backed requirements and application
-   conditions. Each support must quote a nonempty exact substring of the canonical,
-   hash-bound original. Every issue needs exactly one assessment for every dimension.
-   An addressed dimension must reference a requirement for the same issue and
-   dimension. Corrections use explicit supersession; obsolete interpretations remain
-   in audit history and leave the current drafting state.
+   conditions. Complete canonical originals appear as ordered, numbered passages;
+   the model selects `citation` and `span_number` instead of rewriting quotations,
+   hashes or offsets. Code resolves each selector to the exact original passage and
+   validates canonical identity and integrity. Requirements retain an issue-owned
+   rule and application, without a `Requirement.dimension` field. Every issue needs
+   exactly one assessment for every dimension. Those assessments are the sole
+   dimension relations: the same supported finding can serve several dimensions
+   when each assessment explains its relevance. An addressed dimension references
+   requirements belonging to that issue. Corrections use explicit supersession;
+   obsolete interpretations remain in audit history and leave the drafting state.
 5. **Source-derived issues — Gemini:** the reader actively resolves existing issues.
    It can open a linked child when a question discovered in the originals could
    materially change the parent's outcome and cannot be handled adequately inside
@@ -76,11 +81,14 @@ ingest, relabel, reindex or change publication metadata.
    receipts with query, status and access/truncation limitations. If the early source
    return has not been used, flags can direct that one return. Incomplete review
    prevents drafting a publishable answer.
-7. **Integrated draft — Gemini:** produce one answer with a literal claim inventory,
-   citations, conditions and unresolved issues. Issues serve as a private checklist;
-   they do not force repeated per-issue answer sections. Code validates source quotes,
-   literal answer excerpts and citation targets and inserts any required scoped
-   validity disclosure before review.
+7. **Integrated draft — Gemini:** produce a `GeneratedDraft` of ordered Markdown
+   blocks with claim bindings, passage selectors, conditions and unresolved issues.
+   Code compiles the actual block text into one literal answer and derives claim
+   excerpts from their containing blocks. The model does not recopy an answer or
+   `answer_excerpt` field. Issues serve as a private checklist; blocks do not force
+   repeated per-issue sections. Code validates passage selectors, literal claim
+   bindings and citation targets, then inserts required scoped validity disclosure
+   before review.
 8. **Draft review — JEV:** independently check all dimensions, the entire answer's
    coverage, every material legal assertion (including assertions absent from the
    planned issues), source conditions and consistency across issues. JEV scores are
@@ -102,6 +110,38 @@ exceptions/exemptions, penalties/reductions, tax/financial consequences, alterna
 routes, procedure/deadlines, evidence/documents, operational steps, missing facts,
 and liability/conflicting sources. A dimension can be addressed, affirmatively
 not applicable, or unresolved; lack of evidence does not prove non-applicability.
+
+## Canonical passage and finding contract
+
+`canonical_evidence_view` preserves every retained original, its citation, source and
+chunk identities, full text hash, citable state and metadata. It replaces the flat
+`text` field with ordered `passages` containing `span_number` and exact text. Joining
+those passage texts reconstructs the original byte for byte, including Unicode,
+whitespace and paragraph boundaries. Passage boundaries are transport selectors;
+they do not define a legal provision or limit the context the reader must consider.
+Select multiple passages when a condition, exception or operative rule crosses a
+boundary. No source-specific LLM call or retrieval reduction is introduced.
+
+`PassageReference` contains only strict positive integer `citation` and `span_number`
+fields. The model cannot submit a quotation, hash, witness ID or character offset.
+`resolve_passage` derives the exact quotation, offsets and hash-bound witness identity
+from the current ledger original. It rejects missing or unknown selectors, invalid
+source/chunk targets, changed hashes, external/derived/untrusted/truncated originals,
+and whitespace-only support. Canonical integrity establishes source binding; it does
+not establish a finding's legal truth, relevance, applicability or in-force status.
+
+The model records each issue-owned finding once, then links it through
+`DimensionAssessment.requirement_ids`. Code checks complete and unique matrix rows,
+known same-issue findings, supersession and dependent issue integrity. JEV evaluates
+whether each assessment's reason and linked finding actually support that dimension's
+result. Reusing one finding across dimensions is valid when its legal content supports
+each relationship; a valid ID link alone is insufficient.
+
+Writer claims bind to their containing block and select the same canonical passages.
+The compiler joins blocks in order and derives literal claim excerpts; it does not
+infer legal support. JEV still examines the entire published draft, including claimless
+headings or connective blocks that might contain an unrecorded legal assertion,
+qualifying conditions, and contradictions across blocks and issues.
 
 ## Calls, retrieval width and cost accounting
 
@@ -212,7 +252,9 @@ that the corpus contains every potentially relevant legal source.
 
 ## Validation
 
-Provider-free tests cover review failure, literal source support, dimension closure,
+Provider-free tests cover review failure, complete numbered canonical source views,
+strict passage selectors, source identity/hash/trust checks, Unicode and whitespace
+preservation, compiled literal claim bindings, shared findings across dimensions, dimension closure,
 supersession, model-chosen dependencies across dimensions, canonical child triggers,
 dependent parent closure, shared searches without losing outcomes, cancellation, both citation
 display modes, persisted answer/citation state, publication revocation and missing

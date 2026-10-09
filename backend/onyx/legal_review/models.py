@@ -5,6 +5,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, SecretStr, model_validator
 
+from onyx.legal_review.passages import PassageReference as PassageSupport
 from onyx.tools.constants import REGULATORY_MAX_SEARCH_QUERY_CHARS
 
 
@@ -178,15 +179,9 @@ class SourceAction(StrictModel):
     arguments: dict[str, JsonValue]
 
 
-class PassageSupport(StrictModel):
-    citation: int = Field(gt=0, strict=True)
-    quotation: str = Field(min_length=1)
-
-
 class Requirement(StrictModel):
     requirement_id: str = Field(min_length=1)
     issue_id: str = Field(min_length=1)
-    dimension: LegalDimension
     rule: str = Field(min_length=1)
     application: str = Field(min_length=1)
     supports: list[PassageSupport] = Field(min_length=1)

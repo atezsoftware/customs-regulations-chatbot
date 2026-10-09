@@ -50,11 +50,15 @@ def test_wire_contract_preserves_full_packet_and_code_owned_flags(stage: str) ->
         "original_evidence": [
             {
                 "citation": 1,
-                "text": "A ve B birlikte gerekir. " * 500,
+                "passages": [
+                    {"span_number": 1, "text": "A ve B birlikte gerekir. " * 250},
+                    {"span_number": 2, "text": "İstisna birlikte uygulanır. " * 250},
+                ],
                 "source_id": "original-law",
                 "metadata": {"valid_from": "2024-01-01", "legal_status": "in_force"},
             }
         ],
+        "requirements": [{"supports": [{"citation": 1, "span_number": 2}]}],
     }
     before_request = MagicMock()
     check_active = MagicMock()
@@ -73,6 +77,8 @@ def test_wire_contract_preserves_full_packet_and_code_owned_flags(stage: str) ->
             question = payload["questions"][check.id]
             assert question["type"] == "noul"
             assert question["instructions"].endswith(check.instructions)
+            assert "citation and span_number" in question["instructions"]
+            assert "complete canonical original" in question["instructions"]
         return httpx.Response(200, json=_response())
 
     result = JevReviewer(
