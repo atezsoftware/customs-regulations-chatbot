@@ -66,6 +66,7 @@ def test_deadline_retains_completed_receipts_and_cancels_pending_work(
     )
     pending: Future[ToolOutcome] = Future()
     shutdown_calls: list[tuple[bool, bool]] = []
+    progress: list[tuple[int, int]] = []
 
     class ControlledExecutor:
         def __init__(self, **kwargs: Any) -> None:
@@ -104,7 +105,15 @@ def test_deadline_retains_completed_receipts_and_cancels_pending_work(
         SourceAction(need_ids=["rule"], tool=name, arguments={})
         for name in ("read_first", "read_second")
     ]
-    acquirer = CanonicalAcquirer(registry, context, ledger, WorkflowPolicy())
+    acquirer = CanonicalAcquirer(
+        registry,
+        context,
+        ledger,
+        WorkflowPolicy(),
+        on_batch_progress=lambda _rows, active, completed: progress.append(
+            (active, completed)
+        ),
+    )
     with pytest.raises(RunStopped, match="Research deadline"):
         acquirer.acquire(actions, plan)
     receipts = acquirer.last_receipts
@@ -116,3 +125,4 @@ def test_deadline_retains_completed_receipts_and_cancels_pending_work(
     assert item is not None and item.text == "Completed controlling original."
     assert pending.cancelled()
     assert shutdown_calls == [(False, True)]
+    assert progress == [(2, 0), (1, 1)]

@@ -8,30 +8,49 @@ from pydantic import BaseModel, JsonValue
 
 from onyx.asv3.citation_numbers import extract_citation_numbers
 from onyx.asv3.evidence import EvidenceLedger
-from onyx.asv3.models import RunStopped
+from onyx.asv3.models import RunContext, RunStopped
 from onyx.db.legal_composite_sources import SourceKind
 from onyx.legal_composite.acquisition import InvalidSourceAction
 from onyx.legal_composite.dependencies import (
     DependencyExpander,
     assess_dependencies,
     dependency_required_citations,
+    material_dependency_gaps,
 )
 from onyx.legal_composite.models import (
     AnswerReview,
     AuthorityDependency,
+    CompositeWorkflowResult,
     DraftAnswer,
+    DraftPatch,
+    GapResolution,
+    IssueResearchPlan,
+    IssueResearchStep,
+    MaterialDependencyRequest,
+    PassageSupport,
     ResearchPlan,
     ResearchStep,
+    SemanticReview,
     SourceAction,
+    SourceRequirement,
+    StructuredDraftAnswer,
     WorkflowPolicy,
     WorkflowResult,
 )
 from onyx.legal_composite.prompts import (
     ANSWER_PROMPT,
+    PATCH_PROMPT,
     PLAN_PROMPT,
     RESEARCH_PROMPT,
     REVIEW_PROMPT,
 )
+from onyx.legal_composite.requirements import (
+    RequirementLedger,
+    apply_patch,
+    draft_binding_gaps,
+    support_is_original,
+)
+from onyx.legal_composite.reviewer import AnswerReviewer
 from onyx.legal_composite.selection import (
     SourceSelectionResult,
     SourceSelector,
@@ -349,6 +368,8 @@ class LegalCompositeEngine:
         selector: SourceSelector | None = None,
         dependency_expander: DependencyExpander | None = None,
         source_kinds: dict[str, SourceKind] | None = None,
+        reviewer: AnswerReviewer | None = None,
+        evidence_context: RunContext | None = None,
     ) -> None:
         self.gateway = gateway
         self.acquirer = acquirer
@@ -360,8 +381,14 @@ class LegalCompositeEngine:
         self.selector = selector
         self.dependency_expander = dependency_expander
         self.source_kinds = dict(source_kinds or {})
+        self.reviewer = reviewer
+        self.evidence_context = evidence_context
+        self.requirements = RequirementLedger(ledger)
+        self.research_gaps: list[str] = []
+        self.semantic_review: SemanticReview | None = None
         self.dependencies: list[AuthorityDependency] = []
         self.selection: SourceSelectionResult | None = None
+        self.pending_reconsidered: set[int] = set()
         self.plan: ResearchPlan | None = None
         self.receipts: list[dict[str, JsonValue]] = []
         self.last_review: AnswerReview | None = None
@@ -385,6 +412,12 @@ class LegalCompositeEngine:
             if isinstance(number, int)
         ]
         required = list(extract_citation_numbers(draft.answer)) if draft else []
+        if self.reviewer is not None:
+            self.pending_reconsidered -= set(
+                getattr(self.gateway, "last_delivered_citations", set())
+            )
+            required.extend(self.requirements.citations())
+            required.extend(sorted(self.pending_reconsidered))
         required = list(
             dict.fromkeys(
                 [
@@ -459,6 +492,8 @@ class LegalCompositeEngine:
             "authority_dependencies": [
                 edge.model_dump(mode="json") for edge in self.dependencies
             ],
+            "source_requirements": self.requirements.export(),
+            "research_gaps": self.research_gaps,
         }
         if self.selection is not None:
             payload["source_selection"] = {
@@ -535,9 +570,20 @@ class LegalCompositeEngine:
         try:
             return self._run(request, history, instructions)
         except RunStopped as error:
+            status = "cancelled" if "cancel" in str(error).lower() else "unavailable"
+            if self.reviewer is not None:
+                assert self.plan is None or isinstance(self.plan, IssueResearchPlan)
+                return CompositeWorkflowResult(
+                    answer=None,
+                    status=status,
+                    gaps=[str(error)],
+                    plan=self.plan,
+                    semantic_review=self.semantic_review,
+                    source_requirements=self.requirements.records(),
+                )
             return WorkflowResult(
                 answer=None,
-                status="cancelled" if "cancel" in str(error).lower() else "unavailable",
+                status=status,
                 gaps=[str(error)],
                 plan=self.plan,
                 review=self.last_review,
@@ -593,15 +639,85 @@ class LegalCompositeEngine:
                     }
                 )
 
+    def _reconsider_sources(
+        self,
+        numbers: list[int],
+        plan: ResearchPlan,
+        need_ids: set[str] | None = None,
+    ) -> None:
+        if not numbers:
+            return
+        scope = {need.need_id for need in plan.needs} if need_ids is None else need_ids
+        if scope - {need.need_id for need in plan.needs}:
+            raise InvalidSourceAction(
+                "Source reconsideration refers to an unknown issue"
+            )
+        requested = set(numbers)
+        for number in requested:
+            item = self.ledger.get(number)
+            # Recovery changes eligibility, not writer delivery or legal applicability.
+            if item is None or not support_is_original(
+                PassageSupport(citation=number, quotation=item.text),
+                self.ledger,
+                requested,
+            ):
+                raise InvalidSourceAction(
+                    "Source reconsideration requires a canonical original"
+                )
+        if self.selection is None:
+            return
+        recovered = requested & set(self.selection.rejected_citations)
+        if not recovered:
+            return
+        if self.evidence_context is None:
+            raise InvalidSourceAction("Source reconsideration requires its run context")
+        rebound = []
+        for number in recovered:
+            item = self.ledger.get(number)
+            assert item is not None
+            item.question_ids = list(
+                dict.fromkeys([*item.question_ids, *sorted(scope)])
+            )
+            rebound.append(item)
+        self.ledger.add(rebound, self.evidence_context)
+        self.selection = self.selection.model_copy(
+            update={
+                "rejected_citations": sorted(
+                    set(self.selection.rejected_citations) - recovered
+                ),
+                "background_citations": sorted(
+                    set(self.selection.background_citations) | recovered
+                ),
+                "retained_citations": sorted(
+                    set(self.selection.retained_citations) | recovered
+                ),
+            }
+        )
+        self.pending_reconsidered.update(recovered)
+        self.receipts.append(
+            {
+                "status": "reconsidered",
+                "need_ids": sorted(scope),
+                "citations": sorted(recovered),
+                "summary": "Previously excluded originals retained for source reading; earlier selection receipts remain audit history.",
+            }
+        )
+
     def _refresh_dependencies(
-        self, request: str, plan: ResearchPlan, targets: list[int] | None = None
+        self,
+        request: str,
+        plan: ResearchPlan,
+        targets: list[int] | None = None,
+        material_targets: list[MaterialDependencyRequest] | None = None,
     ) -> None:
         if self.dependency_expander is not None and plan.requires_sources:
-            if not targets:
+            if not targets and not material_targets:
                 self.dependencies = self.dependency_expander.synchronize()
                 return
             before = set(self.ledger.citation_numbers())
-            frontier = set(targets)
+            frontier = set(targets or []) | {
+                target.origin_citation for target in material_targets or []
+            }
             delivered = getattr(self.gateway, "last_delivered_citations", before)
             if not frontier <= before or not frontier <= delivered:
                 raise InvalidSourceAction(
@@ -621,7 +737,14 @@ class LegalCompositeEngine:
             self.report("tools", plan.language)
             receipt_start = len(self.dependency_expander.receipts)
             self.dependencies = self.dependency_expander.expand(
-                plan, frontier=frontier, need_bindings=need_bindings
+                plan,
+                frontier=frontier,
+                need_bindings=need_bindings,
+                **(
+                    {"material_targets": material_targets}
+                    if material_targets is not None
+                    else {}
+                ),
             )
             self.receipts.extend(self.dependency_expander.receipts[receipt_start:])
             added = set(self.ledger.citation_numbers()) - before
@@ -635,7 +758,7 @@ class LegalCompositeEngine:
         self.plan = self.gateway.complete(
             PLAN_PROMPT,
             self._payload(request, history, instructions=instructions),
-            ResearchPlan,
+            IssueResearchPlan if self.reviewer is not None else ResearchPlan,
             LLMFlow.LEGAL_COMPOSITE_RESEARCH,
         )
         if not source_free_social_request(request):
@@ -656,15 +779,61 @@ class LegalCompositeEngine:
                 step = self.gateway.complete(
                     RESEARCH_PROMPT,
                     self._payload(request, history, instructions=instructions),
-                    ResearchStep,
+                    IssueResearchStep if self.reviewer is not None else ResearchStep,
                     LLMFlow.LEGAL_COMPOSITE_RESEARCH,
                 )
             except RunStopped:
                 self.check_active()
                 break
-            if not step.actions and not step.related_citations:
+            new_requirement_ids = (
+                {row.requirement_id for row in step.requirements}
+                - {row.requirement_id for row in self.requirements.records()}
+                if isinstance(step, IssueResearchStep)
+                else set()
+            )
+            try:
+                if isinstance(step, IssueResearchStep):
+                    assert isinstance(plan, IssueResearchPlan)
+                    self._validate_gap_scope(step, plan)
+                self.requirements.update(
+                    step.requirements if isinstance(step, IssueResearchStep) else [],
+                    plan,
+                    getattr(
+                        self.gateway,
+                        "last_delivered_citations",
+                        set(self.ledger.citation_numbers()),
+                    ),
+                )
+            except InvalidSourceAction as error:
+                self.research_gaps.append(str(error))
+                continue
+            if isinstance(step, IssueResearchStep):
+                assert isinstance(plan, IssueResearchPlan)
+                self._record_research_gaps(
+                    step, plan, new_requirement_ids=new_requirement_ids
+                )
+                self._reconsider_sources(step.reconsider_citations, plan)
+            if (
+                not step.actions
+                and not step.related_citations
+                and not (
+                    isinstance(step, IssueResearchStep)
+                    and (step.material_dependencies or step.reconsider_citations)
+                )
+            ):
+                if not step.ready_to_answer and not self.research_gaps:
+                    self.research_gaps.append(
+                        "Research did not establish readiness for the requested outcomes."
+                    )
                 break
-            self._refresh_dependencies(request, plan, step.related_citations)
+            self._refresh_dependencies(
+                request,
+                plan,
+                step.related_citations if self.reviewer is None else [],
+                step.material_dependencies
+                if isinstance(step, IssueResearchStep)
+                else None,
+            )
             before = set(self.ledger.citation_numbers())
             source_phase_open = not step.actions or self._acquire(step.actions, plan)
             added = set(self.ledger.citation_numbers()) - before
@@ -673,6 +842,9 @@ class LegalCompositeEngine:
             self._refresh_dependencies(request, plan)
         self._refresh_dependencies(request, plan)
         self.report("final", plan.language)
+        if self.reviewer is not None:
+            assert isinstance(plan, IssueResearchPlan)
+            return self._finalize_semantic(request, history, instructions, plan)
         gaps: list[str] = []
         draft: DraftAnswer | None = None
         safe_partial: WorkflowResult | None = None
@@ -792,3 +964,505 @@ class LegalCompositeEngine:
                     self._select_sources(request, plan, added)
                 self._refresh_dependencies(request, plan)
         raise AssertionError("At least one review is required")
+
+    def _finalize_semantic(
+        self,
+        request: str,
+        history: str,
+        instructions: str | None,
+        plan: IssueResearchPlan,
+    ) -> WorkflowResult:
+        assert self.reviewer is not None
+        payload = self._payload(
+            request, history, instructions=instructions, source_phase=False
+        )
+        draft = self.gateway.complete(
+            ANSWER_PROMPT,
+            payload,
+            StructuredDraftAnswer,
+            LLMFlow.LEGAL_COMPOSITE_ANSWER,
+            True,
+        )
+        delivered = set(getattr(self.gateway, "last_delivered_citations", set()))
+        pending_binding_gaps: list[str] = []
+        try:
+            self._accept_draft_reading(
+                draft.requirements, draft.gap_resolutions, plan, delivered
+            )
+        except InvalidSourceAction as error:
+            pending_binding_gaps.append(str(error))
+        gaps: list[str] = []
+        previous: SemanticReview | None = None
+        affected: set[str] | None = None
+        for attempt in range(self.policy.max_reviews):
+            self.check_active()
+            requirements = self.requirements.records()
+            binding_gaps = draft_binding_gaps(
+                draft, plan, requirements, self.ledger, delivered
+            )
+            binding_gaps.extend(pending_binding_gaps)
+            pending_binding_gaps = []
+            questions = self.reviewer.expected_checks(
+                request,
+                plan,
+                draft,
+                requirements,
+                self.dependencies,
+                delivered,
+                previous=previous,
+                affected_sections=affected,
+            )
+            self.report("review", plan.language)
+            review = self.reviewer.review(
+                request,
+                plan,
+                draft,
+                requirements,
+                self.dependencies,
+                delivered,
+                previous=previous,
+                affected_sections=affected,
+            )
+            self.semantic_review = review
+            checked = [check.check_id for check in review.checks]
+            shape_valid = len(checked) == len(set(checked)) and set(checked) == set(
+                questions
+            )
+            failed = []
+            reviewed_by_id = {check.check_id: check for check in review.checks}
+            needs_by_id = {need.need_id: need for need in plan.needs}
+            permit_disclosed_partial = (
+                attempt + 1 >= self.policy.max_reviews or not self.research_available()
+            )
+            for check in review.checks:
+                question = questions.get(check.check_id)
+                if question is None:
+                    continue
+                disclosed_source_gap = (
+                    shape_valid
+                    and not review.failure
+                    and permit_disclosed_partial
+                    and set(check.need_ids) == set(question.need_ids)
+                    and set(check.section_ids) == set(question.section_ids)
+                    and check.check_id.startswith("evidence:")
+                    and check.status == "gap"
+                    and check.confidence >= 0.80
+                    and bool(check.need_ids)
+                    and all(
+                        need_id in draft.unresolved_need_ids
+                        and need_id in needs_by_id
+                        and bool(needs_by_id[need_id].evidence_gaps)
+                        and (issue := reviewed_by_id.get(f"issue:{need_id}"))
+                        is not None
+                        and issue.status == "addressed"
+                        and issue.confidence >= 0.80
+                        for need_id in check.need_ids
+                    )
+                )
+                if disclosed_source_gap:
+                    continue
+                if (
+                    set(check.need_ids) != set(question.need_ids)
+                    or set(check.section_ids) != set(question.section_ids)
+                    or check.confidence < 0.80
+                    or check.status not in {"addressed", "not_applicable"}
+                    or (
+                        check.status == "not_applicable"
+                        and not question.allow_not_applicable
+                    )
+                ):
+                    failed.append(check)
+            gaps = [*binding_gaps]
+            if not shape_valid:
+                gaps.append("review:missing_or_duplicate_check_identity")
+            if review.failure:
+                gaps.append(f"review:provider_failure:{review.failure}")
+            gaps.extend(f"{check.check_id}:{check.status}" for check in failed)
+            dependency_gaps = material_dependency_gaps(
+                self.dependencies, self.ledger, delivered, requirements
+            )
+            by_id = {check.check_id: check for check in review.checks}
+            for edge_id, reasons in dependency_gaps.items():
+                if not reasons:
+                    continue
+                edge = next(row for row in self.dependencies if row.edge_id == edge_id)
+                origin_numbers = {origin.citation for origin in edge.origins}
+                integrity_faults = [
+                    reason
+                    for reason in reasons
+                    if reason.startswith(
+                        ("origin_binding_mismatch", "citation_noncanonical")
+                    )
+                    or (
+                        reason.startswith(
+                            ("citation_missing@", "citation_undelivered@")
+                        )
+                        and int(reason.rsplit("@", 1)[1]) in origin_numbers
+                    )
+                ]
+                if integrity_faults:
+                    gaps.extend(
+                        f"dependency:{edge_id}:{reason}" for reason in integrity_faults
+                    )
+                    continue
+                check = by_id.get(f"dependency:{edge_id}")
+                if (
+                    check is not None
+                    and check.status == "not_applicable"
+                    and check.confidence >= 0.80
+                ):
+                    # Nonmateriality is judged against actual delivered original text,
+                    # never inferred merely from an empty relationship lookup.
+                    continue
+                if set(edge.need_ids) <= set(draft.unresolved_need_ids):
+                    continue
+                gaps.extend(f"dependency:{edge_id}:{reason}" for reason in reasons)
+            unsupported = {
+                need.need_id
+                for need in plan.needs
+                if plan.requires_sources
+                and not any(
+                    requirement.need_id == need.need_id for requirement in requirements
+                )
+            }
+            undisclosed = unsupported - set(draft.unresolved_need_ids)
+            undisclosed |= {
+                need.need_id
+                for need in plan.needs
+                if need.evidence_gaps and need.need_id not in draft.unresolved_need_ids
+            }
+            gaps.extend(
+                f"issue:{need}:no_source_backed_requirement"
+                for need in sorted(undisclosed)
+            )
+            if not gaps:
+                partial = bool(draft.unresolved_need_ids or self.research_gaps)
+                return CompositeWorkflowResult(
+                    answer=draft.answer,
+                    status="partial" if partial else "verified",
+                    gaps=list(self.research_gaps),
+                    plan=plan,
+                    semantic_review=review,
+                    source_requirements=requirements,
+                )
+            if attempt + 1 >= self.policy.max_reviews:
+                break
+            if review.failure or not shape_valid:
+                break
+            affected_needs = {
+                need for check in failed for need in check.need_ids
+            } | undisclosed
+            affected = {
+                section.section_id
+                for section in draft.sections
+                if set(section.need_ids) & affected_needs
+            }
+            if binding_gaps or not shape_valid or review.failure or not affected:
+                affected = {section.section_id for section in draft.sections}
+            # Cross-issue conclusions and summaries are rechecked with their dependencies.
+            affected |= {
+                section.section_id
+                for section in draft.sections
+                if len(section.need_ids) > 1
+            }
+            affected_needs |= {
+                need
+                for section in draft.sections
+                if section.section_id in affected
+                for need in section.need_ids
+            }
+            missing_evidence = (
+                any(
+                    check.status in {"gap", "incorrect"}
+                    and check.check_id.startswith(("evidence:", "gap-resolution:"))
+                    for check in failed
+                )
+                or any(dependency_gaps.values())
+                or bool(undisclosed)
+            )
+            if missing_evidence and self.research_available():
+                repair_research = self._focused_payload(
+                    request, history, draft, gaps, instructions, affected_needs, True
+                )
+                repair_research["review_findings"] = [
+                    {
+                        "check": check.model_dump(mode="json"),
+                        "question": questions[check.check_id].question,
+                    }
+                    for check in failed
+                    if check.check_id in questions
+                ]
+                try:
+                    step = self.gateway.complete(
+                        RESEARCH_PROMPT,
+                        repair_research,
+                        IssueResearchStep,
+                        LLMFlow.LEGAL_COMPOSITE_RESEARCH,
+                    )
+                    self._validate_gap_scope(step, plan, affected_needs)
+                    new_requirement_ids = {
+                        row.requirement_id for row in step.requirements
+                    } - {row.requirement_id for row in self.requirements.records()}
+                    self.requirements.update(
+                        step.requirements,
+                        plan,
+                        set(getattr(self.gateway, "last_delivered_citations", set())),
+                    )
+                    self._record_research_gaps(
+                        step,
+                        plan,
+                        affected_needs,
+                        new_requirement_ids=new_requirement_ids,
+                    )
+                    self._reconsider_sources(
+                        step.reconsider_citations, plan, affected_needs
+                    )
+                    self._refresh_dependencies(
+                        request, plan, [], step.material_dependencies
+                    )
+                    before = set(self.ledger.citation_numbers())
+                    self._acquire(step.actions, plan)
+                    added = set(self.ledger.citation_numbers()) - before
+                    if added:
+                        self._select_sources(request, plan, added)
+                    self._refresh_dependencies(request, plan)
+                except RunStopped:
+                    self.check_active()
+            patch_payload = self._focused_payload(
+                request, history, draft, gaps, instructions, affected_needs, False
+            )
+            patch_payload["affected_section_ids"] = sorted(affected)
+            patch_payload["review_findings"] = [
+                {
+                    "check": check.model_dump(mode="json"),
+                    "question": questions[check.check_id].question,
+                }
+                for check in failed
+                if check.check_id in questions
+            ]
+            self.report("repair", plan.language)
+            patch = self.gateway.complete(
+                PATCH_PROMPT,
+                patch_payload,
+                DraftPatch,
+                LLMFlow.LEGAL_COMPOSITE_ANSWER,
+                True,
+            )
+            try:
+                self._accept_draft_reading(
+                    patch.requirements,
+                    patch.gap_resolutions,
+                    plan,
+                    set(getattr(self.gateway, "last_delivered_citations", set())),
+                    affected_needs,
+                )
+            except InvalidSourceAction as error:
+                pending_binding_gaps.append(str(error))
+            draft = apply_patch(draft, patch, affected)
+            delivered |= set(getattr(self.gateway, "last_delivered_citations", set()))
+            previous = review
+        return CompositeWorkflowResult(
+            answer=None,
+            status="unavailable",
+            gaps=list(dict.fromkeys(gaps)),
+            plan=plan,
+            semantic_review=self.semantic_review,
+            source_requirements=self.requirements.records(),
+        )
+
+    def _focused_payload(
+        self,
+        request: str,
+        history: str,
+        draft: StructuredDraftAnswer,
+        gaps: list[str],
+        instructions: str | None,
+        need_ids: set[str],
+        source_phase: bool,
+    ) -> dict[str, JsonValue]:
+        payload = self._payload(
+            request,
+            history,
+            draft=draft,
+            gaps=gaps,
+            instructions=instructions,
+            source_phase=source_phase,
+        )
+        required = self.requirements.citations(need_ids)
+        required.update(self.pending_reconsidered)
+        required.update(
+            support.citation
+            for claim in draft.claims
+            if set(claim.need_ids) & need_ids
+            for support in claim.supports
+        )
+        dependencies = [
+            edge for edge in self.dependencies if set(edge.need_ids) & need_ids
+        ]
+        required.update(dependency_required_citations(dependencies, self.ledger))
+        available = [
+            number
+            for number in self.ledger.citation_numbers()
+            if (item := self.ledger.get(number)) is not None
+            and (not item.question_ids or set(item.question_ids) & need_ids)
+            and (
+                self.selection is None
+                or number not in self.selection.rejected_citations
+            )
+        ]
+        records: JsonValue = json.loads(
+            self.ledger.serialize_records(
+                [*sorted(required), *available],
+                required=required,
+                max_chars=None if required else 50_000,
+            )
+        )
+        assert isinstance(records, list)
+        payload["original_evidence"] = records
+        payload["required_evidence_numbers"] = sorted(required)
+        payload["omitted_original_ids"] = [
+            number
+            for number in self.ledger.citation_numbers()
+            if number
+            not in {row["citation"] for row in records if isinstance(row, dict)}
+        ]
+        payload["affected_need_ids"] = sorted(need_ids)
+        return payload
+
+    def _accept_draft_reading(
+        self,
+        requirements: list[SourceRequirement],
+        resolutions: list[GapResolution],
+        plan: IssueResearchPlan,
+        delivered: set[int],
+        need_ids: set[str] | None = None,
+    ) -> None:
+        if not resolutions:
+            self.requirements.update(requirements, plan, delivered)
+            return
+        scoped = {row.need_id for row in resolutions}
+        if need_ids is not None and scoped - need_ids:
+            raise InvalidSourceAction("Draft closure refers to an unaffected issue")
+        by_need = {need.need_id: need for need in plan.needs}
+        if scoped - set(by_need):
+            raise InvalidSourceAction("Draft closure refers to an unknown issue")
+        closed = {(row.need_id, row.gap) for row in resolutions}
+        step = IssueResearchStep(
+            actions=[],
+            ready_to_answer=True,
+            remaining_gaps=[],
+            requirements=requirements,
+            gap_resolutions=resolutions,
+            issue_gaps={
+                identity: [
+                    gap
+                    for gap in by_need[identity].evidence_gaps
+                    if (identity, gap) not in closed
+                ]
+                for identity in scoped
+            },
+        )
+        fresh = {row.requirement_id for row in requirements} - {
+            row.requirement_id for row in self.requirements.records()
+        }
+        self._validate_gap_scope(step, plan, scoped, fresh)
+        self.requirements.update(requirements, plan, delivered)
+        self._record_research_gaps(step, plan, scoped, new_requirement_ids=fresh)
+
+    def _validate_gap_scope(
+        self,
+        step: IssueResearchStep,
+        plan: IssueResearchPlan,
+        need_ids: set[str] | None = None,
+        new_requirement_ids: set[str] | None = None,
+    ) -> None:
+        needs = {need.need_id: need for need in plan.needs}
+        scope = set(needs) if need_ids is None else need_ids
+        if scope - set(needs) or set(step.issue_gaps) - scope:
+            raise InvalidSourceAction(
+                "Research gaps refer to an unknown or unaffected issue"
+            )
+        candidates = {row.requirement_id: row for row in step.requirements}
+        fresh = (
+            new_requirement_ids
+            if new_requirement_ids is not None
+            else (
+                set(candidates)
+                - {row.requirement_id for row in self.requirements.records()}
+            )
+        )
+        seen: set[tuple[str, str]] = set()
+        for resolution in step.gap_resolutions:
+            identity = (resolution.need_id, resolution.gap)
+            if (
+                resolution.need_id not in scope
+                or identity in seen
+                or resolution.gap
+                not in {
+                    *needs[resolution.need_id].evidence_gaps,
+                    *(
+                        row.gap
+                        for row in needs[resolution.need_id].evidence_gap_resolutions
+                    ),
+                }
+                or resolution.need_id not in step.issue_gaps
+                or resolution.gap in step.issue_gaps[resolution.need_id]
+                or len(resolution.requirement_ids)
+                != len(set(resolution.requirement_ids))
+                or not set(resolution.requirement_ids) <= fresh
+                or any(
+                    key not in candidates
+                    or candidates[key].need_id != resolution.need_id
+                    for key in resolution.requirement_ids
+                )
+            ):
+                raise InvalidSourceAction(
+                    "Gap closure lacks a fresh same-issue requirement binding"
+                )
+            seen.add(identity)
+
+    def _record_research_gaps(
+        self,
+        step: IssueResearchStep,
+        plan: IssueResearchPlan,
+        need_ids: set[str] | None = None,
+        *,
+        new_requirement_ids: set[str] | None = None,
+    ) -> None:
+        self._validate_gap_scope(step, plan, need_ids, new_requirement_ids)
+        scope = {need.need_id for need in plan.needs} if need_ids is None else need_ids
+        active_ids = {row.requirement_id for row in self.requirements.records()}
+        resolutions = {
+            (row.need_id, row.gap): row
+            for row in step.gap_resolutions
+            if set(row.requirement_ids) <= active_ids
+        }
+        for need in plan.needs:
+            if need.need_id not in scope:
+                continue
+            if need.need_id in step.issue_gaps:
+                proposed = list(step.issue_gaps[need.need_id])
+                retained = []
+                for old_gap in need.evidence_gaps:
+                    resolution = resolutions.get((need.need_id, old_gap))
+                    if old_gap not in proposed and resolution is None:
+                        retained.append(old_gap)
+                need.evidence_gaps = list(dict.fromkeys([*proposed, *retained]))
+                for resolution in step.gap_resolutions:
+                    if resolution.need_id == need.need_id:
+                        # The sole semantic reviewer must verify the latest exact interaction.
+                        need.evidence_gap_resolutions.append(
+                            resolution.model_copy(deep=True)
+                        )
+            elif step.remaining_gaps and not step.issue_gaps:
+                need.evidence_gaps = list(
+                    dict.fromkeys([*need.evidence_gaps, *step.remaining_gaps])
+                )
+        self.research_gaps = list(
+            dict.fromkeys(
+                [
+                    *step.remaining_gaps,
+                    *(gap for need in plan.needs for gap in need.evidence_gaps),
+                ]
+            )
+        )

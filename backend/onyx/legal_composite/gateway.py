@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.models import RunStopped
 from onyx.legal_composite.budget import CallReservation, WorkflowBudget
+from onyx.legal_composite.models import IssueResearchStep
 from onyx.llm.cost import ModelPrice, get_model_price_per_million
 from onyx.llm.cost_overrides import get_override
 from onyx.llm.interfaces import LLM, LLMUserIdentity
@@ -42,6 +43,7 @@ from onyx.tracing.llm_utils import llm_generation_span, record_llm_response
 
 ResponseModel = TypeVar("ResponseModel", bound=BaseModel)
 _RESEARCH_OUTPUT_TOKENS = 2_048
+_REQUIREMENTS_OUTPUT_TOKENS = 6_144
 _PROTOCOL_TOKEN_MARGIN = 256
 _TOKEN_ESTIMATE_MARGIN = 1.25
 _COMPATIBILITY_ATTEMPTS = 3
@@ -195,6 +197,8 @@ class BudgetedGateway:
         reasoning_effort: ReasoningEffort = ReasoningEffort.AUTO,
         run_id: str | None = None,
         scope: dict[str, JsonValue] | None = None,
+        reserve_finalization: bool = True,
+        max_parallel_generations: int = 1,
     ) -> None:
         self.selected_llm = selected_llm
         self.research_llm = research_llm
@@ -224,10 +228,15 @@ class BudgetedGateway:
                 ANTHROPIC_REASONING_EFFORT_BUDGET.get(reasoning_effort, 0) + 1,
             )
         self._prices: dict[tuple[str, str], ModelPrice] = {}
-        self._model_slot = BoundedSemaphore(1)
+        if (
+            isinstance(max_parallel_generations, bool)
+            or not 1 <= max_parallel_generations <= 4
+        ):
+            raise ValueError("Parallel generation count must be between one and four")
+        self._model_slot = BoundedSemaphore(max_parallel_generations)
         for llm in (selected_llm, research_llm):
             self.check_active()
-            budget.check_active()
+            budget.check_active(finalizing=not reserve_finalization)
             config = llm.config
             _validate_budgeted_provider_config(config.custom_config or {})
             self._prices[(config.model_provider, config.model_name)] = _priced_model(
@@ -242,12 +251,13 @@ class BudgetedGateway:
         final_input = min(
             budget.policy.max_context_tokens, selected_llm.config.max_input_tokens
         )
-        budget.configure_finalization(
-            final_input,
-            self._final_output_tokens,
-            (final_input * input_rate + self._final_output_tokens * output_rate)
-            / 1_000_000,
-        )
+        if reserve_finalization:
+            budget.configure_finalization(
+                final_input,
+                self._final_output_tokens,
+                (final_input * input_rate + self._final_output_tokens * output_rate)
+                / 1_000_000,
+            )
 
     def _price(self, llm: LLM) -> ModelPrice:
         config = llm.config
@@ -262,6 +272,7 @@ class BudgetedGateway:
         response_format: dict[str, JsonValue],
         *,
         finalizing: bool = False,
+        output_tokens: int = _RESEARCH_OUTPUT_TOKENS,
     ) -> tuple[list[ChatCompletionMessage], int, list[dict[str, JsonValue]]]:
         body = cast(dict[str, JsonValue], json.loads(json.dumps(payload)))
         raw_records = body.get("original_evidence", [])
@@ -303,7 +314,7 @@ class BudgetedGateway:
             cap = min(
                 cap,
                 self.budget.affordable_input_tokens(
-                    _RESEARCH_OUTPUT_TOKENS,
+                    output_tokens,
                     price.input_per_mtok,
                     price.output_per_mtok,
                 ),
@@ -665,11 +676,21 @@ class BudgetedGateway:
                 "strict": False,
             },
         }
-        messages, input_tokens, records = self._fit_messages(
-            system, payload, schema, llm, response_format, finalizing=finalizing
-        )
         output_tokens = (
-            _RESEARCH_OUTPUT_TOKENS if research else self._final_output_tokens
+            _REQUIREMENTS_OUTPUT_TOKENS
+            if response_type is IssueResearchStep
+            else _RESEARCH_OUTPUT_TOKENS
+            if research
+            else self._final_output_tokens
+        )
+        messages, input_tokens, records = self._fit_messages(
+            system,
+            payload,
+            schema,
+            llm,
+            response_format,
+            finalizing=finalizing,
+            output_tokens=output_tokens,
         )
         reservation, response = self._generate(
             llm,

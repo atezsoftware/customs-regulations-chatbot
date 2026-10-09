@@ -31,6 +31,7 @@ from onyx.db.models import User
 from onyx.legal_composite import runtime
 from onyx.legal_composite.acquisition import CanonicalAcquirer
 from onyx.legal_composite.models import SourceAction, WorkflowResult
+from onyx.legal_composite.requirements import RequirementLedger
 from onyx.legal_composite.routing import SourceLaneRouter
 from onyx.llm.interfaces import LLM, LLMConfig
 from onyx.server.query_and_chat.streaming_models import (
@@ -86,6 +87,7 @@ def harness(monkeypatch: pytest.MonkeyPatch) -> RuntimeHarness:
             self, ledger: EvidenceLedger, report: Callable[[str, str], None]
         ) -> None:
             self.ledger = ledger
+            self.requirements = RequirementLedger(ledger)
             self.report = report
 
         def run(
@@ -167,6 +169,7 @@ def harness(monkeypatch: pytest.MonkeyPatch) -> RuntimeHarness:
     monkeypatch.setattr(runtime, "bind_pc_corpus_scope", bind_scope)
 
     monkeypatch.setattr(runtime, "build_source_selector", lambda **_kwargs: None)
+    monkeypatch.setattr(runtime, "build_answer_reviewer", lambda **_kwargs: MagicMock())
     monkeypatch.setattr(runtime.CompositeSearchTool, "from_fork", lambda _fork: _fork)
 
     def broker_factory(user: User, scope: IndexFilters) -> MagicMock:

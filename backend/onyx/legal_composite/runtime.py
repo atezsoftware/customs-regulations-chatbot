@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 import time
 from collections.abc import Callable
 from uuid import UUID
@@ -44,12 +43,12 @@ from onyx.error_handling.exceptions import OnyxError
 from onyx.legal_composite.acquisition import CanonicalAcquirer
 from onyx.legal_composite.budget import WorkflowBudget
 from onyx.legal_composite.cancellation import PollingCancellation
-from onyx.legal_composite.dependencies import DependencyExpander
+from onyx.legal_composite.dependencies import CompositeDependencyExpander
 from onyx.legal_composite.engine import LegalCompositeEngine
 from onyx.legal_composite.gateway import BudgetedGateway
 from onyx.legal_composite.models import SourceAction, WorkflowPolicy
 from onyx.legal_composite.prompts import PROMPT_VERSION
-from onyx.legal_composite.providers import build_source_selector
+from onyx.legal_composite.providers import build_answer_reviewer, build_source_selector
 from onyx.legal_composite.routing import SourceLaneRouter
 from onyx.legal_composite.search import CompositeSearchTool
 from onyx.legal_composite.shared_work import SharedCanonicalCenters
@@ -183,17 +182,18 @@ def _run_legal_composite_loop(
 ) -> None:
     policy = WorkflowPolicy(
         timeout_seconds=420,
-        finalization_reserve_seconds=100,
-        max_cost_usd=math.inf,
+        finalization_reserve_seconds=140,
+        max_cost_usd=1.50,
+        max_call_seconds=75,
         max_context_tokens=128_000,
         final_output_tokens=8_192,
         max_input_tokens=2_000_000,
-        max_output_tokens=256_000,
-        max_model_calls=128,
-        max_tools=512,
+        max_output_tokens=128_000,
+        max_model_calls=48,
+        max_tools=192,
         max_parallel_tools=len(SourceKind),
-        max_search_calls=384,
-        max_research_rounds=2,
+        max_search_calls=96,
+        max_research_rounds=3,
         selection_reserve_seconds=12,
     )
     started = time.monotonic()
@@ -362,6 +362,7 @@ def _run_legal_composite_loop(
         context,
         ledger,
         policy,
+        coalesce_progress=True,
         registry_for_action=router.registry,
         expand_actions=router.expand,
         lane_inventory=router.inventory(),
@@ -372,7 +373,7 @@ def _run_legal_composite_loop(
             )
         ),
     )
-    dependency_expander = DependencyExpander(
+    dependency_expander = CompositeDependencyExpander(
         broker=broker,
         acquirer=acquirer,
         ledger=ledger,
@@ -384,6 +385,7 @@ def _run_legal_composite_loop(
     try:
         with get_session_with_current_tenant() as price_session:
             gateway = BudgetedGateway(
+                max_parallel_generations=4,
                 selected_llm=llm,
                 research_llm=research_llm or llm,
                 budget=budget,
@@ -407,10 +409,22 @@ def _run_legal_composite_loop(
                 run_id=context.run_id,
                 scope=context.scope,
             )
+            reviewer = build_answer_reviewer(
+                session=price_session,
+                user=user,
+                budget=budget,
+                ledger=ledger,
+                check_active=context.check_active,
+                token_counter=token_counter,
+                run_id=context.run_id,
+                scope=context.scope,
+            )
+            if reviewer is None:
+                raise RunStopped("No authorized answer reviewer is configured")
     except RunStopped as error:
         raise OnyxError(
             OnyxErrorCode.VALIDATION_ERROR,
-            "The selected model cannot fit the Legal Composite generation budget; select a priced, lower-cost model.",
+            "Legal Composite requires an authorized answer reviewer and a priced model that fits the generation budget.",
         ) from error
     if search is not None:
         search.llm = gateway.research_proxy()
@@ -496,7 +510,34 @@ def _run_legal_composite_loop(
         state_container.set_stop_notice(
             localized_notifications(language)["cancelled"][1]
         )
-        if phase == "selection":
+        if phase in {"review", "repair"}:
+            turkish = language.startswith("tr")
+            progress.report(
+                phase,
+                title=(
+                    "Cevap kaynaklarla denetleniyor"
+                    if phase == "review"
+                    else "Eksik bölüm düzeltiliyor"
+                )
+                if turkish
+                else (
+                    "Checking the answer against sources"
+                    if phase == "review"
+                    else "Repairing the affected section"
+                ),
+                message=(
+                    "Sorularınızın kapsamını, koşulları, istisnaları ve kaynakların cevabı desteklemesini denetliyorum."
+                    if phase == "review"
+                    else "Denetimde belirlenen eksikleri giderip değişen bölümleri yeniden kontrol ediyorum."
+                )
+                if turkish
+                else (
+                    "Checking issue coverage, conditions, exceptions and original source support."
+                    if phase == "review"
+                    else "Repairing identified gaps and rechecking the changed sections."
+                ),
+            )
+        elif phase == "selection":
             progress.report(
                 "tools",
                 title="Kaynak uygunluğu denetleniyor"
@@ -526,6 +567,8 @@ def _run_legal_composite_loop(
         selector=selector,
         dependency_expander=dependency_expander,
         source_kinds={str(row.source_id): row.kind for row in catalogue.records},
+        reviewer=reviewer,
+        evidence_context=context,
     )
     result = engine.run(question, history, custom_agent_prompt)
     snapshot: dict[str, JsonValue] = {
@@ -542,6 +585,9 @@ def _run_legal_composite_loop(
         "publication_status": result.status,
         "legal_composite": result.model_dump(mode="json"),
         "legal_composite_budget": budget.snapshot(),
+        "source_requirements": engine.requirements.export(),
+        "answer_reviewer": getattr(reviewer, "mode", "configured_decisions"),
+        "cost_scope": "Generation and Decisions calls only; embedding/reranker costs require separate reconciliation",
         "source_lane_inventory": router.inventory(),
         "source_selection": engine.selection.model_dump(mode="json")
         if engine.selection is not None
@@ -555,13 +601,14 @@ def _run_legal_composite_loop(
         "progress": emitted,
     }
     if result.answer is None or result.status == "cancelled":
-        save_asv3_checkpoint(
-            message_id=assistant_message_id, user_id=user.id, snapshot=snapshot
-        )
         words = localized_notifications(context.language)
         progress.report(
             "cancelled" if result.status == "cancelled" else "failed",
             status="failed",
+        )
+        snapshot["progress"] = emitted
+        save_asv3_checkpoint(
+            message_id=assistant_message_id, user_id=user.id, snapshot=snapshot
         )
         raise OnyxError(OnyxErrorCode.LLM_PROVIDER_ERROR, words["failed"][1])
     context.check_active()
