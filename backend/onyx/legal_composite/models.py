@@ -262,6 +262,7 @@ class ReviewCheck(StrictModel):
     section_ids: list[str]
     status: Literal["addressed", "not_applicable", "gap", "incorrect", "uncertain"]
     confidence: float = Field(ge=0, le=1, allow_inf_nan=False)
+    finding: str = Field(default="", max_length=600)
 
 
 class SemanticReview(StrictModel):

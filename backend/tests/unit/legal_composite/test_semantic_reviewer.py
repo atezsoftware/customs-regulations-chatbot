@@ -222,6 +222,12 @@ def test_one_typed_review_preserves_origins_host_ids_and_input_only_accounting(
         body = json.loads(request.content)
         calls.append(body)
         state = body.get("state") or json.loads(body["input"])
+        if state.get("review_purpose") == "request_coverage":
+            assert state["originals"] == []
+            assert state["sections"] == [
+                s.model_dump(mode="json") for s in draft.sections
+            ]
+            return httpx.Response(200, json=response(body))
         original = ledger.get(1)
         assert original is not None
         assert state["originals"][0]["text"] == original.text
@@ -241,15 +247,13 @@ def test_one_typed_review_preserves_origins_host_ids_and_input_only_accounting(
     assert result.failure is None
     assert {check.check_id for check in result.checks} == set(expected)
     assert all(check.status == "addressed" for check in result.checks)
-    assert len(calls) == 1
+    assert len(calls) == 2
     assert model.budget.snapshot()["estimated_cost_usd"] == pytest.approx(
-        476 * rate / 1_000_000, abs=5e-9
+        2 * 476 * rate / 1_000_000, abs=5e-9
     )
     assert model.budget.snapshot()["output_tokens"] == 0
-    assert (
-        ledger.delivery_flow(next(iter(model.budget._reservations)))
-        == "legal_composite_review"
-    )
+    flows = [ledger.delivery_flow(call_id) for call_id in model.budget._reservations]
+    assert flows.count("legal_composite_review") == 1 and flows.count(None) == 1
 
 
 def test_omitted_original_and_dependency_have_independent_checks() -> None:
@@ -313,7 +317,7 @@ def test_invalid_native_judgment_cannot_approve_and_does_not_retry(defect: str) 
     result = model.review("Question", plan, draft, requirements, [], {1})
     assert result.failure
     assert all(check.status == "uncertain" for check in result.checks)
-    assert calls == 1
+    assert calls == 2
 
 
 def test_low_probability_remains_uncertain_and_prior_approval_is_rechecked() -> None:
@@ -341,7 +345,7 @@ def test_low_probability_remains_uncertain_and_prior_approval_is_rechecked() -> 
         previous=prior,
         affected_sections=set(),
     )
-    assert calls == 2
+    assert calls == 4
     assert all(check.status == "uncertain" for check in result.checks)
 
 
@@ -349,15 +353,22 @@ def test_missing_or_oversized_original_is_never_clipped_or_certified() -> None:
     ledger, plan, draft, requirements = inputs("A complete required rule. " * 10_000)
     calls = 0
 
-    def handler(_request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx.Request) -> httpx.Response:
         nonlocal calls
         calls += 1
-        raise AssertionError("Oversized required context must not be sent")
+        body = json.loads(request.content)
+        assert set(body["questions"]) == {"request:coverage"}
+        assert body["state"]["originals"] == []
+        return httpx.Response(200, json=response(body))
 
     model = reviewer(ledger, handler)
     result = model.review("Question", plan, draft, requirements, [], {1})
-    assert calls == 0 and result.failure
-    assert all(check.status == "uncertain" for check in result.checks)
+    assert calls == 1 and result.failure
+    assert all(
+        check.status == "uncertain"
+        for check in result.checks
+        if check.check_id != "request:coverage"
+    )
 
 
 def test_parallel_partitions_are_bounded_to_four_and_originals_stay_whole(
@@ -415,7 +426,7 @@ def test_timeout_keeps_unknown_spend_reserved_and_returns_uncertain() -> None:
 
     model = reviewer(ledger, handler)
     result = model.review("Question", plan, draft, requirements, [], {1})
-    assert attempts == 1 and result.failure
+    assert attempts == 2 and result.failure
     assert "private" not in result.failure
     assert all(check.status == "uncertain" for check in result.checks)
     assert model.budget.snapshot()["estimated_cost_usd"] > 0
@@ -638,16 +649,23 @@ def test_original_omission_checks_cannot_certify_derived_or_misbound_sources(
         original.metadata[invalid] = True
     calls = 0
 
-    def handler(_request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx.Request) -> httpx.Response:
         nonlocal calls
         calls += 1
-        raise AssertionError("Unverified evidence must not reach reviewer")
+        body = json.loads(request.content)
+        assert set(body["questions"]) == {"request:coverage"}
+        assert body["state"]["originals"] == []
+        return httpx.Response(200, json=response(body))
 
     result = reviewer(ledger, handler).review(
         "Question", plan, draft, requirements, [], {1}
     )
-    assert calls == 0 and result.failure
-    assert all(check.status == "uncertain" for check in result.checks)
+    assert calls == 1 and result.failure
+    assert all(
+        check.status == "uncertain"
+        for check in result.checks
+        if check.check_id != "request:coverage"
+    )
 
 
 def test_precise_evidence_gap_and_unresolved_issue_reach_judge_without_becoming_missing_fact() -> (
@@ -663,6 +681,8 @@ def test_precise_evidence_gap_and_unresolved_issue_reach_judge_without_becoming_
         assert state["needs"][0]["evidence_gaps"] == plan.needs[0].evidence_gaps
         assert state["unresolved_need_ids"] == ["n1"]
         assert state["missing_user_facts"] == []
+        if state.get("review_purpose") == "request_coverage":
+            return httpx.Response(200, json=response(body))
         assert "specifically disclosed" in body["questions"]["issue:n1"]["instructions"]
         evidence_question = body["questions"]["evidence:n1"]
         assert (
@@ -778,6 +798,8 @@ def test_gap_resolution_retains_exact_old_interaction_and_active_original_suppor
         body = json.loads(request.content)
         state = body["state"]
         assert state["needs"][0]["evidence_gap_resolutions"][0]["gap"] == prior_gap
+        if state.get("review_purpose") == "request_coverage":
+            return httpx.Response(200, json=response(body))
         original = ledger.get(1)
         assert original is not None
         assert state["originals"][0]["text"] == original.text
@@ -837,6 +859,8 @@ def test_only_latest_explicit_refresh_of_same_named_gap_is_active_proof() -> Non
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
         assert "gap-resolution:n1:0" not in body["questions"]
+        if body["state"].get("review_purpose") == "request_coverage":
+            return httpx.Response(200, json=response(body))
         assert "gap-resolution:n1:1" in body["questions"]
         assert len(body["state"]["needs"][0]["evidence_gap_resolutions"]) == 2
         return httpx.Response(200, json=response(body))
@@ -892,9 +916,16 @@ def test_generation_reviewer_keeps_fixed_identity_whole_originals_and_no_alterna
             calls.append(payload)
             original = ledger.get(1)
             assert original is not None
-            assert payload["original_evidence"][0]["text"] == original.text
-            assert "text" not in payload["review_context"]["originals"][0]
-            assert payload["required_evidence_numbers"] == [1]
+            coverage_only = (
+                payload["review_context"].get("review_purpose") == "request_coverage"
+            )
+            if coverage_only:
+                assert payload["original_evidence"] == []
+                assert payload["required_evidence_numbers"] == []
+            else:
+                assert payload["original_evidence"][0]["text"] == original.text
+                assert "text" not in payload["review_context"]["originals"][0]
+                assert payload["required_evidence_numbers"] == [1]
             assert "unresolved_need_ids" in payload["review_context"]
             gateway.last_call_id = "generation-call"
             ledger.record_delivery(
@@ -935,14 +966,18 @@ def test_generation_reviewer_keeps_fixed_identity_whole_originals_and_no_alterna
         ledger=ledger,
     )
     result = model.review("Question", plan, draft, requirements, [], {1})
-    assert len(calls) == (1 if invalid is None else 2) and len(gateways) == 2
+    assert len(calls) == (2 if invalid is None else 3) and len(gateways) == 3
     assert ledger.completely_delivered("generation-call") == {1}
     if invalid is None:
         assert result.failure is None
         assert all(check.status == "addressed" for check in result.checks)
     else:
         assert result.failure is not None
-        assert all(check.status == "uncertain" for check in result.checks)
+        assert all(
+            check.status == "uncertain"
+            for check in result.checks
+            if check.check_id != "request:coverage" or invalid != "duplicate"
+        )
 
 
 def test_generation_batches_have_four_worker_overlap_and_independent_delivery_state() -> (
@@ -1185,7 +1220,8 @@ def test_cancel_does_not_wait_for_transport_or_certify_unfinished_call() -> None
         assert time.monotonic() - before < 1
         assert result.failure
         assert all(check.status == "uncertain" for check in result.checks)
-        assert model.budget.snapshot()["unsettled_calls"] == 1
+        unsettled = model.budget.snapshot()["unsettled_calls"]
+        assert isinstance(unsettled, int) and 1 <= unsettled <= 2
     finally:
         release.set()
 
@@ -1253,7 +1289,7 @@ def test_aggregate_checks_have_complete_delivered_issue_originals_before_require
         assert original is not None
         assert row["text"] == original.text and row["text_hash"] == original.text_hash
     assert state["requirements"] == [] and state["canonical_witnesses"] == []
-    assert checks["request:coverage"].citations == [1, 2, 3, 4, 5]
+    assert checks["request:coverage"].citations == []
 
 
 def test_explicit_requirement_and_claim_support_expand_the_actual_original_issue_scope() -> (
@@ -1319,7 +1355,10 @@ def test_first_generation_issue_batch_receives_whole_originals_without_registere
         ) -> Any:
             calls.append(payload)
             assert len(payload["expected_checks"]) <= 32
-            assert payload["original_evidence"]
+            if payload["review_context"].get("review_purpose") == "request_coverage":
+                assert payload["original_evidence"] == []
+            else:
+                assert payload["original_evidence"]
             assert all(
                 row["text"] == ledger._items[row["citation"]].text
                 for row in payload["original_evidence"]
@@ -1432,7 +1471,7 @@ def test_valid_compact_negative_judgment_is_bound_by_host_without_retry(
     model = _compact_mock_reviewer(ledger, complete)
     expected = model.expected_checks("Question", plan, draft, requirements, [], {1})
     result = model.review("Question", plan, draft, requirements, [], {1})
-    assert calls == 1 and result.failure is None
+    assert calls == 2 and result.failure is None
     assert [check.check_id for check in result.checks] == list(expected)
     for check in result.checks:
         original = expected[check.check_id]
@@ -1448,7 +1487,7 @@ def test_compact_protocol_does_not_retry_non_schema_stops(stop: str) -> None:
     result = _compact_mock_reviewer(ledger, complete).review(
         "Question", plan, draft, requirements, [], {1}
     )
-    assert complete.call_count == 1
+    assert complete.call_count == 2
     assert result.failure and all(
         check.status == "uncertain" for check in result.checks
     )
@@ -1484,7 +1523,7 @@ def test_invalid_compact_confidence_never_approves(confidence: object) -> None:
     result = _compact_mock_reviewer(ledger, complete).review(
         "Question", plan, draft, requirements, [], {1}
     )
-    assert calls == 2 and result.failure
+    assert calls == 3 and result.failure
     assert all(check.status == "uncertain" for check in result.checks)
 
 
@@ -1568,7 +1607,10 @@ def test_failed_review_exposes_only_safe_public_protocol_category_and_counts(
         "inventory": "ReviewInventoryError",
         "applicability": "ReviewApplicabilityError",
     }[defect]
-    assert result.failure and error_classes == [expected_class]
+    coverage_class = "ReviewSchemaError" if defect == "inventory" else expected_class
+    assert result.failure and sorted(error_classes) == sorted(
+        [expected_class, coverage_class]
+    )
     assert any(f"protocol={defect}" in summary for summary in summaries)
     assert any("protocol_retries=1" in summary for summary in summaries)
     assert all(
@@ -1604,12 +1646,16 @@ def test_protocol_retry_uses_real_gateway_budget_and_exact_original_delivery(
     def invoke(messages: Any, **_kwargs: Any) -> ModelResponse:
         body = json.loads(messages[1].content)
         calls.append(body)
-        assert body["original_evidence"][0]["text"] == ledger._items[1].text
+        if body["review_context"].get("review_purpose") == "request_coverage":
+            assert body["original_evidence"] == []
+        else:
+            assert body["original_evidence"][0]["text"] == ledger._items[1].text
         rows = [
             {"index": check["index"], "status": "addressed", "confidence": 0.99}
             for check in body["expected_checks"]
         ]
-        if len(calls) == 1:
+        legal_call_count = sum(bool(call["original_evidence"]) for call in calls)
+        if body["original_evidence"] and legal_call_count == 1:
             if malformed == "inventory":
                 rows.pop()
             else:
@@ -1643,11 +1689,12 @@ def test_protocol_retry_uses_real_gateway_budget_and_exact_original_delivery(
         config=model.config, gateway_factory=factory, budget=budget, ledger=ledger
     )
     result = judge.review("Question", plan, draft, requirements, [], {1})
-    assert result.failure is None and len(calls) == 2
-    assert calls[0] == calls[1]
+    assert result.failure is None and len(calls) == 3
+    legal_calls = [body for body in calls if body["original_evidence"]]
+    assert len(legal_calls) == 2 and legal_calls[0] == legal_calls[1]
     snapshot = budget.snapshot()
-    assert snapshot["model_calls"] == 2 and snapshot["unsettled_calls"] == 0
-    assert snapshot["input_tokens"] == 200 and snapshot["output_tokens"] == 20
+    assert snapshot["model_calls"] == 3 and snapshot["unsettled_calls"] == 0
+    assert snapshot["input_tokens"] == 300 and snapshot["output_tokens"] == 30
     delivery_calls = {delivery["call_id"] for delivery in ledger._deliveries}
     assert len(delivery_calls) == 2
     assert all(

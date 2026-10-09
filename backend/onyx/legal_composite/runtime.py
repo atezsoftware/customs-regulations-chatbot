@@ -44,7 +44,6 @@ from onyx.db.models import User
 from onyx.error_handling.error_codes import OnyxErrorCode
 from onyx.error_handling.exceptions import OnyxError
 from onyx.legal_composite.acquisition import CanonicalAcquirer
-from onyx.legal_composite.budget import WorkflowBudget
 from onyx.legal_composite.cancellation import PollingCancellation
 from onyx.legal_composite.dependencies import CompositeDependencyExpander
 from onyx.legal_composite.engine import LegalCompositeEngine
@@ -54,6 +53,7 @@ from onyx.legal_composite.prompts import PROMPT_VERSION
 from onyx.legal_composite.providers import build_answer_reviewer, build_source_selector
 from onyx.legal_composite.routing import SourceLaneRouter
 from onyx.legal_composite.search import CompositeSearchTool
+from onyx.legal_composite.settled_budget import SettledUsageBudget
 from onyx.legal_composite.shared_work import SharedCanonicalCenters
 from onyx.legal_composite.source_lanes import build_lane_broker
 from onyx.llm.factory import get_llm
@@ -388,7 +388,7 @@ def _run_legal_composite_loop(
         context=context,
         source_kinds={str(row.source_id): row.kind for row in catalogue.records},
     )
-    budget = WorkflowBudget(policy, deadline=context.deadline)
+    budget = SettledUsageBudget(policy, deadline=context.deadline)
     budget.retain_selection_time(policy.selection_reserve_seconds)
     try:
         with get_session_with_current_tenant() as price_session:

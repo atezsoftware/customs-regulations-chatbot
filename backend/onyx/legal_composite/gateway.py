@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import re
+from collections import Counter
 from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
@@ -62,6 +63,120 @@ _AUXILIARY_SPAN_FLOWS = {
     LLMFlow.CLASSIFY_SECTION_RELEVANCE.value,
     LLMFlow.SELECT_SECTIONS_FOR_EXPANSION.value,
 }
+_VALIDATION_ERROR_TYPES = frozenset(
+    {
+        "bool_parsing",
+        "bool_type",
+        "dict_type",
+        "extra_forbidden",
+        "float_parsing",
+        "float_type",
+        "greater_than",
+        "greater_than_equal",
+        "int_parsing",
+        "int_type",
+        "json_invalid",
+        "json_type",
+        "less_than",
+        "less_than_equal",
+        "list_type",
+        "literal_error",
+        "missing",
+        "model_type",
+        "none_required",
+        "string_too_long",
+        "string_too_short",
+        "string_type",
+        "too_long",
+        "too_short",
+        "union_tag_invalid",
+        "union_tag_not_found",
+        "value_error",
+    }
+)
+_VALIDATION_FIELDS = frozenset(
+    {
+        "actions",
+        "answer",
+        "checks",
+        "claims",
+        "deleted_claim_ids",
+        "gap_resolutions",
+        "initial_actions",
+        "issue_gaps",
+        "language",
+        "material_dependencies",
+        "missing_user_facts",
+        "needs",
+        "ready_to_answer",
+        "reconsider_citations",
+        "related_citations",
+        "remaining_gaps",
+        "requirements",
+        "requires_sources",
+        "sections",
+        "unresolved_need_ids",
+    }
+)
+
+
+def _record_typed_validation(
+    response_type: type[BaseModel], error: ValidationError | None = None
+) -> None:
+    """Expose only fixed schema categories, never model values or arbitrary locations."""
+    kinds: dict[type[BaseModel], str] = {
+        IssueResearchPlan: "research_plan",
+        IssueResearchStep: "research_step",
+        StructuredDraftAnswer: "draft_answer",
+        ClaimDeltaPatch: "claim_delta",
+    }
+    kind = kinds.get(response_type, "other")
+    types: Counter[str] = Counter()
+    fields: Counter[str] = Counter()
+    if error is not None:
+        for detail in error.errors(
+            include_url=False, include_context=False, include_input=False
+        ):
+            code = detail["type"]
+            types[code if code in _VALIDATION_ERROR_TYPES else "other_error"] += 1
+            location = detail["loc"]
+            field = location[0] if location else "root"
+            fields[
+                field
+                if isinstance(field, str) and field in _VALIDATION_FIELDS
+                else "root"
+                if not location
+                else "other"
+            ] += 1
+    validated = int(error is None)
+    count = error.error_count() if error is not None else 0
+    summary = f"model_kind={kind} validated={validated} errors={count}"
+    type_fragments = [
+        f"{name}={value}"
+        for name, value in sorted(types.items(), key=lambda item: (-item[1], item[0]))
+    ]
+    field_fragments = [
+        f"field_{name}={value}"
+        for name, value in sorted(fields.items(), key=lambda item: (-item[1], item[0]))
+    ]
+    for index in range(max(len(type_fragments), len(field_fragments))):
+        for fragments in (type_fragments, field_fragments):
+            if index < len(fragments):
+                fragment = fragments[index]
+                if len(summary) + len(fragment) + 1 <= 180:
+                    summary += " " + fragment
+    with graph_step(
+        "legal_composite.typed_validation",
+        {"model_kind": kind, "validated": validated, "errors": count},
+        summary=summary,
+    ) as step:
+        step.output_value = {
+            "model_kind": kind,
+            "validated": validated,
+            "errors": count,
+            "error_type_counts": dict(types),
+            "field_counts": dict(fields),
+        }
 
 
 class MissingRequiredOriginal(RunStopped):
@@ -812,7 +927,11 @@ class BudgetedGateway:
         try:
             result = response_type.model_validate_json(content, strict=True)
         except ValidationError as error:
+            if self.share_draft_context:
+                _record_typed_validation(response_type, error)
             raise RunStopped("The model response failed the workflow schema") from error
+        if self.share_draft_context:
+            _record_typed_validation(response_type)
         self.check_active()
         self.budget.check_response_active(finalizing)
         return result
