@@ -15,6 +15,8 @@ from onyx.tools.tool_implementations.search.search_tool import SearchTool
 
 
 class DiscoverySearchTool(SearchTool):
+    NORMALIZED_RERANK_THRESHOLD = 0.82
+
     @classmethod
     def from_fork(cls, fork: SearchTool) -> DiscoverySearchTool:
         instance = cls.__new__(cls)

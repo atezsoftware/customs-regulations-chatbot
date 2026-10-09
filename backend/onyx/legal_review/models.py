@@ -34,6 +34,8 @@ class ReviewCheck(BaseModel):
     instructions: str = Field(min_length=1)
     issue_id: str | None = None
     dimension: str | None = None
+    requirement_id: str | None = Field(default=None, min_length=1)
+    claim_id: str | None = Field(default=None, min_length=1)
 
 
 class ReviewResult(BaseModel):
@@ -206,9 +208,18 @@ class DimensionAssessment(StrictModel):
 class ReadingDecision(StrictModel):
     additional_issues: list[Issue] = Field(default_factory=list)
     requirements: list[Requirement] = Field(default_factory=list)
-    dimensions: list[DimensionAssessment] = Field(default_factory=list)
+    dimensions: list[DimensionAssessment] = Field(
+        description="Required assessment array: full matrix for initial or new issues; explicit sparse updates for previously assessed issues."
+    )
     actions: list[SourceAction] = Field(default_factory=list, max_length=16)
     evidence_gaps: list[str] = Field(default_factory=list)
+
+
+class InitialReadingDecision(ReadingDecision):
+    dimensions: list[DimensionAssessment] = Field(
+        min_length=len(LegalDimension),
+        description="Initial assessment: exactly all twelve dimensions for every known issue and any new source issue, with explicit addressed, not_applicable or unresolved reasoning.",
+    )
 
 
 class AnswerClaim(StrictModel):

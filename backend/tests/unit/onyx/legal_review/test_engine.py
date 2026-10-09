@@ -21,6 +21,7 @@ from onyx.legal_review.models import (
     DiscoveryQuery,
     DraftAnswer,
     InitialDiscoveryPlan,
+    InitialReadingDecision,
     Issue,
     IssuePlan,
     LegalDimension,
@@ -128,6 +129,7 @@ class FakeGateway:
     def __init__(self, results: list[BaseModel]) -> None:
         self.results = list(results)
         self.calls: list[tuple[LLMFlow, dict[str, JsonValue]]] = []
+        self.response_models: list[type[BaseModel]] = []
 
     def complete(
         self,
@@ -140,6 +142,7 @@ class FakeGateway:
     ) -> T:
         del prompt, finalizing
         self.calls.append((flow, state))
+        self.response_models.append(response_model)
         result = self.results.pop(0)
         payload = result.model_dump()
         if response_model is InitialDiscoveryPlan and type(result) is IssuePlan:
@@ -300,16 +303,14 @@ def test_source_text_is_not_truncated_to_fit_review() -> None:
     assert "text" not in originals[0]
 
 
-def test_host_completes_sparse_dimensions_with_unresolved_rows() -> None:
+def test_initial_reader_cannot_skip_any_standard_dimension() -> None:
     sparse = reading()
     sparse.dimensions.pop()
-    workflow, _, reviewer = engine([plan(), sparse, draft()], ["pass", "pass"])
+    workflow, _, reviewer = engine([plan(), sparse], [])
     result = workflow.run("Soru", "")
-    assert result.status == "partial"
-    assert len(result.dimensions) == 12
-    assert result.dimensions[-1].status == "unresolved"
-    assert result.dimensions[-1].requirement_ids == []
-    assert len(reviewer.states) == 2
+    assert result.status == "unavailable" and result.answer is None
+    assert result.dimensions == [] and result.requirements == []
+    assert reviewer.states == []
 
 
 def test_finding_can_support_multiple_dimensions_without_duplicate_extraction() -> None:
@@ -697,6 +698,33 @@ def test_model_cannot_supply_or_paraphrase_the_source_quotation() -> None:
         )
 
 
+def unresolved_reading(issue_ids: tuple[str, ...] = ("i1",)) -> ReadingDecision:
+    return ReadingDecision(
+        dimensions=[
+            DimensionAssessment(
+                issue_id=identity,
+                dimension=dimension,
+                status="unresolved",
+                reason="Bu boyutun maddi etkisi eldeki kaynaklarla henüz çözülemedi.",
+            )
+            for identity in issue_ids
+            for dimension in LegalDimension
+        ]
+    )
+
+
+def complete_assessments(
+    decision: ReadingDecision, issue_ids: tuple[str, ...]
+) -> ReadingDecision:
+    existing = {(row.issue_id, row.dimension) for row in decision.dimensions}
+    decision.dimensions.extend(
+        row
+        for row in unresolved_reading(issue_ids).dimensions
+        if (row.issue_id, row.dimension) not in existing
+    )
+    return decision
+
+
 def prepared_engine(*, shared: bool = False) -> LegalReviewEngine:
     workflow, _, _ = engine([], [])
     workflow.plan = plan()
@@ -731,7 +759,7 @@ def test_global_findings_can_be_shared_across_issues_and_dimensions() -> None:
             assessment("i2", LegalDimension.PROCEDURE, ["r1"]),
         ]
     )
-    workflow._accept_reading(extracted)
+    workflow._accept_reading(complete_assessments(extracted, ("i1", "i2")))
     assert len(workflow.requirements) == 1
     assert len(workflow.dimensions) == 24
     assert workflow._issue_requirements("i1") == workflow._issue_requirements("i2")
@@ -744,7 +772,10 @@ def test_sparse_updates_preserve_previous_assessments_and_complete_new_child() -
     workflow._accept_reading(reading())
     before = workflow.dimensions[0].model_copy(deep=True)
     workflow._accept_reading(
-        ReadingDecision(additional_issues=[source_issue(query=False)])
+        ReadingDecision(
+            dimensions=unresolved_reading(("s1",)).dimensions,
+            additional_issues=[source_issue(query=False)],
+        )
     )
     assert workflow.dimensions[0] == before
     child_rows = [row for row in workflow.dimensions if row.issue_id == "s1"]
@@ -790,7 +821,12 @@ def test_new_same_batch_supersession_chain_keeps_only_final_finding(
     workflow._accept_reading(
         ReadingDecision(
             requirements=records,
-            dimensions=[assessment("i1", LegalDimension.LEGAL_BASIS, ["r3"])],
+            dimensions=complete_assessments(
+                ReadingDecision(
+                    dimensions=[assessment("i1", LegalDimension.LEGAL_BASIS, ["r3"])]
+                ),
+                ("i1",),
+            ).dimensions,
         )
     )
     assert set(workflow.requirements) == {"r3"}
@@ -846,7 +882,7 @@ def test_supersession_invalidates_unupdated_shared_application_without_rebinding
     workflow = prepared_engine(shared=True)
     initial = reading()
     initial.dimensions.append(assessment("i2", LegalDimension.VALIDITY, ["r1"]))
-    workflow._accept_reading(initial)
+    workflow._accept_reading(complete_assessments(initial, ("i1", "i2")))
     replacement = requirement("r2")
     replacement.supersedes_requirement_ids = ["r1"]
     workflow._accept_reading(
@@ -935,7 +971,10 @@ def test_source_child_can_use_accepted_parent_association_history() -> None:
         )
     )
     workflow._accept_reading(
-        ReadingDecision(additional_issues=[source_issue(query=False)])
+        ReadingDecision(
+            dimensions=unresolved_reading(("s1",)).dimensions,
+            additional_issues=[source_issue(query=False)],
+        )
     )
     assert "s1" in workflow.source_issue_triggers
     assert workflow.source_issue_triggers["s1"][0][0].requirement_id == "r1"
@@ -944,14 +983,20 @@ def test_source_child_can_use_accepted_parent_association_history() -> None:
 def test_global_finding_associated_only_to_other_parent_cannot_trigger_child() -> None:
     workflow = prepared_engine(shared=True)
     workflow._accept_reading(
-        ReadingDecision(
-            requirements=[requirement()],
-            dimensions=[assessment("i2", LegalDimension.PROCEDURE, ["r1"])],
+        complete_assessments(
+            ReadingDecision(
+                requirements=[requirement()],
+                dimensions=[assessment("i2", LegalDimension.PROCEDURE, ["r1"])],
+            ),
+            ("i1", "i2"),
         )
     )
     with pytest.raises(ValueError, match="parent-backed requirement association"):
         workflow._accept_reading(
-            ReadingDecision(additional_issues=[source_issue(query=False)])
+            ReadingDecision(
+                dimensions=unresolved_reading(("s1",)).dimensions,
+                additional_issues=[source_issue(query=False)],
+            )
         )
 
 
@@ -985,7 +1030,12 @@ def test_honest_claimless_limitation_still_receives_entire_answer_review() -> No
         unresolved_issue_ids=["i1"],
     )
     workflow, gateway, reviewer = engine(
-        [plan(), ReadingDecision(), limited], ["pass", "pass"]
+        [
+            plan(),
+            unresolved_reading(),
+            limited,
+        ],
+        ["pass", "pass"],
     )
     result = workflow.run("Soru", "")
     assert result.status == "partial" and result.answer is not None
@@ -1002,7 +1052,15 @@ def test_claimless_positive_assertion_can_be_withheld_by_independent_review() ->
         unresolved_issue_ids=["i1"],
     )
     workflow, _, reviewer = engine(
-        [plan(), ReadingDecision(), unsupported, ReadingDecision(), unsupported],
+        [
+            plan(),
+            unresolved_reading(),
+            unsupported,
+            ReadingDecision(
+                dimensions=[],
+            ),
+            unsupported,
+        ],
         ["pass", "flag", "flag"],
     )
     result = workflow.run("Soru", "")
@@ -1034,15 +1092,19 @@ def test_archived_echo_cannot_resurrect_or_rewrite_obsolete_finding() -> None:
     workflow._accept_reading(reading())
     replacement = requirement("r2")
     replacement.supersedes_requirement_ids = ["r1"]
-    workflow._accept_reading(ReadingDecision(requirements=[replacement]))
-    workflow._accept_reading(ReadingDecision(requirements=[requirement()]))
+    workflow._accept_reading(ReadingDecision(dimensions=[], requirements=[replacement]))
+    workflow._accept_reading(
+        ReadingDecision(dimensions=[], requirements=[requirement()])
+    )
     assert set(workflow.requirements) == {"r2"}
     assert set(workflow.requirement_history) == {"r1"}
     modified = requirement()
     modified.rule = "Eski kimlikle yeni ve çelişkili bir yorum."
     before = stable_engine_state(workflow)
     with pytest.raises(ValueError, match="immutable"):
-        workflow._accept_reading(ReadingDecision(requirements=[modified]))
+        workflow._accept_reading(
+            ReadingDecision(dimensions=[], requirements=[modified])
+        )
     assert stable_engine_state(workflow) == before
 
 
@@ -1087,3 +1149,173 @@ def test_corrupted_current_original_fails_closed_and_preserves_frozen_child_audi
     assert result.status == "unavailable" and result.answer is None
     assert result.source_issue_triggers == before
     assert "authorized original passage" in result.gaps[-1]
+
+
+@pytest.mark.parametrize("schema", [ReadingDecision, InitialReadingDecision])
+def test_every_reading_schema_requires_explicit_dimensions_array(
+    schema: type[ReadingDecision],
+) -> None:
+    assert "dimensions" in schema.model_json_schema()["required"]
+    assert "default" not in schema.model_json_schema()["properties"]["dimensions"]
+    with pytest.raises(ValidationError):
+        schema.model_validate({"requirements": [], "actions": []})
+    if schema is InitialReadingDecision:
+        with pytest.raises(ValidationError):
+            schema.model_validate({"dimensions": []})
+    else:
+        assert schema.model_validate({"dimensions": []}).dimensions == []
+
+
+def test_initial_full_unresolved_assessment_advances_to_explicit_sparse_update() -> (
+    None
+):
+    workflow = prepared_engine()
+    assert isinstance(workflow.gateway, FakeGateway)
+    workflow.gateway.results = [unresolved_reading(), ReadingDecision(dimensions=[])]
+    contract = workflow.state("Soru", "")["reading_contract"]
+    assert isinstance(contract, dict)
+    assert contract["mode"] == "initial_assessment"
+    assert contract["full_matrix_required_issue_ids"] == ["i1"]
+    workflow._reading("Soru", "")
+    before = workflow.dimensions.copy()
+    workflow._reading("Soru", "")
+    assert workflow.gateway.response_models == [InitialReadingDecision, ReadingDecision]
+    assert workflow.dimensions == before and workflow.requirements == {}
+    assert all(row.status == "unresolved" for row in workflow.dimensions)
+    contract = workflow.state("Soru", "")["reading_contract"]
+    assert isinstance(contract, dict)
+    assert contract["mode"] == "assessment_update"
+    assert contract["full_matrix_required_issue_ids"] == []
+    assert contract["sparse_update_issue_ids"] == ["i1"]
+
+
+def test_rejected_initial_matrix_does_not_advance_reader_phase() -> None:
+    workflow = prepared_engine()
+    assert isinstance(workflow.gateway, FakeGateway)
+    workflow.gateway.results = [ReadingDecision(dimensions=[]), unresolved_reading()]
+    with pytest.raises(ValidationError):
+        workflow._reading("Soru", "")
+    assert workflow.dimensions == [] and workflow.requirements == {}
+    workflow._reading("Soru", "")
+    assert workflow.gateway.response_models == [
+        InitialReadingDecision,
+        InitialReadingDecision,
+    ]
+
+
+def test_first_assessment_must_cover_every_known_issue_atomically() -> None:
+    workflow = prepared_engine(shared=True)
+    before = stable_engine_state(workflow)
+    with pytest.raises(ValueError, match="every standard dimension"):
+        workflow._accept_reading(reading())
+    assert stable_engine_state(workflow) == before
+
+
+def test_new_source_issue_needs_complete_model_assessment_before_adoption() -> None:
+    workflow = prepared_engine()
+    workflow._accept_reading(reading())
+    before = stable_engine_state(workflow)
+    replacement = requirement("r2")
+    replacement.supersedes_requirement_ids = ["r1"]
+    incomplete = unresolved_reading(("s1",))
+    incomplete.dimensions.pop()
+    incomplete.dimensions.append(assessment("i1", LegalDimension.LEGAL_BASIS, ["r2"]))
+    incomplete.additional_issues = [source_issue(query=False)]
+    incomplete.requirements = [replacement]
+    with pytest.raises(ValueError, match="every standard dimension"):
+        workflow._accept_reading(incomplete)
+    assert stable_engine_state(workflow) == before
+
+
+def test_new_child_full_matrix_preserves_existing_issues_without_reemission() -> None:
+    workflow = prepared_engine(shared=True)
+    workflow._accept_reading(complete_assessments(reading(), ("i1", "i2")))
+    old_rows = [row.model_copy(deep=True) for row in workflow.dimensions]
+    child = unresolved_reading(("s1",))
+    child.additional_issues = [source_issue(query=False)]
+    workflow._accept_reading(child)
+    assert workflow.dimensions[:24] == old_rows
+    assert len(workflow.dimensions) == 36
+    assert all(row.status == "unresolved" for row in workflow.dimensions[24:])
+    assert all("not yet been assessed" not in row.reason for row in workflow.dimensions)
+
+
+def test_supersession_unresolved_application_is_assessed_and_accepts_empty_delta() -> (
+    None
+):
+    workflow = prepared_engine()
+    workflow._accept_reading(reading())
+    replacement = requirement("r2")
+    replacement.supersedes_requirement_ids = ["r1"]
+    workflow._accept_reading(ReadingDecision(requirements=[replacement], dimensions=[]))
+    assert workflow.dimensions[0].status == "unresolved"
+    assert workflow.plan is not None
+    assert workflow._required_assessment_issue_ids(workflow.plan) == []
+    workflow._accept_reading(ReadingDecision(dimensions=[]))
+    assert workflow.dimensions[0].status == "unresolved"
+
+
+def test_active_finding_and_literal_claim_checks_are_bound_in_existing_batches() -> (
+    None
+):
+    workflow, gateway, reviewer = engine([plan(), reading(), draft()], ["pass", "pass"])
+    result = workflow.run("Soru", "")
+    assert result.status == "partial"
+    assert len(gateway.calls) == 3 and len(reviewer.states) == 2
+    assert (
+        result.early_review is not None and "finding:r1" in result.early_review.scores
+    )
+    assert result.final_review is not None
+    assert {
+        "finding:r1",
+        "claim:c1",
+        "all_answer_claims",
+    } <= result.final_review.scores.keys()
+    finding = next(
+        check for check in workflow._checks(draft=False) if check.requirement_id
+    )
+    assert finding.id == "finding:r1" and finding.requirement_id == "r1"
+    assert "r1" in finding.instructions and "operative scope" in finding.instructions
+    assert (
+        "annulment" in finding.instructions
+        and "temporal effect" in finding.instructions
+    )
+    claim = next(
+        check
+        for check in workflow._checks(draft=True, answer=draft())
+        if check.claim_id
+    )
+    assert claim.id == "claim:c1" and claim.claim_id == "c1" and claim.issue_id == "i1"
+    assert "c1" in claim.instructions and "unrelated items" in claim.instructions
+
+
+def test_finding_checks_follow_active_versions_only() -> None:
+    workflow = prepared_engine()
+    workflow._accept_reading(reading())
+    replacement = requirement("r2")
+    replacement.supersedes_requirement_ids = ["r1"]
+    workflow._accept_reading(ReadingDecision(requirements=[replacement], dimensions=[]))
+    checks = workflow._checks(draft=False)
+    assert {check.requirement_id for check in checks if check.requirement_id} == {"r2"}
+    assert "finding:r1" not in {check.id for check in checks}
+
+
+@pytest.mark.parametrize("tamper", ["requirement_id", "instructions", "duplicate"])
+def test_review_flag_must_retain_exact_host_owned_finding_binding(tamper: str) -> None:
+    workflow = prepared_engine()
+    workflow._accept_reading(reading())
+    checks = workflow._checks(draft=False)
+    finding = next(check for check in checks if check.requirement_id == "r1")
+    scores = {check.id: 0.9 if check == finding else 0.1 for check in checks}
+    flags = [finding]
+    if tamper == "duplicate":
+        flags.append(finding)
+    else:
+        flags = [finding.model_copy(update={tamper: "different"})]
+    with patch.object(
+        workflow.reviewer,
+        "review",
+        return_value=ReviewResult(completed=True, scores=scores, flags=flags),
+    ):
+        result = workflow._review("Soru", "", None)
+    assert not result.completed and result.failure_reason == "review_inventory_invalid"

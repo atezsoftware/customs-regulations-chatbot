@@ -18,6 +18,7 @@ from onyx.legal_review.models import (
     DimensionAssessment,
     DraftAnswer,
     InitialDiscoveryPlan,
+    InitialReadingDecision,
     IssueClosure,
     IssuePlan,
     LegalDimension,
@@ -181,11 +182,29 @@ class LegalReviewEngine:
         self, request: str, history: str, draft: DraftAnswer | None = None
     ) -> dict[str, JsonValue]:
         originals: list[JsonValue] = list(canonical_evidence_view(self.ledger))
+        full_required = (
+            self._required_assessment_issue_ids(self.plan) if self.plan else []
+        )
+        full_required_set = set(full_required)
         return {
             "request": request,
             "history": history,
             "plan": self.plan.model_dump(mode="json") if self.plan else None,
             "standard_dimensions": [dimension.value for dimension in LegalDimension],
+            "reading_contract": {
+                "mode": "assessment_update"
+                if self.dimensions
+                else "initial_assessment",
+                "full_matrix_required_issue_ids": full_required,
+                "sparse_update_issue_ids": [
+                    issue.issue_id
+                    for issue in self.plan.issues
+                    if issue.issue_id not in full_required_set
+                ]
+                if self.plan
+                else [],
+                "new_source_issues_require_full_matrix": True,
+            },
             "dimension_assessments": [
                 assessment.model_dump(mode="json") for assessment in self.dimensions
             ],
@@ -300,6 +319,17 @@ class LegalReviewEngine:
             history[previous] = pending.pop(previous)
         return pending, history
 
+    def _required_assessment_issue_ids(self, proposed: IssuePlan) -> list[str]:
+        previous = {(row.issue_id, row.dimension) for row in self.dimensions}
+        return [
+            issue.issue_id
+            for issue in proposed.issues
+            if any(
+                (issue.issue_id, dimension) not in previous
+                for dimension in LegalDimension
+            )
+        ]
+
     def _stage_dimensions(
         self,
         proposed: IssuePlan,
@@ -318,21 +348,28 @@ class LegalReviewEngine:
                     "Dimension assessments must be unique per issue and dimension"
                 )
             changes[key] = row
+        required = {
+            (issue_id, dimension)
+            for issue_id in self._required_assessment_issue_ids(proposed)
+            for dimension in LegalDimension
+        }
+        missing = required - changes.keys()
+        if missing:
+            raise ValueError(
+                "Initial and new issues require every standard dimension exactly once: "
+                + ", ".join(
+                    f"{issue_id}:{dimension.value}"
+                    for issue_id, dimension in sorted(missing)
+                )
+            )
         previous = {(row.issue_id, row.dimension): row for row in self.dimensions}
         result: list[DimensionAssessment] = []
         for issue in proposed.issues:
             for dimension in LegalDimension:
                 key = (issue.issue_id, dimension)
                 row = changes.get(key) or previous.get(key)
-                if row is None:
-                    row = DimensionAssessment(
-                        issue_id=issue.issue_id,
-                        dimension=dimension,
-                        status="unresolved",
-                        reason="This issue and dimension have not yet been assessed.",
-                    )
-                else:
-                    row = row.model_copy(deep=True)
+                assert row is not None
+                row = row.model_copy(deep=True)
                 if any(
                     identity not in requirements and identity not in history
                     for identity in row.requirement_ids
@@ -623,14 +660,16 @@ class LegalReviewEngine:
         decision = self.gateway.complete(
             READING_PROMPT,
             self.state(request, history, draft),
-            ReadingDecision,
+            InitialReadingDecision if not self.dimensions else ReadingDecision,
             LLMFlow.LEGAL_REVIEW_READING,
             finalizing=finalizing,
         )
         self._accept_reading(decision)
         return decision
 
-    def _checks(self, *, draft: bool) -> list[ReviewCheck]:
+    def _checks(
+        self, *, draft: bool, answer: DraftAnswer | None = None
+    ) -> list[ReviewCheck]:
         assert self.plan is not None
         purpose = (
             "Does the literal answer materially omit or misapply"
@@ -657,6 +696,28 @@ class LegalReviewEngine:
             for issue in self.plan.issues
             for dimension in LegalDimension
         ]
+        checks.extend(
+            ReviewCheck(
+                id=f"finding:{finding.requirement_id}",
+                requirement_id=finding.requirement_id,
+                instructions=(
+                    f"Does active global finding {finding.requirement_id} materially "
+                    "misinterpret its selected canonical passages or overgeneralize the "
+                    "rule beyond the original's operative scope, regime, persons, conditions, "
+                    "exceptions, deadline or event-date application? Judge this finding's "
+                    "rule and its linked assessment applications against the complete "
+                    "originals. An amendment or annulment must be bound to the exact norm "
+                    "and temporal effect; a sector-specific condition cannot establish a "
+                    "general rule. A real passage selector alone proves no entailment."
+                    + (
+                        " Also inspect this finding's use in the literal draft."
+                        if draft
+                        else ""
+                    )
+                ),
+            )
+            for finding in self.requirements.values()
+        )
         checks.extend(
             [
                 ReviewCheck(
@@ -690,6 +751,29 @@ class LegalReviewEngine:
                     ),
                 ]
             )
+            if answer is not None:
+                checks.extend(
+                    ReviewCheck(
+                        id=f"claim:{claim.claim_id}",
+                        claim_id=claim.claim_id,
+                        issue_id=claim.issue_ids[0]
+                        if len(claim.issue_ids) == 1
+                        else None,
+                        instructions=(
+                            f"Does draft claim {claim.claim_id}, associated with issues "
+                            f"{', '.join(claim.issue_ids)}, materially lack entailment from "
+                            "its selected canonical passages, omit a decisive condition or "
+                            "exception, or extend the supported assertion beyond the "
+                            "original's operative scope, regime or temporal effect? Locate "
+                            "the assertion this claim's selected supports purport to justify "
+                            "within its literal answer_excerpt. A rendered block may contain "
+                            "other separately inventoried claims; do not demand this claim "
+                            "independently support unrelated items in the shared block. "
+                            "Judge this bound claim and preserve factual qualifications."
+                        ),
+                    )
+                    for claim in answer.claims
+                )
         return checks
 
     def _review(
@@ -698,7 +782,7 @@ class LegalReviewEngine:
         assert self.plan is not None
         self.report("review", self.plan.language)
         self.context.check_active()
-        checks = self._checks(draft=draft is not None)
+        checks = self._checks(draft=draft is not None, answer=draft)
         state = self.state(request, history, draft)
         # Preserve actual facts and discovery limitations without duplicate source bodies.
         review_state = {
@@ -760,10 +844,13 @@ class LegalReviewEngine:
         )
         self.record_review_usage(result.input_tokens, result.output_tokens)
         self.context.check_active()
-        expected = {check.id for check in checks}
+        expected_checks = {check.id: check for check in checks}
+        expected = set(expected_checks)
         flags = {check.id for check in result.flags}
         if result.completed and (
-            set(result.scores) != expected
+            len(result.flags) != len(flags)
+            or any(flag != expected_checks.get(flag.id) for flag in result.flags)
+            or set(result.scores) != expected
             or not flags <= expected
             or flags != {key for key, value in result.scores.items() if value >= 0.5}
             or any(not 0 <= score <= 1 for score in result.scores.values())

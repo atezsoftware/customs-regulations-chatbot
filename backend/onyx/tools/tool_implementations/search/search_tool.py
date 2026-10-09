@@ -1248,6 +1248,7 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
     NAME = "internal_search"
     DISPLAY_NAME = "Internal Search"
     DESCRIPTION = "Search connected applications for information."
+    NORMALIZED_RERANK_THRESHOLD = 0.90
 
     def __init__(
         self,
@@ -2813,6 +2814,7 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
                     chunks=[section.center_chunk for section in candidate_sections],
                     scores=rerank_result.scores_by_chunk,
                     baseline_limit=max_selected_sections,
+                    threshold=self.NORMALIZED_RERANK_THRESHOLD,
                 )
                 guarded_decisions_advisory = (
                     isinstance(override_kwargs, SearchToolRetrievalOverrideKwargs)
