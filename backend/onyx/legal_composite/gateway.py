@@ -18,7 +18,13 @@ from sqlalchemy.orm import Session
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.models import RunStopped
 from onyx.legal_composite.budget import CallReservation, WorkflowBudget
-from onyx.legal_composite.models import IssueResearchPlan, IssueResearchStep
+from onyx.legal_composite.draft_context import encode_draft_context
+from onyx.legal_composite.draft_repair import ClaimDeltaPatch
+from onyx.legal_composite.models import (
+    IssueResearchPlan,
+    IssueResearchStep,
+    StructuredDraftAnswer,
+)
 from onyx.llm.cost import ModelPrice, get_model_price_per_million
 from onyx.llm.cost_overrides import get_override
 from onyx.llm.interfaces import LLM, LLMUserIdentity
@@ -56,6 +62,18 @@ _AUXILIARY_SPAN_FLOWS = {
     LLMFlow.CLASSIFY_SECTION_RELEVANCE.value,
     LLMFlow.SELECT_SECTIONS_FOR_EXPANSION.value,
 }
+
+
+class MissingRequiredOriginal(RunStopped):
+    """A mandatory canonical record is absent before provider admission."""
+
+
+class ModelContextLimit(RunStopped):
+    """Complete required context exceeds the configured model allowance."""
+
+
+class ResearchContextBudgetLimit(RunStopped):
+    """Complete required context exceeds the remaining priced allocation."""
 
 
 def _validate_budgeted_provider_config(settings: Mapping[str, object]) -> None:
@@ -199,6 +217,7 @@ class BudgetedGateway:
         scope: dict[str, JsonValue] | None = None,
         reserve_finalization: bool = True,
         max_parallel_generations: int = 1,
+        share_draft_context: bool = False,
     ) -> None:
         self.selected_llm = selected_llm
         self.research_llm = research_llm
@@ -208,6 +227,9 @@ class BudgetedGateway:
         self.check_active = check_active
         self.token_counter = token_counter
         self.reasoning_effort = reasoning_effort
+        if not isinstance(share_draft_context, bool):
+            raise ValueError("Draft context sharing must be an explicit boolean")
+        self.share_draft_context = share_draft_context
         self._trace_binding: dict[str, str] = {}
         if run_id is not None:
             self._trace_binding["legal_composite_run_id"] = run_id
@@ -295,7 +317,7 @@ class BudgetedGateway:
             and not isinstance(number, bool)
         }
         if required - recorded:
-            raise RunStopped(
+            raise MissingRequiredOriginal(
                 "A required original is absent from the generation payload"
             )
         omitted_raw = body.get("omitted_original_ids", [])
@@ -340,6 +362,46 @@ class BudgetedGateway:
                 ensure_ascii=False,
             )
             input_tokens = _estimated_input_tokens(protocol, self.token_counter)
+            if self.share_draft_context and isinstance(body.get("draft"), dict):
+                encoding = encode_draft_context(body)
+                if encoding is not None:
+                    compact_messages: list[ChatCompletionMessage] = [
+                        SystemMessage(
+                            content=system
+                            + "\n"
+                            + encoding.policy
+                            + "\nReturn one JSON object matching this schema:\n"
+                            + schema
+                        ),
+                        UserMessage(
+                            content=json.dumps(encoding.payload, ensure_ascii=False)
+                        ),
+                    ]
+                    compact_protocol = json.dumps(
+                        {
+                            "messages": [
+                                message.model_dump(mode="json")
+                                for message in compact_messages
+                            ],
+                            "response_format": response_format,
+                        },
+                        ensure_ascii=False,
+                    )
+                    compact_tokens = _estimated_input_tokens(
+                        compact_protocol, self.token_counter
+                    )
+                    if compact_tokens < input_tokens:
+                        with graph_step(
+                            "legal_composite.generation_context_fit",
+                            {},
+                            summary=f"baseline_tokens={input_tokens} input_tokens={compact_tokens} saved_tokens={input_tokens - compact_tokens}",
+                        ) as context_step:
+                            context_step.output_value = {
+                                "baseline_tokens": input_tokens,
+                                "input_tokens": compact_tokens,
+                                "saved_tokens": input_tokens - compact_tokens,
+                            }
+                        messages, input_tokens = compact_messages, compact_tokens
             if input_tokens <= cap:
                 return messages, input_tokens, records
             removable = next(
@@ -351,10 +413,12 @@ class BudgetedGateway:
                 None,
             )
             if removable is None:
-                raise RunStopped(
-                    "Required originals and protocol exceed the remaining research budget"
-                    if cap < context_cap
-                    else "Required originals and protocol exceed the model context budget"
+                if cap < context_cap:
+                    raise ResearchContextBudgetLimit(
+                        "Required originals and protocol exceed the remaining research budget"
+                    )
+                raise ModelContextLimit(
+                    "Required originals and protocol exceed the model context budget"
                 )
             removed = records.pop(removable)
             number = removed.get("citation")
@@ -703,7 +767,12 @@ class BudgetedGateway:
             self.user_identity,
         )
         finish_reason = (response.choice.finish_reason or "").lower()
-        if response_type is IssueResearchPlan:
+        if response_type in {
+            IssueResearchPlan,
+            IssueResearchStep,
+            StructuredDraftAnswer,
+            ClaimDeltaPatch,
+        }:
             reason = (
                 finish_reason
                 if finish_reason
@@ -712,7 +781,9 @@ class BudgetedGateway:
             )
             characters = len(response.choice.message.content or "")
             with graph_step(
-                "legal_composite.plan_response",
+                "legal_composite.plan_response"
+                if response_type is IssueResearchPlan
+                else "legal_composite.typed_response",
                 {"response_type": response_type.__name__},
                 summary=f"finish_reason={reason} characters={characters} tool_calls={bool(response.choice.message.tool_calls)}",
             ) as step:

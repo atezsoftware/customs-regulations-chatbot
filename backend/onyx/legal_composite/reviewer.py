@@ -25,7 +25,13 @@ from onyx.legal_composite.decisions import (
     DecisionsTransportError,
     _estimated_decision_input_tokens,
 )
-from onyx.legal_composite.gateway import BudgetedGateway, _estimated_input_tokens
+from onyx.legal_composite.gateway import (
+    BudgetedGateway,
+    MissingRequiredOriginal,
+    ModelContextLimit,
+    ResearchContextBudgetLimit,
+    _estimated_input_tokens,
+)
 from onyx.legal_composite.models import (
     AuthorityDependency,
     PassageSupport,
@@ -1473,6 +1479,13 @@ class GatewayAnswerReviewer(_CanonicalReviewContext):
             tuple[BudgetedGateway, dict[str, JsonValue], list[ReviewQuestion], int]
         ] = []
         fit_counts = {"invalid_or_unavailable_context": 0, "context_or_budget_limit": 0}
+        fit_details = {
+            "required_missing": 0,
+            "model_capacity": 0,
+            "priced_allocation": 0,
+            "other_stop": 0,
+            "invalid_context": 0,
+        }
         accepted_baseline_tokens: list[int] = []
         accepted_context_tokens: list[int] = []
         compact_batches = 0
@@ -1539,6 +1552,18 @@ class GatewayAnswerReviewer(_CanonicalReviewContext):
                         else "invalid_or_unavailable_context"
                     )
                     fit_counts[category] += 1
+                    detail = (
+                        "required_missing"
+                        if isinstance(error, MissingRequiredOriginal)
+                        else "model_capacity"
+                        if isinstance(error, ModelContextLimit)
+                        else "priced_allocation"
+                        if isinstance(error, ResearchContextBudgetLimit)
+                        else "other_stop"
+                        if isinstance(error, RunStopped)
+                        else "invalid_context"
+                    )
+                    fit_details[detail] += 1
                     check = group[0]
                     results[check.check_id] = self._uncertain(check)
                     failures.append(
@@ -1553,6 +1578,12 @@ class GatewayAnswerReviewer(_CanonicalReviewContext):
         pending = list(checks.values())
         for start in range(0, len(pending), 32):
             pack(pending[start : start + 32])
+        with graph_step(
+            "legal_composite.review_context_failures",
+            {},
+            summary=" ".join(f"{key}={value}" for key, value in fit_details.items()),
+        ) as detail_step:
+            detail_step.output_value = dict(fit_details)
         with graph_step(
             "legal_composite.review_context_fit",
             {},

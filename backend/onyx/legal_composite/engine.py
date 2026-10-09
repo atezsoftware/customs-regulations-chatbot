@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Callable
 from typing import Protocol, TypeVar
 
@@ -17,12 +18,17 @@ from onyx.legal_composite.dependencies import (
     dependency_required_citations,
     material_dependency_gaps,
 )
+from onyx.legal_composite.draft_repair import (
+    CLAIM_DELTA_PATCH_PROMPT,
+    ClaimDeltaPatch,
+    apply_claim_delta,
+    canonicalize_delta_supports,
+)
 from onyx.legal_composite.models import (
     AnswerReview,
     AuthorityDependency,
     CompositeWorkflowResult,
     DraftAnswer,
-    DraftPatch,
     GapResolution,
     IssueResearchPlan,
     IssueResearchStep,
@@ -39,14 +45,12 @@ from onyx.legal_composite.models import (
 )
 from onyx.legal_composite.prompts import (
     ANSWER_PROMPT,
-    PATCH_PROMPT,
     PLAN_PROMPT,
     RESEARCH_PROMPT,
     REVIEW_PROMPT,
 )
 from onyx.legal_composite.requirements import (
     RequirementLedger,
-    apply_patch,
     canonicalize_draft_supports,
     draft_binding_gaps,
     support_is_original,
@@ -58,6 +62,7 @@ from onyx.legal_composite.selection import (
     selection_request_from_ledger,
 )
 from onyx.tools.constants import REGULATORY_MAX_SEARCH_QUERY_CHARS
+from onyx.tracing.answer_graph import graph_step
 from onyx.tracing.flows import LLMFlow
 
 ResponseModel = TypeVar("ResponseModel", bound=BaseModel)
@@ -445,6 +450,40 @@ class LegalCompositeEngine:
         self.plan: ResearchPlan | None = None
         self.receipts: list[dict[str, JsonValue]] = []
         self.last_review: AnswerReview | None = None
+        self._research_seconds: list[float] = []
+        self._source_seconds: dict[str, float] = {}
+
+    def _repair_runway(self) -> float:
+        if not self.research_available():
+            return 0.0
+        if self.evidence_context is None:
+            return float("inf")
+        return max(0.0, self.evidence_context.research_deadline - time.monotonic())
+
+    def _repair_research_has_runway(self) -> bool:
+        planning = max(self._research_seconds, default=self.policy.max_call_seconds)
+        acquisition = min(
+            self._source_seconds.values(), default=self.policy.max_call_seconds
+        )
+        return (
+            self._repair_runway()
+            > planning + acquisition + self.policy.selection_reserve_seconds
+        )
+
+    def _repair_actions_have_runway(self, step: IssueResearchStep) -> bool:
+        tools = {action.tool for action in step.actions}
+        if step.material_dependencies:
+            tools.add("search_corpus")
+        acquisition = max(
+            (
+                self._source_seconds.get(tool, self.policy.max_call_seconds)
+                for tool in tools
+            ),
+            default=0.0,
+        )
+        return (
+            self._repair_runway() > acquisition + self.policy.selection_reserve_seconds
+        )
 
     def _payload(
         self,
@@ -656,6 +695,7 @@ class LegalCompositeEngine:
         ]
 
     def _acquire(self, actions: list[SourceAction], plan: ResearchPlan) -> bool:
+        started = time.monotonic()
         request: dict[str, JsonValue] | None = None
         if self.reviewer is not None:
             request = {
@@ -667,6 +707,12 @@ class LegalCompositeEngine:
             self._mark_deferred_initial_attempts(actions, "requested")
         try:
             self.receipts.extend(self.acquirer.acquire(actions, plan))
+            if self.reviewer is not None and actions:
+                elapsed = time.monotonic() - started
+                for tool in {action.tool for action in actions}:
+                    self._source_seconds[tool] = max(
+                        self._source_seconds.get(tool, 0.0), elapsed
+                    )
             if request is not None:
                 request["status"] = "completed"
                 self._mark_deferred_initial_attempts(actions, "attempted")
@@ -877,12 +923,15 @@ class LegalCompositeEngine:
         self, request: str, history: str, instructions: str | None
     ) -> WorkflowResult:
         self.check_active()
+        planning_started = time.monotonic()
         self.plan = self.gateway.complete(
             PLAN_PROMPT,
             self._payload(request, history, instructions=instructions),
             IssueResearchPlan if self.reviewer is not None else ResearchPlan,
             LLMFlow.LEGAL_COMPOSITE_RESEARCH,
         )
+        if self.reviewer is not None:
+            self._research_seconds.append(time.monotonic() - planning_started)
         if not source_free_social_request(request):
             self.plan = self.plan.model_copy(update={"requires_sources": True})
         plan = self.plan
@@ -909,12 +958,15 @@ class LegalCompositeEngine:
             try:
                 if self.reviewer is not None:
                     self.report("reading", plan.language)
+                reading_started = time.monotonic()
                 step = self.gateway.complete(
                     RESEARCH_PROMPT,
                     self._payload(request, history, instructions=instructions),
                     IssueResearchStep if self.reviewer is not None else ResearchStep,
                     LLMFlow.LEGAL_COMPOSITE_RESEARCH,
                 )
+                if self.reviewer is not None:
+                    self._research_seconds.append(time.monotonic() - reading_started)
             except RunStopped:
                 self.check_active()
                 break
@@ -1305,16 +1357,56 @@ class LegalCompositeEngine:
                 if section.section_id in affected
                 for need in section.need_ids
             }
-            missing_evidence = (
-                any(
-                    check.status in {"gap", "incorrect"}
-                    and check.check_id.startswith(("evidence:", "gap-resolution:"))
-                    for check in failed
+            missing_evidence = any(
+                check.status in {"gap", "incorrect"}
+                and check.check_id.startswith(("evidence:", "gap-resolution:"))
+                for check in failed
+            ) or any(dependency_gaps.values())
+            negative_counts: dict[str, int] = {}
+            for check in failed:
+                candidate_category = check.check_id.split(":", 1)[0].replace("-", "_")
+                category = (
+                    candidate_category
+                    if candidate_category
+                    in {
+                        "issue",
+                        "evidence",
+                        "dimension",
+                        "original",
+                        "requirement",
+                        "claim",
+                        "dependency",
+                        "summary",
+                        "request",
+                        "gap_resolution",
+                        "request_coverage",
+                        "cross_issue_consistency",
+                    }
+                    else "other"
                 )
-                or any(dependency_gaps.values())
-                or bool(undisclosed)
+                negative_counts[category] = negative_counts.get(category, 0) + 1
+            repair_research_ready = (
+                missing_evidence and self._repair_research_has_runway()
             )
-            if missing_evidence and self.research_available():
+            with graph_step(
+                "legal_composite.repair_plan",
+                {},
+                summary=(
+                    f"failed={len(failed)} binding={len(binding_gaps)} "
+                    f"law_gap={int(missing_evidence)} runway={int(repair_research_ready)} "
+                    + " ".join(
+                        f"{key}={value}"
+                        for key, value in sorted(negative_counts.items())
+                    )
+                )[:160],
+            ) as repair_step:
+                repair_step.output_value = {
+                    "failed_checks": len(failed),
+                    "binding_defects": len(binding_gaps),
+                    "missing_evidence": missing_evidence,
+                    "negative_check_categories": negative_counts,
+                }
+            if repair_research_ready:
                 repair_research = self._focused_payload(
                     request, history, draft, gaps, instructions, affected_needs, True
                 )
@@ -1351,15 +1443,16 @@ class LegalCompositeEngine:
                     self._reconsider_sources(
                         step.reconsider_citations, plan, affected_needs
                     )
-                    self._refresh_dependencies(
-                        request, plan, [], step.material_dependencies
-                    )
-                    before = set(self.ledger.citation_numbers())
-                    self._acquire(step.actions, plan)
-                    added = set(self.ledger.citation_numbers()) - before
-                    if added:
-                        self._select_sources(request, plan, added)
-                    self._refresh_dependencies(request, plan)
+                    if self._repair_actions_have_runway(step):
+                        self._refresh_dependencies(
+                            request, plan, [], step.material_dependencies
+                        )
+                        before = set(self.ledger.citation_numbers())
+                        self._acquire(step.actions, plan)
+                        added = set(self.ledger.citation_numbers()) - before
+                        if added:
+                            self._select_sources(request, plan, added)
+                        self._refresh_dependencies(request, plan)
                 except RunStopped:
                     self.check_active()
             patch_payload = self._focused_payload(
@@ -1376,18 +1469,19 @@ class LegalCompositeEngine:
             ]
             self.report("repair", plan.language)
             patch = self.gateway.complete(
-                PATCH_PROMPT,
+                CLAIM_DELTA_PATCH_PROMPT,
                 patch_payload,
-                DraftPatch,
+                ClaimDeltaPatch,
                 LLMFlow.LEGAL_COMPOSITE_ANSWER,
                 True,
             )
             try:
-                patch = canonicalize_draft_supports(
+                patch = canonicalize_delta_supports(
                     patch,
                     self.ledger,
                     set(getattr(self.gateway, "last_delivered_citations", set())),
                 )
+                candidate_draft = apply_claim_delta(draft, patch, affected)
                 self._accept_draft_reading(
                     patch.requirements,
                     patch.gap_resolutions,
@@ -1395,9 +1489,9 @@ class LegalCompositeEngine:
                     set(getattr(self.gateway, "last_delivered_citations", set())),
                     affected_needs,
                 )
+                draft = candidate_draft
             except InvalidSourceAction as error:
                 pending_binding_gaps.append(str(error))
-            draft = apply_patch(draft, patch, affected)
             delivered |= set(getattr(self.gateway, "last_delivered_citations", set()))
             previous = review
         return CompositeWorkflowResult(
