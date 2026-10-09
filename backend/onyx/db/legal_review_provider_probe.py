@@ -43,17 +43,12 @@ old_names = [f'evidence:issue_{i}:{d.value}' for i in range(1, 4) for d in Legal
 text = 'The supplied document explicitly requires a declaration before release.'
 instructions = 'Does the supplied document explicitly require a declaration before release?'
 probes = []
-large_text = text + "\n" + ("This is synthetic source material about declarations, conditions, dates, exceptions and procedure. " * 1650)
 if 'jev' in keys:
-    probes.append(('jev_large_synthetic', 'jev', 'https://openrouter.ai/api/v1/systemone', {
-        'model': 'typesafe/jev-1.13', 'state': large_text,
-        'questions': {name: {'type':'noul','instructions':instructions} for name in old_names}
-    }))
-if 'openai' in keys:
-    probes.append(('openai_decisions_large_synthetic', 'openai', 'https://api.openai.com/v1/decisions', {
-        'model': 'gpt-6-luna', 'input': large_text,
-        'questions': [{'type':'predicate','name':f'q{i:06d}','instructions':instructions} for i in range(39)]
-    }))
+    for name,state,instruction in [('jev_object_state', {'original_evidence':text},instructions),('jev_long_instruction',text,instructions+(' Check only the supplied declaration requirement.'*27))]:
+        probes.append((name, 'jev', 'https://openrouter.ai/api/v1/systemone', {
+            'model': 'typesafe/jev-1.13', 'state': state,
+            'questions': {check_name: {'type':'noul','instructions':instruction} for check_name in old_names}
+        }))
 results = []
 for name, credential_name, endpoint, payload in probes:
     start = time.monotonic()
