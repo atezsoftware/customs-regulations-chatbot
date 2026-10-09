@@ -83,7 +83,7 @@ _DIMENSION_QUESTIONS = {
 }
 _CRITERIA = {
     "addressed": "The draft accurately satisfies this check within the requested scope. A legally supported conditional answer may explicitly preserve unknown USER facts. Precise disclosure of an actual unread LAW interaction satisfies disclosure checks without resolving that law. Disclosure cannot make an unsupported positive claim true; claim and original checks still require entailment and preservation of decisive effects.",
-    "not_applicable": "The user's request scope, facts and actual supplied rules establish that this dimension cannot materially change the requested answer. Mere absence of evidence is insufficient.",
+    "not_applicable": "The user's request scope, facts and complete supplied originals affirmatively establish that this check's matter cannot materially change any bound requested outcome. Mere absence of evidence, missing original context or a contradicted rule is insufficient. A disqualifying condition or adverse effect on a requested route remains material.",
     "gap": "A necessary material matter, qualification, source, or disclosure within the requested scope is missing from the draft. Do not demand unrelated unasked rules.",
     "incorrect": "The draft contradicts or misapplies the supplied facts or originals.",
     "uncertain": "The supplied complete evidence does not establish a reliable judgment.",
@@ -102,7 +102,21 @@ _POLICY = (
     "canonical_witnesses are exact verified quotations, not a claim that surrounding "
     "originals were supplied in this batch. original_context_scope states which originals "
     "are complete here. Separate original omission checks inspect those whole originals. "
-    "Treat missing decisive evidence as uncertain or gap, never addressed or not_applicable."
+    "Never mark missing decisive law addressed or not_applicable in an evidence-completeness "
+    "or gap-resolution check. A supported issue answer with precise disclosure may satisfy "
+    "the issue/disclosure check while that evidence gap remains open. Disclosure never "
+    "validates an unsupported positive claim, omitted operative effect or incorrect rule; "
+    "missing original context needed to validate such a claim or effect remains uncertain "
+    "or gap. Research requirement records do not independently establish legal materiality. "
+    "For requirement checks, first verify the record's interpretation and materiality against "
+    "its complete supporting originals, the original request and facts. A disqualifying "
+    "condition or adverse effect on a requested route remains material even if eligibility "
+    "fails. If the record contradicts the original, choose incorrect and identify the record "
+    "to correct; never insert a disproved rule merely to satisfy the checklist. Requirement "
+    "not_applicable requires affirmative original/fact support that the record is incidental "
+    "or outside every bound requested outcome, and no material draft claim relies on it. "
+    "Missing law or context, an unsupported claim, a contradicted rule, or a condition whose "
+    "failure determines the requested outcome cannot be not_applicable."
 )
 _COVERAGE_POLICY = (
     "Evaluate explicit task coverage only, against the original request, all frozen needs "
@@ -269,7 +283,7 @@ def build_checks(
         # source-backed requirement or material claim has been registered.
         add(
             f"issue:{need.need_id}",
-            "Does the draft answer this need's actual question and required_outcome accurately using sufficient supplied operative evidence for that requested outcome, preserving material conditions? Completeness concerns the requested question, not every possible legal topic. A correct conditional answer preserving unknown USER facts is addressed and need not be an unresolved issue. If need.evidence_gaps is nonempty, every entry must be specifically disclosed in the matching section and this need must be listed in unresolved_need_ids. Missing LAW cannot become an unconditional positive conclusion.",
+            "Does the draft correctly answer this need's actual question and required_outcome within the available evidence, preserving all material conditions? Every positive legal conclusion must be supported by supplied operative originals. For each explicit unclosed need.evidence_gaps entry, addressed requires its precise scoped limitation in the matching section, this need in unresolved_need_ids, and no unsupported categorical conclusion about that unread interaction. A correct supported answer with that explicit limitation is addressed here; this does not certify evidence completeness or close the gap. Evidence and gap-resolution checks separately judge law completeness and closure. Missing or misleading disclosure is gap or incorrect. Supported conditional treatment of unknown USER facts does not create unread LAW. Completeness concerns the requested question, not every possible legal topic.",
             [need.need_id],
             sections,
             need_citations[need.need_id],
@@ -331,10 +345,11 @@ def build_checks(
         sections = [s.section_id for s in draft.sections if item.need_id in s.need_ids]
         add(
             f"requirement:{item.requirement_id}",
-            f"Does the draft include and correctly apply requirement {item.requirement_id}, preserving its complete rule, scope, qualifying conditions, exceptions and missing-user-fact boundary?",
+            f"Is requirement {item.requirement_id} correctly interpreted and material to this need's actual requested outcome under its complete supporting originals, the original request and facts? If material, does the draft correctly communicate and apply its operative rule, conditions, exceptions and missing-fact boundary? Apply the requirement materiality and not_applicable restrictions in review_policy; a research record alone does not establish an answer obligation.",
             [item.need_id],
             sections,
             {s.citation for s in item.supports},
+            True,
         )
     for claim in draft.claims:
         citations = {s.citation for s in claim.supports}

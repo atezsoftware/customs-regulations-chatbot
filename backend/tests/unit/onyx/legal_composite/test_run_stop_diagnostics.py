@@ -84,6 +84,14 @@ def test_legacy_consumer_does_not_emit_new_diagnostics(
     [
         ("Support span ID is not in this exact original", "span_identity"),
         ("Support quotation conflicts with its original span", "span_quotation"),
+        ("Repair cannot change a section's issue bindings", "patch_section_issue"),
+        ("Claim edits cannot move an existing claim", "patch_claim_move"),
+        ("Source requirement identities are immutable", "requirement_immutable"),
+        (
+            "Gap closure lacks a fresh same-issue requirement binding",
+            "gap_requirement_binding",
+        ),
+        ("Claim edits target an unknown section", "patch_sections"),
         ("private original identity and quotation", "source_action"),
     ],
 )

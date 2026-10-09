@@ -7,7 +7,7 @@ import pytest
 from pydantic import BaseModel, JsonValue
 
 from onyx.asv3.evidence import EvidenceLedger
-from onyx.legal_composite.draft_repair import ClaimDeltaPatch
+from onyx.legal_composite.claim_edits import ClaimRepairEdits
 from onyx.legal_composite.engine import LegalCompositeEngine
 from onyx.legal_composite.models import (
     AnswerSection,
@@ -61,16 +61,11 @@ class _Gateway:
                     "issue_gaps": {"a": [SOURCE_GAP]},
                 }
             )
-        assert response_type is ClaimDeltaPatch
+        assert response_type is ClaimRepairEdits
         affected = payload["affected_section_ids"]
         assert isinstance(affected, list)
         return response_type.model_validate(
             {
-                "sections": [
-                    section.model_copy(deep=True, update={"text": ""}).model_dump()
-                    for section in self.draft.sections
-                    if section.section_id in affected
-                ],
                 "claims": [],
                 "unresolved_need_ids": self.draft.unresolved_need_ids,
             }
@@ -294,7 +289,7 @@ def test_source_gap_is_researched_and_rechecked_before_last_allowed_review() -> 
 
     assert result.status == "partial" and SOURCE_GAP in result.gaps
     assert reviewer.calls == 2
-    assert gateway.calls == [StructuredDraftAnswer, IssueResearchStep, ClaimDeltaPatch]
+    assert gateway.calls == [StructuredDraftAnswer, IssueResearchStep, ClaimRepairEdits]
 
 
 @pytest.mark.parametrize(

@@ -683,7 +683,12 @@ def test_precise_evidence_gap_and_unresolved_issue_reach_judge_without_becoming_
         assert state["missing_user_facts"] == []
         if state.get("review_purpose") == "request_coverage":
             return httpx.Response(200, json=response(body))
-        assert "specifically disclosed" in body["questions"]["issue:n1"]["instructions"]
+        issue_instructions = body["questions"]["issue:n1"]["instructions"]
+        assert "precise scoped limitation" in issue_instructions
+        assert (
+            "does not certify evidence completeness or close the gap"
+            in issue_instructions
+        )
         evidence_question = body["questions"]["evidence:n1"]
         assert (
             "even when the draft correctly discloses it"
