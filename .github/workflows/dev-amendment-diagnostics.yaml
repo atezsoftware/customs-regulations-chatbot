@@ -1,4 +1,4 @@
-name: DEV legal review read-only preflight
+name: DEV legal review bounded provider probe
 
 on:
   workflow_dispatch:
@@ -74,7 +74,7 @@ jobs:
           IFS=$'\t' read -r pod container < /tmp/legal-review-target
           kubectl exec -i "$pod" -n customs-regulations-dev -c "$container" -- \
             sh -ec '. /vault/secrets/config; export PYTHONPATH=/app; exec python -' < \
-            backend/onyx/db/legal_review_dev_preflight.py
+            backend/onyx/db/legal_review_provider_probe.py
       - name: Verify the public frontend API reports the requested backend SHA
         if: always() && steps.target.outcome == 'success'
         shell: bash
