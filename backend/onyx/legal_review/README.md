@@ -58,7 +58,12 @@ ingest, relabel, reindex or change publication metadata.
    validates canonical identity and integrity. Requirements are global source
    findings without an issue owner, application or dimension field. Assessments
    alone bind findings to issues and dimensions; their reasons explain the specific
-   application. One finding can serve several issues and dimensions. The model
+   application. One finding can serve several issues and dimensions. The first
+   accepted reading must explicitly assess all twelve dimensions for every issue;
+   newly added issues also require their complete first assessment. Later calls
+   send an explicitly present `dimensions` array containing only changed rows.
+   Host-created unresolved placeholders never count as an accepted assessment.
+   The model
    returns sparse assessment updates, and code maintains the complete twelve-row
    matrix per issue. Unassessed rows remain unresolved and unchanged rows are
    retained. Corrections use explicit supersession; obsolete findings remain in
@@ -81,7 +86,11 @@ ingest, relabel, reindex or change publication metadata.
    proves absence of law or continued legal validity.
 6. **Early review — OpenAI Decisions:** one native Decisions HTTP request using
    `gpt-6-luna` checks all issue/dimension combinations
-   together, requested-outcome coverage and decisive source conditions. It receives
+   together, requested-outcome coverage and decisive source conditions. The same
+   batch also checks each active finding against its selected complete originals
+   for entailment, applicability conditions, exceptions and temporal effects.
+   Finding IDs bind these flags to a specific interpretation that can be corrected.
+   It receives
    complete retained originals, actual conversation facts and compact research
    receipts with query, status and access/truncation limitations. If the early source
    return has not been used, flags can direct that one return. Incomplete review
@@ -100,7 +109,10 @@ ingest, relabel, reindex or change publication metadata.
    unresolved issue IDs; it still undergoes complete independent review.
 8. **Draft review — OpenAI Decisions:** independently check all dimensions, the
    entire answer's coverage, every material legal assertion (including assertions absent from the
-   planned issues), source conditions and consistency across issues. Reviewer scores are
+   planned issues), source conditions and consistency across issues. The same
+   request includes finding-bound checks and claim-bound checks, so the repair can
+   locate the particular rule or literal block and its selected originals. These
+   predicates add no per-source calls or extra review rounds. Reviewer scores are
    defect probabilities; scores at or above `0.5` flag the bound question. A flag is
    a suspicion to investigate, not a legal finding.
 9. **Optional repair:** permit one post-draft evidence-directed repair. The reader
@@ -203,6 +215,12 @@ they are **not** included in the Gemini/Decisions token totals or the 32-admissi
 No total dollar-price or live latency guarantee follows from the stage counts.
 
 ## Default limits and cancellation
+
+The owned Legal Review search fork uses an inclusive `0.82` threshold on the
+global min-max normalized external reranker score. Selection retains the baseline
+candidate coverage and adds the complete qualifying score band. Other search
+workflow classes retain their existing `0.90` default. The search trace records the
+actual normalized threshold and selected identities.
 
 | Limit | Default |
 | --- | ---: |
