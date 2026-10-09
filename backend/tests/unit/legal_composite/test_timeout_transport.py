@@ -443,8 +443,8 @@ def test_late_canonical_compatibility_retry_cannot_republish_closed_capture(
         ),
         (
             StructuredDraftAnswer,
-            '{"sections":[{"section_id":"one","need_ids":["generic"],"text":"supported"}],"unresolved_need_ids":[]}',
-            ["unresolved_need_ids"],
+            '{"sections":[{"section_id":"one","need_ids":["generic"],"text":"supported"}],"claims":[],"unresolved_need_ids":[]}',
+            ["unresolved_need_ids", "sections", "claims"],
         ),
         (
             IssueResearchStep,

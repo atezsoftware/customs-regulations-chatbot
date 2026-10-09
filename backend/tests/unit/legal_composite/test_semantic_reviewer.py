@@ -15,6 +15,7 @@ import pytest
 
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.models import EvidenceItem, RunContext, RunStopped
+from onyx.asv3.witnesses import original_witness_spans
 from onyx.configs.constants import DocumentSource
 from onyx.context.search.models import SearchDoc
 from onyx.legal_composite import providers
@@ -28,6 +29,7 @@ from onyx.legal_composite.models import (
     GapResolution,
     PassageSupport,
     SourceRequirement,
+    SpanSupport,
     WorkflowPolicy,
 )
 from onyx.legal_composite.models import (
@@ -114,7 +116,7 @@ def inputs(
             dimension="legal_basis_and_hierarchy",
             rule="A permit is required for controlled goods.",
             application="Check the goods' control status.",
-            supports=[PassageSupport(citation=1, quotation=original.text)],
+            supports=[SpanSupport(citation=1, quotation=original.text)],
         )
     ]
     return ledger, plan, draft, requirements
@@ -681,6 +683,56 @@ def test_precise_evidence_gap_and_unresolved_issue_reach_judge_without_becoming_
     )
 
 
+def test_reviewer_preserves_selected_occurrences_of_repeated_original_text() -> None:
+    repeated = "x" * 800
+    ledger, plan, draft, requirements = inputs(repeated * 2)
+    spans = original_witness_spans(1, repeated * 2)
+    requirements[0].supports = [
+        SpanSupport(citation=1, quotation=repeated, span_id=span["witness_id"])
+        for span in spans
+    ]
+    judge = reviewer(ledger, lambda _: httpx.Response(500))
+    checks = judge.expected_checks("Question", plan, draft, requirements, [], {1})
+    payload = judge._payload(
+        "Question", plan, draft, requirements, [], list(checks.values()), {1}
+    )
+    state = cast(dict[str, Any], payload["state"])
+    witnesses = state["canonical_witnesses"]
+    assert [(w["start_char"], w["end_char"]) for w in witnesses] == [
+        (0, 800),
+        (800, 1600),
+    ]
+    assert all(w["quotation"] == repeated for w in witnesses)
+    assert (
+        judge._witness(PassageSupport(citation=1, quotation=repeated), {1})[
+            "start_char"
+        ]
+        == 0
+    )
+
+
+@pytest.mark.parametrize("defect", ["invented_id", "other_citation", "quotation"])
+def test_reviewer_rejects_a_false_span_even_with_a_real_original_quotation(
+    defect: str,
+) -> None:
+    text = "x" * 800 + "y" * 800
+    ledger, _, _, _ = inputs(text)
+    spans = original_witness_spans(1, text)
+    span_id = spans[1]["witness_id"]
+    quotation = "y" * 800
+    if defect == "invented_id":
+        span_id = "invented"
+    elif defect == "other_citation":
+        span_id = original_witness_spans(2, text)[1]["witness_id"]
+    else:
+        quotation = "x" * 800
+    judge = reviewer(ledger, lambda _: httpx.Response(500))
+    with pytest.raises(ValueError, match="span differs"):
+        judge._witness(
+            SpanSupport(citation=1, quotation=quotation, span_id=span_id), {1}
+        )
+
+
 def test_answer_omission_is_distinct_from_supplied_evidence_sufficiency() -> None:
     ledger, plan, draft, requirements = inputs()
 
@@ -1120,3 +1172,183 @@ def test_cancel_does_not_wait_for_transport_or_certify_unfinished_call() -> None
         assert model.budget.snapshot()["unsettled_calls"] == 1
     finally:
         release.set()
+
+
+def _unregistered_multi_issue_inputs() -> tuple[
+    EvidenceLedger, ResearchPlan, DraftAnswer
+]:
+    ledger, plan, _draft, _requirements = inputs(
+        "Complete original for the first issue, including its exception.",
+        "Complete original for the second issue, including its deadline.",
+        "Complete original for the third issue, including its remedy.",
+        "Complete original whose issue binding is absent.",
+        "Complete original whose issue binding is unknown to this plan.",
+        "Canonical original acquired but never delivered to the writer.",
+    )
+    bindings = [["n1"], ["n2"], ["n3"], [], ["unknown"], ["n1"]]
+    for citation, identities in enumerate(bindings, 1):
+        ledger._items[citation].question_ids = identities
+    plan.needs = [
+        ResearchNeed(
+            need_id=identity,
+            question=f"Explain the requested outcome for {identity}",
+            governing_source="",
+            conditions_to_check=[],
+        )
+        for identity in ("n1", "n2", "n3")
+    ]
+    draft = DraftAnswer(
+        unresolved_need_ids=[],
+        sections=[
+            AnswerSection(
+                section_id=f"s{index}", need_ids=[identity], text=f"Outcome {identity}."
+            )
+            for index, identity in enumerate(("n1", "n2", "n3"), 1)
+        ],
+        claims=[],
+    )
+    return ledger, plan, draft
+
+
+@pytest.mark.parametrize("identity,citation", [("n1", 1), ("n2", 2), ("n3", 3)])
+def test_aggregate_checks_have_complete_delivered_issue_originals_before_requirements(
+    identity: str, citation: int
+) -> None:
+    ledger, plan, draft = _unregistered_multi_issue_inputs()
+    model = reviewer(ledger, lambda _request: httpx.Response(500))
+    checks = model.expected_checks("Question", plan, draft, [], [], {1, 2, 3, 4, 5})
+    for prefix in ["evidence", "issue"]:
+        assert checks[f"{prefix}:{identity}"].citations == [citation, 4, 5]
+    for dimension in REVIEW_DIMENSIONS:
+        assert checks[f"dimension:{identity}:{dimension}"].citations == [citation, 4, 5]
+    body = model._payload(
+        "Question",
+        plan,
+        draft,
+        [],
+        [],
+        [checks[f"evidence:{identity}"]],
+        {1, 2, 3, 4, 5},
+    )
+    state = cast(dict[str, Any], body["state"])
+    assert [row["citation"] for row in state["originals"]] == [citation, 4, 5]
+    for row in state["originals"]:
+        original = ledger.get(row["citation"])
+        assert original is not None
+        assert row["text"] == original.text and row["text_hash"] == original.text_hash
+    assert state["requirements"] == [] and state["canonical_witnesses"] == []
+    assert checks["request:coverage"].citations == [1, 2, 3, 4, 5]
+
+
+def test_explicit_requirement_and_claim_support_expand_the_actual_original_issue_scope() -> (
+    None
+):
+    ledger, plan, draft = _unregistered_multi_issue_inputs()
+    original = ledger.get(2)
+    assert original is not None
+    requirement = SourceRequirement(
+        requirement_id="cross-issue-rule",
+        need_id="n1",
+        dimension="legal_basis_and_hierarchy",
+        rule="The second source also limits the first requested outcome.",
+        application="Apply only its supported condition.",
+        supports=[SpanSupport(citation=2, quotation=original.text)],
+    )
+    draft.claims = [
+        DraftClaim(
+            claim_id="third-issue-rule",
+            section_id="s3",
+            need_ids=["n3"],
+            answer_excerpt=draft.sections[2].text,
+            supports=[SpanSupport(citation=1, quotation=ledger._items[1].text)],
+        )
+    ]
+    model = reviewer(ledger, lambda _request: httpx.Response(500))
+    checks = model.expected_checks(
+        "Question", plan, draft, [requirement], [], {1, 2, 3}
+    )
+    assert checks["issue:n1"].citations == [1, 2]
+    assert checks["issue:n2"].citations == [2]
+    assert checks["issue:n3"].citations == [1, 3]
+    assert checks["original:1"].need_ids == ["n1", "n3"]
+    assert checks["original:2"].need_ids == ["n1", "n2"]
+    assert len([identity for identity in checks if identity == "original:2"]) == 1
+
+
+def test_first_generation_issue_batch_receives_whole_originals_without_registered_rules() -> (
+    None
+):
+    ledger, plan, draft = _unregistered_multi_issue_inputs()
+    calls: list[dict[str, Any]] = []
+    config = LLMConfig(
+        model_provider="openrouter",
+        model_name="openai/gpt-5.6-luna",
+        temperature=1,
+        api_key="test-not-real",
+        max_input_tokens=128_000,
+    )
+
+    def factory() -> BudgetedGateway:
+        gateway = Mock(spec=BudgetedGateway)
+        gateway.selected_llm = Mock(config=config)
+        gateway.last_call_id = None
+        gateway._fit_messages.return_value = ([], 100, [])
+
+        def complete(
+            _system: str,
+            payload: dict[str, Any],
+            response_type: Any,
+            *_args: Any,
+            **_kwargs: Any,
+        ) -> Any:
+            calls.append(payload)
+            assert len(payload["expected_checks"]) <= 32
+            assert payload["original_evidence"]
+            assert all(
+                row["text"] == ledger._items[row["citation"]].text
+                for row in payload["original_evidence"]
+            )
+            return response_type.model_validate(
+                {
+                    "checks": [
+                        {
+                            "check_id": check["check_id"],
+                            "need_ids": check["need_ids"],
+                            "section_ids": check["section_ids"],
+                            "status": "addressed",
+                            "confidence": 0.99,
+                        }
+                        for check in payload["expected_checks"]
+                    ]
+                }
+            )
+
+        gateway.complete.side_effect = complete
+        return gateway
+
+    model = GatewayAnswerReviewer(
+        config=config,
+        gateway_factory=factory,
+        budget=WorkflowBudget(WorkflowPolicy(max_context_tokens=128_000)),
+        ledger=ledger,
+    )
+    result = model.review("Question", plan, draft, [], [], {1, 2, 3, 4, 5})
+    assert result.failure is None
+    first_issue_batch = next(
+        body
+        for body in calls
+        if body["expected_checks"][0]["check_id"] == "evidence:n1"
+    )
+    identities = [check["check_id"] for check in first_issue_batch["expected_checks"]]
+    assert len(identities) == 32
+    assert all(
+        identity.startswith(("issue:", "evidence:", "dimension:"))
+        for identity in identities
+    )
+    assert first_issue_batch["required_evidence_numbers"] == [1, 2, 3, 4, 5]
+    assert len(first_issue_batch["original_evidence"]) == 5
+    assert first_issue_batch["review_context"]["requirements"] == []
+    assert first_issue_batch["review_context"]["canonical_witnesses"] == []
+    assert not any(
+        row["citation"] == 6 for body in calls for row in body["original_evidence"]
+    )

@@ -5,21 +5,26 @@ from __future__ import annotations
 import hashlib
 from collections import deque
 from collections.abc import Iterable
+from typing import TypeVar
 
 from pydantic import JsonValue
 
 from onyx.asv3.citation_numbers import extract_citation_numbers
 from onyx.asv3.evidence import EvidenceLedger
+from onyx.asv3.witnesses import original_witness_spans
 from onyx.legal_composite.acquisition import InvalidSourceAction
 from onyx.legal_composite.models import (
     DraftPatch,
     PassageSupport,
     ResearchPlan,
     SourceRequirement,
+    SpanSupport,
 )
 from onyx.legal_composite.models import (
     StructuredDraftAnswer as DraftAnswer,
 )
+
+DraftWithSupports = TypeVar("DraftWithSupports", DraftAnswer, DraftPatch)
 
 
 def support_is_original(
@@ -34,6 +39,18 @@ def support_is_original(
         item.search_doc.metadata,
         canonical if isinstance(canonical, dict) else {},
     ]
+    if isinstance(support, SpanSupport) and support.span_id is not None:
+        matches = [
+            span
+            for span in original_witness_spans(support.citation, item.text)
+            if span["witness_id"] == support.span_id
+        ]
+        if (
+            len(matches) != 1
+            or support.quotation
+            != item.text[matches[0]["start_char"] : matches[0]["end_char"]]
+        ):
+            return False
     return (
         bool(support.quotation.strip())
         and item.search_doc.document_id == item.source_id
@@ -46,6 +63,115 @@ def support_is_original(
             for key in ("external", "derived", "untrusted", "truncated")
         )
     )
+
+
+def canonicalize_source_support(
+    support: PassageSupport, ledger: EvidenceLedger, delivered: set[int]
+) -> SpanSupport:
+    """Resolve only host-provided selectors against the delivered immutable original."""
+    item = ledger.get(support.citation)
+    if item is None or not support_is_original(
+        PassageSupport(citation=support.citation, quotation=item.text),
+        ledger,
+        delivered,
+    ):
+        raise InvalidSourceAction(
+            "Support is not an exact delivered original: canonical original binding failed"
+        )
+    span_id = support.span_id if isinstance(support, SpanSupport) else None
+    quotation = support.quotation
+    if span_id is not None:
+        matches = [
+            span
+            for span in original_witness_spans(support.citation, item.text)
+            if span["witness_id"] == span_id
+        ]
+        if len(matches) != 1:
+            raise InvalidSourceAction("Support span ID is not in this exact original")
+        span = matches[0]
+        original = item.text[span["start_char"] : span["end_char"]]
+        if quotation and quotation != original:
+            raise InvalidSourceAction(
+                "Support quotation conflicts with its original span"
+            )
+        quotation = original
+    if not quotation.strip() or quotation not in item.text:
+        raise InvalidSourceAction(
+            "Support quotation is not an exact delivered original passage"
+        )
+    return SpanSupport(citation=support.citation, quotation=quotation, span_id=span_id)
+
+
+def canonicalize_source_requirement(
+    requirement: SourceRequirement, ledger: EvidenceLedger, delivered: set[int]
+) -> SourceRequirement:
+    return requirement.model_copy(
+        deep=True,
+        update={
+            "supports": [
+                canonicalize_source_support(support, ledger, delivered)
+                for support in requirement.supports
+            ]
+        },
+    )
+
+
+def canonicalize_draft_supports(
+    draft: DraftWithSupports, ledger: EvidenceLedger, delivered: set[int]
+) -> DraftWithSupports:
+    """Bind writer and repair references without altering their claims or answer text."""
+    claims = [
+        claim.model_copy(
+            deep=True,
+            update={
+                "supports": [
+                    canonicalize_source_support(support, ledger, delivered)
+                    for support in claim.supports
+                ]
+            },
+        )
+        for claim in draft.claims
+    ]
+    requirements = [
+        canonicalize_source_requirement(requirement, ledger, delivered)
+        for requirement in draft.requirements
+    ]
+    return draft.model_copy(
+        deep=True, update={"claims": claims, "requirements": requirements}
+    )
+
+
+def _original_binding(
+    support: SpanSupport, evidence: EvidenceLedger
+) -> dict[str, JsonValue] | None:
+    item = evidence.get(support.citation)
+    if (
+        item is None
+        or not support_is_original(support, evidence, {support.citation})
+        or support.quotation not in item.text
+    ):
+        return None
+    start = item.text.index(support.quotation)
+    if support.span_id is not None:
+        matches = [
+            span
+            for span in original_witness_spans(support.citation, item.text)
+            if span["witness_id"] == support.span_id
+        ]
+        if len(matches) != 1:
+            return None
+        start = matches[0]["start_char"]
+        if item.text[start : matches[0]["end_char"]] != support.quotation:
+            return None
+    return {
+        "citation": support.citation,
+        "source_id": item.source_id,
+        "chunk_id": item.chunk_id,
+        "text_hash": item.text_hash,
+        "span_id": support.span_id,
+        "start": start,
+        "end": start + len(support.quotation),
+    }
 
 
 class RequirementLedger:
@@ -64,6 +190,9 @@ class RequirementLedger:
         pending = dict(self._requirements)
         seen: set[str] = set()
         for requirement in requirements:
+            requirement = canonicalize_source_requirement(
+                requirement, self.evidence, delivered
+            )
             if requirement.requirement_id in seen:
                 raise InvalidSourceAction("Duplicate source requirement identity")
             seen.add(requirement.requirement_id)
@@ -139,18 +268,24 @@ class RequirementLedger:
             record["superseded_by_requirement_ids"] = sorted(
                 self._superseded_by.get(requirement.requirement_id, set())
             )
-            record["original_bindings"] = [
-                {
-                    "citation": support.citation,
-                    "source_id": item.source_id,
-                    "chunk_id": item.chunk_id,
-                    "text_hash": item.text_hash,
-                    "start": item.text.index(support.quotation),
-                    "end": item.text.index(support.quotation) + len(support.quotation),
-                }
-                for support in requirement.supports
-                if (item := self.evidence.get(support.citation)) is not None
-            ]
+            bindings: list[dict[str, JsonValue]] = []
+            binding_errors: list[dict[str, JsonValue]] = []
+            for support in requirement.supports:
+                binding = _original_binding(support, self.evidence)
+                if binding is None:
+                    binding_errors.append(
+                        {
+                            "citation": support.citation,
+                            "span_id": support.span_id,
+                            "status": "not_canonical_original",
+                        }
+                    )
+                else:
+                    bindings.append(binding)
+            record["original_bindings"] = bindings
+            if binding_errors:
+                record["original_binding_errors"] = binding_errors
+                record["binding_status"] = "invalid"
             records.append(record)
         return records
 
@@ -227,10 +362,17 @@ def apply_patch(
     sections = [
         replacements.get(section.section_id, section) for section in draft.sections
     ]
+    claims = [
+        claim for claim in draft.claims if claim.section_id not in replaced
+    ] + patch.claims
+    identities = [claim.claim_id for claim in claims]
+    if len(identities) != len(set(identities)):
+        raise InvalidSourceAction(
+            "Repair claim identity conflicts with an unchanged section"
+        )
     return DraftAnswer(
         answer="\n\n".join(section.text for section in sections),
         sections=sections,
-        claims=[claim for claim in draft.claims if claim.section_id not in replaced]
-        + patch.claims,
+        claims=claims,
         unresolved_need_ids=patch.unresolved_need_ids,
     )

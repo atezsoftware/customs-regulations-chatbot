@@ -16,7 +16,7 @@ from onyx.db.models import User
 from onyx.legal_composite.budget import WorkflowBudget
 from onyx.legal_composite.decisions import DecisionsClassifier
 from onyx.legal_composite.gateway import BudgetedGateway
-from onyx.legal_composite.reviewer import AnswerReviewer, GatewayAnswerReviewer
+from onyx.legal_composite.reviewer import GatewayAnswerReviewer
 from onyx.legal_composite.selection import GatewaySourceClassifier, SourceSelector
 from onyx.llm.factory import get_llm
 from onyx.llm.interfaces import LLMConfig, LLMUserIdentity
@@ -100,7 +100,7 @@ def build_answer_reviewer(
     token_counter: Callable[[str], int] | None,
     run_id: str,
     scope: dict[str, JsonValue],
-) -> AnswerReviewer | None:
+) -> GatewayAnswerReviewer | None:
     """Use the calibrated single reviewer; failures never select another model."""
     public_providers = fetch_all_accessible_llm_providers(session, user)
     openrouter = [p for p in public_providers if p.provider == "openrouter"]
