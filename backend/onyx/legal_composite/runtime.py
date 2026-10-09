@@ -372,6 +372,7 @@ def _run_legal_composite_loop(
         policy,
         coalesce_progress=True,
         prioritize_observed_reads=True,
+        capture_task_timings=True,
         registry_for_action=router.registry,
         expand_actions=router.expand,
         lane_inventory=router.inventory(),
@@ -605,6 +606,7 @@ def _run_legal_composite_loop(
         use_numbered_reading_supports=True,
         allow_terminal_observed_reads=True,
         recover_invalid_navigation=True,
+        use_observed_read_runway=True,
     )
     result = engine.run(question, history, custom_agent_prompt)
     snapshot: dict[str, JsonValue] = {

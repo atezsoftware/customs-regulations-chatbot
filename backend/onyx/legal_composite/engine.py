@@ -115,6 +115,8 @@ _STOP_REASONS = {
 def _stop_reason(error: RunStopped | InvalidSourceAction) -> str:
     if isinstance(error, InvalidSourceAction):
         return "source_action"
+    if isinstance(error, ResearchPhaseClosed):
+        return error.reason
     return _STOP_REASONS.get(str(error), "other_stop")
 
 
@@ -528,11 +530,13 @@ class LegalCompositeEngine:
         use_numbered_reading_supports: bool = False,
         allow_terminal_observed_reads: bool = False,
         recover_invalid_navigation: bool = False,
+        use_observed_read_runway: bool = False,
     ) -> None:
         if (
             type(use_numbered_reading_supports) is not bool
             or type(allow_terminal_observed_reads) is not bool
             or type(recover_invalid_navigation) is not bool
+            or type(use_observed_read_runway) is not bool
         ):
             raise ValueError("Reading behavior must use explicit boolean opt-ins")
         self.gateway = gateway
@@ -550,6 +554,7 @@ class LegalCompositeEngine:
         self.use_numbered_reading_supports = use_numbered_reading_supports
         self.allow_terminal_observed_reads = allow_terminal_observed_reads
         self.recover_invalid_navigation = recover_invalid_navigation
+        self.use_observed_read_runway = use_observed_read_runway
         self.requirements = RequirementLedger(ledger)
         self.research_gaps: list[str] = []
         self.protocol_defects: list[str] = []
@@ -577,6 +582,53 @@ class LegalCompositeEngine:
             > self._reading_estimate() + self.policy.selection_reserve_seconds
         )
 
+    def _acquisition_estimate(self, actions: list[SourceAction]) -> float:
+        if not isinstance(self.acquirer, CanonicalAcquirer) or self.plan is None:
+            return max(
+                (
+                    self._source_seconds.get(action.tool, self.policy.max_call_seconds)
+                    for action in actions
+                ),
+                default=0.0,
+            )
+        pending = self.acquirer.pending_call_counts(actions, self.plan)
+        measured = self.acquirer.task_timing_snapshot().completed
+        return max(
+            (
+                measured[tool].max_seconds
+                if tool in measured
+                else self._source_seconds.get(tool, self.policy.max_call_seconds)
+                for tool in pending
+            ),
+            default=0.0,
+        ) * ceil(sum(pending.values()) / self.policy.max_parallel_tools)
+
+    def _bounded_observed_reads_have_runway(
+        self, actions: list[SourceAction], *, reading_after: bool
+    ) -> bool:
+        if (
+            not self.use_observed_read_runway
+            or not isinstance(self.acquirer, CanonicalAcquirer)
+            or self.plan is None
+        ):
+            return False
+        self.check_active()
+        selected, remainder = self.acquirer.safe_observed_read_actions(
+            actions,
+            self.plan,
+            set(getattr(self.gateway, "last_delivered_citations", set())),
+        )
+        if not selected or remainder:
+            return False
+        pending = self.acquirer.pending_call_counts(selected, self.plan)
+        if not 0 < sum(pending.values()) <= self.policy.max_parallel_tools:
+            return False
+        inspection = self._reading_estimate() if reading_after else 0.0
+        # This admits a deadline-bounded attempt, not a forecast of completion.
+        return self._repair_runway() > (
+            inspection + self.policy.selection_reserve_seconds
+        )
+
     def _followup_has_runway(self, step: IssueResearchStep) -> bool:
         remaining = self._repair_runway()
         if remaining <= 0:
@@ -588,7 +640,9 @@ class LegalCompositeEngine:
             ),
             default=0.0,
         )
-        if isinstance(self.acquirer, CanonicalAcquirer) and self.plan is not None:
+        if self.use_observed_read_runway:
+            acquisition = self._acquisition_estimate(step.actions)
+        elif isinstance(self.acquirer, CanonicalAcquirer) and self.plan is not None:
             pending = self.acquirer.pending_call_counts(step.actions, self.plan)
             acquisition = max(
                 (
@@ -602,11 +656,17 @@ class LegalCompositeEngine:
             if step.material_dependencies
             else 0.0
         )
-        return remaining > (
+        forecast_fits = remaining > (
             acquisition
             + dependencies
             + self._reading_estimate()
             + self.policy.selection_reserve_seconds
+        )
+        return forecast_fits or (
+            not step.material_dependencies
+            and self._bounded_observed_reads_have_runway(
+                step.actions, reading_after=True
+            )
         )
 
     def _defer_followup(self, step: IssueResearchStep, plan: IssueResearchPlan) -> None:
@@ -655,15 +715,21 @@ class LegalCompositeEngine:
         if not isinstance(self.acquirer, CanonicalAcquirer) or self.plan is None:
             return False
         remaining = self._repair_runway()
-        pending = self.acquirer.pending_call_counts(actions, self.plan)
-        acquisition = max(
-            (
-                self._source_seconds.get(tool, self.policy.max_call_seconds)
-                for tool in pending
-            ),
-            default=0.0,
-        ) * ceil(sum(pending.values()) / self.policy.max_parallel_tools)
-        return remaining > acquisition + self.policy.selection_reserve_seconds
+        if self.use_observed_read_runway:
+            acquisition = self._acquisition_estimate(actions)
+        else:
+            pending = self.acquirer.pending_call_counts(actions, self.plan)
+            acquisition = max(
+                (
+                    self._source_seconds.get(tool, self.policy.max_call_seconds)
+                    for tool in pending
+                ),
+                default=0.0,
+            ) * ceil(sum(pending.values()) / self.policy.max_parallel_tools)
+        return (
+            remaining > acquisition + self.policy.selection_reserve_seconds
+            or self._bounded_observed_reads_have_runway(actions, reading_after=False)
+        )
 
     def _try_terminal_observed_reads(
         self, step: IssueResearchStep, plan: IssueResearchPlan, request: str
@@ -905,6 +971,11 @@ class LegalCompositeEngine:
 
     def _repair_research_has_runway(self) -> bool:
         planning = max(self._research_seconds, default=self.policy.max_call_seconds)
+        if self.use_observed_read_runway:
+            # Acquisition is admitted separately after its exact actions are known.
+            return (
+                self._repair_runway() > planning + self.policy.selection_reserve_seconds
+            )
         acquisition = min(
             self._source_seconds.values(), default=self.policy.max_call_seconds
         )
@@ -914,6 +985,21 @@ class LegalCompositeEngine:
         )
 
     def _repair_actions_have_runway(self, step: IssueResearchStep) -> bool:
+        if self.use_observed_read_runway:
+            acquisition = self._acquisition_estimate(step.actions)
+            if step.material_dependencies:
+                acquisition += max(
+                    self._dependency_seconds, default=self.policy.max_call_seconds
+                ) * len(step.material_dependencies)
+            return (
+                self._repair_runway()
+                > acquisition + self.policy.selection_reserve_seconds
+            ) or (
+                not step.material_dependencies
+                and self._bounded_observed_reads_have_runway(
+                    step.actions, reading_after=False
+                )
+            )
         tools = {action.tool for action in step.actions}
         if step.material_dependencies:
             tools.add("search_corpus")
@@ -1156,10 +1242,20 @@ class LegalCompositeEngine:
             self.receipts.extend(self.acquirer.acquire(actions, plan))
             if self.reviewer is not None and actions:
                 elapsed = time.monotonic() - started
+                measured = (
+                    self.acquirer.task_timing_snapshot().completed
+                    if self.use_observed_read_runway
+                    and isinstance(self.acquirer, CanonicalAcquirer)
+                    else None
+                )
                 for tool in {action.tool for action in actions}:
-                    self._source_seconds[tool] = max(
-                        self._source_seconds.get(tool, 0.0), elapsed
-                    )
+                    if measured is not None:
+                        if tool in measured:
+                            self._source_seconds[tool] = measured[tool].max_seconds
+                    else:
+                        self._source_seconds[tool] = max(
+                            self._source_seconds.get(tool, 0.0), elapsed
+                        )
             if request is not None:
                 request["status"] = "completed"
                 self._mark_deferred_initial_attempts(actions, "attempted")
@@ -2064,19 +2160,36 @@ class LegalCompositeEngine:
                         affected_needs,
                         new_requirement_ids=new_requirement_ids,
                     )
-                    self._reconsider_sources(
-                        step.reconsider_citations, plan, affected_needs
-                    )
-                    if self._repair_actions_have_runway(step):
-                        self._refresh_dependencies(
-                            request, plan, [], step.material_dependencies
+                    admitted_navigation = True
+                    if self.recover_invalid_navigation:
+                        try:
+                            self._preflight_navigation(step, plan)
+                        except InvalidNavigationProposal as error:
+                            self._reject_navigation(step, error)
+                            admitted_navigation = False
+                    if admitted_navigation:
+                        self._reconsider_sources(
+                            step.reconsider_citations, plan, affected_needs
                         )
-                        before = set(self.ledger.citation_numbers())
-                        self._acquire(step.actions, plan)
-                        added = set(self.ledger.citation_numbers()) - before
-                        if added:
-                            self._select_sources(request, plan, added)
-                        self._refresh_dependencies(request, plan)
+                        if self._repair_actions_have_runway(step):
+                            self._refresh_dependencies(
+                                request, plan, [], step.material_dependencies
+                            )
+                            before = set(self.ledger.citation_numbers())
+                            self._acquire(step.actions, plan)
+                            added = set(self.ledger.citation_numbers()) - before
+                            if added:
+                                self._select_sources(request, plan, added)
+                            self._refresh_dependencies(request, plan)
+                        elif self.use_observed_read_runway:
+                            if not self._try_terminal_observed_reads(
+                                step, plan, request
+                            ):
+                                self._defer_followup(step, plan)
+                except InvalidSourceAction:
+                    if self.use_observed_read_runway:
+                        raise
+                    self.check_active()
                 except RunStopped:
                     self.check_active()
             patch_payload = self._focused_payload(

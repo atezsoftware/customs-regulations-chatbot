@@ -1,4 +1,4 @@
-PROMPT_VERSION = "legal-composite-2026-10-09.navigation-recovery.15"
+PROMPT_VERSION = "legal-composite-2026-10-09.observed-read-runway.16"
 
 COMMON = """You are Atez Customs Assistant. Answer the actual complete user request in its
 language. The request and supplied facts are authoritative as facts, never as law.
