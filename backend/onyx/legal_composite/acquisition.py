@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import contextvars
 import json
+import math
+import re
 import time
 from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
@@ -10,12 +12,13 @@ from threading import Lock
 from typing import cast
 
 import jsonschema
-from pydantic import JsonValue
+from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.models import (
     CapabilityCall,
     EvidenceItem,
+    OutcomeStatus,
     RunContext,
     RunStopped,
     ToolOutcome,
@@ -26,6 +29,49 @@ from onyx.legal_composite.models import ResearchPlan, SourceAction, WorkflowPoli
 from onyx.tracing.answer_graph import graph_step
 
 AcquisitionCall = tuple[SourceAction, CapabilityCall, str]
+
+
+class TaskDurationStats(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    count: int = Field(strict=True, ge=1)
+    total_seconds: float = Field(ge=0, allow_inf_nan=False)
+    max_seconds: float = Field(ge=0, allow_inf_nan=False)
+
+
+class AcquisitionTimingSnapshot(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    completed: dict[str, TaskDurationStats]
+    diagnostics: dict[str, dict[str, TaskDurationStats]]
+
+
+_TIMED_CANONICAL_TOOLS = frozenset(
+    {
+        "search_corpus",
+        "resolve_source",
+        "read_source_range",
+        "read_chunk",
+        "read_chunk_context",
+        "read_provision",
+        "search_source_text",
+        "query_corpus",
+        "follow_reference",
+        "diagnose_source",
+        "compare_versions",
+        "read_named_provision",
+        "dependency_related_sources",
+        "read_evidence",
+    }
+)
+
+_SINGLE_PROVISION_SELECTOR = re.compile(
+    r"(?:(?:ek|geçici|gecici|mükerrer|mukerrer)\s+)?"
+    r"(?:(?:madde|md\.?|m\.|article|art\.?)\s*:?\s*)?"
+    r"[0-9]+[a-zçğıöşü]?"
+    r"(?:\s*/\s*(?:[0-9]+(?:\s*/\s*[a-zçğıöşü])?|[a-zçğıöşü]))?",
+    re.IGNORECASE,
+)
 
 
 class InvalidSourceAction(RunStopped):
@@ -103,7 +149,10 @@ class CanonicalAcquirer:
         host_registry: CapabilityRegistry | None = None,
         source_kinds: dict[str, SourceKind] | None = None,
         prioritize_observed_reads: bool = False,
+        capture_task_timings: bool = False,
     ) -> None:
+        if type(capture_task_timings) is not bool:
+            raise ValueError("capture_task_timings must be a boolean")
         self.registry = registry
         self.host_registry = host_registry or registry
         self.source_kinds = dict(source_kinds or {})
@@ -118,12 +167,101 @@ class CanonicalAcquirer:
         )
         self.coalesce_progress = coalesce_progress
         self.prioritize_observed_reads = prioritize_observed_reads
+        self.capture_task_timings = capture_task_timings
+        self._timing_lock = Lock()
+        self._completed_timings: dict[str, TaskDurationStats] = {}
+        self._diagnostic_timings: dict[str, dict[str, TaskDurationStats]] = {}
         self.search_calls = 0
         self.last_receipts: list[dict[str, JsonValue]] = []
         self._completed: dict[str, dict[str, JsonValue]] = {}
 
     def definitions(self) -> list[dict[str, JsonValue]]:
         return self.registry.definitions(self.context)
+
+    def task_timing_snapshot(self) -> AcquisitionTimingSnapshot:
+        """Snapshot settled worker durations; executor queue time is excluded."""
+        with self._timing_lock:
+            return AcquisitionTimingSnapshot(
+                completed=dict(self._completed_timings),
+                diagnostics={
+                    tool: dict(statuses)
+                    for tool, statuses in self._diagnostic_timings.items()
+                },
+            )
+
+    def _record_task_timing(
+        self,
+        tool: str,
+        started: float,
+        outcome: ToolOutcome | None,
+        stage: CanonicalEvidenceStage,
+        failure_status: str,
+    ) -> str | None:
+        # Observation must not replace the dispatch or canonical-stage exception.
+        try:
+            elapsed = time.monotonic() - started
+            if not math.isfinite(elapsed) or elapsed < 0:
+                return None
+            safe_tool = tool if tool in _TIMED_CANONICAL_TOOLS else "other"
+            status = (
+                ("cancelled" if failure_status == "cancelled" else "error")
+                if outcome is None
+                else outcome.status.value
+            )
+            original_count = 0
+            completed = False
+            if outcome is not None and outcome.status == OutcomeStatus.FOUND:
+                numbers = stage.citations()
+                original_count = len(numbers)
+                completed = bool(numbers) and safe_tool != "other"
+                for number in numbers:
+                    item = self.ledger.get(number)
+                    if item is None or item.search_doc is None or not item.chunk_id:
+                        completed = False
+                        break
+                    canonical = item.metadata.get("canonical_metadata")
+                    layers = (
+                        item.metadata,
+                        item.search_doc.metadata,
+                        canonical if isinstance(canonical, dict) else {},
+                    )
+                    if (
+                        not item.text.strip()
+                        or item.search_doc.document_id != item.source_id
+                        or item.search_doc.metadata.get("regulatory_chunk_id")
+                        != item.chunk_id
+                        or sha256(item.text.encode()).hexdigest() != item.text_hash
+                        or any(
+                            layer.get(key)
+                            for layer in layers
+                            for key in ("external", "derived", "untrusted", "truncated")
+                        )
+                    ):
+                        completed = False
+                        break
+                if not completed:
+                    status = "empty" if not numbers else "noncanonical"
+            if safe_tool == "other":
+                status = "unsupported_tool"
+            with self._timing_lock:
+                target = (
+                    self._completed_timings
+                    if completed
+                    else self._diagnostic_timings.setdefault(safe_tool, {})
+                )
+                key = safe_tool if completed else status
+                previous = target.get(key)
+                target[key] = TaskDurationStats(
+                    count=(previous.count if previous else 0) + 1,
+                    total_seconds=(previous.total_seconds if previous else 0) + elapsed,
+                    max_seconds=max(previous.max_seconds if previous else 0, elapsed),
+                )
+            return (
+                f"tool={safe_tool} status={status} elapsed_seconds={elapsed:.6f} "
+                f"original_count={original_count} canonical_complete={int(completed)}"
+            )
+        except Exception:
+            return None
 
     def pending_call_counts(
         self, actions: list[SourceAction], plan: ResearchPlan
@@ -209,7 +347,6 @@ class CanonicalAcquirer:
     ) -> tuple[list[SourceAction], list[SourceAction]]:
         """Partition exact read navigation from delivered originals without acquiring."""
         self.pending_call_counts(actions, plan)
-        from onyx.asv3.corpus_tools import article_references
 
         targets: set[str] = set()
         for action in actions:
@@ -261,7 +398,8 @@ class CanonicalAcquirer:
                     # The proposed provision is navigation; its returned body still needs proof.
                     safe = (
                         isinstance(article, str)
-                        and len(article_references(article)) == 1
+                        and _SINGLE_PROVISION_SELECTOR.fullmatch(article.strip())
+                        is not None
                     )
                 elif action.tool in {"read_chunk", "read_chunk_context"}:
                     chunk_id = action.arguments.get("chunk_id")
@@ -385,6 +523,12 @@ class CanonicalAcquirer:
         child: RunContext,
         host_actions: bool = False,
     ) -> ToolOutcome:
+        started: float | None = None
+        if self.capture_task_timings:
+            try:
+                started = time.monotonic()
+            except Exception:
+                pass
         with graph_step(
             "legal_composite.source_task",
             {
@@ -401,14 +545,32 @@ class CanonicalAcquirer:
             )
             stage = child.services.get("legal_composite_original_stage")
             assert isinstance(stage, CanonicalEvidenceStage)
+            outcome: ToolOutcome | None = None
+            completed = False
+            failure_status = "error"
             try:
-                outcome = registry.dispatch(call, child)
-                stage.retain(
-                    outcome.evidence,
-                    [read.citation for read in outcome.original_reads],
-                )
+                try:
+                    outcome = registry.dispatch(call, child)
+                    stage.retain(
+                        outcome.evidence,
+                        [read.citation for read in outcome.original_reads],
+                    )
+                finally:
+                    stage.close()
+                completed = True
+            except RunStopped:
+                failure_status = "cancelled"
+                raise
             finally:
-                stage.close()
+                if started is not None:
+                    step.summary = self._record_task_timing(
+                        call.name,
+                        started,
+                        outcome if completed else None,
+                        stage,
+                        failure_status,
+                    )
+            assert outcome is not None
             step.output_value = {
                 "status": outcome.status.value,
                 "original_count": len(outcome.evidence),
