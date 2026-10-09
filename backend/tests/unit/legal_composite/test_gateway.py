@@ -2,7 +2,7 @@ import hashlib
 import json
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event, current_thread
-from typing import cast
+from typing import Any, cast
 from unittest.mock import Mock
 
 import pytest
@@ -13,7 +13,14 @@ from onyx.asv3.models import RunStopped
 from onyx.legal_composite.budget import WorkflowBudget
 from onyx.legal_composite.engine import LegalCompositeEngine, SourceAcquirer
 from onyx.legal_composite.gateway import BudgetedGateway
-from onyx.legal_composite.models import DraftAnswer, ResearchStep, WorkflowPolicy
+from onyx.legal_composite.models import (
+    DraftAnswer,
+    IssueResearchPlan,
+    IssueResearchStep,
+    ResearchPlan,
+    ResearchStep,
+    WorkflowPolicy,
+)
 from onyx.llm.cost import ModelPrice
 from onyx.llm.interfaces import LLM, LLMConfig
 from onyx.llm.model_response import Choice, Message, ModelResponse, Usage
@@ -472,6 +479,206 @@ def test_raw_provider_output_limit_cannot_deliver_a_valid_json_prefix(
     model.invoke.assert_called_once()
     ledger.record_delivery.assert_not_called()
     assert gateway.last_call_id is None
+
+
+def _long_issue_plan() -> str:
+    return json.dumps(
+        {
+            "language": "tr",
+            "requires_sources": True,
+            "needs": [
+                {
+                    "need_id": f"requested-outcome-{index}",
+                    "question": f"What rules govern requested outcome {index} under the supplied circumstances?",
+                    "governing_source": "To be established from applicable originals",
+                    "conditions_to_check": [
+                        "Which eligibility conditions affect this requested outcome?",
+                        "Which supplied dates matter to the applicable rule?",
+                        "Which procedure and supporting documents are required?",
+                        "Which exceptions change the result for these facts?",
+                    ],
+                    "required_outcome": "Explain availability, material conditions, the procedure, the deadline and how the supplied facts affect the conclusion.",
+                    "research_dimensions": [
+                        "legal basis",
+                        "eligibility",
+                        "procedure",
+                        "deadline",
+                        "proof",
+                        "exceptions",
+                    ],
+                    "relevant_facts": [
+                        f"The user asks about requested outcome {index} separately from the other alternatives and requires its own conclusion.",
+                        "The question supplies an earlier event date and a later discovery date; neither user date establishes a legal deadline.",
+                        "Some supporting documents exist while the remaining documents have not been identified; the legal proof requirement remains unknown.",
+                    ],
+                    "evidence_gaps": [],
+                    "evidence_gap_resolutions": [],
+                }
+                for index in range(8)
+            ],
+            "discovery_query": "Requested outcomes eligibility procedure deadline proof exceptions",
+            "initial_actions": [
+                {
+                    "need_ids": [f"requested-outcome-{index}"],
+                    "tool": "search",
+                    "arguments": {
+                        "query": f"requested outcome {index} applicable rules and procedure"
+                    },
+                    "source_kind": None,
+                }
+                for index in range(8)
+            ],
+            "missing_user_facts": [],
+        },
+        ensure_ascii=False,
+    )
+
+
+def test_lc_long_issue_plan_receives_capacity_without_losing_issues_or_actions(
+    model: Mock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    content = _long_issue_plan()
+    actual_output_tokens = check_number_of_tokens(content)
+    assert 2_048 < actual_output_tokens < 6_144
+    expected = IssueResearchPlan.model_validate_json(content, strict=True)
+    returned = model.invoke.return_value.model_copy(deep=True)
+    returned.choice.message.content = content
+    returned.usage.completion_tokens = actual_output_tokens
+    returned.usage.total_tokens = returned.usage.prompt_tokens + actual_output_tokens
+    observed_caps: list[int] = []
+
+    def capacity_limited_provider(*_args: Any, **kwargs: Any) -> ModelResponse:
+        cap = kwargs["max_tokens"]
+        observed_caps.append(cap)
+        response = returned.model_copy(deep=True)
+        if cap < actual_output_tokens:
+            response.choice.message.content = content[
+                : len(content) * cap // actual_output_tokens
+            ]
+            response.choice.finish_reason = "length"
+            response.usage.completion_tokens = cap
+            response.usage.total_tokens = response.usage.prompt_tokens + cap
+        return response
+
+    model.invoke.side_effect = capacity_limited_provider
+    budget = WorkflowBudget(WorkflowPolicy())
+    reserve = Mock(wraps=budget.request)
+    monkeypatch.setattr(budget, "request", reserve)
+    gateway = BudgetedGateway(
+        selected_llm=model, research_llm=model, budget=budget, ledger=EvidenceLedger()
+    )
+    result = gateway.complete(
+        "Enumerate the independent issues without guessing law",
+        {"request": "Investigate the supplied alternatives"},
+        IssueResearchPlan,
+        LLMFlow.LEGAL_COMPOSITE_RESEARCH,
+    )
+    assert result == expected
+    assert len(result.needs) == len(result.initial_actions) == 8
+    assert observed_caps == [6_144]
+    assert reserve.call_args.args[1] == 6_144
+    assert model.invoke.call_args.kwargs["timeout_override"] <= 45
+    model.invoke.assert_called_once()
+
+
+@pytest.mark.parametrize("finish_reason", ["length", "max_tokens", "MAX_OUTPUT_TOKENS"])
+def test_lc_issue_plan_rejects_truncation_before_delivery_even_for_valid_json(
+    finish_reason: str, model: Mock
+) -> None:
+    model.invoke.return_value.choice.message.content = _long_issue_plan()
+    model.invoke.return_value.choice.finish_reason = finish_reason
+    ledger = Mock(spec=EvidenceLedger)
+    gateway = BudgetedGateway(
+        selected_llm=model,
+        research_llm=model,
+        budget=WorkflowBudget(WorkflowPolicy()),
+        ledger=ledger,
+    )
+    with pytest.raises(RunStopped, match="truncated"):
+        gateway.complete(
+            "Plan", {}, IssueResearchPlan, LLMFlow.LEGAL_COMPOSITE_RESEARCH
+        )
+    model.invoke.assert_called_once()
+    assert model.invoke.call_args.kwargs["max_tokens"] == 6_144
+    ledger.record_delivery.assert_not_called()
+    assert gateway.last_call_id is None and not gateway.last_delivered_citations
+
+
+def test_lc_issue_plan_rejects_incomplete_json_without_retry(model: Mock) -> None:
+    model.invoke.return_value.choice.message.content = _long_issue_plan()[:-20]
+    model.invoke.return_value.choice.finish_reason = "stop"
+    gateway = BudgetedGateway(
+        selected_llm=model,
+        research_llm=model,
+        budget=WorkflowBudget(WorkflowPolicy()),
+        ledger=EvidenceLedger(),
+    )
+    with pytest.raises(RunStopped, match="workflow schema"):
+        gateway.complete(
+            "Plan", {}, IssueResearchPlan, LLMFlow.LEGAL_COMPOSITE_RESEARCH
+        )
+    model.invoke.assert_called_once()
+
+
+@pytest.mark.parametrize("limited_resource", ["output_tokens", "cost"])
+def test_lc_issue_plan_capacity_cannot_consume_finalization_reserves(
+    limited_resource: str, model: Mock
+) -> None:
+    policy = (
+        WorkflowPolicy(max_output_tokens=10_240)
+        if limited_resource == "output_tokens"
+        else WorkflowPolicy(max_cost_usd=0.012)
+    )
+    budget = WorkflowBudget(policy)
+    gateway = BudgetedGateway(
+        selected_llm=model, research_llm=model, budget=budget, ledger=EvidenceLedger()
+    )
+    with pytest.raises(RunStopped, match="budget exhausted"):
+        gateway.complete(
+            "Plan", {}, IssueResearchPlan, LLMFlow.LEGAL_COMPOSITE_RESEARCH
+        )
+    model.invoke.assert_not_called()
+    assert budget.snapshot()["model_calls"] == 0
+
+
+@pytest.mark.parametrize(
+    "response_type,content,capacity",
+    [
+        (
+            ResearchPlan,
+            '{"language":"tr","requires_sources":true,"needs":[{"need_id":"one","question":"What applies?","governing_source":"Unknown","conditions_to_check":[]}],"initial_actions":[],"missing_user_facts":[]}',
+            2_048,
+        ),
+        (
+            ResearchStep,
+            '{"actions":[],"ready_to_answer":false,"remaining_gaps":[]}',
+            2_048,
+        ),
+        (
+            IssueResearchStep,
+            '{"actions":[],"ready_to_answer":false,"remaining_gaps":[]}',
+            6_144,
+        ),
+    ],
+)
+def test_lc_planning_allowance_preserves_existing_research_class_capacities(
+    response_type: type[ResearchPlan] | type[ResearchStep],
+    content: str,
+    capacity: int,
+    model: Mock,
+) -> None:
+    model.invoke.return_value.choice.message.content = content
+    gateway = BudgetedGateway(
+        selected_llm=model,
+        research_llm=model,
+        budget=WorkflowBudget(WorkflowPolicy()),
+        ledger=EvidenceLedger(),
+    )
+    result = gateway.complete(
+        "Research", {}, response_type, LLMFlow.LEGAL_COMPOSITE_RESEARCH
+    )
+    assert isinstance(result, response_type)
+    assert model.invoke.call_args.kwargs["max_tokens"] == capacity
 
 
 def test_late_provider_result_cannot_publish_evidence_or_start_more_calls(

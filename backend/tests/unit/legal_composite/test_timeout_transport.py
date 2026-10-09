@@ -27,6 +27,7 @@ from onyx.legal_composite.gateway import BudgetedGateway
 from onyx.legal_composite.models import (
     AnswerReview,
     DraftAnswer,
+    IssueResearchPlan,
     IssueResearchStep,
     ResearchPlan,
     ResearchStep,
@@ -452,6 +453,21 @@ def test_late_canonical_compatibility_retry_cannot_republish_closed_capture(
             ["actions", "ready_to_answer", "remaining_gaps"],
         ),
         (
+            IssueResearchPlan,
+            '{"language":"tr","requires_sources":true,"needs":[{"need_id":"generic",'
+            '"question":"Which rule applies?","governing_source":"Applicable law",'
+            '"conditions_to_check":[],"required_outcome":"Explain availability and procedure",'
+            '"research_dimensions":["eligibility","procedure"],"relevant_facts":[]}],'
+            '"initial_actions":[],"missing_user_facts":[]}',
+            [
+                "language",
+                "requires_sources",
+                "needs",
+                "initial_actions",
+                "missing_user_facts",
+            ],
+        ),
+        (
             ResearchPlan,
             '{"language":"tr","requires_sources":true,"needs":[{"need_id":"generic",'
             '"question":"Which rule applies?","governing_source":"Applicable law",'
@@ -520,7 +536,7 @@ def test_canonical_typed_schema_and_phase_reasoning_map_to_native_vertex(
         assert kwargs["reasoning_effort"] == expected_effort
         assert kwargs["max_tokens"] == (
             6_144
-            if response_type is IssueResearchStep
+            if response_type in {IssueResearchPlan, IssueResearchStep}
             else 2_048
             if response_type in {ResearchPlan, ResearchStep}
             else 4_096
@@ -530,7 +546,12 @@ def test_canonical_typed_schema_and_phase_reasoning_map_to_native_vertex(
     completion = Mock(side_effect=complete)
     monkeypatch.setattr("litellm.completion", completion)
     workflow = gateway(model, EvidenceLedger(), reasoning_effort=selected_effort)
-    research = response_type in {ResearchPlan, ResearchStep, IssueResearchStep}
+    research = response_type in {
+        ResearchPlan,
+        ResearchStep,
+        IssueResearchPlan,
+        IssueResearchStep,
+    }
     result = workflow.complete(
         "Return the typed result",
         {},

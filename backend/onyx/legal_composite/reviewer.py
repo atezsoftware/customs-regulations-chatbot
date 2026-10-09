@@ -1034,6 +1034,18 @@ def _decode_generated_review(
     ]
 
 
+def _review_status_summary(checks: list[ReviewCheck]) -> str:
+    counts = {
+        status: sum(check.status == status for check in checks) for status in _CRITERIA
+    }
+    return (
+        f"addressed={counts['addressed']} na={counts['not_applicable']} "
+        f"gap={counts['gap']} incorrect={counts['incorrect']} "
+        f"uncertain={counts['uncertain']} "
+        f"low={sum(check.confidence < 0.80 for check in checks)}"
+    )
+
+
 _GENERATION_POLICY = (
     _POLICY
     + " Evaluate every fixed expected check independently. Return exactly one decision "
@@ -1218,8 +1230,10 @@ class GatewayAnswerReviewer(_CanonicalReviewContext):
                     "protocol_diagnostics": diagnostics,
                     "checks": [item.model_dump(mode="json") for item in decoded],
                 }
-                if attempt:
-                    step.summary = f"checks={len(checks)} input_tokens={input_tokens} protocol_retry_recovered=1"
+                step.summary = (
+                    f"checks={len(checks)} input_tokens={input_tokens} "
+                    f"retry={attempt} {_review_status_summary(decoded)}"
+                )
                 return decoded
 
     def review(
@@ -1337,8 +1351,8 @@ class GatewayAnswerReviewer(_CanonicalReviewContext):
             summary=(
                 f"checks={len(checks)} batches={len(batches)} "
                 f"input_tokens_sum={sum(row[3] for row in batches)} "
-                f"max_batch_tokens={max((row[3] for row in batches), default=0)} "
-                f"protocol_retries={int(not retry_available)}"
+                f"protocol_retries={int(not retry_available)} "
+                f"{_review_status_summary(list(results.values()))}"
             ),
         ) as step:
             step.output_value = {
