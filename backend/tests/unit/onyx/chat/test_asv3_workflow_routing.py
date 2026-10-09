@@ -9,6 +9,7 @@ import pytest
 from onyx.asv3.workflow_variant import (
     ASV3_GUARDED_EXPERIMENTAL_VARIANT,
     ASV3_GUARDRAILS_V2_VARIANT,
+    ASV3_GUARDRAILS_V3_VARIANT,
     ASV3_TUNED_VARIANT,
 )
 from onyx.chat import process_message
@@ -309,6 +310,77 @@ def test_actual_chat_worker_restores_guardrails_v2_from_resume_checkpoint() -> N
 
     assert not any(isinstance(item, StreamingError) for item in result)
     assert invocations[0]["workflow_variant"] == ASV3_GUARDRAILS_V2_VARIANT
+    assert invocations[0]["research_llm"] is research
+    assert invocations[0]["repair_llm"] is repair
+    assert [
+        call.kwargs["llm_override"].model_version
+        for call in model_factory.call_args_list
+    ] == ["gemini-3.5-flash-lite", "gemini-3.8-flash"]
+
+
+def test_actual_chat_worker_restores_guardrails_v3_from_resume_checkpoint() -> None:
+    setup = _make_setup()
+    setup.persona.id = process_message.DEFAULT_PERSONA_ID
+    setup.new_msg_req = SendMessageRequest.model_validate(
+        {
+            "message": "İlgili mevzuat nedir?",
+            "atez_search_v3": True,
+            "asv3_research_profile": "normal",
+            "asv3_guardrails_v2": True,
+            "asv3_resume_message_id": 43,
+        }
+    )
+    selected = setup.llms[0]
+    selected.config = LLMConfig(
+        model_provider="openai",
+        model_name="user-selected",
+        max_input_tokens=200000,
+        temperature=0,
+    )
+    research = MagicMock(spec=LLM)
+    research.config = LLMConfig(
+        model_provider="vertex_ai",
+        model_name="gemini-3.5-flash-lite",
+        max_input_tokens=1_048_576,
+        temperature=0,
+    )
+    repair = MagicMock(spec=LLM)
+    repair.config = research.config.model_copy(
+        update={"model_name": "gemini-3.8-flash"}
+    )
+    setup.user_message.id = 1
+    setup.reserved_messages[0].id = 2
+    invocations: list[dict[str, Any]] = []
+
+    with (
+        patch(
+            "onyx.chat.process_message.load_asv3_checkpoint",
+            return_value={"asv3_workflow_variant": ASV3_GUARDRAILS_V3_VARIANT},
+        ),
+        patch(
+            "onyx.asv3.runtime.run_asv3_loop",
+            side_effect=lambda **args: invocations.append(args),
+        ),
+        patch("onyx.chat.process_message.construct_tools", return_value={}),
+        patch(
+            "onyx.chat.process_message.get_llm_for_persona",
+            side_effect=[research, repair],
+        ) as model_factory,
+        patch("onyx.chat.process_message.get_llm_token_counter", return_value=len),
+        patch(
+            "onyx.chat.process_message.load_settings",
+            return_value=SimpleNamespace(auto_detect_search_filters=False),
+        ),
+        patch("onyx.chat.process_message.llm_loop_completion_handle"),
+        patch("onyx.chat.process_message.record_final_answer_message"),
+        patch("onyx.chat.process_message.set_processing_status"),
+    ):
+        result = list(
+            process_message._run_models(cast(ChatTurnSetup, setup), MagicMock())
+        )
+
+    assert not any(isinstance(item, StreamingError) for item in result)
+    assert invocations[0]["workflow_variant"] == ASV3_GUARDRAILS_V3_VARIANT
     assert invocations[0]["research_llm"] is research
     assert invocations[0]["repair_llm"] is repair
     assert [

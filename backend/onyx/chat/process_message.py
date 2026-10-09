@@ -1728,10 +1728,12 @@ def _run_models(
                         raise ValueError("ASv3 is unavailable inside a project")
                     guarded_resume = False
                     guardrails_v2_resume = False
+                    guardrails_v3_resume = False
                     if setup.new_msg_req.asv3_resume_message_id is not None:
                         from onyx.asv3.workflow_variant import (
                             ASV3_GUARDED_EXPERIMENTAL_VARIANT,
                             ASV3_GUARDRAILS_V2_VARIANT,
+                            ASV3_GUARDRAILS_V3_VARIANT,
                         )
 
                         resume_checkpoint = load_asv3_checkpoint(
@@ -1748,8 +1750,13 @@ def _run_models(
                             and resume_checkpoint.get("asv3_workflow_variant")
                             == ASV3_GUARDRAILS_V2_VARIANT
                         )
+                        guardrails_v3_resume = (
+                            resume_checkpoint is not None
+                            and resume_checkpoint.get("asv3_workflow_variant")
+                            == ASV3_GUARDRAILS_V3_VARIANT
+                        )
                     checkpoint_selects_guardrails = (
-                        guarded_resume or guardrails_v2_resume
+                        guarded_resume or guardrails_v2_resume or guardrails_v3_resume
                     )
                     workflow = resolve_asv3_workflow(
                         "deep"
@@ -1765,6 +1772,11 @@ def _run_models(
                             guardrails_v2_resume
                             if checkpoint_selects_guardrails
                             else setup.new_msg_req.asv3_guardrails_v2
+                        ),
+                        guardrails_v3=(
+                            guardrails_v3_resume
+                            if checkpoint_selects_guardrails
+                            else setup.new_msg_req.asv3_guardrails_v3
                         ),
                     )
                     research_profile = workflow.research_profile
@@ -1799,7 +1811,7 @@ def _run_models(
                                 llm_provider_api_key=research_llm.config.api_key,
                             )
                     repair_llm = None
-                    if workflow.uses_guardrails_v2:
+                    if workflow.uses_guardrails_v2 or workflow.uses_guardrails_v3:
                         try:
                             repair_llm = (
                                 model_llm.with_model(
@@ -1830,7 +1842,7 @@ def _run_models(
                                     )
                         except Exception:
                             logger.warning(
-                                "Experimental Guardrails v2 repair model unavailable; "
+                                "Experimental Guardrails repair model unavailable; "
                                 "the original ASv3 answer will be retained",
                                 exc_info=True,
                             )

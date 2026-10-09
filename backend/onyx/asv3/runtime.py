@@ -88,6 +88,7 @@ from onyx.asv3.workers import WorkerPool
 from onyx.asv3.workflow_variant import (
     ASV3_GUARDED_EXPERIMENTAL_VARIANT,
     ASV3_GUARDRAILS_V2_VARIANT,
+    ASV3_GUARDRAILS_V3_VARIANT,
     ASV3_STANDARD_VARIANT,
     ASV3_TUNED_VARIANT,
     checkpoint_variant_fields,
@@ -281,13 +282,17 @@ def run_asv3_loop(
         "",
     )
     guarded_experimental = workflow_variant == ASV3_GUARDED_EXPERIMENTAL_VARIANT
+    guardrails_v3 = workflow_variant == ASV3_GUARDRAILS_V3_VARIANT
+    bounded_guardrails = guarded_experimental or guardrails_v3
     context = RunContext(
         language="und",
-        timeout_seconds=1800 if guarded_experimental else float("inf"),
-        research_reserve_seconds=30 if guarded_experimental else 0,
+        timeout_seconds=1800 if bounded_guardrails else float("inf"),
+        research_reserve_seconds=(
+            120 if guardrails_v3 else 30 if guarded_experimental else 0
+        ),
         budget=(
             SharedBudget(max_tools=24, max_decisions=32)
-            if guarded_experimental
+            if bounded_guardrails
             else SharedBudget(unlimited_execution=True)
         ),
         cancelled=lambda: not is_connected(chat_session_id, cache),
@@ -298,7 +303,7 @@ def run_asv3_loop(
                     "provider_max_attempts": 2,
                     "provider_compatibility_attempts": 1,
                 }
-                if guarded_experimental
+                if bounded_guardrails
                 else {}
             ),
         },
@@ -361,6 +366,10 @@ def run_asv3_loop(
         raise ValueError("Unknown ASv3 research profile")
     if parallel_research and research_profile != "experimental":
         raise ValueError("Parallel research requires the Experimental profile")
+    if guardrails_v3 and (research_profile != "normal" or parallel_research):
+        raise ValueError(
+            "Experimental Guardrails v3 requires the normal non-parallel ASv3 profile"
+        )
     if (
         parallel_research
         and previous is not None
@@ -394,6 +403,7 @@ def run_asv3_loop(
         ASV3_TUNED_VARIANT,
         ASV3_GUARDED_EXPERIMENTAL_VARIANT,
         ASV3_GUARDRAILS_V2_VARIANT,
+        ASV3_GUARDRAILS_V3_VARIANT,
     }:
         context.services["asv3_workflow_variant"] = workflow_variant
     context.services["independent_question_mode"] = (

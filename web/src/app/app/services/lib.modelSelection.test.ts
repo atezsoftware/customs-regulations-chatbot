@@ -244,6 +244,34 @@ it("serializes Experimental Guardrails v2 without enabling the existing guardrai
   expect(payload.deep_research).toBe(false);
 });
 
+it("serializes Experimental Guardrails v3 without enabling either earlier guardrails variant", async () => {
+  global.fetch = jest.fn().mockResolvedValue({
+    ok: false,
+    status: 400,
+    json: async () => ({ detail: "capture-v3" }),
+  });
+
+  await expect(
+    sendMessage({
+      message: "Muafiyet şartları nelerdir?",
+      parentMessageId: null,
+      chatSessionId: "session-1",
+      filters: null,
+      experimentalGuardrailsV3: true,
+    }).next()
+  ).rejects.toThrow("capture-v3");
+
+  const request = jest.mocked(global.fetch).mock.calls[0]![1];
+  const payload = JSON.parse(String(request?.body));
+  expect(payload.atez_search_v3).toBe(true);
+  expect(payload.asv3_research_profile).toBe("normal");
+  expect(payload.asv3_guardrails_v3).toBe(true);
+  expect(payload).not.toHaveProperty("asv3_guarded_experimental");
+  expect(payload).not.toHaveProperty("asv3_guardrails_v2");
+  expect(payload).not.toHaveProperty("asv3_parallel_research");
+  expect(payload.deep_research).toBe(false);
+});
+
 it("carries the explicit checkpoint owner when resuming ASv3", async () => {
   global.fetch = jest.fn().mockResolvedValue({
     ok: false,

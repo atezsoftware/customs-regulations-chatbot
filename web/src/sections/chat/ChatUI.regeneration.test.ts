@@ -84,6 +84,42 @@ it("keeps Guardrails v2 selected for a new generation without a checkpoint", () 
   });
 });
 
+it("keeps Guardrails v3 selected for a new generation without a checkpoint", () => {
+  expect(
+    getRegenerationResearchMode({
+      atezSearchEnabled: false,
+      atezSearchV2Enabled: false,
+      atezSearchV3Enabled: true,
+      experimentalResearchEnabled: false,
+      experimentalParallelResearchEnabled: false,
+      experimentalGuardrailsEnabled: false,
+      experimentalGuardrailsV2Enabled: false,
+      experimentalGuardrailsV3Enabled: true,
+    })
+  ).toMatchObject({
+    atezSearchV3: true,
+    experimentalGuardrails: false,
+    experimentalGuardrailsV2: false,
+    experimentalGuardrailsV3: true,
+  });
+});
+
+it("lets the saved ASv3 checkpoint determine v3 after the input mode changes", () => {
+  const mode = getRegenerationResearchMode({
+    asv3ResumeMessageId: 43,
+    atezSearchEnabled: false,
+    atezSearchV2Enabled: false,
+    atezSearchV3Enabled: false,
+    experimentalResearchEnabled: false,
+    experimentalParallelResearchEnabled: false,
+    experimentalGuardrailsEnabled: true,
+    experimentalGuardrailsV2Enabled: false,
+    experimentalGuardrailsV3Enabled: false,
+  });
+  expect(mode.atezSearchV3).toBe(true);
+  expect(mode).not.toHaveProperty("experimentalGuardrailsV3");
+});
+
 it("keeps Legal Composite when regenerating without an ASv3 checkpoint", () => {
   expect(
     getRegenerationResearchMode({
