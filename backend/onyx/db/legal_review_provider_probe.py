@@ -43,20 +43,21 @@ old_names = [f'evidence:issue_{i}:{d.value}' for i in range(1, 4) for d in Legal
 text = 'The supplied document explicitly requires a declaration before release.'
 instructions = 'Does the supplied document explicitly require a declaration before release?'
 probes = []
+large_text = text + "\n" + ("This is synthetic source material about declarations, conditions, dates, exceptions and procedure. " * 1650)
 if 'jev' in keys:
-    probes.append(('jev_current_contract', 'jev', 'https://openrouter.ai/api/v1/systemone', {
-        'model': 'typesafe/jev-1.13', 'state': text,
+    probes.append(('jev_large_synthetic', 'jev', 'https://openrouter.ai/api/v1/systemone', {
+        'model': 'typesafe/jev-1.13', 'state': large_text,
         'questions': {name: {'type':'noul','instructions':instructions} for name in old_names}
     }))
 if 'openai' in keys:
-    probes.append(('openai_decisions_39', 'openai', 'https://api.openai.com/v1/decisions', {
-        'model': 'gpt-6-luna', 'input': text,
+    probes.append(('openai_decisions_large_synthetic', 'openai', 'https://api.openai.com/v1/decisions', {
+        'model': 'gpt-6-luna', 'input': large_text,
         'questions': [{'type':'predicate','name':f'q{i:06d}','instructions':instructions} for i in range(39)]
     }))
 results = []
 for name, credential_name, endpoint, payload in probes:
     start = time.monotonic()
-    result = {'probe':name, 'questions':len(payload['questions'])}
+    result = {'probe':name, 'questions':len(payload['questions']), 'request_bytes':len(json.dumps(payload,ensure_ascii=False).encode())}
     try:
         with httpx.Client(timeout=30, follow_redirects=False, trust_env=False) as client:
             response = client.post(endpoint, headers={'Authorization':'Bearer '+keys[credential_name]}, json=payload)
