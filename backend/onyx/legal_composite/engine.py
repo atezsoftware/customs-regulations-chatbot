@@ -47,6 +47,7 @@ from onyx.legal_composite.prompts import (
 from onyx.legal_composite.requirements import (
     RequirementLedger,
     apply_patch,
+    canonicalize_draft_supports,
     draft_binding_gaps,
     support_is_original,
 )
@@ -60,6 +61,23 @@ from onyx.tools.constants import REGULATORY_MAX_SEARCH_QUERY_CHARS
 from onyx.tracing.flows import LLMFlow
 
 ResponseModel = TypeVar("ResponseModel", bound=BaseModel)
+
+
+def _add_span_previews(records: list[JsonValue]) -> None:
+    """Expose short navigation labels while preserving the whole original text."""
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        text = record.get("text")
+        spans = record.get("witness_spans")
+        if not isinstance(text, str) or not isinstance(spans, list):
+            continue
+        for span in spans:
+            if not isinstance(span, dict):
+                continue
+            start, end = span.get("start_char"), span.get("end_char")
+            if isinstance(start, int) and isinstance(end, int):
+                span["preview"] = text[start : min(start + 140, end)]
 
 
 def _compact_original_catalogue(
@@ -385,6 +403,7 @@ class LegalCompositeEngine:
         self.evidence_context = evidence_context
         self.requirements = RequirementLedger(ledger)
         self.research_gaps: list[str] = []
+        self.protocol_defects: list[str] = []
         self.semantic_review: SemanticReview | None = None
         self.dependencies: list[AuthorityDependency] = []
         self.selection: SourceSelectionResult | None = None
@@ -456,9 +475,11 @@ class LegalCompositeEngine:
                 [*required, *recent_numbers, *available],
                 required=required,
                 max_chars=None if required else 50_000,
+                include_witness_spans=self.reviewer is not None,
             )
         )
         assert isinstance(records, list)
+        _add_span_previews(records)
         for record in records:
             if not isinstance(record, dict):
                 continue
@@ -494,6 +515,7 @@ class LegalCompositeEngine:
             ],
             "source_requirements": self.requirements.export(),
             "research_gaps": self.research_gaps,
+            "protocol_defects": self.protocol_defects,
         }
         if self.selection is not None:
             payload["source_selection"] = {
@@ -569,7 +591,7 @@ class LegalCompositeEngine:
     ) -> WorkflowResult:
         try:
             return self._run(request, history, instructions)
-        except RunStopped as error:
+        except (RunStopped, InvalidSourceAction) as error:
             status = "cancelled" if "cancel" in str(error).lower() else "unavailable"
             if self.reviewer is not None:
                 assert self.plan is None or isinstance(self.plan, IssueResearchPlan)
@@ -805,7 +827,7 @@ class LegalCompositeEngine:
                     ),
                 )
             except InvalidSourceAction as error:
-                self.research_gaps.append(str(error))
+                self.protocol_defects.append(str(error))
                 continue
             if isinstance(step, IssueResearchStep):
                 assert isinstance(plan, IssueResearchPlan)
@@ -986,6 +1008,7 @@ class LegalCompositeEngine:
         delivered = set(getattr(self.gateway, "last_delivered_citations", set()))
         pending_binding_gaps: list[str] = []
         try:
+            draft = canonicalize_draft_supports(draft, self.ledger, delivered)
             self._accept_draft_reading(
                 draft.requirements, draft.gap_resolutions, plan, delivered
             )
@@ -1249,6 +1272,11 @@ class LegalCompositeEngine:
                 True,
             )
             try:
+                patch = canonicalize_draft_supports(
+                    patch,
+                    self.ledger,
+                    set(getattr(self.gateway, "last_delivered_citations", set())),
+                )
                 self._accept_draft_reading(
                     patch.requirements,
                     patch.gap_resolutions,
@@ -1315,9 +1343,11 @@ class LegalCompositeEngine:
                 [*sorted(required), *available],
                 required=required,
                 max_chars=None if required else 50_000,
+                include_witness_spans=True,
             )
         )
         assert isinstance(records, list)
+        _add_span_previews(records)
         payload["original_evidence"] = records
         payload["required_evidence_numbers"] = sorted(required)
         payload["omitted_original_ids"] = [

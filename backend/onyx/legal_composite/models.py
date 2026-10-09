@@ -100,6 +100,24 @@ class PassageSupport(StrictModel):
     quotation: str = Field(min_length=1)
 
 
+class SpanSupport(PassageSupport):
+    span_id: str | None = Field(default=None, min_length=1)
+    quotation: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def accept_literal_support(cls, value: object) -> object:
+        if isinstance(value, PassageSupport) and not isinstance(value, cls):
+            return value.model_dump(mode="python")
+        return value
+
+    @model_validator(mode="after")
+    def witness_present(self) -> SpanSupport:
+        if self.span_id is None and not self.quotation.strip():
+            raise ValueError("Support needs an original span ID or literal quotation")
+        return self
+
+
 class SourceRequirement(StrictModel):
     supersedes_requirement_ids: list[str] = Field(default_factory=list)
     requirement_id: str = Field(min_length=1)
@@ -107,7 +125,7 @@ class SourceRequirement(StrictModel):
     dimension: str = Field(min_length=1)
     rule: str = Field(min_length=1)
     application: str = Field(min_length=1)
-    supports: list[PassageSupport] = Field(min_length=1)
+    supports: list[SpanSupport] = Field(min_length=1)
     missing_user_facts: list[str] = Field(default_factory=list)
 
 
@@ -140,7 +158,8 @@ class IssueResearchStep(ResearchStep):
 class AnswerSection(StrictModel):
     section_id: str = Field(min_length=1)
     need_ids: list[str] = Field(min_length=1)
-    text: str = Field(min_length=1)
+    text: str = ""
+    claim_ids: list[Annotated[str, Field(min_length=1)]] = Field(default_factory=list)
 
 
 class DraftClaim(StrictModel):
@@ -148,8 +167,52 @@ class DraftClaim(StrictModel):
     section_id: str = Field(min_length=1)
     need_ids: list[str] = Field(min_length=1)
     answer_excerpt: str = Field(min_length=1)
-    supports: list[PassageSupport] = Field(default_factory=list)
+    supports: list[SpanSupport] = Field(default_factory=list)
     requirement_ids: list[str] = Field(default_factory=list)
+
+
+def render_claim_sections(
+    sections: list[AnswerSection], claims: list[DraftClaim]
+) -> list[AnswerSection]:
+    """Render addressed claims exactly once while retaining literal-text sections."""
+    section_ids = [section.section_id for section in sections]
+    claim_ids = [claim.claim_id for claim in claims]
+    if len(section_ids) != len(set(section_ids)):
+        raise ValueError("Answer sections must have unique identities")
+    if len(claim_ids) != len(set(claim_ids)):
+        raise ValueError("Claims must have unique identities")
+    by_id = {claim.claim_id: claim for claim in claims}
+    rendered: list[AnswerSection] = []
+    for section in sections:
+        if not section.claim_ids:
+            if not section.text.strip():
+                raise ValueError("Literal section text cannot be empty")
+            rendered.append(section.model_copy(deep=True))
+            continue
+        if len(section.claim_ids) != len(set(section.claim_ids)):
+            raise ValueError("A section cannot reference a claim more than once")
+        selected: list[DraftClaim] = []
+        for identity in section.claim_ids:
+            claim = by_id.get(identity)
+            if claim is None:
+                raise ValueError("Section refers to an unknown claim")
+            if claim.section_id != section.section_id:
+                raise ValueError("Section cannot render another section's claim")
+            if set(claim.need_ids) - set(section.need_ids):
+                raise ValueError("Rendered claim refers to another section's issue")
+            selected.append(claim)
+        own_claims = {
+            claim.claim_id for claim in claims if claim.section_id == section.section_id
+        }
+        if set(section.claim_ids) != own_claims:
+            raise ValueError("Rendered section must include every claim assigned to it")
+        body = "\n\n".join(claim.answer_excerpt for claim in selected)
+        if section.text == body or section.text.endswith("\n\n" + body):
+            text = section.text
+        else:
+            text = "\n\n".join(part for part in (section.text, body) if part)
+        rendered.append(section.model_copy(deep=True, update={"text": text}))
+    return rendered
 
 
 class DraftAnswer(StrictModel):
@@ -161,15 +224,13 @@ class StructuredDraftAnswer(DraftAnswer):
     gap_resolutions: list[GapResolution] = Field(default_factory=list)
     answer: str = ""
     unresolved_need_ids: list[str]
-    sections: list[AnswerSection] = Field(default_factory=list)
-    claims: list[DraftClaim] = Field(default_factory=list)
+    sections: list[AnswerSection]
+    claims: list[DraftClaim]
     requirements: list[SourceRequirement] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def section_identity(self) -> StructuredDraftAnswer:
-        ids = [section.section_id for section in self.sections]
-        if len(ids) != len(set(ids)):
-            raise ValueError("Answer sections must have unique identities")
+        self.sections = render_claim_sections(self.sections, self.claims)
         joined = "\n\n".join(section.text for section in self.sections)
         if self.sections:
             if self.answer and self.answer != joined:
@@ -179,9 +240,6 @@ class StructuredDraftAnswer(DraftAnswer):
             self.answer = joined
         if not self.answer.strip():
             raise ValueError("Answer cannot be empty")
-        claims = [claim.claim_id for claim in self.claims]
-        if len(claims) != len(set(claims)):
-            raise ValueError("Claims must have unique identities")
         return self
 
 
@@ -191,6 +249,11 @@ class DraftPatch(StrictModel):
     claims: list[DraftClaim]
     unresolved_need_ids: list[str]
     requirements: list[SourceRequirement] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def render_sections(self) -> DraftPatch:
+        self.sections = render_claim_sections(self.sections, self.claims)
+        return self
 
 
 class ReviewCheck(StrictModel):

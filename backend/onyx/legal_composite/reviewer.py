@@ -17,6 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.models import RunStopped
+from onyx.asv3.witnesses import original_witness_spans
 from onyx.legal_composite.budget import WorkflowBudget
 from onyx.legal_composite.decisions import (
     DecisionsClassifier,
@@ -30,6 +31,7 @@ from onyx.legal_composite.models import (
     ReviewCheck,
     SemanticReview,
     SourceRequirement,
+    SpanSupport,
 )
 from onyx.legal_composite.models import (
     IssueResearchPlan as ResearchPlan,
@@ -148,6 +150,40 @@ def build_checks(
     del request, previous, affected_sections
     checks: dict[str, ReviewQuestion] = {}
     by_requirement = {item.requirement_id: item for item in requirements}
+    all_need_ids = [need.need_id for need in plan.needs]
+    need_citations: dict[str, set[int]] = {identity: set() for identity in all_need_ids}
+    original_needs: dict[int, set[str]] = {}
+    for citation in delivered:
+        item = ledger.get(citation)
+        bound = {
+            identity
+            for identity in all_need_ids
+            if item is not None and identity in item.question_ids
+        } or set(all_need_ids)
+        original_needs[citation] = bound
+        for identity in bound:
+            need_citations[identity].add(citation)
+
+    def bind_supports(need_ids: list[str], citations: set[int]) -> None:
+        for identity in need_ids:
+            if identity not in need_citations:
+                continue
+            for citation in citations.intersection(delivered):
+                need_citations[identity].add(citation)
+                original_needs[citation].add(identity)
+
+    for requirement in requirements:
+        bind_supports(
+            [requirement.need_id],
+            {support.citation for support in requirement.supports},
+        )
+    for claim in draft.claims:
+        citations = {support.citation for support in claim.supports}
+        for identity in claim.requirement_ids:
+            requirement = by_requirement.get(identity)
+            if requirement is not None:
+                citations.update(support.citation for support in requirement.supports)
+        bind_supports(claim.need_ids, citations)
 
     def add(
         check_id: str,
@@ -194,16 +230,16 @@ def build_checks(
             "Are the supplied operative originals and verified requirements sufficient for this need's actual requested outcome, without a material unread LAW interaction? A draft omission or misapplication of already supplied evidence is not an evidence gap. Unknown USER facts preserved as conditions are not unread law. A known decisive unread law interaction, including need.evidence_gaps, is gap even when the draft correctly discloses it; uncertain does not establish that another source is missing.",
             [need.need_id],
             sections,
-            set(),
+            need_citations[need.need_id],
         )
-        # Bound witnesses support aggregate checks; whole-original omission checks
-        # separately preserve the complete context of every delivered source.
+        # Aggregate judgments need whole delivered originals even before any
+        # source-backed requirement or material claim has been registered.
         add(
             f"issue:{need.need_id}",
             "Does the draft answer this need's actual question and required_outcome accurately using sufficient supplied operative evidence for that requested outcome, preserving material conditions? Completeness concerns the requested question, not every possible legal topic. A correct conditional answer preserving unknown USER facts is addressed and need not be an unresolved issue. If need.evidence_gaps is nonempty, every entry must be specifically disclosed in the matching section and this need must be listed in unresolved_need_ids. Missing LAW cannot become an unconditional positive conclusion.",
             [need.need_id],
             sections,
-            set(),
+            need_citations[need.need_id],
         )
         for dimension in REVIEW_DIMENSIONS:
             add(
@@ -211,18 +247,16 @@ def build_checks(
                 f"Within the user's requested scope: {_DIMENSION_QUESTIONS[dimension]} Choose not_applicable only when the request scope, supplied rules and facts establish no material effect on this answer.",
                 [need.need_id],
                 sections,
-                set(),
+                need_citations[need.need_id],
                 True,
             )
 
-    all_need_ids = [need.need_id for need in plan.needs]
     for citation in sorted(delivered):
-        item = ledger.get(citation)
         bound = [
             identity
             for identity in all_need_ids
-            if item is not None and identity in item.question_ids
-        ] or all_need_ids
+            if identity in original_needs[citation]
+        ]
         add(
             f"original:{citation}",
             f"Across EVERY bound need and its draft sections and source requirements, does the draft preserve every decisive condition, exception, contrary or favorable effect of complete original citation {citation} within the requested scope? Any omitted effect in any bound issue is gap and any contradicted effect is incorrect; not_applicable means this original has no material effect on ANY bound issue under the supplied facts.",
@@ -241,7 +275,7 @@ def build_checks(
         "Does the complete draft and issue inventory cover every explicit request, subquestion and requested alternative in the original user request? A matter omitted entirely from the plan is still gap. Evaluate coverage within the requested scope rather than inventing new legal questions.",
         [need.need_id for need in plan.needs],
         [section.section_id for section in draft.sections],
-        set(),
+        set(delivered),
     )
 
     for edge in dependencies:
@@ -381,6 +415,21 @@ class _CanonicalReviewContext:
         if not support.quotation.strip() or support.quotation not in text:
             raise ValueError("Reviewer witness is not an exact delivered quotation")
         start = text.index(support.quotation)
+        if isinstance(support, SpanSupport) and support.span_id is not None:
+            matches = [
+                span
+                for span in original_witness_spans(support.citation, text)
+                if span["witness_id"] == support.span_id
+            ]
+            if (
+                len(matches) != 1
+                or text[matches[0]["start_char"] : matches[0]["end_char"]]
+                != support.quotation
+            ):
+                raise ValueError(
+                    "Reviewer witness span differs from its exact original"
+                )
+            start = matches[0]["start_char"]
         return {
             **original,
             "quotation": support.quotation,
@@ -421,7 +470,11 @@ class _CanonicalReviewContext:
                     )
         related_claims = [c for c in draft.claims if c.section_id in section_ids]
         supports = {
-            (support.citation, support.quotation): support
+            (
+                support.citation,
+                support.span_id if isinstance(support, SpanSupport) else None,
+                support.quotation,
+            ): support
             for item in [*related_requirements, *related_claims]
             for support in item.supports
         }

@@ -88,6 +88,7 @@ def harness(monkeypatch: pytest.MonkeyPatch) -> RuntimeHarness:
         ) -> None:
             self.ledger = ledger
             self.requirements = RequirementLedger(ledger)
+            self.protocol_defects: list[str] = []
             self.report = report
 
         def run(
@@ -170,6 +171,7 @@ def harness(monkeypatch: pytest.MonkeyPatch) -> RuntimeHarness:
 
     monkeypatch.setattr(runtime, "build_source_selector", lambda **_kwargs: None)
     monkeypatch.setattr(runtime, "build_answer_reviewer", lambda **_kwargs: MagicMock())
+    monkeypatch.setattr(runtime, "get_llm", lambda **_kwargs: llm_mock)
     monkeypatch.setattr(runtime.CompositeSearchTool, "from_fork", lambda _fork: _fork)
 
     def broker_factory(user: User, scope: IndexFilters) -> MagicMock:

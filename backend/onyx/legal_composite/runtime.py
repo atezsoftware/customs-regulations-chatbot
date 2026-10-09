@@ -53,6 +53,7 @@ from onyx.legal_composite.routing import SourceLaneRouter
 from onyx.legal_composite.search import CompositeSearchTool
 from onyx.legal_composite.shared_work import SharedCanonicalCenters
 from onyx.legal_composite.source_lanes import build_lane_broker
+from onyx.llm.factory import get_llm
 from onyx.llm.interfaces import LLM, LLMUserIdentity
 from onyx.llm.models import ReasoningEffort
 from onyx.server.query_and_chat.placement import Placement
@@ -186,7 +187,7 @@ def _run_legal_composite_loop(
         max_cost_usd=1.50,
         max_call_seconds=75,
         max_context_tokens=128_000,
-        final_output_tokens=8_192,
+        final_output_tokens=16_384,
         max_input_tokens=2_000_000,
         max_output_tokens=128_000,
         max_model_calls=48,
@@ -384,17 +385,41 @@ def _run_legal_composite_loop(
     budget.retain_selection_time(policy.selection_reserve_seconds)
     try:
         with get_session_with_current_tenant() as price_session:
+            reviewer = build_answer_reviewer(
+                session=price_session,
+                user=user,
+                budget=budget,
+                ledger=ledger,
+                check_active=context.check_active,
+                token_counter=token_counter,
+                run_id=context.run_id,
+                scope=context.scope,
+            )
+            if reviewer is None:
+                raise RunStopped("No authorized answer reviewer is configured")
+            config = reviewer.config
+            typed_research_llm = get_llm(
+                provider=config.model_provider,
+                model=config.model_name,
+                max_input_tokens=config.max_input_tokens,
+                deployment_name=None,
+                api_key=config.api_key,
+                api_base="https://openrouter.ai/api/v1",
+                temperature=1,
+            )
             gateway = BudgetedGateway(
                 max_parallel_generations=4,
                 selected_llm=llm,
-                research_llm=research_llm or llm,
+                research_llm=typed_research_llm,
                 budget=budget,
                 ledger=ledger,
                 db_session=price_session,
                 user_identity=user_identity,
                 check_active=context.check_active,
                 token_counter=token_counter,
-                reasoning_effort=reasoning_effort,
+                reasoning_effort=ReasoningEffort.LOW
+                if reasoning_effort is ReasoningEffort.AUTO
+                else reasoning_effort,
                 run_id=context.run_id,
                 scope=context.scope,
             )
@@ -409,18 +434,6 @@ def _run_legal_composite_loop(
                 run_id=context.run_id,
                 scope=context.scope,
             )
-            reviewer = build_answer_reviewer(
-                session=price_session,
-                user=user,
-                budget=budget,
-                ledger=ledger,
-                check_active=context.check_active,
-                token_counter=token_counter,
-                run_id=context.run_id,
-                scope=context.scope,
-            )
-            if reviewer is None:
-                raise RunStopped("No authorized answer reviewer is configured")
     except RunStopped as error:
         raise OnyxError(
             OnyxErrorCode.VALIDATION_ERROR,
@@ -586,6 +599,7 @@ def _run_legal_composite_loop(
         "legal_composite": result.model_dump(mode="json"),
         "legal_composite_budget": budget.snapshot(),
         "source_requirements": engine.requirements.export(),
+        "protocol_defects": engine.protocol_defects,
         "answer_reviewer": getattr(reviewer, "mode", "configured_decisions"),
         "cost_scope": "Generation and Decisions calls only; embedding/reranker costs require separate reconciliation",
         "source_lane_inventory": router.inventory(),
