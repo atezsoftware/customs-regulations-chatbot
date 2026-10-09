@@ -39,6 +39,11 @@ from onyx.legal_composite.query_repair import (
     plan_with_only_oversized_query,
     restore_plan_query,
 )
+from onyx.legal_composite.reading_evidence import (
+    IssueReadingResponse,
+    ReadingWitnessManifest,
+    reading_witness_manifest,
+)
 from onyx.llm.cost import ModelPrice, get_model_price_per_million
 from onyx.llm.cost_overrides import get_override
 from onyx.llm.interfaces import LLM, LLMUserIdentity
@@ -150,6 +155,7 @@ def _record_typed_validation(
         IssueResearchPlan: "research_plan",
         DiscoveryQuery: "query_compression",
         IssueResearchStep: "research_step",
+        IssueReadingResponse: "research_step",
         StructuredDraftAnswer: "draft_answer",
         DraftComposition: "draft_answer",
         ClaimDeltaPatch: "claim_delta",
@@ -391,6 +397,7 @@ class BudgetedGateway:
             ).hexdigest()
         self.last_call_id: str | None = None
         self.last_delivered_citations: set[int] = set()
+        self.last_reading_manifest: ReadingWitnessManifest | None = None
         self._final_output_tokens = budget.policy.final_output_tokens
         if "claude" in selected_llm.config.model_name.lower():
             self._final_output_tokens = max(
@@ -885,6 +892,7 @@ class BudgetedGateway:
     ) -> ResponseModel:
         self.last_call_id = None
         self.last_delivered_citations = set()
+        self.last_reading_manifest = None
         self.check_active()
         self.budget.check_active(finalizing)
         research = flow is LLMFlow.LEGAL_COMPOSITE_RESEARCH
@@ -903,7 +911,8 @@ class BudgetedGateway:
         }
         output_tokens = (
             _REQUIREMENTS_OUTPUT_TOKENS
-            if response_type in {IssueResearchPlan, IssueResearchStep}
+            if response_type
+            in {IssueResearchPlan, IssueResearchStep, IssueReadingResponse}
             else _RESEARCH_OUTPUT_TOKENS
             if research
             else self._final_output_tokens
@@ -935,6 +944,7 @@ class BudgetedGateway:
         if response_type in {
             IssueResearchPlan,
             IssueResearchStep,
+            IssueReadingResponse,
             StructuredDraftAnswer,
             DraftComposition,
             ClaimDeltaPatch,
@@ -974,6 +984,10 @@ class BudgetedGateway:
         self.last_delivered_citations = self.ledger.completely_delivered(
             reservation.call_id
         )
+        if response_type is IssueReadingResponse:
+            self.last_reading_manifest = reading_witness_manifest(
+                records, call_id=reservation.call_id
+            )
         self.check_active()
         self.budget.check_response_active(finalizing)
         try:
@@ -987,6 +1001,7 @@ class BudgetedGateway:
                         frozen, overlong_query = repair
                         parent_call_id = self.last_call_id
                         parent_delivered = set(self.last_delivered_citations)
+                        parent_manifest = self.last_reading_manifest
                         try:
                             query = self.complete(
                                 QUERY_REPAIR_PROMPT,
@@ -1003,6 +1018,7 @@ class BudgetedGateway:
                         finally:
                             self.last_call_id = parent_call_id
                             self.last_delivered_citations = parent_delivered
+                            self.last_reading_manifest = parent_manifest
                         repaired = restore_plan_query(frozen, query)
                         with graph_step(
                             "legal_composite.query_compression",

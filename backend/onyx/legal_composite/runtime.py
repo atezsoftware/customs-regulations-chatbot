@@ -602,6 +602,8 @@ def _run_legal_composite_loop(
         source_kinds={str(row.source_id): row.kind for row in catalogue.records},
         reviewer=reviewer,
         evidence_context=context,
+        use_numbered_reading_supports=True,
+        allow_terminal_observed_reads=True,
     )
     result = engine.run(question, history, custom_agent_prompt)
     snapshot: dict[str, JsonValue] = {

@@ -5,6 +5,7 @@ import json
 import time
 from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from hashlib import sha256
 from threading import Lock
 from typing import cast
 
@@ -199,6 +200,74 @@ class CanonicalAcquirer:
         for action in pending.values():
             counts[action.tool] = counts.get(action.tool, 0) + 1
         return counts
+
+    def safe_observed_read_actions(
+        self,
+        actions: list[SourceAction],
+        plan: ResearchPlan,
+        delivered: set[int],
+    ) -> tuple[list[SourceAction], list[SourceAction]]:
+        """Partition exact read navigation from delivered originals without acquiring."""
+        self.pending_call_counts(actions, plan)
+        from onyx.asv3.corpus_tools import article_references
+
+        targets: set[str] = set()
+        for action in actions:
+            source_id = action.arguments.get("source_id")
+            if action.tool in {
+                "read_provision",
+                "read_chunk",
+                "read_chunk_context",
+            } and isinstance(source_id, str):
+                targets.add(source_id)
+        observed: dict[str, set[str]] = {}
+        for number in delivered:
+            if type(number) is not int:
+                continue
+            item = self.ledger.get(number)
+            if (
+                item is None
+                or item.source_id not in targets
+                or item.search_doc is None
+                or not item.chunk_id
+            ):
+                continue
+            canonical = item.metadata.get("canonical_metadata")
+            layers = (
+                item.metadata,
+                item.search_doc.metadata,
+                canonical if isinstance(canonical, dict) else {},
+            )
+            if (
+                item.search_doc.document_id != item.source_id
+                or item.search_doc.metadata.get("regulatory_chunk_id") != item.chunk_id
+                or sha256(item.text.encode()).hexdigest() != item.text_hash
+                or any(
+                    layer.get(flag)
+                    for layer in layers
+                    for flag in ("external", "derived", "untrusted", "truncated")
+                )
+            ):
+                continue
+            observed.setdefault(item.source_id, set()).add(item.chunk_id)
+        selected: list[SourceAction] = []
+        remaining: list[SourceAction] = []
+        for action in actions:
+            source_id = action.arguments.get("source_id")
+            safe = False
+            if isinstance(source_id, str) and source_id in observed:
+                if action.tool == "read_provision":
+                    article = action.arguments.get("article")
+                    # The proposed provision is navigation; its returned body still needs proof.
+                    safe = (
+                        isinstance(article, str)
+                        and len(article_references(article)) == 1
+                    )
+                elif action.tool in {"read_chunk", "read_chunk_context"}:
+                    chunk_id = action.arguments.get("chunk_id")
+                    safe = isinstance(chunk_id, str) and chunk_id in observed[source_id]
+            (selected if safe else remaining).append(action)
+        return selected, remaining
 
     def _scheduled_calls(
         self, calls: list[AcquisitionCall], *, host_actions: bool = False
