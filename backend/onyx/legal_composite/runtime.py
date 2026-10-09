@@ -604,6 +604,7 @@ def _run_legal_composite_loop(
         evidence_context=context,
         use_numbered_reading_supports=True,
         allow_terminal_observed_reads=True,
+        recover_invalid_navigation=True,
     )
     result = engine.run(question, history, custom_agent_prompt)
     snapshot: dict[str, JsonValue] = {

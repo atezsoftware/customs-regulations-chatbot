@@ -54,6 +54,12 @@ from onyx.legal_composite.models import (
     WorkflowPolicy,
     WorkflowResult,
 )
+from onyx.legal_composite.navigation import (
+    NAVIGATION_REPAIR_PROMPT,
+    InvalidNavigationProposal,
+    NavigationProposal,
+    validate_navigation,
+)
 from onyx.legal_composite.prompts import (
     ANSWER_PROMPT,
     PLAN_PROMPT,
@@ -521,10 +527,12 @@ class LegalCompositeEngine:
         evidence_context: RunContext | None = None,
         use_numbered_reading_supports: bool = False,
         allow_terminal_observed_reads: bool = False,
+        recover_invalid_navigation: bool = False,
     ) -> None:
         if (
             type(use_numbered_reading_supports) is not bool
             or type(allow_terminal_observed_reads) is not bool
+            or type(recover_invalid_navigation) is not bool
         ):
             raise ValueError("Reading behavior must use explicit boolean opt-ins")
         self.gateway = gateway
@@ -541,6 +549,7 @@ class LegalCompositeEngine:
         self.evidence_context = evidence_context
         self.use_numbered_reading_supports = use_numbered_reading_supports
         self.allow_terminal_observed_reads = allow_terminal_observed_reads
+        self.recover_invalid_navigation = recover_invalid_navigation
         self.requirements = RequirementLedger(ledger)
         self.research_gaps: list[str] = []
         self.protocol_defects: list[str] = []
@@ -737,6 +746,162 @@ class LegalCompositeEngine:
         if self.evidence_context is None:
             return float("inf")
         return max(0.0, self.evidence_context.research_deadline - time.monotonic())
+
+    def _preflight_navigation(
+        self, step: IssueResearchStep, plan: IssueResearchPlan
+    ) -> None:
+        self.check_active()
+        if step.related_citations:
+            raise InvalidNavigationProposal("dependencies", "relationship_format")
+        if not isinstance(self.acquirer, CanonicalAcquirer):
+            raise InvalidSourceAction(
+                "Navigation preflight requires a canonical acquirer"
+            )
+        validate_navigation(
+            NavigationProposal(
+                actions=step.actions,
+                reconsider_citations=step.reconsider_citations,
+                material_dependencies=step.material_dependencies,
+            ),
+            acquirer=self.acquirer,
+            ledger=self.ledger,
+            plan=plan,
+            delivered=set(getattr(self.gateway, "last_delivered_citations", set())),
+            dependency_expander=self.dependency_expander,
+        )
+
+    def _reject_navigation(
+        self, step: IssueResearchStep, error: InvalidNavigationProposal
+    ) -> None:
+        self.protocol_defects.append(str(error))
+        self.deferred_followup_steps.append(
+            {
+                "actions": [row.model_dump(mode="json") for row in step.actions],
+                "reconsider_citations": list(step.reconsider_citations),
+                "material_dependencies": [
+                    row.model_dump(mode="json") for row in step.material_dependencies
+                ],
+                "status": "invalid_navigation",
+                "reason": error.reason,
+                "failure_stage": error.stage,
+                "navigation_only": True,
+            }
+        )
+        with graph_step(
+            "legal_composite.navigation_admission",
+            {},
+            summary=f"stage={error.stage} reason={error.reason} accepted=0",
+        ) as admission:
+            admission.output_value = {
+                "stage": error.stage,
+                "reason": error.reason,
+                "accepted": False,
+            }
+
+    def _complete_navigation_repair(
+        self,
+        step: IssueResearchStep,
+        request: str,
+        history: str,
+        instructions: str | None,
+    ) -> IssueResearchStep:
+        view = self._payload(request, history, instructions=instructions)
+        payload: dict[str, JsonValue] = {
+            key: view[key]
+            for key in (
+                "request",
+                "conversation",
+                "assistant_instructions",
+                "plan",
+                "tools",
+                "observed_source_directory",
+                "original_catalogue",
+                "source_lane_inventory",
+                "limits",
+                "protocol_defects",
+                "deferred_followup_source_actions",
+            )
+            if key in view
+        }
+        payload["rejected_navigation"] = {
+            "actions": [row.model_dump(mode="json") for row in step.actions],
+            "reconsider_citations": list(step.reconsider_citations),
+            "material_dependencies": [
+                row.model_dump(mode="json") for row in step.material_dependencies
+            ],
+        }
+        parent_call = self.gateway.last_call_id
+        parent_delivered = set(getattr(self.gateway, "last_delivered_citations", set()))
+        parent_manifest = getattr(self.gateway, "last_reading_manifest", None)
+        try:
+            proposal = self.gateway.complete(
+                NAVIGATION_REPAIR_PROMPT,
+                payload,
+                NavigationProposal,
+                LLMFlow.LEGAL_COMPOSITE_RESEARCH,
+            )
+        finally:
+            self.gateway.last_call_id = parent_call
+            setattr(self.gateway, "last_delivered_citations", parent_delivered)
+            setattr(self.gateway, "last_reading_manifest", parent_manifest)
+        return step.model_copy(
+            update={
+                "actions": proposal.actions,
+                "reconsider_citations": proposal.reconsider_citations,
+                "material_dependencies": proposal.material_dependencies,
+                "related_citations": [],
+            }
+        )
+
+    def _admit_source_reading(
+        self,
+        response: ResearchStep | IssueResearchStep | IssueReadingResponse,
+        plan: ResearchPlan,
+    ) -> tuple[ResearchStep | IssueResearchStep, set[str]] | None:
+        try:
+            step = self._resolve_source_reading(response)
+            new_ids = (
+                {row.requirement_id for row in step.requirements}
+                - {row.requirement_id for row in self.requirements.records()}
+                if isinstance(step, IssueResearchStep)
+                else set()
+            )
+            if isinstance(step, IssueResearchStep):
+                assert isinstance(plan, IssueResearchPlan)
+                self._validate_gap_scope(step, plan)
+            self.requirements.update(
+                step.requirements if isinstance(step, IssueResearchStep) else [],
+                plan,
+                getattr(
+                    self.gateway,
+                    "last_delivered_citations",
+                    set(self.ledger.citation_numbers()),
+                ),
+            )
+        except InvalidSourceAction as error:
+            if self.reviewer is not None:
+                with graph_step(
+                    "legal_composite.reading_admission",
+                    {},
+                    summary=f"accepted=0 reason={_admission_reason(error)}",
+                ) as admission:
+                    admission.output_value = {
+                        "accepted": False,
+                        "reason": _admission_reason(error),
+                    }
+            self.protocol_defects.append(str(error))
+            return None
+        if self.reviewer is not None:
+            with graph_step(
+                "legal_composite.reading_admission",
+                {},
+                summary=f"accepted=1 new_requirements={len(new_ids)}",
+            ) as admission:
+                admission.output_value = {
+                    "accepted": True,
+                    "new_requirements": len(new_ids),
+                }
+        return step, new_ids
 
     def _repair_research_has_runway(self) -> bool:
         planning = max(self._research_seconds, default=self.policy.max_call_seconds)
@@ -1317,6 +1482,8 @@ class LegalCompositeEngine:
             initial_actions = initial_discovery_actions(plan, request)
         source_phase_open = not initial_actions or self._acquire(initial_actions, plan)
         self._select_sources(request, plan)
+        pending_navigation: IssueResearchStep | None = None
+        navigation_repair_used = False
         for _round in range(self.policy.max_research_rounds):
             if (
                 not source_phase_open
@@ -1324,6 +1491,11 @@ class LegalCompositeEngine:
                 or not self.research_available()
             ):
                 break
+            response: ResearchStep | IssueResearchStep | IssueReadingResponse | None = (
+                None
+            )
+            step: ResearchStep | IssueResearchStep | None = None
+            new_requirement_ids: set[str] = set()
             try:
                 if self.reviewer is not None:
                     if not self._reading_has_runway():
@@ -1340,9 +1512,17 @@ class LegalCompositeEngine:
                         break
                     self.report("reading", plan.language)
                 reading_started = time.monotonic()
-                response = self._complete_source_reading(
-                    self._payload(request, history, instructions=instructions),
-                )
+                repairing_navigation = pending_navigation is not None
+                if pending_navigation is not None:
+                    navigation_repair_used = True
+                    step = self._complete_navigation_repair(
+                        pending_navigation, request, history, instructions
+                    )
+                    pending_navigation = None
+                else:
+                    response = self._complete_source_reading(
+                        self._payload(request, history, instructions=instructions),
+                    )
                 if self.reviewer is not None:
                     self._research_seconds.append(time.monotonic() - reading_started)
             except ResearchPhaseClosed as error:
@@ -1361,54 +1541,28 @@ class LegalCompositeEngine:
             except RunStopped:
                 self.check_active()
                 break
-            try:
-                step = self._resolve_source_reading(response)
-                new_requirement_ids = (
-                    {row.requirement_id for row in step.requirements}
-                    - {row.requirement_id for row in self.requirements.records()}
-                    if isinstance(step, IssueResearchStep)
-                    else set()
-                )
-                if isinstance(step, IssueResearchStep):
-                    assert isinstance(plan, IssueResearchPlan)
-                    self._validate_gap_scope(step, plan)
-                self.requirements.update(
-                    step.requirements if isinstance(step, IssueResearchStep) else [],
-                    plan,
-                    getattr(
-                        self.gateway,
-                        "last_delivered_citations",
-                        set(self.ledger.citation_numbers()),
-                    ),
-                )
-            except InvalidSourceAction as error:
-                if self.reviewer is not None:
-                    with graph_step(
-                        "legal_composite.reading_admission",
-                        {},
-                        summary=f"accepted=0 reason={_admission_reason(error)}",
-                    ) as reading_step:
-                        reading_step.output_value = {
-                            "accepted": False,
-                            "reason": _admission_reason(error),
-                        }
-                self.protocol_defects.append(str(error))
-                continue
-            if self.reviewer is not None:
-                with graph_step(
-                    "legal_composite.reading_admission",
-                    {},
-                    summary=f"accepted=1 new_requirements={len(new_requirement_ids)}",
-                ) as reading_step:
-                    reading_step.output_value = {
-                        "accepted": True,
-                        "new_requirements": len(new_requirement_ids),
-                    }
+            if not repairing_navigation:
+                assert response is not None
+                admitted = self._admit_source_reading(response, plan)
+                if admitted is None:
+                    continue
+                step, new_requirement_ids = admitted
+            assert step is not None
             if isinstance(step, IssueResearchStep):
                 assert isinstance(plan, IssueResearchPlan)
-                self._record_research_gaps(
-                    step, plan, new_requirement_ids=new_requirement_ids
-                )
+                if not repairing_navigation:
+                    self._record_research_gaps(
+                        step, plan, new_requirement_ids=new_requirement_ids
+                    )
+                if self.recover_invalid_navigation:
+                    try:
+                        self._preflight_navigation(step, plan)
+                    except InvalidNavigationProposal as error:
+                        self._reject_navigation(step, error)
+                        if navigation_repair_used:
+                            break
+                        pending_navigation = step
+                        continue
                 self._reconsider_sources(step.reconsider_citations, plan)
             if (
                 not step.actions
