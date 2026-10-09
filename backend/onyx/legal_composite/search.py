@@ -28,6 +28,7 @@ from onyx.context.search.retrieval.query_embedding_scope import (
 )
 from onyx.db.legal_composite_sources import SourceKind
 from onyx.federated_connectors.federated_retrieval import FederatedRetrievalInfo
+from onyx.legal_composite.native_trace import compact_native_index
 from onyx.legal_composite.shared_search import SharedPreparedRetrieval
 from onyx.natural_language_processing.search_nlp_models import EmbeddingModel
 from onyx.regulatory.heading_path import RegulatoryProvisionReference
@@ -49,6 +50,7 @@ class CompositeSearchTool(SearchTool):
     _shared_query_embeddings: ParallelQueryEmbeddingScope | None = None
 
     def enable_shared_prepared_work(self) -> None:
+        self.document_index = compact_native_index(self.document_index)
         self._shared_prepared_retrieval = SharedPreparedRetrieval()
         self._shared_query_embeddings = ParallelQueryEmbeddingScope(cache_queries=True)
 

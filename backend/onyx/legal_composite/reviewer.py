@@ -10,10 +10,11 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
 from contextvars import copy_context
+from threading import Lock
 from typing import Literal, Protocol, cast
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, JsonValue
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
 
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.models import RunStopped
@@ -966,15 +967,79 @@ class DecisionsAnswerReviewer(_CanonicalReviewContext):
         )
 
 
+class _GeneratedDecision(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    index: int = Field(ge=0)
+    status: ReviewStatus
+    confidence: float = Field(ge=0, le=1, allow_inf_nan=False)
+
+
 class _GeneratedReview(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
-    checks: list[ReviewCheck]
+    checks: list[_GeneratedDecision] = Field(min_length=1, max_length=32)
+
+
+class ReviewProtocolError(ValueError):
+    def __init__(self, category: str, counts: dict[str, int]) -> None:
+        super().__init__(category)
+        self.category = category
+        self.counts = counts
+
+
+class ReviewSchemaError(ReviewProtocolError):
+    pass
+
+
+class ReviewInventoryError(ReviewProtocolError):
+    pass
+
+
+class ReviewApplicabilityError(ReviewProtocolError):
+    pass
+
+
+def _decode_generated_review(
+    result: _GeneratedReview, checks: list[ReviewQuestion]
+) -> list[ReviewCheck]:
+    indices = [item.index for item in result.checks]
+    expected = set(range(len(checks)))
+    observed = set(indices)
+    counts = {
+        "expected": len(checks),
+        "received": len(indices),
+        "missing": len(expected - observed),
+        "duplicates": len(indices) - len(observed),
+        "unknown": len(observed - expected),
+    }
+    if counts["missing"] or counts["duplicates"] or counts["unknown"]:
+        raise ReviewInventoryError("inventory", counts)
+    by_index = {item.index: item for item in result.checks}
+    forbidden_na = sum(
+        by_index[index].status == "not_applicable" and not check.allow_not_applicable
+        for index, check in enumerate(checks)
+    )
+    if forbidden_na:
+        raise ReviewApplicabilityError(
+            "applicability", {**counts, "forbidden_na": forbidden_na}
+        )
+    return [
+        ReviewCheck(
+            check_id=check.check_id,
+            need_ids=check.need_ids,
+            section_ids=check.section_ids,
+            status=by_index[index].status,
+            confidence=by_index[index].confidence,
+        )
+        for index, check in enumerate(checks)
+    ]
 
 
 _GENERATION_POLICY = (
     _POLICY
-    + " Evaluate every fixed expected check independently. Return exactly one typed "
-    "check per host check ID with identical need_ids and section_ids. Use only the "
+    + " Evaluate every fixed expected check independently. Return exactly one decision "
+    "per expected_checks index, containing ONLY index, status and confidence. Return "
+    "every supplied integer index exactly once; do not return check_id, need_ids or "
+    "section_ids. The host binds those immutable identities. Use only the "
     "allowed status criteria. Confidence must honestly reflect your judgment; do not "
     "inflate it to pass a gate. Do not invent excerpts, quotations, checks, laws, or "
     "user facts. Complete originals are in original_evidence; context references "
@@ -1037,7 +1102,10 @@ class GatewayAnswerReviewer(_CanonicalReviewContext):
         return {
             "review_context": state,
             "status_criteria": _CRITERIA,
-            "expected_checks": [check.model_dump(mode="json") for check in checks],
+            "expected_checks": [
+                {"index": index, **check.model_dump(mode="json")}
+                for index, check in enumerate(checks)
+            ],
             "original_evidence": cast(list[JsonValue], originals),
             "required_evidence_numbers": [
                 original["citation"] for original in originals
@@ -1049,6 +1117,8 @@ class GatewayAnswerReviewer(_CanonicalReviewContext):
         gateway: BudgetedGateway,
         payload: dict[str, JsonValue],
         checks: list[ReviewQuestion],
+        input_tokens: int,
+        acquire_protocol_retry: Callable[[], bool],
     ) -> list[ReviewCheck]:
         with graph_step(
             "legal_composite.semantic_review_batch",
@@ -1058,54 +1128,99 @@ class GatewayAnswerReviewer(_CanonicalReviewContext):
                 "provider": self.config.model_provider,
                 "check_ids": [check.check_id for check in checks],
             },
+            summary=f"checks={len(checks)} input_tokens={input_tokens}",
         ) as step:
-            try:
-                result = gateway.complete(
-                    _GENERATION_POLICY,
-                    payload,
-                    _GeneratedReview,
-                    LLMFlow.LEGAL_COMPOSITE_REVIEW,
-                    finalizing=True,
-                )
-            finally:
-                # A malformed judgment cannot erase the actual exact quotations sent.
-                if gateway.last_call_id is not None:
-                    state = cast(dict[str, JsonValue], payload["review_context"])
-                    witnesses = cast(
-                        list[dict[str, JsonValue]], state["canonical_witnesses"]
+            diagnostics: list[dict[str, JsonValue]] = []
+            attempt = 0
+            while True:
+                try:
+                    try:
+                        result = gateway.complete(
+                            _GENERATION_POLICY
+                            + (
+                                " The prior response had invalid output protocol. Return the "
+                                "same independently evaluated checks with every supplied "
+                                "integer index once. Do not change judgments to satisfy an "
+                                "approval threshold. not_applicable is allowed only where "
+                                "that expected check explicitly permits it."
+                                if attempt
+                                else ""
+                            ),
+                            payload,
+                            _GeneratedReview,
+                            LLMFlow.LEGAL_COMPOSITE_REVIEW,
+                            finalizing=True,
+                        )
+                    finally:
+                        # A malformed judgment cannot erase the actual quotations sent.
+                        if gateway.last_call_id is not None:
+                            state = cast(
+                                dict[str, JsonValue], payload["review_context"]
+                            )
+                            witnesses = cast(
+                                list[dict[str, JsonValue]], state["canonical_witnesses"]
+                            )
+                            self.ledger.record_delivery(
+                                gateway.last_call_id,
+                                LLMFlow.LEGAL_COMPOSITE_REVIEW.value,
+                                (
+                                    {**witness, "text": witness["quotation"]}
+                                    for witness in witnesses
+                                ),
+                            )
+                    decoded = _decode_generated_review(result, checks)
+                except (ReviewProtocolError, ValidationError, RunStopped) as error:
+                    if isinstance(error, ReviewProtocolError):
+                        protocol_error = error
+                    else:
+                        schema_error = (
+                            error
+                            if isinstance(error, ValidationError)
+                            else error.__cause__
+                        )
+                        if not isinstance(schema_error, ValidationError):
+                            raise
+                        protocol_error = ReviewSchemaError(
+                            "schema",
+                            {
+                                "expected": len(checks),
+                                "validation_errors": schema_error.error_count(),
+                            },
+                        )
+                    diagnostics.append(
+                        {
+                            "category": protocol_error.category,
+                            "attempt": attempt + 1,
+                            **protocol_error.counts,
+                        }
                     )
-                    self.ledger.record_delivery(
-                        gateway.last_call_id,
-                        LLMFlow.LEGAL_COMPOSITE_REVIEW.value,
-                        (
-                            {**witness, "text": witness["quotation"]}
-                            for witness in witnesses
-                        ),
+                    step.summary = (
+                        f"protocol={protocol_error.category} retry={attempt} "
+                        + " ".join(
+                            f"{key}={value}"
+                            for key, value in protocol_error.counts.items()
+                        )
+                        + f" input_tokens={input_tokens}"
                     )
-            identities = [item.check_id for item in result.checks]
-            by_id = {check.check_id: check for check in checks}
-            if len(identities) != len(set(identities)) or set(identities) != set(by_id):
-                raise ValueError("Generated review check inventory differs")
-            for item in result.checks:
-                expected = by_id[item.check_id]
-                if (
-                    item.need_ids != expected.need_ids
-                    or item.section_ids != expected.section_ids
-                    or (
-                        item.status == "not_applicable"
-                        and not expected.allow_not_applicable
-                    )
-                ):
-                    raise ValueError(
-                        "Generated review identity or applicability differs"
-                    )
-            step.output_value = {
-                "mode": self.mode,
-                "call_id": gateway.last_call_id,
-                "confidence_basis": "reviewer judgment; not a native calibrated probability",
-                "checks": [item.model_dump(mode="json") for item in result.checks],
-            }
-            return result.checks
+                    step.output_value = {"protocol_diagnostics": diagnostics}
+                    if attempt:
+                        raise protocol_error from None
+                    self.check_active()
+                    self.budget.check_active(finalizing=True)
+                    if not acquire_protocol_retry():
+                        raise protocol_error from None
+                    attempt += 1
+                    continue
+                step.output_value = {
+                    "mode": self.mode,
+                    "call_id": gateway.last_call_id,
+                    "confidence_basis": "reviewer judgment; not a native calibrated probability",
+                    "protocol_diagnostics": diagnostics,
+                    "checks": [item.model_dump(mode="json") for item in decoded],
+                }
+                if attempt:
+                    step.summary = f"checks={len(checks)} input_tokens={input_tokens} protocol_retry_recovered=1"
+                return decoded
 
     def review(
         self,
@@ -1126,8 +1241,18 @@ class GatewayAnswerReviewer(_CanonicalReviewContext):
         results: dict[str, ReviewCheck] = {}
         failures: list[str] = []
         batches: list[
-            tuple[BudgetedGateway, dict[str, JsonValue], list[ReviewQuestion]]
+            tuple[BudgetedGateway, dict[str, JsonValue], list[ReviewQuestion], int]
         ] = []
+        retry_lock = Lock()
+        retry_available = True
+
+        def acquire_protocol_retry() -> bool:
+            nonlocal retry_available
+            with retry_lock:
+                available = retry_available
+                retry_available = False
+                return available
+
         preview = self.gateway_factory()
         schema = _GeneratedReview.model_json_schema()
         response_format: dict[str, JsonValue] = {
@@ -1139,11 +1264,11 @@ class GatewayAnswerReviewer(_CanonicalReviewContext):
             },
         }
 
-        def fitted(group: list[ReviewQuestion]) -> dict[str, JsonValue]:
+        def fitted(group: list[ReviewQuestion]) -> tuple[dict[str, JsonValue], int]:
             body = self._generation_payload(
                 request, plan, draft, requirements, dependencies, group, delivered
             )
-            preview._fit_messages(
+            _, input_tokens, _ = preview._fit_messages(
                 _GENERATION_POLICY,
                 body,
                 json.dumps(schema, ensure_ascii=False),
@@ -1152,13 +1277,13 @@ class GatewayAnswerReviewer(_CanonicalReviewContext):
                 finalizing=True,
                 output_tokens=self.budget.policy.final_output_tokens,
             )
-            return body
+            return body, input_tokens
 
         def pack(group: list[ReviewQuestion]) -> None:
             self.check_active()
             self.budget.check_active(finalizing=True)
             try:
-                body = fitted(group)
+                body, input_tokens = fitted(group)
             except (ValueError, TypeError, RunStopped):
                 if len(group) > 1:
                     midpoint = len(group) // 2
@@ -1171,7 +1296,7 @@ class GatewayAnswerReviewer(_CanonicalReviewContext):
                         "A check's complete decisive context was unavailable or oversized"
                     )
             else:
-                batches.append((self.gateway_factory(), body, group))
+                batches.append((self.gateway_factory(), body, group, input_tokens))
 
         pending = list(checks.values())
         for start in range(0, len(pending), 32):
@@ -1184,16 +1309,18 @@ class GatewayAnswerReviewer(_CanonicalReviewContext):
                     gateway,
                     payload,
                     group,
+                    input_tokens,
+                    acquire_protocol_retry,
                 )
-                for gateway, payload, group in batches
+                for gateway, payload, group, input_tokens in batches
             ]
-            for future, (_, _, group) in zip(futures, batches):
+            for future, (_, _, group, _) in zip(futures, batches):
                 try:
                     for result in cast(list[ReviewCheck], future.result()):
                         results[result.check_id] = result
                 except Exception:
                     failures.append(
-                        "Structured semantic review unavailable, invalid or stopped; no retry or alternate reviewer"
+                        "Structured semantic review unavailable, invalid or stopped; no alternate reviewer"
                     )
                     results.update(
                         (check.check_id, self._uncertain(check)) for check in group
@@ -1207,6 +1334,12 @@ class GatewayAnswerReviewer(_CanonicalReviewContext):
                 "expected_checks": len(checks),
                 "batches": len(batches),
             },
+            summary=(
+                f"checks={len(checks)} batches={len(batches)} "
+                f"input_tokens_sum={sum(row[3] for row in batches)} "
+                f"max_batch_tokens={max((row[3] for row in batches), default=0)} "
+                f"protocol_retries={int(not retry_available)}"
+            ),
         ) as step:
             step.output_value = {
                 "mode": self.mode,

@@ -19,6 +19,7 @@ from onyx.asv3.witnesses import original_witness_spans
 from onyx.configs.constants import DocumentSource
 from onyx.context.search.models import SearchDoc
 from onyx.legal_composite import providers
+from onyx.legal_composite import reviewer as reviewer_module
 from onyx.legal_composite.budget import WorkflowBudget
 from onyx.legal_composite.gateway import BudgetedGateway
 from onyx.legal_composite.models import (
@@ -47,7 +48,9 @@ from onyx.legal_composite.reviewer import (
     GatewayAnswerReviewer,
     ReviewQuestion,
 )
-from onyx.llm.interfaces import LLMConfig
+from onyx.llm.cost import ModelPrice
+from onyx.llm.interfaces import LLM, LLMConfig
+from onyx.llm.model_response import Choice, Message, ModelResponse, Usage
 
 
 def inputs(
@@ -845,7 +848,18 @@ def test_only_latest_explicit_refresh_of_same_named_gap_is_active_proof() -> Non
     assert model.review("Question", plan, draft, requirements, [], {1}).failure is None
 
 
-@pytest.mark.parametrize("invalid", [None, "missing", "need_id", "not_applicable"])
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        None,
+        "missing",
+        "duplicate",
+        "unknown",
+        "bool_index",
+        "need_id",
+        "not_applicable",
+    ],
+)
 def test_generation_reviewer_keeps_fixed_identity_whole_originals_and_no_alternate(
     invalid: str | None,
 ) -> None:
@@ -890,9 +904,7 @@ def test_generation_reviewer_keeps_fixed_identity_whole_originals_and_no_alterna
             )
             rows = [
                 {
-                    "check_id": check["check_id"],
-                    "need_ids": check["need_ids"],
-                    "section_ids": check["section_ids"],
+                    "index": check["index"],
                     "status": "addressed",
                     "confidence": 0.99,
                 }
@@ -900,6 +912,12 @@ def test_generation_reviewer_keeps_fixed_identity_whole_originals_and_no_alterna
             ]
             if invalid == "missing":
                 rows.pop()
+            elif invalid == "duplicate":
+                rows[-1]["index"] = rows[0]["index"]
+            elif invalid == "unknown":
+                rows[-1]["index"] = len(rows)
+            elif invalid == "bool_index":
+                rows[0]["index"] = True
             elif invalid == "need_id":
                 rows[0]["need_ids"] = ["different-need"]
             elif invalid == "not_applicable":
@@ -917,7 +935,7 @@ def test_generation_reviewer_keeps_fixed_identity_whole_originals_and_no_alterna
         ledger=ledger,
     )
     result = model.review("Question", plan, draft, requirements, [], {1})
-    assert len(calls) == 1 and len(gateways) == 2
+    assert len(calls) == (1 if invalid is None else 2) and len(gateways) == 2
     assert ledger.completely_delivered("generation-call") == {1}
     if invalid is None:
         assert result.failure is None
@@ -983,9 +1001,7 @@ def test_generation_batches_have_four_worker_overlap_and_independent_delivery_st
                 {
                     "checks": [
                         {
-                            "check_id": check["check_id"],
-                            "need_ids": check["need_ids"],
-                            "section_ids": check["section_ids"],
+                            "index": check["index"],
                             "status": "addressed",
                             "confidence": 0.99,
                         }
@@ -1312,9 +1328,7 @@ def test_first_generation_issue_batch_receives_whole_originals_without_registere
                 {
                     "checks": [
                         {
-                            "check_id": check["check_id"],
-                            "need_ids": check["need_ids"],
-                            "section_ids": check["section_ids"],
+                            "index": check["index"],
                             "status": "addressed",
                             "confidence": 0.99,
                         }
@@ -1351,4 +1365,291 @@ def test_first_generation_issue_batch_receives_whole_originals_without_registere
     assert first_issue_batch["review_context"]["canonical_witnesses"] == []
     assert not any(
         row["citation"] == 6 for body in calls for row in body["original_evidence"]
+    )
+
+
+def _compact_mock_reviewer(
+    ledger: EvidenceLedger,
+    complete: Callable[..., Any],
+    *,
+    separate_checks: bool = False,
+) -> GatewayAnswerReviewer:
+    config = LLMConfig(
+        model_provider="openrouter",
+        model_name="openai/gpt-5.6-luna",
+        temperature=1,
+        api_key="test-not-real",
+        max_input_tokens=128_000,
+    )
+
+    def factory() -> BudgetedGateway:
+        gateway = Mock(spec=BudgetedGateway)
+        gateway.selected_llm = Mock(config=config)
+        gateway.last_call_id = None
+
+        def fit(_system: str, body: dict[str, Any], *_args: Any, **_kwargs: Any) -> Any:
+            if separate_checks and len(body["expected_checks"]) > 1:
+                raise RunStopped("Whole context fits a single check")
+            return [], 100, body["original_evidence"]
+
+        gateway._fit_messages.side_effect = fit
+        gateway.complete.side_effect = complete
+        return gateway
+
+    return GatewayAnswerReviewer(
+        config=config,
+        gateway_factory=factory,
+        budget=WorkflowBudget(WorkflowPolicy(max_model_calls=100)),
+        ledger=ledger,
+    )
+
+
+@pytest.mark.parametrize("status", ["gap", "incorrect", "uncertain"])
+def test_valid_compact_negative_judgment_is_bound_by_host_without_retry(
+    status: str,
+) -> None:
+    ledger, plan, draft, requirements = inputs()
+    calls = 0
+
+    def complete(
+        _system: str,
+        body: dict[str, Any],
+        response_type: Any,
+        *_args: Any,
+        **_kwargs: Any,
+    ) -> Any:
+        nonlocal calls
+        calls += 1
+        return response_type.model_validate(
+            {
+                "checks": [
+                    {"index": check["index"], "status": status, "confidence": 0.93}
+                    for check in reversed(body["expected_checks"])
+                ]
+            }
+        )
+
+    model = _compact_mock_reviewer(ledger, complete)
+    expected = model.expected_checks("Question", plan, draft, requirements, [], {1})
+    result = model.review("Question", plan, draft, requirements, [], {1})
+    assert calls == 1 and result.failure is None
+    assert [check.check_id for check in result.checks] == list(expected)
+    for check in result.checks:
+        original = expected[check.check_id]
+        assert check.status == status and check.confidence == 0.93
+        assert check.need_ids == original.need_ids
+        assert check.section_ids == original.section_ids
+
+
+@pytest.mark.parametrize("stop", ["timeout", "length", "budget", "cancel", "provider"])
+def test_compact_protocol_does_not_retry_non_schema_stops(stop: str) -> None:
+    ledger, plan, draft, requirements = inputs()
+    complete = Mock(side_effect=RunStopped(stop))
+    result = _compact_mock_reviewer(ledger, complete).review(
+        "Question", plan, draft, requirements, [], {1}
+    )
+    assert complete.call_count == 1
+    assert result.failure and all(
+        check.status == "uncertain" for check in result.checks
+    )
+
+
+@pytest.mark.parametrize("confidence", [float("nan"), float("inf"), -0.1, 1.1, True])
+def test_invalid_compact_confidence_never_approves(confidence: object) -> None:
+    ledger, plan, draft, requirements = inputs()
+    calls = 0
+
+    def complete(
+        _system: str,
+        body: dict[str, Any],
+        response_type: Any,
+        *_args: Any,
+        **_kwargs: Any,
+    ) -> Any:
+        nonlocal calls
+        calls += 1
+        return response_type.model_validate(
+            {
+                "checks": [
+                    {
+                        "index": check["index"],
+                        "status": "addressed",
+                        "confidence": confidence,
+                    }
+                    for check in body["expected_checks"]
+                ]
+            }
+        )
+
+    result = _compact_mock_reviewer(ledger, complete).review(
+        "Question", plan, draft, requirements, [], {1}
+    )
+    assert calls == 2 and result.failure
+    assert all(check.status == "uncertain" for check in result.checks)
+
+
+def test_only_one_malformed_batch_can_retry_in_the_entire_parallel_host_review() -> (
+    None
+):
+    ledger, plan, draft, requirements = inputs()
+    calls = 0
+    lock = Lock()
+
+    def complete(
+        _system: str,
+        _body: dict[str, Any],
+        response_type: Any,
+        *_args: Any,
+        **_kwargs: Any,
+    ) -> Any:
+        nonlocal calls
+        with lock:
+            calls += 1
+        return response_type.model_validate(
+            {"checks": [{"index": 1, "status": "addressed", "confidence": 0.99}]}
+        )
+
+    model = _compact_mock_reviewer(ledger, complete, separate_checks=True)
+    expected = model.expected_checks("Question", plan, draft, requirements, [], {1})
+    result = model.review("Question", plan, draft, requirements, [], {1})
+    assert calls == len(expected) + 1
+    assert result.failure and all(
+        check.status == "uncertain" for check in result.checks
+    )
+
+
+@pytest.mark.parametrize("defect", ["schema", "inventory", "applicability"])
+def test_failed_review_exposes_only_safe_public_protocol_category_and_counts(
+    defect: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ledger, plan, draft, requirements = inputs()
+    summaries: list[str] = []
+    error_classes: list[str] = []
+
+    @contextmanager
+    def capture(_operation: str, *_args: Any, summary: str | None = None) -> Any:
+        step = Mock()
+        step.summary = summary
+        try:
+            yield step
+        except Exception as error:
+            error_classes.append(type(error).__name__)
+            raise
+        finally:
+            if isinstance(step.summary, str):
+                summaries.append(step.summary)
+
+    monkeypatch.setattr(reviewer_module, "graph_step", capture)
+
+    def complete(
+        _system: str,
+        body: dict[str, Any],
+        response_type: Any,
+        *_args: Any,
+        **_kwargs: Any,
+    ) -> Any:
+        rows = [
+            {"index": check["index"], "status": "addressed", "confidence": 0.99}
+            for check in body["expected_checks"]
+        ]
+        if defect == "schema":
+            rows[0]["unexpected_private_output"] = "private-source-text"
+        elif defect == "inventory":
+            rows.pop()
+        else:
+            rows[0]["status"] = "not_applicable"
+        return response_type.model_validate({"checks": rows})
+
+    result = _compact_mock_reviewer(ledger, complete).review(
+        "Question", plan, draft, requirements, [], {1}
+    )
+    expected_class = {
+        "schema": "ReviewSchemaError",
+        "inventory": "ReviewInventoryError",
+        "applicability": "ReviewApplicabilityError",
+    }[defect]
+    assert result.failure and error_classes == [expected_class]
+    assert any(f"protocol={defect}" in summary for summary in summaries)
+    assert any("protocol_retries=1" in summary for summary in summaries)
+    assert all(
+        len(summary) <= 160 and "private-source-text" not in summary
+        for summary in summaries
+    )
+
+
+@pytest.mark.parametrize("malformed", ["schema", "inventory"])
+def test_protocol_retry_uses_real_gateway_budget_and_exact_original_delivery(
+    malformed: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ledger, plan, draft, requirements = inputs()
+    model = Mock(spec=LLM)
+    model.config = LLMConfig(
+        model_provider="openrouter",
+        model_name="openai/gpt-5.6-luna",
+        temperature=1,
+        max_input_tokens=128_000,
+    )
+    monkeypatch.setattr(
+        "onyx.legal_composite.gateway.get_model_price_per_million",
+        lambda *_args: ModelPrice(
+            model=model.config.model_name,
+            provider="openrouter",
+            input_per_mtok=0.1,
+            output_per_mtok=0.5,
+            cache_per_mtok=None,
+        ),
+    )
+    calls: list[dict[str, Any]] = []
+
+    def invoke(messages: Any, **_kwargs: Any) -> ModelResponse:
+        body = json.loads(messages[1].content)
+        calls.append(body)
+        assert body["original_evidence"][0]["text"] == ledger._items[1].text
+        rows = [
+            {"index": check["index"], "status": "addressed", "confidence": 0.99}
+            for check in body["expected_checks"]
+        ]
+        if len(calls) == 1:
+            if malformed == "inventory":
+                rows.pop()
+            else:
+                rows[0]["index"] = True
+        return ModelResponse(
+            id=f"protocol-call-{len(calls)}",
+            created="0",
+            choice=Choice(message=Message(content=json.dumps({"checks": rows}))),
+            usage=Usage(
+                prompt_tokens=100,
+                completion_tokens=10,
+                total_tokens=110,
+                cache_creation_input_tokens=0,
+                cache_read_input_tokens=0,
+            ),
+        )
+
+    model.invoke.side_effect = invoke
+    budget = WorkflowBudget(WorkflowPolicy(max_context_tokens=128_000))
+
+    def factory() -> BudgetedGateway:
+        return BudgetedGateway(
+            selected_llm=model,
+            research_llm=model,
+            budget=budget,
+            ledger=ledger,
+            reserve_finalization=False,
+        )
+
+    judge = GatewayAnswerReviewer(
+        config=model.config, gateway_factory=factory, budget=budget, ledger=ledger
+    )
+    result = judge.review("Question", plan, draft, requirements, [], {1})
+    assert result.failure is None and len(calls) == 2
+    assert calls[0] == calls[1]
+    snapshot = budget.snapshot()
+    assert snapshot["model_calls"] == 2 and snapshot["unsettled_calls"] == 0
+    assert snapshot["input_tokens"] == 200 and snapshot["output_tokens"] == 20
+    delivery_calls = {delivery["call_id"] for delivery in ledger._deliveries}
+    assert len(delivery_calls) == 2
+    assert all(
+        ledger.completely_delivered(str(call_id)) == {1} for call_id in delivery_calls
     )
