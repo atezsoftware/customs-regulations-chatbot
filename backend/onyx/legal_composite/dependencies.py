@@ -5,8 +5,9 @@ from __future__ import annotations
 import json
 import re
 import unicodedata
+from collections.abc import Callable
 from hashlib import sha256
-from typing import cast
+from typing import Literal, cast
 
 from pydantic import JsonValue
 
@@ -759,8 +760,79 @@ class DependencyExpander:
         ).kind
 
 
+HostDependencyStage = Literal["discovery", "provisions"]
+
+
 class CompositeDependencyExpander(DependencyExpander):
     """Legal Composite material discovery, isolated from legacy workflow behavior."""
+
+    def __init__(
+        self,
+        *,
+        broker: CorpusBroker,
+        acquirer: CanonicalAcquirer,
+        ledger: EvidenceLedger,
+        context: RunContext,
+        source_kinds: dict[str, SourceKind],
+        host_stage_admission: Callable[
+            [list[SourceAction], ResearchPlan, HostDependencyStage], bool
+        ]
+        | None = None,
+    ) -> None:
+        super().__init__(
+            broker=broker,
+            acquirer=acquirer,
+            ledger=ledger,
+            context=context,
+            source_kinds=source_kinds,
+        )
+        self.host_stage_admission = host_stage_admission
+        self._active_edges: set[str] = set()
+        self._deferred_edges: set[str] = set()
+
+    def _defer_stage(self, stage: HostDependencyStage, reason: str) -> None:
+        self._deferred_edges.update(self._active_edges)
+        for key in self._active_edges:
+            edge = self.edges[key]
+            edge.discovery_gaps.append(
+                f"Material dependency {stage} stage was deferred before closure."
+            )
+        self.receipts.append(
+            {
+                "status": "dependency_stage_deferred",
+                "stage": stage,
+                "reason": reason,
+                "edge_ids": sorted(self._active_edges),
+                "navigation_only": True,
+                "absence_proven": False,
+            }
+        )
+
+    def _wave(
+        self, actions: list[SourceAction], plan: ResearchPlan
+    ) -> list[dict[str, JsonValue]]:
+        if self.host_stage_admission is None:
+            return super()._wave(actions, plan)
+        if not actions:
+            return []
+        stage: HostDependencyStage = (
+            "discovery"
+            if any(action.tool != "read_provision" for action in actions)
+            else "provisions"
+        )
+        if not self.host_stage_admission(actions, plan, stage):
+            self._defer_stage(stage, "stage_admission")
+            return []
+        try:
+            receipts = self.acquirer.acquire_host_actions(actions, plan)
+        except InvalidSourceAction:
+            raise
+        except RunStopped:
+            self.context.check_active()
+            receipts = self.acquirer.last_receipts
+            self._defer_stage(stage, "acquisition_stopped")
+        self.receipts.extend(receipts)
+        return receipts
 
     def _anchor(self, item: EvidenceItem) -> ProvisionNavigationAnchor | None:
         kind = self.verified_kinds.get(
@@ -1236,9 +1308,18 @@ class CompositeDependencyExpander(DependencyExpander):
         with graph_step(
             "legal_composite.authority_dependencies", {"edge_count": len(fresh)}
         ) as step:
-            self._expand(fresh, plan)
+            self._active_edges = {edge.edge_id for edge in fresh}
+            self._deferred_edges = set()
+            try:
+                self._expand(fresh, plan)
+            finally:
+                self._active_edges = set()
             self._expanded.update(
-                {edge.edge_id: self._edge_state(edge) for edge in fresh}
+                {
+                    edge.edge_id: self._edge_state(edge)
+                    for edge in fresh
+                    if edge.edge_id not in self._deferred_edges
+                }
             )
             step.output_value = {
                 "edge_count": len(self.edges),

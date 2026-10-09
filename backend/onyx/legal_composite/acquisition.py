@@ -150,9 +150,14 @@ class CanonicalAcquirer:
         source_kinds: dict[str, SourceKind] | None = None,
         prioritize_observed_reads: bool = False,
         capture_task_timings: bool = False,
+        expand_host_search_lanes: bool = False,
     ) -> None:
         if type(capture_task_timings) is not bool:
             raise ValueError("capture_task_timings must be a boolean")
+        if type(expand_host_search_lanes) is not bool:
+            raise ValueError("expand_host_search_lanes must be a boolean")
+        if expand_host_search_lanes and expand_actions is None:
+            raise ValueError("Host search lane expansion requires a source lane router")
         self.registry = registry
         self.host_registry = host_registry or registry
         self.source_kinds = dict(source_kinds or {})
@@ -168,6 +173,7 @@ class CanonicalAcquirer:
         self.coalesce_progress = coalesce_progress
         self.prioritize_observed_reads = prioritize_observed_reads
         self.capture_task_timings = capture_task_timings
+        self.expand_host_search_lanes = expand_host_search_lanes
         self._timing_lock = Lock()
         self._completed_timings: dict[str, TaskDurationStats] = {}
         self._diagnostic_timings: dict[str, dict[str, TaskDurationStats]] = {}
@@ -337,6 +343,136 @@ class CanonicalAcquirer:
         counts: dict[str, int] = {}
         for action in pending.values():
             counts[action.tool] = counts.get(action.tool, 0) + 1
+        return counts
+
+    def _expanded_host_actions(
+        self, actions: list[SourceAction], plan: ResearchPlan
+    ) -> list[SourceAction]:
+        if not self.expand_host_search_lanes:
+            return list(actions)
+        expanded: list[SourceAction] = []
+        for action in actions:
+            if action.tool != "search_corpus":
+                expanded.append(action)
+                continue
+            lanes = self.expand_actions([action.model_copy(deep=True)], plan)
+            if (
+                len(lanes) != len(SourceKind)
+                or {lane.source_kind for lane in lanes} != set(SourceKind)
+                or any(
+                    lane.tool != action.tool
+                    or lane.arguments != action.arguments
+                    or lane.need_ids != action.need_ids
+                    for lane in lanes
+                )
+            ):
+                raise InvalidSourceAction(
+                    "Host search expansion must preserve every independent source lane"
+                )
+            expanded.extend(lanes)
+        return expanded
+
+    def _prepared_host_calls(
+        self, actions: list[SourceAction], plan: ResearchPlan
+    ) -> tuple[list[AcquisitionCall], list[AcquisitionCall]]:
+        """Validate and coalesce a host batch without dispatch, binding or spend."""
+        from onyx.asv3.legal_source_reviews import related_source_reviews_enabled
+
+        known_needs = {need.need_id for need in plan.needs}
+        metadata_keys = {
+            "_public_update",
+            "_need_id",
+            "_language",
+            "_notifications",
+            "_external_requested",
+            "_outcomes",
+            "_coverage",
+            *(
+                {"_related_source_reviews"}
+                if related_source_reviews_enabled(self.context)
+                else set()
+            ),
+        }
+        prepared: dict[str, AcquisitionCall] = {}
+        for action in actions:
+            if set(action.need_ids) - known_needs:
+                raise InvalidSourceAction(
+                    "Source action refers to an unknown frozen need"
+                )
+            registry = (
+                self.host_registry
+                if action.source_kind is None
+                else self.registry_for_action(action)
+            )
+            spec = registry.get(action.tool)
+            if spec is None or spec.external or spec.orchestrates:
+                raise InvalidSourceAction(
+                    "Source action is outside the canonical capability allowlist"
+                )
+            arguments = dict(action.arguments)
+            if action.tool == "search_corpus":
+                arguments["expand_query"] = False
+            if not jsonschema.Draft202012Validator(spec.parameters).is_valid(
+                {
+                    key: value
+                    for key, value in arguments.items()
+                    if key not in metadata_keys
+                }
+            ):
+                raise InvalidSourceAction(
+                    "Source action arguments do not match the canonical capability schema"
+                )
+            signature = json.dumps(
+                {
+                    "tool": action.tool,
+                    "source_kind": action.source_kind,
+                    "arguments": {
+                        key: value
+                        for key, value in arguments.items()
+                        if key != "_public_update"
+                    },
+                },
+                sort_keys=True,
+            )
+            previous = prepared.get(signature)
+            if previous is not None:
+                previous_action, previous_call, _ = previous
+                prepared[signature] = (
+                    previous_action.model_copy(
+                        deep=True,
+                        update={
+                            "need_ids": list(
+                                dict.fromkeys(
+                                    previous_action.need_ids + action.need_ids
+                                )
+                            )
+                        },
+                    ),
+                    previous_call,
+                    signature,
+                )
+            else:
+                prepared[signature] = (
+                    action,
+                    CapabilityCall(name=action.tool, arguments=arguments),
+                    signature,
+                )
+        pending: list[AcquisitionCall] = []
+        reused: list[AcquisitionCall] = []
+        for call in prepared.values():
+            (reused if call[2] in self._completed else pending).append(call)
+        return pending, reused
+
+    def pending_host_call_counts(
+        self, actions: list[SourceAction], plan: ResearchPlan
+    ) -> dict[str, int]:
+        """Count the exact pending lane and host calls without acquiring originals."""
+        pending, _reused = self._prepared_host_calls(
+            self._expanded_host_actions(actions, plan), plan
+        )
+        counts: dict[str, int] = {}
+        for _action, call, _signature in pending:
+            counts[call.name] = counts.get(call.name, 0) + 1
         return counts
 
     def safe_observed_read_actions(
@@ -585,7 +721,7 @@ class CanonicalAcquirer:
     def acquire_host_actions(
         self, actions: list[SourceAction], plan: ResearchPlan
     ) -> list[dict[str, JsonValue]]:
-        """Run observed dependency targets without expanding each query to every lane."""
+        """Run observed targets with optional independent host-search lanes."""
         return self._acquire(actions, plan, host_actions=True)
 
     def _acquire(
@@ -600,6 +736,12 @@ class CanonicalAcquirer:
         self.context.check_research_active()
         need_ids = {need.need_id for need in plan.needs}
         calls: list[AcquisitionCall] = []
+        reused_calls: list[AcquisitionCall] = []
+        if host_actions and self.expand_host_search_lanes:
+            calls, reused_calls = self._prepared_host_calls(
+                self._expanded_host_actions(actions, plan), plan
+            )
+            actions = []
         for action in actions:
             if set(action.need_ids) - need_ids:
                 raise InvalidSourceAction(
@@ -688,6 +830,21 @@ class CanonicalAcquirer:
                 "Canonical acquisition budget exhausted; unresolved needs remain open"
             )
         self.search_calls += requested_searches
+        for action, call, signature in reused_calls:
+            recorded = self._completed[signature].get("citations", [])
+            assert isinstance(recorded, list)
+            self._bind_originals(
+                [number for number in recorded if isinstance(number, int)],
+                action.need_ids,
+            )
+            result.append(
+                {
+                    **self._completed[signature],
+                    "need_ids": list(action.need_ids),
+                    "reused": True,
+                    "host_arguments": dict(call.arguments),
+                }
+            )
         scheduled_calls = self._scheduled_calls(calls, host_actions=host_actions)
         executor = ThreadPoolExecutor(
             max_workers=self.policy.max_parallel_tools,
