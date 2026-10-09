@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import time
 from collections import defaultdict
 from collections.abc import Callable
 from datetime import date
+from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
 from sqlalchemy import and_, or_, select
@@ -34,6 +36,9 @@ from onyx.db.models import (
 )
 
 ALGORITHM_VERSION = "original-opening-v1"
+
+if TYPE_CHECKING:
+    from onyx.db.regulatory_publication import PublicationStore
 
 
 def _window_condition(as_of: date | None) -> ColumnElement[bool]:
@@ -133,19 +138,43 @@ def load_prepared_source_lane_catalogue(
     user: User,
     filters: IndexFilters,
     check_active: Callable[[], None],
+    publication_store: "PublicationStore | None" = None,
+    record_timing: Callable[[str, float], None] | None = None,
 ) -> SourceLaneCatalogue:
     """Read compact stored types with current scope/ACL; never read chunk text."""
     records: list[SourceClassification] = []
     offset, more = 0, True
     while more:
         check_active()
-        sources, more = find_source_inventory_page(
-            session, user=user, filters=filters, offset=offset, limit=SOURCE_PAGE_SIZE
-        )
+        started = time.perf_counter()
+        if publication_store is None and record_timing is None:
+            sources, more = find_source_inventory_page(
+                session,
+                user=user,
+                filters=filters,
+                offset=offset,
+                limit=SOURCE_PAGE_SIZE,
+            )
+        else:
+            sources, more = find_source_inventory_page(
+                session,
+                user=user,
+                filters=filters,
+                offset=offset,
+                limit=SOURCE_PAGE_SIZE,
+                publication_store=publication_store,
+                record_timing=record_timing,
+            )
+        if record_timing is not None:
+            record_timing("inventory_page_seconds", time.perf_counter() - started)
+        started = time.perf_counter()
         records.extend(_prepared_records(session, sources, filters.as_of_date))
+        if record_timing is not None:
+            record_timing("prepared_records_seconds", time.perf_counter() - started)
         offset += SOURCE_PAGE_SIZE
     missing = sum(row.preparation_id is None for row in records)
-    return SourceLaneCatalogue(
+    started = time.perf_counter()
+    catalogue = SourceLaneCatalogue(
         user_id=user.id,
         scope_sha256=source_scope_sha256(user, filters),
         records=tuple(records),
@@ -158,6 +187,9 @@ def load_prepared_source_lane_catalogue(
             else ()
         ),
     )
+    if record_timing is not None:
+        record_timing("catalogue_build_seconds", time.perf_counter() - started)
+    return catalogue
 
 
 def revalidate_prepared_source_classification(

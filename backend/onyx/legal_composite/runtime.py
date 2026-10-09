@@ -32,7 +32,10 @@ from onyx.context.search.models import BaseFilters, IndexFilters
 from onyx.db.asv3_corpus import bind_pc_corpus_scope
 from onyx.db.asv3_runs import save_asv3_checkpoint
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
-from onyx.db.legal_composite_preparation import load_prepared_source_lane_catalogue
+from onyx.db.legal_composite_catalogue import (
+    CatalogueTimings,
+    load_prepared_source_lane_catalogue,
+)
 from onyx.db.legal_composite_sources import (
     SourceKind,
 )
@@ -254,6 +257,7 @@ def _run_legal_composite_loop(
         message="Kayıtlı kaynak türleri yükleniyor; on iki türün aramaları paralel başlayacak.",
     )
     context.check_research_active()
+    catalogue_timings = CatalogueTimings()
     with graph_step("legal_composite.prepared_catalogue", {}) as catalogue_step:
         with get_session_with_current_tenant() as session:
             catalogue = load_prepared_source_lane_catalogue(
@@ -261,11 +265,14 @@ def _run_legal_composite_loop(
                 user=user,
                 filters=scope,
                 check_active=context.check_research_active,
+                timings=catalogue_timings,
             )
+        catalogue_step.summary = catalogue_timings.safe_summary()
         catalogue_step.output_value = {
             **catalogue.provenance(),
             "runtime_opening_reads": 0,
             "runtime_classifications": 0,
+            "catalogue_timings": catalogue_timings.snapshot(),
         }
     search = next((tool for tool in tools if isinstance(tool, SearchTool)), None)
     if search is not None:
@@ -549,6 +556,16 @@ def _run_legal_composite_loop(
                     if phase == "review"
                     else "Repairing identified gaps and rechecking the changed sections."
                 ),
+            )
+        elif phase == "reading":
+            progress.report(
+                "reading",
+                title="Kaynak hükümleri okunuyor"
+                if language.startswith("tr")
+                else "Reading source provisions",
+                message="Bulunan özgün hükümleri her sorunuz için değerlendirip koşulları, süreleri ve gerekli diğer kaynakları belirliyorum."
+                if language.startswith("tr")
+                else "Evaluating the original provisions for each question to identify conditions, deadlines and other required sources.",
             )
         elif phase == "selection":
             progress.report(
