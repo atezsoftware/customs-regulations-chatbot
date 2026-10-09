@@ -367,6 +367,7 @@ class BudgetedGateway:
         max_parallel_generations: int = 1,
         share_draft_context: bool = False,
         preserve_research_finalization_on_timeout: bool = False,
+        use_selected_llm_for_initial_plan: bool = False,
     ) -> None:
         self.selected_llm = selected_llm
         self.research_llm = research_llm
@@ -386,6 +387,9 @@ class BudgetedGateway:
         self.preserve_research_finalization_on_timeout = (
             preserve_research_finalization_on_timeout
         )
+        if type(use_selected_llm_for_initial_plan) is not bool:
+            raise ValueError("Initial planner selection must be an explicit boolean")
+        self.use_selected_llm_for_initial_plan = use_selected_llm_for_initial_plan
         self._trace_binding: dict[str, str] = {}
         if run_id is not None:
             self._trace_binding["legal_composite_run_id"] = run_id
@@ -899,6 +903,12 @@ class BudgetedGateway:
         self.budget.check_active(finalizing)
         research = flow is LLMFlow.LEGAL_COMPOSITE_RESEARCH
         llm = self.research_llm if research else self.selected_llm
+        if (
+            research
+            and self.use_selected_llm_for_initial_plan
+            and response_type is IssueResearchPlan
+        ):
+            llm = self.selected_llm
         if finalizing == research:
             raise ValueError("Generation flow and phase must agree")
         full_schema = response_type.model_json_schema()

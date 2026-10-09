@@ -420,6 +420,7 @@ def _run_legal_composite_loop(
                 max_parallel_generations=4,
                 share_draft_context=True,
                 preserve_research_finalization_on_timeout=True,
+                use_selected_llm_for_initial_plan=True,
                 selected_llm=llm,
                 research_llm=typed_research_llm,
                 budget=budget,
