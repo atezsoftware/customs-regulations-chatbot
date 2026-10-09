@@ -27,6 +27,7 @@ class LLMFlow(StrEnum):
     LEGAL_REVIEW_REPAIR = "legal_review_repair"
     LEGAL_REVIEW_SEARCH = "legal_review_search"
     LEGAL_REVIEW_JEV = "legal_review_jev"
+    LEGAL_REVIEW_DECISION = "legal_review_decision"
     SUPERSEARCH_PLAN = "supersearch_plan"
     SUPERSEARCH_SOURCE_FOCUS = "supersearch_source_focus"
     SUPERSEARCH_ANSWER = "supersearch_answer"

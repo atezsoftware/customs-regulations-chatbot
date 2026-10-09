@@ -12,13 +12,17 @@ from pydantic import JsonValue, ValidationError
 from onyx.asv3.models import RunContext, SharedBudget
 from onyx.legal_review.drafting import GeneratedBlock, GeneratedClaim, GeneratedDraft
 from onyx.legal_review.gateway import GeminiGateway
-from onyx.legal_review.models import InitialDiscoveryPlan, WorkflowPolicy
+from onyx.legal_review.models import (
+    InitialDiscoveryPlan,
+    LegalDimension,
+    WorkflowPolicy,
+)
 from onyx.llm.interfaces import LLM, LLMConfig
 from onyx.llm.model_response import Choice, Message, ModelResponse
 from onyx.prompts.legal_review.prompts import PLAN_PROMPT
 from onyx.regulatory.structured_llm import StructuredOutputValidationError
 from onyx.tracing.flows import LLMFlow
-from tests.unit.onyx.legal_review.test_engine import draft, engine, plan, reading
+from tests.unit.onyx.legal_review.test_engine import RULE, draft, engine, plan
 
 
 def omitted_queries() -> dict[str, JsonValue]:
@@ -73,6 +77,34 @@ def generated_draft() -> GeneratedDraft:
         ],
         unresolved_issue_ids=fixture.unresolved_issue_ids,
     )
+
+
+def reading_response() -> dict[str, JsonValue]:
+    return {
+        "requirements": [
+            {
+                "requirement_id": "r1",
+                "rule": RULE,
+                "supports": [{"citation": 1, "span_number": 1}],
+            }
+        ],
+        "dimensions": [
+            {
+                "issue_id": "i1",
+                "dimension": dimension.value,
+                "status": "addressed"
+                if dimension is LegalDimension.LEGAL_BASIS
+                else "not_applicable",
+                "reason": "Başvuru için belgenin ibrazı gerekir."
+                if dimension is LegalDimension.LEGAL_BASIS
+                else "Bu boyutun istenen başvuru şartına etkisi yoktur.",
+                "requirement_ids": ["r1"]
+                if dimension is LegalDimension.LEGAL_BASIS
+                else [],
+            }
+            for dimension in LegalDimension
+        ],
+    }
 
 
 def gateway(llm: MagicMock, context: RunContext) -> GeminiGateway:
@@ -168,7 +200,7 @@ def test_initial_schema_correction_is_separately_metered_and_can_resume_research
     llm.invoke.side_effect = [
         response(omitted_queries()),
         response(valid_plan().model_dump(mode="json")),
-        response(reading().model_dump(mode="json")),
+        response(reading_response()),
         response(generated_draft().model_dump(mode="json")),
     ]
     workflow.gateway = gateway(llm, workflow.context)

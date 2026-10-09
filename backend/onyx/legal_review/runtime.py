@@ -24,16 +24,16 @@ from onyx.configs.constants import MessageType
 from onyx.context.search.models import BaseFilters, IndexFilters
 from onyx.db.asv3_corpus import bind_pc_corpus_scope
 from onyx.db.asv3_runs import save_asv3_checkpoint
-from onyx.db.legal_review_providers import resolve_legal_review_jev
+from onyx.db.legal_review_providers import resolve_legal_review_decision
 from onyx.db.memory import UserMemoryContext
 from onyx.db.models import User
 from onyx.error_handling.error_codes import OnyxErrorCode
 from onyx.error_handling.exceptions import OnyxError
 from onyx.legal_review.acquisition import SourceAcquirer
+from onyx.legal_review.decisions import DecisionsReviewer
 from onyx.legal_review.engine import LegalReviewEngine
 from onyx.legal_review.gateway import GeminiGateway, MeteredLLM, UsageMeter
-from onyx.legal_review.jev import JevReviewer
-from onyx.legal_review.models import JevProviderConfig, WorkflowPolicy
+from onyx.legal_review.models import DecisionProviderConfig, WorkflowPolicy
 from onyx.legal_review.provider import require_legal_review_model
 from onyx.legal_review.search import DiscoverySearchTool
 from onyx.llm.factory import get_llm_token_counter
@@ -79,11 +79,11 @@ def run_legal_review_loop(
 ) -> None:
     del research_llm, custom_agent_prompt
     require_legal_review_model(llm)
-    jev_provider = resolve_legal_review_jev(user)
-    if jev_provider is None:
+    review_provider = resolve_legal_review_decision(user)
+    if review_provider is None:
         raise OnyxError(
             OnyxErrorCode.INVALID_INPUT,
-            "Legal Review requires a TypeSafe key or an accessible official OpenRouter JEV credential.",
+            "Legal Review requires an accessible configured OpenAI gpt-6-luna provider for the Decisions API.",
         )
     metadata = ChatTraceMetadata(
         chat_session_id=str(chat_session_id),
@@ -99,7 +99,7 @@ def run_legal_review_loop(
             simple_chat_history=simple_chat_history,
             tools=tools,
             llm=llm,
-            jev_provider=jev_provider,
+            review_provider=review_provider,
             user=user,
             chat_session_id=chat_session_id,
             assistant_message_id=assistant_message_id,
@@ -122,7 +122,7 @@ def _run(
     simple_chat_history: list[ChatMessageSimple],
     tools: list[Tool],
     llm: LLM,
-    jev_provider: JevProviderConfig,
+    review_provider: DecisionProviderConfig,
     user: User,
     chat_session_id: UUID,
     assistant_message_id: int,
@@ -258,9 +258,8 @@ def _run(
             reasoning_effort=reasoning_effort,
         ),
         acquirer=acquirer,
-        reviewer=JevReviewer(
-            route=jev_provider.route,
-            api_key=jev_provider.api_key.get_secret_value(),
+        reviewer=DecisionsReviewer(
+            api_key=review_provider.api_key.get_secret_value(),
             before_request=admit_review,
             check_active=context.check_active,
         ),
@@ -282,7 +281,7 @@ def _run(
         "request": question,
         "scope": context.scope,
         "asv3_workflow_variant": "legal_review",
-        "jev_provider": jev_provider.model_dump(mode="json"),
+        "review_provider": review_provider.model_dump(mode="json"),
         "prompt_version": PROMPT_VERSION,
         "publication_status": result.status,
         "legal_review": result.model_dump(mode="json"),
@@ -300,7 +299,7 @@ def _run(
             "model_chunks": 50,
         },
         "processing_seconds": time.monotonic() - started,
-        "usage_scope": "Gemini and JEV token usage; embedding/reranker calls retain their separate provider traces",
+        "usage_scope": "Gemini Flash and OpenAI Decisions token usage; embedding/reranker calls retain their separate provider traces",
     }
     if result.answer is None:
         report(

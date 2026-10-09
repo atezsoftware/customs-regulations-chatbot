@@ -1,4 +1,4 @@
-"""Provider-free JEV resolution with existing provider group and persona rules."""
+"""Provider-free reviewer resolution with existing provider and persona rules."""
 
 from typing import cast
 from unittest.mock import MagicMock
@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from onyx.auth.schemas import UserRole
 from onyx.configs import app_configs
 from onyx.db import legal_review_providers as providers
-from onyx.db.models import LLMProvider, Persona, User, UserGroup
+from onyx.db.models import LLMProvider, ModelConfiguration, Persona, User, UserGroup
 from onyx.utils.sensitive import make_mock_sensitive_value
 
 
@@ -164,3 +164,178 @@ def test_missing_default_persona_cannot_use_even_public_provider(
     )
     assert providers.resolve_legal_review_jev(user(), db_session=session) is None
     session.scalars.assert_not_called()
+
+
+def decision_provider(
+    *,
+    identity: int = 1,
+    public: bool = True,
+    base: str | None = "https://api.openai.com/v1",
+    key: str | None = "openai-fixture-key",
+    groups: list[int] | None = None,
+    personas: list[int] | None = None,
+) -> LLMProvider:
+    return LLMProvider(
+        id=identity,
+        name=f"OpenAI {identity}",
+        provider="openai",
+        api_base=base,
+        api_key=make_mock_sensitive_value(key),
+        is_public=public,
+        groups=[UserGroup(id=value) for value in groups or []],
+        personas=[Persona(id=value) for value in personas or []],
+        model_configurations=[ModelConfiguration(name="gpt-6-luna", is_visible=True)],
+    )
+
+
+@pytest.mark.parametrize("base", [None, "", "https://api.openai.com/v1/"])
+def test_decision_uses_accessible_official_openai_without_mutating_provider(
+    base: str | None,
+) -> None:
+    row = decision_provider(base=base, public=False, groups=[3], personas=[0])
+    session = MagicMock(spec=Session)
+    session.scalars.return_value = [row]
+    before = (
+        row.name,
+        row.provider,
+        row.api_base,
+        row.is_public,
+        [(model.name, model.is_visible) for model in row.model_configurations],
+    )
+    config = providers.resolve_legal_review_decision(
+        user(), persona=Persona(id=0), db_session=session
+    )
+    assert config is not None and config.route == "openai_decisions"
+    assert config.provider_name == "OpenAI 1"
+    assert config.api_key.get_secret_value() == "openai-fixture-key"
+    assert "openai-fixture-key" not in repr(config)
+    assert config.model_dump() == {
+        "route": "openai_decisions",
+        "provider_name": "OpenAI 1",
+    }
+    session.refresh.assert_called_once_with(row, attribute_names=["api_key"])
+    cast(MagicMock, row.api_key).get_value.assert_called_once_with(apply_mask=False)
+    assert before == (
+        row.name,
+        row.provider,
+        row.api_base,
+        row.is_public,
+        [(model.name, model.is_visible) for model in row.model_configurations],
+    )
+    session.add.assert_not_called()
+    session.add_all.assert_not_called()
+    session.delete.assert_not_called()
+    session.flush.assert_not_called()
+    session.commit.assert_not_called()
+    statement = session.scalars.call_args.args[0]
+    sql = str(statement.compile(compile_kwargs={"literal_binds": True}))
+    assert "llm_provider.provider = 'openai'" in sql
+    assert "model_configuration.name = 'gpt-6-luna'" in sql
+    assert "model_configuration.is_visible = true" in sql
+
+
+@pytest.mark.parametrize(
+    "base",
+    [
+        "https://proxy.example/v1",
+        "http://api.openai.com/v1",
+        "https://api.openai.com/v1?credential=secret",
+        "https://api.openai.com.attacker.example/v1",
+    ],
+)
+def test_decision_off_domain_provider_is_rejected_before_decryption(base: str) -> None:
+    row = decision_provider(base=base)
+    session = MagicMock(spec=Session)
+    session.scalars.return_value = [row]
+    assert (
+        providers.resolve_legal_review_decision(
+            user(), persona=Persona(id=0), db_session=session
+        )
+        is None
+    )
+    session.refresh.assert_not_called()
+    cast(MagicMock, row.api_key).get_value.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "row",
+    [decision_provider(public=False, groups=[9]), decision_provider(personas=[7])],
+)
+def test_decision_inaccessible_provider_cannot_decrypt(row: LLMProvider) -> None:
+    session = MagicMock(spec=Session)
+    session.scalars.return_value = [row]
+    assert (
+        providers.resolve_legal_review_decision(
+            user(), persona=Persona(id=0), db_session=session
+        )
+        is None
+    )
+    session.refresh.assert_not_called()
+    cast(MagicMock, row.api_key).get_value.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "rows", [[], [decision_provider(key=None)], [decision_provider(key=" ")]]
+)
+def test_decision_missing_provider_or_credential_has_no_alternate_route(
+    rows: list[LLMProvider], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(app_configs, "TYPESAFE_API_KEY", "legacy-direct-fixture-key")
+    session = MagicMock(spec=Session)
+    session.scalars.return_value = rows
+    assert (
+        providers.resolve_legal_review_decision(
+            user(), persona=Persona(id=0), db_session=session
+        )
+        is None
+    )
+    cast(MagicMock, providers.check_llm_cost_limit_for_provider).assert_not_called()
+
+
+def test_decision_cost_limit_refusal_cannot_select_another_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = decision_provider(identity=1)
+    second = decision_provider(identity=2)
+    session = MagicMock(spec=Session)
+    session.scalars.return_value = [first, second]
+    guard = MagicMock(side_effect=RuntimeError("quota exhausted"))
+    monkeypatch.setattr(providers, "check_llm_cost_limit_for_provider", guard)
+    with pytest.raises(RuntimeError, match="quota exhausted"):
+        providers.resolve_legal_review_decision(
+            user(), persona=Persona(id=0), db_session=session
+        )
+    guard.assert_called_once()
+    assert guard.call_args.kwargs["db_session"] is session
+    assert guard.call_args.kwargs["llm_provider_api_key"] == "openai-fixture-key"
+    cast(MagicMock, second.api_key).get_value.assert_not_called()
+
+
+def test_decision_admin_still_obeys_persona_restriction() -> None:
+    blocked = decision_provider(identity=1, public=False, personas=[7])
+    allowed = decision_provider(identity=2, public=False, groups=[9], personas=[0])
+    session = MagicMock(spec=Session)
+    session.scalars.return_value = [blocked, allowed]
+    config = providers.resolve_legal_review_decision(
+        user(admin=True), persona=Persona(id=0), db_session=session
+    )
+    assert config is not None and config.provider_name == "OpenAI 2"
+    cast(MagicMock, blocked.api_key).get_value.assert_not_called()
+
+
+@pytest.mark.parametrize("available", [False, True])
+def test_decision_requires_the_existing_default_persona(
+    available: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session = MagicMock(spec=Session)
+    session.scalars.return_value = [decision_provider(personas=[0])]
+    monkeypatch.setattr(
+        providers,
+        "get_default_behavior_persona",
+        lambda _session: Persona(id=0) if available else None,
+    )
+    assert (
+        providers.resolve_legal_review_decision(user(), db_session=session) is not None
+    ) is available
+    if not available:
+        session.scalars.assert_not_called()

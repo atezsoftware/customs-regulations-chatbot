@@ -42,6 +42,10 @@ class ReviewResult(BaseModel):
     scores: dict[str, float] = Field(default_factory=dict)
     flags: list[ReviewCheck] = Field(default_factory=list)
     failure_reason: str | None = None
+    http_status: int | None = Field(default=None, ge=100, le=599)
+    error_code: str | None = None
+    error_param: str | None = None
+    request_id: str | None = None
     input_tokens: int = Field(default=0, ge=0)
     output_tokens: int = Field(default=0, ge=0)
 
@@ -49,6 +53,13 @@ class ReviewResult(BaseModel):
 class JevProviderConfig(BaseModel):
     model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
     route: Literal["typesafe", "openrouter"]
+    api_key: SecretStr = Field(exclude=True, repr=False)
+    provider_name: str | None = None
+
+
+class DecisionProviderConfig(BaseModel):
+    model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
+    route: Literal["openai_decisions"] = "openai_decisions"
     api_key: SecretStr = Field(exclude=True, repr=False)
     provider_name: str | None = None
 
@@ -85,7 +96,6 @@ class Issue(StrictModel):
     origin: Literal["question", "source"] = "question"
     parent_issue_id: str | None = None
     trigger_dimension: LegalDimension | None = None
-    supporting_citations: list[int] = Field(default_factory=list)
     supporting_requirement_ids: list[str] = Field(default_factory=list)
     material_reason: str | None = None
     closure_criteria: list[str] = Field(default_factory=list)
@@ -95,7 +105,6 @@ class Issue(StrictModel):
         if self.origin == "source" and not (
             self.parent_issue_id
             and self.trigger_dimension is not None
-            and self.supporting_citations
             and self.supporting_requirement_ids
             and self.material_reason
             and self.material_reason.strip()
@@ -107,13 +116,6 @@ class Issue(StrictModel):
             )
         if self.origin == "question" and self.parent_issue_id is not None:
             raise ValueError("Question issues cannot have a source dependency parent")
-        if any(
-            type(citation) is not int or citation <= 0
-            for citation in self.supporting_citations
-        ):
-            raise ValueError(
-                "Source triggers must be positive canonical citation numbers"
-            )
         if any(
             not query.strip() or len(query) > REGULATORY_MAX_SEARCH_QUERY_CHARS
             for query in self.research_queries
@@ -181,9 +183,7 @@ class SourceAction(StrictModel):
 
 class Requirement(StrictModel):
     requirement_id: str = Field(min_length=1)
-    issue_id: str = Field(min_length=1)
     rule: str = Field(min_length=1)
-    application: str = Field(min_length=1)
     supports: list[PassageSupport] = Field(min_length=1)
     missing_user_facts: list[str] = Field(default_factory=list)
     supersedes_requirement_ids: list[str] = Field(default_factory=list)
@@ -206,7 +206,7 @@ class DimensionAssessment(StrictModel):
 class ReadingDecision(StrictModel):
     additional_issues: list[Issue] = Field(default_factory=list)
     requirements: list[Requirement] = Field(default_factory=list)
-    dimensions: list[DimensionAssessment]
+    dimensions: list[DimensionAssessment] = Field(default_factory=list)
     actions: list[SourceAction] = Field(default_factory=list, max_length=16)
     evidence_gaps: list[str] = Field(default_factory=list)
 
@@ -220,7 +220,7 @@ class AnswerClaim(StrictModel):
 
 class DraftAnswer(StrictModel):
     answer: str = Field(min_length=1)
-    claims: list[AnswerClaim] = Field(min_length=1)
+    claims: list[AnswerClaim]
     unresolved_issue_ids: list[str] = Field(default_factory=list)
 
 
@@ -238,6 +238,7 @@ class WorkflowResult(StrictModel):
     requirements: list[RequirementRecord] = Field(default_factory=list)
     dimensions: list[DimensionAssessment] = Field(default_factory=list)
     issue_closures: list[IssueClosure] = Field(default_factory=list)
+    source_issue_triggers: list[dict[str, JsonValue]] = Field(default_factory=list)
     gaps: list[str] = Field(default_factory=list)
     early_review: ReviewResult | None = None
     final_review: ReviewResult | None = None

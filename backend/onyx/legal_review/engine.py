@@ -18,7 +18,6 @@ from onyx.legal_review.models import (
     DimensionAssessment,
     DraftAnswer,
     InitialDiscoveryPlan,
-    Issue,
     IssueClosure,
     IssuePlan,
     LegalDimension,
@@ -32,7 +31,11 @@ from onyx.legal_review.models import (
     WorkflowPolicy,
     WorkflowResult,
 )
-from onyx.legal_review.passages import canonical_evidence_view, resolve_passage
+from onyx.legal_review.passages import (
+    CanonicalPassage,
+    canonical_evidence_view,
+    resolve_passage,
+)
 from onyx.prompts.legal_review.prompts import (
     DRAFT_PROMPT,
     PLAN_PROMPT,
@@ -44,6 +47,9 @@ from onyx.tracing.answer_graph import graph_step
 from onyx.tracing.flows import LLMFlow
 
 ResponseModel = TypeVar("ResponseModel", bound=BaseModel)
+SourceTriggerBinding = tuple[
+    RequirementRecord, tuple[DimensionAssessment, ...], tuple[CanonicalPassage, ...]
+]
 
 
 class ModelGateway(Protocol):
@@ -161,6 +167,10 @@ class LegalReviewEngine:
         self.requirements: dict[str, RequirementRecord] = {}
         self.requirement_history: dict[str, RequirementRecord] = {}
         self.dimensions: list[DimensionAssessment] = []
+        self.requirement_associations: dict[
+            tuple[str, str], tuple[DimensionAssessment, ...]
+        ] = {}
+        self.source_issue_triggers: dict[str, tuple[SourceTriggerBinding, ...]] = {}
         self.gaps: list[str] = []
         self.early_review: ReviewResult | None = None
         self.final_review: ReviewResult | None = None
@@ -184,6 +194,7 @@ class LegalReviewEngine:
                 for requirement in self.requirements.values()
             ],
             "original_evidence": originals,
+            "source_issue_triggers": self._source_trigger_state(),
             "source_operations": list(self.acquirer.receipts),
             "evidence_gaps": list(self.gaps),
             "issue_closures": [
@@ -213,28 +224,14 @@ class LegalReviewEngine:
             else None,
         }
 
-    def _accept_reading(self, decision: ReadingDecision) -> None:
-        assert self.plan is not None
-        if any(issue.origin != "source" for issue in decision.additional_issues):
-            raise ValueError(
-                "Additional issues must be material source-derived dependencies"
-            )
-        proposed = IssuePlan.model_validate(
-            {
-                **self.plan.model_dump(mode="python"),
-                "issues": [*self.plan.issues, *decision.additional_issues],
-            }
-        )
-        known = {issue.issue_id for issue in proposed.issues}
-        pending = dict(self.requirements)
-        history = dict(self.requirement_history)
-        seen: set[str] = set()
-        for requirement in decision.requirements:
-            if requirement.requirement_id in seen:
+    def _stage_requirements(
+        self, incoming: list[Requirement]
+    ) -> tuple[dict[str, RequirementRecord], dict[str, RequirementRecord]]:
+        records: dict[str, RequirementRecord] = {}
+        for requirement in incoming:
+            identity = requirement.requirement_id
+            if identity in records:
                 raise ValueError("Duplicate requirement identity")
-            seen.add(requirement.requirement_id)
-            if requirement.issue_id not in known:
-                raise ValueError("Requirement refers to an unknown issue")
             for support in requirement.supports:
                 validate_support(support, self.ledger)
             record = RequirementRecord.model_validate(
@@ -250,57 +247,156 @@ class LegalReviewEngine:
                 raise ValueError(
                     "Requirement is outside its recorded event-date window"
                 )
-            if (
-                record.requirement_id in pending
-                and pending[record.requirement_id] != record
-            ):
+            existing = self.requirements.get(identity) or self.requirement_history.get(
+                identity
+            )
+            if existing is not None and existing != record:
                 raise ValueError("Requirement identity is immutable")
-            if record.requirement_id in history:
-                raise ValueError("Superseded requirement identity cannot be reused")
-            for identity in record.supersedes_requirement_ids:
-                previous = pending.get(identity)
-                if (
-                    previous is None
-                    or previous.issue_id != record.issue_id
-                    or previous.requirement_id == record.requirement_id
+            records[identity] = record
+        pending = {
+            **self.requirements,
+            **{
+                identity: record
+                for identity, record in records.items()
+                if identity not in self.requirement_history
+            },
+        }
+        replacements: dict[str, str] = {}
+        edges: dict[str, list[str]] = {}
+        for identity, record in records.items():
+            # Unchanged active or archived echoes never repeat a version operation.
+            if identity in self.requirements or identity in self.requirement_history:
+                continue
+            edges[identity] = list(record.supersedes_requirement_ids)
+            for previous in record.supersedes_requirement_ids:
+                if previous == identity:
+                    raise ValueError("Requirement supersession cannot replace itself")
+                if previous not in pending:
+                    raise ValueError(
+                        "Supersession must replace a known active or batch requirement"
+                    )
+                if previous in replacements and replacements[previous] != identity:
+                    raise ValueError(
+                        "Requirement supersession has ambiguous replacements"
+                    )
+                replacements[previous] = identity
+        indegrees = dict.fromkeys(pending, 0)
+        for previous_ids in edges.values():
+            for previous in previous_ids:
+                indegrees[previous] += 1
+        ready = [identity for identity, degree in indegrees.items() if degree == 0]
+        visited = 0
+        while ready:
+            identity = ready.pop()
+            visited += 1
+            for previous in edges.get(identity, []):
+                indegrees[previous] -= 1
+                if indegrees[previous] == 0:
+                    ready.append(previous)
+        if visited != len(indegrees):
+            raise ValueError("Requirement supersession must be acyclic")
+        history = dict(self.requirement_history)
+        for previous in replacements:
+            history[previous] = pending.pop(previous)
+        return pending, history
+
+    def _stage_dimensions(
+        self,
+        proposed: IssuePlan,
+        updates: list[DimensionAssessment],
+        requirements: dict[str, RequirementRecord],
+        history: dict[str, RequirementRecord],
+    ) -> list[DimensionAssessment]:
+        known = {issue.issue_id for issue in proposed.issues}
+        changes: dict[tuple[str, LegalDimension], DimensionAssessment] = {}
+        for row in updates:
+            key = (row.issue_id, row.dimension)
+            if row.issue_id not in known:
+                raise ValueError("Dimension assessment refers to an unknown issue")
+            if key in changes:
+                raise ValueError(
+                    "Dimension assessments must be unique per issue and dimension"
+                )
+            changes[key] = row
+        previous = {(row.issue_id, row.dimension): row for row in self.dimensions}
+        result: list[DimensionAssessment] = []
+        for issue in proposed.issues:
+            for dimension in LegalDimension:
+                key = (issue.issue_id, dimension)
+                row = changes.get(key) or previous.get(key)
+                if row is None:
+                    row = DimensionAssessment(
+                        issue_id=issue.issue_id,
+                        dimension=dimension,
+                        status="unresolved",
+                        reason="This issue and dimension have not yet been assessed.",
+                    )
+                else:
+                    row = row.model_copy(deep=True)
+                if any(
+                    identity not in requirements and identity not in history
+                    for identity in row.requirement_ids
                 ):
                     raise ValueError(
-                        "Supersession must replace an existing same-issue requirement"
+                        "Dimension assessment refers to an unknown finding"
                     )
-                history[identity] = pending.pop(identity)
-            pending[record.requirement_id] = record
-        self._validate_source_issues(proposed, pending, history)
-        expected = {
-            (issue_id, dimension) for issue_id in known for dimension in LegalDimension
-        }
-        keys = [(row.issue_id, row.dimension) for row in decision.dimensions]
-        if len(keys) != len(set(keys)) or set(keys) != expected:
-            raise ValueError("Every issue needs every standard dimension exactly once")
-        for assessment in decision.dimensions:
-            if assessment.status == "addressed" and not assessment.requirement_ids:
-                raise ValueError(
-                    "Addressed dimensions require original-backed requirements"
-                )
-            for identity in assessment.requirement_ids:
-                requirement = pending.get(identity)
-                if requirement is None or requirement.issue_id != assessment.issue_id:
+                obsolete = [
+                    identity
+                    for identity in row.requirement_ids
+                    if identity not in requirements
+                ]
+                if obsolete:
+                    row.status = "unresolved"
+                    row.reason = (
+                        "Referenced findings were superseded and their application needs "
+                        f"reassessment: {', '.join(obsolete)}. " + row.reason
+                    )
+                    row.requirement_ids = [
+                        identity
+                        for identity in row.requirement_ids
+                        if identity in requirements
+                    ]
+                if row.status == "addressed" and not row.requirement_ids:
                     raise ValueError(
-                        "Dimension requirements must belong to the same issue"
+                        "Addressed dimensions require original-backed findings"
                     )
-                if (
-                    assessment.status == "addressed"
-                    and requirement.legal_status == "annulled"
+                if row.status == "addressed" and any(
+                    requirements[identity].legal_status == "annulled"
+                    for identity in row.requirement_ids
                 ):
                     raise ValueError(
                         "An annulled requirement cannot close an operative dimension"
                     )
-        self.requirements = pending
-        self.requirement_history = history
-        self.dimensions = decision.dimensions
-        self.gaps = list(decision.evidence_gaps)
-        self.plan = proposed
+                result.append(row)
+        return result
+
+    def _accept_reading(self, decision: ReadingDecision) -> None:
+        assert self.plan is not None
+        if any(issue.origin != "source" for issue in decision.additional_issues):
+            raise ValueError(
+                "Additional issues must be material source-derived dependencies"
+            )
+        proposed = IssuePlan.model_validate(
+            {
+                **self.plan.model_dump(mode="python"),
+                "issues": [*self.plan.issues, *decision.additional_issues],
+            }
+        )
+        pending, history = self._stage_requirements(decision.requirements)
+        dimensions = self._stage_dimensions(
+            proposed, decision.dimensions, pending, history
+        )
+        triggers = self._validate_source_issues(proposed, pending, history, dimensions)
+        associations = dict(self.requirement_associations)
+        for row in dimensions:
+            for identity in row.requirement_ids:
+                key = (row.issue_id, identity)
+                previous = associations.get(key, ())
+                if row not in previous:
+                    associations[key] = (*previous, row.model_copy(deep=True))
+        actions = list(decision.actions)
         for issue in decision.additional_issues:
-            decision.actions.extend(
+            actions.extend(
                 SourceAction(
                     issue_ids=[issue.issue_id],
                     tool="search_corpus",
@@ -308,19 +404,29 @@ class LegalReviewEngine:
                 )
                 for query in issue.research_queries
             )
+        known = {issue.issue_id for issue in proposed.issues}
         combined: dict[tuple[str, str], SourceAction] = {}
-        for action in decision.actions:
+        for action in actions:
+            if set(action.issue_ids) - known:
+                raise ValueError("Source action refers to an unknown issue")
             key = (
                 action.tool,
                 json.dumps(action.arguments, sort_keys=True, ensure_ascii=False),
             )
-            previous = combined.get(key)
-            if previous is None:
+            previous_action = combined.get(key)
+            if previous_action is None:
                 combined[key] = action.model_copy(deep=True)
             else:
-                previous.issue_ids = list(
-                    dict.fromkeys([*previous.issue_ids, *action.issue_ids])
+                previous_action.issue_ids = list(
+                    dict.fromkeys([*previous_action.issue_ids, *action.issue_ids])
                 )
+        self.requirements = pending
+        self.requirement_history = history
+        self.dimensions = dimensions
+        self.requirement_associations = associations
+        self.source_issue_triggers = triggers
+        self.gaps = list(decision.evidence_gaps)
+        self.plan = proposed
         decision.actions = list(combined.values())
         self.pending_actions = list(decision.actions)
 
@@ -332,50 +438,120 @@ class LegalReviewEngine:
         self.acquirer.acquire(actions, self.plan, finalizing=finalizing)
         self.pending_actions = []
 
-    def _source_key(
-        self, issue: Issue
-    ) -> tuple[str | None, LegalDimension | None, tuple[tuple[str, str], ...]]:
-        triggers: set[tuple[str, str]] = set()
-        for citation in issue.supporting_citations:
-            item = self.ledger.get(citation)
-            if item is None or item.chunk_id is None or item.search_doc is None:
-                raise ValueError("Source issue trigger is not a canonical original")
-            article = item.metadata.get("article_no") or item.search_doc.metadata.get(
-                "article_no"
-            )
-            triggers.add((item.source_id, str(article or item.chunk_id)))
-        return issue.parent_issue_id, issue.trigger_dimension, tuple(sorted(triggers))
-
     def _validate_source_issues(
         self,
         proposed: IssuePlan,
         requirements: dict[str, RequirementRecord],
         history: dict[str, RequirementRecord],
-    ) -> None:
-        identities: set[
-            tuple[str | None, LegalDimension | None, tuple[tuple[str, str], ...]]
-        ] = set()
+        dimensions: list[DimensionAssessment],
+    ) -> dict[str, tuple[SourceTriggerBinding, ...]]:
+        triggers = dict(self.source_issue_triggers)
         for issue in proposed.issues:
             if issue.origin != "source":
                 continue
-            key = self._source_key(issue)
-            if key in identities:
-                raise ValueError(
-                    "Duplicate parent/source/dimension dependency; resolve the existing issue"
-                )
-            identities.add(key)
-            supported: set[int] = set()
-            for identity in issue.supporting_requirement_ids:
-                requirement = requirements.get(identity) or history.get(identity)
-                if requirement is None or requirement.issue_id != issue.parent_issue_id:
+            existing = triggers.get(issue.issue_id)
+            if existing is not None:
+                if {row.requirement_id for row, _, _ in existing} != set(
+                    issue.supporting_requirement_ids
+                ) or any(
+                    row.issue_id != issue.parent_issue_id
+                    for _, associations, _ in existing
+                    for row in associations
+                ):
                     raise ValueError(
-                        "Source issue must be triggered by an exact parent-backed requirement"
+                        "Adopted source issue trigger identity is immutable"
                     )
-                supported.update(support.citation for support in requirement.supports)
-            if set(issue.supporting_citations) - supported:
-                raise ValueError(
-                    "Source issue citations must bind to its parent requirement supports"
+                for record, _, _ in existing:
+                    for support in record.supports:
+                        validate_support(support, self.ledger)
+                continue
+            bindings: list[SourceTriggerBinding] = []
+            for identity in dict.fromkeys(issue.supporting_requirement_ids):
+                requirement = requirements.get(identity) or history.get(identity)
+                associations = tuple(
+                    row.model_copy(deep=True)
+                    for row in dimensions
+                    if row.issue_id == issue.parent_issue_id
+                    and identity in row.requirement_ids
+                ) or self.requirement_associations.get(
+                    (issue.parent_issue_id or "", identity), ()
                 )
+                if requirement is None or not associations:
+                    raise ValueError(
+                        "Source issue must be triggered by an exact parent-backed requirement association"
+                    )
+                for support in requirement.supports:
+                    validate_support(support, self.ledger)
+                bindings.append(
+                    (
+                        requirement.model_copy(deep=True),
+                        tuple(row.model_copy(deep=True) for row in associations),
+                        tuple(
+                            resolve_passage(support, self.ledger)
+                            for support in requirement.supports
+                        ),
+                    )
+                )
+            triggers[issue.issue_id] = tuple(bindings)
+        return triggers
+
+    def _source_trigger_state(self) -> list[JsonValue]:
+        if self.plan is None:
+            return []
+        result: list[JsonValue] = []
+        for issue in self.plan.issues:
+            if issue.origin != "source":
+                continue
+            result.append(
+                {
+                    "issue_id": issue.issue_id,
+                    "parent_issue_id": issue.parent_issue_id,
+                    "trigger_dimension": issue.trigger_dimension.value
+                    if issue.trigger_dimension is not None
+                    else None,
+                    "findings": [
+                        {
+                            "finding": record.model_dump(mode="json"),
+                            "parent_assessments": [
+                                row.model_dump(mode="json") for row in associations
+                            ],
+                            "canonical_passages": [
+                                passage.model_dump(mode="json", exclude={"quotation"})
+                                for passage in passages
+                            ],
+                        }
+                        for record, associations, passages in self.source_issue_triggers.get(
+                            issue.issue_id, ()
+                        )
+                    ],
+                }
+            )
+        return result
+
+    def _issue_requirements(self, issue_id: str) -> list[RequirementRecord]:
+        identities = dict.fromkeys(
+            identity
+            for row in self.dimensions
+            if row.issue_id == issue_id
+            for identity in row.requirement_ids
+        )
+        return [
+            self.requirements[identity]
+            for identity in identities
+            if identity in self.requirements
+        ]
+
+    def _uncertain_issue_ids(self) -> set[str]:
+        if self.plan is None:
+            return set()
+        return {
+            issue.issue_id
+            for issue in self.plan.issues
+            if any(
+                row.validity == "unknown" or row.legal_status in {"unknown", "annulled"}
+                for row in self._issue_requirements(issue.issue_id)
+            )
+        }
 
     def issue_closures(self) -> list[IssueClosure]:
         if self.plan is None:
@@ -386,11 +562,7 @@ class LegalReviewEngine:
             if issue.parent_issue_id is not None:
                 children.setdefault(issue.parent_issue_id, []).append(issue.issue_id)
             rows = [row for row in self.dimensions if row.issue_id == issue.issue_id]
-            requirements = [
-                row
-                for row in self.requirements.values()
-                if row.issue_id == issue.issue_id
-            ]
+            requirements = self._issue_requirements(issue.issue_id)
             reasons = [row.reason for row in rows if row.status == "unresolved"]
             status = "closed"
             if len(rows) != len(LegalDimension) or reasons:
@@ -497,7 +669,7 @@ class LegalReviewEngine:
                 ),
                 ReviewCheck(
                     id="source_conditions",
-                    instructions="Does the research or literal answer materially contradict or omit a decisive condition, exception, qualification or contrary effect of the complete original evidence, or conceal a partial/unread provision or temporal-law gap? No search result or JEV score proves absence of other law.",
+                    instructions="Does the research or literal answer materially contradict or omit a decisive condition, exception, qualification or contrary effect of the complete original evidence, or conceal a partial/unread provision or temporal-law gap? No search result or review score proves absence of other law.",
                 ),
                 ReviewCheck(
                     id="issue_dependencies",
@@ -599,7 +771,7 @@ class LegalReviewEngine:
             return ReviewResult(
                 completed=False, failure_reason="review_inventory_invalid"
             )
-        with graph_step("legal_review.jev_result", {}) as step:
+        with graph_step("legal_review.review_result", {}) as step:
             step.output_value = result.model_dump(mode="json")
         return result
 
@@ -627,16 +799,13 @@ class LegalReviewEngine:
                         "Claim support must appear in its published passage"
                     )
                 supported_citations.add(support.citation)
-        if not cited or cited - supported_citations:
+        if not draft.claims and not draft.unresolved_issue_ids:
+            raise ValueError("A claimless draft must disclose unresolved issues")
+        if (draft.claims and not cited) or cited - supported_citations:
             raise ValueError("Published citations must bind to supported answer claims")
         unresolved = (
             {row.issue_id for row in self.dimensions if row.status == "unresolved"}
-            | {
-                row.issue_id
-                for row in self.requirements.values()
-                if row.validity == "unknown"
-                or row.legal_status in {"unknown", "annulled"}
-            }
+            | self._uncertain_issue_ids()
             | {row.issue_id for row in self.issue_closures() if row.status != "closed"}
         )
         if unresolved - set(draft.unresolved_issue_ids):
@@ -646,11 +815,7 @@ class LegalReviewEngine:
 
     def _disclose_validity(self, draft: DraftAnswer) -> DraftAnswer:
         assert self.plan is not None
-        affected = {
-            row.issue_id
-            for row in self.requirements.values()
-            if row.validity == "unknown" or row.legal_status in {"unknown", "annulled"}
-        }
+        affected = self._uncertain_issue_ids()
         dependencies = [
             row
             for row in self.issue_closures()
@@ -714,6 +879,7 @@ class LegalReviewEngine:
                 "requirements": list(self.requirements.values()),
                 "dimensions": self.dimensions,
                 "issue_closures": self.issue_closures(),
+                "source_issue_triggers": self._source_trigger_state(),
                 "gaps": [
                     *self.gaps,
                     *(
