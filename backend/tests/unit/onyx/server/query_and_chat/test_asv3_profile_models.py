@@ -112,3 +112,32 @@ def test_guarded_experimental_requires_explicit_normal_asv3_selection() -> None:
                     **invalid,
                 }
             )
+
+
+def test_guardrails_v3_requires_explicit_normal_non_parallel_asv3_selection() -> None:
+    selected = SendMessageRequest.model_validate(
+        {
+            "message": "Question",
+            "atez_search_v3": True,
+            "asv3_research_profile": "normal",
+            "asv3_guardrails_v3": True,
+        }
+    )
+    assert selected.asv3_guardrails_v3 is True
+
+    for invalid in (
+        {"asv3_research_profile": "experimental"},
+        {"asv3_parallel_research": True},
+        {"deep_research": True},
+        {"atez_search_v3": False},
+    ):
+        with pytest.raises(ValidationError):
+            SendMessageRequest.model_validate(
+                {
+                    "message": "Question",
+                    "atez_search_v3": True,
+                    "asv3_research_profile": "normal",
+                    "asv3_guardrails_v3": True,
+                    **invalid,
+                }
+            )

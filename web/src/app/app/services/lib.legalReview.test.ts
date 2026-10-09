@@ -62,6 +62,7 @@ it.each<Partial<SendMessageParams>>([
   { experimentalParallelResearch: true },
   { experimentalGuardrails: true },
   { experimentalGuardrailsV2: true },
+  { experimentalGuardrailsV3: true },
   { legalComposite: true },
   { supersearch: true },
 ])(
@@ -89,6 +90,7 @@ it.each<Partial<SendMessageParams>>([
   { experimentalParallelResearch: true },
   { experimentalGuardrails: true },
   { experimentalGuardrailsV2: true },
+  { experimentalGuardrailsV3: true },
   { asv3ResumeMessageId: 41 },
 ])(
   "rejects mixed workflows and ASv3 checkpoints before sending (%j)",

@@ -215,6 +215,8 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
         experimentalGuardrails: experimentalGuardrailsEnabledForCurrentWorkflow,
         experimentalGuardrailsV2:
           experimentalGuardrailsV2EnabledForCurrentWorkflow,
+        experimentalGuardrailsV3:
+          experimentalGuardrailsV3EnabledForCurrentWorkflow,
       });
     }
   }
@@ -255,6 +257,8 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
     toggleExperimentalGuardrails,
     experimentalGuardrailsV2Enabled,
     toggleExperimentalGuardrailsV2,
+    experimentalGuardrailsV3Enabled,
+    toggleExperimentalGuardrailsV3,
   } = useDeepResearchToggle({
     chatSessionId: currentChatSessionId,
     agentId: selectedAgent?.id,
@@ -302,6 +306,10 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
     currentProjectId === null &&
     (selectedAgent ?? liveAgent)?.id === 0 &&
     experimentalGuardrailsV2Enabled;
+  const experimentalGuardrailsV3EnabledForCurrentWorkflow =
+    currentProjectId === null &&
+    (selectedAgent ?? liveAgent)?.id === 0 &&
+    experimentalGuardrailsV3Enabled;
 
   const [presentingDocument, setPresentingDocument] =
     useState<MinimalOnyxDocument | null>(null);
@@ -657,6 +665,9 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
       experimentalGuardrailsV2:
         experimentalGuardrailsV2EnabledForCurrentWorkflow &&
         !multiModel.isMultiModelActive,
+      experimentalGuardrailsV3:
+        experimentalGuardrailsV3EnabledForCurrentWorkflow &&
+        !multiModel.isMultiModelActive,
       messageIdToResend: lastUserMsg.messageId,
     });
   }, [
@@ -674,6 +685,7 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
     experimentalParallelResearchEnabledForCurrentWorkflow,
     experimentalGuardrailsEnabledForCurrentWorkflow,
     experimentalGuardrailsV2EnabledForCurrentWorkflow,
+    experimentalGuardrailsV3EnabledForCurrentWorkflow,
     multiModel.isMultiModelActive,
   ]);
 
@@ -734,6 +746,9 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
         experimentalGuardrailsV2:
           experimentalGuardrailsV2EnabledForCurrentWorkflow &&
           !multiModel.isMultiModelActive,
+        experimentalGuardrailsV3:
+          experimentalGuardrailsV3EnabledForCurrentWorkflow &&
+          !multiModel.isMultiModelActive,
         selectedModels: multiModel.isMultiModelActive
           ? multiModel.selectedModels
           : undefined,
@@ -757,6 +772,7 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
       experimentalParallelResearchEnabledForCurrentWorkflow,
       experimentalGuardrailsEnabledForCurrentWorkflow,
       experimentalGuardrailsV2EnabledForCurrentWorkflow,
+      experimentalGuardrailsV3EnabledForCurrentWorkflow,
       multiModel.isMultiModelActive,
       multiModel.selectedModels,
       foldSidebarForMultiModel,
@@ -842,6 +858,9 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
           experimentalGuardrailsV2:
             experimentalGuardrailsV2EnabledForCurrentWorkflow &&
             !multiModel.isMultiModelActive,
+          experimentalGuardrailsV3:
+            experimentalGuardrailsV3EnabledForCurrentWorkflow &&
+            !multiModel.isMultiModelActive,
           selectedModels: multiModel.isMultiModelActive
             ? multiModel.selectedModels
             : undefined,
@@ -876,6 +895,7 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
       experimentalParallelResearchEnabledForCurrentWorkflow,
       experimentalGuardrailsEnabledForCurrentWorkflow,
       experimentalGuardrailsV2EnabledForCurrentWorkflow,
+      experimentalGuardrailsV3EnabledForCurrentWorkflow,
       showOnboarding,
       onboardingDismissed,
       finishOnboarding,
@@ -1095,6 +1115,9 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
                         }
                         experimentalGuardrailsV2Enabled={
                           experimentalGuardrailsV2EnabledForCurrentWorkflow
+                        }
+                        experimentalGuardrailsV3Enabled={
+                          experimentalGuardrailsV3EnabledForCurrentWorkflow
                         }
                         currentMessageFiles={currentMessageFiles}
                         setPresentingDocument={setPresentingDocument}
@@ -1319,6 +1342,9 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
                         experimentalGuardrailsV2Enabled={
                           experimentalGuardrailsV2EnabledForCurrentWorkflow
                         }
+                        experimentalGuardrailsV3Enabled={
+                          experimentalGuardrailsV3EnabledForCurrentWorkflow
+                        }
                         toggleAtezSearchV2={toggleAtezSearchV2}
                         toggleAtezSearchV3={toggleAtezSearchV3}
                         toggleLegalReview={toggleLegalReview}
@@ -1333,6 +1359,9 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
                         }
                         toggleExperimentalGuardrailsV2={
                           toggleExperimentalGuardrailsV2
+                        }
+                        toggleExperimentalGuardrailsV3={
+                          toggleExperimentalGuardrailsV3
                         }
                         isMultiModelActive={multiModel.isMultiModelActive}
                         filterManager={filterManager}

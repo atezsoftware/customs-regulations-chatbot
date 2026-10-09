@@ -22,6 +22,7 @@ class ASv3WorkflowSelection(BaseModel):
         "asv3_tuned",
         "asv3_guarded_experimental",
         "asv3_guardrails_v2",
+        "asv3_guardrails_v3",
     ] = "standard"
 
     @property
@@ -35,6 +36,10 @@ class ASv3WorkflowSelection(BaseModel):
     @property
     def uses_guardrails_v2(self) -> bool:
         return self.workflow_variant == "asv3_guardrails_v2"
+
+    @property
+    def uses_guardrails_v3(self) -> bool:
+        return self.workflow_variant == "asv3_guardrails_v3"
 
 
 class OutcomeStatus(StrEnum):

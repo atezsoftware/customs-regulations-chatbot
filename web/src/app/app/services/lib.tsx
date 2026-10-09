@@ -172,6 +172,7 @@ export interface SendMessageParams {
   experimentalParallelResearch?: boolean;
   experimentalGuardrails?: boolean;
   experimentalGuardrailsV2?: boolean;
+  experimentalGuardrailsV3?: boolean;
   asv3ResumeMessageId?: number;
   asv3AllowExternal?: boolean;
   enabledToolIds?: number[];
@@ -207,6 +208,7 @@ export async function* sendMessage({
   experimentalParallelResearch,
   experimentalGuardrails,
   experimentalGuardrailsV2,
+  experimentalGuardrailsV3,
   asv3ResumeMessageId,
   asv3AllowExternal,
   enabledToolIds,
@@ -232,6 +234,7 @@ export async function* sendMessage({
       experimentalParallelResearch ||
       experimentalGuardrails ||
       experimentalGuardrailsV2 ||
+      experimentalGuardrailsV3 ||
       asv3ResumeMessageId != null)
   ) {
     throw new Error(
@@ -261,7 +264,8 @@ export async function* sendMessage({
         experimentalResearch ||
         experimentalParallelResearch ||
         experimentalGuardrails ||
-        experimentalGuardrailsV2) &&
+        experimentalGuardrailsV2 ||
+        experimentalGuardrailsV3) &&
       !deepResearch &&
       !supersearch
     ),
@@ -270,7 +274,10 @@ export async function* sendMessage({
         ? "deep"
         : experimentalResearch || experimentalParallelResearch
           ? "experimental"
-          : atezSearchV3 || experimentalGuardrails || experimentalGuardrailsV2
+          : atezSearchV3 ||
+              experimentalGuardrails ||
+              experimentalGuardrailsV2 ||
+              experimentalGuardrailsV3
             ? "normal"
             : "deep",
     ...(experimentalParallelResearch && !deepResearch && !supersearch
@@ -282,6 +289,9 @@ export async function* sendMessage({
     ...(experimentalGuardrailsV2 && !deepResearch && !supersearch
       ? { asv3_guardrails_v2: true }
       : {}),
+    ...(experimentalGuardrailsV3 && !deepResearch && !supersearch
+      ? { asv3_guardrails_v3: true }
+      : {}),
     asv3_resume_message_id:
       supersearch || legalReview ? undefined : asv3ResumeMessageId,
     asv3_allow_external: Boolean(
@@ -290,6 +300,7 @@ export async function* sendMessage({
         experimentalParallelResearch ||
         experimentalGuardrails ||
         experimentalGuardrailsV2 ||
+        experimentalGuardrailsV3 ||
         deepResearch) &&
       asv3AllowExternal &&
       !supersearch

@@ -33,6 +33,7 @@ from onyx.legal_composite.models import (
     IssueResearchStep,
     StructuredDraftAnswer,
 )
+from onyx.legal_composite.navigation import NavigationProposal
 from onyx.legal_composite.query_repair import (
     QUERY_REPAIR_PROMPT,
     DiscoveryQuery,
@@ -156,6 +157,7 @@ def _record_typed_validation(
         DiscoveryQuery: "query_compression",
         IssueResearchStep: "research_step",
         IssueReadingResponse: "research_step",
+        NavigationProposal: "navigation_repair",
         StructuredDraftAnswer: "draft_answer",
         DraftComposition: "draft_answer",
         ClaimDeltaPatch: "claim_delta",
@@ -945,6 +947,7 @@ class BudgetedGateway:
             IssueResearchPlan,
             IssueResearchStep,
             IssueReadingResponse,
+            NavigationProposal,
             StructuredDraftAnswer,
             DraftComposition,
             ClaimDeltaPatch,

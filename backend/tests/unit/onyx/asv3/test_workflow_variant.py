@@ -17,6 +17,8 @@ from onyx.asv3.models import ASv3WorkflowSelection, RunContext
 from onyx.asv3.shared_reads import SharedReads
 from onyx.asv3.workflow_variant import (
     ASV3_GUARDED_EXPERIMENTAL_VARIANT,
+    ASV3_GUARDRAILS_V3_POLICY,
+    ASV3_GUARDRAILS_V3_VARIANT,
     ASV3_STANDARD_VARIANT,
     ASV3_TUNED_POLICY,
     ASV3_TUNED_VARIANT,
@@ -119,6 +121,35 @@ def test_guardrails_v2_has_an_isolated_variant_and_checkpoint_policy() -> None:
         resolve_asv3_workflow("normal", True, guardrails_v2=True)
 
 
+def test_guardrails_v3_has_an_isolated_variant_and_checkpoint_policy() -> None:
+    selected = resolve_asv3_workflow("normal", False, guardrails_v3=True)
+
+    assert selected.research_profile == "normal"
+    assert selected.parallel_research is False
+    assert selected.workflow_variant == ASV3_GUARDRAILS_V3_VARIANT
+    assert selected.uses_guardrails_v3
+    assert not selected.uses_guardrails
+    assert not selected.uses_guardrails_v2
+    checkpoint = {
+        **checkpoint_variant_fields(selected.workflow_variant),
+        "research_profile": "normal",
+        "parallel_research": False,
+    }
+    assert checkpoint["asv3_workflow_policy"] == ASV3_GUARDRAILS_V3_POLICY
+    validate_asv3_variant_resume(selected.workflow_variant, checkpoint)
+
+    for incompatible in (
+        {"guarded_experimental": True},
+        {"guardrails_v2": True},
+    ):
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            resolve_asv3_workflow("normal", False, guardrails_v3=True, **incompatible)
+    with pytest.raises(ValueError, match="normal profile"):
+        resolve_asv3_workflow("experimental", False, guardrails_v3=True)
+    with pytest.raises(ValueError, match="without parallel"):
+        resolve_asv3_workflow("normal", True, guardrails_v3=True)
+
+
 def test_guardrails_v2_request_validation_is_independent_from_v1() -> None:
     request = SendMessageRequest.model_validate(
         {
@@ -139,6 +170,44 @@ def test_guardrails_v2_request_validation_is_independent_from_v1() -> None:
                 "asv3_research_profile": "normal",
                 "asv3_guarded_experimental": True,
                 "asv3_guardrails_v2": True,
+            }
+        )
+
+
+def test_guardrails_v3_request_validation_is_independent_from_v1_and_v2() -> None:
+    request = SendMessageRequest.model_validate(
+        {
+            "message": "İlgili mevzuat nedir?",
+            "atez_search_v3": True,
+            "asv3_research_profile": "normal",
+            "asv3_guardrails_v3": True,
+        }
+    )
+    assert request.asv3_guardrails_v3 is True
+    assert request.asv3_guarded_experimental is False
+    assert request.asv3_guardrails_v2 is False
+
+    for conflicting_flag in (
+        "asv3_guarded_experimental",
+        "asv3_guardrails_v2",
+    ):
+        with pytest.raises(ValidationError, match="mutually exclusive"):
+            SendMessageRequest.model_validate(
+                {
+                    "message": "İlgili mevzuat nedir?",
+                    "atez_search_v3": True,
+                    "asv3_research_profile": "normal",
+                    "asv3_guardrails_v3": True,
+                    conflicting_flag: True,
+                }
+            )
+    with pytest.raises(ValidationError, match="normal non-parallel"):
+        SendMessageRequest.model_validate(
+            {
+                "message": "İlgili mevzuat nedir?",
+                "atez_search_v3": True,
+                "asv3_research_profile": "experimental",
+                "asv3_guardrails_v3": True,
             }
         )
     with pytest.raises(ValidationError, match="normal non-parallel"):
@@ -333,6 +402,37 @@ def test_guarded_runtime_has_finite_cost_and_latency_limits(
     assert context.services["asv3_workflow_variant"] == (
         ASV3_GUARDED_EXPERIMENTAL_VARIANT
     )
+
+
+def test_guardrails_v3_runtime_reserves_time_for_final_review(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kwargs, _broker, _selected, _checkpoints, _queue = setup_run(monkeypatch)
+    kwargs.pop("test_language")
+    contexts = []
+    original_model = runtime.ResearchModel
+
+    def make_model(llm: LLM, context: Any, **options: Any) -> ResearchModel:
+        contexts.append(context)
+        return original_model(llm, context, **options)
+
+    monkeypatch.setattr(runtime, "ResearchModel", make_model)
+    kwargs.update(
+        research_profile="normal",
+        parallel_research=False,
+        workflow_variant=ASV3_GUARDRAILS_V3_VARIANT,
+    )
+    runtime.run_asv3_loop(**kwargs)
+
+    context = contexts[0]
+    remaining_total_seconds = context.deadline - time.monotonic()
+    remaining_research_seconds = context.research_deadline - time.monotonic()
+    assert 1798 <= remaining_total_seconds <= 1800
+    assert 1678 <= remaining_research_seconds <= 1680
+    assert context.budget.unlimited_execution is False
+    assert context.budget.limits["tools"] == 24
+    assert context.budget.limits["decisions"] == 32
+    assert context.services["asv3_workflow_variant"] == ASV3_GUARDRAILS_V3_VARIANT
 
 
 def test_guarded_runtime_keeps_source_tools_cheap_and_coordinator_selected(

@@ -97,6 +97,7 @@ export interface AppInputBarProps {
   experimentalParallelResearchEnabled?: boolean;
   experimentalGuardrailsEnabled?: boolean;
   experimentalGuardrailsV2Enabled?: boolean;
+  experimentalGuardrailsV3Enabled?: boolean;
   setPresentingDocument?: (document: MinimalOnyxDocument) => void;
   toggleDeepResearch: () => void;
   toggleAtezSearch?: () => void;
@@ -109,6 +110,7 @@ export interface AppInputBarProps {
   toggleExperimentalParallelResearch?: () => void;
   toggleExperimentalGuardrails?: () => void;
   toggleExperimentalGuardrailsV2?: () => void;
+  toggleExperimentalGuardrailsV3?: () => void;
   isMultiModelActive?: boolean;
   disabled: boolean;
   awaitingPreferredSelection?: boolean;
@@ -141,6 +143,7 @@ const AppInputBar = React.memo(
     experimentalParallelResearchEnabled = false,
     experimentalGuardrailsEnabled = false,
     experimentalGuardrailsV2Enabled = false,
+    experimentalGuardrailsV3Enabled = false,
     toggleDeepResearch,
     toggleAtezSearchV3,
     toggleLegalComposite,
@@ -150,6 +153,7 @@ const AppInputBar = React.memo(
     toggleExperimentalParallelResearch,
     toggleExperimentalGuardrails,
     toggleExperimentalGuardrailsV2,
+    toggleExperimentalGuardrailsV3,
     isMultiModelActive,
     setPresentingDocument,
     disabled,
@@ -900,6 +904,25 @@ const AppInputBar = React.memo(
                     }
                   >
                     Experimental Guardrails v2
+                  </SelectButton>
+                )}
+                {showAtezSearch && toggleExperimentalGuardrailsV3 && (
+                  <SelectButton
+                    disabled={disabled || isMultiModelActive}
+                    variant="select-light"
+                    icon={SvgSparkle}
+                    onClick={toggleExperimentalGuardrailsV3}
+                    state={
+                      experimentalGuardrailsV3Enabled ? "selected" : "empty"
+                    }
+                    foldable={false}
+                    tooltip={
+                      isMultiModelActive
+                        ? "Experimental Guardrails v3 runs with one model. Remove extra models to use it."
+                        : "ASv3 Tek Araştırma, outcome ve kaynak kontrolü, gerektiğinde tek onarım"
+                    }
+                  >
+                    Experimental Guardrails v3
                   </SelectButton>
                 )}
               </>

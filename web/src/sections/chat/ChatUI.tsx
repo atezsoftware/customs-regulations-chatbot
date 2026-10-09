@@ -38,6 +38,7 @@ interface RegenerationResearchModeInput {
   experimentalParallelResearchEnabled: boolean;
   experimentalGuardrailsEnabled: boolean;
   experimentalGuardrailsV2Enabled?: boolean;
+  experimentalGuardrailsV3Enabled?: boolean;
 }
 
 export function getRegenerationResearchMode({
@@ -52,6 +53,7 @@ export function getRegenerationResearchMode({
   experimentalParallelResearchEnabled,
   experimentalGuardrailsEnabled,
   experimentalGuardrailsV2Enabled = false,
+  experimentalGuardrailsV3Enabled = false,
 }: RegenerationResearchModeInput) {
   const resumingAsv3 = Boolean(asv3ResumeMessageId);
   return {
@@ -71,6 +73,9 @@ export function getRegenerationResearchMode({
     experimentalGuardrailsV2: resumingAsv3
       ? false
       : experimentalGuardrailsV2Enabled,
+    ...(experimentalGuardrailsV3Enabled && !resumingAsv3
+      ? { experimentalGuardrailsV3: true }
+      : {}),
   };
 }
 
@@ -97,6 +102,7 @@ export interface ChatUIProps {
     experimentalParallelResearch?: boolean;
     experimentalGuardrails?: boolean;
     experimentalGuardrailsV2?: boolean;
+    experimentalGuardrailsV3?: boolean;
     asv3ResumeMessageId?: number;
     asv3AllowExternal?: boolean;
     modelOverride?: LlmDescriptor;
@@ -120,6 +126,7 @@ export interface ChatUIProps {
   experimentalParallelResearchEnabled?: boolean;
   experimentalGuardrailsEnabled?: boolean;
   experimentalGuardrailsV2Enabled?: boolean;
+  experimentalGuardrailsV3Enabled?: boolean;
   currentMessageFiles: any[];
 
   onResubmit: () => void;
@@ -156,6 +163,7 @@ const ChatUI = React.memo(
     experimentalParallelResearchEnabled = false,
     experimentalGuardrailsEnabled = false,
     experimentalGuardrailsV2Enabled = false,
+    experimentalGuardrailsV3Enabled = false,
     currentMessageFiles,
     onResubmit,
     anchorNodeId,
@@ -199,6 +207,9 @@ const ChatUI = React.memo(
     const experimentalGuardrailsV2EnabledRef = useRef(
       experimentalGuardrailsV2Enabled
     );
+    const experimentalGuardrailsV3EnabledRef = useRef(
+      experimentalGuardrailsV3Enabled
+    );
     const currentMessageFilesRef = useRef(currentMessageFiles);
     const selectedModelsRef = useRef(selectedModels);
     onSubmitRef.current = onSubmit;
@@ -215,6 +226,8 @@ const ChatUI = React.memo(
     experimentalGuardrailsEnabledRef.current = experimentalGuardrailsEnabled;
     experimentalGuardrailsV2EnabledRef.current =
       experimentalGuardrailsV2Enabled;
+    experimentalGuardrailsV3EnabledRef.current =
+      experimentalGuardrailsV3Enabled;
     currentMessageFilesRef.current = currentMessageFiles;
     selectedModelsRef.current = selectedModels;
 
@@ -241,6 +254,8 @@ const ChatUI = React.memo(
               experimentalGuardrailsEnabledRef.current,
             experimentalGuardrailsV2Enabled:
               experimentalGuardrailsV2EnabledRef.current,
+            experimentalGuardrailsV3Enabled:
+              experimentalGuardrailsV3EnabledRef.current,
           });
           return await onSubmitRef.current({
             message: regenerationRequest.parentMessage.message,
@@ -287,6 +302,9 @@ const ChatUI = React.memo(
             !(models && models.length >= 2),
           experimentalGuardrailsV2:
             experimentalGuardrailsV2EnabledRef.current &&
+            !(models && models.length >= 2),
+          experimentalGuardrailsV3:
+            experimentalGuardrailsV3EnabledRef.current &&
             !(models && models.length >= 2),
           selectedModels: models && models.length >= 2 ? models : undefined,
         });
