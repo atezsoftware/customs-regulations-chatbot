@@ -86,6 +86,8 @@ def test_legacy_consumer_does_not_emit_new_diagnostics(
         ("Support quotation conflicts with its original span", "span_quotation"),
         ("Repair cannot change a section's issue bindings", "patch_section_issue"),
         ("Claim edits cannot move an existing claim", "patch_claim_move"),
+        ("Claim edits cannot change existing issue bindings", "patch_claim_issue"),
+        ("New claim edits need an explicit issue subset", "patch_claim_issue"),
         ("Source requirement identities are immutable", "requirement_immutable"),
         (
             "Gap closure lacks a fresh same-issue requirement binding",

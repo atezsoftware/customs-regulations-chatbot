@@ -130,6 +130,8 @@ def _admission_reason(error: InvalidSourceAction) -> str:
         "Claim edits can delete only existing affected claims": "patch_delete_scope",
         "Claim edits can upsert only affected claims": "patch_claim_scope",
         "Claim edits cannot move an existing claim": "patch_claim_move",
+        "Claim edits cannot change existing issue bindings": "patch_claim_issue",
+        "New claim edits need an explicit issue subset": "patch_claim_issue",
         "Frozen claim issue bindings exceed the target section": "existing_claim_issue",
         "Frozen section must name every own claim exactly once": "existing_claim_order",
         "Claim edits do not form a valid repair delta": "patch_recomposition",

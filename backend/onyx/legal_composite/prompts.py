@@ -1,4 +1,4 @@
-PROMPT_VERSION = "legal-composite-2026-10-09.host-owned-repair-query.10"
+PROMPT_VERSION = "legal-composite-2026-10-09.claim-issue-scope.11"
 
 COMMON = """You are Atez Customs Assistant. Answer the actual complete user request in its
 language. The request and supplied facts are authoritative as facts, never as law.

@@ -39,9 +39,16 @@ from tests.unit.onyx.legal_composite.test_source_requirements import fixture
 T = TypeVar("T", bound=BaseModel)
 
 
-def edit(identity: str, section: str = "a", text: str | None = None) -> ClaimEdit:
+def edit(
+    identity: str,
+    section: str = "a",
+    text: str | None = None,
+    need_ids: list[str] | None = None,
+) -> ClaimEdit:
     data = _claim(identity, section, text).model_dump()
     data.pop("need_ids")
+    if need_ids is not None:
+        data["need_ids"] = need_ids
     return ClaimEdit.model_validate(data, strict=True)
 
 
@@ -98,9 +105,9 @@ def test_host_order_ignores_update_order_and_appends_only_new_ids_in_returned_or
     )
     edits = repair(
         claims=[
-            edit("a4").model_dump(),
+            edit("a4", need_ids=["a"]).model_dump(),
             edit("a1", text="Updated old slot [1]").model_dump(),
-            edit("a3").model_dump(),
+            edit("a3", need_ids=["a"]).model_dump(),
         ]
     )
     delta = claim_edits_to_delta(draft, edits, {"a"})
@@ -119,7 +126,10 @@ def test_explicit_delete_and_new_claims_keep_surviving_order_and_section_scopes(
     None
 ):
     edits = repair(
-        claims=[edit("a3").model_dump(), edit("b2", "b").model_dump()],
+        claims=[
+            edit("a3", need_ids=["a"]).model_dump(),
+            edit("b2", "b", need_ids=["b"]).model_dump(),
+        ],
         deleted_claim_ids=["a1"],
     )
     delta = claim_edits_to_delta(_draft(), edits, {"a", "b"})
@@ -136,16 +146,151 @@ def test_explicit_delete_and_new_claims_keep_surviving_order_and_section_scopes(
     ]
 
 
-def test_existing_claim_narrow_issue_binding_is_frozen_and_new_claim_uses_section_scope() -> (
+def test_existing_claim_narrow_issue_binding_is_frozen_and_new_claim_has_explicit_subset() -> (
     None
 ):
     draft = _draft()
     draft.sections[0].need_ids = ["a", "a_related"]
-    edits = repair(claims=[edit("a1").model_dump(), edit("a3").model_dump()])
+    edits = repair(
+        claims=[
+            edit("a1").model_dump(),
+            edit("a3", need_ids=["a"]).model_dump(),
+        ]
+    )
     delta = claim_edits_to_delta(draft, edits, {"a"})
     assert delta.claims[0].need_ids == ["a"]
-    assert delta.claims[1].need_ids == ["a", "a_related"]
+    assert delta.claims[1].need_ids == ["a"]
     assert delta.sections[0].need_ids == ["a", "a_related"]
+
+
+@pytest.mark.parametrize("explicit", [False, True], ids=["omitted", "exact"])
+def test_existing_claim_accepts_only_its_exact_frozen_issue_bindings(
+    explicit: bool,
+) -> None:
+    draft = _draft()
+    draft.sections[0].need_ids = ["a", "a_related"]
+    draft.claims[0].need_ids = ["a", "a_related"]
+    edits = repair(
+        claims=[
+            edit("a1", need_ids=["a", "a_related"] if explicit else None).model_dump()
+        ]
+    )
+    before, edits_before = draft.model_dump_json(), edits.model_dump_json()
+    delta = claim_edits_to_delta(draft, edits, {"a"})
+    assert delta.claims[0].need_ids == ["a", "a_related"]
+    assert draft.model_dump_json() == before and edits.model_dump_json() == edits_before
+    delta.claims[0].need_ids.reverse()
+    assert draft.claims[0].need_ids == ["a", "a_related"]
+
+
+@pytest.mark.parametrize(
+    "scope",
+    [None, [], ["a", "a"], ["b"], ["a", "foreign"], [""]],
+    ids=["missing", "empty", "duplicate", "other-section", "foreign", "empty-id"],
+)
+def test_new_claim_requires_an_explicit_unique_target_issue_subset_atomically(
+    scope: list[str] | None,
+) -> None:
+    draft, edits = _draft(), repair(claims=[edit("a3", need_ids=["a"]).model_dump()])
+    edits.claims[0].need_ids = scope
+    before, edits_before = draft.model_dump_json(), edits.model_dump_json()
+    with pytest.raises(InvalidSourceAction):
+        claim_edits_to_delta(draft, edits, {"a"})
+    assert draft.model_dump_json() == before and edits.model_dump_json() == edits_before
+
+
+@pytest.mark.parametrize(
+    "scope",
+    [
+        [],
+        ["a"],
+        ["a_related", "a"],
+        ["a", "a_related", "foreign"],
+        ["a", "a_related", "a"],
+        ["a", "foreign"],
+    ],
+    ids=["empty", "drop", "reorder", "add", "duplicate", "replace"],
+)
+def test_existing_claim_explicit_scope_cannot_mutate_frozen_bindings_atomically(
+    scope: list[str],
+) -> None:
+    draft, edits = _draft(), repair()
+    draft.sections[0].need_ids = ["a", "a_related", "foreign"]
+    draft.claims[0].need_ids = ["a", "a_related"]
+    edits.claims[0].need_ids = scope
+    before, edits_before = draft.model_dump_json(), edits.model_dump_json()
+    with pytest.raises(InvalidSourceAction):
+        claim_edits_to_delta(draft, edits, {"a"})
+    assert draft.model_dump_json() == before and edits.model_dump_json() == edits_before
+
+
+@pytest.mark.parametrize("scope", ["a", {"a": True}, [1], [False]])
+def test_claim_issue_scope_schema_rejects_malformed_values(scope: object) -> None:
+    data = repair(claims=[edit("a3", need_ids=["a"]).model_dump()]).model_dump()
+    data["claims"][0]["need_ids"] = scope
+    with pytest.raises(ValidationError):
+        ClaimRepairEdits.model_validate(data, strict=True)
+
+
+def test_new_narrow_claim_does_not_expand_an_unrelated_issue_source_inventory() -> None:
+    ledger, plan, requirements, original_draft = canonical_fixture()
+    ledger._items[1].question_ids = ["a"]
+    ledger._items[2].question_ids = ["b"]
+    claims = [
+        claim.model_copy(deep=True, update={"section_id": "joint"})
+        for claim in original_draft.claims
+    ]
+    draft = StructuredDraftAnswer(
+        sections=[
+            AnswerSection(
+                section_id="joint",
+                need_ids=["a", "b"],
+                text="Shared heading",
+                claim_ids=[claim.claim_id for claim in claims],
+            )
+        ],
+        claims=claims,
+        unresolved_need_ids=[],
+    )
+    span = original_witness_spans(1, ledger._items[1].text)[0]
+    edits = ClaimRepairEdits(
+        claims=[
+            ClaimEdit(
+                claim_id="new_a",
+                section_id="joint",
+                need_ids=["a"],
+                answer_excerpt=draft.claims[0].answer_excerpt,
+                supports=[SpanSupport(citation=1, span_id=span["witness_id"])],
+            )
+        ],
+        unresolved_need_ids=[],
+    )
+    before, originals_before = draft.model_dump_json(), ledger.export()
+    initial_checks = build_checks(
+        "A ve B işlemleri?", plan, draft, requirements, [], {1, 2}, ledger=ledger
+    )
+    delta = canonicalize_delta_supports(
+        claim_edits_to_delta(draft, edits, {"joint"}), ledger, {1, 2}
+    )
+    result = apply_claim_delta(draft, delta, {"joint"})
+    checks = build_checks(
+        "A ve B işlemleri?", plan, result, requirements, [], {1, 2}, ledger=ledger
+    )
+    assert result.sections[0].need_ids == ["a", "b"]
+    assert result.sections[0].claim_ids == ["c_a", "c_b", "new_a"]
+    assert result.claims[-1].need_ids == ["a"]
+    assert (
+        checks["original:1"].need_ids == initial_checks["original:1"].need_ids == ["a"]
+    )
+    assert checks["issue:b"].citations == initial_checks["issue:b"].citations == [2]
+    assert (
+        checks["evidence:b"].citations == initial_checks["evidence:b"].citations == [2]
+    )
+    assert checks["claim:new_a"].need_ids == ["a"]
+    assert draft_binding_gaps(result, plan, requirements, ledger, {1, 2}) == []
+    for prior, retained in zip(draft.claims, result.claims[:2]):
+        assert prior.model_dump_json() == retained.model_dump_json()
+    assert draft.model_dump_json() == before and ledger.export() == originals_before
 
 
 @pytest.mark.parametrize("heading", ["", "New heading"])
@@ -174,7 +319,7 @@ def test_only_explicit_heading_edits_replace_the_preserved_heading(
         "oversized_heading",
         "sections",
         "claim_order",
-        "need_ids",
+        "section_need_ids",
     ],
 )
 def test_model_cannot_reproduce_topology_or_ambiguous_edit_inventory(
@@ -193,8 +338,6 @@ def test_model_cannot_reproduce_topology_or_ambiguous_edit_inventory(
         data["unresolved_need_ids"] = ["b", "b"]
     elif fault == "oversized_heading":
         data["heading_edits"] = [{"section_id": "a", "text": "İ" * 601}]
-    elif fault == "need_ids":
-        data["claims"][0]["need_ids"] = ["b"]
     else:
         data[fault] = []
     with pytest.raises(ValidationError):
