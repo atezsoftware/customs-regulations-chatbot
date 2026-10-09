@@ -95,6 +95,7 @@ class CanonicalAcquirer:
         | None = None,
         lane_inventory: dict[str, JsonValue] | None = None,
         on_batch_progress: Callable[[list[SourceAction], int, int], None] | None = None,
+        coalesce_progress: bool = False,
         host_registry: CapabilityRegistry | None = None,
         source_kinds: dict[str, SourceKind] | None = None,
     ) -> None:
@@ -110,6 +111,7 @@ class CanonicalAcquirer:
         self.on_batch_progress = on_batch_progress or (
             lambda _actions, _pending, _completed: None
         )
+        self.coalesce_progress = coalesce_progress
         self.search_calls = 0
         self.last_receipts: list[dict[str, JsonValue]] = []
         self._completed: dict[str, dict[str, JsonValue]] = {}
@@ -391,8 +393,11 @@ class CanonicalAcquirer:
                     self._completed[signature] = row
                     result.append(row)
                     completed_count += 1
-                    self.on_batch_progress(batch_actions, len(pending), completed_count)
-                    last_progress = time.monotonic()
+                    if not self.coalesce_progress:
+                        self.on_batch_progress(
+                            batch_actions, len(pending), completed_count
+                        )
+                        last_progress = time.monotonic()
                     with graph_step(
                         "legal_composite.acquisition",
                         {
@@ -405,6 +410,9 @@ class CanonicalAcquirer:
                             "status": outcome.status.value,
                             "citations": numbers,
                         }
+                if completed and self.coalesce_progress:
+                    self.on_batch_progress(batch_actions, len(pending), completed_count)
+                    last_progress = time.monotonic()
                 if stopped is not None:
                     raise stopped
             return result

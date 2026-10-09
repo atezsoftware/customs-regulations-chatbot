@@ -1,10 +1,10 @@
 """Exercise the canonical non-streaming adapter without provider network calls."""
 
 from collections.abc import Callable
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
 from copy import deepcopy
-from threading import Event
+from threading import Barrier, Event
 from typing import Any
 from unittest.mock import Mock
 
@@ -27,8 +27,10 @@ from onyx.legal_composite.gateway import BudgetedGateway
 from onyx.legal_composite.models import (
     AnswerReview,
     DraftAnswer,
+    IssueResearchStep,
     ResearchPlan,
     ResearchStep,
+    StructuredDraftAnswer,
     WorkflowPolicy,
 )
 from onyx.llm.cost import ModelPrice
@@ -440,6 +442,16 @@ def test_late_canonical_compatibility_retry_cannot_republish_closed_capture(
             ["answer", "unresolved_need_ids"],
         ),
         (
+            StructuredDraftAnswer,
+            '{"sections":[{"section_id":"one","need_ids":["generic"],"text":"supported"}],"unresolved_need_ids":[]}',
+            ["unresolved_need_ids"],
+        ),
+        (
+            IssueResearchStep,
+            '{"actions":[],"ready_to_answer":true,"remaining_gaps":[]}',
+            ["actions", "ready_to_answer", "remaining_gaps"],
+        ),
+        (
             ResearchPlan,
             '{"language":"tr","requires_sources":true,"needs":[{"need_id":"generic",'
             '"question":"Which rule applies?","governing_source":"Applicable law",'
@@ -493,7 +505,7 @@ def test_canonical_typed_schema_and_phase_reasoning_map_to_native_vertex(
         grammar = native["response_json_schema"]
         assert grammar["required"] == required
         assert grammar["additionalProperties"] is False
-        if response_type is DraftAnswer:
+        if response_type in {DraftAnswer, StructuredDraftAnswer}:
             assert grammar["properties"]["answer"]["type"] == "string"
             assert grammar["properties"]["unresolved_need_ids"]["type"] == "array"
         else:
@@ -502,19 +514,23 @@ def test_canonical_typed_schema_and_phase_reasoning_map_to_native_vertex(
         assert kwargs["tools"] is None
         expected_effort = (
             ("medium" if selected_effort is ReasoningEffort.AUTO else "high")
-            if response_type is DraftAnswer
+            if response_type in {DraftAnswer, StructuredDraftAnswer}
             else "low"
         )
         assert kwargs["reasoning_effort"] == expected_effort
         assert kwargs["max_tokens"] == (
-            2_048 if response_type in {ResearchPlan, ResearchStep} else 4_096
+            6_144
+            if response_type is IssueResearchStep
+            else 2_048
+            if response_type in {ResearchPlan, ResearchStep}
+            else 4_096
         )
         return response(content)
 
     completion = Mock(side_effect=complete)
     monkeypatch.setattr("litellm.completion", completion)
     workflow = gateway(model, EvidenceLedger(), reasoning_effort=selected_effort)
-    research = response_type in {ResearchPlan, ResearchStep}
+    research = response_type in {ResearchPlan, ResearchStep, IssueResearchStep}
     result = workflow.complete(
         "Return the typed result",
         {},
@@ -621,3 +637,61 @@ def test_portable_native_schema_keeps_strict_host_validation(
     completion.assert_called_once()
     portable = completion.call_args.kwargs["response_format"]["json_schema"]["schema"]
     assert "minLength" not in portable["properties"]["answer"]
+
+
+def test_reviewer_gateway_preserves_existing_writer_budget_after_research_phase(
+    model: LitellmLLM, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = [0.0]
+    ledger = EvidenceLedger()
+    writer = gateway(model, ledger, lambda: now[0])
+    completion = Mock(
+        return_value=response('{"answer":"supported","unresolved_need_ids":[]}')
+    )
+    monkeypatch.setattr("litellm.completion", completion)
+    writer.complete("Answer", {}, DraftAnswer, LLMFlow.LEGAL_COMPOSITE_ANSWER, True)
+    now[0] = 95.0
+    before = writer.budget.snapshot()
+    reviewer = BudgetedGateway(
+        selected_llm=model,
+        research_llm=model,
+        budget=writer.budget,
+        ledger=ledger,
+        reserve_finalization=False,
+    )
+    assert reviewer.budget is writer.budget
+    assert writer.budget.snapshot() == before
+    reviewer.complete("Review", {}, DraftAnswer, LLMFlow.LEGAL_COMPOSITE_REVIEW, True)
+    assert writer.budget.snapshot()["model_calls"] == 2
+    assert writer.budget.snapshot()["unsettled_calls"] == 0
+
+
+def test_lc_opt_in_auxiliary_generations_do_not_wait_for_each_other(
+    model: LitellmLLM, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    together = Barrier(2)
+
+    def complete(**kwargs: Any) -> litellm.ModelResponse:
+        assert kwargs["tools"] is None
+        together.wait(timeout=3)
+        return response("relevant original")
+
+    monkeypatch.setattr("litellm.completion", complete)
+    workflow = BudgetedGateway(
+        selected_llm=model,
+        research_llm=model,
+        budget=WorkflowBudget(WorkflowPolicy()),
+        ledger=EvidenceLedger(),
+        max_parallel_generations=2,
+    )
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        first = workers.submit(
+            workflow.research_invoke, UserMessage(content="independent A")
+        )
+        second = workers.submit(
+            workflow.research_invoke, UserMessage(content="independent B")
+        )
+        assert first.result(timeout=5).choice.message.content == "relevant original"
+        assert second.result(timeout=5).choice.message.content == "relevant original"
+    assert workflow.budget.snapshot()["model_calls"] == 2
+    assert workflow.budget.snapshot()["unsettled_calls"] == 0

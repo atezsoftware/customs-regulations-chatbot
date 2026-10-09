@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
@@ -49,6 +49,20 @@ class ResearchNeed(StrictModel):
     source_kinds: list[SourceKind] = Field(default_factory=list)
 
 
+class GapResolution(StrictModel):
+    need_id: str = Field(min_length=1)
+    gap: str = Field(min_length=1)
+    requirement_ids: list[str] = Field(min_length=1)
+
+
+class IssueResearchNeed(ResearchNeed):
+    required_outcome: str = ""
+    research_dimensions: list[str] = Field(default_factory=list)
+    relevant_facts: list[str] = Field(default_factory=list)
+    evidence_gaps: list[str] = Field(default_factory=list)
+    evidence_gap_resolutions: list[GapResolution] = Field(default_factory=list)
+
+
 class SourceAction(StrictModel):
     need_ids: list[str] = Field(min_length=1)
     tool: str = Field(min_length=1)
@@ -77,6 +91,35 @@ class ResearchPlan(StrictModel):
         return self
 
 
+class IssueResearchPlan(ResearchPlan):
+    needs: list[IssueResearchNeed] = Field(min_length=1)
+
+
+class PassageSupport(StrictModel):
+    citation: int = Field(gt=0)
+    quotation: str = Field(min_length=1)
+
+
+class SourceRequirement(StrictModel):
+    supersedes_requirement_ids: list[str] = Field(default_factory=list)
+    requirement_id: str = Field(min_length=1)
+    need_id: str = Field(min_length=1)
+    dimension: str = Field(min_length=1)
+    rule: str = Field(min_length=1)
+    application: str = Field(min_length=1)
+    supports: list[PassageSupport] = Field(min_length=1)
+    missing_user_facts: list[str] = Field(default_factory=list)
+
+
+class MaterialDependencyRequest(StrictModel):
+    need_ids: list[str] = Field(min_length=1)
+    origin_citation: int = Field(gt=0, strict=True)
+    instrument_name: str = Field(min_length=1)
+    instrument_number: str | None = None
+    article: str = Field(min_length=1)
+    reason: str = Field(min_length=1)
+
+
 class ResearchStep(StrictModel):
     actions: list[SourceAction]
     ready_to_answer: bool
@@ -84,14 +127,84 @@ class ResearchStep(StrictModel):
     related_citations: list[int] = Field(default_factory=list)
 
 
+class IssueResearchStep(ResearchStep):
+    reconsider_citations: list[Annotated[int, Field(gt=0, strict=True)]] = Field(
+        default_factory=list
+    )
+    gap_resolutions: list[GapResolution] = Field(default_factory=list)
+    requirements: list[SourceRequirement] = Field(default_factory=list)
+    material_dependencies: list[MaterialDependencyRequest] = Field(default_factory=list)
+    issue_gaps: dict[str, list[str]] = Field(default_factory=dict)
+
+
+class AnswerSection(StrictModel):
+    section_id: str = Field(min_length=1)
+    need_ids: list[str] = Field(min_length=1)
+    text: str = Field(min_length=1)
+
+
+class DraftClaim(StrictModel):
+    claim_id: str = Field(min_length=1)
+    section_id: str = Field(min_length=1)
+    need_ids: list[str] = Field(min_length=1)
+    answer_excerpt: str = Field(min_length=1)
+    supports: list[PassageSupport] = Field(default_factory=list)
+    requirement_ids: list[str] = Field(default_factory=list)
+
+
 class DraftAnswer(StrictModel):
     answer: str = Field(min_length=1)
     unresolved_need_ids: list[str]
 
 
-class PassageSupport(StrictModel):
-    citation: int = Field(gt=0)
-    quotation: str = Field(min_length=1)
+class StructuredDraftAnswer(DraftAnswer):
+    gap_resolutions: list[GapResolution] = Field(default_factory=list)
+    answer: str = ""
+    unresolved_need_ids: list[str]
+    sections: list[AnswerSection] = Field(default_factory=list)
+    claims: list[DraftClaim] = Field(default_factory=list)
+    requirements: list[SourceRequirement] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def section_identity(self) -> StructuredDraftAnswer:
+        ids = [section.section_id for section in self.sections]
+        if len(ids) != len(set(ids)):
+            raise ValueError("Answer sections must have unique identities")
+        joined = "\n\n".join(section.text for section in self.sections)
+        if self.sections:
+            if self.answer and self.answer != joined:
+                raise ValueError(
+                    "Answer must exactly join its sections with two newlines"
+                )
+            self.answer = joined
+        if not self.answer.strip():
+            raise ValueError("Answer cannot be empty")
+        claims = [claim.claim_id for claim in self.claims]
+        if len(claims) != len(set(claims)):
+            raise ValueError("Claims must have unique identities")
+        return self
+
+
+class DraftPatch(StrictModel):
+    gap_resolutions: list[GapResolution] = Field(default_factory=list)
+    sections: list[AnswerSection]
+    claims: list[DraftClaim]
+    unresolved_need_ids: list[str]
+    requirements: list[SourceRequirement] = Field(default_factory=list)
+
+
+class ReviewCheck(StrictModel):
+    check_id: str = Field(min_length=1)
+    need_ids: list[str]
+    section_ids: list[str]
+    status: Literal["addressed", "not_applicable", "gap", "incorrect", "uncertain"]
+    confidence: float = Field(ge=0, le=1, allow_inf_nan=False)
+
+
+class SemanticReview(StrictModel):
+    checks: list[ReviewCheck]
+    repair_actions: list[SourceAction] = Field(default_factory=list)
+    failure: str | None = None
 
 
 class ConditionReview(StrictModel):
@@ -169,3 +282,9 @@ class WorkflowResult(StrictModel):
     gaps: list[str]
     plan: ResearchPlan | None = None
     review: AnswerReview | None = None
+
+
+class CompositeWorkflowResult(WorkflowResult):
+    plan: IssueResearchPlan | None = None
+    semantic_review: SemanticReview | None = None
+    source_requirements: list[SourceRequirement] = Field(default_factory=list)
