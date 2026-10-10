@@ -1675,6 +1675,47 @@ def test_unassessed_review_check_can_be_repaired_but_cannot_pass_unassessed(
         assert result.non_publication_reason is None
 
 
+@pytest.mark.parametrize("research_deadline", [1000.9, 1500.0])
+def test_discovery_timeout_retains_evidence_and_uses_reserved_writer_phase(
+    research_deadline: float,
+) -> None:
+    workflow, gateway, reviewer = engine([plan(), draft()], ["pass"])
+    workflow.context.research_deadline = research_deadline
+    workflow.context.deadline = 2500
+
+    def interrupted_reading(*_args: Any, **_kwargs: Any) -> None:
+        workflow._accept_reading(reading())
+        raise TimeoutError("structured LLM deadline exhausted")
+
+    with (
+        patch("onyx.legal_review.engine.time.monotonic", return_value=1000.5),
+        patch.object(workflow, "_research", side_effect=interrupted_reading),
+        patch.object(workflow, "_audit_before_draft") as audit,
+    ):
+        result = workflow.run("Soru", "")
+    audit.assert_called_once_with("Soru", "")
+    assert workflow.requirements["r1"].rule == RULE
+    assert gateway.calls[-1][0] is LLMFlow.LEGAL_REVIEW_DRAFT
+    reviewed_draft = reviewer.states[-1]["draft"]
+    assert isinstance(reviewed_draft, dict)
+    assert reviewed_draft["answer"] == draft().answer
+    assert result.answer and result.publication_mode != "limit_reached"
+    assert "structured LLM deadline exhausted" not in result.gaps
+    recorded_discovery = workflow.review_work_history[0]
+    assert isinstance(recorded_discovery, dict)
+    assert recorded_discovery["status"] == "incomplete"
+
+
+def test_discovery_timeout_never_overrides_cancellation() -> None:
+    workflow = prepared_engine()
+    workflow.context.cancel()
+    with (
+        patch.object(workflow, "_acquire", side_effect=TimeoutError("Cancelled")),
+        pytest.raises(TimeoutError),
+    ):
+        workflow._collect_evidence("Soru", "", [])
+
+
 def test_deferred_research_audit_dispatches_new_gap_after_discovery_deadline() -> None:
     from onyx.legal_review.models import (
         ReviewDiagnosis,

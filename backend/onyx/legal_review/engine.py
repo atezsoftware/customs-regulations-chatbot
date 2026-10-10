@@ -1696,7 +1696,21 @@ class LegalReviewEngine:
                         "reason": "No material gap or insufficient research time; full final review retained",
                     }
                 )
-        except (RunStopped, TimeoutError):
+        except TimeoutError as error:
+            if self.context.is_cancelled():
+                raise
+            self.review_work_history.append(
+                {
+                    "stage": "discovery",
+                    "status": "phase_ended"
+                    if time.monotonic() >= self.context.research_deadline
+                    else "incomplete",
+                    "reason": str(error),
+                    "continuation": "Retained evidence proceeds to independent audit and drafting in the reserved phases.",
+                }
+            )
+            self.report("finalizing", self.context.language)
+        except RunStopped:
             if (
                 self.context.is_cancelled()
                 or time.monotonic() < self.context.research_deadline
