@@ -1,6 +1,10 @@
 """Separate research admission from review of the text actually being published."""
 
+from typing import Literal
+
 from pydantic import JsonValue
+
+ReviewPurpose = Literal["research_readiness", "publication"]
 
 
 def scope_review_state(state: dict[str, JsonValue]) -> dict[str, JsonValue]:
@@ -62,7 +66,7 @@ def scope_review_state(state: dict[str, JsonValue]) -> dict[str, JsonValue]:
 def publication_state(state: dict[str, JsonValue]) -> dict[str, JsonValue]:
     """Review all originals and the whole answer without replaying research machinery."""
     scoped = scope_review_state(state)
-    return {
+    result = {
         key: value
         for key, value in scoped.items()
         if key
@@ -80,3 +84,17 @@ def publication_state(state: dict[str, JsonValue]) -> dict[str, JsonValue]:
             "source_issue_triggers",
         }
     }
+    result["review_purpose"] = "publication"
+    return result
+
+
+def research_examination_state(
+    state: dict[str, JsonValue],
+) -> dict[str, JsonValue]:
+    """Keep actual investigations visible before deciding whether research is needed."""
+    result = publication_state(state)
+    for key in ("research_needs", "source_operations", "research_record"):
+        if key in state:
+            result[key] = state[key]
+    result["review_purpose"] = "research_readiness"
+    return result
