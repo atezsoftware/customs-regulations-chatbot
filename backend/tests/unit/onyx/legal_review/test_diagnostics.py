@@ -841,3 +841,43 @@ def test_parallel_publication_preserves_complete_context_and_all_checks() -> Non
     ):
         with pytest.raises(TimeoutError):
             examiner.examine(state, checks, 30)
+
+
+def test_editor_dispositions_bind_every_check_in_provider_schema() -> None:
+    examiner = OpenAIReviewDiagnoser(api_key="test")
+    state: dict[str, JsonValue] = {
+        "draft": {"answer": "The original answer."},
+        "editor_findings": [{"check_id": "claim:one"}, {"check_id": "source:two"}],
+    }
+
+    def complete(packet: dict, model: type[StrictModel], *_args: object) -> StrictModel:
+        assert packet["editor_findings"][1]["slot"] == "q0002"
+        body = {
+            "replacements": [],
+            "unresolved_issue_ids": [],
+            "findings": {"q0001": "resolved"},
+        }
+        with pytest.raises(ValidationError, match="q0002"):
+            model.model_validate(body)
+        body["findings"]["q0002"] = "unresolved"
+        return model.model_validate(body)
+
+    with patch.object(examiner, "_complete", side_effect=complete):
+        result = examiner.edit(state, 30)
+    assert result.resolved_check_ids == ["claim:one"]
+    assert result.unresolved_check_ids == ["source:two"]
+
+
+def test_raw_stream_timeout_reaches_partial_publication_boundary() -> None:
+    import httpx
+
+    from onyx.tracing.flows import LLMFlow
+
+    examiner = OpenAIReviewDiagnoser(api_key="test")
+    with patch.object(
+        examiner, "_complete_stream", side_effect=httpx.ReadTimeout("idle")
+    ):
+        with pytest.raises(TimeoutError, match="stream timed out"):
+            examiner._complete(
+                {}, StrictModel, "prompt", LLMFlow.LEGAL_REVIEW_EDITOR, 30, 1000
+            )

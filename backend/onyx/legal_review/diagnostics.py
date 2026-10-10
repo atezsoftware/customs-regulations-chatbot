@@ -16,7 +16,7 @@ from onyx.legal_review.adjudication import (
     PUBLICATION_PROMPT,
     publication_response_model,
 )
-from onyx.legal_review.drafting import EditorialEdits
+from onyx.legal_review.drafting import DraftEdits, EditorialEdits
 from onyx.legal_review.models import (
     DIAGNOSIS_MODEL,
     DiagnosisFinding,
@@ -375,10 +375,35 @@ class OpenAIReviewDiagnoser:
         """The independent examiner edits the integrated answer once, without tools."""
         from openai import OpenAIError
 
+        supplied = state.get("editor_findings")
+        if not isinstance(supplied, list) or not supplied:
+            raise ValueError("Editor requires a nonempty finding inventory")
+        slots: dict[str, str] = {}
+        findings: list[JsonValue] = []
+        for index, row in enumerate(supplied, 1):
+            if not isinstance(row, dict) or not isinstance(row.get("check_id"), str):
+                raise ValueError("Editor finding requires a known check identity")
+            slot = f"q{index:04d}"
+            slots[slot] = row["check_id"]
+            findings.append({"slot": slot, **row})
+        if len(set(slots.values())) != len(slots):
+            raise ValueError("Editor findings must have unique identities")
+        disposition_fields: dict[str, Any] = {
+            slot: (Literal["resolved", "unresolved"], Field()) for slot in slots
+        }
+        dispositions = create_model(
+            "EditorialFindingDispositions", __base__=StrictModel, **disposition_fields
+        )
+        response_model = create_model(
+            "BoundEditorialEdits",
+            __base__=DraftEdits,
+            findings=(dispositions, Field()),
+        )
+        packet = {**state, "editor_findings": findings}
         try:
             response = self._complete(
-                model_state(scope_review_state(state), LLMFlow.LEGAL_REVIEW_EDITOR),
-                EditorialEdits,
+                model_state(scope_review_state(packet), LLMFlow.LEGAL_REVIEW_EDITOR),
+                response_model,
                 CORPUS_CURRENCY
                 + """Act as the final legal editor. Return targeted replacements
 of existing repair_base blocks, retaining their IDs and all unaffected correct conclusions.
@@ -389,8 +414,8 @@ A correction needs no new search. For a missing source or fact, condition the af
 or say precisely what cannot be established; never invent the missing outcome. Preserve source
 selectors, conditions and claim bindings. Check consistency across the WHOLE merged answer,
 including dependent calculations and conclusions. Do not rewrite unaffected blocks.
-Group duplicate findings and resolve their shared defect once. Return each editor finding's check_id
-exactly once across resolved_check_ids and unresolved_check_ids. A missing source remains unresolved
+Group duplicate findings and resolve their shared defect once. Return resolved or unresolved
+for EVERY code-owned q slot in findings. Never copy or invent check IDs. A missing source remains unresolved
 even after you honestly qualify its conclusion. Do not claim that an unperformed search or review
 succeeded. Return unresolved_issue_ids for remaining gaps. There will be no further research or
 editor loop. The host publishes the result as partial with an explicit review-status notice.
@@ -399,7 +424,21 @@ editor loop. The host publishes the result as partial with an explicit review-st
                 timeout_seconds,
                 _MODEL_OUTPUT_CAPACITY,
             )
-            return EditorialEdits.model_validate(response.model_dump())
+            parsed = response.model_dump()
+            decisions = parsed.pop("findings")
+            return EditorialEdits(
+                **parsed,
+                resolved_check_ids=[
+                    identity
+                    for slot, identity in slots.items()
+                    if decisions[slot] == "resolved"
+                ],
+                unresolved_check_ids=[
+                    identity
+                    for slot, identity in slots.items()
+                    if decisions[slot] == "unresolved"
+                ],
+            )
         except OpenAIError as error:
             raise ValueError(f"openai_review_editor_{type(error).__name__}") from error
 
@@ -582,6 +621,28 @@ editor loop. The host publishes the result as partial with an explicit review-st
         return planning.compile(compiled)
 
     def _complete(
+        self,
+        packet: dict[str, JsonValue],
+        response_model: type[StrictModel],
+        prompt: str,
+        flow: LLMFlow,
+        timeout_seconds: float,
+        max_output_tokens: int,
+    ) -> StrictModel:
+        import httpx
+
+        try:
+            return self._complete_stream(
+                packet, response_model, prompt, flow, timeout_seconds, max_output_tokens
+            )
+        except httpx.TimeoutException as error:
+            raise TimeoutError("Independent examiner stream timed out") from error
+        except httpx.HTTPError as error:
+            raise ValueError(
+                f"Independent examiner stream transport: {type(error).__name__}"
+            ) from error
+
+    def _complete_stream(
         self,
         packet: dict[str, JsonValue],
         response_model: type[StrictModel],
