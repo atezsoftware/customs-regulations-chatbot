@@ -25,6 +25,7 @@ from onyx.chat.models import ChatMessageSimple
 from onyx.configs import app_configs
 from onyx.configs.constants import MessageType
 from onyx.context.search.models import IndexFilters
+from onyx.db.asv3_runs import decode_asv3_checkpoint, encode_asv3_checkpoint
 from onyx.db.models import User
 from onyx.error_handling.exceptions import OnyxError
 from onyx.legal_review import runtime
@@ -46,6 +47,7 @@ from onyx.server.query_and_chat.streaming_models import (
     SectionEnd,
 )
 from onyx.tools.tool_implementations.search.search_tool import SearchTool
+from tests.unit.onyx.legal_review.test_checkpoint_storage import large_checkpoint
 from tests.unit.onyx.legal_review.test_engine import (
     RULE,
     FakeGateway,
@@ -210,6 +212,30 @@ def runtime_fixture(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         llm=llm,
         arguments=arguments,
     )
+
+
+def test_large_audit_checkpoint_does_not_prevent_checked_answer_delivery(
+    runtime_fixture: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = runtime_fixture
+    audit = large_checkpoint()["candidate_audit"]
+    monkeypatch.setattr(
+        runtime.LegalReviewCandidateAudit, "export", lambda _self: audit
+    )
+
+    def save(**kwargs: object) -> None:
+        snapshot = cast(dict[str, JsonValue], kwargs["snapshot"])
+        fixture.checkpoints.append(
+            decode_asv3_checkpoint(encode_asv3_checkpoint(snapshot))
+        )
+
+    monkeypatch.setattr(runtime, "save_asv3_checkpoint", save)
+    runtime.run_legal_review_loop(**fixture.arguments)
+    assert RULE in fixture.state.get_answer_tokens()
+    assert fixture.state.get_citation_to_doc()[1].document_id == "source-1"
+    assert fixture.checkpoints[-1]["candidate_audit"] == audit
+    assert isinstance(fixture.packets[-1].obj, ASv3Progress)
+    assert fixture.packets[-1].obj.phase == "completed"
 
 
 @pytest.mark.parametrize("include_citations", [False, True])

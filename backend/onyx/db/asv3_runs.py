@@ -17,6 +17,10 @@ from onyx.asv3.parallel_checkpoint import (
 )
 from onyx.configs.constants import MessageType
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
+from onyx.db.legal_review_checkpoint import (
+    compact_legal_review_checkpoint,
+    restore_legal_review_checkpoint,
+)
 from onyx.db.models import ChatMessage, ChatSession, ToolCall
 
 ASV3_CHECKPOINT_TOOL_ID = -3001
@@ -28,7 +32,9 @@ MAX_DECODED_CHECKPOINT_BYTES = 8_000_000
 def encode_asv3_checkpoint(snapshot: dict[str, JsonValue]) -> str:
     raw = json.dumps(
         compact_parallel_checkpoint(
-            {**snapshot, "version": ASV3_CHECKPOINT_VERSION},
+            compact_legal_review_checkpoint(
+                {**snapshot, "version": ASV3_CHECKPOINT_VERSION}
+            ),
             max_unit_bytes=MAX_DECODED_CHECKPOINT_BYTES,
         ),
         ensure_ascii=False,
@@ -68,8 +74,8 @@ def decode_asv3_checkpoint(payload: str) -> dict[str, JsonValue]:
         data = json.loads(raw)
     if not isinstance(data, dict) or data.get("version") != ASV3_CHECKPOINT_VERSION:
         raise ValueError("Unsupported ASv3 checkpoint version")
-    return restore_parallel_checkpoint(
-        data, max_unit_bytes=MAX_DECODED_CHECKPOINT_BYTES
+    return restore_legal_review_checkpoint(
+        restore_parallel_checkpoint(data, max_unit_bytes=MAX_DECODED_CHECKPOINT_BYTES)
     )
 
 
