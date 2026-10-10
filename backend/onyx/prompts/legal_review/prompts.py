@@ -1,4 +1,4 @@
-PROMPT_VERSION = "legal-review-2026-10-10.55"
+PROMPT_VERSION = "legal-review-2026-10-10.56"
 
 CORPUS_CURRENCY = """When corpus_currency.assume_current_versions is true, treat all supplied
 chunks as current versions of the user's maintained corpus. Missing validity metadata
@@ -51,6 +51,13 @@ lossless transport representation, not additional evidence or a legal status det
 PLAN_PROMPT = (
     COMMON
     + """
+The host preserves explicit_request_units from the user's own list boundaries. Return
+request_coverage for EVERY code-owned slot, explaining its requested_result and mapping it to
+known issue_ids. A slot cannot disappear even when its investigation is shared. Compare each
+unit's requested result with the selected issue's question, requested_outcome and closure_criteria:
+the issue must genuinely cover that result, not merely mention the same subject. Adjust the
+issue scope or create a distinct coherent issue if needed. These user-unit slots are coverage
+anchors, not issue definitions; do not mechanically create one issue or search per slot.
 First inventory every explicit requested result and alternative in requested_outcomes,
 including later subquestions, then bind each to the issue_ids that investigate it. Check
 this inventory against the complete request before returning the plan. A coverage mapping

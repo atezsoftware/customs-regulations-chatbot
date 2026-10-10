@@ -30,7 +30,6 @@ from onyx.legal_review.models import (
     DimensionAssessment,
     DraftAnswer,
     EvidenceResolutionDecision,
-    InitialDiscoveryPlan,
     InitialReadingDecision,
     IssueClosure,
     IssuePlan,
@@ -57,6 +56,7 @@ from onyx.legal_review.passages import (
     canonical_evidence_view,
     resolve_passage,
 )
+from onyx.legal_review.planning import InitialPlanContract
 from onyx.legal_review.research import ResearchLedger
 from onyx.legal_review.review_scope import scope_review_state
 from onyx.legal_review.source_accounting import SourceAccountant
@@ -2054,12 +2054,13 @@ class LegalReviewEngine:
 
     def _run(self, request: str, history: str) -> WorkflowResult:
         self.report("planning", "tr")
-        planning_state = self.state(request, history)
+        contract = InitialPlanContract(request)
+        planning_state = {**self.state(request, history), **contract.state()}
         try:
             initial_plan = self.gateway.complete(
                 PLAN_PROMPT,
                 planning_state,
-                InitialDiscoveryPlan,
+                contract.response_model,
                 LLMFlow.LEGAL_REVIEW_PLANNER,
             )
         except StructuredOutputValidationError:
@@ -2067,14 +2068,16 @@ class LegalReviewEngine:
             initial_plan = self.gateway.complete(
                 PLAN_PROMPT
                 + "\nThe previous initial plan did not satisfy its schema. Return a complete "
-                "replacement including requested_outcomes covering every requested result, "
+                "replacement including every explicit request_coverage slot bound to known issues, "
+                "requested_outcomes covering every requested result, "
                 "material_reason and closure_criteria for every issue, and the required nonempty discovery_queries array with "
                 "query text and known issue_ids. Preserve every requested outcome. "
                 "Do not invent source identities or require a query per issue.",
-                {**self.state(request, history), "planning_schema_correction": True},
-                InitialDiscoveryPlan,
+                {**planning_state, "planning_schema_correction": True},
+                contract.response_model,
                 LLMFlow.LEGAL_REVIEW_PLANNER,
             )
+        initial_plan = contract.compile(initial_plan)
         self.plan = IssuePlan.model_validate(
             initial_plan.model_dump(
                 mode="python", exclude={"discovery_queries", "requested_outcomes"}
