@@ -10,7 +10,7 @@ from onyx.auth.schemas import UserRole
 from onyx.configs import app_configs
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.db.llm import can_user_access_llm_provider, fetch_user_group_ids
-from onyx.db.models import LLMProvider, Persona, User, UserGroup
+from onyx.db.models import LLMProvider, ModelConfiguration, Persona, User, UserGroup
 from onyx.db.persona import get_default_behavior_persona
 from onyx.legal_review.models import (
     DIAGNOSIS_MODEL,
@@ -47,8 +47,8 @@ def _resolve_decision(
         select(LLMProvider)
         .where(
             LLMProvider.provider == "openai",
-            LLMProvider.model_configurations.any(name="gpt-6-luna", is_visible=True),
-            LLMProvider.model_configurations.any(name=DIAGNOSIS_MODEL, is_visible=True),
+            LLMProvider.model_configurations.any(name="gpt-6-luna"),
+            LLMProvider.model_configurations.any(name=DIAGNOSIS_MODEL),
         )
         .options(
             load_only(
@@ -56,6 +56,10 @@ def _resolve_decision(
                 LLMProvider.name,
                 LLMProvider.api_base,
                 LLMProvider.is_public,
+                LLMProvider.is_auto_mode,
+            ),
+            selectinload(LLMProvider.model_configurations).load_only(
+                ModelConfiguration.name, ModelConfiguration.is_visible
             ),
             selectinload(LLMProvider.groups).load_only(UserGroup.id),
             selectinload(LLMProvider.personas).load_only(Persona.id),
@@ -64,6 +68,15 @@ def _resolve_decision(
     )
     group_ids = fetch_user_group_ids(session, user)
     for provider in providers:
+        # Auto visibility is a managed chat recommendation, not an internal-stage
+        # allowlist. Manual providers retain their administrator-selected models.
+        available = {
+            model.name
+            for model in provider.model_configurations
+            if provider.is_auto_mode or model.is_visible
+        }
+        if not {"gpt-6-luna", DIAGNOSIS_MODEL} <= available:
+            continue
         if not can_user_access_llm_provider(
             provider, group_ids, persona, is_admin=user.role == UserRole.ADMIN
         ):

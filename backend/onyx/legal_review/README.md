@@ -52,6 +52,10 @@ ACLs, dates, canonical text hashes and publication fences apply throughout.
    Existing-source corrections and missing-source research remain distinct.
    A failed Decisions screen can fall back to a complete independent examination within
    the phase budget. The graph distinguishes binary examiner verdicts from Decisions scores.
+   Reviewer credentials use an authorized official OpenAI provider with both configured
+   model identities. Auto-mode chat recommendations do not disable internal reviewers;
+   manual providers still require those models to be enabled. Provider/persona/group
+   access and cost limits apply before credential use; catalogue visibility is unchanged.
 8. **Correct or research.** If existing originals suffice, the independent examiner
    edits the affected answer blocks directly. No research or separate Gemini rewrite is
    needed for that path. Material source gaps can use one post-draft research/repair

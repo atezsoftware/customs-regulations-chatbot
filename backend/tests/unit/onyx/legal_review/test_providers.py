@@ -235,7 +235,41 @@ def test_decision_uses_accessible_official_openai_without_mutating_provider(
     assert "llm_provider.provider = 'openai'" in sql
     assert "model_configuration.name = 'gpt-6-luna'" in sql
     assert "model_configuration.name = 'gpt-6.1-sol'" in sql
-    assert "model_configuration.is_visible = true" in sql
+    assert "model_configuration.is_visible = true" not in sql
+
+
+@pytest.mark.parametrize(
+    ("auto", "visible", "missing", "accepted"),
+    [
+        (True, False, False, True),
+        (False, False, False, False),
+        (False, True, False, True),
+        (True, False, True, False),
+    ],
+)
+def test_managed_recommendations_do_not_disable_configured_internal_reviewers(
+    auto: bool,
+    visible: bool,
+    missing: bool,
+    accepted: bool,
+) -> None:
+    row = decision_provider()
+    row.is_auto_mode = auto
+    for model in row.model_configurations:
+        model.is_visible = visible
+    if missing:
+        row.model_configurations.pop()
+    session = MagicMock(spec=Session)
+    session.scalars.return_value = [row]
+    result = providers.resolve_legal_review_decision(
+        user(), persona=Persona(id=0), db_session=session
+    )
+    assert (result is not None) is accepted
+    assert all(model.is_visible is visible for model in row.model_configurations)
+    session.commit.assert_not_called()
+    if not accepted:
+        session.refresh.assert_not_called()
+        cast(MagicMock, row.api_key).get_value.assert_not_called()
 
 
 @pytest.mark.parametrize(
