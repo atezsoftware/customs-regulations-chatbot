@@ -63,6 +63,10 @@ ACLs, dates, canonical text hashes and publication fences apply throughout.
    findings, and contrary/limiting sources. Exact equivalent findings share one slot while
    every original check ID remains accounted for. Historical findings carry the answer
    revision they concern. The merged answer receives an independent post-editor check.
+   If that check succeeds with time remaining, accepted research questions receive a
+   final source-work reconciliation. Every question retains its host-owned identities;
+   closure requires canonical support from its executed investigation or continuation.
+   Missing evidence and user facts stay open. This pass neither searches nor rewrites.
 9. **Publish.** Publish the available answer when the time/repair boundary is reached,
    even when review findings remain. `publication_mode` distinguishes reviewed,
    editor-verified, editor-adjusted, limit-reached and review-incomplete answers. An
@@ -119,6 +123,8 @@ operations, review inputs and results. Additional explicit steps are:
   status and pending source operations after an accepted reading.
 - `legal_review.research_audit`: the deferred pre-draft independent audit, confirmed
   work or its explicit phase interruption; it cannot silently count as completed.
+- `legal_review.research_reconciliation`: source-backed dispositions after successful
+  answer verification, or the explicit failure retaining prior open questions.
 - `legal_review.review_diagnoses` and `legal_review.final_adjudication`: research versus
   correction decisions and their supporting passages.
 - `legal_review.editor` / generation flow `legal_review_editor`: actual editor input,

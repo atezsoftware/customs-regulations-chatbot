@@ -1,4 +1,4 @@
-PROMPT_VERSION = "legal-review-2026-10-10.59"
+PROMPT_VERSION = "legal-review-2026-10-10.60"
 
 CORPUS_CURRENCY = """When corpus_currency.assume_current_versions is true, treat all supplied
 chunks as current versions of the user's maintained corpus. Missing validity metadata

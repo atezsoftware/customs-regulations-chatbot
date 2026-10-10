@@ -18,6 +18,7 @@ from onyx.legal_review.adjudication import (
 )
 from onyx.legal_review.drafting import DraftEdits, EditorialEdits
 from onyx.legal_review.editor_context import editorial_context, group_editor_findings
+from onyx.legal_review.evidence_resolution import EvidenceResolutionPlan
 from onyx.legal_review.models import (
     DIAGNOSIS_MODEL,
     DiagnosisFinding,
@@ -27,6 +28,7 @@ from onyx.legal_review.models import (
     PublicationFinding,
     PublicationReview,
     ResearchQuestion,
+    ResearchResolution,
     ReviewCheck,
     ReviewDiagnosis,
     ReviewDiagnosisBatch,
@@ -666,6 +668,42 @@ prerequisite even when several findings concern another part of its block.
         )
         return _compile_diagnoses(parsed.model_dump(), slots)
 
+    def close_research(
+        self,
+        state: dict[str, JsonValue],
+        plan: EvidenceResolutionPlan,
+        timeout_seconds: float,
+    ) -> list[ResearchResolution]:
+        packet = plan.state(
+            {
+                **publication_state(state),
+                "source_operations": state.get("source_operations", []),
+            }
+        )
+        response = self._complete(
+            model_state(packet, LLMFlow.LEGAL_REVIEW_DIAGNOSIS),
+            plan.closure_response_model(),
+            CORPUS_CURRENCY
+            + """Reconcile each accepted research question against the
+complete acquired originals after the answer was independently checked. Return every
+bound slot exactly once. This is source-work accounting, not another answer editor or
+research planner. The draft and earlier interpretations are candidates, never evidence.
+Resolve only when canonical operative passages actually establish the requested effect.
+Dispute a gap only with source-backed grounds that its premise or scope is inapplicable.
+A qualification in the answer, successful retrieval, source title or lack of metadata
+alone cannot settle a legal question. If a judicial effect was requested, administrative
+commentary alone cannot establish it. Preserve genuinely missing legal evidence as
+unresolved and specific missing user facts as needs_user_facts. Do not invent an absent
+judgment, infer absence from no search hits, request tools, open issues or rewrite prose.
+Use actual returned_citations and canonical continuations as witnesses; citations must
+support the precise question, including its conditions and contrary branches.
+""",
+            LLMFlow.LEGAL_REVIEW_DIAGNOSIS,
+            timeout_seconds,
+            _MODEL_OUTPUT_CAPACITY,
+        )
+        return plan.compile_closure(response)
+
     def consolidate(
         self,
         state: dict[str, JsonValue],
@@ -715,16 +753,21 @@ prerequisite even when several findings concern another part of its block.
         max_output_tokens: int,
     ) -> StrictModel:
         import httpx
+        from openai import APITimeoutError, OpenAIError
 
         try:
             return self._complete_stream(
                 packet, response_model, prompt, flow, timeout_seconds, max_output_tokens
             )
-        except httpx.TimeoutException as error:
+        except (httpx.TimeoutException, APITimeoutError) as error:
             raise TimeoutError("Independent examiner stream timed out") from error
         except httpx.HTTPError as error:
             raise ValueError(
                 f"Independent examiner stream transport: {type(error).__name__}"
+            ) from error
+        except OpenAIError as error:
+            raise ValueError(
+                f"Independent examiner provider: {type(error).__name__}"
             ) from error
 
     def _complete_stream(

@@ -1778,6 +1778,106 @@ def test_deferred_research_audit_dispatches_new_gap_after_discovery_deadline() -
     assert workflow.issue_closures()[0].status == "open"
 
 
+@pytest.mark.parametrize(
+    ("disposition", "current_corpus"),
+    [("resolved", True), ("disputed", True), ("unresolved", True), ("resolved", False)],
+)
+def test_publication_reconciliation_requires_canonical_source_work_before_closure(
+    disposition: str,
+    current_corpus: bool,
+) -> None:
+    from onyx.legal_review.models import (
+        ReviewDiagnosis,
+        ReviewDiagnosisBatch,
+        ReviewResearchTask,
+    )
+
+    workflow = prepared_engine()
+    workflow.policy = WorkflowPolicy(assume_current_corpus=current_corpus)
+    workflow._accept_reading(reading())
+    workflow.last_draft = draft().model_copy(update={"unresolved_issue_ids": ["i1"]})
+    workflow.editor_verification_passed = True
+    check_id = "evidence:i1:legal_basis_and_hierarchy"
+    workflow._repair_check_issues = {check_id: {"i1"}}
+    workflow.review_diagnoses = ReviewDiagnosisBatch(
+        diagnoses=[
+            ReviewDiagnosis(
+                check_ids=[check_id],
+                kind="research",
+                dimension=LegalDimension.LEGAL_BASIS,
+                assertion=RULE,
+                reason="Read the operative condition.",
+                required_change="Establish the condition.",
+                supports=[PassageSupport(citation=1, span_number=1)],
+                research_task_ids=["task1"],
+            )
+        ],
+        research_tasks=[
+            ReviewResearchTask(
+                task_id="task1",
+                subject="Application condition",
+                question="Is the document required?",
+                dimension=LegalDimension.LEGAL_BASIS,
+                query="belge şartı",
+                existing_need_id="need1",
+                supports=[PassageSupport(citation=1, span_number=1)],
+            )
+        ],
+    )
+    workflow.acquirer.receipts.append(
+        {
+            "tool": "search_corpus",
+            "status": "found",
+            "issue_ids": ["i1"],
+            "research_need_ids": ["need1"],
+            "evidence_ids": [1],
+        }
+    )
+    workflow.research_closer = Mock(
+        return_value=[
+            ResearchResolution.model_validate(
+                {
+                    "check_ids": [check_id],
+                    "issue_ids": ["i1"],
+                    "disposition": disposition,
+                    "reason": "The newly read original establishes the application condition.",
+                    "supports": [{"citation": 1, "span_number": 1}],
+                    "missing_user_facts": [],
+                }
+            )
+        ]
+    )
+    workflow._reconcile_publication_research("Soru", "")
+    assert workflow.research_resolutions[0].disposition == disposition
+    assert bool(workflow._unresolved_repair_issue_ids()) == (
+        disposition == "unresolved"
+    )
+    assert bool(workflow.last_draft.unresolved_issue_ids) == (
+        disposition == "unresolved" or not current_corpus
+    )
+    workflow.research_closer = Mock(
+        return_value=[
+            ResearchResolution(
+                check_ids=[check_id],
+                issue_ids=["i1"],
+                disposition="resolved",
+                reason="Unsupported closure",
+                supports=[PassageSupport(citation=99, span_number=1)],
+                missing_user_facts=[],
+            )
+        ]
+    )
+    before = list(workflow.research_resolutions)
+    workflow._reconcile_publication_research("Soru", "")
+    assert workflow.research_resolutions == before
+    workflow.acquirer.receipts.clear()
+    workflow.research_closer = Mock(
+        return_value=[before[0].model_copy(update={"disposition": "resolved"})]
+    )
+    workflow._reconcile_publication_research("Soru", "")
+    assert workflow.research_resolutions == before
+
+
 def test_deferred_audit_timeout_does_not_consume_writer_or_erase_findings() -> None:
     workflow = prepared_engine()
     workflow._accept_reading(reading())

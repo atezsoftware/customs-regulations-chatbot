@@ -9,7 +9,9 @@ from onyx.legal_review.models import (
     EvidenceResolutionDecision,
     ReadingDecision,
     ResearchDisposition,
+    ResearchResolution,
     ReviewDiagnosisBatch,
+    StrictModel,
 )
 
 
@@ -108,20 +110,48 @@ class EvidenceResolutionPlan:
             },
         }
 
-    def compile(self, result: ReadingDecision) -> EvidenceResolutionDecision:
-        payload = result.model_dump(mode="json")
-        supplied = payload["research_resolutions"]
+    def closure_response_model(self) -> type[StrictModel]:
+        disposition = create_model(
+            "PublicationResearchDisposition",
+            __base__=ResearchDisposition,
+            slot=(Literal.__getitem__(tuple(self.slots)), Field()),
+            disposition=(
+                Literal["resolved", "disputed", "needs_user_facts", "unresolved"],
+                Field(),
+            ),
+        )
+        return create_model(
+            "PublicationResearchClosure",
+            __base__=StrictModel,
+            research_resolutions=(
+                GenericAlias(list, disposition),
+                Field(min_length=len(self.slots), max_length=len(self.slots)),
+            ),
+        )
+
+    def compile_closure(self, result: StrictModel) -> list[ResearchResolution]:
+        supplied = result.model_dump(mode="json")["research_resolutions"]
         rows = {row["slot"]: row for row in supplied}
         if len(supplied) != len(rows) or rows.keys() != self.slots.keys():
             raise ValueError(
                 "Evidence resolution must preserve every accepted question"
             )
-        payload["research_resolutions"] = [
-            {
-                **{key: value for key, value in rows[slot].items() if key != "slot"},
-                "check_ids": diagnosis.check_ids,
-                "issue_ids": self.issues[slot],
-            }
+        return [
+            ResearchResolution.model_validate(
+                {
+                    **{
+                        key: value for key, value in rows[slot].items() if key != "slot"
+                    },
+                    "check_ids": diagnosis.check_ids,
+                    "issue_ids": self.issues[slot],
+                }
+            )
             for slot, diagnosis in self.slots.items()
+        ]
+
+    def compile(self, result: ReadingDecision) -> EvidenceResolutionDecision:
+        payload = result.model_dump(mode="json")
+        payload["research_resolutions"] = [
+            row.model_dump(mode="json") for row in self.compile_closure(result)
         ]
         return EvidenceResolutionDecision.model_validate(payload)

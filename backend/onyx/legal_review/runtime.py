@@ -260,6 +260,12 @@ def _run(
         meter.check()
         context.budget.consume("decisions")
 
+    examiner = OpenAIReviewDiagnoser(
+        api_key=review_provider.api_key.get_secret_value(),
+        before_request=admit_review,
+        check_active=context.check_active,
+        record_usage=meter.record,
+    )
     engine = LegalReviewEngine(
         complete_articles=acquirer.complete_articles,
         gateway=GeminiGateway(
@@ -287,12 +293,8 @@ def _run(
             check_active=context.check_active,
             max_input_tokens=policy.max_context_tokens,
         ),
-        diagnoser=OpenAIReviewDiagnoser(
-            api_key=review_provider.api_key.get_secret_value(),
-            before_request=admit_review,
-            check_active=context.check_active,
-            record_usage=meter.record,
-        ),
+        diagnoser=examiner,
+        research_closer=examiner.close_research,
         ledger=ledger,
         context=context,
         policy=policy,

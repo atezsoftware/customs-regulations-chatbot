@@ -206,6 +206,11 @@ class LegalReviewEngine:
         report: Callable[[str, str], None] = lambda _phase, _language: None,
         record_review_usage: Callable[[int, int], None] = lambda _input, _output: None,
         complete_articles: Callable[[set[int], bool], bool] | None = None,
+        research_closer: Callable[
+            [dict[str, JsonValue], EvidenceResolutionPlan, float],
+            list[ResearchResolution],
+        ]
+        | None = None,
     ) -> None:
         self.gateway = gateway
         self.acquirer = acquirer
@@ -216,6 +221,7 @@ class LegalReviewEngine:
         self.diagnoser = diagnoser
         self.source_accountant = source_accountant
         self.complete_articles = complete_articles
+        self.research_closer = research_closer
         self.source_assessments: list[dict[str, JsonValue]] = []
         self.review_diagnoses: ReviewDiagnosisBatch | None = None
         self.final_adjudication: PublicationReview | None = None
@@ -1060,7 +1066,7 @@ class LegalReviewEngine:
         settled_research = {
             identity
             for row in self.research_resolutions
-            if row.disposition in {"resolved", "rebutted"}
+            if row.disposition in {"resolved", "disputed"}
             for identity in row.check_ids
         }
         unassessed_research = (
@@ -1092,6 +1098,79 @@ class LegalReviewEngine:
                 for issue_id in row.issue_ids
             }
         )
+
+    def _reconcile_publication_research(
+        self, request: str, history: str, *, answer_reviewed: bool = False
+    ) -> None:
+        if not (
+            (self.editor_verification_passed or answer_reviewed)
+            and self.research_closer is not None
+            and self.review_diagnoses is not None
+            and any(row.kind == "research" for row in self.review_diagnoses.diagnoses)
+        ):
+            return
+        settled = {
+            identity
+            for row in self.research_resolutions
+            if row.disposition in {"resolved", "disputed"}
+            for identity in row.check_ids
+        }
+        if all(
+            identity in settled
+            for row in self.review_diagnoses.diagnoses
+            if row.kind == "research"
+            for identity in row.check_ids
+        ):
+            return
+        remaining = self.context.deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        assert self.plan is not None and self.last_draft is not None
+        contract = EvidenceResolutionPlan(
+            self.review_diagnoses, self._repair_check_issues
+        )
+        with graph_step("legal_review.research_reconciliation", {}) as step:
+            try:
+                resolutions = self.research_closer(
+                    self.state(request, history, self.last_draft),
+                    contract,
+                    min(self.policy.verification_reserve_seconds, remaining),
+                )
+                decision = EvidenceResolutionDecision(
+                    dimensions=[],
+                    research_resolutions=resolutions,
+                )
+                self._validate_research_resolutions(decision, self.plan)
+                self.research_resolutions = resolutions
+                open_ids = {
+                    row.issue_id
+                    for row in self.issue_closures()
+                    if row.status != "closed"
+                }
+                self.last_draft = self._bind_unresolved_issues(
+                    self.last_draft.model_copy(
+                        update={
+                            "unresolved_issue_ids": [
+                                identity
+                                for identity in self.last_draft.unresolved_issue_ids
+                                if identity in open_ids
+                            ]
+                        }
+                    )
+                )
+                step.output_value = {
+                    "status": "completed",
+                    "research_resolutions": [
+                        row.model_dump(mode="json") for row in resolutions
+                    ],
+                }
+            except (ValueError, TimeoutError, RunStopped) as error:
+                self.context.check_active()
+                step.output_value = {
+                    "status": "incomplete",
+                    "reason": str(error),
+                    "prior_closure_retained": True,
+                }
 
     def _validate_research_resolutions(
         self,
@@ -2281,6 +2360,7 @@ class LegalReviewEngine:
                     [row.model_dump(mode="json") for row in findings],
                 ):
                     assert self.last_draft is not None
+                    self._reconcile_publication_research(request, history)
                     partial = bool(
                         self.last_draft.unresolved_issue_ids
                         or self.gaps
@@ -2449,6 +2529,11 @@ class LegalReviewEngine:
             repair_review = self.final_review
             if self.diagnoser is not None and self.final_review.completed:
                 if self._final_review_is_publishable(request, history, draft):
+                    self._reconcile_publication_research(
+                        request, history, answer_reviewed=True
+                    )
+                    assert self.last_draft is not None
+                    draft = self.last_draft
                     partial = bool(
                         draft.unresolved_issue_ids or self.gaps or self.pending_actions
                     )
@@ -2542,5 +2627,8 @@ class LegalReviewEngine:
             return self._publish_partial(
                 request, history, "Final review has unresolved findings"
             )
+        self._reconcile_publication_research(request, history, answer_reviewed=True)
+        assert self.last_draft is not None
+        draft = self.last_draft
         partial = bool(draft.unresolved_issue_ids or self.gaps or self.pending_actions)
         return self._result("partial" if partial else "verified", draft.answer)

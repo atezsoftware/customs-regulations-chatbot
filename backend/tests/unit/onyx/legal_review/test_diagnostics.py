@@ -20,6 +20,27 @@ from onyx.legal_review.diagnostics import (
 )
 from onyx.legal_review.models import ReviewCheck, ReviewDiagnosisBatch, StrictModel
 from onyx.legal_review.review_scope import scope_review_state
+from onyx.tracing.flows import LLMFlow
+
+
+@pytest.mark.parametrize("timeout", [False, True])
+def test_provider_errors_preserve_the_engine_recovery_contract(timeout: bool) -> None:
+    import httpx
+    from openai import APITimeoutError, OpenAIError
+
+    error = (
+        APITimeoutError(request=httpx.Request("POST", "https://api.openai.com"))
+        if timeout
+        else OpenAIError("Provider failed")
+    )
+    examiner = OpenAIReviewDiagnoser(api_key="test")
+    with (
+        patch.object(examiner, "_complete_stream", side_effect=error),
+        pytest.raises(TimeoutError if timeout else ValueError),
+    ):
+        examiner._complete(
+            {}, StrictModel, "Review", LLMFlow.LEGAL_REVIEW_DIAGNOSIS, 120, 1000
+        )
 
 
 def test_repair_diagnosis_receives_the_matching_confirmed_publication_defect() -> None:
