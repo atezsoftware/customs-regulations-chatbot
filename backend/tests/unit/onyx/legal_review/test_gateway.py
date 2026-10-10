@@ -49,6 +49,27 @@ def test_schema_and_json_reminder_can_exhaust_capacity_before_provider_call() ->
     call.assert_not_called()
 
 
+@pytest.mark.parametrize("size,admitted", [(195_000, True), (205_000, False)])
+def test_default_context_admission_uses_configured_provider_capacity(
+    size: int, admitted: bool
+) -> None:
+    transport = gateway()
+    state: dict[str, JsonValue] = {"request": "x" * size}
+    with patch(
+        "onyx.legal_review.gateway.generate_structured",
+        return_value=Response(decision="ok"),
+    ) as call:
+        if admitted:
+            transport.complete("Read.", state, Response, LLMFlow.LEGAL_REVIEW_READING)
+            assert json.loads(call.call_args.kwargs["user_prompt"]) == state
+        else:
+            with pytest.raises(RunStopped, match="context exceeds"):
+                transport.complete(
+                    "Read.", state, Response, LLMFlow.LEGAL_REVIEW_READING
+                )
+            call.assert_not_called()
+
+
 def test_provider_timeout_is_safe_and_no_automatic_retry_is_added() -> None:
     transport = gateway()
     with patch(
@@ -105,3 +126,65 @@ def test_writer_provider_receives_normalized_view_without_mutating_host_state() 
     actual = json.loads(call.call_args.kwargs["user_prompt"])
     assert "tools" not in actual and actual["source_registry"] == {}
     assert "tools" in state
+
+
+def test_correction_reports_root_errors_instead_of_a_nested_passage_object() -> None:
+    from pydantic import Field, ValidationError
+
+    from onyx.legal_review.gateway import root_validation_error
+    from onyx.regulatory.structured_llm import _validate_json_object
+
+    class Row(BaseModel):
+        value: int = Field(gt=0)
+
+    class Batch(BaseModel):
+        rows: list[Row]
+
+    content = json.dumps({"rows": [{"value": -1} for _ in range(5)]})
+    with pytest.raises(ValidationError) as generic:
+        _validate_json_object(content, Batch)
+    # The shared prose-tolerant parser selects the smaller nested-object error.
+    assert generic.value.errors()[0]["loc"] == ("rows",)
+    actual = root_validation_error(content, Batch, generic.value)
+    assert [row["loc"] for row in actual.errors()] == [
+        ("rows", index, "value") for index in range(5)
+    ]
+    assert (
+        root_validation_error("prose " + content, Batch, generic.value) is generic.value
+    )
+
+
+@pytest.mark.parametrize(
+    "flow",
+    [
+        LLMFlow.LEGAL_REVIEW_PLANNER,
+        LLMFlow.LEGAL_REVIEW_READING,
+        LLMFlow.LEGAL_REVIEW_SOURCE_ACCOUNTING,
+        LLMFlow.LEGAL_REVIEW_DRAFT,
+        LLMFlow.LEGAL_REVIEW_REPAIR,
+    ],
+)
+def test_every_structured_phase_streams_with_its_actual_workflow_deadline(
+    flow: LLMFlow,
+) -> None:
+    from onyx.legal_review.gateway import MeteredLLM, UsageMeter
+
+    transport = gateway()
+    selected = cast(MagicMock, transport.llm)
+    selected.with_stream_cancellation_check.return_value = selected
+    transport.llm = MeteredLLM(
+        selected, transport.context, UsageMeter(transport.policy)
+    )
+    finalizing = flow in {LLMFlow.LEGAL_REVIEW_DRAFT, LLMFlow.LEGAL_REVIEW_REPAIR}
+    with patch(
+        "onyx.legal_review.gateway.generate_structured",
+        return_value=Response(decision="ok"),
+    ) as call:
+        transport.complete("Read or write.", {}, Response, flow, finalizing=finalizing)
+    invocation = call.call_args.args[0]
+    assert isinstance(invocation, MeteredLLM)
+    assert invocation.reader_deadline == (
+        transport.context.deadline
+        if finalizing
+        else transport.context.research_deadline
+    )

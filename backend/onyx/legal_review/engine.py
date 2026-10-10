@@ -3,32 +3,41 @@
 from __future__ import annotations
 
 import json
+import math
 import time
 from collections.abc import Callable, Sequence
 from datetime import date
-from typing import Protocol, TypeVar
+from typing import Literal, Protocol, TypeVar
 
 from pydantic import BaseModel, JsonValue
 
 from onyx.asv3.citation_numbers import extract_citation_numbers
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.models import RunContext, RunStopped
+from onyx.legal_review.adjudication import cited_source_checks
+from onyx.legal_review.contracts import ReadingContractError
+from onyx.legal_review.dimensions import DIMENSION_GUIDANCE
 from onyx.legal_review.drafting import GeneratedDraft, compile_draft
+from onyx.legal_review.evidence_resolution import EvidenceResolutionPlan
 from onyx.legal_review.models import (
     DimensionAssessment,
     DraftAnswer,
+    EvidenceResolutionDecision,
     InitialDiscoveryPlan,
     InitialReadingDecision,
     IssueClosure,
     IssuePlan,
     LegalDimension,
     PassageSupport,
+    PublicationReview,
     ReadingDecision,
     RepairReadingDecision,
     RepairResolution,
     Requirement,
     RequirementRecord,
+    ResearchResolution,
     ReviewCheck,
+    ReviewDiagnosisBatch,
     ReviewResult,
     SourceAction,
     WorkflowPolicy,
@@ -39,8 +48,13 @@ from onyx.legal_review.passages import (
     canonical_evidence_view,
     resolve_passage,
 )
+from onyx.legal_review.research import ResearchLedger
+from onyx.legal_review.review_scope import scope_review_state
+from onyx.legal_review.source_accounting import SourceAccountant
+from onyx.legal_review.transport import model_state
 from onyx.prompts.legal_review.prompts import (
     DRAFT_PROMPT,
+    EVIDENCE_RESOLUTION_PROMPT,
     PLAN_PROMPT,
     READING_PROMPT,
     REPAIR_PROMPT,
@@ -86,6 +100,22 @@ class Reviewer(Protocol):
         checks: Sequence[ReviewCheck],
         timeout_seconds: float,
     ) -> ReviewResult: ...
+
+
+class Diagnoser(Protocol):
+    def diagnose(
+        self,
+        state: dict[str, JsonValue],
+        checks: Sequence[ReviewCheck],
+        timeout_seconds: float,
+    ) -> ReviewDiagnosisBatch: ...
+
+    def examine(
+        self,
+        state: dict[str, JsonValue],
+        checks: Sequence[ReviewCheck],
+        timeout_seconds: float,
+    ) -> PublicationReview: ...
 
 
 def validate_support(support: PassageSupport, ledger: EvidenceLedger) -> None:
@@ -156,6 +186,8 @@ class LegalReviewEngine:
         ledger: EvidenceLedger,
         context: RunContext,
         policy: WorkflowPolicy,
+        diagnoser: Diagnoser | None = None,
+        source_accountant: SourceAccountant | None = None,
         report: Callable[[str, str], None] = lambda _phase, _language: None,
         record_review_usage: Callable[[int, int], None] = lambda _input, _output: None,
     ) -> None:
@@ -165,6 +197,16 @@ class LegalReviewEngine:
         self.ledger = ledger
         self.context = context
         self.policy = policy
+        self.diagnoser = diagnoser
+        self.source_accountant = source_accountant
+        self.source_assessments: list[dict[str, JsonValue]] = []
+        self.review_diagnoses: ReviewDiagnosisBatch | None = None
+        self.final_adjudication: PublicationReview | None = None
+        self.draft_adjudication: PublicationReview | None = None
+        self.review_work_history: list[JsonValue] = []
+        self.research_resolutions: list[ResearchResolution] = []
+        self.research = ResearchLedger()
+        self._review_receipts_start = 0
         self.report = report
         self.record_review_usage = record_review_usage
         self.plan: IssuePlan | None = None
@@ -179,6 +221,7 @@ class LegalReviewEngine:
         self.early_review: ReviewResult | None = None
         self.final_review: ReviewResult | None = None
         self.repair_used = False
+        self.reading_correction_used = False
         self.pending_actions: list[SourceAction] = []
         self.repair_checks: dict[str, ReviewCheck] = {}
         self.repair_resolutions: list[RepairResolution] = []
@@ -201,6 +244,10 @@ class LegalReviewEngine:
             "history": history,
             "plan": self.plan.model_dump(mode="json") if self.plan else None,
             "standard_dimensions": [dimension.value for dimension in LegalDimension],
+            "dimension_guidance": {
+                dimension.value: guidance
+                for dimension, guidance in DIMENSION_GUIDANCE.items()
+            },
             "reading_contract": {
                 "mode": "assessment_update"
                 if self.dimensions
@@ -223,6 +270,12 @@ class LegalReviewEngine:
                 for requirement in self.requirements.values()
             ],
             "original_evidence": originals,
+            "source_assessments": list(self.source_assessments),
+            "material_source_leads": [
+                row
+                for row in self.source_assessments
+                if row["disposition"] in {"material_limitation", "needs_operative_read"}
+            ],
             "source_issue_triggers": self._source_trigger_state(),
             "source_operations": list(self.acquirer.receipts),
             "evidence_gaps": list(self.gaps),
@@ -233,15 +286,17 @@ class LegalReviewEngine:
                 action.model_dump(mode="json") for action in self.pending_actions
             ],
             "limits": {
-                "total_search_budget": self.policy.max_searches,
-                "remaining_search_budget": max(
-                    0, self.policy.max_searches - self.acquirer.searches
-                ),
                 "remaining_research_seconds": max(
                     0, self.context.research_deadline - time.monotonic()
-                ),
-                "max_research_rounds": self.policy.max_research_rounds,
+                )
+                if math.isfinite(self.context.research_deadline)
+                else None,
+                "searches_performed": self.acquirer.searches,
+                "max_searches_per_research_need": 1,
                 "max_postdraft_repairs": 1,
+                "remaining_reading_contract_corrections": int(
+                    not self.reading_correction_used
+                ),
             },
             "tools": self.acquirer.definitions(),
             "draft": draft.model_dump(mode="json") if draft else None,
@@ -258,6 +313,22 @@ class LegalReviewEngine:
             "repair_resolutions": [
                 row.model_dump(mode="json") for row in self.repair_resolutions
             ],
+            "review_diagnoses": self.review_diagnoses.model_dump(mode="json")
+            if self.review_diagnoses
+            else None,
+            "final_adjudication": self.final_adjudication.model_dump(mode="json")
+            if self.final_adjudication
+            else None,
+            "draft_adjudication": self.draft_adjudication.model_dump(mode="json")
+            if self.draft_adjudication
+            else None,
+            "research_resolutions": [
+                row.model_dump(mode="json") for row in self.research_resolutions
+            ],
+            "research_needs": [
+                row.model_dump(mode="json") for row in self.research.needs.values()
+            ],
+            "skipped_searches": list(self.research.skipped),
         }
 
     def _stage_requirements(
@@ -443,6 +514,8 @@ class LegalReviewEngine:
         triggers = self._validate_source_issues(proposed, pending, history, dimensions)
         if isinstance(decision, RepairReadingDecision):
             self._validate_repair_resolutions(decision, pending, dimensions)
+        if isinstance(decision, (EvidenceResolutionDecision, RepairReadingDecision)):
+            self._validate_research_resolutions(decision, proposed)
         associations = dict(self.requirement_associations)
         for row in dimensions:
             for identity in row.requirement_ids:
@@ -485,6 +558,10 @@ class LegalReviewEngine:
             self.repair_resolutions = [
                 row.model_copy(deep=True) for row in decision.repair_resolutions
             ]
+        if isinstance(decision, (EvidenceResolutionDecision, RepairReadingDecision)):
+            self.research_resolutions = [
+                row.model_copy(deep=True) for row in decision.research_resolutions
+            ]
         self.gaps = list(
             dict.fromkeys(
                 [
@@ -501,11 +578,41 @@ class LegalReviewEngine:
         decision.actions = list(combined.values())
         self.pending_actions = list(decision.actions)
 
-    def _start_repair(self, draft: DraftAnswer) -> None:
-        if self.repair_checks:
+    def _start_repair(
+        self,
+        draft: DraftAnswer | None,
+        review: ReviewResult | None = None,
+    ) -> None:
+        if self.repair_checks and review is None:
             return
-        assert self.plan is not None and self.final_review is not None
-        self.repair_checks = {check.id: check for check in self.final_review.flags}
+        selected_review = review or self.final_review
+        assert self.plan is not None and selected_review is not None
+        if self.repair_checks:
+            self.review_work_history.append(
+                {
+                    "checks": [
+                        check.model_dump(mode="json")
+                        for check in self.repair_checks.values()
+                    ],
+                    "diagnoses": self.review_diagnoses.model_dump(mode="json")
+                    if self.review_diagnoses
+                    else None,
+                    "resolutions": [
+                        row.model_dump(mode="json") for row in self.repair_resolutions
+                    ],
+                    "research_resolutions": [
+                        row.model_dump(mode="json") for row in self.research_resolutions
+                    ],
+                }
+            )
+        self.repair_checks = {
+            check.id: check for check in self._review_work(selected_review)
+        }
+        self.repair_resolutions = []
+        self.review_diagnoses = None
+        self.research_resolutions = []
+        self._review_receipts_start = len(self.acquirer.receipts)
+        self._repair_check_issues = {}
         self._repair_requirements = {
             identity: record.model_copy(deep=True)
             for identity, record in self.requirements.items()
@@ -514,7 +621,7 @@ class LegalReviewEngine:
             (row.issue_id, row.dimension): row.model_copy(deep=True)
             for row in self.dimensions
         }
-        claims = {claim.claim_id: claim for claim in draft.claims}
+        claims = {claim.claim_id: claim for claim in draft.claims} if draft else {}
         for check in self.repair_checks.values():
             if check.issue_id is not None:
                 issues = {check.issue_id}
@@ -529,6 +636,152 @@ class LegalReviewEngine:
             else:
                 issues = {issue.issue_id for issue in self.plan.issues}
             self._repair_check_issues[check.id] = issues
+
+    def _diagnose_review(
+        self,
+        request: str,
+        history: str,
+        draft: DraftAnswer | None,
+        review: ReviewResult,
+    ) -> None:
+        self._start_repair(draft, review)
+        if self.diagnoser is None:
+            return
+        deadline = self.context.deadline if draft else self.context.research_deadline
+        diagnoses = self.diagnoser.diagnose(
+            self.state(request, history, draft),
+            self._review_work(review),
+            min(self.policy.max_call_seconds, max(0, deadline - time.monotonic())),
+        )
+        self._validate_diagnoses(diagnoses, self._review_work(review))
+        self.review_diagnoses = diagnoses
+        with graph_step("legal_review.review_diagnoses", {}) as step:
+            step.output_value = diagnoses.model_dump(mode="json")
+        actions: dict[str, SourceAction] = {}
+        for task in diagnoses.research_tasks:
+            check_ids = {
+                check_id
+                for row in diagnoses.diagnoses
+                if task.task_id in row.research_task_ids
+                for check_id in row.check_ids
+            }
+            issue_ids = sorted(
+                {
+                    issue_id
+                    for check_id in check_ids
+                    for issue_id in self._repair_check_issues[check_id]
+                }
+            )
+            need = self.research.bind_task(
+                task,
+                issue_ids,
+                covered_dimensions=diagnoses.research_coverage.get(task.task_id, []),
+            )
+            if task.query:
+                query = task.query
+                key = " ".join(query.casefold().split())
+                if key in actions:
+                    actions[key].issue_ids = sorted(
+                        set(actions[key].issue_ids) | set(issue_ids)
+                    )
+                    actions[key].research_need_ids.append(need.need_id)
+                    for field, value in (
+                        ("coverage_item", task.subject),
+                        ("evidence_target", task.question),
+                    ):
+                        previous = str(actions[key].arguments[field])
+                        if value not in previous.split("\n\n"):
+                            actions[key].arguments[field] = previous + "\n\n" + value
+                else:
+                    actions[key] = SourceAction(
+                        tool="search_corpus",
+                        arguments={
+                            "query": query,
+                            "mode": "hybrid",
+                            "coverage_item": task.subject,
+                            "evidence_target": task.question,
+                        },
+                        issue_ids=issue_ids,
+                        research_need_ids=[need.need_id],
+                    )
+        if actions:
+            assert self.plan is not None
+            self.report("tools", self.plan.language)
+            self._acquire(list(actions.values()), finalizing=draft is not None)
+
+    def _validate_diagnoses(
+        self, diagnoses: ReviewDiagnosisBatch, checks: Sequence[ReviewCheck]
+    ) -> None:
+        identities = [
+            identity for row in diagnoses.diagnoses for identity in row.check_ids
+        ]
+        if len(identities) != len(set(identities)) or set(identities) != {
+            check.id for check in checks
+        }:
+            raise ValueError(
+                "Independent diagnosis must cover the exact review inventory"
+            )
+        for row in diagnoses.diagnoses:
+            for check in checks:
+                if (
+                    check.id in row.check_ids
+                    and check.dimension is not None
+                    and row.dimension != check.dimension
+                ):
+                    raise ValueError("Diagnosis must retain the assessed dimension")
+            for support in row.supports:
+                validate_support(support, self.ledger)
+        for task in diagnoses.research_tasks:
+            for support in task.supports:
+                validate_support(support, self.ledger)
+
+    def _final_review_is_publishable(
+        self, request: str, history: str, draft: DraftAnswer
+    ) -> bool:
+        self.final_adjudication = None
+        review = self.final_review
+        if review is None or not review.completed:
+            return False
+        if not review.flags:
+            return True
+        if self.diagnoser is None:
+            return False
+        self.context.check_active()
+        adjudication = self.diagnoser.examine(
+            self.state(request, history, draft),
+            review.flags,
+            min(
+                self.policy.max_call_seconds,
+                max(0, self.context.deadline - time.monotonic()),
+            ),
+        )
+        self._validate_publication_review(adjudication, review.flags, draft)
+        self.final_adjudication = adjudication
+        with graph_step("legal_review.final_adjudication", {}) as step:
+            step.output_value = adjudication.model_dump(mode="json")
+        self.context.check_active()
+        return all(row.disposition != "defect" for row in adjudication.findings)
+
+    def _validate_publication_review(
+        self,
+        adjudication: PublicationReview,
+        checks: Sequence[ReviewCheck],
+        draft: DraftAnswer,
+    ) -> None:
+        identities = [row.check_id for row in adjudication.findings]
+        if len(identities) != len(set(identities)) or set(identities) != {
+            check.id for check in checks
+        }:
+            raise ValueError(
+                "Publication adjudication must cover the exact review inventory"
+            )
+        for row in adjudication.findings:
+            if any(quote not in draft.answer for quote in row.answer_quotes):
+                raise ValueError(
+                    "Publication assessment quotes text absent from the answer"
+                )
+            for support in row.supports:
+                validate_support(support, self.ledger)
 
     def _validate_repair_resolutions(
         self,
@@ -598,15 +851,129 @@ class LegalReviewEngine:
             if resolution.disposition == "unresolved"
             for identity in resolution.check_ids
             for issue_id in self._repair_check_issues.get(identity, ())
+        } | {
+            issue_id
+            for row in self.research_resolutions
+            if row.disposition
+            in {"request_sources", "needs_user_facts", "exhausted", "unresolved"}
+            for issue_id in row.issue_ids
         }
 
-    def _acquire(
-        self, actions: list[SourceAction], *, finalizing: bool = False
+    def _validate_research_resolutions(
+        self,
+        decision: EvidenceResolutionDecision | RepairReadingDecision,
+        proposed: IssuePlan,
     ) -> None:
+        questions = (
+            [row for row in self.review_diagnoses.diagnoses if row.kind == "research"]
+            if self.review_diagnoses
+            else []
+        )
+        expected = {identity for row in questions for identity in row.check_ids}
+        supplied = [
+            identity
+            for row in decision.research_resolutions
+            for identity in row.check_ids
+        ]
+        if len(supplied) != len(set(supplied)) or set(supplied) != expected:
+            raise ValueError(
+                "Every independent research question requires its own source-work disposition; a corrected assessment or caveat does not resolve it"
+            )
+        known = {issue.issue_id for issue in proposed.issues}
+        actionable = {
+            identity for action in decision.actions for identity in action.issue_ids
+        } | {
+            issue.issue_id
+            for issue in decision.additional_issues
+            if issue.research_queries
+        }
+        for row in decision.research_resolutions:
+            if set(row.issue_ids) - known:
+                raise ValueError("Research question refers to an unknown issue")
+            for support in row.supports:
+                validate_support(support, self.ledger)
+            if (
+                row.disposition == "request_sources"
+                and not set(row.issue_ids) <= actionable
+            ):
+                raise ValueError(
+                    "A request_sources disposition must include executable source operations for its issues"
+                )
+            task_ids = {
+                task_id
+                for question in questions
+                if set(question.check_ids) & set(row.check_ids)
+                for task_id in question.research_task_ids
+            }
+            bound_needs = (
+                {
+                    task.existing_need_id
+                    for task in self.review_diagnoses.research_tasks
+                    if task.task_id in task_ids and task.existing_need_id is not None
+                }
+                if self.review_diagnoses
+                else set()
+            )
+            read_citations: set[int] = set()
+            for index, receipt in enumerate(self.acquirer.receipts):
+                receipt_issues = receipt.get("issue_ids")
+                evidence_ids = receipt.get("evidence_ids")
+                receipt_needs = receipt.get("research_need_ids")
+                bound_investigation = isinstance(receipt_needs, list) and any(
+                    identity in bound_needs
+                    for identity in receipt_needs
+                    if isinstance(identity, str)
+                )
+                continuation = (
+                    index >= self._review_receipts_start
+                    and isinstance(receipt.get("tool"), str)
+                    and receipt.get("tool") != "search_corpus"
+                )
+                if (
+                    (bound_investigation or continuation)
+                    and receipt.get("status") in {"found", "partial"}
+                    and isinstance(receipt_issues, list)
+                    and any(identity in receipt_issues for identity in row.issue_ids)
+                    and isinstance(evidence_ids, list)
+                ):
+                    read_citations.update(
+                        identity
+                        for identity in evidence_ids
+                        if isinstance(identity, int)
+                    )
+            if row.disposition in {"resolved", "disputed"} and not any(
+                support.citation in read_citations for support in row.supports
+            ):
+                raise ValueError(
+                    f"Research resolution {row.check_ids} needs supporting originals from an executed source operation bound to its research need, or a subsequent canonical continuation; earlier bound search results remain eligible"
+                )
+            if row.disposition == "needs_user_facts" and not row.missing_user_facts:
+                raise ValueError(
+                    "A user-fact blocker must identify the actual missing facts"
+                )
+            if row.disposition == "exhausted" and not (
+                math.isfinite(self.context.research_deadline)
+                and self.context.research_deadline - time.monotonic()
+                <= self.policy.max_call_seconds
+            ):
+                raise ValueError(
+                    "There is no exhausted execution limit; resolve the research question or request sources"
+                )
+
+    def _acquire(self, actions: list[SourceAction], *, finalizing: bool = False) -> int:
         assert self.plan is not None
-        self.pending_actions = list(actions)
-        self.acquirer.acquire(actions, self.plan, finalizing=finalizing)
+        admitted = self.research.admit(actions, self.plan)
+        self.pending_actions = admitted
+        if not admitted:
+            return 0
+        before = set(self.ledger.citation_numbers())
+        receipt_start = len(self.acquirer.receipts)
+        self.acquirer.acquire(admitted, self.plan, finalizing=finalizing)
+        self.research.record_results(
+            admitted, self.acquirer.receipts[receipt_start:], before
+        )
         self.pending_actions = []
+        return len(admitted)
 
     def _validate_source_issues(
         self,
@@ -755,6 +1122,16 @@ class LegalReviewEngine:
                 reasons.append(
                     "A material legal limitation identified during repair remains unresolved"
                 )
+            for assessment in self.source_assessments:
+                continuation = assessment.get("requested_read")
+                if (
+                    assessment.get("content_status") == "operative_effect_missing"
+                    and isinstance(continuation, dict)
+                    and isinstance(identities := continuation.get("issue_ids"), list)
+                    and issue.issue_id in identities
+                ):
+                    status = "open"
+                    reasons.append(str(assessment["missing_effect"]))
             if status == "closed" and any(
                 row.validity == "unknown" or row.legal_status in {"unknown", "annulled"}
                 for row in requirements
@@ -786,6 +1163,51 @@ class LegalReviewEngine:
                         )
         return [closures[issue.issue_id] for issue in self.plan.issues]
 
+    def _account_sources(
+        self,
+        request: str,
+        history: str,
+        *,
+        finalizing: bool = False,
+        draft: DraftAnswer | None = None,
+    ) -> None:
+        if self.source_accountant is None:
+            return
+        assert self.plan is not None
+        while True:
+            self.source_assessments = self.source_accountant.scan(
+                self.state(request, history, draft), finalizing=finalizing
+            )
+            executed = {
+                json.dumps(
+                    {"tool": row["tool"], "arguments": row["arguments"]}, sort_keys=True
+                )
+                for row in self.acquirer.receipts
+            }
+            actions: dict[str, SourceAction] = {}
+            for assessment in self.source_assessments:
+                if assessment.get("requested_read") is None:
+                    continue
+                action = SourceAction.model_validate(assessment["requested_read"])
+                key = json.dumps(
+                    {"tool": action.tool, "arguments": action.arguments}, sort_keys=True
+                )
+                if key in executed:
+                    continue
+                if key in actions:
+                    actions[key].issue_ids = sorted(
+                        set(actions[key].issue_ids) | set(action.issue_ids)
+                    )
+                else:
+                    actions[key] = action
+            if not actions:
+                return
+            before = set(self.ledger.citation_numbers())
+            self.report("tools", self.plan.language)
+            self._acquire(list(actions.values()), finalizing=finalizing)
+            if set(self.ledger.citation_numbers()) == before:
+                return
+
     def _reading(
         self,
         request: str,
@@ -796,26 +1218,113 @@ class LegalReviewEngine:
     ) -> ReadingDecision:
         assert self.plan is not None
         self.report("reading", self.plan.language)
-        repairing = (
+        self._account_sources(request, history, finalizing=finalizing, draft=draft)
+        repairing = bool(self.repair_checks) or (
             draft is not None
             and self.final_review is not None
             and bool(self.final_review.flags)
         )
         if repairing and draft is not None:
             self._start_repair(draft)
-        decision = self.gateway.complete(
-            REPAIR_READING_PROMPT if repairing else READING_PROMPT,
-            self.state(request, history, draft),
-            RepairReadingDecision
+        independent_plan = repairing and self.review_diagnoses is not None
+        resolution_plan = (
+            EvidenceResolutionPlan(self.review_diagnoses, self._repair_check_issues)
+            if independent_plan and self.review_diagnoses is not None
+            else None
+        )
+        response_model = (
+            resolution_plan.response_model()
+            if resolution_plan is not None
+            else RepairReadingDecision
             if repairing
             else InitialReadingDecision
             if not self.dimensions
-            else ReadingDecision,
-            LLMFlow.LEGAL_REVIEW_READING,
-            finalizing=finalizing,
+            else ReadingDecision
         )
-        self._accept_reading(decision)
-        return decision
+        prompt = (
+            EVIDENCE_RESOLUTION_PROMPT
+            if independent_plan
+            else REPAIR_READING_PROMPT
+            if repairing
+            else READING_PROMPT
+        )
+        state = self.state(request, history, draft)
+        while True:
+            if resolution_plan is not None:
+                state = resolution_plan.state(state)
+            try:
+                decision = self.gateway.complete(
+                    prompt,
+                    state,
+                    response_model,
+                    LLMFlow.LEGAL_REVIEW_READING,
+                    finalizing=finalizing,
+                )
+                if resolution_plan is not None:
+                    decision = resolution_plan.compile(decision)
+                try:
+                    self._accept_reading(decision)
+                except ValueError as error:
+                    raise ReadingContractError(
+                        str(error), decision.model_dump(mode="json")
+                    ) from error
+                return decision
+            except ReadingContractError as error:
+                if self.reading_correction_used:
+                    raise
+                self.reading_correction_used = True
+                # The rejected proposal was never committed; this is a new admission.
+                state = {
+                    **self.state(request, history, draft),
+                    "reading_contract_correction": {
+                        "diagnostics": error.diagnostics,
+                        "rejected_proposal": error.candidate,
+                    },
+                }
+                prompt += (
+                    "\nThe previous completed proposal violated the reading contract. "
+                    "Use reading_contract_correction diagnostics to return one complete "
+                    "corrected replacement. Preserve the canonical source identities and "
+                    "all unaffected assessments. No part of the rejected proposal was accepted. "
+                    "Include requirement_ids in every row; addressed needs real supporting "
+                    "findings, never an invented link. If evidence is insufficient, mark "
+                    "unresolved and state the gap. This is the sole contract correction."
+                )
+
+    def _research(
+        self,
+        request: str,
+        history: str,
+        *,
+        finalizing: bool = False,
+        draft: DraftAnswer | None = None,
+    ) -> None:
+        seen: set[str] = set()
+        while True:
+            decision = self._reading(
+                request, history, finalizing=finalizing, draft=draft
+            )
+            if not decision.actions:
+                return
+            signature = json.dumps(
+                {
+                    "actions": [
+                        action.model_dump(mode="json") for action in decision.actions
+                    ],
+                    "originals": sorted(self.ledger.citation_numbers()),
+                },
+                sort_keys=True,
+                ensure_ascii=False,
+            )
+            if signature in seen:
+                raise ValueError(
+                    "Research repeated the same source operations without new evidence"
+                )
+            seen.add(signature)
+            assert self.plan is not None
+            self.report("tools", self.plan.language)
+            if not self._acquire(decision.actions, finalizing=finalizing):
+                return
 
     def _checks(
         self, *, draft: bool, answer: DraftAnswer | None = None
@@ -832,13 +1341,20 @@ class LegalReviewEngine:
                 instructions=(
                     f"{purpose} {dimension.value} for the requested outcome of issue "
                     f"{issue.issue_id}? Judge within the request's scope from the complete "
+                    f"originals using this criterion: {DIMENSION_GUIDANCE[dimension]} "
                     "originals and actual user facts. An affirmed not_applicable needs a "
                     "reason; absent evidence cannot establish non-applicability. Precisely "
                     "disclosed unresolved law is acceptable only without an unsupported "
                     "positive conclusion. Unknown chunk dates do not prove legal validity."
-                    " Assess whether each dimension's reason and linked findings actually "
-                    "establish its relevance and result from the originals; a finding can "
-                    "support multiple dimensions, but an ID link alone proves no entailment."
+                    + (
+                        " Evaluate the literal draft's treatment of this dimension, including "
+                        "material omissions. Internal research status is not an assertion "
+                        "in the answer. Do not require a separate paragraph per dimension."
+                        if draft
+                        else " Assess whether each dimension's reason and linked findings "
+                        "establish its relevance and result from the originals; a finding can "
+                        "support multiple dimensions, but an ID link alone proves no entailment."
+                    )
                 ),
                 issue_id=issue.issue_id,
                 dimension=dimension.value,
@@ -851,19 +1367,21 @@ class LegalReviewEngine:
                 id=f"finding:{finding.requirement_id}",
                 requirement_id=finding.requirement_id,
                 instructions=(
-                    f"Does active global finding {finding.requirement_id} materially "
-                    "misinterpret its selected canonical passages or overgeneralize the "
-                    "rule beyond the original's operative scope, regime, persons, conditions, "
-                    "exceptions, deadline or event-date application? Judge this finding's "
-                    "rule and its linked assessment applications against the complete "
+                    (
+                        f"Does the literal answer materially misapply or omit a decisive "
+                        f"effect of the sources bound by finding_sources entry {finding.requirement_id}? "
+                        "Inspect their use and any contrary effect on a requested outcome. "
+                        "An unused or superseded interpretation in private research is not "
+                        "an answer defect. Does the answer overgeneralize the "
+                        if draft
+                        else f"Does active global finding {finding.requirement_id} materially "
+                        "misinterpret its selected canonical passages or overgeneralize the "
+                    )
+                    + "rule beyond the original's operative scope, regime, persons, conditions, "
+                    "exceptions, deadline or event-date application? Judge against the complete "
                     "originals. An amendment or annulment must be bound to the exact norm "
                     "and temporal effect; a sector-specific condition cannot establish a "
                     "general rule. A real passage selector alone proves no entailment."
-                    + (
-                        " Also inspect this finding's use in the literal draft."
-                        if draft
-                        else ""
-                    )
                 ),
             )
             for finding in self.requirements.values()
@@ -880,11 +1398,28 @@ class LegalReviewEngine:
                 ),
                 ReviewCheck(
                     id="source_conditions",
-                    instructions="Does the research or literal answer materially contradict or omit a decisive condition, exception, qualification or contrary effect of the complete original evidence, or conceal a partial/unread provision or temporal-law gap? No search result or review score proves absence of other law.",
+                    instructions=(
+                        "Does the literal answer"
+                        if draft
+                        else "Does the extracted research"
+                    )
+                    + " materially contradict or omit a decisive condition, exception, qualification or contrary effect of the complete original evidence, or conceal a partial/unread provision or temporal-law gap? No search result or review score proves absence of other law.",
                 ),
                 ReviewCheck(
                     id="issue_dependencies",
-                    instructions="Does any source-derived issue lack a material connection to its parent's requested outcome or its exact canonical trigger, or does an issue claimed resolved fail its explicit closure criteria? Does the answer treat a parent conclusion as complete while a material dependent child remains open or partial? Review all issue_closures and dependencies against the originals, supplied facts and literal answer; do not demand new issues for incidental references or every category.",
+                    instructions=(
+                        "Does the literal answer present an unsupported complete conclusion "
+                        "while a material dependency remains unresolved, or omit that dependency's "
+                        "effect on the requested outcome? Internal open/partial issue status alone "
+                        "is not a defect: inspect whether the actual answer properly conditions "
+                        "the affected conclusion."
+                        if draft
+                        else "Does any source-derived issue lack a material connection to its "
+                        "parent's requested outcome or its exact canonical trigger, or does an "
+                        "issue claimed resolved fail its explicit closure criteria?"
+                    )
+                    + " Review issue_closures and dependencies against originals and supplied "
+                    "facts; do not demand new issues for incidental references or every category.",
                 ),
             ]
         )
@@ -899,9 +1434,14 @@ class LegalReviewEngine:
                         id="answer_consistency",
                         instructions="Does the integrated answer contain a material contradiction, repetition with conflicting conditions, or unsupported cross-issue conclusion or summary? Judge the entire answer against actual facts and originals, not only isolated issue paragraphs.",
                     ),
+                    ReviewCheck(
+                        id="answer_quotations",
+                        instructions="Does any purported direct source quotation in the literal answer change the quoted wording or its legally material boundaries? Compare with the identified original passage and its role, including the exact text amended, repealed or annulled. Words appearing elsewhere in a quoted older rule do not establish that they form part of the operative disposition. Clearly marked omissions may shorten a quotation without changing its meaning; a paraphrase must not be presented as verbatim. Exclude quotations of the user's own question and mere labels.",
+                    ),
                 ]
             )
             if answer is not None:
+                checks.extend(cited_source_checks(answer))
                 checks.extend(
                     ReviewCheck(
                         id=f"claim:{claim.claim_id}",
@@ -926,6 +1466,17 @@ class LegalReviewEngine:
                 )
         return checks
 
+    @staticmethod
+    def _review_work(review: ReviewResult) -> list[ReviewCheck]:
+        return [*review.flags, *review.unassessed_checks]
+
+    @staticmethod
+    def _review_can_repair(review: ReviewResult) -> bool:
+        return review.completed or (
+            review.failure_reason == "openai_decision_refusal"
+            and bool(review.unassessed_checks)
+        )
+
     def _review(
         self, request: str, history: str, draft: DraftAnswer | None
     ) -> ReviewResult:
@@ -933,7 +1484,7 @@ class LegalReviewEngine:
         self.report("review", self.plan.language)
         self.context.check_active()
         checks = self._checks(draft=draft is not None, answer=draft)
-        state = self.state(request, history, draft)
+        state = scope_review_state(self.state(request, history, draft))
         # Preserve actual facts and discovery limitations without duplicate source bodies.
         review_state = {
             key: value
@@ -946,6 +1497,10 @@ class LegalReviewEngine:
                 "final_review",
                 "repair_contract",
                 "repair_resolutions",
+                "review_diagnoses",
+                "research_resolutions",
+                "source_assessments",
+                "material_source_leads",
             }
         }
         diagnostic_keys = {
@@ -985,6 +1540,7 @@ class LegalReviewEngine:
                 }
             )
         review_state["research_record"] = research_record
+        review_state = model_state(review_state, LLMFlow.LEGAL_REVIEW_DECISION)
         deadline = self.context.deadline if draft else self.context.research_deadline
         result = self.reviewer.review(
             review_state,
@@ -999,10 +1555,18 @@ class LegalReviewEngine:
         expected_checks = {check.id: check for check in checks}
         expected = set(expected_checks)
         flags = {check.id for check in result.flags}
-        if result.completed and (
+        unassessed = {check.id for check in result.unassessed_checks}
+        if self._review_can_repair(result) and (
             len(result.flags) != len(flags)
+            or len(result.unassessed_checks) != len(unassessed)
+            or bool(result.completed and unassessed)
+            or bool(unassessed & result.scores.keys())
+            or any(
+                check != expected_checks.get(check.id)
+                for check in result.unassessed_checks
+            )
             or any(flag != expected_checks.get(flag.id) for flag in result.flags)
-            or set(result.scores) != expected
+            or set(result.scores) | unassessed != expected
             or not flags <= expected
             or flags != {key for key, value in result.scores.items() if value >= 0.5}
             or any(not 0 <= score <= 1 for score in result.scores.values())
@@ -1052,52 +1616,15 @@ class LegalReviewEngine:
                 "Draft must disclose all unresolved evidence/validity issues"
             )
 
-    def _disclose_validity(self, draft: DraftAnswer) -> DraftAnswer:
-        assert self.plan is not None
-        affected = self._uncertain_issue_ids()
-        dependencies = [
-            row
-            for row in self.issue_closures()
-            if row.status == "open" or row.blocking_child_ids
-        ]
-        unresolved = affected | {row.issue_id for row in dependencies}
-        questions = "; ".join(
-            issue.question for issue in self.plan.issues if issue.issue_id in affected
+    def _bind_unresolved_issues(self, draft: DraftAnswer) -> DraftAnswer:
+        """Keep closure bookkeeping separate from the writer's reviewed legal prose."""
+        unresolved = (
+            self._uncertain_issue_ids()
+            | {row.issue_id for row in self.dimensions if row.status == "unresolved"}
+            | {row.issue_id for row in self.issue_closures() if row.status != "closed"}
         )
-        disclosure = (
-            (
-                "Yürürlük sınırı: Şu meselelerde dayanılan kaynakların olay tarihi itibarıyla "
-                f"yürürlük ve iptal durumu kesinleştirilemedi: {questions}. "
-                "Bu meselelerin sonuçları yürürlük ve iptal durumu teyidine bağlıdır."
-                if self.plan.language.startswith("tr")
-                else f"Validity limitation: The operative and annulment status of sources for {questions} "
-                "on the event date could not be established. These conclusions remain conditional "
-                "on verification of their operative and annulment status."
-            )
-            if affected
-            else ""
-        )
-        if dependencies:
-            dependency_questions = "; ".join(
-                issue.question
-                for issue in self.plan.issues
-                if issue.issue_id in {row.issue_id for row in dependencies}
-            )
-            dependency_disclosure = (
-                f"İnceleme sınırı: Şu sonucu etkileyen meseleler veya bağlı alt meseleleri tamamlanamadı: {dependency_questions}. İlgili sonuçlar bu açık meselelerin çözümüne bağlıdır."
-                if self.plan.language.startswith("tr")
-                else f"Research limitation: These material issues or their dependent questions remain unresolved: {dependency_questions}. The affected conclusions remain conditional on resolving these questions."
-            )
-            disclosure = "\n\n".join(
-                part for part in (disclosure, dependency_disclosure) if part
-            )
-        if not disclosure:
-            return draft
         return draft.model_copy(
             update={
-                "answer": draft.answer
-                if disclosure in draft.answer
-                else draft.answer + "\n\n" + disclosure,
                 "unresolved_issue_ids": list(
                     dict.fromkeys([*draft.unresolved_issue_ids, *sorted(unresolved)])
                 ),
@@ -1109,10 +1636,13 @@ class LegalReviewEngine:
         status: str,
         answer: str | None = None,
         gap: str | None = None,
+        *,
+        non_publication_reason: Literal["review_rejected"] | None = None,
     ) -> WorkflowResult:
         return WorkflowResult.model_validate(
             {
                 "status": status,
+                "non_publication_reason": non_publication_reason,
                 "answer": answer,
                 "plan": self.plan,
                 "requirements": list(self.requirements.values()),
@@ -1131,8 +1661,16 @@ class LegalReviewEngine:
                 "early_review": self.early_review,
                 "final_review": self.final_review,
                 "repair_used": self.repair_used,
+                "reading_correction_used": self.reading_correction_used,
                 "repair_checks": list(self.repair_checks.values()),
                 "repair_resolutions": self.repair_resolutions,
+                "review_diagnoses": self.review_diagnoses,
+                "final_adjudication": self.final_adjudication,
+                "draft_adjudication": self.draft_adjudication,
+                "review_work_history": self.review_work_history,
+                "research_resolutions": self.research_resolutions,
+                "research_needs": list(self.research.needs.values()),
+                "skipped_searches": self.research.skipped,
             }
         )
 
@@ -1198,47 +1736,18 @@ class LegalReviewEngine:
                 "unavailable",
                 gap="The initial plan supplied no discovery query for authorized original research",
             )
-        if len(initial) > self.policy.max_searches:
-            return self._result(
-                "unavailable",
-                gap="Planner discovery queries exceed the explicit total search budget",
-            )
         self._acquire(initial)
         if not self.ledger.citation_numbers():
             return self._result(
                 "unavailable", gap="No authorized original evidence was read"
             )
-        decision = ReadingDecision(dimensions=[])
-        early_return_used = False
-        for round_number in range(self.policy.max_research_rounds):
-            self.context.check_research_active()
-            decision = self._reading(request, history)
-            if (
-                not decision.actions
-                or round_number + 1 >= self.policy.max_research_rounds
-            ):
-                break
-            self.report("tools", self.plan.language)
-            self._acquire(decision.actions)
-        if decision.actions and time.monotonic() < self.context.research_deadline:
-            self.report("tools", self.plan.language)
-            self._acquire(decision.actions)
-            early_return_used = True
-            decision = self._reading(request, history)
+        self._research(request, history)
         self.early_review = self._review(request, history, None)
-        if not self.early_review.completed:
+        if not self._review_can_repair(self.early_review):
             return self._result("unavailable", gap=self.early_review.failure_reason)
-        if (
-            (self.early_review.flags or decision.actions)
-            and not early_return_used
-            and time.monotonic() < self.context.research_deadline
-        ):
-            # One evidence-directed response to the early batched review.
-            if self.early_review.flags:
-                decision = self._reading(request, history)
-            if decision.actions:
-                self._acquire(decision.actions)
-                self._reading(request, history)
+        if self._review_work(self.early_review):
+            self._diagnose_review(request, history, None, self.early_review)
+            self._research(request, history)
         self.report("final", self.plan.language)
         draft = compile_draft(
             self.gateway.complete(
@@ -1247,20 +1756,50 @@ class LegalReviewEngine:
                 GeneratedDraft,
                 LLMFlow.LEGAL_REVIEW_DRAFT,
                 finalizing=True,
-            )
+            ),
+            ledger=self.ledger,
         )
-        draft = self._disclose_validity(draft)
+        draft = self._bind_unresolved_issues(draft)
         self._validate_draft(draft)
         self.final_review = self._review(request, history, draft)
-        if not self.final_review.completed:
+        if not self._review_can_repair(self.final_review):
             return self._result("unavailable", gap=self.final_review.failure_reason)
-        if self.final_review.flags:
+        if self._review_work(self.final_review):
+            repair_review = self.final_review
+            if self.diagnoser is not None and self.final_review.completed:
+                if self._final_review_is_publishable(request, history, draft):
+                    partial = bool(
+                        draft.unresolved_issue_ids or self.gaps or self.pending_actions
+                    )
+                    return self._result(
+                        "partial" if partial else "verified", draft.answer
+                    )
+                assert self.final_adjudication is not None
+                self.draft_adjudication = self.final_adjudication
+                self.final_adjudication = None
+                defects = {
+                    row.check_id
+                    for row in self.draft_adjudication.findings
+                    if row.disposition == "defect"
+                }
+                repair_review = self.final_review.model_copy(
+                    update={
+                        "scores": {
+                            identity: score
+                            for identity, score in self.final_review.scores.items()
+                            if identity in defects
+                        },
+                        "flags": [
+                            check
+                            for check in self.final_review.flags
+                            if check.id in defects
+                        ],
+                    }
+                )
             self.repair_used = True
             self.report("repair", self.plan.language)
-            decision = self._reading(request, history, finalizing=True, draft=draft)
-            if decision.actions:
-                self._acquire(decision.actions, finalizing=True)
-                self._reading(request, history, finalizing=True, draft=draft)
+            self._diagnose_review(request, history, draft, repair_review)
+            self._research(request, history, finalizing=True, draft=draft)
             draft = compile_draft(
                 self.gateway.complete(
                     REPAIR_PROMPT,
@@ -1268,12 +1807,19 @@ class LegalReviewEngine:
                     GeneratedDraft,
                     LLMFlow.LEGAL_REVIEW_REPAIR,
                     finalizing=True,
-                )
+                ),
+                ledger=self.ledger,
             )
-            draft = self._disclose_validity(draft)
+            draft = self._bind_unresolved_issues(draft)
             self._validate_draft(draft)
             self.final_review = self._review(request, history, draft)
-        if not self.final_review.completed or self.final_review.flags:
-            return self._result("unavailable", gap="Final legal review did not pass")
+        if not self._final_review_is_publishable(request, history, draft):
+            return self._result(
+                "unavailable",
+                gap="Final legal review did not pass",
+                non_publication_reason="review_rejected"
+                if self.final_review.completed
+                else None,
+            )
         partial = bool(draft.unresolved_issue_ids or self.gaps or self.pending_actions)
         return self._result("partial" if partial else "verified", draft.answer)

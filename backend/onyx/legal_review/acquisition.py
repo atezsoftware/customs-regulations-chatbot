@@ -48,16 +48,10 @@ class SourceAcquirer:
                 raise ValueError("Source action refers to an unknown issue")
             arguments = dict(action.arguments)
             if action.tool == "search_corpus":
-                if self.searches >= self.policy.max_searches:
-                    raise RunStopped("Legal review search budget exhausted")
                 self.searches += 1
-                arguments.update(
-                    {
-                        "coverage_item": ", ".join(action.issue_ids),
-                        "evidence_target": "Complete operative originals and material limiting or contrary authority for the requested outcomes",
-                        "expand_query": False,
-                    }
-                )
+                arguments.setdefault("coverage_item", ", ".join(action.issue_ids))
+                arguments.setdefault("evidence_target", arguments["query"])
+                arguments["expand_query"] = False
             calls.append(
                 (
                     action,
@@ -110,6 +104,7 @@ class SourceAcquirer:
                         "tool": call.name,
                         "arguments": call.arguments,
                         "issue_ids": list(action.issue_ids),
+                        "research_need_ids": list(action.research_need_ids),
                         "status": outcome.status.value,
                         "summary": outcome.summary,
                         "data": outcome.data,

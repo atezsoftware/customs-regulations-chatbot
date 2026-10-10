@@ -18,6 +18,19 @@ class PassageReference(BaseModel):
     span_number: int = Field(gt=0, strict=True)
 
 
+def source_passage_references(
+    citation: int, ledger: EvidenceLedger
+) -> list[PassageReference]:
+    """An inline source selection refers to its complete authorized original."""
+    item = ledger.get(citation)
+    validate_canonical_original(item)
+    assert item is not None
+    return [
+        PassageReference(citation=citation, span_number=index)
+        for index, _ in enumerate(original_witness_spans(citation, item.text), 1)
+    ]
+
+
 class CanonicalPassage(BaseModel):
     model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
 

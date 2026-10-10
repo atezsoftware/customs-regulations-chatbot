@@ -10,7 +10,12 @@ import pytest
 from pydantic import JsonValue, ValidationError
 
 from onyx.asv3.models import RunContext, SharedBudget
-from onyx.legal_review.drafting import GeneratedBlock, GeneratedClaim, GeneratedDraft
+from onyx.legal_review.drafting import (
+    ClaimApplication,
+    GeneratedBlock,
+    GeneratedClaim,
+    GeneratedDraft,
+)
 from onyx.legal_review.gateway import GeminiGateway
 from onyx.legal_review.models import (
     InitialDiscoveryPlan,
@@ -70,6 +75,11 @@ def generated_draft() -> GeneratedDraft:
                         claim_id=claim.claim_id,
                         issue_ids=claim.issue_ids,
                         supports=claim.supports,
+                        application=ClaimApplication(
+                            source_conditions="The original requires the document.",
+                            fact_application="The question requests that condition.",
+                            remaining_uncertainty=None,
+                        ),
                     )
                     for claim in fixture.claims
                 ],

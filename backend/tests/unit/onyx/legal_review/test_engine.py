@@ -1,6 +1,6 @@
 from collections.abc import Sequence
 from typing import TypeVar
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 from pydantic import BaseModel, JsonValue, ValidationError
@@ -20,16 +20,20 @@ from onyx.legal_review.models import (
     DimensionAssessment,
     DiscoveryQuery,
     DraftAnswer,
+    EvidenceResolutionDecision,
     InitialDiscoveryPlan,
     InitialReadingDecision,
     Issue,
     IssuePlan,
     LegalDimension,
     PassageSupport,
+    PublicationFinding,
+    PublicationReview,
     ReadingDecision,
     RepairReadingDecision,
     RepairResolution,
     Requirement,
+    ResearchResolution,
     ReviewCheck,
     ReviewResult,
     SourceAction,
@@ -182,7 +186,14 @@ class FakeGateway:
                         "block_id": "b1",
                         "text": result.answer,
                         "claims": [
-                            claim.model_dump(exclude={"answer_excerpt"})
+                            {
+                                **claim.model_dump(exclude={"answer_excerpt"}),
+                                "application": {
+                                    "source_conditions": "The original requires the document.",
+                                    "fact_application": "Explain the stated application condition.",
+                                    "remaining_uncertainty": "The event date is not supplied.",
+                                },
+                            }
                             for claim in result.claims
                         ],
                     }
@@ -231,7 +242,19 @@ class FakeReviewer:
             return ReviewResult(
                 completed=False, failure_reason="jev_review_timeout", input_tokens=20
             )
+        if outcome == "refusal":
+            return ReviewResult(
+                completed=False,
+                failure_reason="openai_decision_refusal",
+                scores={check.id: 0.1 for check in checks[:-1]},
+                unassessed_checks=[checks[-1]],
+            )
         flags = [checks[-1]] if outcome == "flag" else []
+        if outcome.startswith("flag:"):
+            flags = [
+                check for check in checks if check.id == outcome.removeprefix("flag:")
+            ]
+            assert len(flags) == 1
         return ReviewResult(
             completed=True,
             scores={check.id: 0.9 if check in flags else 0.1 for check in checks},
@@ -265,7 +288,7 @@ def test_main_path_has_one_early_and_one_draft_review_and_honest_validity() -> N
     workflow, gateway, reviewer = engine([plan(), reading(), draft()], ["pass", "pass"])
     result = workflow.run("Başvuru şartı nedir?", "")
     assert result.status == "partial"
-    assert result.answer is not None and "Yürürlük sınırı" in result.answer
+    assert result.answer == draft().answer
     assert result.requirements[0].legal_status == "unknown"
     assert len(result.dimensions) == 12
     assert len(reviewer.states) == 2
@@ -276,8 +299,11 @@ def test_main_path_has_one_early_and_one_draft_review_and_honest_validity() -> N
     ]
     assert reviewer.states[0]["draft"] is None
     assert isinstance(reviewer.states[1]["draft"], dict)
-    assert "Yürürlük sınırı" in str(reviewer.states[1]["draft"])
+    assert reviewer.states[1]["draft"]["answer"] == draft().answer
+    assert reviewer.states[1]["draft"]["unresolved_issue_ids"] == ["i1"]
     assert "tools" not in reviewer.states[1]
+    assert "review_diagnoses" not in reviewer.states[1]
+    assert "research_resolutions" not in reviewer.states[1]
 
 
 def test_missing_review_never_publishes_an_unchecked_draft() -> None:
@@ -286,6 +312,27 @@ def test_missing_review_never_publishes_an_unchecked_draft() -> None:
     assert result.status == "unavailable" and result.answer is None
     assert "jev_review_timeout" in result.gaps
     assert len(gateway.calls) == 2 and len(reviewer.states) == 1
+
+
+def test_research_continues_through_multiple_distinct_source_returns() -> None:
+    first = reading(actions=True)
+    second = reading(actions=True)
+    second.actions[0].arguments["article"] = "3"
+    workflow, gateway, _ = engine(
+        [plan(), first, second, reading(), draft()], ["pass", "pass"]
+    )
+    result = workflow.run("Başvuru şartı nedir?", "")
+    assert result.answer is not None
+    assert (
+        len([flow for flow, _ in gateway.calls if flow is LLMFlow.LEGAL_REVIEW_READING])
+        == 3
+    )
+    assert isinstance(workflow.acquirer, FakeAcquirer)
+    assert [
+        action.arguments["article"]
+        for action in workflow.acquirer.actions
+        if action.tool == "read_provision"
+    ] == ["2", "3"]
 
 
 def test_one_repair_uses_literal_draft_then_stops_on_remaining_flags() -> None:
@@ -306,7 +353,7 @@ def test_one_repair_uses_literal_draft_then_stops_on_remaining_flags() -> None:
 def test_unknown_passage_support_is_rejected_before_jev() -> None:
     bad = reading()
     bad.requirements[0].supports = [PassageSupport(citation=1, span_number=999)]
-    workflow, _, reviewer = engine([plan(), bad], [])
+    workflow, _, reviewer = engine([plan(), bad, bad], [])
     result = workflow.run("Başvuru şartı nedir?", "")
     assert result.status == "unavailable" and result.answer is None
     assert reviewer.states == []
@@ -323,6 +370,32 @@ def test_source_text_is_not_truncated_to_fit_review() -> None:
         "".join(str(row["text"]) for row in passages if isinstance(row, dict)) == RULE
     )
     assert "text" not in originals[0]
+
+
+def test_final_review_does_not_treat_private_interpretations_as_answer_claims() -> None:
+    extracted = reading()
+    private_interpretation = "Özel araştırma yorumu: aksi yönde karar bulunmamaktadır."
+    extracted.dimensions[2].reason = private_interpretation
+    workflow, _, reviewer = engine([plan(), extracted, draft()], ["pass", "pass"])
+    result = workflow.run("Başvuru şartı nedir?", "")
+    early, final = reviewer.states
+    assert early["review_target"] == "research"
+    assert private_interpretation in str(early["dimension_assessments"])
+    assert final["review_target"] == "literal_answer"
+    assert "dimension_assessments" not in final and "requirements" not in final
+    assert private_interpretation not in str(final)
+    assert final["original_evidence"] == early["original_evidence"]
+    assert final["source_registry"] == early["source_registry"]
+    assert final["finding_sources"] == [
+        {
+            "requirement_id": "r1",
+            "issue_ids": ["i1"],
+            "supports": [PassageSupport(citation=1, span_number=1).model_dump()],
+        }
+    ]
+    assert isinstance(final["draft"], dict)
+    assert final["draft"]["answer"] == result.answer
+    assert result.dimensions[2].reason == private_interpretation
 
 
 def test_initial_reader_cannot_skip_any_standard_dimension() -> None:
@@ -514,22 +587,27 @@ def test_model_opens_material_source_dependency_and_researches_it_once(
     assert result.status == "partial"
 
 
-def test_parent_stays_open_and_disclosed_while_material_child_is_open() -> None:
+def test_parent_stays_open_without_rewriting_prose_while_material_child_is_open() -> (
+    None
+):
     workflow, _, reviewer = engine(
         [plan(), reading_child(additional=True, resolved=False, query=False), draft()],
         ["pass", "pass"],
     )
     result = workflow.run("Başvuru şartı nedir?", "")
     assert [row.status for row in result.issue_closures] == ["open", "open"]
-    assert result.answer is not None and "İnceleme sınırı" in result.answer
-    assert "İnceleme sınırı" in str(reviewer.states[-1]["draft"])
+    assert result.answer == draft().answer
+    reviewed = reviewer.states[-1]["draft"]
+    assert isinstance(reviewed, dict)
+    assert reviewed["answer"] == draft().answer
+    assert reviewed["unresolved_issue_ids"] == ["i1", "s1"]
     assert result.status == "partial"
 
 
 def test_source_issue_cannot_bind_unobserved_parent_requirement() -> None:
     bad = reading_child(additional=True, resolved=False, query=False)
     bad.additional_issues[0].supporting_requirement_ids = ["invented"]
-    workflow, _, reviewer = engine([plan(), bad], [])
+    workflow, _, reviewer = engine([plan(), bad, bad], [])
     result = workflow.run("Soru", "")
     assert result.status == "unavailable" and reviewer.states == []
     assert "parent-backed requirement" in result.gaps[-1]
@@ -604,26 +682,33 @@ def test_issue_count_has_no_arbitrary_cap_and_dependencies_remain_acyclic() -> N
         IssuePlan(language="tr", issues=[plan().issues[0], child])
 
 
-def test_distinct_initial_queries_respect_global_search_budget_before_dispatch() -> (
-    None
-):
-    issues = [
-        plan()
-        .issues[0]
-        .model_copy(
-            update={
-                "issue_id": f"i{index}",
-                "research_queries": [f"Focused query {index}"],
-            }
-        )
-        for index in range(25)
-    ]
-    workflow, _, _ = engine([IssuePlan(language="tr", issues=issues)], [])
-    result = workflow.run("Soru", "")
-    assert (
-        isinstance(workflow.acquirer, FakeAcquirer) and workflow.acquirer.actions == []
+def test_distinct_initial_queries_have_no_global_search_quota() -> None:
+    discovery = InitialDiscoveryPlan(
+        language="tr",
+        issues=[
+            plan().issues[0].model_copy(update={"issue_id": f"i{index}"})
+            for index in range(25)
+        ],
+        discovery_queries=[
+            DiscoveryQuery(query=f"Focused query {index}", issue_ids=[f"i{index}"])
+            for index in range(25)
+        ],
     )
-    assert result.status == "unavailable" and "total search budget" in result.gaps[-1]
+    workflow, _, _ = engine([], [])
+    workflow.plan = discovery
+    workflow._acquire(
+        [
+            SourceAction(
+                tool="search_corpus",
+                arguments={"query": query.query},
+                issue_ids=query.issue_ids,
+            )
+            for query in discovery.discovery_queries
+        ]
+    )
+    assert isinstance(workflow.acquirer, FakeAcquirer)
+    assert workflow.acquirer.searches == 25
+    assert len(workflow.research.needs) == 25
 
 
 def test_related_issues_share_initial_search_without_losing_requested_outcomes() -> (
@@ -728,6 +813,7 @@ def unresolved_reading(issue_ids: tuple[str, ...] = ("i1",)) -> ReadingDecision:
                 dimension=dimension,
                 status="unresolved",
                 reason="Bu boyutun maddi etkisi eldeki kaynaklarla henüz çözülemedi.",
+                requirement_ids=[],
             )
             for identity in issue_ids
             for dimension in LegalDimension
@@ -1034,15 +1120,17 @@ def test_unbound_unknown_finding_does_not_taint_unrelated_issue_closure_or_discl
             dimension=dimension,
             status="not_applicable",
             reason="Bu dar mesele bakımından bu boyutun maddi etkisi yoktur.",
+            requirement_ids=[],
         )
         for dimension in LegalDimension
     )
     workflow._accept_reading(chosen)
     assert workflow._uncertain_issue_ids() == {"i1"}
     assert [row.status for row in workflow.issue_closures()] == ["partial", "closed"]
-    disclosed = workflow._disclose_validity(draft())
+    disclosed = workflow._bind_unresolved_issues(draft())
     assert disclosed.unresolved_issue_ids == ["i1"]
-    assert "unbound" not in disclosed.answer
+    assert disclosed.answer == draft().answer
+    assert disclosed.claims == draft().claims
 
 
 def test_honest_claimless_limitation_still_receives_entire_answer_review() -> None:
@@ -1078,10 +1166,10 @@ def test_claimless_positive_assertion_can_be_withheld_by_independent_review() ->
             plan(),
             unresolved_reading(),
             unsupported,
-            repair_reading("answer_consistency"),
+            repair_reading("all_answer_claims"),
             unsupported,
         ],
-        ["pass", "flag", "flag"],
+        ["pass", "flag:all_answer_claims", "flag:all_answer_claims"],
     )
     result = workflow.run("Soru", "")
     assert result.status == "unavailable" and result.answer is None
@@ -1465,7 +1553,7 @@ def test_unresolved_repair_gap_keeps_issue_open_and_must_be_disclosed() -> None:
     assert decision.repair_resolutions[0].correction in workflow.gaps
     with pytest.raises(ValueError, match="all unresolved"):
         workflow._validate_draft(draft())
-    disclosed = workflow._disclose_validity(draft())
+    disclosed = workflow._bind_unresolved_issues(draft())
     workflow._validate_draft(disclosed)
     assert disclosed.unresolved_issue_ids == ["i1"]
 
@@ -1491,3 +1579,494 @@ def test_repair_diagnostics_reach_writer_but_not_independent_review_input() -> N
         for state in reviewer.states
     )
     assert result.repair_resolutions and result.repair_checks
+
+
+@pytest.mark.parametrize("last_review", ["pass", "refusal"])
+def test_unassessed_review_check_can_be_repaired_but_cannot_pass_unassessed(
+    last_review: str,
+) -> None:
+    workflow, gateway, reviewer = engine(
+        [plan(), reading(), draft(), repair_reading(), draft()],
+        ["pass", "refusal", last_review],
+    )
+    result = workflow.run("Soru", "")
+    assert result.repair_used
+    assert len(reviewer.states) == 3
+    assert gateway.calls[3][1]["repair_contract"] == {
+        "required_check_ids": ["claim:c1"],
+        "grouped_check_ids_allowed": True,
+    }
+    assert result.status == ("partial" if last_review == "pass" else "unavailable")
+    if last_review == "refusal":
+        assert not result.answer
+        assert result.non_publication_reason is None
+
+
+def test_completed_rejected_final_review_is_distinct_from_provider_failure() -> None:
+    workflow, _, _ = engine(
+        [plan(), reading(), draft(), repair_reading(), draft()],
+        ["pass", "flag", "flag"],
+    )
+    result = workflow.run("Soru", "")
+    assert result.status == "unavailable" and result.answer is None
+    assert result.non_publication_reason == "review_rejected"
+    assert result.final_review is not None and result.final_review.completed
+
+
+def test_early_review_research_is_bound_executed_and_reassessed() -> None:
+    from onyx.legal_review.models import (
+        ReviewDiagnosis,
+        ReviewDiagnosisBatch,
+        ReviewResearchTask,
+    )
+
+    workflow, gateway, _ = engine([], ["pass"])
+    workflow.plan = plan()
+    workflow.ledger.add([original()], workflow.context)
+    workflow._accept_reading(reading())
+    workflow._acquire(
+        [
+            SourceAction(
+                issue_ids=["i1"],
+                tool="search_corpus",
+                arguments={"query": "Başvuru koşulları"},
+            )
+        ]
+    )
+    check = ReviewCheck(
+        id="early-validity",
+        instructions="Missing operative version?",
+        issue_id="i1",
+        dimension=LegalDimension.VALIDITY.value,
+    )
+    review = ReviewResult(completed=True, flags=[check], scores={check.id: 0.9})
+    diagnosis = ReviewDiagnosisBatch(
+        diagnoses=[
+            ReviewDiagnosis(
+                kind="research",
+                assertion="The condition is stated as currently operative.",
+                reason="The event-date version is unverified.",
+                required_change="Read the amendment history.",
+                supports=[PassageSupport(citation=1, span_number=1)],
+                research_task_ids=["validity"],
+                dimension=LegalDimension.VALIDITY,
+                check_ids=[check.id],
+            )
+        ],
+        research_tasks=[
+            ReviewResearchTask(
+                task_id="validity",
+                subject="Application condition",
+                question="Was this application condition amended by the event date?",
+                query="başvuru şartı değişiklik yürürlük",
+                existing_need_id=None,
+                supports=[PassageSupport(citation=1, span_number=1)],
+                dimension=LegalDimension.VALIDITY,
+            )
+        ],
+    )
+
+    class IndependentExaminer:
+        def examine(
+            self,
+            state: dict[str, JsonValue],
+            checks: Sequence[ReviewCheck],
+            timeout_seconds: float,
+        ) -> PublicationReview:
+            del state, checks, timeout_seconds
+            raise AssertionError("This research test must not adjudicate an answer")
+
+        def diagnose(
+            self,
+            state: dict[str, JsonValue],
+            checks: Sequence[ReviewCheck],
+            timeout_seconds: float,
+        ) -> ReviewDiagnosisBatch:
+            assert state["request"] == "Soru"
+            assert list(checks) == [check]
+            assert timeout_seconds > 0
+            return diagnosis
+
+    workflow.diagnoser = IndependentExaminer()
+    workflow._diagnose_review("Soru", "", None, review)
+    assert workflow.acquirer.searches == 2
+    assert not gateway.calls
+    searched_need_id = diagnosis.research_tasks[0].existing_need_id
+    assert searched_need_id is not None
+    request = RepairReadingDecision(
+        dimensions=[
+            DimensionAssessment(
+                issue_id="i1",
+                dimension=LegalDimension.VALIDITY,
+                status="unresolved",
+                reason="Operative amendment history is unread.",
+                requirement_ids=[],
+            )
+        ],
+        actions=[
+            SourceAction(
+                issue_ids=["i1"],
+                tool="search_corpus",
+                arguments={"query": "başvuru şartı değişiklik yürürlük"},
+                research_need_ids=[searched_need_id],
+            )
+        ],
+        repair_resolutions=[
+            RepairResolution(
+                check_ids=[check.id],
+                diagnosis="Operative amendment history is unread.",
+                correction="Read it before closing the issue.",
+                disposition="unresolved",
+                scope="research",
+                supports=[],
+            )
+        ],
+        research_resolutions=[
+            ResearchResolution(
+                check_ids=[check.id],
+                issue_ids=["i1"],
+                disposition="request_sources",
+                reason="Read the operative amendment history.",
+                supports=[],
+                missing_user_facts=[],
+            )
+        ],
+    )
+    from onyx.legal_review.evidence_resolution import EvidenceResolutionPlan
+
+    resolution_plan = EvidenceResolutionPlan(diagnosis, {check.id: {"i1"}})
+    gateway.results = [
+        resolution_plan.response_model().model_validate(
+            {
+                **request.model_dump(
+                    exclude={"repair_resolutions", "research_resolutions"}
+                ),
+                "research_resolutions": [
+                    {
+                        "slot": "r0001",
+                        **request.research_resolutions[0].model_dump(
+                            exclude={"check_ids", "issue_ids"}
+                        ),
+                    }
+                ],
+            }
+        )
+    ]
+    decision = workflow._reading("Soru", "")
+    assert gateway.response_models[-1].__name__ == "BoundEvidenceResolutionDecision"
+    assert "repair_contract" not in gateway.calls[-1][1]
+    assert gateway.calls[-1][1]["review_diagnoses"] == diagnosis.model_dump(mode="json")
+    assert workflow.issue_closures()[0].status == "open"
+    workflow._acquire(decision.actions)
+    assert workflow.acquirer.searches == 2
+    assert not workflow.pending_actions
+    assert workflow.issue_closures()[0].status == "open"
+    # Merely executing retrieval is not proof that the research question is resolved.
+    assert not workflow.repair_resolutions
+    assert workflow.research_resolutions
+
+    omitted_work = EvidenceResolutionDecision(dimensions=[], research_resolutions=[])
+    with pytest.raises(ValueError, match="Every independent research question"):
+        workflow._accept_reading(omitted_work)
+
+    missing_work = request.model_copy(deep=True)
+    missing_work.actions = []
+    missing_work.repair_resolutions[0].disposition = "correct"
+    with pytest.raises(ValueError, match="executable source operations"):
+        workflow._accept_reading(missing_work)
+
+    claimed_done = request.model_copy(deep=True)
+    claimed_done.actions = []
+    claimed_done.research_resolutions[0].disposition = "resolved"
+    claimed_done.research_resolutions[0].supports = [
+        PassageSupport(citation=1, span_number=1)
+    ]
+    with pytest.raises(ValueError, match="executed source operation"):
+        workflow._accept_reading(claimed_done)
+
+    dismissed = claimed_done.model_copy(deep=True)
+    dismissed.research_resolutions[0].disposition = "disputed"
+    with pytest.raises(ValueError, match="executed source operation"):
+        workflow._accept_reading(dismissed)
+
+    # Re-reading a known original is genuine source work; a novel citation is not required.
+    workflow.acquirer.receipts.append(
+        {
+            "tool": "read_provision",
+            "status": "found",
+            "issue_ids": ["i1"],
+            "evidence_ids": [1],
+        }
+    )
+    workflow._accept_reading(claimed_done)
+    assert workflow.research_resolutions[0].disposition == "resolved"
+
+    # The next review reuses this exact completed need instead of searching again.
+    workflow.acquirer.receipts[-1]["research_need_ids"] = [searched_need_id]
+    workflow._review_receipts_start = len(workflow.acquirer.receipts)
+    workflow._accept_reading(claimed_done)
+    assert workflow.research_resolutions[0].disposition == "resolved"
+    assert workflow.acquirer.searches == 2
+
+    # An older or newer unrelated search cannot justify this research disposition.
+    workflow.acquirer.receipts[-1]["research_need_ids"] = ["another-need"]
+    with pytest.raises(ValueError, match="executed source operation"):
+        workflow._accept_reading(claimed_done)
+    workflow.acquirer.receipts.append(
+        {
+            "tool": "search_corpus",
+            "status": "found",
+            "issue_ids": ["i1"],
+            "research_need_ids": ["another-need"],
+            "evidence_ids": [1],
+        }
+    )
+    with pytest.raises(ValueError, match="executed source operation"):
+        workflow._accept_reading(claimed_done)
+
+
+def test_final_review_starts_fresh_work_without_losing_early_audit() -> None:
+    workflow, _, _ = engine([], [])
+    workflow.plan = plan()
+    workflow.ledger.add([original()], workflow.context)
+    workflow._accept_reading(reading())
+    early = ReviewCheck(id="early", instructions="Early check", issue_id="i1")
+    final = ReviewCheck(id="final", instructions="Final check", claim_id="c1")
+    workflow._start_repair(None, ReviewResult(completed=True, flags=[early]))
+    workflow._start_repair(draft(), ReviewResult(completed=True, flags=[final]))
+    assert set(workflow.repair_checks) == {"final"}
+    assert set(workflow._repair_check_issues) == {"final"}
+    assert len(workflow.review_work_history) == 1
+
+
+def test_completed_contract_correction_is_atomic_and_available_only_once() -> None:
+    from onyx.legal_review.contracts import ReadingContractError
+
+    invalid = reading()
+    invalid.dimensions[0].requirement_ids = []
+    workflow, gateway, _ = engine([invalid, reading()], [])
+    workflow.plan = plan()
+    workflow.ledger.add([original()], workflow.context)
+    workflow._reading("Soru", "")
+    assert workflow.reading_correction_used
+    assert len(gateway.calls) == 2
+    corrected_state = gateway.calls[1][1]
+    assert corrected_state["requirements"] == []
+    assert corrected_state["dimension_assessments"] == []
+    assert corrected_state["reading_contract_correction"]
+    accepted = workflow.state("Soru", "")
+    gateway.results = [invalid]
+    with pytest.raises(ReadingContractError):
+        workflow._reading("Soru", "")
+    assert len(gateway.calls) == 3
+    assert workflow.state("Soru", "")["requirements"] == accepted["requirements"]
+    assert (
+        workflow.state("Soru", "")["dimension_assessments"]
+        == accepted["dimension_assessments"]
+    )
+
+
+def test_grouped_review_searches_are_dispatched_in_one_batch_before_reader() -> None:
+    from onyx.legal_review.models import (
+        ReviewDiagnosis,
+        ReviewDiagnosisBatch,
+        ReviewResearchTask,
+    )
+
+    workflow, gateway, _ = engine([], [])
+    workflow.plan = plan()
+    workflow.ledger.add([original()], workflow.context)
+    workflow._accept_reading(reading())
+    checks = [
+        ReviewCheck(id="basis", instructions="Check basis", issue_id="i1"),
+        ReviewCheck(id="validity", instructions="Check validity", issue_id="i1"),
+        ReviewCheck(id="exception", instructions="Check exception", issue_id="i1"),
+    ]
+    diagnoses = ReviewDiagnosisBatch(
+        diagnoses=[
+            ReviewDiagnosis(
+                kind="research",
+                assertion="The requirement is unconditional.",
+                reason="Material conditions are unread.",
+                required_change="Read the controlling conditions.",
+                supports=[PassageSupport(citation=1, span_number=1)],
+                research_task_ids=task_ids,
+                dimension=None,
+                check_ids=ids,
+            )
+            for ids, task_ids in [
+                (["basis", "validity"], ["operative", "exception"]),
+                (["exception"], ["exception"]),
+            ]
+        ],
+        research_tasks=[
+            ReviewResearchTask(
+                task_id=identity,
+                subject=subject,
+                question=question,
+                query=query,
+                existing_need_id=None,
+                dimension=dimension,
+                supports=[PassageSupport(citation=1, span_number=1)],
+            )
+            for identity, subject, question, query, dimension in [
+                (
+                    "operative",
+                    "Primary basis",
+                    "What is its operative scope?",
+                    "primary basis amendments",
+                    LegalDimension.VALIDITY,
+                ),
+                (
+                    "exception",
+                    "Eligibility exception",
+                    "When does this exception apply?",
+                    "eligibility exception conditions",
+                    LegalDimension.EXCEPTIONS,
+                ),
+            ]
+        ],
+    )
+    workflow.diagnoser = Mock()
+    workflow.diagnoser.diagnose.return_value = diagnoses
+    with patch.object(
+        workflow.acquirer, "acquire", wraps=workflow.acquirer.acquire
+    ) as acquire:
+        workflow._diagnose_review(
+            "Soru", "", None, ReviewResult(completed=True, flags=checks)
+        )
+    acquire.assert_called_once()
+    assert len(acquire.call_args.args[0]) == 2
+    assert workflow.acquirer.searches == 2
+    assert len(workflow.research.needs) == 2
+    assert all(need.attempted for need in workflow.research.needs.values())
+    assert not gateway.calls
+
+
+@pytest.mark.parametrize("disposition", ["defect", "rebutted", "disclosed_limitation"])
+def test_final_adjudication_preserves_scores_and_blocks_actual_defects(
+    disposition: str,
+) -> None:
+    workflow = prepared_engine()
+    workflow._accept_reading(reading())
+    check = ReviewCheck(
+        id="claim:c1",
+        instructions="Does the claim omit the document condition?",
+        claim_id="c1",
+    )
+    workflow.final_review = ReviewResult(
+        completed=True, scores={check.id: 0.9}, flags=[check]
+    )
+    examiner = Mock()
+    finding = PublicationFinding.model_validate(
+        {
+            "check_id": check.id,
+            "disposition": disposition,
+            "target": "assertion",
+            "answer_quotes": [draft().answer],
+            "reason": "Compare the actual answer condition with the original.",
+            "required_change": "Restore the omitted condition."
+            if disposition == "defect"
+            else None,
+            "supports": [{"citation": 1, "span_number": 1}],
+        }
+    )
+    adjudication = PublicationReview(findings=[finding])
+    examiner.examine.return_value = adjudication
+    workflow.diagnoser = examiner
+    assert workflow._final_review_is_publishable("Soru", "", draft()) is (
+        disposition != "defect"
+    )
+    assert workflow.final_adjudication == adjudication
+    assert workflow.final_review.scores == {
+        check.id: 0.9
+    } and workflow.final_review.flags == [check]
+    examiner.diagnose.assert_not_called()
+    assert examiner.examine.call_args.args[0]["draft"] == draft().model_dump(
+        mode="json"
+    )
+
+
+@pytest.mark.parametrize(
+    "invalid", ["missing_check", "unknown_passage", "private_quote"]
+)
+def test_final_adjudication_cannot_bypass_evidence_or_inventory(invalid: str) -> None:
+    workflow = prepared_engine()
+    workflow._accept_reading(reading())
+    check = ReviewCheck(id="dimension", instructions="Check")
+    workflow.final_review = ReviewResult(
+        completed=True, scores={check.id: 0.9}, flags=[check]
+    )
+    examiner = Mock()
+    examiner.examine.return_value = PublicationReview(
+        findings=[
+            PublicationFinding(
+                check_id="wrong" if invalid == "missing_check" else check.id,
+                disposition="rebutted",
+                target="assertion",
+                required_change=None,
+                answer_quotes=[
+                    "Private research claim absent from answer"
+                    if invalid == "private_quote"
+                    else draft().answer
+                ],
+                reason="The condition is preserved.",
+                supports=[
+                    PassageSupport(
+                        citation=1,
+                        span_number=999 if invalid == "unknown_passage" else 1,
+                    )
+                ],
+            )
+        ]
+    )
+    workflow.diagnoser = examiner
+    with pytest.raises(ValueError):
+        workflow._final_review_is_publishable("Soru", "", draft())
+    assert workflow.final_adjudication is None
+
+
+def test_rebutted_draft_flags_do_not_trigger_research_or_rewrite() -> None:
+    workflow, gateway, reviewer = engine([plan(), reading(), draft()], ["pass", "flag"])
+    examiner = Mock()
+    examiner.examine.return_value = PublicationReview(
+        findings=[
+            PublicationFinding(
+                check_id="claim:c1",
+                disposition="rebutted",
+                target="assertion",
+                answer_quotes=[draft().answer],
+                reason="The required submission is already stated.",
+                required_change=None,
+                supports=[PassageSupport(citation=1, span_number=1)],
+            )
+        ]
+    )
+    workflow.diagnoser = examiner
+    result = workflow.run("Soru", "")
+    assert result.answer is not None and result.status == "partial"
+    assert not result.repair_used and len(gateway.calls) == 3
+    assert len(reviewer.states) == 2 and result.final_adjudication is not None
+    assert result.final_review is not None and result.final_review.flags
+    examiner.examine.assert_called_once()
+    examiner.diagnose.assert_not_called()
+
+
+def test_source_usage_is_in_the_same_review_inventory_without_new_issues() -> None:
+    workflow = prepared_engine()
+    workflow._accept_reading(reading())
+    assert workflow.plan is not None
+    original_plan = workflow.plan.model_dump()
+    before = dict(workflow.context.budget.used)
+    research_checks = workflow._checks(draft=False)
+    answer_checks = workflow._checks(draft=True, answer=draft())
+    assert not any(check.source_citation for check in research_checks)
+    source_checks = [check for check in answer_checks if check.source_citation]
+    assert [(check.id, check.source_citation) for check in source_checks] == [
+        ("source_use:1", 1)
+    ]
+    assert {check.id for check in answer_checks}.issuperset(
+        {"claim:c1", "source_conditions", "all_answer_claims", "request_coverage"}
+    )
+    assert workflow.plan.model_dump() == original_plan
+    assert workflow.context.budget.used == before

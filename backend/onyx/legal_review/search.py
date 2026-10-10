@@ -46,9 +46,20 @@ class DiscoverySearchTool(SearchTool):
         override_kwargs: SearchToolOverrideKwargs,
         **llm_kwargs: Any,
     ) -> ToolResponse:
+        # The parent request explains the case; each source operation has its own
+        # evidence question, which must remain the relevance target during reranking.
+        target = llm_kwargs.get("evidence_target")
+        if not isinstance(target, str) or not target.strip():
+            queries = llm_kwargs.get("queries", [])
+            target = (
+                "\n\n".join(query for query in queries if isinstance(query, str))
+                if isinstance(queries, list)
+                else ""
+            )
         bounded = SearchToolRetrievalOverrideKwargs.model_validate(
             {
                 **override_kwargs.model_dump(mode="python"),
+                "rerank_context": target or None,
                 "skip_query_expansion": True,
                 "per_lane_num_hits": 256,
                 "rerank_candidate_limit": 384,

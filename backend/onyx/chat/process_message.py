@@ -1693,7 +1693,6 @@ def _run_models(
                         chat_session_id=setup.chat_session.id,
                         user_message_id=setup.user_message.id,
                         assistant_message_id=setup.reserved_messages[model_idx].id,
-                        reasoning_effort=ReasoningEffort.LOW,
                         include_citations=setup.new_msg_req.include_citations,
                         cache=setup.cache,
                         custom_agent_prompt=setup.custom_agent_prompt,

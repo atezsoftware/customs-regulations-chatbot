@@ -184,7 +184,10 @@ def decision_provider(
         is_public=public,
         groups=[UserGroup(id=value) for value in groups or []],
         personas=[Persona(id=value) for value in personas or []],
-        model_configurations=[ModelConfiguration(name="gpt-6-luna", is_visible=True)],
+        model_configurations=[
+            ModelConfiguration(name="gpt-6-luna", is_visible=True),
+            ModelConfiguration(name="gpt-6.1-sol", is_visible=True),
+        ],
     )
 
 
@@ -231,6 +234,7 @@ def test_decision_uses_accessible_official_openai_without_mutating_provider(
     sql = str(statement.compile(compile_kwargs={"literal_binds": True}))
     assert "llm_provider.provider = 'openai'" in sql
     assert "model_configuration.name = 'gpt-6-luna'" in sql
+    assert "model_configuration.name = 'gpt-6.1-sol'" in sql
     assert "model_configuration.is_visible = true" in sql
 
 

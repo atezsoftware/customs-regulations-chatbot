@@ -9,6 +9,14 @@ from onyx.legal_review.drafting import GeneratedDraft, compile_draft
 from onyx.legal_review.passages import PassageReference
 
 
+def application_payload() -> dict[str, str | None]:
+    return {
+        "source_conditions": "The procedure requires the specified document.",
+        "fact_application": "The case requests the application procedure.",
+        "remaining_uncertainty": "The document has not yet been obtained.",
+    }
+
+
 def draft_payload() -> dict[str, Any]:
     return {
         "blocks": [
@@ -20,6 +28,7 @@ def draft_payload() -> dict[str, Any]:
                     {
                         "claim_id": "procedure-and-evidence",
                         "issue_ids": ["I1", "I2"],
+                        "application": application_payload(),
                         "supports": [
                             {"citation": 1, "span_number": 2},
                             {"citation": 2, "span_number": 1},
@@ -34,6 +43,7 @@ def draft_payload() -> dict[str, Any]:
                     {
                         "claim_id": "refund",
                         "issue_ids": ["I1"],
+                        "application": application_payload(),
                         "supports": [{"citation": 2, "span_number": 3}],
                     }
                 ],
@@ -191,6 +201,7 @@ def test_host_markers_preserve_closed_fences_and_following_prose(fence: str) -> 
                         {
                             "claim_id": "procedure",
                             "issue_ids": ["I1"],
+                            "application": application_payload(),
                             "supports": [{"citation": 1, "span_number": 1}],
                         }
                     ],
@@ -220,6 +231,7 @@ def test_host_markers_preserve_markdown_table_body() -> None:
                         {
                             "claim_id": "procedure",
                             "issue_ids": ["I1"],
+                            "application": application_payload(),
                             "supports": [{"citation": 1, "span_number": 1}],
                         }
                     ],
@@ -233,3 +245,101 @@ def test_host_markers_preserve_markdown_table_body() -> None:
     assert "<td>Başvuru</td>" in html and "<td>Belge</td>" in html
     assert "</table>\n<p>[1]</p>" in html
     assert compiled.claims[0].answer_excerpt == text + "\n\n[1]"
+
+
+@pytest.mark.parametrize(
+    "field", ["source_conditions", "fact_application", "remaining_uncertainty"]
+)
+def test_application_cannot_omit_a_source_to_case_check(field: str) -> None:
+    payload = draft_payload()
+    del payload["blocks"][1]["claims"][0]["application"][field]
+    with pytest.raises(ValidationError):
+        GeneratedDraft.model_validate(payload)
+
+
+def test_private_application_does_not_become_an_answer_or_independent_review_claim() -> (
+    None
+):
+    payload = draft_payload()
+    private_note = "Internal prerequisite analysis distinct from the published answer."
+    payload["blocks"][1]["claims"][0]["application"]["fact_application"] = private_note
+    generated = GeneratedDraft.model_validate(payload)
+    compiled = compile_draft(generated)
+    assert private_note in str(generated.model_dump())
+    assert private_note not in str(compiled.model_dump())
+    assert compiled.claims[0].supports == generated.blocks[1].claims[0].supports
+    assert compiled.claims[0].answer_excerpt == generated.blocks[1].text
+
+
+def test_inline_original_is_bound_without_changing_prose_or_asserting_entailment() -> (
+    None
+):
+    from onyx.asv3.evidence import EvidenceLedger
+    from onyx.asv3.models import RunContext
+    from onyx.legal_review.adjudication import cited_source_checks
+    from onyx.legal_review.passages import resolve_passage
+    from tests.unit.onyx.legal_review.test_engine import original
+
+    ledger = EvidenceLedger()
+    ledger.add([original()], RunContext())
+    payload = draft_payload()
+    payload["blocks"] = [payload["blocks"][2]]
+    payload["blocks"][0]["text"] = "İlgili koşul. [1] [2]"
+    generated = GeneratedDraft.model_validate(payload)
+    compiled = compile_draft(generated, ledger=ledger)
+    assert compiled.answer == generated.blocks[0].text
+    assert compiled.claims[0].supports == generated.blocks[0].claims[0].supports
+    inline = compiled.claims[1]
+    assert inline.claim_id.startswith("inline:")
+    assert inline.issue_ids == ["I1"]
+    assert inline.answer_excerpt == generated.blocks[0].text
+    assert inline.supports == [PassageReference(citation=1, span_number=1)]
+    assert resolve_passage(inline.supports[0], ledger).quotation == original().text
+    # It remains a source-use review obligation, not a positive legal assessment.
+    assert any(check.source_citation == 1 for check in cited_source_checks(compiled))
+
+
+def test_unknown_inline_original_is_not_discarded_or_promoted_to_evidence() -> None:
+    from onyx.asv3.evidence import EvidenceLedger
+    from onyx.asv3.models import RunContext
+    from tests.unit.onyx.legal_review.test_engine import original
+
+    ledger = EvidenceLedger()
+    ledger.add([original()], RunContext())
+    payload = draft_payload()
+    payload["blocks"][1]["text"] = "İddia. [999]"
+    with pytest.raises(ValueError, match="canonical original"):
+        compile_draft(GeneratedDraft.model_validate(payload), ledger=ledger)
+
+
+def test_claimless_citation_needs_an_existing_issue_binding() -> None:
+    from onyx.asv3.evidence import EvidenceLedger
+    from onyx.asv3.models import RunContext
+    from tests.unit.onyx.legal_review.test_engine import original
+
+    ledger = EvidenceLedger()
+    ledger.add([original()], RunContext())
+    generated = GeneratedDraft.model_validate(
+        {
+            "blocks": [{"block_id": "unscoped", "text": "İddia. [1]", "claims": []}],
+            "unresolved_issue_ids": ["I1"],
+        }
+    )
+    with pytest.raises(ValueError, match="known issue binding"):
+        compile_draft(generated, ledger=ledger)
+
+
+def test_qualified_summary_can_reuse_a_cited_sources_existing_issue() -> None:
+    from onyx.asv3.evidence import EvidenceLedger
+    from onyx.asv3.models import RunContext
+    from tests.unit.onyx.legal_review.test_engine import original
+
+    ledger = EvidenceLedger()
+    ledger.add([original()], RunContext())
+    payload = draft_payload()
+    payload["blocks"][0]["text"] = "Başvuru koşulludur. [1]"
+    generated = GeneratedDraft.model_validate(payload)
+    compiled = compile_draft(generated, ledger=ledger)
+    summary = next(c for c in compiled.claims if c.claim_id == "inline:heading")
+    assert summary.issue_ids == ["I1", "I2"]
+    assert summary.answer_excerpt == generated.blocks[0].text
