@@ -2352,6 +2352,97 @@ def test_final_adjudication_preserves_scores_and_blocks_actual_defects(
     )
 
 
+@pytest.mark.parametrize("unavailable", ["repair_used", "publication_reserve"])
+def test_research_readiness_verdict_is_not_reused_for_terminal_publication(
+    unavailable: str,
+) -> None:
+    import time
+
+    workflow = prepared_engine()
+    workflow._accept_reading(reading())
+    check = ReviewCheck(id="claim:c1", claim_id="c1", instructions="Check condition")
+    workflow.final_review = ReviewResult(
+        method="independent_adjudication",
+        completed=True,
+        scores={check.id: 0.0},
+        flags=[check],
+    )
+    examiner = Mock()
+    examiner.examine.return_value = PublicationReview(
+        findings=[
+            PublicationFinding(
+                check_id=check.id,
+                disposition="rebutted",
+                target="assertion",
+                reason="Condition already preserved.",
+                required_change=None,
+                supports=[PassageSupport(citation=1, span_number=1)],
+                answer_quotes=[draft().answer],
+            )
+        ]
+    )
+    workflow.diagnoser = examiner
+    assert workflow._final_review_is_publishable("Soru", "", draft())
+    assert examiner.examine.call_args.args[0]["review_purpose"] == "research_readiness"
+    assert workflow._final_review_is_publishable("Soru", "", draft())
+    examiner.examine.assert_called_once()
+    if unavailable == "repair_used":
+        workflow.repair_used = True
+    else:
+        workflow.context.deadline = (
+            time.monotonic()
+            + workflow.policy.publication_reserve_seconds
+            + workflow.policy.writer_reserve_seconds
+            - 1
+        )
+    assert workflow._final_review_is_publishable("Soru", "", draft())
+    assert examiner.examine.call_count == 2
+    assert examiner.examine.call_args.args[0]["review_purpose"] == "publication"
+
+
+def test_uninvestigated_effect_dispatches_research_despite_settled_reading() -> None:
+    workflow = prepared_engine()
+    workflow._accept_reading(reading())
+    check = ReviewCheck(
+        id="judicial-effect",
+        issue_id="i1",
+        dimension="case_law_and_rulings",
+        instructions="Does a judicial effect change the document condition?",
+    )
+    review = ReviewResult(completed=True, scores={check.id: 0.9}, flags=[check])
+    workflow.final_review = review
+    examiner = Mock()
+    examiner.examine.return_value = PublicationReview(
+        findings=[
+            PublicationFinding(
+                check_id=check.id,
+                disposition="defect",
+                target="assertion",
+                reason="The administrative explanation does not establish judicial effect.",
+                required_change="Investigate the primary rule's judicial effect.",
+                supports=[PassageSupport(citation=1, span_number=1)],
+                answer_quotes=[draft().answer],
+                repair_kind="research",
+                research_query="Application document condition judicial effect",
+            )
+        ]
+    )
+    workflow.diagnoser = examiner
+    assert not workflow._final_review_is_publishable("Soru", "", draft())
+    workflow.draft_adjudication = workflow.final_adjudication
+    workflow._diagnose_review("Soru", "", draft(), review)
+    examiner.diagnose.assert_not_called()
+    assert isinstance(workflow.acquirer, FakeAcquirer)
+    searches = [a for a in workflow.acquirer.actions if a.tool == "search_corpus"]
+    assert len(searches) == 1
+    assert (
+        searches[0].arguments["query"]
+        == "Application document condition judicial effect"
+    )
+    assert searches[0].issue_ids == ["i1"]
+    assert searches[0].research_need_ids
+
+
 @pytest.mark.parametrize(
     "invalid", ["missing_check", "unknown_passage", "private_quote"]
 )

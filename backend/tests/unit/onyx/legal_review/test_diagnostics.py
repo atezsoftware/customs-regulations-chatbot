@@ -943,6 +943,107 @@ def test_parallel_publication_preserves_complete_context_and_all_checks() -> Non
             examiner.examine(state, checks, 30)
 
 
+@pytest.mark.parametrize("research_available", [True, False])
+def test_examiner_separates_material_research_from_terminal_publication(
+    research_available: bool,
+) -> None:
+    from onyx.legal_review.adjudication import (
+        PUBLICATION_PROMPT,
+        RESEARCH_EXAMINATION_PROMPT,
+    )
+
+    state: dict[str, JsonValue] = {
+        "review_purpose": "research_readiness" if research_available else "publication",
+        "draft": {"answer": "The application requires the document. [1]"},
+        "original_evidence": [
+            {
+                "citation": 1,
+                "source_id": "primary-source",
+                "metadata": {"title": "Application rule"},
+                "passages": [{"span_number": 1, "text": "Document required."}],
+            }
+        ],
+        "requirements": [
+            {"requirement_id": "primary", "supports": [{"citation": 1}]},
+            {"requirement_id": "implementation", "supports": [{"citation": 1}]},
+        ],
+        "dimension_assessments": [
+            {
+                "issue_id": "eligibility",
+                "dimension": "legal_basis_and_hierarchy",
+                "requirement_ids": ["primary", "implementation"],
+            }
+        ],
+        "research_needs": [{"subject": "application", "status": "complete"}],
+        "source_operations": [
+            {
+                "tool": "search_corpus",
+                "arguments": {"query": "application document"},
+                "data": {"total_hits": 2, "irrelevant_payload": "navigation"},
+            }
+        ],
+    }
+    check = ReviewCheck(
+        id="judicial-effect",
+        issue_id="eligibility",
+        dimension="case_law_and_rulings",
+        instructions="Could a judicial effect change the application condition?",
+    )
+
+    def complete(
+        packet: dict[str, JsonValue],
+        response_model: type[StrictModel],
+        prompt: str,
+        *_args: object,
+    ) -> StrictModel:
+        assert prompt == (
+            RESEARCH_EXAMINATION_PROMPT if research_available else PUBLICATION_PROMPT
+        )
+        received = cast(dict[str, JsonValue], packet["state"])
+        assert received["review_purpose"] == state["review_purpose"]
+        assert received["draft"] == state["draft"]
+        originals = cast(list[dict[str, JsonValue]], received["original_evidence"])
+        assert originals[0]["passages"] == [
+            {"span_number": 1, "text": "Document required."}
+        ]
+        flags = cast(list[dict[str, JsonValue]], packet["flagged_checks"])
+        assert flags[0]["relevant_finding_ids"] == ["implementation", "primary"]
+        assert ("research_needs" in received) is research_available
+        assert ("research_record" in received) is research_available
+        assert "source_operations" not in received
+        if research_available:
+            record = cast(list[dict[str, JsonValue]], received["research_record"])
+            assert record[0]["arguments"] == {"query": "application document"}
+            assert record[0]["result_limitations"] == {"total_hits": 2}
+        return response_model.model_validate(
+            {
+                "q0001": {
+                    "disposition": "defect" if research_available else "rebutted",
+                    "target": "assertion",
+                    "reason": "Investigate the primary rule's judicial effect."
+                    if research_available
+                    else "The answer preserves the established condition.",
+                    "required_change": "Establish the judicial effect."
+                    if research_available
+                    else None,
+                    "repair_kind": "research" if research_available else None,
+                    "research_query": "Application rule judicial effect"
+                    if research_available
+                    else None,
+                    "supports": [{"citation": 1, "span_number": 1}],
+                    "answer_spans": ["a0001"],
+                }
+            }
+        )
+
+    examiner = OpenAIReviewDiagnoser(api_key="test")
+    with patch.object(examiner, "_complete", side_effect=complete) as call:
+        result = examiner.examine(state, [check], 30)
+    call.assert_called_once()
+    assert (result.findings[0].repair_kind == "research") is research_available
+    assert "source_operations" in state
+
+
 def test_editor_dispositions_bind_every_check_in_provider_schema() -> None:
     examiner = OpenAIReviewDiagnoser(api_key="test")
     state: dict[str, JsonValue] = {

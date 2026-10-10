@@ -14,6 +14,7 @@ from pydantic import Field, JsonValue, create_model
 
 from onyx.legal_review.adjudication import (
     PUBLICATION_PROMPT,
+    RESEARCH_EXAMINATION_PROMPT,
     publication_response_model,
 )
 from onyx.legal_review.drafting import DraftEdits, EditorialEdits
@@ -36,7 +37,11 @@ from onyx.legal_review.models import (
     StrictModel,
 )
 from onyx.legal_review.research_planning import ResearchPlan, question_response_type
-from onyx.legal_review.review_scope import publication_state, scope_review_state
+from onyx.legal_review.review_scope import (
+    publication_state,
+    research_examination_state,
+    scope_review_state,
+)
 from onyx.legal_review.streaming import Deadline, deadline_transport
 from onyx.legal_review.transport import model_state
 from onyx.prompts.legal_review.prompts import CORPUS_CURRENCY, RESEARCH_PLANNING_PROMPT
@@ -547,12 +552,20 @@ prerequisite even when several findings concern another part of its block.
             for index, passage in enumerate(draft["answer"].split("\n\n"), 1)
             if passage.strip()
         }
+        research_available = state.get("review_purpose") == "research_readiness"
+        review_state = (
+            research_examination_state(state)
+            if research_available
+            else publication_state(state)
+        )
         packet: dict[str, JsonValue] = {
-            "state": model_state(
-                publication_state(state), LLMFlow.LEGAL_REVIEW_DIAGNOSIS
-            ),
+            "state": model_state(review_state, LLMFlow.LEGAL_REVIEW_DIAGNOSIS),
             "flagged_checks": [
-                {"slot": f"q{index:04d}", **check.model_dump(mode="json")}
+                {
+                    "slot": f"q{index:04d}",
+                    **check.model_dump(mode="json"),
+                    "relevant_finding_ids": _check_scope(review_state, check),
+                }
                 for index, check in enumerate(checks, 1)
             ],
             "answer_passages": dict(answer_spans),
@@ -562,7 +575,9 @@ prerequisite even when several findings concern another part of its block.
             parsed = self._complete(
                 packet,
                 publication_response_model(checks, answer_spans),
-                PUBLICATION_PROMPT,
+                RESEARCH_EXAMINATION_PROMPT
+                if research_available
+                else PUBLICATION_PROMPT,
                 LLMFlow.LEGAL_REVIEW_DIAGNOSIS,
                 timeout_seconds,
                 _MODEL_OUTPUT_CAPACITY,

@@ -7,7 +7,7 @@ import math
 import time
 from collections.abc import Callable, Sequence
 from datetime import date
-from typing import Literal, Protocol, TypeVar
+from typing import Literal, Protocol, TypeVar, cast
 
 from pydantic import BaseModel, JsonValue
 
@@ -59,7 +59,7 @@ from onyx.legal_review.passages import (
 )
 from onyx.legal_review.planning import InitialPlanContract
 from onyx.legal_review.research import ResearchLedger
-from onyx.legal_review.review_scope import scope_review_state
+from onyx.legal_review.review_scope import ReviewPurpose, scope_review_state
 from onyx.legal_review.source_accounting import SourceAccountant
 from onyx.legal_review.transport import model_state
 from onyx.legal_review.writer_coverage import WriterCoverageContract
@@ -227,6 +227,7 @@ class LegalReviewEngine:
         self.final_adjudication: PublicationReview | None = None
         self.draft_adjudication: PublicationReview | None = None
         self.adjudication_answer_revision: str | None = None
+        self.adjudication_review_purpose: ReviewPurpose | None = None
         self.editor_verification_passed = False
         self.review_work_history: list[JsonValue] = []
         self.research_resolutions: list[ResearchResolution] = []
@@ -865,6 +866,23 @@ class LegalReviewEngine:
             for support in task.supports:
                 validate_support(support, self.ledger)
 
+    def _answer_review_purpose(self) -> ReviewPurpose:
+        return (
+            "research_readiness"
+            if not self.repair_used
+            and self.context.deadline - time.monotonic()
+            > self.policy.publication_reserve_seconds
+            + self.policy.writer_reserve_seconds
+            else "publication"
+        )
+
+    def _answer_examination_state(
+        self, request: str, history: str, draft: DraftAnswer
+    ) -> dict[str, JsonValue]:
+        state = self.state(request, history, draft)
+        state["review_purpose"] = self._answer_review_purpose()
+        return state
+
     def _final_review_is_publishable(
         self, request: str, history: str, draft: DraftAnswer
     ) -> bool:
@@ -875,6 +893,7 @@ class LegalReviewEngine:
             and review.method == "independent_adjudication"
             and self.final_adjudication is not None
             and self.adjudication_answer_revision == answer_revision(draft.answer)
+            and self.adjudication_review_purpose == self._answer_review_purpose()
         ):
             return all(
                 row.disposition != "defect" for row in self.final_adjudication.findings
@@ -887,8 +906,9 @@ class LegalReviewEngine:
         if self.diagnoser is None:
             return False
         self.context.check_active()
+        examination_state = self._answer_examination_state(request, history, draft)
         adjudication = self.diagnoser.examine(
-            self.state(request, history, draft),
+            examination_state,
             review.flags,
             min(
                 self.policy.publication_review_seconds,
@@ -906,10 +926,14 @@ class LegalReviewEngine:
         self._validate_publication_review(adjudication, review.flags, draft)
         self.final_adjudication = adjudication
         self.adjudication_answer_revision = answer_revision(draft.answer)
+        self.adjudication_review_purpose = cast(
+            ReviewPurpose, examination_state["review_purpose"]
+        )
         with graph_step("legal_review.final_adjudication", {}) as step:
             step.output_value = {
                 **adjudication.model_dump(mode="json"),
                 "answer_revision": self.adjudication_answer_revision,
+                "review_purpose": self.adjudication_review_purpose,
             }
         self.context.check_active()
         return all(row.disposition != "defect" for row in adjudication.findings)
@@ -970,6 +994,7 @@ class LegalReviewEngine:
             self._validate_publication_review(adjudication, checks, draft)
             self.final_adjudication = adjudication
             self.adjudication_answer_revision = answer_revision(draft.answer)
+            self.adjudication_review_purpose = "publication"
             self.editor_verification_passed = all(
                 row.disposition != "defect" for row in adjudication.findings
             )
@@ -2066,8 +2091,11 @@ class LegalReviewEngine:
                 },
             ) as step:
                 try:
+                    examination_state = self._answer_examination_state(
+                        request, history, draft
+                    )
                     adjudication = self.diagnoser.examine(
-                        self.state(request, history, draft),
+                        examination_state,
                         checks,
                         min(
                             self.policy.publication_review_seconds,
@@ -2083,6 +2111,9 @@ class LegalReviewEngine:
                     self._validate_publication_review(adjudication, checks, draft)
                     self.final_adjudication = adjudication
                     self.adjudication_answer_revision = answer_revision(draft.answer)
+                    self.adjudication_review_purpose = cast(
+                        ReviewPurpose, examination_state["review_purpose"]
+                    )
                     defects = {
                         row.check_id
                         for row in adjudication.findings
@@ -2101,6 +2132,7 @@ class LegalReviewEngine:
                         "status": "completed",
                         "method": result.method,
                         "answer_revision": self.adjudication_answer_revision,
+                        "review_purpose": self.adjudication_review_purpose,
                         "adjudication": adjudication.model_dump(mode="json"),
                     }
                 except (ValueError, TimeoutError, RunStopped) as error:
