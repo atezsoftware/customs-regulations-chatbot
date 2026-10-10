@@ -380,19 +380,17 @@ def _run(
             + (result.gaps[-1] if result.gaps else "Review incomplete."),
         )
     final = result.answer
-    publication_context = context
-    if result.publication_mode != "reviewed":
-        # The generation deadline stops models/tools, not delivery of retained work.
-        # Authorization, immutable-source checks and user cancellation still apply.
-        publication_context = RunContext(
-            run_id=context.run_id,
-            language=context.language,
-            scope=context.scope,
-            services=context.services,
-            budget=context.budget,
-            timeout_seconds=30,
-            cancelled=context.is_cancelled,
-        )
+    # Generation expiry cannot revoke an already retained or verified answer.
+    # Authorization, immutable-source checks and user cancellation still apply.
+    publication_context = RunContext(
+        run_id=context.run_id,
+        language=context.language,
+        scope=context.scope,
+        services=context.services,
+        budget=context.budget,
+        timeout_seconds=30,
+        cancelled=context.is_cancelled,
+    )
     if result.status == "partial":
         prefix = (
             "Kısmi yanıt" if context.language.startswith("tr") else "Partial answer"

@@ -446,8 +446,12 @@ def test_review_rejection_cannot_publish_answer_or_hide_incomplete_review(
 
 
 @pytest.mark.parametrize("revoke", [False, True])
-def test_expired_generation_delivers_partial_with_citations_after_authorization_check(
-    runtime_fixture: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, revoke: bool
+@pytest.mark.parametrize("reviewed", [False, True])
+def test_expired_generation_delivers_retained_answer_after_authorization_check(
+    runtime_fixture: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+    revoke: bool,
+    reviewed: bool,
 ) -> None:
     fixture = runtime_fixture
     fixture.broker.reject_publication = revoke
@@ -456,9 +460,10 @@ def test_expired_generation_delivers_partial_with_citations_after_authorization_
         engine.ledger.add([original()], engine.context)
         engine.context.deadline = 0
         return WorkflowResult(
-            status="partial",
-            publication_mode="limit_reached",
-            answer=draft().answer + "\n\nSon kontrol tamamlanamadı.",
+            status="verified" if reviewed else "partial",
+            publication_mode="reviewed" if reviewed else "limit_reached",
+            final_review=ReviewResult(completed=True) if reviewed else None,
+            answer=draft().answer,
         )
 
     monkeypatch.setattr(runtime.LegalReviewEngine, "run", exhausted)
@@ -469,11 +474,12 @@ def test_expired_generation_delivers_partial_with_citations_after_authorization_
         return
     runtime.run_legal_review_loop(**fixture.arguments)
     rendered = fixture.state.get_answer_tokens()
-    assert rendered and RULE in rendered and "Kısmi yanıt" in rendered
+    assert rendered and RULE in rendered
+    assert ("Kısmi yanıt" in rendered) is not reviewed
     assert fixture.broker.revalidated
     assert any(isinstance(p.obj, CitationInfo) for p in fixture.packets)
-    assert (
-        fixture.checkpoints[-1]["legal_review"]["publication_mode"] == "limit_reached"
+    assert fixture.checkpoints[-1]["legal_review"]["publication_mode"] == (
+        "reviewed" if reviewed else "limit_reached"
     )
 
 
