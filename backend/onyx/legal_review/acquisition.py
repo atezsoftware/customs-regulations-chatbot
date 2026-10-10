@@ -64,7 +64,9 @@ class SourceAcquirer:
         if not items:
             return False
         end = (
-            self.context.deadline - self.policy.publication_reserve_seconds - 60
+            self.context.deadline
+            - self.policy.publication_reserve_seconds
+            - self.policy.writer_reserve_seconds
             if finalizing
             else self.context.research_deadline
         )
@@ -195,7 +197,7 @@ class SourceAcquirer:
                 deadline=self.context.deadline,
                 research_deadline=self.context.deadline
                 - self.policy.publication_reserve_seconds
-                - 60,
+                - self.policy.writer_reserve_seconds,
                 cancelled=self.context.is_cancelled,
             )
             if finalizing

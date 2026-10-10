@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+import re
+
 from pydantic import Field, field_validator, model_validator
 
 from onyx.asv3.citation_numbers import extract_citation_numbers
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.legal_review.models import AnswerClaim, DraftAnswer, StrictModel
-from onyx.legal_review.passages import PassageReference, source_passage_references
+from onyx.legal_review.passages import (
+    PassageReference,
+    resolve_passage,
+    source_passage_references,
+)
 
 
 class ClaimApplication(StrictModel):
@@ -112,14 +118,43 @@ def compile_draft(
     rendered: list[tuple[GeneratedBlock, str]] = []
     inline_claims: list[AnswerClaim] = []
     for block in checked.blocks:
-        cited = set(extract_citation_numbers(block.text))
+
+        def render_selector(match: re.Match[str]) -> str:
+            support = PassageReference(
+                citation=int(match[1]), span_number=int(match[2])
+            )
+            if ledger is not None:
+                resolve_passage(support, ledger)
+            elif support not in [
+                ref for claim in block.claims for ref in claim.supports
+            ]:
+                raise ValueError("Inline passage selector has no canonical binding")
+            return f"[{support.citation}]"
+
+        def render_group(match: re.Match[str]) -> str:
+            return (
+                "["
+                + re.sub(
+                    r"(\d+):(\d+)",
+                    lambda selector: render_selector(selector)[1:-1],
+                    match[1],
+                )
+                + "]"
+            )
+
+        prose = re.sub(
+            r"\[(\d+(?::\d+)?(?:\s*,\s*\d+(?::\d+)?)*)\]",
+            render_group,
+            block.text,
+        )
+        cited = set(extract_citation_numbers(prose))
         selected = dict.fromkeys(
             support.citation for claim in block.claims for support in claim.supports
         )
         missing = [citation for citation in selected if citation not in cited]
         markers = " ".join(f"[{citation}]" for citation in missing)
         # A suffix on a closing fence or table row would change Markdown structure.
-        text = block.text + ("\n\n" + markers if markers else "")
+        text = prose + ("\n\n" + markers if markers else "")
         rendered.append((block, text))
         inline_only = sorted(cited - selected.keys())
         if ledger is not None and inline_only:

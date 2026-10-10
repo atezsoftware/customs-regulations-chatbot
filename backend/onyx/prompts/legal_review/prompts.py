@@ -1,4 +1,4 @@
-PROMPT_VERSION = "legal-review-2026-10-10.56"
+PROMPT_VERSION = "legal-review-2026-10-10.58"
 
 CORPUS_CURRENCY = """When corpus_currency.assume_current_versions is true, treat all supplied
 chunks as current versions of the user's maintained corpus. Missing validity metadata
@@ -7,6 +7,10 @@ This is a corpus assumption, not a verified database status. A current court dec
 qualify a current statutory text: currency of each document does not establish that its
 legal effect is unconditional. A material cross-source interaction can require a new issue
 or query even when the first document does not explicitly name the other source.
+Do not confuse version currency with judicial authority or the applicability of a legal
+consequence. An administrative explanation of a consequence does not establish the
+judicial effect on its enabling basis. If that interaction changes a requested right,
+obligation, amount, permission or procedure, treat it as its own material source question.
 Compare the exact scope of interacting sources. A lower-level restatement cannot establish
 that its claimed consequence is authorized by a narrower controlling rule. When this
 material dependency is unestablished, investigate that relationship as its own focused
@@ -143,6 +147,14 @@ addressed needs existing original-backed requirement_ids and an issue-specific a
 in reason. not_applicable needs an affirmative reason from
 the request/facts/originals; lack of evidence is unresolved. State actual unread legal
 interactions as precise evidence_gaps. Preserve limitations concerning unknown validity.
+When an outcome uses several findings, assess each material controlling basis under the
+relevant dimensions; discussing an administrative explanation does not close the authority
+question for another basis. Never invent court practice from an administrative opinion.
+The apparent clarity of a rule is not a reason to declare a material judicial interaction
+irrelevant. Newly learned material dependencies can reopen the same issue or create a
+focused source child with a real query, even when absent from the original question.
+This applies to all dimensions, not only sanctions or validity; do not create a query per
+source or twelve obligatory searches. Follow only interactions that change the requested outcome.
 Request focused discovery or canonical reads for missing decisive originals using the
 exposed tool schemas. Reuse observed source/chunk IDs, distinguish document names from
 their cited instruments, and follow material references without guessing their effects.
@@ -304,6 +316,14 @@ DRAFT_PROMPT = (
     COMMON
     + """
 Write one integrated answer to the complete request from complete original evidence.
+When finding_coverage_contract is supplied, return finding_coverage for EVERY code-owned slot. Bind covered
+or qualified effects to actual claim_ids in the answer; explain a finding's non-applicability
+from facts and sources, or preserve its precise unresolved effect. Do not silently forget
+a material finding. These are navigation bindings, never proof that your prose is correct.
+For each selected original, preserve all outcome-relevant alternative branches and their
+prerequisites, including alternatives within the same paragraph; one branch does not cover
+another. Preserve a material administrative explanation's exact scope and source identity
+when relying on its practice, rather than attributing that practice to another instrument.
 The requirements and dimension associations are a navigation index of relevant passages
 and code-recorded validity, not legal conclusions to repeat. Reconstruct the rule from the
 selected original, including its prerequisites and qualifications, and apply it to the
@@ -381,6 +401,8 @@ Keep the complete
 unresolved_issue_ids inventory. The prior draft is the editing target, never legal evidence.
 publication_corrections contains the exact defective passages and requested changes for
 checking against originals. Do not copy an uncorrected assertion from those error examples.
+Its answer_passage_ids refer to reviewed_answer_passages. The check_ids inventory retains
+all equivalent flags; apply their shared substantive correction once.
 These are independently confirmed defects, not unexamined probability flags. Apply each
 requested correction. Do not reassert a rejected conclusion from the same prior reasoning.
 Only newly obtained controlling evidence resolving the exact defect can justify retaining

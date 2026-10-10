@@ -1,5 +1,5 @@
 from collections.abc import Sequence
-from typing import TypeVar
+from typing import Any, TypeVar, cast
 from unittest.mock import Mock, patch
 
 import pytest
@@ -205,31 +205,50 @@ class FakeGateway:
                 }
                 for slot, text in units.items()
             }
-        if response_model in {GeneratedDraft, DraftEdits} and isinstance(
+        if issubclass(response_model, (GeneratedDraft, DraftEdits)) and isinstance(
             result, DraftAnswer
         ):
-            payload = {
-                "blocks": [
-                    {
-                        "block_id": "b1",
-                        "text": result.answer,
-                        "claims": [
-                            {
-                                **claim.model_dump(exclude={"answer_excerpt"}),
-                                "application": {
-                                    "source_conditions": "The original requires the document.",
-                                    "fact_application": "Explain the stated application condition.",
-                                    "remaining_uncertainty": "The event date is not supplied.",
-                                },
-                            }
-                            for claim in result.claims
-                        ],
-                    }
-                ],
-                "unresolved_issue_ids": result.unresolved_issue_ids,
-            }
+            payload = cast(
+                dict[str, Any],
+                {
+                    "blocks": [
+                        {
+                            "block_id": "b1",
+                            "text": result.answer,
+                            "claims": [
+                                {
+                                    **claim.model_dump(exclude={"answer_excerpt"}),
+                                    "application": {
+                                        "source_conditions": "The original requires the document.",
+                                        "fact_application": "Explain the stated application condition.",
+                                        "remaining_uncertainty": "The event date is not supplied.",
+                                    },
+                                }
+                                for claim in result.claims
+                            ],
+                        }
+                    ],
+                    "unresolved_issue_ids": result.unresolved_issue_ids,
+                },
+            )
             if response_model is DraftEdits:
                 payload["replacements"] = payload.pop("blocks")
+        if "finding_coverage" in response_model.model_fields:
+            claim_ids = [
+                claim["claim_id"]
+                for block in payload["blocks"]
+                for claim in block["claims"]
+            ]
+            payload["finding_coverage"] = {
+                slot: {
+                    "disposition": "covered" if claim_ids else "unresolved",
+                    "claim_ids": claim_ids,
+                    "reason": "Fixture accounts for the application condition.",
+                }
+                for slot in cast(
+                    dict[str, JsonValue], state["finding_coverage_contract"]
+                )
+            }
         return response_model.model_validate(payload)
 
 
@@ -1656,6 +1675,150 @@ def test_unassessed_review_check_can_be_repaired_but_cannot_pass_unassessed(
         assert result.non_publication_reason is None
 
 
+def test_deferred_research_audit_dispatches_new_gap_after_discovery_deadline() -> None:
+    from onyx.legal_review.models import (
+        ReviewDiagnosis,
+        ReviewDiagnosisBatch,
+        ReviewResearchTask,
+    )
+
+    check_id = f"evidence:i1:{LegalDimension.CASE_LAW.value}"
+    workflow, _, reviewer = engine([], [f"flag:{check_id}"])
+    workflow.plan = plan()
+    workflow.ledger.add([original()], workflow.context)
+    workflow._accept_reading(reading())
+    workflow.context.research_deadline = 999
+    workflow.context.deadline = 1900
+    workflow.source_accountant = Mock()
+    examiner = Mock()
+    examiner.diagnose.return_value = ReviewDiagnosisBatch(
+        diagnoses=[
+            ReviewDiagnosis(
+                check_ids=[check_id],
+                kind="research",
+                dimension=LegalDimension.CASE_LAW,
+                assertion=RULE,
+                reason="The controlling provision's judicial effect was not researched.",
+                required_change="Establish whether a court ruling limits the controlling provision.",
+                supports=[PassageSupport(citation=1, span_number=1)],
+                research_task_ids=["judicial-effect"],
+            )
+        ],
+        research_tasks=[
+            ReviewResearchTask(
+                task_id="judicial-effect",
+                subject="Application document condition",
+                question="Does a court ruling limit this document condition?",
+                query="başvuru belge şartı yargı kararı iptal",
+                dimension=LegalDimension.CASE_LAW,
+                supports=[PassageSupport(citation=1, span_number=1)],
+                existing_need_id=None,
+            )
+        ],
+    )
+    workflow.diagnoser = examiner
+    with (
+        patch("onyx.legal_review.engine.time.monotonic", return_value=1000),
+        patch.object(workflow, "_research") as reread,
+    ):
+        workflow._audit_before_draft("Soru", "")
+        workflow._audit_before_draft("Soru", "")
+    assert len(reviewer.states) == 1
+    assert examiner.diagnose.call_args.args[-1] == 450
+    assert workflow.acquirer.searches == 1
+    assert isinstance(workflow.acquirer, FakeAcquirer)
+    assert (
+        workflow.acquirer.actions[0].arguments["query"]
+        == "başvuru belge şartı yargı kararı iptal"
+    )
+    assert workflow.research.needs["review_need_1"].attempted
+    reread.assert_called_once_with("Soru", "", finalizing=True)
+    assert workflow.early_review is not None
+    assert workflow.issue_closures()[0].status == "open"
+
+
+def test_deferred_audit_timeout_does_not_consume_writer_or_erase_findings() -> None:
+    workflow = prepared_engine()
+    workflow._accept_reading(reading())
+    workflow.context.research_deadline = 999
+    workflow.context.deadline = 1900
+    workflow.source_accountant = Mock()
+    workflow.diagnoser = Mock()
+    with (
+        patch("onyx.legal_review.engine.time.monotonic", return_value=1000),
+        patch.object(workflow, "_review", side_effect=TimeoutError("Audit incomplete")),
+    ):
+        workflow._audit_before_draft("Soru", "")
+    assert workflow.requirements["r1"].rule == RULE
+    audit = workflow.review_work_history[-1]
+    assert isinstance(audit, dict) and audit["status"] == "incomplete"
+    assert workflow.last_draft is None
+    workflow.context.cancel()
+    with (
+        patch("onyx.legal_review.engine.time.monotonic", return_value=1000),
+        patch.object(workflow, "_review", side_effect=TimeoutError("Cancelled")),
+        pytest.raises(TimeoutError),
+    ):
+        workflow._audit_before_draft("Soru", "")
+
+
+@pytest.mark.parametrize("has_defect", [False, True])
+def test_failed_decision_screen_can_use_full_independent_review_without_repeating_it(
+    has_defect: bool,
+) -> None:
+    from onyx.legal_review.editor_context import answer_revision
+
+    workflow = prepared_engine()
+    workflow._accept_reading(reading())
+    workflow.policy = WorkflowPolicy()
+    reviewer = Mock()
+    reviewer.review.return_value = ReviewResult(
+        completed=False,
+        failure_reason="openai_decision_review_http_error",
+        http_status=504,
+    )
+    examiner = Mock()
+
+    def examine(
+        _state: dict[str, JsonValue], checks: Sequence[ReviewCheck], timeout: float
+    ) -> PublicationReview:
+        assert timeout == workflow.policy.publication_review_seconds
+        assert "request_coverage" in {check.id for check in checks}
+        return PublicationReview(
+            findings=[
+                PublicationFinding(
+                    check_id=check.id,
+                    disposition="defect"
+                    if has_defect and check.id == "source_conditions"
+                    else "rebutted",
+                    target="assertion",
+                    reason="Actual source assessment",
+                    required_change="Preserve the condition"
+                    if has_defect and check.id == "source_conditions"
+                    else None,
+                    supports=draft().claims[0].supports,
+                    answer_quotes=[draft().answer],
+                    repair_kind="correction"
+                    if has_defect and check.id == "source_conditions"
+                    else None,
+                )
+                for check in checks
+            ]
+        )
+
+    examiner.examine.side_effect = examine
+    workflow.reviewer, workflow.diagnoser = reviewer, examiner
+    workflow.final_review = workflow._review("Soru", "", draft())
+    assert (
+        workflow.final_review.completed
+        and workflow.final_review.method == "independent_adjudication"
+    )
+    assert bool(workflow.final_review.flags) == has_defect
+    assert workflow.adjudication_answer_revision == answer_revision(draft().answer)
+    assert workflow._final_review_is_publishable("Soru", "", draft()) is not has_defect
+    examiner.examine.assert_called_once()
+
+
 def test_completed_rejected_final_review_is_distinct_from_provider_failure() -> None:
     workflow, _, _ = engine(
         [plan(), reading(), draft(), repair_reading(), draft()],
@@ -2174,8 +2337,146 @@ def test_independent_editor_changes_wording_without_research_or_repair_loop() ->
     examiner.diagnose.assert_not_called()
 
 
+@pytest.mark.parametrize("post_editor_defect", [False, True])
+def test_editor_labels_do_not_replace_independent_verification(
+    post_editor_defect: bool,
+) -> None:
+    workflow, gateway, _ = engine([plan(), reading(), draft()], ["pass", "flag"])
+    workflow.policy = WorkflowPolicy(
+        always_review_research=True, assume_current_corpus=True
+    )
+    examiner = Mock()
+    finding = PublicationFinding(
+        check_id="claim:c1",
+        disposition="defect",
+        target="assertion",
+        reason="Condition missing.",
+        required_change="Preserve the document condition.",
+        supports=[PassageSupport(citation=1, span_number=1)],
+        repair_kind="correction",
+        answer_quotes=[draft().answer],
+    )
+
+    def examine(
+        state: dict[str, JsonValue], checks: Sequence[ReviewCheck], _timeout: float
+    ) -> PublicationReview:
+        if examiner.examine.call_count == 1:
+            return PublicationReview(findings=[finding])
+        answer = cast(dict[str, JsonValue], state["draft"])["answer"]
+        assert isinstance(answer, str) and "Belge ibraz edilirse" in answer
+        return PublicationReview(
+            findings=[
+                PublicationFinding(
+                    check_id=check.id,
+                    disposition="defect"
+                    if post_editor_defect and check.id == "all_answer_claims"
+                    else "rebutted",
+                    target="assertion",
+                    reason="Independently checked against the original.",
+                    required_change="Internal correction, not publication prose."
+                    if post_editor_defect and check.id == "all_answer_claims"
+                    else None,
+                    repair_kind="correction"
+                    if post_editor_defect and check.id == "all_answer_claims"
+                    else None,
+                    answer_quotes=[answer],
+                    supports=[PassageSupport(citation=1, span_number=1)],
+                )
+                for check in checks
+            ]
+        )
+
+    def edit(state: dict[str, JsonValue], _timeout: float) -> EditorialEdits:
+        base = GeneratedDraft.model_validate(state["repair_base"])
+        replacement = base.blocks[0].model_copy(deep=True)
+        replacement.text = "Belge ibraz edilirse başvuru kabul edilir. [1]"
+        return EditorialEdits(
+            replacements=[replacement],
+            unresolved_issue_ids=[],
+            resolved_check_ids=["claim:c1"],
+            unresolved_check_ids=[],
+        )
+
+    examiner.examine.side_effect = examine
+    examiner.edit.side_effect = edit
+    workflow.diagnoser = examiner
+    result = workflow.run("Soru", "")
+    assert examiner.examine.call_count == 2
+    assert result.status == ("partial" if post_editor_defect else "verified")
+    assert result.publication_mode == (
+        "editor_adjusted" if post_editor_defect else "editor_verified"
+    )
+    assert result.answer and "Internal correction" not in result.answer
+    assert not result.repair_used and len(gateway.calls) == 3
+    assert workflow.editor_verification_passed is not post_editor_defect
+
+
+def test_stale_findings_are_bound_to_the_old_answer_and_can_already_be_resolved() -> (
+    None
+):
+    workflow, _, _ = engine([plan(), reading(), draft()], ["pass", "pass"])
+    workflow.policy = WorkflowPolicy(
+        always_review_research=True, assume_current_corpus=True
+    )
+    workflow.run("Soru", "")
+    assert workflow.last_draft is not None
+    workflow.adjudication_answer_revision = "earlier-answer-digest"
+    workflow.draft_adjudication = PublicationReview(
+        findings=[
+            PublicationFinding(
+                check_id="claim:c1",
+                disposition="defect",
+                target="assertion",
+                reason="A past version omitted the condition.",
+                required_change="Preserve the condition already in the current answer.",
+                supports=[PassageSupport(citation=1, span_number=1)],
+                repair_kind="correction",
+                answer_quotes=["Past text."],
+            )
+        ]
+    )
+    examiner = Mock()
+
+    def edit(state: dict[str, JsonValue], _timeout: float) -> EditorialEdits:
+        assert state["findings_answer_revision"] == "earlier-answer-digest"
+        assert state["answer_revision"] != state["findings_answer_revision"]
+        return EditorialEdits(
+            replacements=[],
+            unresolved_issue_ids=[],
+            resolved_check_ids=["claim:c1"],
+            unresolved_check_ids=[],
+        )
+
+    def examine(
+        state: dict[str, JsonValue], checks: Sequence[ReviewCheck], _timeout: float
+    ) -> PublicationReview:
+        answer = cast(dict[str, JsonValue], state["draft"])["answer"]
+        return PublicationReview(
+            findings=[
+                PublicationFinding(
+                    check_id=check.id,
+                    disposition="rebutted",
+                    target="assertion",
+                    reason="The current answer already preserves the condition.",
+                    required_change=None,
+                    supports=[PassageSupport(citation=1, span_number=1)],
+                    answer_quotes=[cast(str, answer)],
+                )
+                for check in checks
+            ]
+        )
+
+    examiner.edit.side_effect = edit
+    examiner.examine.side_effect = examine
+    workflow.diagnoser = examiner
+    result = workflow._publish_partial("Soru", "", "Prior review interrupted")
+    assert result.status == "verified" and result.answer == draft().answer
+    assert result.editorial_changes == []
+    examiner.examine.assert_called_once()
+
+
 @pytest.mark.parametrize("expired", [True, False])
-def test_editor_failure_or_deadline_retains_answer_and_visible_findings(
+def test_editor_failure_or_deadline_retains_answer_and_audited_findings(
     expired: bool,
 ) -> None:
     workflow, _, _ = engine([plan(), reading(), draft()], ["pass", "pass"])
@@ -2203,7 +2504,12 @@ def test_editor_failure_or_deadline_retains_answer_and_visible_findings(
     result = workflow._publish_partial("Soru", "", "Deadline", time_exhausted=True)
     assert result.status == "partial" and result.publication_mode == "limit_reached"
     assert result.answer and draft().answer in result.answer
-    assert "Belge şartı doğrulanmalı." in result.answer
+    assert "Belge şartı doğrulanmalı." not in result.answer
+    assert result.final_adjudication is not None
+    assert (
+        result.final_adjudication.findings[0].required_change
+        == "Belge şartı doğrulanmalı."
+    )
     assert "doğrulanmadı" in result.answer
     assert examiner.edit.call_count == (0 if expired else 1)
 

@@ -226,7 +226,22 @@ def test_initial_schema_correction_is_separately_metered_and_can_resume_research
             }
         ),
         response(reading_response()),
-        response(generated_draft().model_dump(mode="json")),
+        response(
+            {
+                **generated_draft().model_dump(mode="json"),
+                "finding_coverage": {
+                    "f0001": {
+                        "disposition": "covered",
+                        "claim_ids": [
+                            claim.claim_id
+                            for block in generated_draft().blocks
+                            for claim in block.claims
+                        ],
+                        "reason": "The application condition is preserved.",
+                    }
+                },
+            }
+        ),
     ]
     workflow.gateway = gateway(llm, workflow.context)
     result = workflow.run("Başvuru şartı nedir?", "Verilen olgular")

@@ -69,7 +69,29 @@ def test_research_deadline_still_writes_and_reviews_a_partial_answer() -> None:
     assert result.status == "partial" and result.answer
     assert result.final_review is not None
     assert result.final_review.completed and len(reviewer.states) == 1
-    assert "Research time ended" in result.gaps[0]
+    assert result.issue_closures[0].status == "open"
+    assert any(
+        isinstance(row, dict)
+        and row.get("stage") == "discovery"
+        and row.get("status") == "phase_ended"
+        for row in result.review_work_history
+    )
+
+
+def test_completed_research_is_not_permanently_partial_after_a_phase_boundary() -> None:
+    workflow, _, _ = engine([plan(), draft()], ["pass"])
+    workflow.policy = WorkflowPolicy()
+
+    def completed_before_boundary(*_args: object, **_kwargs: object) -> None:
+        workflow._accept_reading(reading())
+        workflow.context.research_deadline = time.monotonic() - 1
+        raise TimeoutError("discovery phase ended after findings were accepted")
+
+    with patch.object(workflow, "_research", side_effect=completed_before_boundary):
+        result = workflow.run("Soru", "")
+    assert result.status == "verified" and result.answer
+    assert all(row.status == "closed" for row in result.issue_closures)
+    assert not result.gaps
 
 
 def test_one_issue_may_discover_distinct_source_targets() -> None:
@@ -232,6 +254,7 @@ def test_overlapping_confirmed_gaps_dispatch_one_search_without_rediagnosis() ->
     workflow.plan = plan()
     workflow.ledger.add([original()], workflow.context)
     examiner = MagicMock()
+    examiner.consolidate.side_effect = lambda _state, diagnosed, _timeout: diagnosed
     workflow.diagnoser = examiner
     checks = [
         ReviewCheck(

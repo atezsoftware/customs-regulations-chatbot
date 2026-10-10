@@ -50,6 +50,7 @@ class ReviewCheck(BaseModel):
 
 
 class ReviewResult(BaseModel):
+    method: Literal["native_decisions", "independent_adjudication"] = "native_decisions"
     model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
     completed: bool
     scores: dict[str, float] = Field(default_factory=dict)
@@ -80,10 +81,13 @@ class DecisionProviderConfig(BaseModel):
 
 class WorkflowPolicy(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
-    timeout_seconds: float | None = Field(default=600, gt=0)
-    finalization_reserve_seconds: float = Field(default=300, gt=0)
-    publication_reserve_seconds: float = Field(default=120, gt=0)
-    editor_reserve_seconds: float = Field(default=60, gt=0)
+    timeout_seconds: float | None = Field(default=1200, gt=0)
+    finalization_reserve_seconds: float = Field(default=900, gt=0)
+    publication_reserve_seconds: float = Field(default=360, gt=0)
+    editor_reserve_seconds: float = Field(default=120, gt=0)
+    verification_reserve_seconds: float = Field(default=120, gt=0)
+    writer_reserve_seconds: float = Field(default=90, gt=0)
+    publication_review_seconds: float = Field(default=120, gt=0)
     assume_current_corpus: bool = True
     always_review_research: bool = False
     max_call_seconds: int = Field(default=45, gt=0)
@@ -520,12 +524,19 @@ class IssueClosure(StrictModel):
 
 
 class WorkflowResult(StrictModel):
+    writer_coverage: list[dict[str, JsonValue]] = Field(default_factory=list)
+    writer_coverage_answer_revision: str | None = None
     status: Literal["verified", "partial", "unavailable", "cancelled"]
     non_publication_reason: Literal["review_rejected", "time_exhausted"] | None = None
     publication_mode: Literal[
-        "reviewed", "editor_adjusted", "limit_reached", "review_incomplete"
+        "reviewed",
+        "editor_verified",
+        "editor_adjusted",
+        "limit_reached",
+        "review_incomplete",
     ] = "reviewed"
     editorial_changes: list[dict[str, JsonValue]] = Field(default_factory=list)
+    editor_verification_passed: bool = False
     reading_correction_used: bool = False
     answer: str | None = None
     plan: IssuePlan | None = None
@@ -551,9 +562,22 @@ class WorkflowResult(StrictModel):
 
     @model_validator(mode="after")
     def rejected_review_has_no_published_answer(self) -> "WorkflowResult":
-        if self.publication_mode != "reviewed" and self.status == "verified":
+        if (
+            self.publication_mode not in {"reviewed", "editor_verified"}
+            and self.status == "verified"
+        ):
             raise ValueError(
                 "Unfinished review or editorial publication must remain partial"
+            )
+        if self.publication_mode == "editor_verified" and (
+            not self.editor_verification_passed
+            or self.final_adjudication is None
+            or any(
+                row.disposition == "defect" for row in self.final_adjudication.findings
+            )
+        ):
+            raise ValueError(
+                "Editorial verification requires completed independent evidence"
             )
         if self.non_publication_reason is not None and (
             self.status != "unavailable"

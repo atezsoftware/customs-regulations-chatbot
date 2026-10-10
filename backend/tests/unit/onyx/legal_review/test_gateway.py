@@ -30,7 +30,7 @@ def gateway(*, policy: WorkflowPolicy | None = None) -> GeminiGateway:
     return GeminiGateway(
         llm=cast(LLM, llm),
         context=RunContext(
-            timeout_seconds=240,
+            timeout_seconds=900,
             research_reserve_seconds=110,
             budget=SharedBudget(max_decisions=32),
         ),

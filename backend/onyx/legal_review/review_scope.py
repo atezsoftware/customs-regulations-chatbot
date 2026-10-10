@@ -57,3 +57,26 @@ def scope_review_state(state: dict[str, JsonValue]) -> dict[str, JsonValue]:
     result["review_target"] = "literal_answer"
     result["finding_sources"] = findings
     return result
+
+
+def publication_state(state: dict[str, JsonValue]) -> dict[str, JsonValue]:
+    """Review all originals and the whole answer without replaying research machinery."""
+    scoped = scope_review_state(state)
+    return {
+        key: value
+        for key, value in scoped.items()
+        if key
+        in {
+            "request",
+            "history",
+            "plan",
+            "requested_outcomes",
+            "corpus_currency",
+            "original_evidence",
+            "draft",
+            "finding_sources",
+            "review_target",
+            "issue_closures",
+            "source_issue_triggers",
+        }
+    }
