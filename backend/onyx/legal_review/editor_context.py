@@ -50,6 +50,22 @@ def editorial_context(state: dict[str, JsonValue]) -> dict[str, JsonValue]:
     ):
         selected.update(_citations(state.get(key)))
     originals = list(_rows(state.get("original_evidence")))
+    accounted: set[int] = set()
+    for assessment in _rows(state.get("source_assessments")):
+        citations = assessment.get("citations")
+        if isinstance(citations, list):
+            accounted.update(
+                citation for citation in citations if type(citation) is int
+            )
+        if assessment.get("disposition") != "irrelevant":
+            selected.update(_citations(assessment.get("supports")))
+    # A phase can end after retrieval but before interpretation. Those originals
+    # remain open evidence, rather than becoming implicitly rejected sources.
+    selected.update(
+        citation
+        for row in originals
+        if type(citation := row.get("citation")) is int and citation not in accounted
+    )
     # Passage selectors may identify one paragraph. Keep every available paragraph
     # of its article so a nearby condition or contrary branch cannot disappear.
     article_keys: set[tuple[str, str]] = set()
@@ -95,7 +111,7 @@ def editorial_context(state: dict[str, JsonValue]) -> dict[str, JsonValue]:
     result["editor_context_scope"] = {
         "included_citations": [row["citation"] for row in cast(list[dict], included)],
         "available_original_count": len(originals),
-        "selection": "All claim and finding bases, material alternatives and their complete available articles",
+        "selection": "All claim and finding bases, relevant assessed passages, unassessed originals, material alternatives and their complete available articles",
     }
     return result
 

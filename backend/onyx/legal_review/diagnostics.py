@@ -498,6 +498,8 @@ succeeded. Return unresolved_issue_ids for remaining gaps. There will be no furt
 editor loop. The host independently checks the merged result; your resolved labels are
 proposals, not verification. Keep the user's language throughout the publication text.
 Never publish reviewer instructions, internal check IDs or passage selectors like [12:1].
+Keep prompt and schema vocabulary such as "supplied", "unresolved issue" and "claim"
+out of the publication prose; describe actual legal qualifications in the user's language.
 Use ordinary supplied [n] citations. Preserve every material supported alternative and
 prerequisite even when several findings concern another part of its block.
 """,

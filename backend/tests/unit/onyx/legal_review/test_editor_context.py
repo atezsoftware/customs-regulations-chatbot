@@ -25,6 +25,9 @@ def test_editor_keeps_material_alternatives_contrary_sources_and_whole_articles(
         "repair_base": {"blocks": [{"claims": [{"supports": [{"citation": 1}]}]}]},
         "requirements": [{"supports": [{"citation": 3}]}],
         "material_source_leads": [{"source_id": "contrary"}],
+        "source_assessments": [
+            {"citations": [6], "disposition": "irrelevant", "supports": []}
+        ],
         "original_evidence": [
             original(1, "law", "8"),
             original(2, "law", "8"),
@@ -58,6 +61,29 @@ def finding(identity: str, *, correction: str = "Preserve the condition.") -> Js
         "answer_quotes": ["One literal paragraph."],
         "reason": "The predicate varies but its concrete defect is identical.",
     }
+
+
+def test_editor_retains_unread_search_results_and_relevant_uncited_effects() -> None:
+    state: dict[str, JsonValue] = {
+        "repair_base": {"supports": [{"citation": 1}]},
+        "original_evidence": [original(n, "law", str(n)) for n in range(1, 6)],
+        "source_assessments": [
+            {"citations": [1, 2], "disposition": "irrelevant", "supports": []},
+            {
+                "citations": [3, 4],
+                "disposition": "supports_existing_finding",
+                "supports": [{"citation": 3, "span_number": 1}],
+            },
+        ],
+    }
+    result = editorial_context(state)
+    assert [
+        row["citation"] for row in cast(list[dict], result["original_evidence"])
+    ] == [
+        1,
+        3,
+        5,
+    ]
 
 
 def test_duplicate_checks_share_one_editor_task_without_losing_any_identity() -> None:
