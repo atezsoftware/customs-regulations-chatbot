@@ -31,11 +31,13 @@ from onyx.error_handling.error_codes import OnyxErrorCode
 from onyx.error_handling.exceptions import OnyxError
 from onyx.legal_review.acquisition import SourceAcquirer
 from onyx.legal_review.decisions import DecisionsReviewer
+from onyx.legal_review.diagnostics import OpenAIReviewDiagnoser
 from onyx.legal_review.engine import LegalReviewEngine
 from onyx.legal_review.gateway import GeminiGateway, MeteredLLM, UsageMeter
 from onyx.legal_review.models import DecisionProviderConfig, WorkflowPolicy
 from onyx.legal_review.provider import require_legal_review_model
 from onyx.legal_review.search import DiscoverySearchTool
+from onyx.legal_review.source_accounting import SourceAccountant
 from onyx.llm.factory import get_llm_token_counter
 from onyx.llm.interfaces import LLM, LLMUserIdentity
 from onyx.llm.models import ReasoningEffort
@@ -71,7 +73,7 @@ def run_legal_review_loop(
     user_identity: LLMUserIdentity | None = None,
     research_llm: LLM | None = None,
     token_counter: Callable[[str], int] | None = None,
-    reasoning_effort: ReasoningEffort = ReasoningEffort.LOW,
+    reasoning_effort: ReasoningEffort = ReasoningEffort.MEDIUM,
     include_citations: bool = True,
     custom_agent_prompt: str | None = None,
     user_memory_context: UserMemoryContext | None = None,
@@ -83,7 +85,7 @@ def run_legal_review_loop(
     if review_provider is None:
         raise OnyxError(
             OnyxErrorCode.INVALID_INPUT,
-            "Legal Review requires an accessible configured OpenAI gpt-6-luna provider for the Decisions API.",
+            "Legal Review requires an accessible configured OpenAI gpt-6-luna provider for Decisions and gpt-6.1-sol for independent evidence examination.",
         )
     metadata = ChatTraceMetadata(
         chat_session_id=str(chat_session_id),
@@ -139,7 +141,7 @@ def _run(
     started = time.monotonic()
     policy = WorkflowPolicy()
     context = RunContext(
-        timeout_seconds=policy.timeout_seconds,
+        timeout_seconds=policy.timeout_seconds or float("inf"),
         research_reserve_seconds=policy.finalization_reserve_seconds,
         cancelled=lambda: not is_connected(chat_session_id, cache),
         budget=SharedBudget(
@@ -150,6 +152,7 @@ def _run(
             max_inflight_models=1,
             final_decision_reserve=8,
             coordinator_decision_reserve=0,
+            unlimited_execution=True,
         ),
         services={"provider_max_attempts": 1, "provider_compatibility_attempts": 1},
         corpus_only=True,
@@ -223,6 +226,7 @@ def _run(
             "repair": "Belirlenen eksikler bir kez düzeltiliyor",
             "completed": "Hukuki inceleme tamamlandı",
             "failed": "Hukuki inceleme tamamlanamadı",
+            "withheld": "Son kontrol tamamlandı; cevap doğrulanamadı",
             "cancelled": "Hukuki inceleme durduruldu",
         }
         event = ASv3Progress(
@@ -237,7 +241,7 @@ def _run(
             else "cancelled"
             if phase == "cancelled"
             else "failed"
-            if phase == "failed"
+            if phase in {"failed", "withheld"}
             else "running",
             title=titles.get(phase, "Hukuki inceleme sürüyor"),
         )
@@ -257,11 +261,29 @@ def _run(
             token_counter=token_counter,
             reasoning_effort=reasoning_effort,
         ),
+        source_accountant=SourceAccountant(
+            GeminiGateway(
+                llm=selected,
+                context=context,
+                policy=policy,
+                token_counter=token_counter,
+                reasoning_effort=ReasoningEffort.MEDIUM,
+            ),
+            ledger,
+            parallelism=policy.max_parallel_tools,
+        ),
         acquirer=acquirer,
         reviewer=DecisionsReviewer(
             api_key=review_provider.api_key.get_secret_value(),
             before_request=admit_review,
             check_active=context.check_active,
+            max_input_tokens=policy.max_context_tokens,
+        ),
+        diagnoser=OpenAIReviewDiagnoser(
+            api_key=review_provider.api_key.get_secret_value(),
+            before_request=admit_review,
+            check_active=context.check_active,
+            record_usage=meter.record,
         ),
         ledger=ledger,
         context=context,
@@ -288,6 +310,7 @@ def _run(
         "evidence": ledger.export(),
         "progress": progress,
         "source_operations": acquirer.receipts,
+        "source_assessments": engine.source_assessments,
         "requirement_history": [
             row.model_dump(mode="json") for row in engine.requirement_history.values()
         ],
@@ -302,6 +325,19 @@ def _run(
         "usage_scope": "Gemini Flash and OpenAI Decisions token usage; embedding/reranker calls retain their separate provider traces",
     }
     if result.answer is None:
+        if result.non_publication_reason == "review_rejected":
+            context.check_active()
+            report("withheld", context.language)
+            save_asv3_checkpoint(
+                message_id=assistant_message_id, user_id=user.id, snapshot=snapshot
+            )
+            _emit_review_notice(
+                emitter=emitter,
+                state_container=state_container,
+                context=context,
+                processing_seconds=time.monotonic() - started,
+            )
+            return
         report(
             "cancelled" if result.status == "cancelled" else "failed", context.language
         )
@@ -358,6 +394,7 @@ def _run(
     save_asv3_checkpoint(
         message_id=assistant_message_id, user_id=user.id, snapshot=snapshot
     )
+
     state_container.add_search_docs(list(mapping.values()))
     state_container.set_pre_answer_processing_time(time.monotonic() - started)
     processor = DynamicCitationProcessor(
@@ -405,3 +442,42 @@ def _run(
     save_asv3_checkpoint(
         message_id=assistant_message_id, user_id=user.id, snapshot=snapshot
     )
+
+
+def _emit_review_notice(
+    *,
+    emitter: Emitter,
+    state_container: ChatStateContainer,
+    context: RunContext,
+    processing_seconds: float,
+) -> None:
+    """Persist a non-answer notice without exposing a rejected legal draft."""
+    notice = (
+        "Bu soru için son kontrolden geçmiş güvenilir bir cevap oluşturulamadı. "
+        "Kaynakların olaya uygulanmasına ilişkin eksikler giderilemediği için "
+        "taslak cevap yayımlanmadı."
+        if context.language.startswith("tr")
+        else "A reliable answer that passed the final review could not be produced "
+        "for this question. The draft was withheld because unresolved issues remain "
+        "in applying the sources to the facts."
+    )
+    context.check_active()
+    state_container.set_pre_answer_processing_time(processing_seconds)
+    emitter.emit(
+        Packet(
+            placement=Placement(turn_index=0),
+            obj=AgentResponseStart(
+                final_documents=[],
+                pre_answer_processing_seconds=processing_seconds,
+            ),
+        )
+    )
+    context.check_active()
+    state_container.set_answer_tokens(notice)
+    emitter.emit(
+        Packet(
+            placement=Placement(turn_index=0),
+            obj=AgentResponseDelta(content=notice),
+        )
+    )
+    emitter.emit(Packet(placement=Placement(turn_index=0), obj=SectionEnd()))

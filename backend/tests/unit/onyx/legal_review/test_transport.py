@@ -188,3 +188,117 @@ def test_initial_followup_keeps_early_flags_until_a_draft_review_exists() -> Non
 def test_invalid_evidence_cannot_be_silently_dropped(evidence: JsonValue) -> None:
     with pytest.raises(ValueError):
         model_state({"original_evidence": evidence}, LLMFlow.LEGAL_REVIEW_READING)
+
+
+@pytest.mark.parametrize(
+    "tool,data",
+    [
+        (
+            "resolve_source",
+            {"sources": [{"source_id": "source-a", "source_name": "Regulation"}]},
+        ),
+        (
+            "query_corpus",
+            {"headings": [{"position": 41, "heading": "Operative disposition"}]},
+        ),
+        ("read_source_range", {"has_more": True, "next_position": 41}),
+        ("read_provision", {"evidence_truncated": True, "evidence_next_position": 53}),
+        ("read_chunk_context", {"has_more": True, "next_offset": 27}),
+    ],
+)
+@pytest.mark.parametrize(
+    "flow", [LLMFlow.LEGAL_REVIEW_READING, LLMFlow.LEGAL_REVIEW_SOURCE_ACCOUNTING]
+)
+def test_source_navigation_results_and_continuation_cursors_reach_the_reader(
+    tool: str, data: dict[str, JsonValue], flow: LLMFlow
+) -> None:
+    state: dict[str, JsonValue] = {
+        "source_operations": [{"tool": tool, "status": "partial", "data": data}]
+    }
+    before = copy.deepcopy(state)
+    result = model_state(state, flow)
+    record = cast(list[dict[str, JsonValue]], result["research_record"])[0]
+    assert record["navigation"] == data
+    assert state == before
+    for cursor in ("next_position", "next_offset", "evidence_next_position"):
+        if cursor in data:
+            assert (
+                cast(dict[str, JsonValue], record["result_limitations"])[cursor]
+                == data[cursor]
+            )
+
+
+@pytest.mark.parametrize(
+    "flow", [LLMFlow.LEGAL_REVIEW_DRAFT, LLMFlow.LEGAL_REVIEW_REPAIR]
+)
+def test_writer_reconstructs_rules_without_inheriting_private_interpretations(
+    flow: LLMFlow,
+) -> None:
+    supports: list[JsonValue] = [{"citation": 1, "span_number": 1}]
+    state: dict[str, JsonValue] = {
+        "original_evidence": originals(),
+        "requirements": [
+            {
+                "requirement_id": "r1",
+                "rule": "Unverified blended interpretation.",
+                "supports": supports,
+                "validity": "unknown",
+                "legal_status": "unknown",
+            }
+        ],
+        "dimension_assessments": [
+            {
+                "issue_id": "i1",
+                "status": "addressed",
+                "requirement_ids": ["r1"],
+                "reason": "Unsupported application.",
+            },
+            {
+                "issue_id": "i2",
+                "status": "unresolved",
+                "requirement_ids": [],
+                "reason": "A necessary condition remains unknown.",
+            },
+        ],
+        "draft": {
+            "answer": "Prior unsupported wording.",
+            "claims": [
+                {
+                    "claim_id": "c1",
+                    "issue_ids": ["i1"],
+                    "answer_excerpt": "Prior unsupported wording.",
+                    "supports": supports,
+                }
+            ],
+            "unresolved_issue_ids": ["i2"],
+        },
+        "draft_adjudication": {
+            "findings": [
+                {
+                    "check_id": "claim:c1",
+                    "disposition": "defect",
+                    "answer_quotes": ["Confirmed error target."],
+                    "supports": supports,
+                }
+            ]
+        },
+    }
+    before = copy.deepcopy(state)
+    view = model_state(state, flow)
+    assert state == before
+    assert "Unverified blended interpretation" not in str(view)
+    assert "Unsupported application" not in str(view)
+    assert "Prior unsupported wording" not in str(view)
+    assert "A necessary condition remains unknown" in str(view)
+    assert "Confirmed error target" in str(view)
+    assert cast(list[dict], view["requirements"])[0]["supports"] == supports
+    assert cast(list[dict], view["requirements"])[0]["legal_status"] == "unknown"
+    assert cast(list[dict], view["previous_claim_sources"])[0]["supports"] == supports
+    assert view["previous_unresolved_issue_ids"] == ["i2"]
+    assert restore_evidence(view) == [
+        {key: value for key, value in cast(dict, row).items() if key != "text_hash"}
+        for row in originals()
+    ]
+    reader = model_state(state, LLMFlow.LEGAL_REVIEW_READING)
+    assert reader["requirements"] == state["requirements"]
+    assert reader["draft"] == state["draft"]

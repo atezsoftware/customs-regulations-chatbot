@@ -37,8 +37,9 @@ ingest, relabel, reindex or change publication metadata.
 
 1. **Preflight:** select the `vertex_ai` override and require the exact model name
    `gemini-3.8-flash` for research and drafting. Resolve an accessible configured
-   `openai` provider with visible `gpt-6-luna` and an official OpenAI base URL for
-   the native Decisions reviewer before research begins. Existing group, persona
+   `openai` provider with visible `gpt-6-luna` for native Decisions and `gpt-6.1-sol`
+   for independent diagnosis/publication examination, using the official OpenAI base
+   URL before research begins. Existing group, persona
    and provider cost limits also apply; provider rows and model visibility are not
    changed. All available simple conversation history is retained. Earlier user
    messages can supply facts;
@@ -48,10 +49,26 @@ ingest, relabel, reindex or change publication metadata.
    list with query text and covered `issue_ids`. Related issues share searches; no
    per-issue query is required. Code
    attaches the twelve dimensions; issue identification does not assume unseen law.
-3. **Discovery and canonical acquisition:** run bounded, parallel hybrid searches,
+3. **Discovery and canonical acquisition:** run parallel hybrid searches with bounded concurrency,
    rank candidates and hydrate authorized originals into the shared evidence ledger.
    Search hits, labels and rank scores provide navigation, rather than legal proof.
-4. **Reading — Gemini:** extract source-backed requirements and application
+   Each operation preserves the model's concrete evidence question as its reranking
+   context. The full parent case remains available for legal analysis, without replacing
+   the relevance target of an independent source search. Shared queries retain all their
+   bound questions; source and article identities receive no case-specific boosts.
+4. **Reading — Gemini:** first account for newly received sources in parallel batches,
+   preserving every original and source identity. The source pass uses medium reasoning
+   to distinguish an operative rule or disposition from a quotation, party submission,
+   reasoning or procedural background. It reports a concrete established effect or a
+   material missing effect. A quoted rule cannot establish the containing decision's
+   outcome. The model selects canonical continuations for material unread effects;
+   the host executes those reads together before synthesis. It does not rediscover the
+   same source or create an issue per document. Completed identical reads are not
+   repeated, and no-new-evidence operations leave their missing effect open. An expanded
+   source or changed research question invalidates the corresponding assessment cache.
+   This inventory is recorded in checkpoints and generation traces; independent review
+   receives the originals rather than adopting these preliminary interpretations.
+   Then extract source-backed requirements and application
    conditions. Complete canonical originals appear as ordered, numbered passages;
    the model selects `citation` and `span_number` instead of rewriting quotations,
    hashes or offsets. Code resolves each selector to the exact original passage and
@@ -80,8 +97,11 @@ ingest, relabel, reindex or change publication metadata.
    Accepted triggers retain that provenance after supersession. Code rejects cycles;
    distinct material questions can share a source and dimension. The model reuses
    an existing dependency for the same unresolved question and can use existing originals,
-   request a canonical read or choose a focused search. One early source return can
-   execute its requested operations and reread the originals before the early review.
+   request a canonical read or choose a focused search. Each distinct material gap receives
+   one discovery search; an empty or failed result consumes that attempt. An initial broad
+   issue search does not consume the focused search for a specific gap exposed by its results.
+   A genuinely different source-derived dependency gets its own attempt, while a paraphrase
+   of the same unresolved question does not. Canonical reads can complete returned sources.
    Missing evidence and unexecuted operations remain gaps; a zero-result search never
    proves absence of law or continued legal validity.
 6. **Early review — OpenAI Decisions:** one native Decisions HTTP request using
@@ -92,11 +112,64 @@ ingest, relabel, reindex or change publication metadata.
    Finding IDs bind these flags to a specific interpretation that can be corrected.
    It receives
    complete retained originals, actual conversation facts and compact research
-   receipts with query, status and access/truncation limitations. If the early source
-   return has not been used, flags can direct that one return. Incomplete review
-   prevents drafting a publishable answer.
+   receipts with query, status and access/truncation limitations. An independent batched OpenAI examiner diagnoses flagged checks using code-owned
+   response slots. Each research diagnosis contains its concrete source questions. Code
+   assigns task identities and compiles the shared inventory; the model never has to keep
+   forward task references aligned with a separate list. Identical questions and query
+   strings share work without dropping their bound diagnoses or supporting passages.
+   Dimension-specific slots retain their assessed dimension and cannot alias a diagnosis
+   in another dimension or issue. Their explicit finding scope includes all findings used
+   by that issue, across its dimensions, rather than inheriting one narrow assessment.
+   A second batched OpenAI Responses call combines the accepted questions into shared
+   searches. Questions about the same controlling norm can share one query for conditions,
+   amounts, exceptions, temporal changes and judicial effects. The planner returns fixed
+   gap keys, explicit shared-group references and a coverage reason for each gap; code
+   resolves their dependency graph and rejects missing keys, unknown references and cycles.
+   It retains every diagnosis and derives the dimensions covered by each shared search.
+   Query sharing never closes an assessment or proves that all its evidence was found.
+   Subsequent reuse is allowed in the dimensions explicitly covered by the prior search;
+   an operative-only search cannot consume a separate judicial question. Automatic identity
+   matching also includes subject and question. Independent tasks run together, with no
+   per-source or per-flag model call and no arbitrary query-count target.
+   Provider schemas encode fresh work (a required nonempty query) and reuse (an eligible
+   attempted need ID with no new query) as separate alternatives. Both fields being null
+   is invalid in the schema sent to the provider, not merely in a post-response validator.
+   Only code-owned specific gap IDs are eligible for reuse in its response schema; broad
+   initial issue searches cannot suppress newly identified research. Its material source
+   questions include discovery queries, which the host executes in one batch with bounded
+   parallelism before handing the results to the reader. The reader does not
+   decide again whether to execute an independently identified source task. It returns
+   actual findings, changed assessments and further source actions, rather than a second
+   diagnosis or a self-declared completion inventory. A known original may retain its
+   citation number; novelty of an ID is not evidence of completed research. Source
+   operations and the reader's claims remain subject to independent answer review.
+   Evidence reading answers a code-owned keyed inventory of concrete research diagnoses;
+   the host restores their check and issue identities. Correction-only findings cannot
+   accidentally enter that inventory. Each shared investigation provides an index of all
+   its returned originals, preserving potentially limiting or contrary leads without
+   selecting a particular source family or supplying a legal outcome. Canonical texts
+   remain intact. A search receipt is not a resolved legal question.
+   Native Decisions refusals retain the valid results for other checks and carry the
+   unanswered check into the one repair as unassessed. Transport or malformed-response
+   failures still stop the workflow. Publication requires a completed final review;
+   a refusal never counts as a passing score.
+   When a completed final review rejects the repaired draft, the chat shows an
+   explicit non-answer notice instead of misclassifying that outcome as a model
+   provider error. The checkpoint remains `unavailable` with no published legal
+   answer and records `non_publication_reason: review_rejected`. The notice carries
+   no draft text or citations. Incomplete reviews, provider/transport failures and
+   revoked source access remain failures; cancellation still prevents publication.
 7. **Integrated draft — Gemini:** produce a `GeneratedDraft` of ordered Markdown
    blocks with claim bindings, passage selectors, conditions and unresolved issues.
+   The writer receives finding-to-source bindings, recorded validity and unresolved gaps,
+   while private rule paraphrases and affirmative assessment reasons stay in the research
+   ledger. Repair receives exact confirmed error targets and prior source bindings instead
+   of copying the old answer as a template. All canonical originals remain intact.
+   Within the same call, each block selects its supporting passages and records a concise
+   source-to-case application before generating its prose. That private record states the
+   operative source conditions, their match to supplied facts and any remaining uncertainty.
+   It is retained in generation traces, not published or used as proof by the independent
+   reviewer; the reviewer still receives canonical originals and the literal answer.
    Code adds missing selected source markers as separate paragraphs within their
    containing blocks, preserving Markdown fences and tables. It compiles the actual
    rendered block text into one literal answer and derives claim excerpts from it.
@@ -104,8 +177,11 @@ ingest, relabel, reindex or change publication metadata.
    does not recopy an answer or `answer_excerpt` field. Issues serve as a private
    checklist; blocks do not force
    repeated per-issue sections. Code validates passage selectors, literal claim
-   bindings and citation targets, then inserts required scoped validity disclosure
-   before review. A limitation-only answer can have no claims only with explicit
+   bindings and citation targets. Code binds unresolved issue IDs from the complete
+   closure ledger without adding blanket legal conclusions or rewriting the prose.
+   The writer distinguishes missing facts, unverified metadata and established adverse
+   effects, and qualifies only the affected conclusions. The full literal answer and
+   its actual disclosures remain subject to independent review. A limitation-only answer can have no claims only with explicit
    unresolved issue IDs; it still undergoes complete independent review.
 8. **Draft review — OpenAI Decisions:** independently check all dimensions, the
    entire answer's coverage, every material legal assertion (including assertions absent from the
@@ -114,17 +190,49 @@ ingest, relabel, reindex or change publication metadata.
    locate the particular rule or literal block and its selected originals. These
    predicates add no per-source calls or extra review rounds. Reviewer scores are
    defect probabilities; scores at or above `0.5` flag the bound question. A flag is
-   a suspicion to investigate, not a legal finding.
-9. **Optional repair:** permit one post-draft evidence-directed repair. The existing
-   batched reader call sees the actual draft and flags and returns grouped diagnoses
-   and concrete corrections covering each code-owned flagged check exactly once.
-   It distinguishes research corrections, prose/claim corrections, unresolved effects
-   and source-backed rebuttals. Code validates check identities and passage selectors;
-   correcting a finding requires an actual research update. Findings and all affected
-   assessment uses are corrected before the writer receives the repair plan. The
-   reader can obtain missing originals, and the writer produces a complete replacement.
-   The diagnosis itself never marks review passed. One Decisions recheck follows. Remaining flags
-   or incomplete review withhold publication; they do not start another repair.
+   a suspicion to investigate, not a legal finding. Research review assesses private
+   findings and dimension reasons. Draft review assesses the literal rendered answer;
+   its packet retains all originals and finding-to-source/issue bindings but excludes
+   private interpretations that could be mistaken for assertions in the answer.
+   Open issue status alone does not establish an answer defect: the reviewer checks
+   whether the corresponding conclusion preserves the material qualification.
+9. **Optional repair:** permit one post-draft evidence-directed repair. A separate
+   publication examiner first distinguishes actual answer defects from rebutted flags
+   and correctly disclosed limitations. It assesses the literal answer, not ideal research
+   completeness. It selects code-owned answer passages; the host derives exact quotations
+   instead of asking the model to retype them. The answer, inventory and source selectors
+   are validated. If no material defect remains, no rewrite or new research is triggered.
+   Only confirmed defect checks enter the independent research diagnosis.
+   Each check carries its matched publication finding, literal answer passages and requested
+   change into diagnosis; a broad predicate does not replace the identified defect. The
+   query planner receives only prior attempts referenced by the accepted gaps. With at most
+   one fresh query, no query-sharing call is needed; existing attempts remain unchanged.
+   The reader then sees
+   the actual draft, diagnoses, source receipts and originals. Code binds every flag
+   to the examiner's diagnosis and executes its discovery queries before the reader.
+   The reader updates findings and their assessment uses and can request more source
+   operations. The writer receives these evidence updates and the independent change
+   plan, then produces a complete replacement. The reader does not redundantly
+   reclassify every flag or attest that its own correction has passed review.
+   One Decisions recheck follows. Remaining probabilistic flags receive one independent
+   batched examination against the exact replacement answer and complete originals.
+   Its inventory, selected literal answer text and all source passages are validated.
+   Publication requires every residual flag to be substantively rebutted or shown to be
+   an accurately disclosed limitation. A concealed source gap or a false positive conclusion
+   still blocks publication, as do any remaining material correction, invalid inventory or
+   incomplete native review. This examination does not execute searches or start another repair.
+   Raw scores and flags are preserved alongside the final adjudication for audit.
+   The shared review batch also includes one source-use predicate per distinct cited
+   original. These are review checks, not issues or separate LLM calls. They prevent a
+   broadly supported answer section from hiding misuse of a narrower cited provision.
+   All original evidence remains available to the reviewer; source-use checks do not
+   replace whole-answer, contrary-source, or twelve-dimension review.
+   An inline numeric citation also selects a source. The compiler preserves the literal
+   prose and binds inline selections absent from structured claims to the complete
+   canonical original, within the containing block's issue scope (or the same source's
+   existing issue bindings for a claimless summary). It does not infer legal entailment.
+   Unknown, noncanonical or unscoped references fail validation; new bindings undergo
+   the same claim, source-use and whole-answer review. No binding-repair LLM call is added.
 10. **Publication:** revalidate cited evidence against current authorization and
     publication state, persist its checkpoint, and then emit the standard answer and
     citation packets. Answer text, citation mapping, source operations, supersession
@@ -195,7 +303,7 @@ An invalid initial structured plan permits one separately admitted Flash schema
 correction. It preserves the request and uses the same remaining deadline and call
 budget; provider failures do not trigger this correction.
 
-Planner, reader, writer and repair use Gemini 3.8 Flash with low reasoning effort.
+Planner, reader, writer and repair use Gemini 3.8 Flash with medium reasoning effort.
 Their model transport shares repeated source metadata and heading prefixes in a
 document registry. Citation numbers, chunk identities, complete passage text and all
 temporal/closure metadata remain recoverable without truncation. Canonical hash checks
@@ -210,7 +318,11 @@ The fixed override has temperature zero. The independent reviewer uses the nativ
 `https://api.openai.com/v1/decisions` endpoint with pinned `gpt-6-luna` and named
 defect predicates. Predicate names map back to code-owned checks; the provider does
 not generate queries or workflow actions. Each invocation makes one physical
-request without internal retries or partitions. Missing credentials, refusals,
+request without internal retries or partitions. The separate Responses examiner uses
+one streamed batch for flagged checks. Its output allowance scales with the check
+inventory within the model's capacity. Terminal status and usage are captured before
+structured parsing; truncated output is never repaired into an accepted diagnosis.
+Missing credentials, refusals,
 invalid responses, deadline failures and oversized packets prevent review completion.
 There is no TypeSafe, OpenRouter, chat-completion or alternate-model fallback.
 Checkpoints retain only the `openai_decisions` route and provider name, never keys.
@@ -225,9 +337,9 @@ Embedding and ranking inference still use the deployment's configured providers.
 The existing ranking configuration can use a cross-encoder or an external chat
 completion ranker; the latter is a separate model call, potentially a model other
 than Gemini. Search's selected secondary LLM calls use the public `ScopedSearchLLM`
-and are counted in the shared generation budget and Gemini usage meter. Embedding
+and are counted in the shared execution counters and Gemini usage meter. Embedding
 and external reranker calls retain their own provider traces and usage accounting;
-they are **not** included in the Gemini/Decisions token totals or the 32-admission counter.
+they are **not** included in the Gemini/Decisions token totals.
 No total dollar-price or live latency guarantee follows from the stage counts.
 
 ## Default limits and cancellation
@@ -240,39 +352,43 @@ actual normalized threshold and selected identities.
 
 | Limit | Default |
 | --- | ---: |
-| Overall cooperative deadline | 240 seconds |
-| Finalization reserve | 110 seconds |
-| Planner/reader/writer/repair or Decisions call timeout | 45 seconds |
-| Shared Gemini/secondary-LLM/Decisions admissions | 32 |
-| Admissions reserved for finalization | 8 |
-| Source operations | 96 |
-| Discovery queries across all issues and rounds | 24 |
+| Overall cooperative deadline | None by default; explicit cancellation remains active |
+| Finalization reserve when an explicit deadline is configured | 80 seconds |
+| Gemini reader, examiner and native Decisions idle-network timeout | 45 seconds; no cumulative call deadline |
+| Aggregate model admissions, source operations and reader rounds | No quota |
+| Discovery searches per distinct material gap | 1; initial broad discovery is separate |
 | Parallel source operations | 4 |
-| Initial reader rounds | 1 |
-| Early source returns | 1 |
 | Post-draft repairs | 1 |
-| Input/output token admission thresholds | 2,000,000 / 128,000 |
-| Gemini context ceiling | 192,000 tokens, or the smaller provider limit |
-| Maximum generated output per Gemini call | 16,384 tokens |
-| Evidence budget | 2,000,000 bytes |
-| Serialized Decisions request/response cap | 256,000 bytes each |
+| Aggregate input/output token quota | None by default |
+| Gemini context ceiling | Configured provider input capacity; an explicit policy cap may lower it |
+| Decisions input ceiling | 922,000 tokens (GPT-6 Luna context minus full output reserve); an explicit policy cap may lower it |
+| Maximum generated output per Gemini call | 65,536 tokens (provider capacity) |
+| Maximum generated output per OpenAI diagnosis/planning call | 128,000 tokens (provider capacity) |
+| Evidence capacity | 2,000,000 bytes |
+| Serialized Decisions request/response capacity | 4,000,000 / 256,000 bytes |
 
-Actual provider usage is recorded after each response, including a failed Decisions
-validation with reported usage. Token thresholds are admission checks against usage
-already observed; they are not an exact advance estimate of the next response's
-bill. There is one provider attempt and one compatibility attempt for selected LLM
-calls. Secondary search generations use the remaining research deadline; external
-embedding/reranker providers retain their own timeout behavior. The reviewer provider's
-token limits also apply: the byte cap alone does not guarantee a packet fits those
-limits. Provider rejection produces an explicit incomplete review.
+Actual provider usage and execution counts are recorded. Technical context and packet
+capacities still apply; originals are never silently clipped to fit. Native Decisions
+requests also undergo model-token admission. Reader streams enforce idle-network timeouts,
+explicit cancellation, and any configured absolute phase deadline, without imposing a total
+reading duration on the default unlimited run. Each provider call has one physical attempt.
+Embedding/reranker providers retain their own timeout behavior.
 
-There is no numeric issue-count limit. Materiality, reuse of existing issues and
-global time, call, search, tool and context budgets control growth. Every explicit
-requested outcome must remain represented; the planner must not compress outcomes to
-fit an artificial issue cap. Identical initial queries and identical source operations
-within a reading batch are executed once with their issue IDs combined. A decisive
-question that cannot be resolved within the remaining budget stays open and disclosed
-instead of being forcibly closed.
+The workflow does not impose a shared 192,000-token context ceiling on different
+providers. Gemini uses its configured input capacity. Native Decisions uses the
+[documented GPT-6 Luna capacity](https://developers.openai.com/api/docs/models/gpt-6-luna),
+with output headroom. Compact JSON changes only transport whitespace; all original
+passages and provenance remain present. Larger-than-provider requests still fail admission.
+
+There is no numeric issue-count or aggregate search-count limit. Each specific gap receives
+one search, shared across all checks it can resolve; independently useful searches run with
+four-way concurrency. Matching issue IDs or dimensions alone does not establish duplicate
+questions. Materiality, reuse of existing gaps and supported resolution guide research.
+Every explicit requested outcome remains represented.
+Identical operations within one batch execute once with their issue IDs combined. Repeating
+identical operations with unchanged evidence is detected as no progress. Missing user facts
+remain explicit and conditional. After its single attempt, a missing authority remains a
+precisely disclosed gap rather than triggering another wording of the same search.
 
 Stop checks propagate through research, selected provider calls, Decisions response
 handling and publication. Pending pooled operations are cancelled when possible;
@@ -286,8 +402,9 @@ Code derives each issue's `open`, `partial` or `closed` status from its complete
 assessment matrix, supported resolution, pending operations and validity limits.
 The model cannot declare closure directly. An open or partial material child prevents
 its parent being closed. A newly discovered unresolved dependency is preserved in the
-writer/reviewer state, result and checkpoint, and code inserts a scoped research
-limitation into the literal draft before final review when needed. Validity and
+writer/reviewer state, result and checkpoint. Code binds unresolved issue IDs without
+appending a blanket disclaimer; the writer must qualify the affected conclusions and
+the independent reviewer checks those actual qualifications. Validity and
 supported resolution use the issue's linked global findings, not finding ownership.
 
 Recorded version windows, read dates and a chunk lifecycle value such as `active`

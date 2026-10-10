@@ -33,6 +33,9 @@ _DIAGNOSTIC_KEYS = frozenset(
         "access_denied",
         "continuation",
         "next_cursor",
+        "next_position",
+        "next_offset",
+        "evidence_next_position",
         "total_hits",
         "matched_count",
         "unmapped_result_count",
@@ -126,6 +129,38 @@ def _normalize_originals(state: dict[str, JsonValue]) -> None:
     state["source_registry"] = registry
 
 
+def _prepare_writer_evidence(state: dict[str, JsonValue]) -> None:
+    """Use research as a source index, not an authoritative legal paraphrase."""
+    requirements = state.get("requirements")
+    if isinstance(requirements, list):
+        state["requirements"] = [
+            {key: value for key, value in row.items() if key != "rule"}
+            for row in requirements
+            if isinstance(row, dict)
+        ]
+    assessments = state.get("dimension_assessments")
+    if isinstance(assessments, list):
+        state["dimension_assessments"] = [
+            {
+                key: value
+                for key, value in row.items()
+                if key != "reason" or row.get("status") == "unresolved"
+            }
+            for row in assessments
+            if isinstance(row, dict)
+        ]
+    draft = state.pop("draft", None)
+    if isinstance(draft, dict):
+        state["previous_unresolved_issue_ids"] = draft.get("unresolved_issue_ids")
+        claims = draft.get("claims")
+        if isinstance(claims, list):
+            state["previous_claim_sources"] = [
+                {key: value for key, value in row.items() if key != "answer_excerpt"}
+                for row in claims
+                if isinstance(row, dict)
+            ]
+
+
 def model_state(state: dict[str, JsonValue], flow: LLMFlow) -> dict[str, JsonValue]:
     """Keep canonical passages intact while sharing repeated provenance fields."""
     result = copy.deepcopy(state)
@@ -148,11 +183,42 @@ def model_state(state: dict[str, JsonValue], flow: LLMFlow) -> dict[str, JsonVal
                         )
                         if key in _DIAGNOSTIC_KEYS
                     },
+                    **(
+                        {"navigation": data}
+                        if flow
+                        in {
+                            LLMFlow.LEGAL_REVIEW_READING,
+                            LLMFlow.LEGAL_REVIEW_SOURCE_ACCOUNTING,
+                        }
+                        and receipt.get("tool") != "search_corpus"
+                        and isinstance(data, dict)
+                        else {}
+                    ),
                 }
             )
         result["research_record"] = record
     if flow in {LLMFlow.LEGAL_REVIEW_DRAFT, LLMFlow.LEGAL_REVIEW_REPAIR}:
-        result.pop("tools", None)
+        _prepare_writer_evidence(result)
+        for key in (
+            "tools",
+            "reading_contract",
+            "repair_contract",
+            "final_adjudication",
+            "source_assessments",
+        ):
+            result.pop(key, None)
+        if isinstance(result.get("review_diagnoses"), dict):
+            result.pop("early_review", None)
+            result.pop("final_review", None)
+        adjudication = result.pop("draft_adjudication", None)
+        if isinstance(adjudication, dict) and isinstance(
+            adjudication.get("findings"), list
+        ):
+            result["publication_corrections"] = [
+                row
+                for row in adjudication["findings"]
+                if isinstance(row, dict) and row.get("disposition") == "defect"
+            ]
     if isinstance(result.get("final_review"), dict):
         result.pop("early_review", None)
     return result

@@ -14,6 +14,7 @@ from onyx.asv3.models import (
     EvidenceItem,
     OutcomeStatus,
     RunContext,
+    RunStopped,
     ToolOutcome,
     ToolSpec,
 )
@@ -27,7 +28,13 @@ from onyx.context.search.models import IndexFilters
 from onyx.db.models import User
 from onyx.error_handling.exceptions import OnyxError
 from onyx.legal_review import runtime
-from onyx.legal_review.models import DecisionProviderConfig
+from onyx.legal_review.models import (
+    DecisionProviderConfig,
+    PassageSupport,
+    ReviewResult,
+    WorkflowResult,
+)
+from onyx.legal_review.source_accounting import SourceAssessment, SourceInventory
 from onyx.llm.interfaces import LLM, LLMConfig
 from onyx.server.query_and_chat.streaming_models import (
     AgentResponseDelta,
@@ -35,6 +42,7 @@ from onyx.server.query_and_chat.streaming_models import (
     ASv3Progress,
     CitationInfo,
     Packet,
+    SectionEnd,
 )
 from onyx.tools.tool_implementations.search.search_tool import SearchTool
 from tests.unit.onyx.legal_review.test_engine import (
@@ -82,7 +90,22 @@ class CanonicalBrokerFixture:
 @pytest.fixture
 def runtime_fixture(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     broker = CanonicalBrokerFixture()
-    gateway = FakeGateway([plan(), reading(), draft()])
+    inventory = SourceInventory(
+        source_assessments=[
+            SourceAssessment(
+                slot="s0001",
+                disposition="supports_existing_finding",
+                reason=RULE,
+                passage_roles=["operative_rule"],
+                established_effect=RULE,
+                supports=[PassageSupport(citation=1, span_number=1)],
+                missing_effect=None,
+                content_status="operative_effect_read",
+                requested_read=None,
+            )
+        ]
+    )
+    gateway = FakeGateway([plan(), inventory, reading(), draft()])
     reviewer = FakeReviewer(["pass", "pass"])
     checkpoints: list[dict[str, JsonValue]] = []
     packets: list[Packet] = []
@@ -195,7 +218,7 @@ def test_published_answer_and_canonical_checkpoint_persist_for_both_citation_mod
         if isinstance(packet.obj, AgentResponseDelta)
     )
     assert fixture.state.get_answer_tokens() == rendered
-    assert RULE in rendered and "Yürürlük sınırı" in rendered
+    assert RULE in rendered and "Yürürlük sınırı" not in rendered
     assert fixture.state.get_citation_to_doc()[1].document_id == "source-1"
     assert fixture.broker.revalidated[0].text == RULE
     assert len(fixture.broker.calls) == 1
@@ -273,3 +296,94 @@ def test_resolved_openai_decision_config_reaches_reviewer_before_any_work(
     }
     assert "jev_provider" not in fixture.checkpoints[-1]
     assert "openai-fixture-key" not in str(fixture.checkpoints)
+
+
+def test_rejected_review_streams_only_notice_and_retains_unavailable_checkpoint(
+    runtime_fixture: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = runtime_fixture
+    result = WorkflowResult(
+        status="unavailable",
+        non_publication_reason="review_rejected",
+        final_review=ReviewResult(completed=True),
+        gaps=["Final legal review did not pass"],
+    )
+    monkeypatch.setattr(runtime.LegalReviewEngine, "run", lambda *_args: result)
+
+    runtime.run_legal_review_loop(**fixture.arguments)
+
+    rendered = "".join(
+        p.obj.content for p in fixture.packets if isinstance(p.obj, AgentResponseDelta)
+    )
+    assert "taslak cevap yayımlanmadı" in rendered
+    assert fixture.state.get_answer_tokens() == rendered
+    assert RULE not in rendered
+    assert fixture.state.get_citation_to_doc() == {}
+    assert not any(isinstance(p.obj, CitationInfo) for p in fixture.packets)
+    assert isinstance(fixture.packets[-1].obj, SectionEnd)
+    checkpoint = fixture.checkpoints[-1]
+    assert checkpoint["publication_status"] == "unavailable"
+    assert checkpoint["legal_review"]["answer"] is None
+    assert checkpoint["legal_review"]["non_publication_reason"] == "review_rejected"
+    assert checkpoint["progress"][-1]["phase"] == "withheld"
+    assert not any(
+        isinstance(p.obj, ASv3Progress) and p.obj.status == "completed"
+        for p in fixture.packets
+    )
+
+
+def test_provider_failure_is_not_reported_as_completed_review(
+    runtime_fixture: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = runtime_fixture
+    result = WorkflowResult(
+        status="unavailable",
+        final_review=ReviewResult(completed=False, failure_reason="provider_timeout"),
+        gaps=["provider_timeout"],
+    )
+    monkeypatch.setattr(runtime.LegalReviewEngine, "run", lambda *_args: result)
+    with pytest.raises(OnyxError, match="provider_timeout"):
+        runtime.run_legal_review_loop(**fixture.arguments)
+    assert fixture.state.get_answer_tokens() is None
+    assert not any(isinstance(p.obj, AgentResponseStart) for p in fixture.packets)
+    assert fixture.checkpoints[-1]["publication_status"] == "unavailable"
+
+
+def test_rejected_review_notice_honors_stop_before_streaming(
+    runtime_fixture: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = runtime_fixture
+    result = WorkflowResult(
+        status="unavailable",
+        non_publication_reason="review_rejected",
+        final_review=ReviewResult(completed=True),
+    )
+    monkeypatch.setattr(runtime.LegalReviewEngine, "run", lambda *_args: result)
+    monkeypatch.setattr(runtime, "is_connected", lambda *_args: False)
+    with pytest.raises(RunStopped):
+        runtime.run_legal_review_loop(**fixture.arguments)
+    assert fixture.state.get_answer_tokens() is None
+    assert not any(isinstance(p.obj, AgentResponseStart) for p in fixture.packets)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"status": "partial"},
+        {"answer": "Unchecked draft"},
+        {"final_review": None},
+        {"final_review": {"completed": False}},
+    ],
+)
+def test_review_rejection_cannot_publish_answer_or_hide_incomplete_review(
+    changes: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError, match="completed review and no answer"):
+        WorkflowResult.model_validate(
+            {
+                "status": "unavailable",
+                "non_publication_reason": "review_rejected",
+                "final_review": {"completed": True},
+                **changes,
+            }
+        )

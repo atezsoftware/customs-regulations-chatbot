@@ -12,7 +12,11 @@ from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.db.llm import can_user_access_llm_provider, fetch_user_group_ids
 from onyx.db.models import LLMProvider, Persona, User, UserGroup
 from onyx.db.persona import get_default_behavior_persona
-from onyx.legal_review.models import DecisionProviderConfig, JevProviderConfig
+from onyx.legal_review.models import (
+    DIAGNOSIS_MODEL,
+    DecisionProviderConfig,
+    JevProviderConfig,
+)
 from onyx.server.usage_limits import check_llm_cost_limit_for_provider
 from shared_configs.contextvars import get_current_tenant_id
 
@@ -44,6 +48,7 @@ def _resolve_decision(
         .where(
             LLMProvider.provider == "openai",
             LLMProvider.model_configurations.any(name="gpt-6-luna", is_visible=True),
+            LLMProvider.model_configurations.any(name=DIAGNOSIS_MODEL, is_visible=True),
         )
         .options(
             load_only(

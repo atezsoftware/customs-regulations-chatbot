@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterator
-from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import httpx
@@ -89,7 +88,11 @@ def test_complete_state_is_shared_once_and_wire_names_bind_code_owned_checks(
         assert set(payload) == {"model", "input", "questions"}
         assert payload["model"] == "gpt-6-luna"
         assert isinstance(payload["input"], str)
-        assert json.loads(payload["input"]) == state
+        shared = json.loads(payload["input"])
+        contract = shared.pop("review_contract")
+        assert shared == state
+        assert "citation and span_number" in contract
+        assert "complete canonical original" in contract
         assert request.content.count(b"original-law") == 1
         assert [question["name"] for question in payload["questions"]] == [
             "q000001",
@@ -98,8 +101,7 @@ def test_complete_state_is_shared_once_and_wire_names_bind_code_owned_checks(
         for check, question in zip(checks, payload["questions"], strict=True):
             assert question["type"] == "predicate"
             assert question["instructions"].endswith(check.instructions)
-            assert "citation and span_number" in question["instructions"]
-            assert "complete canonical original" in question["instructions"]
+            assert "review_contract" in question["instructions"]
         return httpx.Response(
             200, json=_response(), headers={"x-request-id": "req_test"}
         )
@@ -214,17 +216,19 @@ def test_answer_inventory_must_exactly_match_unique_host_wire_names(
     assert result.scores == {} and result.flags == []
 
 
-def test_refusal_preserves_usage_but_never_publishes_partial_scores() -> None:
+def test_refusal_retains_assessed_results_and_explicitly_unassessed_checks() -> None:
     response = _response()
     response["answers"] = [
         {"type": "refusal", "name": "q000001"},
-        {"type": "predicate", "name": "q000002", "probability": 0.0},
+        {"type": "predicate", "name": "q000002", "probability": 0.9},
     ]
     result = _review(response)
     assert not result.completed
     assert result.failure_reason == "openai_decision_refusal"
     assert result.input_tokens == 120
-    assert result.scores == {} and result.flags == []
+    assert result.scores == {_checks()[1].id: 0.9}
+    assert result.flags == [_checks()[1]]
+    assert result.unassessed_checks == [_checks()[0]]
 
 
 @pytest.mark.parametrize(
@@ -290,8 +294,8 @@ def test_no_credential_means_no_http_or_quota_admission(credential: str | None) 
 @pytest.mark.parametrize(
     "state",
     [
-        {"original_evidence": "a" * 256_001},
-        {"original_evidence": "ğ" * 150_000},
+        {"original_evidence": "a" * 4_000_001},
+        {"original_evidence": "ğ" * 2_000_001},
         {"invalid": float("nan")},
     ],
 )
@@ -444,11 +448,11 @@ def test_explicit_error_in_success_status_never_overrides_failure() -> None:
     assert result.scores == {}
 
 
-def test_response_stream_checks_overall_deadline(
+def test_progressing_response_has_no_cumulative_call_deadline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     now = [0.0]
-    monkeypatch.setattr(decisions, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    monkeypatch.setattr("time.monotonic", lambda: now[0])
 
     class DelayedStream(httpx.SyncByteStream):
         def __iter__(self) -> Iterator[bytes]:
@@ -462,8 +466,8 @@ def test_response_stream_checks_overall_deadline(
             lambda _request: httpx.Response(200, stream=DelayedStream())
         ),
     ).review({}, _checks(), 5.0)
-    assert result.failure_reason == "openai_decision_review_timeout"
-    assert result.scores == {}
+    assert result.completed
+    assert result.scores == {"I1:kanıt/⟦1⟧": 0.5, "global.coverage": 0.04}
 
 
 def test_cancellation_after_response_retains_usage_without_success() -> None:
@@ -490,3 +494,52 @@ def test_invalid_timeout_never_admits_a_request(timeout: float) -> None:
     assert result.failure_reason == "openai_decision_invalid_timeout"
     handler.assert_not_called()
     before_request.assert_not_called()
+
+
+def test_large_utf8_packet_preserves_every_original_within_context() -> None:
+    original = "Türkçe özgün hüküm ve koşulları. " * 10_000
+    state: dict[str, JsonValue] = {"original_evidence": original}
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert len(request.content) > 256_000
+        assert (
+            json.loads(json.loads(request.content)["input"])["original_evidence"]
+            == original
+        )
+        return httpx.Response(200, json=_response())
+
+    result = DecisionsReviewer(
+        api_key="test", transport=httpx.MockTransport(handler)
+    ).review(state, _checks(), 5)
+    assert result.completed
+    assert len(requests) == 1
+
+
+def test_context_budget_is_checked_before_provider_admission() -> None:
+    handler, admission = MagicMock(), MagicMock()
+    result = DecisionsReviewer(
+        api_key="test",
+        transport=httpx.MockTransport(handler),
+        before_request=admission,
+        max_input_tokens=20,
+        token_counter=lambda _: 21,
+    ).review({"original_evidence": "intact"}, _checks(), 5)
+    assert result.failure_reason == "openai_decision_review_context_too_large"
+    handler.assert_not_called()
+    admission.assert_not_called()
+
+
+@pytest.mark.parametrize("tokens,admitted", [(250_000, True), (1_050_001, False)])
+def test_native_review_uses_model_capacity_instead_of_legacy_cost_ceiling(
+    tokens: int, admitted: bool
+) -> None:
+    handler = MagicMock(return_value=httpx.Response(200, json=_response()))
+    result = DecisionsReviewer(
+        api_key="test",
+        transport=httpx.MockTransport(handler),
+        token_counter=lambda _: tokens,
+    ).review({"original_evidence": "intact"}, _checks(), 5)
+    assert result.completed is admitted
+    assert handler.call_count == int(admitted)
