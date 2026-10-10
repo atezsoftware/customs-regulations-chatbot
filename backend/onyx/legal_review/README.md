@@ -138,6 +138,11 @@ operations, review inputs and results. Additional explicit steps are:
 
 Checkpoints also retain canonical source journeys from retrieval receipts and reading
 assessment through requirements to final draft claims, plus candidate-selection audit.
+Legal Review stores repeated field names and source/audit strings once in a lossless
+dictionary. The shared encoded/decoded checkpoint limits remain unchanged; restoration
+checks content hashes, references, depth and a separate 64 MB expansion ceiling before
+returning the original snapshot. `legal_review.checkpoint_storage` records per-field
+sizes and successful persistence before the answer is streamed.
 Credentials are never included. No ingestion, relabelling, reindexing or source metadata
 mutation belongs to this workflow.
 

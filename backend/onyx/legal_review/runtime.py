@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 from collections.abc import Callable
 from uuid import UUID, uuid4
@@ -54,7 +55,23 @@ from onyx.server.query_and_chat.streaming_models import (
 )
 from onyx.tools.interface import Tool
 from onyx.tools.tool_implementations.search.search_tool import SearchTool
+from onyx.tracing.answer_graph import graph_step
 from onyx.tracing.framework.create import ChatTraceMetadata, ensure_trace
+
+
+def _persist_checkpoint(
+    *, message_id: int, user_id: UUID | None, snapshot: dict[str, JsonValue]
+) -> None:
+    fields = {
+        key: len(json.dumps(value, ensure_ascii=False).encode())
+        for key, value in snapshot.items()
+    }
+    with graph_step(
+        "legal_review.checkpoint_storage",
+        {"sequence": snapshot.get("sequence"), "field_bytes": fields},
+    ) as step:
+        save_asv3_checkpoint(message_id=message_id, user_id=user_id, snapshot=snapshot)
+        step.output_value = {"stored": True, "lossless_dictionary": True}
 
 
 def run_legal_review_loop(
@@ -340,7 +357,7 @@ def _run(
             if result.non_publication_reason == "review_rejected":
                 context.check_active()
             report("withheld", context.language)
-            save_asv3_checkpoint(
+            _persist_checkpoint(
                 message_id=assistant_message_id, user_id=user.id, snapshot=snapshot
             )
             _emit_review_notice(
@@ -354,7 +371,7 @@ def _run(
         report(
             "cancelled" if result.status == "cancelled" else "failed", context.language
         )
-        save_asv3_checkpoint(
+        _persist_checkpoint(
             message_id=assistant_message_id, user_id=user.id, snapshot=snapshot
         )
         raise OnyxError(
@@ -409,13 +426,13 @@ def _run(
                 "gaps": [*result.gaps, str(error)],
             }
         ).model_dump(mode="json")
-        save_asv3_checkpoint(
+        _persist_checkpoint(
             message_id=assistant_message_id, user_id=user.id, snapshot=snapshot
         )
         raise
     ledger.include(numbers)
     snapshot["evidence"] = ledger.export()
-    save_asv3_checkpoint(
+    _persist_checkpoint(
         message_id=assistant_message_id, user_id=user.id, snapshot=snapshot
     )
 
@@ -463,7 +480,7 @@ def _run(
     snapshot.update(
         sequence=2, progress=progress, processing_seconds=time.monotonic() - started
     )
-    save_asv3_checkpoint(
+    _persist_checkpoint(
         message_id=assistant_message_id, user_id=user.id, snapshot=snapshot
     )
 
