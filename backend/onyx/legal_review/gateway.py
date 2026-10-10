@@ -223,7 +223,11 @@ class GeminiGateway:
             deadline = self.context.research_deadline
             self.context.consume_research_decision()
         if finalizing:
-            if flow in {LLMFlow.LEGAL_REVIEW_DRAFT, LLMFlow.LEGAL_REVIEW_REPAIR}:
+            if flow in {
+                LLMFlow.LEGAL_REVIEW_DRAFT,
+                LLMFlow.LEGAL_REVIEW_REPAIR,
+                LLMFlow.LEGAL_REVIEW_FINDING_BINDING,
+            }:
                 deadline -= self.policy.publication_reserve_seconds
             else:
                 deadline -= (

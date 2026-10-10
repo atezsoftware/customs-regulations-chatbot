@@ -1,4 +1,4 @@
-PROMPT_VERSION = "legal-review-2026-10-10.61"
+PROMPT_VERSION = "legal-review-2026-10-11.62"
 
 CORPUS_CURRENCY = """When corpus_currency.assume_current_versions is true, treat all supplied
 chunks as current versions of the user's maintained corpus. Missing validity metadata
@@ -311,6 +311,16 @@ The independent final reviewer still examines the resulting originals, assessmen
 literal replacement answer. This stage uses the batched source tools when a missing original could change the outcome.
 """
 )
+
+FINDING_BINDING_PROMPT = """
+Repair the affected finding-to-claim navigation bindings for the frozen answer.
+Return only the supplied affected slots. Select claim_ids only from the schema's
+existing claim IDs, by the literal block text and claim application. Do not rename
+claims, rewrite prose, change sources or conduct research. An association is not
+proof of legal correctness. If the frozen text does not cover the finding, mark
+it unresolved with an empty claim_ids list and a precise reason. Use not_applicable
+only when the frozen answer establishes that the finding does not apply.
+"""
 
 DRAFT_PROMPT = (
     COMMON
