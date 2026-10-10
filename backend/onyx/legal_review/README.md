@@ -32,10 +32,16 @@ ACLs, dates, canonical text hashes and publication fences apply throughout.
    discovery can have multiple queries. A specific later gap gets one focused search and
    at most one justified improved retry; identical and renamed repeats are excluded.
    Independent queries are combined and executed in parallel.
-5. **Conditional research review.** Native OpenAI Decisions (`gpt-6-luna`) screens
+5. **Research review.** Native OpenAI Decisions (`gpt-6-luna`) screens
    material unresolved research where needed. An independent `gpt-6.1-sol` examiner
    separates actual source gaps from corrections and rebutted suspicions. Confirmed
    research tasks are dispatched by the host, not offered back to the reader to skip.
+   If initial discovery used its phase, the independent research audit still runs once
+   before drafting within a separate phase retaining writer/publication time. This
+   examines controlling bases and cross-source effects beyond the reader's closure labels.
+   Diagnosis check batches run in parallel and retain every check/task binding; one
+   shared planner merges overlapping investigations. Failed planning retains the completed
+   diagnoses instead of losing them. Confirmed gaps stay open until assessed against sources.
 6. **Draft — Gemini.** Produce one integrated answer with block-level claim/source
    bindings. Issues remain a research checklist rather than mandatory answer sections.
    Exact cited passage selectors are checked by code; this does not prove entailment.
@@ -44,31 +50,47 @@ ACLs, dates, canonical text hashes and publication fences apply throughout.
    whole originals. Larger check inventories run in up to four parallel batches; every
    batch sees the entire answer and source context. Equivalent findings share diagnoses.
    Existing-source corrections and missing-source research remain distinct.
+   A failed Decisions screen can fall back to a complete independent examination within
+   the phase budget. The graph distinguishes binary examiner verdicts from Decisions scores.
 8. **Correct or research.** If existing originals suffice, the independent examiner
    edits the affected answer blocks directly. No research or separate Gemini rewrite is
    needed for that path. Material source gaps can use one post-draft research/repair
    round within the available time, followed by review. The final editor may correct
    remaining wording and qualify unresolved conclusions once; it cannot start searches.
    Its response must account for every supplied finding, preserve unaffected blocks and
-   retain valid claims, source selectors and known issue identities.
+   retain valid claims, source selectors and known issue identities. The editorial packet
+   preserves the whole current answer, complete articles for its claims and material
+   findings, and contrary/limiting sources. Exact equivalent findings share one slot while
+   every original check ID remains accounted for. Historical findings carry the answer
+   revision they concern. The merged answer receives an independent post-editor check.
+   If that check succeeds with time remaining, accepted research questions receive a
+   final source-work reconciliation. Every question retains its host-owned identities;
+   closure requires canonical support from its executed investigation or continuation.
+   Missing evidence and user facts stay open. This pass neither searches nor rewrites.
 9. **Publish.** Publish the available answer when the time/repair boundary is reached,
    even when review findings remain. `publication_mode` distinguishes reviewed,
-   editor-adjusted, limit-reached and review-incomplete answers. The latter three are
-   explicitly partial, never verified. Unresolved confirmed findings remain visible.
+   editor-verified, editor-adjusted, limit-reached and review-incomplete answers. An
+   editor-verified answer is verified only when current research issues also close. The
+   latter three are explicitly partial, never verified. Internal findings stay in the
+   execution graph; the editor qualifies affected conclusions without publishing raw
+   reviewer instructions or duplicate caveats.
    If the first writer did not finish, return established research findings labelled as
    incomplete application to the facts, or honestly state that no outcome was established.
    User cancellation and revoked/inconsistent source authorization still block delivery.
 
 ## Time and source assumptions
 
-Default total generation/research time is 600 seconds. Initial research reserves the
-last 300 seconds for writing, review and corrections. Drafting retains 120 seconds for
-publication work; examination retains the last 60 seconds for the independent editor.
+Default total generation/research time is at most 1200 seconds. Initial research reserves
+the last 900 seconds for its independent audit, writing, review, source repair and corrections. Drafting retains
+360 seconds for publication work. Publication examination is bounded to 120 seconds and
+retains 120 seconds each for the independent editor and post-editor verification. Repair
+research additionally retains 90 seconds for its writer. Successful work publishes early;
+the longer ceiling is correction/verification capacity, not a required run duration.
 Each source/model phase enforces its absolute deadline as well as a 45-second idle
 network timeout. Provider failures do not gain unlimited retries. A separate bounded
 30-second delivery context permits authorization revalidation and streaming after the
 model deadline; it preserves cancellation and does not admit more model/tool research.
-This is an approximate ten-minute response target, not a transport latency guarantee.
+These phase deadlines do not guarantee provider or delivery latency.
 
 There is no aggregate token quota, model-call quota, issue-count limit or total search
 count limit. Physical concurrency, the overall deadline, per-gap retries, provider
@@ -99,6 +121,10 @@ operations, review inputs and results. Additional explicit steps are:
 - `legal_review.issue_plan`: issues, facts, closure criteria and bound discovery queries.
 - `legal_review.issue_update`: adopted issues, new child IDs, source triggers, closure
   status and pending source operations after an accepted reading.
+- `legal_review.research_audit`: the deferred pre-draft independent audit, confirmed
+  work or its explicit phase interruption; it cannot silently count as completed.
+- `legal_review.research_reconciliation`: source-backed dispositions after successful
+  answer verification, or the explicit failure retaining prior open questions.
 - `legal_review.review_diagnoses` and `legal_review.final_adjudication`: research versus
   correction decisions and their supporting passages.
 - `legal_review.editor` / generation flow `legal_review_editor`: actual editor input,

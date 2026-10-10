@@ -155,3 +155,16 @@ def test_duplicate_slots_cannot_discard_an_unanswered_question() -> None:
     payload["research_resolutions"][1]["slot"] = "r0001"
     with pytest.raises(ValueError, match="preserve every accepted question"):
         mapping.compile(mapping.response_model().model_validate(payload))
+
+
+def test_publication_closure_preserves_inventory_without_reopening_tools() -> None:
+    mapping = plan()
+    schema = mapping.closure_response_model()
+    payload = response()
+    payload.pop("dimensions")
+    compiled = mapping.compile_closure(schema.model_validate(payload))
+    assert [row.check_ids for row in compiled] == [["a", "b"], ["d"]]
+    assert compiled[0].issue_ids == ["i1", "i2"]
+    payload["research_resolutions"][0]["disposition"] = "request_sources"
+    with pytest.raises(ValidationError):
+        schema.model_validate(payload)

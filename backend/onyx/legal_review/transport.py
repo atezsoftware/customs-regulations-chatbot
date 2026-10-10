@@ -10,6 +10,7 @@ from typing import cast
 
 from pydantic import JsonValue
 
+from onyx.legal_review.editor_context import group_editor_findings
 from onyx.tracing.flows import LLMFlow
 
 _DIAGNOSTIC_KEYS = frozenset(
@@ -214,11 +215,22 @@ def model_state(state: dict[str, JsonValue], flow: LLMFlow) -> dict[str, JsonVal
         if isinstance(adjudication, dict) and isinstance(
             adjudication.get("findings"), list
         ):
-            result["publication_corrections"] = [
+            corrections = [
                 row
                 for row in adjudication["findings"]
                 if isinstance(row, dict) and row.get("disposition") == "defect"
             ]
+            if corrections:
+                rows, _, passages = group_editor_findings(corrections)
+                result["publication_corrections"] = cast(list[JsonValue], rows)
+                result["reviewed_answer_passages"] = passages
+                diagnoses = result.get("review_diagnoses")
+                if isinstance(diagnoses, dict):
+                    # The same confirmed corrections otherwise arrive a second time,
+                    # with full answer quotations repeated in every check alias.
+                    result["review_diagnoses"] = {
+                        "research_tasks": diagnoses.get("research_tasks", [])
+                    }
     if isinstance(result.get("final_review"), dict):
         result.pop("early_review", None)
     return result

@@ -78,6 +78,29 @@ def test_integrated_draft_compiles_exact_blocks_and_multiple_source_bindings() -
     assert "answer_excerpt" not in str(generated.model_dump())
 
 
+@pytest.mark.parametrize("markers", ["[1:2] [2:1]", "[1:2, 2:1]", "[1:2, 2]"])
+def test_internal_span_selector_renders_as_an_ordinary_bound_citation(
+    markers: str,
+) -> None:
+    payload = draft_payload()
+    payload["blocks"][1]["text"] = "Başvuru yapılabilir. " + markers
+    generated = GeneratedDraft.model_validate(payload)
+    compiled = compile_draft(generated)
+    assert "[1:2]" not in compiled.answer and "[2:1]" not in compiled.answer
+    assert (
+        "Başvuru yapılabilir. " + markers.replace(":2", "").replace(":1", "")
+        in compiled.answer
+    )
+    assert compiled.claims[0].supports == generated.blocks[1].claims[0].supports
+
+
+def test_unknown_inline_span_cannot_be_laundered_into_a_valid_source_number() -> None:
+    payload = draft_payload()
+    payload["blocks"][1]["text"] = "Başvuru yapılabilir. [1:999]"
+    with pytest.raises(ValueError, match="canonical binding"):
+        compile_draft(GeneratedDraft.model_validate(payload))
+
+
 def test_claims_field_is_required_even_for_heading() -> None:
     payload = draft_payload()
     del payload["blocks"][0]["claims"]

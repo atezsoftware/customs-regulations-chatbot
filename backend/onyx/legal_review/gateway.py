@@ -226,7 +226,10 @@ class GeminiGateway:
             if flow in {LLMFlow.LEGAL_REVIEW_DRAFT, LLMFlow.LEGAL_REVIEW_REPAIR}:
                 deadline -= self.policy.publication_reserve_seconds
             else:
-                deadline -= self.policy.publication_reserve_seconds + 60
+                deadline -= (
+                    self.policy.publication_reserve_seconds
+                    + self.policy.writer_reserve_seconds
+                )
             self.context.services["legal_review_phase_deadline"] = deadline
             if time.monotonic() >= deadline:
                 raise TimeoutError(

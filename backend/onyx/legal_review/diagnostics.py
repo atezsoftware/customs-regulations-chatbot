@@ -17,6 +17,8 @@ from onyx.legal_review.adjudication import (
     publication_response_model,
 )
 from onyx.legal_review.drafting import DraftEdits, EditorialEdits
+from onyx.legal_review.editor_context import editorial_context, group_editor_findings
+from onyx.legal_review.evidence_resolution import EvidenceResolutionPlan
 from onyx.legal_review.models import (
     DIAGNOSIS_MODEL,
     DiagnosisFinding,
@@ -26,6 +28,7 @@ from onyx.legal_review.models import (
     PublicationFinding,
     PublicationReview,
     ResearchQuestion,
+    ResearchResolution,
     ReviewCheck,
     ReviewDiagnosis,
     ReviewDiagnosisBatch,
@@ -33,10 +36,11 @@ from onyx.legal_review.models import (
     StrictModel,
 )
 from onyx.legal_review.research_planning import ResearchPlan, question_response_type
-from onyx.legal_review.review_scope import scope_review_state
+from onyx.legal_review.review_scope import publication_state, scope_review_state
 from onyx.legal_review.streaming import Deadline, deadline_transport
 from onyx.legal_review.transport import model_state
 from onyx.prompts.legal_review.prompts import CORPUS_CURRENCY, RESEARCH_PLANNING_PROMPT
+from onyx.tracing.answer_graph import graph_step
 from onyx.tracing.flows import LLMFlow
 from onyx.tracing.llm_utils import traced_llm_call
 
@@ -184,6 +188,49 @@ def _compile_diagnoses(
     )
 
 
+def _merge_diagnosis_batches(
+    batches: Sequence[ReviewDiagnosisBatch], checks: Sequence[ReviewCheck]
+) -> ReviewDiagnosisBatch:
+    tasks: dict[str, ReviewResearchTask] = {}
+    diagnoses: list[ReviewDiagnosis] = []
+    for batch in batches:
+        identities: dict[str, str] = {}
+        for task in batch.research_tasks:
+            key = json.dumps(
+                task.model_dump(mode="json", exclude={"task_id", "supports"}),
+                sort_keys=True,
+            )
+            if key not in tasks:
+                tasks[key] = task.model_copy(
+                    update={"task_id": f"task_{len(tasks) + 1}"}, deep=True
+                )
+            merged = tasks[key]
+            for support in task.supports:
+                if support not in merged.supports:
+                    merged.supports.append(support)
+            identities[task.task_id] = merged.task_id
+        diagnoses.extend(
+            row.model_copy(
+                update={
+                    "research_task_ids": list(
+                        dict.fromkeys(
+                            identities[identity] for identity in row.research_task_ids
+                        )
+                    )
+                }
+            )
+            for row in batch.diagnoses
+        )
+    covered = [identity for row in diagnoses for identity in row.check_ids]
+    if len(covered) != len(set(covered)) or set(covered) != {
+        check.id for check in checks
+    }:
+        raise ValueError("Parallel diagnosis must retain the exact check inventory")
+    return ReviewDiagnosisBatch(
+        diagnoses=diagnoses, research_tasks=list(tasks.values())
+    )
+
+
 DIAGNOSIS_PROMPT = (
     CORPUS_CURRENCY
     + """You are the independent evidence examiner of a legal research workflow.
@@ -321,12 +368,43 @@ class OpenAIReviewDiagnoser:
     ) -> ReviewDiagnosisBatch:
         from openai import OpenAIError
 
+        if not checks or len({check.id for check in checks}) != len(checks):
+            raise ValueError("Diagnosis requires a unique nonempty check inventory")
         deadline = time.monotonic() + timeout_seconds
         try:
-            diagnosed = self._diagnose(state, checks, timeout_seconds)
-            return self.consolidate(
-                state, diagnosed, max(0, deadline - time.monotonic())
-            )
+            count = min(4, max(1, (len(checks) + 7) // 8))
+            if count == 1:
+                diagnosed = self._diagnose(state, checks, timeout_seconds)
+            else:
+                batches = [list(checks[index::count]) for index in range(count)]
+
+                def assess(batch: list[ReviewCheck]) -> ReviewDiagnosisBatch:
+                    return self._diagnose(
+                        state, batch, max(0, deadline - time.monotonic())
+                    )
+
+                with ThreadPoolExecutor(max_workers=count) as executor:
+                    futures = [
+                        executor.submit(copy_context().run, assess, batch)
+                        for batch in batches
+                    ]
+                    results = [
+                        cast(ReviewDiagnosisBatch, future.result())
+                        for future in futures
+                    ]
+                diagnosed = _merge_diagnosis_batches(results, checks)
+            try:
+                return self.consolidate(
+                    state, diagnosed, max(0, deadline - time.monotonic())
+                )
+            except (TimeoutError, ValueError) as error:
+                self.check_active()
+                with graph_step("legal_review.research_plan_fallback", {}) as step:
+                    step.output_value = {
+                        "reason": str(error),
+                        "retained_diagnoses": diagnosed.model_dump(mode="json"),
+                    }
+                return diagnosed
         except OpenAIError as error:
             if time.monotonic() >= deadline:
                 raise TimeoutError("Independent diagnosis deadline exceeded") from error
@@ -378,16 +456,7 @@ class OpenAIReviewDiagnoser:
         supplied = state.get("editor_findings")
         if not isinstance(supplied, list) or not supplied:
             raise ValueError("Editor requires a nonempty finding inventory")
-        slots: dict[str, str] = {}
-        findings: list[JsonValue] = []
-        for index, row in enumerate(supplied, 1):
-            if not isinstance(row, dict) or not isinstance(row.get("check_id"), str):
-                raise ValueError("Editor finding requires a known check identity")
-            slot = f"q{index:04d}"
-            slots[slot] = row["check_id"]
-            findings.append({"slot": slot, **row})
-        if len(set(slots.values())) != len(slots):
-            raise ValueError("Editor findings must have unique identities")
+        findings, slots, answer_passages = group_editor_findings(supplied)
         disposition_fields: dict[str, Any] = {
             slot: (Literal["resolved", "unresolved"], Field()) for slot in slots
         }
@@ -399,10 +468,14 @@ class OpenAIReviewDiagnoser:
             __base__=DraftEdits,
             findings=(dispositions, Field()),
         )
-        packet = {**state, "editor_findings": findings}
+        packet = {
+            **editorial_context(state),
+            "editor_findings": cast(list[JsonValue], findings),
+            "answer_passages": answer_passages,
+        }
         try:
             response = self._complete(
-                model_state(scope_review_state(packet), LLMFlow.LEGAL_REVIEW_EDITOR),
+                model_state(packet, LLMFlow.LEGAL_REVIEW_EDITOR),
                 response_model,
                 CORPUS_CURRENCY
                 + """Act as the final legal editor. Return targeted replacements
@@ -415,10 +488,22 @@ or say precisely what cannot be established; never invent the missing outcome. P
 selectors, conditions and claim bindings. Check consistency across the WHOLE merged answer,
 including dependent calculations and conclusions. Do not rewrite unaffected blocks.
 Group duplicate findings and resolve their shared defect once. Return resolved or unresolved
-for EVERY code-owned q slot in findings. Never copy or invent check IDs. A missing source remains unresolved
+for EVERY code-owned q slot in findings. Each slot may cover several original check IDs.
+answer_passage_ids identify the exact historical passages in answer_passages. When
+findings_answer_revision differs from answer_revision, those findings concern a PREVIOUS
+draft: assess them against current repair_base, do not restore old text or demand an edit
+already present. Mark an already correctly repaired defect resolved without changing it.
+Use the WHOLE current answer to check that a condition or alternative is not already covered.
+Never copy or invent check IDs. A missing source remains unresolved
 even after you honestly qualify its conclusion. Do not claim that an unperformed search or review
 succeeded. Return unresolved_issue_ids for remaining gaps. There will be no further research or
-editor loop. The host publishes the result as partial with an explicit review-status notice.
+editor loop. The host independently checks the merged result; your resolved labels are
+proposals, not verification. Keep the user's language throughout the publication text.
+Never publish reviewer instructions, internal check IDs or passage selectors like [12:1].
+Keep prompt and schema vocabulary such as "supplied", "unresolved issue" and "claim"
+out of the publication prose; describe actual legal qualifications in the user's language.
+Use ordinary supplied [n] citations. Preserve every material supported alternative and
+prerequisite even when several findings concern another part of its block.
 """,
                 LLMFlow.LEGAL_REVIEW_EDITOR,
                 timeout_seconds,
@@ -430,12 +515,14 @@ editor loop. The host publishes the result as partial with an explicit review-st
                 **parsed,
                 resolved_check_ids=[
                     identity
-                    for slot, identity in slots.items()
+                    for slot, identities in slots.items()
+                    for identity in identities
                     if decisions[slot] == "resolved"
                 ],
                 unresolved_check_ids=[
                     identity
-                    for slot, identity in slots.items()
+                    for slot, identities in slots.items()
+                    for identity in identities
                     if decisions[slot] == "unresolved"
                 ],
             )
@@ -462,7 +549,7 @@ editor loop. The host publishes the result as partial with an explicit review-st
         }
         packet: dict[str, JsonValue] = {
             "state": model_state(
-                scope_review_state(state), LLMFlow.LEGAL_REVIEW_DIAGNOSIS
+                publication_state(state), LLMFlow.LEGAL_REVIEW_DIAGNOSIS
             ),
             "flagged_checks": [
                 {"slot": f"q{index:04d}", **check.model_dump(mode="json")}
@@ -581,6 +668,42 @@ editor loop. The host publishes the result as partial with an explicit review-st
         )
         return _compile_diagnoses(parsed.model_dump(), slots)
 
+    def close_research(
+        self,
+        state: dict[str, JsonValue],
+        plan: EvidenceResolutionPlan,
+        timeout_seconds: float,
+    ) -> list[ResearchResolution]:
+        packet = plan.state(
+            {
+                **publication_state(state),
+                "source_operations": state.get("source_operations", []),
+            }
+        )
+        response = self._complete(
+            model_state(packet, LLMFlow.LEGAL_REVIEW_DIAGNOSIS),
+            plan.closure_response_model(),
+            CORPUS_CURRENCY
+            + """Reconcile each accepted research question against the
+complete acquired originals after the answer was independently checked. Return every
+bound slot exactly once. This is source-work accounting, not another answer editor or
+research planner. The draft and earlier interpretations are candidates, never evidence.
+Resolve only when canonical operative passages actually establish the requested effect.
+Dispute a gap only with source-backed grounds that its premise or scope is inapplicable.
+A qualification in the answer, successful retrieval, source title or lack of metadata
+alone cannot settle a legal question. If a judicial effect was requested, administrative
+commentary alone cannot establish it. Preserve genuinely missing legal evidence as
+unresolved and specific missing user facts as needs_user_facts. Do not invent an absent
+judgment, infer absence from no search hits, request tools, open issues or rewrite prose.
+Use actual returned_citations and canonical continuations as witnesses; citations must
+support the precise question, including its conditions and contrary branches.
+""",
+            LLMFlow.LEGAL_REVIEW_DIAGNOSIS,
+            timeout_seconds,
+            _MODEL_OUTPUT_CAPACITY,
+        )
+        return plan.compile_closure(response)
+
     def consolidate(
         self,
         state: dict[str, JsonValue],
@@ -630,16 +753,21 @@ editor loop. The host publishes the result as partial with an explicit review-st
         max_output_tokens: int,
     ) -> StrictModel:
         import httpx
+        from openai import APITimeoutError, OpenAIError
 
         try:
             return self._complete_stream(
                 packet, response_model, prompt, flow, timeout_seconds, max_output_tokens
             )
-        except httpx.TimeoutException as error:
+        except (httpx.TimeoutException, APITimeoutError) as error:
             raise TimeoutError("Independent examiner stream timed out") from error
         except httpx.HTTPError as error:
             raise ValueError(
                 f"Independent examiner stream transport: {type(error).__name__}"
+            ) from error
+        except OpenAIError as error:
+            raise ValueError(
+                f"Independent examiner provider: {type(error).__name__}"
             ) from error
 
     def _complete_stream(
@@ -699,7 +827,9 @@ editor loop. The host publishes the result as partial with an explicit review-st
                         "strict": True,
                     },
                 },
-                reasoning={"effort": "medium"},
+                reasoning={
+                    "effort": "low" if flow == LLMFlow.LEGAL_REVIEW_EDITOR else "medium"
+                },
                 max_output_tokens=min(
                     _MODEL_OUTPUT_CAPACITY,
                     max_output_tokens,

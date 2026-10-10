@@ -20,6 +20,27 @@ from onyx.legal_review.diagnostics import (
 )
 from onyx.legal_review.models import ReviewCheck, ReviewDiagnosisBatch, StrictModel
 from onyx.legal_review.review_scope import scope_review_state
+from onyx.tracing.flows import LLMFlow
+
+
+@pytest.mark.parametrize("timeout", [False, True])
+def test_provider_errors_preserve_the_engine_recovery_contract(timeout: bool) -> None:
+    import httpx
+    from openai import APITimeoutError, OpenAIError
+
+    error = (
+        APITimeoutError(request=httpx.Request("POST", "https://api.openai.com"))
+        if timeout
+        else OpenAIError("Provider failed")
+    )
+    examiner = OpenAIReviewDiagnoser(api_key="test")
+    with (
+        patch.object(examiner, "_complete_stream", side_effect=error),
+        pytest.raises(TimeoutError if timeout else ValueError),
+    ):
+        examiner._complete(
+            {}, StrictModel, "Review", LLMFlow.LEGAL_REVIEW_DIAGNOSIS, 120, 1000
+        )
 
 
 def test_repair_diagnosis_receives_the_matching_confirmed_publication_defect() -> None:
@@ -105,6 +126,85 @@ def _mixed_research_batch(fresh_count: int) -> ReviewDiagnosisBatch:
         },
         {"q0001": ReviewCheck(id="check", instructions="Check conditions")},
     )
+
+
+def test_parallel_diagnosis_preserves_every_check_and_the_whole_source_context() -> (
+    None
+):
+    from threading import Barrier, Lock
+
+    from onyx.legal_review.models import ReviewDiagnosis
+
+    checks = [
+        ReviewCheck(id=f"check-{index}", instructions="Inspect the decisive effects")
+        for index in range(17)
+    ]
+    state: dict[str, JsonValue] = {
+        "request": "All requested legal outcomes",
+        "original_evidence": [
+            {
+                "citation": 1,
+                "passages": [{"span_number": 1, "text": "The complete original"}],
+            }
+        ],
+    }
+    barrier, lock = Barrier(3), Lock()
+    observed: list[list[str]] = []
+
+    def assess(
+        packet: dict[str, JsonValue], batch: list[ReviewCheck], _timeout: float
+    ) -> ReviewDiagnosisBatch:
+        assert packet is state
+        barrier.wait(timeout=3)
+        with lock:
+            observed.append([check.id for check in batch])
+        return ReviewDiagnosisBatch(
+            diagnoses=[
+                ReviewDiagnosis(
+                    check_ids=[check.id],
+                    kind="disputed",
+                    assertion="The supplied rule",
+                    reason="Its conditions are already preserved.",
+                    required_change="No correction",
+                    supports=[],
+                    research_task_ids=[],
+                    dimension=None,
+                )
+                for check in batch
+            ],
+            research_tasks=[],
+        )
+
+    examiner = OpenAIReviewDiagnoser(api_key="test")
+    with patch.object(examiner, "_diagnose", side_effect=assess):
+        result = examiner.diagnose(state, checks, 10)
+    assert len(observed) == 3
+    assert {identity for group in observed for identity in group} == {
+        check.id for check in checks
+    }
+    assert {identity for row in result.diagnoses for identity in row.check_ids} == {
+        check.id for check in checks
+    }
+
+
+def test_research_planning_timeout_retains_completed_actionable_diagnoses() -> None:
+    batch = _mixed_research_batch(2)
+    active = MagicMock()
+    examiner = OpenAIReviewDiagnoser(api_key="test", check_active=active)
+    with (
+        patch.object(examiner, "_diagnose", return_value=batch),
+        patch.object(
+            examiner, "consolidate", side_effect=TimeoutError("Planner deadline")
+        ),
+    ):
+        result = examiner.diagnose(
+            {"request": "Question"},
+            [ReviewCheck(id="check", instructions="Inspect")],
+            10,
+        )
+    assert result is batch
+    assert len(result.research_tasks) == 3
+    active.assert_called_once()
 
 
 def test_one_fresh_search_with_prior_attempts_needs_no_replanning_call() -> None:
@@ -847,6 +947,7 @@ def test_editor_dispositions_bind_every_check_in_provider_schema() -> None:
     examiner = OpenAIReviewDiagnoser(api_key="test")
     state: dict[str, JsonValue] = {
         "draft": {"answer": "The original answer."},
+        "repair_base": {"blocks": []},
         "editor_findings": [{"check_id": "claim:one"}, {"check_id": "source:two"}],
     }
 
