@@ -176,7 +176,10 @@ class FakeGateway:
         self.response_models.append(response_model)
         result = self.results.pop(0)
         payload = result.model_dump()
-        if response_model is InitialDiscoveryPlan and type(result) is IssuePlan:
+        if (
+            issubclass(response_model, InitialDiscoveryPlan)
+            and type(result) is IssuePlan
+        ):
             payload["requested_outcomes"] = [
                 {"request": issue.requested_outcome, "issue_ids": [issue.issue_id]}
                 for issue in result.issues
@@ -189,6 +192,19 @@ class FakeGateway:
                 {"query": query, "issue_ids": identities}
                 for query, identities in shared.items()
             ]
+        if (
+            issubclass(response_model, InitialDiscoveryPlan)
+            and "request_coverage" in response_model.model_fields
+        ):
+            units = state["explicit_request_units"]
+            assert isinstance(units, dict)
+            payload["request_coverage"] = {
+                slot: {
+                    "requested_result": str(text),
+                    "issue_ids": [issue["issue_id"] for issue in payload["issues"]],
+                }
+                for slot, text in units.items()
+            }
         if response_model in {GeneratedDraft, DraftEdits} and isinstance(
             result, DraftAnswer
         ):

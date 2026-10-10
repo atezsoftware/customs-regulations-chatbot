@@ -217,7 +217,14 @@ def test_initial_schema_correction_is_separately_metered_and_can_resume_research
     llm = MagicMock(spec=LLM)
     llm.invoke.side_effect = [
         response(omitted_queries()),
-        response(valid_plan().model_dump(mode="json")),
+        response(
+            {
+                **valid_plan().model_dump(mode="json"),
+                "request_coverage": {
+                    "q0001": {"requested_result": "Başvuru şartı", "issue_ids": ["i1"]}
+                },
+            }
+        ),
         response(reading_response()),
         response(generated_draft().model_dump(mode="json")),
     ]
