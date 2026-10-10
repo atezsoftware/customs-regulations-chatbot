@@ -3,7 +3,15 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, SecretStr, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    JsonValue,
+    SecretStr,
+    field_validator,
+    model_validator,
+)
 
 from onyx.legal_review.passages import PassageReference as PassageSupport
 from onyx.tools.constants import REGULATORY_MAX_SEARCH_QUERY_CHARS
@@ -75,6 +83,7 @@ class WorkflowPolicy(BaseModel):
     timeout_seconds: float | None = Field(default=600, gt=0)
     finalization_reserve_seconds: float = Field(default=300, gt=0)
     publication_reserve_seconds: float = Field(default=120, gt=0)
+    editor_reserve_seconds: float = Field(default=60, gt=0)
     assume_current_corpus: bool = True
     always_review_research: bool = False
     max_call_seconds: int = Field(default=45, gt=0)
@@ -171,7 +180,46 @@ class DiscoveryQuery(StrictModel):
         return self
 
 
+class PlannedIssue(Issue):
+    origin: Literal["question"] = "question"
+    material_reason: str = Field(min_length=1)
+    closure_criteria: list[str] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def actionable_issue(self) -> PlannedIssue:
+        if not self.material_reason.strip() or any(
+            not item.strip() for item in self.closure_criteria
+        ):
+            raise ValueError(
+                "Planned issues need a material reason and actionable closure criteria"
+            )
+        return self
+
+
+class RequestedOutcome(StrictModel):
+    request: str = Field(
+        min_length=1,
+        description="A distinct requested result or alternative from the complete user question, without assuming the legal answer.",
+    )
+    issue_ids: list[str] = Field(min_length=1)
+
+
 class InitialDiscoveryPlan(IssuePlan):
+    issues: list[PlannedIssue] = Field(min_length=1)
+    requested_outcomes: list[RequestedOutcome] = Field(
+        min_length=1,
+        description="Cover every explicit requested result and alternative. Many requests can map to one issue, and one request can map to several. Do not omit later subquestions.",
+    )
+
+    @field_validator("issues", mode="before")
+    @classmethod
+    def read_issue_models(cls, value: object) -> object:
+        if isinstance(value, list):
+            return [
+                row.model_dump() if isinstance(row, Issue) else row for row in value
+            ]
+        return value
+
     discovery_queries: list[DiscoveryQuery] = Field(
         min_length=1,
         description="Required shared initial searches, each bound to the covered issue IDs.",
@@ -180,8 +228,17 @@ class InitialDiscoveryPlan(IssuePlan):
     @model_validator(mode="after")
     def known_query_issues(self) -> InitialDiscoveryPlan:
         known = {issue.issue_id for issue in self.issues}
+        covered = {
+            identity for row in self.requested_outcomes for identity in row.issue_ids
+        }
+        if covered != known:
+            raise ValueError("Requested outcomes must cover exactly the planned issues")
         if any(set(query.issue_ids) - known for query in self.discovery_queries):
             raise ValueError("Discovery queries must refer to known issue identities")
+        if {
+            identity for query in self.discovery_queries for identity in query.issue_ids
+        } != known:
+            raise ValueError("Every planned issue must be covered by initial discovery")
         return self
 
 
@@ -465,9 +522,14 @@ class IssueClosure(StrictModel):
 class WorkflowResult(StrictModel):
     status: Literal["verified", "partial", "unavailable", "cancelled"]
     non_publication_reason: Literal["review_rejected", "time_exhausted"] | None = None
+    publication_mode: Literal[
+        "reviewed", "editor_adjusted", "limit_reached", "review_incomplete"
+    ] = "reviewed"
+    editorial_changes: list[dict[str, JsonValue]] = Field(default_factory=list)
     reading_correction_used: bool = False
     answer: str | None = None
     plan: IssuePlan | None = None
+    requested_outcomes: list[RequestedOutcome] = Field(default_factory=list)
     requirements: list[RequirementRecord] = Field(default_factory=list)
     dimensions: list[DimensionAssessment] = Field(default_factory=list)
     issue_closures: list[IssueClosure] = Field(default_factory=list)
@@ -489,6 +551,10 @@ class WorkflowResult(StrictModel):
 
     @model_validator(mode="after")
     def rejected_review_has_no_published_answer(self) -> "WorkflowResult":
+        if self.publication_mode != "reviewed" and self.status == "verified":
+            raise ValueError(
+                "Unfinished review or editorial publication must remain partial"
+            )
         if self.non_publication_reason is not None and (
             self.status != "unavailable"
             or self.answer is not None

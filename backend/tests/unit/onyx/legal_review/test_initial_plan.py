@@ -48,6 +48,9 @@ def valid_plan() -> InitialDiscoveryPlan:
     return InitialDiscoveryPlan.model_validate(
         {
             **plan().model_dump(),
+            "requested_outcomes": [
+                {"request": "Application condition", "issue_ids": ["i1"]}
+            ],
             "discovery_queries": [
                 {"query": "Başvuru şartı belge ibrazı", "issue_ids": ["i1"]}
             ],
@@ -188,8 +191,13 @@ def test_one_global_query_validates_with_31_issues_and_no_per_issue_query_fields
             "issue_id": f"i{index}",
             "question": "Başvuru şartı nedir?",
             "requested_outcome": f"Sonuç {index}",
+            "material_reason": "Resolve eligibility.",
+            "closure_criteria": ["Establish eligibility conditions."],
         }
         for index in range(31)
+    ]
+    data["requested_outcomes"] = [
+        {"request": "Eligibility", "issue_ids": [f"i{index}" for index in range(31)]}
     ]
     data["discovery_queries"] = [
         {
@@ -249,3 +257,34 @@ def test_provider_failure_never_triggers_schema_correction() -> None:
         workflow.run("Başvuru şartı nedir?", "")
     assert llm.invoke.call_count == 1
     assert workflow.context.budget.snapshot()["decisions"] == 1
+
+
+def test_outcome_coverage_can_group_requests_without_losing_issue_discovery() -> None:
+    data = valid_plan().model_dump()
+    data["requested_outcomes"] = [
+        {"request": "Which condition applies?", "issue_ids": ["i1"]},
+        {"request": "How does that condition affect release?", "issue_ids": ["i1"]},
+    ]
+    grouped = InitialDiscoveryPlan.model_validate(data)
+    assert len(grouped.issues) == 1 and len(grouped.requested_outcomes) == 2
+    data["requested_outcomes"][0]["issue_ids"] = ["unknown"]
+    with pytest.raises(ValidationError, match="exactly the planned issues"):
+        InitialDiscoveryPlan.model_validate(data)
+
+
+def test_initial_issue_cannot_omit_materiality_or_closure_criteria() -> None:
+    for field in ("material_reason", "closure_criteria"):
+        data = valid_plan().model_dump()
+        data["issues"][0].pop(field)
+        with pytest.raises(ValidationError, match=field):
+            InitialDiscoveryPlan.model_validate(data)
+
+
+def test_declared_issue_cannot_silently_miss_initial_discovery() -> None:
+    data = valid_plan().model_dump()
+    data["issues"].append({**data["issues"][0], "issue_id": "i2"})
+    data["requested_outcomes"].append(
+        {"request": "Another outcome", "issue_ids": ["i2"]}
+    )
+    with pytest.raises(ValidationError, match="covered by initial discovery"):
+        InitialDiscoveryPlan.model_validate(data)

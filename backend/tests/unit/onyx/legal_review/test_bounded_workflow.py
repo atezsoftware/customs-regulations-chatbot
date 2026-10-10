@@ -21,6 +21,7 @@ from onyx.legal_review.models import (
     InitialDiscoveryPlan,
     PublicationFinding,
     PublicationReview,
+    RequestedOutcome,
     ReviewCheck,
     ReviewResult,
     SourceAction,
@@ -74,6 +75,9 @@ def test_research_deadline_still_writes_and_reviews_a_partial_answer() -> None:
 def test_one_issue_may_discover_distinct_source_targets() -> None:
     initial = InitialDiscoveryPlan(
         **plan().model_dump(),
+        requested_outcomes=[
+            RequestedOutcome(request="Application condition", issue_ids=["i1"])
+        ],
         discovery_queries=[
             DiscoveryQuery(query=query, issue_ids=["i1"])
             for query in ["application conditions", "application official form"]

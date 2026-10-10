@@ -80,6 +80,11 @@ class DraftEdits(StrictModel):
     unresolved_issue_ids: list[str]
 
 
+class EditorialEdits(DraftEdits):
+    resolved_check_ids: list[str]
+    unresolved_check_ids: list[str]
+
+
 def apply_draft_edits(base: GeneratedDraft, edits: DraftEdits) -> GeneratedDraft:
     """Replace named prose blocks; preserve all unaffected text and claim bindings."""
     known = {block.block_id for block in base.blocks}

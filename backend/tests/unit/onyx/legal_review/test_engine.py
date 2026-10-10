@@ -9,7 +9,7 @@ from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.models import EvidenceItem, RunContext, SharedBudget
 from onyx.configs.constants import DocumentSource
 from onyx.context.search.models import SearchDoc
-from onyx.legal_review.drafting import DraftEdits, GeneratedDraft
+from onyx.legal_review.drafting import DraftEdits, EditorialEdits, GeneratedDraft
 from onyx.legal_review.engine import (
     LegalReviewEngine,
     recorded_legal_status,
@@ -27,11 +27,13 @@ from onyx.legal_review.models import (
     IssuePlan,
     LegalDimension,
     PassageSupport,
+    PlannedIssue,
     PublicationFinding,
     PublicationReview,
     ReadingDecision,
     RepairReadingDecision,
     RepairResolution,
+    RequestedOutcome,
     Requirement,
     ResearchResolution,
     ReviewCheck,
@@ -70,7 +72,11 @@ def plan() -> IssuePlan:
     return IssuePlan(
         language="tr",
         issues=[
-            Issue(
+            PlannedIssue(
+                material_reason="The document condition changes application eligibility.",
+                closure_criteria=[
+                    "Establish the document condition and its application."
+                ],
                 issue_id="i1",
                 question="Başvuru şartı nedir?",
                 requested_outcome="Başvuru şartını açıklamak",
@@ -171,6 +177,10 @@ class FakeGateway:
         result = self.results.pop(0)
         payload = result.model_dump()
         if response_model is InitialDiscoveryPlan and type(result) is IssuePlan:
+            payload["requested_outcomes"] = [
+                {"request": issue.requested_outcome, "issue_ids": [issue.issue_id]}
+                for issue in result.issues
+            ]
             shared: dict[str, list[str]] = {}
             for issue in result.issues:
                 for query in issue.research_queries:
@@ -349,7 +359,8 @@ def test_one_repair_uses_literal_draft_then_stops_on_remaining_flags() -> None:
         ["pass", "flag", "flag"],
     )
     result = workflow.run("Başvuru şartı nedir?", "")
-    assert result.status == "unavailable" and result.answer is None
+    assert result.status == "partial" and result.answer
+    assert result.publication_mode == "review_incomplete"
     assert result.repair_used is True
     assert len(reviewer.states) == 3
     repair_read = gateway.calls[3][1]
@@ -673,8 +684,10 @@ def test_distinct_dependencies_can_share_one_source_operation(tool: str) -> None
 
 
 def test_issue_count_has_no_arbitrary_cap_and_dependencies_remain_acyclic() -> None:
-    issues = [
-        plan().issues[0].model_copy(update={"issue_id": f"i{index}"})
+    issues: list[Issue] = [
+        PlannedIssue.model_validate(
+            plan().issues[0].model_copy(update={"issue_id": f"i{index}"}).model_dump()
+        )
         for index in range(31)
     ]
     assert len(IssuePlan(language="tr", issues=issues).issues) == 31
@@ -692,9 +705,18 @@ def test_issue_count_has_no_arbitrary_cap_and_dependencies_remain_acyclic() -> N
 
 def test_distinct_initial_queries_have_no_global_search_quota() -> None:
     discovery = InitialDiscoveryPlan(
+        requested_outcomes=[
+            RequestedOutcome(request=f"Outcome {index}", issue_ids=[f"i{index}"])
+            for index in range(25)
+        ],
         language="tr",
         issues=[
-            plan().issues[0].model_copy(update={"issue_id": f"i{index}"})
+            PlannedIssue.model_validate(
+                plan()
+                .issues[0]
+                .model_copy(update={"issue_id": f"i{index}"})
+                .model_dump()
+            )
             for index in range(25)
         ],
         discovery_queries=[
@@ -736,8 +758,14 @@ def test_related_issues_share_initial_search_without_losing_requested_outcomes()
     for issue in issues:
         issue.research_queries = []
     grouped = InitialDiscoveryPlan(
+        requested_outcomes=[
+            RequestedOutcome(
+                request=issue.requested_outcome, issue_ids=[issue.issue_id]
+            )
+            for issue in issues
+        ],
         language="tr",
-        issues=issues,
+        issues=[PlannedIssue.model_validate(issue.model_dump()) for issue in issues],
         discovery_queries=[
             DiscoveryQuery(
                 query="Başvuru kabul belgenin ibrazı",
@@ -778,7 +806,7 @@ def test_initial_planner_cannot_invent_source_issues_before_retrieval() -> None:
     )
     workflow, _, _ = engine([premature], [])
     result = workflow.run("Soru", "")
-    assert result.status == "unavailable" and "initial plan" in result.gaps[-1]
+    assert result.status == "unavailable" and "origin" in result.gaps[-1]
     assert (
         isinstance(workflow.acquirer, FakeAcquirer) and workflow.acquirer.actions == []
     )
@@ -1163,7 +1191,7 @@ def test_honest_claimless_limitation_still_receives_entire_answer_review() -> No
     assert reviewer.states[-1]["draft"] is not None
 
 
-def test_claimless_positive_assertion_can_be_withheld_by_independent_review() -> None:
+def test_unresolved_positive_assertion_is_explicitly_unverified_after_limit() -> None:
     unsupported = DraftAnswer(
         answer="Başvuru kesinlikle kabul edilir.",
         claims=[],
@@ -1180,7 +1208,8 @@ def test_claimless_positive_assertion_can_be_withheld_by_independent_review() ->
         ["pass", "flag:all_answer_claims", "flag:all_answer_claims"],
     )
     result = workflow.run("Soru", "")
-    assert result.status == "unavailable" and result.answer is None
+    assert result.status == "partial" and result.answer
+    assert result.publication_mode == "review_incomplete"
     assert result.repair_used and len(reviewer.states) == 3
 
 
@@ -1604,9 +1633,10 @@ def test_unassessed_review_check_can_be_repaired_but_cannot_pass_unassessed(
         "required_check_ids": ["claim:c1"],
         "grouped_check_ids_allowed": True,
     }
-    assert result.status == ("partial" if last_review == "pass" else "unavailable")
+    assert result.status == "partial"
     if last_review == "refusal":
-        assert not result.answer
+        assert result.answer
+        assert result.publication_mode == "review_incomplete"
         assert result.non_publication_reason is None
 
 
@@ -1616,8 +1646,9 @@ def test_completed_rejected_final_review_is_distinct_from_provider_failure() -> 
         ["pass", "flag", "flag"],
     )
     result = workflow.run("Soru", "")
-    assert result.status == "unavailable" and result.answer is None
-    assert result.non_publication_reason == "review_rejected"
+    assert result.status == "partial" and result.answer
+    assert result.publication_mode == "review_incomplete"
+    assert result.non_publication_reason is None
     assert result.final_review is not None and result.final_review.completed
 
 
@@ -1675,6 +1706,12 @@ def test_early_review_research_is_bound_executed_and_reassessed() -> None:
     )
 
     class IndependentExaminer:
+        def edit(
+            self, state: dict[str, JsonValue], timeout_seconds: float
+        ) -> EditorialEdits:
+            del state, timeout_seconds
+            raise AssertionError("Research diagnosis does not edit a draft")
+
         def examine(
             self,
             state: dict[str, JsonValue],
@@ -2078,3 +2115,116 @@ def test_source_usage_is_in_the_same_review_inventory_without_new_issues() -> No
     )
     assert workflow.plan.model_dump() == original_plan
     assert workflow.context.budget.used == before
+
+
+def test_independent_editor_changes_wording_without_research_or_repair_loop() -> None:
+    from onyx.legal_review.drafting import EditorialEdits
+
+    workflow, gateway, reviewer = engine([plan(), reading(), draft()], ["pass", "flag"])
+    finding = PublicationFinding(
+        check_id="claim:c1",
+        disposition="defect",
+        target="assertion",
+        reason="The prerequisite must qualify the conclusion.",
+        required_change="State the document condition in the conclusion.",
+        supports=[PassageSupport(citation=1, span_number=1)],
+        repair_kind="correction",
+        answer_quotes=[draft().answer],
+    )
+    examiner = Mock()
+    examiner.examine.return_value = PublicationReview(findings=[finding])
+
+    def edit(state: dict[str, JsonValue], _timeout: float) -> EditorialEdits:
+        base = GeneratedDraft.model_validate(state["repair_base"])
+        replacement = base.blocks[0].model_copy(deep=True)
+        replacement.text = "Belge ibraz edilirse başvuru kabul edilir. [1]"
+        return EditorialEdits(
+            replacements=[replacement],
+            unresolved_issue_ids=["i1"],
+            resolved_check_ids=["claim:c1"],
+            unresolved_check_ids=[],
+        )
+
+    examiner.edit.side_effect = edit
+    workflow.diagnoser = examiner
+    result = workflow.run("Soru", "")
+    assert result.status == "partial" and result.publication_mode == "editor_adjusted"
+    assert result.answer and "Belge ibraz edilirse" in result.answer
+    assert "Açık kalan kontrol bulguları" not in result.answer
+    assert result.editorial_changes[0]["before"] == draft().answer
+    assert not result.repair_used and len(gateway.calls) == 3
+    assert len(reviewer.states) == 2
+    examiner.edit.assert_called_once()
+    examiner.diagnose.assert_not_called()
+
+
+@pytest.mark.parametrize("expired", [True, False])
+def test_editor_failure_or_deadline_retains_answer_and_visible_findings(
+    expired: bool,
+) -> None:
+    workflow, _, _ = engine([plan(), reading(), draft()], ["pass", "pass"])
+    workflow.run("Soru", "")
+    workflow.final_adjudication = PublicationReview(
+        findings=[
+            PublicationFinding(
+                check_id="claim:c1",
+                disposition="defect",
+                target="assertion",
+                reason="Missing document condition",
+                required_change="Belge şartı doğrulanmalı.",
+                supports=[],
+                repair_kind="research",
+                research_query="Belge şartı",
+                answer_quotes=[draft().answer],
+            )
+        ]
+    )
+    examiner = Mock()
+    examiner.edit.side_effect = TimeoutError("Editor exhausted")
+    workflow.diagnoser = examiner
+    if expired:
+        workflow.context.deadline = 0
+    result = workflow._publish_partial("Soru", "", "Deadline", time_exhausted=True)
+    assert result.status == "partial" and result.publication_mode == "limit_reached"
+    assert result.answer and draft().answer in result.answer
+    assert "Belge şartı doğrulanmalı." in result.answer
+    assert "doğrulanmadı" in result.answer
+    assert examiner.edit.call_count == (0 if expired else 1)
+
+
+def test_timeout_before_first_draft_preserves_findings_but_cancellation_never_publishes() -> (
+    None
+):
+    workflow = prepared_engine()
+    workflow._accept_reading(reading())
+    workflow.context.deadline = 0
+    with patch.object(workflow, "_run", side_effect=TimeoutError("Deadline")):
+        result = workflow.run("Soru", "")
+    assert result.status == "partial" and result.answer and RULE in result.answer
+    assert "olaya uygulanması tamamlanmadı" in result.answer
+    workflow.context.cancel()
+    with patch.object(workflow, "_run", side_effect=TimeoutError("Deadline")):
+        stopped = workflow.run("Soru", "")
+    assert stopped.status == "cancelled" and stopped.answer is None
+
+
+def test_issue_plan_updates_and_publication_decision_are_visible_in_graph() -> None:
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+
+    steps: dict[str, list[SimpleNamespace]] = {}
+
+    def capture(operation: str, _input: object) -> object:
+        node = SimpleNamespace(output_value=None)
+        steps.setdefault(operation, []).append(node)
+        return nullcontext(node)
+
+    workflow, _, _ = engine([plan(), reading(), draft()], ["pass", "pass"])
+    with patch("onyx.legal_review.engine.graph_step", side_effect=capture):
+        result = workflow.run("Soru", "")
+    assert steps["legal_review.issue_plan"][0].output_value["discovery_queries"]
+    assert steps["legal_review.issue_update"][0].output_value["closures"]
+    assert (
+        steps["legal_review.publication_decision"][0].output_value["status"]
+        == result.status
+    )

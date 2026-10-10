@@ -229,6 +229,8 @@ def _run(
             "final": "Bütünleşik cevap hazırlanıyor",
             "finalizing": "Araştırma süresi tamamlandı; cevap ve son kontrol hazırlanıyor",
             "repair": "Belirlenen eksikler bir kez düzeltiliyor",
+            "editing": "Kontrolcü mevcut kaynaklarla cevabı düzenliyor",
+            "publishing_partial": "Eldeki cevap açık kalan noktalarıyla yayımlanıyor",
             "completed": "Hukuki inceleme tamamlandı",
             "failed": "Hukuki inceleme tamamlanamadı",
             "withheld": "Son kontrol tamamlandı; cevap doğrulanamadı",
@@ -359,16 +361,29 @@ def _run(
             + (result.gaps[-1] if result.gaps else "Review incomplete."),
         )
     final = result.answer
+    publication_context = context
+    if result.publication_mode != "reviewed":
+        # The generation deadline stops models/tools, not delivery of retained work.
+        # Authorization, immutable-source checks and user cancellation still apply.
+        publication_context = RunContext(
+            run_id=context.run_id,
+            language=context.language,
+            scope=context.scope,
+            services=context.services,
+            budget=context.budget,
+            timeout_seconds=30,
+            cancelled=context.is_cancelled,
+        )
     if result.status == "partial":
         prefix = (
             "Kısmi yanıt" if context.language.startswith("tr") else "Partial answer"
         )
         final = prefix + "\n\n" + final
     try:
-        context.check_active()
+        publication_context.check_active()
         numbers = extract_citation_numbers(final)
         items = [item for number in numbers if (item := ledger.get(number)) is not None]
-        broker.revalidate_evidence(items, context)
+        broker.revalidate_evidence(items, publication_context)
         mapping = {
             number: doc
             for number, doc in ledger.citation_mapping().items()
@@ -423,7 +438,7 @@ def _run(
     parts: list[str] = []
     for token in (final, None):
         for part in processor.process_token(token):
-            context.check_active()
+            publication_context.check_active()
             if isinstance(part, CitationInfo):
                 part.preview_url = (
                     f"/api/asv3/citation/{assistant_message_id}/{part.citation_number}"

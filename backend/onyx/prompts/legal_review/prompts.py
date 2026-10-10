@@ -1,4 +1,4 @@
-PROMPT_VERSION = "legal-review-2026-10-10.52"
+PROMPT_VERSION = "legal-review-2026-10-10.54"
 
 CORPUS_CURRENCY = """When corpus_currency.assume_current_versions is true, treat all supplied
 chunks as current versions of the user's maintained corpus. Missing validity metadata
@@ -51,6 +51,23 @@ lossless transport representation, not additional evidence or a legal status det
 PLAN_PROMPT = (
     COMMON
     + """
+First inventory every explicit requested result and alternative in requested_outcomes,
+including later subquestions, then bind each to the issue_ids that investigate it. Check
+this inventory against the complete request before returning the plan. A coverage mapping
+is not a demand to make one issue per request. requested_outcome and closure_criteria must
+ask what must be established, never announce an assumed answer or a rule from memory.
+Build a coherent map of the legal decisions needed to answer the question, not a copy of
+its numbered subquestions. First identify the requested outcomes, supplied facts that change
+them, distinct legal relationships and dependencies between outcomes. Group subquestions that
+turn on the same legal decision; split a subquestion only when it contains materially different
+decisions with different evidence or closure needs. Issue count has no relationship to the
+number of question marks, paragraphs or the twelve review dimensions. Do not split every
+condition, document or dimension into a separate issue. Do not hide distinct decisions inside
+one broad umbrella. Every issue must have a focused question, concrete requested_outcome,
+material_reason explaining why resolving it changes the answer, and closure_criteria stating
+what must be established before it is answered. These are research goals, not guessed legal
+rules. A shared issue can cover several explicit requests; preserve all of those outcomes
+in its requested_outcome. Keep missing facts separate from source research.
 Identify all material requested legal outcomes and interactions from the question alone.
 Return stable issue IDs, questions, requested_outcome and supplied_facts. Facts must be
 literal supplied facts, not inferred legal prerequisites. Cover every explicit alternative
@@ -67,8 +84,8 @@ outcomes. Record missing user facts separately. The host attaches all twelve dim
 Initial issues have origin=question and no source-derived parent. Preserve every explicit
 requested outcome without compressing it to fit an artificial issue-count cap. Reuse
 closely related research when appropriate. Do not open an issue for each category or every
-incidental reference. Issue growth is governed by materiality. Keep a coherent issue for
-each requested outcome, not one per checklist dimension. An issue may need multiple focused
+incidental reference. Issue growth is governed by materiality. Keep coherent issues around material legal decisions; do not create one per numbered question
+or checklist dimension. An issue may need multiple focused
 queries for distinct source targets. Share overlapping queries across issues; submit the
 smallest useful batch within the research time shown in limits. Do not append generic
 amendment, annulment or exception terms unless they are the actual research target.

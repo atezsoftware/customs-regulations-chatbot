@@ -26,6 +26,7 @@ class LLMFlow(StrEnum):
     LEGAL_REVIEW_READING = "legal_review_reading"
     LEGAL_REVIEW_DRAFT = "legal_review_draft"
     LEGAL_REVIEW_REPAIR = "legal_review_repair"
+    LEGAL_REVIEW_EDITOR = "legal_review_editor"
     LEGAL_REVIEW_SEARCH = "legal_review_search"
     LEGAL_REVIEW_JEV = "legal_review_jev"
     LEGAL_REVIEW_DECISION = "legal_review_decision"
