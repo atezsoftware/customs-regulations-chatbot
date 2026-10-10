@@ -32,6 +32,7 @@ from onyx.legal_review.models import (
     DecisionProviderConfig,
     PassageSupport,
     ReviewResult,
+    WorkflowPolicy,
     WorkflowResult,
 )
 from onyx.legal_review.source_accounting import SourceAssessment, SourceInventory
@@ -89,6 +90,13 @@ class CanonicalBrokerFixture:
 
 @pytest.fixture
 def runtime_fixture(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+    monkeypatch.setattr(
+        runtime,
+        "WorkflowPolicy",
+        lambda: WorkflowPolicy(
+            always_review_research=True, assume_current_corpus=False
+        ),
+    )
     broker = CanonicalBrokerFixture()
     inventory = SourceInventory(
         source_assessments=[
@@ -349,6 +357,28 @@ def test_provider_failure_is_not_reported_as_completed_review(
     assert fixture.checkpoints[-1]["publication_status"] == "unavailable"
 
 
+def test_time_exhaustion_after_deadline_streams_notice_without_unchecked_answer(
+    runtime_fixture: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def exhausted(engine: runtime.LegalReviewEngine, *_args: object) -> WorkflowResult:
+        engine.context.deadline = 0
+        return WorkflowResult(
+            status="unavailable", non_publication_reason="time_exhausted"
+        )
+
+    monkeypatch.setattr(runtime.LegalReviewEngine, "run", exhausted)
+    fixture = runtime_fixture
+    runtime.run_legal_review_loop(**fixture.arguments)
+    rendered = "".join(
+        p.obj.content for p in fixture.packets if isinstance(p.obj, AgentResponseDelta)
+    )
+    assert "süresi" in rendered
+    assert RULE not in rendered
+    assert fixture.state.get_answer_tokens() == rendered
+    assert isinstance(fixture.packets[-1].obj, SectionEnd)
+    assert fixture.checkpoints[-1]["publication_status"] == "unavailable"
+
+
 def test_rejected_review_notice_honors_stop_before_streaming(
     runtime_fixture: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -386,4 +416,43 @@ def test_review_rejection_cannot_publish_answer_or_hide_incomplete_review(
                 "final_review": {"completed": True},
                 **changes,
             }
+        )
+
+
+@pytest.mark.parametrize("revoke", [False, True])
+def test_expired_generation_delivers_partial_with_citations_after_authorization_check(
+    runtime_fixture: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, revoke: bool
+) -> None:
+    fixture = runtime_fixture
+    fixture.broker.reject_publication = revoke
+
+    def exhausted(engine: runtime.LegalReviewEngine, *_args: object) -> WorkflowResult:
+        engine.ledger.add([original()], engine.context)
+        engine.context.deadline = 0
+        return WorkflowResult(
+            status="partial",
+            publication_mode="limit_reached",
+            answer=draft().answer + "\n\nSon kontrol tamamlanamadı.",
+        )
+
+    monkeypatch.setattr(runtime.LegalReviewEngine, "run", exhausted)
+    if revoke:
+        with pytest.raises(ValueError, match="revoked"):
+            runtime.run_legal_review_loop(**fixture.arguments)
+        assert not any(isinstance(p.obj, AgentResponseDelta) for p in fixture.packets)
+        return
+    runtime.run_legal_review_loop(**fixture.arguments)
+    rendered = fixture.state.get_answer_tokens()
+    assert rendered and RULE in rendered and "Kısmi yanıt" in rendered
+    assert fixture.broker.revalidated
+    assert any(isinstance(p.obj, CitationInfo) for p in fixture.packets)
+    assert (
+        fixture.checkpoints[-1]["legal_review"]["publication_mode"] == "limit_reached"
+    )
+
+
+def test_unfinished_editor_result_cannot_be_labelled_verified() -> None:
+    with pytest.raises(ValueError, match="must remain partial"):
+        WorkflowResult(
+            status="verified", answer="Text", publication_mode="editor_adjusted"
         )

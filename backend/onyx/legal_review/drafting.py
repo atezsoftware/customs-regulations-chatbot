@@ -75,6 +75,28 @@ class GeneratedDraft(StrictModel):
         return self
 
 
+class DraftEdits(StrictModel):
+    replacements: list[GeneratedBlock]
+    unresolved_issue_ids: list[str]
+
+
+class EditorialEdits(DraftEdits):
+    resolved_check_ids: list[str]
+    unresolved_check_ids: list[str]
+
+
+def apply_draft_edits(base: GeneratedDraft, edits: DraftEdits) -> GeneratedDraft:
+    """Replace named prose blocks; preserve all unaffected text and claim bindings."""
+    known = {block.block_id for block in base.blocks}
+    replacements = {block.block_id: block for block in edits.replacements}
+    if len(replacements) != len(edits.replacements) or replacements.keys() - known:
+        raise ValueError("Draft edits must identify unique existing blocks")
+    return GeneratedDraft(
+        blocks=[replacements.get(block.block_id, block) for block in base.blocks],
+        unresolved_issue_ids=edits.unresolved_issue_ids,
+    )
+
+
 def compile_draft(
     generated: GeneratedDraft, *, ledger: EvidenceLedger | None = None
 ) -> DraftAnswer:

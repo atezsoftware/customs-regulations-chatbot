@@ -222,6 +222,16 @@ class GeminiGateway:
             self.context.check_research_active()
             deadline = self.context.research_deadline
             self.context.consume_research_decision()
+        if finalizing:
+            if flow in {LLMFlow.LEGAL_REVIEW_DRAFT, LLMFlow.LEGAL_REVIEW_REPAIR}:
+                deadline -= self.policy.publication_reserve_seconds
+            else:
+                deadline -= self.policy.publication_reserve_seconds + 60
+            self.context.services["legal_review_phase_deadline"] = deadline
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    "Legal Review retained time for final publication review"
+                )
         serialized = json.dumps(
             model_state(state, flow), ensure_ascii=False, separators=(",", ":")
         )

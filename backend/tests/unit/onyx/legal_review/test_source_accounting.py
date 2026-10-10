@@ -14,6 +14,7 @@ from onyx.legal_review.source_accounting import (
     SourceAccountant,
     SourceAssessment,
     SourceInventory,
+    inventory_response_model,
 )
 from tests.unit.onyx.legal_review.test_engine import original, plan
 
@@ -90,6 +91,26 @@ def test_inventory_caches_only_unchanged_sources_and_questions() -> None:
     packet["request"] = "A newly requested material consequence"
     accountant.scan(packet)
     assert gateway.complete.call_count == 3
+
+
+def test_inventory_provider_schema_allows_only_real_citation_passage_pairs() -> None:
+    from jsonschema import Draft202012Validator
+    from jsonschema import ValidationError as SchemaError
+
+    ledger = EvidenceLedger()
+    ledger.add([original()], RunContext())
+    model = inventory_response_model(
+        {"s0001": "source-1"}, canonical_evidence_view(ledger)
+    )
+    validate = Draft202012Validator(model.model_json_schema()).validate
+    payload = SourceInventory(source_assessments=[assessment()]).model_dump(mode="json")
+    validate(payload)
+    payload["source_assessments"][0]["supports"][0]["span_number"] = 2
+    with pytest.raises(SchemaError):
+        validate(payload)
+    payload["source_assessments"][0]["supports"][0] = {"citation": 9, "span_number": 1}
+    with pytest.raises(SchemaError):
+        validate(payload)
 
 
 @pytest.mark.parametrize(
@@ -198,3 +219,54 @@ def test_a_quoted_supporting_rule_does_not_claim_the_containing_sources_limiting
     )
     assert row.passage_roles == ["quoted_rule"]
     assert row.requested_read is None
+
+
+def test_finished_parallel_inventory_survives_another_batch_deadline() -> None:
+    ledger = EvidenceLedger()
+    context = RunContext()
+    for index in range(16):
+        item = original()
+        item.source_id = f"source-{index}"
+        item.chunk_id = f"chunk-{index}"
+        assert item.search_doc is not None
+        item.search_doc = item.search_doc.model_copy(
+            update={
+                "document_id": item.source_id,
+                "metadata": {"regulatory_chunk_id": item.chunk_id},
+            }
+        )
+        ledger.add([item], context)
+
+    def complete(
+        _prompt: str, packet: dict[str, Any], *_args: Any, **_kwargs: Any
+    ) -> SourceInventory:
+        inventory = packet["source_inventory"]
+        if any(row["source_id"] == "source-0" for row in inventory):
+            raise TimeoutError("Research window ended")
+        return SourceInventory(
+            source_assessments=[
+                assessment(
+                    slot=row["slot"],
+                    disposition="irrelevant",
+                    supports=[],
+                    requested_read=None,
+                    content_status="not_needed",
+                    missing_effect=None,
+                )
+                for row in inventory
+            ]
+        )
+
+    gateway = Mock()
+    gateway.complete.side_effect = complete
+    accountant = SourceAccountant(gateway, ledger, parallelism=2)
+    with patch(
+        "onyx.legal_review.source_accounting.as_completed",
+        side_effect=lambda futures: reversed(futures),
+    ):
+        with pytest.raises(TimeoutError):
+            accountant.scan(state(ledger))
+    retained = accountant.snapshot()
+    assert len(retained) == 8
+    assert "source-0" not in {row["source_id"] for row in retained}
+    assert len(accountant._signatures) == 8
