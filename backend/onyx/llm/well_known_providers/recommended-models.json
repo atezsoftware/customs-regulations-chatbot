@@ -1,6 +1,6 @@
 {
-  "version": "1.12",
-  "updated_at": "2026-10-10T00:00:00Z",
+  "version": "1.13",
+  "updated_at": "2026-10-10T15:39:34Z",
   "providers": {
     "openai": {
       "default_model": "gpt-5.6-sol",
@@ -33,6 +33,10 @@
         {
           "name": "claude-sonnet-5-5",
           "display_name": "Claude Sonnet 5.5"
+        },
+        {
+          "name": "claude-haiku-4-5",
+          "display_name": "Claude Haiku 4.5"
         },
         {
           "name": "claude-haiku-5-5",
