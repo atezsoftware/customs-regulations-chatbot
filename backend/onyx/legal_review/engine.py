@@ -62,10 +62,15 @@ from onyx.legal_review.research import ResearchLedger
 from onyx.legal_review.review_scope import ReviewPurpose, scope_review_state
 from onyx.legal_review.source_accounting import SourceAccountant
 from onyx.legal_review.transport import model_state
-from onyx.legal_review.writer_coverage import WriterCoverageContract
+from onyx.legal_review.writer_coverage import (
+    FindingBindingContract,
+    FindingBindingError,
+    WriterCoverageContract,
+)
 from onyx.prompts.legal_review.prompts import (
     DRAFT_PROMPT,
     EVIDENCE_RESOLUTION_PROMPT,
+    FINDING_BINDING_PROMPT,
     PLAN_PROMPT,
     READING_PROMPT,
     REPAIR_PROMPT,
@@ -2164,6 +2169,65 @@ class LegalReviewEngine:
             step.output_value = result.model_dump(mode="json")
         return result
 
+    def _accept_writer_draft(
+        self, response: GeneratedDraft, contract: WriterCoverageContract
+    ) -> DraftAnswer:
+        generated = GeneratedDraft.model_validate(
+            response.model_dump(mode="python", exclude={"finding_coverage"})
+        )
+        draft = self._bind_unresolved_issues(
+            compile_draft(generated, ledger=self.ledger)
+        )
+        self._validate_draft(draft)
+        # Source-validated prose survives failures in the separate navigation audit.
+        self.last_generated, self.last_draft = generated, draft
+        self.writer_coverage_answer_revision = answer_revision(draft.answer)
+        recovery_status = "not_needed"
+        try:
+            _, self.writer_coverage = contract.compile(response)
+        except FindingBindingError as error:
+            binding = FindingBindingContract(contract, response, error.invalid_slots)
+            with graph_step(
+                "legal_review.finding_binding_recovery",
+                {
+                    "invalid_slots": error.invalid_slots,
+                    "answer_revision": self.writer_coverage_answer_revision,
+                },
+            ) as step:
+                try:
+                    repair = self.gateway.complete(
+                        FINDING_BINDING_PROMPT,
+                        binding.state(),
+                        binding.response_model,
+                        LLMFlow.LEGAL_REVIEW_FINDING_BINDING,
+                        finalizing=True,
+                    )
+                    self.writer_coverage = binding.compile(repair)
+                    recovery_status = "corrected"
+                    step.output_value = {
+                        "status": recovery_status,
+                        "answer_unchanged": True,
+                        "findings": self.writer_coverage,
+                    }
+                except (ValueError, TimeoutError, RunStopped) as correction_error:
+                    self.writer_coverage = contract.unresolved_audit(response)
+                    self.gaps.append("Finding-to-claim accounting remains incomplete")
+                    recovery_status = "unresolved"
+                    step.output_value = {
+                        "status": recovery_status,
+                        "reason": str(correction_error),
+                        "retained_previous_draft": True,
+                        "answer_unchanged": True,
+                        "findings": self.writer_coverage,
+                    }
+        with graph_step("legal_review.writer_coverage", {}) as step:
+            step.output_value = {
+                "findings": self.writer_coverage,
+                "answer_revision": self.writer_coverage_answer_revision,
+                "binding_recovery": recovery_status,
+            }
+        return draft
+
     def _validate_draft(self, draft: DraftAnswer) -> None:
         assert self.plan is not None
         known = {issue.issue_id for issue in self.plan.issues}
@@ -2539,17 +2603,15 @@ class LegalReviewEngine:
             LLMFlow.LEGAL_REVIEW_DRAFT,
             finalizing=True,
         )
-        generated, self.writer_coverage = writer_contract.compile(response)
-        draft = compile_draft(generated, ledger=self.ledger)
-        self.writer_coverage_answer_revision = answer_revision(draft.answer)
-        with graph_step("legal_review.writer_coverage", {}) as step:
-            step.output_value = {
-                "findings": self.writer_coverage,
-                "answer_revision": self.writer_coverage_answer_revision,
-            }
-        draft = self._bind_unresolved_issues(draft)
-        self._validate_draft(draft)
-        self.last_generated, self.last_draft = generated, draft
+        draft = self._accept_writer_draft(response, writer_contract)
+        return self._finish_draft(request, history, draft)
+
+    def _finish_draft(
+        self, request: str, history: str, draft: DraftAnswer
+    ) -> WorkflowResult:
+        assert self.plan is not None
+        assert self.last_generated is not None
+        generated = self.last_generated
         self.final_review = self._review(request, history, draft)
         if not self._review_can_repair(self.final_review):
             return self._publish_partial(

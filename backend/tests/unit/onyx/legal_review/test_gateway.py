@@ -162,6 +162,7 @@ def test_correction_reports_root_errors_instead_of_a_nested_passage_object() -> 
         LLMFlow.LEGAL_REVIEW_SOURCE_ACCOUNTING,
         LLMFlow.LEGAL_REVIEW_DRAFT,
         LLMFlow.LEGAL_REVIEW_REPAIR,
+        LLMFlow.LEGAL_REVIEW_FINDING_BINDING,
     ],
 )
 def test_every_structured_phase_streams_with_its_actual_workflow_deadline(
@@ -175,7 +176,11 @@ def test_every_structured_phase_streams_with_its_actual_workflow_deadline(
     transport.llm = MeteredLLM(
         selected, transport.context, UsageMeter(transport.policy)
     )
-    finalizing = flow in {LLMFlow.LEGAL_REVIEW_DRAFT, LLMFlow.LEGAL_REVIEW_REPAIR}
+    finalizing = flow in {
+        LLMFlow.LEGAL_REVIEW_DRAFT,
+        LLMFlow.LEGAL_REVIEW_REPAIR,
+        LLMFlow.LEGAL_REVIEW_FINDING_BINDING,
+    }
     with patch(
         "onyx.legal_review.gateway.generate_structured",
         return_value=Response(decision="ok"),
