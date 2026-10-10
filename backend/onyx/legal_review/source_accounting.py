@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import json
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextvars import copy_context
-from typing import TYPE_CHECKING, Literal, cast
+from types import GenericAlias
+from typing import TYPE_CHECKING, Any, Literal, Union, cast
 
 from jsonschema import Draft202012Validator
-from pydantic import JsonValue, model_validator
+from pydantic import Field, JsonValue, create_model, model_validator
 
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.legal_review.contracts import ReadingContractError
@@ -85,6 +86,39 @@ class SourceInventory(StrictModel):
     source_assessments: list[SourceAssessment]
 
 
+def inventory_response_model(
+    slots: dict[str, str], originals: list[dict[str, JsonValue]]
+) -> type[SourceInventory]:
+    references: list[Any] = []
+    for original in originals:
+        passages = cast(list[dict[str, JsonValue]], original["passages"])
+        references.append(
+            create_model(
+                f"InventoryPassage{original['citation']}",
+                __base__=PassageSupport,
+                citation=(Literal.__getitem__((original["citation"],)), Field()),
+                span_number=(
+                    Literal.__getitem__(tuple(row["span_number"] for row in passages)),
+                    Field(),
+                ),
+            )
+        )
+    reference_type: Any = (
+        references[0] if len(references) == 1 else Union[tuple(references)]
+    )
+    assessment = create_model(
+        "BoundSourceAssessment",
+        __base__=SourceAssessment,
+        slot=(Literal.__getitem__(tuple(slots)), Field()),
+        supports=(GenericAlias(list, reference_type), Field()),
+    )
+    return create_model(
+        "BoundSourceInventory",
+        __base__=SourceInventory,
+        source_assessments=(GenericAlias(list, assessment), Field()),
+    )
+
+
 class SourceAccountant:
     def __init__(
         self, gateway: ModelGateway, ledger: EvidenceLedger, *, parallelism: int = 4
@@ -95,6 +129,9 @@ class SourceAccountant:
         self._scope = ""
         self._signatures: dict[str, tuple[tuple[int, str], ...]] = {}
         self._assessments: dict[str, dict[str, JsonValue]] = {}
+
+    def snapshot(self) -> list[dict[str, JsonValue]]:
+        return list(self._assessments.values())
 
     def scan(
         self, state: dict[str, JsonValue], *, finalizing: bool = False
@@ -131,7 +168,11 @@ class SourceAccountant:
             or signatures[source] != self._signatures.get(source)
         ]
         if not changed:
-            return list(self._assessments.values())
+            return self.snapshot()
+        self._scope = scope
+        for source in changed:
+            self._signatures.pop(source, None)
+            self._assessments.pop(source, None)
         # Partition work, never omit it. Small inventories stay in one batch.
         count = min(self.parallelism, max(1, len(changed) // 8))
         batches: list[list[str]] = [[] for _ in range(count)]
@@ -155,6 +196,7 @@ class SourceAccountant:
                     "plan",
                     "requirements",
                     "review_diagnoses",
+                    "corpus_currency",
                     "tools",
                 )
                 if key in state
@@ -188,11 +230,14 @@ class SourceAccountant:
                 }
                 for slot, source in slots.items()
             ]
+            response_model = inventory_response_model(
+                slots, [row for source in sources for row in groups[source]]
+            )
             try:
                 result = self.gateway.complete(
                     SOURCE_ACCOUNTING_PROMPT,
                     packet,
-                    SourceInventory,
+                    response_model,
                     LLMFlow.LEGAL_REVIEW_SOURCE_ACCOUNTING,
                     finalizing=finalizing,
                 )
@@ -207,7 +252,7 @@ class SourceAccountant:
                     "A quotation or procedural request cannot establish the source's own outcome. "
                     "Return the complete source inventory, preserving all unaffected assessments.",
                     packet,
-                    SourceInventory,
+                    response_model,
                     LLMFlow.LEGAL_REVIEW_SOURCE_ACCOUNTING,
                     finalizing=finalizing,
                 )
@@ -267,13 +312,9 @@ class SourceAccountant:
                 executor.submit(copy_context().run, read_batch, batch)
                 for batch in batches
             ]
-            results = [
-                cast(list[dict[str, JsonValue]], future.result()) for future in futures
-            ]
-        self._scope = scope
-        for batch in results:
-            for assessment in batch:
-                source = cast(str, assessment["source_id"])
-                self._assessments[source] = assessment
-                self._signatures[source] = signatures[source]
-        return list(self._assessments.values())
+            for future in as_completed(futures):
+                for assessment in cast(list[dict[str, JsonValue]], future.result()):
+                    source = cast(str, assessment["source_id"])
+                    self._assessments[source] = assessment
+                    self._signatures[source] = signatures[source]
+        return self.snapshot()

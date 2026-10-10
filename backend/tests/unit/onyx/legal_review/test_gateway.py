@@ -184,7 +184,7 @@ def test_every_structured_phase_streams_with_its_actual_workflow_deadline(
     invocation = call.call_args.args[0]
     assert isinstance(invocation, MeteredLLM)
     assert invocation.reader_deadline == (
-        transport.context.deadline
+        transport.context.deadline - transport.policy.publication_reserve_seconds
         if finalizing
         else transport.context.research_deadline
     )

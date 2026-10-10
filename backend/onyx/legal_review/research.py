@@ -1,4 +1,4 @@
-"""One discovery attempt per material question, retained across review stages."""
+"""Distinct queries and one reasoned retry, retained across review stages."""
 
 from collections.abc import Sequence
 
@@ -112,14 +112,14 @@ class ResearchLedger:
                 dict.fromkeys(
                     identity
                     for identity in need_ids
-                    if not self.needs[identity].attempted
+                    if self._can_search(self.needs[identity], action)
                 )
             )
             if not available:
                 self.skipped.append(
                     {
                         "research_need_ids": list(need_ids),
-                        "reason": "This gap already received its one discovery search",
+                        "reason": "Duplicate query or this gap's focused retry is exhausted",
                         "query": action.arguments.get("query"),
                     }
                 )
@@ -129,8 +129,27 @@ class ResearchLedger:
                 need = self.needs[identity]
                 need.attempted = True
                 need.query = str(action.arguments["query"])
+                need.attempted_queries.append(need.query)
+                need.new_evidence_ids = []
             admitted.append(action.model_copy(update={"research_need_ids": available}))
         return admitted
+
+    @staticmethod
+    def _can_search(need: ResearchNeed, action: SourceAction) -> bool:
+        query = " ".join(str(action.arguments["query"]).casefold().split())
+        previous = need.attempted_queries or ([need.query] if need.query else [])
+        if query in {" ".join(value.casefold().split()) for value in previous}:
+            return False
+        if not need.attempted:
+            return True
+        if need.origin == "question" and not action.research_need_ids:
+            return True
+        return bool(
+            len(previous) < 2
+            and need.receipt_ids
+            and action.retry_reason
+            and action.retry_reason.strip()
+        )
 
     def record_results(
         self,

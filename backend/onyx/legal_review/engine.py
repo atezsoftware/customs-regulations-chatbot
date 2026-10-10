@@ -15,9 +15,15 @@ from onyx.asv3.citation_numbers import extract_citation_numbers
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.models import RunContext, RunStopped
 from onyx.legal_review.adjudication import cited_source_checks
+from onyx.legal_review.audit import evidence_journey
 from onyx.legal_review.contracts import ReadingContractError
 from onyx.legal_review.dimensions import DIMENSION_GUIDANCE
-from onyx.legal_review.drafting import GeneratedDraft, compile_draft
+from onyx.legal_review.drafting import (
+    DraftEdits,
+    GeneratedDraft,
+    apply_draft_edits,
+    compile_draft,
+)
 from onyx.legal_review.evidence_resolution import EvidenceResolutionPlan
 from onyx.legal_review.models import (
     DimensionAssessment,
@@ -37,7 +43,9 @@ from onyx.legal_review.models import (
     RequirementRecord,
     ResearchResolution,
     ReviewCheck,
+    ReviewDiagnosis,
     ReviewDiagnosisBatch,
+    ReviewResearchTask,
     ReviewResult,
     SourceAction,
     WorkflowPolicy,
@@ -190,6 +198,7 @@ class LegalReviewEngine:
         source_accountant: SourceAccountant | None = None,
         report: Callable[[str, str], None] = lambda _phase, _language: None,
         record_review_usage: Callable[[int, int], None] = lambda _input, _output: None,
+        complete_articles: Callable[[set[int], bool], bool] | None = None,
     ) -> None:
         self.gateway = gateway
         self.acquirer = acquirer
@@ -199,6 +208,7 @@ class LegalReviewEngine:
         self.policy = policy
         self.diagnoser = diagnoser
         self.source_accountant = source_accountant
+        self.complete_articles = complete_articles
         self.source_assessments: list[dict[str, JsonValue]] = []
         self.review_diagnoses: ReviewDiagnosisBatch | None = None
         self.final_adjudication: PublicationReview | None = None
@@ -223,6 +233,7 @@ class LegalReviewEngine:
         self.repair_used = False
         self.reading_correction_used = False
         self.pending_actions: list[SourceAction] = []
+        self.last_draft: DraftAnswer | None = None
         self.repair_checks: dict[str, ReviewCheck] = {}
         self.repair_resolutions: list[RepairResolution] = []
         self._repair_requirements: dict[str, RequirementRecord] = {}
@@ -244,6 +255,10 @@ class LegalReviewEngine:
             "history": history,
             "plan": self.plan.model_dump(mode="json") if self.plan else None,
             "standard_dimensions": [dimension.value for dimension in LegalDimension],
+            "corpus_currency": {
+                "assume_current_versions": self.policy.assume_current_corpus,
+                "basis": "User-supplied current corpus; explicit source effects and event dates still govern",
+            },
             "dimension_guidance": {
                 dimension.value: guidance
                 for dimension, guidance in DIMENSION_GUIDANCE.items()
@@ -292,7 +307,12 @@ class LegalReviewEngine:
                 if math.isfinite(self.context.research_deadline)
                 else None,
                 "searches_performed": self.acquirer.searches,
-                "max_searches_per_research_need": 1,
+                "max_searches_per_research_need": 2,
+                "remaining_total_seconds": max(
+                    0, self.context.deadline - time.monotonic()
+                )
+                if math.isfinite(self.context.deadline)
+                else None,
                 "max_postdraft_repairs": 1,
                 "remaining_reading_contract_corrections": int(
                     not self.reading_correction_used
@@ -647,12 +667,70 @@ class LegalReviewEngine:
         self._start_repair(draft, review)
         if self.diagnoser is None:
             return
-        deadline = self.context.deadline if draft else self.context.research_deadline
-        diagnoses = self.diagnoser.diagnose(
-            self.state(request, history, draft),
-            self._review_work(review),
-            min(self.policy.max_call_seconds, max(0, deadline - time.monotonic())),
+        deadline = (
+            self.context.deadline - self.policy.publication_reserve_seconds - 60
+            if draft
+            else self.context.research_deadline
         )
+        confirmed = (
+            {
+                row.check_id: row
+                for row in self.draft_adjudication.findings
+                if row.disposition == "defect"
+            }
+            if draft is not None and self.draft_adjudication is not None
+            else {}
+        )
+        checks = self._review_work(review)
+        if confirmed and all(
+            check.id in confirmed and confirmed[check.id].repair_kind is not None
+            for check in checks
+        ):
+            tasks = {
+                check.id: ReviewResearchTask(
+                    task_id=f"publication:{check.id}",
+                    subject=confirmed[check.id].research_query or check.id,
+                    question=confirmed[check.id].required_change
+                    or confirmed[check.id].reason,
+                    query=confirmed[check.id].research_query,
+                    dimension=LegalDimension(check.dimension)
+                    if check.dimension is not None
+                    else LegalDimension.LEGAL_BASIS,
+                    supports=confirmed[check.id].supports,
+                    existing_need_id=None,
+                )
+                for check in checks
+                if confirmed[check.id].repair_kind == "research"
+            }
+            diagnoses = ReviewDiagnosisBatch(
+                diagnoses=[
+                    ReviewDiagnosis(
+                        check_ids=[check.id],
+                        kind="research" if check.id in tasks else "correction",
+                        dimension=LegalDimension(check.dimension)
+                        if check.dimension is not None
+                        else None,
+                        assertion="\n\n".join(confirmed[check.id].answer_quotes),
+                        reason=confirmed[check.id].reason,
+                        required_change=confirmed[check.id].required_change
+                        or "Correct the identified defect",
+                        supports=confirmed[check.id].supports,
+                        research_task_ids=[tasks[check.id].task_id]
+                        if check.id in tasks
+                        else [],
+                    )
+                    for check in checks
+                ],
+                research_tasks=list(tasks.values()),
+            )
+        else:
+            diagnoses = self.diagnoser.diagnose(
+                self.state(request, history, draft),
+                checks,
+                max(0, deadline - time.monotonic())
+                if math.isfinite(deadline)
+                else self.policy.max_call_seconds,
+            )
         self._validate_diagnoses(diagnoses, self._review_work(review))
         self.review_diagnoses = diagnoses
         with graph_step("legal_review.review_diagnoses", {}) as step:
@@ -702,6 +780,7 @@ class LegalReviewEngine:
                             "evidence_target": task.question,
                         },
                         issue_ids=issue_ids,
+                        retry_reason=task.question if need.attempted else None,
                         research_need_ids=[need.need_id],
                     )
         if actions:
@@ -750,10 +829,9 @@ class LegalReviewEngine:
         adjudication = self.diagnoser.examine(
             self.state(request, history, draft),
             review.flags,
-            min(
-                self.policy.max_call_seconds,
-                max(0, self.context.deadline - time.monotonic()),
-            ),
+            max(0, self.context.deadline - time.monotonic())
+            if math.isfinite(self.context.deadline)
+            else self.policy.max_call_seconds,
         )
         self._validate_publication_review(adjudication, review.flags, draft)
         self.final_adjudication = adjudication
@@ -1085,7 +1163,11 @@ class LegalReviewEngine:
             issue.issue_id
             for issue in self.plan.issues
             if any(
-                row.validity == "unknown" or row.legal_status in {"unknown", "annulled"}
+                row.legal_status == "annulled"
+                or (
+                    not self.policy.assume_current_corpus
+                    and (row.validity == "unknown" or row.legal_status == "unknown")
+                )
                 for row in self._issue_requirements(issue.issue_id)
             )
         }
@@ -1133,7 +1215,11 @@ class LegalReviewEngine:
                     status = "open"
                     reasons.append(str(assessment["missing_effect"]))
             if status == "closed" and any(
-                row.validity == "unknown" or row.legal_status in {"unknown", "annulled"}
+                row.legal_status == "annulled"
+                or (
+                    not self.policy.assume_current_corpus
+                    and (row.validity == "unknown" or row.legal_status == "unknown")
+                )
                 for row in requirements
             ):
                 status = "partial"
@@ -1175,9 +1261,13 @@ class LegalReviewEngine:
             return
         assert self.plan is not None
         while True:
-            self.source_assessments = self.source_accountant.scan(
-                self.state(request, history, draft), finalizing=finalizing
-            )
+            try:
+                self.source_assessments = self.source_accountant.scan(
+                    self.state(request, history, draft), finalizing=finalizing
+                )
+            except (RunStopped, TimeoutError):
+                self.source_assessments = self.source_accountant.snapshot()
+                raise
             executed = {
                 json.dumps(
                     {"tool": row["tool"], "arguments": row["arguments"]}, sort_keys=True
@@ -1304,7 +1394,21 @@ class LegalReviewEngine:
             decision = self._reading(
                 request, history, finalizing=finalizing, draft=draft
             )
+            expanded = (
+                self.complete_articles(
+                    {
+                        support.citation
+                        for record in self.requirements.values()
+                        for support in record.supports
+                    },
+                    finalizing,
+                )
+                if self.complete_articles is not None
+                else False
+            )
             if not decision.actions:
+                if expanded:
+                    continue
                 return
             signature = json.dumps(
                 {
@@ -1326,6 +1430,57 @@ class LegalReviewEngine:
             if not self._acquire(decision.actions, finalizing=finalizing):
                 return
 
+    def _should_review_research(self) -> bool:
+        if self.policy.always_review_research:
+            return True
+        material_gap = any(
+            row.status == "unresolved" and row.dimension != LegalDimension.FACTS
+            for row in self.dimensions
+        ) or any(
+            row.get("disposition") in {"material_limitation", "needs_operative_read"}
+            for row in self.source_assessments
+        )
+        return material_gap and (
+            self.context.research_deadline - time.monotonic()
+            >= 2 * self.policy.max_call_seconds
+        )
+
+    def _collect_evidence(
+        self, request: str, history: str, initial: list[SourceAction]
+    ) -> None:
+        try:
+            self._acquire(initial)
+            if not self.ledger.citation_numbers():
+                return
+            self._research(request, history)
+            if self._should_review_research():
+                self.early_review = self._review(request, history, None)
+                if not self._review_can_repair(self.early_review):
+                    raise ValueError(
+                        self.early_review.failure_reason or "Early review failed"
+                    )
+                if self._review_work(self.early_review):
+                    self._diagnose_review(request, history, None, self.early_review)
+                    self._research(request, history)
+            else:
+                self.review_work_history.append(
+                    {
+                        "stage": "early_review",
+                        "status": "skipped",
+                        "reason": "No material gap or insufficient research time; full final review retained",
+                    }
+                )
+        except (RunStopped, TimeoutError):
+            if (
+                self.context.is_cancelled()
+                or time.monotonic() < self.context.research_deadline
+            ):
+                raise
+            self.gaps.append(
+                "Research time ended; preserve unresolved source questions as specific limitations."
+            )
+            self.report("finalizing", self.context.language)
+
     def _checks(
         self, *, draft: bool, answer: DraftAnswer | None = None
     ) -> list[ReviewCheck]:
@@ -1345,7 +1500,9 @@ class LegalReviewEngine:
                     "originals and actual user facts. An affirmed not_applicable needs a "
                     "reason; absent evidence cannot establish non-applicability. Precisely "
                     "disclosed unresolved law is acceptable only without an unsupported "
-                    "positive conclusion. Unknown chunk dates do not prove legal validity."
+                    "positive conclusion. Apply corpus_currency: absent date or status metadata "
+                    "alone is not a defect under the supplied current-corpus assumption. "
+                    "Explicit amendments, annulments and event-date restrictions still govern."
                     + (
                         " Evaluate the literal draft's treatment of this dimension, including "
                         "material omissions. Internal research status is not an assertion "
@@ -1480,6 +1637,7 @@ class LegalReviewEngine:
     def _review(
         self, request: str, history: str, draft: DraftAnswer | None
     ) -> ReviewResult:
+        self.last_draft = draft
         assert self.plan is not None
         self.report("review", self.plan.language)
         self.context.check_active()
@@ -1637,7 +1795,8 @@ class LegalReviewEngine:
         answer: str | None = None,
         gap: str | None = None,
         *,
-        non_publication_reason: Literal["review_rejected"] | None = None,
+        non_publication_reason: Literal["review_rejected", "time_exhausted"]
+        | None = None,
     ) -> WorkflowResult:
         return WorkflowResult.model_validate(
             {
@@ -1671,6 +1830,13 @@ class LegalReviewEngine:
                 "research_resolutions": self.research_resolutions,
                 "research_needs": list(self.research.needs.values()),
                 "skipped_searches": self.research.skipped,
+                "source_journey": evidence_journey(
+                    self.ledger,
+                    self.acquirer.receipts,
+                    self.source_assessments,
+                    self.requirements,
+                    self.last_draft,
+                ),
             }
         )
 
@@ -1681,6 +1847,18 @@ class LegalReviewEngine:
             return self._result(
                 "cancelled" if self.context.is_cancelled() else "unavailable",
                 gap=str(error),
+                non_publication_reason="time_exhausted"
+                if not self.context.is_cancelled()
+                and time.monotonic()
+                >= min(
+                    self.context.deadline,
+                    float(
+                        self.context.services.get(
+                            "legal_review_phase_deadline", self.context.deadline
+                        )
+                    ),
+                )
+                else None,
             )
         except ValueError as error:
             return self._result("unavailable", gap=str(error))
@@ -1736,29 +1914,20 @@ class LegalReviewEngine:
                 "unavailable",
                 gap="The initial plan supplied no discovery query for authorized original research",
             )
-        self._acquire(initial)
+        self._collect_evidence(request, history, initial)
         if not self.ledger.citation_numbers():
             return self._result(
                 "unavailable", gap="No authorized original evidence was read"
             )
-        self._research(request, history)
-        self.early_review = self._review(request, history, None)
-        if not self._review_can_repair(self.early_review):
-            return self._result("unavailable", gap=self.early_review.failure_reason)
-        if self._review_work(self.early_review):
-            self._diagnose_review(request, history, None, self.early_review)
-            self._research(request, history)
         self.report("final", self.plan.language)
-        draft = compile_draft(
-            self.gateway.complete(
-                DRAFT_PROMPT,
-                self.state(request, history),
-                GeneratedDraft,
-                LLMFlow.LEGAL_REVIEW_DRAFT,
-                finalizing=True,
-            ),
-            ledger=self.ledger,
+        generated = self.gateway.complete(
+            DRAFT_PROMPT,
+            self.state(request, history),
+            GeneratedDraft,
+            LLMFlow.LEGAL_REVIEW_DRAFT,
+            finalizing=True,
         )
+        draft = compile_draft(generated, ledger=self.ledger)
         draft = self._bind_unresolved_issues(draft)
         self._validate_draft(draft)
         self.final_review = self._review(request, history, draft)
@@ -1796,20 +1965,46 @@ class LegalReviewEngine:
                         ],
                     }
                 )
+            if (
+                self.context.deadline - time.monotonic()
+                <= self.policy.publication_reserve_seconds
+            ):
+                return self._result(
+                    "unavailable",
+                    gap="Insufficient time for a checked repair",
+                    non_publication_reason="time_exhausted",
+                )
             self.repair_used = True
             self.report("repair", self.plan.language)
-            self._diagnose_review(request, history, draft, repair_review)
-            self._research(request, history, finalizing=True, draft=draft)
-            draft = compile_draft(
-                self.gateway.complete(
-                    REPAIR_PROMPT,
-                    self.state(request, history, draft),
-                    GeneratedDraft,
-                    LLMFlow.LEGAL_REVIEW_REPAIR,
-                    finalizing=True,
-                ),
-                ledger=self.ledger,
+            evidence_deadline = (
+                self.context.deadline - self.policy.publication_reserve_seconds - 60
             )
+            self.context.services["legal_review_phase_deadline"] = evidence_deadline
+            try:
+                self._diagnose_review(request, history, draft, repair_review)
+                if (
+                    self.review_diagnoses is None
+                    or self.review_diagnoses.research_tasks
+                ):
+                    self._research(request, history, finalizing=True, draft=draft)
+            except (RunStopped, TimeoutError):
+                if self.context.is_cancelled() or time.monotonic() < evidence_deadline:
+                    raise
+                self.gaps.append(
+                    "Repair research time ended; disclose the specific unresolved effects at their conclusions."
+                )
+            edits = self.gateway.complete(
+                REPAIR_PROMPT,
+                {
+                    **self.state(request, history, draft),
+                    "repair_base": generated.model_dump(mode="json"),
+                },
+                DraftEdits,
+                LLMFlow.LEGAL_REVIEW_REPAIR,
+                finalizing=True,
+            )
+            generated = apply_draft_edits(generated, edits)
+            draft = compile_draft(generated, ledger=self.ledger)
             draft = self._bind_unresolved_issues(draft)
             self._validate_draft(draft)
             self.final_review = self._review(request, history, draft)

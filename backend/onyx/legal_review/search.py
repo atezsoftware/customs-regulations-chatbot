@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Any
+from uuid import uuid4
 
 from onyx.chat.emitter import Emitter
 from onyx.server.query_and_chat.placement import Placement
@@ -68,6 +69,8 @@ class DiscoverySearchTool(SearchTool):
                 "preserve_source_diversity": True,
                 "reuse_diversity_comparisons": True,
                 "guarded_decisions_advisory": False,
+                "capture_candidate_audit": True,
+                "candidate_audit_run_id": str(uuid4()),
             }
         )
         return super().run(placement, bounded, **llm_kwargs)

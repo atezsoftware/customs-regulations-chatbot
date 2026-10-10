@@ -11,7 +11,7 @@ from pydantic import JsonValue
 from onyx.asv3.citation_numbers import extract_citation_numbers
 from onyx.asv3.corpus_tools import CorpusBroker, build_corpus_specs
 from onyx.asv3.evidence import EvidenceLedger
-from onyx.asv3.models import RunContext, SharedBudget
+from onyx.asv3.models import RunContext, RunStopped, SharedBudget
 from onyx.asv3.registry import CapabilityRegistry, build_core_specs
 from onyx.asv3.search_adapter import build_search_adapter
 from onyx.cache.interface import CacheBackend
@@ -30,6 +30,7 @@ from onyx.db.models import User
 from onyx.error_handling.error_codes import OnyxErrorCode
 from onyx.error_handling.exceptions import OnyxError
 from onyx.legal_review.acquisition import SourceAcquirer
+from onyx.legal_review.audit import LegalReviewCandidateAudit
 from onyx.legal_review.decisions import DecisionsReviewer
 from onyx.legal_review.diagnostics import OpenAIReviewDiagnoser
 from onyx.legal_review.engine import LegalReviewEngine
@@ -178,6 +179,8 @@ def _run(
         ),
         "",
     )
+    candidate_audit = LegalReviewCandidateAudit(context, request=question)
+    context.services["candidate_audit"] = candidate_audit
     search = next((tool for tool in tools if isinstance(tool, SearchTool)), None)
     if search is None:
         raise OnyxError(
@@ -212,6 +215,7 @@ def _run(
         ledger=ledger,
         policy=policy,
         search_adapter=adapter,
+        broker=broker,
     )
     progress: list[JsonValue] = []
     state_container.set_stop_notice("Hukuki inceleme kullanıcı tarafından durduruldu.")
@@ -223,6 +227,7 @@ def _run(
             "reading": "Kaynak koşulları ve kanıt boşlukları değerlendiriliyor",
             "review": "Kaynak ve cevap kontrolü yapılıyor",
             "final": "Bütünleşik cevap hazırlanıyor",
+            "finalizing": "Araştırma süresi tamamlandı; cevap ve son kontrol hazırlanıyor",
             "repair": "Belirlenen eksikler bir kez düzeltiliyor",
             "completed": "Hukuki inceleme tamamlandı",
             "failed": "Hukuki inceleme tamamlanamadı",
@@ -254,6 +259,7 @@ def _run(
         context.budget.consume("decisions")
 
     engine = LegalReviewEngine(
+        complete_articles=acquirer.complete_articles,
         gateway=GeminiGateway(
             llm=selected,
             context=context,
@@ -311,6 +317,7 @@ def _run(
         "progress": progress,
         "source_operations": acquirer.receipts,
         "source_assessments": engine.source_assessments,
+        "candidate_audit": candidate_audit.export(),
         "requirement_history": [
             row.model_dump(mode="json") for row in engine.requirement_history.values()
         ],
@@ -325,8 +332,9 @@ def _run(
         "usage_scope": "Gemini Flash and OpenAI Decisions token usage; embedding/reranker calls retain their separate provider traces",
     }
     if result.answer is None:
-        if result.non_publication_reason == "review_rejected":
-            context.check_active()
+        if result.non_publication_reason in {"review_rejected", "time_exhausted"}:
+            if result.non_publication_reason == "review_rejected":
+                context.check_active()
             report("withheld", context.language)
             save_asv3_checkpoint(
                 message_id=assistant_message_id, user_id=user.id, snapshot=snapshot
@@ -336,6 +344,7 @@ def _run(
                 state_container=state_container,
                 context=context,
                 processing_seconds=time.monotonic() - started,
+                time_exhausted=result.non_publication_reason == "time_exhausted",
             )
             return
         report(
@@ -352,9 +361,7 @@ def _run(
     final = result.answer
     if result.status == "partial":
         prefix = (
-            "Kısmi yanıt — bazı belirleyici noktalar doğrulanamadı."
-            if context.language.startswith("tr")
-            else "Partial answer — some decisive points could not be verified."
+            "Kısmi yanıt" if context.language.startswith("tr") else "Partial answer"
         )
         final = prefix + "\n\n" + final
     try:
@@ -450,6 +457,7 @@ def _emit_review_notice(
     state_container: ChatStateContainer,
     context: RunContext,
     processing_seconds: float,
+    time_exhausted: bool = False,
 ) -> None:
     """Persist a non-answer notice without exposing a rejected legal draft."""
     notice = (
@@ -461,7 +469,18 @@ def _emit_review_notice(
         "for this question. The draft was withheld because unresolved issues remain "
         "in applying the sources to the facts."
     )
-    context.check_active()
+    if time_exhausted:
+        notice = (
+            "İnceleme süresi içinde son kontrolden geçmiş bir cevap hazırlanamadı. "
+            "Kontrolü tamamlanmamış taslak yayımlanmadı."
+            if context.language.startswith("tr")
+            else "No answer passed the final review within the research time. "
+            "The unchecked draft was withheld."
+        )
+        if context.is_cancelled():
+            raise RunStopped("Legal Review cancelled")
+    else:
+        context.check_active()
     state_container.set_pre_answer_processing_time(processing_seconds)
     emitter.emit(
         Packet(
@@ -472,7 +491,10 @@ def _emit_review_notice(
             ),
         )
     )
-    context.check_active()
+    if context.is_cancelled():
+        raise RunStopped("Legal Review cancelled")
+    if not time_exhausted:
+        context.check_active()
     state_container.set_answer_tokens(notice)
     emitter.emit(
         Packet(

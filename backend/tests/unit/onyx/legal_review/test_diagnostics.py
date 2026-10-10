@@ -708,6 +708,8 @@ def test_publication_schema_selects_literal_answer_passages_instead_of_retyping(
         "disposition": "rebutted",
         "target": "assertion",
         "reason": "Condition present",
+        "repair_kind": None,
+        "research_query": None,
         "required_change": None,
         "supports": [],
         "answer_spans": ["a0001"],
@@ -754,3 +756,88 @@ def test_cited_source_checks_preserve_each_basis_without_creating_issues() -> No
     assert checks[1].issue_id == "procedure"
     assert "general, procedure" in checks[0].instructions
     assert draft.model_dump() == before
+
+
+def test_publication_duplicate_references_preserve_every_check_and_literal_passage() -> (
+    None
+):
+    checks = [
+        ReviewCheck(id=str(index), instructions="Check the same condition")
+        for index in range(3)
+    ]
+
+    def complete(
+        packet: dict[str, JsonValue], response_model: type[StrictModel], *_args: object
+    ) -> StrictModel:
+        assert packet["answer_passages"] == {"a0001": "Approval releases the security."}
+        return response_model.model_validate(
+            {
+                "q0001": {
+                    "disposition": "defect",
+                    "target": "assertion",
+                    "reason": "Release also requires settlement.",
+                    "required_change": "Preserve the settlement condition.",
+                    "repair_kind": "correction",
+                    "research_query": None,
+                    "supports": [],
+                    "answer_spans": ["a0001"],
+                },
+                "q0002": {"same_as": "q0001"},
+                "q0003": {"same_as": "q0002"},
+            }
+        )
+
+    examiner = OpenAIReviewDiagnoser(api_key="test")
+    with patch.object(examiner, "_complete", side_effect=complete):
+        result = examiner.examine(
+            {"draft": {"answer": "Approval releases the security."}}, checks, 10
+        )
+    assert [row.check_id for row in result.findings] == [row.id for row in checks]
+    assert all(
+        row.answer_quotes == ["Approval releases the security."]
+        for row in result.findings
+    )
+    assert all(row.repair_kind == "correction" for row in result.findings)
+
+
+def test_parallel_publication_preserves_complete_context_and_all_checks() -> None:
+    from onyx.legal_review.models import PublicationFinding, PublicationReview
+
+    checks = [
+        ReviewCheck(id=str(index), instructions="Check the source")
+        for index in range(34)
+    ]
+    state: dict[str, JsonValue] = {
+        "draft": {"answer": "All conclusions and qualifications."},
+        "original_evidence": [],
+    }
+
+    def assess(
+        packet: dict[str, JsonValue], batch: list[ReviewCheck], timeout: float
+    ) -> PublicationReview:
+        assert packet is state and timeout > 0
+        return PublicationReview(
+            findings=[
+                PublicationFinding(
+                    check_id=check.id,
+                    disposition="rebutted",
+                    target="not_applicable",
+                    reason="Condition already present",
+                    required_change=None,
+                    supports=[],
+                    answer_quotes=["All conclusions and qualifications."],
+                )
+                for check in batch
+            ]
+        )
+
+    examiner = OpenAIReviewDiagnoser(api_key="test")
+    with patch.object(examiner, "_examine_batch", side_effect=assess) as batches:
+        result = examiner.examine(state, checks, 30)
+    assert batches.call_count == 3
+    assert [row.check_id for row in result.findings] == [row.id for row in checks]
+    with patch.object(
+        examiner, "_examine_batch", side_effect=TimeoutError("one batch incomplete")
+    ):
+        with pytest.raises(TimeoutError):
+            examiner.examine(state, checks, 30)

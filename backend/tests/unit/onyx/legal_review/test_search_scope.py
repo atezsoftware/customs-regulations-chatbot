@@ -78,6 +78,8 @@ def test_relevance_uses_the_specific_evidence_question_through_acquisition(
     assert forwarded.rerank_context == target
     assert forwarded.max_llm_chunks == 50
     assert forwarded.rerank_candidate_limit == 384
+    assert forwarded.capture_candidate_audit is True
+    assert forwarded.candidate_audit_run_id
     assert DiscoverySearchTool.NORMALIZED_RERANK_THRESHOLD == 0.82
     assert (
         overrides.rerank_context

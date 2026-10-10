@@ -9,7 +9,7 @@ from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.models import EvidenceItem, RunContext, SharedBudget
 from onyx.configs.constants import DocumentSource
 from onyx.context.search.models import SearchDoc
-from onyx.legal_review.drafting import GeneratedDraft
+from onyx.legal_review.drafting import DraftEdits, GeneratedDraft
 from onyx.legal_review.engine import (
     LegalReviewEngine,
     recorded_legal_status,
@@ -179,7 +179,9 @@ class FakeGateway:
                 {"query": query, "issue_ids": identities}
                 for query, identities in shared.items()
             ]
-        if response_model is GeneratedDraft and isinstance(result, DraftAnswer):
+        if response_model in {GeneratedDraft, DraftEdits} and isinstance(
+            result, DraftAnswer
+        ):
             payload = {
                 "blocks": [
                     {
@@ -200,6 +202,8 @@ class FakeGateway:
                 ],
                 "unresolved_issue_ids": result.unresolved_issue_ids,
             }
+            if response_model is DraftEdits:
+                payload["replacements"] = payload.pop("blocks")
         return response_model.model_validate(payload)
 
 
@@ -266,7 +270,9 @@ class FakeReviewer:
 def engine(
     outputs: list[BaseModel], reviews: list[str]
 ) -> tuple[LegalReviewEngine, FakeGateway, FakeReviewer]:
-    context = RunContext(budget=SharedBudget(max_decisions=32))
+    context = RunContext(
+        timeout_seconds=float("inf"), budget=SharedBudget(max_decisions=32)
+    )
     ledger = EvidenceLedger()
     gateway = FakeGateway(outputs)
     reviewer = FakeReviewer(reviews)
@@ -277,7 +283,9 @@ def engine(
             reviewer=reviewer,
             ledger=ledger,
             context=context,
-            policy=WorkflowPolicy(),
+            policy=WorkflowPolicy(
+                always_review_research=True, assume_current_corpus=False
+            ),
         ),
         gateway,
         reviewer,

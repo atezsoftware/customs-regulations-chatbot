@@ -13,7 +13,9 @@ DIMENSION_GUIDANCE: dict[LegalDimension, str] = {
         "Establish the version applicable on the event date, including amendments, repeal, "
         "annulment, deferred effective dates and transitional provisions. Distinguish a missing "
         "event date from missing legal research. A recent read date or an unchanged older "
-        "explanation does not establish the controlling norm's current validity."
+        "explanation does not establish the controlling norm's current validity. When the "
+        "current-corpus assumption is enabled, missing metadata alone needs no investigation; "
+        "focus on concrete source effects or event-date differences."
     ),
     LegalDimension.CASE_LAW: (
         "Investigate judicial decisions or authoritative rulings capable of changing a material "

@@ -106,6 +106,15 @@ class DeadlineBackend(httpcore.NetworkBackend):
         )
 
 
+def deadline_transport(deadline: Deadline) -> httpx.HTTPTransport:
+    """Apply one absolute deadline to every socket operation, including streamed reads."""
+    transport = httpx.HTTPTransport(retries=0)
+    pool = transport._pool
+    assert isinstance(pool, httpcore.ConnectionPool)
+    pool._network_backend = DeadlineBackend(pool._network_backend, deadline)
+    return transport
+
+
 def read_stream(
     selected: LitellmLLM,
     *,
@@ -129,11 +138,7 @@ def read_stream(
         from_litellm_model_response_stream,
     )
 
-    transport = httpx.HTTPTransport(retries=0)
-    # httpcore caches the body read timeout. Clamp each socket operation instead.
-    pool = transport._pool
-    assert isinstance(pool, httpcore.ConnectionPool)
-    pool._network_backend = DeadlineBackend(pool._network_backend, deadline)
+    transport = deadline_transport(deadline)
     client = HTTPHandler(
         client=httpx.Client(
             transport=transport,
