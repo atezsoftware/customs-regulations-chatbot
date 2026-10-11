@@ -1,5 +1,6 @@
 import { Feedback, SessionType } from "@/lib/types";
 import type { ResponseUsage } from "@/sections/chat/usage/interfaces";
+import type { SessionFeedbackResponse } from "@/app/app/interfaces";
 
 export interface QueryAnalytics {
   total_queries: number;
@@ -46,6 +47,7 @@ export interface ChatSessionSnapshot {
   assistant_name: string | null;
   time_created: string;
   flow_type: SessionType;
+  session_feedback?: SessionFeedbackResponse | null;
 }
 
 export interface ChatSessionMinimal {
@@ -62,6 +64,7 @@ export interface ChatSessionMinimal {
   feedback_type: Feedback | "mixed" | null;
   flow_type: SessionType;
   conversation_length: number;
+  session_feedback?: SessionFeedbackResponse | null;
 }
 
 export interface UsageReport {

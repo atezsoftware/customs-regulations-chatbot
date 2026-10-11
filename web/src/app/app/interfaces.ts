@@ -201,6 +201,19 @@ export interface Message {
   processingDurationSeconds?: number;
 }
 
+export type SessionFeedbackRating = 1 | 2 | 3 | 4;
+
+export interface SessionFeedbackResponse {
+  chat_session_id: string;
+  rating: SessionFeedbackRating;
+  label: string;
+  feedback_text: string | null;
+  version: number;
+  time_created: string;
+  time_updated: string;
+  evaluated_through_message_id: number | null;
+}
+
 export interface BackendChatSession {
   chat_session_id: string;
   description: string;
@@ -213,6 +226,7 @@ export interface BackendChatSession {
   current_temperature_override: number | null;
   current_reasoning_effort_override: ReasoningEffortOverride | null;
   current_alternate_model?: string;
+  session_feedback: SessionFeedbackResponse | null;
 
   owner_name: string | null;
   packets: Packet[][];

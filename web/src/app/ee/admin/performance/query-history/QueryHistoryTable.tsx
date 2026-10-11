@@ -23,6 +23,9 @@ import { PageSelector } from "@/components/PageSelector";
 import type { Route } from "next";
 import { useRouter } from "next/navigation";
 import { FeedbackBadge } from "@/app/ee/admin/performance/query-history/FeedbackBadge";
+import { SessionFeedbackBadge } from "@/app/ee/admin/performance/query-history/SessionFeedbackBadge";
+import { SESSION_FEEDBACK_OPTIONS } from "@/lib/chat/session-feedback/constants";
+import type { SessionFeedbackRating } from "@/app/app/interfaces";
 import KickoffCSVExport from "@/app/ee/admin/performance/query-history/KickoffCSVExport";
 import CardSection from "@/components/admin/CardSection";
 import usePaginatedFetch from "@/hooks/usePaginatedFetch";
@@ -40,7 +43,7 @@ import {
   PREVIOUS_CSV_TASK_BUTTON_NAME,
 } from "@/app/ee/admin/performance/query-history/constants";
 import { humanReadableFormatWithTime } from "@opal/time";
-import { Modal } from "@opal/components";
+import { Modal, Text as OpalText } from "@opal/components";
 import { Button, Divider } from "@opal/components";
 import { Badge } from "@/components/ui/badge";
 import {
@@ -96,6 +99,9 @@ function QueryHistoryTableRow({
       </TableCell>
       <TableCell>
         <FeedbackBadge feedback={chatSessionMinimal.feedback_type} />
+      </TableCell>
+      <TableCell>
+        <SessionFeedbackBadge feedback={chatSessionMinimal.session_feedback} />
       </TableCell>
       <TableCell className="overflow-hidden">
         <Text className="break-words line-clamp-3">
@@ -279,6 +285,7 @@ export function QueryHistoryTable() {
   const [dateRange, setDateRange] = useState<DateRange>(undefined);
   const [filters, setFilters] = useState<{
     feedback_type?: Feedback | "all";
+    session_rating?: SessionFeedbackRating;
     start_time?: string;
     end_time?: string;
   }>({});
@@ -347,6 +354,37 @@ export function QueryHistoryTable() {
               }}
             />
 
+            <Section alignItems="start" gap={0.25}>
+              <OpalText font="main-ui-action">Sohbet değerlendirmesi</OpalText>
+              <InputSelect
+                value={filters.session_rating?.toString() || "all"}
+                onValueChange={(value) => {
+                  setFilters((prev) => {
+                    const nextFilters = { ...prev };
+                    if (value === "all") {
+                      delete nextFilters.session_rating;
+                    } else {
+                      const option = SESSION_FEEDBACK_OPTIONS.find(
+                        ({ rating }) => rating.toString() === value
+                      );
+                      if (option) nextFilters.session_rating = option.rating;
+                    }
+                    return nextFilters;
+                  });
+                }}
+              >
+                <InputSelect.Trigger aria-label="Sohbet değerlendirmesi" />
+                <InputSelect.Content>
+                  <InputSelect.Item value="all">Tümü</InputSelect.Item>
+                  {SESSION_FEEDBACK_OPTIONS.map(({ rating, label }) => (
+                    <InputSelect.Item key={rating} value={rating.toString()}>
+                      {`${rating}/4 · ${label}`}
+                    </InputSelect.Item>
+                  ))}
+                </InputSelect.Content>
+              </InputSelect>
+            </Section>
+
             <AdminDateRangeSelector
               value={dateRange}
               onValueChange={onTimeRangeChange}
@@ -363,12 +401,13 @@ export function QueryHistoryTable() {
         <Section>
           <Table className="mt-5 table-fixed">
             <colgroup>
-              <col className="w-[16%]" />
-              <col className="w-[22%]" />
-              <col className="w-[8%]" />
-              <col className="w-[11%]" />
+              <col className="w-[15%]" />
+              <col className="w-[18%]" />
+              <col className="w-[7%]" />
+              <col className="w-[9%]" />
               <col className="w-[10%]" />
-              <col className="w-[12%]" />
+              <col className="w-[10%]" />
+              <col className="w-[10%]" />
               <col className="w-[10%]" />
               <col className="w-[11%]" />
             </colgroup>
@@ -377,6 +416,9 @@ export function QueryHistoryTable() {
                 <TableHead>First User Message</TableHead>
                 <TableHead>First AI Response</TableHead>
                 <TableHead>Feedback</TableHead>
+                <TableHead>
+                  <OpalText font="main-ui-action">Sohbet puanı</OpalText>
+                </TableHead>
                 <TableHead>User</TableHead>
                 <TableHead>Persona</TableHead>
                 <TableHead>AI Model</TableHead>
@@ -387,7 +429,7 @@ export function QueryHistoryTable() {
             {isLoading ? (
               <TableBody>
                 <TableRow>
-                  <TableCell colSpan={8} className="text-center">
+                  <TableCell colSpan={9} className="text-center">
                     <div className="flex justify-center">
                       <SvgSimpleLoader className="h-6 w-6" />
                     </div>

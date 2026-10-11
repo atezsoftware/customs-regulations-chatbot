@@ -15,6 +15,8 @@ import { useAppBackground } from "@/providers/AppBackgroundProvider";
 import { useTheme } from "next-themes";
 import useBrowserInfo from "@/hooks/useBrowserInfo";
 import ShareChatSessionModal from "@/sections/modals/ShareChatSessionModal";
+import SessionFeedbackModal from "@/sections/modals/SessionFeedbackModal";
+import { useChatSessionStore } from "@/app/app/stores/useChatSessionStore";
 import { useProjectsContext } from "@/providers/ProjectsContext";
 import useChatSessions from "@/hooks/useChatSessions";
 import {
@@ -58,6 +60,7 @@ import {
   SvgSearchMenu,
   SvgShare,
   SvgSidebar,
+  SvgStar,
   SvgTrash,
 } from "@opal/icons";
 import { useIsSearchModeAvailable, useSettings } from "@/lib/settings/hooks";
@@ -83,6 +86,17 @@ function Header() {
   const { setFolded } = useSidebarState();
   const { fullWidthChat, toggleFullWidthChat } = useFullWidthChat();
   const [showShareModal, setShowShareModal] = useState(false);
+  const [feedbackSessionId, setFeedbackSessionId] = useState<string | null>(
+    null
+  );
+  const activeChatSessionId = appFocus.isChat() ? appFocus.getId() : null;
+  const activeSession = useChatSessionStore((store) =>
+    activeChatSessionId ? store.sessions.get(activeChatSessionId) : undefined
+  );
+  const sessionFeedback = activeSession?.sessionFeedback;
+  useEffect(() => {
+    setFeedbackSessionId(null);
+  }, [activeChatSessionId]);
   const [deleteModalOpen, setDeleteModalOpen] = useState(false);
   const [showMoveCustomAgentModal, setShowMoveCustomAgentModal] =
     useState(false);
@@ -313,6 +327,17 @@ function Header() {
 
   return (
     <>
+      {feedbackSessionId && feedbackSessionId === activeChatSessionId && (
+        <SessionFeedbackModal
+          key={feedbackSessionId}
+          sessionId={feedbackSessionId}
+          onClose={() =>
+            setFeedbackSessionId((openSessionId) =>
+              openSessionId === feedbackSessionId ? null : openSessionId
+            )
+          }
+        />
+      )}
       {showShareModal && currentChatSession && (
         <ShareChatSessionModal
           chatSession={currentChatSession}
@@ -456,6 +481,26 @@ function Header() {
           - more-options buttons
         */}
               <div className="flex flex-1 justify-end items-center">
+                {activeChatSessionId && (
+                  <Button
+                    icon={SvgStar}
+                    prominence="tertiary"
+                    responsiveHideText
+                    aria-label="Sohbeti değerlendir"
+                    tooltip="Sohbeti değerlendir"
+                    disabled={
+                      !activeSession ||
+                      activeSession.isFetchingChatMessages ||
+                      (!activeSession.isLoaded &&
+                        activeSession.messageTree.size === 0)
+                    }
+                    onClick={() => setFeedbackSessionId(activeChatSessionId)}
+                  >
+                    {sessionFeedback
+                      ? `${sessionFeedback.rating}/4 ${sessionFeedback.label}`
+                      : "Sohbeti değerlendir"}
+                  </Button>
+                )}
                 {appFocus.isChat() && currentChatSession && (
                   <FrostedDiv className="flex shrink flex-row items-center">
                     <Button

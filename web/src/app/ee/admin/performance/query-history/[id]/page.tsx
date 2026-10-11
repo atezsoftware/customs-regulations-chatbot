@@ -9,8 +9,9 @@ import { ErrorCallout } from "@/components/ErrorCallout";
 import { errorHandlingFetcher } from "@/lib/fetcher";
 import { SWR_KEYS } from "@/lib/swr-keys";
 import { timestampToReadableDate } from "@/lib/dateUtils";
-import type { ChatSessionSnapshot } from "../../usage/types";
-import QueryHistoryTranscript from "./QueryHistoryTranscript";
+import type { ChatSessionSnapshot } from "@/app/ee/admin/performance/usage/types";
+import QueryHistoryTranscript from "@/app/ee/admin/performance/query-history/[id]/QueryHistoryTranscript";
+import { SessionFeedbackBadge } from "@/app/ee/admin/performance/query-history/SessionFeedbackBadge";
 
 interface QueryHistoryConversationProps {
   chatSessionId: string;
@@ -64,6 +65,24 @@ function QueryHistoryConversation({
           <Text font="secondary-body" color="text-03">
             {`AI modeli: ${modelDisplayNames.join(", ")}`}
           </Text>
+        )}
+        {chatSessionSnapshot.session_feedback && (
+          <div className="flex flex-col gap-2 border-t border-border-02 pt-3">
+            <Text font="main-ui-action">Sohbet değerlendirmesi</Text>
+            <SessionFeedbackBadge
+              feedback={chatSessionSnapshot.session_feedback}
+            />
+            <Text font="secondary-body" color="text-03">
+              {`Son değerlendirme: ${timestampToReadableDate(chatSessionSnapshot.session_feedback.time_updated)}`}
+            </Text>
+            {chatSessionSnapshot.session_feedback.feedback_text && (
+              <div className="whitespace-pre-wrap break-words">
+                <Text font="main-ui-body" as="p">
+                  {chatSessionSnapshot.session_feedback.feedback_text}
+                </Text>
+              </div>
+            )}
+          </div>
         )}
       </div>
 

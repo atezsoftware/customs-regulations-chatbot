@@ -7,6 +7,7 @@ import {
   BackendChatSession,
   FeedbackType,
   QueuedMessage,
+  SessionFeedbackResponse,
 } from "../interfaces";
 import {
   getLatestMessageChain,
@@ -41,6 +42,7 @@ interface ChatSessionData {
   isLoaded: boolean;
   description?: string;
   personaId?: number;
+  sessionFeedback: SessionFeedbackResponse | null;
 
   // Streaming duration tracking
   streamingStartTime?: number;
@@ -75,6 +77,10 @@ interface ChatSessionStore {
   updateSessionData: (
     sessionId: string,
     updates: Partial<ChatSessionData>
+  ) => void;
+  updateSessionFeedback: (
+    sessionId: string,
+    feedback: SessionFeedbackResponse | null
   ) => void;
   updateSessionMessageTree: (
     sessionId: string,
@@ -201,6 +207,7 @@ const createInitialSessionData = (
 
   lastAccessed: new Date(),
   isLoaded: false,
+  sessionFeedback: null,
   queuedMessages: [],
   latestMessageRenderComplete: true,
   isStreamDraining: false,
@@ -272,6 +279,12 @@ export const useChatSessionStore = create<ChatSessionStore>()((set, get) => ({
 
       return { sessions: newSessions };
     });
+  },
+
+  updateSessionFeedback: (sessionId, feedback) => {
+    const currentFeedback = get().sessions.get(sessionId)?.sessionFeedback;
+    if ((feedback?.version ?? 0) < (currentFeedback?.version ?? 0)) return;
+    get().updateSessionData(sessionId, { sessionFeedback: feedback });
   },
 
   updateSessionMessageTree: (
@@ -620,6 +633,12 @@ export const useChatSessionStore = create<ChatSessionStore>()((set, get) => ({
       get().updateSessionData(sessionId, initialData);
     } else {
       get().createSession(sessionId, initialData);
+    }
+    if (backendSession) {
+      get().updateSessionFeedback(
+        sessionId,
+        backendSession.session_feedback ?? null
+      );
     }
   },
 
