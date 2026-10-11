@@ -32,6 +32,9 @@ from onyx.utils.logger import setup_logger
 from onyx.utils.postgres_sanitization import sanitize_string
 
 logger = setup_logger()
+RESERVED_ASSISTANT_MESSAGE = (
+    "Response was terminated prior to completion, try regenerating."
+)
 
 
 # Note: search/streaming packet helpers moved to streaming_utils.py
@@ -179,6 +182,12 @@ def delete_messages_and_files_from_chat_session(
     chat_session_id: UUID, db_session: Session
 ) -> None:
     delete_answer_graphs_for_session(db_session, chat_session_id)
+    # Graph cleanup commits internally; lock before deleting the feedback snapshot's messages.
+    db_session.scalar(
+        select(ChatSession.id)
+        .where(ChatSession.id == chat_session_id)
+        .with_for_update()
+    )
     # Select messages older than cutoff_time with files
     messages_with_files = (
         db_session.execute(
@@ -645,7 +654,7 @@ def reserve_message_id(
         chat_session_id=chat_session_id,
         parent_message_id=parent_message,
         latest_child_message_id=None,
-        message="Response was terminated prior to completion, try regenerating.",
+        message=RESERVED_ASSISTANT_MESSAGE,
         token_count=15,
         message_type=message_type,
         model_display_name=model_display_name,
@@ -687,7 +696,7 @@ def reserve_multi_model_message_ids(
             chat_session_id=chat_session_id,
             parent_message_id=parent_message_id,
             latest_child_message_id=None,
-            message="Response was terminated prior to completion, try regenerating.",
+            message=RESERVED_ASSISTANT_MESSAGE,
             token_count=15,  # placeholder; updated on completion by llm_loop_completion_handle
             message_type=MessageType.ASSISTANT,
             model_display_name=display_name,

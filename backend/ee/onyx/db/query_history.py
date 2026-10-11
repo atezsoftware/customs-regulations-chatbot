@@ -8,7 +8,13 @@ from sqlalchemy.sql.expression import UnaryExpression, literal
 
 from ee.onyx.background.task_name_builders import QUERY_HISTORY_TASK_NAME_PREFIX
 from onyx.configs.constants import QAFeedbackType
-from onyx.db.models import ChatMessage, ChatMessageFeedback, ChatSession, TaskQueueState
+from onyx.db.models import (
+    ChatMessage,
+    ChatMessageFeedback,
+    ChatSession,
+    ChatSessionFeedback,
+    TaskQueueState,
+)
 from onyx.db.tasks import get_all_tasks_with_prefix
 
 
@@ -16,6 +22,7 @@ def _build_filter_conditions(
     start_time: datetime | None,
     end_time: datetime | None,
     feedback_filter: QAFeedbackType | None,
+    session_rating: int | None = None,
 ) -> list[ColumnElement]:
     """
     Helper function to build all filter conditions for chat sessions.
@@ -31,6 +38,13 @@ def _build_filter_conditions(
         conditions.append(ChatSession.time_created >= start_time)
     if end_time is not None:
         conditions.append(ChatSession.time_created <= end_time)
+
+    if session_rating is not None:
+        conditions.append(
+            ChatSession.session_feedback.has(
+                ChatSessionFeedback.rating == session_rating
+            )
+        )
 
     if feedback_filter is not None:
         feedback_subq = (
@@ -68,8 +82,11 @@ def get_total_filtered_chat_sessions_count(
     start_time: datetime | None,
     end_time: datetime | None,
     feedback_filter: QAFeedbackType | None,
+    session_rating: int | None = None,
 ) -> int:
-    conditions = _build_filter_conditions(start_time, end_time, feedback_filter)
+    conditions = _build_filter_conditions(
+        start_time, end_time, feedback_filter, session_rating
+    )
     stmt = (
         select(func.count(distinct(ChatSession.id)))
         .select_from(ChatSession)
@@ -85,8 +102,11 @@ def get_page_of_chat_sessions(
     page_num: int,
     page_size: int,
     feedback_filter: QAFeedbackType | None = None,
+    session_rating: int | None = None,
 ) -> Sequence[ChatSession]:
-    conditions = _build_filter_conditions(start_time, end_time, feedback_filter)
+    conditions = _build_filter_conditions(
+        start_time, end_time, feedback_filter, session_rating
+    )
 
     subquery = (
         select(ChatSession.id)
@@ -104,6 +124,7 @@ def get_page_of_chat_sessions(
         .options(
             joinedload(ChatSession.user),
             joinedload(ChatSession.persona),
+            joinedload(ChatSession.session_feedback),
             contains_eager(ChatSession.messages).joinedload(
                 ChatMessage.chat_message_feedbacks
             ),
@@ -152,6 +173,7 @@ def fetch_chat_sessions_eagerly_by_time(
         .options(
             joinedload(ChatSession.user),
             joinedload(ChatSession.persona),
+            joinedload(ChatSession.session_feedback),
             contains_eager(ChatSession.messages).joinedload(
                 ChatMessage.chat_message_feedbacks
             ),

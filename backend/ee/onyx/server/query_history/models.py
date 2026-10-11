@@ -10,6 +10,7 @@ from onyx.configs.constants import MessageType, QAFeedbackType, SessionType
 from onyx.db.enums import TaskStatus
 from onyx.db.models import ChatMessage, ChatSession, FileRecord, TaskQueueState
 from onyx.llm.usage_cost import ResponseUsage
+from onyx.server.query_and_chat.models import SessionFeedbackResponse
 
 
 class AbridgedSearchDoc(BaseModel):
@@ -85,6 +86,7 @@ class ChatSessionMinimal(BaseModel):
     feedback_type: QAFeedbackType | None
     flow_type: SessionType
     conversation_length: int
+    session_feedback: SessionFeedbackResponse | None = None
 
     @classmethod
     def from_chat_session(cls, chat_session: ChatSession) -> "ChatSessionMinimal":
@@ -141,6 +143,11 @@ class ChatSessionMinimal(BaseModel):
             ),
             time_created=chat_session.time_created,
             feedback_type=session_feedback_type,
+            session_feedback=(
+                SessionFeedbackResponse.from_model(chat_session.session_feedback)
+                if chat_session.session_feedback
+                else None
+            ),
             flow_type=(
                 SessionType.SLACK if chat_session.onyxbot_flow else SessionType.CHAT
             ),
@@ -163,6 +170,7 @@ class ChatSessionSnapshot(BaseModel):
     assistant_name: str | None
     time_created: datetime
     flow_type: SessionType
+    session_feedback: SessionFeedbackResponse | None = None
 
 
 class QuestionAnswerPairSnapshot(BaseModel):
@@ -179,12 +187,17 @@ class QuestionAnswerPairSnapshot(BaseModel):
     user_email: str
     time_created: datetime
     flow_type: SessionType
+    session_feedback_rating: int | None = None
+    session_feedback_label: str | None = None
+    session_feedback_text: str | None = None
+    session_feedback_updated_at: datetime | None = None
 
     @classmethod
     def from_chat_session_snapshot(
         cls,
         chat_session_snapshot: ChatSessionSnapshot,
     ) -> list["QuestionAnswerPairSnapshot"]:
+        session_feedback = chat_session_snapshot.session_feedback
         message_pairs: list[tuple[MessageSnapshot, MessageSnapshot]] = []
         for ind in range(1, len(chat_session_snapshot.messages), 2):
             message_pairs.append(
@@ -207,6 +220,18 @@ class QuestionAnswerPairSnapshot(BaseModel):
                 user_email=get_display_email(chat_session_snapshot.user_email),
                 time_created=user_message.time_created,
                 flow_type=chat_session_snapshot.flow_type,
+                session_feedback_rating=(
+                    session_feedback.rating if session_feedback else None
+                ),
+                session_feedback_label=(
+                    session_feedback.label if session_feedback else None
+                ),
+                session_feedback_text=(
+                    session_feedback.feedback_text if session_feedback else None
+                ),
+                session_feedback_updated_at=(
+                    session_feedback.time_updated if session_feedback else None
+                ),
             )
             for ind, (user_message, ai_message) in enumerate(message_pairs)
         ]
@@ -229,6 +254,18 @@ class QuestionAnswerPairSnapshot(BaseModel):
             "user_email": self.user_email,
             "time_created": str(self.time_created),
             "flow_type": self.flow_type,
+            "session_feedback_rating": (
+                str(self.session_feedback_rating)
+                if self.session_feedback_rating is not None
+                else ""
+            ),
+            "session_feedback_label": self.session_feedback_label or "",
+            "session_feedback_text": self.session_feedback_text or "",
+            "session_feedback_updated_at": (
+                self.session_feedback_updated_at.isoformat()
+                if self.session_feedback_updated_at
+                else ""
+            ),
         }
 
 

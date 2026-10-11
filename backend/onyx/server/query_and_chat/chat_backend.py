@@ -69,6 +69,7 @@ from onyx.db.llm import (
 from onyx.db.models import ChatMessage, ChatSessionSharedStatus, Persona, User
 from onyx.db.persona import get_persona_by_id
 from onyx.db.response_usage import get_response_usage
+from onyx.db.session_feedback import get_session_feedback, upsert_session_feedback
 from onyx.db.tools import get_tools_by_ids
 from onyx.db.usage import UsageType, increment_usage
 from onyx.db.user_file import get_file_id_by_user_file_id
@@ -110,6 +111,8 @@ from onyx.server.query_and_chat.models import (
     MessageOrigin,
     RenameChatSessionResponse,
     SendMessageRequest,
+    SessionFeedbackRequest,
+    SessionFeedbackResponse,
     SetPreferredResponseRequest,
     UpdateChatSessionReasoningRequest,
     UpdateChatSessionTemperatureRequest,
@@ -510,6 +513,11 @@ def get_chat_session(
         )
     ]
 
+    session_feedback = (
+        get_session_feedback(db_session, session_id)
+        if not is_shared and chat_session.user_id == user_id
+        else None
+    )
     return ChatSessionDetailResponse(
         chat_session_id=session_id,
         description=chat_session.description,
@@ -527,6 +535,11 @@ def get_chat_session(
         # Packets are now directly serialized as Packet Pydantic models
         packets=replay_packet_lists,
         current_run=current_run,
+        session_feedback=(
+            SessionFeedbackResponse.from_model(session_feedback)
+            if session_feedback is not None
+            else None
+        ),
     )
 
 
@@ -936,6 +949,28 @@ def set_preferred_response_endpoint(
         )
     except ValueError as e:
         raise OnyxError(OnyxErrorCode.INVALID_INPUT, str(e))
+
+
+@router.put(
+    "/chat-session/{session_id}/feedback",
+    tags=PUBLIC_API_TAGS,
+    dependencies=get_feedback_rate_limiters(),
+)
+def put_session_feedback(
+    session_id: UUID,
+    feedback: SessionFeedbackRequest,
+    user: User = Depends(require_permission(Permission.WRITE_CHAT)),
+    db_session: Session = Depends(get_session),
+) -> SessionFeedbackResponse:
+    saved_feedback = upsert_session_feedback(
+        db_session=db_session,
+        chat_session_id=session_id,
+        user_id=user.id,
+        rating=feedback.rating,
+        feedback_text=feedback.feedback_text,
+        expected_version=feedback.expected_version,
+    )
+    return SessionFeedbackResponse.from_model(saved_feedback)
 
 
 @router.post(

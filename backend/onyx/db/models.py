@@ -3257,6 +3257,12 @@ class ChatSession(Base):
         foreign_keys="ChatMessage.chat_session_id",
     )
     persona: Mapped["Persona"] = relationship("Persona")
+    session_feedback: Mapped["ChatSessionFeedback | None"] = relationship(
+        "ChatSessionFeedback",
+        back_populates="chat_session",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
 
 
 class ChatMessage(Base):
@@ -3582,6 +3588,43 @@ class DocumentRetrievalFeedback(Base):
     )
     document: Mapped[Document] = relationship(
         "Document", back_populates="retrieval_feedbacks"
+    )
+
+
+class ChatSessionFeedback(Base):
+    __tablename__ = "chat_session_feedback"
+    __table_args__ = (
+        CheckConstraint("rating BETWEEN 1 AND 4", name="session_feedback_rating_check"),
+        CheckConstraint("version >= 1", name="session_feedback_version_check"),
+        CheckConstraint(
+            "char_length(feedback_text) <= 5000",
+            name="session_feedback_text_length_check",
+        ),
+    )
+
+    chat_session_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("chat_session.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    rating: Mapped[int] = mapped_column(Integer)
+    feedback_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    submitted_by_user_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("user.id", ondelete="CASCADE")
+    )
+    evaluated_through_message_id: Mapped[int | None] = mapped_column(
+        ForeignKey("chat_message.id", ondelete="SET NULL"), nullable=True
+    )
+    version: Mapped[int] = mapped_column(Integer, server_default=text("1"))
+    time_created: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    time_updated: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    chat_session: Mapped[ChatSession] = relationship(
+        "ChatSession", back_populates="session_feedback"
     )
 
 

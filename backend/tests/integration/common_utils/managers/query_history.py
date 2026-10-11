@@ -23,6 +23,7 @@ class QueryHistoryManager:
         feedback_type: QAFeedbackType | None = None,
         start_time: datetime | None = None,
         end_time: datetime | None = None,
+        session_rating: int | None = None,
     ) -> PaginatedReturn[ChatSessionMinimal]:
         query_params: dict[str, str | int] = {
             "page_num": page_num,
@@ -30,6 +31,8 @@ class QueryHistoryManager:
         }
         if feedback_type:
             query_params["feedback_type"] = feedback_type.value
+        if session_rating is not None:
+            query_params["session_rating"] = session_rating
         if start_time:
             query_params["start_time"] = start_time.isoformat()
         if end_time:

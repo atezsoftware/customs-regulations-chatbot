@@ -3,9 +3,20 @@ from unittest.mock import Mock, patch
 from uuid import uuid4
 
 from ee.onyx.server.query_history.api import snapshot_from_chat_session
-from ee.onyx.server.query_history.models import ChatSessionMinimal
-from onyx.configs.constants import MessageType
-from onyx.db.models import ChatMessage, ChatSession, Persona, User
+from ee.onyx.server.query_history.models import (
+    ChatSessionMinimal,
+    QuestionAnswerPairSnapshot,
+)
+from onyx.configs.constants import MessageType, QAFeedbackType
+from onyx.db.models import (
+    ChatMessage,
+    ChatMessageFeedback,
+    ChatSession,
+    ChatSessionFeedback,
+    Persona,
+    User,
+)
+from onyx.utils.csv_utils import sanitize_csv_row
 
 
 def _message(
@@ -109,3 +120,67 @@ def test_minimal_snapshot_includes_each_model_used_in_the_conversation() -> None
     snapshot = ChatSessionMinimal.from_chat_session(chat_session)
 
     assert snapshot.model_display_names == ["GPT-5", "Claude Sonnet 4"]
+
+
+def test_session_feedback_in_admin_snapshots_and_sanitized_csv_rows() -> None:
+    submitted_by = uuid4()
+    timestamp = datetime.now(timezone.utc)
+    messages = [
+        _message(1, MessageType.USER, "First question"),
+        _message(2, MessageType.ASSISTANT, "First answer"),
+        _message(3, MessageType.USER, "Second question"),
+        _message(4, MessageType.ASSISTANT, "Second answer"),
+    ]
+    messages[1].chat_message_feedbacks = [
+        ChatMessageFeedback(is_positive=True, feedback_text="Message feedback")
+    ]
+    chat_session = ChatSession(
+        id=uuid4(),
+        user=None,
+        persona=None,
+        description="Session feedback",
+        persona_id=0,
+        time_created=timestamp,
+        onyxbot_flow=False,
+        messages=messages,
+    )
+    chat_session.session_feedback = ChatSessionFeedback(
+        chat_session_id=chat_session.id,
+        rating=2,
+        feedback_text="=SUM(A1)",
+        submitted_by_user_id=submitted_by,
+        evaluated_through_message_id=4,
+        version=1,
+        time_created=timestamp,
+        time_updated=timestamp,
+    )
+    minimal = ChatSessionMinimal.from_chat_session(chat_session)
+    assert minimal.feedback_type == QAFeedbackType.LIKE
+    assert minimal.session_feedback is not None
+    assert minimal.session_feedback.label == "Eksik"
+    assert "submitted_by_user_id" not in minimal.session_feedback.model_dump()
+
+    with (
+        patch(
+            "ee.onyx.server.query_history.api.get_chat_messages_by_session",
+            return_value=messages,
+        ),
+        patch("ee.onyx.server.query_history.api.get_response_usage", return_value={}),
+    ):
+        snapshot = snapshot_from_chat_session(chat_session, Mock())
+    assert snapshot is not None
+    assert snapshot.session_feedback == minimal.session_feedback
+    rows = [
+        sanitize_csv_row(pair.to_json())
+        for pair in QuestionAnswerPairSnapshot.from_chat_session_snapshot(snapshot)
+    ]
+    assert len(rows) == 2
+    assert rows[0]["feedback_type"] == "like"
+    assert rows[0]["feedback_text"] == "Message feedback"
+    assert rows[1]["feedback_type"] == ""
+    for row in rows:
+        assert row["session_feedback_rating"] == "2"
+        assert row["session_feedback_label"] == "Eksik"
+        assert row["session_feedback_text"] == "'=SUM(A1)"
+        assert row["session_feedback_updated_at"] == timestamp.isoformat()
+        assert set(row) == set(QuestionAnswerPairSnapshot.model_fields)

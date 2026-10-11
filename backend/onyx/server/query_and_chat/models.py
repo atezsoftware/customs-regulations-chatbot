@@ -3,12 +3,12 @@ from enum import Enum
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from onyx.configs.constants import DocumentSource, MessageType, SessionType
 from onyx.context.search.models import BaseFilters, SavedSearchDoc, SearchDoc, Tag
 from onyx.db.enums import ChatSessionSharedStatus
-from onyx.db.models import ChatSession
+from onyx.db.models import ChatSession, ChatSessionFeedback
 from onyx.file_store.models import FileDescriptor
 from onyx.llm.override_models import LLMOverride
 from onyx.llm.usage_cost import ResponseUsage
@@ -436,6 +436,51 @@ class CurrentRunInfo(BaseModel):
     run_id: int
 
 
+class SessionFeedbackRequest(BaseModel):
+    rating: int = Field(strict=True, ge=1, le=4)
+    feedback_text: str | None = Field(default=None, strict=True, max_length=5000)
+    expected_version: int | None = Field(default=None, strict=True, ge=0)
+
+    @field_validator("feedback_text", mode="before")
+    @classmethod
+    def normalize_feedback_text(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            if "\x00" in value:
+                raise ValueError("Feedback text cannot contain null characters")
+            return value.strip() or None
+        return value
+
+
+class SessionFeedbackResponse(BaseModel):
+    chat_session_id: UUID
+    rating: int = Field(ge=1, le=4)
+    label: Literal["Yanlış", "Eksik", "Kısmi doğru", "Doğru"]
+    feedback_text: str | None
+    version: int
+    time_created: datetime
+    time_updated: datetime
+    evaluated_through_message_id: int | None
+
+    @classmethod
+    def from_model(cls, feedback: ChatSessionFeedback) -> "SessionFeedbackResponse":
+        labels: tuple[Literal["Yanlış", "Eksik", "Kısmi doğru", "Doğru"], ...] = (
+            "Yanlış",
+            "Eksik",
+            "Kısmi doğru",
+            "Doğru",
+        )
+        return cls(
+            chat_session_id=feedback.chat_session_id,
+            rating=feedback.rating,
+            label=labels[feedback.rating - 1],
+            feedback_text=feedback.feedback_text,
+            version=feedback.version,
+            time_created=feedback.time_created,
+            time_updated=feedback.time_updated,
+            evaluated_through_message_id=feedback.evaluated_through_message_id,
+        )
+
+
 class ChatSessionDetailResponse(BaseModel):
     chat_session_id: UUID
     description: str | None
@@ -454,6 +499,7 @@ class ChatSessionDetailResponse(BaseModel):
     # Set while a run is in flight and resumable: cursor-0 replay+tail is
     # available at /chat-session/{id}/resume-stream.
     current_run: CurrentRunInfo | None = None
+    session_feedback: SessionFeedbackResponse | None = None
 
 
 class AdminSearchRequest(BaseModel):

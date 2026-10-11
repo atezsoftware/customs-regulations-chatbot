@@ -52,7 +52,11 @@ from onyx.error_handling.exceptions import OnyxError
 from onyx.file_store.file_store import get_default_file_store
 from onyx.llm.usage_cost import ResponseUsage
 from onyx.server.documents.models import PaginatedReturn
-from onyx.server.query_and_chat.models import ChatSessionDetails, ChatSessionsResponse
+from onyx.server.query_and_chat.models import (
+    ChatSessionDetails,
+    ChatSessionsResponse,
+    SessionFeedbackResponse,
+)
 from onyx.server.settings.store import load_settings
 from onyx.utils.threadpool_concurrency import parallel_yield
 from shared_configs.contextvars import get_current_tenant_id
@@ -163,6 +167,11 @@ def snapshot_from_chat_session(
         assistant_name=chat_session.persona.name if chat_session.persona else None,
         time_created=chat_session.time_created,
         flow_type=flow_type,
+        session_feedback=(
+            SessionFeedbackResponse.from_model(chat_session.session_feedback)
+            if chat_session.session_feedback
+            else None
+        ),
     )
 
 
@@ -210,6 +219,7 @@ def get_chat_session_history(
     page_num: int = Query(0, ge=0),
     page_size: int = Query(10, ge=1),
     feedback_type: QAFeedbackType | None = None,
+    session_rating: int | None = Query(None, ge=1, le=4),
     start_time: datetime | None = None,
     end_time: datetime | None = None,
     _: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
@@ -226,6 +236,7 @@ def get_chat_session_history(
         start_time=start_time,
         end_time=end_time,
         feedback_filter=feedback_type,
+        session_rating=session_rating,
     )
 
     total_filtered_chat_sessions_count = get_total_filtered_chat_sessions_count(
@@ -233,6 +244,7 @@ def get_chat_session_history(
         start_time=start_time,
         end_time=end_time,
         feedback_filter=feedback_type,
+        session_rating=session_rating,
     )
 
     minimal_chat_sessions: list[ChatSessionMinimal] = []
