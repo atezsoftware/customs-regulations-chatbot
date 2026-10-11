@@ -9,7 +9,7 @@ from typing import Any, Protocol
 
 from onyx.db.models import AnswerGraphEdge, AnswerGraphNode, AnswerGraphRun
 
-_MAX_EXPORT_BYTES = 128 * 1024 * 1024
+_MAX_EXPORT_BYTES = 512 * 1024 * 1024
 
 
 class BinaryWriter(Protocol):
@@ -28,7 +28,7 @@ class _Writer:
     def write(self, value: str) -> int:
         data = value.encode("utf-8")
         if self.written + len(data) > _MAX_EXPORT_BYTES:
-            raise MarkdownExportTooLarge("Answer graph detail exceeds 128 MiB")
+            raise MarkdownExportTooLarge("Answer graph detail exceeds 512 MiB")
         self.output.write(data)
         self.written += len(data)
         return len(value)

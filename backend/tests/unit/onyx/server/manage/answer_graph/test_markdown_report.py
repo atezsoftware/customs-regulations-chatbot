@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
@@ -108,6 +109,20 @@ def test_markdown_rejects_oversized_export_without_silent_truncation(
         )
 
 
+def test_markdown_export_allows_graphs_larger_than_128_mib() -> None:
+    class DiscardingOutput:
+        def write(self, value: bytes, /) -> int:
+            return len(value)
+
+    writer = markdown_report._Writer(DiscardingOutput())
+    chunk = "x" * (1024 * 1024)
+
+    for _ in range(129):
+        writer.write(chunk)
+
+    assert writer.written == 129 * 1024 * 1024
+
+
 def test_admin_markdown_endpoint_streams_complete_report(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -122,6 +137,16 @@ def test_admin_markdown_endpoint_streams_complete_report(
         started_at=started,
         attributes={"agent": "Chat agent"},
     )
+    second_node = AnswerGraphNode(
+        node_id="search",
+        parent_node_id="root",
+        kind="step",
+        operation="search.bm25",
+        status="COMPLETE",
+        capture_status="COMPLETE",
+        started_at=started + timedelta(seconds=1),
+        attributes={},
+    )
     run = AnswerGraphRun(
         id=uuid4(),
         assistant_message_id=2657,
@@ -132,14 +157,42 @@ def test_admin_markdown_endpoint_streams_complete_report(
     monkeypatch.setattr(
         api,
         "list_answer_graph_nodes",
-        lambda _db, _id, **_kwargs: [node],
+        lambda _db, _id, **_kwargs: [node, second_node],
     )
     monkeypatch.setattr(
         api,
         "list_answer_graph_edges",
         lambda _db, _id, **_kwargs: [],
     )
-    monkeypatch.setattr(api, "get_answer_graph_node_payloads", lambda *_: {})
+    payload_query_count = 0
+
+    def payloads(*_: object) -> object:
+        nonlocal payload_query_count
+        payload_query_count += 1
+        yield SimpleNamespace(
+            node_id="root", part="input", ciphertext=b"captured-input"
+        )
+        yield SimpleNamespace(
+            node_id="search", part="output", ciphertext=b"captured-output"
+        )
+
+    monkeypatch.setattr(api, "iter_answer_graph_payloads", payloads, raising=False)
+
+    def reject_per_node_payload_query(*_: object) -> dict[str, bytes]:
+        raise AssertionError("Markdown export must not query payloads per node")
+
+    monkeypatch.setattr(
+        api, "get_answer_graph_node_payloads", reject_per_node_payload_query
+    )
+    monkeypatch.setattr(
+        api,
+        "_part",
+        lambda ciphertext, **_: (
+            (ciphertext.decode("utf-8"), "CAPTURED")
+            if ciphertext is not None
+            else (None, "NOT_RETURNED")
+        ),
+    )
     monkeypatch.setattr(api, "record_answer_graph_access", lambda *_, **__: None)
     app = FastAPI()
     register_onyx_exception_handlers(app)
@@ -162,4 +215,7 @@ def test_admin_markdown_endpoint_streams_complete_report(
     assert response.headers["content-disposition"].endswith('2657.md"')
     assert "```mermaid\nflowchart LR" in response.text
     assert "## Step 001 — chat.input" in response.text
-    assert "### Input — `NOT_RETURNED`" in response.text
+    assert "captured-input" in response.text
+    assert "## Step 002 — search.bm25" in response.text
+    assert "captured-output" in response.text
+    assert payload_query_count == 1

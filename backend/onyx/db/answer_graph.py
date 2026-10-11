@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime
 import hashlib
 import time
+from collections.abc import Generator
 from typing import Any
 from uuid import UUID
 
@@ -395,6 +396,30 @@ def get_answer_graph_node_payloads(
             )
         )
     }
+
+
+def iter_answer_graph_payloads(
+    db_session: Session, run_id: UUID
+) -> Generator[AnswerGraphPayload, None, None]:
+    result = db_session.scalars(
+        select(AnswerGraphPayload)
+        .join(
+            AnswerGraphNode,
+            (AnswerGraphNode.run_id == AnswerGraphPayload.run_id)
+            & (AnswerGraphNode.node_id == AnswerGraphPayload.node_id),
+        )
+        .where(AnswerGraphPayload.run_id == run_id)
+        .order_by(
+            AnswerGraphNode.started_at,
+            AnswerGraphNode.node_id,
+            AnswerGraphPayload.part,
+        )
+        .execution_options(yield_per=100)
+    )
+    try:
+        yield from result
+    finally:
+        result.close()
 
 
 def latest_answer_graph_node_id(db_session: Session, run_id: UUID) -> str | None:

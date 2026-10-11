@@ -3,6 +3,7 @@
 import { use, useEffect, useMemo, useRef, useState } from "react";
 import useSWR from "swr";
 import { Button, InputTypeIn } from "@opal/components";
+import { downloadFile } from "@/lib/download";
 import { useUser } from "@/providers/UserProvider";
 import {
   buildGraphLayout,
@@ -314,13 +315,16 @@ export default function AnswerGraphPage({
   };
   const downloadExport = async (format: "pdf" | "markdown") => {
     if (!runId || downloading) return;
+    const endpoint = `/api/admin/answer-graphs/${runId}/${format}`;
+    const filename = `answer-execution-${messageId}.${format === "markdown" ? "md" : "pdf"}`;
+    if (format === "markdown") {
+      downloadFile(filename, { url: endpoint });
+      return;
+    }
     setDownloading(format);
     setDownloadError(null);
     try {
-      const response = await fetch(
-        `/api/admin/answer-graphs/${runId}/${format}`,
-        { cache: "no-store" }
-      );
+      const response = await fetch(endpoint, { cache: "no-store" });
       if (!response.ok) {
         const failure = (await response.json().catch(() => null)) as {
           detail?: string;
@@ -333,7 +337,7 @@ export default function AnswerGraphPage({
       const url = URL.createObjectURL(await response.blob());
       const link = document.createElement("a");
       link.href = url;
-      link.download = `answer-execution-${messageId}.${format === "markdown" ? "md" : "pdf"}`;
+      link.download = filename;
       link.click();
       window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
     } catch (failure) {

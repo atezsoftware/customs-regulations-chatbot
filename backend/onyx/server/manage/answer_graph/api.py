@@ -17,6 +17,7 @@ from onyx.db.answer_graph import (
     get_answer_graph_node_payloads,
     get_answer_graph_run,
     get_answer_graph_run_by_message,
+    iter_answer_graph_payloads,
     list_answer_graph_edges,
     list_answer_graph_nodes,
     record_answer_graph_access,
@@ -218,8 +219,15 @@ def download_graph_markdown(
             OnyxErrorCode.PAYLOAD_TOO_LARGE, "Answer graph is too large for export"
         )
 
+    payload_rows = iter_answer_graph_payloads(db_session, run_id)
+    current_payload = next(payload_rows, None)
+
     def load_parts(node: AnswerGraphNode) -> dict[str, tuple[object, str]]:
-        payloads = get_answer_graph_node_payloads(db_session, run_id, node.node_id)
+        nonlocal current_payload
+        payloads: dict[str, bytes] = {}
+        while current_payload is not None and current_payload.node_id == node.node_id:
+            payloads[current_payload.part] = current_payload.ciphertext
+            current_payload = next(payload_rows, None)
         return {
             part: _part(
                 payloads.get(part),
@@ -233,7 +241,10 @@ def download_graph_markdown(
 
     output = SpooledTemporaryFile(max_size=1024 * 1024, mode="w+b")
     try:
-        write_answer_graph_markdown(run, nodes, edges, load_parts, output)
+        try:
+            write_answer_graph_markdown(run, nodes, edges, load_parts, output)
+        finally:
+            payload_rows.close()
         record_answer_graph_access(
             db_session, run_id=run_id, user_id=user.id, action="markdown_export"
         )
