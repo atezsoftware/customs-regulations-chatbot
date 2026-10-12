@@ -1302,6 +1302,8 @@ def run_asv3_loop(
             lean_native_mode=True,
             research_llm=research_llm,
         )
+        if workers is None:
+            raise ValueError("Researcher requires its worker pool")
         child_registry = (
             CapabilityRegistry(
                 common_specs
@@ -1310,9 +1312,14 @@ def run_asv3_loop(
                 )
             )
             if independent
-            else registry
+            else CapabilityRegistry(
+                common_specs
+                + workers.tool_specs()
+                + build_research_specs(research_state, ledger)
+            )
         )
         child.services["registry"] = child_registry
+        child_complete: str | None = None
         child_partial: str | None = None
 
         def submit_child_partial(
@@ -1346,68 +1353,76 @@ def run_asv3_loop(
                 summary="Supported partial answer and precise source gap retained.",
             )
 
-        if independent:
-
-            def submit_child_answer(
-                args: dict[str, JsonValue], _context: RunContext
-            ) -> ToolOutcome:
-                candidate = (
-                    str(args["answer"])
-                    if parallel_research
-                    else str(args["answer"]).strip()
-                )
-                gap = source_publication_gap(
-                    candidate, researcher_model.last_call_id, run_context=child
-                )
-                child_harness.last_draft = candidate
-                child_harness.publication_gap = gap
-                if gap is not None:
-                    return gap
+        def submit_child_answer(
+            args: dict[str, JsonValue], _context: RunContext
+        ) -> ToolOutcome:
+            nonlocal child_complete
+            candidate = (
+                str(args["answer"])
+                if parallel_research
+                else str(args["answer"]).strip()
+            )
+            gap = source_publication_gap(
+                candidate, researcher_model.last_call_id, run_context=child
+            )
+            child_harness.last_draft = candidate
+            child_harness.publication_gap = gap
+            if gap is not None:
+                return gap
+            if independent:
                 child.services["submitted_answer"] = candidate
-                return ToolOutcome(
-                    status=OutcomeStatus.FOUND,
-                    summary="Complete supported question answer retained.",
-                )
+            else:
+                child_complete = candidate
+            return ToolOutcome(
+                status=OutcomeStatus.FOUND,
+                summary="Complete supported question answer retained."
+                if independent
+                else "Complete supported research result returned to the coordinator.",
+            )
 
-            child_registry.register(
-                ToolSpec(
-                    name="submit_answer",
-                    description="Finish this question with its complete original-supported answer; coverage metadata may accompany this same final decision.",
-                    parameters={
-                        "type": "object",
-                        "properties": {
-                            "answer": {"type": "string", "minLength": 1},
-                            "basis": {"type": "string", "enum": ["originals"]},
-                        },
-                        "required": ["answer", "basis"],
-                        "additionalProperties": False,
+        child_registry.register(
+            ToolSpec(
+                name="submit_answer",
+                description="Finish this question with its complete original-supported answer; coverage metadata may accompany this same final decision."
+                if independent
+                else "Return the complete original-supported research result to the coordinator and finish this task. The coordinator alone publishes the final answer.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "answer": {"type": "string", "minLength": 1},
+                        "basis": {"type": "string", "enum": ["originals"]},
                     },
-                    handler=submit_child_answer,
-                    parallel_safe=False,
-                    consumes_tool_budget=False,
-                )
+                    "required": ["answer", "basis"],
+                    "additionalProperties": False,
+                },
+                handler=submit_child_answer,
+                parallel_safe=False,
+                consumes_tool_budget=False,
             )
-            child_registry.register(
-                ToolSpec(
-                    name="submit_partial_answer",
-                    description="Finish this question with supported parts and its precise unresolved source gap. Preserve available detail and original citations. Missing source text is not proof that no rule exists.",
-                    parameters={
-                        "type": "object",
-                        "properties": {
-                            "answer": {
-                                "type": "string",
-                                "minLength": 1,
-                                "description": "Complete supported answer and precise source gaps. Use recorded global [n] citations beside supported legal claims; (n) is not a citation. Preserve legal article/paragraph numbering.",
-                            }
-                        },
-                        "required": ["answer"],
-                        "additionalProperties": False,
+        )
+        child_registry.register(
+            ToolSpec(
+                name="submit_partial_answer",
+                description="Finish this question with supported parts and its precise unresolved source gap. Preserve available detail and original citations. Missing source text is not proof that no rule exists."
+                if independent
+                else "Return supported findings and precise unresolved source gaps to the coordinator and finish this task. Cite each supported legal claim; missing text is not proof that no rule exists. The coordinator alone publishes.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "answer": {
+                            "type": "string",
+                            "minLength": 1,
+                            "description": "Complete supported answer and precise source gaps. Use recorded global [n] citations beside supported legal claims; (n) is not a citation. Preserve legal article/paragraph numbering.",
+                        }
                     },
-                    handler=submit_child_partial,
-                    parallel_safe=False,
-                    consumes_tool_budget=False,
-                )
+                    "required": ["answer"],
+                    "additionalProperties": False,
+                },
+                handler=submit_child_partial,
+                parallel_safe=False,
+                consumes_tool_budget=False,
             )
+        )
 
         def child_checkpoint(snapshot: dict[str, JsonValue]) -> None:
             callback = child.services.get("record_child_checkpoint")
@@ -1437,14 +1452,13 @@ def run_asv3_loop(
             )
             if independent
             else None,
+            complete_submission=(lambda: child_complete) if not independent else None,
             partial_submission=lambda: child_partial,
         )
         if independent:
             remember_session_originals(child_harness)
-            for spec in build_core_specs(
-                child_registry, ledger, child_harness.snapshot
-            ):
-                child_registry.register(spec)
+        for spec in build_core_specs(child_registry, ledger, child_harness.snapshot):
+            child_registry.register(spec)
         result = child_harness.run()
         data: dict[str, JsonValue] = {
             "evidence_numbers": sorted(

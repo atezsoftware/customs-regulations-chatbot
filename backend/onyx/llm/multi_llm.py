@@ -9,6 +9,7 @@ from contextlib import AbstractContextManager, contextmanager, nullcontext
 from functools import lru_cache
 from itertools import chain
 from typing import TYPE_CHECKING, Any, Literal, TypedDict, Union, cast
+from urllib.parse import urlparse
 
 from pydantic import TypeAdapter
 from readerwriterlock import rwlock
@@ -58,6 +59,12 @@ from onyx.llm.models import (
 )
 from onyx.llm.override_models import LLMSeed
 from onyx.llm.request_context import get_llm_mock_response
+from onyx.llm.tool_argument_stream import (
+    TOOL_ARGUMENT_STREAM_ABORT,
+    ToolArgumentStreamGuard,
+    close_sync_stream,
+    stream_with_first_chunk,
+)
 from onyx.llm.utils import build_litellm_passthrough_kwargs
 from onyx.llm.well_known_providers.constants import VERTEX_LOCATION_KWARG
 from onyx.tracing.answer_graph import graph_step
@@ -514,6 +521,7 @@ class LitellmLLM(LLM):
     See https://python.langchain.com/docs/integrations/chat/litellm"""
 
     _stream_cancellation_check: Callable[[], None] | None = None
+    _tool_argument_stream_guard: bool = False
 
     def __init__(
         self,
@@ -728,13 +736,17 @@ class LitellmLLM(LLM):
         uses_adaptive_thinking = any(
             _anthropic_uses_adaptive_thinking(name) for name in model_identity_names
         )
-        is_reasoning = uses_adaptive_thinking or any(
-            model_is_reasoning_model(name, self.config.model_provider)
-            for name in model_identity_names
+        is_reasoning = (
+            self._uses_guarded_openai_responses()
+            or uses_adaptive_thinking
+            or any(
+                model_is_reasoning_model(name, self.config.model_provider)
+                for name in model_identity_names
+            )
         )
         # All OpenAI models will use responses API for consistency
         # Responses API is needed to get reasoning packets from OpenAI models
-        is_openai_model = is_true_openai_model(
+        is_openai_model = self._uses_guarded_openai_responses() or is_true_openai_model(
             self.config.model_provider, self.config.model_name
         )
         is_ollama = self._model_provider == LlmProviderNames.OLLAMA_CHAT
@@ -1099,6 +1111,34 @@ class LitellmLLM(LLM):
                     else nullcontext()
                 )
                 with env_ctx:
+                    if (
+                        self._uses_guarded_openai_responses()
+                        and stream
+                        and tools
+                        and not (get_llm_mock_response() or MOCK_LLM_RESPONSE)
+                    ):
+                        from litellm.llms.openai.responses.transformation import (
+                            OpenAIResponsesAPIConfig,
+                        )
+
+                        if OpenAIResponsesAPIConfig().should_fake_stream(
+                            model_bare, True, "openai"
+                        ):
+                            from onyx.llm.native_responses_stream import (
+                                native_responses_stream,
+                            )
+
+                            return native_responses_stream(
+                                model=model_bare,
+                                messages=messages,
+                                tools=tools,
+                                optional_params=opts,
+                                passthrough_kwargs=passthrough_kwargs,
+                                api_base=self._api_base or None,
+                                timeout=timeout_override or self._timeout,
+                                max_tokens=max_tokens,
+                                client=client,
+                            )
                     return litellm.completion(
                         mock_response=get_llm_mock_response() or MOCK_LLM_RESPONSE,
                         model=model,
@@ -1181,13 +1221,23 @@ class LitellmLLM(LLM):
                         try:
                             first_chunk = next(chunks)
                         except StopIteration:
+                            if self._tool_argument_stream_guard:
+                                close_sync_stream(response)
                             graph_call.output_value = {"stream": "empty"}
                             return iter(())
+                        except Exception:
+                            if self._tool_argument_stream_guard:
+                                close_sync_stream(response)
+                            raise
                         graph_call.output_value = {
                             "first_chunk_received": True,
                             "stream_output": "recorded_by_generation_span",
                         }
-                        return chain((first_chunk,), chunks)
+                        return (
+                            stream_with_first_chunk(response, first_chunk, chunks)
+                            if self._tool_argument_stream_guard
+                            else chain((first_chunk,), chunks)
+                        )
                 except BadRequestError as e:
                     if self._seed is not None and "seed" in str(e).lower():
                         raise
@@ -1226,6 +1276,11 @@ class LitellmLLM(LLM):
     ) -> "LitellmLLM":
         bound = copy.copy(self)
         bound._stream_cancellation_check = check_active
+        return bound
+
+    def with_tool_argument_stream_guard(self) -> "LitellmLLM":
+        bound = copy.copy(self)
+        bound._tool_argument_stream_guard = True
         return bound
 
     def with_temperature(self, temperature: float) -> "LitellmLLM":
@@ -1272,7 +1327,8 @@ class LitellmLLM(LLM):
         """Providers whose sync calls need a fresh per-call HTTPHandler instead of
         litellm's shared module_level_client (see threading notes in invoke())."""
         return (
-            is_true_openai_model(self.config.model_provider, self.config.model_name)
+            self._uses_guarded_openai_responses()
+            or is_true_openai_model(self.config.model_provider, self.config.model_name)
             or self.config.model_provider == LlmProviderNames.ANTHROPIC
             # Vertex Gemini's sync streaming adapter does not forward timeout
             # to its shared HTTP client. Bind explicit limits to an owned client.
@@ -1280,6 +1336,21 @@ class LitellmLLM(LLM):
                 timeout_override is not None
                 and self.config.model_provider == LlmProviderNames.VERTEX_AI
                 and self.config.model_name.startswith("gemini-")
+            )
+        )
+
+    def _uses_guarded_openai_responses(self) -> bool:
+        # Keep this known first-party model's Responses contract when bundled
+        # metadata is missing.
+        # Never infer a proxy's capabilities from an arbitrary model name.
+        return (
+            self._tool_argument_stream_guard
+            and self._model_provider == LlmProviderNames.OPENAI
+            and self._api_surface is None
+            and self._model_version == "gpt-6.1-sol"
+            and (
+                not self._api_base
+                or urlparse(self._api_base).hostname == "api.openai.com"
             )
         )
 
@@ -1341,6 +1412,8 @@ class LitellmLLM(LLM):
         # and not every model path was traced thoroughly. It is also possible that in future versions of LiteLLM
         # they will realize that their OpenAI handling is not threadsafe. Hope they will just fix it.
         client = None
+        aborted = None
+        observed_usage = None
         if self._uses_isolated_client(timeout_override):
             client = HTTPHandler(timeout=timeout_override or self._timeout)
 
@@ -1375,7 +1448,50 @@ class LitellmLLM(LLM):
                     Iterator[LiteLLMModelResponseStream],
                     completion_response,
                 )
-                chunks = list(stream_response)
+                if self._tool_argument_stream_guard and tools:
+                    from onyx.llm.model_response import (
+                        from_litellm_model_response_stream,
+                    )
+                    from onyx.tracing.framework.create import get_current_span
+                    from onyx.tracing.framework.span_data import GenerationSpanData
+
+                    guard = ToolArgumentStreamGuard()
+                    chunks = []
+                    try:
+                        for chunk in stream_response:
+                            if self._stream_cancellation_check is not None:
+                                self._stream_cancellation_check()
+                            chunks.append(chunk)
+                            delta = from_litellm_model_response_stream(chunk)
+                            if delta.usage is not None:
+                                observed_usage = delta.usage
+                            aborted = guard.accept(delta)
+                            if aborted is not None:
+                                span = get_current_span()
+                                if span is not None and isinstance(
+                                    span.span_data, GenerationSpanData
+                                ):
+                                    diagnostic = {
+                                        **aborted.model_dump(),
+                                        "usage_status": "provider_reported"
+                                        if observed_usage is not None
+                                        else "unknown",
+                                    }
+                                    span.span_data.request_params = {
+                                        **(span.span_data.request_params or {}),
+                                        TOOL_ARGUMENT_STREAM_ABORT: diagnostic,
+                                    }
+                                    span.set_error(
+                                        {
+                                            "message": "Tool argument stream cancelled before completion; argument repair required",
+                                            "data": diagnostic,
+                                        }
+                                    )
+                                break
+                    finally:
+                        close_sync_stream(stream_response)
+                else:
+                    chunks = list(stream_response)
                 response = cast(
                     LiteLLMModelResponse,
                     stream_chunk_builder(chunks),
@@ -1384,6 +1500,11 @@ class LitellmLLM(LLM):
                 response = cast(LiteLLMModelResponse, completion_response)
 
             model_response = from_litellm_model_response(response)
+            if use_streaming and aborted is not None:
+                model_response.choice.finish_reason = TOOL_ARGUMENT_STREAM_ABORT
+                # stream_chunk_builder estimates missing usage. An aborted
+                # request has unknown billable usage until the provider reports it.
+                model_response.usage = observed_usage
 
             # Track LLM cost for Onyx-managed API keys
             if model_response.usage:

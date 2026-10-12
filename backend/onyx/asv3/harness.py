@@ -58,6 +58,7 @@ class Harness:
         max_context_chars: int = 60000,
         finalize_guard: Callable[[], ToolOutcome | None] | None = None,
         draft_guard: Callable[[str], ToolOutcome | None] | None = None,
+        complete_submission: Callable[[], str | None] | None = None,
         partial_submission: Callable[[], str | None] | None = None,
         report_terminal: bool = True,
         report_started: bool = True,
@@ -78,6 +79,7 @@ class Harness:
         self.max_context_chars = max_context_chars
         self.finalize_guard = finalize_guard
         self.draft_guard = draft_guard
+        self.complete_submission = complete_submission
         self.partial_submission = partial_submission
         self.report_terminal = report_terminal
         self.report_started = report_started
@@ -1244,10 +1246,15 @@ class Harness:
                         )
                         self._trim_turns()
                     self._save()
-                    submitted = self.context.services.get("submitted_answer")
+                    submitted = (
+                        self.complete_submission()
+                        if self.complete_submission is not None
+                        else self.context.services.get("submitted_answer")
+                    )
                     if (
                         (
-                            not self.context.depth
+                            self.complete_submission is not None
+                            or not self.context.depth
                             or self.context.services.get("independent_question") is True
                         )
                         and isinstance(submitted, str)
