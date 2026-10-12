@@ -92,6 +92,12 @@ class LLM(abc.ABC):
             "This LLM does not support an isolated stream cancellation binding"
         )
 
+    def with_tool_argument_stream_guard(self) -> "LLM":
+        """Bind incremental tool JSON recovery without changing other callers."""
+        raise NotImplementedError(
+            "This LLM does not support an isolated tool argument stream guard"
+        )
+
     def invoke(
         self,
         prompt: LanguageModelInput,

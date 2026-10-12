@@ -1545,9 +1545,7 @@ class ResearchModel:
                 reasoning_effort=self.reasoning_effort,
                 user_identity=self.user_identity,
                 **(
-                    {
-                        "provider_compatibility_attempts": provider_compatibility_attempts
-                    }
+                    {"provider_compatibility_attempts": provider_compatibility_attempts}
                     if provider_compatibility_attempts is not None
                     else {}
                 ),
@@ -2044,6 +2042,15 @@ class ResearchModel:
                         )
             except ValueError:
                 argument_error = "Tool arguments must be a complete JSON object"
+                from onyx.llm.tool_argument_stream import (
+                    TOOL_ARGUMENT_STREAM_ABORT,
+                    complete_object_prefix_fields,
+                )
+
+                if response.choice.finish_reason == TOOL_ARGUMENT_STREAM_ABORT:
+                    args = complete_object_prefix_fields(
+                        call.function.arguments, decoder=strict_json_decoder()
+                    )
             if argument_error and not return_argument_errors:
                 raise ValueError(argument_error)
             calls.append(
@@ -4450,6 +4457,10 @@ class ResearchModel:
         research: bool,
         native_catalogue: _NativeOriginalCatalogue | None = None,
     ) -> ModelResponse | None:
+        from onyx.llm.multi_llm import LitellmLLM
+
+        if self.lean_native_mode and tools and isinstance(call_llm, LitellmLLM):
+            call_llm = call_llm.with_tool_argument_stream_guard()
         try:
             response = self._invoke(
                 prompt,
