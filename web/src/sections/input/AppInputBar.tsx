@@ -614,6 +614,15 @@ const AppInputBar = React.memo(
       currentProjectId,
     ]);
 
+    // Only ASv3 Tek Araştırma, Experimental ASv3 and Hukuki İnceleme (Flash)
+    // are offered in the UI. The other workflows stay in the codebase but are
+    // hidden here; flip a flag to expose one again.
+    const SHOW_SUPERSEARCH_BUTTON = false;
+    const SHOW_LEGAL_COMPOSITE_BUTTON = false;
+    const SHOW_DEEP_RESEARCH_BUTTON = false;
+    const SHOW_EXPERIMENTAL_BUTTON = false;
+    const SHOW_GUARDRAILS_BUTTONS = false;
+
     const showAtezSearch = useMemo(() => {
       const isProjectWorkflow = currentProjectId !== null;
       return (
@@ -749,7 +758,7 @@ const AppInputBar = React.memo(
               </SelectButton>
             ) : (
               <>
-                {showAtezSearch && toggleSupersearch && (
+                {SHOW_SUPERSEARCH_BUTTON && showAtezSearch && toggleSupersearch && (
                   <SelectButton
                     disabled={disabled || isMultiModelActive}
                     variant="select-light"
@@ -783,7 +792,7 @@ const AppInputBar = React.memo(
                     Hukuki İnceleme (Flash)
                   </SelectButton>
                 )}
-                {showAtezSearch && toggleLegalComposite && (
+                {SHOW_LEGAL_COMPOSITE_BUTTON && showAtezSearch && toggleLegalComposite && (
                   <SelectButton
                     disabled={disabled || isMultiModelActive}
                     variant="select-light"
@@ -817,7 +826,7 @@ const AppInputBar = React.memo(
                     ASv3 Tek Araştırma
                   </SelectButton>
                 )}
-                {showDeepResearch && (
+                {SHOW_DEEP_RESEARCH_BUTTON && showDeepResearch && (
                   <SelectButton
                     disabled={disabled || isMultiModelActive}
                     variant="select-light"
@@ -834,7 +843,7 @@ const AppInputBar = React.memo(
                     Deep Research
                   </SelectButton>
                 )}
-                {showAtezSearch && toggleExperimentalResearch && (
+                {SHOW_EXPERIMENTAL_BUTTON && showAtezSearch && toggleExperimentalResearch && (
                   <SelectButton
                     disabled={disabled || isMultiModelActive}
                     variant="select-light"
@@ -870,7 +879,7 @@ const AppInputBar = React.memo(
                     Experimental ASv3
                   </SelectButton>
                 )}
-                {showAtezSearch && toggleExperimentalGuardrails && (
+                {SHOW_GUARDRAILS_BUTTONS && showAtezSearch && toggleExperimentalGuardrails && (
                   <SelectButton
                     disabled={disabled || isMultiModelActive}
                     variant="select-light"
@@ -887,7 +896,7 @@ const AppInputBar = React.memo(
                     Experimental Guardrails
                   </SelectButton>
                 )}
-                {showAtezSearch && toggleExperimentalGuardrailsV2 && (
+                {SHOW_GUARDRAILS_BUTTONS && showAtezSearch && toggleExperimentalGuardrailsV2 && (
                   <SelectButton
                     disabled={disabled || isMultiModelActive}
                     variant="select-light"
@@ -906,7 +915,7 @@ const AppInputBar = React.memo(
                     Experimental Guardrails v2
                   </SelectButton>
                 )}
-                {showAtezSearch && toggleExperimentalGuardrailsV3 && (
+                {SHOW_GUARDRAILS_BUTTONS && showAtezSearch && toggleExperimentalGuardrailsV3 && (
                   <SelectButton
                     disabled={disabled || isMultiModelActive}
                     variant="select-light"
