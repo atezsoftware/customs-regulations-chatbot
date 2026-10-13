@@ -11,9 +11,16 @@ from typing import Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
-from onyx.asv3.authority import folded, known_statute_source_ids
+from onyx.asv3.authority import folded, known_statute_source_ids, statute_references
 from onyx.asv3.evidence import EvidenceLedger
-from onyx.asv3.models import CapabilityCall, OutcomeStatus, RunContext, ToolReceipt
+from onyx.asv3.focused_source_target import focused_source_target
+from onyx.asv3.models import (
+    CapabilityCall,
+    OutcomeStatus,
+    RunContext,
+    ToolOutcome,
+    ToolReceipt,
+)
 
 
 def _hash(value: object) -> str:
@@ -119,6 +126,7 @@ class _Episode(BaseModel):
     next_action: dict[str, JsonValue] | None = None
     evidence_numbers: list[int] = Field(default_factory=list)
     observed_calls: list[str] = Field(default_factory=list)
+    source_ids: list[str] = Field(default_factory=list)
     detail: str = ""
 
     @model_validator(mode="after")
@@ -139,6 +147,10 @@ class _Episode(BaseModel):
             type(value) is not int or value < 1 for value in self.evidence_numbers
         ):
             raise ValueError("Governing episode original references changed")
+        if len(self.source_ids) != len(set(self.source_ids)) or any(
+            not source_id for source_id in self.source_ids
+        ):
+            raise ValueError("Governing episode source identities changed")
         if self.next_action is not None and (
             set(self.next_action) != {"name", "arguments"}
             or self.next_action["name"] not in {"read_provision", "read_source_range"}
@@ -179,6 +191,229 @@ class GoverningOriginalAcquisitions:
             + "."
         )
         return canonical_matching_originals(probe, ledger)
+
+    @staticmethod
+    def _query_target_keys(query: str) -> set[str]:
+        references = statute_references(
+            query,
+            strict_reference_boundaries=True,
+            syntactic_reference_binding=True,
+            unicode_ordinals=True,
+        )
+        if any(reference.clause_shorthand for reference in references):
+            return set()
+        return {
+            GoverningOriginalTarget(
+                instrument_number=reference.number,
+                article=reference.article,
+                qualifier=reference.qualifier,
+                paragraph=reference.paragraph,
+                clause=reference.clause,
+            ).key
+            for reference in references
+        }
+
+    @staticmethod
+    def _same_read_target(
+        call: CapabilityCall, episode: _Episode, ledger: EvidenceLedger
+    ) -> bool:
+        if call.name == "search_corpus":
+            routed = focused_source_target(call.arguments)
+            evidence_target = call.arguments.get("evidence_target")
+            if routed is None or not isinstance(evidence_target, str):
+                return False
+            source_name, _article = routed
+            references = statute_references(
+                f"{episode.target.source_name} {evidence_target[len(source_name) :]}",
+                strict_reference_boundaries=True,
+                syntactic_reference_binding=True,
+                unicode_ordinals=True,
+            )
+            if (
+                len(references) != 1
+                or references[0].article is None
+                or references[0].clause_shorthand
+            ):
+                return False
+            reference = references[0]
+            requested = CapabilityCall(
+                name="read_named_provision",
+                call_id=call.call_id,
+                arguments={
+                    "source_name": source_name,
+                    "article": " ".join(
+                        value
+                        for value in (reference.qualifier, reference.article)
+                        if value
+                    ),
+                    **(
+                        {"paragraph": reference.paragraph}
+                        if reference.paragraph
+                        else {}
+                    ),
+                    **({"clause": reference.clause} if reference.clause else {}),
+                },
+            )
+            return GoverningOriginalAcquisitions._same_read_target(
+                requested, episode, ledger
+            )
+        if call.name not in {
+            "read_named_provision",
+            "read_provision",
+            "search_source_text",
+            "follow_reference",
+        }:
+            return False
+        target = episode.target
+        source_ids = {
+            *episode.source_ids,
+            *known_statute_source_ids(target.source_name, ledger),
+        }
+        if call.name == "read_named_provision":
+            name = call.arguments.get("source_name")
+            if not isinstance(name, str):
+                return False
+            numbers = {
+                reference.number
+                for reference in statute_references(
+                    name,
+                    strict_reference_boundaries=True,
+                    syntactic_reference_binding=True,
+                )
+            }
+            same_source = (
+                numbers == {target.instrument_number}
+                or name.strip() == target.instrument_number
+                if target.instrument_number
+                else folded(name) == target.formal_name
+            )
+            named_ids = known_statute_source_ids(name, ledger)
+            same_source = same_source or (
+                len(named_ids) == 1 and named_ids[0] in source_ids
+            )
+        elif call.name in {"read_provision", "search_source_text", "follow_reference"}:
+            source_id = call.arguments.get(
+                "target_source_id" if call.name == "follow_reference" else "source_id"
+            )
+            same_source = isinstance(source_id, str) and source_id in source_ids
+        else:
+            return False
+        if call.name == "search_source_text":
+            pattern = call.arguments.get("pattern")
+            return (
+                same_source
+                and target.article is not None
+                and isinstance(pattern, str)
+                and GoverningOriginalAcquisitions._query_target_keys(
+                    f"{target.source_name} {pattern}"
+                )
+                == {target.key}
+            )
+        article = call.arguments.get("article")
+        if not same_source or not isinstance(article, str):
+            return False
+        if any(
+            field in call.arguments and not isinstance(call.arguments[field], str)
+            for field in ("paragraph", "clause")
+        ):
+            return False
+        locator = re.fullmatch(
+            r"(?:(gecici|ek|mukerrer)\s+)?(\d+(?:\s*/\s*[a-z])?)(?:\s*/\s*(\d+))?",
+            folded(article).strip(),
+        )
+        if locator is None:
+            return False
+        paragraph = call.arguments.get("paragraph", locator[3])
+        if locator[3] and paragraph != locator[3]:
+            return False
+        requested = GoverningOriginalTarget(
+            instrument_number=target.instrument_number,
+            formal_name=target.formal_name,
+            article=re.sub(r"\s+", "", locator[2]).upper(),
+            qualifier=locator[1],
+            paragraph=paragraph if isinstance(paragraph, str) else None,
+            clause=_text(call.arguments.get("clause")),
+        )
+        return requested.key == target.key
+
+    def admission_gap(
+        self, call: CapabilityCall, context: RunContext, ledger: EvidenceLedger
+    ) -> ToolOutcome | None:
+        """Refuse only a proven repeat of an already owned governing target."""
+        if call.name not in {
+            "read_named_provision",
+            "read_provision",
+            "search_source_text",
+            "search_corpus",
+            "resolve_source",
+            "query_corpus",
+            "follow_reference",
+        }:
+            return None
+        self.check_context(context)
+        if (
+            call.name == "search_corpus"
+            and call.arguments.get("discover_related_sources") is True
+            and _text(call.arguments.get("evidence_target"))
+            and _text(call.arguments.get("coverage_item"))
+        ):
+            # The exposed mode seeks another instrument or decision, not this original.
+            return None
+        query = call.arguments.get("query")
+        query_targets = (
+            self._query_target_keys(query)
+            if call.name in {"search_corpus", "resolve_source", "query_corpus"}
+            and isinstance(query, str)
+            and not (
+                call.name == "search_corpus"
+                and focused_source_target(call.arguments) is not None
+            )
+            else set()
+        )
+        with self._lock:
+            for key, episode in self._episodes.items():
+                if episode.status not in {"in_progress", "unavailable", "failed"}:
+                    continue
+                same_call = (
+                    episode.active_call is not None and episode.active_call == call
+                )
+                if same_call and episode.owner == str(
+                    context.services.get("task_id") or "root"
+                ):
+                    return None
+                if not (
+                    same_call
+                    or (episode.target.article is not None and query_targets == {key})
+                    or self._same_read_target(call, episode, ledger)
+                ):
+                    continue
+                if episode.status != "in_progress" and self.matching_originals(
+                    episode.target, ledger
+                ):
+                    continue
+                return ToolOutcome(
+                    status=OutcomeStatus.DENIED,
+                    summary="This governing-original target already has an acquisition episode; no repeat lookup was executed.",
+                    data={
+                        "governing_original_retry_blocked": True,
+                        "governing_original_target_key": key,
+                        "governing_original_target": episode.target.model_dump(
+                            mode="json"
+                        ),
+                        "acquisition_status": episode.status,
+                        "instruction": (
+                            "The owning acquisition is still in progress. Use its actual task state; do not restart it or infer unavailability. Continue distinct needs."
+                            if episode.status == "in_progress"
+                            else "Retain this target as an explicit unresolved original-source gap. Continue distinct needs or submit the supported parts; do not restart the same acquisition or claim source absence."
+                        ),
+                        "source_gap_notice": self.records_for([episode.target])[0][
+                            "source_gap_notice"
+                        ],
+                        "absence_proven": False,
+                        "legal_approval": False,
+                    },
+                )
+        return None
 
     def next_call(
         self,
@@ -253,6 +488,9 @@ class GoverningOriginalAcquisitions:
             ):
                 return False
             episode.active_call = call.model_copy(deep=True)
+            source_id = call.arguments.get("source_id")
+            if isinstance(source_id, str) and source_id not in episode.source_ids:
+                episode.source_ids.append(source_id)
             episode.next_action = None
             return True
 
@@ -280,6 +518,9 @@ class GoverningOriginalAcquisitions:
                 dict.fromkeys([*episode.evidence_numbers, *receipt.evidence_ids])
             )
             data = receipt.outcome.data
+            source_id = data.get("source_id")
+            if isinstance(source_id, str) and source_id not in episode.source_ids:
+                episode.source_ids.append(source_id)
             if receipt.call.name == "resolve_source":
                 sources = data.get("sources")
                 resolved_source_id = (

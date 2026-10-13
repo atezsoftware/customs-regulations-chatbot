@@ -317,6 +317,9 @@ class CapabilityRegistry:
     def research_binding_gap(
         self, call: CapabilityCall, context: RunContext
     ) -> ToolOutcome | None:
+        governing_gap = self.governing_acquisition_gap(call, context)
+        if governing_gap is not None:
+            return governing_gap
         spec = self.get(call.name)
         state = context.services.get("research_state")
         if (
@@ -334,6 +337,22 @@ class CapabilityRegistry:
                     return None
                 return state.action_binding_gap(None)
             return state.action_binding_gap(call.arguments.get("_need_id"))
+        return None
+
+    def governing_acquisition_gap(
+        self, call: CapabilityCall, context: RunContext
+    ) -> ToolOutcome | None:
+        from onyx.asv3.evidence import EvidenceLedger
+        from onyx.asv3.governing_acquisitions import GoverningOriginalAcquisitions
+
+        if context.services.get("asv3_workflow_variant") != ASV3_TUNED_VARIANT:
+            return None
+        episodes = context.services.get("tuned_governing_acquisitions")
+        ledger = context.services.get("evidence")
+        if isinstance(episodes, GoverningOriginalAcquisitions) and isinstance(
+            ledger, EvidenceLedger
+        ):
+            return episodes.admission_gap(call, context, ledger)
         return None
 
     def dispatch(self, call: CapabilityCall, context: RunContext) -> ToolOutcome:
