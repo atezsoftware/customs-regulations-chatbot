@@ -205,3 +205,25 @@ it("keeps Supersearch for regeneration and preserves an ASv3 checkpoint's workfl
     atezSearchV3: true,
   });
 });
+
+it("preserves exp cropped regeneration and defers resume variant to its checkpoint", () => {
+  const input = {
+    atezSearchEnabled: false,
+    atezSearchV2Enabled: false,
+    atezSearchV3Enabled: false,
+    experimentalResearchEnabled: false,
+    experimentalParallelResearchEnabled: false,
+    experimentalGuardrailsEnabled: false,
+    asv3ExpCroppedEnabled: true,
+  };
+  const fresh = getRegenerationResearchMode(input);
+  expect(fresh.asv3ExpCropped).toBe(true);
+  expect(fresh).not.toHaveProperty("asv3ExpCheap");
+  const resumed = getRegenerationResearchMode({
+    ...input,
+    asv3ResumeMessageId: 123,
+  });
+  expect(resumed.atezSearchV3).toBe(true);
+  expect(resumed).not.toHaveProperty("asv3ExpCropped");
+  expect(resumed).not.toHaveProperty("asv3ExpCheap");
+});

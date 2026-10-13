@@ -17,6 +17,7 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, JsonValue
 
 from onyx.asv3.artifacts import artifact_reference, compact_json
+from onyx.asv3.cropped_worker_handoff import expand_worker_handoff
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.models import (
     LocalBudget,
@@ -630,13 +631,24 @@ class WorkerPool:
             self._changed.notify_all()
         self._report_task(task_id)
 
-    @staticmethod
-    def _task_view(task: TaskSnapshot, *, full: bool = False) -> TaskSnapshot:
+    def _task_view(self, task: TaskSnapshot, *, full: bool = False) -> TaskSnapshot:
+        outcome = task.outcome
+        handoff = outcome.data.get("cropped_worker_handoff") if outcome else None
+        if self.context.services.get("asv3_exp_cropped") is True and isinstance(
+            handoff, dict
+        ):
+            ledger = self.context.services.get("evidence")
+            if (
+                not isinstance(ledger, EvidenceLedger)
+                or handoff.get("task_id") != task.task_id
+            ):
+                raise ValueError("Cropped worker handoff task or ledger changed")
+            expand_worker_handoff(handoff, ledger=ledger, context=self.context)
+            full = True
         if full or task.independent_question:
             return task.model_copy(update={"child_checkpoint": None}).model_copy(
                 deep=True
             )
-        outcome = task.outcome
         if outcome is not None:
             data = compact_json(outcome.data, max_chars=6000)
             assert isinstance(data, dict)

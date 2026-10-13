@@ -6,6 +6,7 @@ from collections.abc import Callable, Generator
 from dataclasses import dataclass
 from datetime import date
 from typing import Any
+from typing import cast as typing_cast
 from uuid import UUID
 
 from sqlalchemy import (
@@ -57,6 +58,8 @@ from onyx.regulatory.publication_reads import (
     require_publication_files,
 )
 from onyx.regulatory.source_identity import source_file_identity_matches
+from onyx.tracing.answer_graph import graph_step
+from onyx.utils.threadpool_concurrency import run_functions_tuples_in_parallel
 
 
 class CorpusScopeUnavailable(ValueError):
@@ -197,6 +200,7 @@ def iter_source_chunks_by_ids(
     chunk_ids: tuple[str, ...],
     index: PublicationIndexSnapshot | None,
     check_active: Callable[[], None],
+    batch_publication_checks: bool = False,
 ) -> Generator[CorpusChunk, None, None]:
     """Stream exact retained originals under the same live source/snapshot fences."""
     if not chunk_ids:
@@ -204,6 +208,50 @@ def iter_source_chunks_by_ids(
     check_active()
     require_source(session, user=user, filters=filters, source_id=source_id)
     observation = observe_publication_read()
+    pending: list[CorpusChunk] = []
+    originals = _iter_exact_source_chunks(
+        session,
+        filters=filters,
+        source_id=source_id,
+        chunk_ids=chunk_ids,
+        index=index,
+        check_active=check_active,
+    )
+    try:
+        for chunk in originals:
+            if batch_publication_checks:
+                pending.append(chunk)
+            elif filter_publication_read(
+                observation, [chunk], lambda value: str(value.source_id)
+            ):
+                yield chunk
+    finally:
+        originals.close()
+    check_active()
+    if batch_publication_checks:
+        # Exact originals from one source share a publication fence. Hold all of
+        # them until the live source and publication checks below have passed.
+        pending = filter_publication_read(
+            observation, pending, lambda value: str(value.source_id)
+        )
+    require_source(session, user=user, filters=filters, source_id=source_id)
+    require_publication_files(observation, (source_id,))
+    if batch_publication_checks:
+        for chunk in pending:
+            check_active()
+            yield chunk
+
+
+def _iter_exact_source_chunks(
+    session: Session,
+    *,
+    filters: IndexFilters,
+    source_id: UUID,
+    chunk_ids: tuple[str, ...],
+    index: PublicationIndexSnapshot | None,
+    check_active: Callable[[], None],
+) -> Generator[CorpusChunk, None, None]:
+    """Internal text reader; callers own fresh source and publication fences."""
     effective_date = filters.as_of_date or date.today()
     qualified = source_id in qualified_file_ids(session, (source_id,))
     if qualified:
@@ -224,10 +272,7 @@ def iter_source_chunks_by_ids(
                 if binding.derived_role != "canonical":
                     continue
                 chunk = _binding_chunk(source_id, binding, effective_date)
-                if filter_publication_read(
-                    observation, [chunk], lambda value: str(value.source_id)
-                ):
-                    yield chunk
+                yield chunk
         finally:
             bindings.close()
     else:
@@ -274,15 +319,130 @@ def iter_source_chunks_by_ids(
                     row.validity_end_date,
                     row.status,
                 )
-                if filter_publication_read(
-                    observation, [chunk], lambda value: str(value.source_id)
-                ):
-                    yield chunk
+                yield chunk
         finally:
             rows.close()
+
+
+@dataclass(frozen=True)
+class CorpusSearchCenterRead:
+    source: CorpusSource
+    chunks: tuple[CorpusChunk, ...]
+    index: PublicationIndexSnapshot | None
+
+
+def _require_exact_sources(
+    session: Session,
+    *,
+    user: User,
+    filters: IndexFilters,
+    source_ids: tuple[UUID, ...],
+    check_active: Callable[[], None],
+) -> dict[UUID, CorpusSource]:
+    sources: dict[UUID, CorpusSource] = {}
+    for offset in range(0, len(source_ids), 100):
+        check_active()
+        page = source_ids[offset : offset + 100]
+        rows, more = find_sources(
+            session, user=user, filters=filters, source_ids=page, limit=len(page)
+        )
+        if more or len(rows) != len(page) or {row.id for row in rows} != set(page):
+            raise PermissionError("Source is unavailable or outside authorized scope.")
+        sources.update((row.id, row) for row in rows)
+    return sources
+
+
+def read_search_centers_batch(
+    *,
+    user: User,
+    filters: IndexFilters,
+    source_chunk_ids: dict[UUID, tuple[str, ...]],
+    query_indexes: dict[UUID, PublicationIndexSnapshot],
+    check_active: Callable[[], None],
+) -> dict[UUID, CorpusSearchCenterRead]:
+    """Authorize one exact search packet twice; expose nothing before final fences."""
+    requests = {
+        source_id: tuple(dict.fromkeys(chunk_ids))
+        for source_id, chunk_ids in source_chunk_ids.items()
+    }
+    if not requests:
+        return {}
+    if any(not chunk_ids for chunk_ids in requests.values()):
+        raise ValueError("Search centers require nonempty exact chunk identities.")
     check_active()
-    require_source(session, user=user, filters=filters, source_id=source_id)
-    require_publication_files(observation, (source_id,))
+    observation = observe_publication_read()
+    source_ids = tuple(requests)
+    # Separate sessions prevent ORM relationship caches from masking ACL changes.
+    with get_session_with_current_tenant() as session:
+        sources = _require_exact_sources(
+            session,
+            user=user,
+            filters=filters,
+            source_ids=source_ids,
+            check_active=check_active,
+        )
+        require_publication_files(observation, source_ids)
+
+    def read_source(source_id: UUID) -> CorpusSearchCenterRead:
+        check_active()
+        center_ids = requests[source_id]
+        with graph_step(
+            "asv3.canonical_hydration.centers",
+            {"source_id": str(source_id), "center_ids": center_ids},
+            summary="Read exact retrieved originals without implicit expansion",
+        ) as step:
+            with get_session_with_current_tenant() as session:
+                index = query_indexes.get(source_id)
+                if index is None:
+                    index = resolve_source_query_index(session, source_id)
+                originals = _iter_exact_source_chunks(
+                    session,
+                    filters=filters,
+                    source_id=source_id,
+                    chunk_ids=center_ids,
+                    index=index,
+                    check_active=check_active,
+                )
+                try:
+                    chunks = tuple(originals)
+                finally:
+                    originals.close()
+            if len({chunk.id for chunk in chunks}) != len(chunks) or any(
+                chunk.source_id != source_id or chunk.id not in center_ids
+                for chunk in chunks
+            ):
+                raise CorpusScopeUnavailable(
+                    "Retrieved original has ambiguous canonical bindings."
+                )
+            check_active()
+            step.output_value = {
+                "requested_center_count": len(center_ids),
+                "hydrated_chunk_count": len(chunks),
+                "hydrated_characters": sum(len(chunk.text) for chunk in chunks),
+                "context_expanded": False,
+            }
+            return CorpusSearchCenterRead(sources[source_id], chunks, index)
+
+    reads = typing_cast(
+        list[CorpusSearchCenterRead],
+        run_functions_tuples_in_parallel(
+            [(read_source, (source_id,)) for source_id in source_ids], max_workers=4
+        ),
+    )
+    check_active()
+    with get_session_with_current_tenant() as session:
+        current = _require_exact_sources(
+            session,
+            user=user,
+            filters=filters,
+            source_ids=source_ids,
+            check_active=check_active,
+        )
+        if current != sources:
+            raise CorpusScopeUnavailable("Source identity changed during hydration.")
+        require_publication_files(observation, source_ids)
+    check_active()
+    return {read.source.id: read for read in reads}
 
 
 def read_search_source_closures(
@@ -818,11 +978,16 @@ def source_provision_position(
     article: str,
     qualifier: str | None,
     index: PublicationIndexSnapshot | None,
+    allow_canonical_text_fallback: bool = False,
+    check_active: Callable[[], None] | None = None,
 ) -> int | None:
     """Locate an article from fenced structural metadata without hydrating a source."""
     from onyx.regulatory.heading_path import parse_regulatory_article_heading
 
-    if not article.isdecimal() or len(article) > 4:
+    inserted = bool(re.fullmatch(r"\d{1,4}/[A-ZÇĞİÖŞÜ]", article))
+    if not (article.isdecimal() and len(article) <= 4) and not (
+        allow_canonical_text_fallback and inserted and qualifier is None
+    ):
         return None
     require_source(session, user=user, filters=filters, source_id=source_id)
     observation = observe_publication_read()
@@ -838,6 +1003,12 @@ def source_provision_position(
         )["heading_path"]
         position = cast(
             RegulatoryTemporalProjection.payload["semantic_position"].astext, Integer
+        )
+        identifier = RegulatoryTemporalProjection.canonical_chunk_id
+        body = RegulatoryTemporalProjection.payload["representation_text"].astext
+        metadata = cast(
+            RegulatoryTemporalProjection.payload["projection"]["source_json"].astext,
+            JSONB,
         )
         statement = select(position, headings).where(
             RegulatoryTemporalProjection.user_file_id == source_id,
@@ -855,6 +1026,8 @@ def source_provision_position(
         )
     else:
         headings, position = RegulatoryChunk.heading_path, RegulatoryChunk.position
+        identifier, metadata = RegulatoryChunk.id, RegulatoryChunk.chunk_metadata
+        body = RegulatoryChunk.text
         statement = select(position, headings).where(
             RegulatoryChunk.user_file_id == source_id,
             RegulatoryChunk.chunk_type.is_distinct_from("hierarchical_aggregate"),
@@ -874,10 +1047,14 @@ def source_provision_position(
             )
     # SQL only narrows candidates; exact own-heading identity is checked below.
     pattern = rf"(madde[[:space:]]+{article}([^0-9]|$)|{article}[[:space:].]+madde)"
-    rows = session.execute(
-        statement.where(cast(headings, Text).op("~*")(pattern))
-        .order_by(position)
-        .limit(64)
+    rows = (
+        []
+        if inserted
+        else session.execute(
+            statement.where(cast(headings, Text).op("~*")(pattern))
+            .order_by(position)
+            .limit(64)
+        )
     )
     result = None
     for row in rows:
@@ -889,6 +1066,51 @@ def source_provision_position(
                 break
         if result is not None:
             break
+    if result is None and allow_canonical_text_fallback:
+        from onyx.asv3.cropped_corpus_identity import (
+            verified_inserted_article_opening,
+            verified_own_article_identity,
+        )
+
+        # Identifiers only locate candidates; actual fenced originals prove identity.
+        candidate_filter = cast(metadata["provision_identifiers"], Text).op("~*")(
+            pattern
+        )
+        if inserted:
+            own_prefix = rf"^[[:space:]]*\*\*MADDE[[:space:]]+{re.escape(article)}[[:space:].:–—-]*\*\*"
+            # A later paragraph can have a corrected heading while the opener
+            # still has stale metadata. Never anchor an inserted article mid-body.
+            candidate_filter = body.op("~*")(own_prefix)
+        identifiers = tuple(
+            session.scalars(
+                statement.with_only_columns(identifier)
+                .where(candidate_filter)
+                .order_by(position, identifier)
+                .limit(65)
+            )
+        )
+        if len(identifiers) <= 64:
+            originals = iter_source_chunks_by_ids(
+                session,
+                user=user,
+                filters=filters,
+                source_id=source_id,
+                chunk_ids=tuple(dict.fromkeys(identifiers)),
+                index=index,
+                check_active=check_active or (lambda: None),
+                batch_publication_checks=True,
+            )
+            matches = [
+                chunk.position
+                for chunk in originals
+                if (
+                    verified_inserted_article_opening(chunk, (article, qualifier))
+                    if inserted
+                    else verified_own_article_identity(chunk) == (article, qualifier)
+                )
+            ]
+            if len(matches) == 1:
+                result = matches[0]
     require_source(session, user=user, filters=filters, source_id=source_id)
     require_publication_files(observation, (source_id,))
     return result
@@ -1112,6 +1334,7 @@ def _find_sources_with_title_queries(
     offset: int,
     limit: int,
     basename_only: bool = False,
+    exact_basename_pattern: str | None = None,
 ) -> tuple[list[CorpusSource], bool]:
     if offset < 0 or not 1 <= limit <= 100:
         raise ValueError("Source pages require offset >= 0 and limit 1..100.")
@@ -1119,6 +1342,17 @@ def _find_sources_with_title_queries(
     statement = _source_statement(filters)
     if source_ids is not None:
         statement = statement.where(UserFile.id.in_(source_ids))
+    if exact_basename_pattern is not None:
+        normalized_basename = func.regexp_replace(
+            func.lower(
+                func.translate(
+                    UserFile.name, "ÇĞİÖŞÜÂÎÛçğıöşüâîû", "CGIOSUAIUcgiosuaiu"
+                )
+            ),
+            "^.*/",
+            "",
+        )
+        statement = statement.where(normalized_basename.op("~")(exact_basename_pattern))
     parsed = [
         _source_title_query(query, basename_only=basename_only) for query in queries
     ]
@@ -1154,6 +1388,7 @@ def find_sources(
     limit: int = 50,
     allow_numbered_title_fallback: bool = False,
     allow_reversed_numbered_title_fallback: bool = False,
+    allow_canonical_filename_fallback: bool = False,
 ) -> tuple[list[CorpusSource], bool]:
     """Resolve scoped titles; an opted-in formal fallback verifies canonical identity."""
     sources, more = _find_sources_with_title_queries(
@@ -1166,13 +1401,21 @@ def find_sources(
         limit=limit,
     )
     if (
-        not (allow_numbered_title_fallback or allow_reversed_numbered_title_fallback)
+        not (
+            allow_numbered_title_fallback
+            or allow_reversed_numbered_title_fallback
+            or allow_canonical_filename_fallback
+        )
         or sources
         or more
         or source_ids is not None
     ):
         return sources, more
-    identity = _numbered_law_title(query) if allow_numbered_title_fallback else None
+    identity = (
+        _numbered_law_title(query)
+        if allow_numbered_title_fallback or allow_canonical_filename_fallback
+        else None
+    )
     if identity is None and allow_reversed_numbered_title_fallback:
         identity = _reversed_numbered_law_title(query)
     if identity is None:
@@ -1200,19 +1443,85 @@ def find_sources(
         limit=limit,
         basename_only=True,
     )
-    return [
+    verified = [
         source
         for source in candidates
         if _source_has_numbered_law_identity(
             session, user=user, filters=filters, source=source, identity=identity
         )
-    ], more
+    ]
+    if verified or more or not allow_canonical_filename_fallback:
+        return verified, more
+    candidates, more = _find_sources_with_title_queries(
+        session,
+        user=user,
+        filters=filters,
+        queries=(identity.number,),
+        source_ids=None,
+        offset=0,
+        limit=100,
+        basename_only=True,
+        exact_basename_pattern=_numeric_law_basename_pattern(identity.number),
+    )
+    if more:
+        return [], True
+    verified = [
+        candidate
+        for candidate in candidates
+        if _source_has_numeric_filename_law_identity(
+            session, user=user, filters=filters, source=candidate, identity=identity
+        )
+    ]
+    return verified[offset : offset + limit], len(verified) > offset + limit
 
 
 @dataclass(frozen=True)
 class NumberedLawTitle:
     number: str
     title: str
+
+
+def _numeric_law_basename_pattern(number: str) -> str:
+    return rf"^0*{number}[ _.-]+sayili[ _.-]+kanunu?\.(md|txt|pdf)$"
+
+
+def _source_has_numeric_filename_law_identity(
+    session: Session,
+    *,
+    user: User,
+    filters: IndexFilters,
+    source: CorpusSource,
+    identity: NumberedLawTitle,
+) -> bool:
+    translation = str.maketrans("ÇĞİÖŞÜÂÎÛçğıöşüâîû", "CGIOSUAIUcgiosuaiu")
+    basename = source.name.rsplit("/", 1)[-1].translate(translation).lower()
+    if re.fullmatch(_numeric_law_basename_pattern(identity.number), basename) is None:
+        return False
+    index = resolve_source_query_index(session, source.id)
+    _, chunks, _ = read_source_chunks(
+        session,
+        user=user,
+        filters=filters,
+        source_id=source.id,
+        limit=2,
+        query_indexes={source.id: index} if index is not None else None,
+    )
+    for chunk in chunks:
+        if (
+            chunk.source_id != source.id
+            or str(chunk.metadata.get("document_type", "")).lower() != "kanun"
+            or not chunk.heading_path
+            or any(
+                chunk.metadata.get(flag)
+                for flag in ("derived", "external", "untrusted", "truncated")
+            )
+        ):
+            return False
+        title = " ".join(chunk.heading_path[0].translate(translation).lower().split())
+        title = re.sub(r"kanunu$", "kanun", title)
+        if title != identity.title and _numbered_law_title(title) != identity:
+            return False
+    return bool(chunks)
 
 
 def _numbered_law_title(value: str) -> NumberedLawTitle | None:

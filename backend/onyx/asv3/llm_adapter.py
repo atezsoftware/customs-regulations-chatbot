@@ -12,7 +12,7 @@ import time
 from collections.abc import Callable, Iterator
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
-from typing import Annotated, Literal, TypedDict, cast
+from typing import TYPE_CHECKING, Annotated, Literal, TypedDict, cast
 from uuid import uuid4
 
 import jsonschema
@@ -34,7 +34,14 @@ from onyx.asv3.authority_reference_diagnostics import (
     source_contained_reference_catalogue,
 )
 from onyx.asv3.authority_requirements import AuthorityRequirements
+from onyx.asv3.cheap_authority import CheapAuthorityPolicy
+from onyx.asv3.cheap_repair_packet import (
+    cheap_repair_observations,
+    prepare_cheap_repair_view,
+)
 from onyx.asv3.citation_numbers import extract_citation_numbers
+from onyx.asv3.cropped_article_bindings import cropped_identity_ledger
+from onyx.asv3.cropped_crossrefs import CroppedCrossReferencePolicy
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.judicial_sections import (
     judicial_disposition_gap,
@@ -97,6 +104,9 @@ from onyx.asv3.terminal_wire_schema import (
     strict_terminal_tools,
 )
 from onyx.asv3.workflow_variant import ASV3_TUNED_VARIANT
+
+if TYPE_CHECKING:
+    from onyx.asv3.cropped_sections import CroppedSectionMaterialContext
 from onyx.configs.chat_configs import (
     LLM_FIRST_CHUNK_RETRY_BASE_DELAY_S,
     LLM_FIRST_CHUNK_RETRY_JITTER_RATIO,
@@ -126,6 +136,7 @@ from onyx.llm.models import (
 from onyx.llm.models import (
     FunctionCall as NativeFunctionCall,
 )
+from onyx.llm.native_responses_stream import CroppedResponseTerminalError
 from onyx.prompts.asv3.coordinator_reference import (
     COORDINATOR_REFERENCE_PROMPT,
     RESEARCHER_REFERENCE_PROMPT,
@@ -150,6 +161,7 @@ from onyx.prompts.asv3.tuned import (
     TUNED_SOURCE_ANSWER_PROMPT,
     TUNED_SOURCE_RESEARCH_PROMPT,
 )
+from onyx.prompts.asv3_cropped_writing import CROPPED_SOURCE_OWNERSHIP
 from onyx.regulatory.structured_llm import (
     _portable_structured_output_schema,
     _retry_after_seconds,
@@ -171,18 +183,48 @@ class _NativeOriginalCatalogue:
     message_index: int
     content_sha256: str
     records: tuple[dict[str, JsonValue], ...]
+    cheap_metadata: bool = False
 
     @classmethod
-    def bind(cls, prompt: list[ChatCompletionMessage]) -> _NativeOriginalCatalogue:
-        index = len(prompt) - 1
+    def bind(
+        cls,
+        prompt: list[ChatCompletionMessage],
+        *,
+        cheap_metadata: bool = False,
+        message_index: int | None = None,
+    ) -> _NativeOriginalCatalogue:
+        index = len(prompt) - 1 if message_index is None else message_index
         text = cls._host_text(prompt, index)
         payload = parse_json_object(text)
-        records = expand_source_metadata(payload)
+        records = cls._expand(payload, cheap_metadata)
         return cls(
             index,
             hashlib.sha256(text.encode("utf-8")).hexdigest(),
             tuple(copy.deepcopy(cast(list[dict[str, JsonValue]], records))),
+            cheap_metadata,
         )
+
+    @staticmethod
+    def _expand(
+        payload: dict[str, JsonValue], cheap_metadata: bool
+    ) -> list[dict[str, JsonValue]]:
+        if cheap_metadata:
+            from onyx.asv3.cheap_metadata_transport import expand_cheap_metadata
+
+            if any(
+                header in payload
+                for header in (
+                    "cropped_canonical_fields_transport",
+                    "cropped_catalogue_alias_transport",
+                )
+            ):
+                from onyx.asv3.cropped_handoff_transport import (
+                    expand_cropped_handoff_transport,
+                )
+
+                payload = expand_cropped_handoff_transport(payload)
+            return expand_cheap_metadata(payload)
+        return expand_source_metadata(payload)
 
     @staticmethod
     def _host_text(prompt: list[ChatCompletionMessage], index: int) -> str:
@@ -207,7 +249,9 @@ class _NativeOriginalCatalogue:
         text = self._host_text(prompt, self.message_index)
         if hashlib.sha256(text.encode("utf-8")).hexdigest() != self.content_sha256:
             raise ValueError("Native original catalogue host message changed")
-        if expand_source_metadata(parse_json_object(text)) != list(self.records):
+        if self._expand(parse_json_object(text), self.cheap_metadata) != list(
+            self.records
+        ):
             raise ValueError("Native original catalogue binding changed")
 
 
@@ -788,6 +832,7 @@ class ResearchModel:
         self.llm = llm
         self.answer_llm = answer_llm
         self._writing_answer = False
+        self._cropped_source_writer_started = False
         self._answer_researching = False
         self.research_llm = (
             None
@@ -805,6 +850,20 @@ class ResearchModel:
         self.lean_native_mode = (
             lean_native_mode or context.services.get("lean_native_mode") is True
         )
+        if self.lean_native_mode and context.services.get("asv3_exp_cropped") is True:
+            from onyx.llm.multi_llm import LitellmLLM
+
+            if (
+                isinstance(llm, LitellmLLM)
+                and llm.with_tool_argument_stream_guard()._uses_guarded_openai_responses()
+            ):
+                import tiktoken
+
+                # Calibrated approximation; whole-call framing and headroom still apply.
+                encoding = tiktoken.get_encoding("o200k_base")
+                self.token_counter = lambda text: len(
+                    encoding.encode(text, disallowed_special=())
+                )
         self.last_call_id: str | None = None
         self.last_finish_reason: str | None = None
         self.last_response_truncated = False
@@ -812,6 +871,9 @@ class ResearchModel:
         self._native_first_decision_started = False
         self._native_first_decision_completed = False
         self._assembly_researching = False
+        self._cheap_repair_fingerprint: str | None = None
+        self._cheap_repair_attempts = 0
+        self._cheap_acquisition_fingerprint: str | None = None
 
     def native_sampling_snapshot(self) -> dict[str, JsonValue]:
         config = self.llm.config
@@ -839,11 +901,19 @@ class ResearchModel:
                 "research_model": config.model_name,
                 "research_temperature": config.temperature,
             }
-        return {
+        snapshot: dict[str, JsonValue] = {
             "settings": settings,
             "first_decision_started": self._native_first_decision_started,
             "first_decision_completed": self._native_first_decision_completed,
         }
+        if self.context.services.get("asv3_exp_cheap") is True:
+            snapshot["cheap_repair"] = {
+                "version": 1,
+                "fingerprint": self._cheap_repair_fingerprint,
+                "attempts": self._cheap_repair_attempts,
+                "acquisition_fingerprint": self._cheap_acquisition_fingerprint,
+            }
+        return snapshot
 
     def restore_native_sampling(self, checkpoint: dict[str, JsonValue]) -> None:
         saved = checkpoint.get("native_coordinator_sampling")
@@ -866,6 +936,30 @@ class ResearchModel:
             self._native_first_decision_completed = (
                 saved["first_decision_completed"] is True
             )
+            if self.context.services.get("asv3_exp_cheap") is True:
+                repair = saved.get("cheap_repair")
+                if not isinstance(repair, dict) or repair.get("version") != 1:
+                    raise ValueError("Invalid ASv3Exp Cheap repair checkpoint")
+                attempts = repair.get("attempts")
+                fingerprint = repair.get("fingerprint")
+                acquisition = repair.get("acquisition_fingerprint")
+                if (
+                    type(attempts) is not int
+                    or attempts < 0
+                    or any(
+                        value is not None
+                        and (
+                            not isinstance(value, str)
+                            or re.fullmatch(r"[a-f0-9]{64}", value) is None
+                        )
+                        for value in (fingerprint, acquisition)
+                    )
+                    or (fingerprint is None and attempts != 0)
+                ):
+                    raise ValueError("Invalid ASv3Exp Cheap repair checkpoint")
+                self._cheap_repair_fingerprint = cast(str | None, fingerprint)
+                self._cheap_repair_attempts = attempts
+                self._cheap_acquisition_fingerprint = cast(str | None, acquisition)
             if (
                 self._native_first_decision_completed
                 and not self._native_first_decision_started
@@ -983,7 +1077,14 @@ class ResearchModel:
         return total
 
     def _limits(self, max_tokens: int) -> tuple[int, int]:
-        selected = self.answer_llm if self._writing_answer else self.llm
+        selected = (
+            self.answer_llm or self.llm
+            if self._writing_answer
+            and self.context.services.get("asv3_exp_cropped") is True
+            else self.answer_llm
+            if self._writing_answer
+            else self.llm
+        )
         assert selected is not None
         limit = selected.config.max_input_tokens
         if not self._writing_answer and self.research_llm is not None:
@@ -1153,7 +1254,19 @@ class ResearchModel:
                     "tool_history",
                 ):
                     payload.pop(key, None)
-            data = json.dumps(payload, ensure_ascii=False)
+            if self.context.services.get("asv3_exp_cropped") is True:
+                from onyx.asv3.cropped_transport import serialize_cropped_payload
+
+                data = serialize_cropped_payload(payload, self._tokens)
+            elif (
+                self.context.services.get("asv3_exp_cheap") is True
+                and "original_metadata_codec" in payload
+            ):
+                from onyx.asv3.cheap_metadata_transport import serialize_cheap_payload
+
+                data = serialize_cheap_payload(payload, self._tokens)
+            else:
+                data = json.dumps(payload, ensure_ascii=False)
         # The ledger/checkpoint retains the audit. Provider continuity needs only
         # the most recent complete pair with its original provider call IDs.
         turns = (
@@ -1374,6 +1487,12 @@ class ResearchModel:
         call_llm: LLM | None = None,
         native_catalogue: _NativeOriginalCatalogue | None = None,
     ) -> ModelResponse:
+        from onyx.asv3.cropped_cost_budget import (
+            CroppedCostBudget,
+            cropped_cache_write_partition_verified,
+        )
+        from onyx.asv3.cropped_research_limit import CroppedResearchLimit
+
         selected_llm = call_llm if call_llm is not None else self.llm
         response_model = (
             (response_model or structured_model(flow)) if structured else None
@@ -1412,6 +1531,31 @@ class ResearchModel:
                         payload = parse_json_object(text)
                     except ValueError:
                         continue
+                    if (
+                        native_catalogue is not None
+                        and native_catalogue.cheap_metadata
+                        and "original_metadata_codec" in payload
+                    ):
+                        from onyx.asv3.cheap_metadata_transport import (
+                            expand_cheap_payload,
+                        )
+
+                        if self.context.services.get(
+                            "asv3_exp_cropped"
+                        ) is True and any(
+                            header in payload
+                            for header in (
+                                "cropped_canonical_fields_transport",
+                                "cropped_catalogue_alias_transport",
+                            )
+                        ):
+                            from onyx.asv3.cropped_handoff_transport import (
+                                expand_cropped_handoff_transport,
+                            )
+
+                            payload = expand_cropped_handoff_transport(payload)
+                        else:
+                            payload = expand_cheap_payload(payload)
                     if native_catalogue is not None:
                         payloads.append(payload)
                     leads = payload.get("related_source_navigation")
@@ -1466,6 +1610,34 @@ class ResearchModel:
             if tools
             else tools
         )
+        response_format = (
+            {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": response_model.__name__,
+                    "schema": copy.deepcopy(
+                        _portable_structured_output_schema(
+                            response_model.model_json_schema()
+                        )
+                    ),
+                    "strict": False,
+                },
+            }
+            if response_model is not None
+            else None
+        )
+        cropped_input_budget: dict[str, int] | None = None
+        if self.context.services.get("asv3_exp_cropped") is True:
+            from onyx.asv3.cropped_transport import enforce_cropped_input_budget
+
+            cropped_input_budget = enforce_cropped_input_budget(
+                self._input_cost(prompt, wire_tools),
+                response_format_tokens=(
+                    self._tokens(json.dumps(response_format, ensure_ascii=False))
+                    if response_format is not None
+                    else 0
+                ),
+            )
         with _generation_resources(
             self.context,
             selected_llm,
@@ -1474,6 +1646,11 @@ class ResearchModel:
             wire_tools or None,
             research=research,
         ) as span:
+            if cropped_input_budget is not None:
+                span.span_data.request_params = {
+                    **(span.span_data.request_params or {}),
+                    "asv3_exp_cropped_input_budget": cropped_input_budget,
+                }
             deadline = (
                 self.context.research_deadline if research else self.context.deadline
             )
@@ -1496,65 +1673,216 @@ class ResearchModel:
                 raise ValueError(
                     "provider_compatibility_attempts must be a positive integer"
                 )
-            response = selected_llm.invoke(
-                prompt=prompt,
-                # Provider normalization must not rewrite canonical validation schemas.
-                tools=copy.deepcopy(wire_tools) if wire_tools else None,
-                tool_choice=(
-                    ToolChoiceOptions.REQUIRED
-                    if bool(tools)
-                    and (
-                        (
-                            require_source_review_action
-                            # Vertex constrained calling rejects this tool catalogue.
-                            # Selected terminal actions still undergo provenance validation.
-                            and selected_llm.config.model_provider != "vertex_ai"
-                        )
-                        or (
-                            not self.context.depth
-                            and self.context.services.get("independent_question_mode")
-                            is True
-                            and bool(self.context.services.get("independent_answers"))
-                            and any(
-                                isinstance(function := tool.get("function"), dict)
-                                and function.get("name") == "assemble_answers"
-                                for tool in tools
+            cost_budget = None
+            cost_ticket = None
+            controller = None
+            cost_research = False
+            if self.context.services.get("asv3_exp_cropped") is True:
+                from onyx.llm.multi_llm import LitellmLLM
+
+                cost_budget = self.context.services.get("cropped_cost_budget")
+                controller = self.context.services.get("cropped_research_controller")
+                cost_research = flow in {
+                    LLMFlow.ASV3_COORDINATOR,
+                    LLMFlow.ASV3_RESEARCHER,
+                    LLMFlow.KEYWORD_QUERY_EXPANSION,
+                    LLMFlow.SEMANTIC_QUERY_REPHRASE,
+                }
+                if isinstance(cost_budget, CroppedCostBudget):
+                    assert cropped_input_budget is not None
+                    cost_ticket = cost_budget.prepare(
+                        selected_llm.config.model_name,
+                        selected_llm.config.model_provider,
+                        cropped_input_budget["counted_input_tokens"],
+                        max_tokens,
+                        research=cost_research,
+                        owner=str(self.context.services.get("task_id") or "root"),
+                        enforce=True,
+                        phase=(
+                            "repair"
+                            if self.context.services.get("cropped_cost_phase")
+                            == "repair"
+                            or flow
+                            in {
+                                LLMFlow.ASV3_TARGETED_EVIDENCE_CHECK,
+                                LLMFlow.ASV3_ANSWER_REPAIR,
+                            }
+                            else "finalization"
+                            if self._writing_answer
+                            or flow in {LLMFlow.ASV3_FINAL, LLMFlow.ASV3_VERIFICATION}
+                            else "research"
+                        ),
+                        service_tier=getattr(selected_llm.config, "service_tier", None),
+                        cache_writes_disabled=isinstance(selected_llm, LitellmLLM)
+                        and selected_llm.cropped_native_cache_writes_disabled,
+                    )
+                    if cost_ticket.bounded:
+                        max_tokens = cost_ticket.max_tokens
+                    span.span_data.request_params = {
+                        **(span.span_data.request_params or {}),
+                        "asv3_exp_cropped_cost_reservation": {
+                            "research": cost_research,
+                            "input_upper_tokens": cost_ticket.input_upper_tokens,
+                            "max_tokens": max_tokens,
+                            "reserved_usd": cost_ticket.reserved_usd,
+                            "bounded": cost_ticket.bounded,
+                            "cache_writes_disabled": cost_ticket.cache_writes_disabled,
+                        },
+                    }
+            response: ModelResponse | None = None
+            provider_error: BaseException | None = None
+            try:
+                if isinstance(controller, CroppedResearchLimit):
+                    controller.reserve_model(
+                        str(self.context.services.get("task_id") or "root"),
+                        research=cost_research,
+                        context=self.context,
+                    )
+                response = selected_llm.invoke(
+                    prompt=prompt,
+                    # Provider normalization must not rewrite canonical validation schemas.
+                    tools=copy.deepcopy(wire_tools) if wire_tools else None,
+                    tool_choice=(
+                        ToolChoiceOptions.REQUIRED
+                        if bool(tools)
+                        and (
+                            (
+                                require_source_review_action
+                                # Vertex constrained calling rejects this tool catalogue.
+                                # Selected terminal actions still undergo provenance validation.
+                                and selected_llm.config.model_provider != "vertex_ai"
+                            )
+                            or (
+                                not self.context.depth
+                                and self.context.services.get(
+                                    "independent_question_mode"
+                                )
+                                is True
+                                and bool(
+                                    self.context.services.get("independent_answers")
+                                )
+                                and any(
+                                    isinstance(function := tool.get("function"), dict)
+                                    and function.get("name") == "assemble_answers"
+                                    for tool in tools
+                                )
                             )
                         )
-                    )
-                    else ToolChoiceOptions.AUTO
-                    if tools
-                    else ToolChoiceOptions.NONE
-                ),
-                structured_response_format={
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": response_model.__name__,
-                        "schema": copy.deepcopy(
-                            _portable_structured_output_schema(
-                                response_model.model_json_schema()
+                        else ToolChoiceOptions.AUTO
+                        if tools
+                        else ToolChoiceOptions.NONE
+                    ),
+                    structured_response_format=response_format,
+                    max_tokens=max_tokens,
+                    timeout_override=timeout,
+                    reasoning_effort=self.reasoning_effort,
+                    user_identity=self.user_identity,
+                    **(
+                        {
+                            "provider_compatibility_attempts": provider_compatibility_attempts
+                        }
+                        if provider_compatibility_attempts is not None
+                        else {}
+                    ),
+                )
+            except BaseException as error:
+                provider_error = error
+                raise
+            finally:
+                if (
+                    isinstance(cost_budget, CroppedCostBudget)
+                    and cost_ticket is not None
+                ):
+                    cost_budget.complete(
+                        cost_ticket,
+                        response.usage
+                        if response is not None
+                        else provider_error.usage
+                        if isinstance(provider_error, CroppedResponseTerminalError)
+                        else None,
+                        error=provider_error,
+                        cache_write_partition_verified=cropped_cache_write_partition_verified(
+                            provider_error.terminal
+                            if isinstance(provider_error, CroppedResponseTerminalError)
+                            else (span.span_data.request_params or {}).get(
+                                "asv3_exp_cropped_response_terminal"
                             )
                         ),
-                        "strict": False,
-                    },
+                    )
+                if self.context.services.get("asv3_exp_cropped") is True:
+                    from onyx.asv3.cropped_task_packets import CroppedTaskPacketStore
+
+                    packets = self.context.services.get("cropped_task_packet_store")
+                    actual_usage = (
+                        response.usage
+                        if response is not None
+                        else (
+                            provider_error.usage
+                            if isinstance(provider_error, CroppedResponseTerminalError)
+                            else None
+                        )
+                    )
+                    if (
+                        isinstance(packets, CroppedTaskPacketStore)
+                        and actual_usage is not None
+                    ):
+                        packets.record_input(
+                            str(self.context.services.get("task_id") or "root"),
+                            actual_usage.prompt_tokens,
+                        )
+            assert response is not None
+            if cropped_input_budget is not None:
+                span.span_data.request_params = {
+                    **(span.span_data.request_params or {}),
+                    "asv3_exp_cropped_input_budget": cropped_input_budget,
                 }
-                if response_model is not None
-                else None,
-                max_tokens=max_tokens,
-                timeout_override=timeout,
-                reasoning_effort=self.reasoning_effort,
-                user_identity=self.user_identity,
-                **(
-                    {"provider_compatibility_attempts": provider_compatibility_attempts}
-                    if provider_compatibility_attempts is not None
-                    else {}
-                ),
+                if cost_ticket is not None:
+                    span.span_data.request_params[
+                        "asv3_exp_cropped_cost_reservation"
+                    ] = {
+                        "research": cost_research,
+                        "input_upper_tokens": cost_ticket.input_upper_tokens,
+                        "max_tokens": max_tokens,
+                        "reserved_usd": cost_ticket.reserved_usd,
+                        "bounded": cost_ticket.bounded,
+                    }
+            terminal = (span.span_data.request_params or {}).get(
+                "asv3_exp_cropped_response_terminal"
             )
+            if (
+                self.context.services.get("asv3_exp_cropped") is True
+                and self.lean_native_mode
+                and not self._writing_answer
+                and flow in {LLMFlow.ASV3_COORDINATOR, LLMFlow.ASV3_RESEARCHER}
+                and (response.choice.finish_reason or "").lower() == "stop"
+                and response.usage is not None
+                and response.usage.completion_tokens >= max_tokens
+                and not (
+                    isinstance(terminal, dict) and terminal.get("status") == "completed"
+                )
+            ):
+                response = response.model_copy(deep=True)
+                response.choice.finish_reason = "length"
             record_llm_response(span, response)
             self.last_finish_reason = response.choice.finish_reason
             self.last_response_truncated = (
                 response.choice.finish_reason or ""
             ).lower() in {"length", "max_tokens", "max_output_tokens"}
+            if (
+                self.context.services.get("asv3_exp_cropped") is True
+                and response.usage is not None
+                and response.usage.completion_tokens >= max_tokens
+            ):
+                self.last_response_truncated = True
+            # Responses normalization can report stop after exhausting the output cap.
+            if (
+                self.context.services.get("asv3_exp_cheap") is True
+                and flow
+                in {LLMFlow.ASV3_SOURCE_INVENTORY, LLMFlow.ASV3_CONDITION_REVIEW}
+                and response.usage is not None
+                and response.usage.completion_tokens >= max_tokens
+            ):
+                self.last_response_truncated = True
             self.last_call_id = (
                 span.span_id if span.span_id != "no-op" else "asv3-call-" + uuid4().hex
             )
@@ -1568,6 +1896,34 @@ class ResearchModel:
             self.context.services["last_model_call_id"] = self.last_call_id
         self.context.check_active()
         return response
+
+    def _cheap_condition_catalogue(
+        self, prompt: list[ChatCompletionMessage], flow: LLMFlow
+    ) -> _NativeOriginalCatalogue | None:
+        if not (
+            self.context.services.get("asv3_exp_cropped") is True
+            or (
+                self.context.services.get("asv3_exp_cheap") is True
+                and flow
+                in {LLMFlow.ASV3_SOURCE_INVENTORY, LLMFlow.ASV3_CONDITION_REVIEW}
+            )
+        ):
+            return None
+        for index in range(len(prompt) - 1, -1, -1):
+            message = prompt[index]
+            if not isinstance(message, UserMessage) or not isinstance(
+                message.content, str
+            ):
+                continue
+            try:
+                payload = parse_json_object(message.content)
+            except ValueError:
+                continue
+            if "original_metadata_catalogue" in payload:
+                return _NativeOriginalCatalogue.bind(
+                    prompt, cheap_metadata=True, message_index=index
+                )
+        return None
 
     def invoke_text(
         self,
@@ -1614,9 +1970,18 @@ class ResearchModel:
             max_tokens=output,
             research=not consume_budget,
             response_model=response_model,
+            **_native_catalogue_kwargs(self._cheap_condition_catalogue(prompt, flow)),
         )
 
         def truncated_output(result: ModelResponse) -> bool:
+            if (
+                self.context.services.get("asv3_exp_cheap") is True
+                and flow
+                in {LLMFlow.ASV3_SOURCE_INVENTORY, LLMFlow.ASV3_CONDITION_REVIEW}
+                and result.usage is not None
+                and result.usage.completion_tokens >= output
+            ):
+                return True
             if flow in {
                 LLMFlow.ASV3_SOURCE_INVENTORY,
                 LLMFlow.ASV3_SOURCE_USE_REVIEW,
@@ -1700,6 +2065,9 @@ class ResearchModel:
                 research=not consume_budget,
                 structured=False,
                 response_model=response_model,
+                **_native_catalogue_kwargs(
+                    self._cheap_condition_catalogue(prompt, flow)
+                ),
             )
             try:
                 return valid(repaired)
@@ -2691,6 +3059,7 @@ class ResearchModel:
         *,
         candidate_coverage: list[dict[str, JsonValue]] | None = None,
         candidate_reviews: list[JsonValue] | None = None,
+        repair_observations: list[dict[str, JsonValue]] | None = None,
     ) -> tuple[list[ChatCompletionMessage], list[dict[str, JsonValue]], int]:
         instruction = (
             TUNED_SOURCE_ANSWER_PROMPT
@@ -2701,6 +3070,27 @@ class ResearchModel:
             if self._writing_answer
             else self._research_instruction()
         )
+        if (
+            self.context.services.get("asv3_exp_cropped") is True
+            and self.context.services.get("asv3_exp_cheap") is not True
+        ):
+            instruction += "\n\n" + CROPPED_SOURCE_OWNERSHIP
+        if (
+            self.context.services.get("asv3_exp_cropped") is True
+            and self._writing_answer
+            and isinstance(view.research_state.get("cropped_section_assignment"), dict)
+        ):
+            instruction += (
+                "\nWrite only the owned cropped_section_assignment, preserving every material "
+                "condition, exception and subsequent step supported by its actual originals. "
+                "The complete request and facts establish scenario scope; other sections will "
+                "address their separately assigned effects. Do not invent or duplicate another "
+                "section's conclusion or claim that this section completes the whole request. "
+                "Use only assigned original citation numbers. Preserve precise unresolved "
+                "effects using submit_partial_answer when necessary. The host concatenates "
+                "your exact body with the other guarded sections and independently assesses "
+                "coverage and consistency; that assessment cannot rewrite or repair this body."
+            )
         if (
             not self._writing_answer
             and view.draft_to_repair
@@ -2716,6 +3106,24 @@ class ResearchModel:
                 "Correct unsupported assertions; do not shorten supported detail. "
                 "Research further only for a precise unresolved material effect."
             )
+        if self.context.services.get("asv3_exp_cropped") is True:
+            instruction += (
+                "\nBind each independent material research topic to update_research.needs "
+                "with the exact research_bindings IDs, purpose and completion test. Create "
+                "the need and its source actions together in the same decision; use _need_id "
+                "on each source action. Keep active_need_ids focused on the work in progress. "
+                "Record candidate findings with literal witnesses when a need is answered; "
+                "candidate status is not legal approval. Preserve genuine depends_on links "
+                "and reopen a retained need when a new fact or source changes its effect. "
+                "A cropped_task_packet contains the active dependency closure; detached "
+                "candidates remain addressable and their originals return for final writing. "
+                "Follow cross-references at most one step from a directly relevant original: "
+                "read its immediate referenced provision, but do not recursively research "
+                "references inside that provision. Use follow_reference for such reads so "
+                "the host can preserve origin and depth. Continuing the same article is "
+                "not another reference step. A nested unread reference is not evidence of "
+                "its legal effect; preserve any material uncertainty without inventing a rule."
+            )
         question: dict[str, JsonValue] = {
             "request": view.request,
         }
@@ -2730,6 +3138,11 @@ class ResearchModel:
             question["conversation"] = self.history
         if len(view.questions) > 1:
             question["questions"] = list(view.questions)
+        if self.context.services.get("asv3_exp_cropped") is True:
+            question["question_bindings"] = [
+                {"question_id": f"q{index}", "question": text}
+                for index, text in enumerate(view.questions)
+            ]
         assistant_instructions = self.context.services.get("assistant_instructions")
         if (
             not self.context.depth
@@ -2747,6 +3160,38 @@ class ResearchModel:
             "language": self.context.language,
             "request": view.request,
         }
+        from onyx.asv3.cropped_context_pressure import cropped_context_pressure
+
+        pressure = cropped_context_pressure(
+            self.context, view, writing_answer=self._writing_answer
+        )
+        if pressure is not None:
+            context["cropped_context_pressure"] = pressure
+        if self.context.services.get("asv3_exp_cropped") is True:
+            context["research_state"] = copy.deepcopy(view.research_state)
+            crossrefs = self.context.services.get("cropped_cross_references")
+            if isinstance(crossrefs, CroppedCrossReferencePolicy):
+                context["cross_reference_scope"] = crossrefs.view(self.context)
+            from onyx.asv3.cropped_completion import build_cropped_completion_context
+            from onyx.asv3.cropped_cost_budget import CroppedCostBudget
+
+            completion = build_cropped_completion_context(
+                self.context,
+                view.request,
+                facts=view.facts,
+                publication_gap=view.publication_gap,
+            )
+            self.context.services["cropped_completion_context"] = completion
+            context["cropped_completion"] = completion.writer_view()
+
+            cost_state = self.context.services.get("cropped_cost_budget")
+            if isinstance(cost_state, CroppedCostBudget):
+                context["cropped_cost_state"] = cost_state.state_instructions()
+        if repair_observations is not None:
+            context["research_state"] = copy.deepcopy(view.research_state)
+            context["repair_research_observations"] = cast(
+                list[JsonValue], repair_observations
+            )
         from onyx.asv3.registry import native_research_bindings
 
         research_bindings = native_research_bindings(self.context)
@@ -2782,6 +3227,28 @@ class ResearchModel:
             context["governing_source_requirements"] = authority_requirements.view(
                 self.context
             )
+        cheap_authority = self.context.services.get("cheap_authority_policy")
+        if isinstance(cheap_authority, CheapAuthorityPolicy):
+            requirements = cheap_authority.view(self.context)
+            if requirements.get("retained_authority_requirements"):
+                context["governing_source_requirements"] = requirements
+        if self.context.services.get("asv3_exp_cheap") is True:
+            from onyx.asv3.cheap_source_review import CheapSourceReviewPolicy
+
+            source_policy = self.context.services.get("cheap_source_review_policy")
+            if isinstance(source_policy, CheapSourceReviewPolicy):
+                conditions = source_policy.required_conditions()
+                if conditions:
+                    context["retained_source_conditions"] = cast(JsonValue, conditions)
+                    context["retained_source_condition_note"] = (
+                        "These immutable requirements were extracted from complete originals "
+                        "without the draft. Reassess every requirement against the actual "
+                        "scenario and all affected summary, detail and table units. Preserve "
+                        "its actors, thresholds, exceptions and subsequent steps with its "
+                        "own inline source. A broad condition or a separate discussion cannot "
+                        "correct an unchanged categorical application. Do not infer facts or "
+                        "drop a requirement because the draft omitted it."
+                    )
         pending = self.pending_tasks()
         if pending:
             context["research_tasks"] = pending
@@ -2866,12 +3333,35 @@ class ResearchModel:
             if self.context.depth
             else None
         )
+        packet = view.research_state.get("cropped_task_packet")
+        if (
+            self.context.services.get("asv3_exp_cropped") is True
+            and not self._writing_answer
+            and view.draft_to_repair is None
+            and view.publication_gap is None
+            and isinstance(packet, dict)
+        ):
+            assigned_packet = packet.get("selected_outcome_ids")
+            if isinstance(assigned_packet, list):
+                outcome_subset = [
+                    value for value in assigned_packet if isinstance(value, str)
+                ]
         if isinstance(outcomes, OutcomeMap):
             required.update(outcomes.preferred_citations(outcome_ids=outcome_subset))
         from onyx.asv3.evidence import EvidenceLedger
 
         ledger = self.context.services.get("evidence")
         if isinstance(ledger, EvidenceLedger):
+            if isinstance(cheap_authority, CheapAuthorityPolicy):
+                witnesses = [
+                    witness
+                    for witness in cheap_authority.identity_witnesses(ledger)
+                    if witness["previous_article_no"] != witness["article_no"]
+                ]
+                if witnesses:
+                    context["governing_article_identity_witnesses"] = cast(
+                        list[JsonValue], witnesses
+                    )
             related = related_provision_originals(
                 ledger, records, citation_numbers=required
             )
@@ -3021,6 +3511,30 @@ class ResearchModel:
                             "checks apply to the complete reconstructed answer."
                         )
                 context["retained_answer"] = retained_answer
+        if self.context.services.get("asv3_exp_cropped") is True:
+            from onyx.asv3.cropped_cost_budget import CroppedCostBudget
+            from onyx.asv3.cropped_research_limit import CroppedResearchLimit
+
+            controller = self.context.services.get("cropped_research_controller")
+            if isinstance(controller, CroppedResearchLimit):
+                selected = controller.available_tools(selected, self.context)
+            cost_state = self.context.services.get("cropped_cost_budget")
+            if (
+                isinstance(cost_state, CroppedCostBudget)
+                and not cost_state.research_allowed
+            ):
+                selected = [
+                    tool
+                    for tool in selected
+                    if isinstance(function := tool.get("function"), dict)
+                    and function.get("name")
+                    in {
+                        "submit_answer",
+                        "submit_partial_answer",
+                        "submit_retained_answer",
+                        "submit_retained_partial_answer",
+                    }
+                ]
         if (
             independent_mode
             and independent_answers
@@ -3415,6 +3929,51 @@ class ResearchModel:
                     )
             if current_originals:
                 current["original_evidence"] = cast(list[JsonValue], current_originals)
+            if self.context.services.get("asv3_exp_cropped") is True:
+                from onyx.asv3.cropped_task_packets import (
+                    project_restored_cropped_observations,
+                    restored_cropped_topic_observations,
+                )
+
+                restored = restored_cropped_topic_observations(view)
+                observations = current.get("repair_research_observations")
+                if restored is not None:
+                    rows = (
+                        [row for row in observations if isinstance(row, dict)]
+                        if isinstance(observations, list)
+                        else []
+                    )
+                    rows = [
+                        row
+                        for row in rows
+                        if "cropped_restored_topic_context" not in row
+                    ]
+                    observations = [*rows, *restored]
+                    research_state = current.get("research_state")
+                    if isinstance(research_state, dict):
+                        current["research_state"] = {
+                            key: value
+                            for key, value in research_state.items()
+                            if key != "cropped_restored_topic_context"
+                        }
+                if isinstance(observations, list):
+                    fallback_numbers = {
+                        row.get("citation")
+                        for row in current_originals
+                        if type(row.get("citation")) is int
+                    }
+                    current["repair_research_observations"] = cast(
+                        list[JsonValue],
+                        project_restored_cropped_observations(
+                            [row for row in observations if isinstance(row, dict)],
+                            [
+                                row
+                                for row in complete_originals
+                                if row.get("citation") in fallback_numbers
+                            ],
+                            self.context,
+                        ),
+                    )
             if unique:
                 current["original_evidence_ranges"] = [
                     {
@@ -3483,6 +4042,18 @@ class ResearchModel:
                         "metadata for its full current locators, dates and version evidence; "
                         "citation-specific fields never override shared fields."
                     )
+            if self.context.services.get("asv3_exp_cropped") is True:
+                from onyx.asv3.cropped_transport import serialize_cropped_payload
+
+                current_content = serialize_cropped_payload(current, self._tokens)
+            elif self.context.services.get("asv3_exp_cheap") is True and current.get(
+                "original_metadata_catalogue"
+            ):
+                from onyx.asv3.cheap_metadata_transport import serialize_cheap_payload
+
+                current_content = serialize_cheap_payload(current, self._tokens)
+            else:
+                current_content = json.dumps(current, ensure_ascii=False)
             return [
                 *prefix,
                 *(
@@ -3490,7 +4061,7 @@ class ResearchModel:
                     for turn in native_turns
                     for message in [turn.assistant, *turn.results]
                 ),
-                UserMessage(content=json.dumps(current, ensure_ascii=False)),
+                UserMessage(content=current_content),
             ]
 
         prompt = messages()
@@ -3540,6 +4111,134 @@ class ResearchModel:
             )
         return prompt, selected, output
 
+    def _cheap_publication_fingerprint(self, view: HarnessView) -> str:
+        ledger = self.context.services.get("evidence")
+        originals = (
+            ledger.provision_metadata() if isinstance(ledger, EvidenceLedger) else []
+        )
+        return hashlib.sha256(
+            json.dumps(
+                {
+                    "run_id": self.context.run_id,
+                    "scope": self.context.scope,
+                    "request": view.request,
+                    "draft": view.draft_to_repair,
+                    "gap": view.publication_gap,
+                    "facts": view.facts,
+                    "questions": view.questions,
+                    "research_state": view.research_state,
+                    "originals": originals,
+                },
+                sort_keys=True,
+                ensure_ascii=False,
+            ).encode()
+        ).hexdigest()
+
+    def _cheap_fresh_repair(self, view: HarnessView) -> Decision | None:
+        if (
+            self.context.services.get("asv3_exp_cheap") is not True
+            or not self.lean_native_mode
+            or self.answer_llm is not None
+            or not view.publication_gap
+            or not view.draft_to_repair
+        ):
+            return None
+        ledger = self.context.services.get("evidence")
+        if not isinstance(ledger, EvidenceLedger):
+            return None
+        from onyx.asv3.cheap_source_review import CheapSourceReviewPolicy
+
+        source_policy = self.context.services.get("cheap_source_review_policy")
+        if isinstance(source_policy, CheapSourceReviewPolicy):
+            inventory_gap = source_policy.ensure_inventory(self, ledger, view.questions)
+            if inventory_gap is not None:
+                return None
+        fingerprint = self._cheap_publication_fingerprint(view)
+        if fingerprint != self._cheap_repair_fingerprint:
+            self._cheap_repair_fingerprint = fingerprint
+            self._cheap_repair_attempts = 0
+        # Repeated identical rejections broaden research; they never approve or drop checks.
+        if self._cheap_repair_attempts >= 2:
+            return None
+        originals = cast(
+            list[dict[str, JsonValue]],
+            json.loads(
+                ledger.serialize_records(ledger.citation_numbers(), max_chars=None)
+            ),
+        )
+        fresh = prepare_cheap_repair_view(view, originals)
+        if fresh is None:
+            return None
+        with graph_step(
+            "asv3.cheap_fresh_repair",
+            {"originals": len(originals), "retained_turns": len(view.turns)},
+        ) as preparation:
+            from onyx.llm.multi_llm import LitellmLLM
+
+            # Fewer tokens cannot justify abandoning discounted native history.
+            if (
+                isinstance(self.llm, LitellmLLM)
+                and self.llm.asv3_exp_cheap_has_history_cache_boundary
+            ):
+                preparation.output_value = {
+                    "fallback": "recorded_history_cache_boundary",
+                    "billable_advantage": "unverified",
+                }
+                return None
+            try:
+                prompt, tools, output = self._fit_native_decision(
+                    fresh, repair_observations=cheap_repair_observations(view)
+                )
+            except RunStopped as error:
+                if str(error) != (
+                    "The complete question, required originals and native tools exceed the selected model context"
+                ):
+                    raise
+                preparation.output_value = {
+                    "fallback": "complete_packet_exceeds_context"
+                }
+                return None
+            fresh_cost = self._input_cost(prompt, tools)
+            try:
+                ordinary_prompt, ordinary_tools, _ordinary_output = (
+                    self._fit_native_decision(view)
+                )
+            except RunStopped as error:
+                if str(error) != (
+                    "The complete question, required originals and native tools exceed the selected model context"
+                ):
+                    raise
+                ordinary_cost = None
+            else:
+                ordinary_cost = self._input_cost(ordinary_prompt, ordinary_tools)
+                if fresh_cost >= ordinary_cost:
+                    preparation.output_value = {
+                        "fallback": "fresh_input_is_not_smaller",
+                        "fresh_input_tokens": fresh_cost,
+                        "ordinary_input_tokens": ordinary_cost,
+                    }
+                    return None
+            preparation.output_value = {
+                "messages": len(prompt),
+                "policy": "complete-originals-fresh-v1",
+                "fresh_input_tokens": fresh_cost,
+                "ordinary_input_tokens": ordinary_cost,
+            }
+        self._cheap_repair_attempts += 1
+        decision = self._invoke_decision(
+            fresh, prompt, tools, output, flow_override=LLMFlow.ASV3_ANSWER_REPAIR
+        )
+        decision = self._experimental_terminal_envelope(
+            decision,
+            tools,
+            publication_gap=fresh.publication_gap,
+            retained_draft=fresh.draft_to_repair,
+            request=fresh.request,
+        )
+        return resolve_retained_answer(
+            decision, self.context, fresh.draft_to_repair, request=fresh.request
+        )
+
     def decide(self, view: HarnessView) -> Decision:
         if (
             not self.context.depth
@@ -3548,9 +4247,45 @@ class ResearchModel:
             self.context.check_active()
         else:
             self.context.check_research_active()
+        if (
+            self.lean_native_mode
+            and self.context.services.get("asv3_exp_cropped") is True
+            and not self._writing_answer
+        ):
+            research_limit = self.context.services.get("cropped_research_limit")
+            if callable(research_limit):
+                finish_request = research_limit(view, self.context)
+                if finish_request is not None:
+                    if not isinstance(finish_request, dict):
+                        raise ValueError(
+                            "Cropped research limit must return a finish request"
+                        )
+                    return self._decide_cropped_source_answer(
+                        view, finish_request=finish_request
+                    )
         acquisition = self._publication_source_acquisition(view)
         if acquisition is not None:
-            return acquisition
+            if self.context.services.get("asv3_exp_cheap") is not True:
+                return acquisition
+            fingerprint = hashlib.sha256(
+                json.dumps(
+                    {
+                        "publication": self._cheap_publication_fingerprint(view),
+                        "calls": [
+                            {"name": call.name, "arguments": call.arguments}
+                            for call in acquisition.calls
+                        ],
+                    },
+                    sort_keys=True,
+                    ensure_ascii=False,
+                ).encode()
+            ).hexdigest()
+            if fingerprint != self._cheap_acquisition_fingerprint:
+                self._cheap_acquisition_fingerprint = fingerprint
+                return acquisition
+        fresh_repair = self._cheap_fresh_repair(view)
+        if fresh_repair is not None:
+            return fresh_repair
         if self.lean_native_mode:
             if (
                 self.answer_llm is not None
@@ -3572,6 +4307,28 @@ class ResearchModel:
             )
             with preparation:
                 prompt, tools, output = self._fit_native_decision(view)
+            if self.context.services.get("asv3_exp_cropped") is True:
+                from onyx.asv3.cropped_transport import CroppedInputOverflow
+
+                try:
+                    self._check_cropped_input(prompt, tools)
+                except CroppedInputOverflow:
+                    from onyx.asv3.cropped_research_limit import CroppedResearchLimit
+
+                    controller = self.context.services.get(
+                        "cropped_research_controller"
+                    )
+                    if isinstance(controller, CroppedResearchLimit):
+                        controller.force_finish(
+                            "ordinary_input_packet_exceeds_cropped_limit"
+                        )
+                    return self._decide_cropped_source_answer(
+                        view,
+                        finish_request={
+                            "reason": "The ordinary input packet exceeds the Cropped input limit",
+                            "research_complete": False,
+                        },
+                    )
             assembly_decision = (
                 not self.context.depth
                 and self.context.services.get("independent_question_mode") is True
@@ -3583,13 +4340,27 @@ class ResearchModel:
                 and not assembly_decision
                 and (self.context.depth > 0 or self._native_first_decision_completed)
             )
-            decision = self._invoke_decision(
-                view,
-                prompt,
-                tools,
-                output,
-                call_llm_override=self.research_llm if use_research_model else None,
-            )
+            from onyx.asv3.cropped_cost_budget import CroppedResearchBudgetReached
+
+            try:
+                decision = self._invoke_decision(
+                    view,
+                    prompt,
+                    tools,
+                    output,
+                    call_llm_override=self.research_llm if use_research_model else None,
+                )
+            except CroppedResearchBudgetReached:
+                if self.context.services.get("asv3_exp_cropped") is not True:
+                    raise
+                return self._decide_cropped_source_answer(
+                    view,
+                    finish_request={
+                        "reason": "The shared research generation allowance was reached",
+                        "research_complete": False,
+                        "absence_proven": False,
+                    },
+                )
             decision = resolve_retained_answer(
                 decision, self.context, view.draft_to_repair, request=view.request
             )
@@ -3704,6 +4475,538 @@ class ResearchModel:
             )
         return self._decide_research(view)
 
+    def _decide_cropped_source_answer(
+        self,
+        view: HarnessView,
+        *,
+        candidate: Decision | None = None,
+        finish_request: dict[str, JsonValue] | None = None,
+        allow_sections: bool = True,
+    ) -> Decision:
+        """Write once from the complete retained originals using the same selected model."""
+        if self.context.services.get("asv3_exp_cropped") is not True:
+            raise ValueError("Fresh source writing is restricted to Cropped")
+        from onyx.asv3.cropped_worker_handoff import (
+            CroppedWorkerHandoff,
+            should_handoff_worker,
+        )
+
+        if should_handoff_worker(self.context):
+            raise CroppedWorkerHandoff()
+        collect_workers = self.context.services.get("cropped_before_writer")
+        if not self.context.depth and callable(collect_workers):
+            waiting = collect_workers()
+            if waiting is not None:
+                if not isinstance(waiting, Decision):
+                    raise ValueError(
+                        "Cropped writer collection requires a host decision"
+                    )
+                return waiting
+        from onyx.asv3.cropped_cost_budget import CroppedCostBudget
+
+        cost_budget = self.context.services.get("cropped_cost_budget")
+        if (
+            not isinstance(cost_budget, CroppedCostBudget)
+            or cost_budget.research_allowed
+        ):
+            read_plan = self._decide_cropped_read_plan(view)
+            if read_plan is not None:
+                return read_plan
+        from onyx.asv3.cropped_sections import CroppedSectionMaterialContext
+        from onyx.asv3.cropped_transport import (
+            CroppedInputOverflow,
+            prepare_cropped_writer_view,
+        )
+
+        handoff = prepare_cropped_writer_view(
+            view, self.context, self._native_original_records(view.turns)
+        )
+        from onyx.asv3.cropped_task_packets import restored_cropped_topic_observations
+
+        material_context = CroppedSectionMaterialContext.capture(
+            self.context,
+            view.request,
+            research_tasks=self.pending_tasks(),
+            repair_observations=(
+                restored_cropped_topic_observations(handoff)
+                or cheap_repair_observations(view)
+            ),
+        )
+        if finish_request is not None:
+            from onyx.asv3.cropped_research_limit import CroppedResearchLimit
+
+            controller = self.context.services.get("cropped_research_controller")
+            retained_only = isinstance(controller, CroppedResearchLimit) and (
+                controller.forced_finish
+                and not controller.policy.enforce_observed_limits
+            )
+            handoff.research_state["cropped_completion_request"] = {
+                "request": copy.deepcopy(finish_request),
+                "legal_approval": False,
+                "new_source_acquisition_closed": retained_only,
+                "instruction": (
+                    "Complete the supported answer from retained originals and all question, "
+                    "fact and source obligations. This host limit is not proof of legal "
+                    "completeness or source absence. Preserve material conditions, exceptions, "
+                    "favorable grounds, counterarguments and subsequent steps. If a material "
+                    "effect still needs a precise original, disclose its exact unresolved "
+                    "effect in a supported partial answer. "
+                    + (
+                        "New source acquisition is closed by the host for this invocation, "
+                        "even if the separate monetary budget reports research_allowed=true. "
+                        "Use the retained originals and exposed recorded-evidence tools. "
+                        "Do not request discovery of unavailable tools. Unread material is "
+                        "not absent law: disclose only the precise unresolved effect. "
+                        if retained_only
+                        else "If research_allowed is false, no new lookup is permitted; "
+                        "otherwise request only a precise focused lookup. Do not launch "
+                        "another broad survey or invent missing facts. "
+                    )
+                    + "When a focused lookup is permitted, identify all currently known independent "
+                    "material targets for this owner and request them together in one decision. "
+                    "Use a bounded compose_tool_calls program for dependent source resolution and "
+                    "original reads when appropriate. Read the provisions explicitly named in the "
+                    "user's decision before deciding their legal effect. Existing task outcome "
+                    "ownership still applies: use only the assigned outcome IDs in metadata. "
+                    "A worker handoff contains actual observations and unapproved reasoning, "
+                    "not a verified legal answer. Assess their effects against the delivered "
+                    "originals and complete the assigned user outcomes yourself. "
+                    "For large known sources request complete operative provisions and their "
+                    "material references, instead of paging through the entire source. "
+                    "Batching changes the order of reads, never their required conditions, "
+                    "exceptions, dates, source scope or completeness checks."
+                ),
+            }
+        coverage = self._retain_candidate_conditions(candidate) if candidate else None
+        if candidate is not None:
+            body = candidate.answer or next(
+                (
+                    str(call.arguments.get("answer", ""))
+                    for call in candidate.calls
+                    if call.name in {"submit_answer", "submit_partial_answer"}
+                ),
+                "",
+            )
+            if body:
+                handoff.draft_to_repair = body
+        self._writing_answer = True
+        pending_tasks = self.pending_tasks
+        self.pending_tasks = material_context.research_tasks
+        try:
+            self.context.budget.consume("decisions")
+            prompt, tools, output = self._fit_native_decision(
+                handoff,
+                candidate_coverage=coverage,
+                repair_observations=material_context.repair_observations(),
+            )
+            decision = self._invoke_decision(
+                handoff,
+                prompt,
+                tools,
+                output,
+                call_llm_override=self.llm,
+                flow_override=LLMFlow.ASV3_FINAL,
+            )
+            decision = self._experimental_terminal_envelope(
+                decision,
+                tools,
+                publication_gap=handoff.publication_gap,
+                retained_draft=handoff.draft_to_repair,
+                request=handoff.request,
+            )
+            return resolve_retained_answer(
+                decision,
+                self.context,
+                handoff.draft_to_repair,
+                request=handoff.request,
+            )
+        except CroppedInputOverflow:
+            if not allow_sections:
+                raise
+            return self._assemble_cropped_sections(
+                handoff, material_context=material_context
+            )
+        finally:
+            self.pending_tasks = pending_tasks
+            self._writing_answer = False
+
+    def _decide_cropped_read_plan(self, view: HarnessView) -> Decision | None:
+        """Choose focused original reads before paying to write from the full packet."""
+        from onyx.asv3.cropped_research_limit import CroppedResearchLimit
+
+        controller = self.context.services.get("cropped_research_controller")
+        if (
+            self.context.services.get("asv3_exp_cropped") is not True
+            or self.context.depth
+            or view.draft_to_repair
+            or view.publication_gap
+            or not isinstance(controller, CroppedResearchLimit)
+            or not controller.long_tail
+            or not controller.policy.enforce_observed_limits
+        ):
+            return None
+        owner = str(self.context.services.get("task_id") or "root")
+        if controller.read_plan_reserved(self.context, owner):
+            return None
+        from onyx.asv3.cropped_read_planning import (
+            CroppedPlanningReceiptSnapshot,
+            build_cropped_read_planning_packet,
+            serialize_cropped_read_planning_packet,
+        )
+
+        snapshot_provider = self.context.services.get(
+            "cropped_committed_receipt_snapshot"
+        )
+        committed_receipt_snapshot = None
+        if callable(snapshot_provider):
+            committed_receipt_snapshot = snapshot_provider()
+            if not isinstance(
+                committed_receipt_snapshot, CroppedPlanningReceiptSnapshot
+            ):
+                raise ValueError("Invalid committed Cropped planning receipt snapshot")
+            committed_receipt_snapshot.validate(self.context, view.request)
+        packet = build_cropped_read_planning_packet(
+            view,
+            self.context,
+            research_tasks=self.pending_tasks(),
+            committed_receipt_snapshot=committed_receipt_snapshot,
+        )
+        if packet.get("planning_targets_available") is not True:
+            return None
+        operations = packet.get("operations")
+        if isinstance(operations, list):
+            controller.register_failed_named_reads(operations, self.context)
+        reference_navigation = packet.get("source_reference_navigation")
+        if isinstance(reference_navigation, list):
+            controller.register_failed_named_source_aliases(
+                reference_navigation, self.context
+            )
+        names = {
+            "read_named_provision",
+            "read_provision",
+            "read_chunk",
+            "read_chunk_context",
+            "follow_reference",
+            "search_source_text",
+            "resolve_source",
+            "compose_tool_calls",
+        }
+        tools = [
+            tool
+            for tool in controller.available_tools(view.tools, self.context)
+            if isinstance(function := tool.get("function"), dict)
+            and function.get("name") in names
+        ]
+        if not tools:
+            return None
+        prompt: list[ChatCompletionMessage] = [
+            SystemMessage(
+                content=(
+                    "Select precise missing original reads, not a legal answer or a completeness verdict. "
+                    "The packet is a selective read-planning view. Navigation cards and references are "
+                    "not original text, legal approval, current-validity proof or evidence of absence. "
+                    "The later writer receives all retained originals and uses all ordinary checks. "
+                    "Identify the provisions explicitly named by the user and concrete material leads "
+                    "in actual researcher suggestions; choose all known independent targets in one "
+                    "bounded batch. Use only exposed exact original-reading actions; a dependent "
+                    "compose_tool_calls program may resolve a known failed source identity then read "
+                    "its complete operative provision. Preserve relevant exceptions, conditions, dates "
+                    "and ruling continuations. Never repeat an already completed exact read or the same "
+                    "failed source-name lookup; reuse recorded results. An unresolved read is not proof "
+                    "of absence. Do not browse broad new subjects, publish an answer, mark research "
+                    "complete, or promote unapproved researcher reasoning to law. If no concrete read "
+                    "is needed, return the exact text READ_PLANNING_DONE without a tool call."
+                )
+            ),
+            UserMessage(
+                content=serialize_cropped_read_planning_packet(packet, self._tokens)
+            ),
+        ]
+        with graph_step(
+            "asv3.cropped_read_planning",
+            {
+                "legal_approval": False,
+                "input_tokens": self._input_cost(prompt, tools),
+            },
+        ) as preparation:
+            # A large projection cannot justify another full-packet planning call.
+            if self._input_cost(prompt, tools) > 24_000:
+                preparation.output_value = {
+                    "skipped": "planning_packet_exceeds_small_call_limit",
+                    "legal_approval": False,
+                }
+                return None
+            if not controller.reserve_read_plan(self.context, owner):
+                return None
+            checkpoint = self.context.services.get("cropped_repair_checkpoint")
+            if callable(checkpoint):
+                checkpoint(durable=True)
+            self.context.budget.consume("decisions")
+            response = self._invoke_once(
+                prompt,
+                tools,
+                LLMFlow.ASV3_TARGETED_RESEARCH,
+                max_tokens=2048,
+                research=False,
+                structured=False,
+                call_llm=self.llm,
+            )
+            if (response.choice.finish_reason or "").lower() in {
+                "length",
+                "max_tokens",
+            }:
+                raise RunStopped("Cropped read planning was truncated before execution")
+            decision = self._decision(response, tools)
+            preparation.output_value = {
+                "model_call_id": self.last_call_id,
+                "planned_calls": len(decision.calls),
+                "legal_approval": False,
+            }
+            if not decision.calls:
+                if (decision.answer or "").strip() != "READ_PLANNING_DONE":
+                    raise RunStopped(
+                        "Cropped read planner returned an unsupported completion envelope"
+                    )
+                return None
+            return decision.model_copy(update={"answer": None})
+
+    def _check_cropped_input(
+        self,
+        prompt: list[ChatCompletionMessage],
+        tools: list[dict[str, JsonValue]],
+    ) -> dict[str, int]:
+        from onyx.asv3.cropped_transport import enforce_cropped_input_budget
+
+        wire_tools = strict_terminal_tools(
+            source_answer_wire_tools(tools) if self._writing_answer else tools,
+            self.context,
+            self.llm.config.model_provider,
+            self.llm.config.model_name,
+        )
+        return enforce_cropped_input_budget(self._input_cost(prompt, wire_tools))
+
+    def _assemble_cropped_sections(
+        self,
+        view: HarnessView,
+        *,
+        material_context: CroppedSectionMaterialContext | None = None,
+    ) -> Decision:
+        """Use actual bounded writers, then assess an immutable host assembly."""
+        from onyx.asv3.cropped_repair_model import fresh_model
+        from onyx.asv3.cropped_sections import (
+            CroppedAssemblyAssessment,
+            CroppedAssemblyReview,
+            CroppedAssemblyReviewInput,
+            CroppedSectionGeneration,
+            CroppedSectionMaterialContext,
+            CroppedSectionPlan,
+            CroppedSectionStore,
+            assemble_cropped_sections,
+        )
+        from onyx.asv3.cropped_transport import CroppedInputOverflow
+        from onyx.asv3.models import OutcomeStatus
+
+        ledger = self.context.services.get("evidence")
+        gap_check = self.context.services.get("cropped_section_publication_gap")
+        if not isinstance(ledger, EvidenceLedger) or not callable(gap_check):
+            raise RunStopped(
+                "Cropped section writing requires its actual publication guard"
+            )
+        if material_context is None:
+            material_context = CroppedSectionMaterialContext.capture(
+                self.context,
+                view.request,
+                research_tasks=self.pending_tasks(),
+                repair_observations=cheap_repair_observations(view),
+            )
+        material_context.validate(self.context, view.request)
+        self.context.services["cropped_section_material_context"] = material_context
+
+        def scoped_model(plan: CroppedSectionPlan | None = None) -> ResearchModel:
+            fresh = fresh_model(self)
+            # Preserve execution reservations and owner fences while isolating receipts.
+            fresh.context.services.update(self.context.services)
+            fresh.context.services["cropped_cost_phase"] = "finalization"
+            fresh.context.services.pop("last_model_call_id", None)
+            fresh.context.services["provider_max_attempts"] = 1
+            fresh.context.services["provider_compatibility_attempts"] = 1
+            if plan is not None:
+                fresh.context.services["task_outcome_ids"] = list(plan.outcome_ids)
+            fresh.history = self.history
+            fresh.pending_tasks = material_context.research_tasks
+            fresh._writing_answer = True
+            return fresh
+
+        def fit_section(
+            fresh: ResearchModel, prepared: HarnessView, plan: CroppedSectionPlan
+        ) -> tuple[list[ChatCompletionMessage], list[dict[str, JsonValue]], int]:
+            material_context.require_assignment(
+                self.context, view.request, ledger, list(plan.evidence_numbers)
+            )
+            prompt, tools, output = fresh._fit_native_decision(
+                prepared, repair_observations=material_context.repair_observations()
+            )
+            if lossless_original_transport_enabled(fresh.context):
+                delivered = _NativeOriginalCatalogue.bind(prompt, cheap_metadata=True)
+                if {row["citation"] for row in delivered.records} != set(
+                    plan.evidence_numbers
+                ):
+                    raise RunStopped(
+                        "Cropped section fitting introduced an unassigned source dependency"
+                    )
+            return prompt, tools, output
+
+        def count_input(prepared: HarnessView, plan: CroppedSectionPlan) -> int:
+            fresh = scoped_model(plan)
+            try:
+                prompt, tools, _ = fit_section(fresh, prepared, plan)
+                return fresh._check_cropped_input(prompt, tools)["counted_input_tokens"]
+            except CroppedInputOverflow as error:
+                return error.counted_tokens
+
+        def capture(fresh: ResearchModel) -> str:
+            if not fresh.last_call_id:
+                raise RunStopped(
+                    "Cropped section invocation has no actual writer receipt"
+                )
+            self.last_call_id = fresh.last_call_id
+            self.last_finish_reason = fresh.last_finish_reason
+            self.last_response_truncated = fresh.last_response_truncated
+            self.context.services["last_model_call_id"] = fresh.last_call_id
+            return fresh.last_call_id
+
+        def write_section(
+            prepared: HarnessView, plan: CroppedSectionPlan
+        ) -> CroppedSectionGeneration:
+            fresh = scoped_model(plan)
+            fresh.context.budget.consume("decisions")
+            prompt, tools, output = fit_section(fresh, prepared, plan)
+            decision = fresh._invoke_decision(
+                prepared,
+                prompt,
+                tools,
+                output,
+                call_llm_override=self.llm,
+                flow_override=LLMFlow.ASV3_FINAL,
+            )
+            decision = resolve_retained_answer(
+                decision,
+                fresh.context,
+                prepared.draft_to_repair,
+                request=prepared.request,
+            )
+            if (
+                len(decision.calls) != 1
+                or decision.calls[0].name
+                not in {"submit_answer", "submit_partial_answer"}
+                or decision.calls[0].argument_error
+                or fresh.last_response_truncated
+            ):
+                raise RunStopped(
+                    "Cropped section writer did not return one valid terminal"
+                )
+            call = decision.calls[0]
+            answer = call.arguments.get("answer")
+            if not isinstance(answer, str) or not answer.strip():
+                raise RunStopped("Cropped section writer returned an empty body")
+            answer = answer.strip()
+            call_id = capture(fresh)
+            # Invoke the real terminal metadata validators, without executing publication.
+            from onyx.asv3.registry import CapabilityRegistry
+
+            registry = fresh.context.services.get("registry")
+            if isinstance(registry, CapabilityRegistry):
+                gap = registry.outcome_metadata_gap(call, fresh.context)
+                if gap is not None:
+                    raise RunStopped(
+                        "Cropped section terminal source conditions were rejected"
+                    )
+            fresh._retain_candidate_conditions(decision)
+            return CroppedSectionGeneration(
+                answer=answer,
+                model_call_id=call_id,
+                status=(
+                    OutcomeStatus.PARTIAL
+                    if call.name == "submit_partial_answer"
+                    else OutcomeStatus.FOUND
+                ),
+            )
+
+        def review_assembly(
+            supplied: CroppedAssemblyReviewInput,
+        ) -> CroppedAssemblyReview:
+            from onyx.asv3.cropped_completion import (
+                build_cropped_completion_context,
+                validate_cropped_required_followups,
+            )
+
+            completion = build_cropped_completion_context(
+                self.context,
+                supplied.request,
+                facts=list(supplied.facts),
+                publication_gap=supplied.publication_gap,
+            )
+            if supplied.completion_context != completion.writer_view():
+                raise RunStopped(
+                    "Cropped assembly review context changed before invocation"
+                )
+            fresh = scoped_model()
+            text = fresh.invoke_text(
+                "Assess only section coverage and consistency of the exact supplied assembly. "
+                "Check every supplied determination, retained source-bound requirement, fact, "
+                "qualification and unresolved issue across the sections. The supplied body is "
+                "immutable: do not rewrite it, add legal claims, or infer that all corpus sources "
+                "were reviewed. This assessment does not replace the original-source guards. "
+                "Return the supplied section and determination IDs in their exact order. "
+                "Complete means every requested determination is addressed, including an "
+                "honest unresolved gap, not that unknown legal effects have been verified. "
+                "Use required_followups optionally only for definitely necessary material "
+                "questions bound to the supplied existing open need/outcome IDs. A followup "
+                "is not a legal finding; omit optional extensions and resolved matters.",
+                supplied.model_dump_json(),
+                LLMFlow.ASV3_VERIFICATION,
+                response_model_override=CroppedAssemblyAssessment,
+            )
+            assessment = CroppedAssemblyAssessment.model_validate_json(text)
+            validated = validate_cropped_required_followups(
+                [row.model_dump(mode="json") for row in assessment.required_followups],
+                self.context,
+                supplied.request,
+                completion,
+                answer=supplied.answer,
+                facts=list(supplied.facts),
+                publication_gap=supplied.publication_gap,
+            )
+            return CroppedAssemblyReview(
+                review_scope=assessment.review_scope,
+                assessed_section_ids=assessment.assessed_section_ids,
+                assessed_determination_ids=assessment.assessed_determination_ids,
+                complete=assessment.complete,
+                consistent=assessment.consistent,
+                missing=assessment.missing,
+                contradictions=assessment.contradictions,
+                required_followups=list(validated.items),
+                model_call_id=capture(fresh),
+                answer_hash=supplied.answer_hash,
+                completion_snapshot=completion.export(),
+            )
+
+        store = self.context.services.get("cropped_section_store")
+        if store is not None and not isinstance(store, CroppedSectionStore):
+            raise RunStopped("Cropped section checkpoint has an invalid store")
+        return assemble_cropped_sections(
+            view,
+            self.context,
+            ledger,
+            count_input=count_input,
+            write_section=write_section,
+            review_assembly=review_assembly,
+            publication_gap=lambda body, call_id: gap_check(
+                body, call_id, self.context
+            ),
+            store=store,
+        )
+
     def _decide_source_answer(
         self,
         view: HarnessView,
@@ -3771,9 +5074,19 @@ class ResearchModel:
             or not isinstance(ledger, EvidenceLedger)
         ):
             return None
-        identity_ledger = bound_identity_ledger(ledger, self.context)
-        references = cited_lower_statute_references(
-            view.draft_to_repair, identity_ledger
+        identity_ledger = (
+            cropped_identity_ledger(ledger, self.context)
+            if self.context.services.get("asv3_exp_cropped") is True
+            else bound_identity_ledger(ledger, self.context)
+        )
+        crossrefs = self.context.services.get("cropped_cross_references")
+        references = (
+            crossrefs.filter_references(
+                view.draft_to_repair, identity_ledger, self.context
+            )
+            if self.context.services.get("asv3_exp_cropped") is True
+            and isinstance(crossrefs, CroppedCrossReferencePolicy)
+            else cited_lower_statute_references(view.draft_to_repair, identity_ledger)
         )
         definitions = {
             function["name"]: function.get("parameters")
@@ -3846,13 +5159,19 @@ class ResearchModel:
                 )
             ):
                 continue
-            calls.append(
-                CapabilityCall(
-                    name=name,
-                    arguments=arguments,
-                    call_id="publication-reference-" + uuid4().hex,
-                )
+            call = CapabilityCall(
+                name=name,
+                arguments=arguments,
+                call_id="publication-reference-" + uuid4().hex,
             )
+            if self.context.services.get("asv3_exp_cropped") is True and isinstance(
+                crossrefs, CroppedCrossReferencePolicy
+            ):
+                if not crossrefs.reserve_acquisition(
+                    call, reference, self.context, identity_ledger
+                ):
+                    continue
+            calls.append(call)
         if calls:
             return self._source_acquisition_decision(calls)
         state = self._related_source_range_continuations(
@@ -4476,6 +5795,45 @@ class ResearchModel:
         )
         return self._invoke_decision(view, prompt, tools, output)
 
+    def _cropped_initial_decision_output(self, output: int, flow: LLMFlow) -> int:
+        if (
+            self.context.services.get("asv3_exp_cropped") is True
+            and not self._writing_answer
+            and flow in {LLMFlow.ASV3_COORDINATOR, LLMFlow.ASV3_RESEARCHER}
+        ):
+            # Large valid output can still use the native completion path.
+            return min(output, 16_384)
+        return output
+
+    def _cropped_large_writer_cache(
+        self,
+        prompt: list[ChatCompletionMessage],
+        tools: list[dict[str, JsonValue]],
+        flow: LLMFlow,
+    ) -> bool:
+        from onyx.asv3.cropped_research_limit import CroppedResearchLimit
+
+        if (
+            self.context.services.get("asv3_exp_cropped") is not True
+            or not self._writing_answer
+            or flow != LLMFlow.ASV3_FINAL
+        ):
+            return False
+        # A packet rejected before dispatch must not consume the first writer.
+        self._check_cropped_input(prompt, tools)
+        already_started = self._cropped_source_writer_started
+        self._cropped_source_writer_started = True
+        controller = self.context.services.get("cropped_research_controller")
+        if (
+            already_started
+            or not isinstance(controller, CroppedResearchLimit)
+            or not controller.budget_limited
+            or self._input_cost(prompt, tools) < 100_000
+        ):
+            return False
+        # Preserve implicit reuse for research and subsequent writer calls.
+        return True
+
     def _native_decision_response(
         self,
         prompt: list[ChatCompletionMessage],
@@ -4491,7 +5849,11 @@ class ResearchModel:
 
         if self.lean_native_mode and tools and isinstance(call_llm, LitellmLLM):
             call_llm = call_llm.with_tool_argument_stream_guard()
-            if (
+            if self.context.services.get("asv3_exp_cropped") is True:
+                call_llm = call_llm.with_cropped_response_terminal_capture(
+                    explicit_cache=self._cropped_large_writer_cache(prompt, tools, flow)
+                )
+            elif (
                 self.context.services.get("asv3_workflow_variant") == ASV3_TUNED_VARIANT
                 and call_llm._uses_guarded_openai_responses()
             ):
@@ -4531,6 +5893,7 @@ class ResearchModel:
         output: int,
         *,
         call_llm_override: LLM | None = None,
+        flow_override: LLMFlow | None = None,
     ) -> Decision:
         def normalize_arguments(
             name: str, arguments: dict[str, JsonValue]
@@ -4614,14 +5977,22 @@ class ResearchModel:
                         parts.append(image)
         prompt[-1] = UserMessage(content=parts)
         native_catalogue = (
-            _NativeOriginalCatalogue.bind(prompt)
+            _NativeOriginalCatalogue.bind(
+                prompt,
+                cheap_metadata=(
+                    self.context.services.get("asv3_exp_cheap") is True
+                    or self.context.services.get("asv3_exp_cropped") is True
+                ),
+            )
             if self.lean_native_mode
             and lossless_original_transport_enabled(self.context)
             else None
         )
-        flow = (
+        flow = flow_override or (
             LLMFlow.ASV3_RESEARCHER if self.context.depth else LLMFlow.ASV3_COORDINATOR
         )
+        if self.lean_native_mode:
+            output = self._cropped_initial_decision_output(output, flow)
         call_llm = call_llm_override or (
             self._native_decision_llm(view) if self.lean_native_mode else self.llm
         )
@@ -4771,9 +6142,99 @@ class ResearchModel:
                     argument_normalizer=argument_normalizer,
                 )
             break
+        if self.context.services.get("asv3_exp_cropped") is True:
+            decision = self._repair_cropped_terminal_metadata(decision, view, call_llm)
         self._native_first_decision_started = True
         self._native_first_decision_completed = True
         return decision
+
+    def _repair_cropped_terminal_metadata(
+        self, decision: Decision, view: HarnessView, call_llm: LLM
+    ) -> Decision:
+        from onyx.asv3.cropped_terminal_metadata import (
+            prepare_cropped_terminal_metadata_repair,
+        )
+        from onyx.asv3.registry import CapabilityRegistry
+        from onyx.prompts.asv3_cropped_terminal_metadata import (
+            CROPPED_TERMINAL_METADATA_REPAIR,
+        )
+
+        try:
+            contract = prepare_cropped_terminal_metadata_repair(
+                decision, view, self.context, self.last_call_id
+            )
+            if contract is None:
+                return decision
+            registry = self.context.services.get("registry")
+            assert isinstance(registry, CapabilityRegistry)
+            isolated = copy.copy(self.context)
+            isolated.services = dict(self.context.services)
+            isolated.services.pop("last_model_call_id", None)
+            isolated.services["provider_max_attempts"] = 1
+            isolated.services["provider_compatibility_attempts"] = 1
+            # This is envelope correction of a retained first publication,
+            # not a new source assessment or a semantic answer rewrite.
+            isolated.services["cropped_cost_phase"] = "finalization"
+            patcher = ResearchModel(
+                call_llm,
+                isolated,
+                user_identity=self.user_identity,
+                reasoning_effort=self.reasoning_effort,
+                token_counter=self.token_counter,
+                lean_native_mode=self.lean_native_mode,
+            )
+            patcher._writing_answer = True
+            prompt, tools, output = patcher._fit(
+                CROPPED_TERMINAL_METADATA_REPAIR
+                + "\nReturn JSON conforming to this schema: "
+                + json.dumps(ToolArgumentPatch.model_json_schema(), ensure_ascii=False),
+                contract.payload_json,
+                [],
+                max_tokens=2048,
+                research=False,
+            )
+            response = patcher._invoke_once(
+                prompt,
+                tools,
+                LLMFlow.ASV3_VERIFICATION,
+                max_tokens=output,
+                research=False,
+                response_model=ToolArgumentPatch,
+            )
+            if patcher.last_response_truncated or (
+                response.choice.finish_reason or ""
+            ).lower() not in {"", "stop"}:
+                raise ValueError("Terminal metadata correction did not complete")
+            text = response.choice.message.content or ""
+            if envelopes := response.choice.message.tool_calls:
+                if len(envelopes) != 1 or envelopes[0].function.name not in {
+                    "json_tool_call",
+                    ToolArgumentPatch.__name__,
+                }:
+                    raise ValueError("Unexpected terminal metadata correction envelope")
+                text = envelopes[0].function.arguments or ""
+            patch = ToolArgumentPatch.model_validate_json(
+                normalize_structured_response(text, ToolArgumentPatch)
+            )
+            if (
+                len(patch.entries) != 1
+                or patch.entries[0].call_id != "metadata:0"
+                or patch.entries[0].arguments_json is None
+            ):
+                raise ValueError(
+                    "Terminal metadata correction omitted its bound action"
+                )
+            return contract.apply(
+                parse_json_object(patch.entries[0].arguments_json),
+                self.context,
+                registry,
+            )
+        except ValueError as error:
+            raise RunStopped(
+                "Cropped terminal metadata correction failed; the unapproved answer "
+                "was not published and no new source research was started: "
+                + str(error)
+            ) from error
 
     def _complete_native_response(
         self,

@@ -19,15 +19,38 @@ from pydantic import JsonValue
 
 from onyx.asv3.answer_model import source_answer_model, uses_source_answer_model
 from onyx.asv3.article_bindings import ArticleBindings, bound_identity_ledger
-from onyx.asv3.authority import native_named_authority_gap
+from onyx.asv3.authority import cited_lower_statute_gap, native_named_authority_gap
 from onyx.asv3.authority_requirements import AuthorityRequirements
 from onyx.asv3.candidate_audit import CandidateAudit
 from onyx.asv3.canonical_authority import (
     canonical_cited_lower_statute_gap,
     canonical_named_authority_gap,
 )
+from onyx.asv3.cheap_authority import (
+    CheapAuthorityPolicy,
+)
+from onyx.asv3.cheap_source_review import CheapSourceReviewPolicy
 from onyx.asv3.citation_numbers import extract_citation_numbers
 from onyx.asv3.corpus_tools import CorpusBroker, build_corpus_specs
+from onyx.asv3.cropped_article_bindings import (
+    CroppedArticleBindings,
+    cropped_identity_ledger,
+    cropped_named_authority_gap,
+)
+from onyx.asv3.cropped_cost_budget import CroppedCostBudget
+from onyx.asv3.cropped_crossrefs import CroppedCrossReferencePolicy
+from onyx.asv3.cropped_focused_repair import (
+    CroppedFocusedRepair,
+    authority_answer_with_cropped_disclosures,
+)
+from onyx.asv3.cropped_repair_state import CroppedRepairState
+from onyx.asv3.cropped_research_limit import CroppedResearchLimit
+from onyx.asv3.cropped_sections import CroppedSectionStore
+from onyx.asv3.cropped_task_packets import CroppedTaskPacketStore
+from onyx.asv3.cropped_worker_handoff import (
+    WORKER_HANDOFF_REASON,
+    build_worker_handoff,
+)
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.external_tools import build_external_specs
 from onyx.asv3.governing_acquisitions import (
@@ -51,8 +74,10 @@ from onyx.asv3.llm_adapter import (
     ResearchModel,
 )
 from onyx.asv3.models import (
+    CapabilityCall,
     Decision,
     EvidenceItem,
+    HarnessView,
     OutcomeStatus,
     RunContext,
     RunStopped,
@@ -102,6 +127,8 @@ from onyx.asv3.supplemental_tools import (
 )
 from onyx.asv3.workers import WorkerPool
 from onyx.asv3.workflow_variant import (
+    ASV3_EXP_CHEAP_VARIANT,
+    ASV3_EXP_CROPPED_VARIANT,
     ASV3_GUARDED_EXPERIMENTAL_VARIANT,
     ASV3_GUARDRAILS_V2_VARIANT,
     ASV3_GUARDRAILS_V3_VARIANT,
@@ -353,6 +380,26 @@ def run_asv3_loop(
     ):
         raise ValueError("ASv3 resume requires the same authorized scope and question")
     validate_asv3_variant_resume(workflow_variant, previous)
+    checkpoint_workflow_variant = workflow_variant
+    if workflow_variant == ASV3_EXP_CROPPED_VARIANT:
+        if research_profile != "normal" or parallel_research:
+            raise ValueError(
+                "exp cropped requires the normal profile without parallel research"
+            )
+        context.services["asv3_exp_cropped"] = True
+        workflow_variant = ASV3_TUNED_VARIANT
+    if workflow_variant == ASV3_EXP_CHEAP_VARIANT:
+        if research_profile != "normal" or parallel_research:
+            raise ValueError(
+                "ASv3Exp Cheap requires the normal profile without parallel research"
+            )
+        from onyx.llm.multi_llm import LitellmLLM
+
+        if isinstance(llm, LitellmLLM):
+            llm = llm.with_asv3_exp_cheap_cache()
+        context.services["asv3_exp_cheap"] = True
+        # Cheap retains the tuned engine contract and its separate checkpoint identity.
+        workflow_variant = ASV3_TUNED_VARIANT
     if workflow_variant == ASV3_TUNED_VARIANT and (
         research_profile != "normal" or parallel_research
     ):
@@ -434,11 +481,88 @@ def run_asv3_loop(
     context.services["evidence"] = ledger
     article_bindings = (
         ArticleBindings(context, question)
-        if workflow_variant == ASV3_TUNED_VARIANT
+        if checkpoint_workflow_variant == ASV3_TUNED_VARIANT
         else None
     )
     if article_bindings is not None:
         context.services["tuned_article_bindings"] = article_bindings
+    cropped_repair_state = (
+        CroppedRepairState(
+            context,
+            "\n\n".join(
+                message.message
+                for message in simple_chat_history[-8:]
+                if message.message_type == MessageType.USER
+            )
+            or question,
+        )
+        if context.services.get("asv3_exp_cropped") is True
+        else None
+    )
+    if cropped_repair_state is not None:
+        context.services["cropped_repair_state"] = cropped_repair_state
+        context.services["cropped_user_context"] = cropped_repair_state.request
+    cropped_research_controller = (
+        CroppedResearchLimit(context, cropped_repair_state.request)
+        if cropped_repair_state is not None
+        else None
+    )
+    cropped_cost_budget = (
+        CroppedCostBudget(context, cropped_repair_state.request)
+        if cropped_repair_state is not None
+        else None
+    )
+    if cropped_research_controller is not None:
+        assert cropped_repair_state is not None
+        context.services["cropped_research_controller"] = cropped_research_controller
+        context.services["cropped_cost_budget"] = cropped_cost_budget
+        context.services["cropped_task_packet_store"] = CroppedTaskPacketStore(
+            context, cropped_repair_state.request
+        )
+        context.services["cropped_cross_references"] = CroppedCrossReferencePolicy(
+            context, cropped_repair_state.request
+        )
+        context.services["cropped_article_bindings"] = CroppedArticleBindings(
+            context, cropped_repair_state.request
+        )
+        context.services["cropped_token_counter"] = token_counter
+        context.services["user_id"] = str(user.id)
+
+        def cropped_finish_request(
+            view: HarnessView, owner: RunContext
+        ) -> dict[str, JsonValue] | None:
+            assert cropped_research_controller is not None
+            if cropped_cost_budget is not None and cropped_cost_budget.finish_reason:
+                cropped_research_controller.force_finish(
+                    cropped_cost_budget.finish_reason
+                )
+            return cropped_research_controller.finish_request(view, owner)
+
+        context.services["cropped_research_limit"] = cropped_finish_request
+
+    def cropped_checkpoint_fields() -> dict[str, JsonValue]:
+        if cropped_research_controller is None or cropped_cost_budget is None:
+            return {}
+        fields: dict[str, JsonValue] = {
+            "cropped_research_limit": cropped_research_controller.export(),
+            "cropped_cost_budget": cropped_cost_budget.export(),
+        }
+        packets = context.services.get("cropped_task_packet_store")
+        if isinstance(packets, CroppedTaskPacketStore):
+            fields["cropped_task_packets"] = packets.export()
+        crossrefs = context.services.get("cropped_cross_references")
+        if isinstance(crossrefs, CroppedCrossReferencePolicy):
+            fields["cropped_cross_references"] = crossrefs.export()
+        bindings = context.services.get("cropped_article_bindings")
+        if isinstance(bindings, CroppedArticleBindings):
+            fields["cropped_article_bindings"] = bindings.export()
+        store = context.services.get("cropped_section_store")
+        view = context.services.get("cropped_section_publication_view")
+        if isinstance(store, CroppedSectionStore) and isinstance(view, HarnessView):
+            fields["cropped_section_store"] = store.export()
+            fields["cropped_section_publication_view"] = view.model_dump(mode="json")
+        return fields
+
     parallel_answers = (
         ParallelAnswerReceipts(context, question, user_id=str(user.id))
         if parallel_research
@@ -453,7 +577,7 @@ def run_asv3_loop(
         context.services["legal_source_reviews"] = source_reviews
     governing_acquisitions = (
         GoverningOriginalAcquisitions(context, question)
-        if workflow_variant == ASV3_TUNED_VARIANT
+        if checkpoint_workflow_variant == ASV3_TUNED_VARIANT
         else None
     )
     if governing_acquisitions is not None:
@@ -474,31 +598,59 @@ def run_asv3_loop(
     )
     if authority_requirements is not None:
         context.services["authority_requirements"] = authority_requirements
+    cheap_authority_policy = (
+        CheapAuthorityPolicy(context, question)
+        if context.services.get("asv3_exp_cheap") is True
+        else None
+    )
+    if cheap_authority_policy is not None:
+        context.services["cheap_authority_policy"] = cheap_authority_policy
 
     def named_authority_gap(
         answer: str,
         model_call_id: str | None,
         run_context: RunContext | None = None,
     ) -> dict[str, JsonValue] | None:
+        if cheap_authority_policy is not None:
+            return cheap_authority_policy.publication_gap(
+                answer, model_call_id, run_context or context, ledger
+            )
         if answer_llm is not None:
             # This policy accepts a supplied passage establishing the actual claim.
             return None
-        gap = (
-            canonical_named_authority_gap(
+        checked_answer = (
+            authority_answer_with_cropped_disclosures(answer, cropped_repair_state)
+            if cropped_repair_state is not None
+            else answer
+        )
+        strict = (
+            research_profile == "experimental" or workflow_variant == ASV3_TUNED_VARIANT
+        )
+        syntactic = parallel_research or workflow_variant == ASV3_TUNED_VARIANT
+        if context.services.get("asv3_exp_cropped") is True:
+            gap = cropped_named_authority_gap(
+                checked_answer,
+                ledger,
+                run_context or context,
+                strict_reference_boundaries=strict,
+                syntactic_reference_binding=syntactic,
+                strict_numeric_paragraphs=True,
+            )
+        elif checkpoint_workflow_variant == ASV3_TUNED_VARIANT:
+            gap = canonical_named_authority_gap(
                 answer,
                 bound_identity_ledger(ledger, run_context or context),
                 strict_reference_boundaries=True,
                 syntactic_reference_binding=True,
                 strict_numeric_paragraphs=True,
             )
-            if workflow_variant == ASV3_TUNED_VARIANT
-            else native_named_authority_gap(
-                answer,
+        else:
+            gap = native_named_authority_gap(
+                checked_answer,
                 ledger,
-                strict_reference_boundaries=research_profile == "experimental",
-                syntactic_reference_binding=parallel_research,
+                strict_reference_boundaries=strict,
+                syntactic_reference_binding=syntactic,
             )
-        )
         if authority_requirements is not None:
             return authority_requirements.publication_gap(
                 answer, model_call_id, run_context or context, ledger, native_gap=gap
@@ -596,7 +748,7 @@ def run_asv3_loop(
     research_state = ResearchState(
         initial_questions(question),
         context,
-        require_need_bindings=False,
+        require_need_bindings=context.services.get("asv3_exp_cropped") is True,
     )
     context.services.update(scenario_state=scenarios, research_state=research_state)
     outcome_map = OutcomeMap(
@@ -607,6 +759,22 @@ def run_asv3_loop(
         reuse_retained_conditions=workflow_variant == ASV3_TUNED_VARIANT,
     )
     context.services["outcome_map"] = outcome_map
+    user_owned_history = "\n".join(
+        message.message
+        for message in simple_chat_history[-8:]
+        if message.message_type == MessageType.USER and message.message != question
+    )
+    cheap_source_review_policy = (
+        CheapSourceReviewPolicy(
+            context,
+            user_owned_history + "\n" + question if user_owned_history else question,
+            initial_questions(question),
+        )
+        if context.services.get("asv3_exp_cheap") is True
+        else None
+    )
+    if cheap_source_review_policy is not None:
+        context.services["cheap_source_review_policy"] = cheap_source_review_policy
     candidate_audit = (
         CandidateAudit(context, request=question)
         if workflow_variant == ASV3_GUARDRAILS_V3_VARIANT
@@ -782,7 +950,7 @@ def run_asv3_loop(
                 checkpoint_sequence += 1
                 snapshot.update(
                     sequence=checkpoint_sequence,
-                    **checkpoint_variant_fields(workflow_variant),
+                    **checkpoint_variant_fields(checkpoint_workflow_variant),
                     prompt_version=TUNED_PROMPT_VERSION
                     if workflow_variant == ASV3_TUNED_VARIANT
                     else EXPERIMENTAL_PARALLEL_PROMPT_VERSION
@@ -814,6 +982,15 @@ def run_asv3_loop(
                     snapshot["legal_source_reviews"] = source_reviews.export()
                 if authority_requirements is not None:
                     snapshot["authority_requirements"] = authority_requirements.export()
+                if cheap_authority_policy is not None:
+                    snapshot["cheap_authority_policy"] = cheap_authority_policy.export()
+                if cheap_source_review_policy is not None:
+                    snapshot["cheap_source_review_policy"] = (
+                        cheap_source_review_policy.export()
+                    )
+                if cropped_repair_state is not None:
+                    snapshot["cropped_repair_state"] = cropped_repair_state.export()
+                    snapshot.update(cropped_checkpoint_fields())
                 receipts = (
                     parallel_answers.export() if parallel_answers is not None else {}
                 )
@@ -972,6 +1149,13 @@ def run_asv3_loop(
             with checkpoint_lock:
                 lock_wait_seconds = time.monotonic() - lock_started
                 context.check_active()
+                if cropped_repair_state is not None:
+                    if threading.get_ident() == root_owner_thread:
+                        publish_root_control()
+                    with root_control_lock:
+                        if parallel_root_control is None:
+                            raise ValueError("Cropped checkpoint control is missing")
+                        snapshot = copy.deepcopy(parallel_root_control)
                 if parallel_research:
                     if harness is None:
                         raise ValueError("Parallel capture requires its root harness")
@@ -982,7 +1166,7 @@ def run_asv3_loop(
                 checkpoint_sequence += 1
                 snapshot.update(
                     sequence=checkpoint_sequence,
-                    **checkpoint_variant_fields(workflow_variant),
+                    **checkpoint_variant_fields(checkpoint_workflow_variant),
                     prompt_version=TUNED_PROMPT_VERSION
                     if workflow_variant == ASV3_TUNED_VARIANT
                     else EXPERIMENTAL_PARALLEL_PROMPT_VERSION
@@ -994,13 +1178,13 @@ def run_asv3_loop(
                     parallel_research=parallel_research,
                     execution_mode="native",
                     native_coordinator_sampling=snapshot["native_coordinator_sampling"]
-                    if acquisition_child_capture
+                    if acquisition_child_capture or cropped_repair_state is not None
                     else model.native_sampling_snapshot(),
                     scope=context.scope,
                     progress=list(emitted),
                     progress_state=progress.export(),
                     public_profile=snapshot["public_profile"]
-                    if acquisition_child_capture
+                    if acquisition_child_capture or cropped_repair_state is not None
                     else profile.model_dump(mode="json"),
                     workers=workers.export() if workers else {},
                     question_research=question_research.export()
@@ -1008,13 +1192,15 @@ def run_asv3_loop(
                     else {},
                     outcome_map=outcome_map.export(),
                     publication_status=snapshot["publication_status"]
-                    if acquisition_child_capture
+                    if acquisition_child_capture or cropped_repair_state is not None
                     else publication_status.value,
                     publication_stop_reason=snapshot["publication_stop_reason"]
-                    if acquisition_child_capture
+                    if acquisition_child_capture or cropped_repair_state is not None
                     else publication_stop_reason,
                     final_publication_gap=snapshot["publication_gap"]
                     if acquisition_child_capture
+                    else snapshot["final_publication_gap"]
+                    if cropped_repair_state is not None
                     else harness.publication_gap.model_dump(mode="json")
                     if harness and harness.publication_gap
                     else None,
@@ -1035,6 +1221,18 @@ def run_asv3_loop(
                     snapshot["governing_original_acquisitions"] = (
                         governing_acquisitions.export()
                     )
+                if cheap_authority_policy is not None:
+                    snapshot["cheap_authority_policy"] = cheap_authority_policy.export()
+                if cheap_source_review_policy is not None:
+                    snapshot["cheap_source_review_policy"] = (
+                        cheap_source_review_policy.export()
+                    )
+                if cropped_repair_state is not None:
+                    snapshot["cropped_repair_state"] = cropped_repair_state.export()
+                    snapshot.update(cropped_checkpoint_fields())
+                    snapshot["research_state"] = research_state.export()
+                    snapshot["evidence"] = ledger.export()
+                    snapshot["budget"] = context.budget.snapshot()
                 guardrails_v2_review = context.services.get("guardrails_v2_review")
                 if isinstance(guardrails_v2_review, dict):
                     snapshot["guardrails_v2_review"] = cast(
@@ -1124,9 +1322,13 @@ def run_asv3_loop(
     def root_checkpoint(*, durable: bool = False) -> None:
         if harness is None:
             raise ValueError("Root checkpoint requires its harness")
-        if parallel_research or (
-            governing_acquisitions is not None
-            and threading.get_ident() != root_owner_thread
+        if (
+            parallel_research
+            or cropped_repair_state is not None
+            or (
+                governing_acquisitions is not None
+                and threading.get_ident() != root_owner_thread
+            )
         ):
             checkpoint({}, durable=durable)
             return
@@ -1143,11 +1345,24 @@ def run_asv3_loop(
             durable=True
         )
 
+    if cropped_repair_state is not None:
+        context.services["cropped_repair_checkpoint"] = root_checkpoint
+
     def record(receipt: ToolReceipt) -> None:
         acquisition_recorded = (
             governing_acquisitions is not None
             and governing_acquisitions.record_receipt(receipt, context, ledger)
         )
+        if cropped_research_controller is not None:
+            from onyx.asv3.cropped_session_reuse import record_cropped_session_receipt
+
+            record_cropped_session_receipt(receipt, context, ledger)
+        if cropped_research_controller is not None:
+            cropped_research_controller.record_sources(
+                item
+                for number in receipt.evidence_ids
+                if (item := ledger.get(number)) is not None
+            )
         if checkpoint_writer is not None:
             checkpoint_writer.raise_if_failed()
         for number in receipt.evidence_ids:
@@ -1219,8 +1434,14 @@ def run_asv3_loop(
             else []
         )
         if isinstance(numbers, list):
+            if cropped_research_controller is not None:
+                from onyx.asv3.cropped_session_reuse import session_numbers_to_remember
+
+                numbers = session_numbers_to_remember(numbers, context, ledger)
             for number in numbers:
-                item = ledger.get(number) if type(number) is int else None
+                if type(number) is not int:
+                    continue
+                item = ledger.get(number)
                 if item is not None:
                     if item.search_doc is None and item.metadata.get("source_sha256"):
                         ledger.add(
@@ -1515,6 +1736,11 @@ def run_asv3_loop(
             callback(snapshot)
             root_checkpoint()
 
+        child_focused_repair = (
+            CroppedFocusedRepair(cropped_repair_state)
+            if cropped_repair_state is not None
+            else None
+        )
         child_harness = Harness(
             request=task,
             context=child,
@@ -1536,6 +1762,11 @@ def run_asv3_loop(
             else None,
             complete_submission=(lambda: child_complete) if not independent else None,
             partial_submission=lambda: child_partial,
+            repair_decision=(
+                lambda active: child_focused_repair.decide(active, researcher_model)
+            )
+            if child_focused_repair is not None
+            else None,
         )
         if independent:
             remember_session_originals(child_harness)
@@ -1549,6 +1780,24 @@ def run_asv3_loop(
             "questions": result.questions,
             "facts": result.facts,
         }
+        if result.stop_reason == WORKER_HANDOFF_REASON:
+            child_research_state = child.services.get("research_state")
+            data["cropped_worker_handoff"] = build_worker_handoff(
+                context=child,
+                result=result,
+                ledger=ledger,
+                turns=child_harness.turns,
+                research_state=child_research_state.export()
+                if isinstance(child_research_state, ResearchState)
+                else {},
+                working_memory=child_harness.working_memory.export(),
+                draft=child_harness.last_draft,
+            )
+            return ToolOutcome(
+                status=OutcomeStatus.PARTIAL,
+                summary="Actual research observations and unresolved needs handed to the coordinator; no verified answer or legal absence is asserted.",
+                data=data,
+            )
         if parallel_answers is not None and independent and result.answer:
             if question_research is None:
                 raise ValueError(
@@ -1587,6 +1836,56 @@ def run_asv3_loop(
         progress=progress,
         max_workers=2 if parallel_research else 4,
     )
+    if cropped_research_controller is not None:
+
+        def cropped_host_decision(
+            active: Harness, *, force_wait: bool = False
+        ) -> Decision | None:
+            if active.context.depth:
+                return None
+            last_calls = active.turns[-1].assistant.tool_calls if active.turns else []
+            waiting_only = bool(last_calls) and all(
+                call.function.name in {"wait_researcher", "list_researchers"}
+                for call in last_calls or []
+            )
+            if not (
+                force_wait or waiting_only or cropped_research_controller.forced_finish
+            ) and not (
+                cropped_cost_budget is not None and cropped_cost_budget.finish_reason
+            ):
+                return None
+            collected: set[str] = set()
+            for receipt in active.receipts:
+                if receipt.call.name != "wait_researcher":
+                    continue
+                tasks = receipt.outcome.data.get("tasks")
+                for task in tasks if isinstance(tasks, list) else []:
+                    if isinstance(task, dict) and task.get("status") not in {
+                        "queued",
+                        "running",
+                    }:
+                        task_id = task.get("task_id")
+                        if isinstance(task_id, str):
+                            collected.add(task_id)
+            tasks = [task for task in workers.list() if task.task_id not in collected]
+            if not tasks:
+                return None
+            return Decision(
+                calls=[
+                    CapabilityCall(
+                        name="wait_researcher",
+                        arguments={"task_id": task.task_id, "timeout_seconds": 5},
+                    )
+                    for task in tasks
+                ]
+            )
+
+        context.services["cropped_host_decision"] = cropped_host_decision
+        context.services["cropped_before_writer"] = lambda: (
+            cropped_host_decision(harness, force_wait=True)
+            if harness is not None
+            else None
+        )
     question_research = QuestionResearch(
         context, workers, initial_questions(question), host_assembly=parallel_research
     )
@@ -1669,18 +1968,54 @@ def run_asv3_loop(
         *,
         requires_sources: bool | None = None,
         run_context: RunContext | None = None,
+        cropped_section: bool = False,
     ) -> ToolOutcome | None:
+        active_context = run_context or context
+        assembly_numbers: set[int] | None = None
+        if active_context.services.get("asv3_exp_cropped") is True:
+            store = active_context.services.get("cropped_section_store")
+            view = active_context.services.get("cropped_section_publication_view")
+            if isinstance(store, CroppedSectionStore) and store.owns_assembly(answer):
+                if not isinstance(view, HarnessView):
+                    raise ValueError("Cropped section publication view is missing")
+                store.verify_assembly(
+                    active_context,
+                    view,
+                    answer,
+                    ledger,
+                    lambda body, call_id: source_publication_gap(
+                        body,
+                        call_id,
+                        run_context=active_context,
+                        cropped_section=True,
+                    ),
+                )
+                assembly_numbers = store.assembly_original_numbers(answer)
         numbers = extract_citation_numbers(answer)
+        # Cheap retains governing dependencies even when delivery blocks this draft first.
+        cheap_authority_gap = (
+            named_authority_gap(answer, model_call_id, run_context)
+            if cheap_authority_policy is not None
+            else None
+        )
         unknown = sorted(set(numbers) - ledger.citation_mapping().keys())
         if unknown:
+            if cheap_source_review_policy is not None:
+                cheap_source_review_policy.mark_repair_requested()
             return ToolOutcome(
                 status=OutcomeStatus.PARTIAL,
                 summary="Use recorded original citation numbers.",
                 data={"unknown_citations": unknown},
             )
-        delivered = ledger.completely_delivered(model_call_id or "")
+        delivered = (
+            assembly_numbers
+            if assembly_numbers is not None
+            else ledger.completely_delivered(model_call_id or "")
+        )
         undelivered = [n for n in numbers if n not in delivered]
         if undelivered:
+            if cheap_source_review_policy is not None:
+                cheap_source_review_policy.mark_repair_requested()
             return ToolOutcome(
                 status=OutcomeStatus.PARTIAL,
                 summary="Read cited originals that have not reached the model.",
@@ -1689,6 +2024,8 @@ def run_asv3_loop(
         if (
             profile.requires_sources if requires_sources is None else requires_sources
         ) and not numbers:
+            if cheap_source_review_policy is not None:
+                cheap_source_review_policy.mark_repair_requested()
             return ToolOutcome(
                 status=OutcomeStatus.PARTIAL,
                 summary="A legal answer needs recorded original citations. Retrieve the operative source or disclose the precise gap using submit_partial_answer.",
@@ -1696,7 +2033,11 @@ def run_asv3_loop(
             )
         tuned = context.services.get("asv3_workflow_variant") == ASV3_TUNED_VARIANT
         gaps: list[ToolOutcome] = []
-        authority_gap = named_authority_gap(answer, model_call_id, run_context)
+        authority_gap = (
+            cheap_authority_gap
+            if cheap_authority_policy is not None
+            else named_authority_gap(answer, model_call_id, run_context)
+        )
         if authority_gap is not None:
             gap = ToolOutcome(
                 status=OutcomeStatus.PARTIAL,
@@ -1707,8 +2048,31 @@ def run_asv3_loop(
                 return gap
             gaps.append(gap)
         if tuned and answer_llm is None:
-            reference_gap = canonical_cited_lower_statute_gap(
-                answer, bound_identity_ledger(ledger, run_context or context), delivered
+            reference_ledger = (
+                cheap_authority_policy.identity_ledger(ledger)
+                if cheap_authority_policy is not None
+                else cropped_identity_ledger(ledger, active_context)
+                if active_context.services.get("asv3_exp_cropped") is True
+                else ledger
+            )
+            crossrefs = active_context.services.get("cropped_cross_references")
+            reference_gap = (
+                cited_lower_statute_gap(
+                    answer,
+                    reference_ledger,
+                    delivered,
+                    references=crossrefs.filter_references(
+                        answer, reference_ledger, active_context
+                    ),
+                )
+                if active_context.services.get("asv3_exp_cropped") is True
+                and isinstance(crossrefs, CroppedCrossReferencePolicy)
+                else cited_lower_statute_gap(answer, reference_ledger, delivered)
+                if cheap_authority_policy is not None
+                or active_context.services.get("asv3_exp_cropped") is True
+                else canonical_cited_lower_statute_gap(
+                    answer, bound_identity_ledger(ledger, active_context), delivered
+                )
             )
             if reference_gap is not None:
                 gaps.append(
@@ -1719,13 +2083,38 @@ def run_asv3_loop(
                     )
                 )
         if source_reviews is not None:
-            review_gap = source_reviews.publication_gap(
-                answer, model_call_id or "", run_context or context, ledger
-            )
+            if assembly_numbers is not None:
+                review_gap = source_reviews.publication_gap_for_cropped_assembly(
+                    answer,
+                    active_context,
+                    ledger,
+                    delivered_numbers=assembly_numbers,
+                )
+            elif cropped_section:
+                review_gap = source_reviews.publication_gap_for_cropped_section(
+                    answer,
+                    model_call_id or "",
+                    active_context,
+                    ledger,
+                    assigned_numbers=delivered,
+                )
+            else:
+                review_gap = source_reviews.publication_gap(
+                    answer, model_call_id or "", active_context, ledger
+                )
             if review_gap is not None:
                 if not tuned:
                     return review_gap
                 gaps.append(review_gap)
+        if cheap_source_review_policy is not None:
+            if gaps:
+                cheap_source_review_policy.mark_repair_requested()
+            else:
+                review_gap = cheap_source_review_policy.publication_gap(
+                    answer, model, ledger
+                )
+                if review_gap is not None:
+                    gaps.append(review_gap)
         combined = combine_source_publication_gaps(gaps)
         if combined is not None and governing_acquisitions is not None:
             records = governing_acquisitions.records_for(
@@ -1734,6 +2123,13 @@ def run_asv3_loop(
             if records:
                 combined.data["governing_original_acquisition_episodes"] = records
         return combined
+
+    if cropped_repair_state is not None:
+        context.services["cropped_section_publication_gap"] = (
+            lambda body, call_id, owner: source_publication_gap(
+                body, call_id, run_context=owner, cropped_section=True
+            )
+        )
 
     def publication_guard(
         answer: str,
@@ -1839,6 +2235,30 @@ def run_asv3_loop(
     if parallel_answers is not None:
         question_research.accepted_answer_guard = validate_parallel_answer
 
+    def completion_candidate(candidate: str, child: RunContext) -> str:
+        if (
+            child.services.get("asv3_exp_cropped") is not True
+            or child.services.get("asv3_exp_cheap") is True
+        ):
+            return candidate
+        from onyx.asv3.cropped_completion import (
+            CroppedValidatedFollowups,
+            append_cropped_required_followups,
+        )
+
+        validated = child.services.pop("cropped_validated_required_followups", None)
+        if not isinstance(validated, CroppedValidatedFollowups):
+            return candidate
+        facts = list(harness.facts) if harness is not None else []
+        scenario = child.services.get("scenario_state")
+        if isinstance(scenario, ScenarioState):
+            current = scenario.snapshot().get("facts", [])
+            if isinstance(current, list):
+                facts = list(dict.fromkeys([*facts, *(str(item) for item in current)]))
+        return append_cropped_required_followups(
+            candidate, validated, child, validated.snapshot.request, facts=facts
+        )
+
     def submit_answer(args: dict[str, JsonValue], child: RunContext) -> ToolOutcome:
         if child.depth or not standalone_answer_call:
             return ToolOutcome(
@@ -1864,6 +2284,14 @@ def run_asv3_loop(
             harness.publication_gap = gap
         if gap is not None:
             return gap
+        try:
+            candidate = completion_candidate(candidate, child)
+        except ValueError as error:
+            return ToolOutcome(
+                status=OutcomeStatus.INVALID,
+                summary="Required followups no longer match this answer or its open scope.",
+                data={"invalid_required_followups": True, "detail": str(error)},
+            )
         context.services["submitted_answer"] = candidate
         return ToolOutcome(
             status=OutcomeStatus.FOUND, summary="Complete answer submitted"
@@ -1932,6 +2360,14 @@ def run_asv3_loop(
             harness.publication_gap = gap
         if gap is not None:
             return gap
+        try:
+            candidate = completion_candidate(candidate, child)
+        except ValueError as error:
+            return ToolOutcome(
+                status=OutcomeStatus.INVALID,
+                summary="Required followups no longer match this answer or its open scope.",
+                data={"invalid_required_followups": True, "detail": str(error)},
+            )
         partial = candidate
         return ToolOutcome(
             status=OutcomeStatus.PARTIAL,
@@ -1953,6 +2389,11 @@ def run_asv3_loop(
             consumes_tool_budget=False,
         )
     )
+    root_focused_repair = (
+        CroppedFocusedRepair(cropped_repair_state)
+        if cropped_repair_state is not None
+        else None
+    )
     harness = Harness(
         request=question,
         context=context,
@@ -1967,7 +2408,24 @@ def run_asv3_loop(
         partial_submission=lambda: clarification or partial,
         report_terminal=False,
         on_decision=on_decision,
+        repair_decision=(lambda active: root_focused_repair.decide(active, model))
+        if root_focused_repair is not None
+        else None,
     )
+    if context.services.get("asv3_exp_cropped") is True:
+        from onyx.asv3.cropped_read_planning import (
+            CroppedPlanningReceiptSnapshot,
+            snapshot_cropped_planning_receipts,
+        )
+
+        def committed_planning_receipts() -> CroppedPlanningReceiptSnapshot:
+            if threading.get_ident() != root_owner_thread or harness is None:
+                raise ValueError("Cropped planning receipts require their root owner")
+            return snapshot_cropped_planning_receipts(harness)
+
+        context.services["cropped_committed_receipt_snapshot"] = (
+            committed_planning_receipts
+        )
     for spec in build_core_specs(registry, ledger, harness.snapshot):
         registry.register(spec)
 
@@ -1990,23 +2448,40 @@ def run_asv3_loop(
 
     try:
         if previous is None:
+            session_previous = load_asv3_session_checkpoint(
+                chat_session_id=chat_session_id,
+                user_message_id=user_message_id,
+                user_id=user.id,
+            )
             retain_session_research(
-                load_asv3_session_checkpoint(
-                    chat_session_id=chat_session_id,
-                    user_message_id=user_message_id,
-                    user_id=user.id,
-                ),
+                session_previous,
                 context,
                 ledger,
                 broker.revalidate_evidence,
             )
+            if cropped_research_controller is not None:
+                from onyx.asv3.cropped_session_reuse import (
+                    install_cropped_session_reuse,
+                )
+
+                install_cropped_session_reuse(
+                    context, ledger, question, previous=session_previous
+                )
             remember_session_originals(harness)
         if previous is not None:
+            if cropped_repair_state is not None:
+                saved_cropped_repair = previous.get("cropped_repair_state")
+                if not isinstance(saved_cropped_repair, dict):
+                    raise ValueError(
+                        "exp cropped resume requires its focused repair state"
+                    )
+                cropped_repair_state.restore(saved_cropped_repair)
+                cropped_repair_state.close_interrupted_attempts()
             remembered = previous.get("session_research")
             if isinstance(remembered, dict):
                 context.services["session_research"] = remembered
             harness.restore(previous)
-            if governing_acquisitions is None:
+            if governing_acquisitions is None and cropped_repair_state is None:
                 harness.publication_gap = None
             if governing_acquisitions is not None:
                 saved_acquisitions = previous.get("governing_original_acquisitions")
@@ -2021,9 +2496,70 @@ def run_asv3_loop(
                 if not isinstance(saved_bindings, dict):
                     raise ValueError("Invalid article-binding checkpoint")
                 article_bindings.restore(saved_bindings, context, ledger)
+            if cropped_research_controller is not None:
+                from onyx.asv3.cropped_session_reuse import (
+                    install_cropped_session_reuse,
+                )
+
+                install_cropped_session_reuse(context, ledger, question)
             saved_outcomes = previous.get("outcome_map")
             if isinstance(saved_outcomes, dict):
                 outcome_map.restore(saved_outcomes, ledger)
+            if (
+                cropped_research_controller is not None
+                and cropped_cost_budget is not None
+            ):
+                saved_limit = previous.get("cropped_research_limit")
+                saved_cost = previous.get("cropped_cost_budget")
+                if not isinstance(saved_limit, dict) or not isinstance(
+                    saved_cost, dict
+                ):
+                    raise ValueError(
+                        "Cropped checkpoint is missing its research or cost limits"
+                    )
+                cropped_research_controller.restore(saved_limit)
+                cropped_cost_budget.restore(saved_cost)
+                saved_packets = previous.get("cropped_task_packets")
+                packets = context.services.get("cropped_task_packet_store")
+                if not isinstance(saved_packets, dict) or not isinstance(
+                    packets, CroppedTaskPacketStore
+                ):
+                    raise ValueError("Cropped checkpoint is missing its task packets")
+                packets.restore(saved_packets, ledger)
+                saved_crossrefs = previous.get("cropped_cross_references")
+                crossrefs = context.services.get("cropped_cross_references")
+                if not isinstance(saved_crossrefs, dict) or not isinstance(
+                    crossrefs, CroppedCrossReferencePolicy
+                ):
+                    raise ValueError(
+                        "Cropped checkpoint is missing reference provenance"
+                    )
+                crossrefs.restore(saved_crossrefs, context, ledger)
+                saved_bindings = previous.get("cropped_article_bindings")
+                bindings = context.services.get("cropped_article_bindings")
+                if not isinstance(saved_bindings, dict) or not isinstance(
+                    bindings, CroppedArticleBindings
+                ):
+                    raise ValueError("Cropped checkpoint is missing article witnesses")
+                bindings.restore(saved_bindings, context, ledger)
+                saved_store = previous.get("cropped_section_store")
+                saved_view = previous.get("cropped_section_publication_view")
+                if saved_store is not None or saved_view is not None:
+                    if not isinstance(saved_store, dict) or not isinstance(
+                        saved_view, dict
+                    ):
+                        raise ValueError("Cropped section checkpoint is incomplete")
+                    publication_view = HarnessView.model_validate(saved_view)
+                    store = CroppedSectionStore(
+                        context, publication_view.request, user_id=str(user.id)
+                    )
+                    store.restore(
+                        saved_store, context, publication_view.request, ledger
+                    )
+                    context.services["cropped_section_store"] = store
+                    context.services["cropped_section_publication_view"] = (
+                        publication_view
+                    )
             saved_audit = previous.get("candidate_audit")
             if candidate_audit is not None and isinstance(saved_audit, dict):
                 candidate_audit.restore(saved_audit)
@@ -2031,6 +2567,20 @@ def run_asv3_loop(
             if source_reviews is not None and isinstance(saved_reviews, dict):
                 source_reviews.restore(saved_reviews, context, question, ledger)
             saved_requirements = previous.get("authority_requirements")
+            if cheap_authority_policy is not None:
+                saved_cheap_authority = previous.get("cheap_authority_policy")
+                if not isinstance(saved_cheap_authority, dict):
+                    raise ValueError(
+                        "ASv3Exp Cheap checkpoint is missing its authority policy"
+                    )
+                cheap_authority_policy.restore(saved_cheap_authority, context, question)
+            if cheap_source_review_policy is not None:
+                saved_source_policy = previous.get("cheap_source_review_policy")
+                if not isinstance(saved_source_policy, dict):
+                    raise ValueError(
+                        "ASv3Exp Cheap checkpoint is missing its source condition policy"
+                    )
+                cheap_source_review_policy.restore(saved_source_policy, ledger)
             if authority_requirements is not None and isinstance(
                 saved_requirements, dict
             ):
@@ -2062,10 +2612,13 @@ def run_asv3_loop(
             checkpoint_sequence = saved_sequence
             if parallel_answers is not None and question_research.answers:
                 question_research.assemble_retained_answers()
-        if governing_acquisitions is not None:
+        if (
+            governing_acquisitions is not None
+            or parallel_research
+            or cropped_repair_state is not None
+        ):
             publish_root_control()
         if parallel_research:
-            publish_root_control()
             checkpoint_writer = ParallelCheckpointWriter(
                 persist_checkpoint, capture=capture_parallel_checkpoint
             )

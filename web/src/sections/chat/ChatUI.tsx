@@ -34,6 +34,7 @@ interface RegenerationResearchModeInput {
   legalCompositeEnabled?: boolean;
   legalReviewEnabled?: boolean;
   supersearchEnabled?: boolean;
+  asv3ExpCroppedEnabled?: boolean;
   experimentalResearchEnabled: boolean;
   experimentalParallelResearchEnabled: boolean;
   experimentalGuardrailsEnabled: boolean;
@@ -49,6 +50,7 @@ export function getRegenerationResearchMode({
   legalCompositeEnabled = false,
   legalReviewEnabled = false,
   supersearchEnabled = false,
+  asv3ExpCroppedEnabled = false,
   experimentalResearchEnabled,
   experimentalParallelResearchEnabled,
   experimentalGuardrailsEnabled,
@@ -63,6 +65,7 @@ export function getRegenerationResearchMode({
     legalComposite: !resumingAsv3 && legalCompositeEnabled,
     ...(!resumingAsv3 && legalReviewEnabled ? { legalReview: true } : {}),
     supersearch: !resumingAsv3 && supersearchEnabled,
+    ...(asv3ExpCroppedEnabled && !resumingAsv3 ? { asv3ExpCropped: true } : {}),
     experimentalResearch: resumingAsv3 ? false : experimentalResearchEnabled,
     experimentalParallelResearch: resumingAsv3
       ? false
@@ -98,6 +101,7 @@ export interface ChatUIProps {
     legalComposite?: boolean;
     legalReview?: boolean;
     supersearch?: boolean;
+    asv3ExpCropped?: boolean;
     experimentalResearch?: boolean;
     experimentalParallelResearch?: boolean;
     experimentalGuardrails?: boolean;
@@ -122,6 +126,7 @@ export interface ChatUIProps {
   legalCompositeEnabled?: boolean;
   legalReviewEnabled?: boolean;
   supersearchEnabled?: boolean;
+  asv3ExpCroppedEnabled?: boolean;
   experimentalResearchEnabled?: boolean;
   experimentalParallelResearchEnabled?: boolean;
   experimentalGuardrailsEnabled?: boolean;
@@ -159,6 +164,7 @@ const ChatUI = React.memo(
     legalCompositeEnabled = false,
     legalReviewEnabled = false,
     supersearchEnabled = false,
+    asv3ExpCroppedEnabled = false,
     experimentalResearchEnabled = false,
     experimentalParallelResearchEnabled = false,
     experimentalGuardrailsEnabled = false,
@@ -197,6 +203,7 @@ const ChatUI = React.memo(
     const legalReviewEnabledRef = useRef(legalReviewEnabled);
     const legalCompositeEnabledRef = useRef(legalCompositeEnabled);
     const supersearchEnabledRef = useRef(supersearchEnabled);
+    const asv3ExpCroppedEnabledRef = useRef(asv3ExpCroppedEnabled);
     const experimentalResearchEnabledRef = useRef(experimentalResearchEnabled);
     const experimentalParallelResearchEnabledRef = useRef(
       experimentalParallelResearchEnabled
@@ -220,6 +227,7 @@ const ChatUI = React.memo(
     legalReviewEnabledRef.current = legalReviewEnabled;
     legalCompositeEnabledRef.current = legalCompositeEnabled;
     supersearchEnabledRef.current = supersearchEnabled;
+    asv3ExpCroppedEnabledRef.current = asv3ExpCroppedEnabled;
     experimentalResearchEnabledRef.current = experimentalResearchEnabled;
     experimentalParallelResearchEnabledRef.current =
       experimentalParallelResearchEnabled;
@@ -247,6 +255,7 @@ const ChatUI = React.memo(
             legalCompositeEnabled: legalCompositeEnabledRef.current,
             legalReviewEnabled: legalReviewEnabledRef.current,
             supersearchEnabled: supersearchEnabledRef.current,
+            asv3ExpCroppedEnabled: asv3ExpCroppedEnabledRef.current,
             experimentalResearchEnabled: experimentalResearchEnabledRef.current,
             experimentalParallelResearchEnabled:
               experimentalParallelResearchEnabledRef.current,
@@ -291,6 +300,8 @@ const ChatUI = React.memo(
           legalComposite:
             legalCompositeEnabledRef.current && !(models && models.length >= 2),
           supersearch: supersearchEnabledRef.current,
+          asv3ExpCropped:
+            asv3ExpCroppedEnabledRef.current && !(models && models.length >= 2),
           experimentalResearch:
             experimentalResearchEnabledRef.current &&
             !(models && models.length >= 2),

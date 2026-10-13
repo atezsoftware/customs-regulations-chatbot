@@ -4,14 +4,17 @@ import json
 import time
 from collections.abc import Callable, Iterator
 from contextlib import nullcontext
-from typing import TypedDict
+from typing import TypedDict, cast
 from uuid import uuid4
 
 from pydantic import JsonValue
 
 from onyx.asv3.candidate_audit import CandidateAudit, CandidateAuditRecord
 from onyx.asv3.corpus_tools import CorpusBroker
-from onyx.asv3.llm_adapter import model_slot, provider_retry_delay
+from onyx.asv3.cropped_cost_budget import CroppedCostBudget, CroppedCostTicket
+from onyx.asv3.cropped_research_limit import CroppedResearchLimit
+from onyx.asv3.cropped_transport import enforce_cropped_input_budget
+from onyx.asv3.llm_adapter import ResearchModel, model_slot, provider_retry_delay
 from onyx.asv3.models import (
     CapabilityCall,
     EvidenceItem,
@@ -41,8 +44,9 @@ from onyx.db.asv3_candidate_inventory import asv3_source_inventory_scope
 from onyx.db.asv3_corpus import bind_pc_corpus_scope
 from onyx.db.memory import UserMemoryContext
 from onyx.llm.interfaces import LLM, LLMConfig, LLMUserIdentity
-from onyx.llm.model_response import ModelResponse, ModelResponseStream
+from onyx.llm.model_response import ModelResponse, ModelResponseStream, Usage
 from onyx.llm.models import LanguageModelInput, ReasoningEffort, ToolChoiceOptions
+from onyx.llm.multi_llm import LitellmLLM
 from onyx.regulatory.structured_llm import is_retryable_provider_error
 from onyx.server.query_and_chat.placement import Placement
 from onyx.tools.constants import REGULATORY_MAX_SEARCH_QUERY_CHARS
@@ -147,6 +151,68 @@ class ScopedSearchLLM(LLM):
             return max(1, configured)
         return None
 
+    def _cropped_reservation(
+        self,
+        prompt: LanguageModelInput,
+        tools: list[dict] | None,
+        response_format: dict | None,
+        tool_choice: ToolChoiceOptions | None,
+        max_tokens: int | None,
+    ) -> tuple[CroppedCostBudget | None, CroppedCostTicket | None]:
+        if self.context.services.get("asv3_exp_cropped") is not True:
+            return None, None
+        counter = self.context.services.get("cropped_token_counter")
+        model = ResearchModel(
+            self.selected,
+            self.context,
+            token_counter=cast(Callable[[str], int], counter)
+            if callable(counter)
+            else None,
+            lean_native_mode=True,
+        )
+        incoming = model._input_cost(
+            prompt if isinstance(prompt, list) else [prompt],
+            cast(list[dict[str, JsonValue]], tools or []),
+        )
+        if response_format is not None:
+            incoming += model._tokens(json.dumps(response_format, ensure_ascii=False))
+        if tool_choice is not None:
+            incoming += model._tokens(json.dumps(tool_choice, ensure_ascii=False))
+        enforce_cropped_input_budget(incoming)
+        budget = self.context.services.get("cropped_cost_budget")
+        if not isinstance(budget, CroppedCostBudget):
+            raise RunStopped(
+                "Cropped secondary generation requires its shared cost budget"
+            )
+        return budget, budget.prepare(
+            self.config.model_name,
+            self.config.model_provider,
+            incoming,
+            max_tokens,
+            research=True,
+            owner=str(self.context.services.get("task_id", "coordinator")),
+            enforce=True,
+            phase="repair"
+            if self.context.services.get("cropped_cost_phase") == "repair"
+            else "research",
+            service_tier=getattr(self.config, "service_tier", None),
+            cache_writes_disabled=(
+                isinstance(self.selected, LitellmLLM)
+                and self.selected.cropped_native_cache_writes_disabled
+            ),
+        )
+
+    def _record_cropped_input(self, usage: Usage | None) -> None:
+        if self.context.services.get("asv3_exp_cropped") is not True or usage is None:
+            return
+        from onyx.asv3.cropped_task_packets import CroppedTaskPacketStore
+
+        packets = self.context.services.get("cropped_task_packet_store")
+        if isinstance(packets, CroppedTaskPacketStore):
+            packets.record_input(
+                str(self.context.services.get("task_id") or "root"), usage.prompt_tokens
+            )
+
     def invoke(
         self,
         prompt: LanguageModelInput,
@@ -170,16 +236,29 @@ class ScopedSearchLLM(LLM):
                 compatibility_attempts
             )
         for attempt in range(max_attempts):
+            budget: CroppedCostBudget | None = None
+            ticket: CroppedCostTicket | None = None
+            result: ModelResponse | None = None
+            failure: Exception | None = None
             try:
                 with model_slot(self.context, research=True):
                     self.context.consume_research_decision()
+                    budget, ticket = self._cropped_reservation(
+                        prompt,
+                        tools,
+                        structured_response_format,
+                        tool_choice,
+                        max_tokens,
+                    )
                     result = self.selected.invoke(
                         prompt=prompt,
                         tools=tools,
                         tool_choice=tool_choice,
                         structured_response_format=structured_response_format,
                         timeout_override=self.timeout(timeout_override),
-                        max_tokens=max_tokens,
+                        max_tokens=ticket.max_tokens
+                        if ticket is not None and ticket.bounded
+                        else max_tokens,
                         reasoning_effort=reasoning_effort,
                         user_identity=user_identity or self.user_identity,
                         use_streaming=use_streaming,
@@ -188,11 +267,21 @@ class ScopedSearchLLM(LLM):
                     self.context.check_research_active()
                     return result
             except Exception as error:
+                failure = error
                 if attempt == max_attempts - 1 or not is_retryable_provider_error(
                     error
                 ):
                     raise
                 self.wait_to_retry(error, attempt)
+            finally:
+                if budget is not None and ticket is not None:
+                    budget.complete(
+                        ticket,
+                        result.usage if result else None,
+                        failure,
+                        cache_write_partition_verified=False,
+                    )
+                    self._record_cropped_input(result.usage if result else None)
         raise AssertionError("Selected-provider retry loop did not terminate")
 
     def stream(
@@ -209,25 +298,41 @@ class ScopedSearchLLM(LLM):
         max_attempts = self.provider_max_attempts()
         for attempt in range(max_attempts):
             emitted = False
+            budget: CroppedCostBudget | None = None
+            ticket: CroppedCostTicket | None = None
+            usage = None
+            failure: Exception | None = None
             try:
                 with model_slot(self.context, research=True):
                     self.context.consume_research_decision()
+                    budget, ticket = self._cropped_reservation(
+                        prompt,
+                        tools,
+                        structured_response_format,
+                        tool_choice,
+                        max_tokens,
+                    )
                     for part in self.selected.stream(
                         prompt=prompt,
                         tools=tools,
                         tool_choice=tool_choice,
                         structured_response_format=structured_response_format,
                         timeout_override=self.timeout(timeout_override),
-                        max_tokens=max_tokens,
+                        max_tokens=ticket.max_tokens
+                        if ticket is not None and ticket.bounded
+                        else max_tokens,
                         reasoning_effort=reasoning_effort,
                         user_identity=user_identity or self.user_identity,
                     ):
                         self.context.check_research_active()
                         emitted = True
+                        if part.usage is not None:
+                            usage = part.usage
                         yield part
                     self.context.check_research_active()
                     return
             except Exception as error:
+                failure = error
                 if (
                     emitted
                     or attempt == max_attempts - 1
@@ -235,6 +340,12 @@ class ScopedSearchLLM(LLM):
                 ):
                     raise
                 self.wait_to_retry(error, attempt)
+            finally:
+                if budget is not None and ticket is not None:
+                    budget.complete(
+                        ticket, usage, failure, cache_write_partition_verified=False
+                    )
+                    self._record_cropped_input(usage)
 
 
 class ScopedSearchAdapter:
@@ -315,6 +426,8 @@ def build_search_adapter(
             ),
         ]
         scoped = tool.fork_for_independent_context(emitter=NullEmitter())
+        if context.services.get("asv3_exp_cropped") is True:
+            scoped.llm = ScopedSearchLLM(tool.llm, context, user_identity)
         scoped.user_selected_filters = broker.filters.model_copy(deep=True)
         forks = scoped.fork_for_query_batch(
             len(eligible),
@@ -349,6 +462,9 @@ def build_search_adapter(
                 summary="Search requires the actual conversation or researcher user/task history",
             )
         prepared = context.services.get("search_batch_tool")
+        controller = context.services.get("cropped_research_controller")
+        if isinstance(controller, CroppedResearchLimit):
+            controller.record_search(str(uuid4()))
         isolated = (
             prepared
             if isinstance(prepared, SearchTool)
@@ -560,7 +676,10 @@ def build_search_adapter(
             sort_keys=True,
         )
         with asv3_source_inventory_scope(
-            scope_key=scope_key, check_active=context.check_active
+            scope_key=scope_key,
+            check_active=context.check_active,
+            batch_temporal_reads=context.services.get("asv3_exp_cropped") is True,
+            batch_candidate_inventory=context.services.get("asv3_exp_cropped") is True,
         ):
             return search_in_scope(args, context)
 

@@ -1,0 +1,73 @@
+[
+  {
+    "mode": {},
+    "body": "{\"message\":\"Original question\",\"chat_session_id\":\"session-1\",\"parent_message_id\":88,\"internal_search_filters\":null,\"deep_research\":false,\"atez_search\":false,\"atez_search_v2\":false,\"atez_search_v3\":false,\"asv3_research_profile\":\"deep\",\"asv3_allow_external\":false,\"forced_tool_id\":null,\"llm_override\":{\"model_provider\":\"OpenAI\",\"model_provider_type\":\"openai\",\"model_version\":\"gpt-6.1-sol\"},\"llm_overrides\":null,\"origin\":\"unknown\",\"additional_context\":null}"
+  },
+  {
+    "mode": {
+      "atezSearchV3": true
+    },
+    "body": "{\"message\":\"Original question\",\"chat_session_id\":\"session-1\",\"parent_message_id\":88,\"internal_search_filters\":null,\"deep_research\":false,\"atez_search\":false,\"atez_search_v2\":false,\"atez_search_v3\":true,\"asv3_research_profile\":\"normal\",\"asv3_allow_external\":true,\"forced_tool_id\":null,\"llm_override\":{\"model_provider\":\"OpenAI\",\"model_provider_type\":\"openai\",\"model_version\":\"gpt-6.1-sol\"},\"llm_overrides\":null,\"origin\":\"unknown\",\"additional_context\":null}"
+  },
+  {
+    "mode": {
+      "deepResearch": true
+    },
+    "body": "{\"message\":\"Original question\",\"chat_session_id\":\"session-1\",\"parent_message_id\":88,\"internal_search_filters\":null,\"deep_research\":true,\"atez_search\":false,\"atez_search_v2\":false,\"atez_search_v3\":false,\"asv3_research_profile\":\"deep\",\"asv3_allow_external\":true,\"forced_tool_id\":null,\"llm_override\":{\"model_provider\":\"OpenAI\",\"model_provider_type\":\"openai\",\"model_version\":\"gpt-6.1-sol\"},\"llm_overrides\":null,\"origin\":\"unknown\",\"additional_context\":null}"
+  },
+  {
+    "mode": {
+      "experimentalResearch": true
+    },
+    "body": "{\"message\":\"Original question\",\"chat_session_id\":\"session-1\",\"parent_message_id\":88,\"internal_search_filters\":null,\"deep_research\":false,\"atez_search\":false,\"atez_search_v2\":false,\"atez_search_v3\":true,\"asv3_research_profile\":\"experimental\",\"asv3_allow_external\":true,\"forced_tool_id\":null,\"llm_override\":{\"model_provider\":\"OpenAI\",\"model_provider_type\":\"openai\",\"model_version\":\"gpt-6.1-sol\"},\"llm_overrides\":null,\"origin\":\"unknown\",\"additional_context\":null}"
+  },
+  {
+    "mode": {
+      "experimentalParallelResearch": true
+    },
+    "body": "{\"message\":\"Original question\",\"chat_session_id\":\"session-1\",\"parent_message_id\":88,\"internal_search_filters\":null,\"deep_research\":false,\"atez_search\":false,\"atez_search_v2\":false,\"atez_search_v3\":true,\"asv3_research_profile\":\"experimental\",\"asv3_parallel_research\":true,\"asv3_allow_external\":true,\"forced_tool_id\":null,\"llm_override\":{\"model_provider\":\"OpenAI\",\"model_provider_type\":\"openai\",\"model_version\":\"gpt-6.1-sol\"},\"llm_overrides\":null,\"origin\":\"unknown\",\"additional_context\":null}"
+  },
+  {
+    "mode": {
+      "experimentalGuardrails": true
+    },
+    "body": "{\"message\":\"Original question\",\"chat_session_id\":\"session-1\",\"parent_message_id\":88,\"internal_search_filters\":null,\"deep_research\":false,\"atez_search\":false,\"atez_search_v2\":false,\"atez_search_v3\":true,\"asv3_research_profile\":\"normal\",\"asv3_guarded_experimental\":true,\"asv3_allow_external\":true,\"forced_tool_id\":null,\"llm_override\":{\"model_provider\":\"OpenAI\",\"model_provider_type\":\"openai\",\"model_version\":\"gpt-6.1-sol\"},\"llm_overrides\":null,\"origin\":\"unknown\",\"additional_context\":null}"
+  },
+  {
+    "mode": {
+      "experimentalGuardrailsV2": true
+    },
+    "body": "{\"message\":\"Original question\",\"chat_session_id\":\"session-1\",\"parent_message_id\":88,\"internal_search_filters\":null,\"deep_research\":false,\"atez_search\":false,\"atez_search_v2\":false,\"atez_search_v3\":true,\"asv3_research_profile\":\"normal\",\"asv3_guardrails_v2\":true,\"asv3_allow_external\":true,\"forced_tool_id\":null,\"llm_override\":{\"model_provider\":\"OpenAI\",\"model_provider_type\":\"openai\",\"model_version\":\"gpt-6.1-sol\"},\"llm_overrides\":null,\"origin\":\"unknown\",\"additional_context\":null}"
+  },
+  {
+    "mode": {
+      "experimentalGuardrailsV3": true
+    },
+    "body": "{\"message\":\"Original question\",\"chat_session_id\":\"session-1\",\"parent_message_id\":88,\"internal_search_filters\":null,\"deep_research\":false,\"atez_search\":false,\"atez_search_v2\":false,\"atez_search_v3\":true,\"asv3_research_profile\":\"normal\",\"asv3_guardrails_v3\":true,\"asv3_allow_external\":true,\"forced_tool_id\":null,\"llm_override\":{\"model_provider\":\"OpenAI\",\"model_provider_type\":\"openai\",\"model_version\":\"gpt-6.1-sol\"},\"llm_overrides\":null,\"origin\":\"unknown\",\"additional_context\":null}"
+  },
+  {
+    "mode": {
+      "legalComposite": true
+    },
+    "body": "{\"message\":\"Original question\",\"chat_session_id\":\"session-1\",\"parent_message_id\":88,\"internal_search_filters\":null,\"deep_research\":false,\"atez_search\":false,\"atez_search_v2\":false,\"legal_composite\":true,\"atez_search_v3\":false,\"asv3_research_profile\":\"deep\",\"asv3_allow_external\":false,\"forced_tool_id\":null,\"llm_override\":{\"model_provider\":\"OpenAI\",\"model_provider_type\":\"openai\",\"model_version\":\"gpt-6.1-sol\"},\"llm_overrides\":null,\"origin\":\"unknown\",\"additional_context\":null}"
+  },
+  {
+    "mode": {
+      "supersearch": true
+    },
+    "body": "{\"message\":\"Original question\",\"chat_session_id\":\"session-1\",\"parent_message_id\":88,\"internal_search_filters\":null,\"deep_research\":false,\"atez_search\":false,\"atez_search_v2\":false,\"supersearch\":true,\"atez_search_v3\":false,\"asv3_research_profile\":\"deep\",\"asv3_allow_external\":false,\"allowed_tool_ids\":[],\"forced_tool_id\":null,\"llm_override\":{\"model_provider\":\"OpenAI\",\"model_provider_type\":\"openai\",\"model_version\":\"gpt-6.1-sol\"},\"llm_overrides\":null,\"origin\":\"unknown\",\"additional_context\":null}"
+  },
+  {
+    "mode": {
+      "legalReview": true
+    },
+    "body": "{\"message\":\"Original question\",\"chat_session_id\":\"session-1\",\"parent_message_id\":88,\"internal_search_filters\":null,\"deep_research\":false,\"atez_search\":false,\"atez_search_v2\":false,\"legal_review\":true,\"atez_search_v3\":false,\"asv3_research_profile\":\"deep\",\"asv3_allow_external\":false,\"allowed_tool_ids\":[],\"forced_tool_id\":null,\"llm_override\":null,\"llm_overrides\":null,\"origin\":\"unknown\",\"additional_context\":null}"
+  },
+  {
+    "mode": {
+      "atezSearchV3": true,
+      "asv3ResumeMessageId": 101
+    },
+    "body": "{\"message\":\"Original question\",\"chat_session_id\":\"session-1\",\"parent_message_id\":88,\"internal_search_filters\":null,\"deep_research\":false,\"atez_search\":false,\"atez_search_v2\":false,\"atez_search_v3\":true,\"asv3_research_profile\":\"normal\",\"asv3_resume_message_id\":101,\"asv3_allow_external\":true,\"forced_tool_id\":null,\"llm_override\":{\"model_provider\":\"OpenAI\",\"model_provider_type\":\"openai\",\"model_version\":\"gpt-6.1-sol\"},\"llm_overrides\":null,\"origin\":\"unknown\",\"additional_context\":null}"
+  }
+]

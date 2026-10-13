@@ -11,10 +11,16 @@ from pydantic import JsonValue
 from sqlalchemy import String, cast, literal, select
 from sqlalchemy.orm import Session
 
+from onyx.asv3.exp_cheap_checkpoint import (
+    EXP_CHEAP_CHECKPOINT_STORAGE_KEY,
+    compact_exp_cheap_checkpoint,
+    restore_exp_cheap_checkpoint,
+)
 from onyx.asv3.parallel_checkpoint import (
     compact_parallel_checkpoint,
     restore_parallel_checkpoint,
 )
+from onyx.asv3.workflow_variant import ASV3_EXP_CHEAP_VARIANT
 from onyx.configs.constants import MessageType
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.db.legal_review_checkpoint import (
@@ -30,15 +36,17 @@ MAX_DECODED_CHECKPOINT_BYTES = 8_000_000
 
 
 def encode_asv3_checkpoint(snapshot: dict[str, JsonValue]) -> str:
-    raw = json.dumps(
-        compact_parallel_checkpoint(
-            compact_legal_review_checkpoint(
-                {**snapshot, "version": ASV3_CHECKPOINT_VERSION}
-            ),
+    versioned = {**snapshot, "version": ASV3_CHECKPOINT_VERSION}
+    if snapshot.get("asv3_workflow_variant") == ASV3_EXP_CHEAP_VARIANT:
+        compact = compact_exp_cheap_checkpoint(
+            versioned, max_packed_bytes=MAX_DECODED_CHECKPOINT_BYTES
+        )
+    else:
+        compact = compact_parallel_checkpoint(
+            compact_legal_review_checkpoint(versioned),
             max_unit_bytes=MAX_DECODED_CHECKPOINT_BYTES,
-        ),
-        ensure_ascii=False,
-    ).encode()
+        )
+    raw = json.dumps(compact, ensure_ascii=False).encode()
     if len(raw) > MAX_DECODED_CHECKPOINT_BYTES:
         raise ValueError("ASv3 checkpoint exceeds its decoded payload budget")
     payload = json.dumps(
@@ -74,6 +82,12 @@ def decode_asv3_checkpoint(payload: str) -> dict[str, JsonValue]:
         data = json.loads(raw)
     if not isinstance(data, dict) or data.get("version") != ASV3_CHECKPOINT_VERSION:
         raise ValueError("Unsupported ASv3 checkpoint version")
+    if EXP_CHEAP_CHECKPOINT_STORAGE_KEY in data:
+        if len(payload.encode()) > MAX_CHECKPOINT_BYTES:
+            raise ValueError("ASv3 checkpoint exceeds its durable payload budget")
+        return restore_exp_cheap_checkpoint(
+            data, max_packed_bytes=MAX_DECODED_CHECKPOINT_BYTES
+        )
     return restore_legal_review_checkpoint(
         restore_parallel_checkpoint(data, max_unit_bytes=MAX_DECODED_CHECKPOINT_BYTES)
     )

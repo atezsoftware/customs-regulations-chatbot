@@ -44,6 +44,7 @@ from onyx.db.asv3_corpus import (
     find_related_sources,
     find_sources,
     iter_source_chunks_by_ids,
+    read_search_centers_batch,
     read_search_source_closures,
     read_source_chunks,
     require_source,
@@ -279,6 +280,9 @@ class CorpusBroker:
                 offset=offset,
                 limit=limit,
                 allow_numbered_title_fallback=self.allow_numbered_title_fallback,
+                allow_canonical_filename_fallback=(
+                    context.services.get("asv3_exp_cropped") is True
+                ),
                 allow_reversed_numbered_title_fallback=(
                     parallel_execution_enabled(context)
                 ),
@@ -560,6 +564,9 @@ class CorpusBroker:
                     chunk_ids=(chunk_id,),
                     index=self.query_indexes.get(source.id),
                     check_active=context.check_active,
+                    batch_publication_checks=(
+                        context.services.get("asv3_exp_cropped") is True
+                    ),
                 )
             )
         return source, next((chunk for chunk in chunks if chunk.id == chunk_id), None)
@@ -593,6 +600,9 @@ class CorpusBroker:
                 chunk_ids=ids,
                 index=self.query_indexes.get(source.id),
                 check_active=context.check_active,
+                batch_publication_checks=(
+                    context.services.get("asv3_exp_cropped") is True
+                ),
             )
 
     def provision_start(
@@ -613,6 +623,10 @@ class CorpusBroker:
                 article=article,
                 qualifier=qualifier,
                 index=self.query_indexes.get(source.id),
+                allow_canonical_text_fallback=(
+                    context.services.get("asv3_exp_cropped") is True
+                ),
+                check_active=context.check_active,
             )
 
     def revalidate_evidence(
@@ -679,6 +693,9 @@ class CorpusBroker:
                         chunk_ids=tuple(retained),
                         index=self.query_indexes.get(source.id),
                         check_active=context.check_active,
+                        batch_publication_checks=(
+                            context.services.get("asv3_exp_cropped") is True
+                        ),
                     )
                     seen: set[str] = set()
                     try:
@@ -795,6 +812,8 @@ class CorpusBroker:
                     "Retrieved section has no canonical center identity."
                 )
             grouped.setdefault(doc.document_id, []).append(doc)
+        if context.services.get("asv3_exp_cropped") is True:
+            return self._hydrate_search_centers_batch(grouped, context)
 
         def hydrate_source(
             source_id: str, centers: list[SearchDoc]
@@ -846,6 +865,9 @@ class CorpusBroker:
                         chunk_ids=center_ids,
                         index=self.query_indexes.get(source.id),
                         check_active=context.check_active,
+                        batch_publication_checks=(
+                            context.services.get("asv3_exp_cropped") is True
+                        ),
                     )
                     by_id: dict[str, CorpusChunk] = {}
                     try:
@@ -899,6 +921,78 @@ class CorpusBroker:
         hydrated: dict[tuple[str, int], list[EvidenceItem]] = {}
         for result in results:
             hydrated.update(result)
+        return hydrated
+
+    def _hydrate_search_centers_batch(
+        self, grouped: dict[str, list[SearchDoc]], context: RunContext
+    ) -> dict[tuple[str, int], list[EvidenceItem]]:
+        requests = {
+            UUID(source_id): tuple(
+                str(doc.metadata["regulatory_chunk_id"]) for doc in centers
+            )
+            for source_id, centers in grouped.items()
+        }
+        scope = current_asv3_source_inventory_scope()
+        captured: dict[UUID, PublicationIndexSnapshot] = {}
+        if scope is not None:
+            with scope.lock:
+                captured = {
+                    source_id: index
+                    for source_id, index in scope.query_indexes.items()
+                    if source_id in requests
+                }
+        with self._index_lock:
+            indexes = {
+                source_id: index
+                for source_id, index in self.query_indexes.items()
+                if source_id in requests
+            }
+        for source_id, index in captured.items():
+            previous = indexes.get(source_id)
+            if previous is not None and not previous.matches_temporal_index(index):
+                raise CorpusScopeUnavailable(
+                    "Retrieved source index differs from captured authority."
+                )
+            indexes[source_id] = index
+        reads = read_search_centers_batch(
+            user=self.user,
+            filters=self.filters,
+            source_chunk_ids=requests,
+            query_indexes=indexes,
+            check_active=context.check_active,
+        )
+        with self._index_lock:
+            for source_id, read in reads.items():
+                if read.index is not None:
+                    previous = self.query_indexes.get(source_id)
+                    if previous is not None and not previous.matches_temporal_index(
+                        read.index
+                    ):
+                        raise CorpusScopeUnavailable(
+                            "Retrieved source index differs from captured authority."
+                        )
+                    self.query_indexes[source_id] = read.index
+        context.check_active()
+        hydrated: dict[tuple[str, int], list[EvidenceItem]] = {}
+        for source_id, centers in grouped.items():
+            read = reads[UUID(source_id)]
+            by_id = {chunk.id: chunk for chunk in read.chunks}
+            for doc in centers:
+                chunk = by_id.get(str(doc.metadata["regulatory_chunk_id"]))
+                if chunk is None or chunk.projection_ordinal != doc.chunk_ind:
+                    hydrated[(doc.document_id, doc.chunk_ind)] = []
+                    continue
+                item = evidence_for_chunk(read.source, chunk)
+                item.metadata.update(
+                    retrieval_method="established_search_exact_original",
+                    article_closure_complete=False,
+                    section_context="not_inferred",
+                    additional_context="harness_controlled",
+                    follow_context_tool="read_provision",
+                    retrieved_projection_ordinal=doc.chunk_ind,
+                    retrieved_center=True,
+                )
+                hydrated[(doc.document_id, doc.chunk_ind)] = [item]
         return hydrated
 
     def hydrate_search_results(
@@ -1076,7 +1170,20 @@ def bounded_evidence(
     return items, False
 
 
-def article_identity(chunk: CorpusChunk) -> tuple[str, str | None] | None:
+def _ordered_source_read_data(
+    evidence: list[EvidenceItem], context: RunContext
+) -> dict[str, JsonValue]:
+    if context.services.get("asv3_exp_cropped") is True:
+        from onyx.asv3.cropped_article_bindings import ordered_source_read_data
+    else:
+        from onyx.asv3.article_bindings import ordered_source_read_data
+
+    return ordered_source_read_data(evidence, context)
+
+
+def article_identity(
+    chunk: CorpusChunk, *, allow_canonical_text_fallback: bool = False
+) -> tuple[str, str | None] | None:
     # Clause headings can refer to other laws; only structural headings own a chunk.
     for heading in reversed(chunk.heading_path):
         parsed = parse_regulatory_article_heading(heading)
@@ -1087,6 +1194,12 @@ def article_identity(chunk: CorpusChunk) -> tuple[str, str | None] | None:
         references = extract_regulatory_provision_references("MADDE " + article)
         if references:
             return references[0].article_no, references[0].qualifier
+    if allow_canonical_text_fallback:
+        from onyx.asv3.cropped_corpus_identity import verified_own_article_identity
+
+        own = verified_own_article_identity(chunk)
+        if own is not None:
+            return own
     return None
 
 
@@ -1174,14 +1287,31 @@ def build_corpus_specs(
         )
 
     def read_range(args: dict[str, JsonValue], context: RunContext) -> ToolOutcome:
-        from onyx.asv3.article_bindings import ordered_source_read_data
-
         source, chunks, more = broker.page(
             str(args["source_id"]),
             context,
             start=int(cast(int, args.get("start", 0))),
             limit=int(cast(int, args.get("limit", 30))),
         )
+        if context.services.get("asv3_exp_cropped") is True:
+            from onyx.asv3.cropped_source_navigation import (
+                prospective_cropped_source_navigation,
+            )
+
+            navigation = prospective_cropped_source_navigation(
+                source=source,
+                page=chunks,
+                has_more=more,
+                start=int(cast(int, args.get("start", 0))),
+                context=context,
+                scan_source=lambda: broker.iter_chunks(
+                    str(source.id),
+                    context,
+                    start=int(cast(int, args.get("start", 0))),
+                ),
+            )
+            if navigation is not None:
+                return navigation
         evidence, clipped = bounded_evidence(source, chunks)
         next_position = (
             chunks[len(evidence) - 1].position + 1
@@ -1199,7 +1329,7 @@ def build_corpus_specs(
                 "source_name": source.name,
                 "has_more": more or clipped,
                 "next_position": next_position,
-                **ordered_source_read_data(evidence, context),
+                **_ordered_source_read_data(evidence, context),
             },
             evidence=evidence,
         )
@@ -1263,6 +1393,11 @@ def build_corpus_specs(
                 "evidence_truncated": selection.clipped,
                 "article_closure_complete": False,
                 "sibling_selection_complete": bool(seed.heading_path),
+                **(
+                    _ordered_source_read_data(selection.items, context)
+                    if context.services.get("asv3_exp_cropped") is True
+                    else {}
+                ),
                 "selected_chunk_ids": list(selected_ids),
                 "delivered_chunk_ids": [item.chunk_id for item in selection.items],
                 "oversized_chunk_id": selected_ids[consumed]
@@ -1276,7 +1411,10 @@ def build_corpus_specs(
         )
 
     def provision(args: dict[str, JsonValue], context: RunContext) -> ToolOutcome:
-        from onyx.asv3.article_bindings import ordered_source_read_data
+        from onyx.asv3.cropped_corpus_identity import (
+            InsertedArticleRead,
+            verified_inserted_article_opening,
+        )
 
         requested = article_references(str(args["article"]))
         if len(requested) != 1:
@@ -1302,8 +1440,29 @@ def build_corpus_specs(
         clause = args.get("clause")
         subunit_verified = False
         reached = False
+        inserted_read: InsertedArticleRead | None = None
         for chunk in stream:
-            own = article_identity(chunk)
+            own = article_identity(
+                chunk,
+                allow_canonical_text_fallback=(
+                    context.services.get("asv3_exp_cropped") is True
+                ),
+            )
+            if inserted_read is not None:
+                continuation = inserted_read.consume(chunk)
+                if continuation != "continuation":
+                    stream.truncated = continuation != "boundary"
+                    stream.next_position = chunk.position
+                    break
+                own = target
+            elif (
+                not reached
+                and context.services.get("asv3_exp_cropped") is True
+                and own != target
+                and verified_inserted_article_opening(chunk, target)
+            ):
+                inserted_read = InsertedArticleRead(chunk, target)
+                own = target
             if reached and own is not None and own != target:
                 stream.truncated = False
                 stream.next_position = chunk.position
@@ -1313,7 +1472,11 @@ def build_corpus_specs(
             if identity == target:
                 reached = True
                 selection.add(chunk)
-                inherited_paragraph = chunk.metadata.get("paragraph_no")
+                inherited_paragraph = (
+                    inserted_read.paragraph
+                    if inserted_read is not None
+                    else chunk.metadata.get("paragraph_no")
+                )
                 if inherited_paragraph is None:
                     for heading in reversed(chunk.heading_path):
                         marker = re.match(r"^\s*(?:\((\d+)\)|(\d+)\.)\s", heading)
@@ -1330,7 +1493,10 @@ def build_corpus_specs(
         evidence, clipped = selection.items, selection.clipped
         more = stream.truncated
         partial = (
-            more or clipped or bool((paragraph or clause) and not subunit_verified)
+            more
+            or clipped
+            or bool((paragraph or clause) and not subunit_verified)
+            or (inserted_read is not None and not inserted_read.complete)
         )
         navigation = getattr(broker, "related_sources_for_provision", None)
         related = (
@@ -1353,7 +1519,7 @@ def build_corpus_specs(
                 "next_position": stream.next_position,
                 "evidence_next_position": selection.next_position,
                 "absence_proven": False,
-                **ordered_source_read_data(evidence, context),
+                **_ordered_source_read_data(evidence, context),
                 **(
                     {"related_source_candidates": related}
                     if related is not None

@@ -1,8 +1,10 @@
 """Exercise the replacement selection and checkpoint fences at their real boundaries."""
 
 import copy
+import json
 import math
 import time
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -16,6 +18,10 @@ from onyx.asv3.llm_adapter import ResearchModel
 from onyx.asv3.models import ASv3WorkflowSelection, RunContext
 from onyx.asv3.shared_reads import SharedReads
 from onyx.asv3.workflow_variant import (
+    ASV3_EXP_CHEAP_POLICY,
+    ASV3_EXP_CHEAP_VARIANT,
+    ASV3_EXP_CROPPED_POLICY,
+    ASV3_EXP_CROPPED_VARIANT,
     ASV3_GUARDED_EXPERIMENTAL_VARIANT,
     ASV3_GUARDRAILS_V3_POLICY,
     ASV3_GUARDRAILS_V3_VARIANT,
@@ -32,9 +38,14 @@ from onyx.llm.interfaces import LLM
 from onyx.prompts.asv3.tuned import TUNED_PROMPT_VERSION
 from onyx.server.query_and_chat.models import SendMessageRequest
 from onyx.tools.tool_implementations.search.search_tool import SearchTool
+from tests.unit.onyx.asv3.test_cropped_focused_repair_runtime import (
+    priced_scripted_provider as priced_scripted_provider,
+)
 from tests.unit.onyx.asv3.test_runtime import response, setup_run
 
-pytestmark = pytest.mark.usefixtures("empty_source_inventory")
+pytestmark = pytest.mark.usefixtures(
+    "empty_source_inventory", "priced_scripted_provider"
+)
 
 
 @pytest.mark.parametrize("profile", ["normal", "deep", "experimental"])
@@ -59,6 +70,84 @@ def test_workflow_selection_is_strict_and_immutable() -> None:
     with pytest.raises(ValidationError):
         ASv3WorkflowSelection.model_validate(
             {"research_profile": "normal", "parallel_research": 0}
+        )
+
+
+def test_cheap_selection_keeps_a_distinct_tuned_copy_identity() -> None:
+    selected = resolve_asv3_workflow("normal", False, exp_cheap=True)
+
+    assert selected.workflow_variant == ASV3_EXP_CHEAP_VARIANT
+    assert selected.research_profile == "normal"
+    assert selected.parallel_research is False
+    assert selected.selected_model_only
+    assert not selected.uses_guardrails
+    assert not selected.uses_guardrails_v2
+    assert not selected.uses_guardrails_v3
+    checkpoint = {
+        **checkpoint_variant_fields(selected.workflow_variant),
+        "research_profile": "normal",
+        "parallel_research": False,
+    }
+    assert checkpoint["asv3_workflow_policy"] == ASV3_EXP_CHEAP_POLICY
+    validate_asv3_variant_resume(selected.workflow_variant, checkpoint)
+    with pytest.raises(ValueError, match="same workflow variant"):
+        validate_asv3_variant_resume(ASV3_TUNED_VARIANT, checkpoint)
+    with pytest.raises(ValueError, match="same workflow variant"):
+        validate_asv3_variant_resume(
+            ASV3_EXP_CHEAP_VARIANT,
+            {
+                **checkpoint_variant_fields(ASV3_TUNED_VARIANT),
+                "research_profile": "normal",
+                "parallel_research": False,
+            },
+        )
+
+
+@pytest.mark.parametrize(
+    ("profile", "parallel", "guarded", "v2", "v3"),
+    [
+        ("normal", True, False, False, False),
+        ("experimental", False, False, False, False),
+        ("deep", False, False, False, False),
+        ("normal", False, True, False, False),
+        ("normal", False, False, True, False),
+        ("normal", False, False, False, True),
+    ],
+)
+def test_cheap_resolver_cannot_bypass_profile_or_variant_fences(
+    profile: str, parallel: bool, guarded: bool, v2: bool, v3: bool
+) -> None:
+    with pytest.raises(ValueError):
+        resolve_asv3_workflow(
+            profile,
+            parallel,
+            guarded_experimental=guarded,
+            guardrails_v2=v2,
+            guardrails_v3=v3,
+            exp_cheap=True,
+        )
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        {"asv3_workflow_policy": ASV3_TUNED_POLICY},
+        {"asv3_workflow_policy": None},
+        {"research_profile": "experimental"},
+        {"parallel_research": 0},
+        {"parallel_research": True},
+    ],
+)
+def test_cheap_checkpoint_requires_its_exact_policy(changed: dict[str, Any]) -> None:
+    with pytest.raises(ValueError):
+        validate_asv3_variant_resume(
+            ASV3_EXP_CHEAP_VARIANT,
+            {
+                **checkpoint_variant_fields(ASV3_EXP_CHEAP_VARIANT),
+                "research_profile": "normal",
+                "parallel_research": False,
+                **changed,
+            },
         )
 
 
@@ -303,8 +392,12 @@ def test_standard_keeps_historical_checkpoints_but_rejects_tuned() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "variant", [ASV3_TUNED_VARIANT, ASV3_EXP_CHEAP_VARIANT, ASV3_EXP_CROPPED_VARIANT]
+)
 def test_tuned_runtime_uses_normal_tools_and_selected_model_everywhere(
     monkeypatch: pytest.MonkeyPatch,
+    variant: str,
 ) -> None:
     kwargs, broker, selected, checkpoints, _queue = setup_run(monkeypatch)
     kwargs.pop("test_language")
@@ -334,7 +427,7 @@ def test_tuned_runtime_uses_normal_tools_and_selected_model_everywhere(
     kwargs.update(
         research_profile="normal",
         parallel_research=False,
-        workflow_variant=ASV3_TUNED_VARIANT,
+        workflow_variant=variant,
         research_llm=secondary,
         tools=[search],
     )
@@ -345,6 +438,9 @@ def test_tuned_runtime_uses_normal_tools_and_selected_model_everywhere(
     assert search.llm is secondary
     context = contexts[0]
     assert context.services["asv3_workflow_variant"] == ASV3_TUNED_VARIANT
+    assert context.services.get("asv3_exp_cheap", False) is (
+        variant == ASV3_EXP_CHEAP_VARIANT
+    )
     assert context.services["research_profile"] == "normal"
     assert context.services["experimental_parallel"] is False
     assert context.services["independent_question_mode"] is False
@@ -365,8 +461,184 @@ def test_tuned_runtime_uses_normal_tools_and_selected_model_everywhere(
     assert checkpoints[-1]["prompt_version"] == TUNED_PROMPT_VERSION
     assert checkpoints[-1]["research_profile"] == "normal"
     assert checkpoints[-1]["parallel_research"] is False
-    assert checkpoints[-1]["asv3_workflow_variant"] == ASV3_TUNED_VARIANT
-    assert checkpoints[-1]["asv3_workflow_policy"] == ASV3_TUNED_POLICY
+    assert checkpoints[-1]["asv3_workflow_variant"] == variant
+    assert checkpoints[-1]["asv3_workflow_policy"] == (
+        ASV3_EXP_CHEAP_POLICY
+        if variant == ASV3_EXP_CHEAP_VARIANT
+        else ASV3_EXP_CROPPED_POLICY
+        if variant == ASV3_EXP_CROPPED_VARIANT
+        else ASV3_TUNED_POLICY
+    )
+
+
+def test_cropped_adds_scoped_bindings_while_preserving_history_and_provider_controls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[dict[str, Any]] = []
+    contexts: list[RunContext] = []
+    original_model = runtime.ResearchModel
+    original_context = runtime.RunContext
+    shared_inputs: dict[str, Any] = {}
+    history = [
+        ChatMessageSimple(
+            message="Önceki soru", token_count=2, message_type=MessageType.USER
+        ),
+        ChatMessageSimple(
+            message="Önceki cevap", token_count=2, message_type=MessageType.ASSISTANT
+        ),
+        ChatMessageSimple(
+            message="Merhaba", token_count=1, message_type=MessageType.USER
+        ),
+    ]
+
+    def make_context(**options: Any) -> RunContext:
+        options.setdefault("run_id", "00000000-0000-4000-8000-000000000001")
+        return original_context(**options)
+
+    def observe_model(llm: LLM, context: RunContext, **options: Any) -> ResearchModel:
+        contexts.append(context)
+        assert options["research_llm"] is None
+        return original_model(llm, context, **options)
+
+    monkeypatch.setattr(runtime, "RunContext", make_context)
+    monkeypatch.setattr(runtime, "ResearchModel", observe_model)
+    monkeypatch.setattr(runtime, "time", SimpleNamespace(monotonic=lambda: 1000.0))
+    for variant in (
+        ASV3_TUNED_VARIANT,
+        ASV3_EXP_CHEAP_VARIANT,
+        ASV3_EXP_CROPPED_VARIANT,
+    ):
+        kwargs, _broker, selected, checkpoints, _queue = setup_run(monkeypatch)
+        kwargs.pop("test_language")
+        if not shared_inputs:
+            shared_inputs = {
+                name: kwargs[name]
+                for name in (
+                    "llm",
+                    "user",
+                    "filters",
+                    "user_identity",
+                    "chat_session_id",
+                    "user_message_id",
+                    "assistant_message_id",
+                    "reasoning_effort",
+                    "include_citations",
+                )
+            }
+        kwargs.update(shared_inputs)
+        kwargs.update(research_profile="normal", workflow_variant=variant)
+        kwargs["simple_chat_history"] = copy.deepcopy(history)
+        selected = shared_inputs["llm"]
+        selected.reset_mock()
+        selected.invoke.side_effect = lambda **_arguments: response(
+            calls=[
+                (
+                    "submit_answer",
+                    {"answer": "Merhaba!", "basis": "conversation", "_language": "tr"},
+                )
+            ]
+        )
+        runtime.run_asv3_loop(**kwargs)
+        assert selected.invoke.call_count == 1
+        requests.append(copy.deepcopy(selected.invoke.call_args.kwargs))
+        assert checkpoints[-1]["prompt_version"] == TUNED_PROMPT_VERSION
+        assert checkpoints[-1]["asv3_workflow_variant"] == variant
+
+    assert requests[0] == requests[1]
+
+    def canonical_content(value: Any) -> Any:
+        if isinstance(value, str):
+            try:
+                return json.loads(value)
+            except ValueError:
+                return value
+        if isinstance(value, list):
+            return [canonical_content(item) for item in value]
+        if isinstance(value, dict):
+            return {
+                key: canonical_content(item) if key in {"content", "text"} else item
+                for key, item in value.items()
+            }
+        return value
+
+    # Cropped may serialize JSON whitespace compactly; semantic inputs are exact.
+    logical_requests = [
+        {
+            **request,
+            "prompt": [
+                canonical_content(message.model_dump(mode="json"))
+                for message in request["prompt"]
+            ],
+        }
+        for request in (requests[0], requests[2])
+    ]
+    tuned_requested = logical_requests[0].pop("max_tokens")
+    cropped_allowed = logical_requests[1].pop("max_tokens")
+    assert isinstance(tuned_requested, int)
+    assert isinstance(cropped_allowed, int)
+    assert 2048 <= cropped_allowed <= tuned_requested
+    tuned_prompt = logical_requests[0].pop("prompt")
+    cropped_prompt = logical_requests[1].pop("prompt")
+    logical_requests[0].pop("tools")
+    logical_requests[1].pop("tools")
+    assert logical_requests[0] == logical_requests[1]
+    for message in history:
+        assert message.message in str(tuned_prompt)
+        assert message.message in str(cropped_prompt)
+    assert "question_bindings" in str(cropped_prompt)
+    assert "cropped_completion" in str(cropped_prompt)
+    assert "question_bindings" not in str(tuned_prompt)
+    assert contexts[2].services.get("asv3_exp_cheap", False) is False
+    assert "cheap_authority_policy" not in contexts[2].services
+    assert "cheap_source_review_policy" not in contexts[2].services
+    for context in contexts:
+        assert context.services["asv3_workflow_variant"] == ASV3_TUNED_VARIANT
+        from onyx.asv3.search_adapter import guarded_retrieval_overrides
+
+        retrieval = guarded_retrieval_overrides(
+            context.services["asv3_workflow_variant"]
+        )
+        assert retrieval is not None
+        assert retrieval.per_lane_num_hits == 256
+        assert retrieval.rerank_candidate_limit == 384
+        assert retrieval.regulatory_rerank_candidate_limit == 384
+        assert retrieval.max_llm_chunks == 50
+        assert context.services["asv3_legacy_search_payload"] is True
+        assert context.services["experimental_parallel"] is False
+        assert context.services["independent_question_mode"] is False
+        assert context.budget.unlimited_execution is True
+        assert math.isinf(context.deadline)
+        assert isinstance(context.services["legal_source_reviews"], LegalSourceReviews)
+        assert isinstance(context.services["shared_reads"], SharedReads)
+
+
+def test_cheap_runtime_binds_only_the_selected_model_cache_clone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from onyx.llm import multi_llm
+
+    kwargs, _broker, selected, checkpoints, _queue = setup_run(monkeypatch)
+    kwargs.pop("test_language")
+    kwargs.update(research_profile="normal", workflow_variant=ASV3_EXP_CHEAP_VARIANT)
+    bound = MagicMock(spec=LLM)
+    bound.config = selected.config.model_copy()
+    bound.invoke.side_effect = selected.invoke.side_effect
+    selected.with_asv3_exp_cheap_cache = MagicMock(return_value=bound)
+
+    class CacheBindable:
+        pass
+
+    selected.__class__ = CacheBindable
+    monkeypatch.setattr(multi_llm, "LitellmLLM", CacheBindable)
+
+    runtime.run_asv3_loop(**kwargs)
+
+    selected.with_asv3_exp_cheap_cache.assert_called_once_with()
+    selected.invoke.assert_not_called()
+    assert bound.invoke.call_count == 2
+    assert bound.config == selected.config
+    assert checkpoints[-1]["asv3_workflow_variant"] == ASV3_EXP_CHEAP_VARIANT
+    assert checkpoints[-1]["prompt_version"] == TUNED_PROMPT_VERSION
 
 
 def test_guarded_runtime_has_finite_cost_and_latency_limits(
@@ -534,12 +806,16 @@ def test_guardrails_v2_runtime_reviews_only_the_final_candidate(
     assert checkpoints[-1]["guardrails_v2_review"]["repair_output_tokens"] == 12
 
 
+@pytest.mark.parametrize(
+    "variant", [ASV3_TUNED_VARIANT, ASV3_EXP_CHEAP_VARIANT, ASV3_EXP_CROPPED_VARIANT]
+)
 def test_actual_runtime_resume_fences_before_saved_mode_override(
     monkeypatch: pytest.MonkeyPatch,
+    variant: str,
 ) -> None:
     kwargs, _broker, selected, checkpoints, _queue = setup_run(monkeypatch)
     kwargs.pop("test_language")
-    kwargs.update(research_profile="normal", workflow_variant=ASV3_TUNED_VARIANT)
+    kwargs.update(research_profile="normal", workflow_variant=variant)
     kwargs["simple_chat_history"] = [
         ChatMessageSimple(
             message="Merhaba", token_count=1, message_type=MessageType.USER
@@ -560,7 +836,16 @@ def test_actual_runtime_resume_fences_before_saved_mode_override(
     selected.reset_mock()
     runtime.run_asv3_loop(**kwargs)
     assert selected.invoke.call_count == 1
-    assert checkpoints[-1]["asv3_workflow_variant"] == ASV3_TUNED_VARIANT
+    assert checkpoints[-1]["asv3_workflow_variant"] == variant
+    assert checkpoints[-1]["prompt_version"] == TUNED_PROMPT_VERSION
+    invalid_policy = copy.deepcopy(tuned)
+    invalid_policy["asv3_workflow_policy"] = "different-policy"
+    monkeypatch.setattr(runtime, "load_asv3_checkpoint", lambda **_args: invalid_policy)
+    selected.reset_mock()
+    with pytest.raises(ValueError, match="checkpoint policy"):
+        runtime.run_asv3_loop(**kwargs)
+    selected.invoke.assert_not_called()
+    monkeypatch.setattr(runtime, "load_asv3_checkpoint", lambda **_args: tuned)
     kwargs["workflow_variant"] = ASV3_STANDARD_VARIANT
     selected.reset_mock()
     with pytest.raises(ValueError, match="same workflow variant"):

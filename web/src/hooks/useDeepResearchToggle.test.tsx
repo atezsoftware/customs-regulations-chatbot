@@ -7,6 +7,7 @@ describe("research mode selection", () => {
   it.each([
     ["toggleAtezSearchV3", "atezSearchV3Enabled"],
     ["toggleDeepResearch", "deepResearchEnabled"],
+    ["toggleAsv3ExpCropped", "asv3ExpCroppedEnabled"],
     ["toggleExperimentalResearch", "experimentalResearchEnabled"],
     [
       "toggleExperimentalParallelResearch",
@@ -305,4 +306,51 @@ describe("research mode selection", () => {
     rerender({ chatSessionId: "session-2", agentId: 1 });
     expect(result.current.experimentalParallelResearchEnabled).toBe(false);
   });
+});
+
+it.each([
+  ["toggleAtezSearchV3", "atezSearchV3Enabled"],
+  ["toggleDeepResearch", "deepResearchEnabled"],
+  ["toggleExperimentalResearch", "experimentalResearchEnabled"],
+  ["toggleExperimentalParallelResearch", "experimentalParallelResearchEnabled"],
+  ["toggleExperimentalGuardrails", "experimentalGuardrailsEnabled"],
+  ["toggleExperimentalGuardrailsV2", "experimentalGuardrailsV2Enabled"],
+  ["toggleExperimentalGuardrailsV3", "experimentalGuardrailsV3Enabled"],
+  ["toggleLegalReview", "legalReviewEnabled"],
+  ["toggleLegalComposite", "legalCompositeEnabled"],
+  ["toggleSupersearch", "supersearchEnabled"],
+] as const)(
+  "keeps Cropped exclusive with %s in both directions",
+  (toggle, enabled) => {
+    const { result } = renderHook(() =>
+      useDeepResearchToggle({ chatSessionId: null, agentId: 0 })
+    );
+    act(() => result.current[toggle]());
+    act(() => result.current.toggleAsv3ExpCropped());
+    expect(result.current.asv3ExpCroppedEnabled).toBe(true);
+    expect(result.current[enabled]).toBe(false);
+    act(() => result.current[toggle]());
+    expect(result.current[enabled]).toBe(true);
+    expect(result.current.asv3ExpCroppedEnabled).toBe(false);
+    act(() => result.current.toggleAsv3ExpCropped());
+    act(() => result.current.toggleAsv3ExpCropped());
+    expect(result.current.asv3ExpCroppedEnabled).toBe(false);
+  }
+);
+
+it("preserves Cropped on initial session creation and resets on navigation/agent changes", () => {
+  const { result, rerender } = renderHook(
+    ({ chatSessionId, agentId }) =>
+      useDeepResearchToggle({ chatSessionId, agentId }),
+    { initialProps: { chatSessionId: null as string | null, agentId: 0 } }
+  );
+  expect(result.current.asv3ExpCroppedEnabled).toBe(false);
+  act(() => result.current.toggleAsv3ExpCropped());
+  rerender({ chatSessionId: "session-1", agentId: 0 });
+  expect(result.current.asv3ExpCroppedEnabled).toBe(true);
+  rerender({ chatSessionId: "session-2", agentId: 0 });
+  expect(result.current.asv3ExpCroppedEnabled).toBe(false);
+  act(() => result.current.toggleAsv3ExpCropped());
+  rerender({ chatSessionId: "session-2", agentId: 1 });
+  expect(result.current.asv3ExpCroppedEnabled).toBe(false);
 });

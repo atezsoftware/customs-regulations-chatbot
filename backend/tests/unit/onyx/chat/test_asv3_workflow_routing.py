@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from onyx.asv3.workflow_variant import (
+    ASV3_EXP_CROPPED_VARIANT,
     ASV3_GUARDED_EXPERIMENTAL_VARIANT,
     ASV3_GUARDRAILS_V2_VARIANT,
     ASV3_GUARDRAILS_V3_VARIANT,
@@ -21,21 +22,50 @@ from tests.unit.onyx.chat.test_multi_model_streaming import _make_setup
 
 
 @pytest.mark.parametrize(
-    "requested_profile,parallel,guarded,deep,effective_profile,variant,lite",
+    "requested_profile,parallel,guarded,deep,cropped,effective_profile,variant,lite",
     [
-        ("experimental", True, False, False, "normal", ASV3_TUNED_VARIANT, False),
-        ("experimental", False, False, False, "experimental", "standard", False),
+        (
+            "experimental",
+            True,
+            False,
+            False,
+            False,
+            "normal",
+            ASV3_TUNED_VARIANT,
+            False,
+        ),
+        (
+            "normal",
+            False,
+            False,
+            False,
+            True,
+            "normal",
+            ASV3_EXP_CROPPED_VARIANT,
+            False,
+        ),
+        (
+            "experimental",
+            False,
+            False,
+            False,
+            False,
+            "experimental",
+            "standard",
+            False,
+        ),
         (
             "normal",
             False,
             True,
             False,
+            False,
             "normal",
             ASV3_GUARDED_EXPERIMENTAL_VARIANT,
             True,
         ),
-        ("normal", False, False, False, "normal", "standard", True),
-        ("deep", False, False, True, "deep", "standard", True),
+        ("normal", False, False, False, False, "normal", "standard", True),
+        ("deep", False, False, True, False, "deep", "standard", True),
     ],
 )
 def test_actual_chat_worker_maps_variant_before_lite_construction(
@@ -43,6 +73,7 @@ def test_actual_chat_worker_maps_variant_before_lite_construction(
     parallel: bool,
     guarded: bool,
     deep: bool,
+    cropped: bool,
     effective_profile: str,
     variant: str,
     lite: bool,
@@ -57,6 +88,7 @@ def test_actual_chat_worker_maps_variant_before_lite_construction(
             "asv3_research_profile": requested_profile,
             "asv3_parallel_research": parallel,
             "asv3_guarded_experimental": guarded,
+            "asv3_exp_cropped": cropped,
         }
     )
     selected = setup.llms[0]
@@ -114,10 +146,16 @@ def test_actual_chat_worker_maps_variant_before_lite_construction(
     assert construct.call_args.kwargs["llm"] is selected
     assert setup.new_msg_req.asv3_research_profile == requested_profile
     assert setup.new_msg_req.asv3_parallel_research is parallel
+    assert setup.new_msg_req.asv3_exp_cropped is cropped
 
 
 @pytest.mark.parametrize(
-    "saved_variant", ["standard", ASV3_GUARDED_EXPERIMENTAL_VARIANT]
+    "saved_variant",
+    [
+        "standard",
+        ASV3_GUARDED_EXPERIMENTAL_VARIANT,
+        ASV3_EXP_CROPPED_VARIANT,
+    ],
 )
 def test_actual_chat_worker_restores_variant_from_resume_checkpoint(
     saved_variant: str,
@@ -181,8 +219,11 @@ def test_actual_chat_worker_restores_variant_from_resume_checkpoint(
     assert invocations[0]["workflow_variant"] == saved_variant
     assert invocations[0]["research_profile"] == "normal"
     assert invocations[0]["parallel_research"] is False
-    assert invocations[0]["research_llm"] is secondary
-    lite_factory.assert_called_once()
+    cropped = saved_variant == ASV3_EXP_CROPPED_VARIANT
+    assert invocations[0]["research_llm"] is (None if cropped else secondary)
+    assert lite_factory.call_count == int(not cropped)
+    assert invocations[0]["repair_llm"] is None
+    assert setup.new_msg_req.asv3_exp_cropped is False
 
 
 def test_actual_chat_worker_builds_isolated_guardrails_v2_repair_model() -> None:

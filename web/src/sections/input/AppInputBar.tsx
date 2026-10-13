@@ -93,6 +93,7 @@ export interface AppInputBarProps {
   legalCompositeEnabled?: boolean;
   legalReviewEnabled?: boolean;
   supersearchEnabled?: boolean;
+  asv3ExpCroppedEnabled?: boolean;
   experimentalResearchEnabled?: boolean;
   experimentalParallelResearchEnabled?: boolean;
   experimentalGuardrailsEnabled?: boolean;
@@ -106,6 +107,7 @@ export interface AppInputBarProps {
   toggleLegalComposite?: () => void;
   toggleLegalReview?: () => void;
   toggleSupersearch?: () => void;
+  toggleAsv3ExpCropped?: () => void;
   toggleExperimentalResearch?: () => void;
   toggleExperimentalParallelResearch?: () => void;
   toggleExperimentalGuardrails?: () => void;
@@ -139,6 +141,7 @@ const AppInputBar = React.memo(
     legalCompositeEnabled = false,
     legalReviewEnabled = false,
     supersearchEnabled = false,
+    asv3ExpCroppedEnabled = false,
     experimentalResearchEnabled = false,
     experimentalParallelResearchEnabled = false,
     experimentalGuardrailsEnabled = false,
@@ -149,6 +152,7 @@ const AppInputBar = React.memo(
     toggleLegalComposite,
     toggleLegalReview,
     toggleSupersearch,
+    toggleAsv3ExpCropped,
     toggleExperimentalResearch,
     toggleExperimentalParallelResearch,
     toggleExperimentalGuardrails,
@@ -614,8 +618,8 @@ const AppInputBar = React.memo(
       currentProjectId,
     ]);
 
-    // Only ASv3 Tek Araştırma, Experimental ASv3 and Hukuki İnceleme (Flash)
-    // are offered in the UI. The other workflows stay in the codebase but are
+    // ASv3 Tek Araştırma, Experimental ASv3, exp cropped and Hukuki İnceleme
+    // (Flash) are offered in the UI. The other workflows stay in the codebase but are
     // hidden here; flip a flag to expose one again.
     const SHOW_SUPERSEARCH_BUTTON = false;
     const SHOW_LEGAL_COMPOSITE_BUTTON = false;
@@ -758,23 +762,25 @@ const AppInputBar = React.memo(
               </SelectButton>
             ) : (
               <>
-                {SHOW_SUPERSEARCH_BUTTON && showAtezSearch && toggleSupersearch && (
-                  <SelectButton
-                    disabled={disabled || isMultiModelActive}
-                    variant="select-light"
-                    icon={SvgSearch}
-                    onClick={toggleSupersearch}
-                    state={supersearchEnabled ? "selected" : "empty"}
-                    foldable={false}
-                    tooltip={
-                      isMultiModelActive
-                        ? "Supersearch tek modelle çalışır. Ek modelleri kaldırın."
-                        : "PC Külliyatı içinde hızlı ve kapsamlı araştırma"
-                    }
-                  >
-                    Supersearch
-                  </SelectButton>
-                )}
+                {SHOW_SUPERSEARCH_BUTTON &&
+                  showAtezSearch &&
+                  toggleSupersearch && (
+                    <SelectButton
+                      disabled={disabled || isMultiModelActive}
+                      variant="select-light"
+                      icon={SvgSearch}
+                      onClick={toggleSupersearch}
+                      state={supersearchEnabled ? "selected" : "empty"}
+                      foldable={false}
+                      tooltip={
+                        isMultiModelActive
+                          ? "Supersearch tek modelle çalışır. Ek modelleri kaldırın."
+                          : "PC Külliyatı içinde hızlı ve kapsamlı araştırma"
+                      }
+                    >
+                      Supersearch
+                    </SelectButton>
+                  )}
                 {showAtezSearch && toggleLegalReview && (
                   <SelectButton
                     disabled={disabled || isMultiModelActive}
@@ -792,23 +798,25 @@ const AppInputBar = React.memo(
                     Hukuki İnceleme (Flash)
                   </SelectButton>
                 )}
-                {SHOW_LEGAL_COMPOSITE_BUTTON && showAtezSearch && toggleLegalComposite && (
-                  <SelectButton
-                    disabled={disabled || isMultiModelActive}
-                    variant="select-light"
-                    icon={SvgSearch}
-                    onClick={toggleLegalComposite}
-                    state={legalCompositeEnabled ? "selected" : "empty"}
-                    foldable={false}
-                    tooltip={
-                      isMultiModelActive
-                        ? "Legal Composite runs with one model. Remove extra models to use it."
-                        : "Süre ve maliyet sınırlarıyla kaynak araştırması ve hukuki kanıt kontrolü"
-                    }
-                  >
-                    Legal Composite
-                  </SelectButton>
-                )}
+                {SHOW_LEGAL_COMPOSITE_BUTTON &&
+                  showAtezSearch &&
+                  toggleLegalComposite && (
+                    <SelectButton
+                      disabled={disabled || isMultiModelActive}
+                      variant="select-light"
+                      icon={SvgSearch}
+                      onClick={toggleLegalComposite}
+                      state={legalCompositeEnabled ? "selected" : "empty"}
+                      foldable={false}
+                      tooltip={
+                        isMultiModelActive
+                          ? "Legal Composite runs with one model. Remove extra models to use it."
+                          : "Süre ve maliyet sınırlarıyla kaynak araştırması ve hukuki kanıt kontrolü"
+                      }
+                    >
+                      Legal Composite
+                    </SelectButton>
+                  )}
                 {showAtezSearch && toggleAtezSearchV3 && (
                   <SelectButton
                     disabled={disabled || isMultiModelActive}
@@ -843,21 +851,40 @@ const AppInputBar = React.memo(
                     Deep Research
                   </SelectButton>
                 )}
-                {SHOW_EXPERIMENTAL_BUTTON && showAtezSearch && toggleExperimentalResearch && (
+                {SHOW_EXPERIMENTAL_BUTTON &&
+                  showAtezSearch &&
+                  toggleExperimentalResearch && (
+                    <SelectButton
+                      disabled={disabled || isMultiModelActive}
+                      variant="select-light"
+                      icon={SvgSparkle}
+                      onClick={toggleExperimentalResearch}
+                      state={experimentalResearchEnabled ? "selected" : "empty"}
+                      foldable={false}
+                      tooltip={
+                        isMultiModelActive
+                          ? "Experimental runs with one model. Remove extra models to use it."
+                          : "Kaynakların kapsamını ve tartışmalı hukuki etkileri inceleyen deneysel araştırma"
+                      }
+                    >
+                      Experimental
+                    </SelectButton>
+                  )}
+                {showAtezSearch && toggleAsv3ExpCropped && (
                   <SelectButton
                     disabled={disabled || isMultiModelActive}
                     variant="select-light"
                     icon={SvgSparkle}
-                    onClick={toggleExperimentalResearch}
-                    state={experimentalResearchEnabled ? "selected" : "empty"}
+                    onClick={toggleAsv3ExpCropped}
+                    state={asv3ExpCroppedEnabled ? "selected" : "empty"}
                     foldable={false}
                     tooltip={
                       isMultiModelActive
-                        ? "Experimental runs with one model. Remove extra models to use it."
-                        : "Kaynakların kapsamını ve tartışmalı hukuki etkileri inceleyen deneysel araştırma"
+                        ? "exp cropped tek modelle çalışır. Ek modelleri kaldırın."
+                        : "Experimental ASv3 kopyası; mevcut arama ve kaynak ayarlarıyla çalışır"
                     }
                   >
-                    Experimental
+                    exp cropped
                   </SelectButton>
                 )}
                 {showAtezSearch && toggleExperimentalParallelResearch && (
@@ -879,61 +906,69 @@ const AppInputBar = React.memo(
                     Experimental ASv3
                   </SelectButton>
                 )}
-                {SHOW_GUARDRAILS_BUTTONS && showAtezSearch && toggleExperimentalGuardrails && (
-                  <SelectButton
-                    disabled={disabled || isMultiModelActive}
-                    variant="select-light"
-                    icon={SvgSparkle}
-                    onClick={toggleExperimentalGuardrails}
-                    state={experimentalGuardrailsEnabled ? "selected" : "empty"}
-                    foldable={false}
-                    tooltip={
-                      isMultiModelActive
-                        ? "Experimental Guardrails runs with one model. Remove extra models to use it."
-                        : "Süre, maliyet ve yeniden deneme sınırları olan deneysel ASv3 akışı"
-                    }
-                  >
-                    Experimental Guardrails
-                  </SelectButton>
-                )}
-                {SHOW_GUARDRAILS_BUTTONS && showAtezSearch && toggleExperimentalGuardrailsV2 && (
-                  <SelectButton
-                    disabled={disabled || isMultiModelActive}
-                    variant="select-light"
-                    icon={SvgSparkle}
-                    onClick={toggleExperimentalGuardrailsV2}
-                    state={
-                      experimentalGuardrailsV2Enabled ? "selected" : "empty"
-                    }
-                    foldable={false}
-                    tooltip={
-                      isMultiModelActive
-                        ? "Experimental Guardrails v2 runs with one model. Remove extra models to use it."
-                        : "ASv3 Tek Araştırma, JEV kontrolü ve gerektiğinde tek Gemini onarımı"
-                    }
-                  >
-                    Experimental Guardrails v2
-                  </SelectButton>
-                )}
-                {SHOW_GUARDRAILS_BUTTONS && showAtezSearch && toggleExperimentalGuardrailsV3 && (
-                  <SelectButton
-                    disabled={disabled || isMultiModelActive}
-                    variant="select-light"
-                    icon={SvgSparkle}
-                    onClick={toggleExperimentalGuardrailsV3}
-                    state={
-                      experimentalGuardrailsV3Enabled ? "selected" : "empty"
-                    }
-                    foldable={false}
-                    tooltip={
-                      isMultiModelActive
-                        ? "Experimental Guardrails v3 runs with one model. Remove extra models to use it."
-                        : "ASv3 Tek Araştırma, outcome ve kaynak kontrolü, gerektiğinde tek onarım"
-                    }
-                  >
-                    Experimental Guardrails v3
-                  </SelectButton>
-                )}
+                {SHOW_GUARDRAILS_BUTTONS &&
+                  showAtezSearch &&
+                  toggleExperimentalGuardrails && (
+                    <SelectButton
+                      disabled={disabled || isMultiModelActive}
+                      variant="select-light"
+                      icon={SvgSparkle}
+                      onClick={toggleExperimentalGuardrails}
+                      state={
+                        experimentalGuardrailsEnabled ? "selected" : "empty"
+                      }
+                      foldable={false}
+                      tooltip={
+                        isMultiModelActive
+                          ? "Experimental Guardrails runs with one model. Remove extra models to use it."
+                          : "Süre, maliyet ve yeniden deneme sınırları olan deneysel ASv3 akışı"
+                      }
+                    >
+                      Experimental Guardrails
+                    </SelectButton>
+                  )}
+                {SHOW_GUARDRAILS_BUTTONS &&
+                  showAtezSearch &&
+                  toggleExperimentalGuardrailsV2 && (
+                    <SelectButton
+                      disabled={disabled || isMultiModelActive}
+                      variant="select-light"
+                      icon={SvgSparkle}
+                      onClick={toggleExperimentalGuardrailsV2}
+                      state={
+                        experimentalGuardrailsV2Enabled ? "selected" : "empty"
+                      }
+                      foldable={false}
+                      tooltip={
+                        isMultiModelActive
+                          ? "Experimental Guardrails v2 runs with one model. Remove extra models to use it."
+                          : "ASv3 Tek Araştırma, JEV kontrolü ve gerektiğinde tek Gemini onarımı"
+                      }
+                    >
+                      Experimental Guardrails v2
+                    </SelectButton>
+                  )}
+                {SHOW_GUARDRAILS_BUTTONS &&
+                  showAtezSearch &&
+                  toggleExperimentalGuardrailsV3 && (
+                    <SelectButton
+                      disabled={disabled || isMultiModelActive}
+                      variant="select-light"
+                      icon={SvgSparkle}
+                      onClick={toggleExperimentalGuardrailsV3}
+                      state={
+                        experimentalGuardrailsV3Enabled ? "selected" : "empty"
+                      }
+                      foldable={false}
+                      tooltip={
+                        isMultiModelActive
+                          ? "Experimental Guardrails v3 runs with one model. Remove extra models to use it."
+                          : "ASv3 Tek Araştırma, outcome ve kaynak kontrolü, gerektiğinde tek onarım"
+                      }
+                    >
+                      Experimental Guardrails v3
+                    </SelectButton>
+                  )}
               </>
             )}
 

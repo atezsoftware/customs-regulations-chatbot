@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import contextvars
 import copy
+import hashlib
 import json
+import re
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
@@ -12,6 +14,19 @@ from pydantic import JsonValue
 
 from onyx.asv3.artifacts import ArtifactStore, artifact_reference, compact_json
 from onyx.asv3.citation_numbers import extract_citation_numbers
+from onyx.asv3.cropped_article_bindings import (
+    CroppedArticleBindings,
+    without_ordered_source_read_data,
+)
+from onyx.asv3.cropped_cost_budget import CroppedResearchBudgetReached
+from onyx.asv3.cropped_crossrefs import CroppedCrossReferencePolicy
+from onyx.asv3.cropped_research_limit import CroppedResearchLimit
+from onyx.asv3.cropped_worker_handoff import (
+    WORKER_HANDOFF_REASON,
+    CroppedWorkerHandoff,
+    contains_worker_handoff,
+    should_handoff_worker,
+)
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.models import (
     CapabilityCall,
@@ -26,6 +41,7 @@ from onyx.asv3.models import (
     ToolReceipt,
 )
 from onyx.asv3.native_cache_projection import lossless_original_transport_enabled
+from onyx.asv3.outcome_map import OutcomeMap
 from onyx.asv3.parallel_execution import parallel_execution_enabled
 from onyx.asv3.progress import ProgressReporter, action_narration, public_action_id
 from onyx.asv3.registry import CapabilityRegistry
@@ -64,6 +80,7 @@ class Harness:
         report_started: bool = True,
         on_decision: Callable[[Decision], None] | None = None,
         checkpoint_snapshot: Callable[[], dict[str, JsonValue]] | None = None,
+        repair_decision: Callable[[Harness], Decision] | None = None,
     ) -> None:
         self.request = request
         self.context = context
@@ -84,6 +101,7 @@ class Harness:
         self.report_terminal = report_terminal
         self.report_started = report_started
         self.on_decision = on_decision
+        self.repair_decision = repair_decision
         artifacts = self.context.services.get("artifacts")
         self.artifacts = (
             artifacts if isinstance(artifacts, ArtifactStore) else ArtifactStore()
@@ -98,6 +116,8 @@ class Harness:
         self.publication_gap: ToolOutcome | None = None
         self._blocked_attempts: dict[str, int] = {}
         self._unavailable_governing_attempts: dict[str, int] = {}
+        self._cheap_rejection_fingerprint: str | None = None
+        self._cheap_rejection_attempts = 0
         self._seen_calls: set[str] = set()
         self._seen_failures: set[str] = set()
         self._committed_calls: set[str] = set()
@@ -114,10 +134,22 @@ class Harness:
         self.context.services["registry"] = registry
         self.context.services["evidence"] = self.evidence
 
-    @staticmethod
-    def _receipt_reference(receipt: ToolReceipt) -> ToolReceipt:
-        data = compact_json(receipt.outcome.data)
+    def _receipt_data(
+        self, receipt: ToolReceipt, *, max_chars: int = 12000
+    ) -> dict[str, JsonValue]:
+        data = (
+            copy.deepcopy(receipt.outcome.data)
+            if self.context.services.get("asv3_exp_cropped") is True
+            and contains_worker_handoff(
+                receipt.outcome.data, ledger=self.evidence, context=self.context
+            )
+            else compact_json(receipt.outcome.data, max_chars=max_chars)
+        )
         assert isinstance(data, dict)
+        return data
+
+    def _receipt_reference(self, receipt: ToolReceipt) -> ToolReceipt:
+        data = self._receipt_data(receipt)
         return receipt.model_copy(
             update={
                 "outcome": receipt.outcome.model_copy(
@@ -166,6 +198,7 @@ class Harness:
                 state := self.context.services.get("research_state"), ResearchState
             )
             else {},
+            **self._cheap_retry_checkpoint(),
         }
 
     def snapshot_control(self) -> dict[str, JsonValue]:
@@ -196,7 +229,114 @@ class Harness:
                 else None,
                 "working_memory": self.working_memory.export(),
                 "evidence_working_set": self.evidence_working_set.export(),
+                **self._cheap_retry_checkpoint(),
             }
+        )
+
+    def _cheap_retry_checkpoint(self) -> dict[str, JsonValue]:
+        if self.context.services.get("asv3_exp_cheap") is not True:
+            return {}
+        return {
+            "cheap_publication_retry": {
+                "version": 1,
+                "fingerprint": self._cheap_rejection_fingerprint,
+                "attempts": self._cheap_rejection_attempts,
+            }
+        }
+
+    def _cheap_publication_fingerprint(self, candidate: str, gap: ToolOutcome) -> str:
+        originals: list[JsonValue] = []
+        for number in self.evidence.citation_numbers():
+            item = self.evidence.get(number)
+            assert item is not None
+            originals.append(
+                {
+                    "citation": number,
+                    "source_id": item.source_id,
+                    "chunk_id": item.chunk_id,
+                    "text_hash": item.text_hash,
+                    "metadata": item.metadata,
+                    "search_doc": {
+                        "document_id": item.search_doc.document_id,
+                        "source_type": item.search_doc.source_type.value,
+                        "metadata": item.search_doc.metadata,
+                    }
+                    if item.search_doc is not None
+                    else None,
+                }
+            )
+        outcomes = self.context.services.get("outcome_map")
+        semantic_outcomes = (
+            outcomes.export() if isinstance(outcomes, OutcomeMap) else {}
+        )
+        semantic_outcomes.pop("revision", None)
+        research = self.context.services.get("research_state")
+        semantic_research = (
+            research.export() if isinstance(research, ResearchState) else {}
+        )
+        semantic_research.pop("revision", None)
+        observations = {
+            json.dumps(
+                {
+                    "name": receipt.call.name,
+                    "arguments": {
+                        key: value
+                        for key, value in receipt.call.arguments.items()
+                        if key not in {"_public_update", "_language", "_notifications"}
+                    },
+                    "outcome": receipt.outcome.model_dump(mode="json"),
+                },
+                sort_keys=True,
+                ensure_ascii=False,
+            )
+            for receipt in self.receipts
+            if receipt.call.name
+            not in {
+                "finalization_status",
+                "submit_answer",
+                "submit_partial_answer",
+                "submit_retained_answer",
+                "submit_retained_partial_answer",
+                "assemble_answers",
+            }
+        }
+        return hashlib.sha256(
+            json.dumps(
+                {
+                    "candidate": candidate,
+                    "gap": gap.model_dump(mode="json"),
+                    "originals": originals,
+                    "facts": self.facts,
+                    "questions": self.questions,
+                    "outcomes": semantic_outcomes,
+                    "research": semantic_research,
+                    "observations": sorted(observations),
+                },
+                sort_keys=True,
+                ensure_ascii=False,
+            ).encode()
+        ).hexdigest()
+
+    def _remember_cheap_rejection(self, candidate: str, gap: ToolOutcome) -> None:
+        if self.context.services.get("asv3_exp_cheap") is not True:
+            return
+        fingerprint = self._cheap_publication_fingerprint(candidate, gap)
+        if fingerprint != self._cheap_rejection_fingerprint:
+            self._cheap_rejection_fingerprint = fingerprint
+            self._cheap_rejection_attempts = 0
+        # Initial rejection, two fresh repairs and one ordinary-context fallback.
+        self._cheap_rejection_attempts = min(4, self._cheap_rejection_attempts + 1)
+
+    def _cheap_rejection_exhausted(self) -> bool:
+        return (
+            self.context.services.get("asv3_exp_cheap") is True
+            and self._cheap_rejection_attempts >= 4
+            and self.last_draft is not None
+            and self.publication_gap is not None
+            and self._cheap_rejection_fingerprint
+            == self._cheap_publication_fingerprint(
+                self.last_draft, self.publication_gap
+            )
         )
 
     def restore(self, snapshot: dict[str, JsonValue]) -> None:
@@ -241,6 +381,29 @@ class Harness:
             ):
                 raise ValueError("Invalid unavailable governing submission checkpoint")
             self._unavailable_governing_attempts = cast(dict[str, int], attempts)
+        if self.context.services.get("asv3_exp_cheap") is True:
+            retries = snapshot.get("cheap_publication_retry")
+            if not isinstance(retries, dict):
+                raise ValueError("Cheap publication retry checkpoint is missing")
+            fingerprint, attempts = retries.get("fingerprint"), retries.get("attempts")
+            if (
+                set(retries) != {"version", "fingerprint", "attempts"}
+                or type(retries.get("version")) is not int
+                or retries.get("version") != 1
+                or type(attempts) is not int
+                or not 0 <= attempts <= 4
+                or (
+                    fingerprint is not None
+                    and (
+                        not isinstance(fingerprint, str)
+                        or re.fullmatch(r"[a-f0-9]{64}", fingerprint) is None
+                    )
+                )
+                or (fingerprint is None and attempts != 0)
+            ):
+                raise ValueError("Invalid Cheap publication retry checkpoint")
+            self._cheap_rejection_fingerprint = cast(str | None, fingerprint)
+            self._cheap_rejection_attempts = attempts
         evidence = snapshot.get("evidence")
         if not isinstance(evidence, dict):
             raise ValueError("Checkpoint evidence is missing")
@@ -332,6 +495,19 @@ class Harness:
                         "write_seconds": time.monotonic() - snapshot_finished,
                     }
 
+    def save_repair_checkpoint(self) -> None:
+        """Persist a reserved focused attempt before any research or writer call."""
+        if self.checkpoint is not None:
+            self._save()
+        else:
+            callback = self.context.services.get("cropped_repair_checkpoint")
+            if callable(callback):
+                callback()
+
+    def dispatch_repair_reads(self, calls: list[CapabilityCall]) -> list[ToolReceipt]:
+        """Keep targeted research on the ordinary ACL, receipt and evidence path."""
+        return self._dispatch(calls)
+
     def view(self) -> HarnessView:
         from onyx.asv3.supplemental_tools import ScenarioState
 
@@ -393,7 +569,7 @@ class Harness:
         receipts: list[ToolReceipt] = []
         remaining = self.max_context_chars // 3
         for receipt in reversed(self.receipts):
-            compacted = compact_json(receipt.outcome.data, max_chars=3000)
+            compacted = self._receipt_data(receipt, max_chars=3000)
             assert isinstance(compacted, dict)
             bounded = receipt.model_copy(
                 deep=False,
@@ -417,7 +593,7 @@ class Harness:
                 break
             remaining -= size
             receipts.append(bounded)
-        return HarnessView(
+        view = HarnessView(
             request=self.request,
             questions=list(self.questions),
             facts=list(self.facts),
@@ -438,6 +614,18 @@ class Harness:
                 else None
             ),
         )
+
+        if self.context.services.get("asv3_exp_cropped") is True and isinstance(
+            state, ResearchState
+        ):
+            from onyx.asv3.cropped_task_packets import packet_for_view
+
+            projection = packet_for_view(
+                view, self.receipts, state, self.context, self.evidence
+            )
+            if projection is not None:
+                view, _manifest = projection
+        return view
 
     def _trim_turns(self) -> None:
         if self.context.services.get("lean_native_mode"):
@@ -610,6 +798,19 @@ class Harness:
         if isinstance(state, ResearchState):
             for need_id in need_ids:
                 state.attach(need_id, receipt.evidence_ids)
+        bindings = self.context.services.get("cropped_article_bindings")
+        if self.context.services.get("asv3_exp_cropped") is True and isinstance(
+            bindings, CroppedArticleBindings
+        ):
+            bindings.record_receipt(receipt, self.context, self.evidence)
+            receipt.outcome.data = without_ordered_source_read_data(
+                receipt.outcome.data
+            )
+        crossrefs = self.context.services.get("cropped_cross_references")
+        if self.context.services.get("asv3_exp_cropped") is True and isinstance(
+            crossrefs, CroppedCrossReferencePolicy
+        ):
+            crossrefs.observe(receipt, self.context, self.evidence)
         if (
             receipt.outcome.data.get("invalid_outcome_metadata") is not True
             and receipt.outcome.data.get("research_binding_error") is not True
@@ -625,7 +826,7 @@ class Harness:
         receipt.outcome.artifacts = self.artifacts.add(
             receipt.outcome.artifacts, self.context
         )
-        compacted = compact_json(receipt.outcome.data)
+        compacted = self._receipt_data(receipt)
         assert isinstance(compacted, dict)
         receipt.outcome.data = compacted
         candidate = receipt.call.arguments.get("answer")
@@ -646,6 +847,7 @@ class Harness:
         ):
             self.last_draft = candidate
             self.publication_gap = receipt.outcome
+            self._remember_cheap_rejection(candidate, receipt.outcome)
         self.context.check_active()
         if self.on_receipt:
             self.on_receipt(receipt)
@@ -655,6 +857,10 @@ class Harness:
         self._seen_calls.add(receipt.call.call_id)
         self._committed_calls.add(receipt.call.call_id)
         self._pending_calls.pop(receipt.call.call_id, None)
+        if self.context.services.get("asv3_exp_cropped") is True:
+            from onyx.asv3.cropped_composed_topics import commit_cropped_composed_topics
+
+            commit_cropped_composed_topics(receipt, self.context, self.evidence)
         if (
             receipt.evidence_ids
             and receipt.outcome.status in {OutcomeStatus.FOUND, OutcomeStatus.PARTIAL}
@@ -783,7 +989,10 @@ class Harness:
         self, call: CapabilityCall, signature: str
     ) -> bool:
         """A newly delivered original can invalidate a cached delivery rejection."""
-        if not parallel_execution_enabled(self.context) or call.name not in {
+        if (
+            not parallel_execution_enabled(self.context)
+            and self.context.services.get("asv3_exp_cheap") is not True
+        ) or call.name not in {
             "submit_answer",
             "submit_partial_answer",
             "assemble_answers",
@@ -991,6 +1200,36 @@ class Harness:
                         ),
                     )
                     continue
+                registry_cached = self.registry.cached_cropped_read(call, self.context)
+                if registry_cached is not None:
+                    ready[call.call_id] = ToolReceipt(
+                        call=call, elapsed_seconds=0, outcome=registry_cached
+                    )
+                    continue
+                cropped_limit = self.context.services.get("cropped_research_controller")
+                if (
+                    self.context.services.get("asv3_exp_cropped") is True
+                    and isinstance(cropped_limit, CroppedResearchLimit)
+                    and call.argument_error is None
+                ):
+                    cropped_limit.check_context(self.context)
+                    admission = cropped_limit.admit_tool(
+                        call.name,
+                        call.arguments,
+                        critical_target_key=hashlib.sha256(
+                            self._read_signature(call).encode("utf-8")
+                        ).hexdigest(),
+                        reserve=False,
+                    )
+                    if not admission.allowed and admission.reason != (
+                        "critical_read_already_reserved_reuse_recorded_evidence"
+                    ):
+                        ready[call.call_id] = ToolReceipt(
+                            call=call,
+                            elapsed_seconds=0,
+                            outcome=cropped_limit.blocked_tool(admission),
+                        )
+                        continue
                 self._seen_calls.add(call.call_id)
                 arguments = compact_json(call.arguments, max_chars=1500)
                 assert isinstance(arguments, dict)
@@ -1003,17 +1242,40 @@ class Harness:
             self._save()
             prepared_searches: dict[str, object] = {}
             prepare_search_batch = self.context.services.get("prepare_search_batch")
-            if callable(prepare_search_batch):
-                batch = prepare_search_batch(
-                    [
-                        call
-                        for call in calls
-                        if call.call_id not in ready
-                        and call.name == "search_corpus"
-                        and call.argument_error is None
-                    ],
-                    self.context,
-                )
+            search_calls = [
+                call
+                for call in calls
+                if call.call_id not in ready
+                and call.name == "search_corpus"
+                and call.argument_error is None
+            ]
+            if callable(prepare_search_batch) and (
+                search_calls
+                or self.context.services.get("asv3_exp_cropped") is not True
+            ):
+                try:
+                    batch = prepare_search_batch(
+                        search_calls,
+                        self.context,
+                    )
+                except CroppedResearchBudgetReached as error:
+                    if self.context.services.get("asv3_exp_cropped") is not True:
+                        raise
+                    batch = {}
+                    for call in search_calls:
+                        ready[call.call_id] = ToolReceipt(
+                            call=call,
+                            elapsed_seconds=0,
+                            outcome=ToolOutcome(
+                                status=OutcomeStatus.PARTIAL,
+                                summary=str(error),
+                                data={
+                                    "blocked_by_research_limit": True,
+                                    "not_read": True,
+                                    "absence_proven": False,
+                                },
+                            ),
+                        )
                 if isinstance(batch, dict):
                     prepared_searches = batch
             for call in calls:
@@ -1022,6 +1284,10 @@ class Harness:
                     continue
                 child = self.context.child()
                 child.services["applied_outcome_metadata_call"] = call
+                if self.context.services.get("asv3_exp_cropped") is True:
+                    child.services["cropped_tool_checkpoint"] = (
+                        self.save_repair_checkpoint
+                    )
                 completed = self.context.services.get("hosted_terminal_completed")
                 if (
                     parallel_execution_enabled(self.context)
@@ -1323,6 +1589,11 @@ class Harness:
                         break
                     self.publication_gap = blocked
                     self.context.services.pop("assembled_answer", None)
+                if should_handoff_worker(self.context):
+                    self.context.check_active()
+                    status = OutcomeStatus.PARTIAL
+                    self.stop_reason = WORKER_HANDOFF_REASON
+                    break
                 if self.context.services.get("question_research_started") is True:
                     self.context.check_active()
                 else:
@@ -1343,8 +1614,24 @@ class Harness:
                     raise RunStopped(
                         "Shared tools budget exhausted; recorded originals retained for finalization"
                     )
-                self.context.consume_research_decision()
-                decision = self.decide(self.view())
+                decision: Decision | None = None
+                host_decision = self.context.services.get("cropped_host_decision")
+                if self.context.services.get("asv3_exp_cropped") is True and callable(
+                    host_decision
+                ):
+                    decision = host_decision(self)
+                    if decision is not None and not isinstance(decision, Decision):
+                        raise TypeError(
+                            "Cropped host decision must return Decision or None"
+                        )
+                if decision is None:
+                    self.context.consume_research_decision()
+                    decision = (
+                        self.repair_decision(self)
+                        if self.repair_decision is not None
+                        and self.publication_gap is not None
+                        else self.decide(self.view())
+                    )
                 self.context.check_active()
                 if self.on_decision:
                     self.on_decision(decision)
@@ -1444,11 +1731,20 @@ class Harness:
                         status = OutcomeStatus.PARTIAL
                         self.stop_reason = "repeated_unavailable_governing_original"
                         break
-                    if all(
+                    if self._cheap_rejection_exhausted():
+                        status = OutcomeStatus.PARTIAL
+                        self.stop_reason = "repeated_publication_gap"
+                        break
+                    wait_only = all(
                         call.name in {"wait_researcher", "list_researchers"}
                         for call in decision.calls
-                    ) and any(
+                    )
+                    has_wait = any(
                         call.name == "wait_researcher" for call in decision.calls
+                    )
+                    if wait_only and (
+                        has_wait
+                        or self.context.services.get("asv3_exp_cropped") is True
                     ):
                         wait = self.context.services.get("wait_for_task_change")
                         if callable(wait):
@@ -1471,6 +1767,7 @@ class Harness:
                         if self.on_receipt:
                             self.on_receipt(receipt)
                         repeated = self._repeated_unavailable_governing_gap()
+                        self._remember_cheap_rejection(decision.answer, blocked)
                         self._save()
                         if repeated:
                             status = OutcomeStatus.PARTIAL
@@ -1489,8 +1786,9 @@ class Harness:
                         self._blocked_attempts[fingerprint] = (
                             self._blocked_attempts.get(fingerprint, 0) + 1
                         )
-                        if (
-                            self._blocked_attempts[fingerprint] >= 3
+                        if self._cheap_rejection_exhausted() or (
+                            self.context.services.get("asv3_exp_cheap") is not True
+                            and self._blocked_attempts[fingerprint] >= 3
                             and self.context.services.get("independent_question")
                             is not True
                             and not (
@@ -1527,6 +1825,9 @@ class Harness:
                     )
                     break
                 self._save()
+        except CroppedWorkerHandoff:
+            self.stop_reason = WORKER_HANDOFF_REASON
+            status = OutcomeStatus.PARTIAL
         except RunStopped as error:
             self.stop_reason = str(error)
             status = (

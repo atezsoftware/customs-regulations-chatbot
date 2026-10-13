@@ -46,6 +46,8 @@ class LLMFlow(StrEnum):
     ASV3_SOURCE_USE_REVIEW = "asv3_source_use_review"
     ASV3_FINAL = "asv3_final"
     ASV3_ANSWER_REPAIR = "asv3_answer_repair"
+    ASV3_TARGETED_RESEARCH = "asv3_targeted_research"
+    ASV3_TARGETED_EVIDENCE_CHECK = "asv3_targeted_evidence_check"
     ASV3_LANGUAGE = "asv3_language"
     ASV3_SOURCE_VISION = "asv3_source_vision"
     ASV3_GUARDED_DECISIONS = "asv3_guarded_decisions"
