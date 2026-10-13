@@ -1142,7 +1142,14 @@ class LitellmLLM(LLM):
                     if (
                         self._uses_guarded_openai_responses()
                         and stream
-                        and tools
+                        and (
+                            tools
+                            or (
+                                self._cropped_response_terminal_capture
+                                and self._asv3_exp_cheap_cache is None
+                                and terminal_capture is not None
+                            )
+                        )
                         and not (get_llm_mock_response() or MOCK_LLM_RESPONSE)
                     ):
                         from litellm.llms.openai.responses.transformation import (
@@ -1179,7 +1186,7 @@ class LitellmLLM(LLM):
                             return native_responses_stream(
                                 model=model_bare,
                                 messages=messages,
-                                tools=tools,
+                                tools=tools or [],
                                 optional_params=opts,
                                 passthrough_kwargs=passthrough_kwargs,
                                 api_base=self._api_base or None,
@@ -1505,7 +1512,13 @@ class LitellmLLM(LLM):
             )
             and self._uses_guarded_openai_responses()
             and use_streaming
-            and tools
+            and (
+                tools
+                or (
+                    self._cropped_response_terminal_capture
+                    and self._asv3_exp_cheap_cache is None
+                )
+            )
             else None
         )
 
@@ -1662,6 +1675,15 @@ class LitellmLLM(LLM):
                                         }
                                     )
                                 break
+                    finally:
+                        close_sync_stream(stream_response)
+                elif terminal_capture is not None:
+                    chunks = []
+                    try:
+                        for chunk in stream_response:
+                            if self._stream_cancellation_check is not None:
+                                self._stream_cancellation_check()
+                            chunks.append(chunk)
                     finally:
                         close_sync_stream(stream_response)
                 else:
