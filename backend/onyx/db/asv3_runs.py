@@ -20,7 +20,7 @@ from onyx.asv3.parallel_checkpoint import (
     compact_parallel_checkpoint,
     restore_parallel_checkpoint,
 )
-from onyx.asv3.workflow_variant import ASV3_EXP_CHEAP_VARIANT
+from onyx.asv3.workflow_variant import ASV3_EXP_CHEAP_VARIANT, ASV3_EXP_CROPPED_VARIANT
 from onyx.configs.constants import MessageType
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.db.legal_review_checkpoint import (
@@ -33,21 +33,30 @@ ASV3_CHECKPOINT_TOOL_ID = -3001
 ASV3_CHECKPOINT_VERSION = 1
 MAX_CHECKPOINT_BYTES = 2_500_000
 MAX_DECODED_CHECKPOINT_BYTES = 8_000_000
+MAX_CROPPED_CHECKPOINT_BYTES = 5_000_000
+MAX_CROPPED_DECODED_CHECKPOINT_BYTES = 16_000_000
+
+
+def _checkpoint_limits(snapshot: dict[str, JsonValue]) -> tuple[int, int]:
+    if snapshot.get("asv3_workflow_variant") == ASV3_EXP_CROPPED_VARIANT:
+        return MAX_CROPPED_CHECKPOINT_BYTES, MAX_CROPPED_DECODED_CHECKPOINT_BYTES
+    return MAX_CHECKPOINT_BYTES, MAX_DECODED_CHECKPOINT_BYTES
 
 
 def encode_asv3_checkpoint(snapshot: dict[str, JsonValue]) -> str:
     versioned = {**snapshot, "version": ASV3_CHECKPOINT_VERSION}
+    durable_limit, decoded_limit = _checkpoint_limits(versioned)
     if snapshot.get("asv3_workflow_variant") == ASV3_EXP_CHEAP_VARIANT:
         compact = compact_exp_cheap_checkpoint(
-            versioned, max_packed_bytes=MAX_DECODED_CHECKPOINT_BYTES
+            versioned, max_packed_bytes=decoded_limit
         )
     else:
         compact = compact_parallel_checkpoint(
             compact_legal_review_checkpoint(versioned),
-            max_unit_bytes=MAX_DECODED_CHECKPOINT_BYTES,
+            max_unit_bytes=decoded_limit,
         )
     raw = json.dumps(compact, ensure_ascii=False).encode()
-    if len(raw) > MAX_DECODED_CHECKPOINT_BYTES:
+    if len(raw) > decoded_limit:
         raise ValueError("ASv3 checkpoint exceeds its decoded payload budget")
     payload = json.dumps(
         {
@@ -56,40 +65,55 @@ def encode_asv3_checkpoint(snapshot: dict[str, JsonValue]) -> str:
             "data": base64.b64encode(zlib.compress(raw, level=3)).decode("ascii"),
         }
     )
-    if len(payload.encode()) > MAX_CHECKPOINT_BYTES:
+    if len(payload.encode()) > durable_limit:
         raise ValueError("ASv3 checkpoint exceeds its durable payload budget")
     return payload
 
 
 def decode_asv3_checkpoint(payload: str) -> dict[str, JsonValue]:
-    if len(payload.encode()) > MAX_DECODED_CHECKPOINT_BYTES:
+    payload_size = len(payload.encode())
+    maximum_decoded = max(
+        MAX_DECODED_CHECKPOINT_BYTES, MAX_CROPPED_DECODED_CHECKPOINT_BYTES
+    )
+    if payload_size > maximum_decoded:
         raise ValueError("ASv3 checkpoint exceeds its payload budget")
     data: dict[str, JsonValue] = json.loads(payload)
-    if data.get("encoding") == "zlib-base64":
+    if not isinstance(data, dict):
+        raise ValueError("Unsupported ASv3 checkpoint version")
+    compressed = data.get("encoding") == "zlib-base64"
+    decoded_size = payload_size
+    if compressed:
         encoded = data.get("data")
         if not isinstance(encoded, str):
             raise ValueError("Invalid compressed checkpoint")
         decoder = zlib.decompressobj()
         raw = decoder.decompress(
-            base64.b64decode(encoded, validate=True), MAX_DECODED_CHECKPOINT_BYTES + 1
+            base64.b64decode(encoded, validate=True), maximum_decoded + 1
         )
-        if (
-            len(raw) > MAX_DECODED_CHECKPOINT_BYTES
-            or not decoder.eof
-            or decoder.unused_data
-        ):
+        if len(raw) > maximum_decoded or not decoder.eof or decoder.unused_data:
             raise ValueError("Invalid or oversized compressed checkpoint")
-        data = json.loads(raw)
+        decoded_size = len(raw)
+        try:
+            data = json.loads(raw)
+        except (ValueError, UnicodeError) as error:
+            raise ValueError("Invalid or oversized compressed checkpoint") from error
     if not isinstance(data, dict) or data.get("version") != ASV3_CHECKPOINT_VERSION:
         raise ValueError("Unsupported ASv3 checkpoint version")
+    durable_limit, decoded_limit = _checkpoint_limits(data)
+    if decoded_size > decoded_limit or payload_size > decoded_limit:
+        raise ValueError("ASv3 checkpoint exceeds its decoded payload budget")
+    if (
+        compressed
+        and data.get("asv3_workflow_variant") == ASV3_EXP_CROPPED_VARIANT
+        and payload_size > durable_limit
+    ):
+        raise ValueError("ASv3 checkpoint exceeds its durable payload budget")
     if EXP_CHEAP_CHECKPOINT_STORAGE_KEY in data:
-        if len(payload.encode()) > MAX_CHECKPOINT_BYTES:
+        if payload_size > MAX_CHECKPOINT_BYTES:
             raise ValueError("ASv3 checkpoint exceeds its durable payload budget")
-        return restore_exp_cheap_checkpoint(
-            data, max_packed_bytes=MAX_DECODED_CHECKPOINT_BYTES
-        )
+        return restore_exp_cheap_checkpoint(data, max_packed_bytes=decoded_limit)
     return restore_legal_review_checkpoint(
-        restore_parallel_checkpoint(data, max_unit_bytes=MAX_DECODED_CHECKPOINT_BYTES)
+        restore_parallel_checkpoint(data, max_unit_bytes=decoded_limit)
     )
 
 
