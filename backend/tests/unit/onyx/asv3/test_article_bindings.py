@@ -129,7 +129,7 @@ def test_captured_414_requires_actual_contiguous_host_read() -> None:
     before = ledger.export()
     assert canonical_named_authority_gap(ANSWER, ledger, **OPTIONS)
     assert bound_named_authority_gap(ANSWER, ledger, current, **OPTIONS)
-    assert state.record_receipt(receipt, current, ledger) == 3
+    assert state.record_receipt(receipt, current, ledger) == 2
     assert bound_named_authority_gap(ANSWER, ledger, current, **OPTIONS) is None
     assert ledger.export() == before
     retained = ledger.get(3)
@@ -289,7 +289,7 @@ def test_checkpoint_roundtrip_and_current_scope_fence() -> None:
 def test_checkpoint_current_original_integrity_and_repeated_receipt() -> None:
     current, ledger, state, receipt = setup()
     state.record_receipt(receipt, current, ledger)
-    assert state.record_receipt(receipt, current.child(), ledger) == 3
+    assert state.record_receipt(receipt, current.child(), ledger) == 2
     assert len(cast(list[JsonValue], state.export()["reads"])) == 1
     saved = state.export()
     altered = EvidenceLedger()
@@ -369,7 +369,7 @@ def test_reacquisition_metadata_is_not_source_identity() -> None:
         evidence_ids=ledger.add(direct, current),
         elapsed_seconds=0,
     )
-    assert state.record_receipt(receipt, current, ledger) == 3
+    assert state.record_receipt(receipt, current, ledger) == 2
     assert bound_named_authority_gap(ANSWER, ledger, current, **OPTIONS) is None
     retained = ledger._items[3]
     retained.metadata["read_as_of_date"] = "2099-01-01"
@@ -488,7 +488,7 @@ def test_actual_corpus_range_emits_only_active_tuned_positional_witness(
             evidence_ids=numbers,
             elapsed_seconds=0,
         )
-        assert state.record_receipt(receipt, current, ledger) == 3
+        assert state.record_receipt(receipt, current, ledger) == 2
         assert bound_named_authority_gap(ANSWER, ledger, current, **OPTIONS) is None
 
 
@@ -722,3 +722,109 @@ def test_child_read_identity_is_shared_without_forging_writer_delivery(
         is None
     )
     assert checkpoints[-1]["publication_stop_reason"] == "native_answer_published"
+
+
+@pytest.mark.parametrize("article_metadata", [None, "15"])
+def test_complete_own_article_keeps_every_existing_literal_paragraph(
+    article_metadata: str | None,
+) -> None:
+    items = originals()
+    own = items[0].model_copy(deep=True)
+    own.text = "\n\n".join(item.text for item in items)
+    own.text_hash = hashlib.sha256(own.text.encode()).hexdigest()
+    canonical = own.metadata["canonical_metadata"]
+    assert isinstance(canonical, dict)
+    canonical["article_no"] = article_metadata
+    canonical["paragraph_no"] = None
+    current, ledger, state, receipt = setup([own])
+    body = ANSWER.replace("[3]", "[1]")
+    before = canonical_named_authority_gap(body, ledger, **OPTIONS)
+    assert before is None
+    assert state.record_receipt(receipt, current, ledger) == 0
+    assert state.identity_bindings(current, ledger) == {}
+    assert bound_named_authority_gap(body, ledger, current, **OPTIONS) == before
+    acquisitions = GoverningOriginalAcquisitions(current, "Question")
+    target = GoverningOriginalTarget(
+        instrument_number="5326", article="15", paragraph="3"
+    )
+    assert acquisitions.matching_originals(target, ledger) == [1]
+    assert (
+        acquisitions.matching_originals(
+            target.model_copy(update={"paragraph": "4"}), ledger
+        )
+        == []
+    )
+    lower = original(
+        "Uygulama Tebliği",
+        "1",
+        kind="tebliğ",
+        text="5326 sayılı Kabahatler Kanunu m.15/3 kapsamında başvuru alınır.",
+    )
+    assert ledger.add([lower], current) == [2]
+    projection = bound_identity_ledger(ledger, current)
+    assert (
+        canonical_cited_lower_statute_gap("Başvuru incelenmiştir [2].", projection, {2})
+        is not None
+    )
+    assert (
+        canonical_cited_lower_statute_gap(
+            "Başvuru incelenmiştir [2].", projection, {1, 2}
+        )
+        is None
+    )
+
+
+def test_continuation_after_a_complete_two_paragraph_anchor() -> None:
+    first, second, third = originals()
+    first.text += "\n\n" + second.text
+    first.text_hash = hashlib.sha256(first.text.encode()).hexdigest()
+    metadata = first.metadata["canonical_metadata"]
+    assert isinstance(metadata, dict)
+    metadata["paragraph_no"] = None
+    third.metadata["position"] = 31
+    current, ledger, state, receipt = setup([first, third])
+    assert state.record_receipt(receipt, current, ledger) == 1
+    assert list(state.identity_bindings(current, ledger)) == [2]
+    assert (
+        bound_named_authority_gap(
+            ANSWER.replace("[3]", "[2]"), ledger, current, **OPTIONS
+        )
+        is None
+    )
+    assert (
+        bound_named_authority_gap(
+            ANSWER.replace("[3]", "[1]"), ledger, current, **OPTIONS
+        )
+        is not None
+    )
+
+
+def test_already_known_article_metadata_is_never_narrowed() -> None:
+    items = originals()
+    for item in items:
+        metadata = item.metadata["canonical_metadata"]
+        assert isinstance(metadata, dict)
+        metadata["article_no"] = "15"
+    current, ledger, state, receipt = setup(items)
+    before = ledger.authority_metadata()
+    assert state.record_receipt(receipt, current, ledger) == 0
+    assert state.identity_bindings(current, ledger) == {}
+    assert bound_identity_ledger(ledger, current).authority_metadata() == before
+
+
+def test_plain_numbered_list_is_not_a_second_paragraph_anchor() -> None:
+    first, _second, third = originals()
+    first.text += "\n\n2. İşlem listesi maddesidir."
+    first.text_hash = hashlib.sha256(first.text.encode()).hexdigest()
+    third.metadata["position"] = 31
+    current, ledger, state, receipt = setup([first, third])
+    body = ANSWER.replace("[3]", "[2]")
+    assert canonical_named_authority_gap(body, ledger, **OPTIONS) is not None
+    assert state.record_receipt(receipt, current, ledger) == 0
+    assert state.identity_bindings(current, ledger) == {}
+    assert bound_named_authority_gap(body, ledger, current, **OPTIONS) is not None
+    acquisitions = GoverningOriginalAcquisitions(current, "Question")
+    target = GoverningOriginalTarget(
+        instrument_number="5326", article="15", paragraph="3"
+    )
+    assert acquisitions.matching_originals(target, ledger) == []
