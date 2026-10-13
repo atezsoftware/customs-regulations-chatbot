@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import math
-import re
 from datetime import datetime, timezone
 from typing import Any, Literal
 
@@ -11,7 +9,11 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from onyx.llm import cost_overrides
-from onyx.llm.cost import get_model_price_per_million
+from onyx.llm.cost import (
+    get_model_price_per_million,
+    get_model_pricing_info,
+    get_token_rate_per_million,
+)
 
 
 class TokenCostLine(BaseModel):
@@ -51,17 +53,6 @@ def token_count(usage: dict[str, Any], *keys: str) -> int | None:
         value = usage.get(key)
         if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
             return value
-    return None
-
-
-def _rate(value: Any) -> float | None:
-    if (
-        isinstance(value, (int, float))
-        and not isinstance(value, bool)
-        and math.isfinite(value)
-        and value >= 0
-    ):
-        return float(value) * 1_000_000
     return None
 
 
@@ -118,14 +109,17 @@ def price_generation(
             "cache_read": quote.cache_per_mtok,
         }
     else:
-        import litellm
-
-        try:
-            info = litellm.get_model_info(model=model, custom_llm_provider=provider)
-        except Exception:
-            info = {}
-        tier = params.get("service_tier")
-        suffix = f"_{tier}" if tier in {"flex", "priority"} else ""
+        info = get_model_pricing_info(model, provider)
+        tier = usage.get("service_tier") or params.get("service_tier")
+        if provider == "openai" and tier not in {
+            None,
+            "auto",
+            "default",
+            "standard",
+            "flex",
+            "priority",
+        }:
+            return result
         fields = {
             "input": "input_cost_per_token",
             "output": "output_cost_per_token",
@@ -135,21 +129,11 @@ def price_generation(
             "reasoning": "output_cost_per_reasoning_token",
         }
         for category, field in fields.items():
-            selected = field + suffix
-            candidates = []
-            for key, value in info.items():
-                match = re.fullmatch(
-                    re.escape(field) + r"_above_(\d+)k_tokens" + re.escape(suffix), key
-                )
-                if match and incoming > int(match[1]) * 1000 and value is not None:
-                    candidates.append((int(match[1]), key))
-            if candidates:
-                selected = max(candidates)[1]
-            rates[category] = _rate(info.get(selected))
+            rates[category] = get_token_rate_per_million(info, field, incoming, tier)
         # Standard reasoning is part of completion usage, not an additional token count.
-        if not suffix and rates["reasoning"] is None:
+        if tier not in {"flex", "priority"} and rates["reasoning"] is None:
             rates["reasoning"] = rates["output"]
-        elif suffix:
+        elif tier in {"flex", "priority"}:
             rates["reasoning"] = rates["output"]
         if any(rate is not None for rate in rates.values()):
             result.source = "model_registry"
@@ -157,7 +141,10 @@ def price_generation(
     counts = {"input": incoming - cached - created, "cache_read": cached}
     one_hour = token_count(usage, "cache_creation_1h_tokens")
     five_minute = token_count(usage, "cache_creation_5m_tokens")
-    if (
+    if provider == "openai":
+        # OpenAI reports writes as a disjoint input partition with one write rate.
+        counts["cache_write"] = created
+    elif (
         one_hour is not None
         and five_minute is not None
         and one_hour + five_minute == created

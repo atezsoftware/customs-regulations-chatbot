@@ -41,6 +41,7 @@ def model(
     *,
     capture: bool = True,
     api_base: str | None = None,
+    service_tier: str | None = None,
 ) -> LitellmLLM:
     llm = LitellmLLM(
         api_key="test-key",
@@ -49,6 +50,7 @@ def model(
         max_input_tokens=900000,
         api_base=api_base,
         extra_body={"store": False},
+        model_kwargs={"service_tier": service_tier} if service_tier else None,
     ).with_tool_argument_stream_guard()
     return llm.with_asv3_response_terminal_capture() if capture else llm
 

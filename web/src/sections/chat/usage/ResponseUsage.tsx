@@ -10,7 +10,7 @@ const categories: Record<string, string> = {
   output: "Output",
   reasoning: "Reasoning",
   cache_read: "Cache okuma",
-  cache_write: "Cache yazma (5 dk)",
+  cache_write: "Cache yazma",
   cache_write_1h: "Cache yazma (1 saat)",
   cache_write_unknown: "Cache yazma",
 };

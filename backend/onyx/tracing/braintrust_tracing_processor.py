@@ -183,6 +183,9 @@ class BraintrustTracingProcessor(TracingProcessor):
                 non_cached_input,
                 output_tokens,
                 cache_read_tokens=cache_read,
+                cache_write_tokens=int(usage.get("cache_creation_input_tokens") or 0),
+                service_tier=usage.get("service_tier")
+                or model_config.get("service_tier"),
                 flow=flow,
                 image_count=span.span_data.image_count or 1,
             )

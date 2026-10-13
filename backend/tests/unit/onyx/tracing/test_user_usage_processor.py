@@ -144,26 +144,47 @@ def test_normalizes_prompt_completion_token_aliases(
     assert recorded_calls[0]["output_tokens"] == 3
 
 
-def test_batch_aggregates_matching_ledger_dimensions(
+def test_batch_prices_each_call_before_context_thresholds(
     processor: UserUsageTracingProcessor,
+    recorded_calls: list[dict[str, Any]],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from onyx.llm.cost import compute_cost_cents
+    from onyx.llm.litellm_singleton.config import load_model_metadata_enrichments
+
+    load_model_metadata_enrichments()
+    monkeypatch.setattr(proc_mod, "compute_cost_cents", compute_cost_cents)
+    monkeypatch.setattr(processor._queue, "task_done", lambda: None)
     token = CURRENT_USER_ID_CONTEXTVAR.set(str(uuid4()))
     try:
         first = processor._capture(
-            _generation_span(usage={"input_tokens": 10, "output_tokens": 2})
+            _generation_span(
+                model="gpt-6.1-sol",
+                usage={
+                    "input_tokens": 200000,
+                    "output_tokens": 0,
+                    "cache_creation_input_tokens": 200000,
+                },
+            )
         )
         second = processor._capture(
-            _generation_span(usage={"input_tokens": 20, "output_tokens": 3})
+            _generation_span(
+                model="gpt-6.1-sol",
+                usage={
+                    "input_tokens": 200000,
+                    "output_tokens": 0,
+                    "cache_creation_input_tokens": 200000,
+                },
+            )
         )
     finally:
         CURRENT_USER_ID_CONTEXTVAR.reset(token)
 
     assert first is not None
     assert second is not None
-    aggregated = processor._aggregate_batch([first, second])
-    assert len(aggregated) == 1
-    assert aggregated[0].input_tokens == 30
-    assert aggregated[0].output_tokens == 5
+    processor._flush_batch([first, second])
+    assert [record["input_tokens"] for record in recorded_calls] == [200000, 200000]
+    assert sum(record["cost_cents"] for record in recorded_calls) == pytest.approx(100)
 
 
 def test_no_record_when_user_id_unset(

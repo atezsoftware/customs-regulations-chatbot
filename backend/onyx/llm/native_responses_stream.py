@@ -40,6 +40,8 @@ class NativeResponseTerminalCapture:
     usage: Usage | None = None
     usage_status: str = "missing"
     reported_usage: dict[str, Any] | None = None
+    service_tier: str | None = None
+    requested_tool_cache_breakpoints: int = 0
 
     def diagnostic(self) -> dict[str, Any]:
         return {
@@ -50,6 +52,8 @@ class NativeResponseTerminalCapture:
             "provider_error": self.provider_error,
             "usage_status": self.usage_status,
             "provider_reported_usage": self.reported_usage,
+            "service_tier": self.service_tier,
+            "requested_tool_cache_breakpoints": self.requested_tool_cache_breakpoints,
         }
 
     @property
@@ -90,6 +94,9 @@ class NativeResponseTerminalCapture:
                     data["id"] if isinstance(data.get("id"), str) else None
                 )
                 self.provider_error = data.get("error")
+                tier = data.get("service_tier")
+                if isinstance(tier, str):
+                    self.service_tier = tier
                 details = data.get("incomplete_details")
                 reason = details.get("reason") if isinstance(details, dict) else None
                 self.incomplete_reason = reason if isinstance(reason, str) else None
@@ -109,7 +116,7 @@ class NativeResponseTerminalCapture:
                     if isinstance(raw_usage, dict)
                     else None
                 )
-                self.usage = _reported_response_usage(raw_usage)
+                self.usage = _reported_response_usage(raw_usage, self.service_tier)
                 self.usage_status = (
                     "provider_reported"
                     if self.usage is not None
@@ -160,7 +167,7 @@ def _response_event(chunk: Any) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
-def _reported_response_usage(raw: Any) -> Usage | None:
+def _reported_response_usage(raw: Any, service_tier: str | None = None) -> Usage | None:
     if not isinstance(raw, dict):
         return None
     counts = [raw.get(key) for key in ("input_tokens", "output_tokens", "total_tokens")]
@@ -195,6 +202,7 @@ def _reported_response_usage(raw: Any) -> Usage | None:
         cache_read_input_tokens=cached,
         cache_creation_input_tokens=writes,
         reasoning_tokens=reasoning,
+        service_tier=service_tier,
     )
 
 
@@ -212,6 +220,26 @@ def _native_sse_events(response: Any) -> Iterator[Any]:
             yield from response
     finally:
         close_sync_stream(response)
+
+
+def _with_tool_cache_breakpoints(input_items: Any) -> tuple[Any, int]:
+    """Preserve reusable tool-result endpoints without changing their content."""
+    if not isinstance(input_items, list):
+        return input_items, 0
+    marked = copy.deepcopy(input_items)
+    count = 0
+    for item in marked:
+        if not isinstance(item, dict) or item.get("type") != "function_call_output":
+            continue
+        blocks = item.get("output")
+        if not isinstance(blocks, list) or not blocks:
+            continue
+        endpoint = blocks[-1]
+        if isinstance(endpoint, dict) and endpoint.get("type") == "input_text":
+            # Keep earlier endpoints as history grows; OpenAI bounds cache lookups.
+            endpoint.setdefault("prompt_cache_breakpoint", {"mode": "explicit"})
+            count += 1
+    return marked, count
 
 
 def native_responses_stream(
@@ -271,6 +299,19 @@ def native_responses_stream(
         litellm_logging_obj=logging,
         client=client,
     )
+    if terminal_capture is not None:
+        extra_body = request.get("extra_body")
+        tier = request.get("service_tier")
+        if isinstance(extra_body, dict) and isinstance(
+            extra_body.get("service_tier"), str
+        ):
+            tier = extra_body["service_tier"]
+        if isinstance(tier, str):
+            terminal_capture.service_tier = tier
+    if terminal_capture is not None and model == "gpt-6.1-sol":
+        request["input"], terminal_capture.requested_tool_cache_breakpoints = (
+            _with_tool_cache_breakpoints(request["input"])
+        )
     requested = ResponsesAPIRequestUtils.get_requested_response_api_optional_param(
         request
     )

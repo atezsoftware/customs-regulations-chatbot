@@ -44,6 +44,8 @@ def test_capture_collects_generation_usage_and_aliases() -> None:
                     "prompt_tokens": 17,
                     "completion_tokens": 5,
                     "cache_read_input_tokens": 3,
+                    "cache_creation_input_tokens": 10,
+                    "service_tier": "flex",
                     "cost": 0.000123,
                 },
             )
@@ -56,6 +58,8 @@ def test_capture_collects_generation_usage_and_aliases() -> None:
     assert usage.input_tokens == 17
     assert usage.output_tokens == 5
     assert usage.cache_read_tokens == 3
+    assert usage.cache_write_tokens == 10
+    assert usage.service_tier == "flex"
     assert usage.cost_cents == 0.0123
     assert usage.flow == "chat_response"
 
