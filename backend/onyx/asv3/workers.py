@@ -17,6 +17,8 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, JsonValue
 
 from onyx.asv3.artifacts import artifact_reference, compact_json
+from onyx.asv3.cropped_article_bindings import isolated_cropped_read_capture
+from onyx.asv3.cropped_composed_topics import isolated_cropped_topic_capture
 from onyx.asv3.cropped_worker_handoff import expand_worker_handoff
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.models import (
@@ -245,9 +247,22 @@ class WorkerPool:
             captured = contextvars.copy_context()
             self._futures[task_id] = cast(
                 Future[None],
-                self._executors[child.depth].submit(captured.run, self._run, task_id),
+                self._executors[child.depth].submit(
+                    captured.run, self._run_in_task_scope, task_id
+                ),
             )
             return task_id
+
+    def _run_in_task_scope(self, task_id: str) -> None:
+        child = self._contexts[task_id]
+        if (
+            child.services.get("asv3_exp_cropped") is True
+            and child.services.get("asv3_exp_cheap") is not True
+        ):
+            with isolated_cropped_read_capture(), isolated_cropped_topic_capture():
+                self._run(task_id)
+        else:
+            self._run(task_id)
 
     def _run(self, task_id: str) -> None:
         with self._lock:

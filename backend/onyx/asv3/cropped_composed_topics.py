@@ -49,6 +49,16 @@ _OWNER: ContextVar[_Parent | None] = ContextVar(
 )
 
 
+@contextmanager
+def isolated_cropped_topic_capture() -> Iterator[None]:
+    """Keep worker compositions independent of the caller's pending capture."""
+    token = _OWNER.set(None)
+    try:
+        yield
+    finally:
+        _OWNER.reset(token)
+
+
 def _has_ref(value: object) -> bool:
     if isinstance(value, dict):
         return "$ref" in value or any(_has_ref(v) for v in value.values())

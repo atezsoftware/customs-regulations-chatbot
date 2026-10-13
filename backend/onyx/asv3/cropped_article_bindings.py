@@ -125,6 +125,16 @@ _COMPOSED_OWNER: ContextVar[_ComposedReadOwner | None] = ContextVar(
 )
 
 
+@contextmanager
+def isolated_cropped_read_capture() -> Iterator[None]:
+    """Start a worker without inheriting its caller's compose ownership."""
+    token = _COMPOSED_OWNER.set(None)
+    try:
+        yield
+    finally:
+        _COMPOSED_OWNER.reset(token)
+
+
 def _owner(context: RunContext) -> tuple[str, int]:
     return str(context.services.get("task_id") or "root"), context.depth
 
