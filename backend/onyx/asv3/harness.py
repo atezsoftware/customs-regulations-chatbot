@@ -1194,11 +1194,95 @@ class Harness:
         if not callable(unavailable):
             return False
         keys = unavailable(self.publication_gap.data)
+        return self._record_unavailable_governing_attempts(keys)
+
+    def _record_unavailable_governing_attempts(self, keys: set[str]) -> bool:
         for key in keys:
             self._unavailable_governing_attempts[key] = (
                 self._unavailable_governing_attempts.get(key, 0) + 1
             )
         return any(self._unavailable_governing_attempts[key] >= 3 for key in keys)
+
+    def _repeated_blocked_governing_research(self, receipts: list[ToolReceipt]) -> bool:
+        if (
+            self.context.services.get("asv3_workflow_variant") != ASV3_TUNED_VARIANT
+            or not receipts
+        ):
+            return False
+
+        def blocked_keys(outcome: dict[str, JsonValue]) -> set[str]:
+            data = outcome.get("data")
+            if not isinstance(data, dict):
+                return set()
+            key = data.get("governing_original_target_key")
+            if (
+                outcome.get("status") == OutcomeStatus.DENIED.value
+                and data.get("governing_original_retry_blocked") is True
+                and data.get("acquisition_status") in ("unavailable", "failed")
+                and isinstance(key, str)
+                and key
+            ):
+                return {key}
+            return set()
+
+        keys: set[str] = set()
+        for receipt in receipts:
+            outcome = receipt.outcome
+            if outcome.evidence or outcome.original_reads or outcome.artifacts:
+                return False
+            if receipt.call.name == "compose_tool_calls":
+                steps = outcome.data.get("steps")
+                if not isinstance(steps, dict) or not steps:
+                    return False
+                declared = receipt.call.arguments.get("steps")
+                if not isinstance(declared, list):
+                    return False
+                dependencies: dict[str, set[str]] = {}
+                for item in declared:
+                    if not isinstance(item, dict) or not isinstance(
+                        item.get("id"), str
+                    ):
+                        return False
+                    needs = item.get("depends_on", [])
+                    if not isinstance(needs, list) or any(
+                        not isinstance(need, str) for need in needs
+                    ):
+                        return False
+                    dependencies[item["id"]] = set(cast(list[str], needs))
+                if dependencies.keys() != steps.keys():
+                    return False
+                blocked: set[str] = set()
+                cancelled: set[str] = set()
+                for step_id, step in steps.items():
+                    step_keys = blocked_keys(step) if isinstance(step, dict) else set()
+                    if step_keys:
+                        blocked.add(step_id)
+                        keys.update(step_keys)
+                    elif (
+                        isinstance(step, dict)
+                        and step.get("status") == OutcomeStatus.CANCELLED.value
+                        and step.get("summary") == "A required dependency failed."
+                        and dependencies[step_id]
+                    ):
+                        cancelled.add(step_id)
+                    else:
+                        return False
+                while cancelled:
+                    settled = {
+                        step_id
+                        for step_id in cancelled
+                        if dependencies[step_id] <= blocked
+                    }
+                    if not settled:
+                        return False
+                    blocked.update(settled)
+                    cancelled.difference_update(settled)
+            else:
+                receipt_keys = blocked_keys(outcome.model_dump(mode="json"))
+                if not receipt_keys:
+                    return False
+                keys.update(receipt_keys)
+        return self._record_unavailable_governing_attempts(keys)
 
     def run(self) -> HarnessResult:
         self.stop_reason = None
@@ -1271,9 +1355,11 @@ class Harness:
                     ):
                         raise ValueError("Decision contains duplicate call IDs")
                     results: list[ToolMessage] = []
+                    decision_receipts: list[ToolReceipt] = []
                     rejected_submission = False
                     for receipt in self._dispatch(decision.calls):
                         self.context.check_active()
+                        decision_receipts.append(receipt)
                         results.append(self._model_tool_result(receipt))
                         rejected_submission = rejected_submission or (
                             receipt.call.name
@@ -1285,6 +1371,9 @@ class Harness:
                                 OutcomeStatus.DENIED,
                             }
                         )
+                    repeated_research = self._repeated_blocked_governing_research(
+                        decision_receipts
+                    )
                     if decision.assistant_message is not None:
                         self.turns.append(
                             ResearchTurn(
@@ -1345,6 +1434,10 @@ class Harness:
                             status = OutcomeStatus.PARTIAL
                             self.stop_reason = "repeated_unavailable_governing_original"
                             break
+                    if repeated_research:
+                        status = OutcomeStatus.PARTIAL
+                        self.stop_reason = "repeated_unavailable_governing_original"
+                        break
                     if all(
                         call.name in {"wait_researcher", "list_researchers"}
                         for call in decision.calls
