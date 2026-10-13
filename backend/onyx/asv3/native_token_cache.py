@@ -1,4 +1,4 @@
-"""Bounded token counts for one model's parallel research lifetime."""
+"""Bounded token counts for one model's research lifetime."""
 
 from collections import OrderedDict
 from collections.abc import Callable, Mapping
@@ -9,6 +9,11 @@ TokenCounter = Callable[[str], int]
 
 
 def native_token_cache_enabled(services: Mapping[str, object]) -> bool:
+    if (
+        services.get("asv3_exp_cropped") is True
+        and services.get("asv3_exp_cheap") is not True
+    ):
+        return True
     return services.get("research_profile") == "experimental" and (
         services.get("experimental_parallel") is True
         or services.get("serial_session_diagnostics") is True

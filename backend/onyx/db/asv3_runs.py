@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import base64
 import json
+import time
 import zlib
 from uuid import UUID
 
 from pydantic import JsonValue
 from sqlalchemy import String, cast, literal, select
+from sqlalchemy.exc import InterfaceError, OperationalError
 from sqlalchemy.orm import Session
 
 from onyx.asv3.exp_cheap_checkpoint import (
@@ -35,6 +37,10 @@ MAX_CHECKPOINT_BYTES = 2_500_000
 MAX_DECODED_CHECKPOINT_BYTES = 8_000_000
 MAX_CROPPED_CHECKPOINT_BYTES = 5_000_000
 MAX_CROPPED_DECODED_CHECKPOINT_BYTES = 16_000_000
+_CHECKPOINT_RETRY_DELAYS = (0.2, 0.5)
+_CHECKPOINT_TRANSIENT_SQLSTATES = frozenset(
+    {"08000", "08003", "08006", "40001", "40P01", "57P01", "57P02", "57P03"}
+)
 
 
 def _checkpoint_limits(snapshot: dict[str, JsonValue]) -> tuple[int, int]:
@@ -142,6 +148,44 @@ def save_asv3_checkpoint(
     if not isinstance(run_id, str) or not isinstance(sequence, int) or sequence < 0:
         raise ValueError("An ASv3 checkpoint needs run identity and sequence")
     payload = encode_asv3_checkpoint(snapshot)
+    attempts = (
+        len(_CHECKPOINT_RETRY_DELAYS) + 1
+        if snapshot.get("asv3_workflow_variant") == ASV3_EXP_CROPPED_VARIANT
+        else 1
+    )
+    for attempt in range(attempts):
+        try:
+            _save_checkpoint_payload(
+                message_id=message_id,
+                user_id=user_id,
+                run_id=run_id,
+                sequence=sequence,
+                payload=payload,
+            )
+            return
+        except (InterfaceError, OperationalError) as error:
+            sqlstate = getattr(error.orig, "pgcode", None) or getattr(
+                error.orig, "sqlstate", None
+            )
+            retryable = (
+                sqlstate in _CHECKPOINT_TRANSIENT_SQLSTATES
+                if isinstance(sqlstate, str)
+                else sqlstate is None and error.connection_invalidated
+            )
+            if attempt + 1 == attempts or not retryable:
+                raise
+            time.sleep(_CHECKPOINT_RETRY_DELAYS[attempt])
+
+
+def _save_checkpoint_payload(
+    *,
+    message_id: int,
+    user_id: UUID | None,
+    run_id: str,
+    sequence: int,
+    payload: str,
+) -> None:
+    # A fresh locked transaction also resolves a previous COMMIT with lost acknowledgement.
     with get_session_with_current_tenant() as session:
         message = _require_owned_message(session, message_id, user_id, lock=True)
         record = session.scalar(

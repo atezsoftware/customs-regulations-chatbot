@@ -1,8 +1,11 @@
+import copy
+import json
 from collections.abc import Callable
 from typing import cast
 from unittest.mock import Mock
 
 import pytest
+from pydantic import JsonValue
 
 from onyx.asv3.native_token_cache import (
     NativeTokenCountCache,
@@ -129,3 +132,93 @@ def test_enablement_is_limited_to_trusted_parallel_execution_markers() -> None:
     assert not native_token_cache_enabled(
         {"research_profile": "normal", "experimental_parallel": True}
     )
+
+
+@pytest.mark.parametrize(
+    ("services", "enabled"),
+    [
+        ({"research_profile": "normal", "asv3_exp_cropped": True}, True),
+        ({"research_profile": "normal", "asv3_exp_cropped": "true"}, False),
+        ({"research_profile": "normal", "asv3_exp_cropped": 1}, False),
+        (
+            {
+                "research_profile": "normal",
+                "asv3_exp_cropped": True,
+                "asv3_exp_cheap": True,
+            },
+            False,
+        ),
+        ({"research_profile": "normal", "asv3_exp_cheap": True}, False),
+        ({"research_profile": "normal", "asv3_workflow_variant": "asv3_tuned"}, False),
+        ({"research_profile": "normal"}, False),
+    ],
+)
+def test_cropped_opt_in_preserves_other_workflow_defaults(
+    services: dict[str, object], enabled: bool
+) -> None:
+    assert native_token_cache_enabled(services) is enabled
+
+
+def test_cropped_adapter_reuses_exact_counts_without_changing_prompt_or_tools() -> None:
+    from onyx.asv3.llm_adapter import ResearchModel
+    from onyx.asv3.models import RunContext
+    from onyx.llm.models import (
+        ChatCompletionMessage,
+        SystemMessage,
+        ToolMessage,
+        UserMessage,
+    )
+    from tests.unit.onyx.asv3.test_native_model_adapter import model
+
+    text = "  Özgün hüküm: 10/A; şart, istisna ve süre. [17]\n"
+    prompt: list[ChatCompletionMessage] = [
+        SystemMessage(content="Read the complete original."),
+        ToolMessage(tool_call_id="read-1", content=text),
+        UserMessage(content="Apply its conditions."),
+    ]
+    tools: list[dict[str, JsonValue]] = [
+        {
+            "type": "function",
+            "function": {
+                "name": "read_provision",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+    prompt_before = [message.model_dump_json() for message in prompt]
+    tools_before = json.dumps(tools, ensure_ascii=False)
+    counter = Mock(side_effect=lambda value: len(value.encode("utf-8")))
+    uncached = ResearchModel(
+        model(), RunContext(), token_counter=counter, lean_native_mode=True
+    )
+    cropped = ResearchModel(
+        model(),
+        RunContext(services={"asv3_exp_cropped": True}),
+        token_counter=counter,
+        lean_native_mode=True,
+    )
+    expected = uncached._input_cost(prompt, tools)
+    counter.reset_mock()
+    assert cropped._input_cost(prompt, tools) == expected
+    cold_calls = counter.call_count
+    assert cold_calls > 0
+    assert cropped._input_cost(prompt, tools) == expected
+    assert counter.call_count == cold_calls
+
+    changed = copy.deepcopy(prompt)
+    changed[-1] = UserMessage(content="Apply its changed conditions.")
+    expected_changed = uncached._input_cost(changed, tools)
+    counter.reset_mock()
+    assert cropped._input_cost(changed, tools) == expected_changed
+    assert counter.call_count == 1
+
+    changed_tools = copy.deepcopy(tools)
+    cast(dict[str, JsonValue], changed_tools[0]["function"])["description"] = (
+        "Keep the complete provision."
+    )
+    expected_tools = uncached._input_cost(prompt, changed_tools)
+    counter.reset_mock()
+    assert cropped._input_cost(prompt, changed_tools) == expected_tools
+    assert counter.call_count == 1
+    assert [message.model_dump_json() for message in prompt] == prompt_before
+    assert json.dumps(tools, ensure_ascii=False) == tools_before
