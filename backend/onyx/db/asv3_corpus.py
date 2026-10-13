@@ -336,6 +336,89 @@ def iter_source_chunks_by_ids(
             yield chunk
 
 
+def read_aggregate_search_originals(
+    session: Session,
+    *,
+    user: User,
+    filters: IndexFilters,
+    source_id: UUID,
+    center_ordinals: dict[str, int],
+    index: PublicationIndexSnapshot | None,
+    check_active: Callable[[], None],
+) -> tuple[CorpusSource, dict[str, tuple[CorpusChunk, ...]]]:
+    """Ground failed search centers in their direct, verified atomic members."""
+    from onyx.db.supersearch import resolve_supersearch_center_ids
+
+    check_active()
+    source = require_source(session, user=user, filters=filters, source_id=source_id)
+    observation = observe_publication_read()
+    resolved = resolve_supersearch_center_ids(
+        session,
+        user=user,
+        filters=filters,
+        source_id=source_id,
+        center_ids=tuple(center_ordinals),
+        check_active=check_active,
+        expected_index=index,
+        expected_ordinals=center_ordinals,
+    )
+    aggregates = {
+        center: members
+        for center, members in resolved.items()
+        if members and members != (center,)
+    }
+    member_ids = tuple(
+        dict.fromkeys(member for members in aggregates.values() for member in members)
+    )
+    originals = iter_source_chunks_by_ids(
+        session,
+        user=user,
+        filters=filters,
+        source_id=source_id,
+        chunk_ids=member_ids,
+        index=index,
+        check_active=check_active,
+        batch_publication_checks=True,
+    )
+    chunks: dict[str, CorpusChunk] = {}
+    try:
+        for chunk in originals:
+            if (
+                chunk.id in chunks
+                or chunk.id not in member_ids
+                or chunk.source_id != source_id
+            ):
+                raise CorpusScopeUnavailable(
+                    "Aggregate original has ambiguous canonical identity."
+                )
+            chunks[chunk.id] = chunk
+    finally:
+        originals.close()
+    if set(chunks) != set(member_ids):
+        raise CorpusScopeUnavailable(
+            "Aggregate originals changed after membership resolution."
+        )
+    check_active()
+    with get_session_with_current_tenant() as fresh:
+        current = require_source(fresh, user=user, filters=filters, source_id=source_id)
+        if current != source:
+            raise CorpusScopeUnavailable(
+                "Aggregate source changed during its original read."
+            )
+        if index is not None:
+            current_index = resolve_source_query_index(fresh, source_id)
+            if current_index is None or not index.matches_temporal_index(current_index):
+                raise CorpusScopeUnavailable(
+                    "Aggregate source index changed during its original read."
+                )
+    require_publication_files(observation, (source_id,))
+    check_active()
+    return source, {
+        center: tuple(chunks[member] for member in members)
+        for center, members in aggregates.items()
+    }
+
+
 def _iter_exact_source_chunks(
     session: Session,
     *,

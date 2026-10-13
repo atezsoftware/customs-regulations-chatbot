@@ -35,6 +35,7 @@ from onyx.asv3.models import (
 )
 from onyx.asv3.parallel_execution import capability_slot, parallel_execution_enabled
 from onyx.asv3.shared_reads import SharedReads
+from onyx.asv3.workflow_variant import ASV3_TUNED_VARIANT
 from onyx.configs.constants import DocumentSource
 from onyx.context.search.models import IndexFilters, SearchDoc
 from onyx.db.asv3_candidate_inventory import current_asv3_source_inventory_scope
@@ -46,6 +47,7 @@ from onyx.db.asv3_corpus import (
     find_related_sources,
     find_sources,
     iter_source_chunks_by_ids,
+    read_aggregate_search_originals,
     read_search_centers_batch,
     read_search_source_closures,
     read_source_chunks,
@@ -902,6 +904,62 @@ class CorpusBroker:
         )
 
     def hydrate_search_centers(
+        self, docs: list[SearchDoc], context: RunContext
+    ) -> dict[tuple[str, int], list[EvidenceItem]]:
+        hydrated = self._hydrate_exact_search_centers(docs, context)
+        if context.services.get("asv3_exp_cheap") is True or not (
+            context.services.get("asv3_exp_cropped") is True
+            or context.services.get("asv3_workflow_variant") == ASV3_TUNED_VARIANT
+        ):
+            return hydrated
+        missing: dict[str, list[SearchDoc]] = {}
+        for doc in docs:
+            if not hydrated.get((doc.document_id, doc.chunk_ind)):
+                missing.setdefault(doc.document_id, []).append(doc)
+        for source_id, centers in missing.items():
+            context.check_active()
+            center_ordinals: dict[str, int] = {}
+            for doc in centers:
+                center_id = str(doc.metadata["regulatory_chunk_id"])
+                if (
+                    center_id in center_ordinals
+                    and center_ordinals[center_id] != doc.chunk_ind
+                ):
+                    raise CorpusScopeUnavailable(
+                        "Retrieved center has conflicting projection ordinals."
+                    )
+                center_ordinals[center_id] = doc.chunk_ind
+            with self._index_lock:
+                index = self.query_indexes.get(UUID(source_id))
+            with get_session_with_current_tenant() as session:
+                source, originals = read_aggregate_search_originals(
+                    session,
+                    user=self.user,
+                    filters=self.filters,
+                    source_id=UUID(source_id),
+                    center_ordinals=center_ordinals,
+                    index=index,
+                    check_active=context.check_active,
+                )
+            for doc in centers:
+                center_id = str(doc.metadata["regulatory_chunk_id"])
+                items = []
+                for chunk in originals.get(center_id, ()):
+                    item = evidence_for_chunk(source, chunk)
+                    item.metadata.update(
+                        retrieval_method="established_search_aggregate_originals",
+                        retrieved_aggregate_id=center_id,
+                        retrieved_projection_ordinal=doc.chunk_ind,
+                        article_closure_complete=False,
+                        section_context="not_inferred",
+                        additional_context="harness_controlled",
+                        follow_context_tool="read_provision",
+                    )
+                    items.append(item)
+                hydrated[(doc.document_id, doc.chunk_ind)] = items
+        return hydrated
+
+    def _hydrate_exact_search_centers(
         self, docs: list[SearchDoc], context: RunContext
     ) -> dict[tuple[str, int], list[EvidenceItem]]:
         """Read exact search originals; further context is a research decision."""
