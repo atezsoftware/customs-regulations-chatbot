@@ -65,17 +65,25 @@ def test_ten_dollars_transitions_to_one_writer_with_all_actual_originals(
     assert packets.export()["input_tokens"] == {"root": 100}
 
 
-def test_five_dollars_prevents_focused_source_work_and_any_repair_model_call(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    ("repair_limit", "spent"), [(None, 10.0), (None, 10.01), (5.0, 5.0)]
+)
+def test_repair_limit_prevents_focused_source_work_and_any_repair_model_call(
+    monkeypatch: pytest.MonkeyPatch, repair_limit: float | None, spent: float
 ) -> None:
     adapter, ledger, selected = fixture()
     view = current(ledger)
     monkeypatch.setattr(
         cropped_cost_budget, "_rates", lambda *_args: (1e-6, 1e-6, 0.1e-6, 2e-6)
     )
-    budget = CroppedCostBudget(adapter.context, view.request)
+    budget = (
+        CroppedCostBudget(adapter.context, view.request)
+        if repair_limit is None
+        else CroppedCostBudget(adapter.context, view.request, repair_usd=repair_limit)
+    )
+    assert budget.repair_usd == (10.0 if repair_limit is None else repair_limit)
     budget.record_external_charge(
-        "prior", known_cost_usd=5.0, uncertain_upper_usd=0.0, context=adapter.context
+        "prior", known_cost_usd=spent, uncertain_upper_usd=0.0, context=adapter.context
     )
     adapter.context.services["cropped_cost_budget"] = budget
     harness = MagicMock()
@@ -99,4 +107,4 @@ def test_five_dollars_prevents_focused_source_work_and_any_repair_model_call(
             structured=False,
         )
     selected.invoke.assert_not_called()
-    assert budget.research_allowed
+    assert budget.research_allowed is (spent < budget.research_usd)
