@@ -3,6 +3,8 @@
 import json
 import re
 from collections.abc import Callable, Generator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import date
 from typing import Any
@@ -142,6 +144,98 @@ class CorpusSource:
     id: UUID
     name: str
     file_id: str
+
+
+@dataclass
+class VerifiedSourceOperation:
+    """An active, source-bound DB read; authority expires with its context."""
+
+    source: CorpusSource
+    user: User
+    user_id: UUID
+    tenant: str
+    filters_json: str
+    index: PublicationIndexSnapshot | None
+    check_active: Callable[[], None]
+    active: bool = True
+
+    def matches(self, user: User, filters: IndexFilters, source_id: UUID) -> bool:
+        from shared_configs.contextvars import get_current_tenant_id
+
+        return (
+            self.active
+            and self.user is user
+            and self.user_id == user.id
+            and self.source.id == source_id
+            and self.tenant == get_current_tenant_id()
+            and self.filters_json == filters.model_dump_json()
+        )
+
+
+_VERIFIED_SOURCE_OPERATION: ContextVar[VerifiedSourceOperation | None] = ContextVar(
+    "asv3_verified_source_operation", default=None
+)
+
+
+@contextmanager
+def verified_source_operation(
+    *,
+    user: User,
+    filters: IndexFilters,
+    source_id: UUID,
+    check_active: Callable[[], None],
+) -> Generator[VerifiedSourceOperation | None, None, None]:
+    """Fence one synchronous source read before any result can escape its handler."""
+    from shared_configs.contextvars import get_current_tenant_id
+
+    # Nested reads use their ordinary per-call fences, never a wider authority.
+    if _VERIFIED_SOURCE_OPERATION.get() is not None:
+        token = _VERIFIED_SOURCE_OPERATION.set(None)
+        try:
+            yield None
+        finally:
+            _VERIFIED_SOURCE_OPERATION.reset(token)
+        return
+    check_active()
+    observation = observe_publication_read()
+    with get_session_with_current_tenant() as session:
+        source = require_source(
+            session, user=user, filters=filters, source_id=source_id
+        )
+        index = resolve_source_query_index(session, source_id)
+        require_publication_files(observation, (source_id,))
+    operation = VerifiedSourceOperation(
+        source=source,
+        user=user,
+        user_id=user.id,
+        tenant=get_current_tenant_id(),
+        filters_json=filters.model_dump_json(),
+        index=index.model_copy(deep=True) if index is not None else None,
+        check_active=check_active,
+    )
+    token = _VERIFIED_SOURCE_OPERATION.set(operation)
+    try:
+        yield operation
+    finally:
+        operation.active = False
+        _VERIFIED_SOURCE_OPERATION.reset(token)
+    check_active()
+    if (
+        operation.user_id != user.id
+        or operation.tenant != get_current_tenant_id()
+        or operation.filters_json != filters.model_dump_json()
+    ):
+        raise CorpusScopeUnavailable(
+            "Source operation authority changed during reading."
+        )
+    with get_session_with_current_tenant() as session:
+        current = require_source(
+            session, user=user, filters=filters, source_id=source_id
+        )
+        if current != source:
+            raise CorpusScopeUnavailable("Source identity changed during reading.")
+        require_publication_files(observation, (source_id,))
+    check_active()
 
 
 @dataclass(frozen=True)
@@ -1716,6 +1810,10 @@ def find_related_sources(
 def require_source(
     session: Session, *, user: User, filters: IndexFilters, source_id: UUID
 ) -> CorpusSource:
+    operation = _VERIFIED_SOURCE_OPERATION.get()
+    if operation is not None and operation.matches(user, filters, source_id):
+        operation.check_active()
+        return operation.source
     rows, _ = find_sources(
         session, user=user, filters=filters, source_ids=(source_id,), limit=1
     )

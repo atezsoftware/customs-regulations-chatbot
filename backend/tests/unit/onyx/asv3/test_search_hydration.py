@@ -429,6 +429,23 @@ def validation_broker(
     )
     monkeypatch.setattr(corpus_tools, "require_source", asv3_corpus.require_source)
     monkeypatch.setattr(corpus_tools, "resolve_source_query_index", lambda *_args: None)
+    monkeypatch.setattr(
+        asv3_corpus, "get_session_with_current_tenant", lambda: nullcontext(session)
+    )
+    monkeypatch.setattr(asv3_corpus, "resolve_source_query_index", lambda *_args: None)
+    monkeypatch.setattr(
+        asv3_corpus,
+        "_require_exact_sources",
+        lambda current, **kwargs: {
+            source_id: asv3_corpus.require_source(
+                current,
+                user=kwargs["user"],
+                filters=kwargs["filters"],
+                source_id=source_id,
+            )
+            for source_id in kwargs["source_ids"]
+        },
+    )
     return CorpusBroker(arguments["user"], arguments["filters"])
 
 

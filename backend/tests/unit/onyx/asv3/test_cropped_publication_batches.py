@@ -53,7 +53,8 @@ def test_batch_optimization_is_cropped_only_and_keeps_all_exact_originals(
         [retained(item) for item in originals],
         RunContext(services={"asv3_exp_cropped": cropped}),
     )
-    assert check.call_count == (1 if cropped else len(originals))
+    # Cropped uses the shared packet entry/final publication fences, not per-row filters.
+    assert check.call_count == (0 if cropped else len(originals))
     assert session.scalars.call_count == 1
     assert all(stream.closed for stream in arguments["_streams"])
 

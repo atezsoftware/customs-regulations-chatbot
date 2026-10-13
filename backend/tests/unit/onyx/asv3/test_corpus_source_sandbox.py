@@ -3,7 +3,7 @@
 import hashlib
 import json
 from collections.abc import Generator
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from copy import deepcopy
 from datetime import date
@@ -63,6 +63,14 @@ class MemoryBroker(CorpusBroker):
         self.search_adapter = None
         self.file_store = None
         self.vision_llm = None
+
+    @contextmanager
+    def verified_provision_read(
+        self, source_id: str, context: RunContext
+    ) -> Generator[None, None, None]:
+        # The in-memory broker has no DB authority boundary.
+        self.source(source_id, context)
+        yield
 
     def chunk_siblings(
         self, seed: CorpusChunk, context: RunContext
