@@ -1170,7 +1170,11 @@ class LitellmLLM(LLM):
                                     if terminal_capture is not None
                                     and self._cropped_prompt_cache is not None
                                     else self._asv3_exp_cheap_cache,
-                                    "allow_tool_cache_breakpoints": False,
+                                    "allow_tool_cache_breakpoints": (
+                                        self._cropped_response_terminal_capture
+                                        and self._cropped_prompt_cache is None
+                                        and self._asv3_exp_cheap_cache is None
+                                    ),
                                 }
                             return native_responses_stream(
                                 model=model_bare,
