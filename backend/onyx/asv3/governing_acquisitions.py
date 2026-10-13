@@ -177,10 +177,10 @@ class GoverningOriginalAcquisitions:
         ):
             raise ValueError("Governing-original acquisition scope changed")
 
-    @staticmethod
     def matching_originals(
-        target: GoverningOriginalTarget, ledger: EvidenceLedger
+        self, target: GoverningOriginalTarget, ledger: EvidenceLedger
     ) -> list[int]:
+        from onyx.asv3.article_bindings import bound_identity_ledger
         from onyx.asv3.canonical_authority import canonical_matching_originals
 
         probe = (
@@ -190,7 +190,9 @@ class GoverningOriginalAcquisitions:
             + "uygulanır "
             + "."
         )
-        return canonical_matching_originals(probe, ledger)
+        return canonical_matching_originals(
+            probe, bound_identity_ledger(ledger, self.context)
+        )
 
     @staticmethod
     def _query_target_keys(query: str) -> set[str]:

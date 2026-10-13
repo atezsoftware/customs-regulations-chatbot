@@ -580,6 +580,12 @@ class Harness:
         receipt.evidence_ids = list(
             dict.fromkeys([*receipt.evidence_ids, *reopened_ids])
         )
+        if self.context.services.get("asv3_workflow_variant") == "asv3_tuned":
+            from onyx.asv3.article_bindings import ArticleBindings
+
+            bindings = self.context.services.get("tuned_article_bindings")
+            if isinstance(bindings, ArticleBindings):
+                bindings.consume_receipt(receipt, self.context, self.evidence)
         if receipt.call.name == "read_evidence" and not receipt.outcome.original_reads:
             number = receipt.call.arguments.get("citation")
             item = self.evidence.get(number) if type(number) is int else None

@@ -18,6 +18,7 @@ from uuid import UUID
 from pydantic import JsonValue
 
 from onyx.asv3.answer_model import source_answer_model, uses_source_answer_model
+from onyx.asv3.article_bindings import ArticleBindings, bound_identity_ledger
 from onyx.asv3.authority import native_named_authority_gap
 from onyx.asv3.authority_requirements import AuthorityRequirements
 from onyx.asv3.candidate_audit import CandidateAudit
@@ -431,6 +432,13 @@ def run_asv3_loop(
     context.corpus_only = not (allow_external and profile.external_requested)
     ledger = EvidenceLedger()
     context.services["evidence"] = ledger
+    article_bindings = (
+        ArticleBindings(context, question)
+        if workflow_variant == ASV3_TUNED_VARIANT
+        else None
+    )
+    if article_bindings is not None:
+        context.services["tuned_article_bindings"] = article_bindings
     parallel_answers = (
         ParallelAnswerReceipts(context, question, user_id=str(user.id))
         if parallel_research
@@ -451,7 +459,9 @@ def run_asv3_loop(
     if governing_acquisitions is not None:
         context.services["tuned_governing_acquisitions"] = governing_acquisitions
         context.services["tuned_unavailable_governing_keys"] = lambda gap: (
-            governing_acquisitions.unavailable_keys(gap, ledger)
+            governing_acquisitions.unavailable_keys(
+                gap, bound_identity_ledger(ledger, context)
+            )
         )
     authority_requirements = (
         AuthorityRequirements(
@@ -476,7 +486,7 @@ def run_asv3_loop(
         gap = (
             canonical_named_authority_gap(
                 answer,
-                ledger,
+                bound_identity_ledger(ledger, run_context or context),
                 strict_reference_boundaries=True,
                 syntactic_reference_binding=True,
                 strict_numeric_paragraphs=True,
@@ -1017,6 +1027,8 @@ def run_asv3_loop(
                 if authority_requirements is not None:
                     snapshot["authority_requirements"] = authority_requirements.export()
                 if governing_acquisitions is not None:
+                    if article_bindings is not None:
+                        snapshot["article_bindings"] = article_bindings.export()
                     snapshot["evidence"] = ledger.export()
                     snapshot["research_state"] = research_state.export()
                     snapshot["budget"] = context.budget.snapshot()
@@ -1695,7 +1707,9 @@ def run_asv3_loop(
                 return gap
             gaps.append(gap)
         if tuned and answer_llm is None:
-            reference_gap = canonical_cited_lower_statute_gap(answer, ledger, delivered)
+            reference_gap = canonical_cited_lower_statute_gap(
+                answer, bound_identity_ledger(ledger, run_context or context), delivered
+            )
             if reference_gap is not None:
                 gaps.append(
                     ToolOutcome(
@@ -2002,6 +2016,11 @@ def run_asv3_loop(
                 [item for n in ledger.citation_mapping() if (item := ledger.get(n))],
                 resuming=True,
             )
+            if article_bindings is not None and "article_bindings" in previous:
+                saved_bindings = previous["article_bindings"]
+                if not isinstance(saved_bindings, dict):
+                    raise ValueError("Invalid article-binding checkpoint")
+                article_bindings.restore(saved_bindings, context, ledger)
             saved_outcomes = previous.get("outcome_map")
             if isinstance(saved_outcomes, dict):
                 outcome_map.restore(saved_outcomes, ledger)

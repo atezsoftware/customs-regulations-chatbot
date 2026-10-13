@@ -130,7 +130,8 @@ def test_source_answer_body_publication_keeps_citation_checks_without_statute_re
     own_statute = MagicMock(side_effect=AssertionError("No blanket own-statute demand"))
     lower_reference = MagicMock(side_effect=AssertionError("No every-reference gate"))
     monkeypatch.setattr(runtime, "native_named_authority_gap", own_statute)
-    monkeypatch.setattr(runtime, "cited_lower_statute_gap", lower_reference)
+    monkeypatch.setattr(runtime, "canonical_named_authority_gap", own_statute)
+    monkeypatch.setattr(runtime, "canonical_cited_lower_statute_gap", lower_reference)
     runtime.run_asv3_loop(**kwargs)
     assert research.invoke.call_count == 2
     assert writer.invoke.call_count == len(results)
