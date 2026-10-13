@@ -331,7 +331,7 @@ class CroppedCostBudget:
         *,
         research_usd: float = 10.0,
         total_llm_usd: float = 1.50,
-        repair_usd: float = 5.0,
+        repair_usd: float = 10.0,
     ) -> None:
         if (
             any(
@@ -806,6 +806,16 @@ class CroppedCostBudget:
         if type(payload.get("version")) is not int:
             raise ValueError("Invalid Cropped cost checkpoint version")
         expected = self.export()
+        # Only the former shipped default may upgrade; charge validation stays exact.
+        legacy_repair_upgrade = (
+            self.research_usd,
+            self.total_llm_usd,
+            self.repair_usd,
+        ) == (10.0, 1.50, 10.0) and (
+            payload.get("research_usd"),
+            payload.get("total_llm_usd"),
+            payload.get("repair_usd"),
+        ) == (10.0, 1.50, 5.0)
         for field in (
             "version",
             "run_id",
@@ -818,6 +828,8 @@ class CroppedCostBudget:
             "pricing_policy",
             "excluded_services",
         ):
+            if field == "repair_usd" and legacy_repair_upgrade:
+                continue
             if payload.get(field) != expected[field]:
                 raise ValueError("Cropped cost checkpoint ownership or policy changed")
         state = payload.get("state")

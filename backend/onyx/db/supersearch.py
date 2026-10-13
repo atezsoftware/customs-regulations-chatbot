@@ -23,6 +23,7 @@ from onyx.db.regulatory_public_reads import (
     iter_public_temporal_bindings,
     qualified_file_ids,
 )
+from onyx.document_index.publication_models import PublicationIndexSnapshot
 from onyx.error_handling.error_codes import OnyxErrorCode
 from onyx.error_handling.exceptions import OnyxError
 from onyx.regulatory.publication_reads import (
@@ -109,6 +110,8 @@ def resolve_supersearch_center_ids(
     source_id: UUID,
     center_ids: tuple[str, ...],
     check_active: Callable[[], None],
+    expected_index: PublicationIndexSnapshot | None = None,
+    expected_ordinals: dict[str, int] | None = None,
 ) -> dict[str, tuple[str, ...]]:
     """Resolve search aggregates from authoritative stored membership, without text.
 
@@ -133,6 +136,12 @@ def resolve_supersearch_center_ids(
             raise CorpusScopeUnavailable(
                 "Supersearch source requires a verified query index snapshot."
             )
+        if expected_index is not None and not expected_index.matches_temporal_index(
+            index
+        ):
+            raise CorpusScopeUnavailable(
+                "Search center index changed before resolution."
+            )
         bindings = iter_public_temporal_bindings(
             session,
             source_id,
@@ -149,12 +158,28 @@ def resolve_supersearch_center_ids(
                     raise CorpusScopeUnavailable(
                         "Supersearch publication binding differs from its requested center."
                     )
+                if (
+                    expected_ordinals is not None
+                    and expected_ordinals.get(identifier) != binding.projection.ordinal
+                ):
+                    raise CorpusScopeUnavailable(
+                        "Search center ordinal changed before resolution."
+                    )
                 metadata = {**payload, **binding.representation_metadata}
                 chunk_type = metadata.get("chunk_type")
                 if chunk_type is not None and not isinstance(chunk_type, str):
                     raise CorpusScopeUnavailable(
                         "Supersearch publication center has an invalid chunk type."
                     )
+                if (
+                    expected_ordinals is not None
+                    and binding.derived_role == "hierarchical_aggregate"
+                ):
+                    if chunk_type not in (None, "hierarchical_aggregate"):
+                        raise CorpusScopeUnavailable(
+                            "Search aggregate has contradictory canonical role."
+                        )
+                    chunk_type = "hierarchical_aggregate"
                 if (
                     chunk_type != "hierarchical_aggregate"
                     and binding.derived_role != "canonical"
@@ -196,11 +221,12 @@ def resolve_supersearch_center_ids(
 
         def visible_statement(
             identifiers: tuple[str, ...],
-        ) -> Select[tuple[str, str | None, dict[str, Any]]]:
+        ) -> Select[tuple[str, str | None, dict[str, Any], int]]:
             statement = select(
                 RegulatoryChunk.id,
                 RegulatoryChunk.chunk_type,
                 RegulatoryChunk.chunk_metadata,
+                RegulatoryChunk.projection_ordinal,
             ).where(
                 RegulatoryChunk.user_file_id == source_id,
                 RegulatoryChunk.id.in_(identifiers),
@@ -220,6 +246,13 @@ def resolve_supersearch_center_ids(
 
         for row in session.execute(visible_statement(center_ids)):
             check_active()
+            if (
+                expected_ordinals is not None
+                and expected_ordinals.get(row.id) != row.projection_ordinal
+            ):
+                raise CorpusScopeUnavailable(
+                    "Search center ordinal changed before resolution."
+                )
             resolved[row.id] = _stored_center_members(
                 row.id, row.chunk_type, row.chunk_metadata or {}
             )

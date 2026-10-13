@@ -150,12 +150,12 @@ def test_first_finalization_after_ten_dollars_is_not_repair(
     assert state(budget.export())["spent_usd"] == pytest.approx(0.21)
 
 
-def test_repair_five_dollar_gate_includes_parallel_reservations(
+def test_repair_ten_dollar_gate_includes_parallel_reservations(
     budget: CroppedCostBudget,
 ) -> None:
     budget.record_external_charge(
         "observed-searches",
-        known_cost_usd=4.9,
+        known_cost_usd=9.9,
         uncertain_upper_usd=0.0,
         context=budget.context,
     )
@@ -981,3 +981,124 @@ def test_measured_disabled_write_contract_failure_cannot_be_removed_on_resume(
     checkpoint["state_hash"] = cost_module._hash(saved)
     with pytest.raises(ValueError, match="contract stop was removed"):
         CroppedCostBudget(budget.context, "same request").restore(checkpoint)
+
+
+def legacy_budget(context: RunContext) -> CroppedCostBudget:
+    legacy = CroppedCostBudget(context, "same request", repair_usd=5.0)
+    ticket = legacy.prepare("sol", "openai", 1000, 1024, research=True, owner="root")
+    legacy.complete(ticket, usage(1000, 100))
+    legacy.record_external_charge(
+        "retained-prior-charges",
+        known_cost_usd=5.1,
+        uncertain_upper_usd=0.02,
+        context=context,
+    )
+    return legacy
+
+
+def test_exact_legacy_repair_policy_upgrade_preserves_every_recorded_charge(
+    budget: CroppedCostBudget,
+) -> None:
+    legacy = legacy_budget(budget.context)
+    before = legacy.export()
+    assert not legacy.repair_allowed
+    assert budget.research_usd == budget.repair_usd == 10.0
+    assert budget.total_llm_usd == 1.5
+    budget.restore(before)
+    after = budget.export()
+    assert after["repair_usd"] == 10.0
+    assert {**before, "repair_usd": 10.0} == after
+    assert budget.repair_allowed and budget.research_allowed
+    assert budget.state_instructions()["target_is_hard_cap"] is False
+    resumed = CroppedCostBudget(budget.context, "same request")
+    resumed.restore(after)
+    assert resumed.export() == after
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "research",
+        "target",
+        "repair",
+        "version",
+        "pricing",
+        "run",
+        "request",
+        "scope",
+        "hash",
+        "usage",
+        "reserve",
+    ],
+)
+def test_legacy_upgrade_does_not_relax_policy_ownership_or_cost_proofs(
+    budget: CroppedCostBudget,
+    change: str,
+) -> None:
+    saved = legacy_budget(budget.context).export()
+    if change in {"research", "target", "repair"}:
+        saved[
+            {
+                "research": "research_usd",
+                "target": "total_llm_usd",
+                "repair": "repair_usd",
+            }[change]
+        ] = {"research": 20.0, "target": 3.0, "repair": 4.0}[change]
+    elif change in {"version", "pricing", "run", "request", "scope", "hash"}:
+        field = {
+            "version": "version",
+            "pricing": "pricing_policy",
+            "run": "run_id",
+            "request": "request_hash",
+            "scope": "scope_hash",
+            "hash": "state_hash",
+        }[change]
+        saved[field] = 4 if change == "version" else "changed"
+    else:
+        saved_state = state(saved)
+        calls = saved_state["calls"]
+        assert isinstance(calls, list) and isinstance(calls[0], dict)
+        if change == "usage":
+            supplied_usage = calls[0]["usage"]
+            assert isinstance(supplied_usage, dict)
+            supplied_usage["prompt_tokens"] = 999999
+        else:
+            calls[0]["reserved_usd"] = 0.0
+        saved["state_hash"] = cost_module._hash(saved_state)
+    before = budget.export()
+    with pytest.raises(ValueError):
+        budget.restore(saved)
+    assert budget.export() == before
+
+
+@pytest.mark.parametrize(
+    "custom", [{"repair_usd": 9.0}, {"research_usd": 20.0}, {"total_llm_usd": 3.0}]
+)
+def test_legacy_upgrade_is_not_applied_to_custom_destination_policy(
+    budget: CroppedCostBudget,
+    custom: dict[str, float],
+) -> None:
+    saved = legacy_budget(budget.context).export()
+    destination = CroppedCostBudget(budget.context, "same request", **custom)
+    with pytest.raises(ValueError, match="policy changed"):
+        destination.restore(saved)
+
+
+def test_legacy_upgrade_preserves_unknown_cost_stop(
+    budget: CroppedCostBudget,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    legacy = legacy_budget(budget.context)
+
+    def unknown(*_: object) -> tuple[float, float, float, float]:
+        raise RunStopped("Unavailable pricing")
+
+    monkeypatch.setattr(cost_module, "_rates", unknown)
+    ticket = legacy.prepare(
+        "unknown", "provider", 1000, 1024, research=False, owner="root"
+    )
+    legacy.complete(ticket, None, TimeoutError())
+    saved = legacy.export()
+    budget.restore(saved)
+    assert state(budget.export()) == state(saved)
+    assert not budget.repair_allowed and not budget.research_allowed

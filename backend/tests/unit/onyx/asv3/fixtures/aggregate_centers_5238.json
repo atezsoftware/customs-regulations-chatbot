@@ -1,0 +1,153 @@
+{
+  "source_id": "16771bcf-529d-4c5f-aa4c-8bc7efe363dc",
+  "as_of_date": "2026-10-13",
+  "centers": [
+    {
+      "id": "rc_0949d3ccad11827963e4d64b1e81d1c9421deaaf",
+      "ordinal": 2241,
+      "members": [
+        "rc_5e794cd0c3a3136e58d550c05ce1f3c880a21967",
+        "rc_229a950b4fbe039ac887dd3df90cce7e5a70f227",
+        "rc_ec5afada0668a6fc00dddd7731f2011c47ee7a98"
+      ]
+    },
+    {
+      "id": "rc_09dfd5f961159bcef334c5b7c85a3ac14133c6f6",
+      "ordinal": 2239,
+      "members": [
+        "rc_4a7928bd6cf9d9723ef1e65884b4a0b08efea5b6",
+        "rc_7b4a70a72d73b87a12563ba23e9823f225f0d16e",
+        "rc_865ea3bf814588334d905348965e95944fbaa3ee"
+      ]
+    },
+    {
+      "id": "rc_8dc833aaec2e8fc937123692765c3a6e87649918",
+      "ordinal": 2240,
+      "members": [
+        "rc_4310166ebc6b1a8b9aa04a66525b8081f39fbf31",
+        "rc_a39fb331784202fcd71a6a3bb904420c548ff1ca",
+        "rc_5723d3303417b290387b1cc5a9f48f199a34cdef"
+      ]
+    }
+  ],
+  "originals": [
+    {
+      "id": "rc_4a7928bd6cf9d9723ef1e65884b4a0b08efea5b6",
+      "text": "2. Hareket gümrük idaresi CIM taşıma belgesinin 1, 2 ve 3 üncü yapraklarında gümrük için ayrılmış kutuya:",
+      "position": 570,
+      "projection_ordinal": 570,
+      "heading_path": [
+        "ORTAK TRANSİT REJİMİNE İLİŞKİN SÖZLEŞME",
+        "KISIM 2",
+        "MADDE 97 - EŞYANIN AKİT TARAFLAR ARASINDA TAŞINMASI",
+        "CIM taşıma belgesinin kullanımı",
+        "2. Hareket gümrük idaresi CIM taşıma belgesinin 1, 2 ve 3 üncü yapraklarında gümrük için ayrılmış kutuya:"
+      ]
+    },
+    {
+      "id": "rc_7b4a70a72d73b87a12563ba23e9823f225f0d16e",
+      "text": "(a) T1 rejimi altında taşınan eşya için \"T1\" kodunu;",
+      "position": 571,
+      "projection_ordinal": 571,
+      "heading_path": [
+        "ORTAK TRANSİT REJİMİNE İLİŞKİN SÖZLEŞME",
+        "KISIM 2",
+        "MADDE 97 - EŞYANIN AKİT TARAFLAR ARASINDA TAŞINMASI",
+        "CIM taşıma belgesinin kullanımı",
+        "2. Hareket gümrük idaresi CIM taşıma belgesinin 1, 2 ve 3 üncü yapraklarında gümrük için ayrılmış kutuya:",
+        "(a) \"T1\""
+      ]
+    },
+    {
+      "id": "rc_865ea3bf814588334d905348965e95944fbaa3ee",
+      "text": "(b) T2 rejimi altında taşınan eşya için ve Birlik hükümleri uyarınca girilmesi zorunlu olduğunda, \"T2\" veya \"T2F' kodlarından uygun olanı,\naçıkça yazar.\n\"T2\" veya \"T2F\" kodu, hareket gümrük idaresinin mührü ile onaylanır.",
+      "position": 572,
+      "projection_ordinal": 572,
+      "heading_path": [
+        "ORTAK TRANSİT REJİMİNE İLİŞKİN SÖZLEŞME",
+        "KISIM 2",
+        "MADDE 97 - EŞYANIN AKİT TARAFLAR ARASINDA TAŞINMASI",
+        "CIM taşıma belgesinin kullanımı",
+        "2. Hareket gümrük idaresi CIM taşıma belgesinin 1, 2 ve 3 üncü yapraklarında gümrük için ayrılmış kutuya:",
+        "(b) \"T2\""
+      ]
+    },
+    {
+      "id": "rc_4310166ebc6b1a8b9aa04a66525b8081f39fbf31",
+      "text": "1. Demiryolu ile taşınan eşya için kağıt usul ortak transit rejimine tabi tutulan eşya varış gümrük idaresine vardığında, izinli demiryolu işletmecisi tarafından gümrük idaresine:",
+      "position": 581,
+      "projection_ordinal": 581,
+      "heading_path": [
+        "ORTAK TRANSİT REJİMİNE İLİŞKİN SÖZLEŞME",
+        "KISIM 2",
+        "MADDE 100 - Varış gümrük idaresindeki işlemler",
+        "1. Demiryolu ile taşınan eşya için kağıt usul ortak transit rejimine tabi tutulan eşya varış gümrük idaresine vardığında, izinli demiryolu işletmecisi tarafından gümrük idaresine:"
+      ]
+    },
+    {
+      "id": "rc_a39fb331784202fcd71a6a3bb904420c548ff1ca",
+      "text": "(a) Eşya;",
+      "position": 582,
+      "projection_ordinal": 582,
+      "heading_path": [
+        "ORTAK TRANSİT REJİMİNE İLİŞKİN SÖZLEŞME",
+        "KISIM 2",
+        "MADDE 100 - Varış gümrük idaresindeki işlemler",
+        "1. Demiryolu ile taşınan eşya için kağıt usul ortak transit rejimine tabi tutulan eşya varış gümrük idaresine vardığında, izinli demiryolu işletmecisi tarafından gümrük idaresine:",
+        "(a) Eşya;"
+      ]
+    },
+    {
+      "id": "rc_5723d3303417b290387b1cc5a9f48f199a34cdef",
+      "text": "(b) CM taşıma belgesinin 2 ve 3 no.lu yaprakları\nsunulur.\nVarış gümrük idaresi, CIM taşıma belgesinin 2 no.lu yaprağını mühürledikten sonra izinli demiryolu işletmecisine geri verir ve CIM taşıma belgesinin 3 no.lu yaprağını muhafaza eder.",
+      "position": 583,
+      "projection_ordinal": 583,
+      "heading_path": [
+        "ORTAK TRANSİT REJİMİNE İLİŞKİN SÖZLEŞME",
+        "KISIM 2",
+        "MADDE 100 - Varış gümrük idaresindeki işlemler",
+        "1. Demiryolu ile taşınan eşya için kağıt usul ortak transit rejimine tabi tutulan eşya varış gümrük idaresine vardığında, izinli demiryolu işletmecisi tarafından gümrük idaresine:",
+        "(b) CM taşıma belgesinin 2 ve 3 no.lu yaprakları"
+      ]
+    },
+    {
+      "id": "rc_5e794cd0c3a3136e58d550c05ce1f3c880a21967",
+      "text": "1. Bir Akit Tarafın topraklarında başlayan ve üçüncü ülkede bitecek taşıma işlemine Madde\n97 ve 98, uygulanır.",
+      "position": 586,
+      "projection_ordinal": 586,
+      "heading_path": [
+        "ORTAK TRANSİT REJİMİNE İLİŞKİN SÖZLEŞME",
+        "KISIM 3",
+        "MADDE 101 - EŞYANIN ÜÇÜNCÜ ÜLKELERE VEYA ÜÇÜNCÜ ÜLKELERDEN TAŞINMASI",
+        "Eşyanın üçüncü ülkelere taşınması",
+        "1. Bir Akit Tarafın topraklarında başlayan ve üçüncü ülkede bitecek taşıma işlemine Madde"
+      ]
+    },
+    {
+      "id": "rc_229a950b4fbe039ac887dd3df90cce7e5a70f227",
+      "text": "2. Demiryolu ile taşınan eşya için kağıt usul ortak transit rejimine tabi tutulan eşyanın bir Akit Tarafın topraklarını terk ettiği sınır istasyonundan sorumlu gümrük idaresi, varış gümrük idaresi olarak hareket eder.",
+      "position": 587,
+      "projection_ordinal": 587,
+      "heading_path": [
+        "ORTAK TRANSİT REJİMİNE İLİŞKİN SÖZLEŞME",
+        "KISIM 3",
+        "MADDE 101 - EŞYANIN ÜÇÜNCÜ ÜLKELERE VEYA ÜÇÜNCÜ ÜLKELERDEN TAŞINMASI",
+        "Eşyanın üçüncü ülkelere taşınması",
+        "2. Demiryolu ile taşınan eşya için kağıt usul ortak transit rejimine tabi tutulan eşyanın..."
+      ]
+    },
+    {
+      "id": "rc_ec5afada0668a6fc00dddd7731f2011c47ee7a98",
+      "text": "3. Bu gümrük idaresinde işlem yapılması gerekmez.",
+      "position": 588,
+      "projection_ordinal": 588,
+      "heading_path": [
+        "ORTAK TRANSİT REJİMİNE İLİŞKİN SÖZLEŞME",
+        "KISIM 3",
+        "MADDE 101 - EŞYANIN ÜÇÜNCÜ ÜLKELERE VEYA ÜÇÜNCÜ ÜLKELERDEN TAŞINMASI",
+        "Eşyanın üçüncü ülkelere taşınması",
+        "3. Bu gümrük idaresinde işlem yapılması gerekmez."
+      ]
+    }
+  ]
+}

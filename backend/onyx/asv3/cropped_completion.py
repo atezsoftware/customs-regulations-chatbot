@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 from dataclasses import dataclass
@@ -17,8 +18,9 @@ from pydantic import (
 )
 
 from onyx.asv3.citation_numbers import extract_citation_numbers
+from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.models import RunContext
-from onyx.asv3.outcome_map import OutcomeMap
+from onyx.asv3.outcome_map import OutcomeMap, OutcomeUpdate
 from onyx.asv3.research_state import ResearchState
 
 
@@ -212,6 +214,11 @@ class CroppedValidatedFollowups:
     snapshot: CroppedCompletionContext
     answer_hash: str
     items: tuple[CroppedRequiredFollowup, ...]
+    staged_outcomes_json: str | None = None
+
+
+class CroppedFollowupOutcomeMetadataError(ValueError):
+    """The terminal's outcome update is invalid independently of its followups."""
 
 
 def _eligible(
@@ -262,6 +269,7 @@ def validate_cropped_required_followups(
     answer: str,
     facts: list[str] | None = None,
     publication_gap: dict[str, JsonValue] | None = None,
+    outcome_update: OutcomeUpdate | None = None,
 ) -> CroppedValidatedFollowups:
     """Validate before applying this terminal action's own state updates."""
     current = build_cropped_completion_context(
@@ -275,6 +283,25 @@ def validate_cropped_required_followups(
         [] if raw is None else raw
     )
     research, outcomes = _state(context)
+    staged_outcomes_json = None
+    if outcome_update is not None:
+        current_outcomes = context.services.get("outcome_map")
+        ledger = context.services.get("evidence")
+        if not isinstance(current_outcomes, OutcomeMap) or not isinstance(
+            ledger, EvidenceLedger
+        ):
+            raise ValueError(
+                "Followup declarations require their outcome and source records"
+            )
+        # Same-action declarations extend validation, not the writer's base snapshot.
+        staged = copy.copy(current_outcomes)
+        try:
+            staged.restore(json.loads(snapshot.outcomes_json), ledger)
+            staged.update(outcome_update, ledger)
+        except ValueError as error:
+            raise CroppedFollowupOutcomeMetadataError(str(error)) from error
+        outcomes = staged.export()
+        staged_outcomes_json = _json(outcomes)
     allowed = set(extract_citation_numbers(answer))
     kept: list[CroppedRequiredFollowup] = []
     for item in items:
@@ -286,7 +313,9 @@ def validate_cropped_required_followups(
             )
         if item not in kept:
             kept.append(item)
-    return CroppedValidatedFollowups(snapshot, _hash(answer), tuple(kept))
+    return CroppedValidatedFollowups(
+        snapshot, _hash(answer), tuple(kept), staged_outcomes_json
+    )
 
 
 def append_cropped_required_followups(
@@ -312,7 +341,10 @@ def append_cropped_required_followups(
         raise ValueError("Followups cannot transfer to a changed answer or scenario")
     research, outcomes = _state(context)
     old_research = cast(dict[str, JsonValue], json.loads(snapshot.research_json))
-    old_outcomes = cast(dict[str, JsonValue], json.loads(snapshot.outcomes_json))
+    old_outcomes = cast(
+        dict[str, JsonValue],
+        json.loads(validated.staged_outcomes_json or snapshot.outcomes_json),
+    )
     kept: list[CroppedRequiredFollowup] = []
     for item in validated.items:
         for identity, field, old, current in (

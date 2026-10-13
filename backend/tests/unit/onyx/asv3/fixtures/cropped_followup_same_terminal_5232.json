@@ -1,0 +1,141 @@
+{
+  "provenance": {
+    "captured_message_id": 5232,
+    "scope": "terminal metadata and bound research needs only; answer remains unapproved",
+    "answer_sha256": "2f2824241068f6642fdfa16f960e0fcd3dda40ad0863cfc21fce595e334cda8e"
+  },
+  "request": "VAKA 1 — Çok Modlu (Demiryolu + Karayolu) Taşıma ve Etil Alkol\n\nBir Alman demiryolu işletmecisi, CIM taşıma belgesinin transit beyanı olarak kullanıldığı demiryolu ile taşınan eşya için kağıt usul ortak transit rejimi kapsamında, Türkiye üzerinden İran'a sevk edilmek üzere 1.000 kap tağyir edilmemiş etil alkol (%96, GTİP 2207.10) taşımaktadır. Eşya Halkalı Garı'na geldiğinde, demiryolu hattındaki bir arıza nedeniyle yolculuğun C2 yetki belgeli bir karayolu aracıyla İran'a devam etmesine karar verilmiştir.\n\nDemiryolunda başlayan CIM'li transit işlemi karayolu ayağında nasıl devam eder? Eşya TIR karnesi himayesinde taşınabilir mi?\nKarayolu aracı ve sürücüsü, bu ambalajlı etil alkolü taşırken hangi ADR şartlarını sağlamalıdır?\nEşya karayolunda tamamen yanarsa demiryolu işletmecisinin ve karayolu taşıyıcısının sorumluluğu nedir? Gümrük vergileri bakımından durum ne olur?",
+  "questions": [
+    "VAKA 1 — Çok Modlu (Demiryolu + Karayolu) Taşıma ve Etil Alkol\n\nBir Alman demiryolu işletmecisi, CIM taşıma belgesinin transit beyanı olarak kullanıldığı demiryolu ile taşınan eşya için kağıt usul ortak transit rejimi kapsamında, Türkiye üzerinden İran'a sevk edilmek üzere 1.000 kap tağyir edilmemiş etil alkol (%96, GTİP 2207.10) taşımaktadır. Eşya Halkalı Garı'na geldiğinde, demiryolu hattındaki bir arıza nedeniyle yolculuğun C2 yetki belgeli bir karayolu aracıyla İran'a devam etmesine karar verilmiştir.\n\nDemiryolunda başlayan CIM'li transit işlemi karayolu ayağında nasıl devam eder? Eşya TIR karnesi himayesinde taşınabilir mi?\nKarayolu aracı ve sürücüsü, bu ambalajlı etil alkolü taşırken hangi ADR şartlarını sağlamalıdır?\nEşya karayolunda tamamen yanarsa demiryolu işletmecisinin ve karayolu taşıyıcısının sorumluluğu nedir? Gümrük vergileri bakımından durum ne olur?"
+  ],
+  "needs": [
+    {
+      "need_id": "rail",
+      "question_ids": [
+        "q0"
+      ],
+      "determination_ids": [
+        "q0:d0"
+      ],
+      "purpose": "CIM kağıt ortak transitinin karayoluna geçişi",
+      "completion_test": "Rejim değişikliği, sorumlu ve Halkalı işlemi özgün hükümlerde belirlenir",
+      "kind": "other",
+      "depends_on": [],
+      "status": "open",
+      "gap": "",
+      "material": true,
+      "evidence_numbers": []
+    },
+    {
+      "need_id": "tir",
+      "question_ids": [
+        "q0"
+      ],
+      "determination_ids": [
+        "q0:d1"
+      ],
+      "purpose": "2207.10 alkolün TIR kapsamı",
+      "completion_test": "Ürün yasağı ve alternatif transit belirlenir",
+      "kind": "other",
+      "depends_on": [],
+      "status": "open",
+      "gap": "",
+      "material": true,
+      "evidence_numbers": []
+    },
+    {
+      "need_id": "adr",
+      "question_ids": [
+        "q0"
+      ],
+      "determination_ids": [
+        "q0:d2"
+      ],
+      "purpose": "Ambalajlı yüzde 96 etil alkol ADR araç sürücü koşulları",
+      "completion_test": "Sınıflandırma, muafiyetler, araç ve sürücü belgeleri belirlenir",
+      "kind": "other",
+      "depends_on": [],
+      "status": "blocked",
+      "gap": "ADR teknik ekleri ve yönetmelik özgün metni erişilebilir aramalarda elde edilemedi; yalnız eski uygulama yazıları teslim edildi.",
+      "material": true,
+      "evidence_numbers": []
+    },
+    {
+      "need_id": "loss",
+      "question_ids": [
+        "q0"
+      ],
+      "determination_ids": [
+        "q0:d3",
+        "q0:d4"
+      ],
+      "purpose": "Tam yanmada transit sorumluluğu ve vergi sonuçları",
+      "completion_test": "Asıl sorumlu taşıyıcı, zayi ispatı ve vergi yükümlülüğü özgün hükümlerle belirlenir",
+      "kind": "other",
+      "depends_on": [],
+      "status": "open",
+      "gap": "",
+      "material": true,
+      "evidence_numbers": []
+    }
+  ],
+  "arguments": {
+    "_language": "tr",
+    "_outcomes": [
+      {
+        "outcome_id": "rail",
+        "question_ids": [
+          "q0"
+        ],
+        "detail": "CIM'li demiryolu transitinin karayolu ayağına geçişi ve çok modlu alternatif"
+      },
+      {
+        "outcome_id": "tir",
+        "question_ids": [
+          "q0"
+        ],
+        "detail": "2207.10 yüzde 96 etil alkolün TIR karnesiyle taşınabilmesi"
+      },
+      {
+        "outcome_id": "adr",
+        "question_ids": [
+          "q0"
+        ],
+        "detail": "Ambalajlı alkol için araç ve sürücü ADR şartları ve muafiyetler"
+      },
+      {
+        "outcome_id": "liability",
+        "question_ids": [
+          "q0"
+        ],
+        "detail": "Tam yangın kaybında demiryolu ve karayolu taşıyıcılarının gümrük ve sözleşmesel sorumluluğu"
+      },
+      {
+        "outcome_id": "tax",
+        "question_ids": [
+          "q0"
+        ],
+        "detail": "Türkiye'deki transit yangınında gümrük vergileri, tam zıya ispatı ve favorable değerlendirme"
+      }
+    ],
+    "_required_followups": [
+      {
+        "need_id": "adr",
+        "outcome_id": "adr",
+        "question": "İşlem tarihinde uygulanacak ADR teknik ekleri ve ilgili yönetmeliğin doğrudan hükümleri uyarınca ambalajlı yüzde 96 etil alkolün sınıflandırması, miktar muafiyetleri ve araç-sürücü belge kapsamı nedir?",
+        "material_rationale": "Elde yalnız uygulama yazıları bulunmaktadır; teknik sınıflandırma, muafiyet ve ambalajlı taşıma araç onayı kesinleştirilememiştir.",
+        "definitely_necessary": true,
+        "material": true
+      },
+      {
+        "need_id": "loss",
+        "outcome_id": "liability",
+        "question": "Uygulanacak CIM sürümünün çok modlu veya ikame karayolu taşıması hükümleri, aynı sözleşmeyle devam eden taşıma bakımından Alman işletmecisinin sorumluluğunu nasıl düzenler?",
+        "material_rationale": "Eski CIM genel kayıp hükmü teslim edildi fakat karayolu ikamesinin güncel kapsamı ve uygulanacak sürüm doğrulanamadı.",
+        "definitely_necessary": true,
+        "material": true
+      }
+    ],
+    "answer": "## Hızlı cevap\n\n- **CIM’li işlem karayoluna kendiliğinden taşınmaz.** CIM’in transit beyanı olarak kabulü demiryolu taşımasına ilişkindir. Somut olayda Halkalı’da demiryolu işleminin gümrükçe sonlandırılması ve karayolu ayağı için ayrı transit beyanıyla devam edilmesi gerekir; ara istasyonda başka rejime geçildiğinde o istasyonun gümrüğü varış idaresi olarak hareket eder.[53][222][256][368] Bunun yanında, konteyner açılmadan yapılan, teminatı tüm taşıma sürecini kapsayan standart çok modlu transit için ayrı bir kolaylık vardır; ancak vakada yalnızca “1.000 kap” belirtilmesi bu koşulların bulunduğunu göstermez.[432][434][52]\n- **Verilen Tebliğ metnine göre bu alkol TIR karnesiyle taşınamaz.** %96 ve 2207.10 kodlu denatüre edilmemiş etil alkol yasak listededir. Normal Model 1 karnesi miktardan bağımsız yasaktır; Model 2 için de kefalet kabul edilmediğinden izin verilmez. Model 2 bakımından sonucu değiştirebilecek husus, kefaletin kabul edildiğinin Genel Müdürlükçe duyurulmasıdır.[1][181][182]\n- **ADR yönünden C2 belgesi tek başına uygunluk değerlendirmesi sağlamaz.** Erişilen uygulama yazısı; taşımanın özelliğine uygun SRC5/ADR sürücü eğitim sertifikası, uygun ambalaj, işaretleme, taşıma evrakı, yazılı talimat, koruyucu ekipman ve güvenli yükleme aramaktadır.[108][99] Ancak aşağıda açıklanan teknik kaynak eksikliği nedeniyle bu ambalajlı yük için kesin araç onay türü ve miktar muafiyeti sonucu verilemiyor.\n- **Yangın otomatik olarak bütün sorumlulukları kaldırmaz.** Rejim hak sahibi ve transit statüsünü bilerek eşyayı kabul eden taşıyıcının teslim yükümlülükleri ayrıdır. Türkiye içinde beklenmeyen hal veya mücbir sebepten kaynaklanan telef/kayıp kanıtlanırsa gümrük vergileri aranmaz.[178][179][145] CMR uygulanıyorsa karayolu taşıyıcısı tam kayıptan kural olarak sorumludur; kurtuluş sebebini kendisi kanıtlamalıdır.[317][236][237][282]\n\n## 1. Halkalı’da karayoluna geçiş\n\n### CIM işleminin sınırı\n\nOrtak Transit Sözleşmesi’nin 91. maddesi CIM’i, izinli demiryolu işletmelerinin işbirliği içinde yürüttükleri **demiryolu taşımasında** transit beyanı olarak kabul eder. Bu nedenle yalnızca kamyonun plakasını CIM’e yazmak, İran’a kadar karayoluyla taşımanın aynı demiryolu basitleştirmesi altında sürdürülmesi için yeterli değildir.[53]\n\nSomut vakada izlenecek işlem sırası şöyledir:\n\n1. **Arıza ve aktarma gümrüğe bildirilmelidir.** Gümrük Kanunu m.92/1, beklenmeyen hal veya mücbir sebeple yoluna devam edemeyen transit taşıt için “gecikmeksizin en yakın gümrük idaresine” bildirim; başka taşıta aktarma için gümrük gözetimi ve tutanak öngörür.[144]\n2. **Halkalı’daki yetkili gümrükte CIM’li ayağın varış işlemleri yapılmalıdır.** Ara istasyonda eşya başka gümrük rejimine tabi tutulursa o istasyonun gümrüğü varış idaresidir. İzinli demiryolu işletmecisi eşyayı ve CIM’in 2 ve 3 numaralı yapraklarını sunar; gümrük 2 numaralı yaprağı mühürleyip geri verir, 3 numaralı yaprağı muhafaza eder.[222][92][221][73]\n3. **Karayolu ayağı için ayrı transit beyanı verilmelidir.** Gümrük Kanunu transit rejimi beyanıyla taşımaya izin verir; Gümrük Yönetmeliği ortak ve ulusal transitte transit refakat belgesini kabul eder. Beyan, kâğıt usul uygulanan durumlar dışında rejim hak sahibi tarafından sistem üzerinden yapılır.[256][368][374] Bu çerçevede Halkalı’dan Türkiye’deki çıkış gümrüğüne kadar karayolu ayağı için ulusal transit işlemi kurulmalı; Türkiye’deki işlem, İran içindeki taşımanın gümrük işlemiyle karıştırılmamalıdır.[249][251][368]\n4. **Teminat ve ayniyet önlemleri yeni ayağa göre düzenlenmelidir.** Karayolu transitinde genel kural teminattır; demiryoluna özgü teminat istisnası karayolu taşımasına otomatik olarak aktarılmaz. Ayniyet genel olarak mühürleme ile sağlanır; yeterli tanım ve belirleyici bilgilerin bulunması halinde gümrük mühürsüz sevke karar verebilir.[287][290][291][400]\n\nCIM taşıma sözleşmesinde de değişiklik yapılacaksa, Sözleşme m.96 ayrıca dikkate alınmalıdır: üçüncü ülkede bitmesi öngörülen demiryolu taşımasının sözleşmesel olarak Türkiye içinde bitirilmesi halinde hareket gümrüğünün **ön onayı** gerekir. Hükmün kapsamı dışındaki değişiklikler uygulanabilir, fakat hareket gümrüğüne gecikmeksizin bildirilmelidir.[200][201][202]\n\n**Sonlandırma ile ibra aynı şey değildir:** eşya ve gerekli belgelerin varışa sunulması rejimi sona erdirir; hareket ve varış kayıtlarının karşılaştırılarak usulüne uygun tamamlanmanın belirlenmesi rejimin ibrasını sağlar. Bu nedenle Halkalı’daki teslim kaydı ve önceki işlemin ibra takibi saklanmalıdır.[261][262]\n\n### Çok modlu taşıma alternatifi\n\nTransit Rejimi Tebliği Seri No.4 m.31, hareket–varış arasındaki çok modlu taşıma için **konteyner şartı** getirir. Konteyner mühürlenir; karayolu ayağı varsa bütün taşıma sürecini kapsayan teminat alınır. Demiryolu–karayolu aktarmasında konteyner açılmadan yüklenir, yeni taşıt bilgileri TRB veya taşıma belgelerine yazılır ve değişiklik sisteme sonradan kaydedilir.[432][433][434][52]\n\nBu kolaylık, konteynerli ve uygun teminatlı standart transit seçeneğidir; **CIM’in tek başına kamyon ayağına geçmesi anlamına gelmez.** Ortak Transit Sözleşmesi m.106 da kombine taşımada standart transit usullerinin kullanılmasına izin verir ve CIM üzerinde kullanılan transit beyannamelerine açık atıf yapılmasını düzenler.[65][78]\n\nAyrıca Seri No.6 Tebliğ’de limandan demiryoluna yükleme yerine kadar kısa karayolu ayağının basitleştirme kapsamında kabul edilebildiği bir istisna vardır. Bu istisna, denizyoluyla gelen eşyanın demiryoluna aktarılması, izin sahibinin sorumluluk taahhüdü, karayolu kısmı için teminat ve izin makamının izni koşullarına bağlıdır; Halkalı’dan İran’a kadar demiryolunun tamamen karayoluyla değiştirilmesini kapsamaz.[51]\n\n## 2. TIR karnesi kullanılabilir mi?\n\n**Verilen TIR İşlemleri Tebliği’nin 61. maddesine göre hayır.** Ek-10, hacmen %80 veya daha fazla denatüre edilmemiş etil alkolü, açıkça **2207.10** koduyla saymaktadır. Vakadaki %96 alkol bu tanıma girer.[1][181]\n\nİki ihtimal ayrı değerlendirilmelidir:\n\n| Karne | Sonuç |\n|---|---|\n| **Normal TIR karnesi — Model 1** | Listedeki eşyanın “miktarı ne olursa olsun” taşınmasına izin verilmez; kapları bölmek bu yasağı kaldırmaz.[181] |\n| **Tütün–Alkol TIR karnesi — Model 2** | Tebliğ, bu karne türünü öngörmekle birlikte uluslararası kefil kuruluşun kefaleti kabul etmemesi nedeniyle taşımaya izin vermez. Kefalet kabul edilirse bunun Genel Müdürlükçe duyurulmasını öngörür.[182] |\n\nDolayısıyla somut sevkiyat için mevcut metinle desteklenen çözüm **TIR değil, karayolu transit beyanıdır**.[181][182][256]\n\nİşlem tarihi belirtilmediği ve eldeki metnin son değişiklik durumu kesinleştirilmediği için, Model 2 hakkında daha sonra yapılmış bir kefalet kabul duyurusunun bulunup bulunmadığı bu değerlendirmede doğrulanmış değildir.\n\n## 3. Araç ve sürücünün tehlikeli madde şartları\n\n### Doğrulanabilen uygulama çerçevesi\n\n20.01.2017 tarihli tehlikeli madde taşımacılığı yazısının aktardığı koşullar şunlardır; bunlar teknik ADR eklerinin yerine geçen, eksiksiz bir güncel uygunluk listesi olarak görülmemelidir.[195][196][108][99]\n\n- **Sürücü:** yaptığı taşımacılığın özelliğine uygun ADR sürücü eğitim sertifikası/SRC5.[99]\n- **Ambalaj:** ADR kapsamında test edilip onaylanmış UN sertifikalı taşıma birimleri.[108]\n- **İşaretleme:** araç ve ambalajlarda ADR’ye göre gereken etiket ve işaretler.[99]\n- **Araçtaki belgeler:** taşıma evrakı, yazılı talimat ve diğer zorunlu evrak.[99]\n- **Ekipman ve yükleme:** kişisel ve genel koruyucu ekipman ile yükleme güvenliği kurallarına uygun yükleme.[99]\n\n19.08.2015 tarihli uygulama yazısı da sıradan sevk irsaliyesi, taşıma irsaliyesi veya taşıma senedinin, ADR Bölüm 5.4.1’e göre hazırlanması gereken taşıma evrakı yerine kabul edilmeyeceğini belirtmektedir. Bu nedenle CIM veya CMR’nin mevcut olması, tehlikeli madde taşıma evrakının içerik kontrolünü gereksiz kılmaz.[107][110]\n\n### Ambalajlı yük ile tanker ayrımı\n\n2017 tarihli yazı, yıllık teknik muayene ve ADR/Taşıt Uygunluk Belgesini belirli tank kapasitelerini taşıyan araçlar ve **ambalaj içinde patlayıcı madde taşıyan araçlar** için ifade etmektedir. Bu pasaj, ambalajlı etil alkol taşıyan her kamyon için aynı onay belgesinin zorunlu olduğunu tek başına kanıtlamaz.[108] Buna karşılık 2021 tarihli başka bir yazı daha geniş araç belgelendirmesi ifadeleri kullanmaktadır; bunları teknik kapsam hükmü görülmeden kesin bir araç şartına dönüştürmek doğru olmaz.[103][135]\n\nADR’nin uygulanacak tarihli teknik ekleri ve ilgili karayolu tehlikeli madde yönetmeliğinin doğrudan operative hükümleri elde edilemedi. Bu nedenle %96 etil alkolün kesin UN kaydı, ambalaj grubu, taşıma kategorisi, küçük yük/sınırlı miktar eşikleri, sürücü eğitiminin muafiyet sınırı, turuncu plaka düzeni ve bu ambalajlı taşıma için araç onay türü kesinleştirilemiyor. Ayrıca 1.000 kap bilgisi; kap başına hacmi, toplam litreyi ve ambalaj yapısını göstermediğinden miktara bağlı istisna değerlendirmesi için yeterli veri sağlamıyor.\n\n**Sevk hazırlığı için önerim:** güvenlik bilgi formunun taşıma bilgileri bölümü, kap başına hacim, toplam litre, ambalaj/IBC türü, aracın modeli ve mevcut belgesi ile sürücünün SRC5 kapsamı birlikte kontrol edilmeden bir “ADR’ye tam uygunluk” sonucu verilmemesidir.\n\n## 4. Tam yanmada sorumluluk\n\n### Gümrüğe karşı sorumluluk\n\n**Alman demiryolu işletmecisinin statüsü CIM’den belirlenir.** CIM’in 58b kutusunda “evet” seçeneğiyle UIC kodunu giren izinli işletmeci rejim hak sahibidir. Rejim hak sahibi, eşyayı tam ve sağlam sunmak ve rejim hükümlerine uymakla yükümlüdür; diğer izinli demiryolu işletmecilerinin ayrıca sorumlu olması bu yükümlülüğü kaldırmaz.[76][313][314][58]\n\nHalkalı’da önceki işlem usulüne uygun sonlandırılıp ibra edilmiş ve ayrı karayolu transiti açılmışsa, sonraki işlemin asıl sorumlusu yeni beyandan belirlenir. Alman işletmecisinin önceki CIM’deki sıfatı, onu kendiliğinden yeni karayolu transitinin asıl sorumlusu yapmaz; ancak yeni beyanda da asıl sorumluysa teslim ve rejim yükümlülükleri devam eder.[261][262][374][178]\n\n**Karayolu taşıyıcısı**, transit statüsünü bilerek eşyayı kabul ettiği için, asıl sorumludan bağımsız olarak eşyayı süresinde, sağlam ve noksansız sunmakla yükümlüdür.[179] Fakat bu yükümlülük, yangında mutlaka vergi borcu doğacağı anlamına gelmez: borcun doğması ve tam zıya istisnası ayrıca değerlendirilmelidir.[180][145]\n\n### Eşya sahibine karşı taşıma tazminatı\n\nÜcret karşılığındaki Türkiye–İran karayolu taşıması CMR m.1’in uluslararası taşıma koşullarını karşılıyorsa, karayolu taşıyıcısı teslim aldığı andan teslim anına kadar tam kayıptan kural olarak sorumludur.[317][236]\n\nTaşıyıcı lehine değerlendirilebilecek başlıca ihtimaller:\n\n- Kayıp, hak sahibinin hata/ihmalinden, taşıyıcıya hata yüklemeyen talimatından, yüke has kusurdan veya taşıyıcının önlemesine imkân bulunmayan durumdan kaynaklanmışsa kurtuluş mümkündür; ispat taşıyıcıya aittir.[237][282]\n- Uygun nedensellik bulunduğunda kötü ambalajlama veya gönderici/alıcı tarafından yapılan yükleme gibi özel riskler ileri sürülebilir. Taşıyıcı riske atfedilebilirliği ortaya koymalı; hak sahibi de kaybın o riskten kaynaklanmadığını kanıtlayabilir.[239][241][242][283]\n- Kusurlu araç, kurtuluş gerekçesi değildir; birden fazla neden varsa taşıyıcının sorumlu olduğu nedenin katkısı değerlendirilir.[238][246]\n\nBu nedenle yalnızca “alkol tamamen yandı” bilgisiyle karayolu taşıyıcısını sorumsuz kabul etmek mümkün değildir.[236][237][282]\n\nElde edilen eski CIM metninde demiryolunun taşımaya kabulden teslime kadar eşya kaybından sorumlu olduğu, önleyemeyeceği durumlar veya çare bulamayacağı sonuçlar gibi kurtuluş nedenleri bulunduğu belirtilmektedir.[364]\n\nBununla birlikte uygulanacak güncel CIM sürümü ve demiryolu işletmecisinin karayolu ayağını aynı sözleşme altında yaptırdığı durumda sorumluluğu belirleyen çok modlu/ikame taşıma hükümleri doğrulanamadı. Bu nedenle Alman işletmecisinin eşya sahibine karşı sorumluluğunun yalnızca Halkalı’da kamyona teslimle sona erdiği veya yangının tamamından kesin sorumlu olduğu söylenemez. CIM sözleşmesinin devam edip etmediği ve karayolu sözleşmesinin kimin adına kurulduğu belirleyici eksik olgulardır.\n\n## 5. Gümrük vergileri ve yangın dosyası\n\n**Yangın Türkiye Gümrük Bölgesi içindeki transit sırasında gerçekleşmişse**, Gümrük Kanunu m.92/2’nin sonucu açıktır: beklenmeyen hal veya mücbir sebepten kaynaklanan telef/kayıp kanıtlandığında **“gümrük vergileri aranmaz”**.[145] Yangın İran’da gerçekleşmişse bu Türkiye içi hüküm, İran vergileri hakkında sonuç vermez.[145]\n\nOrtak transit işlemi henüz devam ediyorsa, Sözleşme m.112/2(b), rejimden çıkarılmanın veya koşula uyulmamasının eşyanın tabiatı, öngörülemeyen koşullar, mücbir sebepler yahut gümrük talimatı sonucunda tam tahrip/telafisi imkânsız kayıptan kaynaklandığı durumda borcun ortadan kalkmasını düzenler.[328][310][331]\n\nGümrük Kanunu m.186 da rejim yükümlülüğünün bu nedenlerle yerine getirilememesi için bir istisna içerir; ancak hüküm **m.182 ve m.184/1(a)’yı saklı tutar**. Dolayısıyla olası değerlendirmede yalnızca genel m.186’ya değil, bu transit vakasına doğrudan ilişkin m.92/2’ye dayanılmalıdır.[183][187][145]\n\n### Somut başvuru ve ispat\n\n- Yangının tarihi, yeri, nedeni ve **beyan konusu 1.000 kabın tamamının kaybı** ile bağlantısını gösteren itfaiye, kolluk, fotoğraf, yükleme/teslim ve uzman inceleme kayıtlarını bir dosyada toplamanızı öneririm. Vergi aranmaması için sadece yangının değil, transit eşyanın bu nedenle telef olduğunun kanıtlanması gerekir.[145][391]\n- Gümrük Yönetmeliği m.228, herkesçe bilinen ve duyulan olaylardan kaynaklanan kayıp için **o yerin en büyük mülki idare amirinin belgesini**; trafik kazası için trafik kaza raporu ve en yakın gümrüğün tespiti üzerine gümrük idare amirinin kararını öngörür.[401][410]\n- Ulusal transit ayağında bu belgeler **hareket gümrük idaresine** sunulur; inceleme ve kabul o idareye aittir. İdare gerektiğinde belgeyi veren makamla yazışarak eksiklikleri tamamlatır.[417]\n\n### Olumsuz değerlendirmeye karşı somut dayanak\n\n12.11.2019 tarihli AYM kararında, gümrük sahasındaki yangında zayi olduğu ileri sürülen ithal telefonlar için ödenmiş ÖTV’nin iadesi uyuşmazlığında; idarenin kontrol alanı, aynı mallar için KDV iadesine ilişkin kesinleşmiş karar ve itfaiye raporu birlikte değerlendirilerek ispat yükünün katı uygulanmasının aşırı külfet doğurduğu ve mülkiyet hakkını ihlal ettiği sonucuna varılmıştır. Giderim olarak yeniden yargılama kararı verilmiş, tazminat talebi reddedilmiştir.[480][481][482][483][492][493]\n\nBu karar **her yangında otomatik vergi muafiyeti** kurmaz: vergisi ödenmiş, henüz ithalatçıya teslim edilmemiş ve gümrük sahasında tutulan mallara ilişkindir; karayolundaki özel taşıyıcı gözetimindeki alkolle aynı olgulara dayanmaz.[477][478][481] Bununla birlikte, mevcut resmi delillerin veya eşyanın yangınla bağlantısını gösteren kayıtların gerekçesiz biçimde dışlanmasına karşı, delillerin birlikte değerlendirilmesi yönünde destekleyici bir itiraz dayanağı olabilir.[482]\n\n**Sonuç:** Yangının nedeni ve tam zıya usulünce kanıtlanırsa, teslimin gerçekleşmemesi tek başına gümrük vergisi tahsilini haklı kılmaz. Ancak bu vergi sonucu, taşıma tazminatından kurtuluşla aynı değildir; iki değerlendirme ayrı yapılmalıdır.[145][236][237][282]\n\nİsterseniz kap başına hacim ve ambalaj türü ile CIM’in 58b kutusu ve karayolu taşıma sözleşmesini paylaşarak, **Halkalı’daki rejim hak sahibi değişimini ve yangın halinde sorumluluk dağılımını belge bazında** netleştirebiliriz.\n"
+  }
+}

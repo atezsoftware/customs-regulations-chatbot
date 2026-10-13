@@ -256,6 +256,11 @@ def test_broker_preserves_exact_evidence_metadata_and_missing_centers(
         state["kwargs"]["user"], state["kwargs"]["filters"]
     )
     old = broker.hydrate_search_centers(docs, RunContext())
+    monkeypatch.setattr(
+        corpus_tools,
+        "read_aggregate_search_originals",
+        lambda *_args, **_kwargs: (source, {}),
+    )
     new = broker.hydrate_search_centers(
         docs, RunContext(services={"asv3_exp_cropped": True})
     )

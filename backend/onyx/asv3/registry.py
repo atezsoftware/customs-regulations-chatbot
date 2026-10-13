@@ -12,6 +12,7 @@ from pydantic import JsonValue
 
 from onyx.asv3.cropped_completion import (
     CroppedCompletionContext,
+    CroppedFollowupOutcomeMetadataError,
     CroppedValidatedFollowups,
     build_cropped_completion_context,
     cropped_required_followups_schema,
@@ -449,6 +450,14 @@ class CapabilityRegistry:
                         "Completion writer context changed before execution"
                     )
                 return None
+            try:
+                update = (
+                    self._outcome_update(call)
+                    if "_outcomes" in call.arguments or "_coverage" in call.arguments
+                    else None
+                )
+            except ValueError as error:
+                raise CroppedFollowupOutcomeMetadataError(str(error)) from error
             validated = validate_cropped_required_followups(
                 call.arguments["_required_followups"],
                 context,
@@ -457,9 +466,12 @@ class CapabilityRegistry:
                 answer=answer.strip(),
                 facts=facts,
                 publication_gap=gap,
+                outcome_update=update,
             )
             with self._serial:
                 self._cropped_followups[key] = validated
+        except CroppedFollowupOutcomeMetadataError as error:
+            return self._invalid_outcome_metadata(error)
         except ValueError as error:
             return ToolOutcome(
                 status=OutcomeStatus.INVALID,
@@ -807,6 +819,26 @@ class CapabilityRegistry:
                 summary="Capability execution failed; try a different supported method",
             )
 
+    @staticmethod
+    def _invalid_outcome_metadata(error: ValueError) -> ToolOutcome:
+        return ToolOutcome(
+            status=OutcomeStatus.INVALID,
+            summary="Invalid outcome metadata; correct only its bindings or source ranges.",
+            data={"detail": str(error), "invalid_outcome_metadata": True},
+        )
+
+    @staticmethod
+    def _outcome_update(call: CapabilityCall) -> OutcomeUpdate:
+        raw = call.arguments.get("_coverage", {})
+        if not isinstance(raw, dict):
+            raise ValueError("_coverage must be an object")
+        payload = dict(raw)
+        if "_outcomes" in call.arguments:
+            if "outcomes" in payload:
+                raise ValueError("Use only _outcomes to declare outcomes")
+            payload["outcomes"] = call.arguments["_outcomes"]
+        return OutcomeUpdate.model_validate(payload)
+
     def outcome_metadata_gap(
         self, call: CapabilityCall, context: RunContext
     ) -> ToolOutcome | None:
@@ -857,15 +889,7 @@ class CapabilityRegistry:
                 ledger, EvidenceLedger
             ):
                 raise ValueError("Outcome metadata is unavailable in this context")
-            raw = call.arguments.get("_coverage", {})
-            if not isinstance(raw, dict):
-                raise ValueError("_coverage must be an object")
-            payload = dict(raw)
-            if "_outcomes" in call.arguments:
-                if "outcomes" in payload:
-                    raise ValueError("Use only _outcomes to declare outcomes")
-                payload["outcomes"] = call.arguments["_outcomes"]
-            update = OutcomeUpdate.model_validate(payload)
+            update = self._outcome_update(call)
             subset = context.services.get("task_outcome_ids")
             if context.depth:
                 if not isinstance(subset, list) or not subset:
@@ -881,11 +905,7 @@ class CapabilityRegistry:
                     raise ValueError("Researcher may update only assigned outcomes")
             outcomes.update(update, ledger)
         except ValueError as error:
-            return ToolOutcome(
-                status=OutcomeStatus.INVALID,
-                summary="Invalid outcome metadata; correct only its bindings or source ranges.",
-                data={"detail": str(error), "invalid_outcome_metadata": True},
-            )
+            return self._invalid_outcome_metadata(error)
         return None
 
 
