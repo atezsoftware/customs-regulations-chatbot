@@ -240,10 +240,10 @@ class ArticleBindings:
                 active = own
                 opening = _OWN_ARTICLE_OPENING.match(stripped)
                 assert opening is not None
-                marker = _PARAGRAPH.match(
-                    stripped[opening.end("heading") :].lstrip(".-–—: ")
-                )
+                body = stripped[opening.end("heading") :].lstrip(".-–—: ")
+                marker = _PARAGRAPH.match(body)
             else:
+                body = stripped
                 marker = _PARAGRAPH.match(stripped)
                 if any(
                     parse_regulatory_article_heading(line.replace("**", ""))
@@ -262,6 +262,11 @@ class ArticleBindings:
                 previous_paragraph = None
                 continue
             paragraph = marker[1] or marker[2]
+            paragraphs = [int(paragraph)] + [
+                int(found[1] or found[2])
+                for line in body[marker.end() :].splitlines()[1:]
+                if (found := _PARAGRAPH.match(line)) is not None
+            ]
             identifiers = metadata.get("provision_identifiers")
             declared_articles = (
                 [
@@ -290,11 +295,19 @@ class ArticleBindings:
                     and own is None
                     and int(paragraph) != previous_paragraph + 1
                 )
+                or paragraphs != list(range(paragraphs[0], paragraphs[-1] + 1))
             ):
                 active = None
                 previous_paragraph = None
                 continue
-            previous_paragraph = int(paragraph)
+            previous_paragraph = paragraphs[-1]
+            # Existing identities retain their complete literal paragraph support.
+            if (
+                own is not None
+                or row.get("article_no") is not None
+                or len(paragraphs) != 1
+            ):
+                continue
             result[number] = ArticleParagraphBinding(
                 number,
                 item.source_id,
