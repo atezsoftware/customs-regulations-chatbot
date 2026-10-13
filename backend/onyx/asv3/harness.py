@@ -97,6 +97,7 @@ class Harness:
         self.stop_reason: str | None = None
         self.publication_gap: ToolOutcome | None = None
         self._blocked_attempts: dict[str, int] = {}
+        self._unavailable_governing_attempts: dict[str, int] = {}
         self._seen_calls: set[str] = set()
         self._seen_failures: set[str] = set()
         self._committed_calls: set[str] = set()
@@ -135,6 +136,7 @@ class Harness:
     def snapshot(self) -> dict[str, JsonValue]:
         return {
             "version": 1,
+            **self._tuned_submission_snapshot(),
             "run_id": self.context.run_id,
             "request": self.request,
             "language": self.context.language,
@@ -171,6 +173,7 @@ class Harness:
         return copy.deepcopy(
             {
                 "version": 1,
+                **self._tuned_submission_snapshot(),
                 "run_id": self.context.run_id,
                 "request": self.request,
                 "language": self.context.language,
@@ -230,6 +233,14 @@ class Harness:
         self.stop_reason = reason if isinstance(reason, str) else None
         gap = snapshot.get("publication_gap")
         self.publication_gap = ToolOutcome.model_validate(gap) if gap else None
+        if self.context.services.get("asv3_workflow_variant") == ASV3_TUNED_VARIANT:
+            attempts = snapshot.get("tuned_unavailable_governing_attempts", {})
+            if not isinstance(attempts, dict) or any(
+                not key or type(count) is not int or count < 0
+                for key, count in attempts.items()
+            ):
+                raise ValueError("Invalid unavailable governing submission checkpoint")
+            self._unavailable_governing_attempts = cast(dict[str, int], attempts)
         evidence = snapshot.get("evidence")
         if not isinstance(evidence, dict):
             raise ValueError("Checkpoint evidence is missing")
@@ -1164,6 +1175,31 @@ class Harness:
             ),
         )
 
+    def _tuned_submission_snapshot(self) -> dict[str, JsonValue]:
+        if self.context.services.get("asv3_workflow_variant") != ASV3_TUNED_VARIANT:
+            return {}
+        return {
+            "tuned_unavailable_governing_attempts": dict(
+                self._unavailable_governing_attempts
+            )
+        }
+
+    def _repeated_unavailable_governing_gap(self) -> bool:
+        if (
+            self.context.services.get("asv3_workflow_variant") != ASV3_TUNED_VARIANT
+            or self.publication_gap is None
+        ):
+            return False
+        unavailable = self.context.services.get("tuned_unavailable_governing_keys")
+        if not callable(unavailable):
+            return False
+        keys = unavailable(self.publication_gap.data)
+        for key in keys:
+            self._unavailable_governing_attempts[key] = (
+                self._unavailable_governing_attempts.get(key, 0) + 1
+            )
+        return any(self._unavailable_governing_attempts[key] >= 3 for key in keys)
+
     def run(self) -> HarnessResult:
         self.stop_reason = None
         if (
@@ -1235,9 +1271,20 @@ class Harness:
                     ):
                         raise ValueError("Decision contains duplicate call IDs")
                     results: list[ToolMessage] = []
+                    rejected_submission = False
                     for receipt in self._dispatch(decision.calls):
                         self.context.check_active()
                         results.append(self._model_tool_result(receipt))
+                        rejected_submission = rejected_submission or (
+                            receipt.call.name
+                            in {"submit_answer", "submit_partial_answer"}
+                            and receipt.outcome.status
+                            in {
+                                OutcomeStatus.INVALID,
+                                OutcomeStatus.PARTIAL,
+                                OutcomeStatus.DENIED,
+                            }
+                        )
                     if decision.assistant_message is not None:
                         self.turns.append(
                             ResearchTurn(
@@ -1287,6 +1334,17 @@ class Harness:
                         status = OutcomeStatus.PARTIAL
                         self.stop_reason = "model_requested_partial_publication"
                         break
+                    if (
+                        rejected_submission
+                        and self.context.services.get("asv3_workflow_variant")
+                        == ASV3_TUNED_VARIANT
+                    ):
+                        repeated = self._repeated_unavailable_governing_gap()
+                        self._save()
+                        if repeated:
+                            status = OutcomeStatus.PARTIAL
+                            self.stop_reason = "repeated_unavailable_governing_original"
+                            break
                     if all(
                         call.name in {"wait_researcher", "list_researchers"}
                         for call in decision.calls
@@ -1313,7 +1371,12 @@ class Harness:
                         self.receipts.append(receipt)
                         if self.on_receipt:
                             self.on_receipt(receipt)
+                        repeated = self._repeated_unavailable_governing_gap()
                         self._save()
+                        if repeated:
+                            status = OutcomeStatus.PARTIAL
+                            self.stop_reason = "repeated_unavailable_governing_original"
+                            break
                         fingerprint = json.dumps(
                             {
                                 "evidence": [

@@ -327,11 +327,13 @@ def test_tuned_spawned_partial_retains_accepted_body_without_failed_draft(
 def test_uncited_partial_cannot_assert_an_unsupported_named_rule(
     monkeypatch: pytest.MonkeyPatch, retained: bool
 ) -> None:
-    kwargs, _broker, llm, _checkpoints, _queue = setup_run(monkeypatch)
+    kwargs, broker, llm, _checkpoints, _queue = setup_run(monkeypatch)
     kwargs.pop("test_language")
     kwargs["research_profile"] = "normal"
     if retained:
         kwargs["workflow_variant"] = ASV3_TUNED_VARIANT
+        # This boundary exposes a real source-name lookup, not its fixture list.
+        monkeypatch.setattr(broker, "sources", lambda *_args, **_kwargs: ([], False))
     harnesses = capture_harnesses(monkeypatch)
     rejected = "8917 sayılı Faaliyet Kanunu'nun 27. maddesi uyarınca izin gerekir."
     accepted = (
@@ -378,6 +380,11 @@ def test_uncited_partial_cannot_assert_an_unsupported_named_rule(
     assert harness.partial_submission() == accepted
     assert [receipt.outcome.status for receipt in harness.receipts] == [
         OutcomeStatus.PARTIAL,
+        *([OutcomeStatus.NOT_FOUND] if retained else []),
         OutcomeStatus.PARTIAL,
     ]
+    if retained:
+        acquisition = harness.receipts[1]
+        assert acquisition.call.name == "read_named_provision"
+        assert acquisition.outcome.data["absence_proven"] is False
     assert harness.last_draft == accepted and harness.publication_gap is None

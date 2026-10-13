@@ -84,6 +84,8 @@ if TYPE_CHECKING:
     from litellm import HTTPHandler
     from litellm.types.utils import ModelResponseStream as LiteLLMModelResponseStream
 
+    from onyx.llm.native_responses_stream import NativeResponseTerminalCapture
+
 
 _LLM_PROMPT_LONG_TERM_LOG_CATEGORY = "llm_prompt"
 LEGACY_MAX_TOKENS_KWARG = "max_tokens"
@@ -522,6 +524,7 @@ class LitellmLLM(LLM):
 
     _stream_cancellation_check: Callable[[], None] | None = None
     _tool_argument_stream_guard: bool = False
+    _asv3_response_terminal_capture: bool = False
 
     def __init__(
         self,
@@ -710,6 +713,7 @@ class LitellmLLM(LLM):
         user_identity: LLMUserIdentity | None = None,
         client: "HTTPHandler | None" = None,
         provider_compatibility_attempts: int | None = None,
+        terminal_capture: "NativeResponseTerminalCapture | None" = None,
     ) -> Union["ModelResponse", Iterator["LiteLLMModelResponseStream"]]:
         # Lazy loading to avoid memory bloat for non-inference flows
         from litellm.exceptions import BadRequestError, RateLimitError, Timeout
@@ -1121,8 +1125,11 @@ class LitellmLLM(LLM):
                             OpenAIResponsesAPIConfig,
                         )
 
-                        if OpenAIResponsesAPIConfig().should_fake_stream(
-                            model_bare, True, "openai"
+                        if (
+                            terminal_capture is not None
+                            or OpenAIResponsesAPIConfig().should_fake_stream(
+                                model_bare, True, "openai"
+                            )
                         ):
                             from onyx.llm.native_responses_stream import (
                                 native_responses_stream,
@@ -1138,6 +1145,11 @@ class LitellmLLM(LLM):
                                 timeout=timeout_override or self._timeout,
                                 max_tokens=max_tokens,
                                 client=client,
+                                **(
+                                    {"terminal_capture": terminal_capture}
+                                    if terminal_capture is not None
+                                    else {}
+                                ),
                             )
                     return litellm.completion(
                         mock_response=get_llm_mock_response() or MOCK_LLM_RESPONSE,
@@ -1283,6 +1295,12 @@ class LitellmLLM(LLM):
         bound._tool_argument_stream_guard = True
         return bound
 
+    def with_asv3_response_terminal_capture(self) -> "LitellmLLM":
+        """Preserve first-party native terminal status without changing the request."""
+        bound = copy.copy(self)
+        bound._asv3_response_terminal_capture = True
+        return bound
+
     def with_temperature(self, temperature: float) -> "LitellmLLM":
         if (
             isinstance(temperature, bool)
@@ -1371,6 +1389,42 @@ class LitellmLLM(LLM):
         from litellm import ModelResponse as LiteLLMModelResponse
 
         from onyx.llm.model_response import from_litellm_model_response
+        from onyx.llm.native_responses_stream import (
+            NATIVE_RESPONSE_TERMINAL,
+            NativeResponseTerminalCapture,
+            NativeResponseTerminalError,
+        )
+
+        terminal_capture = (
+            NativeResponseTerminalCapture()
+            if self._asv3_response_terminal_capture
+            and self._uses_guarded_openai_responses()
+            and use_streaming
+            and tools
+            else None
+        )
+
+        def record_terminal() -> None:
+            if terminal_capture is None:
+                return
+            from onyx.tracing.framework.create import get_current_span
+            from onyx.tracing.framework.span_data import GenerationSpanData
+
+            span = get_current_span()
+            if span is not None and isinstance(span.span_data, GenerationSpanData):
+                diagnostic = terminal_capture.diagnostic()
+                span.span_data.request_params = {
+                    **(span.span_data.request_params or {}),
+                    NATIVE_RESPONSE_TERMINAL: diagnostic,
+                }
+                span.span_data.usage = terminal_capture.usage
+                if terminal_capture.failed:
+                    span.set_error(
+                        {
+                            "message": "Native Responses failed before action dispatch",
+                            "data": diagnostic,
+                        }
+                    )
 
         # HTTPHandler Threading & Connection Pool Notes:
         # =============================================
@@ -1431,6 +1485,11 @@ class LitellmLLM(LLM):
                 user_identity=user_identity,
                 client=client,
                 provider_compatibility_attempts=provider_compatibility_attempts,
+                **(
+                    {"terminal_capture": terminal_capture}
+                    if terminal_capture is not None
+                    else {}
+                ),
             )
             if use_streaming:
                 # When env-only custom_config keys are injected (self-hosted
@@ -1492,6 +1551,11 @@ class LitellmLLM(LLM):
                         close_sync_stream(stream_response)
                 else:
                     chunks = list(stream_response)
+                if terminal_capture is not None and aborted is None:
+                    if terminal_capture.event_type is None:
+                        terminal_capture.status = "missing_terminal_event"
+                    if terminal_capture.failed:
+                        raise NativeResponseTerminalError(terminal_capture)
                 response = cast(
                     LiteLLMModelResponse,
                     stream_chunk_builder(chunks),
@@ -1505,13 +1569,28 @@ class LitellmLLM(LLM):
                 # stream_chunk_builder estimates missing usage. An aborted
                 # request has unknown billable usage until the provider reports it.
                 model_response.usage = observed_usage
+            if terminal_capture is not None:
+                model_response.usage = terminal_capture.usage
+                if terminal_capture.event_type is None and aborted is None:
+                    terminal_capture.status = "missing_terminal_event"
+                record_terminal()
+                if terminal_capture.failed:
+                    raise NativeResponseTerminalError(terminal_capture)
+                if terminal_capture.status == "incomplete":
+                    model_response.choice.finish_reason = "length"
 
             # Track LLM cost for Onyx-managed API keys
             if model_response.usage:
                 self._track_llm_cost(model_response.usage)
 
             return model_response
+        except NativeResponseTerminalError as error:
+            record_terminal()
+            if error.usage is not None:
+                self._track_llm_cost(error.usage)
+            raise
         finally:
+            record_terminal()
             if client is not None:
                 client.close()
 

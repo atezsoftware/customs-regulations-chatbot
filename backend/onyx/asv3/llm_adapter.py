@@ -3755,6 +3755,11 @@ class ResearchModel:
 
     def _publication_source_acquisition(self, view: HarnessView) -> Decision | None:
         """Acquire missing originals for retained publication obligations, not approval."""
+        from onyx.asv3.governing_acquisitions import (
+            GoverningOriginalAcquisitions,
+            governing_original_targets,
+        )
+
         reviews = self.context.services.get("legal_source_reviews")
         ledger = self.context.services.get("evidence")
         if (
@@ -3774,6 +3779,26 @@ class ResearchModel:
         }
         calls: list[CapabilityCall] = []
         referenced_originals: set[int] = set()
+        episodes = self.context.services.get("tuned_governing_acquisitions")
+        if isinstance(episodes, GoverningOriginalAcquisitions):
+            for target in governing_original_targets(view.publication_gap):
+                call = episodes.next_call(target, self.context, ledger)
+                if call is None:
+                    continue
+                parameters = definitions.get(call.name)
+                if (
+                    isinstance(parameters, dict)
+                    and jsonschema.Draft202012Validator(parameters).is_valid(
+                        call.arguments
+                    )
+                    and episodes.reserve(target, call, self.context)
+                ):
+                    calls.append(call)
+            if calls:
+                save = self.context.services.get("tuned_governing_checkpoint")
+                if callable(save):
+                    save()
+                return self._source_acquisition_decision(calls)
         for reference in references:
             matching = reference["matching_original_evidence"]
             assert isinstance(matching, list)
@@ -3781,6 +3806,7 @@ class ResearchModel:
             # Existing text will be delivered by the next actual model decision.
             if (
                 matching
+                or isinstance(episodes, GoverningOriginalAcquisitions)
                 or "unread_cited_statute_references" not in view.publication_gap
             ):
                 continue
@@ -4461,6 +4487,11 @@ class ResearchModel:
 
         if self.lean_native_mode and tools and isinstance(call_llm, LitellmLLM):
             call_llm = call_llm.with_tool_argument_stream_guard()
+            if (
+                self.context.services.get("asv3_workflow_variant") == ASV3_TUNED_VARIANT
+                and call_llm._uses_guarded_openai_responses()
+            ):
+                call_llm = call_llm.with_asv3_response_terminal_capture()
         try:
             response = self._invoke(
                 prompt,

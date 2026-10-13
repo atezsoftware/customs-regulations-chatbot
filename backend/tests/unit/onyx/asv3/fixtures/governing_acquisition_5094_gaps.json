@@ -1,0 +1,1398 @@
+{
+  "source": "/Users/kubilaypayci/Desktop/atez/customs-regulations-chatbot/plans/onur-86-dollar-incident-20261012/tool-timeline.json",
+  "source_sha256": "6f3587119fef13bf3737fa6c545934b27d2e95a1527a84b2195781f3ddc9f6f8",
+  "run_id": "e1c06d12-474c-41b8-8f38-211aa53ab771",
+  "assistant_message_id": 5094,
+  "attempts": [
+    {
+      "node_id": "step_529d8e62f4034b49b32113c15a3459d6",
+      "started_at": "2026-10-12T17:53:37.989321Z",
+      "status": "partial",
+      "answer_sha256": "7e0b6265ce59607575f958b936a5c91ee9d43ab4b867002c718c14c1dc500dc9",
+      "named_authority_gaps": [
+        {
+          "unit_id": "au10-63df86841483",
+          "instrument_number": "4458",
+          "article": null,
+          "reference_text": "4458 sayılı Gümrük Kanunundaki",
+          "inline_evidence": [
+            50
+          ],
+          "matching_original_evidence_count_captured": 111,
+          "matching_count_truncated": false
+        },
+        {
+          "unit_id": "au12-b564c19c2c55",
+          "instrument_number": "4684",
+          "article": "3/A",
+          "reference_text": "4684 sayılı Kanun geçici m.3/a",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        },
+        {
+          "unit_id": "au25-20bee89ce164",
+          "instrument_number": "6455",
+          "article": null,
+          "reference_text": "6455 sayılı Kanunla",
+          "inline_evidence": [
+            345,
+            346,
+            526
+          ],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        },
+        {
+          "unit_id": "au28-e6b2c0de65c4",
+          "instrument_number": "4458",
+          "article": null,
+          "reference_text": "Gümrük Kanunun",
+          "inline_evidence": [
+            456,
+            457,
+            459
+          ],
+          "matching_original_evidence_count_captured": 111,
+          "matching_count_truncated": false
+        }
+      ]
+    },
+    {
+      "node_id": "step_02eef5567b4a4879b71007b4fa52a3fa",
+      "started_at": "2026-10-12T17:54:43.596569Z",
+      "status": "partial",
+      "answer_sha256": "67b89eeb6a5121b076451516e5ada752bae75543fbbbc891f6996472d91e7e2c",
+      "named_authority_gaps": [
+        {
+          "unit_id": "au10-63df86841483",
+          "instrument_number": "4458",
+          "article": null,
+          "reference_text": "4458 sayılı Gümrük Kanunundaki",
+          "inline_evidence": [
+            50
+          ],
+          "matching_original_evidence_count_captured": 129,
+          "matching_count_truncated": true
+        },
+        {
+          "unit_id": "au13-5128e6bb0ebb",
+          "instrument_number": "4684",
+          "article": "3/A",
+          "reference_text": "4684 sayılı Kanun geçici m.3/a",
+          "inline_evidence": [
+            625
+          ],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        },
+        {
+          "unit_id": "au26-8ad1aee583ab",
+          "instrument_number": "6455",
+          "article": null,
+          "reference_text": "6455 sayılı Kanunla",
+          "inline_evidence": [
+            345,
+            346,
+            526
+          ],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        },
+        {
+          "unit_id": "au27-cec116002973",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanunun 11. maddesinin",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        },
+        {
+          "unit_id": "au30-325895c29eea",
+          "instrument_number": "4458",
+          "article": null,
+          "reference_text": "Gümrük Kanunun",
+          "inline_evidence": [
+            459
+          ],
+          "matching_original_evidence_count_captured": 129,
+          "matching_count_truncated": true
+        }
+      ]
+    },
+    {
+      "node_id": "step_9f6a15120e0f4f329d778b85bab8fad2",
+      "started_at": "2026-10-12T17:56:50.901116Z",
+      "status": "partial",
+      "answer_sha256": "b429331673c6e0943eca74a6a73361b0649221bd0f173c2ce829375d78cfe9f3",
+      "named_authority_gaps": [
+        {
+          "unit_id": "au10-63df86841483",
+          "instrument_number": "4458",
+          "article": null,
+          "reference_text": "4458 sayılı Gümrük Kanunundaki",
+          "inline_evidence": [
+            50
+          ],
+          "matching_original_evidence_count_captured": 129,
+          "matching_count_truncated": true
+        },
+        {
+          "unit_id": "au15-d7ffe101c80b",
+          "instrument_number": "4684",
+          "article": "3/A",
+          "reference_text": "4684 sayılı Kanun geçici m.3/a",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        },
+        {
+          "unit_id": "au28-764c6f64e0a3",
+          "instrument_number": "6455",
+          "article": null,
+          "reference_text": "6455 sayılı Kanuna",
+          "inline_evidence": [
+            345,
+            346,
+            526
+          ],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        },
+        {
+          "unit_id": "au29-cec116002973",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanunun 11. maddesinin",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        },
+        {
+          "unit_id": "au32-325895c29eea",
+          "instrument_number": "4458",
+          "article": null,
+          "reference_text": "Gümrük Kanunun",
+          "inline_evidence": [
+            459
+          ],
+          "matching_original_evidence_count_captured": 129,
+          "matching_count_truncated": true
+        }
+      ]
+    },
+    {
+      "node_id": "step_ac8ca07d905a442c849702ccdd64db89",
+      "started_at": "2026-10-12T17:57:45.316736Z",
+      "status": "partial",
+      "answer_sha256": "580571c6f38298b76283d328961c6bba7312e3932c9a36a932f054b0eb1cb0e0",
+      "named_authority_gaps": [
+        {
+          "unit_id": "au10-63df86841483",
+          "instrument_number": "4458",
+          "article": null,
+          "reference_text": "4458 sayılı Gümrük Kanunundaki",
+          "inline_evidence": [
+            50
+          ],
+          "matching_original_evidence_count_captured": 129,
+          "matching_count_truncated": true
+        },
+        {
+          "unit_id": "au16-d08a1101f7d3",
+          "instrument_number": "4684",
+          "article": "3/A",
+          "reference_text": "4684 sayılı Kanunun geçici m.3/a",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        },
+        {
+          "unit_id": "au30-3b45fb724348",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanunun 11. maddesinin",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        },
+        {
+          "unit_id": "au33-325895c29eea",
+          "instrument_number": "4458",
+          "article": null,
+          "reference_text": "Gümrük Kanunun",
+          "inline_evidence": [
+            459
+          ],
+          "matching_original_evidence_count_captured": 129,
+          "matching_count_truncated": true
+        }
+      ]
+    },
+    {
+      "node_id": "step_d1c5c25ee5184f9cb150aca10319d2e2",
+      "started_at": "2026-10-12T17:58:29.847262Z",
+      "status": "partial",
+      "answer_sha256": "94af31b1975ff905dbb11d9338b2b98bd059c1c130344fd95aaa076da9c96f0d",
+      "named_authority_gaps": [
+        {
+          "unit_id": "au18-2e6d856eddbc",
+          "instrument_number": "4684",
+          "article": null,
+          "reference_text": "4684 sayılı Kanunun",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 35,
+          "matching_count_truncated": false
+        },
+        {
+          "unit_id": "au32-4086fa7abe77",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanunun 11. maddesinin",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        }
+      ]
+    },
+    {
+      "node_id": "step_a09ba709382945e4b35d2fc777925379",
+      "started_at": "2026-10-12T17:58:57.779047Z",
+      "status": "partial",
+      "answer_sha256": "77928546344274df1a6b295e45228f469b2d49b15ed75e926c8cf6b0dc72bc5c",
+      "named_authority_gaps": [
+        {
+          "unit_id": "au18-64b27e28483c",
+          "instrument_number": "4684",
+          "article": null,
+          "reference_text": "4684 sayılı Kanunun",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 35,
+          "matching_count_truncated": false
+        },
+        {
+          "unit_id": "au32-db86dc968188",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanunun 11. maddesinin",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        }
+      ]
+    },
+    {
+      "node_id": "step_f6532111b6474b81b1b9c8805fcdb015",
+      "started_at": "2026-10-12T17:59:33.636861Z",
+      "status": "partial",
+      "answer_sha256": "da2acdbecd5b7e12048e5ce05600757d1a4bec0e660b3f652024944ed1911042",
+      "named_authority_gaps": [
+        {
+          "unit_id": "au33-cd6ef52d450c",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanunun 11. maddesinin",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        }
+      ]
+    },
+    {
+      "node_id": "step_5550faeb60244c9581fcf3dfbb0c2046",
+      "started_at": "2026-10-12T18:00:07.109251Z",
+      "status": "partial",
+      "answer_sha256": "468ab113b824148449dcbecaf4688f5095e92a3419b8f66ec3ccc09521b638ad",
+      "named_authority_gaps": [
+        {
+          "unit_id": "au33-75ec2301e0ca",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanunun 11. maddesinin",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        }
+      ]
+    },
+    {
+      "node_id": "step_e3e8ef4520c54e83a9e75d110a276b8d",
+      "started_at": "2026-10-12T18:00:39.270049Z",
+      "status": "partial",
+      "answer_sha256": "813fa98ef99387ca8b9edf2f71b6e24f03a95cf7f0073ff00b9646ab9213ff09",
+      "named_authority_gaps": [
+        {
+          "unit_id": "au33-7fa83e0a6fed",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanun m.11",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        }
+      ]
+    },
+    {
+      "node_id": "step_71c7932d8d204b8da364770837dd1f94",
+      "started_at": "2026-10-12T18:01:10.280166Z",
+      "status": "partial",
+      "answer_sha256": "80272d40a3835057258913e7363960ff82e2789b695e53637addd257f8e0474c",
+      "named_authority_gaps": [
+        {
+          "unit_id": "au33-8081877b5545",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanun m.11",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        }
+      ]
+    },
+    {
+      "node_id": "step_23a5721941d04cfbb6e41c1b8b6ae05b",
+      "started_at": "2026-10-12T18:01:44.218659Z",
+      "status": "partial",
+      "answer_sha256": "849f7b6ecfca95a3d1d920e5422bcd3196dc294f353c27c782f24aa2bd250378",
+      "named_authority_gaps": [
+        {
+          "unit_id": "au33-38fdf25ecbb1",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanun m.11",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        }
+      ]
+    },
+    {
+      "node_id": "step_9f8386f4fdb749888109d6ffa0c2dc2e",
+      "started_at": "2026-10-12T18:02:17.848658Z",
+      "status": "partial",
+      "answer_sha256": "c51c254b5c2b203e46cb604e06db55934e2f035e0d783d4c72ac0b85cbc71224",
+      "named_authority_gaps": [
+        {
+          "unit_id": "au33-88f2f1a775c4",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanun m.11",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        },
+        {
+          "unit_id": "au33-88f2f1a775c4",
+          "instrument_number": "6455",
+          "article": null,
+          "reference_text": "6455 sayılı Kanuna",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        }
+      ]
+    },
+    {
+      "node_id": "step_7b7a4d67840a416bb6ca4f5cff370e2b",
+      "started_at": "2026-10-12T18:02:46.411670Z",
+      "status": "partial",
+      "answer_sha256": "655947e53ba59fd23274f866a12737e8fa7ff45ba7dafe1935529ff95b8f8351",
+      "named_authority_gaps": [
+        {
+          "unit_id": "au33-6998652fb756",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanunun 11. maddesinin",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        }
+      ]
+    },
+    {
+      "node_id": "step_779941c681804b87af449edd6cb53792",
+      "started_at": "2026-10-12T18:03:15.049459Z",
+      "status": "partial",
+      "answer_sha256": "aa0e5c454822c38730d9bdc79c5170bd45e1b63611231668a689282888182751",
+      "named_authority_gaps": [
+        {
+          "unit_id": "au33-a1a19607ba7e",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanunun 11. maddesi",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        }
+      ]
+    },
+    {
+      "node_id": "step_a6f017bb92974eeba1f6b80db2587328",
+      "started_at": "2026-10-12T18:03:43.568301Z",
+      "status": "partial",
+      "answer_sha256": "7f0b89b096edd6dffb6fb158f3e5e9bf21c9ce9a64190d031f5b6511b6745cf2",
+      "named_authority_gaps": [
+        {
+          "unit_id": "au33-c19be8d24f42",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanunun 11. maddesinin",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        }
+      ]
+    },
+    {
+      "node_id": "step_4c6c84ce10d8485cab1c74b141bb638a",
+      "started_at": "2026-10-12T18:04:11.806607Z",
+      "status": "partial",
+      "answer_sha256": "e45a4d0723195ee34b519393b0a782b7b7f6eb93d1a52eb4a1627a93c2ce9b44",
+      "named_authority_gaps": [
+        {
+          "unit_id": "au33-a16160ba8100",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanunun 11. maddesi",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        }
+      ]
+    },
+    {
+      "node_id": "step_64826f9cd210484f93424fba04298424",
+      "started_at": "2026-10-12T18:04:40.541270Z",
+      "status": "partial",
+      "answer_sha256": "1d152e8126eb41c40a04f32d30e53446fca54300d8c924f780f987c7dcf6a0b4",
+      "named_authority_gaps": [
+        {
+          "unit_id": "au33-0e2d145ce9dd",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanunun 11. maddesi",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        }
+      ]
+    },
+    {
+      "node_id": "step_3c7cd494fc904d25b8e829b9897b1de5",
+      "started_at": "2026-10-12T18:05:11.329653Z",
+      "status": "partial",
+      "answer_sha256": "ac4a6f4680dca759851f7805ff581c1195ad6172ea38b9c0f5602b03c8e005a5",
+      "named_authority_gaps": [
+        {
+          "unit_id": "au33-0dca8edd1517",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanunun 11. maddesinin",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        }
+      ]
+    },
+    {
+      "node_id": "step_3670a548b24d4f209a15ecb88a593d4c",
+      "started_at": "2026-10-12T18:05:37.013857Z",
+      "status": "partial",
+      "answer_sha256": "c99c2604e86b1fdf7d1a45f659a5bafe03696a21bb604c6c006d4de5211a702b",
+      "named_authority_gaps": [
+        {
+          "unit_id": "au33-4a591af97c0a",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanunun 11. maddesi",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        }
+      ]
+    },
+    {
+      "node_id": "step_e274c98a70964cf49adf0778a6c52eb2",
+      "started_at": "2026-10-12T18:06:24.158673Z",
+      "status": "partial",
+      "answer_sha256": "4b5f9351de459273b09953996ce663c2856db444fa832402d6fbef6e49984322",
+      "named_authority_gaps": [
+        {
+          "unit_id": "au33-dbf9a4be0002",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanunun 11. maddesinin",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        }
+      ]
+    },
+    {
+      "node_id": "step_d62943adb43240339e05336833eaf617",
+      "started_at": "2026-10-12T18:06:52.435472Z",
+      "status": "partial",
+      "answer_sha256": "d97761fd905044826b244811aae8b6f90bcf0c99f49a8ab5e7d8e259b9814c79",
+      "named_authority_gaps": [
+        {
+          "unit_id": "au33-391ebc9ad9b3",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanunun 11. maddesinin",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        }
+      ]
+    },
+    {
+      "node_id": "step_4bf387bc95784c558675b0168c15e5be",
+      "started_at": "2026-10-12T18:07:38.609743Z",
+      "status": "partial",
+      "answer_sha256": "703830be18d82ec22ab16b6814a4103158d897ef4940e914082d05d75471afe0",
+      "named_authority_gaps": [
+        {
+          "unit_id": "au33-741f76214acd",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanunun 11. maddesinin",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        }
+      ]
+    },
+    {
+      "node_id": "step_e8c8234775054a228cc4f5b4ba0d0a94",
+      "started_at": "2026-10-12T18:08:07.940747Z",
+      "status": "partial",
+      "answer_sha256": "4ea6a285bcb87d4fff5a1abdb7b13aa3a3fb9aab5c5cc635a956b52224214194",
+      "named_authority_gaps": [
+        {
+          "unit_id": "au33-75069416ff0c",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanunun 11. maddesinin",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        }
+      ]
+    },
+    {
+      "node_id": "step_e4e2e263ea2c4bf493ff0f0e83e1c0dd",
+      "started_at": "2026-10-12T18:08:34.482468Z",
+      "status": "partial",
+      "answer_sha256": "e31ea3d39fad4c060474820d487853faa5ceab7de4bef244863c9e44540d5793",
+      "named_authority_gaps": [
+        {
+          "unit_id": "au33-df7b48b6a18e",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanunun 11. maddesinin",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        }
+      ]
+    },
+    {
+      "node_id": "step_386e7b226ed7410da8fdb960044c1f9e",
+      "started_at": "2026-10-12T18:09:03.098855Z",
+      "status": "partial",
+      "answer_sha256": "8b637ec317fb84f9944bc86e38fb5af91fef0f2a6301e179bb794211cda4739b",
+      "named_authority_gaps": [
+        {
+          "unit_id": "au33-067b4e0c1d8f",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanun m.11",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        },
+        {
+          "unit_id": "au33-067b4e0c1d8f",
+          "instrument_number": "4458",
+          "article": null,
+          "reference_text": "Gümrük Kanunu",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 129,
+          "matching_count_truncated": true
+        }
+      ]
+    },
+    {
+      "node_id": "step_f3dbb8825d8c41fda9f712039e2a7e8e",
+      "started_at": "2026-10-12T18:09:40.827083Z",
+      "status": "partial",
+      "answer_sha256": "e6541934e16ed9022a6d59f3aec9be22a742a1a438104f6cb58654e6c768646f",
+      "named_authority_gaps": [
+        {
+          "unit_id": "au33-66697cd8e9dd",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanun m.11",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        }
+      ]
+    },
+    {
+      "node_id": "step_55c82888de4948f5b014e485cca07874",
+      "started_at": "2026-10-12T18:10:11.708826Z",
+      "status": "partial",
+      "answer_sha256": "7d089f466475afcc6d0a5809b0d1781b6a28da2bfd3e76aa8b6b2f56df93cfeb",
+      "named_authority_gaps": [
+        {
+          "unit_id": "au4-e843cfcb4d95",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanun m.11",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        },
+        {
+          "unit_id": "au33-32c00c0c8c32",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanun m.11",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        },
+        {
+          "unit_id": "au33-32c00c0c8c32",
+          "instrument_number": "4458",
+          "article": null,
+          "reference_text": "Gümrük Kanununun",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 129,
+          "matching_count_truncated": true
+        }
+      ]
+    },
+    {
+      "node_id": "step_644a348374b04ce0a917a8e5d4a75026",
+      "started_at": "2026-10-12T18:10:42.973242Z",
+      "status": "partial",
+      "answer_sha256": "20a5817ebb164cdba25020cb4f5ac4bb9298ab09d00fd28fdd905a3262706de5",
+      "named_authority_gaps": [
+        {
+          "unit_id": "au4-b82f229f6a81",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanun m.11",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        },
+        {
+          "unit_id": "au34-7da6c8e46a3c",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanun m.11",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        }
+      ]
+    },
+    {
+      "node_id": "step_f11c111804ff4e338560a31621fc05dd",
+      "started_at": "2026-10-12T18:11:17.949859Z",
+      "status": "partial",
+      "answer_sha256": "bcdb3b5fedb8ab5fd1a9bdcb8a1926294b2b06a6b2aa3ee795be5ea6c2ecb3fd",
+      "named_authority_gaps": [
+        {
+          "unit_id": "au4-6f825591db46",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanun m.11",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        },
+        {
+          "unit_id": "au34-32aa2725abe6",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanun m.11",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        },
+        {
+          "unit_id": "au34-32aa2725abe6",
+          "instrument_number": "4458",
+          "article": null,
+          "reference_text": "Gümrük Kanununun",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 129,
+          "matching_count_truncated": true
+        }
+      ]
+    },
+    {
+      "node_id": "step_3ff060897e7b4e4795980bafcb6027ae",
+      "started_at": "2026-10-12T18:11:52.498787Z",
+      "status": "partial",
+      "answer_sha256": "082e07dd307eb99cdd330b015c07780efbc97a45a95535667958e354df616766",
+      "named_authority_gaps": [
+        {
+          "unit_id": "au4-5b87cde88988",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanun m.11",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        },
+        {
+          "unit_id": "au34-9282f5ed8072",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanun m.11",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        }
+      ]
+    },
+    {
+      "node_id": "step_55a69d339a5345dc869cadc302159d29",
+      "started_at": "2026-10-12T18:12:30.459923Z",
+      "status": "partial",
+      "answer_sha256": "ea0b5653452a2a651217f0615c18727dbb0dcb261d5e188a836f5e6cbb25aabd",
+      "named_authority_gaps": [
+        {
+          "unit_id": "au4-916d0b2856ae",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanun m.11",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        },
+        {
+          "unit_id": "au34-75dc887f1c83",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanun m.11",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        }
+      ]
+    },
+    {
+      "node_id": "step_a830e26a1e134861a9546da736197ba0",
+      "started_at": "2026-10-12T18:13:05.694043Z",
+      "status": "partial",
+      "answer_sha256": "2e70dfeb2e8990b6ae5430919b9d6e18d942e42b6b51ae3e9c92ff0bf0206d53",
+      "named_authority_gaps": [
+        {
+          "unit_id": "au4-888ff91c4062",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanun m.11",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        },
+        {
+          "unit_id": "au34-b2b3cf3240b9",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanun m.11",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        }
+      ]
+    },
+    {
+      "node_id": "step_be24c6b823734bcd84ca731844e07d8f",
+      "started_at": "2026-10-12T18:13:36.420561Z",
+      "status": "partial",
+      "answer_sha256": "a693672549d5bb8ab5949cd7e6935f2fa951c242aa6e5d2633c06d9e70316555",
+      "named_authority_gaps": [
+        {
+          "unit_id": "au4-e2cb6969ac97",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanunun 11. maddesinin",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        },
+        {
+          "unit_id": "au34-72f93520775f",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanun m.11",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        }
+      ]
+    },
+    {
+      "node_id": "step_3fe76b6db99c4b1b84cbb82327d53f5e",
+      "started_at": "2026-10-12T18:14:11.054971Z",
+      "status": "partial",
+      "answer_sha256": "e24f7eb57218d7875267aa9ff7b03cd43e6eb1ebff2e45552e0a1267a4acbded",
+      "named_authority_gaps": [
+        {
+          "unit_id": "au4-1023828f6e12",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanun m.11",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        },
+        {
+          "unit_id": "au34-95f305403bca",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanun m.11",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        },
+        {
+          "unit_id": "au34-95f305403bca",
+          "instrument_number": "4458",
+          "article": null,
+          "reference_text": "Gümrük Kanunu",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 129,
+          "matching_count_truncated": true
+        }
+      ]
+    },
+    {
+      "node_id": "step_eacbd11458044011a0a8f59da119a502",
+      "started_at": "2026-10-12T18:14:47.395087Z",
+      "status": "partial",
+      "answer_sha256": "d43eefe3b228f6ca7c5a24e6444b1212953425d1510de73bdaa61710542c7ae8",
+      "named_authority_gaps": [
+        {
+          "unit_id": "au4-bbfd6be2afb5",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanun m.11",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        },
+        {
+          "unit_id": "au34-63719af4f51e",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanun m.11",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        }
+      ]
+    },
+    {
+      "node_id": "step_c88f0f1a48244b2cb1acec11877edf85",
+      "started_at": "2026-10-12T18:15:26.045815Z",
+      "status": "partial",
+      "answer_sha256": "5be714a99a47a4da0437c25e976dd742e8dfbd9ddb5d29274c10657d836a2106",
+      "named_authority_gaps": [
+        {
+          "unit_id": "au4-1f515d4abaf5",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanunun 11. maddesinin",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        },
+        {
+          "unit_id": "au34-cde7598000e4",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanunun 11. maddesinin",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        },
+        {
+          "unit_id": "au34-cde7598000e4",
+          "instrument_number": "4458",
+          "article": null,
+          "reference_text": "Gümrük Kanunu",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 129,
+          "matching_count_truncated": true
+        }
+      ]
+    },
+    {
+      "node_id": "step_bbd7a961708341b484a8e85728eb95f9",
+      "started_at": "2026-10-12T18:16:04.485234Z",
+      "status": "partial",
+      "answer_sha256": "c0a52d200942288fb88bb6157cccf54c1a7f549bb10dd7ad763f25e194c99868",
+      "named_authority_gaps": [
+        {
+          "unit_id": "au4-c7d8b79be32b",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanunun 11. maddesinin",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        },
+        {
+          "unit_id": "au34-4c74ae5224f2",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanunun 11. maddesi",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        }
+      ]
+    },
+    {
+      "node_id": "step_bba89b61562847c2af5235cfadb6569d",
+      "started_at": "2026-10-12T18:16:35.359958Z",
+      "status": "partial",
+      "answer_sha256": "ac122f82ab273fe43188ab2ce88b7e16f937f8859587ce915c72e4892d5f3e2b",
+      "named_authority_gaps": [
+        {
+          "unit_id": "au4-aa44e13db007",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanunun 11. maddesinin",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        },
+        {
+          "unit_id": "au34-49bc007a47cd",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanunun 11. maddesi",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        }
+      ]
+    },
+    {
+      "node_id": "step_00e41d59f1814c5ab61f7c71ac4775f4",
+      "started_at": "2026-10-12T18:17:08.306290Z",
+      "status": "partial",
+      "answer_sha256": "782460f2abcc2821c679c42e80220491a3ead9c090e3b1cafe614ea77ce6885a",
+      "named_authority_gaps": [
+        {
+          "unit_id": "au4-f31fd6f3f3f2",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanunun 11. maddesinin",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        },
+        {
+          "unit_id": "au35-0f4e37ed3574",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanunun 11. maddesinin",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        }
+      ]
+    },
+    {
+      "node_id": "step_5cd69fad489044bdafef9957e938111e",
+      "started_at": "2026-10-12T18:17:36.868143Z",
+      "status": "partial",
+      "answer_sha256": "3e3b992b032baaf6f4930e9c6f89427686ae4641b78d56722fdbbc38143315ce",
+      "named_authority_gaps": [
+        {
+          "unit_id": "au4-0da06f37e9dd",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanun m.11",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        },
+        {
+          "unit_id": "au35-a433f17ef73d",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanun m.11",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        }
+      ]
+    },
+    {
+      "node_id": "step_e6f40af45d5242ee9bd2f6838ecbfd6a",
+      "started_at": "2026-10-12T18:18:11.165116Z",
+      "status": "partial",
+      "answer_sha256": "2af3ebc96ee313deb3472b8782ba2ce7cbafc2e9bb49e86217ced3790b99b2a2",
+      "named_authority_gaps": [
+        {
+          "unit_id": "au4-bf02034e1314",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanunun 11. maddesinin",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        },
+        {
+          "unit_id": "au35-4df5308176d2",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanunun 11. maddesi",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        },
+        {
+          "unit_id": "au35-4df5308176d2",
+          "instrument_number": "4458",
+          "article": null,
+          "reference_text": "Gümrük Kanunu",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 129,
+          "matching_count_truncated": true
+        }
+      ]
+    },
+    {
+      "node_id": "step_67aea9d3106c4574b7abcb08088f1485",
+      "started_at": "2026-10-12T18:18:44.721889Z",
+      "status": "partial",
+      "answer_sha256": "0c836b6ec5a197fa74124ddb2545048bf2091f18d30cd5bf1f1d82f62e964fee",
+      "named_authority_gaps": [
+        {
+          "unit_id": "au4-d5b248f3dc4f",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanunun 11. maddesinin",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        },
+        {
+          "unit_id": "au35-3d91c0e8f9af",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanunun 11. maddesi",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        }
+      ]
+    },
+    {
+      "node_id": "step_3b0aa8094d7b49f8a2d3199337cbfe66",
+      "started_at": "2026-10-12T18:19:14.961897Z",
+      "status": "partial",
+      "answer_sha256": "ed7c5cb0257eff3470db292bd051f0da54f0ea1caa90249be5e0ea3019ced7a4",
+      "named_authority_gaps": [
+        {
+          "unit_id": "au4-9dcd3e4b6544",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanunun 11. maddesinin",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        },
+        {
+          "unit_id": "au35-68969430e777",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanunun 11. maddesi",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        }
+      ]
+    },
+    {
+      "node_id": "step_292430c4f4c24e90918893fbd1d52786",
+      "started_at": "2026-10-12T18:19:45.588345Z",
+      "status": "partial",
+      "answer_sha256": "550f296870c03e48972bc53d898d156836a7808cd557b508b587fa2a8305a3de",
+      "named_authority_gaps": [
+        {
+          "unit_id": "au4-d534b326f1f8",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanunun 11. maddesi",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        },
+        {
+          "unit_id": "au35-6f3a6f7fc864",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanunun 11. maddesi",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        }
+      ]
+    },
+    {
+      "node_id": "step_bed49946f68641a09d0234bdfb1d46fb",
+      "started_at": "2026-10-12T18:20:12.751090Z",
+      "status": "partial",
+      "answer_sha256": "e5250d4e7063a62e648e9e61480725a8ced4456cf4cb4aaf351dc2ea955d3637",
+      "named_authority_gaps": [
+        {
+          "unit_id": "au4-58f21bb82621",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanunun 11. maddesinin",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        },
+        {
+          "unit_id": "au35-796cb54c2f98",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanunun 11. maddesi",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        }
+      ]
+    },
+    {
+      "node_id": "step_bd662f8965994832bc29ed317c603b58",
+      "started_at": "2026-10-12T18:20:44.987162Z",
+      "status": "partial",
+      "answer_sha256": "daa394e9fef2632652d0d6f88131c627d81dea62daaf4eb8b3fb327afe69d63b",
+      "named_authority_gaps": [
+        {
+          "unit_id": "au4-ef5c54933c1a",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanunun 11. maddesi",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        },
+        {
+          "unit_id": "au35-e32a8bed85f2",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanunun 11. maddesi",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        }
+      ]
+    },
+    {
+      "node_id": "step_e966219a5bb540afb9cff0ed204716bc",
+      "started_at": "2026-10-12T18:21:21.248363Z",
+      "status": "partial",
+      "answer_sha256": "c54109cdf4d46d26be645a2b728c9c441c0ce20fb19e51b73ab27ef6b55c2937",
+      "named_authority_gaps": [
+        {
+          "unit_id": "au4-2cc87b64b8fa",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanunun 11. maddesinin",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        },
+        {
+          "unit_id": "au35-d2412a616ba1",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanunun 11. maddesinin",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        }
+      ]
+    },
+    {
+      "node_id": "step_415c78d9037141c697d57e65bfa86071",
+      "started_at": "2026-10-12T18:21:52.062780Z",
+      "status": "partial",
+      "answer_sha256": "ccfe1f89cbbd9915c88eacf770297be4af47eed19714990006e269d78c0f0936",
+      "named_authority_gaps": [
+        {
+          "unit_id": "au4-80e9a6bf135b",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanunun 11. maddesinin",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        },
+        {
+          "unit_id": "au35-e22a8f051a19",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanunun 11. maddesi",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        }
+      ]
+    },
+    {
+      "node_id": "step_be1df762c9b4454b8cca01f0b64f36b7",
+      "started_at": "2026-10-12T18:22:23.943876Z",
+      "status": "partial",
+      "answer_sha256": "e701fd9abe98e081a1d764cefbce079a17227cd2e72a902dc1f75c657b488570",
+      "named_authority_gaps": [
+        {
+          "unit_id": "au4-b7a6ba6be125",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanunun 11. maddesinin",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        },
+        {
+          "unit_id": "au35-6d80bbf83946",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanunun 11. maddesi",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        }
+      ]
+    },
+    {
+      "node_id": "step_a9eea2bfbb744cc48aeb5dc941429f43",
+      "started_at": "2026-10-12T18:22:52.542391Z",
+      "status": "partial",
+      "answer_sha256": "eaa55a9872785e8c97d8d9f75994228294627364008b5b8b2b61d925911d9a62",
+      "named_authority_gaps": [
+        {
+          "unit_id": "au4-9501fc6c5053",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanunun 11. maddesinin",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        },
+        {
+          "unit_id": "au35-6cf58c880385",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanunun 11. maddesi",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        }
+      ]
+    },
+    {
+      "node_id": "step_a2949f541b164e9b8c1f64242376c084",
+      "started_at": "2026-10-12T18:23:20.298107Z",
+      "status": "partial",
+      "answer_sha256": "2749fd02a34815240ff65559fa8e84efbb87a17706f2e444686ea294a4b6bbfb",
+      "named_authority_gaps": [
+        {
+          "unit_id": "au4-8fe61e620cd8",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanunun 11. maddesinin",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        },
+        {
+          "unit_id": "au35-92e661d446e7",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanunun 11. maddesi",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        }
+      ]
+    },
+    {
+      "node_id": "step_6612e90932b5418bb903b75e76cae104",
+      "started_at": "2026-10-12T18:23:54.721981Z",
+      "status": "partial",
+      "answer_sha256": "2ea2b03c2325a967d6000d4613acdb4118eb5c720a176c9aa6f03eca23653ac0",
+      "named_authority_gaps": [
+        {
+          "unit_id": "au4-0035aa713a6c",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanunun 11. maddesi",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        },
+        {
+          "unit_id": "au35-c81a9c69b203",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanunun 11. maddesi",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        }
+      ]
+    },
+    {
+      "node_id": "step_1d12b441b2804a9e815670d1b1554606",
+      "started_at": "2026-10-12T18:24:29.986818Z",
+      "status": "partial",
+      "answer_sha256": "8007c769d096fd6cbabb113580387407cdef4808b6e5ede7a01f040186ac0112",
+      "named_authority_gaps": [
+        {
+          "unit_id": "au4-990ac475ccb2",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanunun 11. maddesinin",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        },
+        {
+          "unit_id": "au35-bb5a1c47ed91",
+          "instrument_number": "6455",
+          "article": "11",
+          "reference_text": "6455 sayılı Kanunun 11. maddesi",
+          "inline_evidence": [],
+          "matching_original_evidence_count_captured": 0,
+          "matching_count_truncated": false
+        }
+      ]
+    },
+    {
+      "node_id": "step_6a0598bdcee24c43a745f1dd458ba3a5",
+      "started_at": "2026-10-12T18:25:03.238279Z",
+      "status": "cancelled",
+      "answer_sha256": "e4b6f9aaf34e5c4a4d54452ec398f64932ea9284966bae089b63ab73ce48f1d2",
+      "named_authority_gaps": []
+    }
+  ]
+}
