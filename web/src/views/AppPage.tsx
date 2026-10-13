@@ -209,6 +209,7 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
         legalComposite: legalCompositeEnabledForCurrentWorkflow,
         legalReview: legalReviewEnabledForCurrentWorkflow,
         supersearch: supersearchEnabledForCurrentWorkflow,
+        asv3ExpCropped: asv3ExpCroppedEnabledForCurrentWorkflow,
         experimentalResearch: experimentalResearchEnabledForCurrentWorkflow,
         experimentalParallelResearch:
           experimentalParallelResearchEnabledForCurrentWorkflow,
@@ -249,6 +250,8 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
     toggleLegalComposite,
     supersearchEnabled,
     toggleSupersearch,
+    asv3ExpCroppedEnabled,
+    toggleAsv3ExpCropped,
     experimentalResearchEnabled,
     toggleExperimentalResearch,
     experimentalParallelResearchEnabled,
@@ -290,6 +293,10 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
     currentProjectId === null &&
     (selectedAgent ?? liveAgent)?.id === 0 &&
     legalCompositeEnabled;
+  const asv3ExpCroppedEnabledForCurrentWorkflow =
+    currentProjectId === null &&
+    (selectedAgent ?? liveAgent)?.id === 0 &&
+    asv3ExpCroppedEnabled;
   const experimentalResearchEnabledForCurrentWorkflow =
     currentProjectId === null &&
     (selectedAgent ?? liveAgent)?.id === 0 &&
@@ -653,6 +660,9 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
         !multiModel.isMultiModelActive,
       legalReview: legalReviewEnabledForCurrentWorkflow,
       supersearch: supersearchEnabledForCurrentWorkflow,
+      asv3ExpCropped:
+        asv3ExpCroppedEnabledForCurrentWorkflow &&
+        !multiModel.isMultiModelActive,
       experimentalResearch:
         experimentalResearchEnabledForCurrentWorkflow &&
         !multiModel.isMultiModelActive,
@@ -681,6 +691,7 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
     legalCompositeEnabledForCurrentWorkflow,
     legalReviewEnabledForCurrentWorkflow,
     supersearchEnabledForCurrentWorkflow,
+    asv3ExpCroppedEnabledForCurrentWorkflow,
     experimentalResearchEnabledForCurrentWorkflow,
     experimentalParallelResearchEnabledForCurrentWorkflow,
     experimentalGuardrailsEnabledForCurrentWorkflow,
@@ -734,6 +745,9 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
           !multiModel.isMultiModelActive,
         legalReview: legalReviewEnabledForCurrentWorkflow,
         supersearch: supersearchEnabledForCurrentWorkflow,
+        asv3ExpCropped:
+          asv3ExpCroppedEnabledForCurrentWorkflow &&
+          !multiModel.isMultiModelActive,
         experimentalResearch:
           experimentalResearchEnabledForCurrentWorkflow &&
           !multiModel.isMultiModelActive,
@@ -768,6 +782,7 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
       legalCompositeEnabledForCurrentWorkflow,
       legalReviewEnabledForCurrentWorkflow,
       supersearchEnabledForCurrentWorkflow,
+      asv3ExpCroppedEnabledForCurrentWorkflow,
       experimentalResearchEnabledForCurrentWorkflow,
       experimentalParallelResearchEnabledForCurrentWorkflow,
       experimentalGuardrailsEnabledForCurrentWorkflow,
@@ -846,6 +861,9 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
             !multiModel.isMultiModelActive,
           legalReview: legalReviewEnabledForCurrentWorkflow,
           supersearch: supersearchEnabledForCurrentWorkflow,
+          asv3ExpCropped:
+            asv3ExpCroppedEnabledForCurrentWorkflow &&
+            !multiModel.isMultiModelActive,
           experimentalResearch:
             experimentalResearchEnabledForCurrentWorkflow &&
             !multiModel.isMultiModelActive,
@@ -891,6 +909,7 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
       legalCompositeEnabledForCurrentWorkflow,
       legalReviewEnabledForCurrentWorkflow,
       supersearchEnabledForCurrentWorkflow,
+      asv3ExpCroppedEnabledForCurrentWorkflow,
       experimentalResearchEnabledForCurrentWorkflow,
       experimentalParallelResearchEnabledForCurrentWorkflow,
       experimentalGuardrailsEnabledForCurrentWorkflow,
@@ -1103,6 +1122,9 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
                         }
                         supersearchEnabled={
                           supersearchEnabledForCurrentWorkflow
+                        }
+                        asv3ExpCroppedEnabled={
+                          asv3ExpCroppedEnabledForCurrentWorkflow
                         }
                         experimentalResearchEnabled={
                           experimentalResearchEnabledForCurrentWorkflow
@@ -1330,6 +1352,9 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
                         supersearchEnabled={
                           supersearchEnabledForCurrentWorkflow
                         }
+                        asv3ExpCroppedEnabled={
+                          asv3ExpCroppedEnabledForCurrentWorkflow
+                        }
                         experimentalResearchEnabled={
                           experimentalResearchEnabledForCurrentWorkflow
                         }
@@ -1350,6 +1375,7 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
                         toggleLegalReview={toggleLegalReview}
                         toggleLegalComposite={toggleLegalComposite}
                         toggleSupersearch={toggleSupersearch}
+                        toggleAsv3ExpCropped={toggleAsv3ExpCropped}
                         toggleExperimentalResearch={toggleExperimentalResearch}
                         toggleExperimentalParallelResearch={
                           toggleExperimentalParallelResearch

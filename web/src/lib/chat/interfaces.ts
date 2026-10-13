@@ -2,6 +2,7 @@ export type WorkflowSelection =
   | "normal"
   | "deep"
   | "experimental"
+  | "asv3_exp_cropped"
   | "experimental_parallel"
   | "experimental_guardrails"
   | "experimental_guardrails_v2"

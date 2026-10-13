@@ -168,6 +168,7 @@ export interface SendMessageParams {
   legalComposite?: boolean;
   legalReview?: boolean;
   supersearch?: boolean;
+  asv3ExpCropped?: boolean;
   experimentalResearch?: boolean;
   experimentalParallelResearch?: boolean;
   experimentalGuardrails?: boolean;
@@ -204,6 +205,7 @@ export async function* sendMessage({
   legalComposite,
   legalReview,
   supersearch,
+  asv3ExpCropped = false,
   experimentalResearch,
   experimentalParallelResearch,
   experimentalGuardrails,
@@ -230,6 +232,7 @@ export async function* sendMessage({
       atezSearchV3 ||
       legalComposite ||
       supersearch ||
+      asv3ExpCropped ||
       experimentalResearch ||
       experimentalParallelResearch ||
       experimentalGuardrails ||
@@ -244,6 +247,24 @@ export async function* sendMessage({
 
   if (supersearch && (llmOverrides?.length ?? 0) > 1) {
     throw new Error("Supersearch tek modelle çalışır.");
+  }
+
+  if (
+    asv3ExpCropped &&
+    (deepResearch ||
+      legalComposite ||
+      legalReview ||
+      supersearch ||
+      experimentalResearch ||
+      experimentalParallelResearch ||
+      experimentalGuardrails ||
+      experimentalGuardrailsV2 ||
+      experimentalGuardrailsV3)
+  ) {
+    throw new Error("exp cropped başka araştırma modlarıyla birleştirilemez.");
+  }
+  if (asv3ExpCropped && (llmOverrides?.length ?? 0) > 1) {
+    throw new Error("exp cropped tek modelle çalışır.");
   }
 
   // Build payload for new send-chat-message API
@@ -261,6 +282,7 @@ export async function* sendMessage({
     ...(supersearch ? { supersearch: true } : {}),
     atez_search_v3: Boolean(
       (atezSearchV3 ||
+        asv3ExpCropped ||
         experimentalResearch ||
         experimentalParallelResearch ||
         experimentalGuardrails ||
@@ -272,17 +294,21 @@ export async function* sendMessage({
     asv3_research_profile:
       supersearch || deepResearch
         ? "deep"
-        : experimentalResearch || experimentalParallelResearch
-          ? "experimental"
-          : atezSearchV3 ||
-              experimentalGuardrails ||
-              experimentalGuardrailsV2 ||
-              experimentalGuardrailsV3
-            ? "normal"
-            : "deep",
-    ...(experimentalParallelResearch && !deepResearch && !supersearch
-      ? { asv3_parallel_research: true }
-      : {}),
+        : asv3ExpCropped
+          ? "normal"
+          : experimentalResearch || experimentalParallelResearch
+            ? "experimental"
+            : atezSearchV3 ||
+                experimentalGuardrails ||
+                experimentalGuardrailsV2 ||
+                experimentalGuardrailsV3
+              ? "normal"
+              : "deep",
+    ...(asv3ExpCropped && !deepResearch && !supersearch
+      ? { asv3_exp_cropped: true, asv3_parallel_research: false }
+      : experimentalParallelResearch && !deepResearch && !supersearch
+        ? { asv3_parallel_research: true }
+        : {}),
     ...(experimentalGuardrails && !deepResearch && !supersearch
       ? { asv3_guarded_experimental: true }
       : {}),
@@ -296,6 +322,7 @@ export async function* sendMessage({
       supersearch || legalReview ? undefined : asv3ResumeMessageId,
     asv3_allow_external: Boolean(
       (atezSearchV3 ||
+        asv3ExpCropped ||
         experimentalResearch ||
         experimentalParallelResearch ||
         experimentalGuardrails ||

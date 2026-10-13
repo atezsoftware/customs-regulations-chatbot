@@ -4,11 +4,11 @@ These reads never grant access: callers retain the existing file/document ACLs.
 """
 
 import json
-from collections.abc import Generator, Mapping
+from collections.abc import Callable, Generator, Mapping
 from datetime import date, timedelta
 from uuid import UUID
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, or_, select, tuple_
 from sqlalchemy.orm import Session
 
 from onyx.db.models import (
@@ -353,9 +353,24 @@ def query_temporal_bindings(
     as_of_date: date,
     projection_ordinals: Mapping[UUID, tuple[int, ...]] | None = None,
 ) -> dict[UUID, list[AnnexTemporalProjection]]:
+    from onyx.db.asv3_candidate_inventory import current_asv3_source_inventory_scope
     from onyx.db.engine.sql_engine import get_session_with_current_tenant
 
     with get_session_with_current_tenant() as session:
+        scope = current_asv3_source_inventory_scope()
+        if (
+            scope is not None
+            and scope.batch_temporal_reads
+            and projection_ordinals is not None
+        ):
+            return _query_temporal_binding_pairs(
+                session,
+                file_ids,
+                index=index,
+                as_of_date=as_of_date,
+                projection_ordinals=projection_ordinals,
+                check_active=scope.check_active,
+            )
         return {
             file_id: load_public_temporal_bindings(
                 session,
@@ -370,6 +385,104 @@ def query_temporal_bindings(
             )
             for file_id in file_ids
         }
+
+
+def _query_temporal_binding_pairs(
+    session: Session,
+    file_ids: tuple[UUID, ...],
+    *,
+    index: PublicationIndexSnapshot,
+    as_of_date: date,
+    projection_ordinals: Mapping[UUID, tuple[int, ...]],
+    check_active: Callable[[], None],
+) -> dict[UUID, list[AnnexTemporalProjection]]:
+    """Validate the exact search-hit pairs with the public reader's joined checks."""
+    check_active()
+    selected: dict[UUID, list[AnnexTemporalProjection]] = {
+        file_id: [] for file_id in file_ids
+    }
+    pairs = sorted(
+        {
+            (file_id, ordinal)
+            for file_id in file_ids
+            for ordinal in projection_ordinals.get(file_id, ())
+        }
+    )
+    if not pairs:
+        return selected
+    query = (
+        select(
+            RegulatoryTemporalProjection,
+            RegulatoryCanonicalRevision,
+            RegulatoryChunk.id,
+            RegulatoryChunk.validity_start_date,
+            RegulatoryChunk.validity_end_date,
+        )
+        .select_from(RegulatoryTemporalProjection)
+        .outerjoin(
+            RegulatoryCanonicalRevision,
+            RegulatoryCanonicalRevision.id
+            == RegulatoryTemporalProjection.canonical_revision_id,
+        )
+        .outerjoin(
+            RegulatoryChunk,
+            and_(
+                RegulatoryChunk.id == RegulatoryTemporalProjection.canonical_chunk_id,
+                RegulatoryChunk.user_file_id
+                == RegulatoryTemporalProjection.user_file_id,
+            ),
+        )
+        .where(
+            tuple_(
+                RegulatoryTemporalProjection.user_file_id,
+                RegulatoryTemporalProjection.projection_ordinal,
+            ).in_(pairs),
+            RegulatoryTemporalProjection.index_uuid == index.index_uuid,
+            RegulatoryTemporalProjection.retired_at.is_(None),
+            or_(
+                RegulatoryTemporalProjection.effective_start.is_(None),
+                RegulatoryTemporalProjection.effective_start <= as_of_date,
+            ),
+            or_(
+                RegulatoryTemporalProjection.effective_end.is_(None),
+                RegulatoryTemporalProjection.effective_end > as_of_date,
+            ),
+        )
+        .order_by(
+            RegulatoryTemporalProjection.user_file_id,
+            RegulatoryTemporalProjection.projection_ordinal,
+        )
+        .execution_options(
+            populate_existing=True,
+            stream_results=True,
+            yield_per=_PUBLIC_TEMPORAL_READ_BATCH_SIZE,
+        )
+    )
+    result = session.execute(query)
+    try:
+        for row, revision, canonical_id, canonical_start, canonical_end in result:
+            check_active()
+            validate_temporal_binding_payload(row)
+            validate_joined_temporal_canonical_revision(row, revision)
+            binding = parse_temporal_binding(row)
+            if _public_temporal_binding_is_visible(
+                binding,
+                index=index,
+                as_of_date=as_of_date,
+                canonical_present=canonical_id is not None,
+                canonical_start=canonical_start,
+                canonical_end=canonical_end,
+            ):
+                selected[row.user_file_id].append(binding)
+    finally:
+        result.close()
+    check_active()
+    return {
+        file_id: sorted(
+            bindings, key=lambda item: (item.semantic_position, item.projection.ordinal)
+        )
+        for file_id, bindings in selected.items()
+    }
 
 
 def current_protected_file_ids(file_ids: tuple[UUID, ...]) -> frozenset[UUID]:

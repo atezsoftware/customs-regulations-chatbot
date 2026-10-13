@@ -1,0 +1,368 @@
+{
+  "capture": "plans/exp-cropped-spike-prevention-20261013/live-sol61-full-vaka2/results/run-20261013T175229Z/harness-0.json",
+  "capture_sha256": "c73bfe84a4cdf0203b17722132b0bb82a8b66c46532356d17235f3c0b8cd11d6",
+  "rows": [
+    {
+      "citation": 551,
+      "item": {
+        "source_id": "12328001-2f21-407e-b230-7d50a8dbf28f",
+        "text": "**MADDE 10/A-** 1. Gümrük idareleri, mevzuatın belirlediği şartlar çerçevesinde, Türkiye Gümrük Bölgesi ile diğer ülkeler arasında taşınan eşyanın giriş, çıkış, transit, aktarma ve nihai kullanımını ve serbest dolaşımda bulunmayan eşyanın durumunu düzenleyen gümrük mevzuatı ve diğer mevzuatın doğru uygulanmasını sağlamak için gerekli görülen gümrük kontrollerini yerine getirir. Uluslararası bir anlaşmanın öngörmesi halinde, mevzuatın doğru bir şekilde uygulanmasına yönelik gümrük kontrolleri başka bir ülkede de yürütülebilir.",
+        "chunk_id": "rc_ae085cae672dd84da16105ef139d4a722c8e1d2d",
+        "search_doc": {
+          "document_id": "12328001-2f21-407e-b230-7d50a8dbf28f",
+          "chunk_ind": 114,
+          "semantic_identifier": "İhracat Mevzuatı/Kanun, Kararname, Yönetmelik, Tebliğ, Genelge/gumruk_kanunu_.md",
+          "link": null,
+          "blurb": "**MADDE 10/A-** 1. Gümrük idareleri, mevzuatın belirlediği şartlar çerçevesinde, Türkiye Gümrük Bölgesi ile diğer ülkeler arasında taşınan eşyanın giriş, çıkış, transit, aktarma ve nihai kullanımını ve serbest dolaşımda bulunmayan eşyanın d",
+          "source_type": "file",
+          "boost": 0,
+          "hidden": false,
+          "metadata": {
+            "regulatory_chunk_id": "rc_ae085cae672dd84da16105ef139d4a722c8e1d2d",
+            "regulatory_heading_path": [
+              "4458 SAYILI GÜMRÜK KANUNU",
+              "Genel Hükümler",
+              "İKİNCİ BÖLÜM",
+              "MADDE 10 - Diğer Hükümler",
+              "2. Gümrük mevzuatının öngördüğü uygulamaların, hangi hallerde ve hangi koşullar altında ba..."
+            ],
+            "regulatory_validity_start_date": "",
+            "regulatory_validity_end_date": ""
+          },
+          "score": null,
+          "is_relevant": null,
+          "relevance_explanation": null,
+          "match_highlights": [],
+          "updated_at": null,
+          "primary_owners": null,
+          "secondary_owners": null,
+          "is_internet": false,
+          "file_id": "f3bf6768-cbe0-4cd2-926d-8958578530e6"
+        },
+        "question_ids": [],
+        "metadata": {
+          "position": 114,
+          "heading_path": [
+            "4458 SAYILI GÜMRÜK KANUNU",
+            "Genel Hükümler",
+            "İKİNCİ BÖLÜM",
+            "MADDE 10 - Diğer Hükümler",
+            "2. Gümrük mevzuatının öngördüğü uygulamaların, hangi hallerde ve hangi koşullar altında ba..."
+          ],
+          "validity_start": null,
+          "validity_end": null,
+          "version_unknown": true,
+          "canonical_metadata": {
+            "document_id": "12328001-2f21-407e-b230-7d50a8dbf28f",
+            "chunk_index": 114,
+            "title": "İhracat Mevzuatı/Kanun, Kararname, Yönetmelik, Tebliğ, Genelge/gumruk_kanunu_.md",
+            "source_type": "user_file",
+            "semantic_identifier": "İhracat Mevzuatı/Kanun, Kararname, Yönetmelik, Tebliğ, Genelge/gumruk_kanunu_.md — 4458 SAYILI GÜMRÜK KANUNU > Genel Hükümler > İKİNCİ BÖLÜM > MADDE 10 - Diğer Hükümler > 2. Gümrük mevzuatının öngördüğü uygulamaların, hangi hallerde ve hangi koşullar altında ba...",
+            "source_links": "{\"0\": \"\"}",
+            "document_sets": [
+              "PC Külliyatı"
+            ],
+            "regulatory_chunk_id": "rc_ae085cae672dd84da16105ef139d4a722c8e1d2d",
+            "heading_path": [
+              "4458 SAYILI GÜMRÜK KANUNU",
+              "Genel Hükümler",
+              "İKİNCİ BÖLÜM",
+              "MADDE 10 - Diğer Hükümler",
+              "2. Gümrük mevzuatının öngördüğü uygulamaların, hangi hallerde ve hangi koşullar altında ba..."
+            ],
+            "provision_identifiers": [
+              "madde 10/a",
+              "madde 10"
+            ],
+            "legal_dates": [
+              "1999-10-27",
+              "1999-11-04"
+            ],
+            "article_no": "10",
+            "clause_label": null,
+            "paragraph_no": "2",
+            "article_title": "Diğer Hükümler",
+            "chunk_variant": "atomic",
+            "document_date": "1999-10-27",
+            "document_type": "kanun",
+            "source_regulatory_chunk_ids": [],
+            "read_as_of_date": "2026-10-13"
+          },
+          "read_as_of_date": "2026-10-13"
+        },
+        "text_hash": "243cd672a382b22615311e5d243801286e005c463641de63ff4b789cbd611e10"
+      }
+    },
+    {
+      "citation": 552,
+      "item": {
+        "source_id": "12328001-2f21-407e-b230-7d50a8dbf28f",
+        "text": "2. Ani ve rastgele yapılanlar dışındaki gümrük kontrolleri; risklerin tespiti ve risk derecesinin ölçülmesi ile ulusal ve gerekli görüldüğü takdirde uluslararası düzeyde riskleri değerlendirerek gerekli önlemleri oluşturmak amacıyla bilgisayarlı veri işleme tekniklerini kullanan risk analizi esas alınarak yapılır.",
+        "chunk_id": "rc_1702d0ea95d13a657416b9d0c86179168de8b373",
+        "search_doc": {
+          "document_id": "12328001-2f21-407e-b230-7d50a8dbf28f",
+          "chunk_ind": 115,
+          "semantic_identifier": "İhracat Mevzuatı/Kanun, Kararname, Yönetmelik, Tebliğ, Genelge/gumruk_kanunu_.md",
+          "link": null,
+          "blurb": "2. Ani ve rastgele yapılanlar dışındaki gümrük kontrolleri; risklerin tespiti ve risk derecesinin ölçülmesi ile ulusal ve gerekli görüldüğü takdirde uluslararası düzeyde riskleri değerlendirerek gerekli önlemleri oluşturmak amacıyla bilgisa",
+          "source_type": "file",
+          "boost": 0,
+          "hidden": false,
+          "metadata": {
+            "regulatory_chunk_id": "rc_1702d0ea95d13a657416b9d0c86179168de8b373",
+            "regulatory_heading_path": [
+              "4458 SAYILI GÜMRÜK KANUNU",
+              "Genel Hükümler",
+              "İKİNCİ BÖLÜM",
+              "MADDE 10 - Diğer Hükümler",
+              "2. Ani ve rastgele yapılanlar dışındaki gümrük kontrolleri"
+            ],
+            "regulatory_validity_start_date": "",
+            "regulatory_validity_end_date": ""
+          },
+          "score": null,
+          "is_relevant": null,
+          "relevance_explanation": null,
+          "match_highlights": [],
+          "updated_at": null,
+          "primary_owners": null,
+          "secondary_owners": null,
+          "is_internet": false,
+          "file_id": "f3bf6768-cbe0-4cd2-926d-8958578530e6"
+        },
+        "question_ids": [],
+        "metadata": {
+          "position": 115,
+          "heading_path": [
+            "4458 SAYILI GÜMRÜK KANUNU",
+            "Genel Hükümler",
+            "İKİNCİ BÖLÜM",
+            "MADDE 10 - Diğer Hükümler",
+            "2. Ani ve rastgele yapılanlar dışındaki gümrük kontrolleri"
+          ],
+          "validity_start": null,
+          "validity_end": null,
+          "version_unknown": true,
+          "canonical_metadata": {
+            "document_id": "12328001-2f21-407e-b230-7d50a8dbf28f",
+            "chunk_index": 115,
+            "title": "İhracat Mevzuatı/Kanun, Kararname, Yönetmelik, Tebliğ, Genelge/gumruk_kanunu_.md",
+            "source_type": "user_file",
+            "semantic_identifier": "İhracat Mevzuatı/Kanun, Kararname, Yönetmelik, Tebliğ, Genelge/gumruk_kanunu_.md — 4458 SAYILI GÜMRÜK KANUNU > Genel Hükümler > İKİNCİ BÖLÜM > MADDE 10 - Diğer Hükümler > 2. Ani ve rastgele yapılanlar dışındaki gümrük kontrolleri",
+            "source_links": "{\"0\": \"\"}",
+            "document_sets": [
+              "PC Külliyatı"
+            ],
+            "regulatory_chunk_id": "rc_1702d0ea95d13a657416b9d0c86179168de8b373",
+            "heading_path": [
+              "4458 SAYILI GÜMRÜK KANUNU",
+              "Genel Hükümler",
+              "İKİNCİ BÖLÜM",
+              "MADDE 10 - Diğer Hükümler",
+              "2. Ani ve rastgele yapılanlar dışındaki gümrük kontrolleri"
+            ],
+            "provision_identifiers": [
+              "madde 10"
+            ],
+            "legal_dates": [
+              "1999-10-27",
+              "1999-11-04"
+            ],
+            "article_no": "10",
+            "clause_label": null,
+            "paragraph_no": "2",
+            "article_title": "Diğer Hükümler",
+            "chunk_variant": "atomic",
+            "document_date": "1999-10-27",
+            "document_type": "kanun",
+            "source_regulatory_chunk_ids": [],
+            "read_as_of_date": "2026-10-13"
+          },
+          "read_as_of_date": "2026-10-13"
+        },
+        "text_hash": "cbf84fb284c564f1478cc0406acac67c2ff184ea2f25dbdac5311658093dbc2d"
+      }
+    },
+    {
+      "citation": 553,
+      "item": {
+        "source_id": "12328001-2f21-407e-b230-7d50a8dbf28f",
+        "text": "3. Müsteşarlık, risk yönetimi çerçevesini oluşturur ve risk kriterleri ile öncelikli kontrol alanlarını belirler. Bu amaçla, risk kriterlerinin tespitine yönelik olarak gümrük işlemleri, gümrük kabahatleri ve kaçakçılık fiillerine ilişkin verileri toplamaya, saklamaya ve işlemeye yetkilidir. Verilerin toplanması, saklanması ve işlenmesine ilişkin usul ve esaslar yönetmelikle belirlenir.",
+        "chunk_id": "rc_2f2b89629ad2dcc5352e9affb96ea9342febed08",
+        "search_doc": {
+          "document_id": "12328001-2f21-407e-b230-7d50a8dbf28f",
+          "chunk_ind": 116,
+          "semantic_identifier": "İhracat Mevzuatı/Kanun, Kararname, Yönetmelik, Tebliğ, Genelge/gumruk_kanunu_.md",
+          "link": null,
+          "blurb": "3. Müsteşarlık, risk yönetimi çerçevesini oluşturur ve risk kriterleri ile öncelikli kontrol alanlarını belirler. Bu amaçla, risk kriterlerinin tespitine yönelik olarak gümrük işlemleri, gümrük kabahatleri ve kaçakçılık fiillerine ilişkin v",
+          "source_type": "file",
+          "boost": 0,
+          "hidden": false,
+          "metadata": {
+            "regulatory_chunk_id": "rc_2f2b89629ad2dcc5352e9affb96ea9342febed08",
+            "regulatory_heading_path": [
+              "4458 SAYILI GÜMRÜK KANUNU",
+              "Genel Hükümler",
+              "İKİNCİ BÖLÜM",
+              "MADDE 10 - Diğer Hükümler",
+              "3. Müsteşarlık, risk yönetimi çerçevesini oluşturur ve risk kriterleri ile öncelikli kontr..."
+            ],
+            "regulatory_validity_start_date": "",
+            "regulatory_validity_end_date": ""
+          },
+          "score": null,
+          "is_relevant": null,
+          "relevance_explanation": null,
+          "match_highlights": [],
+          "updated_at": null,
+          "primary_owners": null,
+          "secondary_owners": null,
+          "is_internet": false,
+          "file_id": "f3bf6768-cbe0-4cd2-926d-8958578530e6"
+        },
+        "question_ids": [],
+        "metadata": {
+          "position": 116,
+          "heading_path": [
+            "4458 SAYILI GÜMRÜK KANUNU",
+            "Genel Hükümler",
+            "İKİNCİ BÖLÜM",
+            "MADDE 10 - Diğer Hükümler",
+            "3. Müsteşarlık, risk yönetimi çerçevesini oluşturur ve risk kriterleri ile öncelikli kontr..."
+          ],
+          "validity_start": null,
+          "validity_end": null,
+          "version_unknown": true,
+          "canonical_metadata": {
+            "document_id": "12328001-2f21-407e-b230-7d50a8dbf28f",
+            "chunk_index": 116,
+            "title": "İhracat Mevzuatı/Kanun, Kararname, Yönetmelik, Tebliğ, Genelge/gumruk_kanunu_.md",
+            "source_type": "user_file",
+            "semantic_identifier": "İhracat Mevzuatı/Kanun, Kararname, Yönetmelik, Tebliğ, Genelge/gumruk_kanunu_.md — 4458 SAYILI GÜMRÜK KANUNU > Genel Hükümler > İKİNCİ BÖLÜM > MADDE 10 - Diğer Hükümler > 3. Müsteşarlık, risk yönetimi çerçevesini oluşturur ve risk kriterleri ile öncelikli kontr...",
+            "source_links": "{\"0\": \"\"}",
+            "document_sets": [
+              "PC Külliyatı"
+            ],
+            "regulatory_chunk_id": "rc_2f2b89629ad2dcc5352e9affb96ea9342febed08",
+            "heading_path": [
+              "4458 SAYILI GÜMRÜK KANUNU",
+              "Genel Hükümler",
+              "İKİNCİ BÖLÜM",
+              "MADDE 10 - Diğer Hükümler",
+              "3. Müsteşarlık, risk yönetimi çerçevesini oluşturur ve risk kriterleri ile öncelikli kontr..."
+            ],
+            "provision_identifiers": [
+              "madde 10"
+            ],
+            "legal_dates": [
+              "1999-10-27",
+              "1999-11-04"
+            ],
+            "article_no": "10",
+            "clause_label": null,
+            "paragraph_no": "3",
+            "article_title": "Diğer Hükümler",
+            "chunk_variant": "atomic",
+            "document_date": "1999-10-27",
+            "document_type": "kanun",
+            "source_regulatory_chunk_ids": [],
+            "read_as_of_date": "2026-10-13"
+          },
+          "read_as_of_date": "2026-10-13"
+        },
+        "text_hash": "55d6b4f1a5494584841bc5bbc542f84d4d3617cb50ac9cac4005281d93144e63"
+      }
+    },
+    {
+      "citation": 554,
+      "item": {
+        "source_id": "12328001-2f21-407e-b230-7d50a8dbf28f",
+        "text": "4. Gümrük idareleri dışındaki yetkili kurumlar tarafından gerçekleştirilecek kontroller, 21/3/2007 tarihli ve 5607 sayılı Kaçakçılıkla Mücadele Kanununun 19 uncu maddesi hükümleri saklı kalmak kaydıyla gümrük idarelerinin koordinasyonunda ve mümkün olduğu ölçüde aynı yer ve zamanda yapılır.",
+        "chunk_id": "rc_501a70a2ab76cef9f36f47fcbe917539587b5760",
+        "search_doc": {
+          "document_id": "12328001-2f21-407e-b230-7d50a8dbf28f",
+          "chunk_ind": 117,
+          "semantic_identifier": "İhracat Mevzuatı/Kanun, Kararname, Yönetmelik, Tebliğ, Genelge/gumruk_kanunu_.md",
+          "link": null,
+          "blurb": "4. Gümrük idareleri dışındaki yetkili kurumlar tarafından gerçekleştirilecek kontroller, 21/3/2007 tarihli ve 5607 sayılı Kaçakçılıkla Mücadele Kanununun 19 uncu maddesi hükümleri saklı kalmak kaydıyla gümrük idarelerinin koordinasyonunda v",
+          "source_type": "file",
+          "boost": 0,
+          "hidden": false,
+          "metadata": {
+            "regulatory_chunk_id": "rc_501a70a2ab76cef9f36f47fcbe917539587b5760",
+            "regulatory_heading_path": [
+              "4458 SAYILI GÜMRÜK KANUNU",
+              "Genel Hükümler",
+              "İKİNCİ BÖLÜM",
+              "MADDE 10 - Diğer Hükümler",
+              "4. Gümrük idareleri dışındaki yetkili kurumlar tarafından gerçekleştirilecek kontroller, 2..."
+            ],
+            "regulatory_validity_start_date": "",
+            "regulatory_validity_end_date": ""
+          },
+          "score": null,
+          "is_relevant": null,
+          "relevance_explanation": null,
+          "match_highlights": [],
+          "updated_at": null,
+          "primary_owners": null,
+          "secondary_owners": null,
+          "is_internet": false,
+          "file_id": "f3bf6768-cbe0-4cd2-926d-8958578530e6"
+        },
+        "question_ids": [],
+        "metadata": {
+          "position": 117,
+          "heading_path": [
+            "4458 SAYILI GÜMRÜK KANUNU",
+            "Genel Hükümler",
+            "İKİNCİ BÖLÜM",
+            "MADDE 10 - Diğer Hükümler",
+            "4. Gümrük idareleri dışındaki yetkili kurumlar tarafından gerçekleştirilecek kontroller, 2..."
+          ],
+          "validity_start": null,
+          "validity_end": null,
+          "version_unknown": true,
+          "canonical_metadata": {
+            "document_id": "12328001-2f21-407e-b230-7d50a8dbf28f",
+            "chunk_index": 117,
+            "title": "İhracat Mevzuatı/Kanun, Kararname, Yönetmelik, Tebliğ, Genelge/gumruk_kanunu_.md",
+            "source_type": "user_file",
+            "semantic_identifier": "İhracat Mevzuatı/Kanun, Kararname, Yönetmelik, Tebliğ, Genelge/gumruk_kanunu_.md — 4458 SAYILI GÜMRÜK KANUNU > Genel Hükümler > İKİNCİ BÖLÜM > MADDE 10 - Diğer Hükümler > 4. Gümrük idareleri dışındaki yetkili kurumlar tarafından gerçekleştirilecek kontroller, 2...",
+            "source_links": "{\"0\": \"\"}",
+            "document_sets": [
+              "PC Külliyatı"
+            ],
+            "regulatory_chunk_id": "rc_501a70a2ab76cef9f36f47fcbe917539587b5760",
+            "heading_path": [
+              "4458 SAYILI GÜMRÜK KANUNU",
+              "Genel Hükümler",
+              "İKİNCİ BÖLÜM",
+              "MADDE 10 - Diğer Hükümler",
+              "4. Gümrük idareleri dışındaki yetkili kurumlar tarafından gerçekleştirilecek kontroller, 2..."
+            ],
+            "provision_identifiers": [
+              "madde 10"
+            ],
+            "legal_dates": [
+              "1999-10-27",
+              "1999-11-04",
+              "2007-03-21"
+            ],
+            "article_no": "10",
+            "clause_label": null,
+            "paragraph_no": "4",
+            "article_title": "Diğer Hükümler",
+            "chunk_variant": "atomic",
+            "document_date": "1999-10-27",
+            "document_type": "kanun",
+            "source_regulatory_chunk_ids": [],
+            "read_as_of_date": "2026-10-13"
+          },
+          "read_as_of_date": "2026-10-13"
+        },
+        "text_hash": "69d0ab6f1a01466ccce2f8419ca57d52acfc503758cfaf4600432b600d3be964"
+      }
+    }
+  ]
+}

@@ -20,6 +20,8 @@ class ASv3WorkflowSelection(BaseModel):
     workflow_variant: Literal[
         "standard",
         "asv3_tuned",
+        "asv3_exp_cheap",
+        "asv3_exp_cropped",
         "asv3_guarded_experimental",
         "asv3_guardrails_v2",
         "asv3_guardrails_v3",
@@ -27,7 +29,11 @@ class ASv3WorkflowSelection(BaseModel):
 
     @property
     def selected_model_only(self) -> bool:
-        return self.workflow_variant == "asv3_tuned"
+        return self.workflow_variant in {
+            "asv3_tuned",
+            "asv3_exp_cheap",
+            "asv3_exp_cropped",
+        }
 
     @property
     def uses_guardrails(self) -> bool:

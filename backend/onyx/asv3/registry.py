@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 import threading
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, Callable, Iterable
@@ -8,6 +10,15 @@ from typing import TYPE_CHECKING, Callable, Iterable
 import jsonschema
 from pydantic import JsonValue
 
+from onyx.asv3.cropped_completion import (
+    CroppedCompletionContext,
+    CroppedValidatedFollowups,
+    build_cropped_completion_context,
+    cropped_required_followups_schema,
+    validate_cropped_required_followups,
+)
+from onyx.asv3.cropped_crossrefs import CroppedCrossReferencePolicy
+from onyx.asv3.cropped_research_limit import CroppedResearchLimit
 from onyx.asv3.legal_source_reviews import (
     LegalSourceReviews,
     RelatedSourceReview,
@@ -91,14 +102,19 @@ def native_research_bindings(
     state = context.services.get("research_state")
     if not (
         context.services.get("lean_native_mode")
-        and context.services.get("research_profile") == "experimental"
         and isinstance(state, ResearchState)
         and (
-            serial_session_diagnostics_enabled(context)
+            _cropped_completion_enabled(context)
             or (
-                context.services.get("experimental_parallel") is True
-                and context.services.get("independent_question") is True
-                and context.depth > 0
+                context.services.get("research_profile") == "experimental"
+                and (
+                    serial_session_diagnostics_enabled(context)
+                    or (
+                        context.services.get("experimental_parallel") is True
+                        and context.services.get("independent_question") is True
+                        and context.depth > 0
+                    )
+                )
             )
         )
     ):
@@ -115,7 +131,11 @@ def native_research_bindings(
             for item in question_determinations(list(state.questions))
         ],
         "notice": (
-            "Use these fixed session IDs for update_research.needs; do not use "
+            "Use these immutable user question IDs, including q0 for an unnumbered "
+            "question. Multiple distinct requested outcomes may bind the same question; "
+            "do not invent additional question IDs."
+            if _cropped_completion_enabled(context)
+            else "Use these fixed session IDs for update_research.needs; do not use "
             "the parent assignment's question or outcome IDs."
             if serial_session_diagnostics_enabled(context)
             else "Use these local IDs for update_research.needs. OutcomeMap.question_ids "
@@ -124,10 +144,23 @@ def native_research_bindings(
     }
 
 
+def _cropped_completion_enabled(context: RunContext) -> bool:
+    return (
+        context.services.get("asv3_exp_cropped") is True
+        and context.services.get("asv3_exp_cheap") is not True
+    )
+
+
 class CapabilityRegistry:
     def __init__(self, specs: Iterable[ToolSpec] = ()) -> None:
         self._specs: dict[str, ToolSpec] = {}
         self._serial = threading.RLock()
+        self._cropped_checkpoint_lock = threading.RLock()
+        self._cropped_reads: dict[str, ToolOutcome] = {}
+        self._cropped_read_locks: dict[str, threading.RLock] = {}
+        self._cropped_followups: dict[
+            tuple[str, str, int, str, str, str], CroppedValidatedFollowups
+        ] = {}
         for spec in specs:
             self.register(spec)
 
@@ -201,6 +234,11 @@ class CapabilityRegistry:
                     items["enum"] = identifiers
             properties = parameters.setdefault("properties", {})
             assert isinstance(properties, dict)
+            if _cropped_completion_enabled(context) and spec.name in {
+                "submit_answer",
+                "submit_partial_answer",
+            }:
+                properties["_required_followups"] = cropped_required_followups_schema()
             if context.services.get("lean_native_mode"):
                 properties["_language"] = {
                     "type": "string",
@@ -320,6 +358,9 @@ class CapabilityRegistry:
         governing_gap = self.governing_acquisition_gap(call, context)
         if governing_gap is not None:
             return governing_gap
+        completion_gap = self.completion_metadata_gap(call, context)
+        if completion_gap is not None:
+            return completion_gap
         spec = self.get(call.name)
         state = context.services.get("research_state")
         if (
@@ -354,6 +395,130 @@ class CapabilityRegistry:
         ):
             return episodes.admission_gap(call, context, ledger)
         return None
+
+    @staticmethod
+    def _followup_key(
+        call: CapabilityCall, context: RunContext, snapshot: CroppedCompletionContext
+    ) -> tuple[str, str, int, str, str, str]:
+        return (
+            context.run_id,
+            str(context.services.get("task_id") or "root"),
+            context.depth,
+            call.call_id,
+            hashlib.sha256(
+                json.dumps(call.arguments, sort_keys=True, allow_nan=False).encode()
+            ).hexdigest(),
+            snapshot.fingerprint,
+        )
+
+    def completion_metadata_gap(
+        self, call: CapabilityCall, context: RunContext
+    ) -> ToolOutcome | None:
+        if (
+            not _cropped_completion_enabled(context)
+            or "_required_followups" not in call.arguments
+        ):
+            return None
+        try:
+            snapshot = context.services.get("cropped_completion_context")
+            answer = call.arguments.get("answer")
+            if (
+                call.name not in {"submit_answer", "submit_partial_answer"}
+                or call.argument_error is not None
+                or not isinstance(snapshot, CroppedCompletionContext)
+                or not isinstance(answer, str)
+            ):
+                raise ValueError(
+                    "Required followups need their actual Cropped terminal writer context"
+                )
+            key = self._followup_key(call, context, snapshot)
+            with self._serial:
+                cached = key in self._cropped_followups
+            facts = json.loads(snapshot.facts_json)
+            gap = json.loads(snapshot.publication_gap_json)
+            if cached:
+                if context.services.get(
+                    "applied_outcome_metadata_call"
+                ) is not call and (
+                    build_cropped_completion_context(
+                        context, snapshot.request, facts=facts, publication_gap=gap
+                    )
+                    != snapshot
+                ):
+                    raise ValueError(
+                        "Completion writer context changed before execution"
+                    )
+                return None
+            validated = validate_cropped_required_followups(
+                call.arguments["_required_followups"],
+                context,
+                snapshot.request,
+                snapshot,
+                answer=answer.strip(),
+                facts=facts,
+                publication_gap=gap,
+            )
+            with self._serial:
+                self._cropped_followups[key] = validated
+        except ValueError as error:
+            return ToolOutcome(
+                status=OutcomeStatus.INVALID,
+                summary="Correct only the required followup bindings or report none.",
+                data={"invalid_required_followups": True, "detail": str(error)},
+            )
+        return None
+
+    @staticmethod
+    def _cropped_read_key(call: CapabilityCall, context: RunContext) -> str | None:
+        controller = context.services.get("cropped_research_controller")
+        if (
+            context.services.get("asv3_exp_cropped") is not True
+            or not isinstance(controller, CroppedResearchLimit)
+            or isinstance(context.services.get("shared_reads"), SharedReads)
+            or call.argument_error is not None
+            or call.name
+            not in {
+                "read_chunk",
+                "read_chunk_context",
+                "read_provision",
+                "read_named_provision",
+                "read_source_range",
+                "follow_reference",
+            }
+        ):
+            return None
+        controller.check_context(context)
+        return hashlib.sha256(
+            json.dumps(
+                [
+                    context.run_id,
+                    context.scope,
+                    context.services.get("task_id", "root"),
+                    call.name,
+                    {
+                        key: value
+                        for key, value in call.arguments.items()
+                        if not key.startswith("_")
+                    },
+                ],
+                sort_keys=True,
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+
+    def cached_cropped_read(
+        self, call: CapabilityCall, context: RunContext
+    ) -> ToolOutcome | None:
+        key = self._cropped_read_key(call, context)
+        with self._serial:
+            cached = self._cropped_reads.get(key) if key is not None else None
+            if cached is None:
+                return None
+            result = cached.model_copy(deep=True)
+        result.data["reused_recorded_read"] = True
+        return result
 
     def dispatch(self, call: CapabilityCall, context: RunContext) -> ToolOutcome:
         try:
@@ -394,6 +559,11 @@ class CapabilityRegistry:
                         "_outcomes",
                         "_coverage",
                         *(
+                            {"_required_followups"}
+                            if _cropped_completion_enabled(context)
+                            else set()
+                        ),
+                        *(
                             {"_related_source_reviews"}
                             if related_source_reviews_enabled(context)
                             else set()
@@ -407,6 +577,18 @@ class CapabilityRegistry:
                     summary="Arguments do not match the capability schema",
                     data={"path": [str(part) for part in error.absolute_path]},
                 )
+            crossrefs = context.services.get("cropped_cross_references")
+            if context.services.get("asv3_exp_cropped") is True and isinstance(
+                crossrefs, CroppedCrossReferencePolicy
+            ):
+                from onyx.asv3.evidence import EvidenceLedger
+
+                ledger = context.services.get("evidence")
+                if not isinstance(ledger, EvidenceLedger):
+                    raise ValueError("Cropped reference admission requires its ledger")
+                reference_gap = crossrefs.admit(call, context, ledger)
+                if reference_gap is not None:
+                    return reference_gap
             metadata_applied = (
                 context.services.pop("applied_outcome_metadata_call", None) is call
             )
@@ -466,9 +648,56 @@ class CapabilityRegistry:
                         },
                     )
 
-            def execute(execution_context: RunContext) -> ToolOutcome:
+            def invoke_handler(execution_context: RunContext) -> ToolOutcome:
+                if _cropped_completion_enabled(execution_context):
+                    execution_context.services.pop(
+                        "cropped_validated_required_followups", None
+                    )
+                    snapshot = execution_context.services.get(
+                        "cropped_completion_context"
+                    )
+                    if isinstance(snapshot, CroppedCompletionContext):
+                        with self._serial:
+                            validated = self._cropped_followups.get(
+                                self._followup_key(call, execution_context, snapshot)
+                            )
+                        if validated is not None:
+                            execution_context.services[
+                                "cropped_validated_required_followups"
+                            ] = validated
+                controller = execution_context.services.get(
+                    "cropped_research_controller"
+                )
+                if execution_context.services.get(
+                    "asv3_exp_cropped"
+                ) is True and isinstance(controller, CroppedResearchLimit):
+                    controller.check_context(execution_context)
+                    admission = controller.admit_tool(
+                        call.name,
+                        arguments,
+                        critical_target_key=hashlib.sha256(
+                            json.dumps(
+                                [call.name, arguments],
+                                sort_keys=True,
+                                ensure_ascii=False,
+                                allow_nan=False,
+                            ).encode()
+                        ).hexdigest(),
+                    )
+                    if not admission.allowed:
+                        return controller.blocked_tool(admission)
+                    if admission.critical_operation_key is not None:
+                        checkpoint = execution_context.services.get(
+                            "cropped_tool_checkpoint"
+                        ) or execution_context.services.get("cropped_repair_checkpoint")
+                        if callable(checkpoint):
+                            with self._cropped_checkpoint_lock:
+                                checkpoint()
                 if spec.consumes_tool_budget:
                     execution_context.budget.consume("tools")
+                return spec.handler(arguments, execution_context)
+
+            def execute(execution_context: RunContext) -> ToolOutcome:
                 slot = (
                     nullcontext()
                     if spec.orchestrates
@@ -482,24 +711,83 @@ class CapabilityRegistry:
                     )
                     with handler_span:
                         if spec.parallel_safe:
-                            return spec.handler(arguments, execution_context)
+                            return invoke_handler(execution_context)
                         with self._serial:
                             execution_context.check_active()
-                            return spec.handler(arguments, execution_context)
+                            return invoke_handler(execution_context)
 
             shared_reads = context.services.get("shared_reads")
-            outcome = (
-                shared_reads.run(call.name, arguments, context, execute)
-                if (
-                    context.services.get("research_profile") == "experimental"
-                    or context.services.get("asv3_workflow_variant")
-                    == ASV3_TUNED_VARIANT
+
+            def acquire() -> ToolOutcome:
+                return (
+                    shared_reads.run(call.name, arguments, context, execute)
+                    if (
+                        context.services.get("research_profile") == "experimental"
+                        or context.services.get("asv3_workflow_variant")
+                        == ASV3_TUNED_VARIANT
+                    )
+                    and isinstance(shared_reads, SharedReads)
+                    else execute(context)
                 )
-                and isinstance(shared_reads, SharedReads)
-                else execute(context)
-            )
-            context.check_active()
-            return outcome
+
+            read_scope = nullcontext()
+            topic_scope = nullcontext()
+            capture_read = None
+            capture_topic = None
+            if context.services.get("asv3_exp_cropped") is True:
+                from onyx.asv3.cropped_article_bindings import (
+                    capture_cropped_dispatched_read,
+                    cropped_composed_read_capture,
+                )
+
+                read_scope = cropped_composed_read_capture(call, context)
+                capture_read = capture_cropped_dispatched_read
+                from onyx.asv3.cropped_composed_topics import (
+                    capture_cropped_dispatched_topic,
+                    cropped_composed_topic_capture,
+                )
+
+                topic_scope = cropped_composed_topic_capture(call, context)
+                capture_topic = capture_cropped_dispatched_topic
+            with read_scope, topic_scope:
+                read_key = self._cropped_read_key(call, context)
+                if read_key is None:
+                    outcome = acquire()
+                else:
+                    with self._serial:
+                        read_lock = self._cropped_read_locks.setdefault(
+                            read_key, threading.RLock()
+                        )
+                    with read_lock:
+                        cached = self.cached_cropped_read(call, context)
+                        if cached is not None:
+                            outcome = cached
+                        else:
+                            outcome = acquire()
+                            if (
+                                outcome.status == OutcomeStatus.FOUND
+                                and outcome.evidence
+                                and not any(
+                                    outcome.data.get(field) is True
+                                    for field in (
+                                        "evidence_truncated",
+                                        "scan_truncated",
+                                        "truncated",
+                                    )
+                                )
+                                and outcome.data.get("evidence_next_position") is None
+                            ):
+                                snapshot = ToolOutcome.model_validate(
+                                    outcome.model_dump(mode="python")
+                                )
+                                with self._serial:
+                                    self._cropped_reads[read_key] = snapshot
+                context.check_active()
+                if capture_read is not None:
+                    capture_read(call, outcome, context)
+                if capture_topic is not None:
+                    capture_topic(call, outcome, context)
+                return outcome
         except RunStopped as error:
             return ToolOutcome(
                 status=OutcomeStatus.CANCELLED
@@ -522,6 +810,9 @@ class CapabilityRegistry:
     def outcome_metadata_gap(
         self, call: CapabilityCall, context: RunContext
     ) -> ToolOutcome | None:
+        completion_gap = self.completion_metadata_gap(call, context)
+        if completion_gap is not None:
+            return completion_gap
         if "_outcomes" not in call.arguments and "_coverage" not in call.arguments:
             return None
         spec = self.get(call.name)
@@ -543,6 +834,11 @@ class CapabilityRegistry:
                 "_external_requested",
                 "_outcomes",
                 "_coverage",
+                *(
+                    {"_required_followups"}
+                    if _cropped_completion_enabled(context)
+                    else set()
+                ),
                 *(
                     {"_related_source_reviews"}
                     if related_source_reviews_enabled(context)

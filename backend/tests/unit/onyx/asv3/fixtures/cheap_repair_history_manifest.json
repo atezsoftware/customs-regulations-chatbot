@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "fixture": "cheap_repair_history.json.gz",
+  "gzip_sha256": "f7234675c1faea170ebc09921642b69a4dcd9777b84c0016f42dc64c4c1c2ba7",
+  "uncompressed_sha256": "d3ad9eb45a33021bad23dba6b14bc949c9d78479182f3c63e27d605282be3bd3",
+  "uncompressed_bytes": 1915957,
+  "message_ids": [
+    4831,
+    4890,
+    4893,
+    4896,
+    4902,
+    4905,
+    4998,
+    5001,
+    5007,
+    5043,
+    5068,
+    5077,
+    5088
+  ],
+  "candidate_events": 18,
+  "original_witness_rows": 822,
+  "source_artifacts": "plans/experimental-sol61-cost-audit-20261012/repair-contribution-audit and benchmark-summary.json",
+  "scope": "12 primary rejected runs plus separate5088 fixture; older4890/4896/4905 v34 predecessor;5068 attempt not published",
+  "network_or_model_calls": 0
+}

@@ -17,6 +17,9 @@ if TYPE_CHECKING:
     from litellm import HTTPHandler
     from litellm.types.utils import ModelResponseStream
 
+    from onyx.llm.asv3_exp_cheap_cache import ASv3ExpCheapCachePolicy
+    from onyx.llm.cropped_prompt_cache import CroppedPromptCachePolicy
+
 
 class NativeResponseTerminalError(RuntimeError):
     """A failed or unsupported terminal response must not dispatch actions."""
@@ -242,6 +245,11 @@ def _with_tool_cache_breakpoints(input_items: Any) -> tuple[Any, int]:
     return marked, count
 
 
+# Cropped consumers share the current native terminal and service-tier validation.
+CroppedResponseTerminalCapture = NativeResponseTerminalCapture
+CroppedResponseTerminalError = NativeResponseTerminalError
+
+
 def native_responses_stream(
     *,
     model: str,
@@ -254,6 +262,8 @@ def native_responses_stream(
     max_tokens: int | None,
     client: "HTTPHandler | None",
     terminal_capture: NativeResponseTerminalCapture | None = None,
+    cache_policy: "ASv3ExpCheapCachePolicy | CroppedPromptCachePolicy | None" = None,
+    allow_tool_cache_breakpoints: bool = True,
 ) -> Iterator["ModelResponseStream"]:
     """Use the ordinary LiteLLM transforms/transport with fake_stream disabled.
 
@@ -308,10 +318,16 @@ def native_responses_stream(
             tier = extra_body["service_tier"]
         if isinstance(tier, str):
             terminal_capture.service_tier = tier
-    if terminal_capture is not None and model == "gpt-6.1-sol":
+    if (
+        terminal_capture is not None
+        and model == "gpt-6.1-sol"
+        and allow_tool_cache_breakpoints
+        and cache_policy is None
+    ):
         request["input"], terminal_capture.requested_tool_cache_breakpoints = (
             _with_tool_cache_breakpoints(request["input"])
         )
+    cache_capture = cache_policy.prepare_request(request) if cache_policy else None
     requested = ResponsesAPIRequestUtils.get_requested_response_api_optional_param(
         request
     )
@@ -361,10 +377,18 @@ def native_responses_stream(
             extra_kwargs=passthrough_kwargs,
         )
     if terminal_capture is not None:
-        response = terminal_capture.events(_native_sse_events(response))
+        response = _native_sse_events(response)
+    if cache_policy is not None and cache_capture is not None:
+        response = cache_policy.capture_response(cast(Any, response), cache_capture)
+    if terminal_capture is not None:
+        response = terminal_capture.events(cast(Any, response))
     completion_stream = transformation.get_model_response_iterator(
         streaming_response=cast(Any, response), sync_stream=True
     )
+    if cache_policy is not None and cache_capture is not None:
+        completion_stream = cache_policy.preserve_cache_write_usage(
+            cast(Any, completion_stream), cache_capture
+        )
     return cast(
         Iterator["ModelResponseStream"],
         CustomStreamWrapper(

@@ -1,17 +1,34 @@
 """Keep acquisition safeguards without compulsory semantic review generations."""
 
+import threading
 from typing import Any, cast
 from unittest.mock import MagicMock
 
 import pytest
 
 from onyx.asv3 import runtime
-from onyx.asv3.models import OutcomeStatus, ToolOutcome
+from onyx.asv3.harness import Harness
+from onyx.asv3.models import OutcomeStatus, ToolOutcome, ToolReceipt
 from onyx.asv3.publication_gaps import combine_source_publication_gaps
 from onyx.asv3.workflow_variant import ASV3_TUNED_VARIANT
 from onyx.llm.interfaces import LLM
+from onyx.llm.model_response import ModelResponse
 from tests.unit.onyx.asv3.test_native_model_adapter import last_payload
 from tests.unit.onyx.asv3.test_runtime import delivered_originals, response, setup_run
+
+
+def _citation_numbers(arguments: dict[str, Any]) -> dict[str, int]:
+    return {row["chunk_id"]: row["citation"] for row in delivered_originals(arguments)}
+
+
+def _source_bound_answer(arguments: dict[str, Any], *, rendered: bool = False) -> str:
+    numbers = _citation_numbers(arguments)
+    if rendered:
+        return (
+            f"Tamir sonucu [[{numbers['chunk-0']}]](https://example.test/law-0); "
+            f"değiştirme sonucu [[{numbers['chunk-1']}]](https://example.test/law-1)."
+        )
+    return f"Tamir sonucu [{numbers['chunk-0']}]; değiştirme sonucu [{numbers['chunk-1']}]."
 
 
 def test_tuned_runtime_delivers_all_originals_without_automatic_review_calls(
@@ -39,9 +56,8 @@ def test_tuned_runtime_delivers_all_originals_without_automatic_review_calls(
             "json_schema", {}
         )
         assert schema.get("name") not in {"SourceUseInventory", "SourceUseReview"}
-    assert kwargs["state_container"].answer_tokens == (
-        "Tamir sonucu [[1]](https://example.test/law-0); "
-        "değiştirme sonucu [[2]](https://example.test/law-1)."
+    assert kwargs["state_container"].answer_tokens == _source_bound_answer(
+        selected.invoke.call_args.kwargs, rendered=True
     )
 
 
@@ -68,7 +84,9 @@ def test_source_answer_runtime_keeps_complete_delivery_and_dynamic_citations(
             "temperature": 1,
         }
     )
-    writer.invoke.return_value = response("Tamir sonucu [1]; değiştirme sonucu [2].")
+    writer.invoke.side_effect = lambda **arguments: response(
+        _source_bound_answer(arguments)
+    )
     resolver = MagicMock(return_value=writer)
     monkeypatch.setattr(runtime, "source_answer_model", resolver)
     runtime.run_asv3_loop(**kwargs)
@@ -82,9 +100,8 @@ def test_source_answer_runtime_keeps_complete_delivery_and_dynamic_citations(
     assert {item.text for item in broker.revalidated} == {
         chunk.text for chunk in broker.chunks.values()
     }
-    assert kwargs["state_container"].answer_tokens == (
-        "Tamir sonucu [[1]](https://example.test/law-0); "
-        "değiştirme sonucu [[2]](https://example.test/law-1)."
+    assert kwargs["state_container"].answer_tokens == _source_bound_answer(
+        writer.invoke.call_args.kwargs, rendered=True
     )
     assert (
         checkpoints[-1]["native_coordinator_sampling"]["settings"][
@@ -95,11 +112,31 @@ def test_source_answer_runtime_keeps_complete_delivery_and_dynamic_citations(
 
 
 @pytest.mark.parametrize("bad_number", [None, 999])
+@pytest.mark.parametrize("reverse_reads", [False, True])
 def test_source_answer_body_publication_keeps_citation_checks_without_statute_rewalk(
     monkeypatch: pytest.MonkeyPatch,
     bad_number: int | None,
+    reverse_reads: bool,
 ) -> None:
-    kwargs, _broker, research, _checkpoints, _queue = setup_run(monkeypatch)
+    kwargs, broker, research, _checkpoints, _queue = setup_run(monkeypatch)
+    if reverse_reads:
+        second_committed = threading.Event()
+        original_page = broker.page
+        original_commit = Harness._commit_receipt
+
+        def page(source_id: str, *args: Any, **arguments: Any) -> Any:
+            result = original_page(source_id, *args, **arguments)
+            if source_id == str(broker.sources[0].id):
+                assert second_committed.wait(3)
+            return result
+
+        def commit(harness: Harness, receipt: ToolReceipt) -> None:
+            original_commit(harness, receipt)
+            if receipt.call.arguments.get("source_id") == str(broker.sources[1].id):
+                second_committed.set()
+
+        monkeypatch.setattr(broker, "page", page)
+        monkeypatch.setattr(Harness, "_commit_receipt", commit)
     kwargs.pop("test_language")
     kwargs.update(research_profile="normal", workflow_variant=ASV3_TUNED_VARIANT)
     research.config = research.config.model_copy(
@@ -110,22 +147,22 @@ def test_source_answer_body_publication_keeps_citation_checks_without_statute_re
     writer.config = research.config.model_copy(
         update={"model_provider": "anthropic", "model_name": "claude-sonnet-5-5"}
     )
-    complete = "Tamir sonucu [1]; değiştirme sonucu [2]."
-    results = []
-    if bad_number:
-        results.append(
-            response(
+    attempts = 0
+
+    def write(**arguments: Any) -> ModelResponse:
+        nonlocal attempts
+        attempts += 1
+        if bad_number and attempts == 1:
+            return response(
                 f"Tamir sonucu [{bad_number}].",
                 calls=[("submit_answer", {"basis": "originals"})],
             )
-        )
-    results.append(
-        response(
-            complete,
+        return response(
+            _source_bound_answer(arguments),
             calls=None if bad_number else [("submit_answer", {"basis": "originals"})],
         )
-    )
-    writer.invoke.side_effect = results
+
+    writer.invoke.side_effect = write
     monkeypatch.setattr(runtime, "source_answer_model", lambda _user: writer)
     own_statute = MagicMock(side_effect=AssertionError("No blanket own-statute demand"))
     lower_reference = MagicMock(side_effect=AssertionError("No every-reference gate"))
@@ -134,11 +171,15 @@ def test_source_answer_body_publication_keeps_citation_checks_without_statute_re
     monkeypatch.setattr(runtime, "canonical_cited_lower_statute_gap", lower_reference)
     runtime.run_asv3_loop(**kwargs)
     assert research.invoke.call_count == 2
-    assert writer.invoke.call_count == len(results)
-    assert kwargs["state_container"].answer_tokens == (
-        "Tamir sonucu [[1]](https://example.test/law-0); "
-        "değiştirme sonucu [[2]](https://example.test/law-1)."
+    assert writer.invoke.call_count == (2 if bad_number else 1)
+    assert kwargs["state_container"].answer_tokens == _source_bound_answer(
+        writer.invoke.call_args.kwargs, rendered=True
     )
+    if reverse_reads:
+        assert _citation_numbers(writer.invoke.call_args.kwargs) == {
+            "chunk-0": 2,
+            "chunk-1": 1,
+        }
     own_statute.assert_not_called()
     lower_reference.assert_not_called()
     if bad_number:

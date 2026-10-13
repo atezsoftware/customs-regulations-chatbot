@@ -1,0 +1,298 @@
+{
+  "capture_path": "plans/exp-cropped-spike-prevention-20261013/live-sol61-full-vaka2/inserted-article-readonly-capture.json",
+  "capture_sha256": "af4a30c65fcb727fcdcca2d1f64c327f96364b12fa0f44bd36cd1e3fcd2c5ac7",
+  "metadata_projection": "Identity and trust fields only; original text and hashes unchanged.",
+  "rows": [
+    {
+      "id": "rc_6513ca6a96b2767352aab2787ada89388533619b",
+      "source_id": "601c6f1f-dc4e-4c26-89e4-8fef59784605",
+      "text": "(5) Boru hattı ile yapılan transit işlemlerine ve basitleştirme koşullarına ilişkin özel hükümler getirmeye Bakanlık yetkilidir.",
+      "position": 1263,
+      "projection_ordinal": 1263,
+      "heading_path": [
+        "GÜMRÜK YÖNETMELİĞİ",
+        "Gümrük Beyanı ve Gümrük Rejimleri",
+        "ÜÇÜNCÜ BÖLÜM",
+        "MADDE 238 - Boru hattı ile taşımalara ilişkin basitleştirilmiş usul",
+        "(5) Boru hattı ile yapılan transit işlemlerine ve basitleştirme koşullarına ilişkin özel hü..."
+      ],
+      "metadata": {
+        "article_no": "238",
+        "clause_label": null,
+        "paragraph_no": "5",
+        "chunk_variant": "atomic",
+        "document_type": "yonetmelik"
+      },
+      "validity_start": null,
+      "validity_end": null,
+      "status": "active",
+      "text_hash": "64af806c58e730613f27d24b710b3b484f292afbeb32311c66a28c437bcf3dad"
+    },
+    {
+      "id": "rc_ad496fe0858a5a5f38c74151956db530e7ad4a23",
+      "source_id": "601c6f1f-dc4e-4c26-89e4-8fef59784605",
+      "text": "**MADDE 238/A -** (1) Transit rejimine konu eşyayı hareket idaresine sunmaksızın transit işlemleri gerçekleştirmek isteyen kişilere izinli gönderici yetkisi verilebilir.",
+      "position": 1264,
+      "projection_ordinal": 1264,
+      "heading_path": [
+        "GÜMRÜK YÖNETMELİĞİ",
+        "Gümrük Beyanı ve Gümrük Rejimleri",
+        "ÜÇÜNCÜ BÖLÜM",
+        "MADDE 238 - Boru hattı ile taşımalara ilişkin basitleştirilmiş usul",
+        "İzinli gönderici yetkisi"
+      ],
+      "metadata": {
+        "article_no": "238",
+        "clause_label": null,
+        "paragraph_no": null,
+        "chunk_variant": "atomic",
+        "document_type": "yonetmelik"
+      },
+      "validity_start": null,
+      "validity_end": null,
+      "status": "active",
+      "text_hash": "a3ff9af5fdfc8e29c79968a9daaaf4bce467a576754b8431f2503636ce32b61d"
+    },
+    {
+      "id": "rc_91a8215e14ba074cf699c8598e4b128eafe6aefa",
+      "source_id": "601c6f1f-dc4e-4c26-89e4-8fef59784605",
+      "text": "**(2) Yetki başvurusunda aranacak koşullar, başvurunun yapılması, başvurunun incelenmesi, yetkinin verilmesi, askıya alınması, iptali, gümrük işlemleri ve diğer hususlar Bakanlıkça düzenlenir.**",
+      "position": 1265,
+      "projection_ordinal": 1265,
+      "heading_path": [
+        "GÜMRÜK YÖNETMELİĞİ",
+        "Gümrük Beyanı ve Gümrük Rejimleri",
+        "ÜÇÜNCÜ BÖLÜM",
+        "MADDE 238 - Boru hattı ile taşımalara ilişkin basitleştirilmiş usul",
+        "İzinli gönderici yetkisi",
+        "(2) Yetki başvurusunda aranacak koşullar, başvurunun yapılması, başvurunun incelenmesi, yet..."
+      ],
+      "metadata": {
+        "article_no": "238",
+        "clause_label": null,
+        "paragraph_no": "2",
+        "chunk_variant": "atomic",
+        "document_type": "yonetmelik"
+      },
+      "validity_start": null,
+      "validity_end": null,
+      "status": "active",
+      "text_hash": "8a071196dd4668b285c35fd1b0e6465ea89337778d6055ee72baf26447239fe8"
+    },
+    {
+      "id": "rc_6eb6b2fd7954e7914367088bf717dd6776d12927",
+      "source_id": "601c6f1f-dc4e-4c26-89e4-8fef59784605",
+      "text": "**MADDE 239 -** (1) Türkiye Gümrük Bölgesine getirilerek, ulusal transit rejimi altında taşınan serbest dolaşımda olmayan eşyanın, varış gümrük idaresince yapılan kontrol ve muayenesi sonucunda eşyanın beyanda belirtilen cinsine uygun olmakla birlikte beyana göre eksik çıkması halinde;",
+      "position": 1266,
+      "projection_ordinal": 1266,
+      "heading_path": [
+        "GÜMRÜK YÖNETMELİĞİ",
+        "Gümrük Beyanı ve Gümrük Rejimleri",
+        "ÜÇÜNCÜ BÖLÜM",
+        "MADDE 239 - Ulusal transit rejiminde serbest dolaşımda olmayan eşyada beyana aykırılık",
+        "(1) Türkiye Gümrük Bölgesine getirilerek, ulusal transit rejimi altında taşınan serbest dol..."
+      ],
+      "metadata": {
+        "article_no": "239",
+        "clause_label": null,
+        "paragraph_no": "1",
+        "chunk_variant": "atomic",
+        "document_type": "yonetmelik"
+      },
+      "validity_start": null,
+      "validity_end": null,
+      "status": "active",
+      "text_hash": "60706f70ec6f31dd2a7eed851312d690fb5202c774856fb38bd1c4ff5c2a4713"
+    },
+    {
+      "id": "rc_242c396fd4afbeb0e2a11b48d0f00f18404546fb",
+      "source_id": "de32173d-cae2-4c2b-aa64-f7e3f51d1dd0",
+      "text": "(8) Teminattan vazgeçme izninin verilmesi durumunda, ek-7'de yer alan sertifika başvuru sahibine iletilir. İzin sahibinin, beşinci fıkra uyarınca ilgili GRN için sistemde tanımlanmış olan tutardan yararlandırılmasına devam edilerek ilgili teminat mektubu 13 üncü madde hükümleri çerçevesinde iade edilir.",
+      "position": 91,
+      "projection_ordinal": 91,
+      "heading_path": [
+        "GÜMRÜK GENEL TEBLİĞİ (TRANSİT REJİMİ) (SERİ NO: 4)",
+        "İKİNCİ KISIM",
+        "MADDE 11 - Kapsamlı teminatta indirim ve teminattan vazgeçme",
+        "(8) Teminattan vazgeçme izninin verilmesi durumunda, ek-7'de yer alan sertifika başvuru sah..."
+      ],
+      "metadata": {
+        "provision_identifiers": [
+          "madde 11"
+        ],
+        "article_no": "11",
+        "clause_label": null,
+        "paragraph_no": "8",
+        "chunk_variant": "atomic",
+        "document_type": "teblig"
+      },
+      "validity_start": null,
+      "validity_end": null,
+      "status": "active",
+      "text_hash": "37bd26244e71abdbfa18916a50ae59c5e488eeafdf02b5fac273ac7e2949fe7c"
+    },
+    {
+      "id": "rc_2096676bece6bb18058ca2a85fd9e6a235f9326e",
+      "source_id": "de32173d-cae2-4c2b-aa64-f7e3f51d1dd0",
+      "text": "**MADDE 11/A -** (1) İzinli gönderici yetkisine sahip firmalara, teminat gümrük idaresine yapılacak başvuru üzerine 11 inci maddenin üçüncü fıkrasında belirtilen ortak koşulların sağlanması durumunda, aynı maddenin ikinci, dördüncü ve beşinci fıkralarında yer alan şartlar aranmaksızın üçüncü düzey kapsamlı teminat kullanıcısı olma hakkı tanınır. 11 inci maddenin üçüncü fıkrasının (b) bendinde yer alan referans tutar ile kapsamlı teminat tutarı arasındaki farkı karşılayacak kadar öz kaynak bulunduğunun gösterilmesi koşulunun ikinci düzey için sağlanması halinde, bu firmalara ikinci düzey kapsamlı teminat kullanıcısı olma hakkı tanınır.",
+      "position": 92,
+      "projection_ordinal": 92,
+      "heading_path": [
+        "GÜMRÜK GENEL TEBLİĞİ (TRANSİT REJİMİ) (SERİ NO: 4)",
+        "İKİNCİ KISIM",
+        "MADDE 11/A - İzinli gönderici yetkisine sahip firmalara kapsamlı teminatta indirim hakkı",
+        "(1) İzinli gönderici yetkisine sahip firmalara, teminat gümrük idaresine yapılacak başvuru..."
+      ],
+      "metadata": {
+        "provision_identifiers": [
+          "madde 11/a",
+          "madde 11"
+        ],
+        "article_no": "11/A",
+        "clause_label": null,
+        "paragraph_no": "1",
+        "chunk_variant": "atomic",
+        "document_type": "teblig"
+      },
+      "validity_start": null,
+      "validity_end": null,
+      "status": "active",
+      "text_hash": "068b518133c97dfb77f4a522b1607590b64a0fe6bd5a00c553c54ce6a98676b8"
+    },
+    {
+      "id": "rc_e6f94a6bee4f3755f1094d202c5e8fb9c0d02f75",
+      "source_id": "de32173d-cae2-4c2b-aa64-f7e3f51d1dd0",
+      "text": "(2) Birinci fıkra kapsamında yapılan başvurunun yeni bir GRN tanımlanmasını da içermesi durumunda, Yönetmeliğin 230 uncu maddesinde belirtilen genel koşulların sağlanması ve Yönetmeliğin 232 nci maddesinde belirtilen bilgi ve belgelerin teminat gümrük idaresine sunulması gerekir.",
+      "position": 93,
+      "projection_ordinal": 93,
+      "heading_path": [
+        "GÜMRÜK GENEL TEBLİĞİ (TRANSİT REJİMİ) (SERİ NO: 4)",
+        "İKİNCİ KISIM",
+        "MADDE 11/A - İzinli gönderici yetkisine sahip firmalara kapsamlı teminatta indirim hakkı",
+        "(2) Birinci fıkra kapsamında yapılan başvurunun yeni bir GRN tanımlanmasını da içermesi dur..."
+      ],
+      "metadata": {
+        "provision_identifiers": [
+          "madde 11"
+        ],
+        "article_no": "11/A",
+        "clause_label": null,
+        "paragraph_no": "2",
+        "chunk_variant": "atomic",
+        "document_type": "teblig"
+      },
+      "validity_start": null,
+      "validity_end": null,
+      "status": "active",
+      "text_hash": "b9da7aae75037ef65db564117d148e56a34b296d66dde713e697b68aac474351"
+    },
+    {
+      "id": "rc_7a5402b33a3269f858985a26a20ee8ee41bd9060",
+      "source_id": "de32173d-cae2-4c2b-aa64-f7e3f51d1dd0",
+      "text": "(3) Başvurunun yeni bir GRN tanımlanmasını da içermesi durumunda, teminat mektubu aslı ve kefil tarafından teminat mektubuna ilişkin olarak düzenlenen Ek-12'de yer alan zeyilname; başvurunun mevcut GRN'ler için yapılması durumunda ise kefil tarafından düzenlenen Ek-12'de yer alan zeyilname; banka teyit yazısı *(…)* ile birlikte doğrudan kefil tarafından teminat gümrük idaresine sunulur. Teminat gümrük idaresine sunulan teminat mektubu ve/veya zeyilnamenin usulüne uygun olarak düzenlendiğinin tespit edilmesini ve teminat gümrük idaresince kabul edilmesini müteakip kapsamlı teminat tutarı referans tutarın % 30'una veya % 50'sine eşit olacak şekilde referans tutar artırılır. (Referans tutar, kapsamlı teminat tutarının 3,33 veya 2 katı olacak şekilde sisteme tanımlanır.)",
+      "position": 94,
+      "projection_ordinal": 94,
+      "heading_path": [
+        "GÜMRÜK GENEL TEBLİĞİ (TRANSİT REJİMİ) (SERİ NO: 4)",
+        "İKİNCİ KISIM",
+        "MADDE 11/A - İzinli gönderici yetkisine sahip firmalara kapsamlı teminatta indirim hakkı",
+        "(3) Başvurunun yeni bir GRN tanımlanmasını da içermesi durumunda, teminat mektubu aslı ve k..."
+      ],
+      "metadata": {
+        "provision_identifiers": [
+          "madde 11"
+        ],
+        "article_no": "11/A",
+        "clause_label": null,
+        "paragraph_no": "3",
+        "chunk_variant": "atomic",
+        "document_type": "teblig"
+      },
+      "validity_start": null,
+      "validity_end": null,
+      "status": "active",
+      "text_hash": "54396cc1771a74111a5b580a7cd66c40c974e5b3302478df1754d32761daa7ac"
+    },
+    {
+      "id": "rc_03c22379a142aadf5ef8439d88e931b91418f9a6",
+      "source_id": "de32173d-cae2-4c2b-aa64-f7e3f51d1dd0",
+      "text": "(4) Üçüncü fıkra uyarınca indirimin tanımlandığı yılı takip eden takvim yılı sonuna kadar indirim tanımlanan GRN kapsamında gerçekleştirilen ihracat taşımalarının en az % 20'sinin izinli gönderici yetkisi kapsamında olmaması halinde kapsamlı teminat düzeyi üçüncü fıkra uygulanmadan önceki teminat düzeyine düşürülür. Bu durumda, izinli gönderici yetkisine sahip firmalar, teminat düzeyinin düşürüldüğü tarihten itibaren iki yıl geçmedikçe bu madde kapsamında yeniden başvuruda bulunamazlar.",
+      "position": 95,
+      "projection_ordinal": 95,
+      "heading_path": [
+        "GÜMRÜK GENEL TEBLİĞİ (TRANSİT REJİMİ) (SERİ NO: 4)",
+        "İKİNCİ KISIM",
+        "MADDE 11/A - İzinli gönderici yetkisine sahip firmalara kapsamlı teminatta indirim hakkı",
+        "(4) Üçüncü fıkra uyarınca indirimin tanımlandığı yılı takip eden takvim yılı sonuna kadar i..."
+      ],
+      "metadata": {
+        "provision_identifiers": [
+          "madde 11"
+        ],
+        "article_no": "11/A",
+        "clause_label": null,
+        "paragraph_no": "4",
+        "chunk_variant": "atomic",
+        "document_type": "teblig"
+      },
+      "validity_start": null,
+      "validity_end": null,
+      "status": "active",
+      "text_hash": "dd1e410ba9008e8f30693f92aa82f34c9469a771d130fd7c79b2ea2359745c1f"
+    },
+    {
+      "id": "rc_590b9cc34c08ecdfb4fc997457b1a7818f66a85f",
+      "source_id": "de32173d-cae2-4c2b-aa64-f7e3f51d1dd0",
+      "text": "(5) İzinli gönderici yetkisinin geri alınması veya iptali durumunda, bu yetkiye istinaden sağlanan her bir GRN için kapsamlı teminat düzeyi üçüncü fıkra uygulanmadan önceki düzeye düşürülür.",
+      "position": 96,
+      "projection_ordinal": 96,
+      "heading_path": [
+        "GÜMRÜK GENEL TEBLİĞİ (TRANSİT REJİMİ) (SERİ NO: 4)",
+        "İKİNCİ KISIM",
+        "MADDE 11/A - İzinli gönderici yetkisine sahip firmalara kapsamlı teminatta indirim hakkı",
+        "(5) İzinli gönderici yetkisinin geri alınması veya iptali durumunda, bu yetkiye istinaden s..."
+      ],
+      "metadata": {
+        "provision_identifiers": [
+          "madde 11"
+        ],
+        "article_no": "11/A",
+        "clause_label": null,
+        "paragraph_no": "5",
+        "chunk_variant": "atomic",
+        "document_type": "teblig"
+      },
+      "validity_start": null,
+      "validity_end": null,
+      "status": "active",
+      "text_hash": "9b1672202c103155a8758dcaa5840decfbcdf026f3d873eb68d0136b27ad42af"
+    },
+    {
+      "id": "rc_26d85782d2f19b99673d7a88d395488006c0016b",
+      "source_id": "de32173d-cae2-4c2b-aa64-f7e3f51d1dd0",
+      "text": "**MADDE 12** - (1) Yönetmeliğin 234 üncü maddesinin üçüncü fıkrasında sayılan durumlardan birinin gerçekleşmesi halinde, kapsamlı teminat veya teminattan vazgeçme izni, durumun niteliğine göre, izin makamı tarafından yeniden değerlendirilebilir, düzeltilebilir, izin makamınca belirlenecek süre boyunca askıya alınabilir ya da iptal edilebilir. Yapılan değerlendirme ve işlem sonucu izin sahibine bildirilir ve sisteme de gerekli kayıt yapılır.",
+      "position": 97,
+      "projection_ordinal": 97,
+      "heading_path": [
+        "GÜMRÜK GENEL TEBLİĞİ (TRANSİT REJİMİ) (SERİ NO: 4)",
+        "İKİNCİ KISIM",
+        "MADDE 12 - Kapsamlı teminat veya teminattan vazgeçme izninin yeniden değerlendirilmesi ve iptali",
+        "(1) Yönetmeliğin 234 üncü maddesinin üçüncü fıkrasında sayılan durumlardan birinin gerçekle..."
+      ],
+      "metadata": {
+        "provision_identifiers": [
+          "madde 12"
+        ],
+        "article_no": "12",
+        "clause_label": null,
+        "paragraph_no": "1",
+        "chunk_variant": "atomic",
+        "document_type": "teblig"
+      },
+      "validity_start": null,
+      "validity_end": null,
+      "status": "active",
+      "text_hash": "7610ee95f064a70bfed5197f9992bfe743bbe9dd9f634edfd5d855d996093d15"
+    }
+  ]
+}

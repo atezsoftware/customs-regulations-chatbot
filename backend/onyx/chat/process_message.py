@@ -1795,8 +1795,10 @@ def _run_models(
                     guarded_resume = False
                     guardrails_v2_resume = False
                     guardrails_v3_resume = False
+                    cropped_resume = False
                     if setup.new_msg_req.asv3_resume_message_id is not None:
                         from onyx.asv3.workflow_variant import (
+                            ASV3_EXP_CROPPED_VARIANT,
                             ASV3_GUARDED_EXPERIMENTAL_VARIANT,
                             ASV3_GUARDRAILS_V2_VARIANT,
                             ASV3_GUARDRAILS_V3_VARIANT,
@@ -1821,28 +1823,45 @@ def _run_models(
                             and resume_checkpoint.get("asv3_workflow_variant")
                             == ASV3_GUARDRAILS_V3_VARIANT
                         )
-                    checkpoint_selects_guardrails = (
-                        guarded_resume or guardrails_v2_resume or guardrails_v3_resume
+                        cropped_resume = (
+                            resume_checkpoint is not None
+                            and resume_checkpoint.get("asv3_workflow_variant")
+                            == ASV3_EXP_CROPPED_VARIANT
+                        )
+                    checkpoint_selects_variant = (
+                        guarded_resume
+                        or guardrails_v2_resume
+                        or guardrails_v3_resume
+                        or cropped_resume
                     )
                     workflow = resolve_asv3_workflow(
-                        "deep"
+                        "normal"
+                        if cropped_resume
+                        else "deep"
                         if _uses_deep_asv3(setup)
                         else setup.new_msg_req.asv3_research_profile,
-                        setup.new_msg_req.asv3_parallel_research,
+                        False
+                        if cropped_resume
+                        else setup.new_msg_req.asv3_parallel_research,
                         guarded_experimental=(
                             guarded_resume
-                            if checkpoint_selects_guardrails
+                            if checkpoint_selects_variant
                             else setup.new_msg_req.asv3_guarded_experimental
                         ),
                         guardrails_v2=(
                             guardrails_v2_resume
-                            if checkpoint_selects_guardrails
+                            if checkpoint_selects_variant
                             else setup.new_msg_req.asv3_guardrails_v2
                         ),
                         guardrails_v3=(
                             guardrails_v3_resume
-                            if checkpoint_selects_guardrails
+                            if checkpoint_selects_variant
                             else setup.new_msg_req.asv3_guardrails_v3
+                        ),
+                        exp_cropped=(
+                            cropped_resume
+                            if checkpoint_selects_variant
+                            else setup.new_msg_req.asv3_exp_cropped
                         ),
                     )
                     research_profile = workflow.research_profile

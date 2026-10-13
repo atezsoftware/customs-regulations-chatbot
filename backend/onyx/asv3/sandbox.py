@@ -164,6 +164,39 @@ def _continuous_compose_enabled(context: RunContext) -> bool:
     return parallel_execution_enabled(context)
 
 
+def _failed_dependency(result: ToolOutcome, context: RunContext) -> bool:
+    return result.status not in {
+        OutcomeStatus.FOUND,
+        OutcomeStatus.PARTIAL,
+        OutcomeStatus.VERSION_UNKNOWN,
+        OutcomeStatus.AMBIGUOUS,
+    } or (
+        context.services.get("asv3_exp_cropped") is True
+        and result.data.get("not_read") is True
+    )
+
+
+def _dependency_failure(
+    results: dict[str, ToolOutcome], dependencies: set[str], context: RunContext
+) -> ToolOutcome:
+    unread = sorted(
+        key for key in dependencies if results[key].data.get("not_read") is True
+    )
+    if context.services.get("asv3_exp_cropped") is True and unread:
+        return ToolOutcome(
+            status=OutcomeStatus.PARTIAL,
+            summary="A required dependency was not read; this step was not executed.",
+            data={
+                "not_read": True,
+                "absence_proven": False,
+                "unread_dependencies": unread,
+            },
+        )
+    return ToolOutcome(
+        status=OutcomeStatus.CANCELLED, summary="A required dependency failed."
+    )
+
+
 def _continuous_compose(
     steps: dict[str, dict[str, JsonValue]],
     dependencies: dict[str, set[str]],
@@ -182,19 +215,10 @@ def _continuous_compose(
                 continue
             context.check_active()
             if any(
-                results[dependency].status
-                not in {
-                    OutcomeStatus.FOUND,
-                    OutcomeStatus.PARTIAL,
-                    OutcomeStatus.VERSION_UNKNOWN,
-                    OutcomeStatus.AMBIGUOUS,
-                }
+                _failed_dependency(results[dependency], context)
                 for dependency in dependencies[key]
             ):
-                results[key] = ToolOutcome(
-                    status=OutcomeStatus.CANCELLED,
-                    summary="A required dependency failed.",
-                )
+                results[key] = _dependency_failure(results, dependencies[key], context)
                 remaining.remove(key)
                 continue
             when = item.get("when")
@@ -371,18 +395,11 @@ def compose(args: dict[str, JsonValue], context: RunContext) -> ToolOutcome:
             for key in ready:
                 item = steps[key]
                 if any(
-                    results[dependency].status
-                    not in {
-                        OutcomeStatus.FOUND,
-                        OutcomeStatus.PARTIAL,
-                        OutcomeStatus.VERSION_UNKNOWN,
-                        OutcomeStatus.AMBIGUOUS,
-                    }
+                    _failed_dependency(results[dependency], context)
                     for dependency in dependencies[key]
                 ):
-                    results[key] = ToolOutcome(
-                        status=OutcomeStatus.CANCELLED,
-                        summary="A required dependency failed.",
+                    results[key] = _dependency_failure(
+                        results, dependencies[key], context
                     )
                     remaining.remove(key)
                     continue
@@ -427,6 +444,12 @@ def compose(args: dict[str, JsonValue], context: RunContext) -> ToolOutcome:
         }
         for result in results.values()
     )
+    if context.services.get("asv3_exp_cropped") is True:
+        bad = bad or any(
+            result.data.get("not_read") is True
+            or result.status in {OutcomeStatus.CANCELLED, OutcomeStatus.TRUNCATED}
+            for result in results.values()
+        )
     return ToolOutcome(
         status=OutcomeStatus.PARTIAL if bad else OutcomeStatus.FOUND,
         summary="Executed dependency-aware capability program; every nested call used this run's registry, budget and authorization.",

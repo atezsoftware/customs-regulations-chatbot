@@ -848,6 +848,33 @@ def _matching_native_rows(
     return matching
 
 
+def native_named_statute_references(
+    text: str, ledger: EvidenceLedger
+) -> list[dict[str, JsonValue]]:
+    """Expose explicit named locators using actual canonical aliases, not approval."""
+    rows = _native_original_rows(ledger)
+    aliases = _authority_aliases(
+        ledger, rows, strict_reference_boundaries=True, syntactic_reference_binding=True
+    )
+    return [
+        {
+            "instrument_number": reference.number or None,
+            "formal_name": name,
+            "article": reference.article,
+            "qualifier": reference.qualifier,
+            "paragraph": reference.paragraph,
+            "clause": reference.clause,
+        }
+        for reference, name in _named_native_references(
+            text,
+            aliases,
+            strict_reference_boundaries=True,
+            syntactic_reference_binding=True,
+            unicode_ordinals=True,
+        )
+    ]
+
+
 def explicit_reference_leads(
     ledger: EvidenceLedger,
     complete_originals: list[dict[str, JsonValue]],
@@ -996,11 +1023,19 @@ def cited_lower_statute_references(
 
 
 def cited_lower_statute_gap(
-    answer: str, ledger: EvidenceLedger, delivered: set[int]
+    answer: str,
+    ledger: EvidenceLedger,
+    delivered: set[int],
+    *,
+    references: list[dict[str, JsonValue]] | None = None,
 ) -> dict[str, JsonValue] | None:
     """Require referenced originals to be read before evaluating a cited lower rule."""
     missing: list[dict[str, JsonValue]] = []
-    for reference in cited_lower_statute_references(answer, ledger):
+    for reference in (
+        cited_lower_statute_references(answer, ledger)
+        if references is None
+        else references
+    ):
         matching = reference["matching_original_evidence"]
         assert isinstance(matching, list)
         if not any(

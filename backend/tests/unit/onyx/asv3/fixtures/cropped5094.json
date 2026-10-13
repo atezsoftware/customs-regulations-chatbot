@@ -1,0 +1,18 @@
+{
+  "fixture_origin": "Historical captured data for offline regression only; never a new tool execution/delivery receipt.",
+  "assistant_message_id": 5094,
+  "deployed_revision": "84aae5bcbf3ddadc6ebd9857505f85384e096e05",
+  "captured_node_id": "step_f6532111b6474b81b1b9c8805fcdb015",
+  "detail_sha256": "4e8178696e1f2b8dbc614ee3c088d4d2763de6897370c157b5a028c79aaa10b4",
+  "text": "6455 sayılı Kanunun 11. maddesinin değişiklik yapan özgün metni ve kendi yürürlük hükmü elde edilemedi. Bu tarihî değişikliğin bilinmeyen beyan tarihlerine etkisi açık kalmaktadır. Önceki paragraftaki Genelge açıklaması, değişiklik kanununun aslı olarak kullanılmamıştır.",
+  "recorded_gaps": [
+    {
+      "unit_id": "au33-cd6ef52d450c",
+      "instrument_number": "6455",
+      "reference_text": "6455 sayılı Kanunun 11. maddesinin",
+      "article": "11",
+      "inline_evidence": [],
+      "matching_original_evidence": []
+    }
+  ]
+}

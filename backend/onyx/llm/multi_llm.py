@@ -84,7 +84,17 @@ if TYPE_CHECKING:
     from litellm import HTTPHandler
     from litellm.types.utils import ModelResponseStream as LiteLLMModelResponseStream
 
+    from onyx.llm.asv3_exp_cheap_cache import ASv3ExpCheapCachePolicy
+    from onyx.llm.cropped_prompt_cache import (
+        CroppedNoCacheWriteContract,
+        CroppedPromptCachePolicy,
+    )
     from onyx.llm.native_responses_stream import NativeResponseTerminalCapture
+
+
+class _NativeCacheOverrides(TypedDict, total=False):
+    cache_policy: "ASv3ExpCheapCachePolicy | CroppedPromptCachePolicy | None"
+    allow_tool_cache_breakpoints: bool
 
 
 _LLM_PROMPT_LONG_TERM_LOG_CATEGORY = "llm_prompt"
@@ -525,6 +535,9 @@ class LitellmLLM(LLM):
     _stream_cancellation_check: Callable[[], None] | None = None
     _tool_argument_stream_guard: bool = False
     _asv3_response_terminal_capture: bool = False
+    _cropped_response_terminal_capture: bool = False
+    _asv3_exp_cheap_cache: "ASv3ExpCheapCachePolicy | None" = None
+    _cropped_prompt_cache: "CroppedPromptCachePolicy | None" = None
 
     def __init__(
         self,
@@ -717,6 +730,15 @@ class LitellmLLM(LLM):
         provider_compatibility_attempts: int | None = None,
         terminal_capture: "NativeResponseTerminalCapture | None" = None,
     ) -> Union["ModelResponse", Iterator["LiteLLMModelResponseStream"]]:
+        if self._cropped_prompt_cache is not None and not (
+            self.cropped_native_cache_writes_disabled
+            and stream
+            and tools
+            and terminal_capture is not None
+        ):
+            raise ValueError(
+                "Zero-write Cropped cache requires guarded native tool streaming"
+            )
         # Lazy loading to avoid memory bloat for non-inference flows
         from litellm.exceptions import BadRequestError, RateLimitError, Timeout
 
@@ -1128,7 +1150,8 @@ class LitellmLLM(LLM):
                         )
 
                         if (
-                            terminal_capture is not None
+                            self._asv3_exp_cheap_cache is not None
+                            or terminal_capture is not None
                             or OpenAIResponsesAPIConfig().should_fake_stream(
                                 model_bare, True, "openai"
                             )
@@ -1137,6 +1160,18 @@ class LitellmLLM(LLM):
                                 native_responses_stream,
                             )
 
+                            cache_overrides: _NativeCacheOverrides = {}
+                            if (
+                                self._cropped_response_terminal_capture
+                                or self._asv3_exp_cheap_cache is not None
+                            ):
+                                cache_overrides = {
+                                    "cache_policy": self._cropped_prompt_cache
+                                    if terminal_capture is not None
+                                    and self._cropped_prompt_cache is not None
+                                    else self._asv3_exp_cheap_cache,
+                                    "allow_tool_cache_breakpoints": False,
+                                }
                             return native_responses_stream(
                                 model=model_bare,
                                 messages=messages,
@@ -1147,6 +1182,7 @@ class LitellmLLM(LLM):
                                 timeout=timeout_override or self._timeout,
                                 max_tokens=max_tokens,
                                 client=client,
+                                **cache_overrides,
                                 **(
                                     {"terminal_capture": terminal_capture}
                                     if terminal_capture is not None
@@ -1303,6 +1339,59 @@ class LitellmLLM(LLM):
         bound._asv3_response_terminal_capture = True
         return bound
 
+    def with_cropped_response_terminal_capture(
+        self, *, explicit_cache: bool = False
+    ) -> "LitellmLLM":
+        from onyx.llm.cropped_prompt_cache import CroppedPromptCachePolicy
+
+        bound = copy.copy(self)
+        bound._cropped_response_terminal_capture = True
+        bound._cropped_prompt_cache = (
+            CroppedPromptCachePolicy() if explicit_cache else None
+        )
+        if explicit_cache and not bound.cropped_native_cache_writes_disabled:
+            raise ValueError(
+                "Zero-write Cropped cache requires first-party guarded Responses"
+            )
+        return bound
+
+    @property
+    def cropped_native_cache_writes_disabled(self) -> bool:
+        """The bound zero-write contract is enforced at native tool dispatch."""
+        return (
+            self._cropped_response_terminal_capture
+            and self._cropped_prompt_cache is not None
+            and self._cropped_prompt_cache.cache_writes_disabled
+            and self._uses_guarded_openai_responses()
+            and not (get_llm_mock_response() or MOCK_LLM_RESPONSE)
+        )
+
+    @property
+    def cropped_native_cache_write_contract(
+        self,
+    ) -> "CroppedNoCacheWriteContract | None":
+        if (
+            self.cropped_native_cache_writes_disabled
+            and self._cropped_prompt_cache is not None
+        ):
+            return self._cropped_prompt_cache.contract
+        return None
+
+    def with_asv3_exp_cheap_cache(self) -> "LitellmLLM":
+        from onyx.llm.asv3_exp_cheap_cache import ASv3ExpCheapCachePolicy
+
+        bound = copy.copy(self)
+        bound._model_kwargs = copy.deepcopy(self._model_kwargs)
+        bound._asv3_exp_cheap_cache = ASv3ExpCheapCachePolicy()
+        return bound
+
+    @property
+    def asv3_exp_cheap_has_history_cache_boundary(self) -> bool:
+        return (
+            self._asv3_exp_cheap_cache is not None
+            and self._asv3_exp_cheap_cache.has_recorded_history_boundary
+        )
+
     def with_temperature(self, temperature: float) -> "LitellmLLM":
         if (
             isinstance(temperature, bool)
@@ -1397,9 +1486,19 @@ class LitellmLLM(LLM):
             NativeResponseTerminalError,
         )
 
+        if self._cropped_prompt_cache is not None and not (
+            self.cropped_native_cache_writes_disabled and use_streaming and tools
+        ):
+            raise ValueError(
+                "Zero-write Cropped cache requires guarded native tool streaming"
+            )
+
         terminal_capture = (
             NativeResponseTerminalCapture()
-            if self._asv3_response_terminal_capture
+            if (
+                self._asv3_response_terminal_capture
+                or self._cropped_response_terminal_capture
+            )
             and self._uses_guarded_openai_responses()
             and use_streaming
             and tools
@@ -1423,6 +1522,11 @@ class LitellmLLM(LLM):
                         else {}
                     ),
                     NATIVE_RESPONSE_TERMINAL: diagnostic,
+                    **(
+                        {"asv3_exp_cropped_response_terminal": diagnostic}
+                        if self._cropped_response_terminal_capture
+                        else {}
+                    ),
                 }
                 span.span_data.usage = terminal_capture.usage
                 if terminal_capture.failed:

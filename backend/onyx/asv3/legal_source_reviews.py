@@ -999,27 +999,144 @@ class LegalSourceReviews:
         ledger: EvidenceLedger,
         raw_reviews: list[JsonValue] | None = None,
     ) -> ToolOutcome | None:
+        return self._publication_gap(answer, call_id, context, ledger, raw_reviews)
+
+    @staticmethod
+    def _require_cropped(context: RunContext) -> None:
+        if (
+            context.services.get("asv3_exp_cropped") is not True
+            or context.services.get("asv3_exp_cheap") is True
+        ):
+            raise ValueError("Section reviews require the isolated Cropped workflow")
+
+    @staticmethod
+    def _record_numbers(record: _LeadRecord, ledger: EvidenceLedger) -> set[int]:
+        numbers = {witness.citation for witness in record.anchor_witnesses}
+        if record.review is not None:
+            numbers.update(witness.citation for witness in record.review.witnesses)
+        return numbers | {
+            number
+            for number, doc in ledger.citation_mapping().items()
+            if doc.document_id == record.source_id
+        }
+
+    def cropped_requirements(
+        self, context: RunContext, ledger: EvidenceLedger
+    ) -> dict[str, JsonValue]:
+        """Exact saved owner dependencies; their existence is not legal approval."""
+        self._require_cropped(context)
+        self._fence(context)
+        with self._lock:
+            rows: list[JsonValue] = []
+            for (owner, _), record in self._records.items():
+                if owner != self._owner(context):
+                    continue
+                self._validate_saved(record, ledger)
+                rows.append(
+                    {
+                        **record.model_dump(mode="json"),
+                        "required_evidence_numbers": sorted(
+                            self._record_numbers(record, ledger)
+                        ),
+                    }
+                )
+        return {
+            "reviews": rows,
+            "notice": "Saved source-bound assessments and exact retention obligations, not legal approval or new original delivery.",
+        }
+
+    def publication_gap_for_cropped_section(
+        self,
+        answer: str,
+        call_id: str,
+        context: RunContext,
+        ledger: EvidenceLedger,
+        assigned_numbers: set[int],
+    ) -> ToolOutcome | None:
+        """Check this source assignment against this actual writer's delivery."""
+        self._require_cropped(context)
+        if (
+            any(
+                type(number) is not int or ledger.get(number) is None
+                for number in assigned_numbers
+            )
+            or not assigned_numbers.issubset(ledger.completely_delivered(call_id))
+            or set(extract_citation_numbers(answer)) - assigned_numbers
+        ):
+            raise ValueError(
+                "Cropped section review requires its actual assigned originals"
+            )
+        return self._publication_gap(
+            answer, call_id, context, ledger, None, assigned_numbers=assigned_numbers
+        )
+
+    def publication_gap_for_cropped_assembly(
+        self,
+        answer: str,
+        context: RunContext,
+        ledger: EvidenceLedger,
+        delivered_numbers: set[int],
+    ) -> ToolOutcome | None:
+        """The caller verifies each exact section receipt before supplying its union."""
+        self._require_cropped(context)
+        if (
+            any(
+                type(number) is not int or ledger.get(number) is None
+                for number in delivered_numbers
+            )
+            or set(extract_citation_numbers(answer)) - delivered_numbers
+        ):
+            raise ValueError(
+                "Cropped assembly review requires validated original delivery"
+            )
+        return self._publication_gap(
+            answer, None, context, ledger, None, delivered_numbers=delivered_numbers
+        )
+
+    def _publication_gap(
+        self,
+        answer: str,
+        call_id: str | None,
+        context: RunContext,
+        ledger: EvidenceLedger,
+        raw_reviews: list[JsonValue] | None,
+        *,
+        assigned_numbers: set[int] | None = None,
+        delivered_numbers: set[int] | None = None,
+    ) -> ToolOutcome | None:
         self._fence(context)
         if not extract_citation_numbers(answer):
             return None
         owner = self._owner(context)
         tuned = context.services.get("asv3_workflow_variant") == ASV3_TUNED_VARIANT
         with self._lock:
-            records = self._preview(
-                [] if raw_reviews is None else raw_reviews, call_id, context, ledger
+            records = (
+                dict(self._records)
+                if call_id is None
+                else self._preview(
+                    [] if raw_reviews is None else raw_reviews, call_id, context, ledger
+                )
             )
             pending: list[JsonValue] = []
             undisclosed: list[JsonValue] = []
             unretained: list[JsonValue] = []
             retain_examined = operative_review_retention_enabled(context)
             delivered = (
-                ledger.completely_delivered(call_id) if retain_examined else None
+                set(delivered_numbers)
+                if delivered_numbers is not None
+                else ledger.completely_delivered(call_id or "")
+                if retain_examined
+                else None
             )
             paragraphs = {p.strip() for p in re.split(r"\n\s*\n", answer)}
             for (record_owner, _), record in records.items():
                 if record_owner != owner:
                     continue
                 self._validate_saved(record, ledger)
+                if assigned_numbers is not None and not self._record_numbers(
+                    record, ledger
+                ).intersection(assigned_numbers):
+                    continue
                 if (
                     tuned
                     and record.review is not None

@@ -1,7 +1,7 @@
 """Uncitable ASv3 planning rows; originals require the public evidence reader."""
 
 import json
-from collections.abc import Callable, Generator, Iterator
+from collections.abc import Callable, Generator, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -70,6 +70,8 @@ class ASv3SourceInventoryScope:
     scope_key: str
     max_cache_bytes: int
     check_active: Callable[[], None]
+    batch_temporal_reads: bool = False
+    batch_candidate_inventory: bool = False
     entries: dict[tuple[str, ...], tuple[ASv3CandidateInventoryRow, ...]] = field(
         default_factory=dict
     )
@@ -93,10 +95,18 @@ def asv3_source_inventory_scope(
     scope_key: str,
     max_cache_bytes: int = 8 * 1024 * 1024,
     check_active: Callable[[], None] = lambda: None,
+    batch_temporal_reads: bool = False,
+    batch_candidate_inventory: bool = False,
 ) -> Iterator[ASv3SourceInventoryScope]:
     if not scope_key or max_cache_bytes < 0:
         raise ValueError("ASv3 source inventory requires a bounded authorized scope")
-    scope = ASv3SourceInventoryScope(scope_key, max_cache_bytes, check_active)
+    scope = ASv3SourceInventoryScope(
+        scope_key,
+        max_cache_bytes,
+        check_active,
+        batch_temporal_reads,
+        batch_candidate_inventory,
+    )
     token = _CURRENT_SCOPE.set(scope)
     try:
         yield scope
@@ -117,6 +127,12 @@ _STRUCTURAL_KEYS = (
 )
 
 
+@dataclass(frozen=True, slots=True)
+class ASv3CandidateInventoryRequest:
+    index: PublicationIndexSnapshot
+    canonical_chunk_ids: tuple[str, ...] | None
+
+
 def read_asv3_candidate_inventory(
     session: Session,
     *,
@@ -127,32 +143,95 @@ def read_asv3_candidate_inventory(
     canonical_chunk_ids: tuple[str, ...] | None = None,
 ) -> tuple[ASv3CandidateInventoryRow, ...]:
     """Keep full candidate breadth without reading vector/revision bodies into Python."""
+    return _read_asv3_candidate_inventories(
+        session,
+        requests={source_id: ASv3CandidateInventoryRequest(index, canonical_chunk_ids)},
+        as_of_date=as_of_date,
+        observation=observation,
+    )[source_id]
+
+
+def read_asv3_candidate_inventories(
+    session: Session,
+    *,
+    requests: Mapping[UUID, ASv3CandidateInventoryRequest],
+    as_of_date: date,
+    observation: ReadObservation,
+) -> dict[UUID, tuple[ASv3CandidateInventoryRow, ...]]:
+    """Read exact candidate groups without changing their uncitable planning status."""
+    scope = current_asv3_source_inventory_scope()
+    if scope is None or not scope.batch_candidate_inventory:
+        raise ValueError(
+            "Candidate batches require an explicit Cropped inventory scope"
+        )
+    if any(request.canonical_chunk_ids is None for request in requests.values()):
+        raise ValueError("Candidate batches require exact canonical IDs per source")
+    return _read_asv3_candidate_inventories(
+        session, requests=requests, as_of_date=as_of_date, observation=observation
+    )
+
+
+def _read_asv3_candidate_inventories(
+    session: Session,
+    *,
+    requests: Mapping[UUID, ASv3CandidateInventoryRequest],
+    as_of_date: date,
+    observation: ReadObservation,
+) -> dict[UUID, tuple[ASv3CandidateInventoryRow, ...]]:
     scope = current_asv3_source_inventory_scope()
     if scope is None:
         raise ValueError("Uncitable inventory requires an explicit ASv3 planning scope")
-    key = (
-        scope.scope_key,
-        str(source_id),
-        index.model_dump_json(),
-        as_of_date.isoformat(),
-        observation.model_dump_json(),
-        json.dumps(sorted(canonical_chunk_ids))
-        if canonical_chunk_ids is not None
-        else "all",
-    )
     scope.check_active()
-    require_publication_files(observation, (source_id,))
+    if not requests:
+        return {}
+    source_ids = tuple(requests)
+    keys = {
+        source_id: (
+            scope.scope_key,
+            str(source_id),
+            request.index.model_dump_json(),
+            as_of_date.isoformat(),
+            observation.model_dump_json(),
+            json.dumps(sorted(request.canonical_chunk_ids))
+            if request.canonical_chunk_ids is not None
+            else "all",
+        )
+        for source_id, request in requests.items()
+    }
+    require_publication_files(observation, source_ids)
     with scope.lock:
-        previous_index = scope.query_indexes.get(source_id)
-        if previous_index is not None and not previous_index.matches_temporal_index(
-            index
-        ):
-            raise ValueError("ASv3 source physical index changed during one invocation")
-        scope.query_indexes[source_id] = index
-        cached = scope.entries.get(key)
-        if cached is not None:
-            require_publication_files(observation, (source_id,))
-            return cached
+        for source_id, request in requests.items():
+            previous_index = scope.query_indexes.get(source_id)
+            if previous_index is not None and not previous_index.matches_temporal_index(
+                request.index
+            ):
+                raise ValueError(
+                    "ASv3 source physical index changed during one invocation"
+                )
+        scope.query_indexes.update(
+            {source_id: request.index for source_id, request in requests.items()}
+        )
+        selected = {
+            source_id: scope.entries[key]
+            for source_id, key in keys.items()
+            if key in scope.entries
+        }
+        pending = {
+            source_id: request
+            for source_id, request in requests.items()
+            if source_id not in selected and request.canonical_chunk_ids != ()
+        }
+        selected.update(
+            {
+                source_id: ()
+                for source_id, request in requests.items()
+                if request.canonical_chunk_ids == ()
+            }
+        )
+        if not pending:
+            scope.check_active()
+            require_publication_files(observation, source_ids)
+            return {source_id: selected[source_id] for source_id in requests}
         binding_fields = (
             func.jsonb_to_record(RegulatoryTemporalProjection.payload)
             .table_valued(
@@ -206,6 +285,7 @@ def read_asv3_candidate_inventory(
         )
         statement = (
             select(
+                RegulatoryTemporalProjection.user_file_id.label("requested_source_id"),
                 RegulatoryTemporalProjection.id,
                 RegulatoryTemporalProjection.payload_sha256,
                 RegulatoryTemporalProjection.canonical_chunk_id,
@@ -251,7 +331,8 @@ def read_asv3_candidate_inventory(
                 and_(
                     RegulatoryChunk.id
                     == RegulatoryTemporalProjection.canonical_chunk_id,
-                    RegulatoryChunk.user_file_id == source_id,
+                    RegulatoryChunk.user_file_id
+                    == RegulatoryTemporalProjection.user_file_id,
                 ),
             )
             .join(binding_fields, true())
@@ -260,8 +341,21 @@ def read_asv3_candidate_inventory(
             .join(canonical_fields, true())
             .join(representation_fields, true())
             .where(
-                RegulatoryTemporalProjection.user_file_id == source_id,
-                RegulatoryTemporalProjection.index_uuid == index.index_uuid,
+                or_(
+                    *[
+                        and_(
+                            RegulatoryTemporalProjection.user_file_id == source_id,
+                            RegulatoryTemporalProjection.index_uuid
+                            == request.index.index_uuid,
+                            RegulatoryTemporalProjection.canonical_chunk_id.in_(
+                                request.canonical_chunk_ids
+                            )
+                            if request.canonical_chunk_ids is not None
+                            else true(),
+                        )
+                        for source_id, request in pending.items()
+                    ]
+                ),
                 RegulatoryTemporalProjection.retired_at.is_(None),
                 or_(
                     RegulatoryTemporalProjection.effective_start.is_(None),
@@ -280,22 +374,31 @@ def read_asv3_candidate_inventory(
                     RegulatoryChunk.validity_end_date > as_of_date,
                 ),
             )
-            .order_by(RegulatoryTemporalProjection.projection_ordinal)
+            .order_by(
+                RegulatoryTemporalProjection.user_file_id,
+                RegulatoryTemporalProjection.projection_ordinal,
+            )
             .execution_options(stream_results=True, yield_per=128)
         )
-        if canonical_chunk_ids is not None:
-            statement = statement.where(
-                RegulatoryTemporalProjection.canonical_chunk_id.in_(canonical_chunk_ids)
-            )
-        rows: list[ASv3CandidateInventoryRow] = []
+        rows: dict[UUID, list[ASv3CandidateInventoryRow]] = {
+            source_id: [] for source_id in pending
+        }
         row_bytes = 0
         index_snapshots: dict[str, PublicationIndexSnapshot] = {}
         with graph_step(
-            "asv3.source_inventory",
+            "asv3.source_inventory"
+            if len(pending) == 1
+            else "asv3.source_inventory_batch",
             {
-                "source_id": str(source_id),
+                **(
+                    {"source_id": str(next(iter(pending)))}
+                    if len(pending) == 1
+                    else {"source_ids": [str(source_id) for source_id in pending]}
+                ),
                 "as_of_date": as_of_date.isoformat(),
-                "index_uuid": index.index_uuid,
+                "index_uuids": sorted(
+                    {request.index.index_uuid for request in pending.values()}
+                ),
                 "citable": False,
             },
         ) as step:
@@ -315,6 +418,9 @@ def read_asv3_candidate_inventory(
                         break
                     fetch_seconds += perf_counter() - started
                     started = perf_counter()
+                    source_id = row["requested_source_id"]
+                    request = pending[source_id]
+                    index = request.index
                     serialized_index = json.dumps(row["binding_index"], sort_keys=True)
                     binding_index = index_snapshots.get(serialized_index)
                     if binding_index is None:
@@ -369,13 +475,13 @@ def read_asv3_candidate_inventory(
                         canonical,
                         closure,
                     )
-                    rows.append(candidate)
+                    rows[source_id].append(candidate)
                     row_bytes += len(repr(candidate).encode()) + 512
                     selection_seconds += perf_counter() - started
             finally:
                 result.close()
             step.output_value = {
-                "rows": len(rows),
+                "rows": sum(len(items) for items in rows.values()),
                 "inventory_bytes": row_bytes,
                 "sql_execute_seconds": execute_seconds,
                 "fetch_seconds": fetch_seconds,
@@ -386,12 +492,15 @@ def read_asv3_candidate_inventory(
                 "cache_limit_bytes": scope.max_cache_bytes,
             }
         scope.check_active()
-        require_publication_files(observation, (source_id,))
-        inventory = tuple(rows)
-        if scope.retained_bytes + row_bytes <= scope.max_cache_bytes:
-            scope.entries[key] = inventory
-            scope.retained_bytes += row_bytes
-    return inventory
+        require_publication_files(observation, source_ids)
+        for source_id, candidates in rows.items():
+            inventory = tuple(candidates)
+            selected[source_id] = inventory
+            size = sum(len(repr(candidate).encode()) + 512 for candidate in candidates)
+            if scope.retained_bytes + size <= scope.max_cache_bytes:
+                scope.entries[keys[source_id]] = inventory
+                scope.retained_bytes += size
+    return {source_id: selected[source_id] for source_id in requests}
 
 
 def iter_verified_asv3_inventory_members(

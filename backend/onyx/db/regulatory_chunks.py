@@ -2174,36 +2174,17 @@ def _compact_public_bindings(
 
     compact: dict[str, _PublicProvisionRead] = {}
     if current_asv3_source_inventory_scope() is not None:
-        allowed = set(canonical_chunk_ids) if canonical_chunk_ids is not None else None
-        for row in read_asv3_candidate_inventory(
-            session,
-            source_id=user_file_id,
-            index=index,
-            as_of_date=as_of_date,
-            observation=observe_publication_read(),
+        return _compact_inventory_rows(
+            read_asv3_candidate_inventory(
+                session,
+                source_id=user_file_id,
+                index=index,
+                as_of_date=as_of_date,
+                observation=observe_publication_read(),
+                canonical_chunk_ids=canonical_chunk_ids,
+            ),
             canonical_chunk_ids=canonical_chunk_ids,
-        ):
-            if allowed is not None and row.canonical_chunk_id not in allowed:
-                continue
-            previous = compact.get(row.canonical_chunk_id)
-            if previous is not None and (
-                previous.semantic_position,
-                previous.projection_ordinal,
-            ) > (row.semantic_position, row.ordinal):
-                continue
-            compact[row.canonical_chunk_id] = _PublicProvisionRead(
-                row.canonical_chunk_id,
-                row.semantic_position,
-                row.ordinal,
-                row.text,
-                row.heading_path,
-                row.image_file_id,
-                row.effective_start,
-                row.effective_end,
-                None,
-                row,
-            )
-        return compact
+        )
     for binding in iter_public_temporal_bindings(
         session,
         user_file_id,
@@ -2232,6 +2213,37 @@ def _compact_public_bindings(
             source_sha256=hashlib.sha256(
                 binding.projection.source_json.encode()
             ).hexdigest(),
+        )
+    return compact
+
+
+def _compact_inventory_rows(
+    rows: Sequence[ASv3CandidateInventoryRow],
+    *,
+    canonical_chunk_ids: tuple[str, ...] | None,
+) -> dict[str, _PublicProvisionRead]:
+    allowed = set(canonical_chunk_ids) if canonical_chunk_ids is not None else None
+    compact: dict[str, _PublicProvisionRead] = {}
+    for row in rows:
+        if allowed is not None and row.canonical_chunk_id not in allowed:
+            continue
+        previous = compact.get(row.canonical_chunk_id)
+        if previous is not None and (
+            previous.semantic_position,
+            previous.projection_ordinal,
+        ) > (row.semantic_position, row.ordinal):
+            continue
+        compact[row.canonical_chunk_id] = _PublicProvisionRead(
+            row.canonical_chunk_id,
+            row.semantic_position,
+            row.ordinal,
+            row.text,
+            row.heading_path,
+            row.image_file_id,
+            row.effective_start,
+            row.effective_end,
+            None,
+            row,
         )
     return compact
 
@@ -2482,27 +2494,62 @@ def _public_sibling_candidates(
     qualified = qualified_file_ids(session, file_ids)
     bindings: dict[str, _PublicProvisionRead] = {}
     effective_date = as_of_date or datetime.date.today()
-    for file_id in qualified:
-        index = (query_indexes or {}).get(file_id)
-        if index is None:
-            continue
-        bindings.update(
-            _compact_public_bindings(
-                session,
-                file_id,
-                index=index,
-                as_of_date=effective_date,
-                canonical_chunk_ids=tuple(
-                    (
-                        row.regulatory_chunk_id
-                        if isinstance(row, RegulatoryChunkSiblingCandidate)
-                        else row.id
-                    )
+    from onyx.db.asv3_candidate_inventory import (
+        ASv3CandidateInventoryRequest,
+        current_asv3_source_inventory_scope,
+        read_asv3_candidate_inventories,
+    )
+
+    scope = current_asv3_source_inventory_scope()
+    if scope is not None and scope.batch_candidate_inventory:
+        requests = {
+            file_id: ASv3CandidateInventoryRequest(
+                query_indexes[file_id],
+                tuple(
+                    row.regulatory_chunk_id
+                    if isinstance(row, RegulatoryChunkSiblingCandidate)
+                    else row.id
                     for row in rows
                     if row.user_file_id == file_id
                 ),
             )
+            for file_id in qualified
+            if query_indexes is not None and file_id in query_indexes
+        }
+        inventories = read_asv3_candidate_inventories(
+            session,
+            requests=requests,
+            as_of_date=effective_date,
+            observation=observation,
         )
+        for file_id, inventory in inventories.items():
+            bindings.update(
+                _compact_inventory_rows(
+                    inventory, canonical_chunk_ids=requests[file_id].canonical_chunk_ids
+                )
+            )
+    else:
+        for file_id in qualified:
+            index = (query_indexes or {}).get(file_id)
+            if index is None:
+                continue
+            bindings.update(
+                _compact_public_bindings(
+                    session,
+                    file_id,
+                    index=index,
+                    as_of_date=effective_date,
+                    canonical_chunk_ids=tuple(
+                        (
+                            row.regulatory_chunk_id
+                            if isinstance(row, RegulatoryChunkSiblingCandidate)
+                            else row.id
+                        )
+                        for row in rows
+                        if row.user_file_id == file_id
+                    ),
+                )
+            )
     candidates = []
     for row in rows:
         candidate = (

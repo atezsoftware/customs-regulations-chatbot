@@ -95,6 +95,7 @@ export interface OnSubmitProps {
   legalComposite?: boolean;
   legalReview?: boolean;
   supersearch?: boolean;
+  asv3ExpCropped?: boolean;
   experimentalResearch?: boolean;
   experimentalParallelResearch?: boolean;
   experimentalGuardrails?: boolean;
@@ -394,6 +395,7 @@ export default function useChatController({
       legalComposite = false,
       legalReview = false,
       supersearch = false,
+      asv3ExpCropped = false,
       experimentalResearch = false,
       experimentalParallelResearch = false,
       experimentalGuardrails = false,
@@ -712,6 +714,7 @@ export default function useChatController({
         if (legalReview) initialAgentNode.legalReview = true;
         initialAgentNode.asv3 =
           atezSearchV3 ||
+          asv3ExpCropped ||
           experimentalResearch ||
           experimentalParallelResearch ||
           experimentalGuardrails ||
@@ -1031,6 +1034,7 @@ export default function useChatController({
           legalComposite,
           legalReview,
           supersearch,
+          asv3ExpCropped,
           experimentalResearch,
           experimentalParallelResearch,
           experimentalGuardrails,
@@ -1041,6 +1045,7 @@ export default function useChatController({
             asv3AllowExternal ??
             explicitASv3ExternalConsent(
               atezSearchV3 ||
+                asv3ExpCropped ||
                 experimentalResearch ||
                 experimentalParallelResearch ||
                 experimentalGuardrails ||

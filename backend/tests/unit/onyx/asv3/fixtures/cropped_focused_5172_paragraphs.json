@@ -1,0 +1,127 @@
+{
+  "read_only_capture": "plans/exp-cropped-spike-prevention-20261013/live-sol61-5172/results/run-20261013T154224Z/runtime/checkpoint-packed.json",
+  "capture_sha256": "6d9f4e2c24d29555390ad5c51cf1ba891dc14b5f743a1db30428225b6aef8c6c",
+  "synthetic_positions": false,
+  "rows": [
+    {
+      "captured_citation": 430,
+      "source_id": "75a82b64-d74c-4c69-852e-b189cef210cb",
+      "chunk_id": "rc_854c821a44ffc9eab538e8bd4c60945cf4d1f84f",
+      "text": "**MADDE 15** .- (1) Bir fiil ile birden fazla kabahatin işlenmesi halinde bu kabahatlere ilişkin tanımlarda sadece idarî para cezası öngörülmüşse, en ağır idarî para cezası verilir. Bu kabahatlerle ilgili olarak kanunda idarî para cezasından başka idarî yaptırımlar da öngörülmüş ise, bu yaptırımların her birinin uygulanmasına karar verilir.",
+      "text_hash": "9a6c5e62fff901b938baab344aab68111e55c70edb9da1daed13b481f6c1edb1",
+      "position": 30,
+      "metadata": {
+        "document_id": "75a82b64-d74c-4c69-852e-b189cef210cb",
+        "chunk_index": 30,
+        "title": "Diğer Kanunlar/5326_sayili_kanun.md",
+        "source_type": "user_file",
+        "semantic_identifier": "Diğer Kanunlar/5326_sayili_kanun.md — KABAHATLER KANUNU > Genel Hükümler > İKİNCİ BÖLÜM > İçtima",
+        "source_links": "{\"0\": \"\"}",
+        "document_sets": [
+          "PC Külliyatı"
+        ],
+        "regulatory_chunk_id": "rc_854c821a44ffc9eab538e8bd4c60945cf4d1f84f",
+        "heading_path": [
+          "KABAHATLER KANUNU",
+          "Genel Hükümler",
+          "İKİNCİ BÖLÜM",
+          "İçtima"
+        ],
+        "provision_identifiers": [
+          "madde 15"
+        ],
+        "legal_dates": [
+          "2005-03-30",
+          "2005-03-31"
+        ],
+        "article_no": null,
+        "clause_label": null,
+        "paragraph_no": null,
+        "article_title": null,
+        "chunk_variant": "atomic",
+        "document_date": null,
+        "document_type": "kanun",
+        "source_regulatory_chunk_ids": [],
+        "read_as_of_date": "2026-10-13"
+      }
+    },
+    {
+      "captured_citation": 431,
+      "source_id": "75a82b64-d74c-4c69-852e-b189cef210cb",
+      "chunk_id": "rc_99585f091649b4e9dfd68d11fcf1cb31a5a51d6f",
+      "text": "(2) Aynı kabahatin birden fazla işlenmesi halinde her bir kabahatle ilgili olarak ayrı ayrı idarî para cezası verilir. Kesintisiz fiille işlenebilen kabahatlerde, bu nedenle idarî yaptırım kararı verilinceye kadar fiil tek sayılır.",
+      "text_hash": "1fd57c3088b6ce314b52eec64b12c4cfb6e859b835fc6cce96ecf624499e2906",
+      "position": 31,
+      "metadata": {
+        "document_id": "75a82b64-d74c-4c69-852e-b189cef210cb",
+        "chunk_index": 31,
+        "title": "Diğer Kanunlar/5326_sayili_kanun.md",
+        "source_type": "user_file",
+        "semantic_identifier": "Diğer Kanunlar/5326_sayili_kanun.md — KABAHATLER KANUNU > Genel Hükümler > İKİNCİ BÖLÜM > (2) Aynı kabahatin birden fazla işlenmesi halinde her bir kabahatle ilgili olarak ayrı ayrı...",
+        "source_links": "{\"0\": \"\"}",
+        "document_sets": [
+          "PC Külliyatı"
+        ],
+        "regulatory_chunk_id": "rc_99585f091649b4e9dfd68d11fcf1cb31a5a51d6f",
+        "heading_path": [
+          "KABAHATLER KANUNU",
+          "Genel Hükümler",
+          "İKİNCİ BÖLÜM",
+          "(2) Aynı kabahatin birden fazla işlenmesi halinde her bir kabahatle ilgili olarak ayrı ayrı..."
+        ],
+        "legal_dates": [
+          "2005-03-30",
+          "2005-03-31"
+        ],
+        "article_no": null,
+        "clause_label": null,
+        "paragraph_no": "2",
+        "article_title": null,
+        "chunk_variant": "atomic",
+        "document_date": null,
+        "document_type": "kanun",
+        "source_regulatory_chunk_ids": [],
+        "read_as_of_date": "2026-10-13"
+      }
+    },
+    {
+      "captured_citation": 415,
+      "source_id": "75a82b64-d74c-4c69-852e-b189cef210cb",
+      "chunk_id": "rc_d73ec2cab56112bf53656dc978be5940828820b2",
+      "text": "(3) Bir fiil hem kabahat hem de suç olarak tanımlanmış ise, sadece suçtan dolayı yaptırım uygulanabilir. Ancak, suçtan dolayı yaptırım uygulanamayan hallerde kabahat dolayısıyla yaptırım uygulanır.",
+      "text_hash": "e8a9c5c2e81144254ece25cf00096d62c5e87c9d45c63650c7cd9ae4b6d8e947",
+      "position": 32,
+      "metadata": {
+        "document_id": "75a82b64-d74c-4c69-852e-b189cef210cb",
+        "chunk_index": 32,
+        "title": "Diğer Kanunlar/5326_sayili_kanun.md",
+        "source_type": "user_file",
+        "semantic_identifier": "Diğer Kanunlar/5326_sayili_kanun.md — KABAHATLER KANUNU > Genel Hükümler > İKİNCİ BÖLÜM > (3) Bir fiil hem kabahat hem de suç olarak tanımlanmış ise, sadece suçtan dolayı yaptırım u...",
+        "source_links": "{\"0\": \"\"}",
+        "document_sets": [
+          "PC Külliyatı"
+        ],
+        "regulatory_chunk_id": "rc_d73ec2cab56112bf53656dc978be5940828820b2",
+        "heading_path": [
+          "KABAHATLER KANUNU",
+          "Genel Hükümler",
+          "İKİNCİ BÖLÜM",
+          "(3) Bir fiil hem kabahat hem de suç olarak tanımlanmış ise, sadece suçtan dolayı yaptırım u..."
+        ],
+        "legal_dates": [
+          "2005-03-30",
+          "2005-03-31"
+        ],
+        "article_no": null,
+        "clause_label": null,
+        "paragraph_no": "3",
+        "article_title": null,
+        "chunk_variant": "atomic",
+        "document_date": null,
+        "document_type": "kanun",
+        "source_regulatory_chunk_ids": [],
+        "read_as_of_date": "2026-10-13"
+      }
+    }
+  ]
+}
