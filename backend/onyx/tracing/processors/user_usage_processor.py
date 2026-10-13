@@ -6,7 +6,7 @@ from __future__ import annotations
 import queue
 import threading
 from collections import defaultdict
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
@@ -56,6 +56,8 @@ class _UsageRecord:
     cache_read_tokens: int
     image_count: int
     window_start: datetime
+    cache_write_tokens: int = 0
+    service_tier: str | None = None
 
 
 def _usage_field(usage: dict[str, Any], *names: str) -> int:
@@ -144,6 +146,8 @@ class UserUsageTracingProcessor(TracingProcessor):
             cache_read_tokens=cache_read_tokens,
             image_count=data.image_count or 1,
             window_start=window_start,
+            cache_write_tokens=_usage_field(usage, "cache_creation_input_tokens"),
+            service_tier=usage.get("service_tier") or model_config.get("service_tier"),
         )
 
     def _drain_loop(self) -> None:
@@ -178,7 +182,8 @@ class UserUsageTracingProcessor(TracingProcessor):
     def _flush_batch(self, batch: list[_UsageRecord]) -> None:
         try:
             records_by_tenant: dict[str, list[_UsageRecord]] = defaultdict(list)
-            for record in self._aggregate_batch(batch):
+            # Context tariffs apply to each invocation, before ledger accumulation.
+            for record in batch:
                 records_by_tenant[record.tenant_id].append(record)
 
             for tenant_id, records in records_by_tenant.items():
@@ -192,33 +197,6 @@ class UserUsageTracingProcessor(TracingProcessor):
         finally:
             for _ in batch:
                 self._queue.task_done()
-
-    @staticmethod
-    def _aggregate_batch(batch: list[_UsageRecord]) -> list[_UsageRecord]:
-        aggregated: dict[
-            tuple[str, str, str, str, str | None, datetime], _UsageRecord
-        ] = {}
-        for record in batch:
-            key = (
-                record.tenant_id,
-                record.user_id,
-                record.model,
-                record.flow,
-                record.provider,
-                record.window_start,
-            )
-            current = aggregated.get(key)
-            if current is None:
-                aggregated[key] = record
-                continue
-            aggregated[key] = replace(
-                current,
-                input_tokens=current.input_tokens + record.input_tokens,
-                output_tokens=current.output_tokens + record.output_tokens,
-                cache_read_tokens=current.cache_read_tokens + record.cache_read_tokens,
-                image_count=current.image_count + record.image_count,
-            )
-        return list(aggregated.values())
 
     def _write_tenant_batch(self, tenant_id: str, records: list[_UsageRecord]) -> None:
         token = CURRENT_TENANT_ID_CONTEXTVAR.set(tenant_id)
@@ -242,6 +220,8 @@ class UserUsageTracingProcessor(TracingProcessor):
             flow=record.flow,
             image_count=record.image_count,
             db_session=db_session,
+            cache_write_tokens=record.cache_write_tokens,
+            service_tier=record.service_tier,
         )
         record_user_usage(
             db_session,

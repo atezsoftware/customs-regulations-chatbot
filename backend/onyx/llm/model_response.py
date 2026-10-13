@@ -45,6 +45,7 @@ class Usage(BaseModel):
     reasoning_tokens: int | None = None
     cache_creation_5m_tokens: int | None = None
     cache_creation_1h_tokens: int | None = None
+    service_tier: str | None = None
 
 
 class ModelResponseStream(BaseModel):
@@ -164,7 +165,9 @@ def _usage_from_usage_data(usage_data: dict[str, Any]) -> Usage:
         completion_tokens=usage_data.get("completion_tokens") or 0,
         prompt_tokens=usage_data.get("prompt_tokens") or 0,
         total_tokens=usage_data.get("total_tokens") or 0,
-        cache_creation_input_tokens=usage_data.get("cache_creation_input_tokens") or 0,
+        cache_creation_input_tokens=usage_data.get("cache_creation_input_tokens")
+        or (usage_data.get("prompt_tokens_details") or {}).get("cache_write_tokens")
+        or 0,
         cache_read_input_tokens=usage_data.get(
             "cache_read_input_tokens",
             (usage_data.get("prompt_tokens_details") or {}).get("cached_tokens"),
@@ -180,6 +183,7 @@ def _usage_from_usage_data(usage_data: dict[str, Any]) -> Usage:
         cache_creation_1h_tokens=(usage_data.get("cache_creation") or {}).get(
             "ephemeral_1h_input_tokens"
         ),
+        service_tier=usage_data.get("service_tier"),
     )
 
 

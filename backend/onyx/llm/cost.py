@@ -1,6 +1,9 @@
 """LLM cost calculation utilities."""
 
+import math
+import re
 import threading
+from typing import Any
 from urllib.parse import quote
 
 import httpx
@@ -26,6 +29,62 @@ class ModelPrice(BaseModel):
     input_per_mtok: float | None
     output_per_mtok: float | None
     cache_per_mtok: float | None
+    cache_write_per_mtok: float | None = None
+
+
+def get_model_pricing_info(model: str, provider: str | None) -> dict[str, Any]:
+    """Retain configured price fields that LiteLLM's typed model view omits."""
+    import litellm
+
+    try:
+        info = dict(litellm.get_model_info(model=model, custom_llm_provider=provider))
+    except Exception:
+        info = {}
+    keys = [info.get("key"), f"{provider}/{model}" if provider else None, model]
+    for key in keys:
+        if not isinstance(key, str):
+            continue
+        configured = litellm.model_cost.get(key)
+        if configured is None:
+            continue
+        for field, value in configured.items():
+            if field.startswith(
+                ("input_cost_per_token", "output_cost_per_token", "cache_")
+            ):
+                info[field] = value
+        break
+    return info
+
+
+def get_token_rate_per_million(
+    info: dict[str, Any],
+    field: str,
+    input_tokens: int,
+    service_tier: str | None = None,
+) -> float | None:
+    """Select a per-call context/tier tariff without inventing missing rates."""
+    if service_tier not in {None, "auto", "default", "standard", "flex", "priority"}:
+        return None
+    suffix = f"_{service_tier}" if service_tier in {"flex", "priority"} else ""
+    selected = field + suffix
+    thresholds: list[tuple[int, str]] = []
+    for key, value in info.items():
+        match = re.fullmatch(
+            re.escape(field) + r"_above_(\d+)k_tokens" + re.escape(suffix), key
+        )
+        if match and input_tokens > int(match[1]) * 1000 and value is not None:
+            thresholds.append((int(match[1]), key))
+    if thresholds:
+        selected = max(thresholds)[1]
+    value = info.get(selected)
+    if (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        and value >= 0
+    ):
+        return float(value) * 1_000_000
+    return None
 
 
 _OPENROUTER_PRICE_CACHE_TTL_SECONDS = 60 * 60
@@ -138,6 +197,7 @@ def get_model_price_per_million(
         input_per_tok = entry.get("input_cost_per_token")
         output_per_tok = entry.get("output_cost_per_token")
         cache_per_tok = entry.get("cache_read_input_token_cost")
+        cache_write_per_tok = entry.get("cache_creation_input_token_cost")
         return ModelPrice(
             model=model,
             provider=provider,
@@ -151,6 +211,11 @@ def get_model_price_per_million(
             ),
             cache_per_mtok=(
                 float(cache_per_tok) * 1_000_000 if cache_per_tok is not None else None
+            ),
+            cache_write_per_mtok=(
+                float(cache_write_per_tok) * 1_000_000
+                if cache_write_per_tok is not None
+                else None
             ),
         )
     except Exception:
@@ -211,16 +276,23 @@ def _price_cost_cents(
     input_tokens: int,
     output_tokens: int,
     cache_read_tokens: int,
+    cache_write_tokens: int = 0,
 ) -> tuple[float, float]:
     input_rate = price.input_per_mtok or 0.0
     output_rate = price.output_per_mtok or 0.0
     cache_rate = (
         price.cache_per_mtok if price.cache_per_mtok is not None else input_rate
     )
+    write_rate = (
+        price.cache_write_per_mtok
+        if price.cache_write_per_mtok is not None
+        else input_rate
+    )
     return (
         (
-            input_tokens / 1_000_000 * input_rate
+            max(input_tokens - cache_write_tokens, 0) / 1_000_000 * input_rate
             + cache_read_tokens / 1_000_000 * cache_rate
+            + cache_write_tokens / 1_000_000 * write_rate
         )
         * 100,
         output_tokens / 1_000_000 * output_rate * 100,
@@ -236,13 +308,21 @@ def compute_cost_cents(
     flow: LLMFlow | str | None = None,
     image_count: int = 1,
     db_session: Session | None = None,
+    cache_write_tokens: int = 0,
+    service_tier: str | None = None,
 ) -> tuple[float, float]:
     """Return (input_cost_cents, output_cost_cents) for an LLM call.
 
+    Input excludes cache reads but includes cache writes. OpenAI writes replace
+    the ordinary input tariff; they are not an additional token count.
     Resolution order: image pricing → admin override → litellm → default
     fallback rates (0 unless set). Never raises (usage hot path)."""
     if flow in IMAGE_FLOWS:
         return 0.0, _image_cost_cents(model, provider) * max(image_count, 1)
+
+    # Other providers' write rates can depend on uncaptured cache lifetimes.
+    if provider != "openai":
+        cache_write_tokens = 0
 
     if db_session is not None:
         try:
@@ -258,6 +338,35 @@ def compute_cost_cents(
     try:
         import litellm
 
+        incoming = input_tokens + cache_read_tokens
+        if provider == "openai":
+            info = get_model_pricing_info(model, provider)
+            write_rate = get_token_rate_per_million(
+                info, "cache_creation_input_token_cost", incoming, service_tier
+            )
+            if write_rate is not None:
+                price = ModelPrice(
+                    model=model,
+                    provider=provider,
+                    input_per_mtok=get_token_rate_per_million(
+                        info, "input_cost_per_token", incoming, service_tier
+                    ),
+                    output_per_mtok=get_token_rate_per_million(
+                        info, "output_cost_per_token", incoming, service_tier
+                    ),
+                    cache_per_mtok=get_token_rate_per_million(
+                        info, "cache_read_input_token_cost", incoming, service_tier
+                    ),
+                    cache_write_per_mtok=write_rate,
+                )
+                return _price_cost_cents(
+                    price,
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                    cache_write_tokens,
+                )
+
         # custom_llm_provider is required for non-self-identifying model names
         # (bedrock/vertex/anthropic-plain) — without it litellm raises and we'd
         # record $0 for entire provider classes.
@@ -269,6 +378,8 @@ def compute_cost_cents(
             prompt_tokens=input_tokens + cache_read_tokens,
             completion_tokens=output_tokens,
             cache_read_input_tokens=cache_read_tokens,
+            cache_creation_input_tokens=cache_write_tokens,
+            service_tier=service_tier,
         )
         input_cents = prompt_cost_usd * 100
         output_cents = completion_cost_usd * 100
@@ -291,6 +402,7 @@ def compute_cost_cents(
                     input_tokens,
                     output_tokens,
                     cache_read_tokens,
+                    cache_write_tokens,
                 )
         return input_cents, output_cents
     except Exception:
@@ -312,6 +424,7 @@ def compute_cost_cents(
                 input_tokens,
                 output_tokens,
                 cache_read_tokens,
+                cache_write_tokens,
             )
 
         billed_input = input_tokens + cache_read_tokens

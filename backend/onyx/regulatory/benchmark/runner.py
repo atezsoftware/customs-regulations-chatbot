@@ -147,6 +147,8 @@ def _usage_cost(
             call.output_tokens,
             call.cache_read_tokens,
             db_session=db_session,
+            cache_write_tokens=call.cache_write_tokens,
+            service_tier=call.service_tier,
         )
         total_cost_cents += input_cost + output_cost
         pricing_available = pricing_available and (

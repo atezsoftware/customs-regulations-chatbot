@@ -219,6 +219,7 @@ def _build_usage_dict(usage: Any | None) -> dict[str, Any] | None:
         "reasoning_tokens",
         "cache_creation_5m_tokens",
         "cache_creation_1h_tokens",
+        "service_tier",
     ):
         value = getattr(usage, field, None)
         if value is not None:

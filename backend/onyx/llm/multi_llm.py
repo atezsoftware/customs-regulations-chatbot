@@ -688,6 +688,8 @@ class LitellmLLM(LLM):
                     non_cached_input,
                     usage.completion_tokens,
                     cache_read_tokens=cache_read,
+                    cache_write_tokens=usage.cache_creation_input_tokens,
+                    service_tier=usage.service_tier,
                     db_session=db_session,
                 )
                 cost_cents = input_cents + output_cents
@@ -1415,6 +1417,11 @@ class LitellmLLM(LLM):
                 diagnostic = terminal_capture.diagnostic()
                 span.span_data.request_params = {
                     **(span.span_data.request_params or {}),
+                    **(
+                        {"service_tier": terminal_capture.service_tier}
+                        if terminal_capture.service_tier is not None
+                        else {}
+                    ),
                     NATIVE_RESPONSE_TERMINAL: diagnostic,
                 }
                 span.span_data.usage = terminal_capture.usage

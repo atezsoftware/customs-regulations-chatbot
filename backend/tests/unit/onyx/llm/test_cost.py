@@ -54,6 +54,38 @@ def _clear_override_cache() -> Generator[None, None, None]:
 
 
 class TestComputeCostCents:
+    @pytest.mark.parametrize(
+        "input_tokens,cached,written,tier,expected_input,expected_output",
+        [
+            (38382, 21755, 38379, None, 9.8129, 0.351),
+            (272000, 0, 272000, None, 68, 0.351),
+            (252001, 20000, 252000, None, 126.4004, 0.5265),
+            (1000, 0, 1000, "flex", 0.125, 0.1755),
+            (1000, 0, 1000, "priority", 0.5, 0.702),
+        ],
+    )
+    def test_sol_cache_writes_replace_input_with_per_call_tariffs(
+        self,
+        input_tokens: int,
+        cached: int,
+        written: int,
+        tier: str | None,
+        expected_input: float,
+        expected_output: float,
+    ) -> None:
+        from onyx.llm.litellm_singleton.config import load_model_metadata_enrichments
+
+        load_model_metadata_enrichments()
+        assert compute_cost_cents(
+            "gpt-6.1-sol",
+            "openai",
+            input_tokens,
+            351,
+            cache_read_tokens=cached,
+            cache_write_tokens=written,
+            service_tier=tier,
+        ) == pytest.approx((expected_input, expected_output))
+
     def test_openrouter_catalog_prices_model_missing_from_litellm(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -234,6 +266,27 @@ class TestImageFlow:
 
 
 class TestOverride:
+    def test_override_keeps_cache_writes_in_admin_input_rate(
+        self,
+        db_session: Session,
+    ) -> None:
+        db_session.add(
+            ModelCostOverride(
+                model="gpt-6.1-sol",
+                input_cost_per_mtok=1,
+                output_cost_per_mtok=2,
+            )
+        )
+        db_session.commit()
+        assert compute_cost_cents(
+            "gpt-6.1-sol",
+            "openai",
+            1000,
+            0,
+            cache_write_tokens=1000,
+            db_session=db_session,
+        ) == pytest.approx((0.1, 0))
+
     def test_override_wins_over_litellm(self, db_session: Session) -> None:
         db_session.add(
             ModelCostOverride(
