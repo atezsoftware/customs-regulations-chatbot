@@ -810,3 +810,21 @@ def test_already_known_article_metadata_is_never_narrowed() -> None:
     assert state.record_receipt(receipt, current, ledger) == 0
     assert state.identity_bindings(current, ledger) == {}
     assert bound_identity_ledger(ledger, current).authority_metadata() == before
+
+
+def test_plain_numbered_list_is_not_a_second_paragraph_anchor() -> None:
+    first, _second, third = originals()
+    first.text += "\n\n2. İşlem listesi maddesidir."
+    first.text_hash = hashlib.sha256(first.text.encode()).hexdigest()
+    third.metadata["position"] = 31
+    current, ledger, state, receipt = setup([first, third])
+    body = ANSWER.replace("[3]", "[2]")
+    assert canonical_named_authority_gap(body, ledger, **OPTIONS) is not None
+    assert state.record_receipt(receipt, current, ledger) == 0
+    assert state.identity_bindings(current, ledger) == {}
+    assert bound_named_authority_gap(body, ledger, current, **OPTIONS) is not None
+    acquisitions = GoverningOriginalAcquisitions(current, "Question")
+    target = GoverningOriginalTarget(
+        instrument_number="5326", article="15", paragraph="3"
+    )
+    assert acquisitions.matching_originals(target, ledger) == []

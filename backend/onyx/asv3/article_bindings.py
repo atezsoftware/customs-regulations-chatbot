@@ -32,6 +32,7 @@ from onyx.regulatory.heading_path import parse_regulatory_article_heading
 _FIELD = "asv3_ordered_source_read"
 _METHODS = {"read_source_range", "read_provision", "read_named_provision"}
 _PARAGRAPH = re.compile(r"^\s*(?:\((\d{1,3})\)|(\d{1,3})\.)\s+\S")
+_CONTINUING_PARAGRAPH = re.compile(r"^\s*\((\d{1,3})\)\s+\S")
 _ACQUISITION_FIELDS = {
     "retrieval_method",
     "section_context",
@@ -263,9 +264,9 @@ class ArticleBindings:
                 continue
             paragraph = marker[1] or marker[2]
             paragraphs = [int(paragraph)] + [
-                int(found[1] or found[2])
+                int(found[1])
                 for line in body[marker.end() :].splitlines()[1:]
-                if (found := _PARAGRAPH.match(line)) is not None
+                if (found := _CONTINUING_PARAGRAPH.match(line)) is not None
             ]
             identifiers = metadata.get("provision_identifiers")
             declared_articles = (
