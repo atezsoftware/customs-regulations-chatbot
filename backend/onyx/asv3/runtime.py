@@ -18,13 +18,21 @@ from uuid import UUID
 from pydantic import JsonValue
 
 from onyx.asv3.answer_model import source_answer_model, uses_source_answer_model
-from onyx.asv3.authority import cited_lower_statute_gap, native_named_authority_gap
+from onyx.asv3.authority import native_named_authority_gap
 from onyx.asv3.authority_requirements import AuthorityRequirements
 from onyx.asv3.candidate_audit import CandidateAudit
+from onyx.asv3.canonical_authority import (
+    canonical_cited_lower_statute_gap,
+    canonical_named_authority_gap,
+)
 from onyx.asv3.citation_numbers import extract_citation_numbers
 from onyx.asv3.corpus_tools import CorpusBroker, build_corpus_specs
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.external_tools import build_external_specs
+from onyx.asv3.governing_acquisitions import (
+    GoverningOriginalAcquisitions,
+    governing_original_targets,
+)
 from onyx.asv3.guardrails_v3 import (
     GuardrailsV3ReviewOutcome,
     build_frozen_review_packet,
@@ -435,6 +443,16 @@ def run_asv3_loop(
     )
     if source_reviews is not None:
         context.services["legal_source_reviews"] = source_reviews
+    governing_acquisitions = (
+        GoverningOriginalAcquisitions(context, question)
+        if workflow_variant == ASV3_TUNED_VARIANT
+        else None
+    )
+    if governing_acquisitions is not None:
+        context.services["tuned_governing_acquisitions"] = governing_acquisitions
+        context.services["tuned_unavailable_governing_keys"] = lambda gap: (
+            governing_acquisitions.unavailable_keys(gap, ledger)
+        )
     authority_requirements = (
         AuthorityRequirements(
             context,
@@ -455,21 +473,32 @@ def run_asv3_loop(
         if answer_llm is not None:
             # This policy accepts a supplied passage establishing the actual claim.
             return None
-        gap = native_named_authority_gap(
-            answer,
-            ledger,
-            strict_reference_boundaries=(
-                research_profile == "experimental"
-                or workflow_variant == ASV3_TUNED_VARIANT
-            ),
-            syntactic_reference_binding=(
-                parallel_research or workflow_variant == ASV3_TUNED_VARIANT
-            ),
+        gap = (
+            canonical_named_authority_gap(
+                answer,
+                ledger,
+                strict_reference_boundaries=True,
+                syntactic_reference_binding=True,
+                strict_numeric_paragraphs=True,
+            )
+            if workflow_variant == ASV3_TUNED_VARIANT
+            else native_named_authority_gap(
+                answer,
+                ledger,
+                strict_reference_boundaries=research_profile == "experimental",
+                syntactic_reference_binding=parallel_research,
+            )
         )
         if authority_requirements is not None:
             return authority_requirements.publication_gap(
                 answer, model_call_id, run_context or context, ledger, native_gap=gap
             )
+        if gap is not None and governing_acquisitions is not None:
+            records = governing_acquisitions.records_for(
+                governing_original_targets(gap)
+            )
+            if records:
+                gap = {**gap, "governing_original_acquisition_episodes": records}
         return gap
 
     registry = CapabilityRegistry()
@@ -908,6 +937,18 @@ def run_asv3_loop(
                 publish_root_control()
             notify_checkpoint(durable=durable)
             return
+        acquisition_child_capture = (
+            governing_acquisitions is not None
+            and threading.get_ident() != root_owner_thread
+        )
+        if governing_acquisitions is not None:
+            if acquisition_child_capture:
+                with root_control_lock:
+                    if parallel_root_control is None:
+                        raise ValueError("Tuned root checkpoint control is missing")
+                    snapshot = copy.deepcopy(parallel_root_control)
+            else:
+                publish_root_control()
         if checkpoint_writer is not None:
             checkpoint_writer.raise_if_failed()
         capture = (
@@ -942,21 +983,29 @@ def run_asv3_loop(
                     research_profile=research_profile,
                     parallel_research=parallel_research,
                     execution_mode="native",
-                    native_coordinator_sampling=model.native_sampling_snapshot(),
+                    native_coordinator_sampling=snapshot["native_coordinator_sampling"]
+                    if acquisition_child_capture
+                    else model.native_sampling_snapshot(),
                     scope=context.scope,
                     progress=list(emitted),
                     progress_state=progress.export(),
-                    public_profile=profile.model_dump(mode="json"),
+                    public_profile=snapshot["public_profile"]
+                    if acquisition_child_capture
+                    else profile.model_dump(mode="json"),
                     workers=workers.export() if workers else {},
                     question_research=question_research.export()
                     if question_research
                     else {},
                     outcome_map=outcome_map.export(),
-                    publication_status=publication_status.value,
-                    publication_stop_reason=publication_stop_reason,
-                    final_publication_gap=harness.publication_gap.model_dump(
-                        mode="json"
-                    )
+                    publication_status=snapshot["publication_status"]
+                    if acquisition_child_capture
+                    else publication_status.value,
+                    publication_stop_reason=snapshot["publication_stop_reason"]
+                    if acquisition_child_capture
+                    else publication_stop_reason,
+                    final_publication_gap=snapshot["publication_gap"]
+                    if acquisition_child_capture
+                    else harness.publication_gap.model_dump(mode="json")
                     if harness and harness.publication_gap
                     else None,
                     scenario=scenarios.snapshot(),
@@ -967,6 +1016,13 @@ def run_asv3_loop(
                     snapshot["legal_source_reviews"] = source_reviews.export()
                 if authority_requirements is not None:
                     snapshot["authority_requirements"] = authority_requirements.export()
+                if governing_acquisitions is not None:
+                    snapshot["evidence"] = ledger.export()
+                    snapshot["research_state"] = research_state.export()
+                    snapshot["budget"] = context.budget.snapshot()
+                    snapshot["governing_original_acquisitions"] = (
+                        governing_acquisitions.export()
+                    )
                 guardrails_v2_review = context.services.get("guardrails_v2_review")
                 if isinstance(guardrails_v2_review, dict):
                     snapshot["guardrails_v2_review"] = cast(
@@ -1056,7 +1112,10 @@ def run_asv3_loop(
     def root_checkpoint(*, durable: bool = False) -> None:
         if harness is None:
             raise ValueError("Root checkpoint requires its harness")
-        if parallel_research:
+        if parallel_research or (
+            governing_acquisitions is not None
+            and threading.get_ident() != root_owner_thread
+        ):
             checkpoint({}, durable=durable)
             return
         started = time.monotonic()
@@ -1067,7 +1126,16 @@ def run_asv3_loop(
             root_snapshot_seconds=time.monotonic() - started,
         )
 
+    if governing_acquisitions is not None:
+        context.services["tuned_governing_checkpoint"] = lambda: root_checkpoint(
+            durable=True
+        )
+
     def record(receipt: ToolReceipt) -> None:
+        acquisition_recorded = (
+            governing_acquisitions is not None
+            and governing_acquisitions.record_receipt(receipt, context, ledger)
+        )
         if checkpoint_writer is not None:
             checkpoint_writer.raise_if_failed()
         for number in receipt.evidence_ids:
@@ -1084,6 +1152,8 @@ def run_asv3_loop(
         state_container.add_search_docs(
             list(_presentation_search_docs(ledger, receipt.evidence_ids).values())
         )
+        if acquisition_recorded:
+            root_checkpoint(durable=True)
 
     def verify(args: dict[str, JsonValue], child: RunContext) -> ToolOutcome:
         child = _verification_context(child)
@@ -1625,7 +1695,7 @@ def run_asv3_loop(
                 return gap
             gaps.append(gap)
         if tuned and answer_llm is None:
-            reference_gap = cited_lower_statute_gap(answer, ledger, delivered)
+            reference_gap = canonical_cited_lower_statute_gap(answer, ledger, delivered)
             if reference_gap is not None:
                 gaps.append(
                     ToolOutcome(
@@ -1642,7 +1712,14 @@ def run_asv3_loop(
                 if not tuned:
                     return review_gap
                 gaps.append(review_gap)
-        return combine_source_publication_gaps(gaps)
+        combined = combine_source_publication_gaps(gaps)
+        if combined is not None and governing_acquisitions is not None:
+            records = governing_acquisitions.records_for(
+                governing_original_targets(combined.data)
+            )
+            if records:
+                combined.data["governing_original_acquisition_episodes"] = records
+        return combined
 
     def publication_guard(
         answer: str,
@@ -1915,7 +1992,12 @@ def run_asv3_loop(
             if isinstance(remembered, dict):
                 context.services["session_research"] = remembered
             harness.restore(previous)
-            harness.publication_gap = None
+            if governing_acquisitions is None:
+                harness.publication_gap = None
+            if governing_acquisitions is not None:
+                saved_acquisitions = previous.get("governing_original_acquisitions")
+                if isinstance(saved_acquisitions, dict):
+                    governing_acquisitions.restore(saved_acquisitions)
             revalidate(
                 [item for n in ledger.citation_mapping() if (item := ledger.get(n))],
                 resuming=True,
@@ -1961,6 +2043,8 @@ def run_asv3_loop(
             checkpoint_sequence = saved_sequence
             if parallel_answers is not None and question_research.answers:
                 question_research.assemble_retained_answers()
+        if governing_acquisitions is not None:
+            publish_root_control()
         if parallel_research:
             publish_root_control()
             checkpoint_writer = ParallelCheckpointWriter(

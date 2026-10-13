@@ -1,0 +1,158 @@
+{
+  "trace_id": 5077,
+  "rows": [
+    {
+      "citation": 280,
+      "source_id": "75a82b64-d74c-4c69-852e-b189cef210cb",
+      "chunk_id": "rc_d73ec2cab56112bf53656dc978be5940828820b2",
+      "text_hash": "e8a9c5c2e81144254ece25cf00096d62c5e87c9d45c63650c7cd9ae4b6d8e947",
+      "metadata": {
+        "title": "Diğer Kanunlar/5326_sayili_kanun.md",
+        "document_date": null,
+        "document_type": "kanun",
+        "read_as_of_date": "2026-10-12",
+        "version_unknown": true,
+        "legal_dates": [
+          "2005-03-30",
+          "2005-03-31"
+        ],
+        "article_no": null,
+        "clause_label": null,
+        "paragraph_no": "3",
+        "article_closure_complete": false,
+        "heading_path": [
+          "KABAHATLER KANUNU",
+          "Genel Hükümler",
+          "İKİNCİ BÖLÜM",
+          "(3) Bir fiil hem kabahat hem de suç olarak tanımlanmış ise, sadece suçtan dolayı yaptırım u..."
+        ]
+      },
+      "text": "(3) Bir fiil hem kabahat hem de suç olarak tanımlanmış ise, sadece suçtan dolayı yaptırım uygulanabilir. Ancak, suçtan dolayı yaptırım uygulanamayan hallerde kabahat dolayısıyla yaptırım uygulanır."
+    },
+    {
+      "citation": 291,
+      "source_id": "75a82b64-d74c-4c69-852e-b189cef210cb",
+      "chunk_id": "rc_854c821a44ffc9eab538e8bd4c60945cf4d1f84f",
+      "text_hash": "9a6c5e62fff901b938baab344aab68111e55c70edb9da1daed13b481f6c1edb1",
+      "metadata": {
+        "title": "Diğer Kanunlar/5326_sayili_kanun.md",
+        "document_date": null,
+        "document_type": "kanun",
+        "read_as_of_date": "2026-10-12",
+        "version_unknown": true,
+        "provision_identifiers": [
+          "madde 15"
+        ],
+        "legal_dates": [
+          "2005-03-30",
+          "2005-03-31"
+        ],
+        "article_no": null,
+        "clause_label": null,
+        "paragraph_no": null,
+        "article_closure_complete": false,
+        "heading_path": [
+          "KABAHATLER KANUNU",
+          "Genel Hükümler",
+          "İKİNCİ BÖLÜM",
+          "İçtima"
+        ]
+      },
+      "text": "**MADDE 15** .- (1) Bir fiil ile birden fazla kabahatin işlenmesi halinde bu kabahatlere ilişkin tanımlarda sadece idarî para cezası öngörülmüşse, en ağır idarî para cezası verilir. Bu kabahatlerle ilgili olarak kanunda idarî para cezasından başka idarî yaptırımlar da öngörülmüş ise, bu yaptırımların her birinin uygulanmasına karar verilir."
+    },
+    {
+      "citation": 574,
+      "source_id": "12328001-2f21-407e-b230-7d50a8dbf28f",
+      "chunk_id": "rc_ae085cae672dd84da16105ef139d4a722c8e1d2d",
+      "text_hash": "243cd672a382b22615311e5d243801286e005c463641de63ff4b789cbd611e10",
+      "metadata": {
+        "title": "İhracat Mevzuatı/Kanun, Kararname, Yönetmelik, Tebliğ, Genelge/gumruk_kanunu_.md",
+        "document_date": "1999-10-27",
+        "document_type": "kanun",
+        "read_as_of_date": "2026-10-12",
+        "version_unknown": true,
+        "provision_identifiers": [
+          "madde 10/a",
+          "madde 10"
+        ],
+        "legal_dates": [
+          "1999-10-27",
+          "1999-11-04"
+        ],
+        "article_no": "10",
+        "clause_label": null,
+        "paragraph_no": "2",
+        "heading_path": [
+          "4458 SAYILI GÜMRÜK KANUNU",
+          "Genel Hükümler",
+          "İKİNCİ BÖLÜM",
+          "MADDE 10 - Diğer Hükümler",
+          "2. Gümrük mevzuatının öngördüğü uygulamaların, hangi hallerde ve hangi koşullar altında ba..."
+        ]
+      },
+      "text": "**MADDE 10/A-** 1. Gümrük idareleri, mevzuatın belirlediği şartlar çerçevesinde, Türkiye Gümrük Bölgesi ile diğer ülkeler arasında taşınan eşyanın giriş, çıkış, transit, aktarma ve nihai kullanımını ve serbest dolaşımda bulunmayan eşyanın durumunu düzenleyen gümrük mevzuatı ve diğer mevzuatın doğru uygulanmasını sağlamak için gerekli görülen gümrük kontrollerini yerine getirir. Uluslararası bir anlaşmanın öngörmesi halinde, mevzuatın doğru bir şekilde uygulanmasına yönelik gümrük kontrolleri başka bir ülkede de yürütülebilir."
+    },
+    {
+      "citation": 575,
+      "source_id": "12328001-2f21-407e-b230-7d50a8dbf28f",
+      "chunk_id": "rc_1702d0ea95d13a657416b9d0c86179168de8b373",
+      "text_hash": "cbf84fb284c564f1478cc0406acac67c2ff184ea2f25dbdac5311658093dbc2d",
+      "metadata": {
+        "title": "İhracat Mevzuatı/Kanun, Kararname, Yönetmelik, Tebliğ, Genelge/gumruk_kanunu_.md",
+        "document_date": "1999-10-27",
+        "document_type": "kanun",
+        "read_as_of_date": "2026-10-12",
+        "version_unknown": true,
+        "provision_identifiers": [
+          "madde 10"
+        ],
+        "legal_dates": [
+          "1999-10-27",
+          "1999-11-04"
+        ],
+        "article_no": "10",
+        "clause_label": null,
+        "paragraph_no": "2",
+        "heading_path": [
+          "4458 SAYILI GÜMRÜK KANUNU",
+          "Genel Hükümler",
+          "İKİNCİ BÖLÜM",
+          "MADDE 10 - Diğer Hükümler",
+          "2. Ani ve rastgele yapılanlar dışındaki gümrük kontrolleri"
+        ]
+      },
+      "text": "2. Ani ve rastgele yapılanlar dışındaki gümrük kontrolleri; risklerin tespiti ve risk derecesinin ölçülmesi ile ulusal ve gerekli görüldüğü takdirde uluslararası düzeyde riskleri değerlendirerek gerekli önlemleri oluşturmak amacıyla bilgisayarlı veri işleme tekniklerini kullanan risk analizi esas alınarak yapılır."
+    },
+    {
+      "citation": 477,
+      "source_id": "75a82b64-d74c-4c69-852e-b189cef210cb",
+      "chunk_id": "rc_808cb96d6b57934c8ef8fcaa7299299111e40cb0",
+      "text_hash": "afda8b6b32c26dae833157a5155e61d335e6915b22d0c8605d2df45f17c8ce27",
+      "text": "**MADDE 8.-** (1) Organ veya temsilcilik görevi yapan ya da organ veya temsilci olmamakla birlikte, tüzel kişinin faaliyeti çerçevesinde görev üstlenen kişinin bu görevi kapsamında işlemiş bulunduğu kabahatten dolayı tüzel kişi hakkında da idarî yaptırım uygulanabilir.",
+      "metadata": {
+        "title": "Diğer Kanunlar/5326_sayili_kanun.md",
+        "document_date": null,
+        "document_type": "kanun",
+        "read_as_of_date": "2026-10-12",
+        "version_unknown": true,
+        "provision_identifiers": [
+          "madde 8"
+        ],
+        "legal_dates": [
+          "2005-03-30",
+          "2005-03-31"
+        ],
+        "article_no": null,
+        "clause_label": null,
+        "paragraph_no": null,
+        "heading_path": [
+          "KABAHATLER KANUNU",
+          "Genel Hükümler",
+          "İKİNCİ BÖLÜM",
+          "Organ veya temsilcinin davranışından dolayı sorumluluk"
+        ]
+      }
+    }
+  ],
+  "provenance": "Frozen 5077 canonical originals captured 2026-10-12; historical citation numbers are fixture navigation only."
+}
