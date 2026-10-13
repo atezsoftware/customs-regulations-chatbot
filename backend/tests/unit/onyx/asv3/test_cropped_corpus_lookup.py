@@ -427,6 +427,20 @@ def prepare_numeric_lookup(
         )
     )
     monkeypatch.setattr(asv3_corpus, "read_source_chunks", read)
+    monkeypatch.setattr(
+        asv3_corpus,
+        "_read_identity_heads_batch",
+        lambda **kwargs: {
+            candidate.id: read(
+                session,
+                user=kwargs["user"],
+                filters=kwargs["filters"],
+                source_id=candidate.id,
+                limit=2,
+            )[1]
+            for candidate in kwargs["sources"]
+        },
+    )
     return session, read
 
 

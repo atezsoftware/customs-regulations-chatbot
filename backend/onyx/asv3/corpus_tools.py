@@ -286,6 +286,11 @@ class CorpusBroker:
                 allow_reversed_numbered_title_fallback=(
                     parallel_execution_enabled(context)
                 ),
+                check_active=(
+                    context.check_active
+                    if context.services.get("asv3_exp_cropped") is True
+                    else None
+                ),
             )
 
     def related_catalog_sources(

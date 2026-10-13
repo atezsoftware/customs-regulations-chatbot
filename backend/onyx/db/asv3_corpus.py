@@ -1377,6 +1377,75 @@ def _find_sources_with_title_queries(
     return retained, len(records) > limit
 
 
+def _read_identity_heads_batch(
+    *,
+    user: User,
+    filters: IndexFilters,
+    sources: list[CorpusSource],
+    check_active: Callable[[], None],
+) -> dict[UUID, list[CorpusChunk]]:
+    """Read identical two-original identity pages with operation-local fences."""
+    if not sources:
+        return {}
+    expected = {source.id: source for source in sources}
+    if len(expected) != len(sources):
+        raise CorpusScopeUnavailable("Identity candidates have duplicate source IDs.")
+    source_ids = tuple(expected)
+    check_active()
+    observation = observe_publication_read()
+    with get_session_with_current_tenant() as session:
+        current = _require_exact_sources(
+            session,
+            user=user,
+            filters=filters,
+            source_ids=source_ids,
+            check_active=check_active,
+        )
+        if current != expected:
+            raise CorpusScopeUnavailable(
+                "Source identity changed before title reading."
+            )
+        require_publication_files(observation, source_ids)
+
+    def read_head(source_id: UUID) -> tuple[UUID, list[CorpusChunk]]:
+        check_active()
+        with get_session_with_current_tenant() as session:
+            index = resolve_source_query_index(session, source_id)
+            chunks, _ = _read_source_chunk_page(
+                session,
+                filters=filters,
+                source_id=source_id,
+                start=0,
+                limit=2,
+                query_indexes={source_id: index} if index is not None else None,
+            )
+        check_active()
+        return source_id, chunks
+
+    pages = typing_cast(
+        list[tuple[UUID, list[CorpusChunk]]],
+        run_functions_tuples_in_parallel(
+            [(read_head, (source_id,)) for source_id in source_ids], max_workers=4
+        ),
+    )
+    check_active()
+    with get_session_with_current_tenant() as session:
+        current = _require_exact_sources(
+            session,
+            user=user,
+            filters=filters,
+            source_ids=source_ids,
+            check_active=check_active,
+        )
+        if current != expected:
+            raise CorpusScopeUnavailable(
+                "Source identity changed during title reading."
+            )
+        require_publication_files(observation, source_ids)
+    check_active()
+    return dict(pages)
+
+
 def find_sources(
     session: Session,
     *,
@@ -1389,6 +1458,7 @@ def find_sources(
     allow_numbered_title_fallback: bool = False,
     allow_reversed_numbered_title_fallback: bool = False,
     allow_canonical_filename_fallback: bool = False,
+    check_active: Callable[[], None] | None = None,
 ) -> tuple[list[CorpusSource], bool]:
     """Resolve scoped titles; an opted-in formal fallback verifies canonical identity."""
     sources, more = _find_sources_with_title_queries(
@@ -1443,11 +1513,26 @@ def find_sources(
         limit=limit,
         basename_only=True,
     )
+    heads = (
+        _read_identity_heads_batch(
+            user=user,
+            filters=filters,
+            sources=candidates,
+            check_active=check_active or (lambda: None),
+        )
+        if allow_canonical_filename_fallback is True
+        else None
+    )
     verified = [
         source
         for source in candidates
         if _source_has_numbered_law_identity(
-            session, user=user, filters=filters, source=source, identity=identity
+            session,
+            user=user,
+            filters=filters,
+            source=source,
+            identity=identity,
+            **({"originals": heads[source.id]} if heads is not None else {}),
         )
     ]
     if verified or more or not allow_canonical_filename_fallback:
@@ -1465,11 +1550,22 @@ def find_sources(
     )
     if more:
         return [], True
+    heads = _read_identity_heads_batch(
+        user=user,
+        filters=filters,
+        sources=candidates,
+        check_active=check_active or (lambda: None),
+    )
     verified = [
         candidate
         for candidate in candidates
         if _source_has_numeric_filename_law_identity(
-            session, user=user, filters=filters, source=candidate, identity=identity
+            session,
+            user=user,
+            filters=filters,
+            source=candidate,
+            identity=identity,
+            originals=heads[candidate.id],
         )
     ]
     return verified[offset : offset + limit], len(verified) > offset + limit
@@ -1492,20 +1588,23 @@ def _source_has_numeric_filename_law_identity(
     filters: IndexFilters,
     source: CorpusSource,
     identity: NumberedLawTitle,
+    originals: list[CorpusChunk] | None = None,
 ) -> bool:
     translation = str.maketrans("ÇĞİÖŞÜÂÎÛçğıöşüâîû", "CGIOSUAIUcgiosuaiu")
     basename = source.name.rsplit("/", 1)[-1].translate(translation).lower()
     if re.fullmatch(_numeric_law_basename_pattern(identity.number), basename) is None:
         return False
-    index = resolve_source_query_index(session, source.id)
-    _, chunks, _ = read_source_chunks(
-        session,
-        user=user,
-        filters=filters,
-        source_id=source.id,
-        limit=2,
-        query_indexes={source.id: index} if index is not None else None,
-    )
+    chunks = originals
+    if chunks is None:
+        index = resolve_source_query_index(session, source.id)
+        _, chunks, _ = read_source_chunks(
+            session,
+            user=user,
+            filters=filters,
+            source_id=source.id,
+            limit=2,
+            query_indexes={source.id: index} if index is not None else None,
+        )
     for chunk in chunks:
         if (
             chunk.source_id != source.id
@@ -1555,17 +1654,20 @@ def _source_has_numbered_law_identity(
     filters: IndexFilters,
     source: CorpusSource,
     identity: NumberedLawTitle,
+    originals: list[CorpusChunk] | None = None,
 ) -> bool:
     # Own canonical metadata is identity evidence; a law quoted in text is not.
-    index = resolve_source_query_index(session, source.id)
-    _, chunks, _ = read_source_chunks(
-        session,
-        user=user,
-        filters=filters,
-        source_id=source.id,
-        limit=2,
-        query_indexes={source.id: index} if index is not None else None,
-    )
+    chunks = originals
+    if chunks is None:
+        index = resolve_source_query_index(session, source.id)
+        _, chunks, _ = read_source_chunks(
+            session,
+            user=user,
+            filters=filters,
+            source_id=source.id,
+            limit=2,
+            query_indexes={source.id: index} if index is not None else None,
+        )
     if not chunks:
         return False
     for chunk in chunks:
@@ -1671,6 +1773,33 @@ def read_source_chunks(
         raise ValueError("Chunk pages require start >= 0 and limit 1..100.")
     source = require_source(session, user=user, filters=filters, source_id=source_id)
     observation = observe_publication_read()
+    chunks, has_more = _read_source_chunk_page(
+        session,
+        filters=filters,
+        source_id=source_id,
+        start=start,
+        limit=limit,
+        query_indexes=query_indexes,
+        historical_inventory=historical_inventory,
+    )
+    chunks = filter_publication_read(
+        observation, chunks, lambda row: str(row.source_id)
+    )
+    require_publication_files(observation, (source_id,))
+    return source, chunks, has_more
+
+
+def _read_source_chunk_page(
+    session: Session,
+    *,
+    filters: IndexFilters,
+    source_id: UUID,
+    start: int,
+    limit: int,
+    query_indexes: dict[UUID, PublicationIndexSnapshot] | None,
+    historical_inventory: bool = False,
+) -> tuple[list[CorpusChunk], bool]:
+    """Internal page reader; callers own live source and publication fences."""
     if source_id in qualified_file_ids(session, (source_id,)):
         if historical_inventory:
             raise CorpusScopeUnavailable(
@@ -1766,11 +1895,7 @@ def read_source_chunks(
             )
             for row in rows[:limit]
         ]
-    chunks = filter_publication_read(
-        observation, chunks, lambda row: str(row.source_id)
-    )
-    require_publication_files(observation, (source_id,))
-    return source, chunks, has_more
+    return chunks, has_more
 
 
 def source_diagnostic(
