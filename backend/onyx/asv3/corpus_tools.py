@@ -1710,6 +1710,19 @@ def build_corpus_specs(
         )
 
     def text_search(args: dict[str, JsonValue], context: RunContext) -> ToolOutcome:
+        read_scope = getattr(broker, "verified_provision_read", None)
+        with (
+            read_scope(str(args["source_id"]), context)
+            if context.services.get("asv3_exp_cropped") is True
+            and context.services.get("asv3_exp_cheap") is not True
+            and callable(read_scope)
+            else nullcontext()
+        ):
+            return text_search_body(args, context)
+
+    def text_search_body(
+        args: dict[str, JsonValue], context: RunContext
+    ) -> ToolOutcome:
         pattern = str(args["pattern"])
         if not pattern or len(pattern) > 512:
             raise ValueError("Pattern must contain 1..512 characters.")
