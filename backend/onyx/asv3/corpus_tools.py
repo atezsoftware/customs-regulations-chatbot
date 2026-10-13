@@ -5,7 +5,8 @@ import difflib
 import json
 import re
 import time
-from collections.abc import Callable, Generator, Iterator
+from collections.abc import Callable, Generator, Iterable, Iterator
+from contextlib import contextmanager, nullcontext
 from datetime import date
 from hashlib import sha256
 from itertools import islice
@@ -40,6 +41,7 @@ from onyx.db.asv3_candidate_inventory import current_asv3_source_inventory_scope
 from onyx.db.asv3_corpus import (
     CorpusChunk,
     CorpusScopeUnavailable,
+    CorpusSearchCenterRead,
     CorpusSource,
     find_related_sources,
     find_sources,
@@ -52,6 +54,7 @@ from onyx.db.asv3_corpus import (
     source_diagnostic,
     source_provision_position,
     source_sibling_ids,
+    verified_source_operation,
 )
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.db.models import User
@@ -93,6 +96,36 @@ SOURCE_FIELD: dict[str, JsonValue] = {
     "format": "uuid",
     "description": "Canonical authorized source_id returned by resolve_source.",
 }
+
+
+def _verify_retained_canonical_chunks(
+    originals: Iterable[CorpusChunk], retained: dict[str, list[EvidenceItem]]
+) -> int:
+    seen: set[str] = set()
+    for current in originals:
+        if current.id in seen or current.id not in retained:
+            raise CorpusScopeUnavailable(
+                "Retained evidence has ambiguous canonical bindings."
+            )
+        digest = sha256(current.text.encode("utf-8")).hexdigest()
+        for item in retained[current.id]:
+            if current.text != item.text or digest != item.text_hash:
+                raise CorpusScopeUnavailable(
+                    "Evidence changed or is outside the captured legal snapshot."
+                )
+            if (
+                item.search_doc is not None
+                and current.projection_ordinal != item.search_doc.chunk_ind
+            ):
+                raise CorpusScopeUnavailable(
+                    "Retained citation ordinal changed in its source snapshot."
+                )
+        seen.add(current.id)
+    if seen != retained.keys():
+        raise CorpusScopeUnavailable(
+            "Retained evidence chunk no longer exists in its source."
+        )
+    return len(seen)
 
 
 class ChunkScan:
@@ -285,6 +318,11 @@ class CorpusBroker:
                 ),
                 allow_reversed_numbered_title_fallback=(
                     parallel_execution_enabled(context)
+                ),
+                check_active=(
+                    context.check_active
+                    if context.services.get("asv3_exp_cropped") is True
+                    else None
                 ),
             )
 
@@ -605,6 +643,54 @@ class CorpusBroker:
                 ),
             )
 
+    @contextmanager
+    def verified_provision_read(
+        self, source_id: str, context: RunContext
+    ) -> Generator[None, None, None]:
+        if context.services.get("asv3_exp_cropped") is not True:
+            yield
+            return
+        identifier = UUID(source_id)
+        with verified_source_operation(
+            user=self.user,
+            filters=self.filters,
+            source_id=identifier,
+            check_active=context.check_active,
+        ) as operation:
+            if operation is None:
+                yield
+                return
+            scope = current_asv3_source_inventory_scope()
+            captured = None
+            if scope is not None:
+                with scope.lock:
+                    captured = scope.query_indexes.get(identifier)
+            with self._index_lock:
+                previous = self.query_indexes.get(identifier)
+                for known in (captured, previous):
+                    if known is not None and (
+                        operation.index is None
+                        or not known.matches_temporal_index(operation.index)
+                    ):
+                        raise CorpusScopeUnavailable(
+                            "Provision source index differs from captured authority."
+                        )
+                if operation.index is not None:
+                    self.query_indexes[identifier] = operation.index.model_copy(
+                        deep=True
+                    )
+            yield
+            with self._index_lock:
+                current = self.query_indexes.get(identifier)
+                if (current is None) != (operation.index is None) or (
+                    current is not None
+                    and operation.index is not None
+                    and not current.matches_temporal_index(operation.index)
+                ):
+                    raise CorpusScopeUnavailable(
+                        "Provision source index changed during reading."
+                    )
+
     def provision_start(
         self, source_id: str, article: str, qualifier: str | None, context: RunContext
     ) -> int | None:
@@ -697,46 +783,25 @@ class CorpusBroker:
                             context.services.get("asv3_exp_cropped") is True
                         ),
                     )
-                    seen: set[str] = set()
                     try:
-                        for current in originals:
-                            if current.id in seen or current.id not in retained:
-                                raise CorpusScopeUnavailable(
-                                    "Retained evidence has ambiguous canonical bindings."
-                                )
-                            digest = sha256(current.text.encode("utf-8")).hexdigest()
-                            for item in retained[current.id]:
-                                if (
-                                    current.text != item.text
-                                    or digest != item.text_hash
-                                ):
-                                    raise CorpusScopeUnavailable(
-                                        "Evidence changed or is outside the captured legal snapshot."
-                                    )
-                                if (
-                                    item.search_doc is not None
-                                    and current.projection_ordinal
-                                    != item.search_doc.chunk_ind
-                                ):
-                                    raise CorpusScopeUnavailable(
-                                        "Retained citation ordinal changed in its source snapshot."
-                                    )
-                            seen.add(current.id)
+                        verified_count = _verify_retained_canonical_chunks(
+                            originals, retained
+                        )
                     finally:
                         originals.close()
-                    if seen != retained.keys():
-                        raise CorpusScopeUnavailable(
-                            "Retained evidence chunk no longer exists in its source."
-                        )
-                step.output_value = {"verified_chunk_count": len(seen)}
+                step.output_value = {"verified_chunk_count": verified_count}
 
-        run_functions_tuples_in_parallel(
-            [
-                (revalidate_source, (source_id, as_of, group))
-                for (source_id, as_of), group in canonical.items()
-            ],
-            max_workers=4,
-        )
+        if context.services.get("asv3_exp_cropped") is True:
+            self._revalidate_canonical_batch(canonical, context)
+        else:
+            run_functions_tuples_in_parallel(
+                [
+                    (revalidate_source, (source_id, as_of, group))
+                    for (source_id, as_of), group in canonical.items()
+                ],
+                max_workers=4,
+            )
+
         for item in native:
             from onyx.asv3.source_tools import read_verified_original, source_slot
 
@@ -749,6 +814,41 @@ class CorpusBroker:
                         "Original source changed after extraction."
                     )
                 del content
+
+    def _revalidate_canonical_batch(
+        self,
+        canonical: dict[tuple[str, date | None], list[EvidenceItem]],
+        context: RunContext,
+    ) -> None:
+        dated: dict[date | None, dict[UUID, dict[str, list[EvidenceItem]]]] = {}
+        for (source_id, as_of), group in canonical.items():
+            retained = dated.setdefault(as_of, {}).setdefault(UUID(source_id), {})
+            for item in group:
+                assert item.chunk_id is not None
+                retained.setdefault(item.chunk_id, []).append(item)
+        for as_of, sources in dated.items():
+            context.check_active()
+            with graph_step(
+                "asv3.canonical_revalidation.batch",
+                {
+                    "as_of_date": str(as_of or "current"),
+                    "source_count": len(sources),
+                    "retained_chunk_count": sum(len(rows) for rows in sources.values()),
+                },
+            ) as step:
+                reads = self._read_canonical_packet(
+                    {source_id: tuple(rows) for source_id, rows in sources.items()},
+                    self.filters.model_copy(update={"as_of_date": as_of}),
+                    context,
+                )
+                verified = 0
+                for source_id, retained in sources.items():
+                    context.check_active()
+                    verified += _verify_retained_canonical_chunks(
+                        reads[source_id].chunks, retained
+                    )
+                context.check_active()
+                step.output_value = {"verified_chunk_count": verified}
 
     def attach_native_citation(
         self, item: EvidenceItem, number: int, message_id: int, context: RunContext
@@ -923,15 +1023,12 @@ class CorpusBroker:
             hydrated.update(result)
         return hydrated
 
-    def _hydrate_search_centers_batch(
-        self, grouped: dict[str, list[SearchDoc]], context: RunContext
-    ) -> dict[tuple[str, int], list[EvidenceItem]]:
-        requests = {
-            UUID(source_id): tuple(
-                str(doc.metadata["regulatory_chunk_id"]) for doc in centers
-            )
-            for source_id, centers in grouped.items()
-        }
+    def _read_canonical_packet(
+        self,
+        requests: dict[UUID, tuple[str, ...]],
+        filters: IndexFilters,
+        context: RunContext,
+    ) -> dict[UUID, CorpusSearchCenterRead]:
         scope = current_asv3_source_inventory_scope()
         captured: dict[UUID, PublicationIndexSnapshot] = {}
         if scope is not None:
@@ -956,7 +1053,7 @@ class CorpusBroker:
             indexes[source_id] = index
         reads = read_search_centers_batch(
             user=self.user,
-            filters=self.filters,
+            filters=filters,
             source_chunk_ids=requests,
             query_indexes=indexes,
             check_active=context.check_active,
@@ -973,6 +1070,18 @@ class CorpusBroker:
                         )
                     self.query_indexes[source_id] = read.index
         context.check_active()
+        return reads
+
+    def _hydrate_search_centers_batch(
+        self, grouped: dict[str, list[SearchDoc]], context: RunContext
+    ) -> dict[tuple[str, int], list[EvidenceItem]]:
+        requests = {
+            UUID(source_id): tuple(
+                str(doc.metadata["regulatory_chunk_id"]) for doc in centers
+            )
+            for source_id, centers in grouped.items()
+        }
+        reads = self._read_canonical_packet(requests, self.filters, context)
         hydrated: dict[tuple[str, int], list[EvidenceItem]] = {}
         for source_id, centers in grouped.items():
             read = reads[UUID(source_id)]
@@ -1411,6 +1520,15 @@ def build_corpus_specs(
         )
 
     def provision(args: dict[str, JsonValue], context: RunContext) -> ToolOutcome:
+        read_scope = getattr(broker, "verified_provision_read", None)
+        with (
+            read_scope(str(args["source_id"]), context)
+            if context.services.get("asv3_exp_cropped") is True and callable(read_scope)
+            else nullcontext()
+        ):
+            return provision_body(args, context)
+
+    def provision_body(args: dict[str, JsonValue], context: RunContext) -> ToolOutcome:
         from onyx.asv3.cropped_corpus_identity import (
             InsertedArticleRead,
             verified_inserted_article_opening,
@@ -1592,6 +1710,19 @@ def build_corpus_specs(
         )
 
     def text_search(args: dict[str, JsonValue], context: RunContext) -> ToolOutcome:
+        read_scope = getattr(broker, "verified_provision_read", None)
+        with (
+            read_scope(str(args["source_id"]), context)
+            if context.services.get("asv3_exp_cropped") is True
+            and context.services.get("asv3_exp_cheap") is not True
+            and callable(read_scope)
+            else nullcontext()
+        ):
+            return text_search_body(args, context)
+
+    def text_search_body(
+        args: dict[str, JsonValue], context: RunContext
+    ) -> ToolOutcome:
         pattern = str(args["pattern"])
         if not pattern or len(pattern) > 512:
             raise ValueError("Pattern must contain 1..512 characters.")
