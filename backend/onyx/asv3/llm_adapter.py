@@ -3755,6 +3755,7 @@ class ResearchModel:
 
     def _publication_source_acquisition(self, view: HarnessView) -> Decision | None:
         """Acquire missing originals for retained publication obligations, not approval."""
+        from onyx.asv3.article_bindings import bound_identity_ledger
         from onyx.asv3.governing_acquisitions import (
             GoverningOriginalAcquisitions,
             governing_original_targets,
@@ -3770,7 +3771,10 @@ class ResearchModel:
             or not isinstance(ledger, EvidenceLedger)
         ):
             return None
-        references = cited_lower_statute_references(view.draft_to_repair, ledger)
+        identity_ledger = bound_identity_ledger(ledger, self.context)
+        references = cited_lower_statute_references(
+            view.draft_to_repair, identity_ledger
+        )
         definitions = {
             function["name"]: function.get("parameters")
             for tool in view.tools
@@ -3782,7 +3786,7 @@ class ResearchModel:
         episodes = self.context.services.get("tuned_governing_acquisitions")
         if isinstance(episodes, GoverningOriginalAcquisitions):
             for target in governing_original_targets(view.publication_gap):
-                call = episodes.next_call(target, self.context, ledger)
+                call = episodes.next_call(target, self.context, identity_ledger)
                 if call is None:
                     continue
                 parameters = definitions.get(call.name)

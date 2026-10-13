@@ -195,12 +195,37 @@ def _own_article_witness(
     )
 
 
+@dataclass(frozen=True)
+class ArticleParagraphBinding:
+    citation: int
+    source_id: str
+    chunk_id: str
+    text_hash: str
+    article_no: str
+    qualifier: str | None
+    paragraph_no: str
+
+
 class _IdentityLedger(EvidenceLedger):
     """Read-only projection; canonical items and physical deliveries stay owned."""
 
-    def __init__(self, ledger: EvidenceLedger) -> None:
+    def __init__(
+        self,
+        ledger: EvidenceLedger,
+        article_bindings: dict[int, ArticleParagraphBinding] | None = None,
+    ) -> None:
         super().__init__()
         self._source = ledger
+        self.article_bindings = dict(article_bindings or {})
+        for number, binding in self.article_bindings.items():
+            item = ledger.get(number)
+            if (
+                binding.citation != number
+                or item is None
+                or item.identity
+                != (binding.source_id, binding.chunk_id, binding.text_hash)
+            ):
+                raise ValueError("Changed ordered article binding")
         self.witnesses: dict[int, ArticleIdentityWitness] = {}
         for row in _native_original_rows(ledger):
             citation = row.get("citation")
@@ -224,6 +249,19 @@ class _IdentityLedger(EvidenceLedger):
         for row in self._source.authority_metadata():
             citation = row.get("citation")
             witness = self.witnesses.get(citation) if type(citation) is int else None
+            binding = (
+                self.article_bindings.get(citation) if type(citation) is int else None
+            )
+            if binding is not None:
+                result.append(
+                    {
+                        **row,
+                        "article_no": binding.article_no,
+                        "article_qualifier": binding.qualifier,
+                        "paragraph_no": binding.paragraph_no,
+                    }
+                )
+                continue
             result.append(
                 {
                     **row,
@@ -236,9 +274,17 @@ class _IdentityLedger(EvidenceLedger):
         return result
 
 
-def canonical_identity_ledger(ledger: EvidenceLedger) -> EvidenceLedger:
+def canonical_identity_ledger(
+    ledger: EvidenceLedger,
+    *,
+    article_bindings: dict[int, ArticleParagraphBinding] | None = None,
+) -> EvidenceLedger:
     """Project verified own-article identity without changing originals or receipts."""
-    return ledger if isinstance(ledger, _IdentityLedger) else _IdentityLedger(ledger)
+    return (
+        ledger
+        if isinstance(ledger, _IdentityLedger) and article_bindings is None
+        else _IdentityLedger(ledger, article_bindings)
+    )
 
 
 def normalize_canonical_authority_references(answer: str) -> str:
@@ -322,12 +368,19 @@ def _recovered_paragraph_gaps(
             matching = _matching_native_rows(
                 reference, name, rows, clause_specific=syntactic_reference_binding
             )
-            if not any(number in ledger.witnesses for number in matching):
+            if not any(
+                number in ledger.witnesses or number in ledger.article_bindings
+                for number in matching
+            ):
                 continue
             proven: list[int] = []
             for number in matching:
                 item = ledger.get(number)
-                if number not in ledger.witnesses or (
+                binding = ledger.article_bindings.get(number)
+                if binding is not None:
+                    if binding.paragraph_no == reference.paragraph:
+                        proven.append(number)
+                elif number not in ledger.witnesses or (
                     item is not None
                     and reference.paragraph in _recovered_paragraphs(item)
                 ):
@@ -472,15 +525,23 @@ def canonical_cited_lower_statute_gap(
                 ):
                     continue
                 matching = _matching_native_rows(reference, name, rows)
-                if not any(number in identity.witnesses for number in matching):
+                if not any(
+                    number in identity.witnesses or number in identity.article_bindings
+                    for number in matching
+                ):
                     continue
                 proven = [
                     number
                     for number in matching
-                    if number not in identity.witnesses
-                    or (
-                        (original := identity.get(number)) is not None
-                        and reference.paragraph in _recovered_paragraphs(original)
+                    if (
+                        identity.article_bindings[number].paragraph_no
+                        == reference.paragraph
+                        if number in identity.article_bindings
+                        else number not in identity.witnesses
+                        or (
+                            (original := identity.get(number)) is not None
+                            and reference.paragraph in _recovered_paragraphs(original)
+                        )
                     )
                 ]
                 if delivered.intersection(proven):
@@ -592,7 +653,9 @@ def canonical_matching_originals(probe: str, ledger: EvidenceLedger) -> list[int
         if (
             (item := identity.get(number)) is not None
             and (
-                reference.paragraph in _recovered_paragraphs(item)
+                identity.article_bindings[number].paragraph_no == reference.paragraph
+                if number in identity.article_bindings
+                else reference.paragraph in _recovered_paragraphs(item)
                 if number in identity.witnesses
                 else str(paragraphs.get(number)) == reference.paragraph
             )

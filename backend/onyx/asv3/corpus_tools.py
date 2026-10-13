@@ -1174,6 +1174,8 @@ def build_corpus_specs(
         )
 
     def read_range(args: dict[str, JsonValue], context: RunContext) -> ToolOutcome:
+        from onyx.asv3.article_bindings import ordered_source_read_data
+
         source, chunks, more = broker.page(
             str(args["source_id"]),
             context,
@@ -1197,6 +1199,7 @@ def build_corpus_specs(
                 "source_name": source.name,
                 "has_more": more or clipped,
                 "next_position": next_position,
+                **ordered_source_read_data(evidence, context),
             },
             evidence=evidence,
         )
@@ -1273,6 +1276,8 @@ def build_corpus_specs(
         )
 
     def provision(args: dict[str, JsonValue], context: RunContext) -> ToolOutcome:
+        from onyx.asv3.article_bindings import ordered_source_read_data
+
         requested = article_references(str(args["article"]))
         if len(requested) != 1:
             return ToolOutcome(
@@ -1348,6 +1353,7 @@ def build_corpus_specs(
                 "next_position": stream.next_position,
                 "evidence_next_position": selection.next_position,
                 "absence_proven": False,
+                **ordered_source_read_data(evidence, context),
                 **(
                     {"related_source_candidates": related}
                     if related is not None
