@@ -1,0 +1,382 @@
+{
+  "message_id": 5309,
+  "records": [
+    {
+      "citation": 126,
+      "item": {
+        "source_id": "fcd8662d-f8fe-4efe-a81f-7de42a151d60",
+        "text": "**MADDE 9. -** Yurt dışından ham petrol ve akaryakıt temin edeceklerin rafinerici veya dağıtıcı veya ihrakiye teslim şirketi lisansına sahip olması gereklidir. Türkiye'de ham petrol üretimi yapan üreticiler, düşük gravite yerli üretim ham petrol ile karıştırılacak miktarda ham petrol ithalatı yapabilirler. Ham petrol ve akaryakıt ithalatı miktar ve belirli teknik ölçümleri yapabilecek donanıma sahip yetkili gümrük idarelerinden yapılır. Dağıtıcılarca yapılacak akaryakıt ithalatı, ilgilinin lisansında yer alan alt başlık kapsamındaki akaryakıtlarla sınırlıdır ve Kuruma bayi bilgileriyle birlikte verilen pazarlama projeksiyonu ile uyumlu olduğu bildirildikten sonra yapılabilir. Dağıtıcılar arası akaryakıt ticareti Kurulun iznine bağlıdır. Dağıtıcılar, herhangi bir dağıtıcıdan aldıkları akaryakıtı başka bir dağıtıcıya satamazlar. Ham petrolün yurt içinde ticareti; sadece rafinerici ve üreticilerce ve birbirleri arasında yapılabilir.",
+        "chunk_id": "rc_57a9d936a89b37de3b3bb65480b3503fab8ee238",
+        "search_doc": {
+          "document_id": "fcd8662d-f8fe-4efe-a81f-7de42a151d60",
+          "chunk_ind": 105,
+          "semantic_identifier": "Diğer Kanunlar/5015_sayili_kanun.md",
+          "link": null,
+          "blurb": "**MADDE 9. -** Yurt dışından ham petrol ve akaryakıt temin edeceklerin rafinerici veya dağıtıcı veya ihrakiye teslim şirketi lisansına sahip olması gereklidir. Türkiye'de ham petrol üretimi yapan üreticiler, düşük gravite yerli üretim ham p",
+          "source_type": "file",
+          "boost": 0,
+          "hidden": false,
+          "metadata": {
+            "regulatory_chunk_id": "rc_57a9d936a89b37de3b3bb65480b3503fab8ee238",
+            "regulatory_heading_path": [
+              "PETROL PİYASASI KANUNU",
+              "Genel Hükümler",
+              "ÜÇÜNCÜ BÖLÜM",
+              "Faaliyetlerin kısıtlanması"
+            ],
+            "regulatory_validity_start_date": "",
+            "regulatory_validity_end_date": ""
+          },
+          "score": null,
+          "is_relevant": null,
+          "relevance_explanation": null,
+          "match_highlights": [],
+          "updated_at": null,
+          "primary_owners": null,
+          "secondary_owners": null,
+          "is_internet": false,
+          "file_id": "9ff77192-7f7e-4404-bc17-350efbddc6b4"
+        },
+        "question_ids": [],
+        "metadata": {
+          "position": 105,
+          "heading_path": [
+            "PETROL PİYASASI KANUNU",
+            "Genel Hükümler",
+            "ÜÇÜNCÜ BÖLÜM",
+            "Faaliyetlerin kısıtlanması"
+          ],
+          "validity_start": null,
+          "validity_end": null,
+          "version_unknown": true,
+          "canonical_metadata": {
+            "document_id": "fcd8662d-f8fe-4efe-a81f-7de42a151d60",
+            "chunk_index": 105,
+            "title": "Diğer Kanunlar/5015_sayili_kanun.md",
+            "source_type": "user_file",
+            "semantic_identifier": "Diğer Kanunlar/5015_sayili_kanun.md — PETROL PİYASASI KANUNU > Genel Hükümler > ÜÇÜNCÜ BÖLÜM > Faaliyetlerin kısıtlanması",
+            "source_links": "{\"0\": \"\"}",
+            "document_sets": [
+              "PC Külliyatı"
+            ],
+            "regulatory_chunk_id": "rc_57a9d936a89b37de3b3bb65480b3503fab8ee238",
+            "heading_path": [
+              "PETROL PİYASASI KANUNU",
+              "Genel Hükümler",
+              "ÜÇÜNCÜ BÖLÜM",
+              "Faaliyetlerin kısıtlanması"
+            ],
+            "provision_identifiers": [
+              "madde 9"
+            ],
+            "legal_dates": [
+              "2003-12-04",
+              "2003-12-20"
+            ],
+            "article_no": null,
+            "clause_label": null,
+            "paragraph_no": null,
+            "article_title": null,
+            "chunk_variant": "atomic",
+            "document_date": null,
+            "document_type": "kanun",
+            "source_regulatory_chunk_ids": [],
+            "read_as_of_date": "2026-10-14"
+          },
+          "read_as_of_date": "2026-10-14",
+          "retrieval_method": "established_search_exact_original",
+          "article_closure_complete": false,
+          "section_context": "not_inferred",
+          "additional_context": "harness_controlled",
+          "follow_context_tool": "read_provision",
+          "retrieved_projection_ordinal": 105,
+          "retrieved_center": true
+        },
+        "text_hash": "501a4c5c66db32a229487499a5cb0ac4ccb31df3f504b98d4a3d7ffb99f3bd10"
+      }
+    },
+    {
+      "citation": 254,
+      "item": {
+        "source_id": "1f835493-d368-4a46-b309-8bdfbc9d1b0f",
+        "text": "d) Diğer ülkelerden karayolu taşıtları ile Türkiye'ye yapılan taşımaları,\nKapsar.\nTaşıma yetkisi\nMADDE 13.- 12 nci maddenin (a) bendindeki taşımaları, uluslararası ikili ve çok taraflı karayolu taşıma anlaşmalarına göre taşıma yapmaya yetkili veya Bakanlıkça izin verilmiş yabancı plakalı taşıtlar ile uluslararası taşımalar için Bakanlıktan yetki belgesi almış taşımacılara ait taşıtlarla yapılabilir.\n12 nci maddenin (b) bendindeki taşımalar, Bakanlıktan uluslar arası taşımacı yetki belgesi almış taşımacılar tarafından yapılır. Yabancı plakalı taşıtlara ise Cumhurbaşkanı kararı ile taşıma yetkisi verilebilir.",
+        "chunk_id": "rc_1b28bd1b05fb354ebae6a9c0ec3723def3097419",
+        "search_doc": {
+          "document_id": "1f835493-d368-4a46-b309-8bdfbc9d1b0f",
+          "chunk_ind": 27,
+          "semantic_identifier": "Diğer Kanunlar/4925_sayili_karayolu_tasima_kanunu.md",
+          "link": null,
+          "blurb": "d) Diğer ülkelerden karayolu taşıtları ile Türkiye'ye yapılan taşımaları,\nKapsar.\nTaşıma yetkisi\nMADDE 13.- 12 nci maddenin (a) bendindeki taşımaları, uluslararası ikili ve çok taraflı karayolu taşıma anlaşmalarına göre taşıma yapmaya yetki",
+          "source_type": "file",
+          "boost": 0,
+          "hidden": false,
+          "metadata": {
+            "regulatory_chunk_id": "rc_1b28bd1b05fb354ebae6a9c0ec3723def3097419",
+            "regulatory_heading_path": [
+              "KARAYOLU TAŞIMA KANUNU",
+              "İKİNCİ KISIM",
+              "BİRİNCİ BÖLÜM",
+              "d) Diğer ülkelerden karayolu taşıtları ile Türkiye'ye yapılan taşımaları,"
+            ],
+            "regulatory_validity_start_date": "",
+            "regulatory_validity_end_date": ""
+          },
+          "score": null,
+          "is_relevant": null,
+          "relevance_explanation": null,
+          "match_highlights": [],
+          "updated_at": null,
+          "primary_owners": null,
+          "secondary_owners": null,
+          "is_internet": false,
+          "file_id": "26411ce3-ca81-4bc2-9c51-9679256b7c82"
+        },
+        "question_ids": [],
+        "metadata": {
+          "position": 27,
+          "heading_path": [
+            "KARAYOLU TAŞIMA KANUNU",
+            "İKİNCİ KISIM",
+            "BİRİNCİ BÖLÜM",
+            "d) Diğer ülkelerden karayolu taşıtları ile Türkiye'ye yapılan taşımaları,"
+          ],
+          "validity_start": null,
+          "validity_end": null,
+          "version_unknown": true,
+          "canonical_metadata": {
+            "document_id": "1f835493-d368-4a46-b309-8bdfbc9d1b0f",
+            "chunk_index": 27,
+            "title": "Diğer Kanunlar/4925_sayili_karayolu_tasima_kanunu.md",
+            "source_type": "user_file",
+            "semantic_identifier": "Diğer Kanunlar/4925_sayili_karayolu_tasima_kanunu.md — KARAYOLU TAŞIMA KANUNU > İKİNCİ KISIM > BİRİNCİ BÖLÜM > d) Diğer ülkelerden karayolu taşıtları ile Türkiye'ye yapılan taşımaları,",
+            "source_links": "{\"0\": \"\"}",
+            "document_sets": [
+              "PC Külliyatı"
+            ],
+            "regulatory_chunk_id": "rc_1b28bd1b05fb354ebae6a9c0ec3723def3097419",
+            "heading_path": [
+              "KARAYOLU TAŞIMA KANUNU",
+              "İKİNCİ KISIM",
+              "BİRİNCİ BÖLÜM",
+              "d) Diğer ülkelerden karayolu taşıtları ile Türkiye'ye yapılan taşımaları,"
+            ],
+            "provision_identifiers": [
+              "madde 13"
+            ],
+            "legal_dates": [
+              "2003-07-10",
+              "2003-07-19"
+            ],
+            "article_no": null,
+            "clause_label": "d",
+            "paragraph_no": null,
+            "article_title": null,
+            "chunk_variant": "atomic",
+            "document_date": null,
+            "document_type": "kanun",
+            "source_regulatory_chunk_ids": [],
+            "read_as_of_date": "2026-10-14"
+          },
+          "read_as_of_date": "2026-10-14"
+        },
+        "text_hash": "03cdda5a9136250aaa4d8bf1b06647782b02f0afb169e2498f19272da1d5cc96"
+      }
+    },
+    {
+      "citation": 255,
+      "item": {
+        "source_id": "1f835493-d368-4a46-b309-8bdfbc9d1b0f",
+        "text": "Yukarıdaki fıkralarda taşıma yetkisi verilen taşıtların, hangi ülkelere hangi kara hudut kapısı, deniz limanı, hava alanı veya limanı, demiryolu istasyonu veya garından taşıma yapacağı Bakanlıkça belirlenir.\n12 nci maddenin (c) ve (d) bentlerindeki taşımalar uluslararası taşımacı yetki belgesine sahip taşımacılar ile ikili ve çok taraflı karayolu taşıma anlaşmalarına göre izin verilmiş veya Bakanlıkça özel izin belgesi verilmiş yabancı taşımacılara ait taşıtlarla yapılabilir.\nYabancı plakalı taşıtlar, Türkiye sınırları dahilindeki iki nokta arasında taşıma yapamazlar.",
+        "chunk_id": "rc_2a279a4657b2957f4bfaaf0ee2a3f6520c5d23cf",
+        "search_doc": {
+          "document_id": "1f835493-d368-4a46-b309-8bdfbc9d1b0f",
+          "chunk_ind": 28,
+          "semantic_identifier": "Diğer Kanunlar/4925_sayili_karayolu_tasima_kanunu.md",
+          "link": null,
+          "blurb": "Yukarıdaki fıkralarda taşıma yetkisi verilen taşıtların, hangi ülkelere hangi kara hudut kapısı, deniz limanı, hava alanı veya limanı, demiryolu istasyonu veya garından taşıma yapacağı Bakanlıkça belirlenir.\n12 nci maddenin (c) ve (d) bentl",
+          "source_type": "file",
+          "boost": 0,
+          "hidden": false,
+          "metadata": {
+            "regulatory_chunk_id": "rc_2a279a4657b2957f4bfaaf0ee2a3f6520c5d23cf",
+            "regulatory_heading_path": [
+              "KARAYOLU TAŞIMA KANUNU",
+              "İKİNCİ KISIM",
+              "BİRİNCİ BÖLÜM",
+              "d) Diğer ülkelerden karayolu taşıtları ile Türkiye'ye yapılan taşımaları,"
+            ],
+            "regulatory_validity_start_date": "",
+            "regulatory_validity_end_date": ""
+          },
+          "score": null,
+          "is_relevant": null,
+          "relevance_explanation": null,
+          "match_highlights": [],
+          "updated_at": null,
+          "primary_owners": null,
+          "secondary_owners": null,
+          "is_internet": false,
+          "file_id": "26411ce3-ca81-4bc2-9c51-9679256b7c82"
+        },
+        "question_ids": [],
+        "metadata": {
+          "position": 28,
+          "heading_path": [
+            "KARAYOLU TAŞIMA KANUNU",
+            "İKİNCİ KISIM",
+            "BİRİNCİ BÖLÜM",
+            "d) Diğer ülkelerden karayolu taşıtları ile Türkiye'ye yapılan taşımaları,"
+          ],
+          "validity_start": null,
+          "validity_end": null,
+          "version_unknown": true,
+          "canonical_metadata": {
+            "document_id": "1f835493-d368-4a46-b309-8bdfbc9d1b0f",
+            "chunk_index": 28,
+            "title": "Diğer Kanunlar/4925_sayili_karayolu_tasima_kanunu.md",
+            "source_type": "user_file",
+            "semantic_identifier": "Diğer Kanunlar/4925_sayili_karayolu_tasima_kanunu.md — KARAYOLU TAŞIMA KANUNU > İKİNCİ KISIM > BİRİNCİ BÖLÜM > d) Diğer ülkelerden karayolu taşıtları ile Türkiye'ye yapılan taşımaları,",
+            "source_links": "{\"0\": \"\"}",
+            "document_sets": [
+              "PC Külliyatı"
+            ],
+            "regulatory_chunk_id": "rc_2a279a4657b2957f4bfaaf0ee2a3f6520c5d23cf",
+            "heading_path": [
+              "KARAYOLU TAŞIMA KANUNU",
+              "İKİNCİ KISIM",
+              "BİRİNCİ BÖLÜM",
+              "d) Diğer ülkelerden karayolu taşıtları ile Türkiye'ye yapılan taşımaları,"
+            ],
+            "legal_dates": [
+              "2003-07-10",
+              "2003-07-19"
+            ],
+            "article_no": null,
+            "clause_label": "d",
+            "paragraph_no": null,
+            "article_title": null,
+            "chunk_variant": "atomic",
+            "document_date": null,
+            "document_type": "kanun",
+            "source_regulatory_chunk_ids": [],
+            "read_as_of_date": "2026-10-14"
+          },
+          "read_as_of_date": "2026-10-14"
+        },
+        "text_hash": "3883ecefb1fb13e7b40adf9a6ee974ce152993b1b8ea5ed0c6dda4267bb6ec62"
+      }
+    },
+    {
+      "citation": 378,
+      "item": {
+        "source_id": "1d1ddd85-2fc8-4645-a648-386128e748fb",
+        "text": "(2) Miktar ve kullanım alanı itibarıyla ticari nitelik arz etmeyen ve 50 kilogramı (50 kilogram dahil) geçmeyenler hariç olmak üzere; ham petrol, akaryakıt ve ihrakiye sayılan akaryakıtların ithalat işlemleri; Ticaret Bakanlığınca belirlenen ve miktar ölçümleri yapabilecek donanıma sahip gümrük idarelerinden yapılır.",
+        "chunk_id": "rc_c287a4f4e4a8f62cd8c82c4dc53f3789cffd2f30",
+        "search_doc": {
+          "document_id": "1d1ddd85-2fc8-4645-a648-386128e748fb",
+          "chunk_ind": 73,
+          "semantic_identifier": "Kararname ve Mahkeme Kararları/epdk_2024-13070_ham_petrol_akaryakit_ihrakiye_madeni_yag_baz_yag_ve_petrolle_iliskili_maddelere_dair_karar.md",
+          "link": null,
+          "blurb": "(2) Miktar ve kullanım alanı itibarıyla ticari nitelik arz etmeyen ve 50 kilogramı (50 kilogram dahil) geçmeyenler hariç olmak üzere; ham petrol, akaryakıt ve ihrakiye sayılan akaryakıtların ithalat işlemleri; Ticaret Bakanlığınca belirlene",
+          "source_type": "file",
+          "boost": 0,
+          "hidden": false,
+          "metadata": {
+            "regulatory_chunk_id": "rc_c287a4f4e4a8f62cd8c82c4dc53f3789cffd2f30",
+            "regulatory_heading_path": [
+              "HAM PETROL, AKARYAKIT, İHRAKİYE, MADENİ YAĞ, BAZ YAĞ VE PETROLLE İLİŞKİLİ MADDELERE DAİR KARAR",
+              "271/1-2 &amp; 375 İhtisas-Lisans, 375 Marker 001-1/2 İhr",
+              "MADDE 5",
+              "(2) Miktar ve kullanım alanı itibarıyla ticari nitelik arz etmeyen ve 50 kilogramı (50 kilo..."
+            ],
+            "regulatory_validity_start_date": "",
+            "regulatory_validity_end_date": ""
+          },
+          "score": null,
+          "is_relevant": null,
+          "relevance_explanation": null,
+          "match_highlights": [],
+          "updated_at": null,
+          "primary_owners": null,
+          "secondary_owners": null,
+          "is_internet": false,
+          "file_id": "85268b2e-95b2-49da-a239-5fd85af458ec"
+        },
+        "question_ids": [],
+        "metadata": {
+          "position": 73,
+          "heading_path": [
+            "HAM PETROL, AKARYAKIT, İHRAKİYE, MADENİ YAĞ, BAZ YAĞ VE PETROLLE İLİŞKİLİ MADDELERE DAİR KARAR",
+            "271/1-2 &amp; 375 İhtisas-Lisans, 375 Marker 001-1/2 İhr",
+            "MADDE 5",
+            "(2) Miktar ve kullanım alanı itibarıyla ticari nitelik arz etmeyen ve 50 kilogramı (50 kilo..."
+          ],
+          "validity_start": null,
+          "validity_end": null,
+          "version_unknown": true,
+          "canonical_metadata": {
+            "document_id": "1d1ddd85-2fc8-4645-a648-386128e748fb",
+            "chunk_index": 73,
+            "title": "Kararname ve Mahkeme Kararları/epdk_2024-13070_ham_petrol_akaryakit_ihrakiye_madeni_yag_baz_yag_ve_petrolle_iliskili_maddelere_dair_karar.md",
+            "source_type": "user_file",
+            "semantic_identifier": "Kararname ve Mahkeme Kararları/epdk_2024-13070_ham_petrol_akaryakit_ihrakiye_madeni_yag_baz_yag_ve_petrolle_iliskili_maddelere_dair_karar.md — HAM PETROL, AKARYAKIT, İHRAKİYE, MADENİ YAĞ, BAZ YAĞ VE PETROLLE İLİŞKİLİ MADDELERE DAİR KARAR > 271/1-2 &amp; 375 İhtisas-Lisans, 375 Marker 001-1/2 İhr > MADDE 5 > (2) Miktar ve kullanım alanı itibarıyla ticari nitelik arz etmeyen ve 50 kilogramı (50 kilo...",
+            "source_links": "{\"0\": \"\"}",
+            "document_sets": [
+              "PC Külliyatı"
+            ],
+            "regulatory_chunk_id": "rc_c287a4f4e4a8f62cd8c82c4dc53f3789cffd2f30",
+            "heading_path": [
+              "HAM PETROL, AKARYAKIT, İHRAKİYE, MADENİ YAĞ, BAZ YAĞ VE PETROLLE İLİŞKİLİ MADDELERE DAİR KARAR",
+              "271/1-2 &amp; 375 İhtisas-Lisans, 375 Marker 001-1/2 İhr",
+              "MADDE 5",
+              "(2) Miktar ve kullanım alanı itibarıyla ticari nitelik arz etmeyen ve 50 kilogramı (50 kilo..."
+            ],
+            "provision_identifiers": [
+              "madde 5"
+            ],
+            "legal_dates": [
+              "2024-12-12",
+              "2024-12-17"
+            ],
+            "article_no": "5",
+            "clause_label": null,
+            "paragraph_no": "2",
+            "article_title": null,
+            "chunk_variant": "atomic",
+            "document_date": null,
+            "document_type": "karar",
+            "source_regulatory_chunk_ids": [],
+            "read_as_of_date": "2026-10-14"
+          },
+          "read_as_of_date": "2026-10-14",
+          "retrieval_method": "established_search_exact_original",
+          "article_closure_complete": false,
+          "section_context": "not_inferred",
+          "additional_context": "harness_controlled",
+          "follow_context_tool": "read_provision",
+          "retrieved_projection_ordinal": 73,
+          "retrieved_center": true
+        },
+        "text_hash": "5b302322a6aca65f9f619bf232fa59e53c596b04fd855a055e494d7a8d3ee8e6"
+      }
+    }
+  ],
+  "authority_units": [
+    {
+      "unit_id": "au20-3672b18f3d26",
+      "text": "Aynı Kararın m.5/2 hükmüne göre, **miktar ve kullanım alanı itibarıyla ticari nitelik arz etmeyen ve 50 kilogramı geçmeyenler hariç**, ham petrol, akaryakıt ve ihrakiye sayılan akaryakıtların ithalat işlemleri Ticaret Bakanlığınca belirlenen ve miktar ölçümleri yapabilecek donanıma sahip gümrük idarelerinden yapılır. Kurtarılan petrolün miktarı ve ticari niteliği verilmediğinden, bu istisnanın gerçekleştiği varsayılamaz. Bu, Kararın kendi hükmüdür; 5015 sayılı Kanun m.9’un bağımsız doğrulaması olarak sunulmamaktadır.[378]",
+      "evidence_numbers": [
+        378
+      ],
+      "presentation_only": false
+    },
+    {
+      "unit_id": "au46-10950a29fe32",
+      "text": "**Türk plakalı tanker/çekiciyle bu sevk, 4925 sayılı Kanun m.13’teki kabotaj yasağına girmez.** Hüküm, Türkiye sınırları içindeki iki nokta arasında taşıma yasağını yabancı plakalı taşıtlar için getirir. Vakada kurtarılan petrol Mersin’de Türk plakalı tankere aktarılıp Kırıkkale’ye götürülecektir; konteyner işletmecisinin yabancı olması, taşıtın plaka statüsünün yerine geçmez.[255]",
+      "evidence_numbers": [
+        255
+      ],
+      "presentation_only": false
+    }
+  ]
+}

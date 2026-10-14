@@ -20,7 +20,6 @@ from onyx.asv3.workflow_variant import (
     ASV3_TUNED_VARIANT,
 )
 from onyx.db.asv3_corpus import CorpusSource
-from onyx.error_handling.exceptions import OnyxError
 from onyx.llm.model_response import ModelResponse, Usage
 from onyx.llm.models import ToolMessage, UserMessage
 from onyx.tracing.flows import LLMFlow
@@ -645,23 +644,26 @@ def test_cropped_root_resume_preserves_exhausted_repair_without_model_or_read(
         )
 
     llm.invoke.side_effect = invoke
-    with pytest.raises(OnyxError):
-        runtime.run_asv3_loop(**kwargs)
+    runtime.run_asv3_loop(**kwargs)
     assert invocations == 3
     assert sources.lookups == ["6455 sayılı Kanun"]
     assert page.call_count == 1
-    previous = copy.deepcopy(checkpoints[-1])
+    assert checkpoints[-1]["publication_status"] == "partial"
+    assert checkpoints[-1]["publication_stop_reason"] == "native_partial_published"
+    previous = copy.deepcopy(
+        next(saved for saved in reversed(checkpoints) if saved.get("publication_gap"))
+    )
     assert previous["last_draft"] == rejected
     assert previous["publication_gap"]["data"]["named_authority_gaps"]
-    assert previous["publication_status"] == "truncated"
     saved_repair = previous["cropped_repair_state"]
     assert len(saved_repair["records"]) == 1
     assert saved_repair["records"][0]["status"] == "not_found"
     assert len(saved_repair["integrations"]["coordinator"]) == 1
     first = harnesses[-1]
     assert first.complete_submission is None
-    assert first.partial_submission is not None and first.partial_submission() is None
-    assert "already received" in (first.stop_reason or "")
+    assert first.partial_submission is not None
+    assert first.partial_submission() == _LOWER_BODY + "\n\n" + _DISCLOSURE
+    assert first.stop_reason == "model_requested_partial_publication"
 
     monkeypatch.setattr(runtime, "load_asv3_checkpoint", lambda **_kwargs: previous)
     kwargs["resume_message_id"] = kwargs["assistant_message_id"]
@@ -669,23 +671,24 @@ def test_cropped_root_resume_preserves_exhausted_repair_without_model_or_read(
     page.reset_mock()
     sources.lookups.clear()
     llm.invoke.side_effect = AssertionError("An exhausted repair cannot call the model")
-    with pytest.raises(OnyxError):
-        runtime.run_asv3_loop(**kwargs)
+    runtime.run_asv3_loop(**kwargs)
     resumed = harnesses[-1]
     assert resumed.context.run_id == first.context.run_id
     assert resumed.context.scope == first.context.scope
     assert resumed.request == first.request
-    assert resumed.publication_gap is not None
-    assert resumed.publication_gap == first.publication_gap
-    assert "already received" in (resumed.stop_reason or "")
+    assert resumed.publication_gap is None
+    assert resumed.stop_reason == "model_requested_partial_publication"
+    assert resumed.partial_submission is not None
+    assert resumed.partial_submission() == first.partial_submission()
     assert llm.invoke.call_count == 0 and page.call_count == 0
     assert sources.lookups == []
-    assert len(resumed.receipts) == len(first.receipts)
+    assert len(resumed.receipts) >= len(first.receipts)
     assert [receipt.call.name for receipt in resumed.receipts].count(
         "read_named_provision"
     ) == 1
     assert checkpoints[-1]["cropped_repair_state"] == saved_repair
-    assert checkpoints[-1]["publication_gap"] == previous["publication_gap"]
+    assert checkpoints[-1]["publication_gap"] is None
+    assert checkpoints[-1]["publication_status"] == "partial"
     assert checkpoints[-1]["asv3_workflow_variant"] == ASV3_EXP_CROPPED_VARIANT
     # Resume revalidates existing originals; it does not acquire or deliver them anew.
     assert {item.source_id for item in broker.revalidated} == {lower}

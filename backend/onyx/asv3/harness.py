@@ -169,6 +169,7 @@ class Harness:
         return {
             "version": 1,
             **self._tuned_submission_snapshot(),
+            **self._cropped_draft_delivery_snapshot(),
             "run_id": self.context.run_id,
             "request": self.request,
             "language": self.context.language,
@@ -207,6 +208,7 @@ class Harness:
             {
                 "version": 1,
                 **self._tuned_submission_snapshot(),
+                **self._cropped_draft_delivery_snapshot(),
                 "run_id": self.context.run_id,
                 "request": self.request,
                 "language": self.context.language,
@@ -241,6 +243,22 @@ class Harness:
                 "version": 1,
                 "fingerprint": self._cheap_rejection_fingerprint,
                 "attempts": self._cheap_rejection_attempts,
+            }
+        }
+
+    def _cropped_draft_delivery_snapshot(self) -> dict[str, JsonValue]:
+        call_id = self.context.services.get("last_model_call_id")
+        if (
+            self.context.services.get("asv3_exp_cropped") is not True
+            or not self.last_draft
+            or not isinstance(call_id, str)
+            or self.evidence.delivery_flow(call_id) is None
+        ):
+            return {}
+        return {
+            "cropped_draft_delivery": {
+                "draft_sha256": hashlib.sha256(self.last_draft.encode()).hexdigest(),
+                "model_call_id": call_id,
             }
         }
 
@@ -408,6 +426,26 @@ class Harness:
         if not isinstance(evidence, dict):
             raise ValueError("Checkpoint evidence is missing")
         self.evidence.restore(evidence, self.context)
+        if self.context.services.get("asv3_exp_cropped") is True:
+            self.context.services.pop("last_model_call_id", None)
+            delivery = snapshot.get("cropped_draft_delivery")
+            if delivery is not None:
+                call_id = (
+                    delivery.get("model_call_id")
+                    if isinstance(delivery, dict)
+                    else None
+                )
+                if (
+                    not isinstance(delivery, dict)
+                    or set(delivery) != {"draft_sha256", "model_call_id"}
+                    or not self.last_draft
+                    or delivery.get("draft_sha256")
+                    != hashlib.sha256(self.last_draft.encode()).hexdigest()
+                    or not isinstance(call_id, str)
+                    or self.evidence.delivery_flow(call_id) is None
+                ):
+                    raise ValueError("Cropped draft delivery checkpoint changed")
+                self.context.services["last_model_call_id"] = call_id
         research = self.context.services.get("research_state")
         saved_research = snapshot.get("research_state")
         if (

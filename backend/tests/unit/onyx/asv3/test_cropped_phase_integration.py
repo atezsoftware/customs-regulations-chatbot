@@ -88,6 +88,7 @@ def test_repair_limit_prevents_focused_source_work_and_any_repair_model_call(
     adapter.context.services["cropped_cost_budget"] = budget
     harness = MagicMock()
     harness.context = adapter.context
+    harness.last_draft = None
     harness.view.return_value = view
     state = CroppedRepairState(adapter.context, view.request)
     with pytest.raises(CroppedRepairBudgetReached):

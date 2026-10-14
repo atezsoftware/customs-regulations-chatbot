@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
 from onyx.context.search.models import SearchDoc
 from onyx.llm.models import AssistantMessage, ToolMessage
+from onyx.regulatory.legistation_metadata import parse_legistation_metadata
 
 
 class ASv3WorkflowSelection(BaseModel):
@@ -128,7 +129,11 @@ def compact_evidence_metadata(metadata: Mapping[str, object]) -> dict[str, JsonV
 
     result: dict[str, JsonValue] = {}
     for key, value in metadata.items():
-        if key in _EVIDENCE_FIELDS:
+        if key == "legistation_metadata":
+            legislation = parse_legistation_metadata(value)
+            if legislation is not None:
+                result[key] = legislation.model_dump(mode="json", exclude_none=True)
+        elif key in _EVIDENCE_FIELDS:
             result[key] = selected(value)
         elif key == "canonical_metadata" and isinstance(value, dict):
             result[key] = selected(value)
@@ -174,6 +179,17 @@ def model_evidence_metadata(metadata: Mapping[str, object]) -> dict[str, JsonVal
         "asv3_operative_unit_complete".split()
     )
     result = {key: value for key, value in merged.items() if key in keys}
+    legislation = merged.get("legistation_metadata")
+    if isinstance(legislation, dict):
+        validity = {
+            key: value
+            for key, value in legislation.items()
+            if key in {"validity_status", "repeal_note"}
+            and isinstance(value, str)
+            and value.strip()
+        }
+        if validity:
+            result["legistation_metadata"] = validity
     for canonical_key, aliases in {
         "heading_path": (
             "heading_path",

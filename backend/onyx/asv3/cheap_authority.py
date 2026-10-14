@@ -202,7 +202,7 @@ class ArticleParagraphBinding:
     text_hash: str
     article_no: str
     qualifier: str | None
-    paragraph_no: str
+    paragraph_no: str | None
 
 
 class _IdentityLedger(EvidenceLedger):
@@ -258,6 +258,11 @@ class _IdentityLedger(EvidenceLedger):
                         "article_no": binding.article_no,
                         "article_qualifier": binding.qualifier,
                         "paragraph_no": binding.paragraph_no,
+                        **(
+                            {"clause_label": None}
+                            if binding.paragraph_no is None
+                            else {}
+                        ),
                     }
                 )
                 continue
@@ -406,6 +411,7 @@ def canonical_named_authority_gap(
     syntactic_reference_binding: bool = False,
     resolve_defined_abbreviations: bool = False,
     strict_numeric_paragraphs: bool = False,
+    allow_negative_attribution_disclosure: bool = False,
 ) -> dict[str, JsonValue] | None:
     """Check source identity; recovered headings never establish unread paragraphs."""
     identity = canonical_identity_ledger(ledger)
@@ -417,6 +423,7 @@ def canonical_named_authority_gap(
         strict_reference_boundaries=strict_reference_boundaries,
         syntactic_reference_binding=syntactic_reference_binding,
         resolve_defined_abbreviations=resolve_defined_abbreviations,
+        allow_negative_attribution_disclosure=allow_negative_attribution_disclosure,
     )
     if strict_numeric_paragraphs:
         paragraph_gaps = _recovered_paragraph_gaps(

@@ -36,7 +36,8 @@ def share_source_metadata(
         common = {
             key: copy.deepcopy(value)
             for key, value in first.items()
-            if all(
+            if key != "legistation_metadata"
+            and all(
                 isinstance(metadata := row["metadata"], dict)
                 and key in metadata
                 and _encoded(metadata[key]) == _encoded(value)
