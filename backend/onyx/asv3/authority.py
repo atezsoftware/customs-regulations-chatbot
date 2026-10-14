@@ -1355,6 +1355,33 @@ def _gap_subject_references(
     return references
 
 
+_NEGATIVE_ATTRIBUTION = re.compile(
+    r"(?P<subject>[^;\n.!?]+?)\s+"
+    r"(?:bağımsız\s+)?doğrulaması\s+olarak\s+sunulmamaktadır"
+    r"(?=\s*(?:[.;!?]|(?:\[\d+\]\s*)+(?:[.;!?]|$)|$))",
+    re.IGNORECASE,
+)
+
+
+def _without_negative_authority_attribution(
+    text: str,
+    aliases: dict[str, set[str]],
+    masking_aliases: dict[str, set[str]],
+) -> str:
+    """An explicit refusal to verify a statute is not an assertion of its effect."""
+    # Keep offsets stable while a shorthand period is separated from sentences.
+    normalized = re.sub(
+        r"\b(m|md)\.", lambda match: match[1] + " ", text, flags=re.IGNORECASE
+    )
+    masked = list(text)
+    for match in _NEGATIVE_ATTRIBUTION.finditer(normalized):
+        subject = folded(match["subject"].replace("**", "").replace("__", ""))
+        subject = re.sub(r"['’](?:un|nun|in|nin)$", "", subject)
+        if _gap_subject_references(subject, aliases, masking_aliases) is not None:
+            masked[match.start() : match.end()] = " " * (match.end() - match.start())
+    return "".join(masked)
+
+
 def _gap_scope_references(
     subject: str,
     aliases: dict[str, set[str]],
@@ -1453,6 +1480,7 @@ def _native_named_authority_gaps(
     resolve_defined_abbreviations: bool = False,
     syntactic_reference_binding: bool = False,
     include_reference_identity: bool = False,
+    allow_negative_attribution_disclosure: bool = False,
 ) -> list[dict[str, JsonValue]]:
     rows = _native_original_rows(ledger)
     # Lower references supply recognition aliases only, never matching originals.
@@ -1502,6 +1530,10 @@ def _native_named_authority_gaps(
         ):
             continue
         attributed = _without_verified_quotes(unit["text"], cited, ledger)
+        if syntactic_reference_binding and allow_negative_attribution_disclosure:
+            attributed = _without_negative_authority_attribution(
+                attributed, gap_aliases, masking_aliases
+            )
         references = _named_native_references(
             attributed,
             aliases,
@@ -1635,6 +1667,7 @@ def native_named_authority_gap(
     strict_reference_boundaries: bool = False,
     resolve_defined_abbreviations: bool = False,
     syntactic_reference_binding: bool = False,
+    allow_negative_attribution_disclosure: bool = False,
 ) -> dict[str, JsonValue] | None:
     """Check local named-statute identity, not legal entailment or unnamed omissions."""
     missing = _native_named_authority_gaps(
@@ -1643,6 +1676,7 @@ def native_named_authority_gap(
         strict_reference_boundaries=strict_reference_boundaries,
         resolve_defined_abbreviations=resolve_defined_abbreviations,
         syntactic_reference_binding=syntactic_reference_binding,
+        allow_negative_attribution_disclosure=allow_negative_attribution_disclosure,
     )
     if not missing:
         return None

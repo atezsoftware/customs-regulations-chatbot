@@ -114,6 +114,48 @@ def authority_answer_with_cropped_disclosures(
     )
 
 
+def unresolved_governing_projection(
+    draft: str,
+    targets: list[CroppedRepairTarget],
+    records: list[dict[str, JsonValue]],
+) -> str | None:
+    """Replace only mapped, exhausted source assertions; never approve the result."""
+    units = assertion_inventory(draft)
+    known = {unit["unit_id"] for unit in units}
+    by_key = {record.get("key"): record for record in records}
+    notices: dict[str, str] = {}
+    for target in targets:
+        record = by_key.get(target.key)
+        if (
+            target.check_kind != "governing_original"
+            or not target.article
+            or not target.unit_ids
+            or not set(target.unit_ids).issubset(known)
+            or record is None
+            or record.get("status") not in {"not_found", "incomplete", "failed"}
+        ):
+            return None
+        notice = source_gap_sentence(target, str(record["status"]))
+        for identifier in target.unit_ids:
+            if identifier in notices and notices[identifier] != notice:
+                return None
+            notices[identifier] = notice
+    if not notices or not any(
+        unit["unit_id"] not in notices and unit["evidence_numbers"] for unit in units
+    ):
+        return None
+    emitted: set[str] = set()
+    result: list[str] = []
+    for unit in units:
+        notice = notices.get(unit["unit_id"])
+        if notice is None:
+            result.append(unit["text"])
+        elif notice not in emitted:
+            result.append(notice)
+            emitted.add(notice)
+    return "\n\n".join(result)
+
+
 def _check_description(value: JsonValue) -> JsonValue:
     if isinstance(value, list):
         return [_check_description(item) for item in value]
@@ -475,6 +517,49 @@ class CroppedFocusedRepair:
             else:
                 harness.context.services["cropped_cost_phase"] = previous
 
+    def _exhausted_decision(self, harness: Harness) -> Decision | None:
+        """A closed repair can still publish an independently guarded retained answer."""
+        if not harness.last_draft or harness.draft_guard is None:
+            return None
+        gap = harness.draft_guard(harness.last_draft)
+        if gap is None:
+            previous_terminal = next(
+                (
+                    receipt.call.name
+                    for receipt in reversed(harness.receipts)
+                    if receipt.call.name in {"submit_answer", "submit_partial_answer"}
+                ),
+                None,
+            )
+            if (
+                not harness.context.depth
+                and previous_terminal == "submit_partial_answer"
+            ):
+                return Decision(
+                    calls=[
+                        CapabilityCall(
+                            name="submit_partial_answer",
+                            arguments={"answer": harness.last_draft},
+                        )
+                    ]
+                )
+            return Decision(answer=harness.last_draft)
+        if harness.context.depth:
+            return None
+        targets = extract_repair_targets(gap.data, harness.last_draft, harness.evidence)
+        candidate = unresolved_governing_projection(
+            harness.last_draft, targets, self.state.records_for(targets)
+        )
+        if candidate is None or harness.draft_guard(candidate) is not None:
+            return None
+        return Decision(
+            calls=[
+                CapabilityCall(
+                    name="submit_partial_answer", arguments={"answer": candidate}
+                )
+            ]
+        )
+
     def _decide(self, harness: Harness, model: ResearchModel) -> Decision:
         from onyx.asv3.cropped_cost_budget import (
             CroppedCostBudget,
@@ -483,6 +568,9 @@ class CroppedFocusedRepair:
 
         budget = harness.context.services.get("cropped_cost_budget")
         if isinstance(budget, CroppedCostBudget) and not budget.repair_allowed:
+            finished = self._exhausted_decision(harness)
+            if finished is not None:
+                return finished
             raise CroppedRepairBudgetReached(
                 "Cropped repair cost limit reached; rejected draft was not published"
             )
@@ -533,6 +621,9 @@ class CroppedFocusedRepair:
                 harness.save_repair_checkpoint()
         owner = str(harness.context.services.get("task_id") or "coordinator")
         if not self.state.reserve_integration(targets, owner):
+            finished = self._exhausted_decision(harness)
+            if finished is not None:
+                return finished
             raise RunStopped(
                 "This deficiency already received its focused attempt and answer integration; originals retained"
             )

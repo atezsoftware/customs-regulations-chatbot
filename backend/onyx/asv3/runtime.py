@@ -2491,6 +2491,10 @@ def run_asv3_loop(
                 [item for n in ledger.citation_mapping() if (item := ledger.get(n))],
                 resuming=True,
             )
+            if cropped_repair_state is not None:
+                retained_call_id = context.services.get("last_model_call_id")
+                if isinstance(retained_call_id, str):
+                    model.last_call_id = retained_call_id
             if article_bindings is not None and "article_bindings" in previous:
                 saved_bindings = previous["article_bindings"]
                 if not isinstance(saved_bindings, dict):

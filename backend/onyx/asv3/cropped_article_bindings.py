@@ -15,7 +15,7 @@ from typing import cast
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
-from onyx.asv3.authority import folded
+from onyx.asv3.authority import _native_original_rows, folded
 from onyx.asv3.cheap_authority import (
     _AMENDING_PASSAGE,
     _OWN_ARTICLE_OPENING,
@@ -45,6 +45,98 @@ _METHODS = {
 }
 _PARAGRAPH = re.compile(r"^\s*(?:\((\d{1,3})\)|(\d{1,3})\.)\s+\S")
 _CONTINUING_PARAGRAPH = re.compile(r"^\s*\((\d{1,3})\)\s+\S")
+_UNNUMBERED_ARTICLE = re.compile(
+    r"(?m)^(?P<heading>(?:\*\*)?(?:(?:GEÇİCİ|MÜKERRER|EK)\s+)?MADDE\s+"
+    r"\d{1,4}(?:/[A-ZÇĞİÖŞÜ])?\s*\.\s*[-–—](?:\*\*)?)\s+(?P<body>\S)",
+    re.IGNORECASE,
+)
+_STRUCTURAL_MARKER = re.compile(r"(?m)^\s*(?:\(?\d{1,3}[.)]|\(?[a-zçğıöşü]\))\s+")
+
+
+def _unnumbered_article_anchor(
+    item: EvidenceItem, row: dict[str, JsonValue]
+) -> tuple[str, str | None, int] | None:
+    """An actual law's literal operative heading, corroborated by its identifiers."""
+    metadata = model_evidence_metadata(item.metadata)
+    canonical = item.metadata.get("canonical_metadata")
+    canonical = canonical if isinstance(canonical, dict) else item.metadata
+    if (
+        any(
+            metadata.get(key)
+            for key in ("truncated", "untrusted", "derived", "external")
+        )
+        or _AMENDING_PASSAGE.search(folded(item.text))
+        or any(
+            canonical.get(key) is not None for key in ("target_article_no", "target_id")
+        )
+    ):
+        return None
+    headings = list(_UNNUMBERED_ARTICLE.finditer(item.text))
+    if not headings:
+        return None
+    heading = headings[-1]
+    parsed = parse_regulatory_article_heading(heading["heading"].replace("**", ""))
+    identifiers = metadata.get("provision_identifiers")
+    if parsed is None or not isinstance(identifiers, list):
+        return None
+    declared = {
+        (identity.article_no, identity.qualifier)
+        for value in identifiers
+        if isinstance(value, str)
+        if (identity := parse_regulatory_article_heading(value)) is not None
+    }
+    body = item.text[heading.start("body") :]
+    original_path = canonical.get("original_heading_path")
+    if (
+        declared != {(parsed.article_no, parsed.qualifier)}
+        or row.get("article_no") not in (None, parsed.article_no)
+        or (
+            row.get("article_no") is not None
+            and row.get("article_qualifier") != parsed.qualifier
+        )
+        or _STRUCTURAL_MARKER.search(body)
+        or body.startswith(('"', "“", "'", "‘"))
+        or not body.rstrip().endswith(".")
+        or (
+            isinstance(original_path, list)
+            and any(
+                isinstance(value, str)
+                and (identity := parse_regulatory_article_heading(value)) is not None
+                and (identity.article_no, identity.qualifier)
+                != (parsed.article_no, parsed.qualifier)
+                for value in original_path
+            )
+        )
+    ):
+        return None
+    return parsed.article_no, parsed.qualifier, heading.start()
+
+
+def _unnumbered_binding(
+    number: int, item: EvidenceItem, article: str, qualifier: str | None
+) -> ArticleParagraphBinding:
+    assert item.chunk_id is not None
+    return ArticleParagraphBinding(
+        number, item.source_id, item.chunk_id, item.text_hash, article, qualifier, None
+    )
+
+
+def _authority_row_map(ledger: EvidenceLedger) -> dict[int, dict[str, JsonValue]]:
+    return {
+        number: row
+        for row in ledger.authority_metadata()
+        if type(number := row.get("citation")) is int
+    }
+
+
+def _source_row_map(ledger: EvidenceLedger) -> dict[int, dict[str, JsonValue]]:
+    return {
+        number: row
+        for row in _native_original_rows(ledger)
+        if type(number := row.get("citation")) is int
+    }
+
+
 _ACQUISITION_FIELDS = frozenset(
     {
         "retrieval_method",
@@ -374,10 +466,17 @@ class CroppedArticleBindings:
             self._pending.pop((task_id, depth, call.call_id), None)
 
     def _bindings(
-        self, record: _RecordedRead, ledger: EvidenceLedger
+        self,
+        record: _RecordedRead,
+        ledger: EvidenceLedger,
+        *,
+        authority_rows: dict[int, dict[str, JsonValue]] | None = None,
+        source_rows: dict[int, dict[str, JsonValue]] | None = None,
     ) -> dict[int, ArticleParagraphBinding]:
         items = self._validate(record, ledger)
-        rows = {row["citation"]: row for row in ledger.authority_metadata()}
+        rows = (
+            authority_rows if authority_rows is not None else _authority_row_map(ledger)
+        )
         result: dict[int, ArticleParagraphBinding] = {}
         active = None
         previous_position = None
@@ -482,6 +581,76 @@ class CroppedArticleBindings:
                 active.qualifier,
                 paragraph,
             )
+        for number, binding in self._unnumbered_bindings(
+            record,
+            ledger,
+            items=items,
+            source_rows=source_rows,
+        ).items():
+            result.setdefault(number, binding)
+        return result
+
+    def _unnumbered_bindings(
+        self,
+        record: _RecordedRead,
+        ledger: EvidenceLedger,
+        *,
+        items: list[EvidenceItem],
+        source_rows: dict[int, dict[str, JsonValue]] | None,
+    ) -> dict[int, ArticleParagraphBinding]:
+        rows = source_rows if source_rows is not None else _source_row_map(ledger)
+        result: dict[int, ArticleParagraphBinding] = {}
+        active: tuple[str, str | None] | None = None
+        previous_position: int | None = None
+        for number, member, item in zip(
+            record.citations, record.read.members, items, strict=True
+        ):
+            if (
+                previous_position is not None
+                and member.position != previous_position + 1
+            ):
+                active = None
+            previous_position = member.position
+            row = rows.get(number)
+            metadata = model_evidence_metadata(item.metadata)
+            if row is None or _AMENDING_PASSAGE.search(folded(item.text)):
+                active = None
+                continue
+            anchor = _unnumbered_article_anchor(item, row)
+            if anchor is not None:
+                article, qualifier, start = anchor
+                active = (article, qualifier)
+                # A chunk crossing an article boundary cannot inherit the last
+                # heading for its preceding text; only subsequent chunks can.
+                if (
+                    start == len(item.text) - len(item.text.lstrip())
+                    and row.get("article_no") is None
+                ):
+                    result[number] = _unnumbered_binding(
+                        number, item, article, qualifier
+                    )
+                continue
+            if (
+                active is None
+                or any(
+                    parse_regulatory_article_heading(line.replace("**", ""))
+                    for line in item.text.splitlines()
+                )
+                or _STRUCTURAL_MARKER.search(item.text)
+                or item.text.lstrip().startswith(('"', "“", "'", "‘"))
+                or not item.text.rstrip().endswith(".")
+                or metadata.get("paragraph_no") is not None
+                or metadata.get("provision_identifiers")
+                or row.get("article_no") not in (None, active[0])
+                or (
+                    row.get("article_no") is not None
+                    and row.get("article_qualifier") != active[1]
+                )
+            ):
+                active = None
+                continue
+            if row.get("article_no") is None:
+                result[number] = _unnumbered_binding(number, item, *active)
         return result
 
     def record_receipt(
@@ -531,13 +700,23 @@ class CroppedArticleBindings:
         return record
 
     def identity_bindings(
-        self, context: RunContext, ledger: EvidenceLedger
+        self,
+        context: RunContext,
+        ledger: EvidenceLedger,
+        *,
+        source_rows: dict[int, dict[str, JsonValue]] | None = None,
     ) -> dict[int, ArticleParagraphBinding]:
         self._check(context)
         with self._lock:
             result: dict[int, ArticleParagraphBinding] = {}
+            authority_rows = _authority_row_map(ledger)
+            source_rows = (
+                source_rows if source_rows is not None else _source_row_map(ledger)
+            )
             for read in self._reads.values():
-                for number, binding in self._bindings(read, ledger).items():
+                for number, binding in self._bindings(
+                    read, ledger, authority_rows=authority_rows, source_rows=source_rows
+                ).items():
                     if number in result and result[number] != binding:
                         raise ValueError("Conflicting ordered article identity")
                     result[number] = binding
@@ -615,11 +794,22 @@ def cropped_identity_ledger(
     ledger: EvidenceLedger, context: RunContext
 ) -> EvidenceLedger:
     state = context.services.get("cropped_article_bindings")
+    source_rows = _source_row_map(ledger)
     bindings = (
-        state.identity_bindings(context, ledger)
+        state.identity_bindings(context, ledger, source_rows=source_rows)
         if isinstance(state, CroppedArticleBindings)
-        else None
+        else {}
     )
+    # A complete literal own heading can identify its own unnumbered passage
+    # without inferring a neighbor or pretending a paragraph number was read.
+    for row in source_rows.values():
+        number = row.get("citation")
+        item = ledger.get(number) if type(number) is int else None
+        if item is None or type(number) is not int or row.get("article_no") is not None:
+            continue
+        anchor = _unnumbered_article_anchor(item, row)
+        if anchor is not None and anchor[2] == len(item.text) - len(item.text.lstrip()):
+            bindings.setdefault(number, _unnumbered_binding(number, item, *anchor[:2]))
     return canonical_identity_ledger(ledger, article_bindings=bindings)
 
 
@@ -640,4 +830,5 @@ def cropped_named_authority_gap(
         syntactic_reference_binding=syntactic_reference_binding,
         resolve_defined_abbreviations=resolve_defined_abbreviations,
         strict_numeric_paragraphs=strict_numeric_paragraphs,
+        allow_negative_attribution_disclosure=True,
     )
