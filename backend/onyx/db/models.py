@@ -3321,6 +3321,9 @@ class ChatMessage(Base):
 
     # The display name of the model that generated this assistant message
     model_display_name: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Research workflow that produced this answer (see onyx.chat.response_workflow);
+    # null for messages created before it was recorded.
+    workflow: Mapped[str | None] = mapped_column(String, nullable=True)
 
     # What does this message contain
     reasoning_tokens: Mapped[str | None] = mapped_column(Text, nullable=True)

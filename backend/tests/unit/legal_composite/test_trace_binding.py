@@ -145,7 +145,7 @@ def test_auxiliary_fallback_is_one_priced_span_with_scope_and_response_binding(
         ).model_dump(mode="json")
         generations.append((run_id, attributes, "COMPLETE", operation))
     session.execute.side_effect = [
-        [(12, 0, run_id, "COMPLETE", "COMPLETE", now, now)],
+        [(12, 0, run_id, "COMPLETE", "COMPLETE", now, now, None)],
         generations,
     ]
     summary = get_response_usage(session, [12], admin=True)[12]
@@ -442,7 +442,7 @@ def test_host_timeout_finishes_one_bound_generation_before_late_provider(
         )
         run_id, now = uuid4(), datetime.now(timezone.utc)
         session.execute.side_effect = [
-            [(12, 0, run_id, "COMPLETE", "COMPLETE", now, now)],
+            [(12, 0, run_id, "COMPLETE", "COMPLETE", now, now, None)],
             [
                 (
                     run_id,

@@ -3,6 +3,7 @@ import {
   ResponseUsageView,
   costLabel,
   formatResponseDuration,
+  workflowLabel,
 } from "@/sections/chat/usage/ResponseUsage";
 import type { ResponseUsage } from "@/sections/chat/usage/interfaces";
 
@@ -60,4 +61,26 @@ it("does not present missing pricing as a free answer", () => {
   expect(costLabel({ ...usage, total_cost_usd: 0 })).toContain("$0.0000");
   expect(formatResponseDuration(59.9)).toBe("1 dk 0 sn");
   expect(formatResponseDuration(null)).toBe("Süre kaydı yok");
+});
+
+it("names the workflow that produced the answer with its input bar label", () => {
+  render(
+    <ResponseUsageView usage={{ ...usage, workflow: "experimental_asv3" }} />
+  );
+
+  expect(
+    screen.getByText(/^Experimental ASv3 · 14 dk 8 sn/)
+  ).toBeInTheDocument();
+});
+
+it("labels each visible workflow as the input bar does", () => {
+  expect(workflowLabel("asv3")).toBe("ASv3 Tek Araştırma");
+  expect(workflowLabel("legal_review")).toBe("Hukuki İnceleme (Flash)");
+  expect(workflowLabel("asv3_exp_cropped")).toBe("exp cropped");
+});
+
+it("omits the workflow when the answer predates it being recorded", () => {
+  render(<ResponseUsageView usage={{ ...usage, workflow: null }} />);
+
+  expect(screen.getByText(/^14 dk 8 sn/)).toBeInTheDocument();
 });

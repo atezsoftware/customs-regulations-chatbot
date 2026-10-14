@@ -26,4 +26,6 @@ export interface ResponseUsage {
   unpriced_calls: number;
   excluded_service_calls?: number;
   models: GenerationCost[];
+  // Identifier from onyx.chat.response_workflow; null on older answers.
+  workflow?: string | null;
 }

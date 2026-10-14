@@ -33,6 +33,7 @@ def test_llm_total_excludes_non_token_services_and_uses_wall_duration() -> None:
                 "COMPLETE",
                 finished - timedelta(seconds=10),
                 finished,
+                None,
             )
         ],
         [
@@ -58,7 +59,7 @@ def test_unpriced_llm_is_retained_as_an_unknown_cost() -> None:
     run_id = uuid4()
     session = MagicMock()
     session.execute.side_effect = [
-        [(12, 50, run_id, "COMPLETE", "COMPLETE", finished, finished)],
+        [(12, 50, run_id, "COMPLETE", "COMPLETE", finished, finished, None)],
         [
             (
                 run_id,
@@ -72,3 +73,16 @@ def test_unpriced_llm_is_retained_as_an_unknown_cost() -> None:
     assert summary.status == "unavailable" and summary.total_cost_usd is None
     assert summary.calls == 1 and summary.unpriced_calls == 1
     assert summary.excluded_service_calls == 0
+
+
+def test_usage_reports_the_workflow_that_produced_the_answer() -> None:
+    """The line under each answer names the workflow alongside cost and time."""
+
+    session = MagicMock()
+    session.execute.side_effect = [
+        [(12, 50, None, None, None, None, None, "experimental_asv3")],
+    ]
+
+    summary = get_response_usage(session, [12], admin=True)[12]
+
+    assert summary.workflow == "experimental_asv3"

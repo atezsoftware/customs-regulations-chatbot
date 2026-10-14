@@ -648,6 +648,7 @@ def reserve_message_id(
     parent_message: int,
     message_type: MessageType = MessageType.ASSISTANT,
     model_display_name: str | None = None,
+    workflow: str | None = None,
 ) -> ChatMessage:
     # Create an temporary holding chat message to the updated and saved at the end
     empty_message = ChatMessage(
@@ -658,6 +659,7 @@ def reserve_message_id(
         token_count=15,
         message_type=message_type,
         model_display_name=model_display_name,
+        workflow=workflow,
     )
 
     # Add the empty message to the session
@@ -683,6 +685,7 @@ def reserve_multi_model_message_ids(
     chat_session_id: UUID,
     parent_message_id: int,
     model_display_names: list[str],
+    workflow: str | None = None,
 ) -> list[ChatMessage]:
     """Reserve N assistant message placeholders for multi-model parallel streaming.
 
@@ -700,6 +703,7 @@ def reserve_multi_model_message_ids(
             token_count=15,  # placeholder; updated on completion by llm_loop_completion_handle
             message_type=MessageType.ASSISTANT,
             model_display_name=display_name,
+            workflow=workflow,
         )
         db_session.add(msg)
         reserved.append(msg)

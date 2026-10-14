@@ -59,6 +59,7 @@ from onyx.chat.models import (
     ToolCallResponse,
 )
 from onyx.chat.prompt_utils import calculate_reserved_tokens
+from onyx.chat.response_workflow import response_workflow
 from onyx.chat.save_chat import save_chat_turn
 from onyx.chat.stop_signal_checker import is_connected as check_stop_signal
 from onyx.chat.stop_signal_checker import reset_cancel_status
@@ -1205,6 +1206,7 @@ def build_chat_turn(
             chat_session_id=chat_session.id,
             parent_message_id=user_message.id,
             model_display_names=model_display_names,
+            workflow=response_workflow(new_msg_req),
         )
         yield MultiModelMessageResponseIDInfo(
             user_message_id=user_message.id,
@@ -1220,6 +1222,7 @@ def build_chat_turn(
             parent_message=user_message.id,
             message_type=MessageType.ASSISTANT,
             model_display_name=model_display_names[0],
+            workflow=response_workflow(new_msg_req),
         )
         reserved_messages = [assistant_response]
         yield MessageResponseIDInfo(

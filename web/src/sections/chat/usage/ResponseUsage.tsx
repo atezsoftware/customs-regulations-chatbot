@@ -20,6 +20,30 @@ const sources: Record<string, string> = {
   admin_override: "Tanımlı kurum fiyatı",
   unavailable: "Fiyat kaydı yok",
 };
+// Mirrors the workflow button labels in AppInputBar so an answer reads with the
+// same name the user picked. Keys come from backend onyx.chat.response_workflow.
+const workflowLabels: Record<string, string> = {
+  asv3: "ASv3 Tek Araştırma",
+  asv3_deep: "ASv3 Deep",
+  experimental_asv3: "Experimental ASv3",
+  experimental: "Experimental",
+  asv3_exp_cropped: "exp cropped",
+  experimental_guardrails: "Experimental Guardrails",
+  experimental_guardrails_v2: "Experimental Guardrails v2",
+  experimental_guardrails_v3: "Experimental Guardrails v3",
+  legal_review: "Hukuki İnceleme (Flash)",
+  legal_composite: "Legal Composite",
+  supersearch: "Supersearch",
+  deep_research: "Deep Research",
+  asv2: "Atez Search v2",
+  asv1: "Atez Search",
+};
+export function workflowLabel(
+  workflow: string | null | undefined
+): string | null {
+  if (!workflow) return null;
+  return workflowLabels[workflow] ?? workflow;
+}
 export function formatResponseDuration(
   seconds: number | null | undefined
 ): string {
@@ -54,7 +78,14 @@ export function ResponseUsageView({
   fallbackDuration,
   compact = false,
 }: ResponseUsageViewProps) {
-  const label = `${formatResponseDuration(usage?.duration_seconds ?? fallbackDuration)} · ${costLabel(usage)}`;
+  const workflow = workflowLabel(usage?.workflow);
+  const label = [
+    workflow,
+    formatResponseDuration(usage?.duration_seconds ?? fallbackDuration),
+    costLabel(usage),
+  ]
+    .filter(Boolean)
+    .join(" · ");
   if (compact || !usage?.models.length)
     return (
       <Text font="secondary-body" color="text-03">

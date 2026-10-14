@@ -34,6 +34,7 @@ def get_response_usage(
             AnswerGraphRun.capture_status,
             AnswerGraphRun.time_created,
             AnswerGraphRun.time_finished,
+            ChatMessage.workflow,
         )
         .join(ChatSession, ChatSession.id == ChatMessage.chat_session_id)
         .outerjoin(
@@ -52,9 +53,11 @@ def get_response_usage(
         )
     rows = list(db_session.execute(statement))
     by_run = {row[2]: row[0] for row in rows if row[2] is not None}
-    summaries = {row[0]: ResponseUsage(duration_seconds=row[1]) for row in rows}
+    summaries = {
+        row[0]: ResponseUsage(duration_seconds=row[1], workflow=row[7]) for row in rows
+    }
     incomplete: set[int] = set()
-    for message_id, duration, run_id, status, capture, started, finished in rows:
+    for message_id, duration, run_id, status, capture, started, finished, _ in rows:
         summary = summaries[message_id]
         if finished is not None and started is not None:
             summary.duration_seconds = max(0, (finished - started).total_seconds())
