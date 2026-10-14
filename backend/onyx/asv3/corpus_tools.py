@@ -1303,12 +1303,22 @@ def evidence_for_chunk(source: CorpusSource, chunk: CorpusChunk) -> EvidenceItem
         match_highlights=[],
         file_id=source.file_id,
     )
+    legislation = (
+        {
+            "legistation_metadata": source.legistation_metadata.model_dump(
+                mode="json", exclude_none=True
+            )
+        }
+        if source.legistation_metadata is not None
+        else {}
+    )
     return EvidenceItem(
         source_id=str(source.id),
         chunk_id=chunk.id,
         text=chunk.text,
         search_doc=doc,
         metadata={
+            **legislation,
             "position": chunk.position,
             "heading_path": list(chunk.heading_path),
             "validity_start": chunk.validity_start.isoformat()

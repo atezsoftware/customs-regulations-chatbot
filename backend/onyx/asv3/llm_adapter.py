@@ -49,6 +49,10 @@ from onyx.asv3.judicial_sections import (
 )
 from onyx.asv3.legal_source_navigation import derive_provision_navigation_anchor
 from onyx.asv3.legal_source_reviews import LegalSourceReviews, annotate_navigation
+from onyx.asv3.legistation_metadata_transport import (
+    LEGISTATION_METADATA_USAGE_RULE,
+    has_legistation_annotations,
+)
 from onyx.asv3.models import (
     CapabilityCall,
     Decision,
@@ -1267,6 +1271,27 @@ class ResearchModel:
                 data = serialize_cheap_payload(payload, self._tokens)
             else:
                 data = json.dumps(payload, ensure_ascii=False)
+            annotation_payload = payload
+            annotation_layout = payload.get("original_metadata_layouts")
+            if (
+                "original_metadata_codec" in payload
+                and (
+                    self.context.services.get("asv3_exp_cheap") is True
+                    or self.context.services.get("asv3_exp_cropped") is True
+                )
+                and isinstance(annotation_layout, list)
+                and any(
+                    isinstance(layout, list) and "legistation_metadata" in layout
+                    for layout in annotation_layout
+                )
+            ):
+                from onyx.asv3.cheap_metadata_transport import expand_cheap_payload
+
+                annotation_payload = expand_cheap_payload(payload)
+            if has_legistation_annotations(
+                annotation_payload
+            ) or has_legistation_annotations(evidence):
+                instruction += "\n\n" + LEGISTATION_METADATA_USAGE_RULE
         # The ledger/checkpoint retains the audit. Provider continuity needs only
         # the most recent complete pair with its original provider call IDs.
         turns = (
@@ -4054,8 +4079,16 @@ class ResearchModel:
                 current_content = serialize_cheap_payload(current, self._tokens)
             else:
                 current_content = json.dumps(current, ensure_ascii=False)
+            current_prefix = prefix
+            if has_legistation_annotations(current):
+                current_prefix = [
+                    SystemMessage(
+                        content=instruction + "\n\n" + LEGISTATION_METADATA_USAGE_RULE
+                    ),
+                    *prefix[1:],
+                ]
             return [
-                *prefix,
+                *current_prefix,
                 *(
                     message
                     for turn in native_turns

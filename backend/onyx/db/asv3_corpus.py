@@ -5,7 +5,7 @@ import re
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
 from typing import Any
 from typing import cast as typing_cast
@@ -54,6 +54,10 @@ from onyx.db.regulatory_public_reads import (
 )
 from onyx.document_index.publication_models import PublicationIndexSnapshot
 from onyx.regulatory.amendments.annexes.models import AnnexTemporalProjection
+from onyx.regulatory.legistation_metadata import (
+    LegistationMetadata,
+    parse_legistation_metadata,
+)
 from onyx.regulatory.publication_reads import (
     filter_publication_read,
     observe_publication_read,
@@ -144,6 +148,7 @@ class CorpusSource:
     id: UUID
     name: str
     file_id: str
+    legistation_metadata: LegistationMetadata | None = None
 
 
 @dataclass
@@ -1400,7 +1405,12 @@ def _validate_filters(session: Session, user: User, filters: IndexFilters) -> No
 
 
 def _source_statement(filters: IndexFilters) -> Any:
-    statement = select(UserFile.id, UserFile.name, UserFile.file_id)
+    statement = select(
+        UserFile.id,
+        UserFile.name,
+        UserFile.file_id,
+        FileRecord.file_metadata["legistation_metadata"].label("legistation_metadata"),
+    ).outerjoin(FileRecord, FileRecord.file_id == UserFile.file_id)
     set_membership = select(DocumentSet__UserFile.user_file_id).join(
         DocumentSet, DocumentSet.id == DocumentSet__UserFile.document_set_id
     )
@@ -1551,7 +1561,16 @@ def _find_sources_with_title_queries(
     retained = filter_publication_read(
         observe_publication_read(), sources, lambda row: str(row.id)
     )
-    return retained, len(records) > limit
+    annotations = {
+        row.id: getattr(row, "legistation_metadata", None) for row in records[:limit]
+    }
+    return [
+        replace(
+            source,
+            legistation_metadata=parse_legistation_metadata(annotations[source.id]),
+        )
+        for source in retained
+    ], len(records) > limit
 
 
 def _read_identity_heads_batch(
