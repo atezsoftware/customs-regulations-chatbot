@@ -12,7 +12,9 @@ import pytest
 
 from onyx.asv3 import runtime
 from onyx.asv3.corpus_tools import ChunkScan, CorpusBroker
+from onyx.asv3.cropped_focused_repair import source_gap_sentence
 from onyx.asv3.cropped_handoff_transport import expand_cropped_handoff_transport
+from onyx.asv3.cropped_repair_state import CroppedRepairState, CroppedRepairTarget
 from onyx.asv3.harness import Harness
 from onyx.asv3.models import OutcomeStatus, RunContext
 from onyx.asv3.workflow_variant import (
@@ -571,8 +573,10 @@ def test_original_experimental_child_keeps_history_and_ordinary_repair(
     assert child_harness.partial_submission() == _LOWER_BODY + "\n\n" + _DISCLOSURE
 
 
+@pytest.mark.parametrize("with_prior_notice", [False, True])
 def test_cropped_root_resume_preserves_exhausted_repair_without_model_or_read(
     monkeypatch: pytest.MonkeyPatch,
+    with_prior_notice: bool,
 ) -> None:
     kwargs, broker, llm, checkpoints, _queue = setup_run(monkeypatch)
     kwargs.pop("test_language")
@@ -583,7 +587,13 @@ def test_cropped_root_resume_preserves_exhausted_repair_without_model_or_read(
     page = MagicMock(wraps=broker.page)
     monkeypatch.setattr(broker, "page", page)
     harnesses = capture_harnesses(monkeypatch)
-    rejected = _LOWER_BODY + "\n\n" + _FIXTURE["text"]
+    prior = CroppedRepairTarget(
+        check_kind="governing_original", instrument_number="6455", article="10"
+    )
+    previous_notice = (
+        source_gap_sentence(prior, "not_found") + "\n\n" if with_prior_notice else ""
+    )
+    rejected = _LOWER_BODY + "\n\n" + previous_notice + _FIXTURE["text"]
     invocations = 0
 
     def invoke(**arguments: Any) -> ModelResponse:
@@ -617,6 +627,14 @@ def test_cropped_root_resume_preserves_exhausted_repair_without_model_or_read(
                 ]
             )
         if invocations == 2:
+            if with_prior_notice:
+                state = harnesses[-1].context.services["cropped_repair_state"]
+                assert isinstance(state, CroppedRepairState)
+                state.reserve(prior)
+                state.finish(
+                    prior.key, "not_found", [], "Earlier focused source attempt."
+                )
+                state.reserve_integration([prior], "coordinator")
             return response(calls=[("submit_partial_answer", {"answer": rejected})])
         assert invocations == 3
         payload = user_payload(arguments["prompt"][-1])
@@ -625,7 +643,7 @@ def test_cropped_root_resume_preserves_exhausted_repair_without_model_or_read(
         target = next(
             unit
             for unit in payload["draft_to_repair"]["units"]
-            if "6455" in unit["text"]
+            if _FIXTURE["text"] in unit["text"]
         )
         return response(
             calls=[
@@ -656,13 +674,18 @@ def test_cropped_root_resume_preserves_exhausted_repair_without_model_or_read(
     assert previous["last_draft"] == rejected
     assert previous["publication_gap"]["data"]["named_authority_gaps"]
     saved_repair = previous["cropped_repair_state"]
-    assert len(saved_repair["records"]) == 1
-    assert saved_repair["records"][0]["status"] == "not_found"
-    assert len(saved_repair["integrations"]["coordinator"]) == 1
+    assert len(saved_repair["records"]) == (2 if with_prior_notice else 1)
+    assert all(record["status"] == "not_found" for record in saved_repair["records"])
+    assert len(saved_repair["integrations"]["coordinator"]) == (
+        2 if with_prior_notice else 1
+    )
     first = harnesses[-1]
     assert first.complete_submission is None
     assert first.partial_submission is not None
-    assert first.partial_submission() == _LOWER_BODY + "\n\n" + _DISCLOSURE
+    assert (
+        first.partial_submission()
+        == _LOWER_BODY + "\n\n" + previous_notice + _DISCLOSURE
+    )
     assert first.stop_reason == "model_requested_partial_publication"
 
     monkeypatch.setattr(runtime, "load_asv3_checkpoint", lambda **_kwargs: previous)

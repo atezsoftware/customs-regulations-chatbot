@@ -41,7 +41,7 @@ from onyx.asv3.cropped_cost_budget import CroppedCostBudget
 from onyx.asv3.cropped_crossrefs import CroppedCrossReferencePolicy
 from onyx.asv3.cropped_focused_repair import (
     CroppedFocusedRepair,
-    authority_answer_with_cropped_disclosures,
+    authority_gap_with_cropped_disclosures,
 )
 from onyx.asv3.cropped_repair_state import CroppedRepairState
 from onyx.asv3.cropped_research_limit import CroppedResearchLimit
@@ -618,23 +618,28 @@ def run_asv3_loop(
         if answer_llm is not None:
             # This policy accepts a supplied passage establishing the actual claim.
             return None
-        checked_answer = (
-            authority_answer_with_cropped_disclosures(answer, cropped_repair_state)
-            if cropped_repair_state is not None
-            else answer
-        )
         strict = (
             research_profile == "experimental" or workflow_variant == ASV3_TUNED_VARIANT
         )
         syntactic = parallel_research or workflow_variant == ASV3_TUNED_VARIANT
         if context.services.get("asv3_exp_cropped") is True:
-            gap = cropped_named_authority_gap(
-                checked_answer,
-                ledger,
-                run_context or context,
-                strict_reference_boundaries=strict,
-                syntactic_reference_binding=syntactic,
-                strict_numeric_paragraphs=True,
+
+            def check_cropped_authority(body: str) -> dict[str, JsonValue] | None:
+                return cropped_named_authority_gap(
+                    body,
+                    ledger,
+                    run_context or context,
+                    strict_reference_boundaries=strict,
+                    syntactic_reference_binding=syntactic,
+                    strict_numeric_paragraphs=True,
+                )
+
+            gap = (
+                authority_gap_with_cropped_disclosures(
+                    answer, cropped_repair_state, check_cropped_authority
+                )
+                if cropped_repair_state is not None
+                else check_cropped_authority(answer)
             )
         elif checkpoint_workflow_variant == ASV3_TUNED_VARIANT:
             gap = canonical_named_authority_gap(
@@ -646,7 +651,7 @@ def run_asv3_loop(
             )
         else:
             gap = native_named_authority_gap(
-                checked_answer,
+                answer,
                 ledger,
                 strict_reference_boundaries=strict,
                 syntactic_reference_binding=syntactic,
