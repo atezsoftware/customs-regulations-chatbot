@@ -1,0 +1,199 @@
+{
+  "message_id": 5315,
+  "records": [
+    {
+      "citation": 70,
+      "item": {
+        "source_id": "f986bc20-148a-4038-a3ce-ffb9a5310016",
+        "text": "Anılan Bakanlıktan alınan ve bir örneği ilişikte yer alan 21.03.2018 tarihli ve 22604 sayılı yazıda özetle; ülkemize demiryolu, denizyolu veya havayoluyla gelen ve varış noktasından karayolu taşıtlarıyla üçüncü ülkelere yapılacak taşımaların 4925 sayılı Karayolu Taşıma Kanununun 12 nci ve 13 üncü maddesi ile 08.01.2018 tarih ve 30295 sayılı Karayolu Taşıma Yönetmeliğinin 59 uncu ve 60 ıncı maddeleri kapsamında yürütülmekte olduğu, söz konusu mevzuat hükümleri çerçevesinde tüm serbest bölgelere veya gümrük antrepolarına demiryolu, veya havayoluyla gelen transit rejimindeki denizyolu (millileşmemiş) eşyanın/kargonun yurtiçine taşımasının mezkur Kanun ve Yönetmelik gereği Bakanlıktan uluslararası veya yurtiçi eşya taşımacılığı yetki belgelerinde (K,C,L,M,N ve P türü) kayıtlı Türk plakalı taşıtlarla, yurtdışı taşımasının ise sadece uluslararası eşya taşımacılığı alanında Bakanlıktan yetki belgesi (C türü, L2 ve M2) almış kişilerin taşıt belgelerinde kayıtlı Türk plakalı taşıtlarla taşınabileceği hususunun ilgi yazılarımız ekinde yer alan 05.06.2014/26116 ve 10.06.2015/40292 tarihli/sayılı yazılarıyla bildirildiği, bu çerçevede limanlarımıza denizyoluyla gelen serbest dolaşımda olmayan (millileşmemiş) eşyanın yabancı plakalı taşıtlarla taşınmasının mümkün bulunmadığı bildirilmiştir.",
+        "chunk_id": "rc_6af6ecfda9c0ebb79ffaa5c305d73742db5b1bf0",
+        "search_doc": {
+          "document_id": "f986bc20-148a-4038-a3ce-ffb9a5310016",
+          "chunk_ind": 3,
+          "semantic_identifier": "Tasarruflu Yazılar/26.03.2018_33069177_denizyoluyla_gelen_serbest_dolasimda_olmayan_millilesmemis_esyanin_yabanci_plakali_tasitlarla_tasinamayacag.md",
+          "link": null,
+          "blurb": "Anılan Bakanlıktan alınan ve bir örneği ilişikte yer alan 21.03.2018 tarihli ve 22604 sayılı yazıda özetle; ülkemize demiryolu, denizyolu veya havayoluyla gelen ve varış noktasından karayolu taşıtlarıyla üçüncü ülkelere yapılacak taşımaları",
+          "source_type": "file",
+          "boost": 0,
+          "hidden": false,
+          "metadata": {
+            "regulatory_chunk_id": "rc_6af6ecfda9c0ebb79ffaa5c305d73742db5b1bf0",
+            "regulatory_heading_path": [
+              "GÜMRÜK VE TİCARET BAKANLIĞI",
+              "DAĞITIM YERLERİNE",
+              "b) 03.07.2015 tarihli ve 9016663 sayılı yazımız."
+            ],
+            "regulatory_validity_start_date": "",
+            "regulatory_validity_end_date": ""
+          },
+          "score": null,
+          "is_relevant": null,
+          "relevance_explanation": null,
+          "match_highlights": [],
+          "updated_at": null,
+          "primary_owners": null,
+          "secondary_owners": null,
+          "is_internet": false,
+          "file_id": "60748c28-dc2a-41a9-b86b-8eb7ddf9bbd2"
+        },
+        "question_ids": [],
+        "metadata": {
+          "position": 3,
+          "heading_path": [
+            "GÜMRÜK VE TİCARET BAKANLIĞI",
+            "DAĞITIM YERLERİNE",
+            "b) 03.07.2015 tarihli ve 9016663 sayılı yazımız."
+          ],
+          "validity_start": null,
+          "validity_end": null,
+          "version_unknown": true,
+          "canonical_metadata": {
+            "document_id": "f986bc20-148a-4038-a3ce-ffb9a5310016",
+            "chunk_index": 3,
+            "title": "Tasarruflu Yazılar/26.03.2018_33069177_denizyoluyla_gelen_serbest_dolasimda_olmayan_millilesmemis_esyanin_yabanci_plakali_tasitlarla_tasinamayacag.md",
+            "source_type": "user_file",
+            "semantic_identifier": "Tasarruflu Yazılar/26.03.2018_33069177_denizyoluyla_gelen_serbest_dolasimda_olmayan_millilesmemis_esyanin_yabanci_plakali_tasitlarla_tasinamayacag.md — GÜMRÜK VE TİCARET BAKANLIĞI > DAĞITIM YERLERİNE > b) 03.07.2015 tarihli ve 9016663 sayılı yazımız.",
+            "source_links": "{\"0\": \"\"}",
+            "document_sets": [
+              "PC Külliyatı"
+            ],
+            "regulatory_chunk_id": "rc_6af6ecfda9c0ebb79ffaa5c305d73742db5b1bf0",
+            "heading_path": [
+              "GÜMRÜK VE TİCARET BAKANLIĞI",
+              "DAĞITIM YERLERİNE",
+              "b) 03.07.2015 tarihli ve 9016663 sayılı yazımız."
+            ],
+            "decision_numbers": [
+              "2014/26116",
+              "2015/40292"
+            ],
+            "legal_dates": [
+              "2018-03-21",
+              "2018-01-08",
+              "2014-06-05",
+              "2015-06-10",
+              "2018-03-26",
+              "2015-07-03"
+            ],
+            "article_no": null,
+            "clause_label": "b",
+            "paragraph_no": null,
+            "article_title": null,
+            "chunk_variant": "atomic",
+            "document_date": "2018-03-26",
+            "document_type": "unknown",
+            "source_regulatory_chunk_ids": [],
+            "read_as_of_date": "2026-10-14"
+          },
+          "read_as_of_date": "2026-10-14",
+          "retrieval_method": "established_search_exact_original",
+          "article_closure_complete": false,
+          "section_context": "not_inferred",
+          "additional_context": "harness_controlled",
+          "follow_context_tool": "read_provision",
+          "retrieved_projection_ordinal": 3,
+          "retrieved_center": true
+        },
+        "text_hash": "fca1972595325ec326242a2e0c90bcbf6cb0396176c3c18c8e235d4208f793ae"
+      }
+    },
+    {
+      "citation": 536,
+      "item": {
+        "source_id": "74c7fa69-4fe5-4885-92f1-6616ba514b5c",
+        "text": "(7) Yabancı plakalı taşıtlar, Türkiye sınırları dâhilinde iki nokta arasında taşıma yapamazlar. Bu fıkraya aykırı hareket edenlere, Kanunun 26 ncı maddesinin birinci fıkrasının (ı) bendinde belirtilen alt sınırın elli katı miktarda idari para cezası uygulanır.",
+        "chunk_id": "rc_f0248b9f2785506fcc7e776477baa0199f83394c",
+        "search_doc": {
+          "document_id": "74c7fa69-4fe5-4885-92f1-6616ba514b5c",
+          "chunk_ind": 231,
+          "semantic_identifier": "Diğer Yönetmelikler/karayolu_tasima_yonetmeligi.md",
+          "link": null,
+          "blurb": "(7) Yabancı plakalı taşıtlar, Türkiye sınırları dâhilinde iki nokta arasında taşıma yapamazlar. Bu fıkraya aykırı hareket edenlere, Kanunun 26 ncı maddesinin birinci fıkrasının (ı) bendinde belirtilen alt sınırın elli katı miktarda idari pa",
+          "source_type": "file",
+          "boost": 0,
+          "hidden": false,
+          "metadata": {
+            "regulatory_chunk_id": "rc_f0248b9f2785506fcc7e776477baa0199f83394c",
+            "regulatory_heading_path": [
+              "KARAYOLU TAŞIMA YÖNETMELİĞİ",
+              "Başlangıç ve Temel Hükümler",
+              "İKİNCİ BÖLÜM",
+              "MADDE 60 - Uluslararası taşıma yetkisi ve yabancı plakalı taşıtlara ilişkin düzenlemeler",
+              "(7) Yabancı plakalı taşıtlar, Türkiye sınırları dâhilinde iki nokta arasında taşıma yapamazlar"
+            ],
+            "regulatory_validity_start_date": "",
+            "regulatory_validity_end_date": ""
+          },
+          "score": null,
+          "is_relevant": null,
+          "relevance_explanation": null,
+          "match_highlights": [],
+          "updated_at": null,
+          "primary_owners": null,
+          "secondary_owners": null,
+          "is_internet": false,
+          "file_id": "7cbba6d6-b131-4949-b34d-ea889b87f755"
+        },
+        "question_ids": [],
+        "metadata": {
+          "position": 231,
+          "heading_path": [
+            "KARAYOLU TAŞIMA YÖNETMELİĞİ",
+            "Başlangıç ve Temel Hükümler",
+            "İKİNCİ BÖLÜM",
+            "MADDE 60 - Uluslararası taşıma yetkisi ve yabancı plakalı taşıtlara ilişkin düzenlemeler",
+            "(7) Yabancı plakalı taşıtlar, Türkiye sınırları dâhilinde iki nokta arasında taşıma yapamazlar"
+          ],
+          "validity_start": null,
+          "validity_end": null,
+          "version_unknown": true,
+          "canonical_metadata": {
+            "document_id": "74c7fa69-4fe5-4885-92f1-6616ba514b5c",
+            "chunk_index": 231,
+            "title": "Diğer Yönetmelikler/karayolu_tasima_yonetmeligi.md",
+            "source_type": "user_file",
+            "semantic_identifier": "Diğer Yönetmelikler/karayolu_tasima_yonetmeligi.md — KARAYOLU TAŞIMA YÖNETMELİĞİ > Başlangıç ve Temel Hükümler > İKİNCİ BÖLÜM > MADDE 60 - Uluslararası taşıma yetkisi ve yabancı plakalı taşıtlara ilişkin düzenlemeler > (7) Yabancı plakalı taşıtlar, Türkiye sınırları dâhilinde iki nokta arasında taşıma yapamazlar",
+            "source_links": "{\"0\": \"\"}",
+            "document_sets": [
+              "PC Külliyatı"
+            ],
+            "regulatory_chunk_id": "rc_f0248b9f2785506fcc7e776477baa0199f83394c",
+            "heading_path": [
+              "KARAYOLU TAŞIMA YÖNETMELİĞİ",
+              "Başlangıç ve Temel Hükümler",
+              "İKİNCİ BÖLÜM",
+              "MADDE 60 - Uluslararası taşıma yetkisi ve yabancı plakalı taşıtlara ilişkin düzenlemeler",
+              "(7) Yabancı plakalı taşıtlar, Türkiye sınırları dâhilinde iki nokta arasında taşıma yapamazlar"
+            ],
+            "provision_identifiers": [
+              "madde 60"
+            ],
+            "legal_dates": [
+              "2018-01-08"
+            ],
+            "article_no": "60",
+            "clause_label": null,
+            "paragraph_no": "7",
+            "article_title": "Uluslararası taşıma yetkisi ve yabancı plakalı taşıtlara ilişkin düzenlemeler",
+            "chunk_variant": "atomic",
+            "document_date": null,
+            "document_type": "yonetmelik",
+            "source_regulatory_chunk_ids": [],
+            "read_as_of_date": "2026-10-14"
+          },
+          "read_as_of_date": "2026-10-14"
+        },
+        "text_hash": "94869a1c0e5eb36d4208c7221df2130df5094a9fa0667ee3eaf22f16032361a1"
+      }
+    }
+  ],
+  "authority_unit": {
+    "unit_id": "au43-ee62a0b3edac",
+    "text": "Bu doğrulama girişimi kanuni hükmün özgün metnini sağlamadığından, yukarıdaki sonucu 4925 sayılı Kanun m.13’ün bağımsız olarak doğrulanmış uygulaması şeklinde sunmuyorum. Doğrulanabilen Yönetmelik m.60/7’nin yasağı yabancı plakaya bağlaması ve 26.03.2018 tarihli idari yazının millileşmemiş eşyanın yurtiçi sevkinde uygun yetki belgesine kayıtlı Türk plakalı taşıtları öngörmesi, **Yönetmelik ve idari uygulama düzeyindeki** değerlendirmeyi destekler; idari yazı kanuni özgün metnin yerine geçmez.[536][70]",
+    "evidence_numbers": [
+      536,
+      70
+    ],
+    "presentation_only": false
+  }
+}

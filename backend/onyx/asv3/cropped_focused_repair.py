@@ -5,12 +5,14 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
 from onyx.asv3.artifacts import compact_json
 from onyx.asv3.assertions import (
+    AssertionUnit,
     AssertionWitness,
     assertion_inventory,
     assertion_witness_valid,
@@ -90,10 +92,10 @@ def source_gap_sentence(target: CroppedRepairTarget, status: str) -> str:
     return f"Bu denemede {reference} dosyaya uygulanabilirliği doğrulanamadı."
 
 
-def authority_answer_with_cropped_disclosures(
+def _authority_units_with_cropped_disclosures(
     answer: str,
     state: CroppedRepairState,
-) -> str:
+) -> list[AssertionUnit]:
     """Accept only exact standalone host notices for completed unresolved attempts."""
     notices: set[str] = set()
     records = state.export().get("records", [])
@@ -107,11 +109,73 @@ def authority_answer_with_cropped_disclosures(
         target = CroppedRepairTarget.model_validate(record["target"])
         if target.check_kind == "governing_original" and target.article:
             notices.add(source_gap_sentence(target, str(record["status"])))
+    return [unit for unit in assertion_inventory(answer) if unit["text"] not in notices]
+
+
+def authority_answer_with_cropped_disclosures(
+    answer: str,
+    state: CroppedRepairState,
+) -> str:
     return "\n\n".join(
         unit["text"]
-        for unit in assertion_inventory(answer)
-        if unit["text"] not in notices
+        for unit in _authority_units_with_cropped_disclosures(answer, state)
     )
+
+
+def authority_gap_with_cropped_disclosures(
+    answer: str,
+    state: CroppedRepairState,
+    check: Callable[[str], dict[str, JsonValue] | None],
+) -> dict[str, JsonValue] | None:
+    """Bind filtered diagnostics to exact kept units of the owned, unfiltered draft."""
+    kept = _authority_units_with_cropped_disclosures(answer, state)
+    checked = "\n\n".join(unit["text"] for unit in kept)
+    projected = assertion_inventory(checked)
+    if len(kept) != len(projected) or any(
+        source["text"] != unit["text"]
+        for source, unit in zip(kept, projected, strict=True)
+    ):
+        return check(answer)
+    identifiers = {
+        unit["unit_id"]: source["unit_id"]
+        for source, unit in zip(kept, projected, strict=True)
+    }
+    gap = check(checked)
+    if gap is None:
+        return None
+
+    def remap(value: JsonValue) -> JsonValue:
+        if isinstance(value, list):
+            return [remap(item) for item in value]
+        if not isinstance(value, dict):
+            return value
+        mapped: dict[str, JsonValue] = {}
+        for key, item in value.items():
+            if key == "unit_id":
+                if not isinstance(item, str) or item not in identifiers:
+                    raise ValueError(
+                        "Diagnostic unit is outside the exact kept inventory"
+                    )
+                mapped[key] = identifiers[item]
+            elif key in {"unit_ids", "answer_unit_ids"}:
+                if not isinstance(item, list) or any(
+                    not isinstance(identifier, str) or identifier not in identifiers
+                    for identifier in item
+                ):
+                    raise ValueError(
+                        "Diagnostic units are outside the exact kept inventory"
+                    )
+                mapped[key] = [
+                    identifiers[cast(str, identifier)] for identifier in item
+                ]
+            else:
+                mapped[key] = remap(item)
+        return mapped
+
+    try:
+        return cast(dict[str, JsonValue], remap(gap))
+    except ValueError:
+        return check(answer)
 
 
 def unresolved_governing_projection(

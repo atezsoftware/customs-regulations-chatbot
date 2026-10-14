@@ -1355,11 +1355,21 @@ def _gap_subject_references(
     return references
 
 
-_NEGATIVE_ATTRIBUTION = re.compile(
-    r"(?P<subject>[^;\n.!?]+?)\s+"
-    r"(?:bağımsız\s+)?doğrulaması\s+olarak\s+sunulmamaktadır"
-    r"(?=\s*(?:[.;!?]|(?:\[\d+\]\s*)+(?:[.;!?]|$)|$))",
-    re.IGNORECASE,
+_NEGATIVE_ATTRIBUTION_END = r"(?=\s*(?:[.;!?]|(?:\[\d+\]\s*)+(?:[.;!?]|$)|$))"
+_NEGATIVE_ATTRIBUTIONS = (
+    re.compile(
+        r"(?P<subject>[^;\n.!?]+?)\s+"
+        r"(?:bağımsız\s+)?doğrulaması\s+olarak\s+sunulmamaktadır"
+        + _NEGATIVE_ATTRIBUTION_END,
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?<!\S)Bu doğrulama girişimi kanuni hükmün özgün metnini sağlamadığından,\s+"
+        r"yukarıdaki sonucu\s+(?P<subject>[^;\n.!?]+?)\s+"
+        r"bağımsız olarak doğrulanmış uygulaması şeklinde sunmuyorum"
+        + _NEGATIVE_ATTRIBUTION_END,
+        re.IGNORECASE,
+    ),
 )
 
 
@@ -1374,11 +1384,14 @@ def _without_negative_authority_attribution(
         r"\b(m|md)\.", lambda match: match[1] + " ", text, flags=re.IGNORECASE
     )
     masked = list(text)
-    for match in _NEGATIVE_ATTRIBUTION.finditer(normalized):
-        subject = folded(match["subject"].replace("**", "").replace("__", ""))
-        subject = re.sub(r"['’](?:un|nun|in|nin)$", "", subject)
-        if _gap_subject_references(subject, aliases, masking_aliases) is not None:
-            masked[match.start() : match.end()] = " " * (match.end() - match.start())
+    for pattern in _NEGATIVE_ATTRIBUTIONS:
+        for match in pattern.finditer(normalized):
+            subject = folded(match["subject"].replace("**", "").replace("__", ""))
+            subject = re.sub(r"['’](?:un|nun|in|nin)$", "", subject)
+            if _gap_subject_references(subject, aliases, masking_aliases) is not None:
+                masked[match.start() : match.end()] = " " * (
+                    match.end() - match.start()
+                )
     return "".join(masked)
 
 
