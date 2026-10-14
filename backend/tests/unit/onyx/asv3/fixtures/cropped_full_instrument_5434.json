@@ -1,0 +1,17 @@
+{
+  "assistant_message_id": 5434,
+  "terminal_node_id": "step_ea95625a4c824af0ae7e1c32841363ae",
+  "focused_node_id": "step_52ced99d08444d8abc7b0a4377ecfe4e",
+  "supported_unit": "**Tarih sınırı:** Olay tarihi belirtilmediği için aşağıda okunan metinlerdeki para cezası tutarlarını olay gününe uygulanacak kesin tutarlar olarak kullanmıyorum. Özellikle trafik yaptırımları ve HGS bakımından olay tarihinde uygulanacak sürüm belirlenmelidir. [4][50][62]",
+  "disclosure_unit": "5393 sayılı Belediye Kanununun kendi özgün metni bu odaklı girişimde elde edilemedi. Bu nedenle bu Kanunun taşımacılık kapsamını bağımsız olarak doğrulayamıyor ve somut uluslararası taşımanın o Kanun kapsamına girdiğini kabul etmiyorum.",
+  "source_attempt_status": "not_found",
+  "source_attempt_detail": "Eksiklik giderilmemiştir. Sunulan metinlerde 3/7/2005 tarihli ve 5393 sayılı Belediye Kanununa atıflar bulunmakla birlikte, istenen Kanunun kendi özgün metni elde edilmemiştir. Diğer kanun ve tebliğlerdeki atıflar, 5393 sayılı Kanunun özgün hükümlerinin yerine geçmez.",
+  "gap_entry": {
+    "unit_id": "au17-d2eb2f42521a",
+    "instrument_number": "5393",
+    "reference_text": "5393 sayılı Belediye Kanununun",
+    "article": null,
+    "inline_evidence": [],
+    "matching_original_evidence": []
+  }
+}

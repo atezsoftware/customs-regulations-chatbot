@@ -1,0 +1,205 @@
+{
+  "provenance": {
+    "graph": "ee0aa91b-a2b3-45b1-95d9-984ca45c73e5",
+    "node": "span_7a56c09a53ed4249a9acd210",
+    "source": "captured physical repair input",
+    "ordered_reads": [
+      "step_ec01baa1865e4f10b2367454ff2e87b9/tckref",
+      "step_68fd7c3b811f48c784771a7bdb7689df/place"
+    ]
+  },
+  "rows": [
+    {
+      "citation": 352,
+      "source_ref": 37,
+      "chunk_id": "rc_a52634a570dad75c98393b4d7ce236e5c3094ee1",
+      "text_hash": "438ec273344e663c9b2503c3cdd6a72482575fd0f884e3fb4442dd4e19d3a0f9",
+      "metadata": {
+        "title": "Diğer Kanunlar/5237_sayili_kanunu.md",
+        "legal_dates": [
+          "2004-09-26",
+          "2004-10-11",
+          "2004-10-12"
+        ],
+        "article_no": null,
+        "clause_label": null,
+        "document_date": "2004-09-26",
+        "document_type": "kanun",
+        "read_as_of_date": "2026-10-14",
+        "version_unknown": true,
+        "provision_identifiers": [
+          "madde 179"
+        ],
+        "paragraph_no": null,
+        "heading_path": [
+          "5237 Sayılı TÜRK CEZA KANUNU",
+          "Topluma Karşı Suçlar",
+          "BİRİNCİ BÖLÜM",
+          "Trafik güvenliğini tehlikeye sokma"
+        ]
+      },
+      "source_id": "18453991-be20-4120-9be9-2a521d26f973",
+      "text": "**MADDE 179. -** (1) Kara, deniz, hava veya demiryolu ulaşımının güven içinde akışını sağlamak için konulmuş her türlü işareti değiştirerek, kullanılamaz hale getirerek, konuldukları yerden kaldırarak, yanlış işaretler vererek, geçiş, varış, kalkış veya iniş yolları üzerine bir şey koyarak ya da teknik işletim sistemine müdahale ederek, başkalarının hayatı, sağlığı veya malvarlığı bakımından bir tehlikeye neden olan kişiye bir yıldan altı yıla kadar hapis cezası verilir.",
+      "position": 731
+    },
+    {
+      "citation": 353,
+      "source_ref": 37,
+      "chunk_id": "rc_dd2476a8822ff5412ac815812e6debfdf89ef3c2",
+      "text_hash": "dc0038475e3dea260ae21de31e8b1095ca6a8c7e9d972d1e20ae7ef4a32a6428",
+      "metadata": {
+        "title": "Diğer Kanunlar/5237_sayili_kanunu.md",
+        "legal_dates": [
+          "2004-09-26",
+          "2004-10-11",
+          "2004-10-12"
+        ],
+        "article_no": null,
+        "clause_label": null,
+        "document_date": "2004-09-26",
+        "document_type": "kanun",
+        "read_as_of_date": "2026-10-14",
+        "version_unknown": true,
+        "paragraph_no": "2",
+        "heading_path": [
+          "5237 Sayılı TÜRK CEZA KANUNU",
+          "Topluma Karşı Suçlar",
+          "BİRİNCİ BÖLÜM",
+          "(2) Kara, deniz, hava veya demiryolu ulaşım araçlarını kişilerin hayat, sağlık veya malvarl..."
+        ]
+      },
+      "source_id": "18453991-be20-4120-9be9-2a521d26f973",
+      "text": "(2) Kara, deniz, hava veya demiryolu ulaşım araçlarını kişilerin hayat, sağlık veya malvarlığı açısından tehlikeli olabilecek şekilde sevk ve idare eden kişi, dört aydan iki yıla kadar hapis cezası ile cezalandırılır.",
+      "position": 732
+    },
+    {
+      "citation": 354,
+      "source_ref": 37,
+      "chunk_id": "rc_532bbc0b277d82668aef29bec9d7017b9a1b3b3c",
+      "text_hash": "cc52e4354c3fd9af320e15271d502991744b242c870341b698aa861269b8cfa4",
+      "metadata": {
+        "title": "Diğer Kanunlar/5237_sayili_kanunu.md",
+        "legal_dates": [
+          "2004-09-26",
+          "2004-10-11",
+          "2004-10-12"
+        ],
+        "article_no": null,
+        "clause_label": null,
+        "document_date": "2004-09-26",
+        "document_type": "kanun",
+        "read_as_of_date": "2026-10-14",
+        "version_unknown": true,
+        "paragraph_no": "3",
+        "heading_path": [
+          "5237 Sayılı TÜRK CEZA KANUNU",
+          "Topluma Karşı Suçlar",
+          "BİRİNCİ BÖLÜM",
+          "(3) Alkol veya uyuşturucu madde etkisiyle ya da başka bir nedenle emniyetli bir şekilde ara..."
+        ]
+      },
+      "source_id": "18453991-be20-4120-9be9-2a521d26f973",
+      "text": "(3) Alkol veya uyuşturucu madde etkisiyle ya da başka bir nedenle emniyetli bir şekilde araç sevk ve idare edemeyecek halde olmasına rağmen araç kullanan kişi altı aydan iki yıla kadar hapis cezası ile cezalandırılır.",
+      "position": 733
+    },
+    {
+      "citation": 374,
+      "source_ref": 18,
+      "chunk_id": "rc_3daf42ed548acbfca03b2a208e92ba5709d6a06a",
+      "text_hash": "6b56ca97e295d0be44086d4046ab9ecc38e4bf5b469156a6a0ba6950cdeb0324",
+      "metadata": {
+        "title": "İhracat Mevzuatı/Kanun, Kararname, Yönetmelik, Tebliğ, Genelge/gumruk_kanunu_.md",
+        "legal_dates": [
+          "1999-10-27",
+          "1999-11-04"
+        ],
+        "document_date": "1999-10-27",
+        "document_type": "kanun",
+        "read_as_of_date": "2026-10-14",
+        "version_unknown": true,
+        "provision_identifiers": [
+          "madde 191/a",
+          "madde 191"
+        ],
+        "article_no": "191",
+        "clause_label": null,
+        "paragraph_no": null,
+        "heading_path": [
+          "4458 SAYILI GÜMRÜK KANUNU",
+          "Gümrük Yükümlülüğü",
+          "BİRİNCİ BÖLÜM",
+          "MADDE 191"
+        ]
+      },
+      "source_id": "12328001-2f21-407e-b230-7d50a8dbf28f",
+      "text": "---------------------------------------------------------------------------------------------------------\n**MADDE 191/A-** 16 ncı, 77 nci, 135 inci ve 167 ila 170 inci maddelere uygun olarak eşyanın mahiyeti veya nihai kullanımı nedeniyle tercihli tarife uygulanmasının ya da ithalat veya ihracat vergilerinden tamamen veya kısmen muafiyetinin mümkün olduğu durumlarda söz konusu tercihli tarife veya vergi muafiyeti;",
+      "position": 905
+    },
+    {
+      "citation": 375,
+      "source_ref": 18,
+      "chunk_id": "rc_1bc3414a90b3f6a85a1e5dcf177634938fce86a3",
+      "text_hash": "4ce9f5005a138a86fc941a0f6f4b2ad0ed2b929361bfb57d88097b2accbcf5ef",
+      "metadata": {
+        "title": "İhracat Mevzuatı/Kanun, Kararname, Yönetmelik, Tebliğ, Genelge/gumruk_kanunu_.md",
+        "legal_dates": [
+          "1999-10-27",
+          "1999-11-04"
+        ],
+        "document_date": "1999-10-27",
+        "document_type": "kanun",
+        "read_as_of_date": "2026-10-14",
+        "version_unknown": true,
+        "provision_identifiers": [
+          "madde 191"
+        ],
+        "article_no": "191",
+        "clause_label": "a",
+        "paragraph_no": null,
+        "heading_path": [
+          "4458 SAYILI GÜMRÜK KANUNU",
+          "Gümrük Yükümlülüğü",
+          "BİRİNCİ BÖLÜM",
+          "MADDE 191",
+          "a) İlgili kişinin hileli bir davranış veya ihmalinin olmaması,"
+        ]
+      },
+      "source_id": "12328001-2f21-407e-b230-7d50a8dbf28f",
+      "text": "a) İlgili kişinin hileli bir davranış veya ihmalinin olmaması,",
+      "position": 906
+    },
+    {
+      "citation": 376,
+      "source_ref": 18,
+      "chunk_id": "rc_fb0535b46e62f086f441cfb505c5f522b2c17eb2",
+      "text_hash": "1bc965b367afba259916fadecc1f927f366dd9cca1389a9fc3b5520ef6a06c55",
+      "metadata": {
+        "title": "İhracat Mevzuatı/Kanun, Kararname, Yönetmelik, Tebliğ, Genelge/gumruk_kanunu_.md",
+        "legal_dates": [
+          "1999-10-27",
+          "1999-11-04"
+        ],
+        "document_date": "1999-10-27",
+        "document_type": "kanun",
+        "read_as_of_date": "2026-10-14",
+        "version_unknown": true,
+        "provision_identifiers": [
+          "madde 191"
+        ],
+        "article_no": "191",
+        "clause_label": "b",
+        "paragraph_no": null,
+        "heading_path": [
+          "4458 SAYILI GÜMRÜK KANUNU",
+          "Gümrük Yükümlülüğü",
+          "BİRİNCİ BÖLÜM",
+          "MADDE 191",
+          "b) Tercihli tarife veya muafiyetin uygulanması için gerekli olan diğer şartların yerine ge..."
+        ]
+      },
+      "source_id": "12328001-2f21-407e-b230-7d50a8dbf28f",
+      "text": "b) Tercihli tarife veya muafiyetin uygulanması için gerekli olan diğer şartların yerine getirildiğinin ilgili kişi tarafından ispat edilmesi,\nşartıyla 182 ila 185 inci, 189 uncu veya 190 ıncı maddelere göre gümrük yükümlülüğü doğduğu hallerde de uygulanır.\n---------------------------------------------------------------------------------------------------------",
+      "position": 907
+    }
+  ]
+}

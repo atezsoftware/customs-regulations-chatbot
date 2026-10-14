@@ -86,7 +86,13 @@ def source_gap_sentence(target: CroppedRepairTarget, status: str) -> str:
         if target.instrument_number
         else target.formal_name or target.source_name or ""
     )
-    reference = f"{name} {target.qualifier + ' ' if target.qualifier else ''}{target.article}. maddesinin"
+    reference = (
+        f"{name} {target.qualifier + ' ' if target.qualifier else ''}{target.article}. maddesinin"
+        if target.article
+        else f"{name}un"
+        if target.instrument_number
+        else f"{name} adlı kaynağın"
+    )
     if status == "not_found":
         return f"{reference} özgün metni elde edilemedi."
     return f"Bu denemede {reference} dosyaya uygulanabilirliği doğrulanamadı."
@@ -107,7 +113,7 @@ def _authority_units_with_cropped_disclosures(
         }:
             continue
         target = CroppedRepairTarget.model_validate(record["target"])
-        if target.check_kind == "governing_original" and target.article:
+        if target.check_kind == "governing_original":
             notices.add(source_gap_sentence(target, str(record["status"])))
     return [unit for unit in assertion_inventory(answer) if unit["text"] not in notices]
 
@@ -192,7 +198,9 @@ def unresolved_governing_projection(
         record = by_key.get(target.key)
         if (
             target.check_kind != "governing_original"
-            or not target.article
+            or not (
+                target.instrument_number or target.formal_name or target.source_name
+            )
             or not target.unit_ids
             or not set(target.unit_ids).issubset(known)
             or record is None
@@ -697,7 +705,6 @@ class CroppedFocusedRepair:
             if (
                 record.get("status") != "found"
                 and target.check_kind == "governing_original"
-                and target.article
             ):
                 record["source_gap_sentence"] = source_gap_sentence(
                     target, str(record["status"])

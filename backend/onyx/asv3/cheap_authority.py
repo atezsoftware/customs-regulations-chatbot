@@ -203,6 +203,7 @@ class ArticleParagraphBinding:
     article_no: str
     qualifier: str | None
     paragraph_no: str | None
+    clause_label: str | None = None
 
 
 class _IdentityLedger(EvidenceLedger):
@@ -259,7 +260,7 @@ class _IdentityLedger(EvidenceLedger):
                         "article_qualifier": binding.qualifier,
                         "paragraph_no": binding.paragraph_no,
                         **(
-                            {"clause_label": None}
+                            {"clause_label": binding.clause_label}
                             if binding.paragraph_no is None
                             else {}
                         ),
