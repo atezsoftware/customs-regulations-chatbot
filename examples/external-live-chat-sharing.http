@@ -1,0 +1,30 @@
+# Server-to-server calls: keep the application API key in the Tariff backend.
+# Tariff must verify its logged-in user's session ownership before create/revoke.
+# The Tariff share page calls its public proxy; these core routes require the same key.
+@core = https://dev-customs-regulations.singlewindow.io
+@apiKey = REPLACE_WITH_APPLICATION_API_KEY
+@sessionId = REPLACE_WITH_OWNED_SESSION_UUID
+@shareToken = REPLACE_WITH_CREATE_RESPONSE_TOKEN
+
+### Create a live link. A missing body uses https://tariff.singlewindow.io/chat/shared.
+POST {{core}}/api/chat/chat-session/{{sessionId}}/share
+Authorization: Bearer {{apiKey}}
+Content-Type: application/json
+
+{"share_url_base":"https://tariff.singlewindow.io/chat/shared"}
+
+### Read current messages. Repeat after sending another message to the same session.
+GET {{core}}/api/chat/shared/{{shareToken}}/messages
+Authorization: Bearer {{apiKey}}
+
+### Revoke this link. Further reads return 404; deleting the session also closes links.
+DELETE {{core}}/api/chat/shared/{{shareToken}}
+Authorization: Bearer {{apiKey}}
+
+# Tariff proxy route: GET /api/v1-0/chat/shared/{shareToken}/messages.
+# Forward the token to the core GET above and return its JSON with no-store caching.
+# Render response.messages in order; session contains title, dates and visible count.
+# New messages appear on the next GET. Polling or refresh is needed on an open page.
+# The selected conversation branch is shown. Unfinished/error/private internal data is omitted.
+# Citations contain number/title and optional public URL; core file previews are not exposed.
+# A response shareUrl is a Tariff URL. Tariff must connect its page/proxy to these core routes.

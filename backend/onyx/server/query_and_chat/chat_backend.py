@@ -95,6 +95,9 @@ from onyx.server.query_and_chat.chat_utils import (
     is_spreadsheet_mime_type,
     parse_spreadsheet_for_preview,
 )
+from onyx.server.query_and_chat.external_sharing import (
+    router as external_sharing_router,
+)
 from onyx.server.query_and_chat.models import (
     ChatFeedbackRequest,
     ChatMessageIdentifier,
@@ -138,6 +141,7 @@ from shared_configs.contextvars import get_current_tenant_id
 logger = setup_logger()
 
 router = APIRouter(prefix="/chat")
+router.include_router(external_sharing_router)
 
 
 @router.get("/message/{message_id}/usage")

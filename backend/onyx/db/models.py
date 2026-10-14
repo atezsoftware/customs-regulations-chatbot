@@ -3270,6 +3270,25 @@ class ChatSession(Base):
     )
 
 
+class ExternalChatShare(Base):
+    __tablename__ = "external_chat_share"
+
+    token_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    chat_session_id: Mapped[UUID] = mapped_column(
+        ForeignKey("chat_session.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    created_by_user_id: Mapped[UUID] = mapped_column(
+        ForeignKey("user.id", ondelete="CASCADE"), nullable=False
+    )
+    api_key_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    time_created: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    revoked_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
 class ChatMessage(Base):
     """Note, the first message in a chain has no contents, it's a workaround to allow edits
     on the first message of a session, an empty root node basically
