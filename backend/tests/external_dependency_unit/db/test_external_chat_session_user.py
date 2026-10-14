@@ -18,6 +18,8 @@ from ee.onyx.server.query_history.models import (
 from onyx.auth.api_key import ApiKeyDescriptor
 from onyx.auth.schemas import UserRole
 from onyx.chat.chat_utils import create_chat_session_from_request
+from onyx.chat.models import CreateChatSessionID
+from onyx.chat.process_message import build_chat_turn
 from onyx.configs.constants import MessageType
 from onyx.db.api_key import (
     insert_api_key,
@@ -232,6 +234,56 @@ def test_inline_session_creation_and_untrusted_key_fields(
     assert created.external_user_name == "Şule İğde"
     assert created.api_key_id == key.api_key_id
     assert created.api_key_name == key.api_key_name
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"message": "İlk soru", "user": "  Çağrı Şahin Öztürk  "},
+        {
+            "message": "İlk soru",
+            "user": "  Çağrı Şahin Öztürk  ",
+            "chat_session_info": {"description": "Dış uygulama"},
+        },
+        {
+            "message": "İlk soru",
+            "chat_session_info": {"user": "  Çağrı Şahin Öztürk  "},
+        },
+    ],
+)
+def test_first_message_creates_session_with_saved_user(
+    db_session: Session,
+    integration_key: tuple[ApiKeyDescriptor, User],
+    payload: dict[str, object],
+) -> None:
+    key, owner = integration_key
+    request = SendMessageRequest.model_validate(payload)
+    assert request.chat_session_info is not None
+    token = CURRENT_USAGE_CREDENTIAL_CONTEXTVAR.set(
+        UsageCredentialIdentity(
+            UsageCredentialType.API_KEY,
+            str(key.api_key_id),
+            key.api_key_name,
+            key.api_key_display,
+        )
+    )
+    setup = build_chat_turn(request, owner, db_session, llm_overrides=None)
+    try:
+        # Session creation is the first stream packet, before answer generation.
+        packet = next(setup)
+    finally:
+        setup.close()
+        CURRENT_USAGE_CREDENTIAL_CONTEXTVAR.reset(token)
+    assert isinstance(packet, CreateChatSessionID)
+    db_session.expire_all()
+    saved = db_session.get(ChatSession, packet.chat_session_id)
+    assert saved is not None
+    history = ChatSessionMinimal.from_chat_session(saved)
+    assert history.user_name == "Çağrı Şahin Öztürk"
+    assert history.api_key_id == key.api_key_id
+    assert history.api_key_name == key.api_key_name
+    assert saved.user_id == owner.id
+    assert saved.description == (request.chat_session_info.description or "")
 
 
 @pytest.mark.parametrize(

@@ -1,9 +1,9 @@
 from datetime import datetime
 from enum import Enum
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import AfterValidator, BaseModel, Field, field_validator, model_validator
 
 from onyx.configs.constants import DocumentSource, MessageType, SessionType
 from onyx.context.search.models import BaseFilters, SavedSearchDoc, SearchDoc, Tag
@@ -15,6 +15,21 @@ from onyx.llm.usage_cost import ResponseUsage
 from onyx.server.query_and_chat.streaming_models import Packet
 
 AUTO_PLACE_AFTER_LATEST_MESSAGE = -1
+
+
+def _normalize_external_user_name(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if "\x00" in value:
+        raise ValueError("User name cannot contain null characters")
+    return value.strip() or None
+
+
+ExternalUserName = Annotated[
+    str | None,
+    Field(strict=True, max_length=255, examples=["Çağrı Şahin Öztürk"]),
+    AfterValidator(_normalize_external_user_name),
+]
 
 
 class MessageOrigin(str, Enum):
@@ -81,22 +96,10 @@ class ChatSessionCreationRequest(BaseModel):
     persona_id: int = 0
     description: str | None = None
     project_id: int | None = None
-    user: str | None = Field(
+    user: ExternalUserName = Field(
         default=None,
-        strict=True,
-        max_length=255,
         description="Optional external user's full name, saved for this session.",
-        examples=["Çağrı Şahin Öztürk"],
     )
-
-    @field_validator("user")
-    @classmethod
-    def normalize_external_user_name(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        if "\x00" in value:
-            raise ValueError("User name cannot contain null characters")
-        return value.strip() or None
 
 
 class ChatFeedbackRequest(BaseModel):
@@ -177,6 +180,10 @@ class SendMessageRequest(BaseModel):
     parent_message_id: int | None = AUTO_PLACE_AFTER_LATEST_MESSAGE
     chat_session_id: UUID | None = None
     chat_session_info: ChatSessionCreationRequest | None = None
+    user: ExternalUserName = Field(
+        default=None,
+        description="Optional external user's full name; recorded only when this message opens a new session.",
+    )
 
     # When True (default), returns StreamingResponse with SSE
     # When False, returns ChatFullResponse with complete data
@@ -357,16 +364,19 @@ class SendMessageRequest(BaseModel):
             raise ValueError(
                 "ASv3 external source permission requires the ASv3 workflow"
             )
-        # If neither is provided, default to creating a new chat session using the
-        # default ChatSessionCreationRequest values.
-        if self.chat_session_id is None and self.chat_session_info is None:
-            return self.model_copy(
-                update={"chat_session_info": ChatSessionCreationRequest()}
-            )
         if self.chat_session_id is not None and self.chat_session_info is not None:
             raise ValueError(
                 "Only one of chat_session_id or chat_session_info should be provided, not both."
             )
+        if self.chat_session_id is None:
+            if self.chat_session_info is None:
+                self.chat_session_info = ChatSessionCreationRequest(user=self.user)
+            elif self.user is not None:
+                if self.chat_session_info.user not in (None, self.user):
+                    raise ValueError("user and chat_session_info.user must match")
+                self.chat_session_info = self.chat_session_info.model_copy(
+                    update={"user": self.user}
+                )
         return self
 
 
