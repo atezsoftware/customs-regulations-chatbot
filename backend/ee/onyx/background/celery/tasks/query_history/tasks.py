@@ -4,10 +4,7 @@ from datetime import datetime
 
 from celery import Task, shared_task
 
-from ee.onyx.server.query_history.api import (
-    ONYX_ANONYMIZED_EMAIL,
-    fetch_and_process_chat_session_history,
-)
+from ee.onyx.server.query_history.api import fetch_and_process_chat_session_history
 from ee.onyx.server.query_history.models import QuestionAnswerPairSnapshot
 from onyx.background.task_utils import construct_query_history_report_name
 from onyx.configs.app_configs import JOB_TIMEOUT
@@ -74,7 +71,7 @@ def export_query_history_task(
             query_history_type = load_settings().query_history_type
             for snapshot in snapshot_generator:
                 if query_history_type == QueryHistoryType.ANONYMIZED:
-                    snapshot.user_email = ONYX_ANONYMIZED_EMAIL
+                    snapshot.anonymize_identity()
 
                 writer.writerows(
                     # Sanitize to prevent CSV/formula injection against

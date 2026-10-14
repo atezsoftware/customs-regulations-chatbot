@@ -81,6 +81,22 @@ class ChatSessionCreationRequest(BaseModel):
     persona_id: int = 0
     description: str | None = None
     project_id: int | None = None
+    user: str | None = Field(
+        default=None,
+        strict=True,
+        max_length=255,
+        description="Optional external user's full name, saved for this session.",
+        examples=["Çağrı Şahin Öztürk"],
+    )
+
+    @field_validator("user")
+    @classmethod
+    def normalize_external_user_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if "\x00" in value:
+            raise ValueError("User name cannot contain null characters")
+        return value.strip() or None
 
 
 class ChatFeedbackRequest(BaseModel):

@@ -228,6 +228,10 @@ def create_chat_session(
     slack_thread_id: str | None = None,
     project_id: int | None = None,
     benchmark_flow: bool = False,
+    external_user_name: str | None = None,
+    api_key_id: int | None = None,
+    api_key_name: str | None = None,
+    api_key_display: str | None = None,
 ) -> ChatSession:
     chat_session = ChatSession(
         user_id=user_id,
@@ -239,6 +243,10 @@ def create_chat_session(
         slack_thread_id=slack_thread_id,
         project_id=project_id,
         benchmark_flow=benchmark_flow,
+        external_user_name=external_user_name,
+        api_key_id=api_key_id,
+        api_key_name=api_key_name,
+        api_key_display=api_key_display,
     )
 
     db_session.add(chat_session)

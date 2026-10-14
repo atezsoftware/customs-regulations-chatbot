@@ -12,6 +12,7 @@ import { timestampToReadableDate } from "@/lib/dateUtils";
 import type { ChatSessionSnapshot } from "@/app/ee/admin/performance/usage/types";
 import QueryHistoryTranscript from "@/app/ee/admin/performance/query-history/[id]/QueryHistoryTranscript";
 import { SessionFeedbackBadge } from "@/app/ee/admin/performance/query-history/SessionFeedbackBadge";
+import QueryHistoryUser from "@/app/ee/admin/performance/query-history/QueryHistoryUser";
 
 interface QueryHistoryConversationProps {
   chatSessionId: string;
@@ -56,10 +57,12 @@ function QueryHistoryConversation({
         <Text font="main-ui-action" color="text-05">
           {chatSessionSnapshot.name || "Untitled conversation"}
         </Text>
+        <QueryHistoryUser
+          session={chatSessionSnapshot}
+          anonymousLabel="Anonymous user"
+        />
         <Text font="secondary-body" color="text-03">
-          {`${chatSessionSnapshot.user_email || "Anonymous user"} · ${
-            chatSessionSnapshot.assistant_name || "Unknown assistant"
-          } · ${timestampToReadableDate(chatSessionSnapshot.time_created)}`}
+          {`${chatSessionSnapshot.assistant_name || "Unknown assistant"} · ${timestampToReadableDate(chatSessionSnapshot.time_created)}`}
         </Text>
         {modelDisplayNames.length > 0 && (
           <Text font="secondary-body" color="text-03">

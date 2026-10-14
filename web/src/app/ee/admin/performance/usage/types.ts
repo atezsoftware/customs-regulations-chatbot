@@ -41,6 +41,10 @@ export interface MessageSnapshot {
 export interface ChatSessionSnapshot {
   id: string;
   user_email: string | null;
+  user_name?: string | null;
+  api_key_id?: number | null;
+  api_key_name?: string | null;
+  api_key_display?: string | null;
   name: string | null;
   messages: MessageSnapshot[];
   assistant_id: number | null;
@@ -54,6 +58,10 @@ export interface ChatSessionMinimal {
   usage?: ResponseUsage | null;
   id: string;
   user_email: string | null;
+  user_name?: string | null;
+  api_key_id?: number | null;
+  api_key_name?: string | null;
+  api_key_display?: string | null;
   name: string | null;
   first_user_message: string;
   first_ai_message: string;

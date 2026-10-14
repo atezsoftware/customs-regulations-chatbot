@@ -12,6 +12,39 @@ from onyx.db.models import ChatMessage, ChatSession, FileRecord, TaskQueueState
 from onyx.llm.usage_cost import ResponseUsage
 from onyx.server.query_and_chat.models import SessionFeedbackResponse
 
+ONYX_ANONYMIZED_EMAIL = "anonymous@anonymous.invalid"
+
+
+class QueryHistoryIdentity(BaseModel):
+    user_email: str
+    user_name: str | None = None
+    api_key_id: int | None = None
+    api_key_name: str | None = None
+    api_key_display: str | None = None
+
+    @classmethod
+    def from_chat_session(cls, chat_session: ChatSession) -> "QueryHistoryIdentity":
+        return cls(
+            user_email=get_display_email(
+                chat_session.user.email if chat_session.user else None
+            ),
+            user_name=(
+                chat_session.external_user_name
+                if chat_session.api_key_id is not None
+                else None
+            ),
+            api_key_id=chat_session.api_key_id,
+            api_key_name=chat_session.api_key_name,
+            api_key_display=chat_session.api_key_display,
+        )
+
+    def anonymize_identity(self) -> None:
+        self.user_email = ONYX_ANONYMIZED_EMAIL
+        self.user_name = None
+        self.api_key_id = None
+        self.api_key_name = None
+        self.api_key_display = None
+
 
 class AbridgedSearchDoc(BaseModel):
     """A subset of the info present in `SearchDoc`"""
@@ -72,10 +105,9 @@ class MessageSnapshot(BaseModel):
         )
 
 
-class ChatSessionMinimal(BaseModel):
+class ChatSessionMinimal(QueryHistoryIdentity):
     id: UUID
     usage: ResponseUsage | None = None
-    user_email: str
     name: str | None
     first_user_message: str
     first_ai_message: str
@@ -123,9 +155,7 @@ class ChatSessionMinimal(BaseModel):
 
         return cls(
             id=chat_session.id,
-            user_email=get_display_email(
-                chat_session.user.email if chat_session.user else None
-            ),
+            **QueryHistoryIdentity.from_chat_session(chat_session).model_dump(),
             name=chat_session.description,
             first_user_message=first_user_message,
             first_ai_message=first_ai_message,
@@ -161,9 +191,8 @@ class ChatSessionMinimal(BaseModel):
         )
 
 
-class ChatSessionSnapshot(BaseModel):
+class ChatSessionSnapshot(QueryHistoryIdentity):
     id: UUID
-    user_email: str
     name: str | None
     messages: list[MessageSnapshot]
     assistant_id: int | None
@@ -191,6 +220,10 @@ class QuestionAnswerPairSnapshot(BaseModel):
     session_feedback_label: str | None = None
     session_feedback_text: str | None = None
     session_feedback_updated_at: datetime | None = None
+    user_name: str | None = None
+    api_key_id: int | None = None
+    api_key_name: str | None = None
+    api_key_display: str | None = None
 
     @classmethod
     def from_chat_session_snapshot(
@@ -198,6 +231,10 @@ class QuestionAnswerPairSnapshot(BaseModel):
         chat_session_snapshot: ChatSessionSnapshot,
     ) -> list["QuestionAnswerPairSnapshot"]:
         session_feedback = chat_session_snapshot.session_feedback
+        identity = chat_session_snapshot.model_dump(
+            include=set(QueryHistoryIdentity.model_fields)
+        )
+        identity["user_email"] = get_display_email(chat_session_snapshot.user_email)
         message_pairs: list[tuple[MessageSnapshot, MessageSnapshot]] = []
         for ind in range(1, len(chat_session_snapshot.messages), 2):
             message_pairs.append(
@@ -217,7 +254,7 @@ class QuestionAnswerPairSnapshot(BaseModel):
                 feedback_type=ai_message.feedback_type,
                 feedback_text=ai_message.feedback_text,
                 persona_name=chat_session_snapshot.assistant_name,
-                user_email=get_display_email(chat_session_snapshot.user_email),
+                **identity,
                 time_created=user_message.time_created,
                 flow_type=chat_session_snapshot.flow_type,
                 session_feedback_rating=(
@@ -266,6 +303,10 @@ class QuestionAnswerPairSnapshot(BaseModel):
                 if self.session_feedback_updated_at
                 else ""
             ),
+            "user_name": self.user_name or "",
+            "api_key_id": str(self.api_key_id) if self.api_key_id is not None else "",
+            "api_key_name": self.api_key_name or "",
+            "api_key_display": self.api_key_display or "",
         }
 
 

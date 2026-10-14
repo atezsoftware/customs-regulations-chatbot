@@ -24,6 +24,7 @@ import type { Route } from "next";
 import { useRouter } from "next/navigation";
 import { FeedbackBadge } from "@/app/ee/admin/performance/query-history/FeedbackBadge";
 import { SessionFeedbackBadge } from "@/app/ee/admin/performance/query-history/SessionFeedbackBadge";
+import QueryHistoryUser from "@/app/ee/admin/performance/query-history/QueryHistoryUser";
 import { SESSION_FEEDBACK_OPTIONS } from "@/lib/chat/session-feedback/constants";
 import type { SessionFeedbackRating } from "@/app/app/interfaces";
 import KickoffCSVExport from "@/app/ee/admin/performance/query-history/KickoffCSVExport";
@@ -104,9 +105,7 @@ function QueryHistoryTableRow({
         <SessionFeedbackBadge feedback={chatSessionMinimal.session_feedback} />
       </TableCell>
       <TableCell className="overflow-hidden">
-        <Text className="break-words line-clamp-3">
-          {chatSessionMinimal.user_email || "-"}
-        </Text>
+        <QueryHistoryUser session={chatSessionMinimal} />
       </TableCell>
       <TableCell className="overflow-hidden">
         <Text className="break-words line-clamp-3">

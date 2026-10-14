@@ -60,6 +60,8 @@ from onyx.tools.models import ChatFile, ToolCallKickoff
 from onyx.utils.logger import setup_logger
 from onyx.utils.threadpool_concurrency import run_functions_tuples_in_parallel
 from onyx.utils.timing import log_function_time
+from shared_configs.contextvars import get_current_usage_credential
+from shared_configs.enums import UsageCredentialType
 
 logger = setup_logger()
 IMAGE_GENERATION_TOOL_NAME = "generate_image"
@@ -158,7 +160,7 @@ def create_chat_session_from_request(
     Includes project ownership and persona access validation.
 
     Args:
-        chat_session_request: The request containing persona_id, description, and project_id
+        chat_session_request: Session settings and optional external user's name
         user: The user creating the session. Anonymous users are represented as a
             User with is_anonymous=True (never None); the access-check helpers
             handle that case. A real User is required so the persona access check
@@ -187,12 +189,26 @@ def create_chat_session_from_request(
         ):
             raise ValueError("User does not have access to persona")
 
+    credential = get_current_usage_credential()
+    api_key = (
+        credential
+        if credential and credential.credential_type == UsageCredentialType.API_KEY
+        else None
+    )
     return create_chat_session(
         db_session=db_session,
         description=chat_session_request.description or "",
         user_id=user.id,
         persona_id=chat_session_request.persona_id,
         project_id=chat_session_request.project_id,
+        external_user_name=chat_session_request.user,
+        api_key_id=(
+            int(api_key.credential_id)
+            if api_key and api_key.credential_id is not None
+            else None
+        ),
+        api_key_name=api_key.credential_name if api_key else None,
+        api_key_display=api_key.credential_display if api_key else None,
     )
 
 

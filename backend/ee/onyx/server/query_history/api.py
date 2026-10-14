@@ -19,9 +19,9 @@ from ee.onyx.server.query_history.models import (
     ChatSessionSnapshot,
     MessageSnapshot,
     QueryHistoryExport,
+    QueryHistoryIdentity,
 )
 from onyx.auth.permissions import require_permission
-from onyx.auth.users import get_display_email
 from onyx.background.celery.versioned_apps.client import app as client_app
 from onyx.background.task_utils import construct_query_history_report_name
 from onyx.configs.constants import (
@@ -62,8 +62,6 @@ from onyx.utils.threadpool_concurrency import parallel_yield
 from shared_configs.contextvars import get_current_tenant_id
 
 router = APIRouter()
-
-ONYX_ANONYMIZED_EMAIL = "anonymous@anonymous.invalid"
 
 
 def ensure_query_history_is_enabled(
@@ -152,9 +150,7 @@ def snapshot_from_chat_session(
 
     return ChatSessionSnapshot(
         id=chat_session.id,
-        user_email=get_display_email(
-            chat_session.user.email if chat_session.user else None
-        ),
+        **QueryHistoryIdentity.from_chat_session(chat_session).model_dump(),
         name=chat_session.description,
         messages=[
             MessageSnapshot.build(message).model_copy(
@@ -289,7 +285,7 @@ def get_chat_session_history(
                 ),
             )
         if query_history_type == QueryHistoryType.ANONYMIZED:
-            minimal_chat_session.user_email = ONYX_ANONYMIZED_EMAIL
+            minimal_chat_session.anonymize_identity()
         minimal_chat_sessions.append(minimal_chat_session)
 
     return PaginatedReturn(
@@ -331,7 +327,7 @@ def get_chat_session_admin(
         )
 
     if query_history_type == QueryHistoryType.ANONYMIZED:
-        snapshot.user_email = ONYX_ANONYMIZED_EMAIL
+        snapshot.anonymize_identity()
 
     return snapshot
 

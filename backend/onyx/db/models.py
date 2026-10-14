@@ -3187,6 +3187,11 @@ class ChatSession(Base):
         ForeignKey("persona.id"), nullable=True
     )
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    external_user_name: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Snapshot of the authenticated creation key; never store its secret.
+    api_key_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    api_key_name: Mapped[str | None] = mapped_column(Text, nullable=True)
+    api_key_display: Mapped[str | None] = mapped_column(String, nullable=True)
     # This chat created by OnyxBot
     onyxbot_flow: Mapped[bool] = mapped_column(Boolean, default=False)
     # Internal benchmark conversations remain auditable but are not user history.
