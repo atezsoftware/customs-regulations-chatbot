@@ -458,10 +458,11 @@ class CroppedRepairState:
                     "Cropped integration requires completed source attempts"
                 )
             previous = self._integrations.get(owner, set())
-            if keys & previous:
+            new_keys = keys - previous
+            if not new_keys:
                 return False
             if (
-                sum(len(value) for value in self._integrations.values()) + len(keys)
+                sum(len(value) for value in self._integrations.values()) + len(new_keys)
                 > 4096
             ):
                 raise ValueError("Cropped integration capacity exceeded")

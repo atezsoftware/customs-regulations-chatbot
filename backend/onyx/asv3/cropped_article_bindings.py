@@ -42,6 +42,7 @@ _METHODS = {
     "read_provision",
     "read_named_provision",
     "read_chunk_context",
+    "follow_reference",
 }
 _PARAGRAPH = re.compile(r"^\s*(?:\((\d{1,3})\)|(\d{1,3})\.)\s+\S")
 _CONTINUING_PARAGRAPH = re.compile(r"^\s*\((\d{1,3})\)\s+\S")
@@ -51,6 +52,107 @@ _UNNUMBERED_ARTICLE = re.compile(
     re.IGNORECASE,
 )
 _STRUCTURAL_MARKER = re.compile(r"(?m)^\s*(?:\(?\d{1,3}[.)]|\(?[a-zçğıöşü]\))\s+")
+_SOURCE_RULE = re.compile(r"\A\s*[-–—]{3,}\s*\n")
+_INSERTED_ARTICLE_OPENING = re.compile(
+    r"\A(?P<heading>\*\*MADDE\s+\d{1,4}/[A-ZÇĞİÖŞÜ]\s*\.?\s*[-–—:]?\*\*)\s+(?P<body>\S)",
+    re.IGNORECASE,
+)
+_INSERTED_CLAUSE = re.compile(r"\A\s*([a-zçğıöşü])\)\s+\S", re.IGNORECASE)
+_CLAUSE_ORDER = "abcçdefgğhıijklmnoöprsştuüvyz"
+
+
+@dataclass(frozen=True)
+class _InsertedArticleIdentity:
+    article_no: str
+    base_article_no: str
+
+
+def _inserted_article_metadata(
+    item: EvidenceItem,
+    row: dict[str, JsonValue],
+    identity: _InsertedArticleIdentity,
+) -> bool:
+    metadata = model_evidence_metadata(item.metadata)
+    canonical = item.metadata.get("canonical_metadata")
+    canonical = canonical if isinstance(canonical, dict) else item.metadata
+    identifiers = metadata.get("provision_identifiers")
+    allowed = {identity.article_no, identity.base_article_no}
+    return bool(
+        folded(str(metadata.get("document_type") or ""))
+        in {"kanun", "law", "act", "statute"}
+        and not any(
+            metadata.get(key)
+            for key in ("truncated", "untrusted", "derived", "external")
+        )
+        and not _AMENDING_PASSAGE.search(folded(item.text))
+        and not any(
+            canonical.get(key) is not None
+            for key in (
+                "target_article_no",
+                "target_id",
+                "asv3_navigation_position_authority",
+            )
+        )
+        and row.get("article_no") in allowed
+        and row.get("article_qualifier") is None
+        and isinstance(identifiers, list)
+        and identifiers
+        and all(
+            isinstance(value, str)
+            and (parsed := parse_regulatory_article_heading(value)) is not None
+            and parsed.article_no in allowed
+            and parsed.qualifier is None
+            for value in identifiers
+        )
+        and not (
+            isinstance(original := canonical.get("original_heading_path"), list)
+            and any(
+                isinstance(value, str)
+                and (parsed := parse_regulatory_article_heading(value)) is not None
+                and (parsed.article_no not in allowed or parsed.qualifier is not None)
+                for value in original
+            )
+        )
+    )
+
+
+def _inserted_article_anchor(
+    item: EvidenceItem, row: dict[str, JsonValue]
+) -> _InsertedArticleIdentity | None:
+    # A separator is source formatting; preceding operative prose is a boundary.
+    text = _SOURCE_RULE.sub("", item.text.lstrip(), count=1)
+    opening = _INSERTED_ARTICLE_OPENING.match(text)
+    if opening is None:
+        return None
+    parsed = parse_regulatory_article_heading(opening["heading"].replace("**", ""))
+    if parsed is None:
+        return None
+    identity = _InsertedArticleIdentity(
+        parsed.article_no, parsed.article_no.split("/")[0]
+    )
+    metadata = model_evidence_metadata(item.metadata)
+    identifiers = metadata.get("provision_identifiers")
+    if (
+        not _inserted_article_metadata(item, row, identity)
+        or metadata.get("paragraph_no") is not None
+        or metadata.get("clause_label") is not None
+        or not isinstance(identifiers, list)
+        or not any(
+            isinstance(value, str)
+            and (declared := parse_regulatory_article_heading(value)) is not None
+            and declared.article_no == identity.article_no
+            and declared.qualifier is None
+            for value in identifiers
+        )
+        or _STRUCTURAL_MARKER.search(text[opening.start("body") :])
+        or text[opening.start("body") :].startswith(('"', "“", "'", "‘"))
+        or any(
+            parse_regulatory_article_heading(line.replace("**", ""))
+            for line in text.splitlines()[1:]
+        )
+    ):
+        return None
+    return identity
 
 
 def _unnumbered_article_anchor(
@@ -588,6 +690,75 @@ class CroppedArticleBindings:
             source_rows=source_rows,
         ).items():
             result.setdefault(number, binding)
+        for number, binding in self._inserted_bindings(
+            record, ledger, items=items, source_rows=source_rows
+        ).items():
+            result.setdefault(number, binding)
+        return result
+
+    def _inserted_bindings(
+        self,
+        record: _RecordedRead,
+        ledger: EvidenceLedger,
+        *,
+        items: list[EvidenceItem],
+        source_rows: dict[int, dict[str, JsonValue]] | None,
+    ) -> dict[int, ArticleParagraphBinding]:
+        """Bind a literal inserted heading and its ordered clauses, not its base."""
+        rows = source_rows if source_rows is not None else _source_row_map(ledger)
+        result: dict[int, ArticleParagraphBinding] = {}
+        active: _InsertedArticleIdentity | None = None
+        previous_position: int | None = None
+        next_clause = 0
+        for number, member, item in zip(
+            record.citations, record.read.members, items, strict=True
+        ):
+            if (
+                previous_position is not None
+                and member.position != previous_position + 1
+            ):
+                active = None
+            previous_position = member.position
+            row = rows.get(number)
+            if row is None:
+                active = None
+                continue
+            anchor = _inserted_article_anchor(item, row)
+            if anchor is not None:
+                active, next_clause = anchor, 0
+                result[number] = _unnumbered_binding(
+                    number, item, anchor.article_no, None
+                )
+                continue
+            clause = _INSERTED_CLAUSE.match(item.text)
+            metadata = model_evidence_metadata(item.metadata)
+            if (
+                active is None
+                or clause is None
+                or next_clause >= len(_CLAUSE_ORDER)
+                or clause[1].lower() != _CLAUSE_ORDER[next_clause]
+                or metadata.get("clause_label") != clause[1].lower()
+                or metadata.get("paragraph_no") is not None
+                or not _inserted_article_metadata(item, row, active)
+                or any(
+                    parse_regulatory_article_heading(line.replace("**", ""))
+                    for line in item.text.splitlines()
+                )
+            ):
+                active = None
+                continue
+            assert item.chunk_id is not None
+            result[number] = ArticleParagraphBinding(
+                number,
+                item.source_id,
+                item.chunk_id,
+                item.text_hash,
+                active.article_no,
+                None,
+                None,
+                clause[1].lower(),
+            )
+            next_clause += 1
         return result
 
     def _unnumbered_bindings(
@@ -674,6 +845,10 @@ class CroppedArticleBindings:
     def _receipt_read(receipt: ToolReceipt) -> _RecordedRead | None:
         if receipt.call.name not in _METHODS:
             return None
+        if receipt.call.name == "follow_reference" and not receipt.call.arguments.get(
+            "target_source_id"
+        ):
+            return None
         raw = receipt.outcome.data.get(_FIELD)
         if raw is None:
             return None
@@ -692,9 +867,12 @@ class CroppedArticleBindings:
             citations=receipt.evidence_ids,
             digest=digest,
         )
-        actual_source = receipt.call.arguments.get(
-            "source_id"
-        ) or receipt.outcome.data.get("source_id")
+        actual_source = (
+            receipt.call.arguments.get("target_source_id")
+            if receipt.call.name == "follow_reference"
+            else receipt.call.arguments.get("source_id")
+            or receipt.outcome.data.get("source_id")
+        )
         if actual_source != read.source_id:
             raise ValueError("Ordered source witness crosses the requested source")
         return record

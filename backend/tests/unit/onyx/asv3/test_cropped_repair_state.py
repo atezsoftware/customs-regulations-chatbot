@@ -425,12 +425,14 @@ def test_integration_is_once_per_target_and_owner_and_persists_before_completion
     assert not resumed.reserve(target)
 
 
-def test_overlapping_integration_batch_is_atomic() -> None:
-    _, _, state = setup()
+def test_new_defect_is_integrated_once_beside_an_already_integrated_defect() -> None:
+    context, _, state = setup()
     first = CroppedRepairTarget(
-        check_kind="governing_original", instrument_number="6455", article="11"
+        check_kind="governing_original", instrument_number="5393"
     )
-    second = first.model_copy(update={"article": "12"})
+    second = CroppedRepairTarget(
+        check_kind="governing_original", instrument_number="4458", article="191/A"
+    )
     state.reserve(first)
     state.reserve(second)
     state.finish(
@@ -440,8 +442,14 @@ def test_overlapping_integration_batch_is_atomic() -> None:
         second.key, "not_found", [], "This attempt did not obtain its original."
     )
     assert state.reserve_integration([first], "coordinator")
+    assert state.reserve_integration([first, second], "coordinator")
     assert not state.reserve_integration([first, second], "coordinator")
-    assert state.reserve_integration([second], "coordinator")
+    assert not state.reserve_integration([first], "coordinator")
+    assert not state.reserve_integration([second], "coordinator")
+    resumed = CroppedRepairState(context, state.request)
+    resumed.restore(state.export())
+    assert not resumed.reserve_integration([first, second], "coordinator")
+    assert not resumed.reserve(first) and not resumed.reserve(second)
     with pytest.raises(ValueError, match="reserved source"):
         state.reserve_integration(
             [second.model_copy(update={"article": "13"})], "coordinator"
@@ -464,6 +472,30 @@ def test_parallel_integration_only_one_wins() -> None:
             )
         )
     assert sum(results) == 1
+
+
+def test_parallel_mixed_batch_reserves_only_the_new_source_target() -> None:
+    _, _, state = setup()
+    previous = CroppedRepairTarget(
+        check_kind="governing_original", instrument_number="5393"
+    )
+    new = CroppedRepairTarget(
+        check_kind="governing_original", instrument_number="4458", article="191/A"
+    )
+    for target in (previous, new):
+        assert state.reserve(target)
+        state.finish(target.key, "not_found", [], "Original was not obtained.")
+    assert state.reserve_integration([previous], "coordinator")
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(
+            pool.map(
+                lambda _: state.reserve_integration([previous, new], "coordinator"),
+                range(32),
+            )
+        )
+    assert sum(results) == 1
+    assert not state.reserve_integration([new], "coordinator")
+    assert not state.reserve(previous) and not state.reserve(new)
 
 
 def test_integration_checkpoint_tampering_rejected() -> None:
