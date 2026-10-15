@@ -4,7 +4,7 @@ import os
 import random
 import re
 import time
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from functools import lru_cache
 from itertools import chain
@@ -47,6 +47,7 @@ from onyx.llm.interfaces import (
 )
 from onyx.llm.model_capabilities import (
     is_gemini_3_model,
+    is_gemini_4_argon_model,
     is_true_openai_model,
     model_is_reasoning_model,
     openai_model_rejects_reasoning_effort,
@@ -56,6 +57,7 @@ from onyx.llm.models import (
     ANTHROPIC_ADAPTIVE_REASONING_EFFORT,
     ANTHROPIC_REASONING_EFFORT_BUDGET,
     OPENAI_REASONING_EFFORT,
+    ChatCompletionMessage,
 )
 from onyx.llm.override_models import LLMSeed
 from onyx.llm.request_context import get_llm_mock_response
@@ -127,7 +129,7 @@ _ANTHROPIC_ADAPTIVE_THINKING_MIN_VERSION = (4, 7)
 # retries provider rejections without them: reasoning keys first, then all.
 # Semantics-changing keys (tools, tool_choice, messages) are never stripped.
 _REASONING_KWARG_KEYS = frozenset(
-    {"thinking", "output_config", "reasoning", "reasoning_effort"}
+    {"thinking", "thinkingConfig", "output_config", "reasoning", "reasoning_effort"}
 )
 _BEST_EFFORT_KWARG_KEYS = _REASONING_KWARG_KEYS | frozenset({"temperature"})
 
@@ -239,6 +241,12 @@ def _sampling_snapshot(
 # cite only inner fields like budget_tokens or effort).
 _KWARG_ERROR_ALIASES: dict[str, tuple[str, ...]] = {
     "thinking": ("thinking", "budget_tokens"),
+    "thinkingConfig": (
+        "thinkingconfig",
+        "thinking_level",
+        "thinking level",
+        "thinkinglevel",
+    ),
     "output_config": ("output_config", "effort"),
     "reasoning": ("reasoning", "effort"),
     "reasoning_effort": (
@@ -954,6 +962,22 @@ class LitellmLLM(LLM):
                 # LiteLLM just does some mapping like this anyway but is incomplete for Anthropic
                 optional_kwargs.pop("reasoning_effort", None)
 
+            elif self.config.model_provider in {"vertex_ai", "gemini"} and any(
+                is_gemini_4_argon_model(name) for name in model_identity_names
+            ):
+                # Bundled LiteLLM only recognizes Gemini 3 for level-based thinking.
+                optional_kwargs["thinkingConfig"] = {
+                    "thinkingLevel": (
+                        "LOW"
+                        if reasoning_effort
+                        in {ReasoningEffort.OFF, ReasoningEffort.LOW}
+                        else "HIGH"
+                        if reasoning_effort
+                        in {ReasoningEffort.HIGH, ReasoningEffort.XHIGH}
+                        else "MEDIUM"
+                    ),
+                    "includeThoughts": reasoning_effort is not ReasoningEffort.OFF,
+                }
             else:
                 # Hope for the best from LiteLLM
                 if reasoning_effort is ReasoningEffort.OFF:
@@ -1375,6 +1399,93 @@ class LitellmLLM(LLM):
             and self._cropped_prompt_cache.cache_writes_disabled
             and self._uses_guarded_openai_responses()
             and not (get_llm_mock_response() or MOCK_LLM_RESPONSE)
+        )
+
+    def cropped_has_free_implicit_cache_writes(
+        self,
+        prompt: Sequence[ChatCompletionMessage],
+        tools: Sequence[Mapping[str, object]],
+    ) -> bool:
+        """Native Argon implicit writes need no extra billable cache-write partition."""
+        # Native implicit cache creation is billed at the ordinary input rate:
+        # https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/context-cache/context-cache-overview
+        if (
+            self._model_provider not in {"vertex_ai", "gemini"}
+            or not is_gemini_4_argon_model(self._model_version)
+            or self._api_base is not None
+            or self._api_surface is not None
+            or self._custom_llm_provider not in {None, self._model_provider}
+            or self._asv3_exp_cheap_cache is not None
+            or self._cropped_prompt_cache is not None
+        ):
+            return False
+
+        from onyx.llm.litellm_singleton import litellm
+
+        environment_base = (
+            "GEMINI_API_BASE"
+            if self._model_provider == "gemini"
+            else "VERTEXAI_API_BASE"
+        )
+        if litellm.api_base or os.environ.get(environment_base):
+            return False
+
+        def explicit_cache(value: object) -> bool:
+            if isinstance(value, dict):
+                return any(
+                    (
+                        isinstance(key, str)
+                        and key.lower().replace("_", "").replace("-", "")
+                        in {
+                            "cachedcontent",
+                            "cachecontrol",
+                            "promptcachekey",
+                            "promptcacheretention",
+                        }
+                        and item is not None
+                    )
+                    or explicit_cache(item)
+                    for key, item in value.items()
+                )
+            if isinstance(value, (list, tuple)):
+                return any(explicit_cache(item) for item in value)
+            return False
+
+        def routing_override(value: object) -> bool:
+            if isinstance(value, dict):
+                return any(
+                    (
+                        isinstance(key, str)
+                        and (
+                            key.lower()
+                            .replace("_", "")
+                            .replace("-", "")
+                            .endswith(("apibase", "baseurl"))
+                            or key.lower().replace("_", "").replace("-", "")
+                            == "customllmprovider"
+                        )
+                        and item is not None
+                    )
+                    or routing_override(item)
+                    for key, item in value.items()
+                )
+            if isinstance(value, (list, tuple)):
+                return any(routing_override(item) for item in value)
+            return False
+
+        if routing_override(self._model_kwargs) or routing_override(
+            self._custom_config
+        ):
+            return False
+
+        return not any(
+            explicit_cache(value)
+            for value in (
+                self._model_kwargs,
+                self._custom_config,
+                [message.model_dump(mode="json") for message in prompt],
+                tools,
+            )
         )
 
     @property
