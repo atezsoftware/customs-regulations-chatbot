@@ -198,7 +198,12 @@ class ScopedSearchLLM(LLM):
             service_tier=getattr(self.config, "service_tier", None),
             cache_writes_disabled=(
                 isinstance(self.selected, LitellmLLM)
-                and self.selected.cropped_native_cache_writes_disabled
+                and (
+                    self.selected.cropped_native_cache_writes_disabled
+                    or self.selected.cropped_has_free_implicit_cache_writes(
+                        prompt if isinstance(prompt, list) else [prompt], tools or []
+                    )
+                )
             ),
         )
 
