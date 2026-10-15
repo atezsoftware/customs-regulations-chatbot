@@ -13,11 +13,17 @@ from pydantic import JsonValue
 from onyx.asv3.citation_numbers import extract_citation_numbers
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.models import CapabilityCall, Decision, HarnessView, RunContext
-from onyx.asv3.outcome_map import OutcomeMap
+from onyx.asv3.outcome_map import OutcomeMap, OutcomeUpdate
 from onyx.asv3.registry import CapabilityRegistry
 from onyx.asv3.retained_answer import resolve_retained_answer
 
 _DETAIL = "Supported outcome needs originals and no open gap"
+_CONDITION_DETAILS = frozenset(
+    {
+        "Supported outcome must retain its source conditions",
+        "Resolution condition belongs to another outcome",
+    }
+)
 _TERMINALS = frozenset(
     {
         "submit_answer",
@@ -75,6 +81,7 @@ class CroppedTerminalMetadataRepair:
     fence_json: str
     source_rows_json: str
     payload_json: str
+    condition_bindings_json: str | None = None
 
     def apply(
         self,
@@ -104,7 +111,18 @@ class CroppedTerminalMetadataRepair:
         prior = cast(list[dict[str, JsonValue]], json.loads(self.resolutions_json))
         if len(replacement) != len(prior):
             raise ValueError("Terminal metadata patch changed resolution identities")
+        if self.condition_bindings_json is not None:
+            if (
+                _json(replacement) != self.condition_bindings_json
+                or _json(_condition_bindings(self.canonical_call, context))
+                != self.condition_bindings_json
+            ):
+                raise ValueError(
+                    "Terminal condition bindings changed recorded relationships"
+                )
         for index, (old, new) in enumerate(zip(prior, replacement, strict=True)):
+            if self.condition_bindings_json is not None:
+                continue
             if not isinstance(new, dict):
                 raise ValueError("Terminal metadata resolution must remain an object")
             if index not in self.mutable_indexes:
@@ -176,6 +194,83 @@ def _source_rows(ledger: EvidenceLedger, numbers: set[int]) -> str:
     return _json(rows)
 
 
+def _condition_bindings(
+    call: CapabilityCall,
+    context: RunContext,
+) -> list[dict[str, JsonValue]]:
+    """Rebind only host-validated conditions and their existing original witnesses."""
+    outcomes, ledger = (
+        context.services.get("outcome_map"),
+        context.services.get("evidence"),
+    )
+    if not isinstance(outcomes, OutcomeMap) or not isinstance(ledger, EvidenceLedger):
+        raise ValueError(
+            "Condition bindings need their owned outcome and source records"
+        )
+    coverage = call.arguments.get("_coverage")
+    if not isinstance(coverage, dict):
+        raise ValueError("Condition bindings need recorded coverage")
+    payload = dict(coverage)
+    if "_outcomes" in call.arguments:
+        if "outcomes" in payload:
+            raise ValueError("Use only _outcomes to declare outcomes")
+        payload["outcomes"] = call.arguments["_outcomes"]
+    update = OutcomeUpdate.model_validate(payload)
+    staged = copy.copy(outcomes)
+    staged.restore(outcomes.export(), ledger)
+    staged.update(update.model_copy(update={"resolutions": []}), ledger)
+    state = staged.view()
+    conditions = state["conditions"]
+    declared_outcomes = state["outcomes"]
+    assert isinstance(conditions, list) and isinstance(declared_outcomes, list)
+    known = {row["condition_id"] for row in conditions if isinstance(row, dict)}
+    known_outcomes = {
+        row["outcome_id"] for row in declared_outcomes if isinstance(row, dict)
+    }
+    raw = coverage.get("resolutions")
+    if not isinstance(raw, list):
+        raise ValueError("Condition bindings need recorded resolutions")
+    result: list[dict[str, JsonValue]] = []
+    for row in raw:
+        if not isinstance(row, dict) or row.get("outcome_id") not in known_outcomes:
+            raise ValueError("Condition binding refers to an unknown outcome")
+        current_ids = row.get("condition_ids", [])
+        current_numbers = row.get("evidence_numbers", [])
+        if not isinstance(current_ids, list) or not isinstance(current_numbers, list):
+            raise ValueError("Condition binding fields must remain lists")
+        if any(
+            not isinstance(identity, str) or identity not in known
+            for identity in current_ids
+        ):
+            raise ValueError("Condition binding refers to an unknown source condition")
+        applicable = [
+            condition
+            for condition in conditions
+            if isinstance(condition, dict)
+            and isinstance(condition.get("outcome_ids"), list)
+            and row["outcome_id"] in condition["outcome_ids"]
+        ]
+        identities = [condition["condition_id"] for condition in applicable]
+        retained = [identity for identity in current_ids if identity in identities]
+        corrected = copy.deepcopy(row)
+        corrected["condition_ids"] = retained
+        if row.get("status") in {"supported", "conditional"}:
+            corrected["condition_ids"] = retained + [
+                identity for identity in identities if identity not in retained
+            ]
+            citations = [
+                witness["citation"]
+                for condition in applicable
+                for witness in cast(list[dict[str, JsonValue]], condition["witnesses"])
+            ]
+            corrected["evidence_numbers"] = current_numbers + sorted(
+                {cast(int, number) for number in citations}
+                - set(cast(list[int], current_numbers))
+            )
+        result.append(corrected)
+    return result
+
+
 def prepare_cropped_terminal_metadata_repair(
     decision: Decision,
     view: HarnessView,
@@ -203,10 +298,13 @@ def prepare_cropped_terminal_metadata_repair(
     canonical = resolve_retained_answer(
         decision, context, view.draft_to_repair, request=view.request
     ).calls[0]
-    if (
-        canonical.argument_error is not None
-        or _validation_gap(canonical, context, registry) != _DETAIL
-    ):
+    if canonical.argument_error is not None:
+        return None
+    detail = _validation_gap(canonical, context, registry)
+    if detail not in {
+        _DETAIL,
+        *_CONDITION_DETAILS,
+    }:
         return None
     call = decision.calls[0]
     coverage = call.arguments.get("_coverage")
@@ -215,13 +313,26 @@ def prepare_cropped_terminal_metadata_repair(
         isinstance(row, dict) for row in resolutions
     ):
         return None
-    mutable = tuple(
-        index
-        for index, row in enumerate(resolutions)
-        if isinstance(row, dict)
-        and row.get("status") in {"supported", "conditional"}
-        and isinstance(gap := row.get("gap"), str)
-        and gap.strip()
+    bindings = (
+        _condition_bindings(canonical, context)
+        if detail in _CONDITION_DETAILS
+        else None
+    )
+    mutable = (
+        tuple(
+            index
+            for index, (old, new) in enumerate(zip(resolutions, bindings, strict=True))
+            if old != new
+        )
+        if bindings is not None
+        else tuple(
+            index
+            for index, row in enumerate(resolutions)
+            if isinstance(row, dict)
+            and row.get("status") in {"supported", "conditional"}
+            and isinstance(gap := row.get("gap"), str)
+            and gap.strip()
+        )
     )
     if not mutable:
         return None
@@ -277,7 +388,7 @@ def prepare_cropped_terminal_metadata_repair(
             {
                 "request": view.request,
                 "call_id": "metadata:0",
-                "validation_error": _DETAIL,
+                "validation_error": detail,
                 "resolutions": resolutions,
                 "mutable_resolution_indexes": list(mutable),
                 "existing_outcome_conditions": outcomes.view(
@@ -286,10 +397,11 @@ def prepare_cropped_terminal_metadata_repair(
                 "unchanged_unapproved_answer": answer,
                 "unchanged_answer_sha256": hashlib.sha256(answer.encode()).hexdigest(),
                 "preserved_gap_observations": [
-                    cast(dict[str, JsonValue], resolutions[index])["gap"]
+                    cast(dict[str, JsonValue], resolutions[index]).get("gap", "")
                     for index in mutable
                 ],
                 "patch_keys": ["resolutions"],
             }
         ),
+        condition_bindings_json=_json(bindings) if bindings is not None else None,
     )
