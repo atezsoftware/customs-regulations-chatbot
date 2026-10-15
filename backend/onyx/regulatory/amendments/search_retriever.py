@@ -29,6 +29,7 @@ from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.db.regulatory_amendment_targets import (
     load_amendment_source_chunks,
     load_amendment_source_identities,
+    load_amendment_structural_source_titles,
 )
 from onyx.db.regulatory_chunks import (
     RegulatoryChunkStructuralMatch,
@@ -58,7 +59,10 @@ from onyx.regulatory.amendments.target_scope import (
     addition_source_identity_is_compatible,
     reconcile_structural_candidates,
 )
-from onyx.regulatory.source_identity import source_file_identity_matches
+from onyx.regulatory.source_identity import (
+    source_file_identifiers_are_compatible,
+    source_file_identity_matches,
+)
 from onyx.regulatory.structured_llm import is_retryable_provider_error
 from onyx.server.query_and_chat.placement import Placement
 from onyx.tools.constants import REGULATORY_MAX_SEARCH_QUERY_CHARS, SEARCH_TOOL_ID
@@ -484,16 +488,37 @@ def build_amendment_search_retriever(
 
     source_identities = load_amendment_source_identities(db_session, user_file_ids)
     source_chunks: dict[str, list[CandidateChunk]] = {}
+    source_file_cache: dict[str, list[str]] = {}
 
     def source_file_loader(instruction: AmendmentInstruction) -> Sequence[str] | None:
         target = instruction.target_source or ""
         if not source_identity_distinguishing_tokens(target):
             return None
-        return [
+        cache_key = " ".join(target.casefold().split())
+        if cache_key in source_file_cache:
+            return source_file_cache[cache_key]
+        files = [
             str(source.user_file_id)
             for source in source_identities
             if source_file_identity_matches(target, source.name, source.root_heading)
         ]
+        if not files:
+            with get_session_with_current_tenant() as identity_session:
+                structural_titles = load_amendment_structural_source_titles(
+                    identity_session, user_file_ids, target
+                )
+            files = [
+                str(source.user_file_id)
+                for source in source_identities
+                if (title := structural_titles.get(source.user_file_id)) is not None
+                and source_file_identifiers_are_compatible(
+                    source.name, source.root_heading
+                )
+                and source_file_identity_matches(target, source.name, title)
+                and source_file_identity_matches(target, source.root_heading, title)
+            ]
+        source_file_cache[cache_key] = files
+        return files
 
     def structural_candidate_loader(
         instruction: AmendmentInstruction,

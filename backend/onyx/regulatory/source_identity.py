@@ -69,18 +69,30 @@ def _series_identities(value: str) -> set[tuple[int, int]]:
     }
 
 
-def source_file_identity_matches(target: str, name: str, root: str) -> bool:
-    """Verify a file's own title and reject conflicting instrument identifiers."""
-    number = named_law_number(target)
+def source_file_identifiers_are_compatible(
+    name: str, root: str, *, check_series: bool = True
+) -> bool:
+    """Reject contradictory identifiers in two titles belonging to one file."""
     filename_number, root_number = named_law_number(name), named_law_number(root)
     if filename_number and root_number and filename_number != root_number:
         return False
+    name_series, root_series = _series_identities(name), _series_identities(root)
+    return not check_series or not (
+        name_series and root_series and name_series != root_series
+    )
+
+
+def source_file_identity_matches(target: str, name: str, root: str) -> bool:
+    """Verify a file's own title and reject conflicting instrument identifiers."""
+    number = named_law_number(target)
+    if not source_file_identifiers_are_compatible(
+        name, root, check_series=number is None
+    ):
+        return False
     if number is not None:
-        return (filename_number or root_number) == number
+        return (named_law_number(name) or named_law_number(root)) == number
     series = _series_identities(target)
     name_series, root_series = _series_identities(name), _series_identities(root)
-    if name_series and root_series and name_series != root_series:
-        return False
     if series and any(
         identities and identities != series for identities in (name_series, root_series)
     ):
