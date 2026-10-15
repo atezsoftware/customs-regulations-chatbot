@@ -1739,7 +1739,12 @@ class ResearchModel:
                         ),
                         service_tier=getattr(selected_llm.config, "service_tier", None),
                         cache_writes_disabled=isinstance(selected_llm, LitellmLLM)
-                        and selected_llm.cropped_native_cache_writes_disabled,
+                        and (
+                            selected_llm.cropped_native_cache_writes_disabled
+                            or selected_llm.cropped_has_free_implicit_cache_writes(
+                                prompt, wire_tools
+                            )
+                        ),
                     )
                     if cost_ticket.bounded:
                         max_tokens = cost_ticket.max_tokens

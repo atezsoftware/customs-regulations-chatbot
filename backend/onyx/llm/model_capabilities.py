@@ -45,6 +45,18 @@ CUSTOM_LITELLM_MODEL_OVERRIDES: dict[str, dict[str, Any]] = {
     for model_name in _TWELVE_LABS_PEGASUS_MODEL_NAMES
 }
 
+# https://ai.google.dev/gemini-api/docs/models/gemini-4-argon
+# Keep the synchronous output allowance inside the provider's per-request cap.
+_GEMINI_4_ARGON_FALLBACK: dict[str, Any] = {
+    "max_input_tokens": 1_048_576,
+    "max_output_tokens": 32_768,
+    "max_tokens": 1_048_576,
+    "supports_reasoning": True,
+    "supports_vision": True,
+    "supports_function_calling": True,
+    "supports_response_schema": True,
+}
+
 
 def _snapshot_model_metadata(value: object) -> object:
     """Detach each container before traversal of LiteLLM's mutable registry."""
@@ -58,9 +70,7 @@ def _snapshot_model_metadata(value: object) -> object:
             _snapshot_model_metadata(item) for item in cast(list[object], value).copy()
         ]
     if isinstance(value, tuple):
-        return tuple(
-            _snapshot_model_metadata(item) for item in cast(tuple[object, ...], value)
-        )
+        return tuple(_snapshot_model_metadata(item) for item in value)
     return copy.deepcopy(value)
 
 
@@ -94,6 +104,14 @@ def get_model_map() -> dict[str, dict[str, Any]]:
         if model_name in starting_map:
             continue
         starting_map[model_name] = copy.deepcopy(model_metadata)
+
+    base_argon = starting_map.get("gemini-4-argon", {})
+    for provider in (None, "vertex_ai", "gemini"):
+        name = f"{provider}/gemini-4-argon" if provider else "gemini-4-argon"
+        starting_map[name] = {
+            **_GEMINI_4_ARGON_FALLBACK,
+            **starting_map.get(name, base_argon),
+        }
 
     # NOTE: outside of the explicit CUSTOM_LITELLM_MODEL_OVERRIDES,
     # we avoid hard-coding additional models here. Ollama, for example,
@@ -221,6 +239,11 @@ def get_llm_max_output_tokens(
 
     max_output_tokens = model_obj.get("max_output_tokens")
     if max_output_tokens is not None:
+        if model_provider in {"vertex_ai", "gemini"} and is_gemini_4_argon_model(
+            model_name
+        ):
+            # Long decode requires continuation handling absent from this adapter.
+            return min(max_output_tokens, 32_768)
         return max_output_tokens
 
     # Fallback to a fraction of max_tokens if max_output_tokens is not specified
@@ -409,6 +432,14 @@ def is_gemini_3_model(model_name: str) -> bool:
             model_name.lower(),
         )
     )
+
+
+def is_gemini_4_argon_model(model_name: str) -> bool:
+    return model_name.lower() in {
+        "gemini-4-argon",
+        "vertex_ai/gemini-4-argon",
+        "gemini/gemini-4-argon",
+    }
 
 
 def model_is_reasoning_model(model_name: str, model_provider: str) -> bool:
