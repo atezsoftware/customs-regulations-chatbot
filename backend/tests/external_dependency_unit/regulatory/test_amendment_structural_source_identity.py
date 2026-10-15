@@ -305,3 +305,292 @@ def test_recovered_title_cannot_override_filename_or_root_identifiers(
     assert "could not be verified" in (retriever.last_attention or "")
     title_loader.assert_called_once()
     search.assert_not_called()
+
+
+def test_labeled_clause_retry_recovers_parent_beyond_shortlist_and_drafts_insertion(
+    source_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from onyx.db.amendment_match_checkpoints import (
+        capture_match_evidence,
+        load_match_checkpoint,
+        persist_match_checkpoint,
+    )
+    from onyx.db.models import (
+        AmendmentBatch,
+        AmendmentMatchCheckpoint,
+        AmendmentProposal,
+    )
+    from onyx.db.regulatory_amendment_order import validate_insertion_order
+    from onyx.db.regulatory_amendments import (
+        claim_batch_for_analysis,
+        reset_batch_attention_for_retry,
+    )
+    from onyx.regulatory.amendments import drafter, match_checkpoint, pipeline
+    from onyx.regulatory.amendments.insertion_order import InsertionOrder
+    from onyx.regulatory.amendments.match_checkpoint import MatchedInstruction
+    from onyx.regulatory.amendments.models import (
+        ChunkFieldsDraft,
+        DateResolution,
+        DraftResult,
+        MatchResult,
+    )
+    from onyx.regulatory.amendments.ranker import CandidateChunk
+    from onyx.regulatory.amendments.structural_target import (
+        parse_amendment_structural_target,
+    )
+
+    session = source_session
+    group, file = _source(session)
+    _title_descendant(session, file, 1, "5")
+    article_path = ["Amaç", _TITLE, "MADDE 6 - Taşıma kuralları"]
+    early_rows = []
+    for position, paragraph, clause in [
+        (2, "1", None),
+        (3, "2", None),
+        *[(position, "2", label) for position, label in enumerate("abcçdefgğh", 4)],
+    ]:
+        marker = f"{clause})" if clause else f"({paragraph})"
+        row = _chunk(session, file, position, f"{marker} Mevcut manevra kuralı.")
+        row.heading_path = [*article_path, f"({paragraph}) Manevra kuralları", marker]
+        row.chunk_type = "clause" if clause else "paragraph"
+        row.chunk_metadata = {"article_no": "6", "paragraph_no": paragraph}
+        if clause:
+            row.chunk_metadata = {**row.chunk_metadata, "clause_label": clause}
+        if position == 2:
+            row.text = "MADDE 6 - (1) Mevcut taşıma kuralları."
+        early_rows.append(row)
+    parent = _chunk(
+        session, file, 14, "(3) Tehlikeli madde taşıyacak tren teşkili kuralları."
+    )
+    parent.heading_path = [*article_path, "(3) Tren teşkili kuralları"]
+    parent.chunk_type = "paragraph"
+    parent.chunk_metadata = {"article_no": "6", "paragraph_no": "3"}
+    existing = _chunk(session, file, 15, "c) Mevcut emniyet vagonu kuralı.")
+    existing.heading_path = [*parent.heading_path, "c) Emniyet vagonu"]
+    existing.chunk_type = "clause"
+    existing.chunk_metadata = {
+        "article_no": "6",
+        "paragraph_no": "3",
+        "clause_label": "c",
+    }
+    following = _chunk(session, file, 16, "(4) Mevcut sevk kuralları.")
+    following.heading_path = [*article_path, "(4) Sevk kuralları"]
+    following.chunk_type = "paragraph"
+    following.chunk_metadata = {"article_no": "6", "paragraph_no": "4"}
+    session.flush()
+    original_rows = {
+        row.id: (row.text, row.position, row.projection_ordinal)
+        for row in [*early_rows, parent, existing, following]
+    }
+    new_text = (
+        "ç) Taşınan tehlikeli maddelerin sınıflarına göre gerekli olduğu durumlarda, "
+        "vagonlar veya taşıma birimleri (büyük konteyner, portatif tank, tank konteyner, "
+        "ÇEGK veya karayolu taşıtı) arasında RID Bölüm 7.5.3’te belirtildiği şekilde "
+        "koruyucu mesafe bulunacaktır."
+    )
+    instruction = AmendmentInstruction(
+        instruction_text=(
+            "MADDE 1- 16/7/2015 tarihli ve 29418 sayılı Resmî Gazete’de yayımlanan "
+            f"{_TARGET.replace('Yönetmelik', 'Yönetmeliğin')} 6 ncı maddesinin üçüncü "
+            f"fıkrasına aşağıdaki (ç) bendi eklenmiştir: “{new_text}”"
+        ),
+        target_source=_TARGET,
+    )
+    result = MatchResult(
+        outcome="new_provision",
+        old_chunk_id=None,
+        confidence=1,
+        rationale="New clause.",
+    )
+    legacy_candidates = [
+        CandidateChunk(
+            chunk_id=row.id,
+            user_file_id=str(file.id),
+            text=row.text,
+            metadata={**row.chunk_metadata, "heading_path": row.heading_path},
+            source_verified=True,
+        )
+        for row in early_rows[:6]
+    ]
+    batch = AmendmentBatch(
+        document_set_id=group.id,
+        raw_text=instruction.instruction_text,
+        status="analyzing",
+        stage="processing",
+        lease_generation=2,
+        instruction_count=5,
+        processed_instruction_count=5,
+        processed_instruction_indices=list(range(5)),
+        user_file_ids=[str(file.id)],
+        segmented_instructions=[
+            {"instruction_text": f"Completed {index}"} for index in range(4)
+        ]
+        + [instruction.model_dump(mode="json")],
+    )
+    session.add(batch)
+    session.flush()
+    completed = [
+        AmendmentProposal(
+            batch_id=batch.id,
+            instruction_index=index,
+            instruction_indices=[index],
+            instruction_text=f"Completed {index}",
+            instruction_texts=[f"Completed {index}"],
+            old_chunk_snapshot={},
+            new_chunk_draft={},
+            status="pending",
+        )
+        for index in range(4)
+    ]
+    session.add_all(completed)
+    inputs = {"raw_text": batch.raw_text, "user_file_ids": batch.user_file_ids}
+    with monkeypatch.context() as legacy:
+        legacy.setattr(match_checkpoint, "MATCH_CONTRACT_VERSION", 3)
+        legacy_hash = match_checkpoint.match_input_sha256(**inputs)
+    current_hash = match_checkpoint.match_input_sha256(**inputs)
+    assert legacy_hash != current_hash
+    checkpoint = MatchedInstruction(
+        instruction_index=4,
+        instruction=instruction,
+        candidates=legacy_candidates,
+        match=result,
+        evidence=capture_match_evidence(
+            session, batch.user_file_ids, legacy_candidates
+        ),
+    )
+    assert persist_match_checkpoint(
+        session,
+        batch_id=batch.id,
+        lease_generation=2,
+        input_sha256=legacy_hash,
+        checkpoint=checkpoint,
+    )
+    assert (
+        load_match_checkpoint(
+            session,
+            batch_id=batch.id,
+            instruction_index=4,
+            input_sha256=legacy_hash,
+        )
+        == checkpoint
+    )
+    batch.status = "analyzed"
+    batch.unmatched_instructions = [
+        instruction.instruction_text + "\n\nAttention: Missing parent."
+    ]
+    session.commit()
+    assert reset_batch_attention_for_retry(session, batch_id=batch.id) is not None
+    assert batch.processed_instruction_indices == [0, 1, 2, 3]
+    assert all(
+        session.get(AmendmentProposal, proposal.id) is proposal
+        for proposal in completed
+    )
+    assert (
+        load_match_checkpoint(
+            session,
+            batch_id=batch.id,
+            instruction_index=4,
+            input_sha256=current_hash,
+        )
+        is None
+    )
+    stored = session.get(AmendmentMatchCheckpoint, (batch.id, 4))
+    assert stored is not None and stored.input_sha256 == legacy_hash
+    lease = claim_batch_for_analysis(session, batch_id=batch.id)
+    assert lease is not None
+    retriever, title_loader, search = _retriever(session, monkeypatch, group, [file])
+    candidates = retriever.search(instruction)
+    assert candidates[0].chunk_id == parent.id
+    assert retriever.query_stats[0]["strategy"] == "verified_parent"
+    target = parse_amendment_structural_target(instruction)
+    assert target is not None and target.clause_label == "ç"
+    title_loader.assert_called_once()
+    search.assert_not_called()
+    monkeypatch.setattr(pipeline, "confirm_match", MagicMock(return_value=result))
+    match = pipeline.confirm_instruction_match(
+        MagicMock(), instruction=instruction, candidates=candidates
+    )
+    assert match == result
+    checkpoint = checkpoint.model_copy(
+        update={
+            "candidates": candidates,
+            "evidence": capture_match_evidence(
+                session, batch.user_file_ids, candidates
+            ),
+        }
+    )
+    assert persist_match_checkpoint(
+        session,
+        batch_id=batch.id,
+        lease_generation=lease.generation,
+        input_sha256=current_hash,
+        checkpoint=checkpoint,
+    )
+    assert (
+        load_match_checkpoint(
+            session,
+            batch_id=batch.id,
+            instruction_index=4,
+            input_sha256=current_hash,
+        )
+        == checkpoint
+    )
+    context = pipeline.load_instruction_draft_context(
+        session,
+        candidates=candidates,
+        match=result,
+        instruction=instruction,
+    )
+    assert context is not None and context.target_user_file_id == file.id
+    assert context.old_chunk_snapshot == {} and context.insertion_members
+    generated = MagicMock(
+        return_value=DraftResult(
+            new_chunk=ChunkFieldsDraft(
+                text=new_text,
+                chunk_type="clause",
+                heading_path=article_path,
+                metadata_changes={
+                    "article_no": "6",
+                    "paragraph_no": "2",
+                    "clause_label": "c",
+                },
+            ),
+            dates=DateResolution(
+                effective_start_date="2023-02-03", rationale="Publication date."
+            ),
+        )
+    )
+    monkeypatch.setattr(drafter, "generate_structured", generated)
+    proposal = pipeline.draft_instruction_group_proposal(
+        MagicMock(),
+        instruction_indices=[4],
+        instructions=[instruction],
+        matches=[result],
+        reference_date="2023-02-03",
+        context=context,
+    )
+    draft = proposal.new_chunk_draft
+    assert proposal.old_chunk_id is None and proposal.instruction_indices == [4]
+    assert draft["user_file_id"] == str(file.id) and draft["text"] == new_text
+    assert draft["chunk_type"] == "clause"
+    assert {
+        key: draft["metadata"][key]
+        for key in ("article_no", "paragraph_no", "clause_label")
+    } == {
+        "article_no": "6",
+        "paragraph_no": "3",
+        "clause_label": "ç",
+    }
+    order = InsertionOrder.model_validate(draft["insertion_order"])
+    assert order.after_chunk_id == existing.id and order.before_chunk_id == following.id
+    assert (
+        order.paragraph_no == "3"
+        and order.clause_label == "ç"
+        and draft["position"] == following.position
+    )
+    assert validate_insertion_order(session, file.id, order) == order
+    assert original_rows == {
+        row.id: (row.text, row.position, row.projection_ordinal)
+        for row in [*early_rows, parent, existing, following]
+    }
+    generated.assert_called_once()

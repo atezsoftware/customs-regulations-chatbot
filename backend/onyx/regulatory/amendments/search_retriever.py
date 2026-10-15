@@ -526,6 +526,9 @@ def build_amendment_search_retriever(
         target = parse_amendment_structural_target(instruction)
         if target is None:
             return []
+        if added_subordinate_unit_kind(instruction.instruction_text) == "clause":
+            # The new clause has no existing row; retrieve its paragraph parent.
+            target = replace(target, clause_label=None)
         normalized_source = " ".join(
             (instruction.target_source or "").casefold().split()
         )
