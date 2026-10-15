@@ -6,6 +6,9 @@ opens with the amending article's own number and only then names the provision
 it changes.
 """
 
+from unittest.mock import MagicMock
+from uuid import UUID
+
 import pytest
 
 from onyx.regulatory.amendments.models import AmendmentInstruction
@@ -49,6 +52,129 @@ _ADD_ARTICLE_PLAIN = "MADDE 14- Aynı Tebliğe aşağıdaki geçici madde eklenm
 _ADD_ANNEX_ROW = (
     "MADDE 17- Aynı Tebliğin Ek-2’sinde yer alan listeye aşağıdaki sıra eklenmiştir."
 )
+
+
+def test_batch_332_five_operations_keep_replacements_and_clause_additions_separate() -> (
+    None
+):
+    prefix = (
+        "MADDE 1- 16/7/2015 tarihli ve 29418 sayılı Resmî Gazete’de yayımlanan "
+        "Tehlikeli Maddelerin Demiryolu ile Taşınması Hakkında Yönetmeliğin "
+        "6 ncı maddesinin "
+    )
+    operations = [
+        "ikinci fıkrasının (d) bendi yürürlükten kaldırılmış",
+        "ikinci fıkrasına aşağıdaki bent eklenmiştir: “ğ) Yeni aydınlatma kuralı.”",
+        "ikinci fıkrasına aşağıdaki bent eklenmiştir: “h) Zorunlu manevra kuralı.”",
+        "üçüncü fıkrasının (c) bendi aşağıdaki şekilde değiştirilmiştir: “c) Yeni tren teşkili kuralı.”",
+        "üçüncü fıkrasına aşağıdaki (ç) bendi eklenmiştir: “ç) Koruyucu mesafe kuralı.”",
+    ]
+    instructions = [prefix + operation for operation in operations]
+    assert [added_subordinate_unit_kind(text) for text in instructions] == [
+        None,
+        "clause",
+        "clause",
+        None,
+        "clause",
+    ]
+    assert not any(explicitly_adds_top_level_provision(text) for text in instructions)
+
+
+@pytest.mark.parametrize(
+    "label, expected",
+    [
+        ("a", "clause"),
+        ("ç", "clause"),
+        ("ğ", "clause"),
+        ("ı", "clause"),
+        ("İ", "clause"),
+        ("12", None),
+        ("çç", None),
+        ("a-b", None),
+    ],
+)
+def test_labeled_clause_addition_accepts_turkish_letters_and_optional_new_word(
+    label: str,
+    expected: str | None,
+) -> None:
+    instruction = (
+        "MADDE 1- Aynı Yönetmeliğin 6 ncı maddesinin üçüncü fıkrasına "
+        f"aşağıdaki yeni ({label}) bendi eklenmiştir: “{label}) Yeni kural.”"
+    )
+    assert added_subordinate_unit_kind(instruction) == expected
+
+
+def test_labeled_addition_inside_quoted_replacement_is_not_the_command() -> None:
+    instruction = (
+        "MADDE 1- Aynı Yönetmeliğin 6 ncı maddesinin üçüncü fıkrası aşağıdaki "
+        "şekilde değiştirilmiştir: “6 ncı maddesinin üçüncü fıkrasına aşağıdaki "
+        "(ç) bendi eklenmiştir.”"
+    )
+    assert added_subordinate_unit_kind(instruction) is None
+
+
+def test_labeled_addition_uses_verified_parent_and_accepts_new_unit_match(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from onyx.regulatory.amendments import pipeline
+    from onyx.regulatory.amendments.models import MatchResult
+    from onyx.regulatory.amendments.search_retriever import AmendmentSearchRetriever
+
+    file_id = UUID("00000000-0000-0000-0000-000000000123")
+    instruction = AmendmentInstruction(
+        instruction_text=(
+            "MADDE 1- Aynı Yönetmeliğin 6 ncı maddesinin üçüncü fıkrasına "
+            "aşağıdaki (ç) bendi eklenmiştir: “ç) Koruyucu mesafe bulunacaktır.”"
+        ),
+        target_source="Tehlikeli Maddelerin Demiryolu ile Taşınması Hakkında Yönetmelik",
+    )
+    parent = CandidateChunk(
+        chunk_id="article-6-paragraph-3",
+        user_file_id=str(file_id),
+        text="(3) Tehlikeli madde taşıyacak tren teşkili kuralları.",
+        metadata={"article_no": "6", "paragraph_no": "3"},
+        structured_match=True,
+    )
+    search = MagicMock(
+        side_effect=AssertionError("Verified parent needs no semantic search")
+    )
+    retriever = AmendmentSearchRetriever(
+        search_tool_factory=search,
+        canonical_candidate_loader=lambda _: {},
+        structural_candidate_loader=lambda _: [parent],
+        source_file_loader=lambda _: [str(file_id)],
+        allowed_user_file_ids=[file_id],
+    )
+    candidates = retriever.search(instruction)
+    assert candidates and candidates[0].chunk_id == parent.chunk_id
+    assert retriever.query_stats[0]["strategy"] == "verified_parent"
+    search.assert_not_called()
+    match = MatchResult(
+        outcome="new_provision",
+        old_chunk_id=None,
+        confidence=1.0,
+        rationale="New clause inside the verified existing parent.",
+    )
+    monkeypatch.setattr(pipeline, "confirm_match", lambda *_args, **_kwargs: match)
+    assert (
+        pipeline.confirm_instruction_match(
+            MagicMock(),
+            instruction=instruction,
+            candidates=candidates,
+        )
+        == match
+    )
+    match = match.model_copy(
+        update={"outcome": "matched", "old_chunk_id": parent.chunk_id}
+    )
+    assert (
+        pipeline.confirm_instruction_match(
+            MagicMock(),
+            instruction=instruction,
+            candidates=candidates,
+        )
+        is None
+    )
 
 
 def test_verified_canonical_root_can_identify_an_opaque_filename() -> None:

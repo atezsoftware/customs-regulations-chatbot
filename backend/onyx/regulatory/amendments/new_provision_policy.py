@@ -31,7 +31,7 @@ _ADDED_PARAGRAPH_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 _ADDED_CLAUSE_RE = re.compile(
-    rf"aşağıdaki\s+(?:yeni\s+)?(?:bent|bend).*?{_ADDITION_VERB}",
+    rf"aşağıdaki\s+(?:yeni\s+)?(?:\([a-zçğıöşü]\)\s+)?(?:bent|bend).*?{_ADDITION_VERB}",
     re.IGNORECASE | re.DOTALL,
 )
 
