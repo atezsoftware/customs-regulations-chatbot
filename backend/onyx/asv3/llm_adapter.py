@@ -6205,6 +6205,21 @@ class ResearchModel:
                 return decision
             registry = self.context.services.get("registry")
             assert isinstance(registry, CapabilityRegistry)
+            if contract.condition_bindings_json is not None:
+                with graph_step(
+                    "asv3.terminal_condition_bindings",
+                    {"mutable_indexes": list(contract.mutable_indexes)},
+                ) as correction:
+                    corrected = contract.apply(
+                        {"resolutions": json.loads(contract.condition_bindings_json)},
+                        self.context,
+                        registry,
+                    )
+                    correction.output_value = {
+                        "answer_unchanged": True,
+                        "source_acquisition_started": False,
+                    }
+                    return corrected
             isolated = copy.copy(self.context)
             isolated.services = dict(self.context.services)
             isolated.services.pop("last_model_call_id", None)
