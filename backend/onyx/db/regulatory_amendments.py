@@ -1371,7 +1371,12 @@ def _lock_reviewed_replacement_scope(
             raise ValueError("Replacement source has unreviewed descendants")
     body = explicit_replacement_body(proposal.instruction_text)
     if kind == "clause_pair":
-        if body != draft["text"] or not body.startswith("a) ") or "\nb) " not in body:
+        if (
+            body is None
+            or body != draft["text"]
+            or not body.startswith("a) ")
+            or "\nb) " not in body
+        ):
             raise ValueError("Reviewed clause replacement differs from source")
     elif body is not None:
         if body != draft["text"] or not body.startswith(f"MADDE {article_no}-"):
@@ -1416,7 +1421,7 @@ def _approve_multi_chunk_proposal(
         raise ValueError("Multiple insertions require one coordinated ordering review")
     insertions = {
         index: validate_insertion_order(
-            db_session, publication_owner.user_file_id, order
+            db_session, publication_owner.user_file_id, order, proposal=proposal
         )
         for index, order in insertions.items()
     }
@@ -1834,7 +1839,9 @@ def approve_amendment_proposal(
             raise ValueError(
                 "Insertion requires file publication ownership and a new target"
             )
-        insertion = validate_insertion_order(db_session, user_file_id, insertion)
+        insertion = validate_insertion_order(
+            db_session, user_file_id, insertion, proposal=proposal
+        )
         draft["position"] = insertion.position
         draft["insertion_order"] = insertion.model_dump(mode="json")
     today = datetime.date.today()
@@ -1968,9 +1975,9 @@ def approve_amendment_proposal(
     db_session.add(new_chunk)
     db_session.flush()
 
-    if old_chunk is not None:
-        from onyx.db.regulatory_annexes import copy_annex_chunk_links
+    from onyx.db.regulatory_annexes import copy_annex_chunk_links
 
+    if old_chunk is not None:
         copy_annex_chunk_links(
             db_session, old_chunk_id=old_chunk.id, new_chunk_id=new_chunk.id
         )
