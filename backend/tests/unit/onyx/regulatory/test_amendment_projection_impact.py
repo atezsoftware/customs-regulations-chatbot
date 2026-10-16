@@ -1,5 +1,8 @@
+import json
+from collections import Counter
+from collections.abc import Callable
 from datetime import date
-from typing import cast
+from typing import Any, cast
 from uuid import uuid4
 
 import pytest
@@ -15,6 +18,133 @@ from tests.unit.onyx.regulatory.indexing_jobs.owned_publication_test_helpers imp
     canonical_row,
     writer_inputs,
 )
+
+
+@pytest.mark.parametrize(
+    "fault", ["source", "quote", "coverage", "persistent", "deadline"]
+)
+def test_after_only_addition_repairs_singleton_proof_without_weakening_guards(
+    monkeypatch: pytest.MonkeyPatch, fault: str
+) -> None:
+    from onyx.regulatory import amendment_projection_impact as impact
+    from tests.unit.onyx.regulatory.test_context_impact_coverage_recovery import inputs
+
+    original_before, original_after, bindings, llm = inputs()
+    bindings[2].projection.source_json = json.dumps(
+        {"regulatory_chunk_id": "consumer-2", "chunk_context": "General import rules."}
+    )
+    before = [
+        row.model_copy(update={"position": i})
+        for i, row in enumerate(original_before[1:])
+    ]
+    addition = original_after[-1].model_copy(
+        update={"position": len(before), "supersedes_chunk_id": None}
+    )
+    after = [*before, addition]
+    calls: Counter[tuple[str, ...]] = Counter()
+    requests: list[dict[str, Any]] = []
+    cache: dict[str, impact.ContextImpactResult] = {}
+    blocked = [True]
+    now = [0.0]
+    deadlines: list[object] = []
+    monkeypatch.setattr(impact, "monotonic", lambda: now[0])
+
+    def resolve(
+        key: str, generate: Callable[[], impact.ContextImpactResult]
+    ) -> impact.ContextImpactResult:
+        if key not in cache:
+            cache[key] = generate()
+        return cache[key]
+
+    def audit(*_args: object, **kwargs: object) -> impact.ContextImpactResult:
+        request = json.loads(str(kwargs["user_prompt"]))
+        requests.append(request)
+        deadlines.append(kwargs["deadline"])
+        keys = tuple(request["contexts"])
+        calls[keys] += 1
+        for change in request["changes"].values():
+            assert change["before"] == [] and [
+                row["id"] for row in change["after"]
+            ] == ["new"]
+        response = impact.ContextImpactResult(
+            decisions=[
+                impact.ContextImpactDecision(
+                    key=key,
+                    affected=key != "2",
+                    quote="Fee is 5%." if key != "2" else "",
+                    reason="The added fee rule changes this statement."
+                    if key != "2"
+                    else "Generic context remains valid.",
+                    source_side="after" if key != "2" else None,
+                    source_id="new" if key != "2" else None,
+                    source_quote="Fee is 7%." if key != "2" else "",
+                )
+                for key in keys
+            ]
+        )
+        if len(keys) > 1:
+            response.decisions[0] = response.decisions[0].model_copy(
+                update={"source_side": "before"}
+            )
+        else:
+            assert kwargs["max_attempts"] == kwargs["provider_max_attempts"] == 1
+            if keys == ("1",) and blocked[0]:
+                if calls[keys] == 1 or fault in {"persistent", "deadline"}:
+                    if fault == "coverage":
+                        response.decisions = []
+                    else:
+                        response.decisions[0] = response.decisions[0].model_copy(
+                            update={"source_quote": "Fee is seven percent."}
+                            if fault == "quote"
+                            else {"source_side": "before"}
+                        )
+                    if fault == "deadline":
+                        now[0] = 181.0
+                else:
+                    feedback = request["validation_feedback"]
+                    assert feedback and feedback["error"]
+                    assert feedback["allowed_source_ids"] == {
+                        "1": {"before": [], "after": ["new"]}
+                    }
+                    assert "after" in feedback["source_guidance"]
+                    if fault != "coverage":
+                        assert feedback["previous_decisions"][0]["key"] == "1"
+        return response
+
+    monkeypatch.setattr(impact, "generate_structured", audit)
+
+    def analyze() -> impact.AmendmentImpactReport:
+        return impact.analyze_amendment_impact(
+            before=before, after=after, bindings=bindings, llm=llm, audit_cache=resolve
+        )
+
+    if fault == "deadline":
+        with pytest.raises(TimeoutError, match="deadline"):
+            analyze()
+        assert calls[("1",)] == 1 and calls[("2",)] == 0 and len(cache) == 1
+        return
+    report = analyze()
+    if fault == "persistent":
+        assert report.unresolved and report.unchanged_ids == []
+        assert calls[("1",)] == 2
+        assert calls[("2",)] == 0 and len(cache) == 1
+        blocked[0] = False
+        report = analyze()
+        assert calls[("0",)] == 1
+    assert not report.unresolved
+    assert set(report.affected_windows) == {"new", "consumer-0", "consumer-1"}
+    assert report.unchanged_ids == ["consumer-2"]
+    assert len(set(deadlines)) == 1
+    proofs = [proof for proof in report.context_evidence if proof.outcome == "affected"]
+    assert len(proofs) == 2 and all(
+        proof.source_side == "after"
+        and proof.source_id == "new"
+        and proof.source_quote == "Fee is 7%."
+        for proof in proofs
+    )
+    assert calls[("0",)] == calls[("2",)] == 1
+    previous = calls.copy()
+    assert not analyze().unresolved and calls == previous
 
 
 def test_insertion_position_shift_does_not_reembed_the_rest_of_the_document() -> None:

@@ -217,7 +217,9 @@ def test_invalid_singleton_never_becomes_unchanged_or_gets_remapped(
     monkeypatch.setattr(impact, "generate_structured", audit)
     with pytest.raises(ValueError):
         run(inputs())
-    assert calls == [["0", "1", "2"], ["0", "1", "2"], ["0"], ["1"]]
+    assert calls == [["0", "1", "2"], ["0", "1", "2"], ["0"], ["1"]] + (
+        [] if fault == "uncertain" else [["1"]]
+    )
 
 
 def test_expired_parent_deadline_prevents_later_singleton_calls(
@@ -308,7 +310,7 @@ def test_existing_parent_cache_and_successful_singletons_resume_independently(
     assert len(result) == 12
     assert calls[tuple(map(str, range(8)))] == 1
     assert calls[("8",)] == 1
-    assert calls[("9",)] == 2
+    assert calls[("9",)] == 3
     previous = calls.copy()
     assert run(data, resolve) == result
     assert calls == previous

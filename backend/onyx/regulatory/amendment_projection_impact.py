@@ -498,20 +498,49 @@ def include_context_consumers(
 
         def recover_singletons() -> ContextImpactResult:
             decisions: list[ContextImpactDecision] = []
-            # At most eight extra provider calls, sequential under the parent deadline.
+            # At most two calls per context, sequential under the parent deadline.
             for key, context in batch.items():
                 singleton = {key: context}
+                singleton_proofs = source_proofs(singleton)
 
                 def generate_one() -> ContextImpactResult:
-                    response = request(singleton, None, singleton_recovery=True)
-                    validate_context_decisions(
-                        singleton, response.decisions, changes=source_proofs(singleton)
-                    )
-                    return response
+                    feedback: dict[str, object] | None = None
+                    for attempt in range(2):
+                        response = request(singleton, feedback, singleton_recovery=True)
+                        try:
+                            validate_context_decisions(
+                                singleton, response.decisions, changes=singleton_proofs
+                            )
+                            return response
+                        except (
+                            ContextImpactCoverageError,
+                            ContextImpactSourceQuoteError,
+                        ) as error:
+                            if attempt == 1:
+                                raise
+                            feedback = {
+                                "error": str(error),
+                                "previous_decisions": response.model_dump(mode="json")[
+                                    "decisions"
+                                ],
+                                "allowed_source_ids": {
+                                    key: {
+                                        side: list(rows)
+                                        for side, rows in singleton_proofs[key].items()
+                                    }
+                                },
+                                "source_guidance": (
+                                    "Use only supplied nonempty before/after sources. "
+                                    "When before is empty, quote an after source; when "
+                                    "after is empty, quote a before source. Never invent "
+                                    "a quote or mark unchanged to avoid a proof error."
+                                ),
+                            }
+                    raise AssertionError("singleton context audit attempts exhausted")
 
                 response = cached(singleton, generate_one)
                 validate_context_decisions(
-                    singleton, response.decisions, changes=source_proofs(singleton)
+                    singleton, response.decisions, changes=singleton_proofs
                 )
                 decisions.extend(response.decisions)
             validate_context_decisions(batch, decisions, changes=proofs)
