@@ -45,6 +45,7 @@ from onyx.configs.chat_configs import (
 from onyx.configs.constants import PUBLIC_API_TAGS, MessageType, MilestoneRecordType
 from onyx.configs.model_configs import LITELLM_PASS_THROUGH_HEADERS
 from onyx.db.chat import (
+    RESERVED_ASSISTANT_MESSAGE,
     add_chats_to_session_from_slack_thread,
     delete_all_chat_sessions_for_user,
     delete_chat_session,
@@ -467,6 +468,20 @@ def get_chat_session(
             "An error occurred while checking if the chat session is processing"
         )
 
+    # Preserve crash-recovery text in storage, but hide it for the exact active
+    # assistant. A multi-model run ID identifies a user turn, not one attempt.
+    pending_message_ids = {
+        message.id
+        for message, detail in zip(session_messages, chat_message_details, strict=True)
+        if current_run is not None
+        and message.message_type == MessageType.ASSISTANT
+        and message.id == current_run.run_id
+        and message.message == RESERVED_ASSISTANT_MESSAGE
+        and message.error is None
+        and detail.message == RESERVED_ASSISTANT_MESSAGE
+        and detail.error is None
+    }
+
     # Every assistant message might have a set of tool calls associated with it, these need to be replayed back for the frontend
     # Each list is the set of tool calls for the given assistant message.
     replay_packet_lists: list[list[Packet]] = []
@@ -487,6 +502,7 @@ def get_chat_session(
                     db_session=db_session,
                     tools_by_id=tools_by_id,
                     asv3_interrupted=processing_state_checked and current_run is None,
+                    suppress_reserved_message=msg.id in pending_message_ids,
                 )
             )
             # msg_packet_list.append(Packet(ind=end_step_nr, obj=OverallStop()))
@@ -504,6 +520,14 @@ def get_chat_session(
                 chat_message_details[index] = (
                     translate_db_message_to_chat_message_detail(message)
                 )
+    chat_message_details = [
+        detail.model_copy(update={"message": ""})
+        if detail.message_id in pending_message_ids
+        and detail.message == RESERVED_ASSISTANT_MESSAGE
+        and detail.error is None
+        else detail
+        for detail in chat_message_details
+    ]
     replay_packet_lists = [
         packets if message_publication_available(message) else []
         for message, packets in zip(
