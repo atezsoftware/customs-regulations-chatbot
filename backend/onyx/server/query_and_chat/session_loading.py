@@ -13,6 +13,7 @@ from onyx.configs.constants import MessageType
 from onyx.context.search.models import SavedSearchDoc, SearchDoc
 from onyx.db.asv3_runs import ASV3_CHECKPOINT_TOOL_ID, decode_asv3_checkpoint
 from onyx.db.chat import (
+    RESERVED_ASSISTANT_MESSAGE,
     get_db_search_doc_by_id,
     translate_db_search_doc_to_saved_search_doc,
 )
@@ -648,6 +649,7 @@ def translate_assistant_message_to_packets(
     tools_by_id: dict[int, Tool] | None = None,
     *,
     asv3_interrupted: bool = False,
+    suppress_reserved_message: bool = False,
 ) -> list[Packet]:
     """
     Translates an assistant message and tool calls to packet format.
@@ -662,6 +664,12 @@ def translate_assistant_message_to_packets(
 
     if chat_message.message_type != MessageType.ASSISTANT:
         raise ValueError(f"Chat message {chat_message.id} is not an assistant message")
+
+    pending_reserved_message = (
+        suppress_reserved_message
+        and chat_message.message == RESERVED_ASSISTANT_MESSAGE
+        and chat_message.error is None
+    )
 
     if chat_message.tool_calls:
         # Group tool calls by turn_number
@@ -1016,7 +1024,7 @@ def translate_assistant_message_to_packets(
         )
         message_turn_index += 1
 
-    if chat_message.message:
+    if chat_message.message and not pending_reserved_message:
         packet_list.extend(
             create_message_packets(
                 message_text=chat_message.message,
@@ -1060,11 +1068,12 @@ def translate_assistant_message_to_packets(
             stop_reason = "user_cancelled"
 
     # Add overall stop packet at the end
-    packet_list.append(
-        Packet(
-            placement=Placement(turn_index=final_turn_index),
-            obj=OverallStop(stop_reason=stop_reason),
+    if not pending_reserved_message:
+        packet_list.append(
+            Packet(
+                placement=Placement(turn_index=final_turn_index),
+                obj=OverallStop(stop_reason=stop_reason),
+            )
         )
-    )
 
     return packet_list if message_publication_available(chat_message) else []
