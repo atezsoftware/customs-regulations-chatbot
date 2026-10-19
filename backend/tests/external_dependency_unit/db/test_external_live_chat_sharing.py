@@ -1,6 +1,7 @@
 from collections.abc import AsyncGenerator, Generator
 from contextlib import asynccontextmanager
 from hashlib import sha256
+from secrets import token_urlsafe
 from typing import NamedTuple
 from uuid import UUID
 
@@ -150,12 +151,68 @@ def _share(context: ShareContext) -> str:
     assert result.status_code == 200
     assert set(result.json()) == {"shareToken", "shareUrl"}
     token = result.json()["shareToken"]
+    assert isinstance(token, str) and len(token) == 36
+    parsed_token = UUID(token)
+    assert parsed_token.version == 4 and str(parsed_token) == token
     assert (
         result.json()["shareUrl"]
         == f"https://tariff.singlewindow.io/chat/shared/{token}"
     )
     assert "no-store" in result.headers["cache-control"]
     return token
+
+
+def test_legacy_tokens_remain_readable_and_revocable_alongside_new_uuid_tokens(
+    db_session: Session, share_context: ShareContext
+) -> None:
+    context = share_context
+    legacy_token = token_urlsafe(32)
+    assert len(legacy_token) == 43
+    legacy_hash = sha256(legacy_token.encode()).hexdigest()
+    db_session.add(
+        ExternalChatShare(
+            token_hash=legacy_hash,
+            chat_session_id=context.session_id,
+            created_by_user_id=context.owner.id,
+            api_key_id=context.owner_key_id,
+        )
+    )
+    db_session.commit()
+    new_token = _share(context)
+
+    for token in (legacy_token, new_token):
+        response = context.client.get(
+            f"/api/chat/shared/{token}/messages",
+            headers=_headers(context.owner_token),
+        )
+        assert response.status_code == 200
+        assert response.json()["session"]["id"] == str(context.session_id)
+        assert [message["content"] for message in response.json()["messages"]] == [
+            "İlk soru",
+            "İlk cevap",
+        ]
+        assert "no-store" in response.headers["cache-control"]
+
+    revoked = context.client.delete(
+        f"/api/chat/shared/{legacy_token}", headers=_headers(context.owner_token)
+    )
+    assert revoked.status_code == 204
+    blocked = context.client.get(
+        f"/api/chat/shared/{legacy_token}/messages",
+        headers=_headers(context.owner_token),
+    )
+    assert blocked.status_code == 404
+    assert "no-store" in blocked.headers["cache-control"]
+    assert (
+        context.client.get(
+            f"/api/chat/shared/{new_token}/messages",
+            headers=_headers(context.owner_token),
+        ).status_code
+        == 200
+    )
+    db_session.expire_all()
+    legacy_share = db_session.get(ExternalChatShare, legacy_hash)
+    assert legacy_share is not None and legacy_share.revoked_at is not None
 
 
 def test_live_link_reads_new_turns_without_exposing_core_ui_or_private_fields(

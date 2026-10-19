@@ -1,6 +1,9 @@
 # Server-to-server calls: keep the application API key in the Tariff backend.
 # Tariff must verify its logged-in user's session ownership before create/revoke.
 # The Tariff share page calls its public proxy; these core routes require the same key.
+# New shareToken values are 36-character UUIDv4 strings, separate from session IDs.
+# Previously created 43-character tokens remain valid for reading and revocation.
+# Forward either token unchanged to the core routes; do not truncate or replace it.
 @core = https://dev-customs-regulations.singlewindow.io
 @apiKey = REPLACE_WITH_APPLICATION_API_KEY
 @sessionId = REPLACE_WITH_OWNED_SESSION_UUID

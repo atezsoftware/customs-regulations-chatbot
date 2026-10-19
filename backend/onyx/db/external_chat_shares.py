@@ -1,9 +1,8 @@
 """External live shares remain separate from the core frontend's public chats."""
 
 import hashlib
-import secrets
 from datetime import datetime, timezone
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -43,7 +42,7 @@ def create_external_chat_share(
     )
     if session is None:
         raise _share_not_found()
-    token = secrets.token_urlsafe(32)
+    token = str(uuid4())
     db_session.add(
         ExternalChatShare(
             token_hash=_token_hash(token),

@@ -34,7 +34,13 @@ class ExternalShareCreateRequest(BaseModel):
 
 
 class ExternalShareCreateResponse(BaseModel):
-    shareToken: str
+    shareToken: str = Field(
+        min_length=36,
+        max_length=36,
+        pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+        description="A new UUIDv4 share token, distinct from the chat session ID.",
+        examples=["eb711ac5-7078-47bb-b8ea-2b3e3067b9ed"],
+    )
     shareUrl: str
 
 
