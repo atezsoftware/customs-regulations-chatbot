@@ -2,6 +2,7 @@ import uuid
 from collections.abc import Generator
 from datetime import datetime, timezone
 from http import HTTPStatus
+from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
@@ -225,7 +226,14 @@ def admin_get_chat_sessions(
     )
 
 
-@router.get("/admin/chat-session-history")
+def private_history_response(response: Response) -> None:
+    response.headers["Cache-Control"] = "private, no-store"
+
+
+@router.get(
+    "/admin/chat-session-history",
+    dependencies=[Depends(private_history_response)],
+)
 def get_chat_session_history(
     page_num: int = Query(0, ge=0),
     page_size: int = Query(10, ge=1),
@@ -233,12 +241,28 @@ def get_chat_session_history(
     session_rating: int | None = Query(None, ge=1, le=4),
     start_time: datetime | None = None,
     end_time: datetime | None = None,
+    user_id: UUID | None = None,
+    user_email: Annotated[str | None, Query(max_length=320)] = None,
+    user_query: Annotated[str | None, Query(max_length=255)] = None,
+    api_key_query: Annotated[str | None, Query(max_length=255)] = None,
+    q: Annotated[str | None, Query(max_length=500)] = None,
     _: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
     db_session: Session = Depends(get_session),
 ) -> PaginatedReturn[ChatSessionMinimal]:
     query_history_type = ensure_query_history_is_enabled(
         disallowed=[QueryHistoryType.DISABLED]
     )
+
+    if query_history_type == QueryHistoryType.ANONYMIZED and (
+        user_id is not None
+        or any(
+            value and value.strip() for value in (user_email, user_query, api_key_query)
+        )
+    ):
+        raise OnyxError(
+            OnyxErrorCode.INSUFFICIENT_PERMISSIONS,
+            "User and API key filters are unavailable in anonymized query history.",
+        )
 
     page_of_chat_sessions = get_page_of_chat_sessions(
         page_num=page_num,
@@ -248,6 +272,11 @@ def get_chat_session_history(
         end_time=end_time,
         feedback_filter=feedback_type,
         session_rating=session_rating,
+        user_id=user_id,
+        user_email=user_email,
+        user_query=user_query,
+        api_key_query=api_key_query,
+        q=q,
     )
 
     total_filtered_chat_sessions_count = get_total_filtered_chat_sessions_count(
@@ -256,6 +285,11 @@ def get_chat_session_history(
         end_time=end_time,
         feedback_filter=feedback_type,
         session_rating=session_rating,
+        user_id=user_id,
+        user_email=user_email,
+        user_query=user_query,
+        api_key_query=api_key_query,
+        q=q,
     )
 
     minimal_chat_sessions: list[ChatSessionMinimal] = []
@@ -307,10 +341,6 @@ def get_chat_session_history(
         items=minimal_chat_sessions,
         total_items=total_filtered_chat_sessions_count,
     )
-
-
-def private_history_response(response: Response) -> None:
-    response.headers["Cache-Control"] = "private, no-store"
 
 
 @router.get(
