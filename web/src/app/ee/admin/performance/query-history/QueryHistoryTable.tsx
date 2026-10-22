@@ -13,7 +13,7 @@ import SvgSimpleLoader from "@opal/icons/simple-loader";
 import { ChatSessionMinimal } from "@/app/ee/admin/performance/usage/types";
 import { Section } from "@/layouts/general-layouts";
 import { timestampToReadableDate } from "@/lib/dateUtils";
-import { Dispatch, SetStateAction, useCallback, useState } from "react";
+import { Dispatch, SetStateAction, useEffect, useState } from "react";
 import { Feedback, TaskStatus } from "@/lib/types";
 import {
   DateRange,
@@ -21,15 +21,24 @@ import {
 } from "@/components/dateRangeSelectors/AdminDateRangeSelector";
 import { PageSelector } from "@/components/PageSelector";
 import type { Route } from "next";
-import { useRouter } from "next/navigation";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { FeedbackBadge } from "@/app/ee/admin/performance/query-history/FeedbackBadge";
 import { SessionFeedbackBadge } from "@/app/ee/admin/performance/query-history/SessionFeedbackBadge";
 import QueryHistoryUser from "@/app/ee/admin/performance/query-history/QueryHistoryUser";
 import { SESSION_FEEDBACK_OPTIONS } from "@/lib/chat/session-feedback/constants";
-import type { SessionFeedbackRating } from "@/app/app/interfaces";
 import KickoffCSVExport from "@/app/ee/admin/performance/query-history/KickoffCSVExport";
 import CardSection from "@/components/admin/CardSection";
-import usePaginatedFetch from "@/hooks/usePaginatedFetch";
+import { useSettings } from "@/lib/settings/hooks";
+import { QueryHistoryType } from "@/lib/settings/types";
+import QueryHistorySearch from "@/app/ee/admin/performance/query-history/QueryHistorySearch";
+import {
+  queryHistoryApiUrl,
+  queryHistorySearchParams,
+  readQueryHistoryFilters,
+  readQueryHistoryPage,
+  type QueryHistoryFilters,
+} from "@/app/ee/admin/performance/query-history/filters";
+import { ADMIN_ROUTES } from "@/lib/admin-routes";
 import { ErrorCallout } from "@/components/ErrorCallout";
 import { errorHandlingFetcher } from "@/lib/fetcher";
 import useSWR from "swr";
@@ -40,7 +49,6 @@ import {
   LIST_QUERY_HISTORY_URL,
   NUM_IN_PAGE,
   ITEMS_PER_PAGE,
-  PAGES_PER_BATCH,
   PREVIOUS_CSV_TASK_BUTTON_NAME,
 } from "@/app/ee/admin/performance/query-history/constants";
 import { humanReadableFormatWithTime } from "@opal/time";
@@ -62,7 +70,7 @@ function QueryHistoryTableRow({
 }) {
   const router = useRouter();
   const conversationHref =
-    `/ee/admin/performance/query-history/${chatSessionMinimal.id}` as Route;
+    `${ADMIN_ROUTES.QUERY_HISTORY.path}/${chatSessionMinimal.id}` as Route;
 
   function openConversation() {
     router.push(conversationHref);
@@ -281,74 +289,82 @@ function PreviousQueryHistoryExportsModal({
 }
 
 export function QueryHistoryTable() {
-  const [dateRange, setDateRange] = useState<DateRange>(undefined);
-  const [filters, setFilters] = useState<{
-    feedback_type?: Feedback | "all";
-    session_rating?: SessionFeedbackRating;
-    start_time?: string;
-    end_time?: string;
-  }>({});
-
+  const router = useRouter();
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
+  const settings = useSettings();
+  const allowIdentity =
+    settings.query_history_type !== QueryHistoryType.ANONYMIZED;
+  const params = new URLSearchParams(searchParams?.toString());
+  const filters = readQueryHistoryFilters(params, allowIdentity);
+  const currentPage = readQueryHistoryPage(params);
+  const from = filters.start_time ? new Date(filters.start_time) : undefined;
+  const to = filters.end_time ? new Date(filters.end_time) : undefined;
+  const dateRange: DateRange =
+    from && to && !Number.isNaN(from.getTime()) && !Number.isNaN(to.getTime())
+      ? { from, to }
+      : undefined;
   const [showModal, setShowModal] = useState(false);
+  const { data, isLoading, error } = useSWR<{
+    items: ChatSessionMinimal[];
+    total_items: number;
+  }>(
+    settings.isLoading
+      ? null
+      : queryHistoryApiUrl(filters, currentPage, ITEMS_PER_PAGE),
+    errorHandlingFetcher,
+    { refreshInterval: 5000, keepPreviousData: false }
+  );
+  const chatSessionData = data?.items;
+  const totalPages = Math.max(
+    1,
+    Math.ceil((data?.total_items || 0) / ITEMS_PER_PAGE)
+  );
 
-  const {
-    currentPageData: chatSessionData,
-    isLoading,
-    error,
-    currentPage,
-    totalPages,
-    goToPage,
-  } = usePaginatedFetch<ChatSessionMinimal>({
-    itemsPerPage: ITEMS_PER_PAGE,
-    pagesPerBatch: PAGES_PER_BATCH,
-    endpoint: "/api/admin/chat-session-history",
-    filter: filters,
-  });
+  function updateFilters(next: QueryHistoryFilters, page = 1) {
+    const nextParams = queryHistorySearchParams(params.toString(), next, page);
+    router.replace(`${pathname}?${nextParams.toString()}` as Route, {
+      scroll: false,
+    });
+  }
 
-  const onTimeRangeChange = useCallback((value: DateRange) => {
-    setDateRange(value);
-
-    if (value?.from && value?.to) {
-      setFilters((prev) => ({
-        ...prev,
-        start_time: value.from.toISOString(),
-        end_time: value.to.toISOString(),
-      }));
-    } else {
-      setFilters((prev) => {
-        const newFilters = { ...prev };
-        delete newFilters.start_time;
-        delete newFilters.end_time;
-        return newFilters;
+  useEffect(() => {
+    if (data && currentPage > totalPages) {
+      const nextParams = queryHistorySearchParams(
+        params.toString(),
+        filters,
+        totalPages
+      );
+      router.replace(`${pathname}?${nextParams.toString()}` as Route, {
+        scroll: false,
       });
     }
-  }, []);
+  }, [data, currentPage, totalPages, pathname, router, searchParams]);
 
-  if (error) {
-    return (
-      <ErrorCallout
-        errorTitle="Error fetching query history"
-        errorMsg={error?.message}
-      />
-    );
+  function onTimeRangeChange(value: DateRange) {
+    updateFilters({
+      ...filters,
+      start_time: value?.from.toISOString(),
+      end_time: value?.to.toISOString(),
+    });
   }
 
   return (
     <>
       <CardSection className="mt-8">
-        <div className="flex">
+        <QueryHistorySearch
+          filters={filters}
+          allowIdentity={allowIdentity}
+          onApply={updateFilters}
+        />
+        <div className="flex flex-wrap gap-4 pb-4">
           <div className="gap-y-3 flex flex-col">
             <SelectFeedbackType
               value={filters.feedback_type || "all"}
               onValueChange={(value) => {
-                setFilters((prev) => {
-                  const newFilters = { ...prev };
-                  if (value === "all") {
-                    delete newFilters.feedback_type;
-                  } else {
-                    newFilters.feedback_type = value;
-                  }
-                  return newFilters;
+                updateFilters({
+                  ...filters,
+                  feedback_type: value === "all" ? undefined : value,
                 });
               }}
             />
@@ -358,18 +374,10 @@ export function QueryHistoryTable() {
               <InputSelect
                 value={filters.session_rating?.toString() || "all"}
                 onValueChange={(value) => {
-                  setFilters((prev) => {
-                    const nextFilters = { ...prev };
-                    if (value === "all") {
-                      delete nextFilters.session_rating;
-                    } else {
-                      const option = SESSION_FEEDBACK_OPTIONS.find(
-                        ({ rating }) => rating.toString() === value
-                      );
-                      if (option) nextFilters.session_rating = option.rating;
-                    }
-                    return nextFilters;
-                  });
+                  const option = SESSION_FEEDBACK_OPTIONS.find(
+                    ({ rating }) => rating.toString() === value
+                  );
+                  updateFilters({ ...filters, session_rating: option?.rating });
                 }}
               >
                 <InputSelect.Trigger aria-label="Sohbet değerlendirmesi" />
@@ -389,15 +397,31 @@ export function QueryHistoryTable() {
               onValueChange={onTimeRangeChange}
             />
           </div>
-          <div className="flex flex-row w-full items-center gap-x-2">
-            <KickoffCSVExport dateRange={dateRange} />
-            <Button prominence="secondary" onClick={() => setShowModal(true)}>
-              {PREVIOUS_CSV_TASK_BUTTON_NAME}
-            </Button>
+          <div className="flex flex-col gap-2 justify-center">
+            <div className="flex flex-wrap items-center gap-2">
+              <KickoffCSVExport dateRange={dateRange} />
+              <Button prominence="secondary" onClick={() => setShowModal(true)}>
+                {PREVIOUS_CSV_TASK_BUTTON_NAME}
+              </Button>
+            </div>
+            <OpalText font="secondary-body" color="text-03">
+              CSV dışa aktarımı yalnızca tarih aralığını kullanır.
+            </OpalText>
           </div>
         </div>
         <Divider />
+        {error && (
+          <ErrorCallout
+            errorTitle="Error fetching query history"
+            errorMsg={error.message}
+          />
+        )}
         <Section>
+          <OpalText font="secondary-body" color="text-03">
+            {data
+              ? `${data.total_items} sohbet bulundu`
+              : "Sohbetler yükleniyor..."}
+          </OpalText>
           <Table className="mt-5 table-fixed">
             <colgroup>
               <col className="w-[15%]" />
@@ -425,8 +449,8 @@ export function QueryHistoryTable() {
                 <TableHead>Toplam cevap süresi / maliyet</TableHead>
               </TableRow>
             </TableHeader>
-            {isLoading ? (
-              <TableBody>
+            <TableBody>
+              {isLoading || settings.isLoading ? (
                 <TableRow>
                   <TableCell colSpan={9} className="text-center">
                     <div className="flex justify-center">
@@ -434,25 +458,31 @@ export function QueryHistoryTable() {
                     </div>
                   </TableCell>
                 </TableRow>
-              </TableBody>
-            ) : (
-              <TableBody>
-                {chatSessionData?.map((chatSessionMinimal) => (
+              ) : chatSessionData?.length === 0 ? (
+                <TableRow>
+                  <TableCell colSpan={9} className="text-center">
+                    <OpalText font="main-ui-body">
+                      Bu filtrelere uygun sohbet bulunamadı.
+                    </OpalText>
+                  </TableCell>
+                </TableRow>
+              ) : (
+                chatSessionData?.map((chatSessionMinimal) => (
                   <QueryHistoryTableRow
                     key={chatSessionMinimal.id}
                     chatSessionMinimal={chatSessionMinimal}
                   />
-                ))}
-              </TableBody>
-            )}
+                ))
+              )}
+            </TableBody>
           </Table>
 
-          {chatSessionData && (
+          {data && data.total_items > 0 && (
             <Section>
               <PageSelector
                 totalPages={totalPages}
                 currentPage={currentPage}
-                onPageChange={goToPage}
+                onPageChange={(page) => updateFilters(filters, page)}
               />
             </Section>
           )}
