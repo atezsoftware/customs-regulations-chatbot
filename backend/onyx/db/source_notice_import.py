@@ -9,7 +9,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 from uuid import uuid4
 
 from pydantic import BaseModel, Field, JsonValue
@@ -20,6 +20,7 @@ from onyx.regulatory.source_notice_identity import (
     NoticeIdentity,
     normalize_notice_alias,
     notice_identity_queries,
+    notice_title_alias,
 )
 
 MANIFEST_VERSION = 1
@@ -95,7 +96,7 @@ class NoticeImportTarget(BaseModel):
     document_set_id: int
     identity_key: str
     instrument_type: str
-    instrument_number: str
+    instrument_number: str | None = None
     instrument_year: int | None = None
     instrument_date: date | None = None
     catalog_title: str
@@ -130,6 +131,12 @@ class SourceNoticeManifest(BaseModel):
     raw_row_count: int
     targets: list[NoticeImportTarget]
     decisions: list[NoticeRowDecision]
+    admission_policy: Literal["structured_only", "catalogue_observations"] = (
+        "structured_only"
+    )
+    prior_manifest_sha256: str | None = None
+    registry_fingerprint: str | None = None
+    baseline_notices: list[NoticeImportTarget] = Field(default_factory=list)
 
 
 def canonical_digest(value: object) -> str:
@@ -137,6 +144,36 @@ def canonical_digest(value: object) -> str:
         value, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str
     )
     return hashlib.sha256(data.encode()).hexdigest()
+
+
+def notice_manifest_digests(manifest: SourceNoticeManifest) -> set[str]:
+    """Retain verification of previously frozen manifests without new optional fields."""
+    payload = manifest.model_dump(mode="json")
+    digests = {canonical_digest(payload)}
+    if (
+        manifest.admission_policy == "structured_only"
+        and not manifest.baseline_notices
+        and manifest.registry_fingerprint is None
+        and manifest.prior_manifest_sha256 is None
+    ):
+        for key in (
+            "admission_policy",
+            "prior_manifest_sha256",
+            "registry_fingerprint",
+            "baseline_notices",
+        ):
+            payload.pop(key)
+        digests.add(canonical_digest(payload))
+    return digests
+
+
+def notice_registry_fingerprint(notices: list[NoticeImportTarget]) -> str:
+    return canonical_digest(
+        [
+            notice.model_dump(mode="json")
+            for notice in sorted(notices, key=lambda notice: notice.identity_key)
+        ]
+    )
 
 
 def inventory_fingerprint(sources: list[ExistingNoticeSource]) -> str:
@@ -608,7 +645,7 @@ def apply_source_notice_manifest(
         raise ValueError("Apply requires the reviewed canonical identity-head audit")
     if manifest.schema_version != MANIFEST_VERSION:
         raise ValueError("Unsupported manifest schema")
-    if canonical_digest(manifest.model_dump(mode="json")) != expected_manifest_sha256:
+    if expected_manifest_sha256 not in notice_manifest_digests(manifest):
         raise ValueError("Manifest digest differs from reviewed plan")
     if (
         manifest.workbook_sha256 != expected_workbook_sha256
@@ -639,6 +676,19 @@ def apply_source_notice_manifest(
         text("SELECT pg_advisory_xact_lock(1762751,:scope)"),
         {"scope": manifest.document_set_id},
     )
+    if manifest.admission_policy == "catalogue_observations":
+        current_registry = read_notice_registry(db_session, manifest.document_set_id)
+        expected_baseline = notice_registry_fingerprint(manifest.baseline_notices)
+        if manifest.registry_fingerprint != expected_baseline:
+            raise ValueError("Manifest registry baseline fingerprint is invalid")
+        expected_after = [*manifest.baseline_notices, *manifest.targets]
+        if len({item.identity_key for item in expected_after}) != len(expected_after):
+            raise ValueError("Manifest registry baseline and new targets overlap")
+        if notice_registry_fingerprint(current_registry) not in {
+            expected_baseline,
+            notice_registry_fingerprint(expected_after),
+        }:
+            raise ValueError("Notice registry changed after planning; repeat dry run")
     existing_records = (
         db_session.execute(
             text(
@@ -655,7 +705,7 @@ def apply_source_notice_manifest(
     existing_by_key = {
         str(record["identity_key"]): record for record in existing_records
     }
-    inserted: list[str] = []
+    pending: list[NoticeImportTarget] = []
     for target in manifest.targets:
         if (
             target.document_set_id != manifest.document_set_id
@@ -676,28 +726,39 @@ def apply_source_notice_manifest(
                     f"Notice identity already exists with different provenance: {target.identity_key}"
                 )
             continue
-        values = target.model_dump(mode="json")
-        for key in ("aliases", "legistation_metadata", "provenance"):
-            values[key] = json.dumps(values[key], ensure_ascii=False)
-        db_session.execute(
-            text("""
-            INSERT INTO regulatory_source_notice
-            (id,document_set_id,identity_key,instrument_type,instrument_number,instrument_year,instrument_date,catalog_title,aliases,legistation_metadata,provenance,content_state,user_file_id,revision)
-            VALUES (CAST(:id AS uuid),:document_set_id,:identity_key,:instrument_type,:instrument_number,:instrument_year,CAST(:instrument_date AS date),:catalog_title,CAST(:aliases AS jsonb),CAST(:legistation_metadata AS jsonb),CAST(:provenance AS jsonb),:content_state,CAST(:user_file_id AS uuid),:revision)
-        """),
-            values,
-        )
-        inserted.append(target.id)
-    return inserted
+        pending.append(target)
+    for offset in range(0, len(pending), 200):
+        _insert_notice_batch(db_session, pending[offset : offset + 200])
+    return [target.id for target in pending]
+
+
+def _insert_notice_batch(
+    db_session: Session, targets: list[NoticeImportTarget]
+) -> None:
+    from uuid import UUID
+
+    from sqlalchemy import insert
+
+    from onyx.db.models import RegulatorySourceNotice
+
+    values = []
+    for target in targets:
+        record = target.model_dump(mode="python")
+        record["id"] = UUID(target.id)
+        values.append(record)
+    statement = insert(RegulatorySourceNotice).values(values)
+    guard_notice_import_statement(str(statement))
+    db_session.execute(statement)
 
 
 def validate_imported_notice_targets(
     manifest: SourceNoticeManifest, actual: list[NoticeImportTarget]
 ) -> dict[str, JsonValue]:
     """Compare every imported business field, including raw text and provenance."""
-    expected_by_key = {target.identity_key: target for target in manifest.targets}
+    expected_records = [*manifest.baseline_notices, *manifest.targets]
+    expected_by_key = {target.identity_key: target for target in expected_records}
     actual_by_key = {target.identity_key: target for target in actual}
-    if len(expected_by_key) != len(manifest.targets) or len(actual_by_key) != len(
+    if len(expected_by_key) != len(expected_records) or len(actual_by_key) != len(
         actual
     ):
         raise ValueError("Duplicate notice identity in manifest or stored registry")
@@ -726,13 +787,14 @@ def validate_imported_notice_targets(
     skipped_rows = {
         row
         for decision in manifest.decisions
-        if decision.classification != "new"
+        if decision.classification not in ("new", "already_registered")
         for row in decision.excel_rows
     }
     skipped_keys = {
         decision.identity_key
         for decision in manifest.decisions
-        if decision.classification != "new" and decision.identity_key is not None
+        if decision.classification not in ("new", "already_registered")
+        and decision.identity_key is not None
     }
     if observed_rows & skipped_rows or set(actual_by_key) & skipped_keys:
         raise ValueError("A held or existing source row was inserted")
@@ -741,6 +803,8 @@ def validate_imported_notice_targets(
     ]
     return {
         "verified_notice_count": len(actual),
+        "new_target_count": len(manifest.targets),
+        "unchanged_baseline_count": len(manifest.baseline_notices),
         "verified_business_field_sha256": canonical_digest(ordered),
         "all_repealed": True,
         "all_metadata_only": True,
@@ -759,14 +823,9 @@ def validate_imported_notice_targets(
     }
 
 
-def verify_stored_source_notice_manifest(
-    db_session: Session,
-    manifest: SourceNoticeManifest,
-    *,
-    expected_manifest_sha256: str,
-) -> dict[str, JsonValue]:
-    if canonical_digest(manifest.model_dump(mode="json")) != expected_manifest_sha256:
-        raise ValueError("Manifest digest differs from reviewed plan")
+def read_notice_registry(
+    db_session: Session, document_set_id: int
+) -> list[NoticeImportTarget]:
     records = db_session.execute(
         text("""
         SELECT id::text AS id,document_set_id,identity_key,instrument_type,
@@ -776,9 +835,20 @@ def verify_stored_source_notice_manifest(
         FROM regulatory_source_notice WHERE document_set_id=:scope
         ORDER BY identity_key
     """),
-        {"scope": manifest.document_set_id},
+        {"scope": document_set_id},
     ).mappings()
-    actual = [NoticeImportTarget.model_validate(dict(record)) for record in records]
+    return [NoticeImportTarget.model_validate(dict(record)) for record in records]
+
+
+def verify_stored_source_notice_manifest(
+    db_session: Session,
+    manifest: SourceNoticeManifest,
+    *,
+    expected_manifest_sha256: str,
+) -> dict[str, JsonValue]:
+    if expected_manifest_sha256 not in notice_manifest_digests(manifest):
+        raise ValueError("Manifest digest differs from reviewed plan")
+    actual = read_notice_registry(db_session, manifest.document_set_id)
     result = validate_imported_notice_targets(manifest, actual)
     counts = db_session.execute(
         text(
@@ -793,3 +863,226 @@ def verify_stored_source_notice_manifest(
         for record in counts
     ]
     return result
+
+
+def _catalogue_observation_fields(
+    row: ExcelNoticeRow,
+) -> tuple[str, str | None, int | None, date | None]:
+    identity, _basis = row_identity(row)
+    if identity is not None:
+        return (
+            identity.instrument_type,
+            identity.number,
+            identity.year,
+            identity.instrument_date,
+        )
+    kinds = {
+        "Diğer Kanunlar": "law",
+        "Genelgeler": "circular",
+        "Kararname ve Mahkeme Kararları": "decision",
+        "Tasarruflu Yazılar": "administrative_letter",
+        "Diğer Yönetmelikler": "regulation",
+        "Tebliğler": "communique",
+    }
+    kind = kinds.get(row.category, "catalogue_observation")
+    first, second = row.raw_values[1:3]
+    number: str | None = None
+    year: int | None = None
+    issued: date | None = None
+    if row.category == "Diğer Kanunlar":
+        number = _positive_number(first)
+    elif row.category in ("Genelgeler", "Kararname ve Mahkeme Kararları"):
+        raw_year = _positive_number(first)
+        year = (
+            int(raw_year)
+            if raw_year is not None and 1800 <= int(raw_year) <= 2099
+            else None
+        )
+        number = _positive_number(second)
+        if (
+            number is None
+            and isinstance(second, str)
+            and re.fullmatch(r"[A-Za-z]+-\d+", second)
+        ):
+            number = second
+    elif row.category == "Tasarruflu Yazılar":
+        number = _positive_number(second)
+        if isinstance(first, str):
+            try:
+                issued = datetime.fromisoformat(first).date()
+            except ValueError:
+                pass
+    return kind, number, year, issued
+
+
+def build_catalogue_observation_manifest(
+    *,
+    workbook_path: Path,
+    workbook_sha256: str,
+    sources: list[ExistingNoticeSource],
+    identity_heads: list[SourceIdentityHead],
+    document_set_id: int,
+    prior_manifest: SourceNoticeManifest,
+    prior_manifest_sha256: str,
+    registry: list[NoticeImportTarget],
+) -> SourceNoticeManifest:
+    """Admit independent catalogue observations without mutating matched source files."""
+    if prior_manifest_sha256 not in notice_manifest_digests(prior_manifest):
+        raise ValueError("Prior reviewed manifest digest differs")
+    if (
+        prior_manifest.workbook_sha256 != workbook_sha256
+        or prior_manifest.document_set_id != document_set_id
+    ):
+        raise ValueError("Prior reviewed manifest belongs to a different source/scope")
+    sheet, rows = read_notice_workbook(workbook_path, expected_sha256=workbook_sha256)
+    raw_groups: dict[str, list[ExcelNoticeRow]] = defaultdict(list)
+    for row in rows:
+        raw_groups[canonical_digest(row.raw_values)].append(row)
+    prior_records: dict[str, NoticeRowDecision] = {}
+    for decision in prior_manifest.decisions:
+        for record in decision.raw_records:
+            digest = canonical_digest(record.raw_values)
+            if digest in prior_records and prior_records[digest] != decision:
+                raise ValueError("Prior decisions disagree for the same raw record")
+            prior_records[digest] = decision
+    if set(prior_records) != set(raw_groups):
+        raise ValueError(
+            "Current raw Excel records differ from prior reviewed manifest"
+        )
+    registry_by_key = {notice.identity_key: notice for notice in registry}
+    if len(registry_by_key) != len(registry):
+        raise ValueError("Duplicate identity in existing notice registry")
+    for target in prior_manifest.targets:
+        existing = registry_by_key.get(target.identity_key)
+        if existing is None or existing.model_dump(mode="json") != target.model_dump(
+            mode="json"
+        ):
+            raise ValueError("Previously imported notice changed or disappeared")
+    prior_by_raw = {
+        canonical_digest(record.raw_values): target
+        for target in prior_manifest.targets
+        for record in [
+            ExcelNoticeRow.model_validate(item)
+            for item in cast(list[JsonValue], target.provenance["raw_records"])
+            if isinstance(item, dict)
+        ]
+    }
+    decisions: list[NoticeRowDecision] = []
+    targets: list[NoticeImportTarget] = []
+    for raw_digest, group in raw_groups.items():
+        row = group[0]
+        prior_decision = prior_records[raw_digest]
+        if prior_decision.classification == "existing":
+            decisions.append(
+                NoticeRowDecision(
+                    excel_rows=[item.excel_row for item in group],
+                    identity_key=prior_decision.identity_key,
+                    classification="existing",
+                    reason="prior_reviewed_confirmed_existing_source_unchanged",
+                    catalog_title=row.catalog_title,
+                    existing_source_ids=prior_decision.existing_source_ids,
+                    raw_records=group,
+                )
+            )
+            continue
+        prior_target = prior_by_raw.get(raw_digest)
+        if prior_target is not None:
+            decisions.append(
+                NoticeRowDecision(
+                    excel_rows=[item.excel_row for item in group],
+                    identity_key=prior_target.identity_key,
+                    classification="already_registered",
+                    reason="previously_imported_typed_notice_unchanged",
+                    catalog_title=row.catalog_title,
+                    existing_source_ids=[],
+                    raw_records=group,
+                )
+            )
+            continue
+        key = "catalog:" + raw_digest
+        kind, number, year, issued = _catalogue_observation_fields(row)
+        identity, basis = row_identity(row)
+        aliases = [key, row.catalog_title]
+        title_alias = notice_title_alias(row.catalog_title)
+        if title_alias is not None:
+            aliases.append(title_alias)
+        if identity is not None:
+            aliases.extend(identity.aliases)
+        target = NoticeImportTarget(
+            id=str(uuid4()),
+            document_set_id=document_set_id,
+            identity_key=key,
+            instrument_type=kind,
+            instrument_number=number,
+            instrument_year=year,
+            instrument_date=issued,
+            catalog_title=row.catalog_title,
+            aliases=list(dict.fromkeys(aliases)),
+            legistation_metadata={
+                "validity_status": "Mülga",
+                "repeal_note": row.catalog_title,
+                "validity_source": workbook_path.name,
+            },
+            provenance={
+                "source_filename": workbook_path.name,
+                "source_sha256": workbook_sha256,
+                "sheet": sheet,
+                "excel_rows": [item.excel_row for item in group],
+                "raw_records": [item.model_dump(mode="json") for item in group],
+                "identity_basis": "opaque_raw_catalogue_observation",
+                "structured_identity_basis": basis,
+                "prior_review_reason": prior_decision.reason,
+                "existing_source_candidates": prior_decision.existing_source_ids,
+                "annotation_only": True,
+                "links_existing_source": False,
+                "repeal_date_supplied": False,
+            },
+        )
+        already = registry_by_key.get(key)
+        if already is not None:
+            if already.model_dump(exclude={"id"}, mode="json") != target.model_dump(
+                exclude={"id"}, mode="json"
+            ):
+                raise ValueError(
+                    "Catalogue observation already exists with different fields"
+                )
+            classification, reason = (
+                "already_registered",
+                "catalogue_observation_already_imported_unchanged",
+            )
+        else:
+            targets.append(target)
+            classification, reason = (
+                "new",
+                "independent_name_only_catalogue_observation",
+            )
+        decisions.append(
+            NoticeRowDecision(
+                excel_rows=[item.excel_row for item in group],
+                identity_key=key,
+                classification=classification,
+                reason=reason,
+                catalog_title=row.catalog_title,
+                existing_source_ids=prior_decision.existing_source_ids,
+                raw_records=group,
+            )
+        )
+    return SourceNoticeManifest(
+        workbook_sha256=workbook_sha256,
+        source_path=str(workbook_path),
+        sheet=sheet,
+        document_set_id=document_set_id,
+        inventory_fingerprint=inventory_fingerprint(sources),
+        inventory_count=len(sources),
+        identity_heads_fingerprint=canonical_digest(
+            [head.model_dump(mode="json") for head in identity_heads]
+        ),
+        identity_heads_count=len(identity_heads),
+        raw_row_count=len(rows),
+        targets=targets,
+        decisions=sorted(decisions, key=lambda item: min(item.excel_rows)),
+        admission_policy="catalogue_observations",
+        prior_manifest_sha256=prior_manifest_sha256,
+        registry_fingerprint=notice_registry_fingerprint(registry),
+        baseline_notices=registry,
+    )

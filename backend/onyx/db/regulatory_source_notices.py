@@ -4,7 +4,7 @@ from typing import Literal, cast
 from uuid import UUID
 
 from pydantic import JsonValue
-from sqlalchemy import Table, inspect, or_, select
+from sqlalchemy import Boolean, Table, func, inspect, or_, select
 from sqlalchemy.engine import Connection
 from sqlalchemy.orm import Session
 
@@ -17,7 +17,10 @@ from onyx.db.asv3_corpus import (
 )
 from onyx.db.models import RegulatorySourceNotice, User
 from onyx.regulatory.legistation_metadata import LegistationMetadata
-from onyx.regulatory.source_notice_identity import notice_identity_queries
+from onyx.regulatory.source_notice_identity import (
+    notice_identity_queries,
+    notice_title_alias,
+)
 from onyx.regulatory.source_notices import SourceNotice
 
 
@@ -172,26 +175,88 @@ def _find_source_notices(
         and not scoped.attached_document_ids
     ):
         return []
-    keys = {key for query in queries or [] for key in notice_identity_queries(query)}
-    identifiers: list[UUID] = []
+    query_groups: list[tuple[set[str], str | None]] = []
+    for query in queries or []:
+        identities = notice_identity_queries(query)
+        query_groups.append(
+            (
+                set(identities),
+                notice_title_alias(query)
+                if query.strip().casefold() not in identities
+                else None,
+            )
+        )
+    scope_conditions = [
+        RegulatorySourceNotice.document_set_id == scoped.asv3_document_set_id,
+    ]
+    if file_only:
+        scope_conditions.append(RegulatorySourceNotice.user_file_id.is_not(None))
+    title_aliases = {alias for _, alias in query_groups if alias is not None}
+    matched_titles: dict[str, set[UUID]] = {}
+    if title_aliases:
+        title_candidates = list(
+            session.execute(
+                select(
+                    RegulatorySourceNotice.id,
+                    RegulatorySourceNotice.catalog_title,
+                    RegulatorySourceNotice.aliases,
+                )
+                .where(
+                    *scope_conditions,
+                    or_(
+                        RegulatorySourceNotice.identity_key.not_like("catalog:%"),
+                        *(
+                            func.jsonb_exists(
+                                RegulatorySourceNotice.aliases, alias, type_=Boolean
+                            )
+                            for alias in sorted(title_aliases)
+                        ),
+                    ),
+                )
+                .limit(1001)
+            )
+        )
+        if len(title_candidates) > 1000:
+            raise CorpusScopeUnavailable(
+                "Exact notice title candidates exceed the bounded lookup."
+            )
+        for identifier, title, aliases in title_candidates:
+            exact = title_aliases.intersection(aliases)
+            old_title = notice_title_alias(title)
+            if old_title in title_aliases:
+                exact.add(old_title)
+            for alias in exact:
+                matched_titles.setdefault(alias, set()).add(identifier)
+    keys: set[str] = set()
+    preferred_identifiers: set[UUID] = set()
+    for identities, title_alias in query_groups:
+        if title_alias is not None and title_alias in matched_titles:
+            preferred_identifiers.update(matched_titles[title_alias])
+        else:
+            keys.update(identities)
+            if title_alias is not None:
+                keys.add(title_alias)
+    identifiers = set(preferred_identifiers)
     for value in notice_ids or []:
         try:
-            identifiers.append(UUID(value))
+            identifiers.add(UUID(value))
         except ValueError:
             continue
     matches = []
     if keys:
         matches.append(RegulatorySourceNotice.identity_key.in_(sorted(keys)))
+        matches.extend(
+            func.jsonb_exists(RegulatorySourceNotice.aliases, key, type_=Boolean)
+            for key in sorted(keys)
+        )
     if identifiers:
         matches.append(RegulatorySourceNotice.id.in_(identifiers))
     if not matches:
         return []
     statement = select(RegulatorySourceNotice).where(
-        RegulatorySourceNotice.document_set_id == scoped.asv3_document_set_id,
+        *scope_conditions,
         or_(*matches),
     )
-    if file_only:
-        statement = statement.where(RegulatorySourceNotice.user_file_id.is_not(None))
     records = list(
         session.scalars(statement.order_by(RegulatorySourceNotice.id).limit(limit))
     )

@@ -11,12 +11,21 @@ fabricated. Existing source files and indexes do not need rewriting.
 
 ## Identity, scope and provenance
 
-Each notice has a UUID, a typed `identity_key`, its original catalogue label,
+Each notice has a UUID, an `identity_key`, its original catalogue label,
 optional aliases, `legistation_metadata`, workbook provenance and a revision.
-Automatic admission requires a reviewed unambiguous identity. A title alone,
-number alone, or an identity shared by different authorities is insufficient.
-Conflicting, existing and weakly identified spreadsheet records are held outside
-the append-only manifest. Duplicate observations retain all original row locators.
+Typed identities identify verified instrument references. A name-only catalogue
+observation instead uses a stable `catalog:` identity derived from its original
+cells. Missing numbers or dates do not prevent a name-only record; unknown dates
+stay null. Different topics, numbers or versions remain separate observations.
+Duplicate observations retain all original row locators. Existing source records
+are never linked or overwritten merely because a title or year/number matches.
+
+Exact normalized full-title aliases resolve named files, including titles with an
+explicit Mülga catalogue marker. A full-title match takes priority over a broader
+typed reference; a generic reference can retain multiple candidate records.
+Neither matching titles nor shared aliases prove that two files are the same
+instrument or historical version. Metadata stays on each file-level notice;
+existing canonical chunks and other source files are not rewritten.
 
 Queries use the ordinary tenant and PC Külliyatı access boundary. Narrower scopes
 that a metadata-only entry cannot satisfy fail closed for notice enrichment,

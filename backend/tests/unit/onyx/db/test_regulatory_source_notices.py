@@ -2,6 +2,8 @@
 
 import importlib.util
 import io
+import json
+import sqlite3
 from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,6 +24,7 @@ from sqlalchemy import (
     Table,
     Uuid,
     create_engine,
+    event,
     select,
 )
 from sqlalchemy.dialects.postgresql import JSONB
@@ -33,6 +36,7 @@ from onyx.context.search.models import IndexFilters, Tag
 from onyx.db import regulatory_source_notices as notices
 from onyx.db.asv3_corpus import CorpusScopeUnavailable
 from onyx.db.models import RegulatorySourceNotice, User
+from onyx.regulatory.source_notice_identity import notice_title_alias
 from onyx.regulatory.source_notices import (
     SourceNotice,
     parse_source_notice_id,
@@ -83,6 +87,13 @@ def database(monkeypatch: pytest.MonkeyPatch) -> Iterator[Session]:
             column.type = Uuid()
         column.server_default = None
     engine = create_engine("sqlite://")
+
+    @event.listens_for(engine, "connect")
+    def enable_jsonb_membership(connection: object, _record: object) -> None:
+        cast(sqlite3.Connection, connection).create_function(
+            "jsonb_exists", 2, lambda value, key: key in json.loads(value)
+        )
+
     metadata.create_all(engine)
     with engine.begin() as connection:
         connection.execute(
@@ -142,7 +153,7 @@ def test_exact_typed_reference_reads_only_requested_identity(database: Session) 
         "2012/7",
         "2013/7 sayılı Genelge",
         "2012/7 sayılı Karar",
-        "Gümrük İşlemleri",
+        "Gümrük",
         "5253 sayılı Kanun",
         "2012/7 sayılı Genelge%%%",
     ],
@@ -278,6 +289,127 @@ def test_read_lookup_never_flushes_unrelated_pending_writes(database: Session) -
     assert pending in database.new
     database.rollback()
     assert len(list(database.scalars(select(RegulatorySourceNotice)))) == 3
+
+
+def add_catalogue_observation(
+    database: Session,
+    identifier: int,
+    title: str,
+    *,
+    aliases: list[str] | None = None,
+    document_set_id: int = 15,
+) -> str:
+    key = "catalog:" + f"{identifier:064x}"
+    title_key = notice_title_alias(title)
+    assert title_key is not None
+    database.add(
+        RegulatorySourceNotice(
+            **notice_values(
+                UUID(int=identifier),
+                document_set_id=document_set_id,
+                identity_key=key,
+                instrument_type="catalogue_observation",
+                instrument_number=None,
+                instrument_year=None,
+                instrument_date=None,
+                catalog_title=title,
+                aliases=[key, title_key, title, *(aliases or [])],
+            )
+        )
+    )
+    database.commit()
+    return key
+
+
+def test_name_only_catalogue_observation_resolves_by_exact_title_and_opaque_key(
+    database: Session,
+) -> None:
+    key = add_catalogue_observation(database, 501, "(Mülga) Tarihsiz Belge Başlığı")
+    for query in [
+        key,
+        "Tarihsiz Belge Başlığı",
+        "TARİHSİZ BELGE BAŞLIĞI",
+        notice_title_alias("Tarihsiz Belge Başlığı"),
+    ]:
+        assert query is not None
+        rows = notices.find_source_notices(database, OWNER, filters(), queries=[query])
+        assert [row.id for row in rows] == [str(UUID(int=501))]
+        assert rows[0].instrument_date is None and rows[0].instrument_number is None
+        assert rows[0].instrument_type == "catalogue_observation"
+    assert (
+        notices.find_source_notices(
+            database, OWNER, filters(), queries=["Tarihsiz Belge"]
+        )
+        == []
+    )
+
+
+def test_same_number_different_topics_are_distinct_ambiguous_candidates(
+    database: Session,
+) -> None:
+    add_catalogue_observation(
+        database,
+        511,
+        "1995/5 sayılı Genelge — Konu A (Mülga)",
+        aliases=["circular:1995:5"],
+    )
+    add_catalogue_observation(
+        database,
+        512,
+        "1995/5 sayılı Genelge — Konu B (Mülga)",
+        aliases=["circular:1995:5"],
+    )
+    generic = notices.find_source_notices(
+        database, OWNER, filters(), queries=["1995/5 sayılı Genelge"]
+    )
+    assert [row.id for row in generic] == [str(UUID(int=511)), str(UUID(int=512))]
+    for identifier, topic in [(511, "A"), (512, "B")]:
+        exact = notices.find_source_notices(
+            database,
+            OWNER,
+            filters(),
+            queries=[f"1995/5 sayılı Genelge — Konu {topic}"],
+        )
+        assert [row.id for row in exact] == [str(UUID(int=identifier))]
+    batch = notices.find_source_notices(
+        database,
+        OWNER,
+        filters(),
+        queries=["1995/5 sayılı Genelge — Konu A", "law:2908"],
+    )
+    assert {row.id for row in batch} == {str(SECOND), str(UUID(int=511))}
+
+
+def test_exact_title_aliases_are_not_merged_and_remain_document_set_scoped(
+    database: Session,
+) -> None:
+    add_catalogue_observation(database, 521, "Kamu Düzeni (Mülga)")
+    add_catalogue_observation(database, 522, "Kamu Düzeni (Mülga)")
+    add_catalogue_observation(database, 523, "Kamu Düzeni (Mülga)", document_set_id=16)
+    rows = notices.find_source_notices(
+        database, OWNER, filters(), queries=["Kamu Düzeni"]
+    )
+    assert [row.id for row in rows] == [str(UUID(int=521)), str(UUID(int=522))]
+    assert len({row.identity_key for row in rows}) == 2
+
+
+def test_legacy_typed_notice_full_title_resolves_without_rewriting_aliases(
+    database: Session,
+) -> None:
+    other = database.get(RegulatorySourceNotice, SECOND)
+    assert other is not None
+    other.catalog_title = "Farklı Eski Kayıt"
+    database.commit()
+    record = database.get(RegulatorySourceNotice, FIRST)
+    assert record is not None
+    aliases_before = list(record.aliases)
+    assert not any(value.startswith("title:") for value in aliases_before)
+    rows = notices.find_source_notices(
+        database, OWNER, filters(), queries=["GÜMRÜK İŞLEMLERİ"]
+    )
+    assert [row.id for row in rows] == [str(FIRST)]
+    assert record.aliases == aliases_before
+    assert not database.new and not database.dirty and not database.deleted
 
 
 def test_typed_notice_and_explicit_target_are_separate_from_file_identity(

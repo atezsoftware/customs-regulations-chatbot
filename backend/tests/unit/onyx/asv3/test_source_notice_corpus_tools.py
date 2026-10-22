@@ -504,3 +504,230 @@ def test_existing_original_does_not_get_hidden_by_unlinked_metadata_notice(
     )
     assert result.status is OutcomeStatus.FOUND
     paid.assert_called_once()
+
+
+def name_only_notice() -> SourceNotice:
+    return notice().model_copy(
+        update={
+            "identity_key": "catalog:regulation:exact-title-observation",
+            "instrument_type": "regulation",
+            "instrument_number": None,
+            "instrument_year": None,
+            "instrument_date": None,
+            "catalog_title": "Eşyanın Nihai Kullanımına İlişkin Yönetmelik",
+            "aliases": ["Eşyanın Nihai Kullanımına İlişkin Yönetmelik"],
+        }
+    )
+
+
+@pytest.mark.parametrize("name", ["resolve_source", "read_named_provision"])
+def test_name_only_file_lookup_preserves_full_title_and_unknown_identity_fields(
+    monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    broker, context, state = setup()
+    record = name_only_notice()
+    state.lookup_queries.return_value = [record]
+    sources = MagicMock(return_value=([], False))
+    monkeypatch.setattr(broker, "sources", sources)
+    original = MagicMock(side_effect=AssertionError("metadata-only file has no chunks"))
+    monkeypatch.setattr(broker, "page", original)
+    monkeypatch.setattr(broker, "iter_chunks", original)
+    full_query = "  " + record.catalog_title + "  "
+    args: dict[str, JsonValue] = (
+        {"source_name": full_query, "article": "1"}
+        if name == "read_named_provision"
+        else {"query": full_query}
+    )
+    result = tool(broker, name).handler(args, context)
+    assert_notice(result)
+    assert result.data["name"] == record.catalog_title
+    assert result.data["instrument_number"] is None
+    assert result.data["instrument_year"] is None
+    assert result.data["instrument_date"] is None
+    state.lookup_queries.assert_called_once_with([full_query])
+    assert sources.call_args.args[0] == full_query
+    original.assert_not_called()
+
+
+@pytest.mark.parametrize("name", ["read_source_range", "open_source_file"])
+def test_selected_name_only_file_returns_file_metadata_without_fake_chunk(
+    monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    broker, context, state = setup()
+    state.by_id.return_value = name_only_notice()
+    original = MagicMock(side_effect=AssertionError("no physical file or chunk"))
+    monkeypatch.setattr(broker, "page", original)
+    monkeypatch.setattr("onyx.asv3.source_tools.read_verified_original", original)
+    result = tool(broker, name).handler({"source_id": TARGET_ID}, context)
+    assert_notice(result)
+    assert result.data["instrument_date"] is None
+    assert "text" not in result.data
+    assert "chunk_id" not in result.data
+    assert result.data["name"] == name_only_notice().catalog_title
+    original.assert_not_called()
+
+
+@pytest.mark.parametrize("name", ["resolve_source", "read_named_provision"])
+@pytest.mark.parametrize("with_real_source", [False, True])
+def test_same_year_number_different_topics_remain_separate_file_candidates(
+    monkeypatch: pytest.MonkeyPatch, name: str, with_real_source: bool
+) -> None:
+    broker, context, state = setup()
+    first = notice().model_copy(
+        update={
+            "identity_key": "catalog:circular:1995:5:observation-a",
+            "instrument_type": "circular",
+            "instrument_number": "5",
+            "instrument_year": 1995,
+            "catalog_title": "1995/5 sayılı Genelge — Birinci konu",
+            "provenance": {"excel_rows": [100]},
+        }
+    )
+    second = first.model_copy(
+        update={
+            "id": "9fed1c53-8bfb-478c-8e3a-3e3ff3ef3050",
+            "identity_key": "catalog:circular:1995:5:observation-b",
+            "catalog_title": "1995/5 sayılı Genelge — İkinci konu",
+            "provenance": {"excel_rows": [101]},
+        }
+    )
+    state.lookup_queries.return_value = [first, second]
+    real = CorpusSource(
+        SOURCE_ID, "Genelgeler/1995-05_mevcut_gercek_kaynak.md", "original"
+    )
+    monkeypatch.setattr(
+        broker,
+        "sources",
+        MagicMock(return_value=([real] if with_real_source else [], False)),
+    )
+    original = MagicMock(side_effect=AssertionError("ambiguous catalogue identity"))
+    monkeypatch.setattr(broker, "page", original)
+    monkeypatch.setattr(broker, "iter_chunks", original)
+    args: dict[str, JsonValue] = (
+        {"source_name": "1995/5 sayılı Genelge", "article": "1"}
+        if name == "read_named_provision"
+        else {"query": "1995/5 sayılı Genelge"}
+    )
+    result = tool(broker, name).handler(args, context)
+    assert result.status is OutcomeStatus.AMBIGUOUS
+    candidates = result.data["sources"]
+    assert isinstance(candidates, list)
+    assert len(candidates) == (3 if with_real_source else 2)
+    records = [
+        row for row in candidates if isinstance(row, dict) and "notice_id" in row
+    ]
+    assert {row["notice_id"] for row in records} == {first.id, second.id}
+    assert {row["name"] for row in records} == {
+        first.catalog_title,
+        second.catalog_title,
+    }
+    assert [row["provenance"] for row in records] == [
+        {"excel_rows": [100]},
+        {"excel_rows": [101]},
+    ]
+    assert result.evidence == [] and result.artifacts == []
+    original.assert_not_called()
+
+
+@pytest.mark.parametrize("named_reads", [False, True])
+def test_name_only_file_focused_repeat_search_stops_before_paid_retrieval(
+    monkeypatch: pytest.MonkeyPatch, named_reads: bool
+) -> None:
+    broker, context, state = setup()
+    record = name_only_notice()
+    state.lookup_queries.return_value = [record]
+    monkeypatch.setattr(broker, "sources", MagicMock(return_value=([], False)))
+    paid = MagicMock(side_effect=AssertionError("known empty file must not rerank"))
+    broker.search_adapter = paid
+    spec = next(
+        item
+        for item in build_corpus_specs(broker, named_provision_reads=named_reads)
+        if item.name == "search_corpus"
+    )
+    for article in ("1", "2"):
+        target = f"{record.catalog_title} madde {article} şartları"
+        result = spec.handler(
+            {"query": target, "mode": "hybrid", "evidence_target": target}, context
+        )
+        assert_notice(result)
+        assert result.data["search_performed"] is False
+        assert result.data["instrument_date"] is None
+    paid.assert_not_called()
+
+
+@pytest.mark.parametrize("named_reads", [False, True])
+def test_name_only_empty_file_does_not_block_different_unnumbered_source_query(
+    named_reads: bool,
+) -> None:
+    from onyx.asv3.models import ToolOutcome
+
+    broker, context, state = setup()
+    state.lookup_queries.return_value = [name_only_notice()]
+    paid = MagicMock(
+        return_value=ToolOutcome(status=OutcomeStatus.FOUND, summary="Other instrument")
+    )
+    broker.search_adapter = paid
+    spec = next(
+        item
+        for item in build_corpus_specs(broker, named_provision_reads=named_reads)
+        if item.name == "search_corpus"
+    )
+    result = spec.handler(
+        {
+            "query": "Ürünün Güvenliğine İlişkin Yönetmelik madde 1 şartları",
+            "mode": "hybrid",
+            "evidence_target": f"{name_only_notice().catalog_title} madde 1 şartları",
+        },
+        context,
+    )
+    assert result.status is OutcomeStatus.FOUND
+    paid.assert_called_once()
+    state.lookup_queries.assert_not_called()
+
+
+@pytest.mark.parametrize("named_reads", [False, True])
+def test_generic_typed_reference_keeps_multiple_empty_file_observations_ambiguous(
+    monkeypatch: pytest.MonkeyPatch, named_reads: bool
+) -> None:
+    broker, context, state = setup()
+    first = notice().model_copy(
+        update={
+            "identity_key": "catalog:circular:first-observation",
+            "instrument_type": "circular",
+            "instrument_year": 1995,
+            "instrument_number": "5",
+            "catalog_title": "1995/5 sayılı Genelge — Birinci konu",
+            "aliases": ["circular:1995:5"],
+        }
+    )
+    second = first.model_copy(
+        update={
+            "id": "9fed1c53-8bfb-478c-8e3a-3e3ff3ef3050",
+            "identity_key": "catalog:circular:second-observation",
+            "catalog_title": "1995/5 sayılı Genelge — İkinci konu",
+        }
+    )
+    state.lookup_queries.return_value = [first, second]
+    monkeypatch.setattr(broker, "sources", MagicMock(return_value=([], False)))
+    paid = MagicMock(side_effect=AssertionError("not a unique original to research"))
+    broker.search_adapter = paid
+    spec = next(
+        item
+        for item in build_corpus_specs(broker, named_provision_reads=named_reads)
+        if item.name == "search_corpus"
+    )
+    result = spec.handler(
+        {
+            "query": "1995/5 sayılı Genelge madde 1 şartları",
+            "mode": "hybrid",
+            "evidence_target": "1995/5 sayılı Genelge madde 1 şartları",
+        },
+        context,
+    )
+    assert result.status is OutcomeStatus.AMBIGUOUS
+    candidates = result.data["sources"]
+    assert isinstance(candidates, list)
+    assert len(candidates) == 2
+    assert result.data["search_performed"] is False
+    assert result.evidence == []
+    paid.assert_not_called()

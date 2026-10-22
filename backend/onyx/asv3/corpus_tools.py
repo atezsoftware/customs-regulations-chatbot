@@ -74,7 +74,11 @@ from onyx.regulatory.heading_path import (
     extract_regulatory_provision_references,
     parse_regulatory_article_heading,
 )
-from onyx.regulatory.source_notice_identity import notice_identity_queries
+from onyx.regulatory.source_notice_identity import (
+    normalize_notice_alias,
+    notice_identity_queries,
+    notice_title_alias,
+)
 from onyx.regulatory.source_notices import SourceNotice
 from onyx.tools.constants import REGULATORY_MAX_SEARCH_QUERY_CHARS
 from onyx.tracing.answer_graph import graph_step
@@ -2237,19 +2241,45 @@ def build_corpus_specs(
                 query + " " + str(args.get("evidence_target", "")),
                 re.IGNORECASE,
             )
-            if related or other_keys - keys:
+            normalized_name = normalize_notice_alias(source_name)
+            named_query = (
+                " " + normalized_name + " " in " " + normalize_notice_alias(query) + " "
+            )
+            if related or other_keys - keys or (not keys and not named_query):
                 target = None
-            elif len(keys) == 1:
+            elif len(keys) <= 1:
+                title_alias = notice_title_alias(source_name)
                 notices = [
                     notice
                     for notice in source_notices_for_queries([source_name], context)
-                    if notice.identity_key in keys
-                    and notice.content_state == "metadata_only"
+                    if notice.content_state == "metadata_only"
+                    and (
+                        title_alias in notice.aliases
+                        or title_alias == notice_title_alias(notice.catalog_title)
+                        or bool(
+                            keys.intersection({notice.identity_key, *notice.aliases})
+                        )
+                    )
                 ]
-                if len(notices) == 1:
+                if notices:
                     sources, more = broker.sources(source_name, context, limit=20)
                     if not sources and not more:
-                        outcome = source_notice_outcome(notices[0])
+                        outcome = (
+                            source_notice_outcome(notices[0])
+                            if len(notices) == 1
+                            else ToolOutcome(
+                                status=OutcomeStatus.AMBIGUOUS,
+                                summary="Multiple metadata-only file observations match this target; choose an exact title or notice ID. They are not one verified instrument identity.",
+                                data={
+                                    "sources": [
+                                        source_notice_data(notice) for notice in notices
+                                    ],
+                                    "absence_proven": False,
+                                    "original_acquired": False,
+                                    "content_available": False,
+                                },
+                            )
+                        )
                         return outcome.model_copy(
                             update={
                                 "data": {
