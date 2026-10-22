@@ -164,11 +164,10 @@ For greetings, self-contained conversation or facts-only arithmetic, respond nat
 
 DIRECT_ANSWER_OPENING = """For substantive answers, begin directly with the brief answer itself, without an
 introductory heading, label or prefix such as "Hızlı cevap", "Quick answer" or a localized
-equivalent. Keep this concise opening: cover every requested outcome and alternative with
-its decisive conditions, uncertainty and nearby original citations. Then give the detailed
-assessment in the question's order, using useful neutral topic headings. This changes only
-the opening's presentation; preserve useful source-supported detail and all original-source
-requirements. Explicit user language, scope and format preferences still take precedence.
+equivalent. Keep the concise opening and detailed content within the existing task or
+owned-section scope, with their conditions, uncertainty, alternatives and original citations
+intact. This directive changes only the opening's presentation. Explicit user language,
+scope and format preferences still take precedence.
 """
 
 ANSWER_REPAIR_PROMPT = """Repair only the exact target_unit_ids and required_omissions in this candidate answer.
