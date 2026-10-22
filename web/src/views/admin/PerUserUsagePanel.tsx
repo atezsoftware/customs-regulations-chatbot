@@ -4,18 +4,31 @@ import { useEffect, useMemo, useState } from "react";
 import { Button, Card, InputTypeIn, MessageCard, Text } from "@opal/components";
 import { SvgChevronLeft, SvgChevronRight, SvgX } from "@opal/icons";
 import { PageLoader, toast } from "@opal/layouts";
-import {
-  resetUserUsage,
-  useUsageExport,
+import { cn } from "@opal/utils";
+import { resetUserUsage, useUsageExport } from "@/lib/usage/userUsage";
+import type {
   UsageExportTotals,
   UsageExportUser,
-} from "@/lib/usage/userUsage";
+  WorkflowUsage,
+  WorkflowUsageKey,
+} from "@/lib/usage/interfaces";
 import { DateRangePickerValue } from "@/components/dateRangeSelectors/AdminDateRangeSelector";
+import { ADMIN_ROUTES } from "@/lib/admin-routes";
+import { buildApiPath } from "@/lib/urlBuilder";
 
 const PAGE_SIZE = 10;
 
 type MetricSortKey = keyof UsageExportTotals;
-type SortKey = "email" | MetricSortKey;
+type WorkflowMetricKey =
+  | "session_count"
+  | "cost_cents"
+  | "average_cost_cents_per_session"
+  | "query_count"
+  | "average_cost_cents_per_query";
+type SortKey =
+  | "email"
+  | MetricSortKey
+  | `${WorkflowUsageKey}.${WorkflowMetricKey}`;
 type SortDir = "asc" | "desc";
 
 function formatTokens(n: number): string {
@@ -98,9 +111,57 @@ const METRIC_COLUMNS: {
   { label: "Cost", sortKey: "cost_cents", format: formatCost },
 ];
 
-function sortValue(user: UsageExportUser, key: SortKey): number | string {
+const WORKFLOWS: { key: WorkflowUsageKey; label: string }[] = [
+  { key: "asv3", label: "Derin Mod · ASv3 Tek" },
+  { key: "asv3_exp_cropped", label: "Hızlı Mod · ASv3 Exp Cropped" },
+];
+
+const WORKFLOW_COLUMNS: {
+  label: string;
+  sortKey: WorkflowMetricKey;
+  format: (value: number) => string;
+}[] = [
+  { label: "Sessions", sortKey: "session_count", format: formatTokens },
+  { label: "Cost", sortKey: "cost_cents", format: formatCost },
+  {
+    label: "Cost / session",
+    sortKey: "average_cost_cents_per_session",
+    format: formatAverageCost,
+  },
+  { label: "Queries", sortKey: "query_count", format: formatTokens },
+  {
+    label: "Cost / query",
+    sortKey: "average_cost_cents_per_query",
+    format: formatAverageCost,
+  },
+];
+
+function workflowCostDescription(usage: WorkflowUsage): string | undefined {
+  if (usage.cost_status === "complete") return undefined;
+  const reason = {
+    partial: "Some research calls have missing or unpriced cost data.",
+    unavailable: "Research cost data was not captured for these queries.",
+    running: "Some queries are still running; cost capture is incomplete.",
+  }[usage.cost_status];
+  return `${reason} Captured cost: ${formatCost(usage.known_cost_cents)}. Averages are unavailable until all query costs are complete.`;
+}
+
+function sortValue(
+  user: UsageExportUser,
+  key: SortKey
+): number | string | null {
   if (key === "email") return user.email.toLowerCase();
-  return user.totals[key];
+  if (!key.includes(".")) return user.totals[key as MetricSortKey];
+  const [workflowKey, metricKey] = key.split(".") as [
+    WorkflowUsageKey,
+    WorkflowMetricKey,
+  ];
+  const usage = user.workflow_usage?.[workflowKey];
+  if (!usage) return null;
+  if (metricKey === "cost_cents" && usage.cost_status !== "unavailable") {
+    return usage.cost_cents ?? usage.known_cost_cents;
+  }
+  return usage[metricKey];
 }
 
 interface UsageRowProps {
@@ -127,33 +188,88 @@ function UsageRow({ user, onReset }: UsageRowProps) {
   }
 
   return (
-    <div
-      className="flex flex-row items-center gap-4 py-2"
-      data-testid={`usage-row-${user.email}`}
-    >
-      <div className="flex-1 truncate">
-        <Text font="main-ui-body">{user.email}</Text>
-      </div>
+    <tr data-testid={`usage-row-${user.email}`}>
+      <td className="sticky left-0 z-10 min-w-64 max-w-64 border-b border-r border-border-01 bg-background-neutral-01 px-3 py-2">
+        <div className="flex w-56 flex-col items-start gap-1">
+          <div className="w-full truncate" title={user.email}>
+            <Text font="main-ui-body">{user.email}</Text>
+          </div>
+          <Button
+            href={buildApiPath(ADMIN_ROUTES.QUERY_HISTORY.path, {
+              user_email: user.email,
+            })}
+            prominence="tertiary"
+            size="sm"
+            aria-label={`Query history for ${user.email}`}
+          >
+            Query history
+          </Button>
+        </div>
+      </td>
       {METRIC_COLUMNS.map((column) => (
-        <div className="w-28 text-right" key={column.sortKey}>
+        <td
+          className="min-w-28 border-b border-border-01 px-3 py-2 text-right"
+          key={column.sortKey}
+        >
           <Text
             font="main-ui-body"
             color={column.muted ? "text-03" : undefined}
           >
             {column.format(totals[column.sortKey])}
           </Text>
-        </div>
+        </td>
       ))}
-      <Button
-        variant="default"
-        prominence="tertiary"
-        size="sm"
-        disabled={resetting}
-        onClick={handleReset}
-      >
-        Reset
-      </Button>
-    </div>
+      {WORKFLOWS.map((workflow) => {
+        const usage = user.workflow_usage?.[workflow.key];
+        return WORKFLOW_COLUMNS.map((column, index) => {
+          const value = usage?.[column.sortKey];
+          const incompleteCost =
+            column.sortKey === "cost_cents" &&
+            usage &&
+            usage.cost_status !== "complete";
+          const displayValue =
+            incompleteCost && usage.cost_status !== "unavailable"
+              ? `≥${formatCost(usage.known_cost_cents)}`
+              : value == null
+                ? "—"
+                : column.format(value);
+          return (
+            <td
+              key={`${workflow.key}.${column.sortKey}`}
+              className={cn(
+                "min-w-28 border-b border-border-01 px-3 py-2 text-right",
+                index === 0 && "border-l"
+              )}
+              title={usage ? workflowCostDescription(usage) : undefined}
+            >
+              <div className="flex flex-col items-end gap-1">
+                <Text font="main-ui-body">{displayValue}</Text>
+                {incompleteCost && (
+                  <Text font="secondary-body" color="text-03">
+                    {usage.cost_status === "running"
+                      ? "In progress"
+                      : usage.cost_status === "partial"
+                        ? "Partial"
+                        : "Unavailable"}
+                  </Text>
+                )}
+              </div>
+            </td>
+          );
+        });
+      })}
+      <td className="border-b border-border-01 px-3 py-2">
+        <Button
+          variant="default"
+          prominence="tertiary"
+          size="sm"
+          disabled={resetting}
+          onClick={handleReset}
+        >
+          Reset
+        </Button>
+      </td>
+    </tr>
   );
 }
 
@@ -164,6 +280,7 @@ interface SortHeaderProps {
   dir: SortDir;
   onSort: (key: SortKey) => void;
   align: "left" | "right";
+  groupLabel: string;
 }
 
 function SortHeader({
@@ -173,37 +290,40 @@ function SortHeader({
   dir,
   onSort,
   align,
+  groupLabel,
 }: SortHeaderProps) {
   const active = activeKey === sortKey;
   const indicator = active ? (dir === "desc" ? " ↓" : " ↑") : "";
   return (
-    <div
-      role="button"
-      tabIndex={0}
-      onClick={() => onSort(sortKey)}
-      onKeyDown={(e) => {
-        if (e.key === "Enter" || e.key === " ") {
-          e.preventDefault();
-          onSort(sortKey);
-        }
-      }}
-      className={`cursor-pointer select-none ${
-        align === "right" ? "w-28 text-right" : "flex-1"
-      }`}
+    <th
+      scope="col"
+      aria-sort={
+        active ? (dir === "desc" ? "descending" : "ascending") : "none"
+      }
+      className="min-w-28 border-b border-border-01 px-2 py-2"
     >
-      <Text font="main-ui-action" color={active ? "text-05" : "text-03"}>
-        {`${label}${indicator}`}
-      </Text>
-    </div>
+      <div className={cn("flex", align === "right" && "justify-end")}>
+        <Button
+          onClick={() => onSort(sortKey)}
+          prominence={active ? "secondary" : "tertiary"}
+          size="sm"
+          aria-label={`Sort ${groupLabel} ${label}`}
+        >
+          {`${label}${indicator}`}
+        </Button>
+      </div>
+    </th>
   );
+}
+
+interface PerUserUsagePanelProps {
+  timeRange: DateRangePickerValue;
 }
 
 /** Searchable, sortable admin per-user usage totals. */
 export default function PerUserUsagePanel({
   timeRange,
-}: {
-  timeRange: DateRangePickerValue;
-}) {
+}: PerUserUsagePanelProps) {
   const { usage, isLoading, error, refetch } = useUsageExport(timeRange);
   const [page, setPage] = useState(0);
   const [query, setQuery] = useState("");
@@ -220,6 +340,8 @@ export default function PerUserUsagePanel({
     return [...filtered].sort((a, b) => {
       const av = sortValue(a, sortKey);
       const bv = sortValue(b, sortKey);
+      if (av === null) return bv === null ? 0 : 1;
+      if (bv === null) return -1;
       const cmp =
         typeof av === "string" && typeof bv === "string"
           ? av.localeCompare(bv)
@@ -276,6 +398,17 @@ export default function PerUserUsagePanel({
           Click a column to rank by it, or search by email. Reset clears usage
           from every currently active limit window.
         </Text>
+        <Text
+          font="secondary-body"
+          color="text-03"
+          title="Workflow estimates include nested research LLM calls, excluding embeddings, reranking, images, and voice. Cost / session and Cost / query divide the same captured cost by their counts."
+        >
+          Workflow columns include only queries with a recorded workflow;
+          sessions used in both modes appear in both groups. Costs are captured
+          research estimates and can differ from existing usage totals. Partial
+          costs show a captured lower bound; — means complete cost data is
+          unavailable.
+        </Text>
 
         <InputTypeIn
           value={query}
@@ -293,34 +426,108 @@ export default function PerUserUsagePanel({
           </Text>
         ) : (
           <>
-            <div className="overflow-x-auto">
-              <div className="min-w-[1900px] flex flex-col divide-y divide-border-01">
-                <div className="flex flex-row items-center gap-4 py-2">
-                  <SortHeader
-                    label="User"
-                    sortKey="email"
-                    activeKey={sortKey}
-                    dir={sortDir}
-                    onSort={handleSort}
-                    align="left"
-                  />
-                  {METRIC_COLUMNS.map((column) => (
-                    <SortHeader
-                      key={column.sortKey}
-                      label={column.label}
-                      sortKey={column.sortKey}
-                      activeKey={sortKey}
-                      dir={sortDir}
-                      onSort={handleSort}
-                      align="right"
+            <div
+              className="overflow-x-auto"
+              role="region"
+              tabIndex={0}
+              aria-label="Per-user usage table; scroll horizontally for workflow columns"
+            >
+              <table
+                className="w-max min-w-full border-separate border-spacing-0"
+                aria-label="Per-user usage"
+              >
+                <thead>
+                  <tr>
+                    <th
+                      className="sticky left-0 z-20 border-b border-r border-border-01 bg-background-neutral-01 px-3 py-2"
+                      scope="colgroup"
+                    >
+                      <Text font="main-ui-action">Account</Text>
+                    </th>
+                    <th
+                      colSpan={METRIC_COLUMNS.length}
+                      scope="colgroup"
+                      className="border-b border-border-01 px-3 py-2 text-left"
+                    >
+                      <Text font="main-ui-action">All workflows</Text>
+                    </th>
+                    {WORKFLOWS.map((workflow) => (
+                      <th
+                        key={workflow.key}
+                        colSpan={WORKFLOW_COLUMNS.length}
+                        scope="colgroup"
+                        className="border-b border-l border-border-01 px-3 py-2 text-left"
+                      >
+                        <Text font="main-ui-action">{workflow.label}</Text>
+                      </th>
+                    ))}
+                    <th
+                      scope="col"
+                      className="border-b border-border-01 px-3 py-2"
+                    >
+                      <Text font="main-ui-action">Actions</Text>
+                    </th>
+                  </tr>
+                  <tr>
+                    <th
+                      scope="col"
+                      aria-sort={
+                        sortKey === "email"
+                          ? sortDir === "desc"
+                            ? "descending"
+                            : "ascending"
+                          : "none"
+                      }
+                      className="sticky left-0 z-20 border-b border-r border-border-01 bg-background-neutral-01 px-3 py-2 text-left"
+                    >
+                      <Button
+                        onClick={() => handleSort("email")}
+                        prominence="tertiary"
+                        size="sm"
+                        aria-label="Sort by user email"
+                      >
+                        {`User${sortKey === "email" ? (sortDir === "desc" ? " ↓" : " ↑") : ""}`}
+                      </Button>
+                    </th>
+                    {METRIC_COLUMNS.map((column) => (
+                      <SortHeader
+                        key={column.sortKey}
+                        label={column.label}
+                        sortKey={column.sortKey}
+                        activeKey={sortKey}
+                        dir={sortDir}
+                        onSort={handleSort}
+                        align="right"
+                        groupLabel="All workflows"
+                      />
+                    ))}
+                    {WORKFLOWS.map((workflow) =>
+                      WORKFLOW_COLUMNS.map((column) => (
+                        <SortHeader
+                          key={`${workflow.key}.${column.sortKey}`}
+                          label={column.label}
+                          sortKey={`${workflow.key}.${column.sortKey}`}
+                          activeKey={sortKey}
+                          dir={sortDir}
+                          onSort={handleSort}
+                          align="right"
+                          groupLabel={workflow.label}
+                        />
+                      ))
+                    )}
+                    <th
+                      scope="col"
+                      aria-label="Usage actions"
+                      className="border-b border-border-01"
                     />
+                  </tr>
+                </thead>
+                <tbody>
+                  {pageUsers.map((user) => (
+                    <UsageRow key={user.email} user={user} onReset={refetch} />
                   ))}
-                  <div className="w-[68px]" />
-                </div>
-                {pageUsers.map((user) => (
-                  <UsageRow key={user.email} user={user} onReset={refetch} />
-                ))}
-              </div>
+                </tbody>
+              </table>
             </div>
 
             {pageCount > 1 && (

@@ -4,41 +4,20 @@ import useSWR from "swr";
 import { errorHandlingFetcher } from "@/lib/fetcher";
 import { SWR_KEYS } from "@/lib/swr-keys";
 import { buildApiPath } from "@/lib/urlBuilder";
+import type {
+  UsageExportDateRange,
+  UsageExportResponse,
+} from "@/lib/usage/interfaces";
 import {
   convertDateToEndOfDay,
   convertDateToStartOfDay,
 } from "@/components/dateRangeSelectors/dateUtils";
 
-interface UsageExportDateRange {
-  from: Date;
-  to: Date;
-}
-
-export interface UsageExportTotals {
-  input_tokens: number;
-  output_tokens: number;
-  cache_read_tokens: number;
-  cost_cents: number;
-  total_tokens: number;
-  total_user_queries: number;
-  total_user_sessions: number;
-  average_tokens_per_query: number;
-  average_tokens_per_session: number;
-  average_cost_cents_per_query: number;
-  average_cost_cents_per_session: number;
-  average_queries_per_session: number;
-}
-
-export interface UsageExportUser {
-  email: string;
-  totals: UsageExportTotals;
-}
-
-export interface UsageExportResponse {
-  start: string;
-  end: string;
-  users: UsageExportUser[];
-}
+export type {
+  UsageExportResponse,
+  UsageExportTotals,
+  UsageExportUser,
+} from "@/lib/usage/interfaces";
 
 export function buildUsageExportUrl(timeRange?: UsageExportDateRange): string {
   if (!timeRange) return SWR_KEYS.adminUsageExport;
