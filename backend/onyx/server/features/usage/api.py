@@ -38,6 +38,7 @@ from onyx.db.user_usage import (
     summarize_usage_by_email,
 )
 from onyx.db.users import get_user_by_email
+from onyx.db.workflow_usage import empty_workflow_usage, get_workflow_usage_by_email
 from onyx.error_handling.error_codes import OnyxErrorCode
 from onyx.error_handling.exceptions import OnyxError
 from onyx.llm.cost import ModelPrice, get_model_price_per_million
@@ -317,6 +318,13 @@ def export_usage(
         # model, so it does not add users found only in period-wide activity.
         include_activity_only=model is None,
     )
+    # Captured answer costs have workflow identity; the daily ledger does not.
+    # A model filter applies only to the legacy ledger export.
+    workflow_usage = (
+        get_workflow_usage_by_email(db_session, start=start_dt, end=end_dt)
+        if model is None
+        else {}
+    )
 
     users: list[UsageExportUser] = []
     for summary in summaries:
@@ -327,6 +335,11 @@ def export_usage(
                     **summary.model_dump(exclude={"email"}),
                 ),
                 records=records_by_email[summary.email],
+                workflow_usage=(
+                    workflow_usage.get(summary.email, empty_workflow_usage())
+                    if model is None
+                    else {}
+                ),
             )
         )
 

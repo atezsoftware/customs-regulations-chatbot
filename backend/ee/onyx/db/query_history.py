@@ -1,19 +1,21 @@
 from collections.abc import Sequence
 from datetime import datetime
+from uuid import UUID
 
-from sqlalchemy import BinaryExpression, ColumnElement, asc, desc, distinct
+from sqlalchemy import BinaryExpression, ColumnElement, asc, desc, distinct, or_
 from sqlalchemy.orm import Session, contains_eager, joinedload
 from sqlalchemy.sql import case, func, select
 from sqlalchemy.sql.expression import UnaryExpression, literal
 
 from ee.onyx.background.task_name_builders import QUERY_HISTORY_TASK_NAME_PREFIX
-from onyx.configs.constants import QAFeedbackType
+from onyx.configs.constants import MessageType, QAFeedbackType
 from onyx.db.models import (
     ChatMessage,
     ChatMessageFeedback,
     ChatSession,
     ChatSessionFeedback,
     TaskQueueState,
+    User,
 )
 from onyx.db.tasks import get_all_tasks_with_prefix
 
@@ -23,21 +25,69 @@ def _build_filter_conditions(
     end_time: datetime | None,
     feedback_filter: QAFeedbackType | None,
     session_rating: int | None = None,
+    user_id: UUID | None = None,
+    user_email: str | None = None,
+    user_query: str | None = None,
+    api_key_query: str | None = None,
+    q: str | None = None,
 ) -> list[ColumnElement]:
-    """
-    Helper function to build all filter conditions for chat sessions.
-    Filters by start and end time, feedback type, and any sessions without messages.
-    start_time: Date from which to filter
-    end_time: Date to which to filter
-    feedback_filter: Feedback type to filter by
-    Returns: List of filter conditions
-    """
+    """Keep page contents and total counts under the same session predicates."""
     conditions = []
 
     if start_time is not None:
         conditions.append(ChatSession.time_created >= start_time)
     if end_time is not None:
         conditions.append(ChatSession.time_created <= end_time)
+
+    if user_id is not None:
+        conditions.append(ChatSession.user_id == user_id)
+    email = (user_email or "").strip()
+    if email:
+        conditions.append(ChatSession.user.has(func.lower(User.email) == email.lower()))
+    user_search = (user_query or "").strip()
+    if user_search:
+        conditions.append(
+            or_(
+                ChatSession.user.has(
+                    func.lower(User.email).contains(
+                        user_search.lower(), autoescape=True
+                    )
+                ),
+                (ChatSession.api_key_id.is_not(None))
+                & ChatSession.external_user_name.icontains(
+                    user_search, autoescape=True
+                ),
+            )
+        )
+    key_search = (api_key_query or "").strip()
+    if key_search:
+        conditions.append(
+            or_(
+                ChatSession.api_key_name.icontains(key_search, autoescape=True),
+                ChatSession.api_key_display.icontains(key_search, autoescape=True),
+                ChatSession.api_key_id == int(key_search)
+                if key_search.isascii()
+                and key_search.isdigit()
+                and len(key_search) <= 10
+                and int(key_search) <= 2147483647
+                else literal(False),
+            )
+        )
+    query_search = (q or "").strip()
+    if query_search:
+        text_matches = or_(
+            ChatSession.description.icontains(query_search, autoescape=True),
+            ChatSession.messages.any(
+                (ChatMessage.message_type == MessageType.USER)
+                & ChatMessage.message.icontains(query_search, autoescape=True)
+            ),
+        )
+        try:
+            session_id = UUID(query_search)
+        except ValueError:
+            conditions.append(text_matches)
+        else:
+            conditions.append(or_(ChatSession.id == session_id, text_matches))
 
     if session_rating is not None:
         conditions.append(
@@ -83,9 +133,22 @@ def get_total_filtered_chat_sessions_count(
     end_time: datetime | None,
     feedback_filter: QAFeedbackType | None,
     session_rating: int | None = None,
+    user_id: UUID | None = None,
+    user_email: str | None = None,
+    user_query: str | None = None,
+    api_key_query: str | None = None,
+    q: str | None = None,
 ) -> int:
     conditions = _build_filter_conditions(
-        start_time, end_time, feedback_filter, session_rating
+        start_time=start_time,
+        end_time=end_time,
+        feedback_filter=feedback_filter,
+        session_rating=session_rating,
+        user_id=user_id,
+        user_email=user_email,
+        user_query=user_query,
+        api_key_query=api_key_query,
+        q=q,
     )
     stmt = (
         select(func.count(distinct(ChatSession.id)))
@@ -103,9 +166,22 @@ def get_page_of_chat_sessions(
     page_size: int,
     feedback_filter: QAFeedbackType | None = None,
     session_rating: int | None = None,
+    user_id: UUID | None = None,
+    user_email: str | None = None,
+    user_query: str | None = None,
+    api_key_query: str | None = None,
+    q: str | None = None,
 ) -> Sequence[ChatSession]:
     conditions = _build_filter_conditions(
-        start_time, end_time, feedback_filter, session_rating
+        start_time=start_time,
+        end_time=end_time,
+        feedback_filter=feedback_filter,
+        session_rating=session_rating,
+        user_id=user_id,
+        user_email=user_email,
+        user_query=user_query,
+        api_key_query=api_key_query,
+        q=q,
     )
 
     subquery = (

@@ -21,7 +21,7 @@ from sqlalchemy.pool import StaticPool
 from onyx.auth.users import current_user
 from onyx.db.engine.sql_engine import get_session
 from onyx.db.enums import Permission
-from onyx.db.models import UserUsage
+from onyx.db.models import AnswerGraphNode, AnswerGraphRun, UserUsage
 from onyx.db.user_usage import (
     UsageExportRow,
     UserActivityCounts,
@@ -82,9 +82,13 @@ def db_session() -> Generator[Session, None, None]:
             text(
                 "CREATE TABLE chat_message ("
                 "id INTEGER PRIMARY KEY, chat_session_id CHAR(36), "
-                "message_type VARCHAR NOT NULL, time_sent DATETIME)"
+                "message_type VARCHAR NOT NULL, time_sent DATETIME, "
+                "workflow VARCHAR, parent_message_id INTEGER, "
+                "processing_duration_seconds FLOAT)"
             )
         )
+    cast(Table, AnswerGraphRun.__table__).create(bind=engine)
+    cast(Table, AnswerGraphNode.__table__).create(bind=engine)
     SessionLocal = sessionmaker(bind=engine)
     session = SessionLocal()
     try:
@@ -312,6 +316,9 @@ class TestExportEndpoint:
         assert alice["totals"]["average_cost_cents_per_query"] == 2.0
         assert alice["totals"]["average_cost_cents_per_session"] == 3.0
         assert alice["totals"]["average_queries_per_session"] == 1.5
+        assert set(alice["workflow_usage"]) == {"asv3", "asv3_exp_cropped"}
+        assert alice["workflow_usage"]["asv3"]["session_count"] == 0
+        assert alice["workflow_usage"]["asv3"]["cost_cents"] == 0.0
 
         bob = users["bob@example.com"]
         assert len(bob["records"]) == 1
@@ -335,6 +342,7 @@ class TestExportEndpoint:
         assert len(body["users"]) == 1
         assert body["users"][0]["email"] == "alice@example.com"
         assert all(r["model"] == "model-b" for r in body["users"][0]["records"])
+        assert body["users"][0]["workflow_usage"] == {}
 
     def test_date_range_end_excludes_later_window(self, db_session: Session) -> None:
         _seed_two_users(db_session)

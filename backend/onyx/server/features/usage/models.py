@@ -4,6 +4,7 @@ from pydantic import BaseModel, Field
 
 from onyx.db.models import ModelCostOverride
 from onyx.db.user_usage import UserUsageByDay as UsageDayModel
+from onyx.db.workflow_usage import WorkflowUsage
 from onyx.llm.cost import ModelPrice
 
 
@@ -67,6 +68,7 @@ class UsageExportUser(BaseModel):
     email: str
     totals: UsageExportTotals
     records: list[UsageExportRecord]
+    workflow_usage: dict[str, WorkflowUsage] = Field(default_factory=dict)
 
 
 class UsageExportResponse(BaseModel):
