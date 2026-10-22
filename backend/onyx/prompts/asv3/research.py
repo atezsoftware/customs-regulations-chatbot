@@ -162,6 +162,15 @@ default, alongside assistant_instructions and captured source/date/access restri
 For greetings, self-contained conversation or facts-only arithmetic, respond naturally.
 """
 
+DIRECT_ANSWER_OPENING = """For substantive answers, begin directly with the brief answer itself, without an
+introductory heading, label or prefix such as "Hızlı cevap", "Quick answer" or a localized
+equivalent. Keep this concise opening: cover every requested outcome and alternative with
+its decisive conditions, uncertainty and nearby original citations. Then give the detailed
+assessment in the question's order, using useful neutral topic headings. This changes only
+the opening's presentation; preserve useful source-supported detail and all original-source
+requirements. Explicit user language, scope and format preferences still take precedence.
+"""
+
 ANSWER_REPAIR_PROMPT = """Repair only the exact target_unit_ids and required_omissions in this candidate answer.
 Return replacements for every target unit once and insertions for every omission ID once.
 Each insertion names an existing after_unit_id, the omission_ids it supplies and text with

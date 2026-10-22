@@ -1629,12 +1629,16 @@ def test_native_history_preserves_each_complete_batch_and_delivers_originals_onc
 
 
 @pytest.mark.parametrize("researcher", [False, True], ids=["coordinator", "researcher"])
+@pytest.mark.parametrize("profile", [None, "normal"], ids=["deep", "standard"])
 def test_core_role_instructions_survive_response_preference_eviction(
     researcher: bool,
+    profile: str | None,
 ) -> None:
     context, ledger = RunContext(depth=int(researcher)), EvidenceLedger()
     context.services["evidence"] = ledger
     context.services["assistant_instructions"] = "Keep the requested units in Turkish."
+    if profile is not None:
+        context.services["research_profile"] = profile
     first = original(ledger, context, "The first condition must hold. " * 16)
     second = original(ledger, context, "The second condition also applies. " * 16)
     llm = model()
@@ -1646,6 +1650,17 @@ def test_core_role_instructions_survive_response_preference_eviction(
     )
     canonical_request = current.request
     complete_prompt, tools, _ = adapter._fit_native_decision(current)
+    system_content = complete_prompt[0].content
+    assert isinstance(system_content, str)
+    assert (llm_adapter.DIRECT_ANSWER_OPENING in system_content) == (
+        profile == "normal"
+    )
+    if profile is None:
+        assert system_content == (
+            llm_adapter.RESEARCHER_PROMPT
+            if researcher
+            else llm_adapter.COORDINATOR_PROMPT
+        )
     question_content = complete_prompt[1].content
     assert isinstance(question_content, str)
     question, preference_paragraph = first_user_payload(complete_prompt[1])
@@ -1671,9 +1686,7 @@ def test_core_role_instructions_survive_response_preference_eviction(
 
     adapter.decide(current)
     prompt = llm.invoke.call_args.kwargs["prompt"]
-    assert prompt[0].content == (
-        llm_adapter.RESEARCHER_PROMPT if researcher else llm_adapter.COORDINATOR_PROMPT
-    )
+    assert prompt[0].content == system_content
     first_content = prompt[1].content
     assert isinstance(first_content, str)
     delivered_question, preference_paragraph = first_user_payload(prompt[1])

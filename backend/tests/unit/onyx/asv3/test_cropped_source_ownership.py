@@ -10,6 +10,7 @@ from onyx.asv3.cheap_authority import canonical_named_authority_gap
 from onyx.asv3.cropped_repair_model import integrate_repair
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.models import EvidenceItem, RunContext
+from onyx.prompts.asv3.research import DIRECT_ANSWER_OPENING
 from onyx.prompts.asv3_cropped_writing import CROPPED_SOURCE_OWNERSHIP
 from tests.unit.onyx.asv3.test_cropped_repair_model import checks, current, fixture
 from tests.unit.onyx.asv3.test_native_authority import original
@@ -49,6 +50,7 @@ def test_actual_native_fit_scopes_source_ownership_to_cropped(
     system = prompt[0].content
     assert isinstance(system, str)
     assert system.count(CROPPED_SOURCE_OWNERSHIP) == int(cropped and not cheap)
+    assert system.count(DIRECT_ANSWER_OPENING) == int(cropped)
     selected.invoke.assert_not_called()
 
 

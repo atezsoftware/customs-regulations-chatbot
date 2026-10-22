@@ -111,7 +111,7 @@ from onyx.asv3.terminal_wire_schema import (
     decode_optional_nulls,
     strict_terminal_tools,
 )
-from onyx.asv3.workflow_variant import ASV3_TUNED_VARIANT
+from onyx.asv3.workflow_variant import ASV3_STANDARD_VARIANT, ASV3_TUNED_VARIANT
 
 if TYPE_CHECKING:
     from onyx.asv3.cropped_sections import CroppedSectionMaterialContext
@@ -158,6 +158,7 @@ from onyx.prompts.asv3.experimental import (
 from onyx.prompts.asv3.research import (
     COORDINATOR_PROMPT,
     DEFAULT_RESPONSE_PREFERENCES,
+    DIRECT_ANSWER_OPENING,
     LEGAL_DEPARTMENT_RESEARCH,
     OUTCOME_COVERAGE_RESEARCH,
     RESEARCHER_PROMPT,
@@ -3165,6 +3166,12 @@ class ResearchModel:
                 "not another reference step. A nested unread reference is not evidence of "
                 "its legal effect; preserve any material uncertainty without inventing a rule."
             )
+        if self.context.services.get("research_profile") == "normal" and (
+            self.context.services.get("asv3_exp_cropped") is True
+            or self.context.services.get("asv3_workflow_variant", ASV3_STANDARD_VARIANT)
+            == ASV3_STANDARD_VARIANT
+        ):
+            instruction += "\n\n" + DIRECT_ANSWER_OPENING
         question: dict[str, JsonValue] = {
             "request": view.request,
         }
