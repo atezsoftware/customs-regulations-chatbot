@@ -12,7 +12,7 @@ from onyx.db.models import ChatSession, ChatSessionFeedback
 from onyx.file_store.models import FileDescriptor
 from onyx.llm.override_models import LLMOverride
 from onyx.llm.usage_cost import ResponseUsage
-from onyx.server.query_and_chat.streaming_models import Packet
+from onyx.server.query_and_chat.streaming_models import CitationInfo, Packet
 
 AUTO_PLACE_AFTER_LATEST_MESSAGE = -1
 
@@ -443,6 +443,8 @@ class ChatMessageDetail(BaseModel):
     context_docs: list[SavedSearchDoc] | None = None
     # Dict mapping citation number to document_id
     citations: dict[int, str] | None = None
+    # Additive exact targets; the legacy document-only map remains unchanged.
+    citation_info: list[CitationInfo] = Field(default_factory=list)
     time_sent: datetime
     files: list[FileDescriptor]
     error: str | None = None

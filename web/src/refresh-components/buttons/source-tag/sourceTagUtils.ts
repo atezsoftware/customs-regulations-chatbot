@@ -65,7 +65,7 @@ export function citationsToSourceInfoArray(
   const seenChunks = new Set<string>();
 
   for (const citation of citations) {
-    const chunkKey = `${citation.document_id}:${citation.chunk_ind ?? "document"}`;
+    const chunkKey = `${citation.document_id}:${citation.chunk_id ?? citation.chunk_ind ?? "document"}`;
     if (seenChunks.has(chunkKey)) continue;
 
     const doc =
@@ -76,7 +76,12 @@ export function citationsToSourceInfoArray(
         : documentMap.get(`${citation.document_id}:${citation.chunk_ind}`);
     if (doc) {
       seenChunks.add(chunkKey);
-      sources.push(documentToSourceInfo(doc));
+      const source = documentToSourceInfo(doc);
+      sources.push({
+        ...source,
+        title: citation.display_title?.trim() || source.title,
+        description: citation.text ?? source.description,
+      });
     }
   }
 

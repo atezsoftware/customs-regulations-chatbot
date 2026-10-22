@@ -167,15 +167,14 @@ export function getTextContent(packets: Packet[]) {
 
 export function getCitations(packets: Packet[]): StreamingCitation[] {
   const citations: StreamingCitation[] = [];
-  const seenChunks = new Set<string>();
+  const seenCitationNumbers = new Set<number>();
 
   packets.forEach((packet) => {
     if (packet.obj.type === PacketType.CITATION_INFO) {
       // Individual citation packet from backend
       const citationInfo = packet.obj as CitationInfo;
-      const chunkKey = `${citationInfo.document_id}:${citationInfo.chunk_ind ?? "document"}`;
-      if (!seenChunks.has(chunkKey)) {
-        seenChunks.add(chunkKey);
+      if (!seenCitationNumbers.has(citationInfo.citation_number)) {
+        seenCitationNumbers.add(citationInfo.citation_number);
         citations.push({
           citation_num: citationInfo.citation_number,
           document_id: citationInfo.document_id,
@@ -183,10 +182,38 @@ export function getCitations(packets: Packet[]): StreamingCitation[] {
           semantic_identifier: citationInfo.semantic_identifier,
           source_type: citationInfo.source_type,
           preview_url: citationInfo.preview_url,
+          display_title: citationInfo.display_title,
+          chunk_id: citationInfo.chunk_id,
+          text: citationInfo.text,
         });
       }
     }
   });
 
   return citations;
+}
+
+/** Keep historical source metadata available even when an older packet omitted it. */
+export function withCitationInfo(
+  packets: Packet[],
+  citationInfo: CitationInfo[] | null | undefined
+): Packet[] {
+  if (!citationInfo?.length) return packets;
+
+  const remaining = new Map(
+    citationInfo.map((citation) => [citation.citation_number, citation])
+  );
+  const hydrated = packets.map((packet) => {
+    if (packet.obj.type !== PacketType.CITATION_INFO) return packet;
+    const citation = remaining.get(packet.obj.citation_number);
+    if (!citation) return packet;
+    remaining.delete(citation.citation_number);
+    return { ...packet, obj: { ...packet.obj, ...citation } };
+  });
+  const placement = packets.find(
+    (packet) => packet.obj.type === PacketType.MESSAGE_START
+  )?.placement ?? { turn_index: 0 };
+  return hydrated.concat(
+    Array.from(remaining.values(), (obj) => ({ placement, obj }))
+  );
 }

@@ -157,6 +157,10 @@ class CitationInfo(BaseObj):
     source_type: DocumentSource | None = None
     # Owned-message endpoint for original-file locations outside the canonical index.
     preview_url: str | None = None
+    # Optional exact evidence for clients which render citations without a fetch.
+    display_title: str | None = None
+    chunk_id: str | None = None
+    text: str | None = None
 
 
 class ToolCallDebug(BaseObj):

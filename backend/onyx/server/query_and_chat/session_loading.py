@@ -650,6 +650,7 @@ def translate_assistant_message_to_packets(
     *,
     asv3_interrupted: bool = False,
     suppress_reserved_message: bool = False,
+    citation_info_override: list[CitationInfo] | None = None,
 ) -> list[Packet]:
     """
     Translates an assistant message and tool calls to packet format.
@@ -1005,6 +1006,12 @@ def translate_assistant_message_to_packets(
                         ),
                     )
                 )
+
+        if citation_info_override is not None:
+            enriched = {item.citation_number: item for item in citation_info_override}
+            citation_info_list = [
+                enriched.get(item.citation_number, item) for item in citation_info_list
+            ]
 
         # Sort citations by order of appearance in message text
         citation_order = extract_citation_order_from_text(chat_message.message or "")

@@ -31,6 +31,12 @@ from onyx.asv3.cheap_authority import (
 )
 from onyx.asv3.cheap_source_review import CheapSourceReviewPolicy
 from onyx.asv3.citation_numbers import extract_citation_numbers
+from onyx.asv3.citation_presentation import (
+    CITATION_SOURCE_TITLES_SERVICE,
+    CitationSourceTitles,
+    citation_presentation_enabled,
+    evidence_citation_presentation,
+)
 from onyx.asv3.corpus_tools import CorpusBroker, build_corpus_specs
 from onyx.asv3.cropped_article_bindings import (
     CroppedArticleBindings,
@@ -195,24 +201,44 @@ def _verification_context(context: RunContext) -> RunContext:
     return isolated
 
 
-def _presentation_search_doc(item: EvidenceItem) -> SearchDoc | None:
+def _presentation_search_doc(
+    item: EvidenceItem,
+    *,
+    enriched_citations: bool = False,
+    source_titles: CitationSourceTitles | None = None,
+) -> SearchDoc | None:
     if item.search_doc is None:
         return None
     document = item.search_doc.model_copy(deep=True)
-    name = official_corpus_source_name(item)
+    name = (
+        evidence_citation_presentation(
+            item,
+            source_title=source_titles.get(item.source_id) if source_titles else None,
+        ).display_title
+        if enriched_citations
+        else official_corpus_source_name(item)
+    )
     if name:
         document.metadata["asv3_source_display_name"] = name
     return document
 
 
 def _presentation_search_docs(
-    ledger: EvidenceLedger, numbers: Iterable[int]
+    ledger: EvidenceLedger,
+    numbers: Iterable[int],
+    *,
+    enriched_citations: bool = False,
+    source_titles: CitationSourceTitles | None = None,
 ) -> dict[int, SearchDoc]:
     documents: dict[int, SearchDoc] = {}
     for number in numbers:
         item = ledger.get(number)
         if item is not None:
-            document = _presentation_search_doc(item)
+            document = _presentation_search_doc(
+                item,
+                enriched_citations=enriched_citations,
+                source_titles=source_titles,
+            )
             if document is not None:
                 documents[number] = document
     return documents
@@ -433,6 +459,12 @@ def run_asv3_loop(
         raise ValueError(
             "Experimental Guardrails v3 requires the normal non-parallel ASv3 profile"
         )
+    enriched_citations = citation_presentation_enabled(
+        checkpoint_workflow_variant, research_profile, parallel_research
+    )
+    citation_source_titles = CitationSourceTitles() if enriched_citations else None
+    if citation_source_titles is not None:
+        context.services[CITATION_SOURCE_TITLES_SERVICE] = citation_source_titles
     if (
         parallel_research
         and previous is not None
@@ -1382,7 +1414,14 @@ def run_asv3_loop(
                     context,
                 )
         state_container.add_search_docs(
-            list(_presentation_search_docs(ledger, receipt.evidence_ids).values())
+            list(
+                _presentation_search_docs(
+                    ledger,
+                    receipt.evidence_ids,
+                    enriched_citations=enriched_citations,
+                    source_titles=citation_source_titles,
+                ).values()
+            )
         )
         if acquisition_recorded:
             root_checkpoint(durable=True)
@@ -2764,7 +2803,12 @@ def run_asv3_loop(
             else result.stop_reason
         )
         progress.report("final")
-        allowed = _presentation_search_docs(ledger, ledger.citation_mapping())
+        allowed = _presentation_search_docs(
+            ledger,
+            ledger.citation_mapping(),
+            enriched_citations=enriched_citations,
+            source_titles=citation_source_titles,
+        )
         numbers = extract_citation_numbers(final)
         if set(numbers) - allowed.keys():
             raise ValueError("ASv3 final answer contains unrecorded citation targets")
@@ -2794,6 +2838,20 @@ def run_asv3_loop(
                 context.check_active()
                 if isinstance(part, CitationInfo):
                     doc = allowed.get(part.citation_number)
+                    if enriched_citations:
+                        cited_item = ledger.get(part.citation_number)
+                        if cited_item is not None:
+                            presentation = evidence_citation_presentation(
+                                cited_item,
+                                source_title=(
+                                    citation_source_titles.get(cited_item.source_id)
+                                    if citation_source_titles
+                                    else None
+                                ),
+                            )
+                            part.display_title = presentation.display_title
+                            part.chunk_id = presentation.chunk_id
+                            part.text = presentation.text
                     if doc and (
                         doc.metadata.get("regulatory_chunk_id")
                         or doc.metadata.get("asv3_native_locator")

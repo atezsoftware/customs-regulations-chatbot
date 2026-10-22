@@ -219,8 +219,8 @@ function handleCitationPacket(state: ProcessorState, packet: Packet): void {
   state.citationMap[citationInfo.citation_number] = citationInfo.document_id;
   state.citationChunkMap[citationInfo.citation_number] = citationInfo.chunk_ind;
 
-  // Also add to citations array for CitedSourcesToggle (deduplicated)
-  const citationIdentity = `${citationInfo.document_id}:${citationInfo.chunk_ind ?? "document"}`;
+  // Every citation number must resolve even when several cite the same chunk.
+  const citationIdentity = String(citationInfo.citation_number);
   if (!state.seenCitationDocIds.has(citationIdentity)) {
     state.seenCitationDocIds.add(citationIdentity);
     state.citations.push({
@@ -230,6 +230,9 @@ function handleCitationPacket(state: ProcessorState, packet: Packet): void {
       semantic_identifier: citationInfo.semantic_identifier,
       source_type: citationInfo.source_type,
       preview_url: citationInfo.preview_url,
+      display_title: citationInfo.display_title,
+      chunk_id: citationInfo.chunk_id,
+      text: citationInfo.text,
     });
   }
 }

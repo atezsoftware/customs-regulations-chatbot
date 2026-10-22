@@ -19,6 +19,83 @@ describe("PreviewModal citation chunk mode", () => {
     );
   });
 
+  it("shows the supplied exact chunk and official title without requesting a preview", async () => {
+    const fetchMock = jest.spyOn(global, "fetch");
+    const officialTitle = "Resmî Başlık <script>alert(1)</script>";
+    const { rerender } = render(
+      <PreviewModal
+        presentingDocument={{
+          preview_type: "citation",
+          document_id: "shared-file",
+          semantic_identifier: officialTitle,
+          citation_number: 10,
+          citation_chunk_id: "canonical-10",
+          citation_chunk_ind: 10,
+          citation_text: "Article 10 exact original text",
+          citation_preview_url: "/api/asv3/citation/101/10",
+        }}
+        onClose={jest.fn()}
+      />
+    );
+    expect(
+      await screen.findByText("Article 10 exact original text")
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("dialog", {
+        name: (name) => name.startsWith(officialTitle),
+      })
+    ).toBeInTheDocument();
+
+    rerender(
+      <PreviewModal
+        presentingDocument={{
+          preview_type: "citation",
+          document_id: "shared-file",
+          semantic_identifier: officialTitle,
+          citation_number: 11,
+          citation_chunk_id: "native-11",
+          citation_chunk_ind: -11,
+          citation_text: "Second citation original source text",
+        }}
+        onClose={jest.fn()}
+      />
+    );
+    expect(
+      await screen.findByText("Second citation original source text")
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText("Article 10 exact original text")
+    ).not.toBeInTheDocument();
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(mockedFetchChatFile).not.toHaveBeenCalled();
+  });
+
+  it("does not fetch a different source when an inline chunk is empty", async () => {
+    const fetchMock = jest.spyOn(global, "fetch");
+    render(
+      <PreviewModal
+        presentingDocument={{
+          preview_type: "citation",
+          document_id: "shared-file",
+          semantic_identifier: "Resmî Başlık",
+          citation_chunk_ind: -2,
+          citation_text: "",
+        }}
+        onClose={jest.fn()}
+      />
+    );
+    expect(
+      await screen.findByRole("dialog", { name: "Resmî Başlık" })
+    ).toBeInTheDocument();
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(mockedFetchChatFile).not.toHaveBeenCalled();
+    expect(
+      screen.queryByText(
+        "The cited chunk is unavailable or you no longer have access to it."
+      )
+    ).not.toBeInTheDocument();
+  });
+
   it("fetches only the exact cited chunk", async () => {
     const fetchMock = jest
       .spyOn(global, "fetch")
@@ -33,6 +110,7 @@ describe("PreviewModal citation chunk mode", () => {
           document_id: "customs-law",
           semantic_identifier: "Gümrük Kanunu · 46. Madde",
           citation_chunk_ind: 46,
+          citation_text: null,
         }}
         onClose={jest.fn()}
       />

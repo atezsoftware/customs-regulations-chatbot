@@ -28,6 +28,7 @@ import { SEARCH_PARAM_NAMES } from "./searchParams";
 import { WEB_SEARCH_TOOL_ID } from "@/app/app/components/tools/constants";
 import { SEARCH_TOOL_ID } from "@/app/app/components/tools/constants";
 import { Packet } from "./streamingModels";
+import { withCitationInfo } from "@/app/app/services/packetUtils";
 
 export async function updateLlmOverrideForChatSession(
   chatSessionId: string,
@@ -564,7 +565,13 @@ export function processRawChatHistory(
   let agentMessageInd = 0;
 
   rawMessages.forEach((messageInfo, _ind) => {
-    const packetsForMessage = packets[agentMessageInd];
+    const packetsForMessage =
+      messageInfo.message_type === "assistant"
+        ? withCitationInfo(
+            packets[agentMessageInd] || [],
+            messageInfo.citation_info
+          )
+        : packets[agentMessageInd];
     const isSupersearch =
       messageInfo.message_type === "assistant" &&
       packetsForMessage?.some(

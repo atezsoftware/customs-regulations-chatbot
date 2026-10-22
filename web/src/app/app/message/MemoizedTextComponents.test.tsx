@@ -2,6 +2,7 @@ import { fireEvent, render, screen } from "@testing-library/react";
 import { OnyxDocument } from "@/lib/search/interfaces";
 import { ValidSources } from "@/lib/types";
 import { MemoizedAnchor, MemoizedLink } from "./MemoizedTextComponents";
+import { setupUser } from "@tests/setup/test-utils";
 
 const citedDocument: OnyxDocument = {
   document_id: "customs-law",
@@ -20,6 +21,69 @@ const citedDocument: OnyxDocument = {
 };
 
 describe("inline document citations", () => {
+  it("shows the official title and opens each same-file citation's own text", async () => {
+    const user = setupUser();
+    const updatePresentingDocument = jest.fn();
+    const title = "Gümrük Kanunu Resmî Başlığı";
+    const references = [
+      {
+        citation_num: 10,
+        document_id: "customs-law",
+        chunk_ind: 46,
+        chunk_id: "canonical-46",
+        display_title: title,
+        text: "Article 46 original text",
+        source_type: ValidSources.UserFile,
+      },
+      {
+        citation_num: 11,
+        document_id: "customs-law",
+        chunk_ind: 47,
+        chunk_id: "canonical-47",
+        display_title: title,
+        text: "Article 47 original text",
+        source_type: ValidSources.UserFile,
+      },
+    ];
+
+    render(
+      <>
+        {[10, 11].map((number) => (
+          <MemoizedAnchor
+            key={number}
+            docs={[citedDocument]}
+            citationReferences={references}
+            updatePresentingDocument={updatePresentingDocument}
+          >
+            {`[${number}]`}
+          </MemoizedAnchor>
+        ))}
+      </>
+    );
+
+    const chips = screen.getAllByRole("button", { name: title });
+    await user.click(chips[0]!);
+    await user.click(chips[1]!);
+    expect(updatePresentingDocument.mock.calls).toEqual([
+      [
+        expect.objectContaining({
+          citation_number: 10,
+          semantic_identifier: title,
+          citation_chunk_id: "canonical-46",
+          citation_text: "Article 46 original text",
+        }),
+      ],
+      [
+        expect.objectContaining({
+          citation_number: 11,
+          semantic_identifier: title,
+          citation_chunk_id: "canonical-47",
+          citation_text: "Article 47 original text",
+        }),
+      ],
+    ]);
+  });
+
   it("opens an exact chunk preview instead of the complete uploaded file", () => {
     const updatePresentingDocument = jest.fn();
 

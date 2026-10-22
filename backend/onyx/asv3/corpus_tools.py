@@ -18,6 +18,10 @@ from pydantic import JsonValue
 from sqlalchemy.exc import SQLAlchemyError
 
 from onyx.asv3.authority import known_statute_source_ids
+from onyx.asv3.citation_presentation import (
+    CITATION_SOURCE_TITLES_SERVICE,
+    CitationSourceTitles,
+)
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.focused_source_target import focused_source_target
 from onyx.asv3.legal_source_navigation import (
@@ -861,6 +865,14 @@ class CorpusBroker:
         if not item.metadata.get("source_sha256") or not item.metadata.get("derived"):
             raise ValueError("Native evidence has no verified original-file proof")
         source = self.source(item.source_id, context)
+        source_titles = context.services.get(CITATION_SOURCE_TITLES_SERVICE)
+        if isinstance(source_titles, CitationSourceTitles):
+            source_titles.remember(
+                str(source.id),
+                source.legistation_metadata.official_title
+                if source.legistation_metadata is not None
+                else None,
+            )
         attached = item.model_copy(deep=True)
         label = context.services.get("native_citation_label")
         locator = item.metadata.get("locator")

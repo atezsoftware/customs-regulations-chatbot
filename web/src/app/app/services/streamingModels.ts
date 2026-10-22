@@ -289,6 +289,9 @@ export interface StreamingCitation {
   semantic_identifier?: string;
   source_type?: ValidSources;
   preview_url?: string | null;
+  display_title?: string | null;
+  chunk_id?: string | null;
+  text?: string | null;
 }
 
 export interface CitationStart extends BaseObj {
@@ -304,6 +307,9 @@ export interface CitationInfo extends BaseObj {
   semantic_identifier?: string;
   source_type?: ValidSources;
   preview_url?: string | null;
+  display_title?: string | null;
+  chunk_id?: string | null;
+  text?: string | null;
 }
 
 // Deep Research Plan Packets
