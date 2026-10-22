@@ -39,6 +39,7 @@ from onyx.asv3.models import (
 )
 from onyx.asv3.parallel_execution import capability_slot, parallel_execution_enabled
 from onyx.asv3.shared_reads import SharedReads
+from onyx.asv3.source_notices import SourceNoticeState
 from onyx.asv3.workflow_variant import ASV3_TUNED_VARIANT
 from onyx.configs.constants import DocumentSource
 from onyx.context.search.models import IndexFilters, SearchDoc
@@ -64,6 +65,7 @@ from onyx.db.asv3_corpus import (
 )
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.db.models import User
+from onyx.db.regulatory_source_notices import find_source_notices
 from onyx.document_index.publication_models import PublicationIndexSnapshot
 from onyx.file_store.file_store import FileStore
 from onyx.llm.interfaces import LLM
@@ -72,6 +74,8 @@ from onyx.regulatory.heading_path import (
     extract_regulatory_provision_references,
     parse_regulatory_article_heading,
 )
+from onyx.regulatory.source_notice_identity import notice_identity_queries
+from onyx.regulatory.source_notices import SourceNotice
 from onyx.tools.constants import REGULATORY_MAX_SEARCH_QUERY_CHARS
 from onyx.tracing.answer_graph import graph_step
 from onyx.utils.threadpool_concurrency import run_functions_tuples_in_parallel
@@ -250,6 +254,15 @@ class CorpusBroker:
         """Authorize every subscriber before sharing its exact source acquisition."""
         context.check_active()
         try:
+            notice = source_notice_read_outcome(source_id, context)
+            if notice is not None:
+                target = notice.data.get("source_id")
+                if notice.data.get("content_available") is True and isinstance(
+                    target, str
+                ):
+                    source_id = target
+                else:
+                    return notice
             with get_session_with_current_tenant() as session:
                 source = require_source(
                     session,
@@ -331,6 +344,26 @@ class CorpusBroker:
                     else None
                 ),
             )
+
+    def source_notices(
+        self,
+        queries: list[str] | None,
+        notice_ids: list[str] | None,
+        context: RunContext,
+    ) -> list[SourceNotice]:
+        """Resolve scoped metadata notices without acquiring corpus originals."""
+        context.check_active()
+        with get_session_with_current_tenant() as session:
+            notices = find_source_notices(
+                session,
+                self.user,
+                self.filters,
+                queries=queries,
+                notice_ids=notice_ids,
+                limit=100,
+            )
+        context.check_active()
+        return notices
 
     def related_catalog_sources(
         self,
@@ -432,12 +465,23 @@ class CorpusBroker:
             }
 
         if parallel_execution_enabled(context):
-            return self._parallel_related_sources(key, context, lookup)
-        # One broker belongs to one captured user/scope. Sibling workers share its pages.
-        with self._related_sources_lock:
-            if key not in self._related_sources:
-                self._related_sources[key] = lookup()
-            return copy.deepcopy(self._related_sources[key])
+            record = self._parallel_related_sources(key, context, lookup)
+        else:
+            # One broker belongs to one captured user/scope. Sibling workers share its pages.
+            with self._related_sources_lock:
+                if key not in self._related_sources:
+                    self._related_sources[key] = lookup()
+                record = copy.deepcopy(self._related_sources[key])
+        queries = record["query_variants"]
+        assert isinstance(queries, list)
+        notices = source_notices_for_queries(
+            [query for query in queries if isinstance(query, str)], context
+        )
+        if notices:
+            record["source_notices"] = [
+                source_notice_data(notice) for notice in notices
+            ]
+        return record
 
     def _parallel_related_sources(
         self,
@@ -1404,12 +1448,86 @@ def article_references(value: str) -> tuple[RegulatoryProvisionReference, ...]:
     return extract_regulatory_provision_references(text)
 
 
+def source_notice_data(notice: SourceNotice) -> dict[str, JsonValue]:
+    return {
+        **cast(dict[str, JsonValue], notice.model_dump(mode="json")),
+        "source_id": notice.user_file_id
+        if notice.content_state == "materialized"
+        else "notice:" + notice.id,
+        "notice_id": notice.id,
+        "name": notice.catalog_title,
+        "source_known": True,
+        "content_available": notice.content_state == "materialized",
+        "original_acquired": False,
+        "metadata_only": notice.content_state == "metadata_only",
+        "absence_proven": False,
+    }
+
+
+def source_notice_outcome(notice: SourceNotice) -> ToolOutcome:
+    if notice.content_state == "materialized":
+        return ToolOutcome(
+            status=OutcomeStatus.PARTIAL,
+            summary="Catalogue notice now has a real source; read its current authorized original before applying any provision.",
+            data=source_notice_data(notice),
+        )
+    return ToolOutcome(
+        status=OutcomeStatus.UNAVAILABLE,
+        summary=(
+            "Bu belge mülga envanterinde kayıtlıdır; özgün metni sistemde "
+            "bulunmamaktadır. Bu bilgi bir madde metni veya kaldırılma tarihinin "
+            "doğrulanması değildir. Aynı içeriksiz belgeyi tekrar okumayı denemeyin."
+        ),
+        data=source_notice_data(notice),
+    )
+
+
+def source_notice_read_outcome(
+    source_id: str, context: RunContext
+) -> ToolOutcome | None:
+    state = context.services.get("source_notice_state")
+    if not isinstance(state, SourceNoticeState):
+        return None
+    if not (source_id.startswith("notice:") or state.known_notice_id(source_id)):
+        return None
+    notice = state.by_id(source_id)
+    if notice is not None:
+        return source_notice_outcome(notice)
+    return ToolOutcome(
+        status=OutcomeStatus.UNAVAILABLE,
+        summary="Metadata-only source notice is outside the current authorized scope or no longer available.",
+        data={
+            "content_available": False,
+            "original_acquired": False,
+            "absence_proven": False,
+        },
+    )
+
+
+def source_notices_for_queries(
+    queries: list[str], context: RunContext
+) -> list[SourceNotice]:
+    state = context.services.get("source_notice_state")
+    if not isinstance(state, SourceNoticeState):
+        return []
+    try:
+        return state.lookup_queries(queries)
+    except (PermissionError, CorpusScopeUnavailable):
+        return []
+
+
 def guarded(
     handler: Callable[[dict[str, JsonValue], RunContext], ToolOutcome],
 ) -> Callable[[dict[str, JsonValue], RunContext], ToolOutcome]:
     def run(args: dict[str, JsonValue], context: RunContext) -> ToolOutcome:
         try:
-            return handler(args, context)
+            notice = source_notice_read_outcome(str(args.get("source_id", "")), context)
+            if notice is None:
+                return handler(args, context)
+            target = notice.data.get("source_id")
+            if notice.data.get("content_available") is True and isinstance(target, str):
+                return handler({**args, "source_id": target}, context)
+            return notice
         except PermissionError:
             return ToolOutcome(
                 status=OutcomeStatus.DENIED,
@@ -1437,9 +1555,12 @@ def build_corpus_specs(
             offset=int(cast(int, args.get("offset", 0))),
             limit=int(cast(int, args.get("limit", 20))),
         )
+        notices = source_notices_for_queries([str(args.get("query", ""))], context)
         status = (
             OutcomeStatus.AMBIGUOUS
-            if len(sources) > 1
+            if len(sources) + len(notices) > 1
+            else OutcomeStatus.UNAVAILABLE
+            if notices
             else OutcomeStatus.FOUND
             if sources
             else OutcomeStatus.NOT_FOUND
@@ -1447,7 +1568,13 @@ def build_corpus_specs(
         data: dict[str, JsonValue] = {
             "sources": [
                 {"source_id": str(source.id), "name": source.name} for source in sources
-            ],
+            ]
+            + [source_notice_data(notice) for notice in notices],
+            **(
+                {"source_notices": [source_notice_data(notice) for notice in notices]}
+                if notices
+                else {}
+            ),
             "has_more": more,
             "next_offset": int(cast(int, args.get("offset", 0)))
             + int(cast(int, args.get("limit", 20))),
@@ -1469,6 +1596,9 @@ def build_corpus_specs(
                     "Preserve the scenario date/scope and verify validity in originals."
                 ),
             }
+        if len(notices) == 1 and not sources and not more:
+            outcome = source_notice_outcome(notices[0])
+            return outcome.model_copy(update={"data": {**outcome.data, **data}})
         return ToolOutcome(
             status=OutcomeStatus.PARTIAL if more else status,
             summary="Authorized source candidates; choose an exact source_id before reading.",
@@ -1600,6 +1730,13 @@ def build_corpus_specs(
         )
 
     def provision(args: dict[str, JsonValue], context: RunContext) -> ToolOutcome:
+        notice = source_notice_read_outcome(str(args["source_id"]), context)
+        if notice is not None:
+            target = notice.data.get("source_id")
+            if notice.data.get("content_available") is True and isinstance(target, str):
+                args = {**args, "source_id": target}
+            else:
+                return notice
         read_scope = getattr(broker, "verified_provision_read", None)
         with (
             read_scope(str(args["source_id"]), context)
@@ -1741,17 +1878,42 @@ def build_corpus_specs(
                 sources, more = broker.sources(
                     str(args["source_name"]), context, limit=20
                 )
-        if len(sources) != 1 or more:
+        notices = source_notices_for_queries([str(args["source_name"])], context)
+        if len(notices) == 1 and not sources and not more:
+            notice = notices[0]
+            if notice.content_state == "metadata_only":
+                return source_notice_outcome(notice)
+            assert notice.user_file_id is not None
+            sources = [broker.source(notice.user_file_id, context)]
+            notices = []
+        source_ids = {str(source.id) for source in sources}
+        notices = [
+            notice
+            for notice in notices
+            if notice.content_state != "materialized"
+            or notice.user_file_id not in source_ids
+        ]
+        if len(sources) != 1 or more or notices:
             return ToolOutcome(
                 status=OutcomeStatus.AMBIGUOUS
-                if sources or more
+                if sources or more or notices
                 else OutcomeStatus.NOT_FOUND,
                 summary="Source identity remains unresolved; choose an exact source_id or refine the source title. This is not evidence of absent law.",
                 data={
                     "sources": [
                         {"source_id": str(source.id), "name": source.name}
                         for source in sources
-                    ],
+                    ]
+                    + [source_notice_data(notice) for notice in notices],
+                    **(
+                        {
+                            "source_notices": [
+                                source_notice_data(notice) for notice in notices
+                            ]
+                        }
+                        if notices
+                        else {}
+                    ),
                     "has_more": more,
                     "absence_proven": False,
                 },
@@ -2054,8 +2216,53 @@ def build_corpus_specs(
         )
 
     def search(args: dict[str, JsonValue], context: RunContext) -> ToolOutcome:
+        target = focused_source_target(args)
+        state = context.services.get("source_notice_state")
+        if target is not None and isinstance(state, SourceNoticeState):
+            source_name, article = target
+            keys = set(notice_identity_queries(source_name))
+            query = str(args.get("query", ""))
+            other_keys = {
+                key
+                for value in [
+                    query,
+                    *cast(list[JsonValue], args.get("source_anchors", [])),
+                ]
+                if isinstance(value, str)
+                for key in notice_identity_queries(value)
+            }
+            related = re.search(
+                r"kald[ıi]r|m[üu]lga|y[üu]r[üu]rl[üu]k|iptal|de[ğg]i[şs]|"
+                r"repeal|amend|annul|replace|related",
+                query + " " + str(args.get("evidence_target", "")),
+                re.IGNORECASE,
+            )
+            if related or other_keys - keys:
+                target = None
+            elif len(keys) == 1:
+                notices = [
+                    notice
+                    for notice in source_notices_for_queries([source_name], context)
+                    if notice.identity_key in keys
+                    and notice.content_state == "metadata_only"
+                ]
+                if len(notices) == 1:
+                    sources, more = broker.sources(source_name, context, limit=20)
+                    if not sources and not more:
+                        outcome = source_notice_outcome(notices[0])
+                        return outcome.model_copy(
+                            update={
+                                "data": {
+                                    **outcome.data,
+                                    "article": article,
+                                    "search_performed": False,
+                                    "acquisition_method": "metadata_only_source_notice",
+                                    "coverage_item": args.get("coverage_item"),
+                                    "evidence_target": args.get("evidence_target"),
+                                }
+                            }
+                        )
         if named_provision_reads:
-            target = focused_source_target(args)
             if target is not None:
                 source_name, article = target
                 outcome = named_provision(

@@ -614,6 +614,14 @@ class CroppedCrossReferencePolicy:
             if pending is not None:
                 self._targets[pending.target_key] = depth
 
+    def referenced_source_ids(self, context: RunContext) -> list[str]:
+        """Identify acquired first-hop sources without exposing mutable policy state."""
+        self.check_context(context)
+        with self._lock:
+            return sorted(
+                {row.source_id for row in self._sources.values() if row.depth > 0}
+            )
+
     def view(self, context: RunContext | None = None) -> dict[str, JsonValue]:
         self.check_context(context or self.context)
         with self._lock:
