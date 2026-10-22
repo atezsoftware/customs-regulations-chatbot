@@ -159,3 +159,52 @@ not HTML. The legacy handler must not guess a chunk by collecting every
 - Other workflows keep their existing citation behavior. Source text and titles
   are presentation data; they are not added to LLM prompts or the next request's
   research context.
+
+## Admin Query History
+
+`GET /api/admin/chat-session-history/{session_id}` exposes the same additive
+`messages[].citation_info` contract. The existing `documents` list remains the
+retrieval inventory; it is not the list or numbering of cited passages.
+
+Query History citation records also provide optional presentation fields:
+
+| Field | Meaning |
+| --- | --- |
+| `link` | The recorded original source URL, when available. |
+| `reference` | The recorded heading or passage location, separate from the official file title. |
+| `resolution_status` | `retained`, `current`, `external`, or `unavailable`. |
+
+`retained` identifies a saved original; opening it still checks current access,
+publication and exact identity. `current` identifies an indexed chunk without a
+verified retained passage; clients must distinguish it from the historical text.
+`external` opens the recorded HTTP(S) source link. `unavailable` keeps the citation
+visible without substituting another chunk. Missing saved mappings appear in
+`messages[].unresolved_citations`, a list of citation numbers, rather than gaining
+invented document or chunk identities.
+
+The admin citation `preview_url` has this shape:
+
+```text
+/api/admin/chat-session-history/{session_id}/citation/{message_id}/{citation_number}
+```
+
+It requires `FULL_ADMIN_PANEL_ACCESS`, enabled Query History, the exact
+session/message/citation binding and current source access. Its response retains
+the existing `ChunkInfo` shape (`content`, `num_tokens`). It does not relax the
+owner checks on `/api/asv3/citation/...` or add inline text to shared/anonymous
+history. Query History may load passage text on demand; supported normal owned
+ASv3 responses continue to provide inline `text` as before.
+
+In every view, keep the number and official file title, and show `reference`
+separately. Two citations may deliberately share an official title or chunk.
+Selection/copy must preserve their original citation numbers and links. An empty
+supplied `text` remains supplied content; it must not trigger replacement fetches.
+
+## Metadata-only source notices
+
+The separate `regulatory_source_notice` catalogue does not contain original
+passages. A `notice:<UUID>` or name-only `catalog:` observation must not become
+`citation_info`, a numbered legal citation or a canonical preview target. Its
+repeal annotation does not supply a missing article or an unknown repeal date.
+Only an ordinarily acquired and validated real source can supply a citation.
+See [Metadata-only regulatory source notices](regulatory-source-notices.md).
