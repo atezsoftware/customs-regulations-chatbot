@@ -59,6 +59,8 @@ export interface MinimalOnyxDocument {
   citation_number?: number;
   citation_chunk_ind?: number;
   citation_preview_url?: string;
+  citation_chunk_id?: string | null;
+  citation_text?: string | null;
 }
 
 export interface CitationPreviewDocument extends MinimalOnyxDocument {

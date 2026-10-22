@@ -4,7 +4,7 @@ import {
   SearchOnyxDocument,
   StreamStopReason,
 } from "@/lib/search/interfaces";
-import { Packet } from "./services/streamingModels";
+import { CitationInfo, Packet } from "@/app/app/services/streamingModels";
 import { ReasoningEffortOverride } from "@/lib/languageModels/types";
 
 export type FeedbackType = "like" | "dislike";
@@ -265,6 +265,7 @@ export interface BackendMessage {
   alternate_assistant_id: number | null; // TODO: rename to agent — https://linear.app/onyx-app/issue/ENG-3766
   chat_session_id: string;
   citations: CitationMap | null;
+  citation_info?: CitationInfo[] | null;
   files: FileDescriptor[];
   tool_call: ToolCallFinalResult | null;
   current_feedback: string | null;

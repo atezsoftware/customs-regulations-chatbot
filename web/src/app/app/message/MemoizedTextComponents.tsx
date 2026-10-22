@@ -190,8 +190,13 @@ export const MemoizedLink = memo(
     // Convert document to SourceInfo for SourceTag
     const documentSourceInfo = useMemo(() => {
       if (!document) return null;
-      return documentToSourceInfo(document as OnyxDocument);
-    }, [document]);
+      const info = documentToSourceInfo(document as OnyxDocument);
+      return {
+        ...info,
+        title: citation?.display_title?.trim() || info.title,
+        description: citation?.text ?? info.description,
+      };
+    }, [citation?.display_title, citation?.text, document]);
 
     // Convert question to SourceInfo for SourceTag
     const questionSourceInfo = useMemo(() => {
@@ -206,7 +211,8 @@ export const MemoizedLink = memo(
         if (
           citedDocument.source_type === ValidSources.Web &&
           citedDocument.is_internet &&
-          !citation.preview_url
+          !citation.preview_url &&
+          citation.text == null
         ) {
           openExternalCitation(citedDocument.link);
         } else {
@@ -232,7 +238,8 @@ export const MemoizedLink = memo(
       }
 
       const displayName = document
-        ? getDisplayNameForSource(document as OnyxDocument)
+        ? citation?.display_title?.trim() ||
+          getDisplayNameForSource(document as OnyxDocument)
         : question?.question || "Question";
 
       return (

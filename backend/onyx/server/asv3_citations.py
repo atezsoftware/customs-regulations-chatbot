@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends
 from pydantic import JsonValue
 from sqlalchemy.orm import Session
 
+from onyx.asv3.citation_identity import saved_item_from_checkpoint
 from onyx.asv3.corpus_tools import CorpusBroker
 from onyx.asv3.models import EvidenceItem, RunContext
 from onyx.auth.permissions import require_permission
@@ -20,46 +21,6 @@ from onyx.natural_language_processing.utils import get_tokenizer
 from onyx.server.documents.models import ChunkInfo
 
 router = APIRouter(prefix="/asv3")
-
-
-def saved_item_from_checkpoint(
-    checkpoint: dict[str, JsonValue], number: int
-) -> tuple[EvidenceItem, IndexFilters]:
-    scope = checkpoint.get("scope")
-    evidence = checkpoint.get("evidence")
-    if number < 1 or not isinstance(scope, dict) or not isinstance(evidence, dict):
-        raise ValueError("Invalid citation checkpoint")
-    if evidence.get("version") != 1:
-        raise ValueError("Unsupported citation ledger version")
-    records = evidence.get("records")
-    if not isinstance(records, list):
-        raise ValueError("Missing citation ledger")
-    record = next(
-        (
-            row
-            for row in records
-            if isinstance(row, dict) and row.get("citation") == number
-        ),
-        None,
-    )
-    if record is None:
-        raise ValueError("Citation not found")
-    item = EvidenceItem.model_validate(record.get("item"))
-    if item.search_doc is None or item.search_doc.document_id != item.source_id:
-        raise ValueError("Citation source identity differs from saved evidence")
-    if item.chunk_id is None:
-        if (
-            not item.metadata.get("derived")
-            or not item.metadata.get("source_sha256")
-            or item.search_doc.chunk_ind != -number
-        ):
-            raise ValueError("Citation is not verified native evidence")
-    elif (
-        item.search_doc.chunk_ind < 0
-        or item.search_doc.metadata.get("regulatory_chunk_id") != item.chunk_id
-    ):
-        raise ValueError("Citation canonical identity differs from saved evidence")
-    return item, IndexFilters.model_validate(scope)
 
 
 def native_item_from_checkpoint(

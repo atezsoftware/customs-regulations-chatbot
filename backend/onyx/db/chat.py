@@ -28,6 +28,7 @@ from onyx.file_store.file_store import get_default_file_store
 from onyx.file_store.models import FileDescriptor
 from onyx.llm.override_models import LLMOverride, PromptOverride
 from onyx.server.query_and_chat.models import ChatMessageDetail
+from onyx.server.query_and_chat.streaming_models import CitationInfo
 from onyx.utils.logger import setup_logger
 from onyx.utils.postgres_sanitization import sanitize_string
 
@@ -951,6 +952,8 @@ def translate_db_search_doc_to_saved_search_doc(
 def translate_db_message_to_chat_message_detail(
     chat_message: ChatMessage,
     remove_doc_content: bool = False,
+    *,
+    citation_info: Sequence[CitationInfo] | None = None,
 ) -> ChatMessageDetail:
     # Get current feedback if any
     current_feedback = None
@@ -982,6 +985,27 @@ def translate_db_message_to_chat_message_detail(
     top_documents = sorted(
         top_documents, key=lambda doc: doc.score or 0.0, reverse=True
     )
+    presented_citations = list(citation_info or []) if not remove_doc_content else []
+    titles = {
+        (citation.document_id, citation.chunk_ind): citation.display_title
+        for citation in presented_citations
+        if citation.display_title is not None
+    }
+    top_documents = [
+        document.model_copy(
+            update={
+                "metadata": {
+                    **document.metadata,
+                    "asv3_source_display_name": titles[
+                        (document.document_id, document.chunk_ind)
+                    ],
+                }
+            }
+        )
+        if (document.document_id, document.chunk_ind) in titles
+        else document
+        for document in top_documents
+    ]
     chat_msg_detail = ChatMessageDetail(
         chat_session_id=chat_message.chat_session_id,
         message_id=chat_message.id,
@@ -992,6 +1016,7 @@ def translate_db_message_to_chat_message_detail(
         message_type=chat_message.message_type,
         context_docs=top_documents,
         citations=converted_citations,
+        citation_info=presented_citations,
         time_sent=chat_message.time_sent,
         files=chat_message.files or [],
         error=chat_message.error,
@@ -1012,6 +1037,7 @@ def translate_db_message_to_chat_message_detail(
                 "error": error,
                 "context_docs": [],
                 "citations": None,
+                "citation_info": [],
                 "reasoning_tokens": None,
                 "files": [],
             }

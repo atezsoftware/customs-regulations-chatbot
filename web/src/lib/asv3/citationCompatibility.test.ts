@@ -11,6 +11,7 @@ import {
   createSearchToolStartPacket,
 } from "@/app/app/message/messageComponents/timeline/hooks/__tests__/testHelpers";
 import type { Packet } from "@/app/app/services/streamingModels";
+import { getCitations, withCitationInfo } from "@/app/app/services/packetUtils";
 
 it("keeps chunk-specific citations and final answer when progress interleaves, including replay", () => {
   const packets: Packet[] = [
@@ -64,6 +65,55 @@ it("keeps chunk-specific citations and final answer when progress interleaves, i
     expect(state.finalAnswerComing).toBe(true);
     expect(collectASv3Progress(packets).terminal).toBe(true);
   }
+});
+
+it("retains official titles and exact texts by citation number through history hydration and replay", () => {
+  const citationInfo = [
+    {
+      type: "citation_info" as const,
+      citation_number: 10,
+      document_id: "same-file",
+      chunk_ind: 7,
+      chunk_id: "canonical-7",
+      display_title: "Resmî Başlık",
+      text: "Madde 7 özgün metni",
+    },
+    {
+      type: "citation_info" as const,
+      citation_number: 11,
+      document_id: "same-file",
+      chunk_ind: 12,
+      chunk_id: "canonical-12",
+      display_title: "Resmî Başlık",
+      text: "Madde 12 özgün metni",
+    },
+    {
+      type: "citation_info" as const,
+      citation_number: 12,
+      document_id: "same-file",
+      chunk_ind: 12,
+      chunk_id: "canonical-12",
+      display_title: "Resmî Başlık",
+      text: "Madde 12 özgün metni",
+    },
+  ];
+  const legacyPackets = [
+    createCitationPacket(10, "same-file", { turn_index: 2 }, 7),
+    createMessageStartPacket({ turn_index: 2 }),
+    createStopPacket(),
+  ];
+  const hydrated = withCitationInfo(legacyPackets, citationInfo);
+  expect(withCitationInfo(legacyPackets, undefined)).toBe(legacyPackets);
+  expect(withCitationInfo(hydrated, citationInfo)).toEqual(hydrated);
+  const state = processPackets(createInitialState(1), hydrated);
+  expect(state.citations).toHaveLength(3);
+  expect(getCitations(hydrated)).toEqual(state.citations);
+  expect(state.citations).toEqual(
+    citationInfo.map(({ type: _type, citation_number, ...citation }) =>
+      expect.objectContaining({ ...citation, citation_num: citation_number })
+    )
+  );
+  expect(state.citationChunkMap).toEqual({ 10: 7, 11: 12, 12: 12 });
 });
 
 it("does not let operational progress occupy the final answer placement", () => {

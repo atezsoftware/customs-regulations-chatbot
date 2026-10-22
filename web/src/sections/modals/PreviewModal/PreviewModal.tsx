@@ -90,6 +90,12 @@ export default function PreviewModal({
       setFileName(originalFileName);
 
       if (isCitationChunk) {
+        if (presentingDocument.citation_text != null) {
+          setMimeType("text/plain");
+          setFileContent(presentingDocument.citation_text);
+          updateFileUrl("");
+          return;
+        }
         let citationUrl: string;
         if (presentingDocument.citation_preview_url) {
           // Native targets are derived by the server from an owned saved message.

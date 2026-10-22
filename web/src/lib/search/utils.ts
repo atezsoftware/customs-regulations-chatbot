@@ -64,8 +64,12 @@ export const openCitation = (
     preview_type: "citation",
     citation_number: citation.citation_num,
     document_id: citation.document_id,
-    semantic_identifier: semanticIdentifier,
+    semantic_identifier: citation.display_title?.trim() || semanticIdentifier,
     citation_chunk_ind: citation.chunk_ind,
+    ...(citation.chunk_id !== undefined
+      ? { citation_chunk_id: citation.chunk_id }
+      : {}),
+    ...(citation.text !== undefined ? { citation_text: citation.text } : {}),
     ...(citation.preview_url
       ? { citation_preview_url: citation.preview_url }
       : {}),
