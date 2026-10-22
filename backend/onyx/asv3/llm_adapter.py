@@ -96,6 +96,10 @@ from onyx.asv3.source_metadata_transport import (
     expand_source_metadata,
     share_source_metadata,
 )
+from onyx.asv3.source_notices import (
+    SOURCE_NOTICE_USAGE_RULE,
+    source_notices_for_model,
+)
 from onyx.asv3.terminal_fact_references import (
     bind_terminal_fact_references,
     normalize_terminal_fact_references,
@@ -1220,10 +1224,17 @@ class ResearchModel:
     ) -> tuple[list[ChatCompletionMessage], list[dict[str, JsonValue]], int]:
         ceiling, output = self._limits(max_tokens)
         selected = tools
+        payload: dict[str, JsonValue] | None
         try:
             payload = parse_json_object(data)
         except ValueError:
             payload = None
+        notices = source_notices_for_model(self.context)
+        if notices:
+            instruction += "\n\n" + SOURCE_NOTICE_USAGE_RULE
+            if payload is None:
+                payload = {"input": data}
+            payload["source_notices"] = notices
         if payload is not None:
             evidence = payload.get("evidence")
             encoded_evidence = isinstance(evidence, str)
@@ -3190,6 +3201,11 @@ class ResearchModel:
             "language": self.context.language,
             "request": view.request,
         }
+        notices = source_notices_for_model(self.context)
+        if notices:
+            context["source_notices"] = notices
+            instruction += "\n\n" + SOURCE_NOTICE_USAGE_RULE
+            prefix[0] = SystemMessage(content=instruction)
         from onyx.asv3.cropped_context_pressure import cropped_context_pressure
 
         pressure = cropped_context_pressure(

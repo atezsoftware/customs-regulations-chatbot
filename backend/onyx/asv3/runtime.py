@@ -125,6 +125,7 @@ from onyx.asv3.session_research import (
     session_research_checkpoint,
 )
 from onyx.asv3.shared_reads import SharedReads
+from onyx.asv3.source_notices import SOURCE_NOTICE_STATE_SERVICE, SourceNoticeState
 from onyx.asv3.source_tools import build_source_specs
 from onyx.asv3.supplemental_tools import (
     ScenarioState,
@@ -709,6 +710,19 @@ def run_asv3_loop(
             research_profile == "experimental" or workflow_variant == ASV3_TUNED_VARIANT
         ),
     )
+    notice_state: SourceNoticeState | None = None
+    if (
+        checkpoint_workflow_variant in {ASV3_STANDARD_VARIANT, ASV3_EXP_CROPPED_VARIANT}
+        and research_profile == "normal"
+        and not parallel_research
+    ):
+        notice_state = SourceNoticeState(
+            context,
+            lambda queries, identifiers: broker.source_notices(
+                queries, identifiers, context
+            ),
+        )
+        context.services[SOURCE_NOTICE_STATE_SERVICE] = notice_state
     if parallel_research or workflow_variant == ASV3_TUNED_VARIANT:
 
         def shared_producer(caller: RunContext) -> RunContext:
@@ -1017,6 +1031,8 @@ def run_asv3_loop(
                 )
                 if source_reviews is not None:
                     snapshot["legal_source_reviews"] = source_reviews.export()
+                if notice_state is not None:
+                    snapshot["source_notices"] = notice_state.export()
                 if authority_requirements is not None:
                     snapshot["authority_requirements"] = authority_requirements.export()
                 if cheap_authority_policy is not None:
@@ -1258,6 +1274,8 @@ def run_asv3_loop(
                     snapshot["governing_original_acquisitions"] = (
                         governing_acquisitions.export()
                     )
+                if notice_state is not None:
+                    snapshot["source_notices"] = notice_state.export()
                 if cheap_authority_policy is not None:
                     snapshot["cheap_authority_policy"] = cheap_authority_policy.export()
                 if cheap_source_review_policy is not None:
@@ -1386,6 +1404,20 @@ def run_asv3_loop(
         context.services["cropped_repair_checkpoint"] = root_checkpoint
 
     def record(receipt: ToolReceipt) -> None:
+        if notice_state is not None:
+            reference_sources: list[str] = []
+            crossrefs = context.services.get("cropped_cross_references")
+            if isinstance(crossrefs, CroppedCrossReferencePolicy):
+                reference_sources = crossrefs.referenced_source_ids(context)
+            notice_state.observe_receipt(
+                receipt,
+                (
+                    item
+                    for number in receipt.evidence_ids
+                    if (item := ledger.get(number)) is not None
+                ),
+                referenced_source_ids=reference_sources,
+            )
         acquisition_recorded = (
             governing_acquisitions is not None
             and governing_acquisitions.record_receipt(receipt, context, ledger)
@@ -2660,6 +2692,39 @@ def run_asv3_loop(
             checkpoint_sequence = saved_sequence
             if parallel_answers is not None and question_research.answers:
                 question_research.assemble_retained_answers()
+        if notice_state is not None:
+            saved_notices = previous.get("source_notices") if previous else None
+            if saved_notices is not None:
+                if not isinstance(saved_notices, dict):
+                    raise ValueError("Invalid source notice checkpoint")
+                notice_state.restore(saved_notices)
+            notice_state.observe_text(question)
+            retained = [
+                item
+                for number in ledger.citation_numbers()
+                if (item := ledger.get(number)) is not None
+            ]
+            crossrefs = context.services.get("cropped_cross_references")
+            reference_sources = {
+                item.source_id
+                for receipt in harness.receipts
+                if receipt.call.name == "follow_reference"
+                for number in receipt.evidence_ids
+                if (item := ledger.get(number)) is not None
+            }
+            if isinstance(crossrefs, CroppedCrossReferencePolicy):
+                reference_sources.update(crossrefs.referenced_source_ids(context))
+            notice_state.observe_receipt(
+                ToolReceipt(
+                    call=CapabilityCall(name="restore_source_notices"),
+                    outcome=ToolOutcome(
+                        status=OutcomeStatus.FOUND, summary="Retained originals"
+                    ),
+                    elapsed_seconds=0,
+                ),
+                retained,
+                referenced_source_ids=reference_sources,
+            )
         if (
             governing_acquisitions is not None
             or parallel_research
@@ -2812,6 +2877,8 @@ def run_asv3_loop(
         numbers = extract_citation_numbers(final)
         if set(numbers) - allowed.keys():
             raise ValueError("ASv3 final answer contains unrecorded citation targets")
+        if notice_state is not None:
+            notice_state.assert_current_access()
         revalidate([item for n in numbers if (item := ledger.get(n))])
         state_container.add_search_docs(list(allowed.values()))
         state_container.set_pre_answer_processing_time(time.monotonic() - start)

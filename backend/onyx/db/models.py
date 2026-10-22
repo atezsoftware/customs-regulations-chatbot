@@ -5826,6 +5826,73 @@ class UserFileProjectionRepair(Base):
     )
 
 
+class RegulatorySourceNotice(Base):
+    """An access-scoped catalogue entry with no fabricated source content."""
+
+    __tablename__ = "regulatory_source_notice"
+
+    id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid4
+    )
+    document_set_id: Mapped[int] = mapped_column(
+        ForeignKey("document_set.id", ondelete="RESTRICT"), nullable=False
+    )
+    identity_key: Mapped[str] = mapped_column(Text, nullable=False)
+    instrument_type: Mapped[str] = mapped_column(Text, nullable=False)
+    instrument_number: Mapped[str | None] = mapped_column(Text, nullable=True)
+    instrument_year: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    instrument_date: Mapped[datetime.date | None] = mapped_column(Date, nullable=True)
+    catalog_title: Mapped[str] = mapped_column(Text, nullable=False)
+    aliases: Mapped[list[str]] = mapped_column(
+        PGJSONB, nullable=False, default=list, server_default=text("'[]'::jsonb")
+    )
+    legistation_metadata: Mapped[dict[str, Any]] = mapped_column(
+        PGJSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
+    )
+    provenance: Mapped[dict[str, Any]] = mapped_column(
+        PGJSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
+    )
+    content_state: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="metadata_only",
+        server_default=text("'metadata_only'"),
+    )
+    user_file_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("user_file.id", ondelete="RESTRICT"), nullable=True
+    )
+    revision: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default=text("1")
+    )
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "document_set_id",
+            "identity_key",
+            name="uq_regulatory_source_notice_identity",
+        ),
+        CheckConstraint("revision >= 1", name="ck_regulatory_source_notice_revision"),
+        CheckConstraint(
+            "(content_state = 'metadata_only' AND user_file_id IS NULL) OR "
+            "(content_state = 'materialized' AND user_file_id IS NOT NULL)",
+            name="ck_regulatory_source_notice_content_state",
+        ),
+        Index(
+            "ix_regulatory_source_notice_instrument",
+            "document_set_id",
+            "instrument_type",
+            "instrument_year",
+            "instrument_number",
+        ),
+    )
+
+
 class RegulatoryChunk(Base):
     """A structure-aware chunk of a regulatory user file.
 
