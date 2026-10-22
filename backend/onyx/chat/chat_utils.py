@@ -341,12 +341,8 @@ def reorganize_citations(
             if matching_citation is None:
                 continue
 
-            new_citation_info[citation_num] = CitationInfo(
-                citation_number=len(new_citation_info) + 1,
-                document_id=matching_citation.document_id,
-                chunk_ind=matching_citation.chunk_ind,
-                semantic_identifier=matching_citation.semantic_identifier,
-                source_type=matching_citation.source_type,
+            new_citation_info[citation_num] = matching_citation.model_copy(
+                update={"citation_number": len(new_citation_info) + 1}
             )
         except Exception:
             pass

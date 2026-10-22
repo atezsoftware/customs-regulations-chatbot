@@ -548,7 +548,7 @@ class DynamicCitationProcessor:
                         chunk_ind=search_doc.chunk_ind,
                         semantic_identifier=search_doc.semantic_identifier,
                         source_type=search_doc.source_type,
-                    )
+                    ).with_source_metadata(search_doc.metadata, link=search_doc.link)
                 )
 
         # Join all citation parts with spaces

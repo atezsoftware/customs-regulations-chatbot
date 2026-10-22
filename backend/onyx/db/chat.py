@@ -1,4 +1,4 @@
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Tuple
 from uuid import UUID
@@ -949,11 +949,103 @@ def translate_db_search_doc_to_saved_search_doc(
     )
 
 
+def load_saved_citation_documents(
+    db_session: Session, messages: Sequence[ChatMessage]
+) -> dict[int, DBSearchDoc]:
+    """Resolve missing citation associations in one read without changing history."""
+    documents = {doc.id: doc for message in messages for doc in message.search_docs}
+    missing = {
+        doc_id
+        for message in messages
+        for doc_id in (message.citations or {}).values()
+        if doc_id not in documents
+    }
+    if missing:
+        documents.update(
+            (doc.id, doc)
+            for doc in db_session.scalars(
+                select(DBSearchDoc).where(DBSearchDoc.id.in_(missing))
+            )
+        )
+    return documents
+
+
+def saved_message_citation_info(
+    message: ChatMessage,
+    *,
+    documents: Mapping[int, DBSearchDoc] | None = None,
+    overrides: Sequence[CitationInfo] | None = None,
+) -> list[CitationInfo]:
+    """Keep each saved citation's exact target in both JSON history and replay."""
+    from onyx.chat.citation_utils import extract_citation_order_from_text
+    from onyx.db.asv3_runs import ASV3_CHECKPOINT_TOOL_ID
+    from onyx.db.regulatory_chat_reads import message_publication_available
+
+    if not message_publication_available(message):
+        return []
+    saved_docs = (
+        documents
+        if documents is not None
+        else {doc.id: doc for doc in message.search_docs}
+    )
+    enriched = {item.citation_number: item for item in overrides or []}
+    asv3 = any(
+        tool.tool_id == ASV3_CHECKPOINT_TOOL_ID for tool in message.tool_calls or []
+    )
+    citations: list[CitationInfo] = []
+    for raw_number, document_id in (message.citations or {}).items():
+        if not str(raw_number).isdigit() or int(raw_number) < 1:
+            continue
+        number = int(raw_number)
+        document = saved_docs.get(document_id)
+        if document is None or document.document_id.startswith(("notice:", "catalog:")):
+            continue
+        metadata = getattr(document, "doc_metadata", None) or {}
+        if metadata.get("metadata_only") is True:
+            continue
+        target = CitationInfo(
+            citation_number=number,
+            document_id=document.document_id,
+            chunk_ind=document.chunk_ind,
+            semantic_identifier=document.semantic_id,
+            source_type=document.source_type,
+            preview_url=(
+                f"/api/asv3/citation/{message.id}/{number}"
+                if metadata.get("asv3_native_locator")
+                or (asv3 and metadata.get("regulatory_chunk_id"))
+                else None
+            ),
+        ).with_source_metadata(metadata, link=getattr(document, "link", None))
+        override = enriched.get(number)
+        if override is not None and (override.document_id, override.chunk_ind) == (
+            target.document_id,
+            target.chunk_ind,
+        ):
+            target = override.model_copy(
+                update={
+                    "reference": override.reference
+                    if override.reference is not None
+                    else target.reference,
+                    "link": override.link if override.link is not None else target.link,
+                }
+            )
+        citations.append(target)
+    order = {
+        number: index
+        for index, number in enumerate(
+            extract_citation_order_from_text(message.message or "")
+        )
+    }
+    citations.sort(key=lambda item: order.get(item.citation_number, float("inf")))
+    return citations
+
+
 def translate_db_message_to_chat_message_detail(
     chat_message: ChatMessage,
     remove_doc_content: bool = False,
     *,
     citation_info: Sequence[CitationInfo] | None = None,
+    citation_documents: Mapping[int, DBSearchDoc] | None = None,
 ) -> ChatMessageDetail:
     # Get current feedback if any
     current_feedback = None
@@ -964,10 +1056,15 @@ def translate_db_message_to_chat_message_detail(
 
     # Convert citations from {citation_num: db_doc_id} to {citation_num: document_id}
     converted_citations = None
-    if chat_message.citations and chat_message.search_docs:
+    if chat_message.citations:
         # Build lookup map: db_doc_id -> document_id
         db_doc_id_to_document_id = {
-            doc.id: doc.document_id for doc in chat_message.search_docs
+            saved_id: doc.document_id
+            for saved_id, doc in (
+                citation_documents
+                if citation_documents is not None
+                else {doc.id: doc for doc in chat_message.search_docs}
+            ).items()
         }
 
         converted_citations = {}
@@ -985,7 +1082,13 @@ def translate_db_message_to_chat_message_detail(
     top_documents = sorted(
         top_documents, key=lambda doc: doc.score or 0.0, reverse=True
     )
-    presented_citations = list(citation_info or []) if not remove_doc_content else []
+    presented_citations = (
+        saved_message_citation_info(
+            chat_message, documents=citation_documents, overrides=citation_info
+        )
+        if not remove_doc_content
+        else []
+    )
     titles = {
         (citation.document_id, citation.chunk_ind): citation.display_title
         for citation in presented_citations

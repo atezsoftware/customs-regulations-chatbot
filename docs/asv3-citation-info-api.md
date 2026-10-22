@@ -208,3 +208,34 @@ passages. A `notice:<UUID>` or name-only `catalog:` observation must not become
 repeal annotation does not supply a missing article or an unknown repeal date.
 Only an ordinarily acquired and validated real source can supply a citation.
 See [Metadata-only regulatory source notices](regulatory-source-notices.md).
+
+## Reading citations in an external API client
+
+`POST /api/chat/send-chat-message` retains each full `citation_info` object in
+both the streamed packets and the `stream: false` JSON response. Each record now
+also carries the recorded `reference` (for example, `Gümrük Kanunu > MADDE 241`)
+and source `link` when available. These location fields do not require a research
+profile change. The existing eligibility and access checks for inline `text` and
+official `display_title` remain unchanged.
+
+For `GET /api/chat/get-chat-session/{session_id}`, every resolved saved citation
+also appears in `messages[].citation_info`, including workflows without inline
+text enrichment. The JSON records and replay packets use the same exact saved
+document/chunk targets and first-use order. If enrichment is unavailable, basic
+targets remain visible without gaining private source text. Content-stripped and
+publication-unavailable responses continue to omit citation details.
+
+External clients must render one entry per `(message_id, citation_number)`.
+`display_title` identifies the file; `reference` identifies the recorded passage
+location. Several entries may have the same title or `document_id`. Neither
+`top_documents` nor `context_docs` is the numbered citation list: they include
+retrieved documents and must not be used to infer citation numbers or select a
+same-file replacement. For instance, `[97]` can point to article 241 while
+`[250]` points to article 242 of the same file. Citation numbers are not article
+numbers.
+
+Use the record's supplied `text`, including an empty string, or its authenticated
+`preview_url`. A missing `reference` means no usable location was recorded; it
+does not permit guessing an article from the citation number or another chunk.
+These changes do not broaden the separately restricted external-share projection
+at `/api/chat/shared/{share_token}/messages`.

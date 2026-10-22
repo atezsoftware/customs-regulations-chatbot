@@ -207,7 +207,8 @@ def test_revoked_access_preserves_legacy_response_without_inline_text(
     message, _ = fixture_message()
     fences[1].side_effect = error
     response = _get_session(monkeypatch, [message], run_id=None)
-    assert response.messages[0].citation_info == []
+    assert [row.citation_number for row in response.messages[0].citation_info] == [1, 5]
+    assert all(row.text is None for row in response.messages[0].citation_info)
     assert response.messages[0].citations == {1: str(SOURCE_ID), 5: str(SOURCE_ID)}
     assert all(
         packet.obj.text is None
@@ -286,7 +287,8 @@ def test_corrupt_checkpoint_does_not_break_old_history(
     assert message.tool_calls
     message.tool_calls[0].tool_call_response = "invalid checkpoint"
     response = _get_session(monkeypatch, [message], run_id=None)
-    assert response.messages[0].citation_info == []
+    assert [row.citation_number for row in response.messages[0].citation_info] == [1, 5]
+    assert all(row.text is None for row in response.messages[0].citation_info)
     for mock in fences:
         mock.assert_not_called()
 
