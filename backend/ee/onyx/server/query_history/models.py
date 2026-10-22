@@ -1,16 +1,29 @@
+from collections.abc import Mapping
 from datetime import datetime
 from uuid import UUID
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from ee.onyx.background.task_name_builders import QUERY_HISTORY_TASK_NAME_PREFIX
+from ee.onyx.db.query_history_citations import (
+    history_citation_info,
+    history_document_metadata,
+)
 from onyx.auth.users import get_display_email
 from onyx.background.task_utils import extract_task_id_from_query_history_report_name
-from onyx.configs.constants import MessageType, QAFeedbackType, SessionType
+from onyx.configs.constants import (
+    DocumentSource,
+    MessageType,
+    QAFeedbackType,
+    SessionType,
+)
 from onyx.db.enums import TaskStatus
 from onyx.db.models import ChatMessage, ChatSession, FileRecord, TaskQueueState
+from onyx.db.models import SearchDoc as DBSearchDoc
+from onyx.db.regulatory_chat_reads import message_publication_available
 from onyx.llm.usage_cost import ResponseUsage
 from onyx.server.query_and_chat.models import SessionFeedbackResponse
+from onyx.server.query_and_chat.streaming_models import CitationInfo
 
 ONYX_ANONYMIZED_EMAIL = "anonymous@anonymous.invalid"
 
@@ -52,6 +65,11 @@ class AbridgedSearchDoc(BaseModel):
     document_id: str
     semantic_identifier: str
     link: str | None
+    chunk_ind: int | None = None
+    source_type: DocumentSource | None = None
+    is_internet: bool = False
+    blurb: str | None = None
+    metadata: dict[str, str | list[str]] = Field(default_factory=dict)
 
 
 class MessageSnapshot(BaseModel):
@@ -64,9 +82,23 @@ class MessageSnapshot(BaseModel):
     feedback_text: str | None
     time_created: datetime
     usage: ResponseUsage | None = None
+    citation_info: list[CitationInfo] = Field(default_factory=list)
+    unresolved_citations: list[int] = Field(default_factory=list)
 
     @classmethod
-    def build(cls, message: ChatMessage) -> "MessageSnapshot":
+    def build(
+        cls,
+        message: ChatMessage,
+        *,
+        citation_documents: Mapping[int, DBSearchDoc] | None = None,
+    ) -> "MessageSnapshot":
+        publication_available = message_publication_available(message)
+        citations, unresolved = history_citation_info(
+            message,
+            citation_documents
+            if citation_documents is not None
+            else {doc.id: doc for doc in message.search_docs},
+        )
         latest_messages_feedback_obj = (
             message.chat_message_feedbacks[-1]
             if len(message.chat_message_feedbacks) > 0
@@ -91,13 +123,21 @@ class MessageSnapshot(BaseModel):
             message=message.message,
             message_type=message.message_type,
             model_display_name=message.model_display_name,
+            citation_info=citations,
+            unresolved_citations=unresolved,
             documents=[
                 AbridgedSearchDoc(
                     document_id=document.document_id,
                     semantic_identifier=document.semantic_id,
                     link=document.link,
+                    chunk_ind=document.chunk_ind,
+                    source_type=document.source_type,
+                    is_internet=bool(document.is_internet),
+                    blurb=document.blurb,
+                    metadata=history_document_metadata(document),
                 )
                 for document in message.search_docs
+                if publication_available
             ],
             feedback_type=feedback_type,
             feedback_text=feedback_text,

@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from http import HTTPStatus
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
@@ -14,6 +14,12 @@ from ee.onyx.db.query_history import (
     get_page_of_chat_sessions,
     get_total_filtered_chat_sessions_count,
 )
+from ee.onyx.db.query_history_citations import (
+    citation_documents,
+    history_citation_message,
+    is_external_citation,
+    retained_citation,
+)
 from ee.onyx.server.query_history.models import (
     ChatSessionMinimal,
     ChatSessionSnapshot,
@@ -21,6 +27,8 @@ from ee.onyx.server.query_history.models import (
     QueryHistoryExport,
     QueryHistoryIdentity,
 )
+from onyx.asv3.corpus_tools import CorpusBroker
+from onyx.asv3.models import RunContext, RunStopped
 from onyx.auth.permissions import require_permission
 from onyx.background.celery.versioned_apps.client import app as client_app
 from onyx.background.task_utils import construct_query_history_report_name
@@ -36,6 +44,9 @@ from onyx.configs.constants import (
     QueryHistoryType,
     SessionType,
 )
+from onyx.context.search.models import IndexFilters
+from onyx.db.asv3_corpus import CorpusScopeUnavailable
+from onyx.db.asv3_runs import ASV3_CHECKPOINT_TOOL_ID
 from onyx.db.chat import (
     get_chat_messages_by_session,
     get_chat_session_by_id,
@@ -45,13 +56,16 @@ from onyx.db.engine.sql_engine import get_session
 from onyx.db.enums import Permission, TaskStatus
 from onyx.db.file_record import get_query_history_export_files
 from onyx.db.models import ChatSession, User
+from onyx.db.regulatory_chat_reads import message_publication_available
 from onyx.db.response_usage import get_response_usage
 from onyx.db.tasks import get_task_with_id, register_task
 from onyx.error_handling.error_codes import OnyxErrorCode
 from onyx.error_handling.exceptions import OnyxError
 from onyx.file_store.file_store import get_default_file_store
 from onyx.llm.usage_cost import ResponseUsage
-from onyx.server.documents.models import PaginatedReturn
+from onyx.natural_language_processing.utils import get_tokenizer
+from onyx.server.documents.document import get_chunk_info
+from onyx.server.documents.models import ChunkInfo, PaginatedReturn
 from onyx.server.query_and_chat.models import (
     ChatSessionDetails,
     ChatSessionsResponse,
@@ -147,15 +161,16 @@ def snapshot_from_chat_session(
     usage = get_response_usage(
         db_session, [message.id for message in messages], admin=True
     )
+    saved_documents = citation_documents(db_session, messages)
 
     return ChatSessionSnapshot(
         id=chat_session.id,
         **QueryHistoryIdentity.from_chat_session(chat_session).model_dump(),
         name=chat_session.description,
         messages=[
-            MessageSnapshot.build(message).model_copy(
-                update={"usage": usage.get(message.id)}
-            )
+            MessageSnapshot.build(
+                message, citation_documents=saved_documents
+            ).model_copy(update={"usage": usage.get(message.id)})
             for message in messages
             if message.message_type != MessageType.SYSTEM
         ],
@@ -294,7 +309,14 @@ def get_chat_session_history(
     )
 
 
-@router.get("/admin/chat-session-history/{chat_session_id}")
+def private_history_response(response: Response) -> None:
+    response.headers["Cache-Control"] = "private, no-store"
+
+
+@router.get(
+    "/admin/chat-session-history/{chat_session_id}",
+    dependencies=[Depends(private_history_response)],
+)
 def get_chat_session_admin(
     chat_session_id: UUID,
     _: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
@@ -330,6 +352,67 @@ def get_chat_session_admin(
         snapshot.anonymize_identity()
 
     return snapshot
+
+
+@router.get(
+    "/admin/chat-session-history/{chat_session_id}/citation/{message_id}/{citation_number}"
+)
+def get_query_history_citation(
+    chat_session_id: UUID,
+    message_id: int,
+    citation_number: int,
+    response: Response,
+    user: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
+    db_session: Session = Depends(get_session),
+) -> ChunkInfo:
+    response.headers["Cache-Control"] = "private, no-store"
+    ensure_query_history_is_enabled(disallowed=[QueryHistoryType.DISABLED])
+    try:
+        message = history_citation_message(db_session, chat_session_id, message_id)
+        documents = citation_documents(db_session, [message])
+        saved = {
+            int(number): doc_id for number, doc_id in (message.citations or {}).items()
+        }
+        document = documents[saved[citation_number]]
+        if (
+            document.document_id.startswith(("notice:", "catalog:"))
+            or (document.doc_metadata or {}).get("metadata_only") is True
+        ):
+            raise ValueError("Catalogue notices are not original evidence")
+        asv3 = any(
+            tool.tool_id == ASV3_CHECKPOINT_TOOL_ID for tool in message.tool_calls or []
+        )
+        if not asv3:
+            if document.chunk_ind < 0 or is_external_citation(document):
+                raise ValueError("Citation has no indexed original")
+            preview = get_chunk_info(
+                document.document_id, document.chunk_ind, user, db_session
+            )
+            if not message_publication_available(message):
+                raise ValueError("Citation publication changed")
+            return preview
+        item, checkpoint = retained_citation(message, citation_number, document)
+        filters = IndexFilters.model_validate(checkpoint.get("scope"))
+        context = RunContext(scope=filters.model_dump(mode="json"), timeout_seconds=30)
+        context.services["asv3_exp_cropped"] = True
+        CorpusBroker(user, filters).revalidate_evidence([item], context)
+        if not message_publication_available(message):
+            raise ValueError("Citation publication changed")
+        return ChunkInfo(
+            content=item.text,
+            num_tokens=len(get_tokenizer(None, None).encode(item.text)),
+        )
+    except (
+        ValueError,
+        KeyError,
+        StopIteration,
+        PermissionError,
+        CorpusScopeUnavailable,
+        TimeoutError,
+        RunStopped,
+        OnyxError,
+    ) as error:
+        raise OnyxError(OnyxErrorCode.NOT_FOUND, "Citation not available") from error
 
 
 @router.get("/admin/query-history/list")

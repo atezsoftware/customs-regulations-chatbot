@@ -161,6 +161,11 @@ class CitationInfo(BaseObj):
     display_title: str | None = None
     chunk_id: str | None = None
     text: str | None = None
+    link: str | None = None
+    reference: str | None = None
+    resolution_status: (
+        Literal["retained", "current", "external", "unavailable"] | None
+    ) = None
 
 
 class ToolCallDebug(BaseObj):
