@@ -71,7 +71,7 @@ describe("QueryHistoryTranscript", () => {
         chunk_ind: citation_number,
         chunk_id: `rc-${citation_number}`,
         display_title: "Official source title",
-        reference: `MADDE ${citation_number}`,
+        reference: `MADDE ${citation_number === 4 ? 241 : 242}`,
         source_type: ValidSources.File,
         text: `\n Passage ${citation_number} original text \n`,
         resolution_status: "retained",
@@ -80,8 +80,8 @@ describe("QueryHistoryTranscript", () => {
     render(<QueryHistoryTranscript messages={[answer]} />);
     const references = screen.getByLabelText("Yanıtta kullanılan atıflar");
     expect(references).toHaveTextContent("Yanıtta kullanılan atıflar · 3");
-    expect(references).toHaveTextContent("MADDE 4");
-    expect(references).toHaveTextContent("MADDE 10");
+    expect(within(references).getByText("MADDE 241")).toBeVisible();
+    expect(within(references).getByText("MADDE 242")).toBeVisible();
     expect(references).toHaveTextContent("[99] · Kaynak çözümlenemedi");
     const buttons = within(references).getAllByRole("button", {
       name: "Official source title",
