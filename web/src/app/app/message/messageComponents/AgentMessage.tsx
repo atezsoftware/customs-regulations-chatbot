@@ -202,12 +202,15 @@ const AgentMessage = React.memo(function AgentMessage({
   // Memoized with granular dependencies to prevent cascading re-renders.
   // Note: chatState object is recreated upstream on every render, so we depend on
   // individual fields instead of the whole object for proper memoization.
+  const citationsPending =
+    !stopPacketSeen && !rawPackets.some(({ obj }) => obj.type === "error");
   const effectiveChatState = useMemo<FullChatState>(
     () => ({
       ...chatState,
       citations: mergedCitations,
       citationChunks: citationChunkMap,
       citationReferences: citations,
+      citationsPending,
       docs: mergedDocs,
     }),
     [
@@ -220,6 +223,7 @@ const AgentMessage = React.memo(function AgentMessage({
       mergedCitations,
       citationChunkMap,
       citations,
+      citationsPending,
       mergedDocs,
     ]
   );

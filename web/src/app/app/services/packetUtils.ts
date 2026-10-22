@@ -185,6 +185,9 @@ export function getCitations(packets: Packet[]): StreamingCitation[] {
           display_title: citationInfo.display_title,
           chunk_id: citationInfo.chunk_id,
           text: citationInfo.text,
+          link: citationInfo.link,
+          reference: citationInfo.reference,
+          resolution_status: citationInfo.resolution_status,
         });
       }
     }

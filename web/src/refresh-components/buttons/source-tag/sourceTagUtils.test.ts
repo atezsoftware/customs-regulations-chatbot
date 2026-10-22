@@ -79,6 +79,33 @@ describe("regulatory citation presentation", () => {
       ["customs-law:46", makeDocument()],
     ]);
 
-    expect(citationsToSourceInfoArray(citations, documentMap)).toEqual([]);
+    expect(citationsToSourceInfoArray(citations, documentMap)).toEqual([
+      expect.objectContaining({ title: "Source 1", description: "" }),
+    ]);
+  });
+
+  it("keeps self-contained references and each number when no document cards exist", () => {
+    const sources = citationsToSourceInfoArray(
+      [4, 10].map((citation_num) => ({
+        citation_num,
+        document_id: "same-file",
+        chunk_ind: 7,
+        display_title: "Official title",
+        text: "",
+        reference: "Page 3",
+        source_type: ValidSources.File,
+      })),
+      new Map()
+    );
+    expect(sources).toEqual(
+      ["4", "10"].map((id) =>
+        expect.objectContaining({
+          id,
+          title: "Official title",
+          description: "",
+          reference: "Page 3",
+        })
+      )
+    );
   });
 });

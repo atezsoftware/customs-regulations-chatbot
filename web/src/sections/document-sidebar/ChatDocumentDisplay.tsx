@@ -6,7 +6,8 @@ import { DocumentUpdatedAtBadge } from "@/components/search/DocumentUpdatedAtBad
 import { MetadataBadge } from "@/components/MetadataBadge";
 import { WebResultIcon } from "@/components/WebResultIcon";
 import { Dispatch, SetStateAction, useMemo } from "react";
-import { openCitation, openDocument } from "@/lib/search/utils";
+import { openCitationSource, openDocument } from "@/lib/search/utils";
+import { getCitationReference } from "@/lib/search/citations";
 import { StreamingCitation } from "@/app/app/services/streamingModels";
 import { ValidSources } from "@/lib/types";
 import { cn } from "@opal/utils";
@@ -69,10 +70,12 @@ export default function ChatDocumentDisplay({
   setPresentingDocument,
   citation,
 }: ChatDocumentDisplayProps) {
-  const isInternet = document.is_internet;
   const title = useMemo(
-    () => getDocumentSourceDisplayName(document) || document.document_id,
-    [document]
+    () =>
+      citation?.display_title?.trim() ||
+      getDocumentSourceDisplayName(document) ||
+      document.document_id,
+    [citation?.display_title, document]
   );
 
   if (document.score === null) {
@@ -86,7 +89,7 @@ export default function ChatDocumentDisplay({
     <div
       onClick={() => {
         if (citation) {
-          openCitation(citation, title, setPresentingDocument);
+          openCitationSource(citation, document, title, setPresentingDocument);
           return;
         }
         openDocument(document, setPresentingDocument);
@@ -106,6 +109,14 @@ export default function ChatDocumentDisplay({
           {title}
         </Truncated>
       </div>
+
+      {citation && (
+        <Text secondaryBody text03>
+          {`[${citation.citation_num}] · ${getCitationReference(citation, document) || "Konum bilgisi yok"}`}
+          {citation.resolution_status === "unavailable" &&
+            " · Kaynak çözümlenemedi"}
+        </Text>
+      )}
 
       {hasMetadata && (
         <DocumentMetadataBlock modal={modal} document={document} />

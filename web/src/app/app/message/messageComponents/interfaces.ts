@@ -35,6 +35,7 @@ export interface FullChatState {
   citations?: CitationMap;
   citationChunks?: CitationChunkMap;
   citationReferences?: StreamingCitation[];
+  citationsPending?: boolean;
   setPresentingDocument?: (document: MinimalOnyxDocument) => void;
   // Regenerate functionality
   regenerate?: (modelOverRide: LlmDescriptor) => Promise<void>;

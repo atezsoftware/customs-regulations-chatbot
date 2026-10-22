@@ -2,7 +2,10 @@ import {
   fireEvent,
   render as renderComponent,
   screen,
+  within,
 } from "@testing-library/react";
+import { setupUser } from "@tests/setup/test-utils";
+import { ValidSources } from "@/lib/types";
 import { Provider as TooltipProvider } from "@radix-ui/react-tooltip";
 import type { ReactNode } from "react";
 import type { MessageSnapshot } from "@/app/ee/admin/performance/usage/types";
@@ -53,6 +56,71 @@ const messages: MessageSnapshot[] = [
 ];
 
 describe("QueryHistoryTranscript", () => {
+  it("opens every same-file citation's retained text and keeps unresolved references visible", async () => {
+    const user = setupUser();
+    const fetchSpy = jest.spyOn(global, "fetch");
+    const answer: MessageSnapshot = {
+      ...messages[1]!,
+      message: "Rule [[4]]() and exception [[10]](). Missing [[99]]().",
+      documents: [],
+      unresolved_citations: [99],
+      citation_info: [4, 10].map((citation_number) => ({
+        type: "citation_info",
+        citation_number,
+        document_id: "same-file",
+        chunk_ind: citation_number,
+        chunk_id: `rc-${citation_number}`,
+        display_title: "Official source title",
+        reference: `MADDE ${citation_number}`,
+        source_type: ValidSources.File,
+        text: `\n Passage ${citation_number} original text \n`,
+        resolution_status: "retained",
+      })),
+    };
+    render(<QueryHistoryTranscript messages={[answer]} />);
+    const references = screen.getByLabelText("Yanıtta kullanılan atıflar");
+    expect(references).toHaveTextContent("Yanıtta kullanılan atıflar · 3");
+    expect(references).toHaveTextContent("MADDE 4");
+    expect(references).toHaveTextContent("MADDE 10");
+    expect(references).toHaveTextContent("[99] · Kaynak çözümlenemedi");
+    const buttons = within(references).getAllByRole("button", {
+      name: "Official source title",
+    });
+    await user.click(buttons[1]!);
+    const passage = await screen.findByText("Passage 10 original text");
+    expect(passage.textContent).toBe("\n Passage 10 original text \n");
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("keeps more than six public web citations reachable through their original links", async () => {
+    const user = setupUser();
+    const openSpy = jest.spyOn(window, "open").mockImplementation(() => null);
+    const answer: MessageSnapshot = {
+      ...messages[1]!,
+      documents: [],
+      citation_info: Array.from({ length: 8 }, (_, index) => ({
+        type: "citation_info",
+        citation_number: index + 1,
+        document_id: `url-${index}`,
+        display_title: `Public source ${index + 1}`,
+        link: `https://official.example/${index + 1}`,
+        source_type: ValidSources.Web,
+        resolution_status: "external",
+      })),
+    };
+    render(<QueryHistoryTranscript messages={[answer]} />);
+    const references = screen.getByLabelText("Yanıtta kullanılan atıflar");
+    expect(within(references).getAllByRole("button")).toHaveLength(8);
+    await user.click(
+      within(references).getByRole("button", { name: "Public source 8" })
+    );
+    expect(openSpy).toHaveBeenCalledWith(
+      "https://official.example/8",
+      "_blank",
+      "noopener,noreferrer"
+    );
+  });
+
   afterEach(() => {
     mockIsAdmin = false;
     jest.restoreAllMocks();

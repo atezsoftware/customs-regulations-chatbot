@@ -162,6 +162,7 @@ export const useMarkdownComponents = (
           citations={state?.citations}
           citationChunks={state?.citationChunks}
           citationReferences={state?.citationReferences}
+          citationsPending={state?.citationsPending}
           href={props.href}
         >
           {props.children}
@@ -174,6 +175,7 @@ export const useMarkdownComponents = (
       state?.citations,
       state?.citationChunks,
       state?.citationReferences,
+      state?.citationsPending,
       state?.setPresentingDocument,
     ]
   );

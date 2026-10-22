@@ -22,6 +22,7 @@ export interface SourceInfo {
   sourceType: ValidSources;
   sourceUrl?: string;
   description?: string;
+  reference?: string;
   metadata?: {
     author?: string;
     date?: string | Date;
@@ -143,6 +144,11 @@ const SourceTagDetailsCardInner = ({
           </div>
         </div>
 
+        {currentSource.reference && (
+          <Text secondaryBody text03 className="px-1.5">
+            {currentSource.reference}
+          </Text>
+        )}
         {/* Metadata row */}
         {(currentSource.metadata?.author ||
           currentSource.metadata?.tags?.length ||

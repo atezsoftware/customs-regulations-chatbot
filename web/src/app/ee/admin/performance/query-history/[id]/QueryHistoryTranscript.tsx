@@ -1,7 +1,16 @@
 "use client";
 import { ResponseUsageView } from "@/sections/chat/usage/ResponseUsage";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { MemoizedAnchor } from "@/app/app/message/MemoizedTextComponents";
+import { registerMarkdownCopyHandler } from "@/app/app/message/copyingUtils";
+import type { StreamingCitation } from "@/app/app/services/streamingModels";
+import type {
+  MinimalOnyxDocument,
+  OnyxDocument,
+} from "@/lib/search/interfaces";
+import PreviewModal from "@/sections/modals/PreviewModal/PreviewModal";
+import { ValidSources } from "@/lib/types";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Button, Text } from "@opal/components";
@@ -156,19 +165,43 @@ function SourceGroup({ group }: { group: SourceGroup }) {
   );
 }
 
-function AssistantMessageMarkdown({ content }: { content: string }) {
+interface AssistantMessageMarkdownProps {
+  content: string;
+  documents: OnyxDocument[];
+  citations: StreamingCitation[];
+  onPreview: (document: MinimalOnyxDocument) => void;
+}
+
+function AssistantMessageMarkdown({
+  content,
+  documents,
+  citations,
+  onPreview,
+}: AssistantMessageMarkdownProps) {
+  const markdownRef = useRef<HTMLDivElement>(null);
+  useEffect(() => registerMarkdownCopyHandler(markdownRef), []);
   const components = useMemo<Components>(
     () => ({
-      a: ({ href, children }) => (
-        <a
-          href={href}
-          target="_blank"
-          rel="noreferrer"
-          className="text-action-selection-05 underline underline-offset-2"
-        >
-          {children}
-        </a>
-      ),
+      a: ({ href, children }) =>
+        /^\[(?:D)?\d+\]$/.test(String(children)) ? (
+          <MemoizedAnchor
+            docs={documents}
+            citationReferences={citations}
+            updatePresentingDocument={onPreview}
+            href={href}
+          >
+            {children}
+          </MemoizedAnchor>
+        ) : (
+          <a
+            href={href}
+            target="_blank"
+            rel="noreferrer"
+            className="text-action-selection-05 underline underline-offset-2"
+          >
+            {children}
+          </a>
+        ),
       code: ({ className, children }) => (
         <code
           className={cn(
@@ -185,17 +218,19 @@ function AssistantMessageMarkdown({ content }: { content: string }) {
         </pre>
       ),
     }),
-    []
+    [documents, citations, onPreview]
   );
 
   return (
-    <ReactMarkdown
-      className="prose prose-onyx max-w-none wrap-break-word font-main-content-body"
-      remarkPlugins={[remarkGfm]}
-      components={components}
-    >
-      {content}
-    </ReactMarkdown>
+    <div ref={markdownRef}>
+      <ReactMarkdown
+        className="prose prose-onyx max-w-none wrap-break-word font-main-content-body"
+        remarkPlugins={[remarkGfm]}
+        components={components}
+      >
+        {content}
+      </ReactMarkdown>
+    </div>
   );
 }
 
@@ -240,17 +275,95 @@ function ReferenceDocuments({ message }: TranscriptMessageProps) {
 }
 
 function AssistantMessage({ message }: TranscriptMessageProps) {
+  const [presentingDocument, setPresentingDocument] =
+    useState<MinimalOnyxDocument | null>(null);
+  const documents = useMemo<OnyxDocument[]>(
+    () =>
+      message.documents
+        .filter((document) => document.chunk_ind != null)
+        .map((document) => ({
+          ...document,
+          chunk_ind: document.chunk_ind!,
+          link: document.link ?? "",
+          source_type: document.source_type ?? ValidSources.NotApplicable,
+          blurb: document.blurb ?? "",
+          metadata: document.metadata ?? {},
+          is_internet: document.is_internet ?? false,
+          boost: 0,
+          hidden: false,
+          score: 0,
+          match_highlights: [],
+          updated_at: null,
+        })),
+    [message.documents]
+  );
+  const citations = useMemo<StreamingCitation[]>(
+    () =>
+      (message.citation_info ?? []).map(
+        ({ type: _type, citation_number, ...citation }) => ({
+          ...citation,
+          citation_num: citation_number,
+        })
+      ),
+    [message.citation_info]
+  );
   return (
     <article
       className="flex max-w-200 flex-col gap-3 self-start"
       data-testid="query-history-assistant-message"
     >
-      <AssistantMessageMarkdown content={message.message} />
+      <AssistantMessageMarkdown
+        content={message.message}
+        documents={documents}
+        citations={citations}
+        onPreview={setPresentingDocument}
+      />
+      {(citations.length > 0 || !!message.unresolved_citations?.length) && (
+        <div
+          className="flex flex-col gap-2"
+          aria-label="Yanıtta kullanılan atıflar"
+        >
+          <Text font="secondary-action">{`Yanıtta kullanılan atıflar · ${citations.length + (message.unresolved_citations?.length ?? 0)}`}</Text>
+          {citations.map((citation) => (
+            <div
+              key={citation.citation_num}
+              className="flex items-center gap-2"
+            >
+              <Text font="secondary-body">{`[${citation.citation_num}]`}</Text>
+              <MemoizedAnchor
+                docs={documents}
+                citationReferences={citations}
+                updatePresentingDocument={setPresentingDocument}
+              >
+                {`[${citation.citation_num}]`}
+              </MemoizedAnchor>
+              {citation.resolution_status === "current" && (
+                <Text font="secondary-body">Güncel kaynak parçası</Text>
+              )}
+            </div>
+          ))}
+          {message.unresolved_citations?.map((number) => (
+            <Text
+              key={number}
+              font="secondary-body"
+            >{`[${number}] · Kaynak çözümlenemedi`}</Text>
+          ))}
+        </div>
+      )}
       <ResponseUsageView usage={message.usage} />
       <div className="flex justify-start">
         <AnswerGraphLink messageId={message.id} />
       </div>
+      {message.documents.length > 0 && (
+        <Text font="secondary-action">Araştırmada getirilen kaynaklar</Text>
+      )}
       <ReferenceDocuments message={message} />
+      {presentingDocument && (
+        <PreviewModal
+          presentingDocument={presentingDocument}
+          onClose={() => setPresentingDocument(null)}
+        />
+      )}
       {message.feedback_type && (
         <div className="flex flex-col items-start gap-1.5">
           <FeedbackBadge feedback={message.feedback_type} />

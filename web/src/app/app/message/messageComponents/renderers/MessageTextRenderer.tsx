@@ -367,6 +367,7 @@ export const MessageTextRenderer: MessageRenderer<
             citations={s?.citations}
             citationChunks={s?.citationChunks}
             citationReferences={s?.citationReferences}
+            citationsPending={s?.citationsPending}
             href={href}
           >
             {children}

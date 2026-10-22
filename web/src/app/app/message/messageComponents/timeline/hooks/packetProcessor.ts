@@ -233,6 +233,9 @@ function handleCitationPacket(state: ProcessorState, packet: Packet): void {
       display_title: citationInfo.display_title,
       chunk_id: citationInfo.chunk_id,
       text: citationInfo.text,
+      link: citationInfo.link,
+      reference: citationInfo.reference,
+      resolution_status: citationInfo.resolution_status,
     });
   }
 }

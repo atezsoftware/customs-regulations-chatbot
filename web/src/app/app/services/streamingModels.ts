@@ -292,6 +292,14 @@ export interface StreamingCitation {
   display_title?: string | null;
   chunk_id?: string | null;
   text?: string | null;
+  link?: string | null;
+  reference?: string | null;
+  resolution_status?:
+    | "retained"
+    | "current"
+    | "external"
+    | "unavailable"
+    | null;
 }
 
 export interface CitationStart extends BaseObj {
@@ -310,6 +318,9 @@ export interface CitationInfo extends BaseObj {
   display_title?: string | null;
   chunk_id?: string | null;
   text?: string | null;
+  link?: string | null;
+  reference?: string | null;
+  resolution_status?: StreamingCitation["resolution_status"];
 }
 
 // Deep Research Plan Packets
