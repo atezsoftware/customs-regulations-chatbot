@@ -1,6 +1,8 @@
 import { Feedback, SessionType } from "@/lib/types";
 import type { ResponseUsage } from "@/sections/chat/usage/interfaces";
 import type { SessionFeedbackResponse } from "@/app/app/interfaces";
+import type { CitationInfo } from "@/app/app/services/streamingModels";
+import type { OnyxDocument } from "@/lib/search/interfaces";
 
 export interface QueryAnalytics {
   total_queries: number;
@@ -24,6 +26,11 @@ export interface AbridgedSearchDoc {
   document_id: string;
   semantic_identifier: string;
   link: string | null;
+  chunk_ind?: number | null;
+  source_type?: OnyxDocument["source_type"] | null;
+  is_internet?: boolean;
+  blurb?: string | null;
+  metadata?: OnyxDocument["metadata"];
 }
 
 export interface MessageSnapshot {
@@ -33,6 +40,8 @@ export interface MessageSnapshot {
   message_type: "user" | "assistant";
   model_display_name: string | null;
   documents: AbridgedSearchDoc[];
+  citation_info?: CitationInfo[];
+  unresolved_citations?: number[];
   feedback_type: Feedback | null;
   feedback_text: string | null;
   time_created: string;

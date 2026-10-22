@@ -5,6 +5,10 @@ import { ValidSources } from "@/lib/types";
 import { getSourceDisplayName } from "@/lib/sources";
 import { SourceInfo } from "@/refresh-components/buttons/source-tag/SourceTagDetailsCard";
 import {
+  getCitationDocument,
+  getCitationReference,
+} from "@/lib/search/citations";
+import {
   getDocumentSourceDisplayName,
   getRegulatorySourceDisplayName,
 } from "@/lib/regulatory/sourceDisplayName";
@@ -62,27 +66,20 @@ export function citationsToSourceInfoArray(
   documentMap: Map<string, OnyxDocument>
 ): SourceInfo[] {
   const sources: SourceInfo[] = [];
-  const seenChunks = new Set<string>();
+  const seenNumbers = new Set<number>();
 
   for (const citation of citations) {
-    const chunkKey = `${citation.document_id}:${citation.chunk_id ?? citation.chunk_ind ?? "document"}`;
-    if (seenChunks.has(chunkKey)) continue;
-
-    const doc =
-      citation.chunk_ind === undefined
-        ? Array.from(documentMap.values()).find(
-            (candidate) => candidate.document_id === citation.document_id
-          )
-        : documentMap.get(`${citation.document_id}:${citation.chunk_ind}`);
-    if (doc) {
-      seenChunks.add(chunkKey);
-      const source = documentToSourceInfo(doc);
-      sources.push({
-        ...source,
-        title: citation.display_title?.trim() || source.title,
-        description: citation.text ?? source.description,
-      });
-    }
+    if (seenNumbers.has(citation.citation_num)) continue;
+    seenNumbers.add(citation.citation_num);
+    const doc = getCitationDocument(citation, Array.from(documentMap.values()));
+    const source = documentToSourceInfo(doc);
+    sources.push({
+      ...source,
+      id: String(citation.citation_num),
+      title: citation.display_title?.trim() || source.title,
+      description: citation.text ?? source.description,
+      reference: getCitationReference(citation, doc),
+    });
   }
 
   // Fallback: if no citations but we have documents, use first few documents

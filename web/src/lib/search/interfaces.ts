@@ -61,6 +61,12 @@ export interface MinimalOnyxDocument {
   citation_preview_url?: string;
   citation_chunk_id?: string | null;
   citation_text?: string | null;
+  citation_resolution_status?:
+    | "retained"
+    | "current"
+    | "external"
+    | "unavailable"
+    | null;
 }
 
 export interface CitationPreviewDocument extends MinimalOnyxDocument {

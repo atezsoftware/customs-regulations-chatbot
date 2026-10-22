@@ -18,11 +18,11 @@ import {
   questionToSourceInfo,
   getDisplayNameForSource,
 } from "@/refresh-components/buttons/source-tag/sourceTagUtils";
+import { openCitationSource, openDocument } from "@/lib/search/utils";
 import {
-  openCitation,
-  openDocument,
-  openExternalCitation,
-} from "@/lib/search/utils";
+  getCitationDocument,
+  getCitationReference,
+} from "@/lib/search/citations";
 import { ensureHrefProtocol } from "@/lib/utils";
 
 interface DocumentCardProps {
@@ -44,6 +44,7 @@ export const MemoizedAnchor = memo(
     citations,
     citationChunks,
     citationReferences,
+    citationsPending = false,
     href,
     updatePresentingDocument,
     children,
@@ -55,6 +56,7 @@ export const MemoizedAnchor = memo(
     citations?: CitationMap;
     citationChunks?: CitationChunkMap;
     citationReferences?: StreamingCitation[];
+    citationsPending?: boolean;
     updatePresentingDocument: (doc: MinimalOnyxDocument) => void;
     href?: string;
     children: React.ReactNode;
@@ -78,51 +80,51 @@ export const MemoizedAnchor = memo(
           // Citations map format: {citation_num: document_id}
           // e.g., {1: "doc_abc", 2: "doc_xyz", 3: "doc_123"}
           let associatedDoc: OnyxDocument | null = null;
-          if (isDocument) {
-            const document_id =
-              citationReference?.document_id ?? citations?.[citation_num];
+          if (isDocument && citationReference) {
+            associatedDoc = getCitationDocument(
+              citationReference,
+              docs ?? [],
+              href
+            );
+          } else if (isDocument) {
+            const document_id = citations?.[citation_num];
             if (document_id) {
-              const chunkInd =
-                citationReference?.chunk_ind ?? citationChunks?.[citation_num];
+              const chunkInd = citationChunks?.[citation_num];
+              const candidates =
+                docs?.filter((d) => d.document_id === document_id) ?? [];
               associatedDoc =
-                docs?.find(
-                  (d) =>
-                    d.document_id === document_id &&
-                    (chunkInd === undefined || d.chunk_ind === chunkInd)
-                ) || null;
-            }
-
-            if (!associatedDoc && citationReference) {
-              associatedDoc = {
-                document_id: citationReference.document_id,
-                semantic_identifier:
-                  citationReference.semantic_identifier ??
-                  `Source ${citationReference.citation_num}`,
-                link: href ?? "",
-                source_type:
-                  citationReference.source_type ?? ValidSources.NotApplicable,
-                blurb: "",
-                boost: 0,
-                hidden: false,
-                score: 0,
-                chunk_ind: citationReference.chunk_ind ?? 0,
-                match_highlights: [],
-                metadata: {},
-                updated_at: null,
-                is_internet: citationReference.source_type === ValidSources.Web,
-              };
+                (chunkInd === undefined
+                  ? candidates.length === 1
+                    ? candidates[0]
+                    : null
+                  : candidates.find((d) => d.chunk_ind === chunkInd)) ?? null;
             }
           }
 
           const associatedSubQuestion = isSubQuestion
             ? subQuestions?.[citation_num - 1]
             : undefined;
+          if (isSubQuestion && !associatedSubQuestion) return <></>;
 
-          if (!associatedDoc && !associatedSubQuestion) {
-            // Citation not resolved yet (data still streaming) — hide the
-            // raw [[N]](url) link entirely. It will render as a chip once
-            // the citation/document data arrives.
-            return <></>;
+          if (
+            (!associatedDoc && !associatedSubQuestion) ||
+            citationReference?.resolution_status === "unavailable"
+          ) {
+            return (
+              <span data-citation-copy-text={value} role="status">
+                <Text secondaryBody text03>
+                  {[
+                    value,
+                    citationReference?.display_title?.trim(),
+                    citationsPending
+                      ? "Kaynak bekleniyor"
+                      : "Kaynak çözümlenemedi",
+                  ]
+                    .filter(Boolean)
+                    .join(" · ")}
+                </Text>
+              </span>
+            );
           }
 
           let icon: React.ReactNode = null;
@@ -195,8 +197,11 @@ export const MemoizedLink = memo(
         ...info,
         title: citation?.display_title?.trim() || info.title,
         description: citation?.text ?? info.description,
+        reference: citation
+          ? getCitationReference(citation, document as OnyxDocument)
+          : undefined,
       };
-    }, [citation?.display_title, citation?.text, document]);
+    }, [citation, document]);
 
     // Convert question to SourceInfo for SourceTag
     const questionSourceInfo = useMemo(() => {
@@ -208,20 +213,12 @@ export const MemoizedLink = memo(
     const handleSourceClick = useCallback(() => {
       if (document && citation && updatePresentingDocument) {
         const citedDocument = document as OnyxDocument;
-        if (
-          citedDocument.source_type === ValidSources.Web &&
-          citedDocument.is_internet &&
-          !citation.preview_url &&
-          citation.text == null
-        ) {
-          openExternalCitation(citedDocument.link);
-        } else {
-          openCitation(
-            citation,
-            getDisplayNameForSource(citedDocument),
-            updatePresentingDocument
-          );
-        }
+        openCitationSource(
+          citation,
+          citedDocument,
+          getDisplayNameForSource(citedDocument),
+          updatePresentingDocument
+        );
       } else if (document && updatePresentingDocument) {
         openDocument(document as OnyxDocument, updatePresentingDocument);
       } else if (question && openQuestion) {
@@ -261,6 +258,15 @@ export const MemoizedLink = memo(
             showDetailsCard
             className="mr-0.5"
           />
+          {documentSourceInfo?.reference && (
+            <Text
+              secondaryBody
+              text03
+              className="inline-block max-w-40 truncate align-middle"
+            >
+              {documentSourceInfo.reference}
+            </Text>
+          )}
         </span>
       );
     }

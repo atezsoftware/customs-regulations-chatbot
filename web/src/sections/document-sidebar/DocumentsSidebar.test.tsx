@@ -7,6 +7,7 @@ import {
 import { OnyxDocument } from "@/lib/search/interfaces";
 import { ValidSources } from "@/lib/types";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { setupUser } from "@tests/setup/test-utils";
 import DocumentsSidebar from "@/sections/document-sidebar/DocumentsSidebar";
 
 jest.mock("@/app/app/stores/useChatSessionStore", () => ({
@@ -53,6 +54,129 @@ function buildCitationPacket(citationNumber: number, chunkInd: number): Packet {
 describe("DocumentsSidebar cited sources", () => {
   beforeEach(() => {
     mockedUseSelectedNodeForDocDisplay.mockReturnValue(22);
+  });
+
+  it("retains separate citation numbers for one chunk", async () => {
+    const user = setupUser();
+    mockedUseCurrentMessageTree.mockReturnValue(
+      new Map([
+        [
+          22,
+          {
+            nodeId: 22,
+            parentNodeId: null,
+            documents: [buildDocument(7)],
+            packets: [buildCitationPacket(1, 7), buildCitationPacket(2, 7)],
+          },
+        ],
+      ])
+    );
+    const onPreview = jest.fn();
+    render(
+      <TooltipProvider>
+        <DocumentsSidebar
+          closeSidebar={jest.fn()}
+          modal={false}
+          selectedDocuments={null}
+          setPresentingDocument={onPreview}
+        />
+      </TooltipProvider>
+    );
+    await user.click(screen.getByText("[2] · ARTICLE 7"));
+    expect(onPreview).toHaveBeenCalledWith(
+      expect.objectContaining({ citation_number: 2, citation_chunk_ind: 7 })
+    );
+  });
+
+  it("opens public internet citations at the same original URL as inline citations", async () => {
+    const user = setupUser();
+    const openSpy = jest.spyOn(window, "open").mockImplementation(() => null);
+    const document = {
+      ...buildDocument(7),
+      source_type: ValidSources.Web,
+      is_internet: true,
+      link: "https://official.example/source",
+    };
+    mockedUseCurrentMessageTree.mockReturnValue(
+      new Map([
+        [
+          22,
+          {
+            nodeId: 22,
+            parentNodeId: null,
+            documents: [document],
+            packets: [buildCitationPacket(1, 7)],
+          },
+        ],
+      ])
+    );
+    const onPreview = jest.fn();
+    render(
+      <TooltipProvider>
+        <DocumentsSidebar
+          closeSidebar={jest.fn()}
+          modal={false}
+          selectedDocuments={null}
+          setPresentingDocument={onPreview}
+        />
+      </TooltipProvider>
+    );
+    await user.click(screen.getAllByText("Customs Act — ARTICLE 7")[0]!);
+    expect(openSpy).toHaveBeenCalledWith(
+      document.link,
+      "_blank",
+      "noopener,noreferrer"
+    );
+    expect(onPreview).not.toHaveBeenCalled();
+    openSpy.mockRestore();
+  });
+
+  it("opens self-contained web citations without new status or document cards", async () => {
+    const user = setupUser();
+    const openSpy = jest.spyOn(window, "open").mockImplementation(() => null);
+    mockedUseCurrentMessageTree.mockReturnValue(
+      new Map([
+        [
+          22,
+          {
+            nodeId: 22,
+            parentNodeId: null,
+            documents: [],
+            packets: [
+              {
+                placement: { turn_index: 1 },
+                obj: {
+                  type: PacketType.CITATION_INFO,
+                  citation_number: 4,
+                  document_id: "public-url",
+                  source_type: ValidSources.Web,
+                  link: "https://official.example/source",
+                },
+              },
+            ],
+          },
+        ],
+      ])
+    );
+    const onPreview = jest.fn();
+    render(
+      <TooltipProvider>
+        <DocumentsSidebar
+          closeSidebar={jest.fn()}
+          modal={false}
+          selectedDocuments={null}
+          setPresentingDocument={onPreview}
+        />
+      </TooltipProvider>
+    );
+    await user.click(screen.getByText("[4] · Konum bilgisi yok"));
+    expect(openSpy).toHaveBeenCalledWith(
+      "https://official.example/source",
+      "_blank",
+      "noopener,noreferrer"
+    );
+    expect(onPreview).not.toHaveBeenCalled();
+    openSpy.mockRestore();
   });
 
   it("keeps and opens two cited chunks from the same document independently", () => {

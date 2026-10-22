@@ -100,7 +100,7 @@ export default function PreviewModal({
         if (presentingDocument.citation_preview_url) {
           // Native targets are derived by the server from an owned saved message.
           if (
-            !/^\/api\/asv3\/citation\/[1-9]\d*\/[1-9]\d*$/.test(
+            !/^\/api\/(?:asv3\/citation|admin\/chat-session-history\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\/citation)\/[1-9]\d*\/[1-9]\d*$/.test(
               presentingDocument.citation_preview_url
             )
           ) {
@@ -111,7 +111,7 @@ export default function PreviewModal({
           citationUrl = presentingDocument.citation_preview_url;
         } else {
           if (
-            presentingDocument.citation_chunk_ind === undefined ||
+            presentingDocument.citation_chunk_ind == null ||
             presentingDocument.citation_chunk_ind < 0
           ) {
             throw new Error(
@@ -136,7 +136,7 @@ export default function PreviewModal({
           payload === null ||
           !("content" in payload) ||
           typeof payload.content !== "string" ||
-          !payload.content.trim()
+          (!presentingDocument.citation_preview_url && !payload.content.trim())
         ) {
           throw new Error("Chunk response did not contain usable content");
         }
@@ -283,7 +283,11 @@ export default function PreviewModal({
       >
         <Modal.Header
           title={fileName || "Document"}
-          description={variant.headerDescription(ctx)}
+          description={
+            presentingDocument.citation_resolution_status === "current"
+              ? "Güncel kaynak parçası · Tarihî kayıtlı pasaj değildir"
+              : variant.headerDescription(ctx)
+          }
           onClose={onClose}
         />
 
@@ -310,6 +314,7 @@ export default function PreviewModal({
             <div className="h-full overflow-y-auto p-4">
               <Text
                 as="p"
+                aria-label="Atıf pasajı"
                 mainContentBody
                 text04
                 className="whitespace-pre-wrap"

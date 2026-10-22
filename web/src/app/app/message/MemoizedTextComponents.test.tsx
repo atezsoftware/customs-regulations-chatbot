@@ -21,6 +21,100 @@ const citedDocument: OnyxDocument = {
 };
 
 describe("inline document citations", () => {
+  it.each(["current", "retained"] as const)(
+    "keeps an explicit %s target on its exact preview",
+    async (resolution_status) => {
+      const user = setupUser();
+      const openSpy = jest.spyOn(window, "open").mockImplementation(() => null);
+      const onPreview = jest.fn();
+      render(
+        <MemoizedLink
+          document={{
+            ...citedDocument,
+            source_type: ValidSources.Web,
+            is_internet: true,
+            link: "https://official.example/source",
+          }}
+          citation={{
+            citation_num: 4,
+            document_id: citedDocument.document_id,
+            chunk_ind: 46,
+            resolution_status,
+          }}
+          updatePresentingDocument={onPreview}
+        >
+          [4]
+        </MemoizedLink>
+      );
+      await user.click(screen.getByRole("button"));
+      expect(openSpy).not.toHaveBeenCalled();
+      expect(onPreview).toHaveBeenCalledWith(
+        expect.objectContaining({ citation_number: 4, citation_chunk_ind: 46 })
+      );
+      openSpy.mockRestore();
+    }
+  );
+  it("keeps a legacy public web target usable from its recorded Markdown link", async () => {
+    const user = setupUser();
+    const openSpy = jest.spyOn(window, "open").mockImplementation(() => null);
+    const onPreview = jest.fn();
+    render(
+      <MemoizedAnchor
+        docs={[]}
+        href="https://official.example/source"
+        citationReferences={[
+          {
+            citation_num: 1,
+            document_id: "url",
+            chunk_ind: 0,
+            source_type: ValidSources.Web,
+          },
+        ]}
+        updatePresentingDocument={onPreview}
+      >
+        [1]
+      </MemoizedAnchor>
+    );
+    await user.click(screen.getByRole("button"));
+    expect(openSpy).toHaveBeenCalledWith(
+      "https://official.example/source",
+      "_blank",
+      "noopener,noreferrer"
+    );
+    expect(onPreview).not.toHaveBeenCalled();
+    openSpy.mockRestore();
+  });
+  it("keeps pending and terminal unresolved markers visible without guessing a target", () => {
+    const onPreview = jest.fn();
+    const { rerender } = render(
+      <MemoizedAnchor
+        docs={[citedDocument, { ...citedDocument, chunk_ind: 47 }]}
+        citations={{ 10: "customs-law" }}
+        citationsPending
+        updatePresentingDocument={onPreview}
+      >
+        [10]
+      </MemoizedAnchor>
+    );
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "[10] · Kaynak bekleniyor"
+    );
+    rerender(
+      <MemoizedAnchor
+        docs={[citedDocument, { ...citedDocument, chunk_ind: 47 }]}
+        citations={{ 10: "customs-law" }}
+        citationsPending={false}
+        updatePresentingDocument={onPreview}
+      >
+        [10]
+      </MemoizedAnchor>
+    );
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "[10] · Kaynak çözümlenemedi"
+    );
+    expect(onPreview).not.toHaveBeenCalled();
+  });
+
   it("shows the official title and opens each same-file citation's own text", async () => {
     const user = setupUser();
     const updatePresentingDocument = jest.fn();

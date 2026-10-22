@@ -11,6 +11,73 @@ const mockedFetchChatFile = fetchChatFile as jest.MockedFunction<
 >;
 
 describe("PreviewModal citation chunk mode", () => {
+  it.each(["", " \n\t "])(
+    "preserves empty or whitespace retained admin content %j",
+    async (content) => {
+      const endpoint =
+        "/api/admin/chat-session-history/9ea01263-7e32-4d85-b0d5-1e951b69f2fc/citation/6202/4";
+      const fetchMock = jest
+        .spyOn(global, "fetch")
+        .mockResolvedValue(new Response(JSON.stringify({ content })));
+      render(
+        <PreviewModal
+          presentingDocument={{
+            preview_type: "citation",
+            document_id: "source",
+            semantic_identifier: "Official title",
+            citation_number: 4,
+            citation_chunk_ind: -4,
+            citation_preview_url: endpoint,
+            citation_resolution_status: "retained",
+          }}
+          onClose={jest.fn()}
+        />
+      );
+      expect((await screen.findByLabelText("Atıf pasajı")).textContent).toBe(
+        content
+      );
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(mockedFetchChatFile).not.toHaveBeenCalled();
+      fetchMock.mockRestore();
+    }
+  );
+  it.each([
+    [-4, "retained"],
+    [4, "current"],
+  ] as const)(
+    "uses the authenticated admin target for index %s and labels current text",
+    async (index, status) => {
+      const endpoint =
+        "/api/admin/chat-session-history/9ea01263-7e32-4d85-b0d5-1e951b69f2fc/citation/6202/4";
+      const fetchMock = jest
+        .spyOn(global, "fetch")
+        .mockResolvedValue(
+          new Response(JSON.stringify({ content: "Verified passage" }))
+        );
+      render(
+        <PreviewModal
+          presentingDocument={{
+            preview_type: "citation",
+            document_id: "source",
+            semantic_identifier: "Official title",
+            citation_number: 4,
+            citation_chunk_ind: index,
+            citation_preview_url: endpoint,
+            citation_resolution_status: status,
+          }}
+          onClose={jest.fn()}
+        />
+      );
+      expect(await screen.findByText("Verified passage")).toBeInTheDocument();
+      expect(fetchMock).toHaveBeenCalledWith(endpoint);
+      if (status === "current")
+        expect(screen.getByRole("dialog")).toHaveAccessibleDescription(
+          "Güncel kaynak parçası · Tarihî kayıtlı pasaj değildir"
+        );
+      expect(mockedFetchChatFile).not.toHaveBeenCalled();
+      fetchMock.mockRestore();
+    }
+  );
   beforeEach(() => {
     mockedFetchChatFile.mockResolvedValue(
       new Response("the complete uploaded file", {

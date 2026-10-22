@@ -13,63 +13,21 @@ import Text from "@/refresh-components/texts/Text";
 import { Button, Divider } from "@opal/components";
 import { SvgSearchMenu, SvgX } from "@opal/icons";
 import { StreamingCitation } from "@/app/app/services/streamingModels";
-import { ValidSources } from "@/lib/types";
+import { getCitationDocument } from "@/lib/search/citations";
 
 interface CitedDocumentEntry {
   citation: StreamingCitation;
   document: OnyxDocument;
 }
 
-const citationIdentity = (citation: StreamingCitation) =>
-  `${citation.document_id}:${citation.chunk_ind ?? "document"}`;
-
 export function buildCitedDocumentEntries(
   citations: StreamingCitation[],
   documents: OnyxDocument[]
 ): CitedDocumentEntry[] {
-  const documentsByChunk = new Map(
-    documents.map((document) => [
-      `${document.document_id}:${document.chunk_ind}`,
-      document,
-    ])
-  );
-
-  return citations.flatMap((citation) => {
-    const matchedDocument =
-      documentsByChunk.get(citationIdentity(citation)) ??
-      (citation.chunk_ind === undefined
-        ? documents.find(
-            (candidate) => candidate.document_id === citation.document_id
-          )
-        : undefined);
-    const document: OnyxDocument = matchedDocument ?? {
-      document_id: citation.document_id,
-      semantic_identifier:
-        citation.semantic_identifier ?? `Source ${citation.citation_num}`,
-      link: "",
-      source_type: citation.source_type ?? ValidSources.NotApplicable,
-      blurb: "",
-      boost: 0,
-      hidden: false,
-      score: 0,
-      chunk_ind: citation.chunk_ind ?? 0,
-      match_highlights: [],
-      metadata: {},
-      updated_at: null,
-      is_internet: citation.source_type === ValidSources.Web,
-    };
-
-    return [
-      {
-        citation,
-        document: {
-          ...document,
-          semantic_identifier:
-            citation.semantic_identifier ?? document.semantic_identifier,
-        },
-      },
-    ];
-  });
+  return citations.map((citation) => ({
+    citation,
+    document: getCitationDocument(citation, documents),
+  }));
 }
 
 // Build an OnyxDocument from basic file info
@@ -207,7 +165,7 @@ const DocumentsSidebar = memo(
               <ChatDocumentDisplayWrapper>
                 {citedDocuments.map(({ citation, document }) => (
                   <ChatDocumentDisplay
-                    key={citationIdentity(citation)}
+                    key={citation.citation_num}
                     setPresentingDocument={setPresentingDocument}
                     modal={modal}
                     document={document}

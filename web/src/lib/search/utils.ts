@@ -70,9 +70,33 @@ export const openCitation = (
       ? { citation_chunk_id: citation.chunk_id }
       : {}),
     ...(citation.text !== undefined ? { citation_text: citation.text } : {}),
+    ...(citation.resolution_status != null
+      ? { citation_resolution_status: citation.resolution_status }
+      : {}),
     ...(citation.preview_url
       ? { citation_preview_url: citation.preview_url }
       : {}),
   };
   updatePresentingDocument(citationTarget);
 };
+
+export function openCitationSource(
+  citation: StreamingCitation,
+  document: OnyxDocument,
+  title: string,
+  updatePresentingDocument: (document: MinimalOnyxDocument) => void
+): void {
+  if (citation.resolution_status === "unavailable") return;
+  if (
+    citation.text == null &&
+    !citation.preview_url &&
+    (citation.resolution_status === "external" ||
+      (citation.resolution_status == null &&
+        document.source_type === ValidSources.Web &&
+        document.is_internet))
+  ) {
+    openExternalCitation(citation.link ?? document.link);
+    return;
+  }
+  openCitation(citation, title, updatePresentingDocument);
+}
