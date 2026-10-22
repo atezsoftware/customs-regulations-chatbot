@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import json
 import zlib
+from collections.abc import Mapping
 from typing import Any, Literal, cast
 
 from pydantic import ValidationError
 from sqlalchemy.orm import Session
 
-from onyx.chat.citation_utils import extract_citation_order_from_text
 from onyx.coding_agent.mock_tools import CODING_AGENT_QUERY_KEY, CODING_AGENT_REPO_KEY
 from onyx.configs.constants import MessageType
 from onyx.context.search.models import SavedSearchDoc, SearchDoc
@@ -15,9 +15,11 @@ from onyx.db.asv3_runs import ASV3_CHECKPOINT_TOOL_ID, decode_asv3_checkpoint
 from onyx.db.chat import (
     RESERVED_ASSISTANT_MESSAGE,
     get_db_search_doc_by_id,
+    saved_message_citation_info,
     translate_db_search_doc_to_saved_search_doc,
 )
 from onyx.db.models import ChatMessage, Tool
+from onyx.db.models import SearchDoc as DBSearchDoc
 from onyx.db.tools import get_tool_by_id
 from onyx.deep_research.dr_mock_tools import (
     RESEARCH_AGENT_IN_CODE_ID,
@@ -651,6 +653,7 @@ def translate_assistant_message_to_packets(
     asv3_interrupted: bool = False,
     suppress_reserved_message: bool = False,
     citation_info_override: list[CitationInfo] | None = None,
+    citation_documents: Mapping[int, DBSearchDoc] | None = None,
 ) -> list[Packet]:
     """
     Translates an assistant message and tool calls to packet format.
@@ -971,54 +974,20 @@ def translate_assistant_message_to_packets(
         max_tool_turn = max(tc.turn_number for tc in chat_message.tool_calls)
 
     citations = chat_message.citations
-    citation_info_list: list[CitationInfo] = []
-    asv3_run = any(
-        tool_call.tool_id == ASV3_CHECKPOINT_TOOL_ID
-        for tool_call in (chat_message.tool_calls or [])
+    related_search_docs = (
+        dict(citation_documents)
+        if citation_documents is not None
+        else {doc.id: doc for doc in chat_message.search_docs}
     )
-
     if citations:
-        related_search_docs = {doc.id: doc for doc in chat_message.search_docs}
-        for citation_num, search_doc_id in citations.items():
-            search_doc = related_search_docs.get(search_doc_id)
-            if search_doc is None:
-                search_doc = get_db_search_doc_by_id(search_doc_id, db_session)
-            if search_doc:
-                citation_info_list.append(
-                    CitationInfo(
-                        citation_number=citation_num,
-                        document_id=search_doc.document_id,
-                        chunk_ind=search_doc.chunk_ind,
-                        semantic_identifier=search_doc.semantic_id,
-                        source_type=search_doc.source_type,
-                        preview_url=(
-                            f"/api/asv3/citation/{chat_message.id}/{citation_num}"
-                            if (getattr(search_doc, "doc_metadata", None) or {}).get(
-                                "asv3_native_locator"
-                            )
-                            or (
-                                asv3_run
-                                and (
-                                    getattr(search_doc, "doc_metadata", None) or {}
-                                ).get("regulatory_chunk_id")
-                            )
-                            else None
-                        ),
-                    )
-                )
-
-        if citation_info_override is not None:
-            enriched = {item.citation_number: item for item in citation_info_override}
-            citation_info_list = [
-                enriched.get(item.citation_number, item) for item in citation_info_list
-            ]
-
-        # Sort citations by order of appearance in message text
-        citation_order = extract_citation_order_from_text(chat_message.message or "")
-        order_map = {num: idx for idx, num in enumerate(citation_order)}
-        citation_info_list.sort(
-            key=lambda c: order_map.get(c.citation_number, float("inf"))
-        )
+        for search_doc_id in set(citations.values()) - related_search_docs.keys():
+            if (
+                search_doc := get_db_search_doc_by_id(search_doc_id, db_session)
+            ) is not None:
+                related_search_docs[search_doc_id] = search_doc
+    citation_info_list = saved_message_citation_info(
+        chat_message, documents=related_search_docs, overrides=citation_info_override
+    )
 
     # Message comes after tool calls, with optional reasoning step beforehand
     message_turn_index = max_tool_turn + 1

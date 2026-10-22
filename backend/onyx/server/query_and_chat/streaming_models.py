@@ -1,6 +1,7 @@
+from collections.abc import Mapping
 from datetime import datetime
 from enum import Enum
-from typing import Annotated, Any, Literal, Union
+from typing import Annotated, Any, Literal, Union, cast
 
 from pydantic import BaseModel, Field
 
@@ -166,6 +167,21 @@ class CitationInfo(BaseObj):
     resolution_status: (
         Literal["retained", "current", "external", "unavailable"] | None
     ) = None
+
+    def with_source_metadata(
+        self, metadata: Mapping[str, object], *, link: str | None = None
+    ) -> "CitationInfo":
+        """Expose the recorded location separately from a shared file-level title."""
+        heading = metadata.get("regulatory_heading_path")
+        reference = (
+            heading
+            if isinstance(heading, str)
+            else " > ".join(cast(list[str], heading))
+            if isinstance(heading, list)
+            and all(isinstance(part, str) for part in heading)
+            else None
+        )
+        return self.model_copy(update={"reference": reference, "link": link})
 
 
 class ToolCallDebug(BaseObj):

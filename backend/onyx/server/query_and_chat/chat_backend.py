@@ -54,6 +54,7 @@ from onyx.db.chat import (
     get_chat_messages_by_session,
     get_chat_session_by_id,
     get_chat_sessions_by_user,
+    load_saved_citation_documents,
     set_as_latest_chat_message,
     set_preferred_response,
     translate_db_message_to_chat_message_detail,
@@ -446,6 +447,9 @@ def get_chat_session(
         prefetch_message_details=True,
     )
 
+    saved_citation_documents = load_saved_citation_documents(
+        db_session, session_messages
+    )
     from onyx.db.asv3_citation_details import owned_asv3_citation_info
 
     citation_details = owned_asv3_citation_info(
@@ -457,7 +461,9 @@ def get_chat_session(
     # Convert messages to ChatMessageDetail format
     chat_message_details = [
         translate_db_message_to_chat_message_detail(
-            msg, citation_info=citation_details.get(msg.id)
+            msg,
+            citation_info=citation_details.get(msg.id),
+            citation_documents=saved_citation_documents,
         )
         for msg in session_messages
     ]
@@ -515,6 +521,7 @@ def get_chat_session(
                     asv3_interrupted=processing_state_checked and current_run is None,
                     suppress_reserved_message=msg.id in pending_message_ids,
                     citation_info_override=citation_details.get(msg.id),
+                    citation_documents=saved_citation_documents,
                 )
             )
             # msg_packet_list.append(Packet(ind=end_step_nr, obj=OverallStop()))

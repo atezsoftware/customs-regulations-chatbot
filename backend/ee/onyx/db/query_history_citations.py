@@ -13,6 +13,7 @@ from onyx.asv3.models import EvidenceItem
 from onyx.chat.citation_utils import extract_citation_order_from_text
 from onyx.configs.constants import MessageType
 from onyx.db.asv3_runs import ASV3_CHECKPOINT_TOOL_ID, decode_asv3_checkpoint
+from onyx.db.chat import load_saved_citation_documents
 from onyx.db.models import ChatMessage, SearchDoc
 from onyx.db.regulatory_chat_reads import message_publication_available
 from onyx.server.query_and_chat.streaming_models import CitationInfo
@@ -22,21 +23,7 @@ from onyx.tools.tool_implementations.web_search.models import WEB_SEARCH_PREFIX
 def citation_documents(
     session: Session, messages: Sequence[ChatMessage]
 ) -> dict[int, SearchDoc]:
-    documents = {doc.id: doc for message in messages for doc in message.search_docs}
-    missing = {
-        doc_id
-        for message in messages
-        for doc_id in (message.citations or {}).values()
-        if doc_id not in documents
-    }
-    if missing:
-        documents.update(
-            (doc.id, doc)
-            for doc in session.scalars(
-                select(SearchDoc).where(SearchDoc.id.in_(missing))
-            )
-        )
-    return documents
+    return load_saved_citation_documents(session, messages)
 
 
 def citation_checkpoint(message: ChatMessage) -> dict[str, JsonValue] | None:
