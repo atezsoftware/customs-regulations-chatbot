@@ -6,6 +6,7 @@ from onyx.regulatory.source_notice_identity import (
     NoticeIdentity,
     normalize_notice_alias,
     notice_identity_queries,
+    notice_title_alias,
 )
 
 
@@ -72,3 +73,37 @@ def test_filename_folding_preserves_tokens() -> None:
         normalize_notice_alias("KANUNLAR/Türk_Vatandaşlığı_Kanunu.md")
         == "kanunlar turk vatandasligi kanunu md"
     )
+
+
+@pytest.mark.parametrize("namespace", ["catalog", "title"])
+def test_opaque_catalogue_and_exact_title_keys_are_idempotent(namespace: str) -> None:
+    key = namespace + ":" + "a1" * 32
+    assert notice_identity_queries(key) == [key]
+    assert notice_identity_queries(key.upper()) == [key]
+    assert notice_identity_queries(key + "f") == []
+    assert notice_identity_queries(namespace + ":short") == []
+
+
+@pytest.mark.parametrize(
+    "title",
+    [
+        "Türk Vatandaşlığı Kanunu",
+        "TÜRK VATANDAŞLIĞI KANUNU (MÜLGA)",
+        "(Mülga) Türk Vatandaşlığı Kanunu",
+        "(Mulga) Türk Vatandaşlığı Kanunu (Mülga) 2010 yılında kaldırılmıştır.",
+        "  Türk_Vatandaşlığı_Kanunu  ",
+    ],
+)
+def test_exact_title_alias_ignores_only_explicit_repeal_annotations(title: str) -> None:
+    assert notice_title_alias(title) == notice_title_alias("Türk Vatandaşlığı Kanunu")
+
+
+def test_exact_title_alias_preserves_different_topics_and_real_title_words() -> None:
+    assert notice_title_alias("1995/5 sayılı Genelge — Konu A") != notice_title_alias(
+        "1995/5 sayılı Genelge — Konu B"
+    )
+    assert notice_title_alias("Mülga Kanunlara Atıflar") != notice_title_alias(
+        "Kanunlara Atıflar"
+    )
+    assert notice_title_alias(" (Mülga) ") is None
+    assert notice_title_alias("...") is None

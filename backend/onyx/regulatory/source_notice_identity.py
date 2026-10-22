@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 import unicodedata
 from dataclasses import dataclass
@@ -53,6 +54,17 @@ def normalize_notice_alias(value: str) -> str:
     return " ".join(re.findall(r"[a-z0-9]+", value))
 
 
+def notice_title_alias(value: str) -> str | None:
+    """Address an exact catalogue title without treating its repeal note as its name."""
+    marker = r"\(\s*m[üu]lga\s*\)"
+    value = re.sub(rf"^\s*(?:{marker}\s*)+", "", value, flags=re.IGNORECASE)
+    title = re.split(marker, value, maxsplit=1, flags=re.IGNORECASE)[0]
+    normalized = normalize_notice_alias(title)
+    if not normalized:
+        return None
+    return "title:" + hashlib.sha256(normalized.encode()).hexdigest()
+
+
 _TYPE_WORDS = {
     "genelge": "circular",
     "karar": "decision",
@@ -93,7 +105,7 @@ def notice_identity_queries(text: str) -> list[str]:
     ).casefold()
     result: dict[str, None] = {}
     for canonical in re.findall(
-        r"(?<![a-z0-9_])(?:law:\d+|(?:circular|decision|communique):(?:18|19|20)\d{2}:\d+|administrative_letter:\d{4}-\d{2}-\d{2}:\d+)(?![a-z0-9_])",
+        r"(?<![a-z0-9_])(?:law:\d+|(?:circular|decision|communique):(?:18|19|20)\d{2}:\d+|administrative_letter:\d{4}-\d{2}-\d{2}:\d+|(?:catalog|title):[a-f0-9]{64})(?![a-z0-9_])",
         folded,
     ):
         result[canonical] = None

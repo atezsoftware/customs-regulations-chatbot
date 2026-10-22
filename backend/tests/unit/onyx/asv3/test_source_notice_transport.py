@@ -336,13 +336,27 @@ def test_direct_user_target_stays_independent_from_reference_depth() -> None:
 
 
 @pytest.mark.parametrize("cropped", [False, True])
+@pytest.mark.parametrize("name_only", [False, True])
 def test_research_writer_and_verifier_receive_current_notice_after_compaction(
     cropped: bool,
+    name_only: bool,
 ) -> None:
     context, catalogue, state = setup()
     if cropped:
         context.services["asv3_exp_cropped"] = True
-    state.observe_evidence([canonical()])
+    if name_only:
+        assert catalogue.row is not None
+        catalogue.row = catalogue.row.model_copy(
+            update={
+                "identity_key": "catalog:" + "a" * 64,
+                "instrument_number": None,
+                "instrument_year": None,
+                "catalog_title": "İçeriği henüz yüklenmemiş Yönetmelik (Mülga)",
+            }
+        )
+        state.observe_notices([catalogue.row])
+    else:
+        state.observe_evidence([canonical()])
     llm = model(limit=1_000_000)
     adapter = ResearchModel(llm, context, lean_native_mode=True)
     for writing in (False, True) if cropped else (False,):
@@ -354,6 +368,11 @@ def test_research_writer_and_verifier_receive_current_notice_after_compaction(
             == "Mülga"
         )
         assert SOURCE_NOTICE_USAGE_RULE in str(prompt[0].content)
+        if name_only:
+            assert data["source_notices"][0]["identity_key"].startswith("catalog:")
+            assert data["source_notices"][0]["instrument_date"] is None
+            assert data["source_notices"][0]["instrument_number"] is None
+            assert "same historical version" in str(prompt[0].content)
     verifier_prompt, _, _ = adapter._fit(
         "Verify",
         json.dumps({"receipts": [{"old": True}], "evidence": []}),
