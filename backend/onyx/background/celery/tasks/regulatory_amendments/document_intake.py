@@ -5,7 +5,7 @@ from uuid import UUID
 from celery import shared_task
 
 from onyx.configs.constants import (
-    CELERY_USER_FILE_PROCESSING_TASK_EXPIRES,
+    CELERY_REGULATORY_INDEXING_TASK_EXPIRES,
     OnyxCeleryPriority,
     OnyxCeleryQueues,
     OnyxCeleryTask,
@@ -52,7 +52,7 @@ def enqueue_intake_indexes(deliveries: list[tuple[UUID, UUID]], tenant_id: str) 
             },
             queue=OnyxCeleryQueues.USER_FILE_PROCESSING,
             priority=OnyxCeleryPriority.HIGH,
-            expires=CELERY_USER_FILE_PROCESSING_TASK_EXPIRES,
+            expires=CELERY_REGULATORY_INDEXING_TASK_EXPIRES,
         )
 
 
