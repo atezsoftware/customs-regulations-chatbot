@@ -9096,6 +9096,57 @@ class RegulatoryDocumentIntakeReprepare(Base):
     )
 
 
+class RegulatoryDocumentIntakePublicationRecovery(Base):
+    """Retained proof for replacing a failed, unpublished intake's frozen work."""
+
+    __tablename__ = "regulatory_document_intake_publication_recovery"
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    intake_id: Mapped[UUID] = mapped_column(ForeignKey("regulatory_document_intake.id"))
+    document_id: Mapped[UUID] = mapped_column(
+        ForeignKey("regulatory_document_intake_file.id")
+    )
+    user_file_id: Mapped[UUID] = mapped_column(nullable=False)
+    previous_attempt_id: Mapped[UUID] = mapped_column(nullable=False)
+    replacement_attempt_id: Mapped[UUID] = mapped_column(unique=True)
+    approved_review_sha256: Mapped[str] = mapped_column(String(64))
+    canonical_sha256: Mapped[str] = mapped_column(String(64))
+    original_manifest_sha256: Mapped[str] = mapped_column(String(64))
+    original_manifest: Mapped[dict[str, Any]] = mapped_column(PGJSONB)
+    original_fencing_token: Mapped[int] = mapped_column(BigInteger)
+    replacement_manifest_sha256: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+    replacement_manifest: Mapped[dict[str, Any] | None] = mapped_column(
+        PGJSONB(none_as_null=True), nullable=True
+    )
+    status: Mapped[str] = mapped_column(Text, default="queued", server_default="queued")
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+    __table_args__ = (
+        UniqueConstraint(
+            "user_file_id",
+            "previous_attempt_id",
+            name="uq_intake_publication_recovery_previous",
+        ),
+        Index(
+            "ix_intake_publication_recovery_intake_created", "intake_id", "created_at"
+        ),
+        CheckConstraint(
+            "status IN ('queued', 'preparing', 'prepared', 'completed', 'failed')",
+            name="intake_publication_recovery_status_check",
+        ),
+        CheckConstraint(
+            "(replacement_manifest IS NULL) = (replacement_manifest_sha256 IS NULL)",
+            name="intake_publication_recovery_replacement_pair",
+        ),
+    )
+
+
 class RegulatorySourceAsset(Base):
     """Append-only metadata for a content-addressed source within one package."""
 
