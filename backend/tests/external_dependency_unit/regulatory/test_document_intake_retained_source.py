@@ -1,5 +1,8 @@
 import datetime
+import json
 from copy import deepcopy
+from hashlib import sha256
+from io import BytesIO
 from types import SimpleNamespace
 from typing import Any, cast
 from uuid import UUID, uuid4
@@ -8,12 +11,16 @@ import pytest
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
+from onyx.auth.schemas import UserRole
+from onyx.configs.constants import FileOrigin
 from onyx.db import document_intake as intake
 from onyx.db import document_intake_edit as editing
 from onyx.db import document_intake_metadata as metadata
 from onyx.db import regulatory_labeling as labeling
+from onyx.db.document_intake_preview import intake_prepared_preview
 from onyx.db.enums import UserFileProjectionRepairStatus, UserFileStatus
 from onyx.db.models import (
+    AmendmentSourcePackage,
     DocumentSet,
     DocumentSet__UserFile,
     ModelConfiguration,
@@ -22,6 +29,7 @@ from onyx.db.models import (
     RegulatoryDocumentIntakeReprepare,
     RegulatoryFilePublication,
     RegulatoryLabelingRun,
+    RegulatorySourceAsset,
     User,
     UserFile,
     UserFileProjectionRepair,
@@ -30,6 +38,7 @@ from onyx.db.regulatory_original_ingestion import original_attachment_receipt
 from onyx.db.regulatory_writer_publication import canonical_scope_digest
 from onyx.file_store.file_store import FileStore
 from onyx.file_store.postgres_file_store import PostgresBackedFileStore
+from onyx.regulatory.amendments.annexes.models import SourceLink
 from onyx.regulatory.document_intake import reprepare_job
 from onyx.regulatory.document_intake.metadata import (
     METADATA_AUDIT_KEY,
@@ -40,6 +49,7 @@ from onyx.regulatory.document_intake.metadata import (
 )
 from onyx.regulatory.document_intake.models import IntakeSourceAsset
 from onyx.regulatory.document_intake.preparation import clone_intake_original
+from tests.external_dependency_unit.conftest import create_test_user
 from tests.external_dependency_unit.regulatory.test_document_intake import (
     _ENVIRONMENT,
     _package,
@@ -372,3 +382,173 @@ def test_completed_approved_same_generation_reprepare_keeps_original_after_revie
             ).original_ingestion_receipt
             == originals[member.user_file_id]
         )
+
+
+def test_intake_preview_binds_owned_binary_and_verified_text_and_fails_closed(
+    intake_session: Session,
+    intake_owner: tuple[User, DocumentSet, ModelConfiguration],
+) -> None:
+    session = intake_session
+    owner, target, model = intake_owner
+    store = PostgresBackedFileStore()
+    package = AmendmentSourcePackage(
+        document_set_id=target.id,
+        created_by=owner.id,
+        environment=_ENVIRONMENT,
+        idempotency_key=str(uuid4()),
+        request_hash=uuid4().hex * 2,
+        input_spec={"url": "https://example.gov/source.docx"},
+        status="processing",
+    )
+    session.add(package)
+    session.flush()
+    binary = b"PK\x03\x04\xff\xfe frozen office original"
+    markdown = "# Yerel Markdown\n\nKaynak metin değişmez.".encode()
+    prepared = "# Türkçe kaynak\n\nİçerik — hazırlanmış belge metni.".encode()
+    assets = []
+    for name, raw, mime_type, text in (
+        (
+            "source.docx",
+            binary,
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            prepared,
+        ),
+        ("native.md", markdown, "text/markdown", markdown),
+        (
+            "missing.docx",
+            binary + b" missing",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            None,
+        ),
+    ):
+        raw_id = store.save_file(
+            BytesIO(raw), name, FileOrigin.USER_FILE, mime_type, db_session=session
+        )
+        text_id = (
+            store.save_file(
+                BytesIO(text),
+                name + ".md",
+                FileOrigin.OTHER,
+                "text/markdown",
+                db_session=session,
+            )
+            if text
+            else None
+        )
+        assets.append(
+            RegulatorySourceAsset(
+                package_id=package.id,
+                sha256=sha256(raw).hexdigest(),
+                file_id=raw_id,
+                text_file_id=text_id,
+                text_sha256=sha256(text).hexdigest() if text else None,
+                mime_type=mime_type,
+                display_name=name,
+                byte_count=len(raw),
+            )
+        )
+    session.add_all(assets)
+    session.flush()
+    links = [
+        SourceLink(
+            parent_asset_hash=assets[0].sha256,
+            target_asset_hash=asset.sha256,
+            parent_url="https://example.gov/source.docx",
+            requested_url=f"https://example.gov/{asset.display_name}",
+            source_field="href",
+            label=asset.display_name,
+            kind="url",
+        )
+        for asset in assets[1:]
+    ]
+    manifest = json.dumps(
+        {
+            "status": "ready",
+            "assets": [{"sha256": asset.sha256} for asset in assets],
+            "links": [link.model_dump(mode="json") for link in links],
+            "issues": [],
+        }
+    ).encode()
+    package.manifest_file_id = store.save_file(
+        BytesIO(manifest),
+        "manifest.json",
+        FileOrigin.OTHER,
+        "application/json",
+        db_session=session,
+    )
+    package.manifest_sha256 = sha256(manifest).hexdigest()
+    package.asset_count, package.total_bytes = (
+        len(assets),
+        sum(asset.byte_count for asset in assets),
+    )
+    package.status = "ready"
+    batch, _created = intake.create_intake(
+        session,
+        source_package_id=package.id,
+        idempotency_key=uuid4(),
+        labeling_model_configuration_id=model.id,
+        user=owner,
+        environment=_ENVIRONMENT,
+    )
+    bound_store = cast(
+        FileStore,
+        SimpleNamespace(
+            read_file=lambda identifier: store.read_file(
+                identifier, db_session=session
+            ),
+            save_file=lambda content, **kwargs: store.save_file(
+                content, **kwargs, db_session=session
+            ),
+        ),
+    )
+    copies = {
+        asset.id: clone_intake_original(
+            intake_id=batch.id,
+            asset=IntakeSourceAsset.model_validate(asset),
+            store=bound_store,
+        )
+        for asset in assets
+    }
+    members = intake.admit_intake_assets(
+        session, batch, assets, links, root_hash=assets[0].sha256, owned_file_ids=copies
+    )
+    root = next(member for member in members if member.role == "root")
+    source = intake_prepared_preview(session, root.user_file_id)
+    assert source is not None
+    assert source.original_file_id == copies[assets[0].id] != assets[0].file_id
+    assert source.raw_sha256 == sha256(binary).hexdigest()
+    assert source.text_file_id == assets[0].text_file_id
+    assert source.text_sha256 == sha256(prepared).hexdigest()
+    with store.read_file(source.original_file_id, db_session=session) as handle:
+        assert handle.read() == binary
+    with store.read_file(source.text_file_id, db_session=session) as handle:
+        assert handle.read().decode() == prepared.decode()
+    native = next(
+        member for member in members if member.source_asset_id == assets[1].id
+    )
+    missing = next(
+        member for member in members if member.source_asset_id == assets[2].id
+    )
+    assert intake_prepared_preview(session, native.user_file_id) is None
+    with pytest.raises(ValueError, match="verified prepared text"):
+        intake_prepared_preview(session, missing.user_file_id)
+    other = create_test_user(session, "preview-other-owner", UserRole.ADMIN)
+    for mutation in ("owner", "package", "missing-file"):
+        savepoint = session.begin_nested()
+        try:
+            file = session.get_one(UserFile, root.user_file_id)
+            if mutation == "owner":
+                file.user_id = other.id
+            elif mutation == "package":
+                package.status = "failed"
+            else:
+                session.delete(file)
+            session.flush()
+            with pytest.raises(ValueError, match="source.*(?:binding|unavailable)"):
+                intake_prepared_preview(session, root.user_file_id)
+        finally:
+            savepoint.rollback()
+            session.expire_all()
+        assert intake_prepared_preview(session, root.user_file_id) == source
+    with store.read_file(copies[assets[0].id], db_session=session) as handle:
+        assert handle.read() == binary

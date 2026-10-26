@@ -10,6 +10,7 @@ import io
 import json
 from datetime import date
 from typing import Literal
+from urllib.parse import quote
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, Form, Query, UploadFile
@@ -39,9 +40,11 @@ from onyx.db.amendment_sources import (
     retry_source_package,
 )
 from onyx.db.document_intake import pending_intake_file_ids
+from onyx.db.document_intake_preview import intake_prepared_preview
 from onyx.db.document_set import get_document_set_by_id_for_user
 from onyx.db.engine.sql_engine import get_session
 from onyx.db.enums import AmendmentBatchStatus, Permission
+from onyx.db.file_record import FileRecordNotFoundError
 from onyx.db.models import DocumentSet, User, UserFile
 from onyx.db.regulatory_amendments import (
     compute_duplicate_targets,
@@ -75,7 +78,7 @@ from onyx.error_handling.error_codes import OnyxErrorCode
 from onyx.error_handling.exceptions import OnyxError
 from onyx.file_store.file_store import get_default_file_store
 from onyx.regulatory.amendments.annexes import config as annex_config
-from onyx.regulatory.amendments.annexes.sources import MAX_ASSET_BYTES
+from onyx.regulatory.amendments.annexes.sources import MAX_ASSET_BYTES, MAX_TEXT_CHARS
 from onyx.regulatory.amendments.runtime import AmendmentRuntime
 from onyx.regulatory.amendments.source_extraction import (
     AmendmentSourceExtractionError,
@@ -196,10 +199,19 @@ def _pdf_response(pdf: bytes, filename: str) -> Response:
     """Inline so the browser renders it; the same bytes are what gets saved."""
 
     safe_name = filename.rsplit("/", 1)[-1].replace('"', "")
+    disposition = f'inline; filename="{safe_name}"'
+    if not safe_name.isascii():
+        ascii_name = (
+            safe_name.encode("ascii", errors="ignore").decode() or "document.pdf"
+        )
+        disposition = (
+            f'inline; filename="{ascii_name}"; '
+            f"filename*=UTF-8''{quote(safe_name, safe='')}"
+        )
     return Response(
         content=pdf,
         media_type="application/pdf",
-        headers={"Content-Disposition": f'inline; filename="{safe_name}"'},
+        headers={"Content-Disposition": disposition},
     )
 
 
@@ -220,10 +232,39 @@ def get_file_pdf(
 
     user_file = _get_owned_user_file(db_session, user_file_id, user)
     require_publication_files(observation, (user_file_id,))
-    with get_default_file_store().read_file(user_file.file_id, mode="b") as handle:
-        markdown = handle.read().decode("utf-8", errors="replace")
+    file_store = get_default_file_store()
+    with file_store.read_file(user_file.file_id, mode="b") as handle:
+        content = handle.read()
 
-    pdf = render_document_pdf(name=user_file.name, markdown=markdown)
+    if content.startswith(b"%PDF-"):
+        pdf = content
+    else:
+        name = user_file.name
+        try:
+            prepared = intake_prepared_preview(db_session, user_file_id)
+            if prepared is None:
+                markdown = content.decode("utf-8", errors="replace")
+            else:
+                if (
+                    prepared.original_file_id != user_file.file_id
+                    or hashlib.sha256(content).hexdigest() != prepared.raw_sha256
+                ):
+                    raise ValueError("The imported original's bytes changed")
+                with file_store.read_file(prepared.text_file_id, mode="b") as handle:
+                    text = handle.read(MAX_TEXT_CHARS * 4 + 1)
+                if (
+                    len(text) > MAX_TEXT_CHARS * 4
+                    or hashlib.sha256(text).hexdigest() != prepared.text_sha256
+                ):
+                    raise ValueError("The imported original's prepared text changed")
+                markdown = text.decode("utf-8")
+                name += " (extracted text)"
+        except (ValueError, FileRecordNotFoundError) as error:
+            raise OnyxError(
+                OnyxErrorCode.SERVICE_UNAVAILABLE,
+                "Verified reading text is unavailable for this uploaded document.",
+            ) from error
+        pdf = render_document_pdf(name=name, markdown=markdown)
     require_publication_files(observation, (user_file_id,))
     return _pdf_response(pdf, f"{user_file.name.rsplit('.', 1)[0]}.pdf")
 
