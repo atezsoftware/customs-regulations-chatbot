@@ -52,6 +52,9 @@ from onyx.regulatory.contextual import (
     fit_context_fields_to_embedding_budget,
     visible_regulatory_snapshot_for_target,
 )
+from onyx.regulatory.document_intake.temporal_context import (
+    intake_temporal_context_rows,
+)
 from onyx.regulatory.heading_path import normalize_regulatory_heading_path
 from onyx.regulatory.indexing_jobs.contextual import (
     get_contextual_token_budget_tokenizer,
@@ -371,6 +374,7 @@ def prepare_normal_context_view(
         raise ValueError("context file scope mismatch")
     if changed_ids:
         rows = rebuild_context_aggregates(rows, changed_ids=changed_ids)
+    rows = intake_temporal_context_rows(rows)
     all_rows = _rows_in_structural_order(rows)
     ordered = effective_context_rows(all_rows, as_of_date)
     if target_ids is not None:

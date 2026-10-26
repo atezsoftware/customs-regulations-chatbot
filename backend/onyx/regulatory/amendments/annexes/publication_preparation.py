@@ -55,6 +55,9 @@ from onyx.regulatory.amendments.annexes.publication_representations import (
 from onyx.regulatory.amendments.annexes.staging import (
     staged_canonical_predecessors,
 )
+from onyx.regulatory.document_intake.temporal_context import (
+    intake_temporal_context_rows,
+)
 
 if TYPE_CHECKING:
     from onyx.db.models import SearchSettings
@@ -337,6 +340,7 @@ def prepare_publication_review(draft: AnnexChangeDraft) -> AnnexChangeDraft:
                             if actual.binding is not None
                         ],
                     )
+                    rows = intake_temporal_context_rows(rows)
                     if len({row.position for row in rows}) != len(rows):
                         raise ValueError(
                             "historical/context source snapshot has ambiguous canonical positions"

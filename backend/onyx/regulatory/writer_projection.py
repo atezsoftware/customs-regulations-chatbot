@@ -44,6 +44,9 @@ from onyx.regulatory.amendments.annexes.publication_representations import (
     _source_template,
 )
 from onyx.regulatory.amendments.annexes.staging import canonical_snapshot_rows
+from onyx.regulatory.document_intake.temporal_context import (
+    intake_temporal_context_rows,
+)
 from onyx.regulatory.indexing_jobs.embedding import _validate_response_vectors
 from onyx.regulatory.projection import prepare_normal_context_view
 from onyx.regulatory.writer_publication_models import (
@@ -384,6 +387,7 @@ def prepare_owned_correction(
                             else previous.semantic_position
                         )
             rows = rebuild_context_aggregates(rows, changed_ids=sorted(changed_ids))
+            rows = intake_temporal_context_rows(rows)
             active = effective_context_rows(rows, when)
             if not active:
                 continue
