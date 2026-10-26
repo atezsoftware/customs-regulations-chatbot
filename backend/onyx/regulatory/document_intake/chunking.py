@@ -33,6 +33,7 @@ from onyx.regulatory.heading_path import parse_regulatory_article_heading
 _SENTENCE_END = re.compile(r"[.!?;:](?:\s+|$)")
 _WORD_END = re.compile(r"\s+")
 _LINE_END = re.compile(r"\n|$")
+_NUMBERING_ONLY = re.compile(r"(?:\d+(?:\.\d+)*[.)]?|\(\d+(?:\.\d+)*\)\.?)")
 
 
 class IntakeRegulatoryChunker(RegulatoryChunker):
@@ -159,6 +160,8 @@ class IntakeRegulatoryChunker(RegulatoryChunker):
                 match.end()
                 for match in pattern.finditer(block.text, start, end)
                 if block.text[start : match.end()].strip()
+                and _NUMBERING_ONLY.fullmatch(block.text[start : match.end()].strip())
+                is None
                 and self._fits([*prefix, self._slice(block, start, match.end())])
             ]
             if boundaries:

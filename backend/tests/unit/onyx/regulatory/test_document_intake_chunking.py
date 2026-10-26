@@ -186,6 +186,71 @@ def test_legacy_chunker_keeps_existing_split_behavior() -> None:
     assert _atomic(result.chunks)[0].text == heading
 
 
+@pytest.mark.parametrize("marker", ["2.", "(2)", "2.1."])
+@pytest.mark.parametrize("space", [" ", "\u00a0\t"])
+def test_real_converted_annex_paragraph_keeps_number_with_first_body_slice(
+    tokenizer: TiktokenTokenizer,
+    marker: str,
+    space: str,
+) -> None:
+    paragraph = (
+        "2. 25/3/2021 tarihli ve 31434 mükerrer sayılı Resmî Gazete’de yayımlanan "
+        "Bilgisayarlar ve Bilgisayar Sunucuları ile İlgili Çevreye Duyarlı Tasarım "
+        "Gerekliliklerine Dair Tebliğ (2013/617/AB) (SGM:2021/14) kapsamındaki "
+        "masaüstü bilgisayarlar, entegre masaüstü bilgisayarlar ve dizüstü bilgisayarlar, "
+        "25/3/2021 tarihli ve 31434 mükerrer sayılı Resmî Gazete’de yayımlanan "
+        "Sunucular ve Veri Depolama Ürünleri ile İlgili Çevreye Duyarlı Tasarım "
+        "Gerekliliklerine Dair Tebliğ (2019/424/AB) (SGM:2021/15) kapsamındaki "
+        "sunucular ve veri depolama ürünleri ile 25/3/2021 tarihli ve 31434 mükerrer "
+        "sayılı Resmî Gazete’de yayımlanan Elektronik Ekranların Çevreye Duyarlı "
+        "Tasarım Gerekliliklerine Dair Tebliğ (2019/2021/AB) (SGM:2021/5) kapsamındaki "
+        "elektronik ekranlar hariç olmak üzere; baskı cihazı dahil, öncelikle iç "
+        "mekanlarda kullanılması amaçlanan bilgi teknolojisi cihazı."
+    )
+    paragraph = paragraph.replace("2. ", marker + space, 1)
+    source = f"# EK-2\n\n{paragraph}"
+    result = IntakeRegulatoryChunker(
+        tokenizer=tokenizer, content_token_limit=312
+    ).chunk_text(source)
+    atomic = _atomic(result.chunks)
+    assert len(atomic) == 2
+    assert atomic[0].text.startswith(marker + space + "25/3/2021")
+    assert all(chunk.text != marker for chunk in atomic)
+    assert all(
+        chunk.metadata.paragraph_no == (None if marker == "2.1." else "2")
+        for chunk in atomic
+    )
+    assert all(
+        chunk.metadata.heading_path == atomic[0].metadata.heading_path
+        for chunk in atomic
+    )
+    _assert_source_coverage(source, paragraph, result.chunks, tokenizer, 312)
+
+
+@pytest.mark.parametrize("marker", ["2.", "(2)", "2.1."])
+def test_legitimate_standalone_source_number_is_preserved(
+    tokenizer: TiktokenTokenizer,
+    marker: str,
+) -> None:
+    result = IntakeRegulatoryChunker(
+        tokenizer=tokenizer, content_token_limit=312
+    ).chunk_text(marker)
+    assert _atomic(result.chunks)[0].text == marker
+
+
+def test_numbered_paragraph_keeps_real_sentence_boundary_preference(
+    tokenizer: TiktokenTokenizer,
+) -> None:
+    sentence = "2. İlk hüküm uygulanır."
+    paragraph = sentence + " " + "Başvuru kayıtları korunur " * 50
+    source = f"# EK-2\n\n{paragraph}"
+    result = IntakeRegulatoryChunker(
+        tokenizer=tokenizer, content_token_limit=40
+    ).chunk_text(source)
+    assert _atomic(result.chunks)[0].text == sentence
+    _assert_source_coverage(source, paragraph, result.chunks, tokenizer, 40)
+
+
 @pytest.mark.parametrize("heading", ["MADDE 1 — Başvuru", "MADDE 1 —\nBaşvuru"])
 def test_plain_converted_article_locator_and_title_stay_with_body(
     tokenizer: TiktokenTokenizer, heading: str
