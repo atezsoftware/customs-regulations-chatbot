@@ -605,32 +605,50 @@ def retry_intake(
             or review_digest(session, batch) != batch.review_sha256
         ):
             raise IntakeConflictError("The approved document snapshot changed")
-        deliveries = []
-        for member in intake_files(session, batch):
-            file = session.get_one(UserFile, member.user_file_id, with_for_update=True)
-            if file.status == UserFileStatus.COMPLETED:
-                continue
-            repair = get_user_file_projection_repair(session, member.user_file_id)
-            if repair and repair.status == UserFileProjectionRepairStatus.RUNNING:
-                continue
-            if repair and repair.status == UserFileProjectionRepairStatus.PENDING:
-                token = repair.attempt_id
-            else:
-                token = claim_user_file_projection_repair(
-                    session, file.id, initial_index=True
+        from onyx.db.document_intake_indexing_retry import (
+            log_failed_intake_index_retry,
+            restore_failed_intake_index_request,
+        )
+
+        retry_audits: list[tuple[dict[str, object], UUID]] = []
+        with session.begin_nested():
+            deliveries = []
+            for member in intake_files(session, batch):
+                file = session.get_one(
+                    UserFile, member.user_file_id, with_for_update=True
                 )
-            if token is None:
-                raise IntakeConflictError(
-                    "The imported file cannot currently be retried"
+                if file.status == UserFileStatus.COMPLETED:
+                    continue
+                retry_evidence = (
+                    restore_failed_intake_index_request(session, batch, member, file)
+                    if file.status == UserFileStatus.FAILED
+                    else None
                 )
-            member.approval_attempt_id, member.status, member.error = (
-                token,
-                "indexing",
-                None,
-            )
-            deliveries.append((file.id, token))
-        batch.status, batch.error = "approving", None
-        session.flush()
+                repair = get_user_file_projection_repair(session, member.user_file_id)
+                if repair and repair.status == UserFileProjectionRepairStatus.RUNNING:
+                    continue
+                if repair and repair.status == UserFileProjectionRepairStatus.PENDING:
+                    token = repair.attempt_id
+                else:
+                    token = claim_user_file_projection_repair(
+                        session, file.id, initial_index=True
+                    )
+                if token is None:
+                    raise IntakeConflictError(
+                        "The imported file cannot currently be retried"
+                    )
+                member.approval_attempt_id, member.status, member.error = (
+                    token,
+                    "indexing",
+                    None,
+                )
+                deliveries.append((file.id, token))
+                if retry_evidence is not None:
+                    retry_audits.append((retry_evidence, token))
+            batch.status, batch.error = "approving", None
+            session.flush()
+        for evidence, token in retry_audits:
+            log_failed_intake_index_retry(evidence, token)
         return deliveries
     batch.status, batch.stage, batch.error = "preparing", "chunking", None
     batch.lease_token, batch.lease_expires_at = None, None

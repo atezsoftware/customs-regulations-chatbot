@@ -21,7 +21,7 @@ from onyx.db.models import (
 from onyx.file_processing.original_ingestion import OriginalIngestionReceipt
 
 
-def _initial_canonical_state(session: Session, file_ids: list[UUID]) -> bool:
+def has_initial_intake_canonical_state(session: Session, file_ids: list[UUID]) -> bool:
     rows = session.execute(
         select(RegulatoryChunk, RegulatoryPublicationOrdinal.ordinal)
         .outerjoin(
@@ -124,7 +124,7 @@ def approved_intake_original_receipt(
             or effective.raw_sha256 != original.raw_sha256
             or effective.plaintext_sha256 != original.plaintext_sha256
             or effective.generation_hash != file.regulatory_chunk_generation_hash
-            or not _initial_canonical_state(
+            or not has_initial_intake_canonical_state(
                 session, [item.user_file_id for item in members]
             )
             or intake.review_digest(session, batch) != batch.review_sha256
