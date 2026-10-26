@@ -619,6 +619,23 @@ def retry_intake(
                 )
                 if file.status == UserFileStatus.COMPLETED:
                     continue
+                if file.status == UserFileStatus.FAILED:
+                    from onyx.db.document_intake_publication_recovery import (
+                        pending_failed_intake_publication,
+                        request_intake_publication_recovery,
+                    )
+
+                    if pending_failed_intake_publication(session, file.id):
+                        token = request_intake_publication_recovery(
+                            session, batch, member, file
+                        )
+                        member.approval_attempt_id, member.status, member.error = (
+                            token,
+                            "indexing",
+                            None,
+                        )
+                        deliveries.append((file.id, token))
+                        continue
                 retry_evidence = (
                     restore_failed_intake_index_request(session, batch, member, file)
                     if file.status == UserFileStatus.FAILED
@@ -628,6 +645,11 @@ def retry_intake(
                 if repair and repair.status == UserFileProjectionRepairStatus.RUNNING:
                     continue
                 if repair and repair.status == UserFileProjectionRepairStatus.PENDING:
+                    from onyx.db.document_intake_publication_recovery import (
+                        associate_pending_recovery,
+                    )
+
+                    associate_pending_recovery(session, batch, member, file, repair)
                     token = repair.attempt_id
                 else:
                     token = claim_user_file_projection_repair(
