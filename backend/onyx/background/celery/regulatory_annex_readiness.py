@@ -17,6 +17,7 @@ _REQUIRED_TASKS = frozenset(
     {
         "acquire_amendment_sources",
         "regulatory_amendment_run",
+        "regulatory_document_intake_prepare",
         "publish_annex_change",
         "recover_annex_publications",
         "recover_amendment_sources",
