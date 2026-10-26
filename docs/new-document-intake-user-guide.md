@@ -8,6 +8,8 @@ Bu kılavuz, yeni bir mevzuatı ve eklerini **Updates** ekranından inceleyip PC
 
 Yönetici hesabınızla **Updates** ekranını açın ve **New document** işaretini etkinleştirin. Doğrudan ekran yolu: `/admin/amendments?new_document=true`.
 
+DEV test ekranı: [Yeni belge ekleme](https://dev-customs-regulations.singlewindow.io/admin/amendments?new_document=true).
+
 Hedef set **PC Külliyatı** olarak sabittir; başka bir document set seçimi yapılmaz. Bu işlemdeki yeni dosyalar üzerinde çalışılır. Setteki diğer belgeler yeniden etiketlenmez. Bir önceki mevzuatın mülga olarak işaretlenmesi, ayrıca seçilip onaylanan bir belge ilişkisidir.
 
 | Elinizdeki kaynak | Ekrandaki seçim | Yapılacak işlem |
@@ -38,6 +40,8 @@ Bir ek alınamazsa paket eksiksizmiş gibi ilerlemez. Hata bölümünde ekin eti
 Hazır Markdown verildiğinde Markdown'a dönüştürme adımı atlanır. Chunk hazırlama, hukuki metadata, yürürlük tarihi çıkarımı ve etiketleme yine yapılır.
 
 Tek belge için UTF-8 kodlamalı bir `.md` dosyası yeterlidir. İlk `# Başlık` belge adı olarak kullanılır; yoksa dosya adı kullanılır. Ana belge ile yerel ekler birlikteyse aşağıdaki ZIP yapısını kullanın:
+
+Bir pakette bir ana belge ve en fazla 20 ek, toplam 21 Markdown belgesi bulunabilir. Alt ekler de bu sayıya dahildir. Bağımsız ana belgeleri ayrı paketlerde yükleyin. Tek mevzuatın bağlı ekleri bu sınırı aşıyorsa yöneticinize başvurun; bağlantılarını korumak için bağlı ekleri ayrı paketlere bölmeyin.
 
 ```text
 manifest.json

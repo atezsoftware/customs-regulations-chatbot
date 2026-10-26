@@ -31,6 +31,7 @@ from onyx.file_store.file_store import FileStore
 from onyx.regulatory.document_intake import metadata_job
 from onyx.regulatory.document_intake.metadata import (
     METADATA_AUDIT_KEY,
+    TARGETS_PER_REQUEST,
     ChunkLegalMetadata,
     LegalMetadataFact,
     LegalMetadataResult,
@@ -275,7 +276,8 @@ def test_real_cached_gateway_reuses_acknowledged_window_after_failure_and_applie
     batch, members, token, article, _closing = _ready_metadata(
         intake_session, intake_owner
     )
-    for position in range(2, 17):
+    monkeypatch.setattr(metadata_job, "METADATA_CONCURRENT_WINDOWS", 1)
+    for position in range(2, TARGETS_PER_REQUEST + 1):
         intake_session.add(
             RegulatoryChunk(
                 id=f"rc_meta_window_{uuid4().hex}",
@@ -381,14 +383,217 @@ def test_real_cached_gateway_reuses_acknowledged_window_after_failure_and_applie
         intake_id=batch.id, lease_token=token, tenant_id="public"
     )
     assert calls == 4
+
     assert (
         len(prompts[0]["complete_document"])
         == len(prompts[1]["complete_document"])
-        == 17
+        == TARGETS_PER_REQUEST + 1
     )
-    assert [len(prompt["target_chunk_ids"]) for prompt in prompts] == [16, 1, 1, 1]
+    assert [len(prompt["target_chunk_ids"]) for prompt in prompts] == [
+        TARGETS_PER_REQUEST,
+        1,
+        1,
+        1,
+    ]
     assert article.chunk_metadata[METADATA_AUDIT_KEY]["model"] == "gemini-3.5-flash"
     metadata_job.run_intake_metadata(
         intake_id=batch.id, lease_token=token, tenant_id="public"
     )
     assert calls == 4
+
+
+@pytest.mark.parametrize("repair_quote", [False, True], ids=["valid", "quote-repair"])
+def test_adaptive_split_keeps_file_unapplied_until_all_cached_leaves_resume(
+    intake_session: Session,
+    intake_owner: tuple[User, DocumentSet, ModelConfiguration],
+    monkeypatch: pytest.MonkeyPatch,
+    repair_quote: bool,
+) -> None:
+    from onyx.regulatory.document_intake.metadata import build_metadata_request
+
+    batch, members, token, article, closing = _ready_metadata(
+        intake_session, intake_owner
+    )
+    if repair_quote:
+        article.text += "\nYeni TEBLİĞ"
+    monkeypatch.setattr(metadata_job, "METADATA_CONCURRENT_WINDOWS", 1)
+    for position in range(2, 4):
+        intake_session.add(
+            RegulatoryChunk(
+                id=f"rc_meta_split_{uuid4().hex}",
+                user_file_id=article.user_file_id,
+                text=f"MADDE {position} — Kural.",
+                position=position,
+                projection_ordinal=position,
+                heading_path=[f"MADDE {position}"],
+                chunk_type="article",
+                chunk_metadata={},
+                status="active",
+                source="indexed",
+            )
+        )
+    intake_session.flush()
+    rows = list(
+        intake_session.scalars(
+            select(RegulatoryChunk)
+            .where(RegulatoryChunk.user_file_id == article.user_file_id)
+            .order_by(RegulatoryChunk.position, RegulatoryChunk.id)
+        )
+    )
+    chunks = metadata.metadata_chunks(rows)
+    parent_ids = [chunk.chunk_id for chunk in chunks]
+    parent_hash = build_metadata_request(chunks, parent_ids).request_hash
+    expected_leaves = {
+        identifier: build_metadata_request(chunks, group).request_hash
+        for group in (parent_ids[:2], parent_ids[2:])
+        for identifier in group
+    }
+    binding = LabelingProviderBinding(
+        model_configuration_id=batch.labeling_model_configuration_id,
+        provider_id=1,
+        project="test",
+        location="global",
+        authentication_mode=VertexAuthenticationMode.SERVICE_ACCOUNT_JSON,
+        credential_identity="test@example.com",
+        model="gemini-3.5-flash",
+        transport="vertex_direct_v1",
+    )
+    store, sdk = _Store(), MagicMock()
+    payloads: list[dict[str, Any]] = []
+
+    def generate(**kwargs: Any) -> genai_types.GenerateContentResponse:
+        payload = json.loads(kwargs["contents"][0].parts[0].text)
+        payloads.append(payload)
+        if len(payloads) == (4 if repair_quote else 3):
+            raise RuntimeError("synthetic second-child interruption")
+        targets = payload["target_chunk_ids"]
+        main_document = len(payload["complete_document"]) == 4
+        fields = (
+            [
+                {
+                    "field": "validity_start_date",
+                    "value": "2027-01-01",
+                    "source_chunk_id": closing.id,
+                    "evidence_quote": "Bu Kanun 1 Ocak 2027 tarihinde yürürlüğe girer.",
+                }
+            ]
+            if main_document
+            else []
+        )
+        if repair_quote and targets == parent_ids[:2]:
+            repaired = "validation_feedback" in payload
+            fields.append(
+                {
+                    "field": "document_title",
+                    "value": "Yeni TEBLİĞ",
+                    "source_chunk_id": article.id,
+                    "evidence_quote": "Yeni TEBLİĞ" if repaired else "Yeni TEBLIĞ",
+                }
+            )
+        outcome = {
+            "chunks": [
+                {"chunk_id": identifier, "fields": fields} for identifier in targets
+            ],
+            "warnings": [],
+        }
+        return genai_types.GenerateContentResponse.model_validate(
+            {
+                "candidates": [
+                    {
+                        "finishReason": "MAX_TOKENS" if len(targets) == 4 else "STOP",
+                        "content": {
+                            "role": "model",
+                            "parts": [{"text": json.dumps(outcome)}],
+                        },
+                    }
+                ]
+            }
+        )
+
+    sdk.models.generate_content.side_effect = generate
+    gateway = vertex_direct.LabelingVertexDirectGateway(
+        config=VertexBatchConfig(
+            model_configuration_id=batch.labeling_model_configuration_id,
+            model_name=binding.model,
+            project="test",
+            location="global",
+            authentication_mode=binding.authentication_mode,
+        ),
+        binding_sha256=binding.fingerprint,
+        credential_identity=binding.credential_identity,
+        credential_json_provider=lambda: None,
+        credentials_factory=lambda: cast(Credentials, object()),
+        client_factory=lambda _credentials: sdk,
+        store=cast(FileStore, store),
+        flow=LLMFlow.REGULATORY_INTAKE_METADATA,
+        max_request_bytes=8 * 1024 * 1024,
+        max_response_bytes=16 * 1024 * 1024,
+    )
+    submit = MagicMock(wraps=gateway.submit)
+    monkeypatch.setattr(gateway, "submit", submit)
+
+    @contextmanager
+    def session_scope() -> Iterator[Session]:
+        yield intake_session
+
+    @contextmanager
+    def traced(**_kwargs: Any) -> Iterator[Any]:
+        yield SimpleNamespace(span_data=SimpleNamespace(usage=None))
+
+    monkeypatch.setattr(metadata_job, "get_session_with_current_tenant", session_scope)
+    monkeypatch.setattr(
+        metadata_job,
+        "resolve_intake_labeling_provider_binding",
+        lambda *_args, **_kwargs: binding,
+    )
+    monkeypatch.setattr(
+        metadata_job, "resolve_labeling_gateway", lambda *_args, **_kwargs: gateway
+    )
+    monkeypatch.setattr(vertex_direct, "traced_llm_call", traced)
+    with pytest.raises(VertexBatchContractError):
+        metadata_job.run_intake_metadata(
+            intake_id=batch.id, lease_token=token, tenant_id="public"
+        )
+    assert len(payloads) == (4 if repair_quote else 3)
+    if repair_quote:
+        repair_request = submit.call_args_list[2].args[0][0]
+        repaired_hash = repair_request.request_hash
+        assert repaired_hash not in {parent_hash, expected_leaves[parent_ids[0]]}
+        assert payloads[2]["validation_feedback"]["repair_attempt"] == 1
+        for identifier in parent_ids[:2]:
+            expected_leaves[identifier] = repaired_hash
+    intake_session.expire_all()
+    assert all(
+        METADATA_AUDIT_KEY not in row.chunk_metadata and row.validity_start_date is None
+        for row in rows
+    )
+    annex = intake_session.scalar(
+        select(RegulatoryChunk).where(
+            RegulatoryChunk.user_file_id == members[1].user_file_id
+        )
+    )
+    assert annex is not None and METADATA_AUDIT_KEY not in annex.chunk_metadata
+    metadata_job.run_intake_metadata(
+        intake_id=batch.id, lease_token=token, tenant_id="public"
+    )
+    assert [len(payload["target_chunk_ids"]) for payload in payloads] == (
+        [4, 2, 2, 2, 2, 1] if repair_quote else [4, 2, 2, 2, 1]
+    )
+    assert all(len(payload["complete_document"]) == 4 for payload in payloads[:-1])
+    assert all(row.validity_start_date == datetime.date(2027, 1, 1) for row in rows)
+    assert all(
+        row.chunk_metadata[METADATA_AUDIT_KEY]["request_hash"]
+        == expected_leaves[row.id]
+        != parent_hash
+        for row in rows
+    )
+    if repair_quote:
+        for row in rows[:2]:
+            assert row.chunk_metadata["document_title"] == "Yeni TEBLİĞ"
+            assert row.chunk_metadata[METADATA_AUDIT_KEY]["fields"]["document_title"][
+                "evidence_quote"
+            ] == "Yeni TEBLİĞ"
+    metadata_job.run_intake_metadata(
+        intake_id=batch.id, lease_token=token, tenant_id="public"
+    )
+    assert len(payloads) == (6 if repair_quote else 5)

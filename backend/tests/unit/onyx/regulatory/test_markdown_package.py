@@ -433,3 +433,36 @@ def test_same_document_fragment_is_an_internal_local_reference() -> None:
     assert link.kind == "internal"
     assert link.parent_asset_hash == link.target_asset_hash == result.assets[0].sha256
     assert link.requested_url == "root.md" and link.original_url == "#section"
+
+
+@pytest.mark.parametrize("document_count", [21, 22])
+def test_document_count_matches_source_package_admission_bound(
+    document_count: int,
+) -> None:
+    documents = [{"path": "ana.md", "title": "Ana belge"}]
+    files = {}
+    links = []
+    for number in range(1, document_count):
+        path = f"ekler/ek-{number}.md"
+        documents.append({"path": path, "title": f"EK-{number}", "parent": "ana.md"})
+        files[path] = f"# EK-{number}\n\nÖzgün ek hükmü {number}.\n".encode()
+        links.append(f"[EK-{number}]({path})")
+    files["ana.md"] = ("# Ana belge\n\n" + "\n".join(links)).encode()
+    content = _zip(
+        files,
+        manifest={
+            "format": "legislation-markdown-v1",
+            "main": "ana.md",
+            "documents": documents,
+        },
+    )
+    if document_count == 21:
+        result = package.parse_markdown_package(content, "sinir.zip")
+        assert len(result.assets) == package.MAX_MARKDOWN_DOCUMENTS == 21
+    else:
+        with pytest.raises(package.MarkdownPackageError) as failure:
+            package.parse_markdown_package(content, "fazla.zip")
+        assert failure.value.code == "markdown_document_count_limit"
+        assert "20 ek" in failure.value.public_message
+        assert "21 belge" in failure.value.public_message
+        assert "bağlı ekleri ayrı paketlere bölmeyin" in failure.value.public_message

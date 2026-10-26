@@ -132,12 +132,12 @@ Eski belgenin mülga tarihi, yeni belgenin yürürlük başlangıcını kendili�
 | Yükleme boyutu | 16 MiB |
 | Markdown dosyası | 2 MiB ve en fazla 2.000.000 karakter |
 | ZIP'in toplam açılmış boyutu | 32 MiB |
-| Markdown belge sayısı | 64 |
+| Markdown belge sayısı | 21 (1 ana belge ve en fazla 20 ek) |
 | ZIP girdisi sayısı, klasörler dahil | 128 |
 | Girdi başına sıkıştırma oranı | En fazla 100:1 |
 | Gerçek bağlantı sayısı, dış atıflar dahil | 500 |
 | Manifest boyutu | 256 KiB |
 
-Sınır aşıldığında içerik kesilmez; paket açık bir hatayla reddedilir. Eksik dosyalar, bağlantısız ekler, döngüler, aynı içeriğe sahip iki Markdown dosyası, harf/Unicode farkıyla çakışan yollar, yinelenen manifest alanları ve referans tanımları kabul edilmez. Güvensiz ZIP yolları, sembolik bağlantılar, şifreli dosyalar ve özel dosya girdileri de reddedilir.
+Sınır aşıldığında içerik kesilmez; paket açık bir hatayla reddedilir. Bağımsız ana belgeleri ayrı paketlerde yükleyin. Tek mevzuatın bağlı ekleri 20 ek sınırını aşıyorsa yöneticinize başvurun; bağlantılarını korumak için bağlı ekleri ayrı paketlere bölmeyin. Eksik dosyalar, bağlantısız ekler, döngüler, aynı içeriğe sahip iki Markdown dosyası, harf/Unicode farkıyla çakışan yollar, yinelenen manifest alanları ve referans tanımları kabul edilmez. Güvensiz ZIP yolları, sembolik bağlantılar, şifreli dosyalar ve özel dosya girdileri de reddedilir.
 
 Hata iletisindeki kod ve paket yolu sorunun konumunu gösterir. Manifest'i ve gerçek bağlantıları düzeltip paketi yeniden yükleyin. Bu doğrulama metnin hukuken eksiksiz olduğunu doğrulamaz; etiketler ve parçalar yeni belge inceleme ekranında ayrıca gözden geçirilmelidir.

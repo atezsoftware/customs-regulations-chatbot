@@ -27,12 +27,13 @@ from onyx.regulatory.amendments.annexes.models import (
     AcquisitionResult,
     SourceLink,
 )
+from onyx.regulatory.amendments.annexes.sources import MAX_ANNEX_ASSETS
 
 MAX_MARKDOWN_UPLOAD_BYTES = 16 * 1024 * 1024
 MAX_MARKDOWN_DOCUMENT_BYTES = 2 * 1024 * 1024
 MAX_MARKDOWN_TEXT_CHARS = 2_000_000
 MAX_MARKDOWN_PACKAGE_BYTES = 32 * 1024 * 1024
-MAX_MARKDOWN_DOCUMENTS = 64
+MAX_MARKDOWN_DOCUMENTS = MAX_ANNEX_ASSETS + 1
 MAX_MARKDOWN_ZIP_ENTRIES = 128
 MAX_MARKDOWN_COMPRESSION_RATIO = 100
 MAX_MARKDOWN_LINKS = 500
@@ -64,6 +65,7 @@ class MarkdownPackageError(ValueError):
     @property
     def public_message(self) -> str:
         messages = {
+            "markdown_document_count_limit": f"Bir Markdown paketinde bir ana belge ve en fazla {MAX_ANNEX_ASSETS} ek bulunabilir (toplam {MAX_MARKDOWN_DOCUMENTS} belge). Bağımsız ana belgeleri ayrı paketlerde yükleyin. Tek mevzuatın bağlı ekleri bu sınırı aşıyorsa yöneticinize başvurun; bağlı ekleri ayrı paketlere bölmeyin.",
             "declared_parent_must_link_to_annex": "Üst Markdown belgesi, manifest'te belirtilen ek dosyasına gerçek bir yerel bağlantı içermelidir.",
             "missing_local_markdown_target": "Markdown bağlantısının hedefi pakette bulunamadı. Dosya yolunu ve büyük/küçük harfleri kontrol edin.",
             "exactly_one_root_manifest_required": "ZIP kökünde veya tek bir dış klasörde bir manifest.json dosyası bulunmalıdır.",
@@ -432,12 +434,17 @@ def _read_archive(content: bytes) -> tuple[_Manifest, dict[str, bytes]]:
                     )
                 raw_files[relative] = data
             try:
-                manifest = _Manifest.model_validate(
-                    json.loads(
-                        raw_files.pop("manifest.json").decode("utf-8-sig"),
-                        object_pairs_hook=_json_object,
-                    )
+                manifest_data = json.loads(
+                    raw_files.pop("manifest.json").decode("utf-8-sig"),
+                    object_pairs_hook=_json_object,
                 )
+                if (
+                    isinstance(manifest_data, dict)
+                    and isinstance(manifest_data.get("documents"), list)
+                    and len(manifest_data["documents"]) > MAX_MARKDOWN_DOCUMENTS
+                ):
+                    raise MarkdownPackageError("markdown_document_count_limit")
+                manifest = _Manifest.model_validate(manifest_data)
             except (
                 UnicodeDecodeError,
                 json.JSONDecodeError,

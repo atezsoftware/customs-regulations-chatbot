@@ -18,7 +18,7 @@ METADATA_AUDIT_KEY = "intake_legal_metadata"
 METADATA_MODEL = "gemini-3.5-flash"
 MAX_METADATA_REQUEST_BYTES = 8 * 1024 * 1024
 MAX_METADATA_RESPONSE_BYTES = 16 * 1024 * 1024
-TARGETS_PER_REQUEST = 16
+TARGETS_PER_REQUEST = 8
 LEGAL_METADATA_FIELDS = frozenset(
     {
         "document_title",
@@ -194,7 +194,7 @@ def build_metadata_request(
         or set(target_ids) - set(ids)
     ):
         raise ValueError(
-            "Metadata requires distinct canonical chunks and 1–16 valid targets"
+            f"Metadata requires distinct canonical chunks and 1–{TARGETS_PER_REQUEST} valid targets"
         )
     prompt = json.dumps(
         {
@@ -217,6 +217,11 @@ def build_metadata_request(
             "thinkingConfig": {"thinkingLevel": "medium"},
         },
     )
+    _check_metadata_request_budget(request)
+    return request
+
+
+def _check_metadata_request_budget(request: VertexBatchRequest) -> None:
     if (
         len(
             json.dumps(
@@ -228,7 +233,44 @@ def build_metadata_request(
         raise ValueError(
             "Complete metadata context exceeds the 8 MiB transport limit; source was not truncated"
         )
-    return request
+
+
+def build_metadata_repair_request(
+    request: VertexBatchRequest,
+    previous_response: str,
+    *,
+    validation_category: Literal[
+        "invalid_json_or_schema", "invalid_coverage_or_evidence"
+    ],
+) -> VertexBatchRequest:
+    payload = json.loads(request.prompt)
+    if "validation_feedback" in payload:
+        raise ValueError("Metadata permits only one repair attempt per target window")
+    payload["validation_feedback"] = {
+        "repair_attempt": 1,
+        "category": validation_category,
+        "original_request_hash": request.request_hash,
+        "previous_response_sha256": hashlib.sha256(
+            previous_response.encode()
+        ).hexdigest(),
+        "instruction": (
+            "The previous response failed strict local validation. Re-extract every "
+            "target using the unchanged complete document and response schema. "
+            "Copy every evidence_quote verbatim, preserving Unicode, Turkish İ/I/ı, "
+            "case, punctuation and whitespace. Never normalize or reconstruct quotes. "
+            "Omit unsupported facts; do not invent replacements. Return each target "
+            "exactly once. Do not repeat the invalid response."
+        ),
+    }
+    repaired = VertexBatchRequest(
+        prompt=json.dumps(
+            payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        ),
+        system_instruction=request.system_instruction,
+        generation_config=request.generation_config,
+    )
+    _check_metadata_request_budget(repaired)
+    return repaired
 
 
 def _fold(text: str) -> str:
