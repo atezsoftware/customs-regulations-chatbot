@@ -15,6 +15,7 @@ from google.genai import types as genai_types
 
 from onyx.regulatory.document_intake import metadata_job
 from onyx.regulatory.document_intake.metadata import (
+    METADATA_VERSION,
     TARGETS_PER_REQUEST,
     MetadataChunk,
     build_metadata_repair_request,
@@ -99,7 +100,7 @@ def _run(gateway: object, sources: list[MetadataChunk]) -> metadata_job.Metadata
     return metadata_job._extract_metadata_document(
         gateway=cast(VertexBatchGateway, gateway),
         chunks=sources,
-        identity_prefix="metadata-v1:tenant:intake:file:binding",
+        identity_prefix=f"metadata-v{METADATA_VERSION}:tenant:intake:file:binding",
         heartbeat=lambda: None,
     )
 
@@ -327,7 +328,7 @@ def test_invalid_bodies_get_one_repair_but_envelope_failures_never_retry(
     )
 
 
-def test_strict_turkish_quote_repair_is_cached_with_valid_windows_and_own_leaf_hash(
+def test_unknown_catalog_id_repair_is_cached_with_valid_windows_and_own_leaf_hash(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     sources = _sources(16)
@@ -344,16 +345,19 @@ def test_strict_turkish_quote_repair_is_cached_with_valid_windows_and_own_leaf_h
         outcome = json.loads(_outcome(targets))
         if targets[0] == "chunk-8":
             repaired = "validation_feedback" in payload
+            evidence_id = next(
+                entry["evidence_id"]
+                for entry in payload["evidence_catalog"]
+                if entry["scope"] == "body" and entry["text"] == "TEBLİĞ"
+            )
             for chunk in outcome["chunks"]:
                 chunk["fields"] = [
                     {
                         "field": "document_type",
                         "value": "teblig",
-                        "source_chunk_id": "chunk-0",
-                        "evidence_quote": "TEBLİĞ" if repaired else "TEBLIĞ",
+                        "evidence_id": evidence_id if repaired else "unknown-id",
                         "basis": "explicit",
-                        "reference_chunk_id": "",
-                        "reference_quote": "",
+                        "reference_evidence_id": "",
                     }
                 ]
             if not repaired:
@@ -450,6 +454,61 @@ def test_single_target_repair_max_tokens_fails_after_two_requests() -> None:
     with pytest.raises(ValueError, match="token budget for one target"):
         _run(gateway, _sources(1))
     assert len(gateway.requests) == 2
+
+
+def test_partial_title_repair_uses_precise_value_coverage_feedback() -> None:
+    sources = [
+        MetadataChunk(
+            chunk_id="article",
+            text="Yeni\nTEBLİĞ",
+            heading_path=["Yeni TEBLİĞ"],
+            chunk_type="article",
+        )
+    ]
+
+    def respond(request: VertexBatchRequest) -> dict[str, Any]:
+        payload = json.loads(request.prompt)
+        repaired = "validation_feedback" in payload
+        if repaired:
+            assert (
+                payload["validation_feedback"]["category"]
+                == "value_not_covered_by_evidence"
+            )
+            assert "covered ENTIRELY" in payload["validation_feedback"]["instruction"]
+        evidence = next(
+            entry
+            for entry in payload["evidence_catalog"]
+            if entry["scope"] == ("heading" if repaired else "body")
+            and entry["text"] == ("Yeni TEBLİĞ" if repaired else "Yeni")
+        )
+        return _envelope(
+            request,
+            "STOP",
+            json.dumps(
+                {
+                    "chunks": [
+                        {
+                            "chunk_id": "article",
+                            "fields": [
+                                {
+                                    "field": "document_title",
+                                    "value": "Yeni TEBLİĞ",
+                                    "evidence_id": evidence["evidence_id"],
+                                    "basis": "explicit",
+                                    "reference_evidence_id": "",
+                                }
+                            ],
+                        }
+                    ]
+                }
+            ),
+        )
+
+    gateway = _Gateway(respond)
+    results = _run(gateway, sources)
+    assert len(gateway.requests) == 2
+    assert results[0][0] == gateway.requests[-1].request_hash
+    assert results[0][1].chunks[0].fields[0].evidence_quote == "Yeni TEBLİĞ"
 
 
 def test_two_outer_windows_propagate_fresh_context_and_return_target_order() -> None:

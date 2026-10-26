@@ -402,20 +402,23 @@ def test_real_cached_gateway_reuses_acknowledged_window_after_failure_and_applie
     assert calls == 4
 
 
-@pytest.mark.parametrize("repair_quote", [False, True], ids=["valid", "quote-repair"])
+@pytest.mark.parametrize(
+    "evidence_case", ["valid", "short-evidence", "unknown-id", "other-document-id"]
+)
 def test_adaptive_split_keeps_file_unapplied_until_all_cached_leaves_resume(
     intake_session: Session,
     intake_owner: tuple[User, DocumentSet, ModelConfiguration],
     monkeypatch: pytest.MonkeyPatch,
-    repair_quote: bool,
+    evidence_case: str,
 ) -> None:
     from onyx.regulatory.document_intake.metadata import build_metadata_request
 
     batch, members, token, article, closing = _ready_metadata(
         intake_session, intake_owner
     )
-    if repair_quote:
-        article.text += "\nYeni TEBLİĞ"
+    article.text += "\nYeni TEBLİĞ\nKapsamı"
+    repair_evidence = evidence_case == "short-evidence"
+    invalid_evidence = evidence_case in {"unknown-id", "other-document-id"}
     monkeypatch.setattr(metadata_job, "METADATA_CONCURRENT_WINDOWS", 1)
     for position in range(2, 4):
         intake_session.add(
@@ -448,6 +451,19 @@ def test_adaptive_split_keeps_file_unapplied_until_all_cached_leaves_resume(
         for group in (parent_ids[:2], parent_ids[2:])
         for identifier in group
     }
+    annex = intake_session.scalar(
+        select(RegulatoryChunk).where(
+            RegulatoryChunk.user_file_id == members[1].user_file_id
+        )
+    )
+    assert annex is not None
+    annex_before = _existing_rows(intake_session, [members[1].user_file_id])
+    foreign_request = build_metadata_request(
+        metadata.metadata_chunks([annex]), [annex.id]
+    )
+    foreign_evidence_id = json.loads(foreign_request.prompt)["evidence_catalog"][0][
+        "evidence_id"
+    ]
     binding = LabelingProviderBinding(
         model_configuration_id=batch.labeling_model_configuration_id,
         provider_id=1,
@@ -461,10 +477,19 @@ def test_adaptive_split_keeps_file_unapplied_until_all_cached_leaves_resume(
     store, sdk = _Store(), MagicMock()
     payloads: list[dict[str, Any]] = []
 
+    def evidence_id(payload: dict[str, Any], source_id: str, text: str) -> str:
+        return next(
+            entry["evidence_id"]
+            for entry in payload["evidence_catalog"]
+            if entry["source_chunk_id"] == source_id
+            and entry["scope"] == "body"
+            and entry["text"] == text
+        )
+
     def generate(**kwargs: Any) -> genai_types.GenerateContentResponse:
         payload = json.loads(kwargs["contents"][0].parts[0].text)
         payloads.append(payload)
-        if len(payloads) == (4 if repair_quote else 3):
+        if not invalid_evidence and len(payloads) == (4 if repair_evidence else 3):
             raise RuntimeError("synthetic second-child interruption")
         targets = payload["target_chunk_ids"]
         main_document = len(payload["complete_document"]) == 4
@@ -473,21 +498,35 @@ def test_adaptive_split_keeps_file_unapplied_until_all_cached_leaves_resume(
                 {
                     "field": "validity_start_date",
                     "value": "2027-01-01",
-                    "source_chunk_id": closing.id,
-                    "evidence_quote": "Bu Kanun 1 Ocak 2027 tarihinde yürürlüğe girer.",
+                    "evidence_id": evidence_id(payload, closing.id, closing.text),
+                    "basis": "explicit",
+                    "reference_evidence_id": "",
                 }
             ]
             if main_document
             else []
         )
-        if repair_quote and targets == parent_ids[:2]:
-            repaired = "validation_feedback" in payload
+        if targets == parent_ids[:2]:
+            if invalid_evidence:
+                title_evidence = (
+                    foreign_evidence_id
+                    if evidence_case == "other-document-id"
+                    else "unknown_evidence_id"
+                )
+            else:
+                quote = (
+                    "Yeni TEBLİĞ"
+                    if repair_evidence and "validation_feedback" not in payload
+                    else article.text
+                )
+                title_evidence = evidence_id(payload, article.id, quote)
             fields.append(
                 {
                     "field": "document_title",
-                    "value": "Yeni TEBLİĞ",
-                    "source_chunk_id": article.id,
-                    "evidence_quote": "Yeni TEBLİĞ" if repaired else "Yeni TEBLIĞ",
+                    "value": "Yeni TEBLİĞ Kapsamı",
+                    "evidence_id": title_evidence,
+                    "basis": "explicit",
+                    "reference_evidence_id": "",
                 }
             )
         outcome = {
@@ -550,12 +589,15 @@ def test_adaptive_split_keeps_file_unapplied_until_all_cached_leaves_resume(
         metadata_job, "resolve_labeling_gateway", lambda *_args, **_kwargs: gateway
     )
     monkeypatch.setattr(vertex_direct, "traced_llm_call", traced)
-    with pytest.raises(VertexBatchContractError):
+    with pytest.raises(
+        ValueError if invalid_evidence else VertexBatchContractError,
+        match="single repair" if invalid_evidence else None,
+    ):
         metadata_job.run_intake_metadata(
             intake_id=batch.id, lease_token=token, tenant_id="public"
         )
-    assert len(payloads) == (4 if repair_quote else 3)
-    if repair_quote:
+    assert len(payloads) == (4 if repair_evidence else 3)
+    if repair_evidence:
         repair_request = submit.call_args_list[2].args[0][0]
         repaired_hash = repair_request.request_hash
         assert repaired_hash not in {parent_hash, expected_leaves[parent_ids[0]]}
@@ -567,17 +609,21 @@ def test_adaptive_split_keeps_file_unapplied_until_all_cached_leaves_resume(
         METADATA_AUDIT_KEY not in row.chunk_metadata and row.validity_start_date is None
         for row in rows
     )
-    annex = intake_session.scalar(
-        select(RegulatoryChunk).where(
-            RegulatoryChunk.user_file_id == members[1].user_file_id
-        )
-    )
-    assert annex is not None and METADATA_AUDIT_KEY not in annex.chunk_metadata
+    assert METADATA_AUDIT_KEY not in annex.chunk_metadata
+    assert _existing_rows(intake_session, [members[1].user_file_id]) == annex_before
+    if invalid_evidence:
+        with pytest.raises(ValueError, match="single repair"):
+            metadata_job.run_intake_metadata(
+                intake_id=batch.id, lease_token=token, tenant_id="public"
+            )
+        assert len(payloads) == 3
+        assert all(METADATA_AUDIT_KEY not in row.chunk_metadata for row in rows)
+        return
     metadata_job.run_intake_metadata(
         intake_id=batch.id, lease_token=token, tenant_id="public"
     )
     assert [len(payload["target_chunk_ids"]) for payload in payloads] == (
-        [4, 2, 2, 2, 2, 1] if repair_quote else [4, 2, 2, 2, 1]
+        [4, 2, 2, 2, 2, 1] if repair_evidence else [4, 2, 2, 2, 1]
     )
     assert all(len(payload["complete_document"]) == 4 for payload in payloads[:-1])
     assert all(row.validity_start_date == datetime.date(2027, 1, 1) for row in rows)
@@ -587,13 +633,12 @@ def test_adaptive_split_keeps_file_unapplied_until_all_cached_leaves_resume(
         != parent_hash
         for row in rows
     )
-    if repair_quote:
-        for row in rows[:2]:
-            assert row.chunk_metadata["document_title"] == "Yeni TEBLİĞ"
-            assert row.chunk_metadata[METADATA_AUDIT_KEY]["fields"]["document_title"][
-                "evidence_quote"
-            ] == "Yeni TEBLİĞ"
+    for row in rows[:2]:
+        assert row.chunk_metadata["document_title"] == "Yeni TEBLİĞ Kapsamı"
+        assert row.chunk_metadata[METADATA_AUDIT_KEY]["fields"]["document_title"][
+            "evidence_quote"
+        ] == article.text
     metadata_job.run_intake_metadata(
         intake_id=batch.id, lease_token=token, tenant_id="public"
     )
-    assert len(payloads) == (6 if repair_quote else 5)
+    assert len(payloads) == (6 if repair_evidence else 5)

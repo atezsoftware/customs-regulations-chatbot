@@ -20,13 +20,14 @@ from onyx.db.models import User
 from onyx.regulatory.document_intake.metadata import (
     MAX_METADATA_REQUEST_BYTES,
     MAX_METADATA_RESPONSE_BYTES,
+    METADATA_VERSION,
     TARGETS_PER_REQUEST,
     LegalMetadataResult,
     MetadataChunk,
     build_metadata_repair_request,
     build_metadata_request,
     metadata_input_hash,
-    validate_metadata_response,
+    validate_metadata_transport_response,
 )
 from onyx.regulatory.indexing_jobs.vertex_batch import (
     VertexBatchGateway,
@@ -103,7 +104,7 @@ def _extract_metadata_targets(
     if not exhausted:
         assert context is not None
         try:
-            result = validate_metadata_response(
+            result = validate_metadata_transport_response(
                 context, chunks=chunks, target_ids=targets
             )
             return [(request.request_hash, result)]
@@ -114,6 +115,9 @@ def _extract_metadata_targets(
                 validation_category=(
                     "invalid_json_or_schema"
                     if isinstance(error, ValidationError)
+                    else "value_not_covered_by_evidence"
+                    if str(error)
+                    == "Metadata value contradicts its quoted source wording"
                     else "invalid_coverage_or_evidence"
                 ),
             )
@@ -127,7 +131,7 @@ def _extract_metadata_targets(
         if not exhausted:
             assert context is not None
             try:
-                result = validate_metadata_response(
+                result = validate_metadata_transport_response(
                     context, chunks=chunks, target_ids=targets
                 )
             except ValueError:
@@ -291,7 +295,7 @@ def run_intake_metadata(*, intake_id: UUID, lease_token: UUID, tenant_id: str) -
         results = _extract_metadata_document(
             gateway=gateway,
             chunks=chunks,
-            identity_prefix=f"metadata-v1:{tenant_id}:{intake_id}:{document_id}:{binding.fingerprint}",
+            identity_prefix=f"metadata-v{METADATA_VERSION}:{tenant_id}:{intake_id}:{document_id}:{binding.fingerprint}",
             heartbeat=heartbeat,
         )
         with get_session_with_current_tenant() as session:
