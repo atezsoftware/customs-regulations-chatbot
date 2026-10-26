@@ -1830,8 +1830,8 @@ class ElasticsearchIndexClient(ElasticsearchClient):
             normalization_method: The score normalization method used by the
                 hybrid query. This is retained for diagnostics; the query body
                 contains the client-side fusion specification.
-            search_type: Label for Prometheus metrics. Does not affect search
-                behavior.
+            search_type: Query purpose. Keyword, semantic and hybrid searches
+                apply confirmed whole-document repeals for the requested date.
 
         Raises:
             Exception: There was an error searching the index.
@@ -1851,6 +1851,18 @@ class ElasticsearchIndexClient(ElasticsearchClient):
 
         observation = observe_publication_read()
         result: dict[str, Any]
+        if search_type in {
+            ElasticsearchSearchType.KEYWORD,
+            ElasticsearchSearchType.SEMANTIC,
+            ElasticsearchSearchType.HYBRID,
+        }:
+            from onyx.db.document_lineage import current_repealed_file_ids
+
+            repealed = current_repealed_file_ids(as_of_date=as_of_date)
+            if repealed:
+                body = self._exclude_repealed_files(
+                    body, tuple(sorted(str(file_id) for file_id in repealed))
+                )
         ctx = self._get_emit_metrics_context_manager(search_type)
         with ctx:
             try:
@@ -2055,6 +2067,41 @@ class ElasticsearchIndexClient(ElasticsearchClient):
         return filter_publication_read(
             observation, search_hits, lambda hit: hit.document_chunk.document_id
         )
+
+    @staticmethod
+    def _exclude_repealed_files(
+        body: dict[str, Any], file_ids: tuple[str, ...]
+    ) -> dict[str, Any]:
+        """Filter whole legal documents before each lane's candidate budget is used."""
+        body = copy.deepcopy(body)
+        exclusion = {"terms": {DOCUMENT_ID_FIELD_NAME: list(file_ids)}}
+        if "_onyx_hybrid_fusion" in body:
+            body["_onyx_hybrid_fusion"]["filters"].append(
+                {"bool": {"must_not": [exclusion]}}
+            )
+            return body
+        if "query" in body or "knn" not in body:
+            body["query"] = {
+                "bool": {
+                    "must": [body.get("query") or {"match_all": {}}],
+                    "must_not": [exclusion],
+                }
+            }
+        if "knn" in body:
+            knn_queries = (
+                body["knn"] if isinstance(body["knn"], list) else [body["knn"]]
+            )
+            for knn in knn_queries:
+                previous = knn.get("filter")
+                filters = (
+                    previous
+                    if isinstance(previous, list)
+                    else [previous]
+                    if previous
+                    else []
+                )
+                knn["filter"] = {"bool": {"filter": filters, "must_not": [exclusion]}}
+        return body
 
     def _search_hybrid_fusion(self, body: dict[str, Any]) -> dict[str, Any]:
         """Fuse independent query lanes without requiring the retriever API."""

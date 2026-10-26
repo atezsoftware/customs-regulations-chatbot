@@ -43,6 +43,7 @@ logger = setup_logger()
 LABELING_LEASE_SECONDS = 300
 LABELING_PREPARATION_PAGE = 128
 LABELING_SHARD_ITEMS = 64
+INTAKE_LABELING_SHARD_ITEMS = 8
 LABELING_SHARD_BYTES = 8 * 1024 * 1024
 LABELING_VERTEX_BATCH_ITEMS = 200_000
 LABELING_VERTEX_BATCH_BYTES = 1_000_000_000
@@ -164,11 +165,18 @@ def _gateway_for_claimed_run(
         user = repository.get_claimed_run_requester(session, lease)
         if user is None:
             raise ValueError("The user who requested labeling is unavailable")
+        direct_concurrency = 1
+        if binding.transport == "vertex_direct_v1":
+            from onyx.db.document_intake_labeling import is_current_intake_labeling_run
+
+            if is_current_intake_labeling_run(session, run):
+                direct_concurrency = 4
         return resolve_labeling_gateway(
             session,
             run.model_configuration_id,
             user=user,
             expected_binding=binding,
+            direct_max_concurrency=direct_concurrency,
         )
 
 
@@ -232,9 +240,15 @@ def _prepare(lease: repository.RunLease, tenant_id: str) -> LabelingStepResult:
                 failed[item.id] = str(error)
             else:
                 prepared.append((str(item.id), request))
+        item_limit = LABELING_SHARD_ITEMS
+        if run.provider_binding.get("transport") == "vertex_direct_v1":
+            from onyx.db.document_intake_labeling import is_current_intake_labeling_run
+
+            if is_current_intake_labeling_run(session, run):
+                item_limit = INTAKE_LABELING_SHARD_ITEMS
         grouped = shard_by_count_and_bytes(
             prepared,
-            item_limit=LABELING_SHARD_ITEMS,
+            item_limit=item_limit,
             byte_limit=LABELING_SHARD_BYTES,
             size_of=vertex_jsonl_line_size,
         )
@@ -285,6 +299,8 @@ def _cancel(
     lease: repository.RunLease, gateway: VertexBatchGateway | None
 ) -> LabelingStepResult:
     with get_session_with_current_tenant() as session:
+        run = repository.load_claimed_run(session, lease)
+        direct = run.provider_binding.get("transport") == "vertex_direct_v1"
         shard = repository.next_cancellable_shard(session, lease)
         if shard is None:
             repository.cancel_claimed_run(session, lease)
@@ -312,9 +328,14 @@ def _cancel(
     terminal_error: str | None = None
     if gateway is None:
         terminal_error = "Cancelled locally; provider cancellation is unavailable"
-    elif remote_job_name is None and shard_status in (
-        "submitting",
-        "reconcile_required",
+    elif (
+        not direct
+        and remote_job_name is None
+        and shard_status
+        in (
+            "submitting",
+            "reconcile_required",
+        )
     ):
         try:
             state = gateway.reconcile_submission(submission_key)
@@ -417,10 +438,11 @@ def _submit_or_reconcile(
 ) -> LabelingStepResult:
     with get_session_with_current_tenant() as session:
         run = repository.load_claimed_run(session, lease)
-        native = (
-            LabelingProviderBinding.model_validate(run.provider_binding).transport
-            == "vertex_gcs_v1"
-        )
+        transport = LabelingProviderBinding.model_validate(
+            run.provider_binding
+        ).transport
+        native = transport == "vertex_gcs_v1"
+        direct = transport == "vertex_direct_v1"
         shard = repository.load_claimed_shard(session, lease, shard_id)
         if shard.status == "prepared":
             if native:
@@ -453,12 +475,16 @@ def _submit_or_reconcile(
             submission_key = shard.submission_key
             session.commit()
             try:
-                if native and isinstance(gateway, StreamingLabelingGateway):
+                if (native or direct) and isinstance(gateway, StreamingLabelingGateway):
                     heartbeat = _lease_heartbeat(lease)
                     state = gateway.submit_stream(
-                        _stream_shard_requests(lease, shard_id, heartbeat),
+                        _stream_shard_requests(lease, shard_id, heartbeat)
+                        if native
+                        else iter(requests),
                         submission_key=submission_key,
-                        max_jsonl_bytes=LABELING_VERTEX_BATCH_BYTES,
+                        max_jsonl_bytes=LABELING_VERTEX_BATCH_BYTES
+                        if native
+                        else LABELING_SHARD_BYTES,
                         on_progress=heartbeat,
                     )
                 else:
@@ -525,14 +551,32 @@ def _submit_or_reconcile(
                 return _next(lease)
             except Exception:
                 with get_session_with_current_tenant() as result_session:
+                    direct_terminal = (
+                        direct
+                        and repository.load_claimed_shard(
+                            result_session, lease, shard_id
+                        ).failure_count
+                        >= LABELING_MAX_PROVIDER_FAILURES - 1
+                    )
                     repository.record_shard_state(
                         result_session,
                         lease,
                         shard_id=shard_id,
-                        status="reconcile_required",
-                        reconcile_seconds=LABELING_RECONCILE_SECONDS,
-                        retry_after_seconds=LABELING_POLL_SECONDS,
-                        error="Provider submission outcome is uncertain",
+                        status=("failed" if direct_terminal else "prepared")
+                        if direct
+                        else "reconcile_required",
+                        reconcile_seconds=None
+                        if direct
+                        else LABELING_RECONCILE_SECONDS,
+                        retry_after_seconds=None
+                        if direct_terminal
+                        else LABELING_POLL_SECONDS,
+                        error=(
+                            "Direct labeling interrupted before recording completion"
+                            if direct
+                            else "Provider submission outcome is uncertain"
+                        ),
+                        increment_failure=direct,
                     )
                     repository.release_run(
                         result_session,
@@ -595,6 +639,15 @@ def _submit_or_reconcile(
             session.commit()
         return _next(lease)
     if state is None:
+        if direct:
+            # There is no remote job to await; resume the same acknowledged cache.
+            with get_session_with_current_tenant() as session:
+                repository.record_shard_state(
+                    session, lease, shard_id=shard_id, status="prepared"
+                )
+                repository.release_run(session, lease, stage="submitting")
+                session.commit()
+            return _next(lease)
         terminal = (
             reconcile_until is None
             or datetime.datetime.now(datetime.timezone.utc) >= reconcile_until
@@ -759,6 +812,11 @@ def _read_and_apply_results(
         run = repository.load_claimed_run(session, lease)
         repository.set_claimed_run_stage(session, lease, "applying")
         taxonomy = TaxonomyDefinition.model_validate(run.taxonomy.definition)
+        intake_quotes = False
+        if run.provider_binding.get("transport") == "vertex_direct_v1":
+            from onyx.db.document_intake_labeling import is_current_intake_labeling_run
+
+            intake_quotes = is_current_intake_labeling_run(session, run)
         session.commit()
     with LabelingResultSpool() as spool:
         for items in _result_pages(lease, shard_id, heartbeat):
@@ -793,9 +851,26 @@ def _read_and_apply_results(
                     )
                     continue
                 try:
-                    outcome = validate_labeling_response(
-                        result.context, text=item.text_snapshot, taxonomy=taxonomy
-                    )
+                    if intake_quotes:
+                        from onyx.regulatory.labeling.intake_quote_resolution import (
+                            resolve_intake_labeling_response,
+                        )
+
+                        outcome, resolutions = resolve_intake_labeling_response(
+                            result.context, text=item.text_snapshot, taxonomy=taxonomy
+                        )
+                        if resolutions:
+                            logger.info(
+                                "Resolved intake label evidence run=%s chunk=%s request=%s audit=%s",
+                                lease.run_id,
+                                item.regulatory_chunk_id,
+                                request_hash,
+                                resolutions,
+                            )
+                    else:
+                        outcome = validate_labeling_response(
+                            result.context, text=item.text_snapshot, taxonomy=taxonomy
+                        )
                 except ValueError as error:
                     outcomes[request_hash] = str(error)
                     continue

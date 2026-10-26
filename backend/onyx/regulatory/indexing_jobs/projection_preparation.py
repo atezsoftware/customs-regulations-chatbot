@@ -23,6 +23,9 @@ from onyx.regulatory.amendments.annexes.context_dependencies import (
 )
 from onyx.regulatory.amendments.annexes.publication_representations import _snapshot
 from onyx.regulatory.amendments.annexes.staging import canonical_snapshot_rows
+from onyx.regulatory.document_intake.temporal_context import (
+    intake_temporal_context_rows,
+)
 from onyx.regulatory.indexing_jobs.contextual import ContextualRequestFactory
 from onyx.regulatory.indexing_jobs.projection_identity import DurableProjectionInput
 from onyx.regulatory.indexing_jobs.vertex_batch import VertexBatchRequest
@@ -103,6 +106,7 @@ def prepare_owned_durable_items(
                 row.chunk_metadata = dict(binding.representation_metadata)
                 row.position = binding.semantic_position
                 matching[canonical_id] = binding
+        rows = intake_temporal_context_rows(rows)
         factory = ContextualRequestFactory(
             job=job,
             rows=rows,

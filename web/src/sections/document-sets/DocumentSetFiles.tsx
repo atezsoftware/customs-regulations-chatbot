@@ -31,6 +31,7 @@ import {
   uploadDocumentSetFiles,
 } from "@/app/admin/documents/sets/lib";
 import RegulatoryFileDetails from "@/sections/document-sets/RegulatoryFileDetails";
+import { getDocumentIntakeCapabilities } from "@/lib/regulatory/documentIntake";
 
 const ACTIVE_FILE_STATUSES = new Set<UserFileStatus>([
   UserFileStatus.UPLOADING,
@@ -247,6 +248,10 @@ export default function DocumentSetFiles({
   const [removingFileId, setRemovingFileId] = useState<string | null>(null);
   const [indexingFileId, setIndexingFileId] = useState<string | null>(null);
   const [indexingAll, setIndexingAll] = useState(false);
+  const { data: intakeCapability } = useSWR(
+    documentSetName === "PC Külliyatı" ? "document-intake-capability" : null,
+    getDocumentIntakeCapabilities
+  );
 
   const {
     data: files,
@@ -374,6 +379,18 @@ export default function DocumentSetFiles({
         </Text>
         <RegulatoryFileDetails
           file={selectedFile}
+          lineageEnabled={Boolean(
+            intakeCapability?.enabled &&
+            intakeCapability.target_document_set_id === documentSetId
+          )}
+          onOpenRelatedFile={(fileId) => {
+            const related = files?.find((file) => file.id === fileId);
+            if (related) setSelectedFile(related);
+            else
+              toast.error(
+                "The related file is not available in this document set."
+              );
+          }}
           onFileRenamed={(name) => {
             setSelectedFile((currentFile) =>
               currentFile ? { ...currentFile, name } : null
@@ -390,6 +407,15 @@ export default function DocumentSetFiles({
       <Text font="main-ui-body" color="text-03" as="p">
         {`Upload regulatory documents to ${documentSetName}. Each file is chunked along its structure and indexed as part of this document set.`}
       </Text>
+
+      {intakeCapability?.enabled &&
+        intakeCapability.target_document_set_id === documentSetId && (
+          <div>
+            <Button href="/admin/amendments?new_document=true" icon={SvgPlus}>
+              Add document with attachments
+            </Button>
+          </div>
+        )}
 
       {canUpload ? (
         <>

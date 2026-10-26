@@ -33,8 +33,33 @@ def original_attachment_receipt(
         publication.gate_closed
         or file.status != UserFileStatus.COMPLETED
         or file.file_id != receipt.file_id
-        or canonical_scope_digest(session, user_file_id) != receipt.canonical_sha256
     ):
+        return None
+    current_canonical_sha256 = canonical_scope_digest(session, user_file_id)
+    if current_canonical_sha256 != receipt.canonical_sha256:
+        from onyx.db.document_intake_original_ingestion import (
+            approved_intake_original_receipt,
+        )
+
+        receipt = approved_intake_original_receipt(
+            session,
+            user_file_id,
+            receipt,
+            canonical_sha256=current_canonical_sha256,
+        )
+        if receipt is None:
+            return None
+    elif (
+        isinstance(file.regulatory_chunk_generation_hash, str)
+        and file.regulatory_chunk_generation_hash != receipt.generation_hash
+    ):
+        from onyx.db.document_intake_reprepare import reprepared_original_receipt
+
+        try:
+            receipt = reprepared_original_receipt(session, user_file_id, receipt)
+        except ValueError:
+            return None
+    if current_canonical_sha256 != receipt.canonical_sha256:
         return None
     return receipt
 

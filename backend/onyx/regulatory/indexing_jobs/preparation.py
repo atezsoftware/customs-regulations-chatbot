@@ -21,10 +21,15 @@ from onyx.db.regulatory_indexing_jobs import (
 from onyx.llm.constants import LlmProviderNames
 from onyx.natural_language_processing.utils import BaseTokenizer, get_tokenizer
 from onyx.regulatory.amendments.annexes.staging import canonical_snapshot_rows
+from onyx.regulatory.document_intake.chunking_profile import (
+    INTAKE_CHUNKING_CODE_VERSION,
+    documents_intake_chunking_version,
+)
 from onyx.regulatory.indexing import (
     document_text_for_regulatory_indexing,
 )
 from onyx.regulatory.indexing_jobs.configuration import (
+    compute_regulatory_chunk_generation_hash,
     resolve_regulatory_indexing_snapshot,
 )
 from onyx.regulatory.indexing_jobs.contextual import (
@@ -211,6 +216,11 @@ def prepare_regulatory_indexing_job(
         db_session,
         input_content_hash=content_hash,
         input_hash_version=input_hash_version,
+        **(
+            {"intake_chunking_version": version}
+            if (version := documents_intake_chunking_version(documents)) is not None
+            else {}
+        ),
     )
     now = datetime.datetime.now(datetime.timezone.utc)
     job = _create_owned_regulatory_indexing_job(
@@ -275,7 +285,29 @@ def prepare_regulatory_indexing_job_from_chunks(
     if user_file.regulatory_chunk_generation_hash is None:
         raise ValueError("CHUNKED user file has no chunk-generation identity")
     if user_file.regulatory_chunk_generation_hash != snapshot.chunk_generation_hash:
+        intake_hash = compute_regulatory_chunk_generation_hash(
+            embedding_provider=snapshot.embedding_provider,
+            embedding_model_name=snapshot.embedding_model_name,
+            enable_contextual_rag=True,
+            intake_chunking_version=INTAKE_CHUNKING_CODE_VERSION,
+        )
+        if user_file.regulatory_chunk_generation_hash == intake_hash:
+            snapshot = snapshot.model_copy(
+                update={
+                    "chunk_generation_hash": intake_hash,
+                    "intake_chunking_version": INTAKE_CHUNKING_CODE_VERSION,
+                }
+            )
+    if user_file.regulatory_chunk_generation_hash != snapshot.chunk_generation_hash:
         raise ValueError("CHUNKED user file generation does not match indexing config")
+    # Later amendments may insert new rows without an initial-ingestion marker.
+    # The file's frozen generation remains authoritative for the whole snapshot.
+    if any(
+        row.chunk_metadata.get("intake_chunking_version")
+        not in (None, snapshot.intake_chunking_version)
+        for row in rows
+    ):
+        raise ValueError("Canonical intake chunking versions are inconsistent")
 
     now = datetime.datetime.now(datetime.timezone.utc)
     job = _create_owned_regulatory_indexing_job(

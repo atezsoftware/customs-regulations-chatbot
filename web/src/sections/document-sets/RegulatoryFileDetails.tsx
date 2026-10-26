@@ -21,6 +21,7 @@ import {
   renameUserFile,
 } from "@/lib/regulatory/svc";
 import type { ProjectFile } from "@/lib/projects/types";
+import LegislationLineageCard from "@/sections/cards/LegislationLineageCard";
 
 const CHUNKS_PER_PAGE = 25;
 
@@ -237,6 +238,8 @@ function ChunkEditModal({ chunk, onClose, onSaved }: ChunkEditModalProps) {
 interface RegulatoryFileDetailsProps {
   file: ProjectFile;
   onFileRenamed: (name: string) => void;
+  lineageEnabled?: boolean;
+  onOpenRelatedFile?: (fileId: string) => void;
 }
 
 interface EditingChunkState {
@@ -247,6 +250,8 @@ interface EditingChunkState {
 export default function RegulatoryFileDetails({
   file,
   onFileRenamed,
+  lineageEnabled = false,
+  onOpenRelatedFile,
 }: RegulatoryFileDetailsProps) {
   const [chunkPage, setChunkPage] = useState({ fileId: file.id, offset: 0 });
   const chunkOffset = chunkPage.fileId === file.id ? chunkPage.offset : 0;
@@ -359,6 +364,13 @@ export default function RegulatoryFileDetails({
           Document PDF
         </Button>
       </div>
+
+      {lineageEnabled && (
+        <LegislationLineageCard
+          fileId={file.id}
+          onOpenRelatedFile={onOpenRelatedFile}
+        />
+      )}
 
       {isLoading ? (
         <Text font="main-ui-body" color="text-03">

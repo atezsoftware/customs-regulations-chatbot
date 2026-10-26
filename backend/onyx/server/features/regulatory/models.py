@@ -70,6 +70,18 @@ class RegulatoryChunkPage(BaseModel):
     limit: int
 
 
+class IntakeChunkReviewSnapshot(RegulatoryChunkSnapshot):
+    labeling_status: str | None = None
+    labeling_error: str | None = None
+
+
+class IntakeChunkReviewPage(BaseModel):
+    items: list[IntakeChunkReviewSnapshot]
+    total: int
+    offset: int
+    limit: int
+
+
 class RegulatoryChunkUpdateRequest(BaseModel):
     """Partial chunk edit. Omitted fields stay unchanged; validity dates may
     be explicitly nulled to clear them."""

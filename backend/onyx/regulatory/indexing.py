@@ -35,6 +35,10 @@ from onyx.regulatory.contextual import (
     MIN_CONTEXTUAL_RAG_RESERVED_TOKENS,
     contextual_reserve_for_embedding_text,
 )
+from onyx.regulatory.document_intake.chunking_profile import (
+    documents_intake_chunking_version,
+    intake_chunking_version,
+)
 from onyx.utils.logger import setup_logger
 from shared_configs.configs import DOC_EMBEDDING_CONTEXT_SIZE
 
@@ -101,6 +105,7 @@ def _group_indexing_documents_by_file(
 
     aggregated: list[IndexingDocument] = []
     for file_documents in grouped.values():
+        documents_intake_chunking_version(file_documents)
         first = file_documents[0]
         sections = [
             section.model_copy()
@@ -170,10 +175,12 @@ class RegulatoryIndexingChunker:
 
         text = document_text_for_regulatory_indexing(document)
         source_file = document.semantic_identifier or document.id
+        intake_version = intake_chunking_version(document)
         chunked, contextual_rag_reserved_tokens = self._chunk_with_embedding_budget(
             text,
             source_path=str(user_file_id),
             source_file=source_file,
+            intake_version=intake_version,
         )
         for warning in chunked.warnings:
             logger.warning(
@@ -226,6 +233,12 @@ class RegulatoryIndexingChunker:
             linked_chunks,
             publication_owner=self.publication_owner,
         )
+        if intake_version is not None:
+            for row in rows:
+                row.chunk_metadata = {
+                    **row.chunk_metadata,
+                    "intake_chunking_version": intake_version,
+                }
         # Assign ids before the session commits so the emitted DocAwareChunks
         # can reference them.
         self.db_session.flush()
@@ -267,12 +280,39 @@ class RegulatoryIndexingChunker:
         *,
         source_path: str,
         source_file: str,
+        intake_version: str | None = None,
     ) -> tuple[ChunkedDocument, list[int]]:
         """Keep legal text intact while reserving room for contextual summaries."""
 
         max_chunk_chars = self._regulatory_chunker.max_chunk_chars
         while True:
-            chunked = RegulatoryChunker(max_chunk_chars=max_chunk_chars).chunk_text(
+            structural_chunker: RegulatoryChunker
+            if intake_version is not None:
+                from onyx.regulatory.document_intake.chunking import (
+                    IntakeRegulatoryChunker,
+                )
+                from onyx.regulatory.document_intake.chunking_profile import (
+                    INTAKE_CHUNKING_CODE_VERSION,
+                )
+
+                if intake_version != INTAKE_CHUNKING_CODE_VERSION:
+                    raise ValueError("The intake chunking version is not supported")
+                structural_chunker = IntakeRegulatoryChunker(
+                    tokenizer=self.tokenizer,
+                    content_token_limit=max(
+                        1,
+                        self.chunk_token_limit
+                        - (
+                            DEFAULT_CONTEXTUAL_RAG_RESERVED_TOKENS
+                            if self.enable_contextual_rag
+                            else 0
+                        ),
+                    ),
+                    max_chunk_chars=max_chunk_chars,
+                )
+            else:
+                structural_chunker = RegulatoryChunker(max_chunk_chars=max_chunk_chars)
+            chunked = structural_chunker.chunk_text(
                 text,
                 source_path=source_path,
                 source_file=source_file,

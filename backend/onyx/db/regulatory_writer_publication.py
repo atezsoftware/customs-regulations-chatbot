@@ -592,6 +592,13 @@ def finalize_writer_publication(
         authority.renew_in_session(session, owner)
         session.commit()
 
+    if manifest.complete_file:
+        from onyx.db.document_lineage import reconcile_completed_intake_file
+
+        with get_session_with_tenant(tenant_id=owner.scope.tenant_id) as session:
+            reconcile_completed_intake_file(session, owner.user_file_id)
+            session.commit()
+
 
 def owned_metadata_baseline(
     owner: FileOwnership, index_names: list[str]

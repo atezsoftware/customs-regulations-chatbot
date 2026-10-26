@@ -1976,6 +1976,16 @@ def get_regulatory_provision_heading_source(
             ).where(RegulatoryChunk.id.in_(unique_seed_ids), *visibility_conditions)
         ).all()
     )
+    from onyx.db.document_lineage import repealed_file_ids
+
+    repealed = repealed_file_ids(
+        db_session,
+        tuple({record.user_file_id for record in seed_records}),
+        as_of_date=as_of_date,
+    )
+    seed_records = [
+        record for record in seed_records if record.user_file_id not in repealed
+    ]
     seed_records = filter_publication_read(
         observation, seed_records, lambda row: str(row.user_file_id)
     )
@@ -2487,10 +2497,14 @@ def _public_sibling_candidates(
     query_indexes: dict[UUID, PublicationIndexSnapshot] | None,
     observation: ReadObservation,
 ) -> list[RegulatoryChunkSiblingCandidate]:
+    from onyx.db.document_lineage import repealed_file_ids
     from onyx.db.regulatory_public_reads import qualified_file_ids
     from onyx.regulatory.publication_reads import filter_publication_read
 
     file_ids = tuple({row.user_file_id for row in rows})
+    repealed = repealed_file_ids(session, file_ids, as_of_date=as_of_date)
+    rows = [row for row in rows if row.user_file_id not in repealed]
+    file_ids = tuple(file_id for file_id in file_ids if file_id not in repealed)
     qualified = qualified_file_ids(session, file_ids)
     bindings: dict[str, _PublicProvisionRead] = {}
     effective_date = as_of_date or datetime.date.today()

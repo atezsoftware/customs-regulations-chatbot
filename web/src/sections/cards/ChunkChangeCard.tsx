@@ -3,9 +3,11 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { CompactMarkdown, Text } from "@opal/components";
 import type { RichStr } from "@opal/types";
+import type { Components } from "react-markdown";
 
 interface ChunkContentProps {
   text: string;
+  components?: Partial<Components>;
 }
 
 /** Render only table structure and text. Source HTML never reaches innerHTML. */
@@ -64,7 +66,7 @@ function tableNode(node: Node, key: string): ReactNode {
   }
 }
 
-export function ChunkContent({ text }: ChunkContentProps) {
+export function ChunkContent({ text, components }: ChunkContentProps) {
   const [table, setTable] = useState<ReactNode>(null);
   useEffect(() => {
     setTable(
@@ -79,7 +81,7 @@ export function ChunkContent({ text }: ChunkContentProps) {
   return table ? (
     <div className="overflow-x-auto text-text-04">{table}</div>
   ) : (
-    <CompactMarkdown>{text}</CompactMarkdown>
+    <CompactMarkdown components={components}>{text}</CompactMarkdown>
   );
 }
 

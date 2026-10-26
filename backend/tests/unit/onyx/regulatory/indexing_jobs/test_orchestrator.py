@@ -46,6 +46,7 @@ from onyx.regulatory.indexing_jobs.models import (
     IndexingGatewayHTTPError,
     IndexingGatewayIndeterminateSubmissionError,
     RegulatoryIndexingConfigSnapshot,
+    RegulatoryInputHashVersion,
 )
 from onyx.regulatory.indexing_jobs.openrouter_batch import (
     OpenRouterEmbeddingBatchRequest,
@@ -333,8 +334,22 @@ def test_preparing_uses_canonical_user_file_loader_and_reaps_staging() -> None:
     assert recovered_document.metadata == {"regulation_number": "2026/1"}
 
 
-def test_claimed_delivery_fences_generation_drift_before_snapshot_validation() -> None:
+@pytest.mark.parametrize("intake_version", [None, "1"])
+def test_claimed_delivery_fences_generation_drift_before_snapshot_validation(
+    intake_version: str | None,
+) -> None:
     runtime = _runtime(RegulatoryIndexingStage.CONTEXT_SUBMIT)
+    generation_hash = compute_regulatory_chunk_generation_hash(
+        embedding_provider=EmbeddingProvider.OPENROUTER,
+        embedding_model_name="openai/text-embedding-3-large",
+        intake_chunking_version=intake_version,
+    )
+    runtime.job.chunk_generation_hash = generation_hash
+    runtime.job.config_snapshot = {
+        **runtime.job.config_snapshot,
+        "chunk_generation_hash": generation_hash,
+        "intake_chunking_version": intake_version,
+    }
     delivery = indexing_job_repository.RegulatoryIndexingCancellationDelivery(
         job_id=runtime.job.id,
         expected_generation=4,
@@ -344,7 +359,7 @@ def test_claimed_delivery_fences_generation_drift_before_snapshot_validation() -
             "onyx.regulatory.indexing_jobs.orchestrator.compute_regulatory_chunk_generation_hash",
             return_value="3" * 64,
             create=True,
-        ),
+        ) as compute_hash,
         patch(
             "onyx.regulatory.indexing_jobs.orchestrator.indexing_job_repository.supersede_regulatory_indexing_job_for_generation_drift",
             return_value=delivery,
@@ -366,6 +381,67 @@ def test_claimed_delivery_fences_generation_drift_before_snapshot_validation() -
 
     assert result.outcome is OrchestrationOutcome.NEXT_STEP
     assert result.expected_generation == 4
+    compute_hash.assert_called_once_with(
+        embedding_provider=EmbeddingProvider.OPENROUTER,
+        embedding_model_name="openai/text-embedding-3-large",
+        intake_chunking_version=intake_version,
+    )
+
+
+@pytest.mark.parametrize("intake_version", [None, "1"])
+def test_chunk_row_preparation_preserves_frozen_profile_without_false_generation_drift(
+    intake_version: str | None,
+) -> None:
+    runtime = _runtime(RegulatoryIndexingStage.PREPARING)
+    generation_hash = compute_regulatory_chunk_generation_hash(
+        embedding_provider=EmbeddingProvider.OPENROUTER,
+        embedding_model_name="openai/text-embedding-3-large",
+        intake_chunking_version=intake_version,
+    )
+    runtime.job.chunk_generation_hash = generation_hash
+    runtime.user_file.regulatory_chunk_generation_hash = generation_hash
+    runtime.job.config_snapshot = {
+        **runtime.job.config_snapshot,
+        "input_hash_version": RegulatoryInputHashVersion.CHUNK_ROWS_V3.value,
+        "chunk_generation_hash": generation_hash,
+        "intake_chunking_version": intake_version,
+    }
+    session = cast(Session, MagicMock())
+    with (
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator.compute_regulatory_chunk_generation_hash",
+            wraps=compute_regulatory_chunk_generation_hash,
+        ) as compute_hash,
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator.indexing_job_repository.supersede_regulatory_indexing_job_for_generation_drift"
+        ) as supersede,
+        patch("onyx.regulatory.indexing_jobs.orchestrator.validate_snapshot_for_stage"),
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator.prepare_claimed_regulatory_indexing_job_from_chunks"
+        ) as prepare,
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator._load_claimed_markdown_documents",
+            side_effect=AssertionError("Frozen canonical rows must not be rechunked"),
+        ),
+    ):
+        from onyx.regulatory.indexing_jobs.orchestrator import _execute_claimed_step
+
+        result = _execute_claimed_step(
+            runtime, tenant_id="tenant-a", db_session=session, now=_NOW
+        )
+    supersede.assert_not_called()
+    compute_hash.assert_called_once_with(
+        embedding_provider=EmbeddingProvider.OPENROUTER,
+        embedding_model_name="openai/text-embedding-3-large",
+        intake_chunking_version=intake_version,
+    )
+    prepare.assert_called_once_with(
+        job_id=runtime.job.id,
+        expected_generation=runtime.job.lease_generation,
+        tenant_id="tenant-a",
+        db_session=session,
+    )
+    assert result.outcome is OrchestrationOutcome.NEXT_STEP
 
 
 def test_unresolved_preparing_delivery_resolves_hash_before_generation_drift() -> None:

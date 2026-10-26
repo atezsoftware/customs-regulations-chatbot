@@ -82,6 +82,7 @@ class LLMFlow(StrEnum):
     CONTEXTUAL_RAG_CHUNK_CONTEXT = "contextual_rag_chunk_context"
     REGULATORY_CONTEXTUAL_BATCH = "regulatory_contextual_batch"
     REGULATORY_LABELING_BATCH = "regulatory_labeling_batch"
+    REGULATORY_INTAKE_METADATA = "regulatory_intake_metadata"
     REGULATORY_EMBEDDING_BATCH = "regulatory_embedding_batch"
     IMAGE_SUMMARIZATION = "image_summarization"
 

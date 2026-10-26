@@ -492,6 +492,9 @@ def validate_prepared_annex_change(
         canonical_snapshot_rows,
         prepare_staged_candidate_rows,
     )
+    from onyx.regulatory.document_intake.temporal_context import (
+        intake_temporal_context_rows,
+    )
 
     candidate_rows = prepare_staged_candidate_rows(
         baseline_scope=draft.baseline_scope,
@@ -500,12 +503,16 @@ def validate_prepared_annex_change(
         evidence_remapping=draft.new_evidence_remapping,
     )
     validate_complete_context_view(
-        rows=canonical_snapshot_rows(draft.baseline_scope),
+        rows=intake_temporal_context_rows(
+            canonical_snapshot_rows(draft.baseline_scope)
+        ),
         view=draft.baseline_context,
         as_of_date=draft.effective_date,
     )
     validate_complete_context_view(
-        rows=candidate_rows, view=draft.impact.prepared, as_of_date=draft.effective_date
+        rows=intake_temporal_context_rows(candidate_rows),
+        view=draft.impact.prepared,
+        as_of_date=draft.effective_date,
     )
     expected_impact = compare_context_views(
         old=draft.baseline_context,

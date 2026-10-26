@@ -665,6 +665,9 @@ def chunk_owned_file(
     from onyx.indexing.embedder import DefaultIndexingEmbedder
     from onyx.regulatory.amendments.annexes import config
     from onyx.regulatory.amendments.annexes.publication_execution import LEASE_TTL
+    from onyx.regulatory.document_intake.chunking_profile import (
+        documents_intake_chunking_version,
+    )
     from onyx.regulatory.indexing_jobs.configuration import (
         compute_regulatory_chunk_generation_hash,
     )
@@ -697,6 +700,7 @@ def chunk_owned_file(
             embedding_provider=current.provider_type,
             embedding_model_name=current.model_name,
             enable_contextual_rag=contextual,
+            intake_chunking_version=documents_intake_chunking_version(documents),
         )
         persist_owned_initial_chunks(
             owner,
@@ -706,6 +710,79 @@ def chunk_owned_file(
             generation_hash=generation_hash,
         )
         return True
+    finally:
+        try:
+            authority.release(owner)
+        except ValueError:
+            pass
+
+
+def reprepare_owned_intake_file(
+    user_file_id: "UUID",
+    tenant_id: str,
+    documents: list["Document"],
+    *,
+    intake_id: "UUID",
+    request_id: "UUID",
+    lease_token: "UUID",
+) -> bool:
+    """Rebuild only an audited, unpublished intake under its file ownership fence."""
+    from uuid import uuid4
+
+    from onyx.db.document_intake_reprepare import persist_owned_reprepared_intake_file
+    from onyx.db.regulatory_writer_publication import load_owned_writer_inputs
+    from onyx.document_index.publication_models import PublicationScope
+    from onyx.indexing.contextual_settings import effective_contextual_rag_enabled
+    from onyx.indexing.embedder import DefaultIndexingEmbedder
+    from onyx.regulatory.amendments.annexes import config
+    from onyx.regulatory.amendments.annexes.publication_execution import LEASE_TTL
+    from onyx.regulatory.document_intake.chunking_profile import (
+        documents_intake_chunking_version,
+    )
+    from onyx.regulatory.indexing_jobs.configuration import (
+        compute_regulatory_chunk_generation_hash,
+    )
+
+    version = documents_intake_chunking_version(documents)
+    if version is None:
+        raise ValueError("Intake preparation requires its versioned source context")
+    authority = PublicationStore(
+        PublicationScope(
+            tenant_id=tenant_id,
+            environment=config.REGULATORY_ANNEX_ENVIRONMENT,
+            database_identity=config.ANNEX_DATABASE_IDENTITY,
+        )
+    )
+    owner = authority.acquire(user_file_id, owner_id=uuid4(), ttl=LEASE_TTL)
+    try:
+        inputs = load_owned_writer_inputs(owner)
+        current = next(
+            (item for item in inputs.settings if item.status.is_current()), None
+        )
+        if current is None:
+            raise ValueError("Intake preparation requires current search settings")
+        embedder = DefaultIndexingEmbedder.from_db_search_settings(
+            search_settings=current
+        )
+        contextual = effective_contextual_rag_enabled(current)
+        return (
+            persist_owned_reprepared_intake_file(
+                owner,
+                documents,
+                embedder.embedding_model.tokenizer,
+                contextual=contextual,
+                generation_hash=compute_regulatory_chunk_generation_hash(
+                    embedding_provider=current.provider_type,
+                    embedding_model_name=current.model_name,
+                    enable_contextual_rag=contextual,
+                    intake_chunking_version=version,
+                ),
+                intake_id=intake_id,
+                request_id=request_id,
+                lease_token=lease_token,
+            )
+            > 0
+        )
     finally:
         try:
             authority.release(owner)

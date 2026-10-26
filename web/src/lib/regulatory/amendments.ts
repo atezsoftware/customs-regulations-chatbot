@@ -550,12 +550,14 @@ export async function createAmendmentSourcePackage(
 export async function uploadAmendmentSourcePackage(
   documentSetId: number,
   idempotencyKey: string,
-  file: File
+  file: File,
+  baseUrl?: string
 ): Promise<AmendmentSourcePackage> {
   const body = new FormData();
   body.append("document_set_id", String(documentSetId));
   body.append("idempotency_key", idempotencyKey);
   body.append("file", file);
+  if (baseUrl?.trim()) body.append("base_url", baseUrl.trim());
   return requestJson(
     "Upload amendment source package",
     "/api/regulatory/amendments/source-packages/upload",

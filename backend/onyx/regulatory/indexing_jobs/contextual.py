@@ -52,6 +52,9 @@ from onyx.regulatory.contextual import (
     fit_context_fields_to_embedding_budget,
     visible_regulatory_snapshot_for_target,
 )
+from onyx.regulatory.document_intake.temporal_context import (
+    intake_temporal_context_rows,
+)
 from onyx.regulatory.indexing_jobs.models import OpenRouterBatchConfig
 from onyx.regulatory.indexing_jobs.vertex_batch import (
     VertexBatchRequest,
@@ -371,7 +374,9 @@ class ContextualRequestFactory:
     )
 
     def __post_init__(self) -> None:
-        self._ordered_rows = tuple(_ordered_rows(self.rows))
+        self._ordered_rows = tuple(
+            _ordered_rows(intake_temporal_context_rows(list(self.rows)))
+        )
         self._row_by_id = {row.id: row for row in self._ordered_rows}
         if any(row.user_file_id != self.job.user_file_id for row in self._ordered_rows):
             raise ContextualMappingError(
@@ -872,6 +877,7 @@ def prepare_durable_context_view(
         raise ContextualMappingError("canonical rows do not belong to the indexing job")
     if changed_ids:
         rows = rebuild_context_aggregates(list(rows), changed_ids=changed_ids)
+    rows = intake_temporal_context_rows(list(rows))
     ordered = effective_context_rows(list(rows), as_of_date)
     if target_ids is not None:
         ordered = [row for row in ordered if row.id in target_ids]

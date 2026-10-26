@@ -17,6 +17,7 @@ def test_runtime_registers_handlers_and_exclusively_consumes_scoped_work() -> No
     assert {
         "acquire_amendment_sources",
         "regulatory_amendment_run",
+        "regulatory_document_intake_prepare",
         "publish_annex_change",
         "recover_annex_publications",
         "recover_amendment_sources",
@@ -95,12 +96,27 @@ def test_readiness_refuses_foreign_worker_stale_pid_missing_handlers_and_concurr
         worker: [
             "acquire_amendment_sources",
             "regulatory_amendment_run",
+            "regulatory_document_intake_prepare",
             "publish_annex_change",
             "recover_annex_publications",
             "recover_amendment_sources",
         ]
     }
     validate_worker(worker, 71, queues=queues, stats=stats, registered=registered)
+    with pytest.raises(ValueError, match="missing required handlers"):
+        validate_worker(
+            worker,
+            71,
+            queues=queues,
+            stats=stats,
+            registered={
+                worker: [
+                    task
+                    for task in registered[worker]
+                    if task != "regulatory_document_intake_prepare"
+                ]
+            },
+        )
     failures = [
         {"queues": {"regulatory_annex@foreign": queues[worker]}},
         {"queues": {worker: queues[worker] + [{"name": "celery"}]}},

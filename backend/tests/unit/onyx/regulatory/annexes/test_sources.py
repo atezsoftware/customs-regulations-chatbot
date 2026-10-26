@@ -268,6 +268,86 @@ def test_pdf_annex_page_does_not_authorize_unrelated_footer_url() -> None:
 
 
 @pytest.mark.parametrize(
+    "matrix, text_origin, annex_origin, unrelated_origin",
+    [
+        ((1, 0, 0, 1, 0, 0), (20, 40), (20, 40), (250, 250)),
+        ((0.5, 0, 0, -0.5, 80, 240), (20, 40), (90, 220), (100, 280)),
+        ((0, 1, -1, 0, 240, 20), (40, 50), (190, 60), (280, 70)),
+        ((1, 0.2, 0.3, 1, 20, 40), (30, 80), (74, 126), (50, 120)),
+    ],
+    ids=["identity", "scaled-flipped", "rotated", "sheared"],
+)
+def test_pdf_transformed_annex_label_matches_its_annotation_only(
+    matrix: tuple[float, float, float, float, float, float],
+    text_origin: tuple[float, float],
+    annex_origin: tuple[float, float],
+    unrelated_origin: tuple[float, float],
+) -> None:
+    from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
+
+    from onyx.regulatory.amendments.annexes.sources import (
+        DownloadedSource,
+        acquire_source_package,
+    )
+
+    writer = PdfWriter()
+    page = writer.add_blank_page(width=400, height=400)
+    page[NameObject("/Resources")] = DictionaryObject(
+        {
+            NameObject("/Font"): DictionaryObject(
+                {
+                    NameObject("/F1"): DictionaryObject(
+                        {
+                            NameObject("/Type"): NameObject("/Font"),
+                            NameObject("/Subtype"): NameObject("/Type1"),
+                            NameObject("/BaseFont"): NameObject("/Helvetica"),
+                        }
+                    )
+                }
+            )
+        }
+    )
+    content = DecodedStreamObject()
+    content.set_data(
+        (
+            f"q {' '.join(str(value) for value in matrix)} cm "
+            f"BT /F1 12 Tf 1 0 0 1 {text_origin[0]} {text_origin[1]} Tm "
+            "(Ekler icin tiklayiniz) Tj ET Q"
+        ).encode()
+    )
+    page[NameObject("/Contents")] = content
+    annex_url = "https://example.gov/files/47.pdf"
+    for origin, url in (
+        (annex_origin, annex_url),
+        (unrelated_origin, "https://example.gov/privacy"),
+    ):
+        writer.add_annotation(
+            0,
+            Link(
+                rect=(origin[0] - 1, origin[1] - 1, origin[0] + 1, origin[1] + 1),
+                url=url,
+            ),
+        )
+    stream = BytesIO()
+    writer.write(stream)
+    fetched: list[str] = []
+
+    def fetch(url: str) -> DownloadedSource:
+        fetched.append(url)
+        return DownloadedSource(pdf_bytes(), "application/pdf", url)
+
+    result = acquire_source_package(
+        content=stream.getvalue(), mime_type="application/pdf", fetch=fetch
+    )
+    assert result.status == "ready"
+    assert len(result.assets) == 2
+    assert fetched == [annex_url]
+    assert len(result.links) == 1
+    assert result.links[0].source_field == "pdf:annotation:0"
+    assert result.links[0].label.strip() == "Ekler icin tiklayiniz"
+
+
+@pytest.mark.parametrize(
     "status, declared, expected",
     [(404, "4", "404"), (200, "100", "truncated"), (302, "4", "redirect_loop")],
 )

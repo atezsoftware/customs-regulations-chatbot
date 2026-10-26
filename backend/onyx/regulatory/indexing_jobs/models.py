@@ -1,4 +1,5 @@
 from enum import StrEnum
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -147,6 +148,7 @@ class RegulatoryIndexingConfigSnapshot(BaseModel):
     chunk_generation_hash: str = Field(
         min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
     )
+    intake_chunking_version: Literal["1"] | None = None
     search_settings_id: int = Field(gt=0)
     embedding_provider: EmbeddingProvider
     embedding_model_name: str = Field(min_length=1)

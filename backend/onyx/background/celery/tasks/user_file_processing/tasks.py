@@ -526,10 +526,30 @@ def _index_requested_user_file(
 
     with get_session_with_current_tenant() as session:
         if not start_user_file_index_request(session, file_id, token):
-            return
+            from onyx.db.document_intake_publication_recovery import (
+                committed_recovery_delivery,
+            )
+
+            if not committed_recovery_delivery(session, file_id, token):
+                return
         status = get_user_file_index_request_status(session, file_id)
     try:
-        if status == UserFileStatus.CHUNKED:
+        from onyx.db.document_intake_publication_recovery import recovery_for_attempt
+
+        with get_session_with_current_tenant() as session:
+            recovery_id = recovery_for_attempt(session, file_id, token)
+        if recovery_id is not None:
+            from onyx.regulatory.document_intake.publication_recovery import (
+                recover_intake_publication,
+            )
+
+            recover_intake_publication(
+                user_file_id=file_id,
+                tenant_id=tenant_id,
+                attempt_id=token,
+                recovery_id=recovery_id,
+            )
+        elif status == UserFileStatus.CHUNKED:
             if app_configs.REGULATORY_BATCH_INDEXING_ENABLED:
                 with get_session_with_current_tenant() as session:
                     job_id = prepare_regulatory_indexing_job_from_chunks(
