@@ -56,6 +56,8 @@ def _fixture(
     owner: tuple[User, DocumentSet, ModelConfiguration],
     store: PostgresBackedFileStore,
     monkeypatch: pytest.MonkeyPatch,
+    *,
+    legacy_chunks: bool = True,
 ) -> tuple[RegulatoryDocumentIntake, UUID]:
     user, _target, model = owner
     display_name, content, _originals = _markdown_input(True, True)
@@ -117,7 +119,8 @@ def _fixture(
         )
 
     with monkeypatch.context() as initial:
-        initial.setattr(writer_publication, "chunk_owned_file", legacy)
+        if legacy_chunks:
+            initial.setattr(writer_publication, "chunk_owned_file", legacy)
         run_id = intake_job.run_document_intake(intake_id=batch_id, tenant_id="public")
     assert run_id is not None
     session.expire_all()

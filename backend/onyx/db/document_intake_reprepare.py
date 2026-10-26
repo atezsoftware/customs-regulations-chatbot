@@ -509,11 +509,19 @@ def reprepared_original_receipt(
             RegulatoryDocumentIntakeReprepare.id.desc(),
         )
         .limit(1)
+        .execution_options(populate_existing=True)
     )
     if request is None:
         return original
+    if not isinstance(request.documents, dict):
+        raise ValueError("Prepared intake receipt is incomplete")
     entry = request.documents.get(str(member.id), {})
-    if entry.get("status") != "prepared" or not entry.get("after_receipt"):
+    if (
+        not isinstance(entry, dict)
+        or entry.get("status") != "prepared"
+        or not entry.get("after_receipt")
+        or entry.get("source_receipt") != original.model_dump(mode="json")
+    ):
         raise ValueError("Prepared intake receipt is incomplete")
     receipt = OriginalIngestionReceipt.model_validate(entry["after_receipt"])
     if (
