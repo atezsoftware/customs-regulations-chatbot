@@ -812,6 +812,11 @@ def _read_and_apply_results(
         run = repository.load_claimed_run(session, lease)
         repository.set_claimed_run_stage(session, lease, "applying")
         taxonomy = TaxonomyDefinition.model_validate(run.taxonomy.definition)
+        intake_quotes = False
+        if run.provider_binding.get("transport") == "vertex_direct_v1":
+            from onyx.db.document_intake_labeling import is_current_intake_labeling_run
+
+            intake_quotes = is_current_intake_labeling_run(session, run)
         session.commit()
     with LabelingResultSpool() as spool:
         for items in _result_pages(lease, shard_id, heartbeat):
@@ -846,9 +851,26 @@ def _read_and_apply_results(
                     )
                     continue
                 try:
-                    outcome = validate_labeling_response(
-                        result.context, text=item.text_snapshot, taxonomy=taxonomy
-                    )
+                    if intake_quotes:
+                        from onyx.regulatory.labeling.intake_quote_resolution import (
+                            resolve_intake_labeling_response,
+                        )
+
+                        outcome, resolutions = resolve_intake_labeling_response(
+                            result.context, text=item.text_snapshot, taxonomy=taxonomy
+                        )
+                        if resolutions:
+                            logger.info(
+                                "Resolved intake label evidence run=%s chunk=%s request=%s audit=%s",
+                                lease.run_id,
+                                item.regulatory_chunk_id,
+                                request_hash,
+                                resolutions,
+                            )
+                    else:
+                        outcome = validate_labeling_response(
+                            result.context, text=item.text_snapshot, taxonomy=taxonomy
+                        )
                 except ValueError as error:
                     outcomes[request_hash] = str(error)
                     continue
