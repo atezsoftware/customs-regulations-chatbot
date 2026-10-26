@@ -1,5 +1,5 @@
 import json
-from typing import cast
+from typing import TypedDict, cast
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -10,6 +10,10 @@ from onyx.db import labeling_configuration as configuration
 from onyx.db.models import LLMProvider, ModelConfiguration, User
 from onyx.llm.constants import LlmProviderNames
 from onyx.llm.well_known_providers.constants import VERTEX_CREDENTIALS_FILE_KWARG
+
+
+class _DirectOptions(TypedDict, total=False):
+    direct_max_concurrency: int
 
 
 def _model() -> ModelConfiguration:
@@ -60,10 +64,12 @@ def test_intake_resolves_existing_credentials_without_gcs_configuration(
 
 @pytest.mark.parametrize("frozen_model", ["gemini-3.5-flash", "gemini-3.8-flash"])
 @pytest.mark.parametrize("direct_timeout", [None, 240])
+@pytest.mark.parametrize("direct_concurrency", [None, 4])
 def test_direct_binding_selects_the_frozen_model_and_existing_credentials_without_storage(
     monkeypatch: pytest.MonkeyPatch,
     frozen_model: str,
     direct_timeout: float | None,
+    direct_concurrency: int | None,
 ) -> None:
     model = _model()
     monkeypatch.setattr(
@@ -75,13 +81,18 @@ def test_direct_binding_selects_the_frozen_model_and_existing_credentials_withou
     binding = configuration._binding(
         model, transport="vertex_direct_v1", model_name=frozen_model
     )
+    options: _DirectOptions = (
+        {}
+        if direct_concurrency is None
+        else {"direct_max_concurrency": direct_concurrency}
+    )
     with patch(
         "onyx.regulatory.labeling.vertex_direct.LabelingVertexDirectGateway",
         autospec=True,
     ) as gateway:
         if direct_timeout is None:
             result = configuration.resolve_labeling_gateway(
-                cast(Session, object()), model.id, expected_binding=binding
+                cast(Session, object()), model.id, expected_binding=binding, **options
             )
         else:
             result = configuration.resolve_labeling_gateway(
@@ -89,6 +100,7 @@ def test_direct_binding_selects_the_frozen_model_and_existing_credentials_withou
                 model.id,
                 expected_binding=binding,
                 direct_request_timeout_seconds=direct_timeout,
+                **options,
             )
     assert result is gateway.return_value
     assert "staging_uri" not in gateway.call_args.kwargs
@@ -97,6 +109,7 @@ def test_direct_binding_selects_the_frozen_model_and_existing_credentials_withou
     assert gateway.call_args.kwargs["request_timeout_seconds"] == (
         direct_timeout or 120
     )
+    assert gateway.call_args.kwargs["max_concurrency"] == (direct_concurrency or 1)
 
 
 def test_intake_reports_missing_service_credentials_without_a_gcs_error(

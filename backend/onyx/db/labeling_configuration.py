@@ -482,6 +482,7 @@ def resolve_labeling_gateway(
     direct_max_request_bytes: int = 768 * 1024,
     direct_max_response_bytes: int = 1024 * 1024,
     direct_request_timeout_seconds: float = 120,
+    direct_max_concurrency: int = 1,
 ) -> LabelingBatchGateway:
     """Resolve credentials while the session is open; perform no network I/O here."""
     transport = (
@@ -537,6 +538,7 @@ def resolve_labeling_gateway(
             credential_identity=binding.credential_identity,
             max_result_bytes=64 * 1024 * 1024,
             request_timeout_seconds=direct_request_timeout_seconds,
+            max_concurrency=direct_max_concurrency,
             max_request_bytes=direct_max_request_bytes,
             max_response_bytes=direct_max_response_bytes,
             flow=direct_flow,

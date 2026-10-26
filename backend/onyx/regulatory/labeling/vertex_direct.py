@@ -10,9 +10,12 @@ import json
 import math
 import re
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import ExitStack, contextmanager
+from contextvars import copy_context
 from hashlib import sha256
 from io import BytesIO
+from threading import Event, Lock
 from typing import TYPE_CHECKING, Literal, Protocol, cast
 
 from google.auth.credentials import Credentials
@@ -111,6 +114,7 @@ class LabelingVertexDirectGateway(VertexBatchGateway):
         credential_identity: str,
         store: FileStore | None = None,
         request_timeout_seconds: float = 120,
+        max_concurrency: int = 1,
         max_result_bytes: int = 64 * 1024 * 1024,
         max_request_bytes: int = MAX_REQUEST_BYTES,
         max_response_bytes: int = MAX_RESPONSE_BYTES,
@@ -131,6 +135,8 @@ class LabelingVertexDirectGateway(VertexBatchGateway):
             raise VertexBatchContractError(
                 "Vertex direct result budget must be positive"
             )
+        if type(max_concurrency) is not int or not 1 <= max_concurrency <= 4:
+            raise VertexBatchContractError("Vertex direct concurrency must be 1–4")
         if not 1 <= max_request_bytes <= _MAX_INPUT_BYTES:
             raise VertexBatchContractError("Vertex direct request budget exceeds 8 MiB")
         if not 1 <= max_response_bytes <= 16 * 1024 * 1024:
@@ -147,6 +153,7 @@ class LabelingVertexDirectGateway(VertexBatchGateway):
         self._identity = credential_identity
         self._store = store
         self._timeout = request_timeout_seconds
+        self._max_concurrency = max_concurrency
         self._max_result_bytes = max_result_bytes
         self._max_request_bytes = max_request_bytes
         self._max_response_bytes = max_response_bytes
@@ -399,6 +406,19 @@ class LabelingVertexDirectGateway(VertexBatchGateway):
             )
         if manifest.cancelled:
             return self._state(manifest)
+        if self._max_concurrency > 1:
+            self._submit_parallel(
+                prepared, submission_key=submission_key, on_progress=on_progress
+            )
+            # Cancellation must never be overwritten by a stale completion manifest.
+            current = self._manifest(submission_key)
+            if current is not None and current.cancelled:
+                return self._state(current)
+            manifest.complete = True
+            self._write(
+                self._manifest_id(submission_key), manifest.model_dump_json().encode()
+            )
+            return self._state(manifest)
         total_bytes = 0
         client: _Client | None = None
         with ExitStack() as clients:
@@ -434,6 +454,114 @@ class LabelingVertexDirectGateway(VertexBatchGateway):
             self._manifest_id(submission_key), manifest.model_dump_json().encode()
         )
         return self._state(manifest)
+
+    def _submit_parallel(
+        self,
+        requests: Sequence[VertexBatchRequest],
+        *,
+        submission_key: str,
+        on_progress: Callable[[], None],
+    ) -> None:
+        stopped, failure_lock = Event(), Lock()
+        failures: list[Exception] = []
+        total_bytes = 0
+        missing: list[VertexBatchRequest] = []
+        for request in requests:
+            on_progress()
+            line = self._result(submission_key, request.request_hash)
+            if line is None:
+                missing.append(request)
+            else:
+                total_bytes += len(line.encode())
+        if total_bytes > self._max_result_bytes:
+            raise VertexBatchContractError(
+                "Vertex direct output exceeds its complete result budget"
+            )
+
+        def record_failure(error: Exception) -> None:
+            with failure_lock:
+                if not failures:
+                    failures.append(error)
+            stopped.set()
+
+        def infer(request: VertexBatchRequest) -> int:
+            try:
+                if stopped.is_set():
+                    return 0
+                with self._client() as client:
+                    try:
+                        line = self._generate(client, request)
+                        stored = _StoredResult(
+                            binding_sha256=self._binding,
+                            submission_key=submission_key,
+                            request_hash=request.request_hash,
+                            request_payload=request.model_dump(
+                                mode="json", exclude={"request_hash"}
+                            ),
+                            line_sha256=sha256(line.encode()).hexdigest(),
+                            line=line,
+                        )
+                        self._write(
+                            self._result_id(submission_key, request.request_hash),
+                            stored.model_dump_json().encode(),
+                        )
+                    except Exception as error:
+                        record_failure(error)
+                        raise
+                return len(line.encode())
+            except Exception as error:
+                record_failure(error)
+                raise
+
+        with ThreadPoolExecutor(max_workers=self._max_concurrency) as executor:
+            pending: set[Future[int]] = set()
+            next_request = 0
+
+            def submit() -> None:
+                nonlocal next_request
+                context = copy_context()
+                request = missing[next_request]
+
+                def run_in_context() -> int:
+                    return context.run(infer, request)
+
+                pending.add(executor.submit(run_in_context))
+                next_request += 1
+
+            try:
+                while next_request < min(self._max_concurrency, len(missing)):
+                    on_progress()
+                    if stopped.is_set():
+                        break
+                    submit()
+                while pending:
+                    done, _ = wait(pending, timeout=30, return_when=FIRST_COMPLETED)
+                    on_progress()
+                    for future in done:
+                        pending.remove(future)
+                        total_bytes += future.result()
+                    if total_bytes > self._max_result_bytes:
+                        raise VertexBatchContractError(
+                            "Vertex direct output exceeds its complete result budget"
+                        )
+                    while (
+                        not stopped.is_set()
+                        and next_request < len(missing)
+                        and len(pending) < self._max_concurrency
+                    ):
+                        on_progress()
+                        if not stopped.is_set():
+                            submit()
+                if failures:
+                    raise failures[0]
+            except Exception:
+                stopped.set()
+                for future in pending:
+                    future.cancel()
+                # Active calls finish and retain their acknowledged receipts.
+                if failures:
+                    raise failures[0] from None
+                raise
 
     def _generate(self, client: _Client, request: VertexBatchRequest) -> str:
         from google.genai import types as genai_types

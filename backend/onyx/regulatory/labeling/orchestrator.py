@@ -43,6 +43,7 @@ logger = setup_logger()
 LABELING_LEASE_SECONDS = 300
 LABELING_PREPARATION_PAGE = 128
 LABELING_SHARD_ITEMS = 64
+INTAKE_LABELING_SHARD_ITEMS = 8
 LABELING_SHARD_BYTES = 8 * 1024 * 1024
 LABELING_VERTEX_BATCH_ITEMS = 200_000
 LABELING_VERTEX_BATCH_BYTES = 1_000_000_000
@@ -164,11 +165,18 @@ def _gateway_for_claimed_run(
         user = repository.get_claimed_run_requester(session, lease)
         if user is None:
             raise ValueError("The user who requested labeling is unavailable")
+        direct_concurrency = 1
+        if binding.transport == "vertex_direct_v1":
+            from onyx.db.document_intake_labeling import is_current_intake_labeling_run
+
+            if is_current_intake_labeling_run(session, run):
+                direct_concurrency = 4
         return resolve_labeling_gateway(
             session,
             run.model_configuration_id,
             user=user,
             expected_binding=binding,
+            direct_max_concurrency=direct_concurrency,
         )
 
 
@@ -232,9 +240,15 @@ def _prepare(lease: repository.RunLease, tenant_id: str) -> LabelingStepResult:
                 failed[item.id] = str(error)
             else:
                 prepared.append((str(item.id), request))
+        item_limit = LABELING_SHARD_ITEMS
+        if run.provider_binding.get("transport") == "vertex_direct_v1":
+            from onyx.db.document_intake_labeling import is_current_intake_labeling_run
+
+            if is_current_intake_labeling_run(session, run):
+                item_limit = INTAKE_LABELING_SHARD_ITEMS
         grouped = shard_by_count_and_bytes(
             prepared,
-            item_limit=LABELING_SHARD_ITEMS,
+            item_limit=item_limit,
             byte_limit=LABELING_SHARD_BYTES,
             size_of=vertex_jsonl_line_size,
         )
