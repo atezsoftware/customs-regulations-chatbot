@@ -60,12 +60,18 @@ class LabelingBatchGateway(VertexBatchGateway, Protocol):
 
 
 LabelingProviderTransport = Literal[
-    "gemini_files_v1", "gemini_inline_api_key_v1", "vertex_gcs_v1"
+    "gemini_files_v1", "gemini_inline_api_key_v1", "vertex_gcs_v1", "vertex_direct_v1"
 ]
 
 _FILES_TRANSPORT: LabelingProviderTransport = "gemini_files_v1"
 _INLINE_TRANSPORT: LabelingProviderTransport = "gemini_inline_api_key_v1"
 _VERTEX_TRANSPORT: LabelingProviderTransport = "vertex_gcs_v1"
+_DIRECT_TRANSPORT: LabelingProviderTransport = "vertex_direct_v1"
+INTAKE_LABELING_MODEL = "gemini-3.5-flash"
+INTAKE_LABELING_CONFIGURATION_ERROR = (
+    "Configure an accessible Google Vertex connection with an enabled model and "
+    "valid credentials before preparing labels."
+)
 _VERTEX_GCS_URI_ENV = "REGULATORY_LABELING_VERTEX_GCS_URI"
 _GCS_BUCKET_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]*[a-z0-9]$")
 _MISSING_STAGING_URI_ERROR = (
@@ -141,6 +147,12 @@ class LabelingProviderBinding(BaseModel):
 
     @model_validator(mode="after")
     def validate_transport_configuration(self) -> "LabelingProviderBinding":
+        if self.transport == _DIRECT_TRANSPORT:
+            if self.api_key_hash is not None or self.staging_uri is not None:
+                raise ValueError(
+                    "Direct Vertex labeling cannot use Batch keys or GCS staging"
+                )
+            return self
         if self.transport == _FILES_TRANSPORT:
             if self.api_key_hash is not None or self.staging_uri is not None:
                 raise ValueError(
@@ -182,6 +194,7 @@ def _binding(
     transport: LabelingProviderTransport = _FILES_TRANSPORT,
     api_key_hash: str | None = None,
     staging_uri: str | None = None,
+    model_name: str = DEFAULT_MODEL,
 ) -> LabelingProviderBinding:
     provider = model.llm_provider
     if provider.provider != LlmProviderNames.VERTEX_AI or not model.is_visible:
@@ -222,6 +235,7 @@ def _binding(
         location=custom.get(VERTEX_LOCATION_KWARG, "global").strip() or "global",
         authentication_mode=authentication_mode,
         credential_identity=identity.strip(),
+        model=model_name,
         transport=transport,
         api_key_hash=api_key_hash,
         staging_uri=staging_uri,
@@ -229,7 +243,7 @@ def _binding(
 
 
 def _inline_binding(
-    model: ModelConfiguration, user: User | None
+    model: ModelConfiguration, user: User | None, *, model_name: str = DEFAULT_MODEL
 ) -> tuple[LabelingProviderBinding, str]:
     api_key = get_gemini_batch_api_key(
         model.llm_provider, user_id=str(user.id) if user is not None else None
@@ -241,6 +255,7 @@ def _inline_binding(
             model,
             transport=_INLINE_TRANSPORT,
             api_key_hash=sha256(api_key.encode()).hexdigest(),
+            model_name=model_name,
         ),
         api_key,
     )
@@ -369,12 +384,104 @@ def get_labeling_provider_options(
     return options
 
 
+def resolve_intake_labeling_provider_binding(
+    db_session: Session,
+    model_configuration_id: int,
+    *,
+    user: User | None = None,
+) -> LabelingProviderBinding:
+    """Freeze the intake model using an existing authorized Vertex connection."""
+    return _binding(
+        _authorized_model(db_session, model_configuration_id, user),
+        transport=_DIRECT_TRANSPORT,
+        model_name=INTAKE_LABELING_MODEL,
+    )
+
+
+def get_intake_labeling_provider_options(
+    db_session: Session,
+    *,
+    user: User,
+) -> list[LabelingProviderOption]:
+    preferred_models = (
+        select(ModelConfiguration.id)
+        .join(ModelConfiguration.llm_provider)
+        .where(
+            LLMProvider.provider == LlmProviderNames.VERTEX_AI,
+            ModelConfiguration.is_visible.is_(True),
+        )
+        .distinct(ModelConfiguration.llm_provider_id)
+        .order_by(ModelConfiguration.llm_provider_id, ModelConfiguration.id)
+    )
+    models = db_session.scalars(
+        _model_statement()
+        .where(ModelConfiguration.id.in_(preferred_models))
+        .order_by(ModelConfiguration.llm_provider_id, ModelConfiguration.id)
+        .execution_options(populate_existing=True)
+    )
+    user_group_ids = fetch_user_group_ids(db_session, user)
+    options: list[LabelingProviderOption] = []
+    for model in models:
+        provider = model.llm_provider
+        if not can_user_access_llm_provider(
+            provider,
+            user_group_ids,
+            persona=None,
+            is_admin=user.role == UserRole.ADMIN,
+        ):
+            continue
+        configuration_error = None
+        try:
+            _binding(
+                model, transport=_DIRECT_TRANSPORT, model_name=INTAKE_LABELING_MODEL
+            )
+        except ValueError as error:
+            configuration_error = str(error)
+        options.append(
+            {
+                "id": model.id,
+                "name": provider.name or "Gemini",
+                "configuration_error": configuration_error,
+            }
+        )
+    return options
+
+
+def select_intake_labeling_provider_binding(
+    db_session: Session, *, user: User
+) -> LabelingProviderBinding:
+    """Choose the first accessible valid credential without adding model records."""
+    options = get_intake_labeling_provider_options(db_session, user=user)
+    errors = [
+        option["configuration_error"]
+        for option in options
+        if option["configuration_error"]
+    ]
+    for option in options:
+        if option["configuration_error"] is None:
+            try:
+                return resolve_intake_labeling_provider_binding(
+                    db_session, option["id"], user=user
+                )
+            except ValueError as error:
+                errors.append(str(error))
+    raise ValueError(
+        "; ".join(dict.fromkeys(errors))
+        if errors
+        else INTAKE_LABELING_CONFIGURATION_ERROR
+    )
+
+
 def resolve_labeling_gateway(
     db_session: Session,
     model_configuration_id: int,
     *,
     user: User | None = None,
     expected_binding: LabelingProviderBinding | None = None,
+    direct_flow: LLMFlow = LLMFlow.REGULATORY_LABELING_BATCH,
+    direct_max_request_bytes: int = 768 * 1024,
+    direct_max_response_bytes: int = 1024 * 1024,
+    direct_request_timeout_seconds: float = 120,
 ) -> LabelingBatchGateway:
     """Resolve credentials while the session is open; perform no network I/O here."""
     transport = (
@@ -388,13 +495,17 @@ def resolve_labeling_gateway(
         user,
         include_batch_key=transport == _INLINE_TRANSPORT,
     )
+    model_name = (
+        expected_binding.model if expected_binding is not None else DEFAULT_MODEL
+    )
     if transport == _INLINE_TRANSPORT:
-        binding, api_key = _inline_binding(model, user)
+        binding, api_key = _inline_binding(model, user, model_name=model_name)
     else:
         api_key = None
         binding = _binding(
             model,
             transport=transport,
+            model_name=model_name,
             staging_uri=(
                 _configured_vertex_staging_uri()
                 if transport == _VERTEX_TRANSPORT
@@ -411,11 +522,25 @@ def resolve_labeling_gateway(
     )
     config = VertexBatchConfig(
         model_configuration_id=model.id,
-        model_name=DEFAULT_MODEL,
+        model_name=binding.model,
         project=binding.project,
         location=binding.location,
         authentication_mode=binding.authentication_mode,
     )
+    if transport == _DIRECT_TRANSPORT:
+        from onyx.regulatory.labeling.vertex_direct import LabelingVertexDirectGateway
+
+        return LabelingVertexDirectGateway(
+            config=config,
+            binding_sha256=binding.fingerprint,
+            credential_json_provider=lambda: raw_credentials,
+            credential_identity=binding.credential_identity,
+            max_result_bytes=64 * 1024 * 1024,
+            request_timeout_seconds=direct_request_timeout_seconds,
+            max_request_bytes=direct_max_request_bytes,
+            max_response_bytes=direct_max_response_bytes,
+            flow=direct_flow,
+        )
     if transport == _FILES_TRANSPORT:
         return GoogleGeminiFilesBatchGateway(
             config=config,

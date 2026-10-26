@@ -9009,6 +9009,93 @@ class AmendmentSourcePackage(Base):
     )
 
 
+class RegulatoryDocumentIntake(Base):
+    """A new-document admission, separate from amendment comparison."""
+
+    __tablename__ = "regulatory_document_intake"
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    source_package_id: Mapped[UUID] = mapped_column(
+        ForeignKey("amendment_source_package.id"), unique=True
+    )
+    document_set_id: Mapped[int] = mapped_column(ForeignKey("document_set.id"))
+    created_by: Mapped[UUID] = mapped_column(ForeignKey("user.id"))
+    idempotency_key: Mapped[UUID] = mapped_column(unique=True)
+    labeling_model_configuration_id: Mapped[int] = mapped_column(
+        ForeignKey("model_configuration.id")
+    )
+    labeling_run_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("regulatory_labeling_run.id"), nullable=True
+    )
+    status: Mapped[str] = mapped_column(Text, default="preparing")
+    stage: Mapped[str] = mapped_column(Text, default="chunking")
+    review_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    lease_token: Mapped[UUID | None] = mapped_column(nullable=True)
+    lease_expires_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class RegulatoryDocumentIntakeFile(Base):
+    """Owns only newly created files; the complete source graph stays frozen."""
+
+    __tablename__ = "regulatory_document_intake_file"
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    intake_id: Mapped[UUID] = mapped_column(
+        ForeignKey("regulatory_document_intake.id", ondelete="CASCADE"), index=True
+    )
+    source_asset_id: Mapped[UUID] = mapped_column(
+        ForeignKey("regulatory_source_asset.id")
+    )
+    user_file_id: Mapped[UUID] = mapped_column(unique=True)
+    parent_document_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("regulatory_document_intake_file.id"), nullable=True
+    )
+    role: Mapped[str] = mapped_column(Text)
+    relationships: Mapped[list[dict[str, Any]]] = mapped_column(PGJSONB, default=list)
+    status: Mapped[str] = mapped_column(Text, default="preparing")
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    approval_attempt_id: Mapped[UUID | None] = mapped_column(nullable=True)
+    __table_args__ = (
+        UniqueConstraint(
+            "intake_id", "source_asset_id", name="uq_document_intake_asset"
+        ),
+    )
+
+
+class RegulatoryDocumentIntakeReprepare(Base):
+    """Durable, scoped rechunking audit for an unpublished intake."""
+
+    __tablename__ = "regulatory_document_intake_reprepare"
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    intake_id: Mapped[UUID] = mapped_column(
+        ForeignKey("regulatory_document_intake.id"), index=True
+    )
+    idempotency_key: Mapped[UUID] = mapped_column(unique=True)
+    expected_sha256: Mapped[str] = mapped_column(String(64))
+    previous_labeling_run_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("regulatory_labeling_run.id"), nullable=True
+    )
+    status: Mapped[str] = mapped_column(Text, default="queued")
+    documents: Mapped[dict[str, Any]] = mapped_column(PGJSONB, default=dict)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('queued', 'running', 'prepared', 'failed')",
+            name="intake_reprepare_status_check",
+        ),
+    )
+
+
 class RegulatorySourceAsset(Base):
     """Append-only metadata for a content-addressed source within one package."""
 
@@ -9674,5 +9761,51 @@ class AnnexPublicationEmbedding(Base):
         CheckConstraint(
             "status IN ('pending', 'submitting', 'submitted', 'complete', 'indeterminate')",
             name="annex_embedding_status_check",
+        ),
+    )
+
+
+class RegulatoryDocumentLineageReview(Base):
+    """Reviewed file-level succession; historic content and chunks remain immutable."""
+
+    __tablename__ = "regulatory_document_lineage_review"
+    intake_document_id: Mapped[UUID] = mapped_column(
+        ForeignKey("regulatory_document_intake_file.id"), primary_key=True
+    )
+    document_set_id: Mapped[int] = mapped_column(ForeignKey("document_set.id"))
+    predecessor_user_file_id: Mapped[UUID] = mapped_column(index=True)
+    successor_user_file_id: Mapped[UUID] = mapped_column(unique=True)
+    predecessor_title: Mapped[str] = mapped_column(Text)
+    successor_title: Mapped[str] = mapped_column(Text)
+    predecessor_sha256: Mapped[str] = mapped_column(String(64))
+    relation: Mapped[str] = mapped_column(Text)
+    effective_date: Mapped[datetime.date | None] = mapped_column(Date, nullable=True)
+    evidence: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(Text, default="draft")
+    confirmed_by: Mapped[UUID] = mapped_column(ForeignKey("user.id"))
+    confirmed_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True))
+    frozen_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    activated_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    __table_args__ = (
+        CheckConstraint(
+            "predecessor_user_file_id <> successor_user_file_id",
+            name="document_lineage_distinct_files_check",
+        ),
+        CheckConstraint(
+            "relation IN ('successor', 'repeals')",
+            name="document_lineage_relation_check",
+        ),
+        CheckConstraint(
+            "status IN ('draft', 'frozen', 'active')",
+            name="document_lineage_status_check",
+        ),
+        CheckConstraint(
+            "relation <> 'repeals' OR (effective_date IS NOT NULL "
+            "AND evidence IS NOT NULL AND length(trim(evidence)) > 0)",
+            name="document_lineage_repeal_evidence_check",
         ),
     )

@@ -38,6 +38,7 @@ from onyx.db.amendment_sources import (
     require_ready_source_package,
     retry_source_package,
 )
+from onyx.db.document_intake import pending_intake_file_ids
 from onyx.db.document_set import get_document_set_by_id_for_user
 from onyx.db.engine.sql_engine import get_session
 from onyx.db.enums import AmendmentBatchStatus, Permission
@@ -89,6 +90,9 @@ from onyx.regulatory.amendments.source_extraction import (
 from onyx.regulatory.pdf import render_chunk_pdf, render_document_pdf
 from onyx.server.features.projects.models import UserFileSnapshot
 from onyx.server.features.regulatory.annex_api import router as annex_router
+from onyx.server.features.regulatory.document_intake_api import (
+    router as document_intake_router,
+)
 from onyx.server.features.regulatory.models import (
     AmendmentBatchSnapshot,
     AmendmentProposalSnapshot,
@@ -118,6 +122,15 @@ router = APIRouter(prefix="/regulatory")
 _FILE_VALIDITY_REINDEX_REQUIRED = (
     "A canonical reindex is required before this file's validity can be updated safely."
 )
+
+
+def _require_ordinary_edit_channel(db_session: Session, user_file_id: UUID) -> None:
+    if pending_intake_file_ids(db_session, [user_file_id], include_approving=True):
+        raise OnyxError(
+            OnyxErrorCode.CONFLICT,
+            "This document is awaiting new-document review. Edit its chunks in "
+            "Updates > New document so its labels and approval remain consistent.",
+        )
 
 
 def _get_owned_user_file(
@@ -331,6 +344,7 @@ def patch_chunk(
         raise OnyxError(OnyxErrorCode.NOT_FOUND, "Chunk not found")
     _get_owned_user_file(db_session, chunk.user_file_id, user)
     file_id = chunk.user_file_id
+    _require_ordinary_edit_channel(db_session, file_id)
 
     if is_hierarchical_aggregate_chunk(chunk):
         raise OnyxError(
@@ -411,6 +425,7 @@ def patch_file_validity(
     """Set explicit snapshot dates only when metadata projection is exact."""
 
     _get_owned_user_file(db_session, user_file_id, user)
+    _require_ordinary_edit_channel(db_session, user_file_id)
     if (
         update_request.validity_start_date is not None
         and update_request.clear_validity_start_date
@@ -481,6 +496,7 @@ def rename_user_file(
     from onyx.regulatory.writer_publication import rename_owned_file
 
     _get_owned_user_file(db_session, user_file_id, user)
+    _require_ordinary_edit_channel(db_session, user_file_id)
     db_session.rollback()
     rename_owned_file(
         user_file_id, get_current_tenant_id(), rename_request.name.strip()
@@ -1183,3 +1199,4 @@ def get_amendment_source_evidence(
 
 
 router.include_router(annex_router)
+router.include_router(document_intake_router)

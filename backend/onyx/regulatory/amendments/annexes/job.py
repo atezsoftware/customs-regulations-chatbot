@@ -15,6 +15,10 @@ from onyx.db.amendment_sources import (
     list_source_assets,
     mark_source_package_failed,
 )
+from onyx.db.document_intake_sources import (
+    MARKDOWN_INPUT_KIND,
+    fail_markdown_source_package,
+)
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.db.models import RegulatorySourceAsset
 from onyx.file_store.file_store import FileStore, get_default_file_store
@@ -32,6 +36,11 @@ from onyx.regulatory.amendments.annexes.sources import (
 from onyx.regulatory.amendments.annexes.sources import (
     download_source_bounded as download_source,
 )
+from onyx.regulatory.document_intake.markdown_package import (
+    MarkdownPackageError,
+    parse_markdown_package,
+)
+from onyx.utils.process_isolation import run_in_isolated_process
 
 
 @dataclass(frozen=True)
@@ -148,13 +157,27 @@ def run_source_package(*, package_id: UUID, environment: str) -> None:
                 )
             return download_source(address, deadline=acquisition_deadline)
 
-        result = acquire_source_package(
-            url=url,
-            content=payload,
-            mime_type=mime_type,
-            display_name=spec.get("display_name", "source"),
-            fetch=fetch,
-        )
+        if spec.get("kind") == MARKDOWN_INPUT_KIND:
+            if payload is None or hashlib.sha256(payload).hexdigest() != spec.get(
+                "input_sha256"
+            ):
+                raise MarkdownPackageError(
+                    "Markdown upload integrity changed; upload the package again"
+                )
+            result = run_in_isolated_process(
+                parse_markdown_package,
+                payload,
+                spec["display_name"],
+                timeout=30,
+            )
+        else:
+            result = acquire_source_package(
+                url=url,
+                content=payload,
+                mime_type=mime_type,
+                display_name=spec.get("display_name", "source"),
+                fetch=fetch,
+            )
         pending_pdfs = [
             asset
             for asset in result.assets
@@ -312,6 +335,14 @@ def run_source_package(*, package_id: UUID, environment: str) -> None:
         if time.monotonic() >= deadline:
             raise TimeoutError("source_preparation_deadline")
         manifest = result.model_dump_json().encode()
+        if spec.get("kind") == MARKDOWN_INPUT_KIND:
+            manifest_data = result.model_dump(mode="json")
+            manifest_data.update(
+                preparation_method="supplied_markdown",
+                input_sha256=spec["input_sha256"],
+                markdown_format="legislation-markdown-v1",
+            )
+            manifest = json.dumps(manifest_data, ensure_ascii=False).encode()
         manifest_id = store.save_file(
             io.BytesIO(manifest),
             display_name="source-manifest.json",
@@ -334,11 +365,22 @@ def run_source_package(*, package_id: UUID, environment: str) -> None:
                 raise RuntimeError("source_preparation_lease_lost")
     except Exception as error:
         with get_session_with_current_tenant() as session:
-            mark_source_package_failed(
-                session,
-                package_id=package_id,
-                environment=environment,
-                lease_token=token,
-                failure=error,
-            )
+            if spec.get("kind") == MARKDOWN_INPUT_KIND and isinstance(
+                error, MarkdownPackageError
+            ):
+                fail_markdown_source_package(
+                    session,
+                    package_id=package_id,
+                    environment=environment,
+                    lease_token=token,
+                    detail=error.public_message,
+                )
+            else:
+                mark_source_package_failed(
+                    session,
+                    package_id=package_id,
+                    environment=environment,
+                    lease_token=token,
+                    failure=error,
+                )
         raise

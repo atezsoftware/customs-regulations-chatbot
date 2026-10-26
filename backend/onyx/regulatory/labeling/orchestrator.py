@@ -285,6 +285,8 @@ def _cancel(
     lease: repository.RunLease, gateway: VertexBatchGateway | None
 ) -> LabelingStepResult:
     with get_session_with_current_tenant() as session:
+        run = repository.load_claimed_run(session, lease)
+        direct = run.provider_binding.get("transport") == "vertex_direct_v1"
         shard = repository.next_cancellable_shard(session, lease)
         if shard is None:
             repository.cancel_claimed_run(session, lease)
@@ -312,9 +314,14 @@ def _cancel(
     terminal_error: str | None = None
     if gateway is None:
         terminal_error = "Cancelled locally; provider cancellation is unavailable"
-    elif remote_job_name is None and shard_status in (
-        "submitting",
-        "reconcile_required",
+    elif (
+        not direct
+        and remote_job_name is None
+        and shard_status
+        in (
+            "submitting",
+            "reconcile_required",
+        )
     ):
         try:
             state = gateway.reconcile_submission(submission_key)
@@ -417,10 +424,11 @@ def _submit_or_reconcile(
 ) -> LabelingStepResult:
     with get_session_with_current_tenant() as session:
         run = repository.load_claimed_run(session, lease)
-        native = (
-            LabelingProviderBinding.model_validate(run.provider_binding).transport
-            == "vertex_gcs_v1"
-        )
+        transport = LabelingProviderBinding.model_validate(
+            run.provider_binding
+        ).transport
+        native = transport == "vertex_gcs_v1"
+        direct = transport == "vertex_direct_v1"
         shard = repository.load_claimed_shard(session, lease, shard_id)
         if shard.status == "prepared":
             if native:
@@ -453,12 +461,16 @@ def _submit_or_reconcile(
             submission_key = shard.submission_key
             session.commit()
             try:
-                if native and isinstance(gateway, StreamingLabelingGateway):
+                if (native or direct) and isinstance(gateway, StreamingLabelingGateway):
                     heartbeat = _lease_heartbeat(lease)
                     state = gateway.submit_stream(
-                        _stream_shard_requests(lease, shard_id, heartbeat),
+                        _stream_shard_requests(lease, shard_id, heartbeat)
+                        if native
+                        else iter(requests),
                         submission_key=submission_key,
-                        max_jsonl_bytes=LABELING_VERTEX_BATCH_BYTES,
+                        max_jsonl_bytes=LABELING_VERTEX_BATCH_BYTES
+                        if native
+                        else LABELING_SHARD_BYTES,
                         on_progress=heartbeat,
                     )
                 else:
@@ -525,14 +537,32 @@ def _submit_or_reconcile(
                 return _next(lease)
             except Exception:
                 with get_session_with_current_tenant() as result_session:
+                    direct_terminal = (
+                        direct
+                        and repository.load_claimed_shard(
+                            result_session, lease, shard_id
+                        ).failure_count
+                        >= LABELING_MAX_PROVIDER_FAILURES - 1
+                    )
                     repository.record_shard_state(
                         result_session,
                         lease,
                         shard_id=shard_id,
-                        status="reconcile_required",
-                        reconcile_seconds=LABELING_RECONCILE_SECONDS,
-                        retry_after_seconds=LABELING_POLL_SECONDS,
-                        error="Provider submission outcome is uncertain",
+                        status=("failed" if direct_terminal else "prepared")
+                        if direct
+                        else "reconcile_required",
+                        reconcile_seconds=None
+                        if direct
+                        else LABELING_RECONCILE_SECONDS,
+                        retry_after_seconds=None
+                        if direct_terminal
+                        else LABELING_POLL_SECONDS,
+                        error=(
+                            "Direct labeling interrupted before recording completion"
+                            if direct
+                            else "Provider submission outcome is uncertain"
+                        ),
+                        increment_failure=direct,
                     )
                     repository.release_run(
                         result_session,
@@ -595,6 +625,15 @@ def _submit_or_reconcile(
             session.commit()
         return _next(lease)
     if state is None:
+        if direct:
+            # There is no remote job to await; resume the same acknowledged cache.
+            with get_session_with_current_tenant() as session:
+                repository.record_shard_state(
+                    session, lease, shard_id=shard_id, status="prepared"
+                )
+                repository.release_run(session, lease, stage="submitting")
+                session.commit()
+            return _next(lease)
         terminal = (
             reconcile_until is None
             or datetime.datetime.now(datetime.timezone.utc) >= reconcile_until

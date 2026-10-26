@@ -68,6 +68,41 @@ test("offers an archive upload control restricted to zip files", async () => {
   expect(archiveInput).toHaveAttribute("accept", ".zip");
 });
 
+test("links PC Külliyatı to new document intake with attachments", async () => {
+  const previousFetch = global.fetch;
+  // GET /api/regulatory/document-intake/capabilities
+  global.fetch = jest.fn().mockResolvedValue({
+    ok: true,
+    json: async () => ({
+      enabled: true,
+      target_document_set_id: 7,
+      target_document_set_name: "PC Külliyatı",
+      error: null,
+    }),
+  });
+  try {
+    render(
+      <DocumentSetFiles documentSetId={7} documentSetName="PC Külliyatı" />
+    );
+    expect(
+      await screen.findByRole("link", { name: "Add document with attachments" })
+    ).toHaveAttribute("href", "/admin/amendments?new_document=true");
+    expect(screen.getByRole("button", { name: "Upload Files" })).toBeVisible();
+  } finally {
+    global.fetch = previousFetch;
+  }
+});
+
+test("keeps attachment intake limited to the canonical PC document set", async () => {
+  renderFiles();
+  expect(
+    await screen.findByRole("button", { name: "Upload Files" })
+  ).toBeVisible();
+  expect(
+    screen.queryByRole("link", { name: "Add document with attachments" })
+  ).not.toBeInTheDocument();
+});
+
 test("uploads a selected archive through the document set upload endpoint", async () => {
   const user = setupUser();
   renderFiles();

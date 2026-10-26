@@ -30,6 +30,13 @@ def original_attachment_receipt(
         publication.original_ingestion_receipt
     )
     if (
+        isinstance(file.regulatory_chunk_generation_hash, str)
+        and file.regulatory_chunk_generation_hash != receipt.generation_hash
+    ):
+        from onyx.db.document_intake_reprepare import reprepared_original_receipt
+
+        receipt = reprepared_original_receipt(session, user_file_id, receipt)
+    if (
         publication.gate_closed
         or file.status != UserFileStatus.COMPLETED
         or file.file_id != receipt.file_id

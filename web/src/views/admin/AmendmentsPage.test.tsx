@@ -32,9 +32,14 @@ import {
 import AmendmentsPage from "@/views/admin/AmendmentsPage";
 
 let mockDocumentSets: Array<{ id: number; name: string }> = [];
+let mockNewDocumentParam: string | null = null;
 
 jest.mock("next/navigation", () => ({
   useRouter: () => ({ back: jest.fn(), push: jest.fn(), replace: jest.fn() }),
+  useSearchParams: () => ({
+    get: (key: string) =>
+      key === "new_document" ? mockNewDocumentParam : null,
+  }),
 }));
 
 jest.mock("@/lib/hooks/useDocumentSets", () => ({
@@ -149,6 +154,7 @@ beforeAll(() => {
 });
 
 beforeEach(() => {
+  mockNewDocumentParam = null;
   mockDocumentSets = [{ id: 7, name: "Transit rules" }];
   mockedListAmendmentBatches.mockReset();
   mockedListAmendmentBatches.mockResolvedValue([]);
@@ -220,6 +226,63 @@ test("keeps legacy source controls usable when grouped capabilities are absent",
   expect(
     screen.queryByRole("button", { name: "Image" })
   ).not.toBeInTheDocument();
+});
+
+test("switches new document mode without starting amendment analysis", async () => {
+  const previousFetch = global.fetch;
+  // GET /api/regulatory/document-intake/capabilities
+  global.fetch = jest.fn().mockResolvedValue({
+    ok: true,
+    json: async () => ({
+      enabled: false,
+      target_document_set_id: null,
+      target_document_set_name: "PC Külliyatı",
+      error: "New document import is unavailable.",
+    }),
+  });
+  try {
+    const user = setupUser();
+    render(<AmendmentsPage />);
+    expect(screen.getByRole("combobox")).toBeVisible();
+    await user.click(screen.getByRole("checkbox", { name: "New document" }));
+    expect(
+      await screen.findByText("New document import is unavailable.")
+    ).toBeVisible();
+    expect(screen.queryByRole("combobox")).not.toBeInTheDocument();
+    expect(mockedAnalyzeAmendment).not.toHaveBeenCalled();
+    await user.click(screen.getByRole("checkbox", { name: "New document" }));
+    expect(screen.getByRole("combobox")).toBeVisible();
+  } finally {
+    global.fetch = previousFetch;
+  }
+});
+
+test("opens the document-set attachment link directly in new document mode", async () => {
+  mockNewDocumentParam = "true";
+  const previousFetch = global.fetch;
+  // GET /api/regulatory/document-intake/capabilities
+  global.fetch = jest.fn().mockResolvedValue({
+    ok: true,
+    json: async () => ({
+      enabled: false,
+      target_document_set_id: null,
+      target_document_set_name: "PC Külliyatı",
+      error: "New document import is unavailable.",
+    }),
+  });
+  try {
+    render(<AmendmentsPage />);
+    expect(
+      screen.getByRole("checkbox", { name: "New document" })
+    ).toBeChecked();
+    expect(
+      await screen.findByText("New document import is unavailable.")
+    ).toBeVisible();
+    expect(screen.queryByRole("combobox")).not.toBeInTheDocument();
+    expect(mockedAnalyzeAmendment).not.toHaveBeenCalled();
+  } finally {
+    global.fetch = previousFetch;
+  }
 });
 
 test("keeps legacy controls when grouped annex support is disabled", async () => {

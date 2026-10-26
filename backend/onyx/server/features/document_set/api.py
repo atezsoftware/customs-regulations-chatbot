@@ -14,6 +14,7 @@ from onyx.configs.constants import (
     OnyxCeleryQueues,
     OnyxCeleryTask,
 )
+from onyx.db.document_intake import pending_intake_file_ids
 from onyx.db.document_set import (
     check_document_sets_are_public,
     fetch_all_document_sets_for_user,
@@ -346,6 +347,12 @@ def index_document_set_file(
             f"Only chunked files can be indexed; this one is {user_file.status.value}",
         )
 
+    if pending_intake_file_ids(db_session, [file_id]):
+        raise OnyxError(
+            OnyxErrorCode.CONFLICT,
+            "Review and approve this new document in Updates before indexing",
+        )
+
     _request_user_file_indexing([user_file], db_session, tenant_id)
     return UserFileSnapshot.from_model(user_file)
 
@@ -457,6 +464,8 @@ def index_document_set_chunked_files(
         for user_file in fetch_user_files_for_document_set(db_session, document_set_id)
         if user_file.status == UserFileStatus.CHUNKED
     ]
+    pending = pending_intake_file_ids(db_session, [file.id for file in chunked_files])
+    chunked_files = [file for file in chunked_files if file.id not in pending]
     _request_user_file_indexing(chunked_files, db_session, tenant_id)
 
     return IndexChunkedFilesResponse(queued=len(chunked_files))

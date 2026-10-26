@@ -121,6 +121,7 @@ for bootstep in app_base.get_bootsteps():
 
 # These handlers are sibling modules, not autodiscovery's default tasks.py.
 celery_app.conf.imports = (
+    "onyx.background.celery.tasks.regulatory_amendments.document_intake",
     "onyx.background.celery.tasks.regulatory_amendments.sources",
     "onyx.background.celery.tasks.regulatory_amendments.tasks",
     "onyx.background.celery.tasks.regulatory_amendments.annex_publication",

@@ -1183,6 +1183,7 @@ def _execute_claimed_step_impl(
         current_chunk_generation_hash = compute_regulatory_chunk_generation_hash(
             embedding_provider=snapshot.embedding_provider,
             embedding_model_name=snapshot.embedding_model_name,
+            intake_chunking_version=snapshot.intake_chunking_version,
         )
         if runtime.job.chunk_generation_hash != current_chunk_generation_hash:
             delivery = indexing_job_repository.supersede_regulatory_indexing_job_for_generation_drift(

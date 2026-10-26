@@ -14,6 +14,8 @@ export interface RegulatoryChunk {
   superseded_by_chunk_id: string | null;
   created_at: string;
   updated_at: string;
+  labeling_status?: string | null;
+  labeling_error?: string | null;
 }
 
 export interface RegulatoryChunkPage {

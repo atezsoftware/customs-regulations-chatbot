@@ -290,7 +290,10 @@ def _inspect_pdf(content: bytes) -> SourceInspection:
             _size: float,
         ) -> None:
             if fragment.strip():
-                fragments.append((fragment, cm[4] + tm[4], cm[5] + tm[5]))
+                # Annotation rectangles use page coordinates, including the CTM.
+                x = tm[4] * cm[0] + tm[5] * cm[2] + cm[4]
+                y = tm[4] * cm[1] + tm[5] * cm[3] + cm[5]
+                fragments.append((fragment, x, y))
 
         text = page.extract_text(visitor_text=visit_text) or ""
         texts.append(text)

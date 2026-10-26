@@ -26,6 +26,9 @@ from onyx.prompts.contextual_retrieval import (
 )
 from onyx.regulatory.chunker import REGULATORY_CHUNKER_CODE_VERSION
 from onyx.regulatory.contextual import MIN_CONTEXTUAL_RAG_RESERVED_TOKENS
+from onyx.regulatory.document_intake.chunking_profile import (
+    INTAKE_CHUNKING_CODE_VERSION,
+)
 from onyx.regulatory.indexing import (
     REGULATORY_CONTEXTUAL_INITIAL_MAX_CHUNK_CHARS,
     REGULATORY_CONTEXTUAL_MIN_MAX_CHUNK_CHARS,
@@ -74,6 +77,7 @@ def compute_regulatory_chunk_generation_hash(
     embedding_provider: EmbeddingProvider | None,
     embedding_model_name: str,
     enable_contextual_rag: bool = True,
+    intake_chunking_version: str | None = None,
 ) -> str:
     """Identify every deterministic input that affects canonical chunk output."""
 
@@ -100,6 +104,10 @@ def compute_regulatory_chunk_generation_hash(
         "default_contextual_reserved_tokens": (DEFAULT_CONTEXTUAL_RAG_RESERVED_TOKENS),
         "minimum_contextual_reserved_tokens": MIN_CONTEXTUAL_RAG_RESERVED_TOKENS,
     }
+    if intake_chunking_version is not None:
+        if intake_chunking_version != INTAKE_CHUNKING_CODE_VERSION:
+            raise ValueError("The intake chunking version is not supported")
+        payload["intake_chunking_version"] = intake_chunking_version
     return sha256(
         json.dumps(
             payload,
@@ -261,6 +269,7 @@ def resolve_regulatory_indexing_snapshot(
     input_hash_version: RegulatoryInputHashVersion = (
         RegulatoryInputHashVersion.CANONICAL_V2
     ),
+    intake_chunking_version: str | None = None,
 ) -> RegulatoryIndexingConfigSnapshot:
     search_settings = get_current_search_settings(db_session, for_update=True)
     _validate_embedding_contract(search_settings)
@@ -275,7 +284,9 @@ def resolve_regulatory_indexing_snapshot(
             embedding_provider=EmbeddingProvider.OPENROUTER,
             embedding_model_name=search_settings.model_name,
             enable_contextual_rag=True,
+            intake_chunking_version=intake_chunking_version,
         ),
+        intake_chunking_version="1" if intake_chunking_version is not None else None,
         search_settings_id=search_settings.id,
         embedding_provider=EmbeddingProvider.OPENROUTER,
         embedding_model_name=search_settings.model_name,
@@ -345,6 +356,7 @@ def validate_snapshot_for_stage(
         embedding_provider=snapshot.embedding_provider,
         embedding_model_name=snapshot.embedding_model_name,
         enable_contextual_rag=True,
+        intake_chunking_version=snapshot.intake_chunking_version,
     )
     unresolved_preparing_snapshot = (
         stage is RegulatoryIndexingStage.PREPARING

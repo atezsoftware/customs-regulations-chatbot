@@ -51,7 +51,7 @@ DEFAULT_NUM_HYBRID_SUBQUERY_CANDIDATES = int(
 
 
 class ElasticsearchSearchType(str, Enum):
-    """Search type label used for Prometheus metrics."""
+    """Query purpose for metrics and current legal visibility versus retained reads."""
 
     HYBRID = "hybrid"
     KEYWORD = "keyword"
