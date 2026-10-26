@@ -116,6 +116,10 @@ Kaydetme, yalnızca değişen dosyanın etiketlerini yeniden üretir; paketteki 
 
 Metin, başlık yolu veya chunk türü değişirse o dosyaya ait önceki LLM kanıtları güncel değil olarak işaretlenir ve LLM'den türetilmiş tarihler temizlenir. Bu alanları güncel bağlama göre yeniden kontrol edin. Gerçekten elle düzelttiğiniz değerler korunur. Önceki ve düzeltilmiş chunk revizyonları saklanır.
 
+Türetilmiş toplu chunk'ların okumada kullanılacağı tarih aralığı, bağlı oldukları bütün kaynak parçalarının geçerlilik aralıklarının kesişimiyle sınırlıdır. Bu sınırlandırma, kayıtlı kaynak metnini ve elle onayladığınız tarih değerlerini değiştirmez.
+
+Kaynakta hüküm devam ettiği halde yalnız “2.” gibi bir chunk oluşmuşsa, onaylamadan önce yöneticiye iletin. Metin ve tarih alanları **After / Save chunk changes** ile düzenlenir; chunk sınırlarını düzeltmek için yönetici, aynı kaynakları ve belge-ek bağlantılarını koruyan yeniden hazırlamayı kullanabilir. Bu işlem yalnızca henüz onaylanmamış, çalışması durmuş ve manuel değişiklik içermeyen bir içe aktarımda kullanılabilir.
+
 ## 5. Önceki mevzuat ve mülga ilişkisini belirleyin
 
 Önceki mevzuat incelemesini dosya bazında açın. Adaylar belge adlarından önerilir; gerekirse **Search previous legislation** ile ad veya numara arayın. Doğru kaydı **Select ...** ile seçin. Bu, belge düzeyindeki kısa bir kontroldür; chunk karşılaştırması değildir.
@@ -141,6 +145,8 @@ Paket **ready** olduğunda **Approve all new documents** düğmesi açılır. Bu
 
 Onaydan sonra **approving / indexing**, işlemin sırada veya sürmekte olduğunu gösterir. **completed**, bütün yeni dosyaların indekslenmesi tamamlandığında görünür. Yalnızca onaya basılmış olmasını tamamlanma saymayın.
 
+Tamamlanan belgeyi PC Külliyatı dosya listesindeki **PDF** veya dosya ayrıntısındaki **Document PDF** ile açabilirsiniz. Kaynak PDF ise yüklenen orijinal PDF aynen gösterilir. Office, HTML veya görsel gibi diğer içe aktarılan biçimlerde, kaynak dosyanın ve hazırlanmış metnin bütünlüğü doğrulanır; hazırlanmış metin PDF olarak gösterilir ve başlıkta **(extracted text)** yazar. Markdown dosyaları metinlerinden PDF olarak görüntülenir.
+
 Geçmiş içe aktarımlar ekrandaki belge adı ve durum düğmelerinde listelenir. Devam eden veya hatalı bir işlemi buradan tekrar açın. Yeni bağımsız bir yükleme için **Start another import** kullanın.
 
 ## 7. Hata olduğunda ne yapmalı?
@@ -150,6 +156,7 @@ Geçmiş içe aktarımlar ekrandaki belge adı ve durum düğmelerinde listeleni
 | Eksik/indirilemeyen ek veya kaynak paketi hatası | Adresi, Original document URL alanını veya kaynak dosyayı kontrol edin. Sunuluyorsa Retry source preparation kullanın. |
 | ZIP yolu, manifest veya bağlantı hatası | Bildirilen paket yolunu düzeltin; dosya adlarını, parent değerlerini ve gerçek yerel bağlantıları eşleştirip paketi yeniden yükleyin. |
 | Metadata ya da etiketleme hatası; partial / failed | İlgili dosya ve chunk hata açıklamasını okuyun. Sunuluyorsa Retry new documents kullanın. Hazır görünmeyen işlemi onaylamayın. |
+| Etiket alıntısı chunk metniyle eşleşmiyor | Chunk'ı orijinal kaynakla karşılaştırın. Metin doğruysa Retry new documents kullanın: geçerli başarılı etiketler korunur, yalnız başarısız veya güncelliğini yitirmiş sonuçlar yeniden işlenir. Metni yalnız orijinal kaynağa göre düzeltin. |
 | Kaydetme sırasında inceleme değişti uyarısı | Gerekirse düzenleme metninizi kopyalayın; güncel durumu yeniden açın, güncel chunk ve tarihleri kontrol edip tekrar kaydedin. |
 | Onaydan sonra indeksleme hatası | Aynı içe aktarımı tekrar açıp Retry new documents kullanın. Aynı dosyaları yeniden yükleyerek ikinci bir içe aktarım oluşturmayın. |
 | Belge ilişkisi engellendi | Önceki dosyanın PC Külliyatı üyeliğini geri sağlayın; Retry document relationship kullanın. Bu işlem yayınlanmış chunk ve etiketleri yeniden üretmez. |
@@ -184,4 +191,32 @@ PDF'nin üçüncü sayfasındaki **“Ekleri için tıklayınız.”** bağlant�
 
 https://www.resmigazete.gov.tr/eskiler/2025/01/20250105-3-1.pdf
 
-İncelemede ana tebliğin ve alınabilen ekin ayrı mevzuat kartları olarak görünmesini, aralarında bağlantı kurulmasını ve kaynaktaki yürürlük hükmünün doğru değerlendirilmesini kontrol edin. Ek adresi erişilemiyorsa eksikliğin açıkça gösterilmesini bekleyin; “ekler mevcut” varsayımıyla onay vermeyin. Bu örnek için tamamlanmış test sonucu, yayın kontrolü kaydında ayrıca belirtilmelidir.
+İncelemede ana tebliğin ve alınabilen ekin ayrı mevzuat kartları olarak görünmesini, aralarında bağlantı kurulmasını ve kaynaktaki yürürlük hükmünün doğru değerlendirilmesini kontrol edin. Ek adresi erişilemiyorsa eksikliğin açıkça gösterilmesini bekleyin; “ekler mevcut” varsayımıyla onay vermeyin. Bu örneğin yerel doğrulama sonucu aşağıdadır.
+
+Kimlik ve yayım bilgilerini ana PDF'nin ilk sayfasından, yürürlük istisnalarını ana PDF'nin 3. sayfasından, ek sürelerini ek PDF'nin fiziksel 3. sayfasından karşılaştırın:
+
+| Kaynak / alan | Beklenen değer |
+| --- | --- |
+| Ana tebliğin kendi numarası | `SGM-2024/5` |
+| Ana tebliğin yayımı | `2025-01-05`; Resmî Gazete sayısı `32773` |
+| Madde 1, 11, 12 ve madde 6'nın (1) numaralı fıkrası | Yürürlük başlangıcı `2025-01-05` |
+| Diğer hükümler; madde 6'nın (2) ve (3) numaralı fıkraları dahil | Yürürlük başlangıcı `2025-05-09` |
+| Ek II, 1(a) | `2025-07-01` tarihine kadar geçerli hüküm; geçerlilik sonu `2025-07-01` |
+| Ek II, 1(b) | `2025-07-01` tarihinden itibaren geçerli hüküm; başlangıç `2025-07-01` |
+| Ekin kendi belge numarası | Bilinmiyor; boş bırakılır. `SGM-2024/3`, atıf yapılan kapsam dışı düzenlemedir. |
+
+Madde 11(b), diğer hükümlerin 9 Mayıs'ta başlayacağını anlatır; madde 11'in kendi yürürlük başlangıcı yine `2025-01-05` olur. Boş veya yanlış LLM alanlarını **After** tarafında kaynakla karşılaştırarak düzeltin ve onaydan önce **Save chunk changes** ile kaydedin; yenilenen etiketlemeyi de inceleyin.
+
+## 10. Gerçek örneğin yerel doğrulama sonucu
+
+26 Ekim 2026 tarihli yerel testte yukarıdaki ana PDF ve bağlı ek PDF, aynı içe aktarımda ayrı mevzuat kayıtları olarak işlendi. İki dosya da **completed** durumuna ulaştı ve indeksleme istekleri başarıyla tamamlandı. Test kapsamı yerel geliştirme ortamıdır; örnek DEV ortamına yüklenmedi.
+
+| Kontrol | Yerel test sonucu |
+| --- | --- |
+| Ana belge ve ek | Ayrı kayıtlar; ana belge-ek bağlantıları ve aralarında geçiş doğrulandı. |
+| Chunk'lar | Ana belgede 41, ekte 136; toplam 177 chunk. Bunların 171'i atomik metin parçası, 6'sı bu parçalardan türetilmiş toplu chunk'tır. |
+| Etiketleme | 171 atomik parçanın tamamının etiketlemesi tamamlandı. Yalnızca bu içe aktarımın yeni dosyaları işlendi. |
+| İnsan incelemesi | Kaynakla karşılaştırılan iki tarih alanı elle düzeltildi ve kaydedildi. Bu değerler otomatik çıkarım başarısı olarak sayılmadı; manuel kaynak bilgisi korundu. |
+| İnceleme ve onay | Kaydedilmemiş değişiklik varken onayın kapalı olması, Discard ile geri alma ve Approve all new documents akışı doğrulandı. |
+
+Bu örnek, otomatik sonuçların onaydan önce kaynakla karşılaştırılması gerektiğini gösterir. Özellikle maddeye özel yürürlük tarihlerini ve eklerin ayrı kimliklerini kontrol edin.
