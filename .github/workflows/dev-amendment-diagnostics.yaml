@@ -6,6 +6,9 @@ on:
         type: choice
         options: [inspect]
         default: inspect
+      full_corpus_hashes:
+        type: boolean
+        default: false
 permissions:
   contents: read
 jobs:
@@ -44,7 +47,7 @@ jobs:
           PY
           IFS=$'\t' read -r pod container < /tmp/amendment-target
           kubectl exec -i "$pod" -n customs-regulations-dev -c "$container" -- \
-            sh -ec '. /vault/secrets/config; export PYTHONPATH=/app; exec python -' < \
+            sh -ec '. /vault/secrets/config; export PYTHONPATH=/app; exec env FOLDER_PROGRESS_ONLY="$1" python -' sh "${{ inputs.full_corpus_hashes && '0' || '1' }}" < \
             backend/onyx/db/diagnose_folder_intake_readonly.py
       - name: Read only scoped worker activity
         shell: bash

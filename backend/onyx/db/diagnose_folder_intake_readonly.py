@@ -79,7 +79,8 @@ def main() -> None:
                    created_at, updated_at, lease_token IS NOT NULL AS claimed,
                    lease_expires_at
               FROM regulatory_document_intake
-             WHERE id = '7b7a8362-f9a7-465a-a582-d09042165728'
+             WHERE id IN ('7b7a8362-f9a7-465a-a582-d09042165728',
+                          'f8d84bb5-411a-4f7e-9105-bb7b11f45d34')
         """,
         "SOURCE_RECOVERY_SCHEDULER": """
             SELECT application_name, state, wait_event_type, wait_event,
@@ -94,6 +95,10 @@ def main() -> None:
     with engine.connect() as connection:
         connection.execute(text("SET TRANSACTION READ ONLY"))
         for label, query in queries.items():
+            if os.environ.get("FOLDER_PROGRESS_ONLY") == "1" and label.startswith(
+                "PROTECTED"
+            ):
+                continue
             rows: list[dict[str, Any]] = [
                 dict(row._mapping) for row in connection.execute(text(query))
             ]
