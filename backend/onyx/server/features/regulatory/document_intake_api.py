@@ -110,7 +110,9 @@ def _enqueue_batch(
     except Exception:
         logger.exception("Document intake dispatch failed for batch=%s", batch.id)
         repository.mark_intake_dispatch_failed(
-            session, batch, "Preparation could not be queued; retry this import"
+            session,
+            batch,
+            "Preparation delivery is pending; automatic recovery will retry",
         )
         session.commit()
 

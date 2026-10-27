@@ -137,7 +137,7 @@ class DynamicTenantScheduler(PersistentScheduler):
                 tenant_task = {
                     "task": task["task"],
                     "schedule": task["schedule"],
-                    "kwargs": {"tenant_id": tenant_id},
+                    "kwargs": {**task.get("kwargs", {}), "tenant_id": tenant_id},
                 }
                 if options := task.get("options"):
                     task_logger.debug(

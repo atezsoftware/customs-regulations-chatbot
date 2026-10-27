@@ -61,8 +61,16 @@ def test_start_freezes_intake_model_and_only_new_files_or_reuses_frozen_run(
         document_set_id=8,
         labeling_model_configuration_id=7,
         labeling_run_id=old_run.id if existing_run else None,
+        status="preparing",
+        lease_token=None,
     )
-    files = [SimpleNamespace(status="chunked", user_file_id=uuid4()) for _ in range(2)]
+    token = uuid4()
+    batch.lease_token = token
+    files = [
+        SimpleNamespace(id=uuid4(), status="chunked", user_file_id=uuid4())
+        for _ in range(2)
+    ]
+    old_run.file_ids = [str(member.user_file_id) for member in files]
     monkeypatch.setattr(intake, "load_intake_job", lambda *_args: (batch, None, None))
     monkeypatch.setattr(intake, "intake_files", lambda *_args: files)
     session.get.return_value = old_run if existing_run else None
@@ -83,7 +91,8 @@ def test_start_freezes_intake_model_and_only_new_files_or_reuses_frozen_run(
     new_run = SimpleNamespace(id=uuid4())
     create = MagicMock(return_value=(new_run, True))
     monkeypatch.setattr(labeling, "create_labeling_run", create)
-    result = intake.start_intake_labeling(session, batch.id, uuid4())
+    monkeypatch.setattr(labeling, "get_active_run_id", lambda *_args: None)
+    result = intake.start_intake_labeling(session, batch.id, token)
     assert result == (old_run.id if existing_run else new_run.id)
     if existing_run:
         resolve.assert_not_called()

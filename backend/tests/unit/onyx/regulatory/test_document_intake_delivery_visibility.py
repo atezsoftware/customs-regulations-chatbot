@@ -14,12 +14,12 @@ from onyx.regulatory.document_intake.models import INTAKE_DELIVERY_SECONDS
 @pytest.mark.parametrize(
     ("delivery_overdue", "lease_seconds", "expected_status"),
     [
-        (True, None, "failed"),
+        (True, None, "preparing"),
         (False, -60, "failed"),
         (True, 300, "preparing"),
         (False, None, "preparing"),
     ],
-    ids=["expired-delivery", "dead-worker", "live-worker", "queued-delivery"],
+    ids=["durable-expired-delivery", "dead-worker", "live-worker", "queued-delivery"],
 )
 def test_preparation_timeout_is_visible_without_stomping_live_work(
     delivery_overdue: bool,

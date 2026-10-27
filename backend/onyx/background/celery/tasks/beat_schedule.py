@@ -21,6 +21,7 @@ from onyx.configs.constants import (
     OnyxCeleryQueues,
     OnyxCeleryTask,
 )
+from onyx.regulatory.amendments.annexes import config as annex_config
 from onyx.server.features.build.configs import SANDBOX_IDLE_CLEANUP_INTERVAL_SECONDS
 from onyx.utils.variable_functionality import _LICENSE_ENFORCEMENT_ENABLED
 from shared_configs.configs import MULTI_TENANT
@@ -348,6 +349,25 @@ if (
         }
     )
 
+
+# Cloud generators do not yet forward arbitrary environment/database task kwargs.
+if not MULTI_TENANT:
+    beat_task_templates.append(
+        {
+            "name": "recover-document-intakes",
+            "task": "recover_document_intakes",
+            "schedule": timedelta(minutes=1),
+            "kwargs": {
+                "environment": annex_config.REGULATORY_ANNEX_ENVIRONMENT,
+                "database_identity": annex_config.ANNEX_DATABASE_IDENTITY,
+            },
+            "options": {
+                "priority": OnyxCeleryPriority.LOW,
+                "expires": 60,
+                "queue": OnyxCeleryQueues.CHECKPOINT_CLEANUP,
+            },
+        }
+    )
 
 # Beat task names that require a vector DB. Filtered out when DISABLE_VECTOR_DB.
 _VECTOR_DB_BEAT_TASK_NAMES: set[str] = {
