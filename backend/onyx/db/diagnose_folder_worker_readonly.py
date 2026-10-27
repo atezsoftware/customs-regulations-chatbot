@@ -5,6 +5,7 @@ import re
 import subprocess
 
 from onyx.background.celery.versioned_apps.regulatory_annex import app
+from onyx.configs import app_configs
 from onyx.regulatory.amendments.annexes.config import source_queue_name
 
 OWNED_FILES = (
@@ -14,6 +15,27 @@ OWNED_FILES = (
 
 
 def main() -> None:
+    print(
+        "CONTEXTUAL_RUNTIME_LIMITS",
+        json.dumps(
+            {
+                name: getattr(app_configs, name)
+                for name in (
+                    "REGULATORY_BATCH_INDEXING_ENABLED",
+                    "ENABLE_CONTEXTUAL_RAG",
+                    "CONTEXTUAL_RAG_MAX_WORKERS",
+                    "CONTEXTUAL_RAG_MAX_RETRIES",
+                    "CONTEXTUAL_RAG_LLM_TIMEOUT_SECONDS",
+                    "CONTEXTUAL_RAG_RETRY_BASE_SECONDS",
+                    "CONTEXTUAL_RAG_RETRY_MAX_SECONDS",
+                    "USE_DOCUMENT_SUMMARY",
+                    "USE_CHUNK_SUMMARY",
+                    "MAX_TOKENS_FOR_FULL_INCLUSION",
+                )
+            }
+        ),
+        flush=True,
+    )
     print("SOURCE_QUEUE", source_queue_name(), flush=True)
     for method in ("active", "reserved", "active_queues"):
         inspector = app.control.inspect(timeout=5)
@@ -27,13 +49,28 @@ def main() -> None:
                     arguments = json.dumps(
                         [item.get("args"), item.get("kwargs")], default=str
                     )
-                    owned = [identifier for identifier in OWNED_FILES if identifier in arguments]
+                    owned = [
+                        identifier
+                        for identifier in OWNED_FILES
+                        if identifier in arguments
+                    ]
                     if owned:
-                        print("OWNED_INDEX_WORKER", json.dumps({
-                            "worker": worker, "inspection": method,
-                            "file_ids": owned,
-                            **{key: item.get(key) for key in ("id", "name", "time_start")},
-                        }, default=str), flush=True)
+                        print(
+                            "OWNED_INDEX_WORKER",
+                            json.dumps(
+                                {
+                                    "worker": worker,
+                                    "inspection": method,
+                                    "file_ids": owned,
+                                    **{
+                                        key: item.get(key)
+                                        for key in ("id", "name", "time_start")
+                                    },
+                                },
+                                default=str,
+                            ),
+                            flush=True,
+                        )
             if method == "active_queues":
                 bounded[worker] = [
                     item.get("name")
@@ -67,12 +104,21 @@ def main() -> None:
             print("ANNEX_LOG", line[:500])
     result = subprocess.run(
         ["tail", "-n", "160", "/var/log/onyx/celery_worker_user_file_processing.log"],
-        capture_output=True, text=True, check=False, timeout=5,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=5,
     )
     for line in result.stdout.splitlines():
-        if re.search(r"api.key|authorization|bearer|password|secret|token=", line, re.I):
+        if re.search(
+            r"api.key|authorization|bearer|password|secret|token=", line, re.I
+        ):
             print("[credential-bearing line omitted]")
-        elif re.search(r"context|llm|litellm|retry|429|timeout|index_single|3521feda|a3c6e8cf|10e927dc", line, re.I):
+        elif re.search(
+            r"context|llm|litellm|retry|429|timeout|index_single|3521feda|a3c6e8cf|10e927dc",
+            line,
+            re.I,
+        ):
             print("INDEX_PROGRESS_LOG", line[:500])
 
 

@@ -34,6 +34,67 @@ def main() -> None:
         max_overflow=0,
     )
     queries = {
+        "ACTIVE_SEARCH_CONTEXT_SETTINGS": """
+            SELECT s.id, s.status, s.index_name, s.model_name AS embedding_model,
+                   s.provider_type AS embedding_provider, s.model_dim,
+                   s.reduced_dimension, s.enable_contextual_rag,
+                   s.contextual_rag_model_configuration_id,
+                   coalesce(explicit_model.id, default_model.id) AS resolved_context_model_id,
+                   coalesce(explicit_model.name, default_model.name) AS context_model_name,
+                   coalesce(explicit_provider.provider, default_provider.provider) AS context_model_provider
+              FROM search_settings s
+              LEFT JOIN model_configuration explicit_model
+                ON explicit_model.id=s.contextual_rag_model_configuration_id
+              LEFT JOIN llm_provider explicit_provider
+                ON explicit_provider.id=explicit_model.llm_provider_id
+              LEFT JOIN llm_model_flow default_flow
+                ON s.contextual_rag_model_configuration_id IS NULL
+               AND default_flow.is_default
+               AND default_flow.llm_model_flow_type::text IN ('CONTEXTUAL_RAG','contextual_rag')
+              LEFT JOIN model_configuration default_model
+                ON default_model.id=default_flow.model_configuration_id
+              LEFT JOIN llm_provider default_provider
+                ON default_provider.id=default_model.llm_provider_id
+             WHERE s.status IN ('PRESENT','FUTURE') ORDER BY s.id LIMIT 8
+        """,
+        "OWNED_PERSISTED_CONTEXT_COUNTS": """
+            WITH owned(id) AS (VALUES
+                ('10e927dc-a124-4c6a-85b1-e3619b61b6d3'::uuid),
+                ('a3c6e8cf-93a9-460b-9edf-a9cdd4ba05a9'::uuid))
+            SELECT o.id AS user_file_id,
+                   (SELECT count(*) FROM regulatory_context_generation g
+                     WHERE g.user_file_id=o.id) AS generation_receipts,
+                   (SELECT count(*) FROM regulatory_context_generation g
+                     WHERE g.user_file_id=o.id AND g.payload->>'stage'='summary') AS summary_receipts,
+                   (SELECT count(*) FROM regulatory_context_generation g
+                     WHERE g.user_file_id=o.id AND g.payload->>'stage'='chunk') AS chunk_receipts,
+                   (SELECT count(*) FROM regulatory_context_snapshot s
+                     WHERE s.user_file_id=o.id) AS source_snapshots,
+                   (SELECT count(*) FROM regulatory_context_projection p
+                      JOIN regulatory_chunk c ON c.id=p.canonical_chunk_id
+                     WHERE c.user_file_id=o.id) AS context_projections,
+                   (SELECT max(p.published_at) FROM regulatory_context_projection p
+                      JOIN regulatory_chunk c ON c.id=p.canonical_chunk_id
+                     WHERE c.user_file_id=o.id) AS last_context_published_at
+              FROM owned o ORDER BY o.id
+        """,
+        "OWNED_TEMPORAL_COUNTS_BY_INDEX": """
+            SELECT user_file_id, index_uuid,
+                   payload#>>'{index,index_name}' AS index_name,
+                   count(*) AS total_bindings,
+                   count(*) FILTER (WHERE retired_at IS NULL) AS active_bindings,
+                   count(*) FILTER (WHERE payload->>'derived_role'='canonical') AS canonical_bindings,
+                   count(*) FILTER (WHERE payload->>'derived_role' IS DISTINCT FROM 'canonical') AS derived_bindings,
+                   min(published_at) AS first_published_at,
+                   max(published_at) AS last_published_at,
+                   min(effective_start) AS first_effective_start,
+                   max(effective_start) AS last_effective_start
+              FROM regulatory_temporal_projection
+             WHERE user_file_id IN ('10e927dc-a124-4c6a-85b1-e3619b61b6d3',
+                                    'a3c6e8cf-93a9-460b-9edf-a9cdd4ba05a9')
+             GROUP BY user_file_id,index_uuid,payload#>>'{index,index_name}'
+             ORDER BY user_file_id,index_uuid LIMIT 12
+        """,
         "OWNED_INDEX_PROGRESS": """
             SELECT f.id, f.status AS file_status, r.attempt_id,
                    r.status AS repair_status, r.updated_at AS repair_updated_at,
