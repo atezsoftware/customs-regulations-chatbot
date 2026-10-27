@@ -194,8 +194,26 @@ def main() -> None:
                    created_at, updated_at, lease_token IS NOT NULL AS claimed,
                    lease_expires_at
               FROM regulatory_document_intake
-             WHERE id IN ('7b7a8362-f9a7-465a-a582-d09042165728',
-                          'f8d84bb5-411a-4f7e-9105-bb7b11f45d34')
+             WHERE source_package_id IN (
+                '8a4c1bb2-66f0-4a6d-bb3b-dfb3adf4b73b',
+                '0e8a9538-c59f-4451-a513-3c9ce71971a3',
+                'c85b6a1d-0dca-4968-b4a5-f4011fc32a7c',
+                '08dd6e41-7c67-4dfa-9c64-48a0d3d33a3a',
+                'f71bd843-0827-4264-976b-911d00930022',
+                '93064b06-86f1-4b3d-aaa4-279471e6e1f8',
+                '0d558987-0ebb-49c1-9a35-fe9e619bde8e',
+                'aae7aa45-1a84-4838-bd13-ae3c1ce632db')
+             ORDER BY created_at
+        """,
+        "GLOBAL_PREPARING_INTAKE_COUNTS": """
+            SELECT p.environment, b.stage,
+                   b.lease_token IS NOT NULL AS claimed,
+                   count(*) AS preparing_batches
+              FROM regulatory_document_intake b
+              JOIN amendment_source_package p ON p.id=b.source_package_id
+             WHERE b.status='preparing'
+             GROUP BY p.environment,b.stage,b.lease_token IS NOT NULL
+             ORDER BY p.environment,b.stage,claimed
         """,
         "SOURCE_RECOVERY_SCHEDULER": """
             SELECT application_name, state, wait_event_type, wait_event,
