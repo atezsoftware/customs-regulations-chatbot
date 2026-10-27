@@ -161,6 +161,7 @@ def test_production_lite_scheduler_contains_only_recovery_and_queue_monitoring()
         "regulatory_labeling_recover_stale",
         "recover_annex_publications",
         "recover_amendment_sources",
+        "recover_document_intakes",
         "monitor_celery_queues",
     }
     from onyx.background.celery.queue_names import REGULATORY_AMENDMENT_QUEUE
@@ -171,6 +172,7 @@ def test_production_lite_scheduler_contains_only_recovery_and_queue_monitoring()
         REGULATORY_AMENDMENT_QUEUE,
         OnyxCeleryQueues.REGULATORY_INDEXING,
         OnyxCeleryQueues.MONITORING,
+        OnyxCeleryQueues.CHECKPOINT_CLEANUP,
     }
     schedules = {template["task"]: template["schedule"] for template in templates}
     assert schedules["regulatory_indexing_recover_stale"] == timedelta(minutes=1)
@@ -199,6 +201,7 @@ def test_lite_global_and_regulatory_beat_schedules_do_not_overlap() -> None:
         OnyxCeleryTask.CHECK_FOR_USER_FILE_PROJECT_SYNC,
         OnyxCeleryTask.CHECK_FOR_USER_FILE_DELETE,
         OnyxCeleryTask.CHECK_FOR_AUTO_LLM_UPDATE,
+        OnyxCeleryTask.PRUNE_ANSWER_GRAPHS,
     }
     assert global_beat_tasks.isdisjoint(regulatory_beat_tasks)
 
@@ -218,7 +221,7 @@ def test_production_lite_scheduler_expands_every_task_with_each_tenant_id(
         ["public", "tenant-a"]
     )
 
-    assert len(schedule) == (12 if annex_enabled else 8)
+    assert len(schedule) == (14 if annex_enabled else 8)
     assert ("recover-annex-publications-public" in schedule) is annex_enabled
     assert {entry["kwargs"]["tenant_id"] for entry in schedule.values()} == {
         "public",
@@ -229,7 +232,11 @@ def test_production_lite_scheduler_expands_every_task_with_each_tenant_id(
         == (
             {"tenant_id", "environment", "database_identity"}
             if entry["task"]
-            in {"recover_annex_publications", "recover_amendment_sources"}
+            in {
+                "recover_annex_publications",
+                "recover_amendment_sources",
+                "recover_document_intakes",
+            }
             else {"tenant_id"}
         )
         for entry in schedule.values()
@@ -260,6 +267,7 @@ def test_production_lite_scheduler_rebuilds_schedule_across_restart(
     expected_names = {
         "recover-annex-publications-public",
         "recover-amendment-sources-public",
+        "recover-document-intakes-public",
         "recover-stale-regulatory-amendments-public",
         "recover-stale-regulatory-indexing-public",
         "recover-stale-regulatory-labeling-public",
@@ -267,7 +275,11 @@ def test_production_lite_scheduler_rebuilds_schedule_across_restart(
     }
     if not annex_enabled:
         expected_names.difference_update(
-            {"recover-annex-publications-public", "recover-amendment-sources-public"}
+            {
+                "recover-annex-publications-public",
+                "recover-amendment-sources-public",
+                "recover-document-intakes-public",
+            }
         )
     assert set(scheduler.schedule) == expected_names
     scheduler.close()
@@ -332,10 +344,12 @@ def test_two_scheduler_ticks_isolate_both_entries_per_tenant_slot_and_advance(
         "regulatory_labeling_recover_stale": 60,
         "recover_annex_publications": 60,
         "recover_amendment_sources": 60,
+        "recover_document_intakes": 60,
     }
     if not annex_enabled:
         del tasks["recover_annex_publications"]
         del tasks["recover_amendment_sources"]
+        del tasks["recover_document_intakes"]
     entry_names = {
         f"{entry_prefix}-{tenant}"
         for entry_prefix in (
@@ -345,11 +359,16 @@ def test_two_scheduler_ticks_isolate_both_entries_per_tenant_slot_and_advance(
             "recover-stale-regulatory-labeling",
             "recover-annex-publications",
             "recover-amendment-sources",
+            "recover-document-intakes",
         )
         for tenant in tenants
         if annex_enabled
         or entry_prefix
-        not in {"recover-annex-publications", "recover-amendment-sources"}
+        not in {
+            "recover-annex-publications",
+            "recover-amendment-sources",
+            "recover-document-intakes",
+        }
     }
     scheduler_app = Celery(
         "regulatory_indexing_beat_entry_isolation_test",
@@ -590,6 +609,7 @@ def test_scheduler_recovers_a_corrupt_pod_local_schedule(
         expected_names = {
             "recover-annex-publications-public",
             "recover-amendment-sources-public",
+            "recover-document-intakes-public",
             "recover-stale-regulatory-amendments-public",
             "recover-stale-regulatory-indexing-public",
             "recover-stale-regulatory-labeling-public",
@@ -600,6 +620,7 @@ def test_scheduler_recovers_a_corrupt_pod_local_schedule(
                 {
                     "recover-annex-publications-public",
                     "recover-amendment-sources-public",
+                    "recover-document-intakes-public",
                 }
             )
         assert set(scheduler.schedule) == expected_names

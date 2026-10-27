@@ -71,7 +71,7 @@ def test_preparation_dispatch_failure_preserves_a_live_worker_claim(
     session = MagicMock(spec=Session)
     session.get.return_value = batch
     repository.mark_intake_dispatch_failed(session, batch, "Queue unavailable")
-    assert batch.status == ("preparing" if claimed else "failed")
+    assert batch.status == "preparing"
     assert batch.error == (None if claimed else "Queue unavailable")
     if claimed:
         assert batch.lease_token is not None

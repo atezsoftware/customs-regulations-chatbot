@@ -359,18 +359,30 @@ def request_reprepare(
 
 
 def claim_reprepare(session: Session, intake_id: UUID, request_id: UUID) -> UUID | None:
-    batch = session.get_one(RegulatoryDocumentIntake, intake_id, with_for_update=True)
+    batch = session.get_one(
+        RegulatoryDocumentIntake,
+        intake_id,
+        with_for_update=True,
+        populate_existing=True,
+    )
     request = session.get_one(
-        RegulatoryDocumentIntakeReprepare, request_id, with_for_update=True
+        RegulatoryDocumentIntakeReprepare,
+        request_id,
+        with_for_update=True,
+        populate_existing=True,
     )
     now = datetime.now(timezone.utc)
     if (
         request.intake_id != batch.id
         or request.status == "prepared"
         or batch.stage != "reprepare"
-        or batch.status not in {"preparing", "failed"}
-        or (batch.lease_expires_at and batch.lease_expires_at > now)
+        or batch.status != "preparing"
+        or batch.lease_token is not None
+        or batch.lease_expires_at is not None
     ):
+        return None
+    latest = latest_reprepare(session, intake_id)
+    if latest is None or latest.id != request_id:
         return None
     batch.status, batch.error = "preparing", None
     batch.lease_token, batch.lease_expires_at = uuid4(), now + timedelta(minutes=10)

@@ -125,7 +125,11 @@ class RegulatoryIndexingScheduler(PersistentScheduler):
 
                 if (
                     template["task"]
-                    in {"recover_annex_publications", "recover_amendment_sources"}
+                    in {
+                        "recover_annex_publications",
+                        "recover_amendment_sources",
+                        "recover_document_intakes",
+                    }
                     and not annex_config.REGULATORY_ANNEX_WORKER_ENABLED
                 ):
                     continue

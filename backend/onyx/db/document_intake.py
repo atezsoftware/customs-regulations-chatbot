@@ -346,18 +346,27 @@ def refresh_intake(session: Session, batch: RegulatoryDocumentIntake) -> None:
 
     # Polling must re-read the worker's lease under the same lock as transitions.
     session.refresh(batch, with_for_update=True)
-    if batch.status == "preparing" and batch.stage in {
-        "chunking",
-        "metadata",
-        "reprepare",
-    }:
+    if (
+        batch.status == "preparing"
+        and batch.stage
+        in {
+            "chunking",
+            "metadata",
+            "reprepare",
+        }
+        and not (
+            batch.stage in {"chunking", "reprepare"}
+            and batch.lease_token is None
+            and batch.lease_expires_at is None
+        )
+    ):
         deadline = batch.lease_expires_at or (
             batch.updated_at + datetime.timedelta(seconds=INTAKE_DELIVERY_SECONDS)
         )
         if deadline < datetime.datetime.now(datetime.timezone.utc):
             batch.status, batch.error = (
                 "failed",
-                "Preparation delivery or worker lease expired; retry this import",
+                "Preparation worker lease expired; retry this import",
             )
             batch.lease_token, batch.lease_expires_at = None, None
     if (
@@ -385,6 +394,7 @@ def refresh_intake(session: Session, batch: RegulatoryDocumentIntake) -> None:
                 )
             else:
                 batch.status, batch.stage = "ready", "review"
+                batch.error = None
                 batch.review_sha256 = review_digest(session, batch)
                 for item in effective_intake_files(session, batch):
                     item.status = "ready"
@@ -393,6 +403,8 @@ def refresh_intake(session: Session, batch: RegulatoryDocumentIntake) -> None:
                 "partial",
                 run.error or "Labeling has unresolved or failed chunks",
             )
+        elif run.status in {"queued", "running"}:
+            batch.error = None
     if batch.stage == "indexing" and batch.status in {"approving", "failed"}:
         files = effective_intake_files(session, batch)
         for item in files:
@@ -552,7 +564,12 @@ def intake_snapshot(
         "id": str(batch.id),
         "source_package_id": str(batch.source_package_id),
         "status": batch.status,
-        "stage": batch.stage,
+        "stage": ("queued_reprepare" if batch.stage == "reprepare" else "queued")
+        if batch.status == "preparing"
+        and batch.stage in {"chunking", "reprepare"}
+        and batch.lease_token is None
+        and batch.lease_expires_at is None
+        else batch.stage,
         "target_document_set_id": batch.document_set_id,
         "target_document_set_name": TARGET_DOCUMENT_SET_NAME,
         "review_sha256": batch.review_sha256,
@@ -797,19 +814,26 @@ def retry_intake(
 
 
 def claim_intake(session: Session, intake_id: UUID) -> UUID | None:
-    batch = session.get(RegulatoryDocumentIntake, intake_id, with_for_update=True)
+    batch = session.get(
+        RegulatoryDocumentIntake,
+        intake_id,
+        with_for_update=True,
+        populate_existing=True,
+    )
     now = datetime.datetime.now(datetime.timezone.utc)
     if (
         batch is None
         or batch.status != "preparing"
         or batch.stage != "chunking"
-        or (batch.lease_expires_at and batch.lease_expires_at > now)
+        or batch.lease_token is not None
+        or batch.lease_expires_at is not None
     ):
         return None
     batch.lease_token, batch.lease_expires_at = (
         uuid4(),
         now + datetime.timedelta(minutes=10),
     )
+    batch.error = None
     session.flush()
     return batch.lease_token
 
@@ -986,10 +1010,37 @@ def mark_intake_file_prepared(
     member.status, member.error = "chunked", None
 
 
-def start_intake_labeling(session: Session, intake_id: UUID, token: UUID) -> UUID:
-    from onyx.db import regulatory_labeling as labeling
-
+def start_intake_labeling(
+    session: Session, intake_id: UUID, token: UUID
+) -> UUID | None:
     batch, _package, _assets = load_intake_job(session, intake_id, token)
+    session.refresh(batch, with_for_update=True)
+    if batch.lease_token != token or batch.status != "preparing":
+        raise IntakeConflictError("The intake preparation lease changed")
+    return _start_intake_labeling_for_batch(session, batch)
+
+
+def resume_intake_labeling(session: Session, intake_id: UUID) -> UUID | None:
+    batch = session.get_one(
+        RegulatoryDocumentIntake,
+        intake_id,
+        with_for_update=True,
+        populate_existing=True,
+    )
+    if (
+        batch.status != "preparing"
+        or batch.stage != "waiting_labeling"
+        or batch.lease_token is not None
+        or batch.lease_expires_at is not None
+    ):
+        return None
+    return _start_intake_labeling_for_batch(session, batch)
+
+
+def _start_intake_labeling_for_batch(
+    session: Session, batch: RegulatoryDocumentIntake
+) -> UUID | None:
+    from onyx.db import regulatory_labeling as labeling
     from onyx.db.document_intake_review import effective_intake_files
 
     files = effective_intake_files(session, batch)
@@ -1015,6 +1066,12 @@ def start_intake_labeling(session: Session, intake_id: UUID, token: UUID) -> UUI
     ):
         run = existing
     else:
+        session.get_one(DocumentSet, batch.document_set_id, with_for_update=True)
+        if labeling.get_active_run_id(session, batch.document_set_id) is not None:
+            batch.stage, batch.error = "waiting_labeling", None
+            batch.lease_token, batch.lease_expires_at = None, None
+            session.flush()
+            return None
         user = session.get_one(User, batch.created_by)
         binding = resolve_intake_labeling_provider_binding(
             session, batch.labeling_model_configuration_id, user=user
@@ -1076,10 +1133,9 @@ def mark_intake_label_dispatch_failed(session: Session, intake_id: UUID) -> None
         populate_existing=True,
     )
     if batch is not None and batch.status == "preparing" and batch.stage == "labeling":
-        batch.status, batch.error = (
-            "failed",
-            "Labeling could not be queued; retry this import",
-        )
+        # The committed labeling run is the durable intent; its recovery task
+        # redelivers a lost broker hint without preparing these files again.
+        batch.error = "Labeling delivery is pending; automatic recovery will retry"
 
 
 def mark_intake_dispatch_failed(
@@ -1098,7 +1154,7 @@ def mark_intake_dispatch_failed(
         or current.lease_token is not None
     ):
         return
-    current.status, current.error = "failed", message[:1000]
+    current.error = message[:1000]
     session.flush()
 
 
