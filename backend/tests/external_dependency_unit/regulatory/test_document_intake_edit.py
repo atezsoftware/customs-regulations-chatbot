@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 
 from onyx.db import document_intake as intake
 from onyx.db import document_intake_edit as editing
+from onyx.db import document_intake_edit_budget as edit_budget
 from onyx.db import regulatory_labeling as labeling
 from onyx.db.labeling_configuration import LabelingProviderBinding
 from onyx.db.models import (
@@ -23,6 +24,13 @@ from onyx.db.models import (
     RegulatoryLabelingItem,
     RegulatoryLabelingRun,
     User,
+    UserFile,
+)
+from onyx.db.search_settings import get_current_search_settings
+from onyx.indexing.contextual_settings import effective_contextual_rag_enabled
+from onyx.natural_language_processing.utils import TiktokenTokenizer
+from onyx.regulatory.indexing_jobs.configuration import (
+    compute_regulatory_chunk_generation_hash,
 )
 from onyx.regulatory.indexing_jobs.models import VertexAuthenticationMode
 from tests.external_dependency_unit.regulatory.test_document_intake import (
@@ -44,6 +52,7 @@ def _ready(
     *,
     aggregate: bool = False,
     metadata_audit: bool = False,
+    chunking_version: str | None = None,
 ) -> tuple[RegulatoryDocumentIntake, list[RegulatoryDocumentIntakeFile]]:
     user, target, model = owner
     batch, members = _admitted(session, user, target, model)
@@ -108,6 +117,32 @@ def _ready(
             )
         )
     session.flush()
+    setting = get_current_search_settings(session)
+    generation = compute_regulatory_chunk_generation_hash(
+        embedding_provider=setting.provider_type,
+        embedding_model_name=setting.model_name,
+        enable_contextual_rag=effective_contextual_rag_enabled(setting),
+        intake_chunking_version=chunking_version,
+    )
+    for member in members:
+        session.get_one(
+            UserFile, member.user_file_id
+        ).regulatory_chunk_generation_hash = generation
+        if chunking_version:
+            for row in session.scalars(
+                select(RegulatoryChunk).where(
+                    RegulatoryChunk.user_file_id == member.user_file_id
+                )
+            ):
+                row.chunk_metadata = {
+                    **row.chunk_metadata,
+                    "intake_chunking_version": chunking_version,
+                }
+    monkeypatch.setattr(
+        edit_budget,
+        "_embedding_tokenizer",
+        lambda _settings: TiktokenTokenizer("text-embedding-3-large"),
+    )
     seed = _completed_labels(session, batch, members)
     binding = LabelingProviderBinding(
         model_configuration_id=model.id,

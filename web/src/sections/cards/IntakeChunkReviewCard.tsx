@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import {
   Button,
   InputTextArea,
@@ -10,7 +10,16 @@ import {
 } from "@opal/components";
 import type { RegulatoryChunk } from "@/lib/regulatory/interfaces";
 import type { IntakeChunkUpdate } from "@/lib/regulatory/documentIntake";
-import type { IntakeMetadataEdits } from "@/lib/regulatory/intakeMetadata";
+import { intakeMetadataEdits } from "@/lib/regulatory/intakeMetadata";
+import {
+  type IntakeChunkReviewDraft,
+  createIntakeChunkDraft,
+  hasIntakeLabelingProblem,
+  intakeChunkDraftDirty,
+  intakeChunkDraftUpdate,
+  intakeChunkDraftValidation,
+  validIntakeDate,
+} from "@/lib/regulatory/intakeChunkDraft";
 import ChunkFieldsReview, {
   ReadOnlyFieldValue,
 } from "@/sections/cards/ChunkFieldsReview";
@@ -31,27 +40,13 @@ interface IntakeChunkReviewCardProps {
     draft: IntakeChunkUpdate,
     expectedReviewSha256: string
   ) => Promise<void>;
-  onDirtyChange: (chunkId: string, dirty: boolean) => void;
-}
-
-function chunkDraft(chunk: RegulatoryChunk): IntakeChunkUpdate {
-  return {
-    text: chunk.text,
-    heading_path: chunk.heading_path,
-    chunk_type: chunk.chunk_type ?? null,
-    validity_start_date: chunk.validity_start_date ?? null,
-    validity_end_date: chunk.validity_end_date ?? null,
-  };
-}
-
-function validDate(value: string | null): boolean {
-  if (!value) return true;
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
-  const parsed = new Date(`${value}T00:00:00Z`);
-  return (
-    Number.isFinite(parsed.getTime()) &&
-    parsed.toISOString().slice(0, 10) === value
-  );
+  onDirtyChange?: (chunkId: string, dirty: boolean) => void;
+  persistedDraft?: IntakeChunkReviewDraft;
+  onDraftChange?: (
+    chunkId: string,
+    draft: IntakeChunkReviewDraft | null
+  ) => void;
+  saveDisabled?: boolean;
 }
 
 export default function IntakeChunkReviewCard({
@@ -64,67 +59,52 @@ export default function IntakeChunkReviewCard({
   children,
   onSave,
   onDirtyChange,
+  persistedDraft,
+  onDraftChange,
+  saveDisabled = false,
 }: IntakeChunkReviewCardProps) {
-  const [draft, setDraft] = useState(() => chunkDraft(chunk));
-  const [baseDraft, setBaseDraft] = useState(() => chunkDraft(chunk));
-  const [baseMetadata, setBaseMetadata] = useState(chunk.chunk_metadata);
-  const [metadataSession, setMetadataSession] = useState(0);
-  const [metadataEdits, setMetadataEdits] = useState<IntakeMetadataEdits>({
-    patch: {},
-    dirty: false,
-    error: null,
-  });
-  const onMetadataEdits = useCallback(
-    (edits: IntakeMetadataEdits) =>
-      setMetadataEdits((current) =>
-        JSON.stringify(current) === JSON.stringify(edits) ? current : edits
-      ),
-    []
+  const [reviewDraft, setReviewDraft] = useState(
+    () => persistedDraft ?? createIntakeChunkDraft(chunk, reviewSha256)
   );
-  const [editReviewSha256, setEditReviewSha256] = useState(reviewSha256);
-  const [headingPath, setHeadingPath] = useState(chunk.heading_path.join("\n"));
+  const {
+    values: draft,
+    baseValues: baseDraft,
+    baseMetadata,
+    headingPath,
+  } = reviewDraft;
+  const metadataEdits = intakeMetadataEdits(
+    baseMetadata,
+    reviewDraft.metadataInputs
+  );
+  function setDraft(values: IntakeChunkUpdate) {
+    setReviewDraft((current) => ({ ...current, values }));
+  }
+  function setHeadingPath(value: string) {
+    setReviewDraft((current) => ({ ...current, headingPath: value }));
+  }
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const dirty =
-    JSON.stringify(draft) !== JSON.stringify(baseDraft) ||
-    headingPath !== baseDraft.heading_path.join("\n") ||
-    metadataEdits.dirty;
+  const dirty = intakeChunkDraftDirty(reviewDraft);
   useEffect(() => {
-    onDirtyChange(chunk.id, dirty);
-  }, [chunk.id, dirty, onDirtyChange]);
+    onDirtyChange?.(chunk.id, dirty);
+    onDraftChange?.(chunk.id, dirty ? reviewDraft : null);
+  }, [chunk.id, dirty, reviewDraft, onDirtyChange, onDraftChange]);
   useEffect(() => {
     if (dirty) return;
-    setDraft(chunkDraft(chunk));
-    setBaseDraft(chunkDraft(chunk));
-    setBaseMetadata(chunk.chunk_metadata);
-    setEditReviewSha256(reviewSha256);
-    setHeadingPath(chunk.heading_path.join("\n"));
-    setMetadataEdits({ patch: {}, dirty: false, error: null });
-    setMetadataSession((current) => current + 1);
+    setReviewDraft(createIntakeChunkDraft(chunk, reviewSha256));
   }, [chunk, reviewSha256, dirty]);
 
-  const validation = !draft.text.trim()
-    ? "Chunk text cannot be empty."
-    : !validDate(draft.validity_start_date) ||
-        !validDate(draft.validity_end_date)
-      ? "Use a valid YYYY-MM-DD date."
-      : draft.validity_start_date &&
-          draft.validity_end_date &&
-          draft.validity_end_date <= draft.validity_start_date
-        ? "The end date must be after the start date."
-        : metadataEdits.error;
+  const validation = intakeChunkDraftValidation(reviewDraft);
   const variant = !editable
     ? "readOnly"
     : saving || disabled
       ? "disabled"
       : "primary";
-  const labelingProblem =
-    Boolean(chunk.labeling_error) ||
-    ["failed", "stale", "cancelled"].includes(chunk.labeling_status ?? "");
+  const labelingProblem = hasIntakeLabelingProblem(chunk);
   const afterChunk: Record<string, unknown> = {
     ...chunk,
     text: draft.text,
-    chunk_type: draft.chunk_type,
+    chunk_type: draft.chunk_type ?? "",
     heading_path: headingPath
       .split("\n")
       .map((heading) => heading.trim())
@@ -135,34 +115,27 @@ export default function IntakeChunkReviewCard({
   };
 
   function reset() {
-    setDraft(chunkDraft(chunk));
-    setBaseDraft(chunkDraft(chunk));
-    setBaseMetadata(chunk.chunk_metadata);
-    setMetadataEdits({ patch: {}, dirty: false, error: null });
-    setMetadataSession((current) => current + 1);
-    setEditReviewSha256(reviewSha256);
-    setHeadingPath(chunk.heading_path.join("\n"));
+    setReviewDraft(createIntakeChunkDraft(chunk, reviewSha256));
     setError(null);
-    onDirtyChange(chunk.id, false);
+    onDirtyChange?.(chunk.id, false);
+    onDraftChange?.(chunk.id, null);
   }
   async function save() {
-    if (validation || saving || disabled || !editable || !editReviewSha256)
+    if (
+      validation ||
+      saving ||
+      disabled ||
+      saveDisabled ||
+      !editable ||
+      !reviewDraft.reviewSha256
+    )
       return;
     setSaving(true);
     setError(null);
     try {
       await onSave(
-        {
-          ...draft,
-          heading_path: headingPath
-            .split("\n")
-            .map((heading) => heading.trim())
-            .filter(Boolean),
-          ...(metadataEdits.dirty
-            ? { chunk_metadata: metadataEdits.patch }
-            : {}),
-        },
-        editReviewSha256
+        intakeChunkDraftUpdate(reviewDraft),
+        reviewDraft.reviewSha256
       );
       reset();
     } catch (cause) {
@@ -226,14 +199,16 @@ export default function IntakeChunkReviewCard({
     if (key === "metadata")
       return (
         <IntakeLegalMetadataFields
-          key={`metadata:${metadataSession}`}
           metadata={baseMetadata}
           editing
           readOnly={!editable}
           disabled={saving || disabled}
           validityStart={draft.validity_start_date}
           validityEnd={draft.validity_end_date}
-          onEdits={onMetadataEdits}
+          inputs={reviewDraft.metadataInputs}
+          onInputsChange={(metadataInputs) =>
+            setReviewDraft((current) => ({ ...current, metadataInputs }))
+          }
         />
       );
     if (key === "validity_start_date" || key === "validity_end_date")
@@ -251,7 +226,7 @@ export default function IntakeChunkReviewCard({
                 ? "readOnly"
                 : saving || disabled
                   ? "disabled"
-                  : validDate(draft[key])
+                  : validIntakeDate(draft[key])
                     ? "primary"
                     : "error"
             }
@@ -319,8 +294,14 @@ export default function IntakeChunkReviewCard({
       </Text>
       {dirty && (
         <Text as="p" font="secondary-body" color="text-03">
-          Saving changes regenerates labels for this document. Other documents
-          keep their current labels.
+          Save all pending chunk changes together to regenerate labels once per
+          changed document. Other documents keep their current labels.
+        </Text>
+      )}
+      {dirty && saveDisabled && (
+        <Text as="p" font="secondary-body" color="text-03">
+          Multiple chunks have unsaved changes. Use Save all chunk changes
+          above.
         </Text>
       )}
       {(validation || error) && (
@@ -337,7 +318,12 @@ export default function IntakeChunkReviewCard({
           </Button>
           <Button
             disabled={
-              !dirty || Boolean(validation) || saving || disabled || !editable
+              !dirty ||
+              Boolean(validation) ||
+              saving ||
+              disabled ||
+              saveDisabled ||
+              !editable
             }
             onClick={() => void save()}
           >

@@ -291,13 +291,9 @@ class RegulatoryIndexingChunker:
                 from onyx.regulatory.document_intake.chunking import (
                     IntakeRegulatoryChunker,
                 )
-                from onyx.regulatory.document_intake.chunking_profile import (
-                    INTAKE_CHUNKING_CODE_VERSION,
-                )
 
-                if intake_version != INTAKE_CHUNKING_CODE_VERSION:
-                    raise ValueError("The intake chunking version is not supported")
                 structural_chunker = IntakeRegulatoryChunker(
+                    chunking_version=intake_version,
                     tokenizer=self.tokenizer,
                     content_token_limit=max(
                         1,

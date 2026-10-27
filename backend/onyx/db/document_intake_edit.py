@@ -1,8 +1,9 @@
 """Correct unpublished intake chunks and relabel only their changed file context."""
 
 import datetime
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from copy import deepcopy
+from dataclasses import dataclass
 from typing import Any
 from uuid import UUID, uuid4, uuid5
 
@@ -11,6 +12,10 @@ from sqlalchemy.orm import Session
 
 from onyx.db import document_intake as intake
 from onyx.db import regulatory_labeling as labeling
+from onyx.db.document_intake_edit_budget import (
+    prospective_intake_edit_rows,
+    validate_intake_edit_budgets,
+)
 from onyx.db.document_intake_metadata import (
     invalidate_metadata_file_context,
     manual_edit_metadata,
@@ -56,9 +61,23 @@ _EDITABLE_FIELDS = frozenset(
     }
 )
 MAX_EDIT_TEXT_CHARS = 2_000_000
+MAX_INTAKE_CHUNK_EDITS = 256
 _TERMINAL_LABELING_STATUSES = frozenset(
     {"completed", "completed_with_errors", "failed", "cancelled"}
 )
+
+
+@dataclass(frozen=True)
+class IntakeChunkEdit:
+    document_id: UUID
+    chunk_id: str
+    updates: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class _PreparedChunkEdit:
+    chunk: RegulatoryChunk
+    updates: dict[str, Any]
 
 
 def edit_review_digest(session: Session, batch: RegulatoryDocumentIntake) -> str | None:
@@ -274,7 +293,7 @@ def _copy_unchanged_label_results(
     *,
     previous: RegulatoryLabelingRun,
     replacement: RegulatoryLabelingRun,
-    changed_file_id: UUID,
+    changed_file_ids: set[UUID],
     allow_incomplete: bool = False,
 ) -> None:
     if not _same_labeling_provenance(previous, replacement):
@@ -285,7 +304,7 @@ def _copy_unchanged_label_results(
         session.scalars(
             select(RegulatoryLabelingItem).where(
                 RegulatoryLabelingItem.run_id == previous.id,
-                RegulatoryLabelingItem.user_file_id != changed_file_id,
+                RegulatoryLabelingItem.user_file_id.not_in(changed_file_ids),
                 RegulatoryLabelingItem.status == "completed",
             )
         )
@@ -301,7 +320,7 @@ def _copy_unchanged_label_results(
     for item in session.scalars(
         select(RegulatoryLabelingItem).where(
             RegulatoryLabelingItem.run_id == replacement.id,
-            RegulatoryLabelingItem.user_file_id != changed_file_id,
+            RegulatoryLabelingItem.user_file_id.not_in(changed_file_ids),
         )
     ):
         old = reusable.get(item.regulatory_chunk_id)
@@ -332,7 +351,43 @@ def edit_intake_chunk(
     expected_review_sha256: str,
     updates: Mapping[str, Any],
 ) -> UUID | None:
-    """Caller commits before dispatching the returned labeling run; no index I/O."""
+    """Preserve the single-chunk contract through the same atomic bulk operation."""
+    return edit_intake_chunks(
+        session,
+        batch,
+        expected_review_sha256=expected_review_sha256,
+        edits=[IntakeChunkEdit(document_id, chunk_id, updates)],
+    )
+
+
+def edit_intake_chunks(
+    session: Session,
+    batch: RegulatoryDocumentIntake,
+    *,
+    expected_review_sha256: str,
+    edits: Sequence[IntakeChunkEdit],
+) -> UUID | None:
+    """Save one review atomically; the caller commits before dispatching one run."""
+    if not edits or len(edits) > MAX_INTAKE_CHUNK_EDITS:
+        raise ValueError("Supply between 1 and 256 chunk edits")
+    if len({edit.chunk_id for edit in edits}) != len(edits):
+        raise ValueError("Each canonical chunk can be edited only once per review")
+    with session.begin_nested():
+        return _edit_intake_chunks(
+            session,
+            batch,
+            expected_review_sha256=expected_review_sha256,
+            edits=edits,
+        )
+
+
+def _edit_intake_chunks(
+    session: Session,
+    batch: RegulatoryDocumentIntake,
+    *,
+    expected_review_sha256: str,
+    edits: Sequence[IntakeChunkEdit],
+) -> UUID | None:
     session.refresh(batch, with_for_update=True)
     intake.refresh_intake(session, batch)
     session.get_one(DocumentSet, batch.document_set_id, with_for_update=True)
@@ -351,95 +406,146 @@ def edit_intake_chunk(
             "The document edit review changed; reload before editing"
         )
     partial_review = batch.status == "partial"
-    member = session.scalar(
-        select(RegulatoryDocumentIntakeFile)
-        .where(
-            RegulatoryDocumentIntakeFile.id == document_id,
-            RegulatoryDocumentIntakeFile.intake_id == batch.id,
-        )
-        .with_for_update()
-    )
-    if member is None:
-        raise ValueError("Intake document not found")
-    file = session.get_one(UserFile, member.user_file_id, with_for_update=True)
-    if file.status != UserFileStatus.CHUNKED or get_user_file_projection_repair(
-        session, file.id
-    ):
-        raise intake.IntakeConflictError(
-            "Only unpublished imported files can be edited in this review"
-        )
-    rows = list(
+    document_ids = {edit.document_id for edit in edits}
+    members = list(
         session.scalars(
-            select(RegulatoryChunk)
-            .where(RegulatoryChunk.user_file_id == file.id)
-            .order_by(RegulatoryChunk.position, RegulatoryChunk.id)
+            select(RegulatoryDocumentIntakeFile)
+            .where(
+                RegulatoryDocumentIntakeFile.id.in_(document_ids),
+                RegulatoryDocumentIntakeFile.intake_id == batch.id,
+            )
+            .order_by(RegulatoryDocumentIntakeFile.id)
             .with_for_update()
         )
     )
-    chunk = next((row for row in rows if row.id == chunk_id), None)
-    if chunk is None:
-        raise ValueError("Chunk does not belong to this intake document")
-    if (
-        is_hierarchical_aggregate_chunk(chunk)
-        or canonical_dependency_ids(chunk)
-        or chunk.source != "indexed"
-        or chunk.status != "active"
-        or chunk.supersedes_chunk_id is not None
-        or chunk.superseded_by_chunk_id is not None
-    ):
-        raise ValueError("Only unversioned canonical chunks can be edited directly")
-    _validated_updates(chunk, updates)
-    normalized_updates = dict(updates)
-    if "text" in normalized_updates:
-        asset = session.get_one(RegulatorySourceAsset, member.source_asset_id)
-        links = [SourceLink.model_validate(value) for value in member.relationships]
-        require_resolved_attachment_references(
-            normalized_updates["text"], asset_sha256=asset.sha256, links=links
+    if {member.id for member in members} != document_ids:
+        raise ValueError("Intake document not found")
+    member_by_id = {member.id: member for member in members}
+    files = {
+        member.user_file_id: session.get_one(
+            UserFile, member.user_file_id, with_for_update=True
         )
-        normalized_updates["text"] = normalize_attachment_navigation(
-            normalized_updates["text"],
-            asset_sha256=asset.sha256,
-            links=links,
-            package_assets=[
-                IntakeSourceAsset.model_validate(value)
-                for value in session.scalars(
-                    select(RegulatorySourceAsset).where(
-                        RegulatorySourceAsset.package_id == asset.package_id
-                    )
-                )
-            ],
+        for member in sorted(members, key=lambda member: member.user_file_id)
+    }
+    for file in files.values():
+        if (
+            file.status != UserFileStatus.CHUNKED
+            or file.user_id != batch.created_by
+            or get_user_file_projection_repair(session, file.id)
+        ):
+            raise intake.IntakeConflictError(
+                "Only unpublished imported files owned by this review can be edited"
+            )
+    rows = list(
+        session.scalars(
+            select(RegulatoryChunk)
+            .where(RegulatoryChunk.user_file_id.in_(files))
+            .order_by(
+                RegulatoryChunk.user_file_id,
+                RegulatoryChunk.position,
+                RegulatoryChunk.id,
+            )
+            .with_for_update()
         )
-    normalized_updates = manual_edit_metadata(chunk, normalized_updates)
-    changes = (
-        _validated_updates(chunk, normalized_updates) if normalized_updates else {}
     )
-    if not changes:
+    by_id = {row.id: row for row in rows}
+    rows_by_file: dict[UUID, list[RegulatoryChunk]] = {}
+    for row in rows:
+        rows_by_file.setdefault(row.user_file_id, []).append(row)
+    prepared_by_file: dict[UUID, list[_PreparedChunkEdit]] = {}
+    assets_by_package: dict[UUID, list[IntakeSourceAsset]] = {}
+    for edit in edits:
+        member = member_by_id[edit.document_id]
+        chunk = by_id.get(edit.chunk_id)
+        if chunk is None or chunk.user_file_id != member.user_file_id:
+            raise ValueError("Chunk does not belong to this intake document")
+        if (
+            is_hierarchical_aggregate_chunk(chunk)
+            or canonical_dependency_ids(chunk)
+            or chunk.source != "indexed"
+            or chunk.status != "active"
+            or chunk.supersedes_chunk_id is not None
+            or chunk.superseded_by_chunk_id is not None
+        ):
+            raise ValueError("Only unversioned canonical chunks can be edited directly")
+        _validated_updates(chunk, edit.updates)
+        normalized_updates = dict(edit.updates)
+        if "text" in normalized_updates:
+            asset = session.get_one(RegulatorySourceAsset, member.source_asset_id)
+            links = [SourceLink.model_validate(value) for value in member.relationships]
+            require_resolved_attachment_references(
+                normalized_updates["text"], asset_sha256=asset.sha256, links=links
+            )
+            if asset.package_id not in assets_by_package:
+                assets_by_package[asset.package_id] = [
+                    IntakeSourceAsset.model_validate(value)
+                    for value in session.scalars(
+                        select(RegulatorySourceAsset).where(
+                            RegulatorySourceAsset.package_id == asset.package_id
+                        )
+                    )
+                ]
+            normalized_updates["text"] = normalize_attachment_navigation(
+                normalized_updates["text"],
+                asset_sha256=asset.sha256,
+                links=links,
+                package_assets=assets_by_package[asset.package_id],
+            )
+        normalized_updates = manual_edit_metadata(chunk, normalized_updates)
+        changes = (
+            _validated_updates(chunk, normalized_updates) if normalized_updates else {}
+        )
+        if changes:
+            prepared_by_file.setdefault(chunk.user_file_id, []).append(
+                _PreparedChunkEdit(chunk, changes)
+            )
+    if not prepared_by_file:
         return None
     if previous is None or previous.status not in _TERMINAL_LABELING_STATUSES:
         raise intake.IntakeConflictError(
             "The completed labeling snapshot is unavailable"
         )
+    validate_intake_edit_budgets(
+        session,
+        files,
+        {
+            file_id: prospective_intake_edit_rows(
+                rows_by_file[file_id],
+                {change.chunk.id: change.updates for change in changes},
+            )
+            for file_id, changes in prepared_by_file.items()
+        },
+    )
     user = session.get_one(User, batch.created_by)
     binding = resolve_intake_labeling_provider_binding(
         session, batch.labeling_model_configuration_id, user=user
     )
-    retain_canonical_revisions(session, capture_canonical_scope(session, file.id))
-    for key, value in changes.items():
-        setattr(chunk, key, value)
-    if any(field in changes for field in ("text", "heading_path", "chunk_type")):
-        invalidate_metadata_file_context(rows)
-    # Cover every edit in legacy review digests, including type-only corrections.
-    chunk.chunk_metadata = {
-        **chunk.chunk_metadata,
-        "intake_edit_revision": str(uuid4()),
-    }
-    rebuilt = rebuild_context_aggregates(rows, changed_ids=[chunk.id])
-    by_id = {row.id: row for row in rows}
-    for replacement in rebuilt:
-        if replacement is not by_id[replacement.id]:
-            by_id[replacement.id].text = replacement.text
-    session.flush()
-    retain_canonical_revisions(session, capture_canonical_scope(session, file.id))
+    # No canonical record changes until every submitted edit has been validated.
+    for file_id in sorted(prepared_by_file):
+        changes = prepared_by_file[file_id]
+        file_rows = rows_by_file[file_id]
+        retain_canonical_revisions(session, capture_canonical_scope(session, file_id))
+        for change in changes:
+            for key, value in change.updates.items():
+                setattr(change.chunk, key, value)
+            change.chunk.chunk_metadata = {
+                **change.chunk.chunk_metadata,
+                "intake_edit_revision": str(uuid4()),
+            }
+        if any(
+            field in change.updates
+            for change in changes
+            for field in ("text", "heading_path", "chunk_type")
+        ):
+            invalidate_metadata_file_context(file_rows)
+        rebuilt = rebuild_context_aggregates(
+            file_rows, changed_ids=[change.chunk.id for change in changes]
+        )
+        for replacement in rebuilt:
+            if replacement is not by_id[replacement.id]:
+                by_id[replacement.id].text = replacement.text
+        session.flush()
+        retain_canonical_revisions(session, capture_canonical_scope(session, file_id))
     run, _created = labeling.create_labeling_run(
         session,
         document_set_id=batch.document_set_id,
@@ -450,20 +556,20 @@ def edit_intake_chunk(
         requested_by_id=batch.created_by,
         idempotency_key=uuid5(previous.id, intake.review_digest(session, batch)),
         target_file_ids=[
-            item.user_file_id for item in intake.intake_files(session, batch)
+            member.user_file_id for member in intake.intake_files(session, batch)
         ],
     )
     _copy_unchanged_label_results(
         session,
         previous=previous,
         replacement=run,
-        changed_file_id=file.id,
+        changed_file_ids=set(prepared_by_file),
         allow_incomplete=partial_review,
     )
     batch.labeling_run_id = run.id
     batch.status, batch.stage, batch.error = "preparing", "labeling", None
     batch.review_sha256, batch.lease_token, batch.lease_expires_at = None, None, None
-    for item in intake.intake_files(session, batch):
-        item.status, item.error = "labeling", None
+    for member in intake.intake_files(session, batch):
+        member.status, member.error = "labeling", None
     session.flush()
     return run.id

@@ -14,6 +14,7 @@ from onyx.connectors.models import Document, TextSection
 from onyx.db.enums import RegulatoryIndexingStage, UserFileStatus
 from onyx.db.models import RegulatoryChunk
 from onyx.regulatory.document_intake.chunking_profile import (
+    INTAKE_CHUNKING_CODE_VERSION,
     documents_intake_chunking_version,
     intake_chunking_version,
 )
@@ -64,16 +65,21 @@ def test_unversioned_source_documents_keep_legacy_profile() -> None:
     assert documents_intake_chunking_version([]) is None
 
 
-def test_explicit_profile_requires_supported_complete_context_and_uniform_documents() -> (
-    None
-):
-    first, second = _document(version="1"), _document(version="1")
-    assert intake_chunking_version(first) == "1"
-    assert documents_intake_chunking_version([first, second]) == "1"
+@pytest.mark.parametrize("version", ["1", "2"])
+def test_explicit_profile_requires_supported_complete_context_and_uniform_documents(
+    version: str,
+) -> None:
+    first, second = _document(version=version), _document(version=version)
+    assert intake_chunking_version(first) == version
+    assert documents_intake_chunking_version([first, second]) == version
     with pytest.raises(ValueError, match="Mixed"):
         documents_intake_chunking_version([first, _document()])
+    with pytest.raises(ValueError, match="Mixed"):
+        documents_intake_chunking_version(
+            [first, _document(version="2" if version == "1" else "1")]
+        )
     with pytest.raises(ValueError):
-        intake_chunking_version(_document(version="2"))
+        intake_chunking_version(_document(version="3"))
     invalid = first.model_copy(
         update={
             "doc_metadata": {"regulatory_document_intake": {"chunking_version": "1"}}
@@ -152,9 +158,28 @@ def test_default_generation_hash_is_byte_exact_original_payload(
         )
         != expected
     )
+    version_one_payload = {**payload, "intake_chunking_version": "1"}
+    version_one_hash = sha256(
+        json.dumps(version_one_payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    assert (
+        configuration.compute_regulatory_chunk_generation_hash(
+            embedding_provider=provider,
+            embedding_model_name="openai/text-embedding-3-large",
+            enable_contextual_rag=contextual,
+            intake_chunking_version="1",
+        )
+        == version_one_hash
+    )
+    assert configuration.compute_regulatory_chunk_generation_hash(
+        embedding_provider=provider,
+        embedding_model_name="openai/text-embedding-3-large",
+        enable_contextual_rag=contextual,
+        intake_chunking_version="2",
+    ) not in {expected, version_one_hash}
 
 
-@pytest.mark.parametrize("version", [None, "1"])
+@pytest.mark.parametrize("version", [None, "1", "2"])
 def test_old_and_intake_snapshots_validate_their_own_generation_without_rechunking(
     monkeypatch: pytest.MonkeyPatch, version: str | None
 ) -> None:
@@ -187,6 +212,8 @@ def test_old_and_intake_snapshots_validate_their_own_generation_without_rechunki
         (None, [None], None),
         ("1", ["1", None], "1"),
         ("1", [None, None], "1"),
+        ("2", ["2", None], "2"),
+        ("2", [None, None], "2"),
     ],
 )
 def test_chunk_row_snapshot_uses_file_identity_after_amendment_insertions(
@@ -204,7 +231,14 @@ def test_chunk_row_snapshot_uses_file_identity_after_amendment_insertions(
 
 @pytest.mark.parametrize(
     ("file_profile", "row_profiles"),
-    [(None, ["1"]), ("1", ["2"]), ("1", ["1", "2"]), ("unknown", [None])],
+    [
+        (None, ["1"]),
+        ("1", ["2"]),
+        ("1", ["1", "2"]),
+        ("2", ["1"]),
+        ("2", ["2", "3"]),
+        ("unknown", [None]),
+    ],
 )
 def test_chunk_row_snapshot_rejects_unknown_or_conflicting_generation_markers(
     monkeypatch: pytest.MonkeyPatch,
@@ -276,3 +310,52 @@ def _prepare_rows_without_database(
         == job_id
     )
     return captured
+
+
+def test_new_source_context_uses_current_version_and_unknown_hash_fails() -> None:
+    metadata = _document(version="1").doc_metadata
+    assert metadata is not None
+    source = IntakeSourceContext.model_validate(metadata["regulatory_document_intake"])
+    fresh = IntakeSourceContext.model_validate(
+        source.model_dump(exclude={"chunking_version"})
+    )
+    assert fresh.chunking_version == INTAKE_CHUNKING_CODE_VERSION == "2"
+    with pytest.raises(ValueError, match="not supported"):
+        configuration.compute_regulatory_chunk_generation_hash(
+            embedding_provider=None,
+            embedding_model_name="embedding",
+            intake_chunking_version="3",
+        )
+
+
+@pytest.mark.parametrize("version", ["1", "2"])
+def test_canonical_writer_passes_frozen_profile_to_intake_chunker(
+    monkeypatch: pytest.MonkeyPatch, version: str
+) -> None:
+    from onyx.regulatory.document_intake import chunking
+    from onyx.regulatory.indexing import RegulatoryIndexingChunker
+
+    captured: dict[str, Any] = {}
+
+    class Chunker:
+        def __init__(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+        def chunk_text(self, *_args: Any, **_kwargs: Any) -> SimpleNamespace:
+            return SimpleNamespace(chunks=[])
+
+    monkeypatch.setattr(chunking, "IntakeRegulatoryChunker", Chunker)
+    writer = SimpleNamespace(
+        _regulatory_chunker=SimpleNamespace(max_chunk_chars=1000),
+        tokenizer=object(),
+        chunk_token_limit=512,
+        enable_contextual_rag=False,
+    )
+    RegulatoryIndexingChunker._chunk_with_embedding_budget(
+        cast(RegulatoryIndexingChunker, writer),
+        "body",
+        source_path="fixture",
+        source_file="fixture.md",
+        intake_version=version,
+    )
+    assert captured["chunking_version"] == version

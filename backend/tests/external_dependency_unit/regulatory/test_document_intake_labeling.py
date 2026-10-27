@@ -346,6 +346,14 @@ def test_cached_label_quotes_resolve_only_for_current_intake_and_preserve_receip
         orchestrator, "resolve_labeling_gateway", lambda *_a, **_k: gateway
     )
     monkeypatch.setattr(vertex_direct, "traced_llm_call", traced)
+
+    def without_selector(**_kwargs: Any) -> None:
+        raise ValueError(
+            "Selector repair is disabled in this whitespace-policy fixture"
+        )
+
+    # The dedicated repair suite exercises the additional durable inference.
+    monkeypatch.setattr(orchestrator, "build_quote_repair", without_selector)
     resolver = intake_quote_resolution.resolve_intake_labeling_response
     if case == "normal-retry":
         monkeypatch.setattr(

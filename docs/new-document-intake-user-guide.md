@@ -110,19 +110,29 @@ Update ekranındaki **Before / After** alan tablosu kullanılır. Yeni belge iç
 
 Alanların yanında bilginin chunk hazırlığından, LLM'den veya manuel incelemeden geldiği gösterilir. LLM'nin tarih çıkarımında kullandığı alıntıyı ve kaynak chunk'ı kontrol edin. Belgenin genel yürürlük maddesi ile maddeye özel istisna farklı tarihler doğurabilir. Tarayıcının yazdırma tarihi, mevzuatın yayım veya yürürlük tarihi değildir. Başka bir mevzuata yapılan atıftaki tarih de yeni belgenin yürürlük tarihi olarak kabul edilmemelidir. Dayanağı bulunmayan veya çözülemeyen tarih boş kalır.
 
-**Düzeltme:** Hazır veya kısmi incelemede `After` alanlarını değiştirin, ardından **Save chunk changes** ile kaydedin. **Discard chunk changes**, kaydedilmemiş değişiklikleri geri alır. Etiketleme çalışırken düzenleme kapalıdır. Teknik kimlikler, kaynak bilgileri ve ilişki/audit alanları salt okunurdur.
+**Düzeltme:** Hazır veya kısmi incelemede `After` alanlarını değiştirin. Aynı incelemede başka chunk'a, **Previous chunks / Next chunks** ile başka sayfaya veya ana belge/ek kartına geçebilirsiniz. Metin, başlık yolu, tür, metadata ve tarih taslakları korunur; dosya kartını gizleyip açmak da taslağı silmez. Taslaklar kaydedilene kadar bu ekrandadır.
 
-Kaydetme, yalnızca değişen dosyanın etiketlerini yeniden üretir; paketteki diğer dosyaların doğrulanmış etiketleri korunur. Yeni etiketleme bitince sonucu tekrar inceleyin. Etiketleri bu tablodan doğrudan değiştirmezsiniz.
+Birden fazla chunk'ı düzenlediğinizde üstteki **Save all chunk changes** ile hepsini birlikte kaydedin. Bu işlem tek bir etiketleme çalışması başlatır; yalnızca değişen dosyalar yeniden işlenir, diğer dosyaların doğrulanmış etiketleri korunur. Tek chunk düzenlediyseniz karttaki **Save chunk changes** de kullanılabilir. Yeni etiketleme bitince sonucu tekrar inceleyin. Etiketleri bu tablodan doğrudan değiştirmezsiniz.
 
-Metin, başlık yolu veya chunk türü değişirse o dosyaya ait önceki LLM kanıtları güncel değil olarak işaretlenir ve LLM'den türetilmiş tarihler temizlenir. Bu alanları güncel bağlama göre yeniden kontrol edin. Gerçekten elle düzelttiğiniz değerler korunur. Önceki ve düzeltilmiş chunk revizyonları saklanır.
+Kaydetmeden önce düzenlenen metinler ve bunlardan yeniden oluşacak toplu chunk'lar, hazırlamadaki metin boyutu sınırına göre kontrol edilir. Bir parça sınırı aşarsa hata, ilgili chunk'ı, ölçülen boyutu ve izin verilen sınırı gösterir; hiçbir değişiklik kaydedilmez ve etiketleme başlamaz. Taslaklarınız korunur. Sığdırmak için hukuki içeriği çıkarmayın; kaynağı koruyan biçim düzeltmesi yeterli değilse yöneticiden yeniden hazırlama desteği isteyin.
+
+**Discard chunk changes** tek chunk'ın, **Discard all chunk changes** bütün sayfa ve dosyalardaki kaydedilmemiş değişiklikleri geri alır. Kaydetme başarısız olursa taslaklar korunur. İnceleme sürümü değişmişse uyarıyı okuyup güncel kaynakla yeniden değerlendirin. Kaydedilmemiş değişiklik varken başka içe aktarıma geçiş, yeniden deneme, yeniden hazırlama ve toplu onay kapalıdır. Etiketleme çalışırken düzenleme kapalıdır. Teknik kimlikler, kaynak bilgileri ve ilişki/audit alanları salt okunurdur.
+
+Etiketleme başarısızlıklarının sayısı hem dosya kartında hem içe aktarımın üstünde gösterilir. İlgili chunk'ta **Labeling: failed** ve hata nedeni bulunur. Bunu yalnızca etiket atanmamış olmasıyla karıştırmayın; başarısız veya kanıtı yetersiz bir chunk varken toplu onay açılmaz.
+
+Metin, başlık yolu veya chunk türü değişirse o dosyaya ait önceki LLM kanıtları güncel değil olarak işaretlenir ve LLM'den türetilmiş tarihler temizlenir. Bu alanları güncel bağlama göre yeniden kontrol edin. Gerçekten elle düzelttiğiniz değerler korunur. Önceki ve düzeltilmiş chunk revizyonları saklanır. Dosya bağlamı uyarısı metadata bölümünde, eski LLM kanıtı uyarısı ilgili alanda gösterilir; bu, her boş veya yapısal alanın değiştiği anlamına gelmez. **Retry new documents**, manuel metin düzenlemesinden sonra metadata'yı LLM'den yeniden çıkarmaz; etiketlemeyi yeniden dener. Metadata değerlerini ve dayanaklarını onaydan önce güncel kaynakla karşılaştırın.
 
 Türetilmiş toplu chunk'ların okumada kullanılacağı tarih aralığı, bağlı oldukları bütün kaynak parçalarının geçerlilik aralıklarının kesişimiyle sınırlıdır. Bu sınırlandırma, kayıtlı kaynak metnini ve elle onayladığınız tarih değerlerini değiştirmez.
 
-Kaynakta hüküm devam ettiği halde yalnız “2.” gibi bir chunk oluşmuşsa, onaylamadan önce yöneticiye iletin. Metin ve tarih alanları **After / Save chunk changes** ile düzenlenir; chunk sınırlarını düzeltmek için yönetici, aynı kaynakları ve belge-ek bağlantılarını koruyan yeniden hazırlamayı kullanabilir. Bu işlem yalnızca henüz onaylanmamış, çalışması durmuş ve manuel değişiklik içermeyen bir içe aktarımda kullanılabilir.
+**Chunk sınırı hatası varsa önce yeniden hazırlamayı değerlendirin.** Kaynakta devamı olduğu halde yalnız “2.” veya tek başına bir tablo başlığı oluşmuşsa, incelemenin altındaki **Reprepare chunks from frozen source** bölümüne bakın. Bu işlem aynı yeni dosyaları, dondurulmuş dönüştürülmüş metni ve ana belge-ek ilişkilerini kullanır; güncel hazırlama kurallarıyla chunk'ları ve etiketleri yeniden üretir. PC Külliyatı'ndaki diğer kayıtları değiştirmez.
+
+Yeniden hazırlama, yalnızca henüz onaylanmamış, aktif çalışması kalmamış ve chunk’larda kaydedilmiş manuel değişiklik içermeyen uygun bir içe aktarımda açılır. Ekran, uygun değilse sunucunun engelleme nedenini gösterir. **Bu nedenle sınırları, manuel düzeltmeleri kaydetmeden önce kontrol edin.** Kaydedilmemiş taslakları önce geri almanız gerekir; kaydedilmiş manuel değişiklik varsa yeniden hazırlama bunların üzerine yazmaz. Bu işlem dondurulmuş kaynak metnindeki okuma/yazım hatasını düzeltmez. Kaynak metni düzeltmek için orijinal belgeye dayanarak `After` alanlarını kullanın. Bir etiketi zorla alabilmek için kaynakta olmayan hüküm eklemeyin.
 
 ## 5. Önceki mevzuat ve mülga ilişkisini belirleyin
 
-Önceki mevzuat incelemesini dosya bazında açın. Adaylar belge adlarından önerilir; gerekirse **Search previous legislation** ile ad veya numara arayın. Doğru kaydı **Select ...** ile seçin. Bu, belge düzeyindeki kısa bir kontroldür; chunk karşılaştırması değildir.
+Önceki mevzuat incelemesini dosya bazında açın. Adaylar belgenin kendi hukuki başlığı ve numarasıyla değerlendirilir. Ham URL veya `20250105-2.htm.pdf` gibi teknik dosya adı tek başına mevzuat kimliği değildir; metindeki başka düzenlemelere ait atıf numaraları da belgenin kendi numarası sayılmaz. Gerekirse **Search previous legislation** ile ad veya numara arayın ve kaynağa uyan kaydı **Select ...** ile seçin. Bu, belge düzeyindeki kısa bir kontroldür; chunk karşılaştırması değildir.
+
+Açık kaldırma hükmünde adı geçen eski düzenleme sette yoksa başka bir kaydı onun yerine seçmeyin. Aday bulunmaması, benzer adlı dosyanın eski düzenleme sayılmasını gerektirmez; doğru kayıt bulunana kadar ilişkiyi boş bırakın.
 
 Örneğin 4000 sayılı bir düzenleme varken 5000 sayılı yeni düzenlemenin gelmesi, tek başına eskiyi mülga yapmaz. Yalnızca önceki/sonraki belge bağı kuracaksanız önceki belgeyi seçip **Save previous legislation relationship** ile kaydedin.
 
@@ -143,7 +153,7 @@ Ana belgeyi ve bütün ekleri, chunk'ları, etiketleri, tarihleri ve varsa önce
 
 Paket **ready** olduğunda **Approve all new documents** düğmesi açılır. Bu düğme, bu içe aktarımdaki bütün yeni dosyaları onaylar; PC Külliyatı'ndaki diğer dosyaları topluca değiştirmez. Kısmi veya başarısız etiketleme varken onay kapalıdır.
 
-Onaydan sonra **approving / indexing**, işlemin sırada veya sürmekte olduğunu gösterir. **completed**, bütün yeni dosyaların indekslenmesi tamamlandığında görünür. Yalnızca onaya basılmış olmasını tamamlanma saymayın.
+Onaydan sonra **approving / indexing**, işlemin sırada veya sürmekte olduğunu gösterir. **completed**, bütün yeni dosyaların indekslenmesi tamamlandığında görünür. Yalnızca onaya basılmış olmasını tamamlanma saymayın. Updates ekranında tamamlanma göründükten sonra PC Külliyatı dosya listesi eski durumu gösteriyorsa sayfayı yenileyin; yeniden **Index** düğmesine basmanız gerekmez.
 
 Tamamlanan belgeyi PC Külliyatı dosya listesindeki **PDF** veya dosya ayrıntısındaki **Document PDF** ile açabilirsiniz. Kaynak PDF ise yüklenen orijinal PDF aynen gösterilir. Office, HTML veya görsel gibi diğer içe aktarılan biçimlerde, kaynak dosyanın ve hazırlanmış metnin bütünlüğü doğrulanır; hazırlanmış metin PDF olarak gösterilir ve başlıkta **(extracted text)** yazar. Markdown dosyaları metinlerinden PDF olarak görüntülenir.
 
@@ -157,7 +167,8 @@ Geçmiş içe aktarımlar ekrandaki belge adı ve durum düğmelerinde listeleni
 | ZIP yolu, manifest veya bağlantı hatası | Bildirilen paket yolunu düzeltin; dosya adlarını, parent değerlerini ve gerçek yerel bağlantıları eşleştirip paketi yeniden yükleyin. |
 | Metadata ya da etiketleme hatası; partial / failed | İlgili dosya ve chunk hata açıklamasını okuyun. Sunuluyorsa Retry new documents kullanın. Hazır görünmeyen işlemi onaylamayın. |
 | Etiket alıntısı chunk metniyle eşleşmiyor | Chunk'ı orijinal kaynakla karşılaştırın. Metin doğruysa Retry new documents kullanın: geçerli başarılı etiketler korunur, yalnız başarısız veya güncelliğini yitirmiş sonuçlar yeniden işlenir. Metni yalnız orijinal kaynağa göre düzeltin. |
-| Kaydetme sırasında inceleme değişti uyarısı | Gerekirse düzenleme metninizi kopyalayın; güncel durumu yeniden açın, güncel chunk ve tarihleri kontrol edip tekrar kaydedin. |
+| Kaydetme sırasında inceleme değişti uyarısı | Taslaklar korunur. Gerekirse düzenleme metninizi kopyalayın; güncel durumu yeniden açın, güncel chunk ve tarihleri kontrol edip tekrar kaydedin. |
+| Tek başına kalan başlık veya yanlış chunk sınırı | Manuel düzeltmeleri kaydetmeden önce Reprepare chunks from frozen source uygunluğunu kontrol edin. Engelleniyorsa gösterilen nedeni değerlendirin; Retry etiketleme, mevcut chunk sınırını değiştirmez. |
 | Onaydan sonra indeksleme hatası | Aynı içe aktarımı tekrar açıp Retry new documents kullanın. Aynı dosyaları yeniden yükleyerek ikinci bir içe aktarım oluşturmayın. |
 | Belge ilişkisi engellendi | Önceki dosyanın PC Külliyatı üyeliğini geri sağlayın; Retry document relationship kullanın. Bu işlem yayınlanmış chunk ve etiketleri yeniden üretmez. |
 
@@ -173,7 +184,9 @@ Kurumunuzun DEV ortamında, sonucu karşılaştırabileceğiniz gerçek bir PDF 
 - Bütün dosyaların ayrı **New legislation** kartı olduğunu ve ana belge-ek bağlantılarının çalıştığını kontrol edin.
 - İlk madde başlığı, uzun bir maddenin devamı, tablo ve yürürlük maddesini kaynak PDF ile karşılaştırın.
 - Tarih alıntısını ve varsa maddeye özel yürürlük istisnasını kontrol edin. Eski mevzuat atfındaki tarihin yeni belgeye aktarılmadığını doğrulayın.
-- Bir chunk alanını değiştirip **Discard chunk changes** deneyin. Sonra gerekli bir düzeltmeyi kaydedin; yalnızca o dosyanın etiketlerinin yenilendiğini kontrol edin.
+- Chunk sınırı hatası varsa, manuel düzeltme kaydetmeden önce **Reprepare chunks from frozen source** uygunluğunu kontrol edin.
+- Ana belge ve ekte farklı sayfalardaki birkaç chunk alanını değiştirin; sayfalar arasında dönünce taslakların korunduğunu kontrol edin. Önce **Discard all chunk changes**, sonra gerekli düzeltmeler için **Save all chunk changes** deneyin; tek etiketleme çalışmasıyla yalnız değişen dosyaların işlendiğini kontrol edin.
+- Başarısız etiket sayısının ve ilgili chunk'ın hata nedeninin açık olduğunu, bu sırada onayın kapalı kaldığını kontrol edin.
 - Varsa önceki mevzuatı seçin; mülga bilgisi için açık hüküm ve tarih kullanın.
 - DEV'de yayımlanması istenen dosyalar için toplu onay verin ve **completed** durumunu bekleyin. Sonra yeni belgeleri PC Külliyatı'nda arayın ve ek bağlantılarını yeniden kontrol edin.
 
@@ -220,3 +233,23 @@ Madde 11(b), diğer hükümlerin 9 Mayıs'ta başlayacağını anlatır; madde 1
 | İnceleme ve onay | Kaydedilmemiş değişiklik varken onayın kapalı olması, Discard ile geri alma ve Approve all new documents akışı doğrulandı. |
 
 Bu örnek, otomatik sonuçların onaydan önce kaynakla karşılaştırılması gerektiğini gösterir. Özellikle maddeye özel yürürlük tarihlerini ve eklerin ayrı kimliklerini kontrol edin.
+
+## 11. İkinci gerçek PDF'nin yerel kullanıcı ekranı testi
+
+27 Ekim 2026 tarihli yerel testte, `SGM-2024/4` ana belgesinin üç sayfalık PDF'si ve bağlı 21 sayfalık taranmış ek PDF, aynı içe aktarımda kullanıcı ekranından incelendi. **Approve all new documents** ile verilen tek toplu onayın ardından iki dosya da **completed** durumuna ulaştı. Bu test yerel geliştirme ortamındadır; dosyalar DEV ortamına yüklenmedi. Test, önceden 16 test dosyası bulunan yalıtılmış yerel veritabanında yapıldı; iki yeni dosyayla toplam 18 oldu. Bu sayı gerçek DEV külliyatının boyutunu göstermez.
+
+- Ana kaynak: https://www.resmigazete.gov.tr/eskiler/2025/01/20250105-2.htm
+- Ek PDF: https://www.resmigazete.gov.tr/eskiler/2025/01/20250105-2-1.pdf
+
+| Kontrol | Yerel kullanıcı ekranı sonucu |
+| --- | --- |
+| Ana belge ve ek | Ayrı mevzuat kayıtları; ana belgede 43, ekte 177, toplam 220 chunk. Bunların 212'si atomik, 8'i türetilmiş toplu chunk. |
+| Kaynak ve chunk incelemesi | Aynı dondurulmuş kaynaklardan yeniden hazırlama kullanıldı. Yedi OCR/metin düzeltmesi, ana belgedeki iki 5 Ocak 2025 tarihi ve bir Yürütme başlığı alanı elle düzeltildi: toplam 10 manuel alan. Bunlar otomatik çıkarım başarısı sayılmadı. |
+| Toplu kayıt ve taslak koruması | Yedi metin ve iki tarih düzeltmesi **Save all chunk changes** ile birlikte kaydedildi. İlk denemede 313 token'lık parça, hazırlamada sabitlenmiş 312 token'lık içerik sınırını aştığı için kayıt durdu; taslaklar korundu. Kaynağı koruyan biçim düzeltmesiyle 311 token'a indirilen kayıt birlikte uygulandı. Başlık metadata'sı tek chunk kaydıyla düzeltildi. |
+| Etiketleme | İki başarısız sonuç yeniden işlenirken 210 geçerli sonuç korundu; sonunda 212 atomik parçanın tamamı etiketlendi. Alıntı doğrulaması gevşetilmedi; etiketi geçirmek için kaynakta olmayan hüküm eklenmedi. |
+| Önceki mevzuat | Açık kaldırma hükmünde atıf yapılan `SGM-2013/6` için sette aday bulunmadı. Başka bir kayıt onun yerine seçilmedi; yanlış mülga ilişkisi kurulmadı. |
+| Onay ve indeksleme | Aynı içe aktarımın iki dosyası da toplu onaydan sonra **completed** oldu. Geçmişten yeniden açıldığında durum korundu; PC Külliyatı listesi yenilenince iki dosya da Completed, chunk sayıları 43 ve 177 olarak göründü. |
+| Mevcut kayıtların korunması | Önceden var olan 16 test dosyası, bunların 204 kanonik chunk'ı, 758 etiket kaydı, 652 blobun içeriği (toplam 94.484.817 bayt), 580 arama indeksi belgesi ve indeks kimlikleri birebir korundu. Uygulamanın genel yayınlama sayacı bu işlem sırasında ilerler; karşılaştırma bütün veritabanının bayt eşitliği iddiası değildir. |
+| Kaynak bütünlüğü | Ana belge-ek kaynak bağlantıları ve orijinal PDF baytları aynı kaldı. Orijinal 21 sayfalık ek PDF, tamamlanmadan sonra kullanıcı ekranından açıldı. |
+
+**Görsel kaynak sınırı:** Orijinal PDF'ler korundu. Taranmış ekteki grafik ve şekiller metinde bütünüyle yeniden üretilmedi; bu bilgileri orijinal PDF'den kontrol edin. Tamamlanan indeksleme, otomatik metin ve metadata'nın insan incelemesinden bağımsız olarak eksiksiz veya hukuken doğru olduğu anlamına gelmez.

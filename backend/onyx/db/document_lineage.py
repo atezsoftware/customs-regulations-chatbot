@@ -3,8 +3,6 @@
 import datetime
 import hashlib
 import json
-import re
-import unicodedata
 from difflib import SequenceMatcher
 from typing import Any, Literal
 from uuid import UUID
@@ -12,6 +10,14 @@ from uuid import UUID
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
+from onyx.db.document_lineage_identity import (
+    document_legal_identities,
+    exact_identity_search_condition,
+    explicit_repeal_targets,
+    identity_search_condition,
+    legal_number_keys,
+    normalized_legal_text,
+)
 from onyx.db.enums import UserFileStatus
 from onyx.db.models import (
     DocumentSet,
@@ -23,23 +29,6 @@ from onyx.db.models import (
 )
 
 LineageRelation = Literal["successor", "repeals"]
-_SUFFIX = re.compile(r"\.(?:md|pdf|html?|docx?|txt)$", re.IGNORECASE)
-_STOP_WORDS = {"sayili", "sayisi", "say", "no", "numarali", "tarihli"}
-_TRANSLATION = str.maketrans("ıİşŞğĞüÜöÖçÇ", "iIsSgGuUoOcC")
-
-
-def _normalized_title(title: str, *, retain_numbers: bool = False) -> str:
-    normalized = unicodedata.normalize(
-        "NFKD", _SUFFIX.sub("", title).translate(_TRANSLATION)
-    )
-    normalized = "".join(c for c in normalized if not unicodedata.combining(c))
-    return " ".join(
-        token
-        for token in re.findall(
-            r"[a-z0-9]+" if retain_numbers else r"[a-z]+", normalized.lower()
-        )
-        if token not in _STOP_WORDS
-    )
 
 
 def _member(
@@ -110,18 +99,21 @@ def predecessor_candidates(
     query: str | None = None,
     limit: int = 10,
 ) -> list[dict[str, Any]]:
-    """Bounded title-only search. Similarity is a suggestion, not a legal decision."""
+    """Suggest own legal identities; selecting a relation remains an explicit review."""
     member = _member(session, batch, document_id)
     new_file = session.get_one(UserFile, member.user_file_id)
-    normalized = _normalized_title(
-        query if query is not None else new_file.name, retain_numbers=query is not None
+    new_identity = document_legal_identities(session, [new_file])[new_file.id]
+    targets = (
+        explicit_repeal_targets(session, new_file.id) if query is None else frozenset()
+    )
+    exact_target = targets if len(targets) == 1 else frozenset()
+    normalized = normalized_legal_text(
+        query if query is not None else new_identity.title or "",
+        retain_numbers=query is not None,
     )
     tokens = sorted(set(normalized.split()), key=lambda token: (-len(token), token))[:8]
-    if not tokens:
+    if not tokens and not exact_target:
         return []
-    normalized_name = func.lower(
-        func.translate(UserFile.name, "ıİşŞğĞüÜöÖçÇ", "iIsSgGuUoOcC")
-    )
     unapproved = (
         select(RegulatoryDocumentIntakeFile.user_file_id)
         .join(
@@ -144,17 +136,15 @@ def predecessor_candidates(
                 UserFile.status == UserFileStatus.COMPLETED,
                 UserFile.id.not_in(unapproved),
                 UserFile.id.not_in(current_batch_files),
-                or_(
-                    *(
-                        normalized_name.contains(token, autoescape=True)
-                        for token in tokens
-                    )
-                ),
+                exact_identity_search_condition(exact_target)
+                if exact_target
+                else identity_search_condition(tokens),
             )
             .order_by(UserFile.created_at.desc(), UserFile.id)
             .limit(300)
         )
     )
+    identities = document_legal_identities(session, files)
     today = datetime.datetime.now(datetime.timezone.utc).date()
     repeal_dates: dict[UUID, datetime.date | None] = {
         file_id: effective_date
@@ -176,25 +166,56 @@ def predecessor_candidates(
         )
     }
     result = []
-    wanted = set(tokens)
+    wanted = set(normalized.split())
+    query_keys = legal_number_keys(query) if query else frozenset()
     for file in files:
-        title = _normalized_title(file.name, retain_numbers=query is not None)
-        available = set(title.split())
-        overlap = len(wanted & available) / max(len(wanted | available), 1)
-        score = round(
-            100
-            * (0.65 * overlap + 0.35 * SequenceMatcher(None, normalized, title).ratio())
-        )
-        if score < 25:
-            continue
+        identity = identities[file.id]
+        if exact_target:
+            if not exact_target.intersection(identity.number_keys):
+                continue
+            score = 100
+            reason = "Kaynakta açıkça kaldırılan mevzuatın kendi numarası eşleşti. Hukuki ilişkiyi onaylayın."
+        elif query_keys.intersection(identity.number_keys):
+            score = 100
+            reason = "Aranan numara belgenin kendi mevzuat kimliğiyle eşleşti. Hukuki ilişkiyi onaylayın."
+        else:
+            title = normalized_legal_text(
+                identity.title or "", retain_numbers=query is not None
+            )
+            if not title:
+                continue
+            if query is not None:
+                title = " ".join(
+                    (
+                        title,
+                        normalized_legal_text(
+                            " ".join(identity.number_keys), retain_numbers=True
+                        ),
+                    )
+                )
+            available = set(title.split())
+            overlap = len(wanted & available) / max(len(wanted | available), 1)
+            score = round(
+                100
+                * (
+                    0.65 * overlap
+                    + 0.35 * SequenceMatcher(None, normalized, title).ratio()
+                )
+            )
+            if score < 25:
+                continue
+            basis = (
+                "Anlamlı dosya adı"
+                if identity.title_source == "filename"
+                else "Belgenin kendi hukuki başlığı"
+            )
+            reason = f"{basis} benzerliği; numara farklılığı tek başına hukuki ilişki kurmaz. Hukuki ilişkiyi onaylayın."
         repeal_date = repeal_dates.get(file.id)
         result.append(
             {
                 "user_file_id": str(file.id),
-                "title": file.name,
-                "reason": "Belge adı benzerliği; numara ve dosya uzantısı dikkate alınmadı. Hukuki ilişkiyi onaylayın."
-                if query is None
-                else "Dosya adına göre aday; hukuki ilişkiyi onaylayın.",
+                "title": identity.title or file.name,
+                "reason": reason,
                 "score": score,
                 "status": "repealed"
                 if repeal_date and repeal_date <= today

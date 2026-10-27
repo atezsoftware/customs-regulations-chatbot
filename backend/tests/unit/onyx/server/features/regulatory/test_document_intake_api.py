@@ -196,8 +196,9 @@ def test_approve_queues_only_durable_intake_file_requests(
     assert events == ["commit", "index", "commit"]
 
 
+@pytest.mark.parametrize("assigned_labels", [[], ["subject:customs"]])
 def test_review_chunk_labels_overlay_does_not_mutate_canonical_metadata(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, assigned_labels: list[str]
 ) -> None:
     batch_id, document_id = uuid4(), uuid4()
     now = datetime.datetime.now(datetime.timezone.utc)
@@ -222,7 +223,7 @@ def test_review_chunk_labels_overlay_does_not_mutate_canonical_metadata(
     monkeypatch.setattr(
         api.repository, "get_intake", lambda *_args: SimpleNamespace(id=batch_id)
     )
-    page = MagicMock(return_value=([(chunk, ["subject:customs"])], 1))
+    page = MagicMock(return_value=([(chunk, assigned_labels)], 1))
     monkeypatch.setattr(api.repository, "intake_chunk_page", page)
     diagnostics = MagicMock(
         return_value={
@@ -239,9 +240,7 @@ def test_review_chunk_labels_overlay_does_not_mutate_canonical_metadata(
         f"/regulatory/document-intake/batches/{batch_id}/documents/{document_id}/chunks?offset=0&limit=10"
     )
     assert response.status_code == 200
-    assert response.json()["items"][0]["chunk_metadata"]["labels"] == [
-        "subject:customs"
-    ]
+    assert response.json()["items"][0]["chunk_metadata"]["labels"] == assigned_labels
     assert response.json()["items"][0]["labeling_status"] == "failed"
     assert (
         response.json()["items"][0]["labeling_error"]
@@ -588,3 +587,167 @@ def test_file_lineage_is_scoped_to_editable_fixed_document_set(
     snapshot.assert_called_once_with(
         session, 8, file_id, as_of=datetime.date(2026, 10, 26)
     )
+
+
+@pytest.mark.parametrize("changed", [False, True])
+def test_bulk_chunk_edit_commits_all_edits_then_dispatches_one_run(
+    monkeypatch: pytest.MonkeyPatch, changed: bool
+) -> None:
+    from onyx.background.celery.tasks.regulatory_labeling import tasks
+    from onyx.db import document_intake_edit
+
+    batch_id, main_id, annex_id, run_id = uuid4(), uuid4(), uuid4(), uuid4()
+    session = MagicMock(spec=Session)
+    events: list[str] = []
+    session.commit.side_effect = lambda: events.append("commit")
+    monkeypatch.setattr(
+        api.repository, "get_intake", lambda *_args: SimpleNamespace(id=batch_id)
+    )
+    snapshot = _snapshot(batch_id)
+    snapshot["labeling_failed_count"] = 5
+    monkeypatch.setattr(api.repository, "intake_snapshot", lambda *_args: snapshot)
+    edit = MagicMock(return_value=run_id if changed else None)
+    monkeypatch.setattr(document_intake_edit, "edit_intake_chunks", edit)
+    dispatch = MagicMock(side_effect=lambda **_kwargs: events.append("dispatch"))
+    monkeypatch.setattr(tasks, "enqueue_labeling_run", dispatch)
+    response = _client(session).patch(
+        f"/regulatory/document-intake/batches/{batch_id}/chunks",
+        json={
+            "expected_review_sha256": "a" * 64,
+            "edits": [
+                {
+                    "document_id": str(main_id),
+                    "chunk_id": "main-date",
+                    "updates": {
+                        "validity_start_date": "2025-01-05",
+                        "validity_end_date": None,
+                    },
+                },
+                {
+                    "document_id": str(annex_id),
+                    "chunk_id": "annex-formula",
+                    "updates": {
+                        "text": "SEC = 0,46 x c^(0,63)",
+                        "chunk_metadata": {"article_title": "Calculation"},
+                    },
+                },
+            ],
+        },
+    )
+    assert response.status_code == 200
+    edit.assert_called_once()
+    edits = edit.call_args.kwargs["edits"]
+    assert len(edits) == 2
+    assert edits[0].document_id == main_id
+    assert edits[0].updates == {
+        "validity_start_date": datetime.date(2025, 1, 5),
+        "validity_end_date": None,
+    }
+    assert edits[1].document_id == annex_id
+    assert edits[1].updates == {
+        "text": "SEC = 0,46 x c^(0,63)",
+        "chunk_metadata": {"article_title": "Calculation"},
+    }
+    assert edit.call_args.kwargs["expected_review_sha256"] == "a" * 64
+    assert response.json()["labeling_failed_count"] == 5
+    assert events == (
+        ["commit", "dispatch", "commit"] if changed else ["commit", "commit"]
+    )
+    if changed:
+        dispatch.assert_called_once_with(run_id=run_id, tenant_id="tenant")
+    else:
+        dispatch.assert_not_called()
+
+
+@pytest.mark.parametrize("invalid", [False, True])
+def test_bulk_chunk_edit_rolls_back_and_never_dispatches_on_failure(
+    monkeypatch: pytest.MonkeyPatch, invalid: bool
+) -> None:
+    from onyx.background.celery.tasks.regulatory_labeling import tasks
+    from onyx.db import document_intake_edit
+
+    session = MagicMock(spec=Session)
+    monkeypatch.setattr(
+        api.repository, "get_intake", lambda *_args: SimpleNamespace(id=uuid4())
+    )
+    error = (
+        ValueError("Invalid final edit")
+        if invalid
+        else api.repository.IntakeConflictError("Review changed")
+    )
+    edit = MagicMock(side_effect=error)
+    monkeypatch.setattr(document_intake_edit, "edit_intake_chunks", edit)
+    dispatch = MagicMock()
+    monkeypatch.setattr(tasks, "enqueue_labeling_run", dispatch)
+    response = _client(session).patch(
+        f"/regulatory/document-intake/batches/{uuid4()}/chunks",
+        json={
+            "expected_review_sha256": "a" * 64,
+            "edits": [
+                {
+                    "document_id": str(uuid4()),
+                    "chunk_id": identifier,
+                    "updates": {"text": "Text"},
+                }
+                for identifier in ("first", "last")
+            ],
+        },
+    )
+    assert response.status_code == (400 if invalid else 409)
+    session.rollback.assert_called_once()
+    session.commit.assert_not_called()
+    dispatch.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    ["empty", "too_many", "duplicate", "empty_updates", "protected", "unexpected"],
+)
+def test_bulk_chunk_edit_request_is_bounded_and_rejects_unknown_fields(
+    monkeypatch: pytest.MonkeyPatch, invalid: str
+) -> None:
+    from onyx.db import document_intake_edit
+
+    edit = MagicMock()
+    monkeypatch.setattr(document_intake_edit, "edit_intake_chunks", edit)
+    entry: dict[str, object] = {
+        "document_id": str(uuid4()),
+        "chunk_id": "chunk",
+        "updates": {"text": "Text"},
+    }
+    entries = [entry]
+    body: dict[str, object] = {"expected_review_sha256": "a" * 64, "edits": entries}
+    if invalid == "empty":
+        entries.clear()
+    elif invalid == "too_many":
+        entries[:] = [{**entry, "chunk_id": f"chunk-{index}"} for index in range(257)]
+    elif invalid == "duplicate":
+        entries.append({**entry, "document_id": str(uuid4())})
+    elif invalid == "empty_updates":
+        entry["updates"] = {}
+    elif invalid == "protected":
+        entry["updates"] = {"approval_attempt_id": str(uuid4())}
+    else:
+        body["labeling_run_id"] = str(uuid4())
+    response = _client(MagicMock(spec=Session)).patch(
+        f"/regulatory/document-intake/batches/{uuid4()}/chunks", json=body
+    )
+    assert response.status_code == 422
+    edit.assert_not_called()
+
+
+def test_bulk_chunk_edit_requires_admin() -> None:
+    response = _client(MagicMock(spec=Session), admin=False).patch(
+        f"/regulatory/document-intake/batches/{uuid4()}/chunks",
+        json={
+            "expected_review_sha256": "a" * 64,
+            "edits": [
+                {
+                    "document_id": str(uuid4()),
+                    "chunk_id": "chunk",
+                    "updates": {"text": "Text"},
+                }
+            ],
+        },
+    )
+    assert response.status_code == 403

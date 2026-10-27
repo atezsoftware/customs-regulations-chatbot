@@ -6,23 +6,31 @@ from onyx.db.models import RegulatoryChunk
 from onyx.regulatory.amendments.annexes.context_dependencies import (
     canonical_dependency_ids,
 )
+from onyx.regulatory.document_intake.chunking_profile import (
+    SUPPORTED_INTAKE_CHUNKING_VERSIONS,
+)
 
 
 def intake_temporal_context_rows(rows: list[RegulatoryChunk]) -> list[RegulatoryChunk]:
     """A complete derived text is visible only while every legal source is visible."""
-    if not any(
-        isinstance(metadata := getattr(row, "chunk_metadata", None), dict)
-        and metadata.get("intake_chunking_version") == "1"
-        for row in rows
-    ):
+    versions: list[object] = []
+    for row in rows:
+        metadata = getattr(row, "chunk_metadata", None)
+        if isinstance(metadata, dict):
+            version = metadata.get("intake_chunking_version")
+            if version is not None:
+                versions.append(version)
+    if not versions:
         return rows
     if (
         len({row.id for row in rows}) != len(rows)
         or len({row.user_file_id for row in rows}) != 1
         or any(
-            row.chunk_metadata.get("intake_chunking_version") not in (None, "1")
-            for row in rows
+            not isinstance(version, str)
+            or version not in SUPPORTED_INTAKE_CHUNKING_VERSIONS
+            for version in versions
         )
+        or len({version for version in versions if isinstance(version, str)}) != 1
     ):
         raise ValueError("Intake temporal context has inconsistent canonical scope")
     by_id = {row.id: row for row in rows}

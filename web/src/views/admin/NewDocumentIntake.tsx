@@ -28,12 +28,23 @@ import {
   getDocumentIntakeCapabilities,
   getDocumentIntakeChunks,
   getDocumentIntakeLabelingSetup,
+  getDocumentIntakeRepreparePreview,
   listDocumentIntakeBatches,
+  reprepareDocumentIntakeBatch,
   retryDocumentIntakeBatch,
   uploadDocumentIntakeMarkdownPackage,
   updateDocumentIntakeChunk,
+  updateDocumentIntakeChunks,
   saveDocumentIntakePredecessorSelection,
 } from "@/lib/regulatory/documentIntake";
+
+import {
+  type IntakeChunkReviewDraft,
+  type IntakePendingChunkEdit,
+  hasIntakeLabelingProblem,
+  intakeChunkDraftUpdate,
+  intakeChunkDraftValidation,
+} from "@/lib/regulatory/intakeChunkDraft";
 
 const sourceModes = [
   { value: "file", label: "File" },
@@ -59,9 +70,11 @@ function labelText(value: unknown): string {
 function Labels({
   value,
   pending = false,
+  failed = false,
 }: {
   value: unknown;
   pending?: boolean;
+  failed?: boolean;
 }) {
   if (
     value &&
@@ -70,12 +83,16 @@ function Labels({
     Object.keys(value).length === 1 &&
     "labels" in value
   ) {
-    return <Labels value={value.labels} pending={pending} />;
+    return <Labels value={value.labels} pending={pending} failed={failed} />;
   }
   if (!value || (typeof value === "object" && !Object.keys(value).length)) {
     return (
       <Text font="secondary-body" color="text-03">
-        {pending ? "Labels pending." : "No labels assigned."}
+        {failed
+          ? "Labeling failed · see the chunk error above."
+          : pending
+            ? "Labels pending."
+            : "No labels assigned."}
       </Text>
     );
   }
@@ -108,6 +125,13 @@ interface DocumentPreviewProps {
   busy: boolean;
   dirtyKeys: Set<string>;
   onDirtyChange: (key: string, dirty: boolean) => void;
+  chunkDrafts: Record<string, IntakePendingChunkEdit>;
+  draftEpoch: number;
+  onChunkDraftChange: (
+    documentId: string,
+    chunkId: string,
+    draft: IntakeChunkReviewDraft | null
+  ) => void;
   onSaveChunk: (
     documentId: string,
     chunkId: string,
@@ -144,12 +168,20 @@ function DocumentPreview({
   onDirtyChange,
   onSaveChunk,
   onSaveLineage,
+  chunkDrafts,
+  draftEpoch,
+  onChunkDraftChange,
 }: DocumentPreviewProps) {
   const [expanded, setExpanded] = useState(true);
   const [offset, setOffset] = useState(0);
   const editReceipt =
     batch.edit_review_sha256 ??
     (batch.status === "ready" ? batch.review_sha256 : null);
+  const onDraftChange = useCallback(
+    (chunkId: string, draft: IntakeChunkReviewDraft | null) =>
+      onChunkDraftChange(document.id, chunkId, draft),
+    [document.id, onChunkDraftChange]
+  );
   const cardRef = useRef<HTMLElement>(null);
   useEffect(() => {
     if (navigation?.documentId !== document.id) return;
@@ -166,11 +198,15 @@ function DocumentPreview({
           document.id,
           editReceipt,
           batch.review_sha256,
+          draftEpoch,
           offset,
         ]
       : null,
     () => getDocumentIntakeChunks(batch.id, document.id, offset),
-    { keepPreviousData: true }
+    {
+      keepPreviousData: true,
+      refreshInterval: batch.status === "preparing" ? 1500 : 0,
+    }
   );
   const parent = batch.documents.find(
     (item) => item.id === document.parent_document_id
@@ -214,7 +250,7 @@ function DocumentPreview({
               prominence="tertiary"
               href={`#${documentCardId(parent.id)}`}
               onClick={() => onNavigate(parent.id)}
-              disabled={dirtyKeys.size > 0 || busy}
+              disabled={busy}
             >
               {`Back to ${parent.display_name}`}
             </Button>
@@ -225,7 +261,7 @@ function DocumentPreview({
               prominence="tertiary"
               href={`#${documentCardId(link.target_document_id)}`}
               onClick={() => onNavigate(link.target_document_id)}
-              disabled={dirtyKeys.size > 0 || busy}
+              disabled={busy}
             >
               {`Open ${link.label || "related document"}`}
             </Button>
@@ -239,6 +275,11 @@ function DocumentPreview({
         >{`Source: ${document.source_url}`}</Text>
       )}
       <Text font="main-ui-action">{`${document.chunk_count} added chunks`}</Text>
+      {Boolean(document.labeling_failed_count) && (
+        <Text as="p" color="status-error-05">
+          {`${document.labeling_failed_count} chunks with failed labeling in this file`}
+        </Text>
+      )}
       <Text font="secondary-action">File labels</Text>
       <Labels value={document.labels} pending={batch.status === "preparing"} />
       {document.error && (
@@ -249,7 +290,7 @@ function DocumentPreview({
       {document.chunk_count > 0 && (
         <Button
           prominence="tertiary"
-          disabled={dirtyKeys.size > 0 || busy}
+          disabled={busy}
           onClick={() => setExpanded(!expanded)}
         >
           {expanded ? "Hide chunks" : "Show added chunks"}
@@ -261,7 +302,7 @@ function DocumentPreview({
           {!data && !error && <Text>Loading chunks…</Text>}
           {data?.items.map((chunk) => (
             <IntakeChunkReviewCard
-              key={chunk.id}
+              key={`${chunk.id}:${draftEpoch}`}
               chunk={chunk}
               documentName={document.display_name}
               sourceUrl={document.source_url}
@@ -271,9 +312,12 @@ function DocumentPreview({
                 Boolean(editReceipt)
               }
               disabled={
-                busy || (dirtyKeys.size > 0 && !dirtyKeys.has(chunk.id))
+                busy ||
+                Array.from(dirtyKeys).some((key) => key.startsWith("lineage:"))
               }
-              onDirtyChange={onDirtyChange}
+              persistedDraft={chunkDrafts[chunk.id]?.draft}
+              onDraftChange={onDraftChange}
+              saveDisabled={Object.keys(chunkDrafts).length > 1}
               onSave={(draft, expectedReviewSha256) =>
                 onSaveChunk(document.id, chunk.id, draft, expectedReviewSha256)
               }
@@ -332,6 +376,7 @@ function DocumentPreview({
               <Labels
                 value={chunk.chunk_metadata.labels}
                 pending={batch.status === "preparing"}
+                failed={hasIntakeLabelingProblem(chunk)}
               />
               <Text
                 font="secondary-body"
@@ -343,7 +388,7 @@ function DocumentPreview({
             <div className="flex items-center gap-2">
               <Button
                 prominence="secondary"
-                disabled={offset === 0 || dirtyKeys.size > 0 || busy}
+                disabled={offset === 0 || busy}
                 onClick={() => setOffset(Math.max(0, offset - data.limit))}
               >
                 Previous chunks
@@ -351,11 +396,7 @@ function DocumentPreview({
               <Text font="secondary-body">{`${offset + 1}–${Math.min(offset + data.items.length, data.total)} of ${data.total}`}</Text>
               <Button
                 prominence="secondary"
-                disabled={
-                  offset + data.limit >= data.total ||
-                  dirtyKeys.size > 0 ||
-                  busy
-                }
+                disabled={offset + data.limit >= data.total || busy}
                 onClick={() => setOffset(offset + data.limit)}
               >
                 Next chunks
@@ -419,7 +460,36 @@ export default function NewDocumentIntake() {
   const [navigation, setNavigation] =
     useState<DocumentPreviewProps["navigation"]>(null);
   const [busy, setBusy] = useState(false);
-  const [dirtyKeys, setDirtyKeys] = useState<Set<string>>(() => new Set());
+  const [lineageDirtyKeys, setDirtyKeys] = useState<Set<string>>(
+    () => new Set()
+  );
+  const [chunkDrafts, setChunkDrafts] = useState<
+    Record<string, IntakePendingChunkEdit>
+  >({});
+  const [draftEpoch, setDraftEpoch] = useState(0);
+  const pendingChunkEdits = Object.values(chunkDrafts);
+  const dirtyKeys = new Set(
+    Array.from(lineageDirtyKeys).concat(Object.keys(chunkDrafts))
+  );
+  const onChunkDraftChange = useCallback(
+    (
+      documentId: string,
+      chunkId: string,
+      draft: IntakeChunkReviewDraft | null
+    ) => {
+      setChunkDrafts((current) => {
+        if (!draft) {
+          if (!(chunkId in current)) return current;
+          const next = { ...current };
+          delete next[chunkId];
+          return next;
+        }
+        if (current[chunkId]?.draft === draft) return current;
+        return { ...current, [chunkId]: { documentId, chunkId, draft } };
+      });
+    },
+    []
+  );
   const onDirtyChange = useCallback((key: string, dirty: boolean) => {
     setDirtyKeys((current) => {
       if (current.has(key) === dirty) return current;
@@ -433,6 +503,7 @@ export default function NewDocumentIntake() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const requestVersion = useRef(0);
   const intakeRequestKeys = useRef(new Map<string, string>());
+  const reprepareRequestKeys = useRef(new Map<string, string>());
   const {
     data: packageData,
     error: packageError,
@@ -466,6 +537,23 @@ export default function NewDocumentIntake() {
     }
   );
   const batch = batchData?.id === initialBatch?.id ? batchData : initialBatch;
+  const reprepareAvailable = Boolean(
+    batch && ["ready", "partial", "failed"].includes(batch.status)
+  );
+  const { data: repreparePreview, error: repreparePreviewError } = useSWR(
+    reprepareAvailable && batch
+      ? [
+          "intake-reprepare",
+          batch.id,
+          batch.status,
+          batch.stage,
+          batch.edit_review_sha256,
+          batch.review_sha256,
+          draftEpoch,
+        ]
+      : null,
+    () => getDocumentIntakeRepreparePreview(batch!.id)
+  );
   useEffect(() => {
     if (
       !batch ||
@@ -494,6 +582,8 @@ export default function NewDocumentIntake() {
     setInitialBatch(null);
     setNavigation(null);
     setDirtyKeys(new Set());
+    setChunkDrafts({});
+    setDraftEpoch((current) => current + 1);
     setRequestError(null);
     setBusy(false);
   }
@@ -545,17 +635,88 @@ export default function NewDocumentIntake() {
     });
   }
 
-  async function saveReview(action: () => Promise<DocumentIntakeBatch>) {
+  async function saveReview(
+    action: () => Promise<DocumentIntakeBatch>,
+    clearChunkDrafts = false
+  ) {
     const version = requestVersion.current;
     setBusy(true);
     try {
       const reviewed = await action();
       if (version !== requestVersion.current) return;
       setInitialBatch(reviewed);
+      if (clearChunkDrafts) {
+        setChunkDrafts({});
+        setDraftEpoch((current) => current + 1);
+      }
       await refreshBatch(reviewed, false);
     } finally {
       if (version === requestVersion.current) setBusy(false);
     }
+  }
+
+  const chunkSaveValidation = pendingChunkEdits
+    .map((edit) => intakeChunkDraftValidation(edit.draft))
+    .find(Boolean);
+  const pendingReceipts = new Set(
+    pendingChunkEdits.map((edit) => edit.draft.reviewSha256)
+  );
+  const chunkSaveError =
+    pendingChunkEdits.length > 256
+      ? "Save at most 256 chunk changes together."
+      : pendingReceipts.size > 1 || pendingReceipts.has(null)
+        ? "These drafts belong to different review versions. Discard and review the changed chunks again."
+        : chunkSaveValidation;
+
+  async function saveAllChunkChanges() {
+    if (!batch || busy || chunkSaveError || !pendingChunkEdits.length) return;
+    setRequestError(null);
+    try {
+      await saveReview(
+        () =>
+          updateDocumentIntakeChunks(
+            batch.id,
+            pendingChunkEdits[0]!.draft.reviewSha256!,
+            pendingChunkEdits.map((edit) => ({
+              document_id: edit.documentId,
+              chunk_id: edit.chunkId,
+              updates: intakeChunkDraftUpdate(edit.draft),
+            }))
+          ),
+        true
+      );
+    } catch (cause) {
+      setRequestError(errorMessage(cause));
+    }
+  }
+
+  async function reprepareChunks() {
+    if (
+      !batch ||
+      busy ||
+      dirtyKeys.size > 0 ||
+      !repreparePreview?.eligible ||
+      !repreparePreview.expected_sha256
+    )
+      return;
+    const batchId = batch.id;
+    const expectedSha256 = repreparePreview.expected_sha256;
+    const identity = `${batchId}:${expectedSha256}`;
+    const key =
+      reprepareRequestKeys.current.get(identity) ??
+      globalThis.crypto.randomUUID();
+    reprepareRequestKeys.current.set(identity, key);
+    await run(async (isCurrent) => {
+      const prepared = await reprepareDocumentIntakeBatch(
+        batchId,
+        expectedSha256,
+        key
+      );
+      if (!isCurrent()) return;
+      setInitialBatch(prepared);
+      setDraftEpoch((current) => current + 1);
+      await refreshBatch(prepared, false);
+    });
   }
 
   if (capabilityError)
@@ -780,6 +941,8 @@ export default function NewDocumentIntake() {
                 requestVersion.current += 1;
                 setInitialBatch(item);
                 setDirtyKeys(new Set());
+                setChunkDrafts({});
+                setDraftEpoch((current) => current + 1);
                 setBusy(false);
                 setRequestError(null);
               }}
@@ -810,6 +973,11 @@ export default function NewDocumentIntake() {
           >{`New documents: ${batch.status}`}</Text>
           <Text font="secondary-body">{batch.stage.replaceAll("_", " ")}</Text>
           <Text font="main-ui-action">{`${batch.documents.length} new files · ${batch.documents.reduce((total, document) => total + document.chunk_count, 0)} added chunks`}</Text>
+          {Boolean(batch.labeling_failed_count) && (
+            <Text as="p" color="status-error-05">
+              {`${batch.labeling_failed_count} chunks with failed labeling across this import`}
+            </Text>
+          )}
           <Text as="p" font="secondary-body" color="text-03">
             Review the added chunks below. Each card contains the full new
             content, labels and editing controls before approval.
@@ -826,6 +994,42 @@ export default function NewDocumentIntake() {
                 .join(" · ")}
             </Text>
           ))}
+          {pendingChunkEdits.length > 0 && (
+            <div className="flex flex-col gap-2 rounded-08 border border-border-02 p-3">
+              <Text font="main-ui-action">{`${pendingChunkEdits.length} unsaved chunk changes`}</Text>
+              <Text font="secondary-body" color="text-03">
+                Continue reviewing other chunks or pages. Save these changes
+                together to start one labeling run.
+              </Text>
+              {chunkSaveError && (
+                <Text color="status-error-05">{chunkSaveError}</Text>
+              )}
+              <div className="flex flex-wrap gap-2">
+                <Button
+                  disabled={
+                    busy ||
+                    Boolean(chunkSaveError) ||
+                    lineageDirtyKeys.size > 0 ||
+                    !["ready", "partial"].includes(batch.status)
+                  }
+                  onClick={() => void saveAllChunkChanges()}
+                >
+                  Save all chunk changes
+                </Button>
+                <Button
+                  prominence="secondary"
+                  disabled={busy}
+                  onClick={() => {
+                    setChunkDrafts({});
+                    setDraftEpoch((current) => current + 1);
+                    setRequestError(null);
+                  }}
+                >
+                  Discard all chunk changes
+                </Button>
+              </div>
+            </div>
+          )}
           {batch.documents.map((document) => (
             <DocumentPreview
               key={document.id}
@@ -835,15 +1039,20 @@ export default function NewDocumentIntake() {
               busy={busy}
               dirtyKeys={dirtyKeys}
               onDirtyChange={onDirtyChange}
+              chunkDrafts={chunkDrafts}
+              draftEpoch={draftEpoch}
+              onChunkDraftChange={onChunkDraftChange}
               onSaveChunk={(documentId, chunkId, draft, expectedReviewSha256) =>
-                saveReview(() =>
-                  updateDocumentIntakeChunk(
-                    batch.id,
-                    documentId,
-                    chunkId,
-                    expectedReviewSha256,
-                    draft
-                  )
+                saveReview(
+                  () =>
+                    updateDocumentIntakeChunk(
+                      batch.id,
+                      documentId,
+                      chunkId,
+                      expectedReviewSha256,
+                      draft
+                    ),
+                  true
                 )
               }
               onSaveLineage={(documentId, selection, expectedReviewSha256) =>
@@ -857,7 +1066,7 @@ export default function NewDocumentIntake() {
                 )
               }
               onNavigate={(documentId) => {
-                if (dirtyKeys.size > 0 || busy) return;
+                if (busy) return;
                 if (!batch.documents.some((item) => item.id === documentId))
                   return;
                 setNavigation((current) => ({
@@ -867,6 +1076,62 @@ export default function NewDocumentIntake() {
               }}
             />
           ))}
+          {reprepareAvailable && (
+            <section
+              aria-label="Reprepare frozen source"
+              className="flex flex-col gap-2 rounded-08 border border-border-02 p-3"
+            >
+              <Text font="main-ui-action">
+                Reprepare chunks from frozen source
+              </Text>
+              <Text as="p" font="secondary-body" color="text-03">
+                Uses the same new files, attachments and frozen converted text.
+                Rebuilds their chunks and regenerates their labels with the
+                current preparation rules. Existing PC Külliyatı records are
+                preserved.
+              </Text>
+              <Text as="p" font="secondary-body" color="text-03">
+                Available before approval when no saved manual changes or
+                publication history need to be preserved. This does not correct
+                the frozen source text.
+              </Text>
+              {!repreparePreview && !repreparePreviewError && (
+                <Text font="secondary-body">
+                  Checking preparation compatibility…
+                </Text>
+              )}
+              {repreparePreview?.reason && (
+                <Text as="p" color="status-error-05">
+                  {repreparePreview.reason}
+                </Text>
+              )}
+              {repreparePreviewError && (
+                <Text as="p" color="status-error-05">
+                  {errorMessage(repreparePreviewError)}
+                </Text>
+              )}
+              {dirtyKeys.size > 0 && (
+                <Text font="secondary-body" color="text-03">
+                  Save or discard your changes before preparing again.
+                </Text>
+              )}
+              <div>
+                <Button
+                  prominence="secondary"
+                  disabled={
+                    busy ||
+                    dirtyKeys.size > 0 ||
+                    !repreparePreview?.eligible ||
+                    !repreparePreview.expected_sha256 ||
+                    Boolean(repreparePreviewError)
+                  }
+                  onClick={() => void reprepareChunks()}
+                >
+                  Reprepare chunks from frozen source
+                </Button>
+              </div>
+            </section>
+          )}
           <div className="flex flex-wrap gap-2">
             {batchError && (
               <Button
@@ -878,7 +1143,7 @@ export default function NewDocumentIntake() {
             )}
             {["partial", "blocked", "failed"].includes(batch.status) && (
               <Button
-                disabled={busy}
+                disabled={busy || dirtyKeys.size > 0}
                 prominence="secondary"
                 onClick={() =>
                   void run(async (isCurrent) => {

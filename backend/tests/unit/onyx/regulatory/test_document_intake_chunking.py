@@ -439,3 +439,139 @@ def test_bare_article_does_not_steal_following_structural_unit_as_title(
         for chunk in result.chunks
         if chunk.metadata.article_no == "1"
     )
+
+
+# Frozen converted source wording from the actual SGM-2024/4 annex review.
+_ADDITIONAL_INFORMATION_HEADING = "Ek Bilgiler1,e:"
+_ADDITIONAL_INFORMATION_CELL = (
+    "| 5/1/2025 tarihli ve 32773 sayılı Resmî Gazete'de yayımlanan Ev Tipi Çamaşır "
+    "Kurutma Makineleri İle İlgili Çevreye Duyarlı Tasarım Gerekliliklerine Dair Tebliğ "
+    "(2023/2533/AB)(SGM-2024/3)'in Ek II'sinin 6 ncı maddesinde yer alan bilgilerin "
+    "bulunduğu tedarikçinin internet sitesine bağlantı linki2,e: |\n| --- |"
+)
+
+
+@pytest.mark.parametrize("version", ["1", "2"])
+def test_source_table_heading_stays_with_its_actual_cell_only_in_version_two(
+    tokenizer: TiktokenTokenizer, version: str
+) -> None:
+    expected = f"{_ADDITIONAL_INFORMATION_HEADING}\n{_ADDITIONAL_INFORMATION_CELL}"
+    source = f"# Kaynak belge\n\n## EK V\n\n{expected}"
+    result = IntakeRegulatoryChunker(
+        tokenizer=tokenizer, content_token_limit=312, chunking_version=version
+    ).chunk_text(source)
+    atomic = _atomic(result.chunks)
+    assert len(atomic) == (1 if version == "2" else 2)
+    if version == "2":
+        assert atomic[0].text == expected
+        assert atomic[0].metadata.chunk_type == "table"
+        assert atomic[0].metadata.appendix_label == "EK v"
+        assert atomic[0].metadata.table_index == 1
+        assert atomic[0].metadata.source_start_block + 1 == (
+            atomic[0].metadata.source_end_block
+        )
+    else:
+        assert atomic[0].text == _ADDITIONAL_INFORMATION_HEADING
+        assert atomic[0].metadata.chunk_type == "free_text"
+        assert atomic[1].text == _ADDITIONAL_INFORMATION_CELL
+    _assert_source_coverage(source, expected, result.chunks, tokenizer, 312)
+
+
+def test_table_heading_merge_measures_combined_text_against_real_token_budget(
+    tokenizer: TiktokenTokenizer,
+) -> None:
+    expected = f"{_ADDITIONAL_INFORMATION_HEADING}\n{_ADDITIONAL_INFORMATION_CELL}"
+    source = f"# Kaynak belge\n\n## EK V\n\n{expected}"
+    limit = len(tokenizer.encode(_ADDITIONAL_INFORMATION_CELL))
+    assert len(tokenizer.encode(expected)) > limit
+    result = IntakeRegulatoryChunker(
+        tokenizer=tokenizer, content_token_limit=limit
+    ).chunk_text(source)
+    atomic = _atomic(result.chunks)
+    assert [chunk.text for chunk in atomic] == [
+        _ADDITIONAL_INFORMATION_HEADING,
+        _ADDITIONAL_INFORMATION_CELL,
+    ]
+    _assert_source_coverage(source, expected, result.chunks, tokenizer, limit)
+
+
+@pytest.mark.parametrize(
+    "boundary", ["## EK VI", "### Ayrı bilgi kapsamı", "## MADDE 2 — Ayrı hüküm"]
+)
+def test_table_heading_does_not_cross_source_structural_boundaries(
+    tokenizer: TiktokenTokenizer, boundary: str
+) -> None:
+    source = (
+        f"# Kaynak belge\n\n## EK V\n\n{_ADDITIONAL_INFORMATION_HEADING}\n\n"
+        f"{boundary}\n\n{_ADDITIONAL_INFORMATION_CELL}"
+    )
+    result = IntakeRegulatoryChunker(
+        tokenizer=tokenizer, content_token_limit=312
+    ).chunk_text(source)
+    atomic = _atomic(result.chunks)
+    assert any(chunk.text == _ADDITIONAL_INFORMATION_HEADING for chunk in atomic)
+    assert not any(
+        _ADDITIONAL_INFORMATION_HEADING in chunk.text
+        and _ADDITIONAL_INFORMATION_CELL in chunk.text
+        for chunk in atomic
+    )
+    assert all(len(tokenizer.encode(chunk.text)) <= 312 for chunk in result.chunks)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Ek bilgiler yalnız ilgili kaynakta belirtilir.",
+        "Ek bilgiler " + "ayrıntılı kaynak bilgisi " * 8 + ":",
+        "Ek Bilgiler:\nBağımsız açıklama ve dipnot metni.",
+    ],
+)
+def test_only_short_single_line_colon_headings_are_attached_to_tables(
+    tokenizer: TiktokenTokenizer, text: str
+) -> None:
+    source = f"# Kaynak belge\n\n## EK V\n\n{text}\n\n{_ADDITIONAL_INFORMATION_CELL}"
+    result = IntakeRegulatoryChunker(
+        tokenizer=tokenizer, content_token_limit=512
+    ).chunk_text(source)
+    assert not any(
+        text in chunk.text and _ADDITIONAL_INFORMATION_CELL in chunk.text
+        for chunk in _atomic(result.chunks)
+    )
+    _assert_source_coverage(
+        source,
+        f"{text}\n{_ADDITIONAL_INFORMATION_CELL}",
+        result.chunks,
+        tokenizer,
+        512,
+    )
+
+
+def test_table_heading_does_not_skip_intervening_source_text(
+    tokenizer: TiktokenTokenizer,
+) -> None:
+    text = f"{_ADDITIONAL_INFORMATION_HEADING}\n\nAyrı açıklama metni korunur."
+    source = f"# Kaynak belge\n\n## EK V\n\n{text}\n\n{_ADDITIONAL_INFORMATION_CELL}"
+    result = IntakeRegulatoryChunker(
+        tokenizer=tokenizer, content_token_limit=312
+    ).chunk_text(source)
+    assert not any(
+        _ADDITIONAL_INFORMATION_HEADING in chunk.text
+        and _ADDITIONAL_INFORMATION_CELL in chunk.text
+        for chunk in _atomic(result.chunks)
+    )
+    _assert_source_coverage(
+        source,
+        f"{text}\n{_ADDITIONAL_INFORMATION_CELL}",
+        result.chunks,
+        tokenizer,
+        312,
+    )
+
+
+def test_unknown_intake_chunking_version_fails_explicitly(
+    tokenizer: TiktokenTokenizer,
+) -> None:
+    with pytest.raises(ValueError, match="version is not supported"):
+        IntakeRegulatoryChunker(
+            tokenizer=tokenizer, content_token_limit=312, chunking_version="3"
+        )

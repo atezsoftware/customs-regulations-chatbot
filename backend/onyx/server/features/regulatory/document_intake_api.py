@@ -32,6 +32,7 @@ from onyx.regulatory.document_intake.api_models import (
     IntakeBatchSnapshot,
     IntakeCapabilities,
     IntakeChunkEditRequest,
+    IntakeChunksEditRequest,
     IntakeCreateRequest,
     IntakePredecessorCandidate,
     IntakePredecessorSelectionRequest,
@@ -491,6 +492,66 @@ def get_intake_chunk_page(
     return IntakeChunkReviewPage(items=items, total=total, offset=offset, limit=limit)
 
 
+def _enqueue_edited_labels(
+    db_session: Session,
+    batch: RegulatoryDocumentIntake,
+    run_id: UUID | None,
+    tenant_id: str,
+) -> None:
+    if run_id is None:
+        return
+    from onyx.background.celery.tasks.regulatory_labeling.tasks import (
+        enqueue_labeling_run,
+    )
+
+    try:
+        enqueue_labeling_run(run_id=run_id, tenant_id=tenant_id)
+    except Exception:
+        logger.exception("Edited intake labeling dispatch failed batch=%s", batch.id)
+        repository.mark_intake_label_dispatch_failed(db_session, batch.id)
+        db_session.commit()
+
+
+@router.patch("/batches/{batch_id}/chunks")
+def edit_intake_chunks(
+    batch_id: UUID,
+    request: IntakeChunksEditRequest,
+    user: User = Depends(_admin),
+    db_session: Session = Depends(get_session),
+    tenant_id: str = Depends(get_current_tenant_id),
+) -> IntakeBatchSnapshot:
+    from onyx.db.document_intake_edit import IntakeChunkEdit
+    from onyx.db.document_intake_edit import edit_intake_chunks as edit_chunks
+
+    batch = _get_batch(db_session, batch_id, user)
+    try:
+        run_id = edit_chunks(
+            db_session,
+            batch,
+            expected_review_sha256=request.expected_review_sha256,
+            edits=[
+                IntakeChunkEdit(
+                    document_id=edit.document_id,
+                    chunk_id=edit.chunk_id,
+                    updates=edit.updates.model_dump(exclude_unset=True),
+                )
+                for edit in request.edits
+            ],
+        )
+        db_session.commit()
+    except (
+        repository.IntakeConflictError,
+        labeling_repository.LabelingStateConflictError,
+    ) as exc:
+        db_session.rollback()
+        raise OnyxError(OnyxErrorCode.CONFLICT, str(exc)) from exc
+    except ValueError as exc:
+        db_session.rollback()
+        raise OnyxError(OnyxErrorCode.INVALID_INPUT, str(exc)) from exc
+    _enqueue_edited_labels(db_session, batch, run_id, tenant_id)
+    return _snapshot(db_session, batch)
+
+
 @router.patch("/batches/{batch_id}/documents/{document_id}/chunks/{chunk_id}")
 def edit_intake_chunk(
     batch_id: UUID,
@@ -501,9 +562,6 @@ def edit_intake_chunk(
     db_session: Session = Depends(get_session),
     tenant_id: str = Depends(get_current_tenant_id),
 ) -> IntakeBatchSnapshot:
-    from onyx.background.celery.tasks.regulatory_labeling.tasks import (
-        enqueue_labeling_run,
-    )
     from onyx.db.document_intake_edit import edit_intake_chunk as edit_chunk
 
     batch = _get_batch(db_session, batch_id, user)
@@ -528,15 +586,7 @@ def edit_intake_chunk(
     except ValueError as exc:
         db_session.rollback()
         raise OnyxError(OnyxErrorCode.INVALID_INPUT, str(exc)) from exc
-    if run_id is not None:
-        try:
-            enqueue_labeling_run(run_id=run_id, tenant_id=tenant_id)
-        except Exception:
-            logger.exception(
-                "Edited intake labeling dispatch failed batch=%s", batch.id
-            )
-            repository.mark_intake_label_dispatch_failed(db_session, batch.id)
-            db_session.commit()
+    _enqueue_edited_labels(db_session, batch, run_id, tenant_id)
     return _snapshot(db_session, batch)
 
 
