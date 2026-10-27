@@ -74,6 +74,14 @@ jobs:
           kubectl exec -i "$pod" -n customs-regulations-dev -c "$container" -- \
             sh -ec '. /vault/secrets/config; export PYTHONPATH=/app; exec python -' < \
             backend/onyx/db/diagnose_folder_worker_readonly.py
+      - name: Diagnose exact cached metadata validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          IFS=$'\t' read -r pod container < /tmp/amendment-target
+          kubectl exec -i "$pod" -n customs-regulations-dev -c "$container" -- \
+            sh -ec '. /vault/secrets/config; export PYTHONPATH=/app; exec python -' < \
+            backend/onyx/db/diagnose_intake_metadata_cache_readonly.py
       - name: Filter amendment approval worker errors
         if: inputs.operation == 'inspect'
         shell: bash
