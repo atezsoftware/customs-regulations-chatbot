@@ -9,10 +9,80 @@ from onyx.regulatory.document_intake.text import (
     attachment_reference_label,
     normalize_attachment_navigation,
     normalize_inline_articles,
+    normalize_wrapped_annex_references,
     prepare_intake_text,
     require_chunk_source_coverage,
     require_resolved_attachment_references,
 )
+
+
+def test_wrapped_annex_reference_keeps_operative_sentence_and_following_article_scope() -> (
+    None
+):
+    source = (
+        "MAKİNE EMNİYETİ YÖNETMELİĞİ\nÜÇÜNCÜ BÖLÜM\nMADDE 15-\n"
+        "(7) İthalatçılar, AB bütünleştirme beyanının bir kopyasını kısmen tamamlanmış makinenin piyasaya arz\n"
+        "edildiği tarihten itibaren en az 10 yıl süreyle Bakanlığa sunmak üzere muhafaza eder ve Bakanlığın talebi üzerine EK-\n"
+        "4 Kısım B'de belirtilen teknik dosyayı Bakanlığa sunar.\n"
+        "(8) İthalatçılar, Bakanlığın gerekçeli talebi doğrultusunda bilgi ve belgeleri sunar.\n"
+        "MADDE 16-\n(1) Dağıtıcılar özenle hareket eder."
+    )
+    ordinary = RegulatoryChunker().chunk_text(source)
+    assert any(
+        "4 Kısım B'de belirtilen teknik dosyayı Bakanlığa sunar."
+        in chunk.metadata.heading_path
+        for chunk in ordinary.chunks
+    )
+    normalized = prepare_intake_text(source)
+    assert "".join(normalized.split()) == "".join(source.split())
+    chunked = RegulatoryChunker().chunk_text(normalized)
+    atomic = [
+        chunk
+        for chunk in chunked.chunks
+        if chunk.metadata.chunk_variant != "hierarchical_aggregate"
+    ]
+    seventh = next(chunk for chunk in atomic if chunk.metadata.paragraph_no == "7")
+    eighth = next(chunk for chunk in atomic if chunk.metadata.paragraph_no == "8")
+    assert seventh.text.endswith(
+        "EK-4 Kısım B'de belirtilen teknik dosyayı Bakanlığa sunar."
+    )
+    assert seventh.metadata.article_no == eighth.metadata.article_no == "15"
+    assert all(
+        "teknik dosyayı Bakanlığa sunar" not in heading
+        for chunk in chunked.chunks
+        for heading in chunk.metadata.heading_path
+    )
+    assert normalize_wrapped_annex_references(normalized) == normalized
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "EK-\n4 KISIM\nGenel hükümler",
+        "Genel hükümler\n4 KISIM\nBaşvuru yapılır.",
+        "# Açıklamada EK-\n4 Kısım B'de belirtilir.",
+        "```text\nBaşvuruda EK-\n4 Kısım B'de belirtilir.\n```",
+        "    Başvuruda EK-\n    4 Kısım B'de belirtilir.\n",
+        "`Başvuruda EK-\n4 Kısım B'de belirtilir.`",
+        "| Açıklama |\n| --- |\n| Başvuruda EK-\n4 Kısım B'de belirtilir. |",
+        "Açıklama | Başvuruda EK-\n4 Kısım B'de belirtilir. |",
+        "Başvuruda EK-\n4 Kısım B'de belirtilir. | diğer hücre",
+    ],
+)
+def test_wrapped_reference_preserves_explicit_headings_code_and_table_boundaries(
+    source: str,
+) -> None:
+    assert normalize_wrapped_annex_references(source) == source
+
+
+def test_actual_tescil_prose_wrap_retains_the_same_numeric_annex_reference() -> None:
+    source = (
+        "c) Demiryolu aracının teknik verileri, bakım programını ve operasyonel özelliklerini içeren belgeler ile Ek-\n"
+        "9'da belirtilen belge."
+    )
+    normalized = normalize_wrapped_annex_references(source)
+    assert normalized == source.replace("Ek-\n9'da", "Ek-9'da")
+    assert "".join(normalized.split()) == "".join(source.split())
 
 
 @pytest.mark.parametrize("lead", ["MADDE 1 -", "GEÇİCİ MADDE 1/A –", "EK MADDE 2 —"])

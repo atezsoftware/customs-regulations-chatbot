@@ -30,6 +30,7 @@ from onyx.db.models import (
     User,
     UserFile,
 )
+from onyx.document_index.publication_models import publication_digest
 from onyx.file_processing.original_ingestion import (
     LoadedUserFileDocuments,
     OriginalIngestionReceipt,
@@ -168,13 +169,27 @@ def _prepared_transition(
     )
 
 
+@pytest.mark.parametrize("formatter_version", [2, 3])
 def test_changed_navigation_reprepare_seals_artifact_preserves_sources_and_survives_future_formatter(
     intake_session: Session,
     intake_owner: tuple[User, DocumentSet, ModelConfiguration],
     native_markdown_runtime: PostgresBackedFileStore,
     monkeypatch: pytest.MonkeyPatch,
+    formatter_version: int,
 ) -> None:
     session = intake_session
+    if formatter_version == 2:
+        derive = normalization.derive_normalization
+
+        def previous_witness(*args: Any, **kwargs: Any) -> dict[str, Any]:
+            proof = derive(*args, **kwargs)
+            proof["formatter_version"] = 2
+            proof["witness_sha256"] = publication_digest(
+                {key: value for key, value in proof.items() if key != "witness_sha256"}
+            )
+            return proof
+
+        monkeypatch.setattr(normalization, "derive_normalization", previous_witness)
     batch, _old_run = _transition_fixture(
         session, intake_owner, native_markdown_runtime, monkeypatch
     )
@@ -219,7 +234,7 @@ def test_changed_navigation_reprepare_seals_artifact_preserves_sources_and_survi
         entry["source_receipt"]["plaintext_sha256"]
         != entry["after_receipt"]["plaintext_sha256"]
     )
-    assert entry["normalization_derivation"]["formatter_version"] == 2
+    assert entry["normalization_derivation"]["formatter_version"] == formatter_version
     assert entry["before_revision_ids"] and entry["after_revision_ids"]
     assert [
         tuple(row) for row in session.execute(select(RegulatorySourceAsset.__table__))
@@ -347,8 +362,6 @@ def test_retained_normalization_forgery_or_source_drift_is_rejected(
             lambda key: BytesIO(b"CORRUPT") if key == target else read(key),
         )
     elif change == "coherent_forgery":
-        from onyx.document_index.publication_models import publication_digest
-
         artifact = changed["normalization_derivation"]
         artifact["normalized_documents"][0]["sections"][0]["text"] += " FORGED"
         forged = LoadedUserFileDocuments(
