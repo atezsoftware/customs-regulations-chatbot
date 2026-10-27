@@ -153,7 +153,7 @@ Ana belgeyi ve bütün ekleri, chunk'ları, etiketleri, tarihleri ve varsa önce
 
 Paket **ready** olduğunda **Approve all new documents** düğmesi açılır. Bu düğme, bu içe aktarımdaki bütün yeni dosyaları onaylar; PC Külliyatı'ndaki diğer dosyaları topluca değiştirmez. Kısmi veya başarısız etiketleme varken onay kapalıdır.
 
-Onaydan sonra **approving / indexing**, işlemin sırada veya sürmekte olduğunu gösterir. **completed**, bütün yeni dosyaların indekslenmesi tamamlandığında görünür. Yalnızca onaya basılmış olmasını tamamlanma saymayın.
+Onaydan sonra **approving / indexing**, işlemin sırada veya sürmekte olduğunu gösterir. **completed**, bütün yeni dosyaların indekslenmesi tamamlandığında görünür. Yalnızca onaya basılmış olmasını tamamlanma saymayın. Updates ekranında tamamlanma göründükten sonra PC Külliyatı dosya listesi eski durumu gösteriyorsa sayfayı yenileyin; yeniden **Index** düğmesine basmanız gerekmez.
 
 Tamamlanan belgeyi PC Külliyatı dosya listesindeki **PDF** veya dosya ayrıntısındaki **Document PDF** ile açabilirsiniz. Kaynak PDF ise yüklenen orijinal PDF aynen gösterilir. Office, HTML veya görsel gibi diğer içe aktarılan biçimlerde, kaynak dosyanın ve hazırlanmış metnin bütünlüğü doğrulanır; hazırlanmış metin PDF olarak gösterilir ve başlıkta **(extracted text)** yazar. Markdown dosyaları metinlerinden PDF olarak görüntülenir.
 
@@ -234,11 +234,22 @@ Madde 11(b), diğer hükümlerin 9 Mayıs'ta başlayacağını anlatır; madde 1
 
 Bu örnek, otomatik sonuçların onaydan önce kaynakla karşılaştırılması gerektiğini gösterir. Özellikle maddeye özel yürürlük tarihlerini ve eklerin ayrı kimliklerini kontrol edin.
 
-## 11. İkinci gerçek PDF için beklenen kontrol
+## 11. İkinci gerçek PDF'nin yerel kullanıcı ekranı testi
 
-Bu bölüm **test senaryosudur; başarılı test sonucu değildir**. `SGM-2024/4` ana belgesini ve bağlı 21 sayfalık taranmış ek PDF'yi aşağıdaki kaynaklarla kontrol edin:
+27 Ekim 2026 tarihli yerel testte, `SGM-2024/4` ana belgesinin üç sayfalık PDF'si ve bağlı 21 sayfalık taranmış ek PDF, aynı içe aktarımda kullanıcı ekranından incelendi. **Approve all new documents** ile verilen tek toplu onayın ardından iki dosya da **completed** durumuna ulaştı. Bu test yerel geliştirme ortamındadır; dosyalar DEV ortamına yüklenmedi. Test, önceden 16 test dosyası bulunan yalıtılmış yerel veritabanında yapıldı; iki yeni dosyayla toplam 18 oldu. Bu sayı gerçek DEV külliyatının boyutunu göstermez.
 
 - Ana kaynak: https://www.resmigazete.gov.tr/eskiler/2025/01/20250105-2.htm
 - Ek PDF: https://www.resmigazete.gov.tr/eskiler/2025/01/20250105-2-1.pdf
 
-Aynı içe aktarım zaten hazırlanmışsa geçmişten açın; aynı dosyaları ikinci kez yüklemeyin. Ana belge ve ekin ayrı kayıtlarını, ekin tablo/dipnotlarını, başarısız chunk nedenlerini ve varsa tek başına kalmış tablo başlıklarını kaynakla karşılaştırın. Yeniden hazırlama gerekiyorsa bunu manuel düzeltmeleri kaydetmeden önce uygulayın. Sonra gerekli düzeltmeleri sayfalar ve dosyalar arasında birlikte hazırlayıp **Save all chunk changes** ile kaydedin. Önceki mevzuat için belgenin kendi başlık/numarasını kullanın; açıkça kaldırılan kayıt bulunamıyorsa başka bir adayı mülga olarak seçmeyin. Sonuçları ancak bütün inceleme ve indeksleme tamamlandıktan sonra başarılı olarak kaydedin.
+| Kontrol | Yerel kullanıcı ekranı sonucu |
+| --- | --- |
+| Ana belge ve ek | Ayrı mevzuat kayıtları; ana belgede 43, ekte 177, toplam 220 chunk. Bunların 212'si atomik, 8'i türetilmiş toplu chunk. |
+| Kaynak ve chunk incelemesi | Aynı dondurulmuş kaynaklardan yeniden hazırlama kullanıldı. Yedi OCR/metin düzeltmesi, ana belgedeki iki 5 Ocak 2025 tarihi ve bir Yürütme başlığı alanı elle düzeltildi: toplam 10 manuel alan. Bunlar otomatik çıkarım başarısı sayılmadı. |
+| Toplu kayıt ve taslak koruması | Yedi metin ve iki tarih düzeltmesi **Save all chunk changes** ile birlikte kaydedildi. İlk denemede 313 token'lık parça, hazırlamada sabitlenmiş 312 token'lık içerik sınırını aştığı için kayıt durdu; taslaklar korundu. Kaynağı koruyan biçim düzeltmesiyle 311 token'a indirilen kayıt birlikte uygulandı. Başlık metadata'sı tek chunk kaydıyla düzeltildi. |
+| Etiketleme | İki başarısız sonuç yeniden işlenirken 210 geçerli sonuç korundu; sonunda 212 atomik parçanın tamamı etiketlendi. Alıntı doğrulaması gevşetilmedi; etiketi geçirmek için kaynakta olmayan hüküm eklenmedi. |
+| Önceki mevzuat | Açık kaldırma hükmünde atıf yapılan `SGM-2013/6` için sette aday bulunmadı. Başka bir kayıt onun yerine seçilmedi; yanlış mülga ilişkisi kurulmadı. |
+| Onay ve indeksleme | Aynı içe aktarımın iki dosyası da toplu onaydan sonra **completed** oldu. Geçmişten yeniden açıldığında durum korundu; PC Külliyatı listesi yenilenince iki dosya da Completed, chunk sayıları 43 ve 177 olarak göründü. |
+| Mevcut kayıtların korunması | Önceden var olan 16 test dosyası, bunların 204 kanonik chunk'ı, 758 etiket kaydı, 652 blobun içeriği (toplam 94.484.817 bayt), 580 arama indeksi belgesi ve indeks kimlikleri birebir korundu. Uygulamanın genel yayınlama sayacı bu işlem sırasında ilerler; karşılaştırma bütün veritabanının bayt eşitliği iddiası değildir. |
+| Kaynak bütünlüğü | Ana belge-ek kaynak bağlantıları ve orijinal PDF baytları aynı kaldı. Orijinal 21 sayfalık ek PDF, tamamlanmadan sonra kullanıcı ekranından açıldı. |
+
+**Görsel kaynak sınırı:** Orijinal PDF'ler korundu. Taranmış ekteki grafik ve şekiller metinde bütünüyle yeniden üretilmedi; bu bilgileri orijinal PDF'den kontrol edin. Tamamlanan indeksleme, otomatik metin ve metadata'nın insan incelemesinden bağımsız olarak eksiksiz veya hukuken doğru olduğu anlamına gelmez.
