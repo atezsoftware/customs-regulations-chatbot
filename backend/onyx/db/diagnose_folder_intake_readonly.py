@@ -34,6 +34,20 @@ def main() -> None:
         max_overflow=0,
     )
     queries = {
+        "OWNED_INDEX_PROGRESS": """
+            SELECT f.id, f.status AS file_status, r.attempt_id,
+                   r.status AS repair_status, r.updated_at AS repair_updated_at,
+                   r.failure_code, j.id AS job_id, j.status AS job_status,
+                   j.stage AS job_stage, j.heartbeat_at, j.next_retry_at,
+                   j.error_code, j.error_message,
+                   j.remote_vertex_job_name IS NOT NULL AS has_remote_vertex_job,
+                   j.remote_openrouter_batch_id IS NOT NULL AS has_remote_openrouter_job
+              FROM user_file f LEFT JOIN user_file_projection_repair r ON r.user_file_id=f.id
+              LEFT JOIN regulatory_indexing_job j ON j.user_file_id=f.id
+             WHERE f.id IN ('10e927dc-a124-4c6a-85b1-e3619b61b6d3',
+                            'a3c6e8cf-93a9-460b-9edf-a9cdd4ba05a9')
+             ORDER BY f.id,j.created_at DESC LIMIT 12
+        """,
         "FROZEN_SOURCE_RAW_DUPLICATES": """
             WITH incoming AS (
                 SELECT id, package_id, sha256, display_name FROM regulatory_source_asset
