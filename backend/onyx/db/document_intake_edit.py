@@ -12,6 +12,10 @@ from sqlalchemy.orm import Session
 
 from onyx.db import document_intake as intake
 from onyx.db import regulatory_labeling as labeling
+from onyx.db.document_intake_edit_budget import (
+    prospective_intake_edit_rows,
+    validate_intake_edit_budgets,
+)
 from onyx.db.document_intake_metadata import (
     invalidate_metadata_file_context,
     manual_edit_metadata,
@@ -501,6 +505,17 @@ def _edit_intake_chunks(
         raise intake.IntakeConflictError(
             "The completed labeling snapshot is unavailable"
         )
+    validate_intake_edit_budgets(
+        session,
+        files,
+        {
+            file_id: prospective_intake_edit_rows(
+                rows_by_file[file_id],
+                {change.chunk.id: change.updates for change in changes},
+            )
+            for file_id, changes in prepared_by_file.items()
+        },
+    )
     user = session.get_one(User, batch.created_by)
     binding = resolve_intake_labeling_provider_binding(
         session, batch.labeling_model_configuration_id, user=user

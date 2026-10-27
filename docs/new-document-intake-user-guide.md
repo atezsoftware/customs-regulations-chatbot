@@ -114,6 +114,8 @@ Alanların yanında bilginin chunk hazırlığından, LLM'den veya manuel incele
 
 Birden fazla chunk'ı düzenlediğinizde üstteki **Save all chunk changes** ile hepsini birlikte kaydedin. Bu işlem tek bir etiketleme çalışması başlatır; yalnızca değişen dosyalar yeniden işlenir, diğer dosyaların doğrulanmış etiketleri korunur. Tek chunk düzenlediyseniz karttaki **Save chunk changes** de kullanılabilir. Yeni etiketleme bitince sonucu tekrar inceleyin. Etiketleri bu tablodan doğrudan değiştirmezsiniz.
 
+Kaydetmeden önce düzenlenen metinler ve bunlardan yeniden oluşacak toplu chunk'lar, hazırlamadaki metin boyutu sınırına göre kontrol edilir. Bir parça sınırı aşarsa hata, ilgili chunk'ı, ölçülen boyutu ve izin verilen sınırı gösterir; hiçbir değişiklik kaydedilmez ve etiketleme başlamaz. Taslaklarınız korunur. Sığdırmak için hukuki içeriği çıkarmayın; kaynağı koruyan biçim düzeltmesi yeterli değilse yöneticiden yeniden hazırlama desteği isteyin.
+
 **Discard chunk changes** tek chunk'ın, **Discard all chunk changes** bütün sayfa ve dosyalardaki kaydedilmemiş değişiklikleri geri alır. Kaydetme başarısız olursa taslaklar korunur. İnceleme sürümü değişmişse uyarıyı okuyup güncel kaynakla yeniden değerlendirin. Kaydedilmemiş değişiklik varken başka içe aktarıma geçiş, yeniden deneme, yeniden hazırlama ve toplu onay kapalıdır. Etiketleme çalışırken düzenleme kapalıdır. Teknik kimlikler, kaynak bilgileri ve ilişki/audit alanları salt okunurdur.
 
 Etiketleme başarısızlıklarının sayısı hem dosya kartında hem içe aktarımın üstünde gösterilir. İlgili chunk'ta **Labeling: failed** ve hata nedeni bulunur. Bunu yalnızca etiket atanmamış olmasıyla karıştırmayın; başarısız veya kanıtı yetersiz bir chunk varken toplu onay açılmaz.
