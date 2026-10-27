@@ -15,6 +15,16 @@ OWNED_FILES = (
 
 
 def main() -> None:
+    registered = app.control.inspect(timeout=5).registered() or {}
+    print(
+        "INTAKE_RECOVERY_REGISTERED",
+        json.dumps({
+            worker: any(str(name).split(" ", 1)[0] == "recover_document_intakes" for name in tasks)
+            for worker, tasks in registered.items()
+            if worker.startswith("light@")
+        }),
+        flush=True,
+    )
     print(
         "CONTEXTUAL_RUNTIME_LIMITS",
         json.dumps(
@@ -72,6 +82,12 @@ def main() -> None:
                             flush=True,
                         )
             if method == "active_queues":
+                if worker.startswith("light@"):
+                    print(
+                        "INTAKE_RECOVERY_CONTROL_QUEUE",
+                        json.dumps({"worker": worker, "consumes_checkpoint_cleanup": any(item.get("name") == "checkpoint_cleanup" for item in items)}),
+                        flush=True,
+                    )
                 bounded[worker] = [
                     item.get("name")
                     for item in items
