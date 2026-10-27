@@ -24,7 +24,6 @@ from onyx.db.models import (
     RegulatoryDocumentIntakeFile,
     UserFile,
 )
-from onyx.file_store.file_store import S3BackedFileStore, get_default_file_store
 from onyx.file_store.postgres_file_store import PostgresBackedFileStore
 from onyx.regulatory.document_intake.metadata import (
     MAX_METADATA_RESPONSE_BYTES,
@@ -109,9 +108,7 @@ class CacheDiagnostic:
             entry.evidence_id: entry
             for entry in build_metadata_evidence_catalog(chunks)
         }
-        self.store = get_default_file_store()
-        if not isinstance(self.store, (PostgresBackedFileStore, S3BackedFileStore)):
-            raise RuntimeError("Unsupported configured read-only diagnostic store")
+        self.store = PostgresBackedFileStore()
         self.identity = (
             f"metadata-v{METADATA_VERSION}:public:{BATCH_ID}:{MEMBER_ID}:{BINDING}"
         )
@@ -128,7 +125,10 @@ class CacheDiagnostic:
         )
         if record is None:
             return None
-        assert isinstance(self.store, (PostgresBackedFileStore, S3BackedFileStore))
+        if record.bucket_name != "postgres":
+            raise RuntimeError(
+                "Direct gateway cache must use its explicit Postgres store"
+            )
         with self.store.read_file(identifier, db_session=self.session) as stream:
             content = stream.read(limit + 1)
         metadata = record.file_metadata
