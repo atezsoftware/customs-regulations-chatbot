@@ -9,6 +9,9 @@ on:
       full_corpus_hashes:
         type: boolean
         default: false
+      decode_metadata_cache:
+        type: boolean
+        default: false
 permissions:
   contents: read
 jobs:
@@ -75,6 +78,7 @@ jobs:
             sh -ec '. /vault/secrets/config; export PYTHONPATH=/app; exec python -' < \
             backend/onyx/db/diagnose_folder_worker_readonly.py
       - name: Diagnose exact cached metadata validation
+        if: inputs.decode_metadata_cache
         shell: bash
         run: |
           set -euo pipefail
