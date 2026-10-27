@@ -161,7 +161,7 @@ def test_unapproved_or_changed_proof_fails_closed(
     )
 
 
-@pytest.mark.parametrize("field", ["file_id", "raw_sha256", "plaintext_sha256"])
+@pytest.mark.parametrize("field", ["file_id", "raw_sha256"])
 def test_reprepare_must_retain_original_source(
     monkeypatch: pytest.MonkeyPatch, field: str
 ) -> None:
@@ -173,6 +173,23 @@ def test_reprepare_must_retain_original_source(
         )
         is None
     )
+
+
+def test_validated_formatter_transition_keeps_original_receipt_immutable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, original, state, resolver = _approved(monkeypatch)
+    effective = original.model_copy(
+        update={"plaintext_sha256": "1" * 64, "documents_sha256": "2" * 64}
+    )
+    resolver.return_value = effective
+    frozen = deepcopy(state["publication"].original_ingestion_receipt)
+    result = authority.approved_intake_original_receipt(
+        session, state["file"].id, original, canonical_sha256="3" * 64
+    )
+    assert result == effective.model_copy(update={"canonical_sha256": "3" * 64})
+    assert state["publication"].original_ingestion_receipt == frozen
+    resolver.assert_called_once_with(session, state["file"].id, original)
 
 
 @pytest.mark.parametrize(

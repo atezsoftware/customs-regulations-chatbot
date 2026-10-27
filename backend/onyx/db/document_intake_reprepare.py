@@ -445,11 +445,15 @@ def persist_owned_reprepared_intake_file(
             proof.file_id != file.file_id
             or proof.raw_sha256 != old.raw_sha256
             or proof.documents_sha256 != documents_sha256(documents)
-            or proof.plaintext_sha256 != old.plaintext_sha256
         ):
             raise ValueError(
                 "Reprepare must use the identical original source and text"
             )
+        normalization = None
+        if proof.plaintext_sha256 != old.plaintext_sha256:
+            from onyx.db.document_intake_normalization import derive_normalization
+
+            normalization = derive_normalization(session, batch, member, old, documents)
         retain_canonical_revisions(session, before)
         session.execute(
             delete(RegulatoryChunk).where(RegulatoryChunk.user_file_id == file.id),
@@ -463,6 +467,17 @@ def persist_owned_reprepared_intake_file(
             enable_contextual_rag=contextual,
             publication_owner=owner,
         )
+        if normalization is not None:
+            from onyx.db.document_intake_normalization import NORMALIZATION_WITNESS_KEY
+
+            for row in session.scalars(
+                select(RegulatoryChunk).where(RegulatoryChunk.user_file_id == file.id)
+            ):
+                row.chunk_metadata = {
+                    **row.chunk_metadata,
+                    NORMALIZATION_WITNESS_KEY: normalization["witness_sha256"],
+                }
+            session.flush()
         after = capture_canonical_scope(session, file.id)
         if not after:
             raise ValueError("Reprepare produced no canonical chunks")
@@ -481,6 +496,8 @@ def persist_owned_reprepared_intake_file(
             after_revision_ids=[str(value) for value in revisions.values()],
             after_receipt=receipt,
         )
+        if normalization is not None:
+            entries[str(member.id)]["normalization_derivation"] = normalization
         request.documents = entries
         batch.lease_expires_at = datetime.now(timezone.utc) + timedelta(minutes=10)
         session.commit()
@@ -524,13 +541,90 @@ def reprepared_original_receipt(
     ):
         raise ValueError("Prepared intake receipt is incomplete")
     receipt = OriginalIngestionReceipt.model_validate(entry["after_receipt"])
+    if receipt.file_id != original.file_id or receipt.raw_sha256 != original.raw_sha256:
+        raise ValueError("Prepared intake receipt changed immutable source evidence")
+    if (
+        receipt.plaintext_sha256 != original.plaintext_sha256
+        or entry.get("normalization_derivation") is not None
+    ):
+        from onyx.db.document_intake_normalization import validated_normalized_documents
+
+        batch = session.get_one(RegulatoryDocumentIntake, member.intake_id)
+        validated_normalized_documents(
+            session,
+            batch,
+            member,
+            original,
+            receipt,
+            entry.get("normalization_derivation"),
+            entry.get("after_revision_ids", []),
+        )
+    return receipt
+
+
+def prepared_reprepare_documents(
+    session: Session,
+    intake_id: UUID,
+    request_id: UUID,
+    lease_token: UUID,
+    document_id: UUID,
+) -> LoadedUserFileDocuments:
+    """Recover a committed file's exact plaintext without changing its chunks."""
+    from onyx.db.document_intake_normalization import (
+        _frozen_source,
+        validated_normalized_documents,
+    )
+    from onyx.regulatory.document_intake.preparation import (
+        load_verified_intake_documents,
+    )
+
+    batch = session.get_one(RegulatoryDocumentIntake, intake_id)
+    request = session.get_one(RegulatoryDocumentIntakeReprepare, request_id)
+    member = session.get_one(RegulatoryDocumentIntakeFile, document_id)
+    entry = request.documents.get(str(document_id), {})
+    if (
+        batch.lease_token != lease_token
+        or batch.stage != "reprepare"
+        or request.intake_id != batch.id
+        or request.status != "running"
+        or member.intake_id != batch.id
+        or entry.get("status") != "prepared"
+        or entry.get("user_file_id") != str(member.user_file_id)
+    ):
+        raise intake.IntakeConflictError("Prepared reprepare ownership changed")
+    _guard_batch(session, batch, running=True)
+    file, publication, _snapshots = _guard_file(session, batch, member)
+    if publication.original_ingestion_receipt != entry["source_receipt"]:
+        raise ValueError("The original reprepare receipt changed")
+    original = OriginalIngestionReceipt.model_validate(entry["source_receipt"])
+    receipt = OriginalIngestionReceipt.model_validate(entry["after_receipt"])
     if (
         receipt.file_id != original.file_id
         or receipt.raw_sha256 != original.raw_sha256
-        or receipt.plaintext_sha256 != original.plaintext_sha256
+        or receipt.generation_hash != file.regulatory_chunk_generation_hash
+        or receipt.canonical_sha256
+        != canonical_scope_digest(session, member.user_file_id)
     ):
-        raise ValueError("Prepared intake receipt changed immutable source evidence")
-    return receipt
+        raise ValueError("The prepared reprepare source or canonical receipt changed")
+    if entry.get("normalization_derivation") is not None:
+        return validated_normalized_documents(
+            session,
+            batch,
+            member,
+            original,
+            receipt,
+            entry["normalization_derivation"],
+            entry.get("after_revision_ids", []),
+        )
+    _context, arguments = _frozen_source(session, batch, member, original)
+    documents = load_verified_intake_documents(**arguments)
+    if (
+        documents.original_extraction.plaintext_sha256 != original.plaintext_sha256
+        or documents.original_extraction.plaintext_sha256 != receipt.plaintext_sha256
+        or documents.original_extraction.documents_sha256 != receipt.documents_sha256
+    ):
+        raise ValueError("The prepared reprepare plaintext changed")
+    return documents
 
 
 def finish_reprepare(

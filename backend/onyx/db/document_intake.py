@@ -12,6 +12,10 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from onyx.db.amendment_sources import require_ready_source_package
+from onyx.db.document_intake_graph import (
+    require_frozen_zip_intake_graph,
+    require_frozen_zip_members,
+)
 from onyx.db.document_set import get_document_set_by_id_for_user
 from onyx.db.enums import UserFileProjectionRepairStatus, UserFileStatus
 from onyx.db.labeling_configuration import (
@@ -39,6 +43,7 @@ from onyx.db.user_file import (
 from onyx.document_index.publication_models import publication_digest
 from onyx.regulatory.amendments.annexes.models import SourceLink
 from onyx.regulatory.document_intake.models import INTAKE_DELIVERY_SECONDS
+from onyx.regulatory.document_intake.source_graph import IntakeGraph
 
 TARGET_DOCUMENT_SET_NAME = "PC Külliyatı"
 
@@ -305,6 +310,15 @@ def review_digest(session: Session, batch: RegulatoryDocumentIntake) -> str:
             for row in chunks
         ],
     }
+    if any("intake_display_name" in row.chunk_metadata for row in chunks):
+        payload["display_names"] = [
+            {"id": str(file_id), "name": name}
+            for file_id, name in session.execute(
+                select(UserFile.id, UserFile.name)
+                .where(UserFile.id.in_(ids))
+                .order_by(UserFile.id)
+            )
+        ]
     lineage = lineage_review_payload(session, batch)
     if lineage:
         payload["document_lineage"] = lineage
@@ -734,8 +748,12 @@ def admit_intake_assets(
     *,
     root_hash: str,
     owned_file_ids: dict[UUID, str] | None = None,
+    intake_graph: IntakeGraph | None = None,
+    source_manifest_bytes: bytes | None = None,
 ) -> list[RegulatoryDocumentIntakeFile]:
-    package = session.get_one(AmendmentSourcePackage, batch.source_package_id)
+    package = session.get_one(
+        AmendmentSourcePackage, batch.source_package_id, populate_existing=True
+    )
     if (
         package.document_set_id != batch.document_set_id
         or package.created_by != batch.created_by
@@ -767,6 +785,17 @@ def admit_intake_assets(
         )
     ):
         raise IntakeConflictError("The source graph does not cover the frozen package")
+    try:
+        graph = require_frozen_zip_intake_graph(
+            session,
+            package,
+            assets,
+            links,
+            intake_graph=intake_graph,
+            manifest_bytes=source_manifest_bytes,
+        )
+    except ValueError as error:
+        raise IntakeConflictError(str(error)) from error
     if (
         session.get_one(DocumentSet, batch.document_set_id).name
         != TARGET_DOCUMENT_SET_NAME
@@ -778,6 +807,11 @@ def admit_intake_assets(
             asset.id for asset in assets
         }:
             raise IntakeConflictError("The frozen source asset membership changed")
+        if graph is not None:
+            try:
+                require_frozen_zip_members(existing, assets, links, graph)
+            except ValueError as error:
+                raise IntakeConflictError(str(error)) from error
         return existing
     if owned_file_ids is not None and (
         set(owned_file_ids) != {asset.id for asset in assets}
@@ -787,13 +821,14 @@ def admit_intake_assets(
         raise IntakeConflictError(
             "Every imported original requires separate owned storage"
         )
+    roots = set(graph.root_hashes) if graph is not None else {root_hash}
     documents = {
         asset.sha256: RegulatoryDocumentIntakeFile(
             id=uuid4(),
             intake_id=batch.id,
             source_asset_id=asset.id,
             user_file_id=uuid4(),
-            role="root" if asset.sha256 == root_hash else "annex",
+            role="root" if asset.sha256 in roots else "annex",
             relationships=[
                 link.model_dump(mode="json")
                 for link in links
@@ -832,7 +867,12 @@ def admit_intake_assets(
             ),
             None,
         )
-        if incoming is not None and member.role != "root":
+        if graph is not None:
+            parent_hash = graph.primary_parent_by_hash.get(digest)
+            member.parent_document_id = (
+                documents[parent_hash].id if parent_hash is not None else None
+            )
+        elif incoming is not None and member.role != "root":
             member.parent_document_id = documents[incoming.parent_asset_hash].id
         session.add(
             DocumentSet__UserFile(

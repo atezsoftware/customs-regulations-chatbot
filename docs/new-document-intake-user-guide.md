@@ -14,14 +14,15 @@ Hedef set **PC Külliyatı** olarak sabittir; başka bir document set seçimi ya
 
 | Elinizdeki kaynak | Ekrandaki seçim | Yapılacak işlem |
 | --- | --- | --- |
-| Orijinal PDF veya başka desteklenen dosya | File | Choose document ile dosyayı seçin. |
+| Orijinal PDF veya başka desteklenen dosya | File | Choose document or ZIP ile dosyayı seçin. |
+| PDF, HTML, DOCX veya Markdown içeren karma ZIP | File | Choose document or ZIP ile arşivi seçin; her belge kendi biçimine göre hazırlanır. |
 | Belgenin internet adresi | URL | New document source URL alanına doğrudan kaynak adresini girin. |
 | Hazır tek Markdown dosyası | Markdown package | Choose Markdown or ZIP ile `.md` dosyasını seçin. |
 | Ana belge ve eklerinin hazır Markdown dosyaları | Markdown package | Manifest içeren ZIP paketini seçin. |
 
-**File**, PDF yanında DOCX, HTML/HTM, XLSX ve desteklenen görsel dosyalarını da alır. Hazır `.md` ve mevzuat ZIP'i için **Markdown package** seçimini kullanın.
+**File**, PDF yanında DOCX, HTML/HTM, XLSX, desteklenen görsel dosyaları ve karma ZIP alır. Hazır tek `.md` veya aşağıdaki özel Markdown manifest standardını kullanan ZIP için **Markdown package** seçimini kullanın.
 
-Dosya yüklerken **Original document URL** alanı, orijinal belgenin web adresidir. Belgedeki `/ekler/ek1.pdf` gibi göreli bağlantıların çözülebilmesi için bu adresi girin. Yerel bilgisayarınızdaki dosya yolu bu alanın yerine geçmez. URL yolunda kaynak adresi zaten verilmiştir.
+Tek orijinal dosya yüklerken **Original document URL** alanı, orijinal belgenin web adresidir. Belgedeki `/ekler/ek1.pdf` gibi göreli bağlantıların çözülebilmesi için bu adresi girin. Yerel bilgisayarınızdaki dosya yolu bu alanın yerine geçmez. URL yolunda kaynak adresi zaten verilmiştir. Karma ZIP'te her dosyanın kaynak adresi gerekiyorsa isteğe bağlı manifestte ayrı belirtilir.
 
 **Prepare source and attachments** düğmesine basın. Kaynak paketindeki dosya adlarını ve belge sayısını kontrol edin. Paket **ready** olunca **Prepare new documents** düğmesine basın.
 
@@ -35,11 +36,17 @@ Her dosya kartında **Main document** veya **Attachment to ...** açıklaması b
 
 Bir ek alınamazsa paket eksiksizmiş gibi ilerlemez. Hata bölümünde ekin etiketi/adresi ve nedeni gösterilir. Örneğin kaynak adresi eksikliği, bulunamayan dosya veya indirilemeyen bağlantı görülebilir. Önce eksikliği giderin; uygunsa **Retry source preparation** ile yeniden deneyin. Kaynak paketinin hazır olması, mevzuatın hukuki içeriğinin doğruluğuna ilişkin kullanıcı incelemesinin yerine geçmez.
 
-## 3. Markdown ve ZIP standardı
+**Karma ZIP yükleme:** Arşivdeki her gerçek belge ayrı mevzuat kaydı olur. PDF ve diğer kaynaklar normal hazırlama akışını kullanır; `.md` üyeleri dönüşümü atlar. Birden fazla bağımsız ana belge aynı ZIP'te bulunabilir. Klasör sırası ve dosya adı, bir belgenin diğerinin eki sayılması için yeterli değildir. Ana belge içindeki gerçek yerel ek bağlantısı, ZIP içindeki tam dosya yoluna çözülür. İnternet ek adresi için önce manifestteki tam `source_url` eşleştirmesi kullanılır; yoksa mevcut güvenli indirme akışı denenir. Bulunamayan veya belirsiz ekler açık hata olur.
+
+Karma ZIP için manifest zorunlu değildir. Bağlantıların birden fazla üst belgeye işaret ettiği durumlarda veya orijinal internet adreslerini ZIP üyeleriyle eşleştirmek için isteğe bağlı manifest kullanın. Bu yolun kuralları ve örneği: [Karma belge ZIP'i](mixed-document-zip.md). Hazır Markdown paketinin manifestiyle aynı format değildir.
+
+**Belge adları:** Hazırlama sırasında LLM'nin belgenin kendi kaynak metninden çıkardığı tam başlık kullanılır. Teknik yükleme adı mevzuat başlığı olarak kaydedilmez; orijinal dosya adı kaynak kanıtında korunur. Ekin kendi başlığı kullanılır. Başlık bulunamaz veya farklı başlıklar çelişirse **Başlık belirlenemedi** görünür. İncelemedeki **document_title** veya **annex_title** alanını düzeltip kaydettiğinizde ilgili yeni dosyanın adı güncellenir. Eski külliyat dosyaları bu nedenle yeniden adlandırılmaz.
+
+## 3. Hazır Markdown standardı
 
 Hazır Markdown verildiğinde Markdown'a dönüştürme adımı atlanır. Chunk hazırlama, hukuki metadata, yürürlük tarihi çıkarımı ve etiketleme yine yapılır.
 
-Tek belge için UTF-8 kodlamalı bir `.md` dosyası yeterlidir. İlk `# Başlık` belge adı olarak kullanılır; yoksa dosya adı kullanılır. Ana belge ile yerel ekler birlikteyse aşağıdaki ZIP yapısını kullanın:
+Tek belge için UTF-8 kodlamalı bir `.md` dosyası yeterlidir. Tam belge başlığını ilk `# Başlık` satırına yazın; LLM metadata hazırlığında kaynaktan başlığı çıkarır. Ana belge ile yerel ekler için özel Markdown paketini seçtiyseniz aşağıdaki ZIP yapısını kullanın:
 
 Bir pakette bir ana belge ve en fazla 20 ek, toplam 21 Markdown belgesi bulunabilir. Alt ekler de bu sayıya dahildir. Bağımsız ana belgeleri ayrı paketlerde yükleyin. Tek mevzuatın bağlı ekleri bu sınırı aşıyorsa yöneticinize başvurun; bağlantılarını korumak için bağlı ekleri ayrı paketlere bölmeyin.
 

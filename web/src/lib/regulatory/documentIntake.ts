@@ -166,6 +166,16 @@ export function uploadDocumentIntakeMarkdownPackage(
   });
 }
 
+export function uploadDocumentIntakeZipPackage(
+  file: File,
+  idempotencyKey: string
+): Promise<AmendmentSourcePackage> {
+  const body = new FormData();
+  body.append("file", file);
+  body.append("idempotency_key", idempotencyKey);
+  return requestJson("/source-packages/zip", { method: "POST", body });
+}
+
 export function listDocumentIntakeBatches(): Promise<DocumentIntakeBatch[]> {
   return requestJson("/batches");
 }

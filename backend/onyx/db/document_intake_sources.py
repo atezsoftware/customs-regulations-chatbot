@@ -1,4 +1,4 @@
-"""Create immutable, user-scoped Markdown source requests for new intake only."""
+"""Create immutable, user-scoped supplied source requests for new intake only."""
 
 import hashlib
 import json
@@ -14,6 +14,7 @@ from onyx.db.document_intake import resolve_intake_target
 from onyx.db.models import AmendmentSourcePackage, User
 from onyx.file_store.file_store import FileStore, get_default_file_store
 from onyx.file_store.postgres_file_store import PostgresBackedFileStore
+from onyx.regulatory.document_intake.source_graph import ZIP_INPUT_KIND
 from onyx.server.features.regulatory.models import (
     AmendmentSourceAssetSnapshot,
     AmendmentSourcePackageSnapshot,
@@ -32,13 +33,70 @@ def create_markdown_source_package(
     content: bytes,
     store: FileStore | None = None,
 ) -> tuple[AmendmentSourcePackage, bool]:
-    target = resolve_intake_target(session, user)
     mime = (
         "application/zip" if display_name.lower().endswith(".zip") else "text/markdown"
     )
+    return _create_supplied_source_package(
+        session,
+        user=user,
+        environment=environment,
+        idempotency_key=idempotency_key,
+        display_name=display_name,
+        content=content,
+        store=store,
+        kind=MARKDOWN_INPUT_KIND,
+        method="supplied_markdown",
+        mime=mime,
+        request_prefix="intake-markdown",
+        input_identifier="markdown-input",
+    )
+
+
+def create_zip_source_package(
+    session: Session,
+    *,
+    user: User,
+    environment: str,
+    idempotency_key: UUID,
+    display_name: str,
+    content: bytes,
+    store: FileStore | None = None,
+) -> tuple[AmendmentSourcePackage, bool]:
+    return _create_supplied_source_package(
+        session,
+        user=user,
+        environment=environment,
+        idempotency_key=idempotency_key,
+        display_name=display_name,
+        content=content,
+        store=store,
+        kind=ZIP_INPUT_KIND,
+        method="mixed_document_zip",
+        mime="application/zip",
+        request_prefix="intake-zip",
+        input_identifier="zip-input",
+    )
+
+
+def _create_supplied_source_package(
+    session: Session,
+    *,
+    user: User,
+    environment: str,
+    idempotency_key: UUID,
+    display_name: str,
+    content: bytes,
+    store: FileStore | None,
+    kind: str,
+    method: str,
+    mime: str,
+    request_prefix: str,
+    input_identifier: str,
+) -> tuple[AmendmentSourcePackage, bool]:
+    target = resolve_intake_target(session, user)
     spec = {
-        "kind": MARKDOWN_INPUT_KIND,
-        "preparation_method": "supplied_markdown",
+        "kind": kind,
+        "preparation_method": method,
         "display_name": display_name,
         "mime_type": mime,
         "input_sha256": hashlib.sha256(content).hexdigest(),
@@ -50,20 +108,20 @@ def create_markdown_source_package(
         session,
         document_set_id=target.id,
         environment=environment,
-        idempotency_key=f"intake-markdown:{user.id}:{idempotency_key}",
+        idempotency_key=f"{request_prefix}:{user.id}:{idempotency_key}",
         request_hash=request_hash,
         input_spec=spec,
         created_by=user.id,
     )
     if package.created_by != user.id:
-        raise ValueError("Markdown source package belongs to another user")
+        raise ValueError("Supplied source package belongs to another user")
     if created:
         file_store = store or get_default_file_store()
-        identifier = str(uuid5(package.id, "markdown-input"))
+        identifier = str(uuid5(package.id, input_identifier))
         metadata = {
             "source_package_id": str(package.id),
             "sha256": hashlib.sha256(content).hexdigest(),
-            "preparation_method": "supplied_markdown",
+            "preparation_method": method,
         }
         if isinstance(file_store, PostgresBackedFileStore):
             package.input_file_id = file_store.save_file(
@@ -107,13 +165,52 @@ def fail_markdown_source_package(
     lease_token: UUID,
     detail: str,
 ) -> None:
+    _fail_supplied_source_package(
+        session,
+        package_id=package_id,
+        environment=environment,
+        lease_token=lease_token,
+        detail=detail,
+        kind=MARKDOWN_INPUT_KIND,
+        code="invalid_markdown_package",
+    )
+
+
+def fail_zip_source_package(
+    session: Session,
+    *,
+    package_id: UUID,
+    environment: str,
+    lease_token: UUID,
+    detail: str,
+) -> None:
+    _fail_supplied_source_package(
+        session,
+        package_id=package_id,
+        environment=environment,
+        lease_token=lease_token,
+        detail=detail,
+        kind=ZIP_INPUT_KIND,
+        code="invalid_zip_package",
+    )
+
+
+def _fail_supplied_source_package(
+    session: Session,
+    *,
+    package_id: UUID,
+    environment: str,
+    lease_token: UUID,
+    detail: str,
+    kind: str,
+    code: str,
+) -> None:
     session.execute(
         update(AmendmentSourcePackage)
         .where(
             AmendmentSourcePackage.id == package_id,
             AmendmentSourcePackage.environment == environment,
-            AmendmentSourcePackage.input_spec["kind"].as_string()
-            == MARKDOWN_INPUT_KIND,
+            AmendmentSourcePackage.input_spec["kind"].as_string() == kind,
             AmendmentSourcePackage.status == "processing",
             AmendmentSourcePackage.lease_token == lease_token,
         )
@@ -121,7 +218,7 @@ def fail_markdown_source_package(
             status="failed",
             issues=[
                 {
-                    "code": "invalid_markdown_package",
+                    "code": code,
                     "retryable": False,
                     "failure_detail": detail[:2000],
                 }

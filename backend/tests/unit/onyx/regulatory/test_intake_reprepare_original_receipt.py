@@ -15,7 +15,7 @@ from onyx.file_processing.original_ingestion import OriginalIngestionReceipt
 
 
 @pytest.mark.parametrize("reprepared", [False, True, "same_generation"])
-def test_unchanged_generation_keeps_original_read_without_intake_audit_query(
+def test_unchanged_generation_keeps_original_and_approved_reprepare_uses_its_review(
     monkeypatch: pytest.MonkeyPatch, reprepared: bool | str
 ) -> None:
     original = OriginalIngestionReceipt(
@@ -49,6 +49,10 @@ def test_unchanged_generation_keeps_original_read_without_intake_audit_query(
         ),
     ]
     resolver = MagicMock(return_value=new)
+    prepared_resolver = MagicMock(return_value=original)
+    monkeypatch.setattr(
+        document_intake_reprepare, "reprepared_original_receipt", prepared_resolver
+    )
     monkeypatch.setattr(
         document_intake_original_ingestion, "approved_intake_original_receipt", resolver
     )
@@ -62,6 +66,53 @@ def test_unchanged_generation_keeps_original_read_without_intake_audit_query(
         session, uuid4()
     ) == (new if reprepared else original)
     assert resolver.call_count == (1 if reprepared else 0)
+    assert prepared_resolver.call_count == (0 if reprepared else 1)
+
+
+@pytest.mark.parametrize("invalid_derivation", [False, True])
+def test_same_canonical_and_generation_resolves_verified_normalized_plaintext(
+    monkeypatch: pytest.MonkeyPatch, invalid_derivation: bool
+) -> None:
+    original = OriginalIngestionReceipt(
+        file_id="original",
+        raw_sha256="a" * 64,
+        documents_sha256="b" * 64,
+        plaintext_sha256="c" * 64,
+        canonical_sha256="d" * 64,
+        generation_hash="e" * 64,
+    )
+    effective = original.model_copy(
+        update={"documents_sha256": "f" * 64, "plaintext_sha256": "9" * 64}
+    )
+    session = MagicMock(spec=Session)
+    session.get.side_effect = [
+        SimpleNamespace(
+            original_ingestion_receipt=original.model_dump(mode="json"),
+            gate_closed=False,
+        ),
+        SimpleNamespace(
+            file_id=original.file_id,
+            status=UserFileStatus.COMPLETED,
+            regulatory_chunk_generation_hash=original.generation_hash,
+        ),
+    ]
+    resolver = MagicMock(
+        return_value=effective,
+        side_effect=ValueError("invalid normalization derivation")
+        if invalid_derivation
+        else None,
+    )
+    monkeypatch.setattr(
+        document_intake_reprepare, "reprepared_original_receipt", resolver
+    )
+    monkeypatch.setattr(
+        "onyx.db.regulatory_writer_publication.canonical_scope_digest",
+        lambda *_args: original.canonical_sha256,
+    )
+    assert regulatory_original_ingestion.original_attachment_receipt(
+        session, uuid4()
+    ) == (None if invalid_derivation else effective)
+    resolver.assert_called_once()
 
 
 def test_ordinary_generation_drift_preserves_matching_original_eligibility(

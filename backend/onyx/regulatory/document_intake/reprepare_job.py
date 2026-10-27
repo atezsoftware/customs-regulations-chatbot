@@ -1,16 +1,23 @@
 """Replay the same frozen originals only for an explicit unpublished reprepare."""
 
+import hashlib
+import json
 from functools import partial
 from uuid import UUID
 
 from onyx.db import document_intake as intake
 from onyx.db import document_intake_reprepare as repository
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
+from onyx.file_processing.original_ingestion import extracted_plaintext
 from onyx.file_store.file_store import get_default_file_store
 from onyx.regulatory.amendments.annexes.evidence import read_source_graph
 from onyx.regulatory.document_intake.metadata_job import run_intake_metadata
 from onyx.regulatory.document_intake.models import IntakeSourceAsset
 from onyx.regulatory.document_intake.preparation import prepare_intake_file
+from onyx.regulatory.document_intake.source_graph import (
+    ZIP_INPUT_KIND,
+    parse_intake_graph,
+)
 
 
 def run_document_intake_reprepare(
@@ -41,6 +48,31 @@ def run_document_intake_reprepare(
                 manifest_sha256=package.manifest_sha256,
                 assets=assets,
             )
+            graph = None
+            if package.input_spec.get("kind") == ZIP_INPUT_KIND:
+                with store.read_file(package.manifest_file_id) as stream:
+                    manifest_bytes = stream.read(150 * 1024 * 1024 + 1)
+                if (
+                    hashlib.sha256(manifest_bytes).hexdigest()
+                    != package.manifest_sha256
+                ):
+                    raise ValueError("Source manifest changed")
+                manifest = json.loads(manifest_bytes)
+                graph = parse_intake_graph(
+                    manifest,
+                    input_kind=ZIP_INPUT_KIND,
+                    asset_hashes=[asset.sha256 for asset in assets],
+                    links=links,
+                )
+                intake.admit_intake_assets(
+                    session,
+                    batch,
+                    assets,
+                    links,
+                    root_hash=manifest["assets"][0]["sha256"],
+                    intake_graph=graph,
+                    source_manifest_bytes=manifest_bytes,
+                )
             views = [IntakeSourceAsset.model_validate(asset) for asset in assets]
             by_id = {asset.id: asset for asset in views}
             package_id = package.id
@@ -56,8 +88,24 @@ def run_document_intake_reprepare(
             session.commit()
         for document_id, file_id, asset_id, _status, original_file_id in work:
             if str(document_id) in done:
+                from onyx.file_store.utils import store_user_file_plaintext
+
+                with get_session_with_current_tenant() as session:
+                    documents = repository.prepared_reprepare_documents(
+                        session, intake_id, request_id, token, document_id
+                    )
+                if not store_user_file_plaintext(
+                    file_id, extracted_plaintext(documents)
+                ):
+                    raise ValueError("Prepared intake plaintext could not be restored")
                 continue
-            prepare_intake_file(
+            prepare = prepare_intake_file
+            if graph is not None:
+                prepare = partial(
+                    prepare,
+                    parent_asset_hashes=graph.parents_for(by_id[asset_id].sha256),
+                )
+            prepare(
                 package_id=package_id,
                 asset=by_id[asset_id],
                 user_file_id=file_id,

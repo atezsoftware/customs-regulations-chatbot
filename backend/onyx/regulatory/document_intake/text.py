@@ -21,12 +21,14 @@ _INLINE_ARTICLE = re.compile(
     r"[ \t]*(?P<body>\S[^\n]*)$",
     re.IGNORECASE | re.MULTILINE,
 )
+_ANNEX_NUMBER_VALUE = r"\d+(?:[/.]\d+)*|[IVXLCDM]+|[A-ZÇĞİÖŞÜ]"
 _ATTACHMENT_PLACEHOLDER = re.compile(
-    r"\bek(?:ler|leri)?\s+(?:için|icin)\s+t[ıi]klay[ıi]n[ıi]z\b",
+    rf"\bek(?:(?:leri|ler)|\s*[-–—:_]?\s*(?P<number>{_ANNEX_NUMBER_VALUE}))?"
+    r"\s+(?:için|icin)\s+t[ıi]klay[ıi]n[ıi]z\b",
     re.IGNORECASE,
 )
 _ANNEX_NUMBER = re.compile(
-    r"\bEK\s*[-–—:_]?\s*(\d+(?:[/.]\d+)*|[IVXLCDM]+|[A-ZÇĞİÖŞÜ])\b",
+    rf"\bEK\s*[-–—:_]?\s*({_ANNEX_NUMBER_VALUE})\b",
     re.IGNORECASE,
 )
 
@@ -37,8 +39,14 @@ def _navigation_suffix(label: str) -> str | None:
         return None
     suffix = label.strip()[match.end() :].strip(" \t\r\n—–-:;.,()[]")
     suffix = re.sub(r"\s*\(?PDF\)?$", "", suffix, flags=re.IGNORECASE).strip()
-    if suffix and _ANNEX_NUMBER.fullmatch(suffix) is None:
-        return None
+    if suffix:
+        number = _ANNEX_NUMBER.fullmatch(suffix)
+        if number is None or (
+            match["number"] and match["number"].upper() != number[1].upper()
+        ):
+            return None
+    if match["number"]:
+        return f"EK-{match['number'].upper()}"
     return suffix
 
 
@@ -50,9 +58,8 @@ def _annex_label(
     label: str, link: SourceLink, assets: dict[str, IntakeSourceAsset]
 ) -> str:
     suffix = _navigation_suffix(label)
-    if suffix:
-        number = _ANNEX_NUMBER.fullmatch(suffix)
-        assert number is not None
+    number = _ANNEX_NUMBER.fullmatch(suffix or label.strip())
+    if number is not None:
         return f"EK-{number[1].upper()}"
     asset = assets.get(link.target_asset_hash or "")
     names = [
@@ -268,7 +275,7 @@ def normalize_attachment_navigation(
     replacements = []
     # A plain navigation sentence may follow operative PDF text on the same line.
     for match in re.finditer(
-        r"(?m)(?:^[ \t]*|(?<=[.!?])[ \t]+)(?P<label>ek(?:ler|leri)?\s+(?:için|icin)\s+t[ıi]klay[ıi]n[ıi]z[^\n]*)$",
+        rf"(?m)(?:^[ \t]*|(?<=[.!?])[ \t]+)(?P<label>{_ATTACHMENT_PLACEHOLDER.pattern}[^\n]*)$",
         masked,
         flags=re.IGNORECASE,
     ):
@@ -280,15 +287,18 @@ def normalize_attachment_navigation(
             link
             for link in outgoing
             if not suffix
-            or _annex_label("", link, assets) == _annex_label(label, link, assets)
+            or _annex_label(link.label or "", link, assets)
+            == _annex_label(label, link, assets)
         ]
         if not selected:
-            selected = outgoing
+            raise ValueError(
+                "Attachment navigation does not match a resolved source asset"
+            )
         references = list(
             dict.fromkeys(
-                f"[{_annex_label(label, link, assets)}]({link.original_url or link.requested_url or link.final_url})"
+                f"[{_annex_label(link.label or '', link, assets)}]({link.original_url or link.requested_url or link.final_url})"
                 if (link.original_url or link.requested_url or link.final_url)
-                else _annex_label(label, link, assets)
+                else _annex_label(link.label or "", link, assets)
                 for link in selected
             )
         )

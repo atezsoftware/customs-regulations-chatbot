@@ -33,6 +33,7 @@ import {
   reprepareDocumentIntakeBatch,
   retryDocumentIntakeBatch,
   uploadDocumentIntakeMarkdownPackage,
+  uploadDocumentIntakeZipPackage,
   updateDocumentIntakeChunk,
   updateDocumentIntakeChunks,
   saveDocumentIntakePredecessorSelection,
@@ -569,6 +570,7 @@ export default function NewDocumentIntake() {
   const configurationErrors = setup?.configuration_errors ?? [];
   const labelingReady =
     Boolean(setup?.providers.length) && configurationErrors.length === 0;
+  const isZipFile = file?.name.toLowerCase().endsWith(".zip") ?? false;
   useEffect(
     () => () => {
       requestVersion.current += 1;
@@ -614,7 +616,14 @@ export default function NewDocumentIntake() {
             })
           : mode === "markdown"
             ? await uploadDocumentIntakeMarkdownPackage(file!, key)
-            : await uploadAmendmentSourcePackage(targetId, key, file!, baseUrl);
+            : isZipFile
+              ? await uploadDocumentIntakeZipPackage(file!, key)
+              : await uploadAmendmentSourcePackage(
+                  targetId,
+                  key,
+                  file!,
+                  baseUrl
+                );
       if (requestVersion.current === version) setInitialPackage(prepared);
     });
   }
@@ -772,7 +781,7 @@ export default function NewDocumentIntake() {
                 accept={
                   mode === "markdown"
                     ? ".zip,.md"
-                    : ".pdf,.docx,.html,.htm,.xlsx,.png,.jpg,.jpeg,.webp,.tif,.tiff"
+                    : ".zip,.pdf,.docx,.html,.htm,.xlsx,.png,.jpg,.jpeg,.webp,.tif,.tiff"
                 }
                 aria-label={
                   mode === "markdown"
@@ -791,10 +800,20 @@ export default function NewDocumentIntake() {
                 >
                   {mode === "markdown"
                     ? "Choose Markdown or ZIP"
-                    : "Choose document"}
+                    : "Choose document or ZIP"}
                 </Button>
                 {file && <Text>{file.name}</Text>}
               </div>
+              {mode === "file" && (
+                <Text as="p" font="secondary-body">
+                  Upload a document or a ZIP containing supported documents.
+                  Each ZIP member is processed according to its own format;
+                  Markdown members skip conversion. Local attachment links
+                  preserve relationships between separate legislation records.
+                  Document names come from source titles extracted during
+                  metadata preparation.
+                </Text>
+              )}
               {mode === "markdown" ? (
                 <div className="flex flex-col gap-2">
                   <Text as="p" font="secondary-body">
@@ -818,7 +837,7 @@ export default function NewDocumentIntake() {
                     </Button>
                   </div>
                 </div>
-              ) : (
+              ) : !isZipFile ? (
                 <InputTypeIn
                   aria-label="Original document URL"
                   placeholder="Original document URL (for relative attachment links)"
@@ -829,7 +848,7 @@ export default function NewDocumentIntake() {
                     setBaseUrl(event.target.value);
                   }}
                 />
-              )}
+              ) : null}
             </div>
           )}
           <div>

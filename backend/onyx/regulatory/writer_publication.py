@@ -2,7 +2,7 @@
 
 from collections.abc import Callable
 from time import monotonic
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypedDict
 
 from elasticsearch import Elasticsearch
 
@@ -37,6 +37,10 @@ if TYPE_CHECKING:
     from onyx.db.regulatory_chunks import RegulatoryFileValidityUpdateResult
     from onyx.db.regulatory_writer_publication import OwnedWriterInputs
     from onyx.document_index.interfaces_new import MetadataUpdateRequest
+
+
+class _EmbeddingConcurrencyOptions(TypedDict, total=False):
+    before_embedding_request: Callable[[], None]
 
 
 def execute_writer_publication(
@@ -560,6 +564,33 @@ def republish_user_file(
                     settings.status.is_future() for settings in inputs.settings
                 )
                 targets = {current_search_settings_id}
+            embedding_request_guard: Callable[[], None] | None = None
+            if index_request_attempt_id is not None:
+                from onyx.db.document_intake_embedding import (
+                    current_intake_embedding_scope,
+                )
+
+                canonical_sha256 = publication_digest(
+                    [row.model_dump(mode="json") for row in inputs.canonical]
+                )
+                if current_intake_embedding_scope(
+                    owner, index_request_attempt_id, canonical_sha256=canonical_sha256
+                ):
+
+                    def check_intake_embedding_owner() -> None:
+                        if lost.is_set() or not current_intake_embedding_scope(
+                            owner,
+                            index_request_attempt_id,
+                            canonical_sha256=canonical_sha256,
+                        ):
+                            raise PublicationOwnershipLost(
+                                "intake embedding publication authority changed"
+                            )
+
+                    embedding_request_guard = check_intake_embedding_owner
+            embedding_options: _EmbeddingConcurrencyOptions = {}
+            if embedding_request_guard is not None:
+                embedding_options["before_embedding_request"] = embedding_request_guard
             with ElasticsearchClient() as transport:
                 manifest = prepare_owned_correction(
                     owner,
@@ -568,6 +599,7 @@ def republish_user_file(
                     inputs.canonical,
                     changed_id=None,
                     target_settings_ids=targets,
+                    **embedding_options,
                 )
             manifest = manifest.model_copy(
                 update={

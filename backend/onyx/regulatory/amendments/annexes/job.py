@@ -18,6 +18,7 @@ from onyx.db.amendment_sources import (
 from onyx.db.document_intake_sources import (
     MARKDOWN_INPUT_KIND,
     fail_markdown_source_package,
+    fail_zip_source_package,
 )
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.db.models import RegulatorySourceAsset
@@ -39,6 +40,11 @@ from onyx.regulatory.amendments.annexes.sources import (
 from onyx.regulatory.document_intake.markdown_package import (
     MarkdownPackageError,
     parse_markdown_package,
+)
+from onyx.regulatory.document_intake.source_graph import ZIP_INPUT_KIND
+from onyx.regulatory.document_intake.zip_package import (
+    ZipPackageError,
+    acquire_zip_package,
 )
 from onyx.utils.process_isolation import run_in_isolated_process
 
@@ -139,7 +145,7 @@ def run_source_package(*, package_id: UUID, environment: str) -> None:
                     address = link.original_url
                 if address:
                     cached_by_url[address] = occurrence
-            if previous_manifest["assets"]:
+            if previous_manifest["assets"] and spec.get("kind") != ZIP_INPUT_KIND:
                 root = existing_by_hash[previous_manifest["assets"][0]["sha256"]]
                 payload = _read_verified_asset(store, root)
                 mime_type = root.mime_type
@@ -157,7 +163,18 @@ def run_source_package(*, package_id: UUID, environment: str) -> None:
                 )
             return download_source(address, deadline=acquisition_deadline)
 
-        if spec.get("kind") == MARKDOWN_INPUT_KIND:
+        if spec.get("kind") == ZIP_INPUT_KIND:
+            if payload is None or hashlib.sha256(payload).hexdigest() != spec.get(
+                "input_sha256"
+            ):
+                raise ZipPackageError("zip_input_integrity_changed")
+            result = acquire_zip_package(
+                payload,
+                spec["display_name"],
+                fetch=fetch,
+                deadline=acquisition_deadline,
+            )
+        elif spec.get("kind") == MARKDOWN_INPUT_KIND:
             if payload is None or hashlib.sha256(payload).hexdigest() != spec.get(
                 "input_sha256"
             ):
@@ -343,6 +360,13 @@ def run_source_package(*, package_id: UUID, environment: str) -> None:
                 markdown_format="legislation-markdown-v1",
             )
             manifest = json.dumps(manifest_data, ensure_ascii=False).encode()
+        elif spec.get("kind") == ZIP_INPUT_KIND:
+            manifest_data = result.model_dump(mode="json")
+            manifest_data.update(
+                preparation_method="mixed_document_zip",
+                input_sha256=spec["input_sha256"],
+            )
+            manifest = json.dumps(manifest_data, ensure_ascii=False).encode()
         manifest_id = store.save_file(
             io.BytesIO(manifest),
             display_name="source-manifest.json",
@@ -369,6 +393,16 @@ def run_source_package(*, package_id: UUID, environment: str) -> None:
                 error, MarkdownPackageError
             ):
                 fail_markdown_source_package(
+                    session,
+                    package_id=package_id,
+                    environment=environment,
+                    lease_token=token,
+                    detail=error.public_message,
+                )
+            elif spec.get("kind") == ZIP_INPUT_KIND and isinstance(
+                error, ZipPackageError
+            ):
+                fail_zip_source_package(
                     session,
                     package_id=package_id,
                     environment=environment,

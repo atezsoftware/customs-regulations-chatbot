@@ -1,6 +1,7 @@
 """Date-qualified normal writer preparation using the complete contextual policy."""
 
 import json
+from collections.abc import Callable
 from datetime import date, timedelta
 from uuid import UUID, uuid4
 
@@ -33,6 +34,7 @@ from onyx.regulatory.amendments.annexes.context_dependencies import (
 from onyx.regulatory.amendments.annexes.models import (
     AnnexCanonicalSnapshot,
     AnnexTemporalProjection,
+    FrozenContextProjection,
     PreparedContextView,
 )
 from onyx.regulatory.amendments.annexes.publication_evidence import _encoder_receipt
@@ -44,6 +46,10 @@ from onyx.regulatory.amendments.annexes.publication_representations import (
     _source_template,
 )
 from onyx.regulatory.amendments.annexes.staging import canonical_snapshot_rows
+from onyx.regulatory.document_intake.embedding import (
+    FrozenEmbeddingGroup,
+    encode_intake_embedding_groups,
+)
 from onyx.regulatory.document_intake.temporal_context import (
     intake_temporal_context_rows,
 )
@@ -63,6 +69,56 @@ def _contains(binding: AnnexTemporalProjection, when: date) -> bool:
     )
 
 
+def _embedding_group_key(context: FrozenContextProjection) -> str:
+    return publication_digest(
+        {"texts": context.embedding_texts, "configuration": context.embedding_config}
+    )
+
+
+def _intake_view_vectors(
+    contexts: list[FrozenContextProjection],
+    candidates: list[FrozenPublicationProjection],
+    embedder: DefaultIndexingEmbedder,
+    *,
+    model_dim: int,
+    vector_dimension: int,
+    tenant_id: str,
+    check_owner: Callable[[], None],
+) -> dict[str, list[list[float]]]:
+    groups: dict[str, FrozenEmbeddingGroup] = {}
+    for context in contexts:
+        if any(
+            candidate.embedding_inputs == tuple(context.embedding_texts)
+            and publication_digest(json.loads(candidate.embedding_config_json))
+            == publication_digest(context.embedding_config)
+            for candidate in candidates
+        ):
+            continue
+        texts, configuration = freeze_encoder_inputs(
+            context.embedding_texts,
+            embedder.embedding_model,
+            model_dim=model_dim,
+            formatter=str(context.embedding_config["formatter"]),
+        )
+        if (
+            texts != context.embedding_texts
+            or configuration != context.embedding_config
+        ):
+            raise ValueError("writer encoder differs from complete frozen inputs")
+        key = _embedding_group_key(context)
+        groups.setdefault(key, FrozenEmbeddingGroup(key=key, texts=tuple(texts)))
+    return encode_intake_embedding_groups(
+        list(groups.values()),
+        encode=lambda texts: embedder.embedding_model.encode(
+            texts=texts,
+            text_type=EmbedTextType.PASSAGE,
+            tenant_id=tenant_id,
+        ),
+        expected_dimension=vector_dimension,
+        check_owner=check_owner,
+    )
+
+
 def prepare_owned_correction(
     owner: FileOwnership,
     client: Elasticsearch,
@@ -73,6 +129,7 @@ def prepare_owned_correction(
     target_settings_ids: set[int] | None = None,
     selective_amendment: bool = False,
     audit_cache: ContextAuditResolver | None = None,
+    before_embedding_request: Callable[[], None] | None = None,
 ) -> WriterPublicationManifest:
     """Correct one canonical version, preserving all other legal time windows."""
     authority = PublicationStore(owner.scope)
@@ -411,6 +468,19 @@ def prepare_owned_correction(
                 ),
             )
             views.append(view)
+            concurrent_vectors = (
+                _intake_view_vectors(
+                    view.projections,
+                    candidates_for_reuse,
+                    embedder,
+                    model_dim=settings.model_dim,
+                    vector_dimension=index.vector_dimension,
+                    tenant_id=owner.scope.tenant_id,
+                    check_owner=before_embedding_request,
+                )
+                if before_embedding_request is not None
+                else None
+            )
             for context in view.projections:
                 row = by_id[context.canonical_chunk_id]
                 semantic_previous = matching.get(row.id)
@@ -459,28 +529,31 @@ def prepare_owned_correction(
                     if "title_vector" in actual_source:
                         source["title_vector"] = actual_source["title_vector"]
                 else:
-                    texts, actual_configuration = freeze_encoder_inputs(
-                        context.embedding_texts,
-                        embedder.embedding_model,
-                        model_dim=settings.model_dim,
-                        formatter=str(context.embedding_config["formatter"]),
-                    )
-                    if (
-                        texts != context.embedding_texts
-                        or actual_configuration != context.embedding_config
-                    ):
-                        raise ValueError(
-                            "writer encoder differs from complete frozen inputs"
+                    if concurrent_vectors is not None:
+                        vectors = concurrent_vectors[_embedding_group_key(context)]
+                    else:
+                        texts, actual_configuration = freeze_encoder_inputs(
+                            context.embedding_texts,
+                            embedder.embedding_model,
+                            model_dim=settings.model_dim,
+                            formatter=str(context.embedding_config["formatter"]),
                         )
-                    vectors = _validate_response_vectors(
-                        embedder.embedding_model.encode(
-                            texts=texts,
-                            text_type=EmbedTextType.PASSAGE,
-                            tenant_id=owner.scope.tenant_id,
-                        ),
-                        expected_count=len(texts),
-                        expected_dimension=index.vector_dimension,
-                    )
+                        if (
+                            texts != context.embedding_texts
+                            or actual_configuration != context.embedding_config
+                        ):
+                            raise ValueError(
+                                "writer encoder differs from complete frozen inputs"
+                            )
+                        vectors = _validate_response_vectors(
+                            embedder.embedding_model.encode(
+                                texts=texts,
+                                text_type=EmbedTextType.PASSAGE,
+                                tenant_id=owner.scope.tenant_id,
+                            ),
+                            expected_count=len(texts),
+                            expected_dimension=index.vector_dimension,
+                        )
                     source["content_vector"] = vectors[0]
                     if source.get("title"):
                         source["title_vector"] = vectors[-1]
