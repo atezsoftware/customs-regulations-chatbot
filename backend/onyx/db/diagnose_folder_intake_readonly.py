@@ -33,17 +33,16 @@ def main() -> None:
         pool_size=1,
         max_overflow=0,
     )
-    protected = """
+    queries = {
+        "PROTECTED_CORPUS": """
+            WITH protected AS (
         SELECT f.id FROM user_file f JOIN document_set__user_file m
           ON m.user_file_id = f.id AND m.document_set_id = 15
          WHERE f.created_at < '2026-10-27T14:49:00Z'
            AND f.id NOT IN ('10e927dc-a124-4c6a-85b1-e3619b61b6d3',
                             'a3c6e8cf-93a9-460b-9edf-a9cdd4ba05a9',
                             '16620cfa-0bf4-4540-b8c3-26ad5210c6b5')
-    """
-    queries = {
-        "PROTECTED_CORPUS": f"""
-            WITH protected AS ({protected})
+    )
             SELECT (SELECT count(*) FROM protected) AS files,
                    (SELECT md5(string_agg(md5(to_jsonb(f)::text), '' ORDER BY f.id))
                       FROM user_file f JOIN protected p ON p.id=f.id) AS file_rows_md5,
@@ -51,8 +50,15 @@ def main() -> None:
                    md5(string_agg(md5(to_jsonb(c)::text), '' ORDER BY c.id)) AS canonical_rows_md5
               FROM regulatory_chunk c JOIN protected p ON p.id=c.user_file_id
         """,
-        "PROTECTED_DERIVED_LABELS": f"""
-            WITH protected AS ({protected})
+        "PROTECTED_DERIVED_LABELS": """
+            WITH protected AS (
+        SELECT f.id FROM user_file f JOIN document_set__user_file m
+          ON m.user_file_id = f.id AND m.document_set_id = 15
+         WHERE f.created_at < '2026-10-27T14:49:00Z'
+           AND f.id NOT IN ('10e927dc-a124-4c6a-85b1-e3619b61b6d3',
+                            'a3c6e8cf-93a9-460b-9edf-a9cdd4ba05a9',
+                            '16620cfa-0bf4-4540-b8c3-26ad5210c6b5')
+    )
             SELECT count(*) AS rows,
                    md5(string_agg(md5(to_jsonb(d)::text), '' ORDER BY d.id)) AS rows_md5
               FROM regulatory_derived_label_projection d
