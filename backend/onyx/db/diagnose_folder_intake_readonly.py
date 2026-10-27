@@ -34,6 +34,33 @@ def main() -> None:
         max_overflow=0,
     )
     queries = {
+        "FROZEN_SOURCE_RAW_DUPLICATES": """
+            WITH incoming AS (
+                SELECT id, package_id, sha256, display_name FROM regulatory_source_asset
+                 WHERE package_id IN (
+                    '8a4c1bb2-66f0-4a6d-bb3b-dfb3adf4b73b',
+                    '0e8a9538-c59f-4451-a513-3c9ce71971a3',
+                    'c85b6a1d-0dca-4968-b4a5-f4011fc32a7c',
+                    '08dd6e41-7c67-4dfa-9c64-48a0d3d33a3a',
+                    'f71bd843-0827-4264-976b-911d00930022',
+                    '93064b06-86f1-4b3d-aaa4-279471e6e1f8',
+                    '0d558987-0ebb-49c1-9a35-fe9e619bde8e',
+                    'aae7aa45-1a84-4838-bd13-ae3c1ce632db')
+            ), old_receipts AS (
+                SELECT f.id, f.name, p.original_ingestion_receipt->>'raw_sha256' AS sha256
+                  FROM user_file f JOIN document_set__user_file m
+                    ON m.user_file_id=f.id AND m.document_set_id=15
+                  JOIN regulatory_file_publication p ON p.user_file_id=f.id
+                 WHERE f.created_at < '2026-10-27T14:49:00Z'
+                   AND p.original_ingestion_receipt->>'raw_sha256' IS NOT NULL
+            )
+            SELECT a.id AS source_asset_id, a.package_id, a.display_name, a.sha256,
+                   (SELECT count(*) FROM old_receipts) AS comparable_old_originals,
+                   coalesce(jsonb_agg(jsonb_build_object('file_id',o.id,'name',o.name)
+                            ORDER BY o.id) FILTER (WHERE o.id IS NOT NULL),'[]') AS old_matches
+              FROM incoming a LEFT JOIN old_receipts o ON o.sha256=a.sha256
+             GROUP BY a.id,a.package_id,a.display_name,a.sha256 ORDER BY a.id
+        """,
         "RECENT_DIRECT_CACHE_COUNTS": """
             SELECT split_part(file_id, '/', 2) AS provider_binding,
                    count(*) FILTER (WHERE file_id LIKE '%/manifest.json') AS request_groups,
