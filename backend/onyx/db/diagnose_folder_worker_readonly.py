@@ -7,6 +7,11 @@ import subprocess
 from onyx.background.celery.versioned_apps.regulatory_annex import app
 from onyx.regulatory.amendments.annexes.config import source_queue_name
 
+OWNED_FILES = (
+    "10e927dc-a124-4c6a-85b1-e3619b61b6d3",
+    "a3c6e8cf-93a9-460b-9edf-a9cdd4ba05a9",
+)
+
 
 def main() -> None:
     print("SOURCE_QUEUE", source_queue_name(), flush=True)
@@ -15,6 +20,20 @@ def main() -> None:
         result = getattr(inspector, method)()
         bounded = {}
         for worker, items in (result or {}).items():
+            if method in {"active", "reserved"}:
+                for item in items:
+                    if item.get("name") != "index_single_user_file":
+                        continue
+                    arguments = json.dumps(
+                        [item.get("args"), item.get("kwargs")], default=str
+                    )
+                    owned = [identifier for identifier in OWNED_FILES if identifier in arguments]
+                    if owned:
+                        print("OWNED_INDEX_WORKER", json.dumps({
+                            "worker": worker, "inspection": method,
+                            "file_ids": owned,
+                            **{key: item.get(key) for key in ("id", "name", "time_start")},
+                        }, default=str), flush=True)
             if method == "active_queues":
                 bounded[worker] = [
                     item.get("name")

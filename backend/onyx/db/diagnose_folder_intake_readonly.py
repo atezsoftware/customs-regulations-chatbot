@@ -38,11 +38,14 @@ def main() -> None:
             SELECT f.id, f.status AS file_status, r.attempt_id,
                    r.status AS repair_status, r.updated_at AS repair_updated_at,
                    r.failure_code, j.id AS job_id, j.status AS job_status,
+                   p.epoch, p.gate_closed, p.lease_expires_at AS publication_lease_expires_at,
+                   p.writer_manifest IS NOT NULL AS has_pending_manifest,
                    j.stage AS job_stage, j.heartbeat_at, j.next_retry_at,
                    j.error_code, j.error_message,
                    j.remote_vertex_job_name IS NOT NULL AS has_remote_vertex_job,
                    j.remote_openrouter_batch_id IS NOT NULL AS has_remote_openrouter_job
               FROM user_file f LEFT JOIN user_file_projection_repair r ON r.user_file_id=f.id
+              LEFT JOIN regulatory_file_publication p ON p.user_file_id=f.id
               LEFT JOIN regulatory_indexing_job j ON j.user_file_id=f.id
              WHERE f.id IN ('10e927dc-a124-4c6a-85b1-e3619b61b6d3',
                             'a3c6e8cf-93a9-460b-9edf-a9cdd4ba05a9')
