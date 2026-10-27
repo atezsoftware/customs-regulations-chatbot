@@ -10,6 +10,8 @@ import {
 import type {
   DocumentIntakeBatch,
   IntakeRepreparePreview,
+  IntakeExistingParentCandidate,
+  IntakePublicationSelection,
 } from "@/lib/regulatory/documentIntake";
 import type { AmendmentSourcePackage } from "@/lib/regulatory/amendments";
 import NewDocumentIntake from "@/views/admin/NewDocumentIntake";
@@ -316,6 +318,333 @@ function mockApi(
   global.fetch = fetchMock;
   return fetchMock;
 }
+
+function mockPublicationApi(
+  initialBatch: DocumentIntakeBatch,
+  parents: IntakeExistingParentCandidate[] = []
+) {
+  const fetchMock = mockApi({ history: [initialBatch] });
+  const original = fetchMock.getMockImplementation()!;
+  let current = initialBatch;
+  fetchMock.mockImplementation(async (input, init) => {
+    const url = String(input);
+    if (url === `${base}/batches/intake-1`) return json(current);
+    if (url.includes("/existing-parent-candidates?")) return json(parents);
+    const id = url.match(/\/documents\/([^/]+)\/publication-review$/)?.[1];
+    if (id && init?.method === "PUT") {
+      const selection = JSON.parse(
+        String(init.body)
+      ) as IntakePublicationSelection;
+      current = {
+        ...current,
+        status: "ready",
+        stage: "review",
+        review_sha256: "9".repeat(64),
+        edit_review_sha256: "9".repeat(64),
+        publication_review_sha256: "8".repeat(64),
+        labeling_failed_count: 0,
+        documents: current.documents.map((document) =>
+          document.id === id
+            ? {
+                ...document,
+                status:
+                  selection.disposition === "source_evidence"
+                    ? "source_evidence"
+                    : "ready",
+                publication_disposition: selection.disposition,
+                duplicate_of_document_id: selection.duplicate_of_document_id,
+                existing_parent:
+                  parents.find(
+                    (parent) =>
+                      parent.user_file_id === selection.existing_parent_file_id
+                  ) ?? null,
+                publication_review: {
+                  decision_id: "decision-1",
+                  reason: selection.reason,
+                  reviewed_at: "2026-10-27T18:00:00Z",
+                },
+              }
+            : document
+        ),
+      };
+      current.active_document_count = current.documents.filter(
+        (document) => document.publication_disposition !== "source_evidence"
+      ).length;
+      return json(current);
+    }
+    return original(input, init);
+  });
+  return fetchMock;
+}
+
+test("retains another rendition as readonly source evidence and can restore it before approval", async () => {
+  const batch: DocumentIntakeBatch = {
+    ...readyBatch,
+    status: "partial",
+    stage: "labeling",
+    review_sha256: null,
+    edit_review_sha256: null,
+    publication_review_sha256: "7".repeat(64),
+    active_document_count: 3,
+    documents: [
+      { ...readyBatch.documents[0]!, display_name: "Main regulation.pdf" },
+      readyBatch.documents[1]!,
+      {
+        ...readyBatch.documents[0]!,
+        id: "html",
+        asset_id: "html-asset",
+        user_file_id: "file-html",
+        display_name: "Other rendition.html",
+      },
+    ],
+  };
+  const fetchMock = mockPublicationApi(batch);
+  const user = setupUser();
+  render(<NewDocumentIntake />);
+  await user.click(
+    await screen.findByRole("button", { name: "Main regulation.pdf (partial)" })
+  );
+  const html = screen.getByRole("region", { name: "Other rendition.html" });
+  const linkedAnnex = screen.getByRole("region", { name: "EK-1.pdf" });
+  await user.click(
+    within(linkedAnnex).getByRole("button", {
+      name: "Review document identity",
+    })
+  );
+  expect(
+    within(linkedAnnex).getByText(
+      "This attachment already has a parent in this import. Its existing source relationship is kept."
+    )
+  ).toBeVisible();
+  expect(
+    within(linkedAnnex).queryByRole("button", {
+      name: "Search existing parent",
+    })
+  ).not.toBeInTheDocument();
+  expect(
+    fetchMock.mock.calls.some(([url]) =>
+      String(url).includes("/documents/annex/existing-parent-candidates")
+    )
+  ).toBe(false);
+  await user.click(
+    within(linkedAnnex).getByRole("button", {
+      name: "Hide document identity review",
+    })
+  );
+  await user.click(
+    within(html).getByRole("button", { name: "Review document identity" })
+  );
+  await user.click(
+    within(html).getByRole("button", {
+      name: "Keep as source evidence of Main regulation.pdf",
+    })
+  );
+  expect(
+    screen.getByRole("button", { name: "Approve all new documents" })
+  ).toBeDisabled();
+  expect(
+    screen.getByRole("button", { name: "Start another import" })
+  ).toBeDisabled();
+  expect(
+    within(html).getByRole("button", { name: "Save document identity review" })
+  ).toBeDisabled();
+  await user.type(
+    within(html).getByLabelText(
+      "Document identity review reason for Other rendition.html"
+    ),
+    "The same original publication is already retained as the PDF."
+  );
+  await user.click(
+    within(html).getByRole("button", { name: "Save document identity review" })
+  );
+  expect(await screen.findByText("2 new files · 2 added chunks")).toBeVisible();
+  expect(within(html).getByText("Source evidence only")).toBeVisible();
+  expect(within(html).queryByText("New legislation")).not.toBeInTheDocument();
+  expect(
+    within(html).queryByRole("region", { name: /^Added chunk/ })
+  ).not.toBeInTheDocument();
+  await user.click(
+    within(html).getByRole("button", { name: "Show retained source chunks" })
+  );
+  expect(
+    await within(html).findByRole("region", { name: "Retained source chunk 1" })
+  ).toBeVisible();
+  expect(within(html).queryByLabelText("After text")).not.toBeInTheDocument();
+  expect(
+    screen.getByRole("button", { name: "Approve all new documents" })
+  ).toBeEnabled();
+  const firstSave = fetchMock.mock.calls.find(([url]) =>
+    String(url).endsWith("/documents/html/publication-review")
+  )!;
+  expect(JSON.parse(String(firstSave[1]?.body))).toEqual({
+    expected_review_sha256: "7".repeat(64),
+    disposition: "source_evidence",
+    duplicate_of_document_id: "root",
+    existing_parent_file_id: null,
+    reason: "The same original publication is already retained as the PDF.",
+  });
+  await user.click(
+    within(html).getByRole("button", { name: "Keep as new legislation" })
+  );
+  await user.type(
+    within(html).getByLabelText(
+      "Document identity review reason for Other rendition.html"
+    ),
+    "Restore this rendition to the legislation review."
+  );
+  await user.click(
+    within(html).getByRole("button", { name: "Save document identity review" })
+  );
+  expect(await screen.findByText("3 new files · 3 added chunks")).toBeVisible();
+  expect(within(html).getByText("New legislation")).toBeVisible();
+  const saves = fetchMock.mock.calls.filter(([url]) =>
+    String(url).endsWith("/documents/html/publication-review")
+  );
+  expect(JSON.parse(String(saves[1]?.[1]?.body))).toEqual({
+    expected_review_sha256: "8".repeat(64),
+    disposition: "legislation",
+    duplicate_of_document_id: null,
+    existing_parent_file_id: null,
+    reason: "Restore this rendition to the legislation review.",
+  });
+  expect(
+    fetchMock.mock.calls.some(([url]) => String(url).endsWith("/approve"))
+  ).toBe(false);
+});
+
+test("links a new attachment to an existing parent and opens its chunks without editing the existing file", async () => {
+  const parent: IntakeExistingParentCandidate = {
+    user_file_id: "existing-parent",
+    display_name: "Existing 2022 regulation",
+    source_url: "https://example.gov/20220618-8.htm",
+    chunk_count: 132,
+  };
+  const batch: DocumentIntakeBatch = {
+    ...readyBatch,
+    publication_review_sha256: "7".repeat(64),
+    documents: readyBatch.documents.map((document) =>
+      document.id === "annex"
+        ? { ...document, role: "root", parent_document_id: null }
+        : document
+    ),
+  };
+  const fetchMock = mockPublicationApi(batch, [parent]);
+  const original = fetchMock.getMockImplementation()!;
+  fetchMock.mockImplementation(async (input, init) => {
+    if (String(input) === `${base}/files/existing-parent/lineage`)
+      return json({
+        user_file_id: "existing-parent",
+        title: parent.display_name,
+        status: "current",
+        effective_date: null,
+        predecessors: [],
+        successors: [],
+        existing_parents: [],
+        attachments: [],
+      });
+    if (
+      String(input).startsWith(
+        "/api/regulatory/files/existing-parent/chunks/page?"
+      )
+    )
+      return json({
+        items: [
+          {
+            id: "existing-chunk",
+            text: "The existing legal text remains unchanged.",
+          },
+        ],
+        total: 1,
+        offset: 0,
+        limit: 10,
+      });
+    return original(input, init);
+  });
+  const user = setupUser();
+  render(<NewDocumentIntake />);
+  await user.click(
+    await screen.findByRole("button", { name: "Main regulation.html (ready)" })
+  );
+  const annex = screen.getByRole("region", { name: "EK-1.pdf" });
+  await user.click(
+    within(annex).getByRole("button", { name: "Review document identity" })
+  );
+  await user.type(
+    within(annex).getByLabelText("Search existing parent for EK-1.pdf"),
+    "Existing 2022"
+  );
+  await user.click(
+    within(annex).getByRole("button", { name: "Search existing parent" })
+  );
+  expect(
+    await within(annex).findByText(
+      "132 existing chunks · https://example.gov/20220618-8.htm"
+    )
+  ).toBeVisible();
+  await user.click(
+    within(annex).getByRole("button", {
+      name: "Select existing parent Existing 2022 regulation",
+    })
+  );
+  await user.type(
+    within(annex).getByLabelText(
+      "Document identity review reason for EK-1.pdf"
+    ),
+    "This is the separately linked annex of that existing publication."
+  );
+  expect(
+    screen.getByRole("button", { name: "Approve all new documents" })
+  ).toBeDisabled();
+  await user.click(
+    within(annex).getByRole("button", { name: "Save document identity review" })
+  );
+  expect(
+    await within(annex).findByText(
+      "Attachment to existing legislation: Existing 2022 regulation"
+    )
+  ).toBeVisible();
+  await user.click(
+    within(annex).getByRole("button", { name: "Open existing parent" })
+  );
+  const preview = await within(annex).findByRole("region", {
+    name: "Existing parent: Existing 2022 regulation",
+  });
+  expect(
+    await within(preview).findByText(
+      "The existing legal text remains unchanged."
+    )
+  ).toBeVisible();
+  expect(
+    within(preview).getByText("Existing legislation · read only")
+  ).toBeVisible();
+  expect(within(preview).queryByRole("textbox")).not.toBeInTheDocument();
+  expect(
+    within(preview).getByRole("link", {
+      name: "Open existing parent document PDF",
+    })
+  ).toHaveAttribute("href", "/api/regulatory/files/existing-parent/pdf");
+  expect(fetchMock).toHaveBeenCalledWith(
+    `${base}/batches/intake-1/documents/annex/existing-parent-candidates?search=Existing%202022&limit=20`,
+    undefined
+  );
+  const save = fetchMock.mock.calls.find(([url]) =>
+    String(url).endsWith("/documents/annex/publication-review")
+  )!;
+  expect(JSON.parse(String(save[1]?.body))).toEqual({
+    expected_review_sha256: "7".repeat(64),
+    disposition: "legislation",
+    duplicate_of_document_id: null,
+    existing_parent_file_id: "existing-parent",
+    reason: "This is the separately linked annex of that existing publication.",
+  });
+  expect(
+    fetchMock.mock.calls.some(
+      ([url, init]) =>
+        String(url).startsWith("/api/regulatory/files/existing-parent") &&
+        init?.method
+    )
+  ).toBe(false);
+});
 
 test("previews separate main and attachment documents and approves only the reviewed new import", async () => {
   const fetchMock = mockApi();

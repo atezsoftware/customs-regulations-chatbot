@@ -9,6 +9,9 @@ import { toast } from "@opal/layouts";
 import { ChunkContent } from "@/sections/cards/ChunkChangeCard";
 import IntakeChunkReviewCard from "@/sections/cards/IntakeChunkReviewCard";
 import IntakePredecessorReview from "@/sections/cards/IntakePredecessorReview";
+import IntakePublicationReview, {
+  RetainedSourceChunk,
+} from "@/sections/cards/IntakePublicationReview";
 import IntakeSourceIssues from "@/views/admin/IntakeSourceIssues";
 import {
   type AmendmentSourcePackage,
@@ -22,6 +25,7 @@ import {
   type IntakeDocument,
   type IntakeChunkUpdate,
   type IntakeLineageSelection,
+  type IntakePublicationSelection,
   approveDocumentIntakeBatch,
   createDocumentIntakeBatch,
   getDocumentIntakeBatch,
@@ -37,6 +41,7 @@ import {
   updateDocumentIntakeChunk,
   updateDocumentIntakeChunks,
   saveDocumentIntakePredecessorSelection,
+  saveDocumentIntakePublicationReview,
 } from "@/lib/regulatory/documentIntake";
 
 import {
@@ -144,6 +149,11 @@ interface DocumentPreviewProps {
     selection: IntakeLineageSelection,
     expectedReviewSha256: string
   ) => Promise<void>;
+  onSavePublication: (
+    documentId: string,
+    selection: IntakePublicationSelection,
+    expectedReviewSha256: string
+  ) => Promise<void>;
 }
 
 function documentCardId(documentId: string): string {
@@ -169,11 +179,13 @@ function DocumentPreview({
   onDirtyChange,
   onSaveChunk,
   onSaveLineage,
+  onSavePublication,
   chunkDrafts,
   draftEpoch,
   onChunkDraftChange,
 }: DocumentPreviewProps) {
-  const [expanded, setExpanded] = useState(true);
+  const sourceEvidence = document.publication_disposition === "source_evidence";
+  const [expanded, setExpanded] = useState(!sourceEvidence);
   const [offset, setOffset] = useState(0);
   const editReceipt =
     batch.edit_review_sha256 ??
@@ -184,6 +196,7 @@ function DocumentPreview({
     [document.id, onChunkDraftChange]
   );
   const cardRef = useRef<HTMLElement>(null);
+  useEffect(() => setExpanded(!sourceEvidence), [sourceEvidence]);
   useEffect(() => {
     if (navigation?.documentId !== document.id) return;
     setExpanded(true);
@@ -212,6 +225,9 @@ function DocumentPreview({
   const parent = batch.documents.find(
     (item) => item.id === document.parent_document_id
   );
+  const duplicateOf = batch.documents.find(
+    (item) => item.id === document.duplicate_of_document_id
+  );
   const documentLinks = (document.document_links ?? []).filter((link) =>
     batch.documents.some((item) => item.id === link.target_document_id)
   );
@@ -227,7 +243,7 @@ function DocumentPreview({
       ref={cardRef}
       id={documentCardId(document.id)}
       tabIndex={-1}
-      aria-label={document.display_name}
+      aria-label={`${document.display_name}${document.mime_type ? ` · ${document.mime_type}` : ""}`}
       className="flex flex-col gap-3 rounded-12 border border-border-02 p-4"
     >
       <div className="flex flex-wrap items-center justify-between gap-2">
@@ -235,15 +251,52 @@ function DocumentPreview({
           {document.display_name}
         </Text>
         <div className="flex flex-wrap gap-2">
-          <Tag title="New legislation" />
+          <Tag
+            title={sourceEvidence ? "Source evidence only" : "New legislation"}
+          />
+          {document.mime_type && <Tag title={document.mime_type} />}
           <Tag title={document.status.replaceAll("_", " ")} />
         </div>
       </div>
       <Text font="secondary-body" color="text-03">
-        {document.role === "root"
-          ? "Main document"
-          : `Attachment to ${parent?.display_name ?? "main document"}`}
+        {sourceEvidence
+          ? `Another rendition of ${duplicateOf?.display_name ?? "the selected document"}`
+          : document.existing_parent
+            ? `Attachment to existing legislation: ${document.existing_parent.display_name}`
+            : document.role === "root"
+              ? "Main document"
+              : `Attachment to ${parent?.display_name ?? "main document"}`}
       </Text>
+      {document.source_display_name && (
+        <Text
+          font="secondary-body"
+          color="text-03"
+        >{`Original source: ${document.source_display_name}`}</Text>
+      )}
+      {sourceEvidence && (
+        <div className="flex flex-col gap-2 rounded-08 border border-border-02 p-3">
+          <Text font="secondary-body">
+            This rendition is retained as source evidence. Its original, chunks
+            and review are kept. It is excluded from labeling, approval and
+            indexing as another legislation.
+          </Text>
+          <Text font="secondary-body" color="text-03">
+            {batch.status === "completed"
+              ? "It is retained in this import's evidence, outside the PC Külliyatı legislation list."
+              : "Approval keeps its evidence in this import and removes the separate rendition from the PC Külliyatı legislation list."}
+          </Text>
+          {duplicateOf && (
+            <div>
+              <Button
+                prominence="tertiary"
+                href={`#${documentCardId(duplicateOf.id)}`}
+                disabled={busy}
+                onClick={() => onNavigate(duplicateOf.id)}
+              >{`Open legislation ${duplicateOf.display_name}`}</Button>
+            </div>
+          )}
+        </div>
+      )}
       {(parent || relatedDocuments.length > 0) && (
         <div className="flex flex-wrap gap-2">
           {parent && (
@@ -275,116 +328,152 @@ function DocumentPreview({
           color="text-03"
         >{`Source: ${document.source_url}`}</Text>
       )}
-      <Text font="main-ui-action">{`${document.chunk_count} added chunks`}</Text>
-      {Boolean(document.labeling_failed_count) && (
+      <Text font="main-ui-action">{`${document.chunk_count} ${sourceEvidence ? "retained source chunks" : "added chunks"}`}</Text>
+      {!sourceEvidence && Boolean(document.labeling_failed_count) && (
         <Text as="p" color="status-error-05">
           {`${document.labeling_failed_count} chunks with failed labeling in this file`}
         </Text>
       )}
-      <Text font="secondary-action">File labels</Text>
-      <Labels value={document.labels} pending={batch.status === "preparing"} />
+      {!sourceEvidence && (
+        <>
+          <Text font="secondary-action">File labels</Text>
+          <Labels
+            value={document.labels}
+            pending={batch.status === "preparing"}
+          />
+        </>
+      )}
       {document.error && (
         <Text as="p" color="status-error-05">
           {document.error}
         </Text>
       )}
+      <IntakePublicationReview
+        batch={batch}
+        document={document}
+        disabled={
+          busy ||
+          (dirtyKeys.size > 0 && !dirtyKeys.has(`publication:${document.id}`))
+        }
+        onDirtyChange={onDirtyChange}
+        onSave={(selection, expectedReviewSha256) =>
+          onSavePublication(document.id, selection, expectedReviewSha256)
+        }
+      />
       {document.chunk_count > 0 && (
         <Button
           prominence="tertiary"
           disabled={busy}
           onClick={() => setExpanded(!expanded)}
         >
-          {expanded ? "Hide chunks" : "Show added chunks"}
+          {expanded
+            ? "Hide chunks"
+            : sourceEvidence
+              ? "Show retained source chunks"
+              : "Show added chunks"}
         </Button>
       )}
       {expanded && document.chunk_count > 0 && (
         <>
           {error && <Text color="status-error-05">{errorMessage(error)}</Text>}
           {!data && !error && <Text>Loading chunks…</Text>}
-          {data?.items.map((chunk) => (
-            <IntakeChunkReviewCard
-              key={`${chunk.id}:${draftEpoch}`}
-              chunk={chunk}
-              documentName={document.display_name}
-              sourceUrl={document.source_url}
-              reviewSha256={editReceipt}
-              editable={
-                ["ready", "partial"].includes(batch.status) &&
-                Boolean(editReceipt)
-              }
-              disabled={
-                busy ||
-                Array.from(dirtyKeys).some((key) => key.startsWith("lineage:"))
-              }
-              persistedDraft={chunkDrafts[chunk.id]?.draft}
-              onDraftChange={onDraftChange}
-              saveDisabled={Object.keys(chunkDrafts).length > 1}
-              onSave={(draft, expectedReviewSha256) =>
-                onSaveChunk(document.id, chunk.id, draft, expectedReviewSha256)
-              }
-            >
-              <ChunkContent
-                text={chunk.text}
-                components={{
-                  a: ({ children, href, node: _node, ...props }) => {
-                    if (!href) return <>{children}</>;
-                    const linkedDocument = documentLinks.find(
-                      (link) =>
-                        normalizedDocumentHref(link.href) ===
-                        normalizedDocumentHref(href)
-                    );
-                    const className =
-                      "text-link hover:text-link-hover underline underline-offset-2";
-                    if (linkedDocument)
+          {data?.items.map((chunk) =>
+            sourceEvidence ? (
+              <RetainedSourceChunk key={chunk.id} chunk={chunk} />
+            ) : (
+              <IntakeChunkReviewCard
+                key={`${chunk.id}:${draftEpoch}`}
+                chunk={chunk}
+                documentName={document.display_name}
+                sourceUrl={document.source_url}
+                reviewSha256={editReceipt}
+                editable={
+                  ["ready", "partial"].includes(batch.status) &&
+                  Boolean(editReceipt)
+                }
+                disabled={
+                  busy ||
+                  Array.from(dirtyKeys).some(
+                    (key) =>
+                      key.startsWith("lineage:") ||
+                      key.startsWith("publication:")
+                  )
+                }
+                persistedDraft={chunkDrafts[chunk.id]?.draft}
+                onDraftChange={onDraftChange}
+                saveDisabled={Object.keys(chunkDrafts).length > 1}
+                onSave={(draft, expectedReviewSha256) =>
+                  onSaveChunk(
+                    document.id,
+                    chunk.id,
+                    draft,
+                    expectedReviewSha256
+                  )
+                }
+              >
+                <ChunkContent
+                  text={chunk.text}
+                  components={{
+                    a: ({ children, href, node: _node, ...props }) => {
+                      if (!href) return <>{children}</>;
+                      const linkedDocument = documentLinks.find(
+                        (link) =>
+                          normalizedDocumentHref(link.href) ===
+                          normalizedDocumentHref(href)
+                      );
+                      const className =
+                        "text-link hover:text-link-hover underline underline-offset-2";
+                      if (linkedDocument)
+                        return (
+                          <a
+                            {...props}
+                            className={className}
+                            href={`#${documentCardId(linkedDocument.target_document_id)}`}
+                            onClick={() =>
+                              onNavigate(linkedDocument.target_document_id)
+                            }
+                          >
+                            {children}
+                          </a>
+                        );
+                      if (href.startsWith("/") || href.startsWith("#"))
+                        return (
+                          <Link
+                            {...props}
+                            className={className}
+                            href={href as Route}
+                          >
+                            {children}
+                          </Link>
+                        );
                       return (
                         <a
                           {...props}
                           className={className}
-                          href={`#${documentCardId(linkedDocument.target_document_id)}`}
-                          onClick={() =>
-                            onNavigate(linkedDocument.target_document_id)
-                          }
+                          href={href}
+                          {...(/^https?:/i.test(href)
+                            ? { target: "_blank", rel: "noopener noreferrer" }
+                            : {})}
                         >
                           {children}
                         </a>
                       );
-                    if (href.startsWith("/") || href.startsWith("#"))
-                      return (
-                        <Link
-                          {...props}
-                          className={className}
-                          href={href as Route}
-                        >
-                          {children}
-                        </Link>
-                      );
-                    return (
-                      <a
-                        {...props}
-                        className={className}
-                        href={href}
-                        {...(/^https?:/i.test(href)
-                          ? { target: "_blank", rel: "noopener noreferrer" }
-                          : {})}
-                      >
-                        {children}
-                      </a>
-                    );
-                  },
-                }}
-              />
-              <Text font="secondary-action">Chunk labels</Text>
-              <Labels
-                value={chunk.chunk_metadata.labels}
-                pending={batch.status === "preparing"}
-                failed={hasIntakeLabelingProblem(chunk)}
-              />
-              <Text
-                font="secondary-body"
-                color="text-03"
-              >{`Type: ${chunk.chunk_type ?? "text"} · Validity: ${chunk.validity_start_date ?? "—"} → ${chunk.validity_end_date ?? "open"}`}</Text>
-            </IntakeChunkReviewCard>
-          ))}
+                    },
+                  }}
+                />
+                <Text font="secondary-action">Chunk labels</Text>
+                <Labels
+                  value={chunk.chunk_metadata.labels}
+                  pending={batch.status === "preparing"}
+                  failed={hasIntakeLabelingProblem(chunk)}
+                />
+                <Text
+                  font="secondary-body"
+                  color="text-03"
+                >{`Type: ${chunk.chunk_type ?? "text"} · Validity: ${chunk.validity_start_date ?? "—"} → ${chunk.validity_end_date ?? "open"}`}</Text>
+              </IntakeChunkReviewCard>
+            )
+          )}
           {data && data.total > data.limit && (
             <div className="flex items-center gap-2">
               <Button
@@ -413,18 +502,20 @@ function DocumentPreview({
             : "No chunks are available for this document."}
         </Text>
       )}
-      <IntakePredecessorReview
-        batch={batch}
-        document={document}
-        disabled={
-          busy ||
-          (dirtyKeys.size > 0 && !dirtyKeys.has(`lineage:${document.id}`))
-        }
-        onDirtyChange={onDirtyChange}
-        onSave={(selection, expectedReviewSha256) =>
-          onSaveLineage(document.id, selection, expectedReviewSha256)
-        }
-      />
+      {!sourceEvidence && (
+        <IntakePredecessorReview
+          batch={batch}
+          document={document}
+          disabled={
+            busy ||
+            (dirtyKeys.size > 0 && !dirtyKeys.has(`lineage:${document.id}`))
+          }
+          onDirtyChange={onDirtyChange}
+          onSave={(selection, expectedReviewSha256) =>
+            onSaveLineage(document.id, selection, expectedReviewSha256)
+          }
+        />
+      )}
     </section>
   );
 }
@@ -538,6 +629,14 @@ export default function NewDocumentIntake() {
     }
   );
   const batch = batchData?.id === initialBatch?.id ? batchData : initialBatch;
+  const activeDocuments =
+    batch?.documents.filter(
+      (document) => document.publication_disposition !== "source_evidence"
+    ) ?? [];
+  const sourceEvidenceDocuments =
+    batch?.documents.filter(
+      (document) => document.publication_disposition === "source_evidence"
+    ) ?? [];
   const reprepareAvailable = Boolean(
     batch && ["ready", "partial", "failed"].includes(batch.status)
   );
@@ -991,7 +1090,12 @@ export default function NewDocumentIntake() {
             font="heading-h3"
           >{`New documents: ${batch.status}`}</Text>
           <Text font="secondary-body">{batch.stage.replaceAll("_", " ")}</Text>
-          <Text font="main-ui-action">{`${batch.documents.length} new files · ${batch.documents.reduce((total, document) => total + document.chunk_count, 0)} added chunks`}</Text>
+          <Text font="main-ui-action">{`${batch.active_document_count ?? activeDocuments.length} new files · ${activeDocuments.reduce((total, document) => total + document.chunk_count, 0)} added chunks`}</Text>
+          {sourceEvidenceDocuments.length > 0 && (
+            <Text font="secondary-body" color="text-03">
+              {`${sourceEvidenceDocuments.length} source renditions retained as evidence · excluded from new legislation`}
+            </Text>
+          )}
           {Boolean(batch.labeling_failed_count) && (
             <Text as="p" color="status-error-05">
               {`${batch.labeling_failed_count} chunks with failed labeling across this import`}
@@ -1082,6 +1186,22 @@ export default function NewDocumentIntake() {
                     expectedReviewSha256,
                     selection
                   )
+                )
+              }
+              onSavePublication={(
+                documentId,
+                selection,
+                expectedReviewSha256
+              ) =>
+                saveReview(
+                  () =>
+                    saveDocumentIntakePublicationReview(
+                      batch.id,
+                      documentId,
+                      expectedReviewSha256,
+                      selection
+                    ),
+                  true
                 )
               }
               onNavigate={(documentId) => {
@@ -1183,6 +1303,7 @@ export default function NewDocumentIntake() {
                 busy ||
                 dirtyKeys.size > 0 ||
                 batch.status !== "ready" ||
+                activeDocuments.length === 0 ||
                 !batch.review_sha256 ||
                 Boolean(batchError)
               }

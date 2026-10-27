@@ -45,3 +45,52 @@ test("shows the successor and explicit repeal on the old legislation and opens t
     undefined
   );
 });
+
+test("opens published parents and attachments as navigation without treating them as succession or repeal", async () => {
+  global.fetch = jest.fn().mockResolvedValue({
+    ok: true,
+    json: async () => ({
+      user_file_id: "current-file",
+      title: "Existing regulation",
+      status: "current",
+      effective_date: null,
+      predecessors: [],
+      successors: [],
+      existing_parents: [
+        {
+          user_file_id: "parent-file",
+          display_name: "Parent regulation",
+          source_url: "https://example.gov/20220618-8.htm",
+        },
+      ],
+      attachments: [
+        {
+          user_file_id: "child-file",
+          display_name: "Published EK-1",
+          source_url: "https://example.gov/20220618-8-1.pdf",
+        },
+      ],
+    }),
+  });
+  const open = jest.fn();
+  const user = setupUser();
+  render(
+    <LegislationLineageCard fileId="current-file" onOpenRelatedFile={open} />
+  );
+  expect(await screen.findByText("Current")).toBeVisible();
+  expect(screen.getByText("Existing parent: Parent regulation")).toBeVisible();
+  expect(screen.getByText("Attachment: Published EK-1")).toBeVisible();
+  expect(screen.getByText("https://example.gov/20220618-8.htm")).toBeVisible();
+  expect(screen.queryByText("Repealed")).not.toBeInTheDocument();
+  expect(screen.queryByText(/^Successor:/)).not.toBeInTheDocument();
+  await user.click(
+    screen.getByRole("button", { name: "Open Parent regulation" })
+  );
+  await user.click(screen.getByRole("button", { name: "Open Published EK-1" }));
+  expect(open.mock.calls).toEqual([["parent-file"], ["child-file"]]);
+  expect(global.fetch).toHaveBeenCalledTimes(1);
+  expect(global.fetch).toHaveBeenCalledWith(
+    "/api/regulatory/document-intake/files/current-file/lineage",
+    undefined
+  );
+});

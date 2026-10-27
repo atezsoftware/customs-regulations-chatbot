@@ -87,6 +87,39 @@ export default function LegislationLineageCard({
               )}
             </div>
           ))}
+          {[
+            ...(data.existing_parents ?? []).map((file) => ({
+              ...file,
+              direction: "Existing parent",
+            })),
+            ...(data.attachments ?? []).map((file) => ({
+              ...file,
+              direction: "Attachment",
+            })),
+          ].map((file) => (
+            <div
+              key={`${file.direction}:${file.user_file_id}`}
+              className="flex flex-col gap-1 border-t border-border-02 pt-2"
+            >
+              <Text font="secondary-action">{`${file.direction}: ${file.display_name}`}</Text>
+              <Text font="secondary-body" color="text-03">
+                Published attachment relationship
+              </Text>
+              {file.source_url && (
+                <Text font="secondary-body" color="text-03">
+                  {file.source_url}
+                </Text>
+              )}
+              {onOpenRelatedFile && (
+                <div>
+                  <Button
+                    prominence="tertiary"
+                    onClick={() => onOpenRelatedFile(file.user_file_id)}
+                  >{`Open ${file.display_name}`}</Button>
+                </div>
+              )}
+            </div>
+          ))}
         </>
       )}
     </section>

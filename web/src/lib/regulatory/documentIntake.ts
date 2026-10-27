@@ -16,6 +16,8 @@ export interface IntakeDocument {
   id: string;
   asset_id: string;
   display_name: string;
+  source_display_name?: string | null;
+  mime_type?: string | null;
   role: "root" | "annex";
   parent_document_id: string | null;
   source_url: string | null;
@@ -31,6 +33,31 @@ export interface IntakeDocument {
     target_document_id: string;
   }[];
   lineage_review?: IntakeLineageReview | null;
+  publication_disposition?: "legislation" | "source_evidence";
+  duplicate_of_document_id?: string | null;
+  existing_parent?: IntakeExistingParent | null;
+  publication_review?: {
+    decision_id: string;
+    reason: string;
+    reviewed_at: string;
+  } | null;
+}
+
+export interface IntakeExistingParent {
+  user_file_id: string;
+  display_name: string;
+  source_url: string | null;
+}
+
+export interface IntakeExistingParentCandidate extends IntakeExistingParent {
+  chunk_count: number;
+}
+
+export interface IntakePublicationSelection {
+  disposition: "legislation" | "source_evidence";
+  duplicate_of_document_id: string | null;
+  existing_parent_file_id: string | null;
+  reason: string;
 }
 
 export interface IntakePredecessorCandidate {
@@ -93,6 +120,8 @@ export interface LegislationLineage {
   effective_date: string | null;
   predecessors: LegislationLineageEdge[];
   successors: LegislationLineageEdge[];
+  existing_parents?: IntakeExistingParent[];
+  attachments?: IntakeExistingParent[];
 }
 
 export interface DocumentIntakeBatch {
@@ -111,6 +140,8 @@ export interface DocumentIntakeBatch {
   target_document_set_name: string;
   review_sha256: string | null;
   edit_review_sha256?: string | null;
+  publication_review_sha256?: string | null;
+  active_document_count?: number;
   labeling_failed_count?: number;
   error?: string | null;
   issues: AmendmentSourceIssue[];
@@ -293,6 +324,35 @@ export function getDocumentIntakePredecessorCandidates(
   const suffix = query ? `?query=${encodeURIComponent(query)}` : "";
   return requestJson(
     `/batches/${encodeURIComponent(batchId)}/documents/${encodeURIComponent(documentId)}/predecessor-candidates${suffix}`
+  );
+}
+
+export function getDocumentIntakeExistingParentCandidates(
+  batchId: string,
+  documentId: string,
+  search = ""
+): Promise<IntakeExistingParentCandidate[]> {
+  return requestJson(
+    `/batches/${encodeURIComponent(batchId)}/documents/${encodeURIComponent(documentId)}/existing-parent-candidates?search=${encodeURIComponent(search)}&limit=20`
+  );
+}
+
+export function saveDocumentIntakePublicationReview(
+  batchId: string,
+  documentId: string,
+  expectedReviewSha256: string,
+  selection: IntakePublicationSelection
+): Promise<DocumentIntakeBatch> {
+  return requestJson(
+    `/batches/${encodeURIComponent(batchId)}/documents/${encodeURIComponent(documentId)}/publication-review`,
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        expected_review_sha256: expectedReviewSha256,
+        ...selection,
+      }),
+    }
   );
 }
 
