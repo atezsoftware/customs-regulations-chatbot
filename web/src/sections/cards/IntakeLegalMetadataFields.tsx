@@ -87,7 +87,9 @@ interface IntakeLegalMetadataFieldsProps {
   disabled: boolean;
   validityStart: string | null;
   validityEnd: string | null;
-  onEdits: (edits: IntakeMetadataEdits) => void;
+  onEdits?: (edits: IntakeMetadataEdits) => void;
+  inputs?: Record<string, string>;
+  onInputsChange?: (inputs: Record<string, string>) => void;
 }
 
 export default function IntakeLegalMetadataFields({
@@ -98,14 +100,23 @@ export default function IntakeLegalMetadataFields({
   validityStart,
   validityEnd,
   onEdits,
+  inputs: controlledInputs,
+  onInputsChange,
 }: IntakeLegalMetadataFieldsProps) {
-  const [inputs, setInputs] = useState(() => intakeMetadataInputs(metadata));
+  const [localInputs, setLocalInputs] = useState(() =>
+    intakeMetadataInputs(metadata)
+  );
+  const inputs = controlledInputs ?? localInputs;
+  function setInputs(next: Record<string, string>) {
+    setLocalInputs(next);
+    onInputsChange?.(next);
+  }
   const edits = useMemo(
     () => intakeMetadataEdits(metadata, inputs),
     [metadata, inputs]
   );
   useEffect(() => {
-    if (editing) onEdits(edits);
+    if (editing) onEdits?.(edits);
   }, [editing, edits, onEdits]);
   const audit = metadataRecord(metadata.intake_legal_metadata);
   const fields = metadataRecord(audit.fields);

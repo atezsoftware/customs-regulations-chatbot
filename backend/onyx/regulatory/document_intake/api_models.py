@@ -2,7 +2,7 @@ import datetime
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
 
 class IntakeCapabilities(BaseModel):
@@ -40,7 +40,7 @@ class IntakeReprepareSnapshot(BaseModel):
     documents: dict[str, JsonValue] = Field(default_factory=dict)
 
 
-class IntakeChunkEditRequest(IntakeApproveRequest):
+class IntakeChunkUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     text: str | None = Field(default=None, min_length=1, max_length=2_000_000)
@@ -49,6 +49,36 @@ class IntakeChunkEditRequest(IntakeApproveRequest):
     chunk_metadata: dict[str, JsonValue] | None = Field(default=None, max_length=64)
     validity_start_date: datetime.date | None = None
     validity_end_date: datetime.date | None = None
+
+
+class IntakeChunkEditRequest(IntakeChunkUpdate, IntakeApproveRequest):
+    pass
+
+
+class IntakeChunkBulkEdit(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    document_id: UUID
+    chunk_id: str = Field(min_length=1, max_length=512)
+    updates: IntakeChunkUpdate
+
+    @model_validator(mode="after")
+    def require_updates(self) -> "IntakeChunkBulkEdit":
+        if not self.updates.model_fields_set:
+            raise ValueError("Supply at least one editable chunk field")
+        return self
+
+
+class IntakeChunksEditRequest(IntakeApproveRequest):
+    model_config = ConfigDict(extra="forbid")
+
+    edits: list[IntakeChunkBulkEdit] = Field(min_length=1, max_length=256)
+
+    @model_validator(mode="after")
+    def require_unique_chunks(self) -> "IntakeChunksEditRequest":
+        if len({edit.chunk_id for edit in self.edits}) != len(self.edits):
+            raise ValueError("Each canonical chunk can be edited only once per review")
+        return self
 
 
 class IntakePredecessorSelectionRequest(IntakeApproveRequest):
@@ -116,6 +146,7 @@ class IntakeDocumentSnapshot(BaseModel):
     source_url: str | None = None
     status: str
     chunk_count: int = Field(ge=0)
+    labeling_failed_count: int = Field(default=0, ge=0)
     labels: dict[str, JsonValue] = Field(default_factory=dict)
     error: str | None = None
     user_file_id: UUID | None = None
@@ -138,5 +169,6 @@ class IntakeBatchSnapshot(BaseModel):
     issues: list[IntakeSourceIssue] = Field(default_factory=list)
     documents: list[IntakeDocumentSnapshot] = Field(default_factory=list)
     labeling_run_id: UUID | None = None
+    labeling_failed_count: int = Field(default=0, ge=0)
     created_at: datetime.datetime | None = None
     updated_at: datetime.datetime | None = None

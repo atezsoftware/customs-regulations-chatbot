@@ -22,7 +22,7 @@ from onyx.llm.constants import LlmProviderNames
 from onyx.natural_language_processing.utils import BaseTokenizer, get_tokenizer
 from onyx.regulatory.amendments.annexes.staging import canonical_snapshot_rows
 from onyx.regulatory.document_intake.chunking_profile import (
-    INTAKE_CHUNKING_CODE_VERSION,
+    SUPPORTED_INTAKE_CHUNKING_VERSIONS,
     documents_intake_chunking_version,
 )
 from onyx.regulatory.indexing import (
@@ -285,19 +285,21 @@ def prepare_regulatory_indexing_job_from_chunks(
     if user_file.regulatory_chunk_generation_hash is None:
         raise ValueError("CHUNKED user file has no chunk-generation identity")
     if user_file.regulatory_chunk_generation_hash != snapshot.chunk_generation_hash:
-        intake_hash = compute_regulatory_chunk_generation_hash(
-            embedding_provider=snapshot.embedding_provider,
-            embedding_model_name=snapshot.embedding_model_name,
-            enable_contextual_rag=True,
-            intake_chunking_version=INTAKE_CHUNKING_CODE_VERSION,
-        )
-        if user_file.regulatory_chunk_generation_hash == intake_hash:
-            snapshot = snapshot.model_copy(
-                update={
-                    "chunk_generation_hash": intake_hash,
-                    "intake_chunking_version": INTAKE_CHUNKING_CODE_VERSION,
-                }
+        for version in sorted(SUPPORTED_INTAKE_CHUNKING_VERSIONS):
+            intake_hash = compute_regulatory_chunk_generation_hash(
+                embedding_provider=snapshot.embedding_provider,
+                embedding_model_name=snapshot.embedding_model_name,
+                enable_contextual_rag=True,
+                intake_chunking_version=version,
             )
+            if user_file.regulatory_chunk_generation_hash == intake_hash:
+                snapshot = snapshot.model_copy(
+                    update={
+                        "chunk_generation_hash": intake_hash,
+                        "intake_chunking_version": version,
+                    }
+                )
+                break
     if user_file.regulatory_chunk_generation_hash != snapshot.chunk_generation_hash:
         raise ValueError("CHUNKED user file generation does not match indexing config")
     # Later amendments may insert new rows without an initial-ingestion marker.

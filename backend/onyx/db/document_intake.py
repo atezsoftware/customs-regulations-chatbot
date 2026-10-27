@@ -8,7 +8,7 @@ from typing import Any
 from uuid import UUID, uuid4, uuid5
 
 from mistune.helpers import unescape_char
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from onyx.db.amendment_sources import require_ready_source_package
@@ -409,6 +409,7 @@ def intake_snapshot(
     lineage_selections = intake_lineage_selections(session, batch)
     labels = _labels(session, batch)
     members = intake_files(session, batch)
+    failed_counts = intake_labeling_failed_counts(session, batch)
     assets = {
         member.source_asset_id: session.get_one(
             RegulatorySourceAsset, member.source_asset_id
@@ -459,6 +460,7 @@ def intake_snapshot(
                 "source_url": asset.final_url or asset.original_url,
                 "status": member.status if file else "deleted",
                 "chunk_count": len(chunk_ids),
+                "labeling_failed_count": failed_counts.get(member.user_file_id, 0),
                 "labels": {
                     "labels": sorted(
                         {
@@ -489,6 +491,7 @@ def intake_snapshot(
         "issues": list(package.issues),
         "error": batch.error,
         "documents": documents,
+        "labeling_failed_count": sum(failed_counts.values()),
         "labeling_run_id": str(batch.labeling_run_id)
         if batch.labeling_run_id
         else None,
@@ -517,6 +520,33 @@ def intake_chunk_page(
     )
     labels = _labels(session, batch)
     return [(row, labels.get(row.id, [])) for row in rows], total
+
+
+def intake_labeling_failed_counts(
+    session: Session, batch: RegulatoryDocumentIntake
+) -> dict[UUID, int]:
+    """Count current owned failures across all pages, including abstained targets."""
+    if batch.labeling_run_id is None:
+        return {}
+    member_files = select(RegulatoryDocumentIntakeFile.user_file_id).where(
+        RegulatoryDocumentIntakeFile.intake_id == batch.id
+    )
+    rows = session.execute(
+        select(RegulatoryLabelingItem.user_file_id, func.count())
+        .join(
+            RegulatoryChunk,
+            (RegulatoryChunk.id == RegulatoryLabelingItem.regulatory_chunk_id)
+            & (RegulatoryChunk.user_file_id == RegulatoryLabelingItem.user_file_id),
+        )
+        .where(
+            RegulatoryLabelingItem.run_id == batch.labeling_run_id,
+            RegulatoryLabelingItem.user_file_id.in_(member_files),
+            RegulatoryLabelingItem.status == "failed",
+            RegulatoryChunk.status == "active",
+        )
+        .group_by(RegulatoryLabelingItem.user_file_id)
+    )
+    return {file_id: count for file_id, count in rows}
 
 
 def intake_chunk_labeling_diagnostics(

@@ -21,6 +21,7 @@ export interface IntakeDocument {
   source_url: string | null;
   status: string;
   chunk_count: number;
+  labeling_failed_count?: number;
   labels: Record<string, unknown>;
   error: string | null;
   user_file_id: string | null;
@@ -61,6 +62,22 @@ export interface IntakeChunkUpdate {
   chunk_metadata?: Record<string, string | number | null>;
 }
 
+export interface IntakeChunkEdit {
+  document_id: string;
+  chunk_id: string;
+  updates: IntakeChunkUpdate;
+}
+
+export interface IntakeRepreparePreview {
+  eligible: boolean;
+  expected_sha256: string | null;
+  reason: string | null;
+  request_id: string | null;
+  status: string | null;
+  previous_labeling_run_id: string | null;
+  documents: Record<string, unknown>;
+}
+
 export interface LegislationLineageEdge {
   user_file_id: string;
   title: string;
@@ -94,6 +111,7 @@ export interface DocumentIntakeBatch {
   target_document_set_name: string;
   review_sha256: string | null;
   edit_review_sha256?: string | null;
+  labeling_failed_count?: number;
   error?: string | null;
   issues: AmendmentSourceIssue[];
   documents: IntakeDocument[];
@@ -180,6 +198,27 @@ export function retryDocumentIntakeBatch(
   });
 }
 
+export function getDocumentIntakeRepreparePreview(
+  batchId: string
+): Promise<IntakeRepreparePreview> {
+  return requestJson(`/batches/${encodeURIComponent(batchId)}/reprepare`);
+}
+
+export function reprepareDocumentIntakeBatch(
+  batchId: string,
+  expectedSha256: string,
+  idempotencyKey: string
+): Promise<DocumentIntakeBatch> {
+  return requestJson(`/batches/${encodeURIComponent(batchId)}/reprepare`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      expected_sha256: expectedSha256,
+      idempotency_key: idempotencyKey,
+    }),
+  });
+}
+
 export function approveDocumentIntakeBatch(
   id: string,
   expectedReviewSha256: string
@@ -219,6 +258,21 @@ export function updateDocumentIntakeChunk(
       }),
     }
   );
+}
+
+export function updateDocumentIntakeChunks(
+  batchId: string,
+  expectedReviewSha256: string,
+  edits: IntakeChunkEdit[]
+): Promise<DocumentIntakeBatch> {
+  return requestJson(`/batches/${encodeURIComponent(batchId)}/chunks`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      expected_review_sha256: expectedReviewSha256,
+      edits,
+    }),
+  });
 }
 
 export function getDocumentIntakePredecessorCandidates(

@@ -26,6 +26,9 @@ from onyx.indexing.embedder import DefaultIndexingEmbedder
 from onyx.natural_language_processing.utils import TiktokenTokenizer
 from onyx.regulatory.amendments.annexes import job as source_job
 from onyx.regulatory.document_intake import job as intake_job
+from onyx.regulatory.document_intake.chunking_profile import (
+    INTAKE_CHUNKING_CODE_VERSION,
+)
 from onyx.regulatory.indexing_jobs.configuration import (
     compute_regulatory_chunk_generation_hash,
 )
@@ -151,7 +154,7 @@ def test_long_native_markdown_uses_real_tokenizer_without_heading_only_chunks(
         embedding_provider=setting.provider_type,
         embedding_model_name=setting.model_name,
         enable_contextual_rag=effective_contextual_rag_enabled(setting),
-        intake_chunking_version="1",
+        intake_chunking_version=INTAKE_CHUNKING_CODE_VERSION,
     )
     assert receipt["generation_hash"] != compute_regulatory_chunk_generation_hash(
         embedding_provider=setting.provider_type,

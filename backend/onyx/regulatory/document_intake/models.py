@@ -6,6 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from onyx.regulatory.amendments.annexes.models import SourceLink
 
 INTAKE_DELIVERY_SECONDS = 15 * 60
+IntakeChunkingVersion = Literal["1", "2"]
 
 
 class IntakeSourceAsset(BaseModel):
@@ -27,7 +28,7 @@ class IntakeSourceAsset(BaseModel):
 class IntakeSourceContext(BaseModel):
     model_config = ConfigDict(frozen=True)
 
-    chunking_version: Literal["1"] = "1"
+    chunking_version: IntakeChunkingVersion = "2"
     package_id: UUID
     asset_id: UUID
     asset_sha256: str

@@ -36,6 +36,9 @@ from onyx.regulatory import writer_publication
 from onyx.regulatory.amendments.annexes import job as source_job
 from onyx.regulatory.document_intake import job as intake_job
 from onyx.regulatory.document_intake import reprepare_job
+from onyx.regulatory.document_intake.chunking_profile import (
+    INTAKE_CHUNKING_CODE_VERSION,
+)
 from tests.external_dependency_unit.regulatory.test_document_intake import _ENVIRONMENT
 from tests.external_dependency_unit.regulatory.test_document_intake import (
     intake_owner as intake_owner,
@@ -286,7 +289,10 @@ def test_reprepare_same_files_retains_old_labels_receipts_and_canonical_revision
             )
         )
     )
-    assert all(row.chunk_metadata["intake_chunking_version"] == "1" for row in rows)
+    assert all(
+        row.chunk_metadata["intake_chunking_version"] == INTAKE_CHUNKING_CODE_VERSION
+        for row in rows
+    )
     assert all(not (row.text.startswith("##") and "\n" not in row.text) for row in rows)
     assert (
         reprepare_job.run_document_intake_reprepare(

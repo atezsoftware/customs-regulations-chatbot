@@ -1,11 +1,22 @@
 """Identify intake-specific chunk semantics without changing legacy generations."""
 
 from collections.abc import Sequence
+from typing import cast
 
 from onyx.connectors.models import Document
-from onyx.regulatory.document_intake.models import IntakeSourceContext
+from onyx.regulatory.document_intake.models import (
+    IntakeChunkingVersion,
+    IntakeSourceContext,
+)
 
-INTAKE_CHUNKING_CODE_VERSION = "1"
+INTAKE_CHUNKING_CODE_VERSION: IntakeChunkingVersion = "2"
+SUPPORTED_INTAKE_CHUNKING_VERSIONS = frozenset({"1", "2"})
+
+
+def supported_intake_chunking_version(version: str) -> IntakeChunkingVersion:
+    if version not in SUPPORTED_INTAKE_CHUNKING_VERSIONS:
+        raise ValueError("The intake chunking version is not supported")
+    return cast(IntakeChunkingVersion, version)
 
 
 def intake_chunking_version(document: Document) -> str | None:
@@ -17,8 +28,6 @@ def intake_chunking_version(document: Document) -> str | None:
     if "chunking_version" not in context:
         return None
     parsed = IntakeSourceContext.model_validate(context)
-    if parsed.chunking_version != INTAKE_CHUNKING_CODE_VERSION:
-        raise ValueError("The intake chunking version is not supported")
     return parsed.chunking_version
 
 

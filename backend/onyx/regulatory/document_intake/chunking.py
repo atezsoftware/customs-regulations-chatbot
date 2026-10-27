@@ -27,6 +27,9 @@ from onyx.regulatory.chunker import (
 from onyx.regulatory.document_intake.chunking_profile import (
     INTAKE_CHUNKING_CODE_VERSION as INTAKE_CHUNKING_CODE_VERSION,
 )
+from onyx.regulatory.document_intake.chunking_profile import (
+    SUPPORTED_INTAKE_CHUNKING_VERSIONS,
+)
 from onyx.regulatory.document_intake.document_profile import intake_document_profile
 from onyx.regulatory.heading_path import parse_regulatory_article_heading
 
@@ -34,6 +37,7 @@ _SENTENCE_END = re.compile(r"[.!?;:](?:\s+|$)")
 _WORD_END = re.compile(r"\s+")
 _LINE_END = re.compile(r"\n|$")
 _NUMBERING_ONLY = re.compile(r"(?:\d+(?:\.\d+)*[.)]?|\(\d+(?:\.\d+)*\)\.?)")
+_TABLE_HEADING_MAX_CHARS = 120
 
 
 class IntakeRegulatoryChunker(RegulatoryChunker):
@@ -46,14 +50,18 @@ class IntakeRegulatoryChunker(RegulatoryChunker):
         content_token_limit: int,
         max_chunk_chars: int = 2400,
         min_chunk_chars: int = 120,
+        chunking_version: str = INTAKE_CHUNKING_CODE_VERSION,
     ) -> None:
         if content_token_limit < 1:
             raise ValueError("Intake content token limit must be positive")
+        if chunking_version not in SUPPORTED_INTAKE_CHUNKING_VERSIONS:
+            raise ValueError("The intake chunking version is not supported")
         super().__init__(
             max_chunk_chars=max_chunk_chars, min_chunk_chars=min_chunk_chars
         )
         self.tokenizer = tokenizer
         self.content_token_limit = content_token_limit
+        self.chunking_version = chunking_version
         self._source_text = ""
         self._source_starts: dict[SourceBlock, int] = {}
 
@@ -243,7 +251,53 @@ class IntakeRegulatoryChunker(RegulatoryChunker):
                 )
             else:
                 retained.append(draft)
+        if self.chunking_version == "2":
+            retained = self._merge_adjacent_table_headings(retained, blocks=blocks)
         return retained, structure
+
+    def _merge_adjacent_table_headings(
+        self, drafts: list[_ChunkDraft], *, blocks: list[SourceBlock]
+    ) -> list[_ChunkDraft]:
+        positions = {block.block_id: index for index, block in enumerate(blocks)}
+        retained: list[_ChunkDraft] = []
+        for index, draft in enumerate(drafts):
+            following = drafts[index + 1] if index + 1 < len(drafts) else None
+            text = _blocks_text(draft.blocks)
+            if (
+                draft.chunk_type == "free_text"
+                and len(draft.blocks) == 1
+                and len(text) <= _TABLE_HEADING_MAX_CHARS
+                and len(text.splitlines()) == 1
+                and text.rstrip().endswith((":", "："))
+                and following is not None
+                and following.chunk_type == "table"
+                and following.blocks
+                and positions[draft.blocks[-1].block_id] + 1
+                == positions[following.blocks[0].block_id]
+                and all(
+                    getattr(draft, field) == getattr(following, field)
+                    for field in (
+                        "parent_id",
+                        "parent_ids",
+                        "parent_path",
+                        "heading_path",
+                        "article_no",
+                        "article_title",
+                        "paragraph_no",
+                        "clause_label",
+                        "subclause_label",
+                        "appendix_label",
+                    )
+                )
+                and self._fits([*draft.blocks, *following.blocks])
+            ):
+                # Retain both original blocks; the table supplies the heading's body.
+                drafts[index + 1] = replace(
+                    following, blocks=[*draft.blocks, *following.blocks]
+                )
+            else:
+                retained.append(draft)
+        return retained
 
     @staticmethod
     def _explicit_article_headings(

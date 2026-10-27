@@ -7,7 +7,10 @@ import {
   waitFor,
   within,
 } from "@tests/setup/test-utils";
-import type { DocumentIntakeBatch } from "@/lib/regulatory/documentIntake";
+import type {
+  DocumentIntakeBatch,
+  IntakeRepreparePreview,
+} from "@/lib/regulatory/documentIntake";
 import type { AmendmentSourcePackage } from "@/lib/regulatory/amendments";
 import NewDocumentIntake from "@/views/admin/NewDocumentIntake";
 
@@ -107,6 +110,9 @@ function mockApi(
       status: string;
     }[];
     editResponse?: Response;
+    bulkEditResponse?: Response | Promise<Response>;
+    repreparePreview?: IntakeRepreparePreview;
+    reprepareResponse?: Response;
     lineageResponse?: Response;
   } = {}
 ) {
@@ -168,6 +174,30 @@ function mockApi(
       if (url === `${base}/batches` && init?.method === "POST")
         return json(batch);
       if (url === `${base}/batches`) return json(options.history ?? []);
+      if (url === `${base}/batches/intake-1/reprepare`) {
+        if (init?.method === "POST") {
+          if (options.reprepareResponse) return options.reprepareResponse;
+          batch = {
+            ...batch,
+            status: "preparing",
+            stage: "reprepare",
+            review_sha256: null,
+            edit_review_sha256: null,
+          };
+          return json(batch);
+        }
+        return json(
+          options.repreparePreview ?? {
+            eligible: true,
+            expected_sha256: "b".repeat(64),
+            reason: null,
+            request_id: null,
+            status: null,
+            previous_labeling_run_id: null,
+            documents: {},
+          }
+        );
+      }
       if (url === `${base}/batches/intake-1/approve`) {
         batch = { ...batch, status: "approving", stage: "indexing" };
         return json(batch);
@@ -200,6 +230,19 @@ function mockApi(
                 }
               : document
           ),
+        };
+        return json(batch);
+      }
+      if (
+        url === `${base}/batches/intake-1/chunks` &&
+        init?.method === "PATCH"
+      ) {
+        if (options.bulkEditResponse) return options.bulkEditResponse;
+        batch = {
+          ...batch,
+          status: "preparing",
+          stage: "labeling",
+          review_sha256: null,
         };
         return json(batch);
       }
@@ -1044,7 +1087,7 @@ test("offers a relationship-only retry after publication is blocked by a removed
   ).toBeDisabled();
 });
 
-test("shows added chunks immediately in bounded pages and preserves unsaved edit guards", async () => {
+test("preserves full drafts across pages and files and atomically saves all changes once", async () => {
   const batch: DocumentIntakeBatch = {
     ...readyBatch,
     documents: readyBatch.documents.map((document) =>
@@ -1053,8 +1096,22 @@ test("shows added chunks immediately in bounded pages and preserves unsaved edit
   };
   const fetchMock = mockApi({ history: [batch] });
   const original = fetchMock.getMockImplementation()!;
+  let failSave = true;
   fetchMock.mockImplementation(async (input, init) => {
     const url = String(input);
+    if (
+      url === `${base}/batches/intake-1/chunks` &&
+      init?.method === "PATCH" &&
+      failSave
+    ) {
+      return {
+        ok: false,
+        status: 409,
+        json: async () => ({
+          detail: "The review changed. Reload before saving.",
+        }),
+      } as Response;
+    }
     if (url.includes("/documents/root/chunks?")) {
       const offset = Number(
         new URL(url, "http://localhost").searchParams.get("offset")
@@ -1068,7 +1125,7 @@ test("shows added chunks immediately in bounded pages and preserves unsaved edit
           chunk_type: "madde",
           validity_start_date: null,
           validity_end_date: null,
-          chunk_metadata: { labels: ["customs"] },
+          chunk_metadata: { labels: ["customs"], table_index: 1 },
         })),
         total: 11,
         offset,
@@ -1095,25 +1152,160 @@ test("shows added chunks immediately in bounded pages and preserves unsaved edit
   ).not.toBeInTheDocument();
   const first = within(root).getByRole("region", { name: "Added chunk 1" });
   await user.type(within(first).getByLabelText("After text"), " Reviewed.");
+  await user.type(
+    within(first).getByLabelText("After heading_path"),
+    "\nNew heading\n"
+  );
+  await user.clear(within(first).getByLabelText("After chunk_type"));
+  await user.type(within(first).getByLabelText("After chunk_type"), "ek");
+  await user.type(
+    within(first).getByLabelText("After validity_start_date"),
+    "2026-10-27"
+  );
+  await user.clear(within(first).getByLabelText("After metadata table_index"));
+  await user.type(
+    within(first).getByLabelText("After metadata table_index"),
+    "1.5"
+  );
   expect(
     within(root).getByRole("button", { name: "Next chunks" })
-  ).toBeDisabled();
+  ).toBeEnabled();
   expect(
     screen.getByRole("button", { name: "Approve all new documents" })
   ).toBeDisabled();
-  await user.click(
-    within(first).getByRole("button", { name: "Discard chunk changes" })
+  expect(
+    screen.getByRole("button", { name: "Start another import" })
+  ).toBeDisabled();
+  expect(
+    screen.getByRole("button", { name: "Save all chunk changes" })
+  ).toBeDisabled();
+  // A second chunk is editable immediately, even while another draft is invalid.
+  const second = within(root).getByRole("region", { name: "Added chunk 2" });
+  expect(within(second).getByLabelText("After text")).not.toHaveAttribute(
+    "readonly"
   );
   await user.click(within(root).getByRole("button", { name: "Next chunks" }));
-  expect(
-    await within(root).findByDisplayValue("Added regulation rule 11.")
-  ).toBeVisible();
+  const lastText = await within(root).findByDisplayValue(
+    "Added regulation rule 11."
+  );
+  await user.type(lastText, " Also reviewed.");
   expect(
     within(root).getAllByRole("region", { name: /^Added chunk/ })
   ).toHaveLength(1);
   expect(within(root).getByText("11–11 of 11")).toBeVisible();
   expect(
     within(root).getByRole("button", { name: "Next chunks" })
+  ).toBeDisabled();
+  const annex = screen.getByRole("region", { name: "EK-1.pdf" });
+  await user.type(
+    within(annex).getByLabelText("After text"),
+    " Annex reviewed."
+  );
+  expect(screen.getByText("3 unsaved chunk changes")).toBeVisible();
+  expect(
+    within(annex).getByRole("button", { name: "Save chunk changes" })
+  ).toBeDisabled();
+  await user.click(
+    within(root).getByRole("button", { name: "Previous chunks" })
+  );
+  const restored = await within(root).findByRole("region", {
+    name: "Added chunk 1",
+  });
+  expect(within(restored).getByLabelText("After text")).toHaveValue(
+    "Added regulation rule 1. Reviewed."
+  );
+  expect(within(restored).getByLabelText("After heading_path")).toHaveValue(
+    "MADDE 1\nNew heading\n"
+  );
+  expect(within(restored).getByLabelText("After chunk_type")).toHaveValue("ek");
+  expect(
+    within(restored).getByLabelText("After validity_start_date")
+  ).toHaveValue("2026-10-27");
+  expect(
+    within(restored).getByLabelText("After metadata table_index")
+  ).toHaveValue("1.5");
+  await user.clear(
+    within(restored).getByLabelText("After metadata table_index")
+  );
+  await user.type(
+    within(restored).getByLabelText("After metadata table_index"),
+    "2"
+  );
+  await user.click(
+    screen.getByRole("button", { name: "Save all chunk changes" })
+  );
+  expect(
+    await screen.findByText("The review changed. Reload before saving.")
+  ).toBeVisible();
+  expect(screen.getByText("3 unsaved chunk changes")).toBeVisible();
+  expect(
+    within(restored).getByLabelText("After metadata table_index")
+  ).toHaveValue("2");
+  expect(within(annex).getByLabelText("After text")).toHaveValue(
+    "Attachment duty table Annex reviewed."
+  );
+  // Failed atomic save retained even the draft on a currently hidden page.
+  await user.click(within(root).getByRole("button", { name: "Next chunks" }));
+  expect(
+    await within(root).findByDisplayValue(
+      "Added regulation rule 11. Also reviewed."
+    )
+  ).toBeVisible();
+  failSave = false;
+  await user.click(
+    screen.getByRole("button", { name: "Save all chunk changes" })
+  );
+  await waitFor(() =>
+    expect(
+      screen.queryByText("3 unsaved chunk changes")
+    ).not.toBeInTheDocument()
+  );
+  const bulkCalls = fetchMock.mock.calls.filter(
+    ([url, init]) =>
+      url === `${base}/batches/intake-1/chunks` && init?.method === "PATCH"
+  );
+  expect(bulkCalls).toHaveLength(2); // One failed atomic attempt, one successful attempt.
+  const payload = JSON.parse(String(bulkCalls[1]![1]!.body));
+  expect(payload.expected_review_sha256).toBe("f".repeat(64));
+  expect(payload.edits).toHaveLength(3);
+  expect(payload.edits).toEqual(
+    expect.arrayContaining([
+      {
+        document_id: "root",
+        chunk_id: "root-chunk-0",
+        updates: {
+          text: "Added regulation rule 1. Reviewed.",
+          heading_path: ["MADDE 1", "New heading"],
+          chunk_type: "ek",
+          validity_start_date: "2026-10-27",
+          validity_end_date: null,
+          chunk_metadata: { table_index: 2 },
+        },
+      },
+      expect.objectContaining({
+        document_id: "root",
+        chunk_id: "root-chunk-10",
+        updates: expect.objectContaining({
+          text: "Added regulation rule 11. Also reviewed.",
+        }),
+      }),
+      expect.objectContaining({
+        document_id: "annex",
+        chunk_id: "chunk-1",
+        updates: expect.objectContaining({
+          text: "Attachment duty table Annex reviewed.",
+        }),
+      }),
+    ])
+  );
+  expect(
+    fetchMock.mock.calls.filter(
+      ([url, init]) =>
+        /\/chunks\/[^?]+$/.test(String(url)) && init?.method === "PATCH"
+    )
+  ).toHaveLength(0);
+  expect(
+    screen.getByRole("button", { name: "Approve all new documents" })
   ).toBeDisabled();
   expect(fetchMock).toHaveBeenCalledWith(
     `${base}/batches/intake-1/documents/root/chunks?offset=10&limit=10`,
@@ -1214,3 +1406,360 @@ test.each([
     ).toBeDisabled();
   }
 );
+
+test("shows exact chunk failures and whole-file/import failure counts without treating failures as empty labels", async () => {
+  const batch: DocumentIntakeBatch = {
+    ...readyBatch,
+    status: "partial",
+    stage: "labeling",
+    review_sha256: null,
+    edit_review_sha256: "c".repeat(64),
+    labeling_failed_count: 5,
+    documents: readyBatch.documents.map((document) => ({
+      ...document,
+      labeling_failed_count: document.id === "root" ? 5 : 0,
+    })),
+  };
+  const fetchMock = mockApi({ history: [batch] });
+  const original = fetchMock.getMockImplementation()!;
+  fetchMock.mockImplementation(async (input, init) => {
+    if (String(input).includes("/documents/root/chunks?"))
+      return json({
+        items: [
+          {
+            id: "root-failed",
+            position: 0,
+            text: "Unresolved source text.",
+            heading_path: [],
+            chunk_metadata: { labels: {} },
+            labeling_status: "failed",
+            labeling_error:
+              "The model abstained: no supported label was identified.",
+          },
+        ],
+        total: 1,
+        offset: 0,
+        limit: 10,
+      });
+    return original(input, init);
+  });
+  const user = setupUser();
+  render(<NewDocumentIntake />);
+  await user.click(
+    await screen.findByRole("button", {
+      name: "Main regulation.html (partial)",
+    })
+  );
+  const root = screen.getByRole("region", { name: "Main regulation.html" });
+  const alert = await within(root).findByRole("alert");
+  expect(within(alert).getByText("Labeling: failed")).toBeVisible();
+  expect(
+    within(alert).getByText(
+      "The model abstained: no supported label was identified."
+    )
+  ).toBeVisible();
+  expect(
+    within(root).getByText("Labeling failed · see the chunk error above.")
+  ).toBeVisible();
+  expect(
+    within(root).queryByText("No labels assigned.")
+  ).not.toBeInTheDocument();
+  expect(
+    within(root).getByText("5 chunks with failed labeling in this file")
+  ).toBeVisible();
+  expect(
+    screen.getByText("5 chunks with failed labeling across this import")
+  ).toBeVisible();
+  expect(
+    screen.getByRole("button", { name: "Approve all new documents" })
+  ).toBeDisabled();
+});
+
+test("discards all drafts across files while preserving the single-chunk save path", async () => {
+  const fetchMock = mockApi({ history: [readyBatch] });
+  const user = setupUser();
+  render(<NewDocumentIntake />);
+  await user.click(
+    await screen.findByRole("button", { name: "Main regulation.html (ready)" })
+  );
+  const root = screen.getByRole("region", { name: "Main regulation.html" });
+  const annex = screen.getByRole("region", { name: "EK-1.pdf" });
+  await within(root).findByDisplayValue("Main document rule");
+  await user.type(within(root).getByLabelText("After text"), " Main edit.");
+  await user.type(within(annex).getByLabelText("After text"), " Annex edit.");
+  await user.click(within(root).getByRole("button", { name: "Hide chunks" }));
+  await user.click(
+    screen.getByRole("button", { name: "Discard all chunk changes" })
+  );
+  expect(
+    screen.queryByRole("button", { name: "Save all chunk changes" })
+  ).not.toBeInTheDocument();
+  expect(
+    screen.getByRole("button", { name: "Approve all new documents" })
+  ).toBeEnabled();
+  expect(within(annex).getByLabelText("After text")).toHaveValue(
+    "Attachment duty table"
+  );
+  await user.click(
+    within(root).getByRole("button", { name: "Show added chunks" })
+  );
+  expect(
+    await within(root).findByDisplayValue("Main document rule")
+  ).toBeVisible();
+  await user.type(within(annex).getByLabelText("After text"), " One edit.");
+  await user.click(
+    within(annex).getByRole("button", { name: "Save chunk changes" })
+  );
+  await waitFor(() =>
+    expect(
+      screen.queryByText("1 unsaved chunk changes")
+    ).not.toBeInTheDocument()
+  );
+  expect(
+    fetchMock.mock.calls.filter(
+      ([url, init]) =>
+        String(url).endsWith("/documents/annex/chunks/chunk-1") &&
+        init?.method === "PATCH"
+    )
+  ).toHaveLength(1);
+  expect(
+    fetchMock.mock.calls.filter(
+      ([url, init]) =>
+        String(url).endsWith("/batches/intake-1/chunks") &&
+        init?.method === "PATCH"
+    )
+  ).toHaveLength(0);
+});
+
+test("reprepares the same frozen-source intake through its eligibility receipt", async () => {
+  const fetchMock = mockApi({ history: [readyBatch] });
+  const user = setupUser();
+  render(<NewDocumentIntake />);
+  await user.click(
+    await screen.findByRole("button", { name: "Main regulation.html (ready)" })
+  );
+  const section = screen.getByRole("region", {
+    name: "Reprepare frozen source",
+  });
+  const button = within(section).getByRole("button", {
+    name: "Reprepare chunks from frozen source",
+  });
+  await waitFor(() => expect(button).toBeEnabled());
+  expect(
+    within(section).getByText(
+      /same new files, attachments and frozen converted text/
+    )
+  ).toBeVisible();
+  await user.click(button);
+  await screen.findByText("New documents: preparing");
+  expect(
+    screen.getByRole("button", { name: "Approve all new documents" })
+  ).toBeDisabled();
+  const calls = fetchMock.mock.calls.filter(
+    ([url, init]) =>
+      String(url).endsWith("/batches/intake-1/reprepare") &&
+      init?.method === "POST"
+  );
+  expect(calls).toHaveLength(1);
+  expect(JSON.parse(String(calls[0]![1]!.body))).toEqual({
+    expected_sha256: "b".repeat(64),
+    idempotency_key: expect.stringMatching(/^[0-9a-f-]{36}$/),
+  });
+  expect(
+    fetchMock.mock.calls.filter(
+      ([url, init]) => url === `${base}/batches` && init?.method === "POST"
+    )
+  ).toHaveLength(0);
+});
+
+test("guards reprepare while drafts exist and retains a stale-preview conflict without starting new work", async () => {
+  const fetchMock = mockApi({
+    history: [readyBatch],
+    reprepareResponse: {
+      ok: false,
+      status: 409,
+      json: async () => ({
+        detail: "The document snapshot changed; reload before reprepare",
+      }),
+    } as Response,
+  });
+  const user = setupUser();
+  render(<NewDocumentIntake />);
+  await user.click(
+    await screen.findByRole("button", { name: "Main regulation.html (ready)" })
+  );
+  const root = screen.getByRole("region", { name: "Main regulation.html" });
+  const section = screen.getByRole("region", {
+    name: "Reprepare frozen source",
+  });
+  const button = within(section).getByRole("button", {
+    name: "Reprepare chunks from frozen source",
+  });
+  await waitFor(() => expect(button).toBeEnabled());
+  await within(root).findByDisplayValue("Main document rule");
+  await user.type(
+    within(root).getByLabelText("After text"),
+    " Unsaved change."
+  );
+  expect(button).toBeDisabled();
+  expect(
+    within(section).getByText(
+      "Save or discard your changes before preparing again."
+    )
+  ).toBeVisible();
+  await user.click(
+    screen.getByRole("button", { name: "Discard all chunk changes" })
+  );
+  await waitFor(() => expect(button).toBeEnabled());
+  await user.click(button);
+  expect(
+    await screen.findByText(
+      "The document snapshot changed; reload before reprepare"
+    )
+  ).toBeVisible();
+  expect(
+    await within(root).findByDisplayValue("Main document rule")
+  ).toBeVisible();
+  expect(screen.getByText("New documents: ready")).toBeVisible();
+  expect(
+    fetchMock.mock.calls.filter(
+      ([url, init]) =>
+        String(url).endsWith("/batches/intake-1/reprepare") &&
+        init?.method === "POST"
+    )
+  ).toHaveLength(1);
+});
+
+test("shows the backend preparation blocker and keeps reprepare unavailable", async () => {
+  const fetchMock = mockApi({
+    history: [readyBatch],
+    repreparePreview: {
+      eligible: false,
+      expected_sha256: null,
+      reason:
+        "Manual edits or legal version history must be preserved; reprepare is unavailable",
+      request_id: null,
+      status: null,
+      previous_labeling_run_id: null,
+      documents: {},
+    },
+  });
+  const user = setupUser();
+  render(<NewDocumentIntake />);
+  await user.click(
+    await screen.findByRole("button", { name: "Main regulation.html (ready)" })
+  );
+  const section = screen.getByRole("region", {
+    name: "Reprepare frozen source",
+  });
+  expect(
+    await within(section).findByText(
+      "Manual edits or legal version history must be preserved; reprepare is unavailable"
+    )
+  ).toBeVisible();
+  expect(
+    within(section).getByRole("button", {
+      name: "Reprepare chunks from frozen source",
+    })
+  ).toBeDisabled();
+  expect(
+    fetchMock.mock.calls.filter(
+      ([url, init]) =>
+        String(url).endsWith("/reprepare") && init?.method === "POST"
+    )
+  ).toHaveLength(0);
+});
+
+test("refreshes rebuilt chunk content and page totals during preparation and stops polling at ready", async () => {
+  jest.useFakeTimers();
+  try {
+    const preparing: DocumentIntakeBatch = {
+      ...readyBatch,
+      status: "preparing",
+      stage: "metadata",
+      review_sha256: null,
+      edit_review_sha256: null,
+      documents: [{ ...readyBatch.documents[0]!, chunk_count: 2 }],
+    };
+    const ready: DocumentIntakeBatch = {
+      ...preparing,
+      status: "ready",
+      stage: "review",
+      review_sha256: "f".repeat(64),
+    };
+    const fetchMock = mockApi({
+      history: [preparing],
+      polledBatches: [preparing, preparing, ready],
+    });
+    const original = fetchMock.getMockImplementation()!;
+    let rebuilt = false;
+    fetchMock.mockImplementation(async (input, init) => {
+      if (String(input).includes("/documents/root/chunks?"))
+        return json({
+          items: [
+            {
+              id: rebuilt ? "rebuilt-table" : "old-heading",
+              position: 0,
+              text: rebuilt
+                ? "Caption with its table body."
+                : "Old standalone caption.",
+              heading_path: [],
+              chunk_type: rebuilt ? "table" : "free_text",
+              chunk_metadata: {},
+            },
+          ],
+          total: rebuilt ? 2 : 3,
+          offset: 0,
+          limit: 1,
+        });
+      return original(input, init);
+    });
+    const chunkCalls = () =>
+      fetchMock.mock.calls.filter(([url]) =>
+        String(url).includes("/documents/root/chunks?")
+      ).length;
+    const user = setupUser({ advanceTimers: jest.advanceTimersByTime });
+    render(<NewDocumentIntake />);
+    await user.click(
+      await screen.findByRole("button", {
+        name: "Main regulation.html (preparing)",
+      })
+    );
+    const root = screen.getByRole("region", { name: "Main regulation.html" });
+    expect(
+      await within(root).findByDisplayValue("Old standalone caption.")
+    ).toHaveAttribute("readonly");
+    expect(within(root).getByText("1–1 of 3")).toBeVisible();
+    const initialCalls = chunkCalls();
+    rebuilt = true;
+    await act(async () => {
+      await jest.advanceTimersByTimeAsync(1600);
+    });
+    expect(
+      await within(root).findByDisplayValue("Caption with its table body.")
+    ).toHaveAttribute("readonly");
+    expect(
+      within(root).queryByDisplayValue("Old standalone caption.")
+    ).not.toBeInTheDocument();
+    expect(within(root).getByText("1–1 of 2")).toBeVisible();
+    expect(chunkCalls()).toBeGreaterThan(initialCalls);
+    await act(async () => {
+      await jest.advanceTimersByTimeAsync(2500);
+    });
+    await screen.findByText("New documents: ready");
+    const input = within(root).getByLabelText("After text");
+    expect(input).not.toHaveAttribute("readonly");
+    await user.type(input, " Reviewed draft.");
+    const settledCalls = chunkCalls();
+    await act(async () => {
+      await jest.advanceTimersByTimeAsync(6000);
+    });
+    expect(chunkCalls()).toBe(settledCalls);
+    expect(input).toHaveValue("Caption with its table body. Reviewed draft.");
+    expect(
+      screen.getByRole("button", { name: "Approve all new documents" })
+    ).toBeDisabled();
+  } finally {
+    jest.useRealTimers();
+  }
+});

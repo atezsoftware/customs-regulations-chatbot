@@ -71,6 +71,7 @@ def _dated_rows(file_id: UUID) -> list[RegulatoryChunk]:
     ]
 
 
+@pytest.mark.parametrize("version", ["1", "2"])
 @pytest.mark.parametrize(
     ("when", "expected"),
     [
@@ -81,9 +82,11 @@ def _dated_rows(file_id: UUID) -> list[RegulatoryChunk]:
     ],
 )
 def test_complete_derived_text_requires_all_sources_without_changing_canonical(
-    when: date, expected: list[str]
+    when: date, expected: list[str], version: str
 ) -> None:
     rows = _dated_rows(uuid4())
+    for row in rows:
+        row.chunk_metadata["intake_chunking_version"] = version
     before = [_snapshot(row) for row in rows]
     qualified = intake_temporal_context_rows(rows)
     assert [row.id for row in effective_context_rows(qualified, when)] == expected
@@ -165,6 +168,17 @@ def test_ordinary_update_rows_keep_exact_identity_and_existing_semantics() -> No
     before = [_snapshot(row) for row in rows]
     assert intake_temporal_context_rows(rows) is rows
     assert [_snapshot(row) for row in rows] == before
+
+
+@pytest.mark.parametrize("markers", [["3", "3"], ["1", "2"], ["2", "3"]])
+def test_unknown_or_mixed_intake_temporal_versions_fail_closed(
+    markers: list[str],
+) -> None:
+    rows = _dated_rows(uuid4())
+    for row, version in zip(rows, markers, strict=False):
+        row.chunk_metadata["intake_chunking_version"] = version
+    with pytest.raises(ValueError, match="inconsistent canonical scope"):
+        intake_temporal_context_rows(rows)
 
 
 @pytest.mark.parametrize("when", [JANUARY, MAY])

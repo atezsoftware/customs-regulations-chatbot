@@ -27,7 +27,7 @@ from onyx.prompts.contextual_retrieval import (
 from onyx.regulatory.chunker import REGULATORY_CHUNKER_CODE_VERSION
 from onyx.regulatory.contextual import MIN_CONTEXTUAL_RAG_RESERVED_TOKENS
 from onyx.regulatory.document_intake.chunking_profile import (
-    INTAKE_CHUNKING_CODE_VERSION,
+    supported_intake_chunking_version,
 )
 from onyx.regulatory.indexing import (
     REGULATORY_CONTEXTUAL_INITIAL_MAX_CHUNK_CHARS,
@@ -105,9 +105,9 @@ def compute_regulatory_chunk_generation_hash(
         "minimum_contextual_reserved_tokens": MIN_CONTEXTUAL_RAG_RESERVED_TOKENS,
     }
     if intake_chunking_version is not None:
-        if intake_chunking_version != INTAKE_CHUNKING_CODE_VERSION:
-            raise ValueError("The intake chunking version is not supported")
-        payload["intake_chunking_version"] = intake_chunking_version
+        payload["intake_chunking_version"] = supported_intake_chunking_version(
+            intake_chunking_version
+        )
     return sha256(
         json.dumps(
             payload,
@@ -286,7 +286,11 @@ def resolve_regulatory_indexing_snapshot(
             enable_contextual_rag=True,
             intake_chunking_version=intake_chunking_version,
         ),
-        intake_chunking_version="1" if intake_chunking_version is not None else None,
+        intake_chunking_version=(
+            supported_intake_chunking_version(intake_chunking_version)
+            if intake_chunking_version is not None
+            else None
+        ),
         search_settings_id=search_settings.id,
         embedding_provider=EmbeddingProvider.OPENROUTER,
         embedding_model_name=search_settings.model_name,
