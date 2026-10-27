@@ -105,15 +105,17 @@ jobs:
                   continue
               statuses={item['name']:item for item in pod['status'].get('containerStatuses',[])}
               for container in pod['spec']['containers']:
-                  if 'customs-regulations-backend-lite-'+suffix+':' in container['image'] and statuses.get(container['name'],{}).get('ready'):
+                  if 'customs-regulations-backend' in container['image'] and statuses.get(container['name'],{}).get('ready'):
                       targets.append((pod['metadata']['name'],container['name']))
-          assert len(targets)==1, 'Expected one ready scoped background container'
-          Path('/tmp/broker-target-'+scope).write_text('\t'.join(targets[0])+'\n')
+          assert targets, 'Expected a ready background container in the exact namespace'
+          targets.sort()
+          Path('/tmp/broker-target-'+scope).write_text(''.join('\t'.join(target)+'\n' for target in targets))
           PY
-            IFS=$'\t' read -r pod container < "/tmp/broker-target-$scope"
-            kubectl exec -i "$pod" -n "$scope" -c "$container" -- \
-              sh -ec '. /vault/secrets/config; export PYTHONPATH=/app; exec env DIAGNOSTIC_SCOPE="$1" python -' sh "$scope" < \
-              backend/onyx/db/diagnose_broker_namespace_readonly.py
+            while IFS=$'\t' read -r pod container; do
+              kubectl exec -i "$pod" -n "$scope" -c "$container" -- \
+                sh -ec '. /vault/secrets/config; export PYTHONPATH=/app; exec env DIAGNOSTIC_SCOPE="$1" python -' sh "$scope" < \
+                backend/onyx/db/diagnose_broker_namespace_readonly.py
+            done < "/tmp/broker-target-$scope"
           done
       - name: Filter amendment approval worker errors
         if: inputs.operation == 'inspect'
