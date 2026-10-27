@@ -65,6 +65,15 @@ def main() -> None:
             print("[credential-bearing line omitted]")
         else:
             print("ANNEX_LOG", line[:500])
+    result = subprocess.run(
+        ["tail", "-n", "160", "/var/log/onyx/celery_worker_user_file_processing.log"],
+        capture_output=True, text=True, check=False, timeout=5,
+    )
+    for line in result.stdout.splitlines():
+        if re.search(r"api.key|authorization|bearer|password|secret|token=", line, re.I):
+            print("[credential-bearing line omitted]")
+        elif re.search(r"context|llm|litellm|retry|429|timeout|index_single|3521feda|a3c6e8cf|10e927dc", line, re.I):
+            print("INDEX_PROGRESS_LOG", line[:500])
 
 
 if __name__ == "__main__":
