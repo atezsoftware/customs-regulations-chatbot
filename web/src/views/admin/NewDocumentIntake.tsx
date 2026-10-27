@@ -770,8 +770,8 @@ export default function NewDocumentIntake() {
     pendingChunkEdits.map((edit) => edit.draft.reviewSha256)
   );
   const chunkSaveError =
-    pendingChunkEdits.length > 256
-      ? "Save at most 256 chunk changes together."
+    pendingChunkEdits.length > 2048
+      ? "Save at most 2048 chunk changes together."
       : pendingReceipts.size > 1 || pendingReceipts.has(null)
         ? "These drafts belong to different review versions. Discard and review the changed chunks again."
         : chunkSaveValidation;

@@ -62,7 +62,7 @@ _EDITABLE_FIELDS = frozenset(
     }
 )
 MAX_EDIT_TEXT_CHARS = 2_000_000
-MAX_INTAKE_CHUNK_EDITS = 256
+MAX_INTAKE_CHUNK_EDITS = 2048
 _TERMINAL_LABELING_STATUSES = frozenset(
     {"completed", "completed_with_errors", "failed", "cancelled"}
 )
@@ -372,7 +372,7 @@ def edit_intake_chunks(
 ) -> UUID | None:
     """Save one review atomically; the caller commits before dispatching one run."""
     if not edits or len(edits) > MAX_INTAKE_CHUNK_EDITS:
-        raise ValueError("Supply between 1 and 256 chunk edits")
+        raise ValueError(f"Supply between 1 and {MAX_INTAKE_CHUNK_EDITS} chunk edits")
     if len({edit.chunk_id for edit in edits}) != len(edits):
         raise ValueError("Each canonical chunk can be edited only once per review")
     with session.begin_nested():

@@ -72,7 +72,7 @@ class IntakeChunkBulkEdit(BaseModel):
 class IntakeChunksEditRequest(IntakeApproveRequest):
     model_config = ConfigDict(extra="forbid")
 
-    edits: list[IntakeChunkBulkEdit] = Field(min_length=1, max_length=256)
+    edits: list[IntakeChunkBulkEdit] = Field(min_length=1, max_length=2048)
 
     @model_validator(mode="after")
     def require_unique_chunks(self) -> "IntakeChunksEditRequest":

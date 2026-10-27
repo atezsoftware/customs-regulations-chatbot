@@ -659,6 +659,50 @@ def test_bulk_chunk_edit_commits_all_edits_then_dispatches_one_run(
         dispatch.assert_not_called()
 
 
+@pytest.mark.parametrize("count", [552, 2048])
+def test_large_date_review_is_one_atomic_request_and_one_label_delivery(
+    monkeypatch: pytest.MonkeyPatch, count: int
+) -> None:
+    from onyx.background.celery.tasks.regulatory_labeling import tasks
+    from onyx.db import document_intake_edit
+
+    batch_id, document_id, run_id = uuid4(), uuid4(), uuid4()
+    session = MagicMock(spec=Session)
+    monkeypatch.setattr(
+        api.repository, "get_intake", lambda *_args: SimpleNamespace(id=batch_id)
+    )
+    monkeypatch.setattr(
+        api.repository, "intake_snapshot", lambda *_args: _snapshot(batch_id)
+    )
+    edit = MagicMock(return_value=run_id)
+    dispatch = MagicMock()
+    monkeypatch.setattr(document_intake_edit, "edit_intake_chunks", edit)
+    monkeypatch.setattr(tasks, "enqueue_labeling_run", dispatch)
+    response = _client(session).patch(
+        f"/regulatory/document-intake/batches/{batch_id}/chunks",
+        json={
+            "expected_review_sha256": "a" * 64,
+            "edits": [
+                {
+                    "document_id": str(document_id),
+                    "chunk_id": f"reviewed-date-{index}",
+                    "updates": {"validity_start_date": "2025-05-09"},
+                }
+                for index in range(count)
+            ],
+        },
+    )
+    assert response.status_code == 200
+    edit.assert_called_once()
+    assert len(edit.call_args.kwargs["edits"]) == count
+    assert all(
+        item.document_id == document_id
+        and item.updates == {"validity_start_date": datetime.date(2025, 5, 9)}
+        for item in edit.call_args.kwargs["edits"]
+    )
+    dispatch.assert_called_once_with(run_id=run_id, tenant_id="tenant")
+
+
 @pytest.mark.parametrize("invalid", [False, True])
 def test_bulk_chunk_edit_rolls_back_and_never_dispatches_on_failure(
     monkeypatch: pytest.MonkeyPatch, invalid: bool
@@ -701,7 +745,15 @@ def test_bulk_chunk_edit_rolls_back_and_never_dispatches_on_failure(
 
 @pytest.mark.parametrize(
     "invalid",
-    ["empty", "too_many", "duplicate", "empty_updates", "protected", "unexpected"],
+    [
+        "empty",
+        "too_many",
+        "duplicate",
+        "duplicate_at_limit",
+        "empty_updates",
+        "protected",
+        "unexpected",
+    ],
 )
 def test_bulk_chunk_edit_request_is_bounded_and_rejects_unknown_fields(
     monkeypatch: pytest.MonkeyPatch, invalid: str
@@ -720,9 +772,12 @@ def test_bulk_chunk_edit_request_is_bounded_and_rejects_unknown_fields(
     if invalid == "empty":
         entries.clear()
     elif invalid == "too_many":
-        entries[:] = [{**entry, "chunk_id": f"chunk-{index}"} for index in range(257)]
+        entries[:] = [{**entry, "chunk_id": f"chunk-{index}"} for index in range(2049)]
     elif invalid == "duplicate":
         entries.append({**entry, "document_id": str(uuid4())})
+    elif invalid == "duplicate_at_limit":
+        entries[:] = [{**entry, "chunk_id": f"chunk-{index}"} for index in range(2048)]
+        entries[-1]["chunk_id"] = entries[0]["chunk_id"]
     elif invalid == "empty_updates":
         entry["updates"] = {}
     elif invalid == "protected":
