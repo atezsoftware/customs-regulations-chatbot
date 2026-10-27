@@ -34,6 +34,16 @@ def main() -> None:
         max_overflow=0,
     )
     queries = {
+        "RECENT_DIRECT_CACHE_COUNTS": """
+            SELECT split_part(file_id, '/', 2) AS provider_binding,
+                   count(*) FILTER (WHERE file_id LIKE '%/manifest.json') AS request_groups,
+                   count(*) FILTER (WHERE file_id NOT LIKE '%/manifest.json') AS result_files,
+                   min(created_at) AS first_created, max(updated_at) AS last_updated
+              FROM file_record
+             WHERE file_id LIKE 'regulatory-labeling-direct/%'
+               AND created_at >= '2026-10-27T15:58:30.872604Z'
+             GROUP BY split_part(file_id, '/', 2)
+        """,
         "PROTECTED_CORPUS": """
             WITH protected AS (
         SELECT f.id FROM user_file f JOIN document_set__user_file m
