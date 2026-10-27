@@ -224,6 +224,40 @@ def main() -> None:
                AND application_name ILIKE '%annex%'
              ORDER BY query_start DESC LIMIT 20
         """,
+        "CANONICAL_DELETE_FK_INDEX_INVENTORY": """
+            SELECT constraint_row.conname AS constraint_name,
+                   source_table.relname AS referencing_table,
+                   attribute.attname AS referencing_column,
+                   constraint_row.confdeltype AS delete_action,
+                   source_table.reltuples::bigint AS estimated_rows,
+                   coalesce((
+                     SELECT json_agg(pg_get_indexdef(index_row.indexrelid))
+                       FROM pg_index index_row
+                      WHERE index_row.indrelid=source_table.oid
+                        AND index_row.indisvalid
+                        AND index_row.indkey[0]=attribute.attnum
+                   ), '[]'::json) AS leading_indexes
+              FROM pg_constraint constraint_row
+              JOIN pg_class source_table ON source_table.oid=constraint_row.conrelid
+              JOIN pg_attribute attribute
+                ON attribute.attrelid=source_table.oid
+               AND attribute.attnum=constraint_row.conkey[1]
+             WHERE constraint_row.contype='f'
+               AND constraint_row.confrelid='regulatory_chunk'::regclass
+             ORDER BY source_table.relname,attribute.attname LIMIT 30
+        """,
+        "INTAKE_ROW_LOCK_WAIT_COUNTS": """
+            SELECT application_name,state,wait_event_type,wait_event,
+                   count(*) AS connections,
+                   max(now()-query_start) AS oldest_query_age,
+                   max(cardinality(pg_blocking_pids(pid))) AS maximum_blockers
+              FROM pg_stat_activity
+             WHERE datname=current_database()
+               AND query ILIKE '%regulatory_document_intake%'
+               AND application_name<>'folder_intake_readonly'
+             GROUP BY application_name,state,wait_event_type,wait_event
+             ORDER BY connections DESC LIMIT 20
+        """,
     }
     with engine.connect() as connection:
         connection.execute(text("SET TRANSACTION READ ONLY"))
