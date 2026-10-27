@@ -849,6 +849,67 @@ def test_alias_to_its_descendant_cannot_create_effective_parent_cycle(
     )
 
 
+@pytest.mark.parametrize("missing", ["raw", "prepared"])
+def test_missing_retained_source_bytes_fail_closed_before_decision_or_new_labels(
+    intake_session: Session,
+    intake_owner: tuple[User, DocumentSet, ModelConfiguration],
+    monkeypatch: pytest.MonkeyPatch,
+    missing: str,
+) -> None:
+    from types import SimpleNamespace
+
+    from onyx.db import document_intake_review as review
+    from onyx.db.models import RegulatoryDocumentIntakeReviewDecision
+    from onyx.file_store import file_store
+
+    production_hash = review._blob_sha256
+    session = intake_session
+    user, _target, _model = intake_owner
+    batch, members, _run, _binding = _three_document_review(
+        session, intake_owner, monkeypatch
+    )
+    accepted = review.publication_review_digest(session, batch)
+    assert accepted
+    store = PostgresBackedFileStore()
+    monkeypatch.setattr(review, "_blob_sha256", production_hash)
+    monkeypatch.setattr(
+        file_store,
+        "get_default_file_store",
+        lambda: SimpleNamespace(
+            read_file=lambda pointer: store.read_file(pointer, db_session=session),
+        ),
+    )
+    asset = session.get_one(RegulatorySourceAsset, members["alias"].source_asset_id)
+    pointer = asset.file_id if missing == "raw" else asset.text_file_id
+    assert pointer
+    store.delete_file(pointer, db_session=session)
+    before = _table_rows(
+        session,
+        RegulatoryDocumentIntakeReviewDecision,
+        RegulatoryLabelingRun,
+        RegulatoryChunk,
+    )
+    with pytest.raises(intake.IntakeConflictError):
+        _decision(
+            session,
+            batch,
+            members["alias"],
+            user,
+            disposition="source_evidence",
+            duplicate=members["root"].id,
+            expected=accepted,
+        )
+    assert (
+        _table_rows(
+            session,
+            RegulatoryDocumentIntakeReviewDecision,
+            RegulatoryLabelingRun,
+            RegulatoryChunk,
+        )
+        == before
+    )
+
+
 @pytest.mark.parametrize(
     "invalid",
     [

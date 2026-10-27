@@ -12,6 +12,7 @@ from sqlalchemy import delete, func, or_, select
 from sqlalchemy.orm import Session, aliased
 
 from onyx.db.enums import UserFileProjectionRepairStatus, UserFileStatus
+from onyx.db.file_record import FileRecordNotFoundError
 from onyx.db.models import (
     AmendmentSourcePackage,
     DocumentSet,
@@ -117,7 +118,7 @@ def _blob_sha256(pointer: str) -> str:
         with get_default_file_store().read_file(pointer) as stream:
             while data := stream.read(1024 * 1024):
                 digest.update(data)
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, FileRecordNotFoundError) as exc:
         from onyx.db.document_intake import IntakeConflictError
 
         raise IntakeConflictError("The retained source bytes are unavailable") from exc
