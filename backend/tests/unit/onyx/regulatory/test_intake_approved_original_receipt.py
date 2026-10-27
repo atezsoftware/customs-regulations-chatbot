@@ -94,6 +94,12 @@ def _approved(
     resolver = MagicMock(return_value=original)
     monkeypatch.setattr(authority, "reprepared_original_receipt", resolver)
     monkeypatch.setattr(
+        "onyx.db.document_intake_review.source_evidence_file_ids", lambda *_args: set()
+    )
+    monkeypatch.setattr(
+        "onyx.db.document_intake_review.latest_publication_decisions", lambda *_args: {}
+    )
+    monkeypatch.setattr(
         intake, "review_digest", lambda *_args: state["batch"].review_sha256
     )
     return session, original, state, resolver

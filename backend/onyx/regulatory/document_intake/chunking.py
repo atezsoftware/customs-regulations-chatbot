@@ -1,12 +1,15 @@
 """Token-bounded splitting for newly admitted documents, before labels are frozen."""
 
+import hashlib
 import re
-from dataclasses import replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
+from typing import Any
 
 from onyx.natural_language_processing.utils import BaseTokenizer
 from onyx.regulatory.chunker import (
     ChunkedDocument,
+    ChunkMetadata,
     DocumentMetadata,
     RegulatoryChunk,
     RegulatoryChunker,
@@ -31,6 +34,7 @@ from onyx.regulatory.document_intake.chunking_profile import (
     SUPPORTED_INTAKE_CHUNKING_VERSIONS,
 )
 from onyx.regulatory.document_intake.document_profile import intake_document_profile
+from onyx.regulatory.document_intake.headings import promote_plain_article_titles
 from onyx.regulatory.heading_path import parse_regulatory_article_heading
 
 _SENTENCE_END = re.compile(r"[.!?;:](?:\s+|$)")
@@ -38,6 +42,37 @@ _WORD_END = re.compile(r"\s+")
 _LINE_END = re.compile(r"\n|$")
 _NUMBERING_ONLY = re.compile(r"(?:\d+(?:\.\d+)*[.)]?|\(\d+(?:\.\d+)*\)\.?)")
 _TABLE_HEADING_MAX_CHARS = 120
+_CELL_BREAK = re.compile(r"(?<!\\)<br\s*/?>", re.IGNORECASE)
+_CELL_NUMBERED_BREAK = re.compile(r"<br\s*/?>\s*\d+(?:\.\d+)+[.)]?\s", re.IGNORECASE)
+_TABLE_SEPARATOR_CELL = re.compile(r"\s*:?-{3,}:?\s*")
+
+
+@dataclass(frozen=True)
+class IntakeTableRow:
+    """Original grid coordinates shared by exact slices of one source cell."""
+
+    version: int
+    table_index: int | None
+    row_index: int
+    cell_index: int
+    row_sha256: str
+    row_source_start_char: int
+    row_source_end_char: int
+    fragment_source_start_char: int
+    fragment_source_end_char: int
+    fragment_index: int
+    fragment_count: int
+
+
+@dataclass(frozen=True)
+class IntakeChunkMetadata(ChunkMetadata):
+    intake_table_row: IntakeTableRow | None = None
+
+    def to_storage_dict(self) -> dict[str, Any]:
+        metadata = super().to_storage_dict()
+        if self.intake_table_row is not None:
+            metadata["intake_table_row"] = asdict(self.intake_table_row)
+        return metadata
 
 
 class IntakeRegulatoryChunker(RegulatoryChunker):
@@ -64,6 +99,7 @@ class IntakeRegulatoryChunker(RegulatoryChunker):
         self.chunking_version = chunking_version
         self._source_text = ""
         self._source_starts: dict[SourceBlock, int] = {}
+        self._table_row_fragments: dict[tuple[int, int], IntakeTableRow] = {}
 
     def chunk_text(
         self,
@@ -75,6 +111,7 @@ class IntakeRegulatoryChunker(RegulatoryChunker):
     ) -> ChunkedDocument:
         self._source_text = text.strip()
         self._source_starts.clear()
+        self._table_row_fragments.clear()
         metadata = _infer_document_metadata(
             path=Path(source_file),
             root_path=None,
@@ -83,6 +120,8 @@ class IntakeRegulatoryChunker(RegulatoryChunker):
             source_path_override=source_path,
         )
         blocks = _markdown_to_blocks(self._source_text)
+        if self.chunking_version == "3":
+            blocks = promote_plain_article_titles(blocks, source_text=self._source_text)
         metadata, ignored = intake_document_profile(blocks=blocks, metadata=metadata)
         chunks, structure = self.chunk_blocks_with_structure(
             [block for block in blocks if block.block_id not in ignored],
@@ -140,6 +179,8 @@ class IntakeRegulatoryChunker(RegulatoryChunker):
                     break
                 end = match.end()
             if end == start:
+                if self.chunking_version == "3":
+                    return self._single_cell_row_prefix_end(block, start, prefix)
                 raise ValueError(
                     "An intake table row exceeds the embedding content token limit"
                 )
@@ -176,6 +217,91 @@ class IntakeRegulatoryChunker(RegulatoryChunker):
                 end = boundaries[-1]
                 break
         return end
+
+    def _single_cell_row_prefix_end(
+        self, block: SourceBlock, start: int, prefix: list[SourceBlock]
+    ) -> int:
+        row_end = block.text.find("\n", start)
+        if row_end == -1:
+            row_end = len(block.text)
+        row = block.text[start:row_end]
+        pipes: list[int] = []
+        escaped = False
+        for index, character in enumerate(row):
+            if character == "|" and not escaped:
+                pipes.append(index)
+            escaped = not escaped if character == "\\" else False
+        if (
+            len(pipes) != 2
+            or pipes != [0, len(row) - 1]
+            or "`" in row
+            or _TABLE_SEPARATOR_CELL.fullmatch(row[1:-1])
+        ):
+            raise ValueError(
+                "An intake table row exceeds the embedding content token limit; "
+                "only a single source cell with safe line breaks can continue"
+            )
+        boundaries = [
+            start + match.start()
+            for match in _CELL_BREAK.finditer(row)
+            if match.start() > 1 and not row[match.start() - 1].isspace()
+        ]
+        parts: list[tuple[int, int]] = []
+        part_start = start
+        while part_start < row_end:
+            remaining = self._slice(block, part_start, row_end)
+            if self._fits([*prefix, remaining]):
+                parts.append((part_start, row_end))
+                break
+            fitting = [
+                boundary
+                for boundary in boundaries
+                if boundary > part_start
+                and self._fits([*prefix, self._slice(block, part_start, boundary)])
+            ]
+            if not fitting:
+                raise ValueError(
+                    "An intake table row exceeds the embedding content token limit; "
+                    "no safe source cell line break fits its final heading and body"
+                )
+            # Keep numbered subfields together when both resulting slices fit.
+            numbered = [
+                boundary
+                for boundary in fitting
+                if _CELL_NUMBERED_BREAK.match(block.text, boundary)
+                and self._fits([self._slice(block, boundary, row_end)])
+            ]
+            part_end = numbered[-1] if numbered else fitting[-1]
+            parts.append((part_start, part_end))
+            part_start = part_end
+            prefix = []
+
+        source_start = self._source_start(block)
+        row_index = 0
+        for preceding in block.text[:start].splitlines():
+            cells = preceding.strip().strip("|").split("|")
+            if cells and all(_TABLE_SEPARATOR_CELL.fullmatch(cell) for cell in cells):
+                continue
+            row_index += 1
+        row_hash = hashlib.sha256(row.encode()).hexdigest()
+        for index, (part_start, part_end) in enumerate(parts):
+            fragment = self._slice(block, part_start, part_end)
+            self._table_row_fragments[(block.block_id, fragment.start_char)] = (
+                IntakeTableRow(
+                    version=1,
+                    table_index=None,
+                    row_index=row_index,
+                    cell_index=0,
+                    row_sha256=row_hash,
+                    row_source_start_char=source_start + start,
+                    row_source_end_char=source_start + row_end,
+                    fragment_source_start_char=fragment.start_char,
+                    fragment_source_end_char=fragment.end_char,
+                    fragment_index=index,
+                    fragment_count=len(parts),
+                )
+            )
+        return parts[0][1]
 
     @staticmethod
     def _is_heading(block: SourceBlock, draft: _ChunkDraft) -> bool:
@@ -251,7 +377,7 @@ class IntakeRegulatoryChunker(RegulatoryChunker):
                 )
             else:
                 retained.append(draft)
-        if self.chunking_version == "2":
+        if self.chunking_version in {"2", "3"}:
             retained = self._merge_adjacent_table_headings(retained, blocks=blocks)
         return retained, structure
 
@@ -385,6 +511,20 @@ class IntakeRegulatoryChunker(RegulatoryChunker):
                     start += 1
                 if start == len(block.text):
                     break
+                fragment = self._table_row_fragments.get(
+                    (block.block_id, self._source_start(block) + start)
+                )
+                if fragment is not None:
+                    end = fragment.fragment_source_end_char - self._source_start(block)
+                    piece = self._slice(block, start, end)
+                    if not self._fits([*current, piece]):
+                        raise ValueError(
+                            "An intake table continuation exceeds its budget"
+                        )
+                    groups.append([*current, piece])
+                    current = []
+                    start = end
+                    continue
                 if len(block.text) - start <= max(64, self.content_token_limit * 8):
                     remaining = (
                         block
@@ -419,6 +559,34 @@ class IntakeRegulatoryChunker(RegulatoryChunker):
             for part, blocks in enumerate(groups, start=1)
         ]
 
+    def _finalize_chunk(
+        self, draft: _ChunkDraft, metadata: DocumentMetadata, order: int
+    ) -> RegulatoryChunk:
+        chunk = super()._finalize_chunk(draft, metadata, order)
+        fragments = [
+            fragment
+            for block in draft.blocks
+            if (
+                fragment := self._table_row_fragments.get(
+                    (block.block_id, block.start_char)
+                )
+            )
+            is not None
+        ]
+        if not fragments:
+            return chunk
+        if len(fragments) != 1 or draft.table_index is None:
+            raise ValueError(
+                "An intake table continuation lost its source row identity"
+            )
+        fragment = replace(fragments[0], table_index=draft.table_index)
+        return replace(
+            chunk,
+            metadata=IntakeChunkMetadata(
+                **asdict(chunk.metadata), intake_table_row=fragment
+            ),
+        )
+
     def _build_hierarchical_aggregate_chunks(
         self,
         *,
@@ -437,12 +605,12 @@ class IntakeRegulatoryChunker(RegulatoryChunker):
             )
             if len(self.tokenizer.encode(chunk.text)) <= self.content_token_limit
         ]
-        return [
-            replace(
-                chunk,
-                metadata=replace(
-                    chunk.metadata, chunk_order=len(atomic_chunks) + index
-                ),
+        aggregates: list[RegulatoryChunk] = []
+        for index, chunk in enumerate(retained):
+            aggregate_metadata = replace(
+                chunk.metadata, chunk_order=len(atomic_chunks) + index
             )
-            for index, chunk in enumerate(retained)
-        ]
+            if isinstance(aggregate_metadata, IntakeChunkMetadata):
+                aggregate_metadata = replace(aggregate_metadata, intake_table_row=None)
+            aggregates.append(replace(chunk, metadata=aggregate_metadata))
+        return aggregates

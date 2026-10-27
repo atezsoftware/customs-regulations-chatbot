@@ -573,5 +573,5 @@ def test_unknown_intake_chunking_version_fails_explicitly(
 ) -> None:
     with pytest.raises(ValueError, match="version is not supported"):
         IntakeRegulatoryChunker(
-            tokenizer=tokenizer, content_token_limit=312, chunking_version="3"
+            tokenizer=tokenizer, content_token_limit=312, chunking_version="4"
         )

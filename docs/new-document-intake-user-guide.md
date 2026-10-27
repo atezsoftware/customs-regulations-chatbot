@@ -42,6 +42,8 @@ Karma ZIP için manifest zorunlu değildir. Bağlantıların birden fazla üst b
 
 **Belge adları:** Hazırlama sırasında LLM'nin belgenin kendi kaynak metninden çıkardığı tam başlık kullanılır. Teknik yükleme adı mevzuat başlığı olarak kaydedilmez; orijinal dosya adı kaynak kanıtında korunur. Ekin kendi başlığı kullanılır. Başlık bulunamaz veya farklı başlıklar çelişirse **Başlık belirlenemedi** görünür. İncelemedeki **document_title** veya **annex_title** alanını düzeltip kaydettiğinizde ilgili yeni dosyanın adı güncellenir. Eski külliyat dosyaları bu nedenle yeniden adlandırılmaz.
 
+Tek ek PDF'sinde EK-1, EK-2 gibi farklı başlıklar birlikte bulunuyorsa her chunk'ın kendi ek başlığını koruyun. Dosyaya ad vermek için bu farklı başlıkların yerine ortak bir hukuki başlık uydurmayın. Gerekirse işlem **completed** olduktan sonra PC Külliyatı'nda dosya ayrıntısını açıp **Rename file** ile kaynak ana belgenin adı ve “Ekler (EK-1–EK-5)” gibi açıklayıcı bir görünen ad kullanın.
+
 ## 3. Hazır Markdown standardı
 
 Hazır Markdown verildiğinde Markdown'a dönüştürme adımı atlanır. Chunk hazırlama, hukuki metadata, yürürlük tarihi çıkarımı ve etiketleme yine yapılır.
@@ -134,6 +136,8 @@ Türetilmiş toplu chunk'ların okumada kullanılacağı tarih aralığı, bağl
 **Chunk sınırı hatası varsa önce yeniden hazırlamayı değerlendirin.** Kaynakta devamı olduğu halde yalnız “2.” veya tek başına bir tablo başlığı oluşmuşsa, incelemenin altındaki **Reprepare chunks from frozen source** bölümüne bakın. Bu işlem aynı yeni dosyaları, dondurulmuş dönüştürülmüş metni ve ana belge-ek ilişkilerini kullanır; güncel hazırlama kurallarıyla chunk'ları ve etiketleri yeniden üretir. PC Külliyatı'ndaki diğer kayıtları değiştirmez.
 
 Yeniden hazırlama, yalnızca henüz onaylanmamış, aktif çalışması kalmamış ve chunk’larda kaydedilmiş manuel değişiklik içermeyen uygun bir içe aktarımda açılır. Ekran, uygun değilse sunucunun engelleme nedenini gösterir. **Bu nedenle sınırları, manuel düzeltmeleri kaydetmeden önce kontrol edin.** Kaydedilmemiş taslakları önce geri almanız gerekir; kaydedilmiş manuel değişiklik varsa yeniden hazırlama bunların üzerine yazmaz. Bu işlem dondurulmuş kaynak metnindeki okuma/yazım hatasını düzeltmez. Kaynak metni düzeltmek için orijinal belgeye dayanarak `After` alanlarını kullanın. Bir etiketi zorla alabilmek için kaynakta olmayan hüküm eklemeyin.
+
+HTML kaynağında sayfa düzeni nedeniyle kaybolmuş madde sınırları, aynı dondurulmuş kaynaktan yeniden kurulabilir. Uzun bir tablo hücresi birden fazla devam chunk'ında gösterilebilir; parçaları birlikte okuyun. Yeniden hazırlama sıraya girdikten sonra başka bir etiketleme çalışması başlarsa aynı istek bekletilir; dosyayı yeniden yüklemeyin.
 
 ## 5. Önceki mevzuat ve mülga ilişkisini belirleyin
 

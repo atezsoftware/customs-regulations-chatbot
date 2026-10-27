@@ -36,6 +36,12 @@ _WRAPPED_ANNEX_REFERENCE = re.compile(
     r"(?P<line_break>\n[ \t]*)(?P<number>\d+(?:[/.]\d+)*[A-Z]?)\b",
     re.IGNORECASE,
 )
+_WRAPPED_ARTICLE = re.compile(
+    r"(?m)^(?P<label>[ \t]*(?:(?:GEÇİCİ|GECICI|MÜKERRER|MUKERRER|EK)"
+    r"[ \t]*(?:\n[ \t]*)?)?MADDE[ \t]+\d+(?:/?[A-Z])?)"
+    r"[ \t]*(?:\n[ \t]*)?(?P<dash>[-–—])[ \t]*(?=\n[ \t]*\(\d{1,3}\))",
+    re.I,
+)
 
 
 def _navigation_suffix(label: str) -> str | None:
@@ -360,6 +366,23 @@ def normalize_wrapped_annex_references(text: str) -> str:
     return _apply_replacements(text, replacements)
 
 
+def normalize_wrapped_article_headings(text: str) -> str:
+    """Join only a line-start article label/dash followed by a real numbered body."""
+    masked, _environment = _mask_code(text)
+    return _apply_replacements(
+        text,
+        [
+            (
+                match.start(),
+                match.end(),
+                f"{' '.join(match['label'].split())}{match['dash']}",
+            )
+            for match in _WRAPPED_ARTICLE.finditer(masked)
+            if "\n" in match[0]
+        ],
+    )
+
+
 def require_chunk_source_coverage(text: str) -> None:
     """Every source letter/digit must reach a chunk or one of its delivered headings."""
     chunked = RegulatoryChunker().chunk_text(text)
@@ -404,16 +427,20 @@ def prepare_intake_text(
     links: Sequence[SourceLink] = (),
     package_assets: Sequence[IntakeSourceAsset] = (),
     preserve_markdown_headings: bool = False,
+    formatter_version: int = 4,
 ) -> str:
+    if formatter_version not in {2, 3, 4}:
+        raise ValueError("The intake formatter version is not supported")
     if asset_sha256 is not None:
         text = normalize_attachment_navigation(
             text, asset_sha256=asset_sha256, links=links, package_assets=package_assets
         )
-    normalized = normalize_wrapped_annex_references(
-        normalize_inline_articles(
-            text, preserve_markdown_headings=preserve_markdown_headings
-        )
+    normalized = normalize_inline_articles(
+        normalize_wrapped_article_headings(text) if formatter_version >= 4 else text,
+        preserve_markdown_headings=preserve_markdown_headings,
     )
+    if formatter_version >= 3:
+        normalized = normalize_wrapped_annex_references(normalized)
     if "".join(text.split()) != "".join(normalized.split()):
         raise ValueError("New document normalization changed the source wording")
     require_chunk_source_coverage(normalized)

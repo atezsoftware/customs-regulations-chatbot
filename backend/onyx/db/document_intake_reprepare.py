@@ -47,6 +47,10 @@ from onyx.regulatory.amendments.annexes.models import AnnexCanonicalSnapshot
 from onyx.regulatory.document_intake.metadata import METADATA_AUDIT_KEY
 
 
+class IntakeReprepareLabelingBusy(intake.IntakeConflictError):
+    """A different labeling run acquired this document set after claim."""
+
+
 def latest_reprepare(
     session: Session, intake_id: UUID
 ) -> RegulatoryDocumentIntakeReprepare | None:
@@ -212,7 +216,12 @@ def _guard_batch(
     )
     from onyx.db.regulatory_labeling import get_active_run_id
 
-    if get_active_run_id(session, batch.document_set_id) is not None:
+    active_run_id = get_active_run_id(session, batch.document_set_id)
+    if active_run_id is not None:
+        if running and active_run_id != batch.labeling_run_id:
+            raise IntakeReprepareLabelingBusy(
+                "Wait for active document-set labeling work to finish"
+            )
         raise intake.IntakeConflictError(
             "Wait for active document-set labeling work to finish"
         )
@@ -292,6 +301,8 @@ def reprepare_snapshot(
             if batch.labeling_run_id
             else None,
             documents=payload,
+            target_chunking_version="3",
+            target_formatter_version=4,
         )
     )
     return {"expected_sha256": digest, "documents": payload}
@@ -337,6 +348,8 @@ def request_reprepare(
         )
         audit[item["document_id"]] = {
             **item,
+            "target_chunking_version": "3",
+            "target_formatter_version": 4,
             "previous_review_sha256": batch.review_sha256,
             "before_revision_ids": [str(value) for value in revisions.values()],
             "status": "pending",
@@ -359,6 +372,56 @@ def request_reprepare(
 
 
 def claim_reprepare(session: Session, intake_id: UUID, request_id: UUID) -> UUID | None:
+    from onyx.db.regulatory_labeling import get_active_run_id
+
+    document_set_id = session.execute(
+        select(RegulatoryDocumentIntake.document_set_id).where(
+            RegulatoryDocumentIntake.id == intake_id
+        )
+    ).scalar_one()
+    session.get_one(DocumentSet, document_set_id, with_for_update=True)
+    # A late delivery must not wait on an intake already finalizing label admission.
+    batch = session.scalar(
+        select(RegulatoryDocumentIntake)
+        .where(RegulatoryDocumentIntake.id == intake_id)
+        .with_for_update(skip_locked=True)
+        .execution_options(populate_existing=True)
+    )
+    if batch is None or batch.document_set_id != document_set_id:
+        return None
+    request = session.scalar(
+        select(RegulatoryDocumentIntakeReprepare)
+        .where(RegulatoryDocumentIntakeReprepare.id == request_id)
+        .with_for_update(skip_locked=True)
+        .execution_options(populate_existing=True)
+    )
+    now = datetime.now(timezone.utc)
+    if (
+        request is None
+        or request.intake_id != batch.id
+        or request.status == "prepared"
+        or batch.stage != "reprepare"
+        or batch.status != "preparing"
+        or batch.lease_token is not None
+        or batch.lease_expires_at is not None
+    ):
+        return None
+    latest = latest_reprepare(session, intake_id)
+    if latest is None or latest.id != request_id:
+        return None
+    if get_active_run_id(session, document_set_id) is not None:
+        return None
+    batch.status, batch.error = "preparing", None
+    batch.lease_token, batch.lease_expires_at = uuid4(), now + timedelta(minutes=10)
+    request.status, request.error = "running", None
+    session.flush()
+    return batch.lease_token
+
+
+def defer_busy_reprepare(
+    session: Session, intake_id: UUID, request_id: UUID, token: UUID
+) -> bool:
+    """Release only a still-owned live claim, retaining completed checkpoints."""
     batch = session.get_one(
         RegulatoryDocumentIntake,
         intake_id,
@@ -371,24 +434,27 @@ def claim_reprepare(session: Session, intake_id: UUID, request_id: UUID) -> UUID
         with_for_update=True,
         populate_existing=True,
     )
-    now = datetime.now(timezone.utc)
-    if (
-        request.intake_id != batch.id
-        or request.status == "prepared"
-        or batch.stage != "reprepare"
-        or batch.status != "preparing"
-        or batch.lease_token is not None
-        or batch.lease_expires_at is not None
-    ):
-        return None
     latest = latest_reprepare(session, intake_id)
-    if latest is None or latest.id != request_id:
-        return None
-    batch.status, batch.error = "preparing", None
-    batch.lease_token, batch.lease_expires_at = uuid4(), now + timedelta(minutes=10)
-    request.status, request.error = "running", None
+    if (
+        batch.status != "preparing"
+        or batch.stage != "reprepare"
+        or batch.lease_token != token
+        or batch.lease_expires_at is None
+        or batch.lease_expires_at <= datetime.now(timezone.utc)
+        or request.intake_id != batch.id
+        or request.status != "running"
+        or latest is None
+        or latest.id != request.id
+        or any(
+            member.approval_attempt_id for member in intake.intake_files(session, batch)
+        )
+    ):
+        return False
+    batch.lease_token, batch.lease_expires_at = None, None
+    batch.error = None
+    request.status, request.error = "queued", None
     session.flush()
-    return batch.lease_token
+    return True
 
 
 def persist_owned_reprepared_intake_file(
@@ -457,6 +523,14 @@ def persist_owned_reprepared_intake_file(
             )
         if not isinstance(documents, LoadedUserFileDocuments):
             raise ValueError("Verified original extraction is required for reprepare")
+        from onyx.regulatory.document_intake.chunking_profile import (
+            documents_intake_chunking_version,
+        )
+        from onyx.regulatory.document_intake.versions import reprepare_target_versions
+
+        version, formatter_version = reprepare_target_versions(entry)
+        if documents_intake_chunking_version(documents) != version:
+            raise ValueError("Prepared documents differ from the frozen target version")
         proof = documents.original_extraction
         old = OriginalIngestionReceipt.model_validate(entry["source_receipt"])
         if (
@@ -471,7 +545,14 @@ def persist_owned_reprepared_intake_file(
         if proof.plaintext_sha256 != old.plaintext_sha256:
             from onyx.db.document_intake_normalization import derive_normalization
 
-            normalization = derive_normalization(session, batch, member, old, documents)
+            normalization = derive_normalization(
+                session,
+                batch,
+                member,
+                old,
+                documents,
+                formatter_version=formatter_version,
+            )
         retain_canonical_revisions(session, before)
         session.execute(
             delete(RegulatoryChunk).where(RegulatoryChunk.user_file_id == file.id),

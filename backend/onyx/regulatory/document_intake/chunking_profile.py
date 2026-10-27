@@ -9,8 +9,8 @@ from onyx.regulatory.document_intake.models import (
     IntakeSourceContext,
 )
 
-INTAKE_CHUNKING_CODE_VERSION: IntakeChunkingVersion = "2"
-SUPPORTED_INTAKE_CHUNKING_VERSIONS = frozenset({"1", "2"})
+INTAKE_CHUNKING_CODE_VERSION: IntakeChunkingVersion = "3"
+SUPPORTED_INTAKE_CHUNKING_VERSIONS = frozenset({"1", "2", "3"})
 
 
 def supported_intake_chunking_version(version: str) -> IntakeChunkingVersion:

@@ -15,6 +15,7 @@ from onyx.file_store.file_store import FileStore, get_default_file_store
 from onyx.regulatory.amendments.annexes.models import SourceLink
 from onyx.regulatory.amendments.annexes.sources import MAX_ASSET_BYTES, MAX_TEXT_CHARS
 from onyx.regulatory.document_intake.models import (
+    IntakeChunkingVersion,
     IntakeFilePreparation,
     IntakeSourceAsset,
     IntakeSourceContext,
@@ -23,6 +24,7 @@ from onyx.regulatory.document_intake.text import (
     prepare_intake_text,
     require_resolved_attachment_references,
 )
+from onyx.regulatory.document_intake.versions import IntakeFormatterVersion
 from onyx.utils.web_content import decode_html_bytes
 
 ChunkFile = Callable[[UUID, str, list[Document]], bool]
@@ -39,6 +41,8 @@ def build_intake_document(
     package_assets: Sequence[IntakeSourceAsset] = (),
     original_file_id: str | None = None,
     parent_asset_hashes: Collection[str] | None = None,
+    formatter_version: IntakeFormatterVersion = 4,
+    chunking_version: IntakeChunkingVersion = "3",
 ) -> Document:
     if asset.package_id != package_id:
         raise ValueError("Source asset belongs to another intake package")
@@ -53,6 +57,7 @@ def build_intake_document(
         links=links,
         package_assets=package_assets,
         preserve_markdown_headings=asset.mime_type == "text/markdown",
+        formatter_version=formatter_version,
     )
     incoming = [
         link.model_copy(deep=True)
@@ -72,6 +77,7 @@ def build_intake_document(
     if any(item.package_id != package_id for item in package_assets):
         raise ValueError("Source context contains an asset from another package")
     context = IntakeSourceContext(
+        chunking_version=chunking_version,
         package_id=package_id,
         asset_id=asset.id,
         asset_sha256=asset.sha256,
@@ -130,10 +136,16 @@ def clone_intake_original(
     )
 
 
-def _canonical_source_text(asset: IntakeSourceAsset, raw: bytes, prepared: str) -> str:
+def _canonical_source_text(
+    asset: IntakeSourceAsset,
+    raw: bytes,
+    prepared: str,
+    *,
+    formatter_version: IntakeFormatterVersion = 4,
+) -> str:
     if asset.mime_type != "text/html":
         return prepared
-    from bs4 import BeautifulSoup
+    from bs4 import BeautifulSoup, Tag
 
     from onyx.file_processing.html_utils import parse_html_page_basic
 
@@ -143,6 +155,12 @@ def _canonical_source_text(asset: IntakeSourceAsset, raw: bytes, prepared: str) 
     ):
         tag.decompose()
     root = soup.find("main") or soup.find("article") or soup.body or soup
+    if not isinstance(root, Tag):
+        raise ValueError("The HTML source has no document container")
+    if formatter_version >= 4:
+        from onyx.regulatory.document_intake.html import canonical_legal_html
+
+        return canonical_legal_html(root)
     # Source-package inspection flattens cells; canonical input retains their grid.
     return parse_html_page_basic(str(root))
 
@@ -157,6 +175,8 @@ def load_verified_intake_documents(
     store: FileStore | None = None,
     original_file_id: str | None = None,
     parent_asset_hashes: Collection[str] | None = None,
+    formatter_version: IntakeFormatterVersion = 4,
+    chunking_version: IntakeChunkingVersion = "3",
 ) -> LoadedUserFileDocuments:
     """Rebuild canonical input exclusively from hash-verified retained sources."""
     if asset.package_id != package_id:
@@ -173,7 +193,9 @@ def load_verified_intake_documents(
     prepared_text = _read_verified(
         file_store, asset.text_file_id, asset.text_sha256, limit=MAX_TEXT_CHARS * 4
     ).decode("utf-8")
-    text = _canonical_source_text(asset, raw, prepared_text)
+    text = _canonical_source_text(
+        asset, raw, prepared_text, formatter_version=formatter_version
+    )
     document = build_intake_document(
         package_id=package_id,
         asset=asset,
@@ -183,6 +205,8 @@ def load_verified_intake_documents(
         package_assets=package_assets,
         original_file_id=owned_file_id,
         parent_asset_hashes=parent_asset_hashes,
+        formatter_version=formatter_version,
+        chunking_version=chunking_version,
     )
     return LoadedUserFileDocuments(
         [document], file_id=owned_file_id, raw_sha256=asset.sha256
@@ -202,6 +226,8 @@ def prepare_intake_file(
     store_plaintext: StorePlaintext | None = None,
     original_file_id: str | None = None,
     parent_asset_hashes: Collection[str] | None = None,
+    formatter_version: IntakeFormatterVersion = 4,
+    chunking_version: IntakeChunkingVersion = "3",
 ) -> IntakeFilePreparation:
     """Prepare an admitted asset without comparing or publishing search content."""
     documents = load_verified_intake_documents(
@@ -213,6 +239,8 @@ def prepare_intake_file(
         store=store,
         original_file_id=original_file_id,
         parent_asset_hashes=parent_asset_hashes,
+        formatter_version=formatter_version,
+        chunking_version=chunking_version,
     )
     if chunk_file is None:
         from onyx.regulatory.writer_publication import chunk_owned_file
