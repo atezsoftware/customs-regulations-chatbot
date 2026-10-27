@@ -35,8 +35,10 @@ from onyx.regulatory.document_intake.api_models import (
     IntakeChunkEditRequest,
     IntakeChunksEditRequest,
     IntakeCreateRequest,
+    IntakeExistingParentCandidate,
     IntakePredecessorCandidate,
     IntakePredecessorSelectionRequest,
+    IntakePublicationReviewRequest,
     IntakeReprepareRequest,
     IntakeReprepareSnapshot,
 )
@@ -413,6 +415,8 @@ def retry_intake_batch(
         raise OnyxError(OnyxErrorCode.INVALID_INPUT, str(exc)) from exc
     if deliveries:
         _enqueue_indexes(db_session, batch, deliveries, tenant_id)
+    elif batch.stage == "labeling":
+        _enqueue_edited_labels(db_session, batch, batch.labeling_run_id, tenant_id)
     elif batch.stage not in {"indexing", "lineage", "completed"}:
         _enqueue_batch(db_session, batch, tenant_id)
     return _snapshot(db_session, batch)
@@ -563,6 +567,67 @@ def _enqueue_edited_labels(
         logger.exception("Edited intake labeling dispatch failed batch=%s", batch.id)
         repository.mark_intake_label_dispatch_failed(db_session, batch.id)
         db_session.commit()
+
+
+@router.put("/batches/{batch_id}/documents/{document_id}/publication-review")
+def set_intake_publication_review(
+    batch_id: UUID,
+    document_id: UUID,
+    request: IntakePublicationReviewRequest,
+    user: User = Depends(_admin),
+    db_session: Session = Depends(get_session),
+    tenant_id: str = Depends(get_current_tenant_id),
+) -> IntakeBatchSnapshot:
+    from onyx.db.document_intake_review import set_publication_review
+
+    batch = _get_batch(db_session, batch_id, user)
+    try:
+        run_id = set_publication_review(
+            db_session,
+            batch,
+            document_id=document_id,
+            expected_review_sha256=request.expected_review_sha256,
+            disposition=request.disposition,
+            duplicate_of_document_id=request.duplicate_of_document_id,
+            existing_parent_file_id=request.existing_parent_file_id,
+            reason=request.reason,
+            user=user,
+        )
+        db_session.commit()
+    except (
+        repository.IntakeConflictError,
+        labeling_repository.LabelingStateConflictError,
+    ) as exc:
+        db_session.rollback()
+        raise OnyxError(OnyxErrorCode.CONFLICT, str(exc)) from exc
+    except ValueError as exc:
+        db_session.rollback()
+        raise OnyxError(OnyxErrorCode.INVALID_INPUT, str(exc)) from exc
+    _enqueue_edited_labels(db_session, batch, run_id, tenant_id)
+    return _snapshot(db_session, batch)
+
+
+@router.get("/batches/{batch_id}/documents/{document_id}/existing-parent-candidates")
+def list_intake_existing_parent_candidates(
+    batch_id: UUID,
+    document_id: UUID,
+    search: str | None = Query(default=None, max_length=500),
+    limit: int = Query(default=20, ge=1, le=50),
+    user: User = Depends(_admin),
+    db_session: Session = Depends(get_session),
+) -> list[IntakeExistingParentCandidate]:
+    from onyx.db.document_intake_review import existing_parent_candidates
+
+    batch = _get_batch(db_session, batch_id, user)
+    try:
+        return [
+            IntakeExistingParentCandidate.model_validate(row)
+            for row in existing_parent_candidates(
+                db_session, batch, document_id, search, limit
+            )
+        ]
+    except ValueError as exc:
+        raise OnyxError(OnyxErrorCode.INVALID_INPUT, str(exc)) from exc
 
 
 @router.patch("/batches/{batch_id}/chunks")
@@ -722,8 +787,13 @@ def get_document_lineage(
     try:
         target = repository.resolve_intake_target(db_session, user)
         reconcile_file_lineage(db_session, target.id, file_id)
+        from onyx.db.document_intake_review import file_attachment_relations
+
         snapshot = DocumentLineageSnapshot.model_validate(
-            file_lineage_snapshot(db_session, target.id, file_id, as_of=as_of)
+            {
+                **file_lineage_snapshot(db_session, target.id, file_id, as_of=as_of),
+                **file_attachment_relations(db_session, target.id, file_id),
+            }
         )
         db_session.commit()
         return snapshot

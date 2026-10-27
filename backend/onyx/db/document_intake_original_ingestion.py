@@ -75,13 +75,14 @@ def approved_intake_original_receipt(
         or not batch.review_sha256
     ):
         return None
-    members = list(
-        session.scalars(
-            select(RegulatoryDocumentIntakeFile)
-            .where(RegulatoryDocumentIntakeFile.intake_id == batch.id)
-            .execution_options(populate_existing=True)
-        )
+    from onyx.db.document_intake_review import (
+        effective_intake_files,
+        source_evidence_file_ids,
     )
+
+    if source_evidence_file_ids(session, [user_file_id]):
+        return None
+    members = effective_intake_files(session, batch)
     if not members or any(
         item.status != "completed" or item.approval_attempt_id is None
         for item in members

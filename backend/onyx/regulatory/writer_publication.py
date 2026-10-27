@@ -500,6 +500,7 @@ def republish_user_file(
 ) -> int:
     from uuid import uuid4
 
+    from onyx.db.document_intake_review import require_publication_file_for_tenant
     from onyx.db.enums import UserFileStatus
     from onyx.db.regulatory_writer_publication import load_owned_writer_inputs
     from onyx.document_index.elasticsearch.client import ElasticsearchClient
@@ -508,6 +509,7 @@ def republish_user_file(
     from onyx.regulatory.amendments.annexes.publication_execution import LEASE_TTL
     from onyx.regulatory.writer_projection import prepare_owned_correction
 
+    require_publication_file_for_tenant(user_file_id, tenant_id)
     authority = PublicationStore(
         PublicationScope(
             tenant_id=tenant_id,

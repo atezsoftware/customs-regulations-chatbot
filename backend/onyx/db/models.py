@@ -9069,6 +9069,51 @@ class RegulatoryDocumentIntakeFile(Base):
     )
 
 
+class RegulatoryDocumentIntakeReviewDecision(Base):
+    """Append-only publication scope decisions, separate from frozen source links."""
+
+    __tablename__ = "regulatory_document_intake_review_decision"
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    intake_id: Mapped[UUID] = mapped_column(
+        ForeignKey("regulatory_document_intake.id"), index=True
+    )
+    document_id: Mapped[UUID] = mapped_column(
+        ForeignKey("regulatory_document_intake_file.id"), index=True
+    )
+    sequence: Mapped[int] = mapped_column(Integer)
+    previous_decision_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("regulatory_document_intake_review_decision.id"), nullable=True
+    )
+    disposition: Mapped[str] = mapped_column(Text)
+    duplicate_of_document_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("regulatory_document_intake_file.id"), nullable=True
+    )
+    existing_parent_file_id: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), nullable=True
+    )
+    existing_parent_snapshot: Mapped[dict[str, Any] | None] = mapped_column(
+        PGJSONB(none_as_null=True), nullable=True
+    )
+    source_snapshot: Mapped[dict[str, Any]] = mapped_column(PGJSONB)
+    reason: Mapped[str] = mapped_column(Text)
+    reviewed_by: Mapped[UUID] = mapped_column(ForeignKey("user.id"))
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    __table_args__ = (
+        UniqueConstraint("document_id", "sequence", name="uq_intake_review_sequence"),
+        CheckConstraint("sequence > 0", name="intake_review_sequence_positive"),
+        CheckConstraint(
+            "(disposition = 'source_evidence' AND duplicate_of_document_id IS NOT NULL AND existing_parent_file_id IS NULL) OR (disposition = 'legislation' AND duplicate_of_document_id IS NULL)",
+            name="intake_review_disposition_check",
+        ),
+        CheckConstraint(
+            "(existing_parent_file_id IS NULL) = (existing_parent_snapshot IS NULL)",
+            name="intake_review_parent_snapshot_check",
+        ),
+    )
+
+
 class RegulatoryDocumentIntakeReprepare(Base):
     """Durable, scoped rechunking audit for an unpublished intake."""
 

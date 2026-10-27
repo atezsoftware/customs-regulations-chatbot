@@ -47,6 +47,12 @@ def is_current_intake_labeling_run(
     if len(associations) != 1:
         return False
     intake_id, document_set_id, owner_id, file_ids = associations[0]
+    from onyx.db.document_intake_review import effective_intake_files
+
+    batch = session.get_one(RegulatoryDocumentIntake, intake_id)
+    effective_ids = {
+        member.user_file_id for member in effective_intake_files(session, batch)
+    }
     if (
         not isinstance(file_ids, list)
         or not file_ids
@@ -73,7 +79,10 @@ def is_current_intake_labeling_run(
                 DocumentSet__UserFile.document_set_id == document_set_id,
             ),
         )
-        .where(RegulatoryDocumentIntakeFile.intake_id == intake_id)
+        .where(
+            RegulatoryDocumentIntakeFile.intake_id == intake_id,
+            RegulatoryDocumentIntakeFile.user_file_id.in_(effective_ids),
+        )
     ).all()
     return (
         bool(members)

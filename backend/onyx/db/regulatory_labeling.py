@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime
+import json
 from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -831,6 +832,24 @@ def create_labeling_run(
             item_source,
         )
     )
+    from onyx.db.document_intake_review import parent_labeling_contexts
+
+    parent_contexts = parent_labeling_contexts(
+        session, [UUID(str(file_id)) for file_id in file_ids]
+    )
+    for file_id, parent_context in parent_contexts.items():
+        if parent_context is not None:
+            for item in session.scalars(
+                select(RegulatoryLabelingItem).where(
+                    RegulatoryLabelingItem.run_id == run.id,
+                    RegulatoryLabelingItem.user_file_id == file_id,
+                )
+            ):
+                item.source_snapshot = {
+                    **item.source_snapshot,
+                    "intake_parent_identity": parent_context,
+                }
+    session.flush()
     run.total_chunks = (
         session.scalar(
             select(func.count()).where(RegulatoryLabelingItem.run_id == run.id)
@@ -1274,12 +1293,24 @@ def prepare_next_item_page(
                 for item in selected
             ]
             advisory = advisories.get(target.regulatory_chunk_id)
+            parent_identity = target.source_snapshot.get("intake_parent_identity")
+            identity_block = (
+                (
+                    "\n[Reviewed main-document identity; topic advisory only, never operative or date evidence]\n"
+                    + json.dumps(parent_identity, ensure_ascii=False, sort_keys=True)
+                )
+                if parent_identity is not None
+                else ""
+            )
             context = bounded_document_context(
                 views,
                 target_id=target.regulatory_chunk_id,
-                max_utf8_bytes=_CONTEXT_BYTE_LIMIT,
+                max_utf8_bytes=_CONTEXT_BYTE_LIMIT
+                - len(identity_block.encode("utf-8")),
             )
             context += "\n[Context selection is bounded to frozen neighboring chunks.]"
+            if identity_block:
+                context += identity_block
             if advisory and advisory.strip():
                 advisory_block = (
                     "\n\n[Existing generated context; advisory only]\n"
@@ -2003,6 +2034,7 @@ def _item_snapshot_is_current(
     current_boundary_ids: Mapping[UUID, frozenset[str]],
     current_windows_complete: Mapping[UUID, bool],
     advisory_hashes: Mapping[str, str],
+    parent_identities: Mapping[UUID, dict[str, Any]],
 ) -> bool:
     try:
         member_ids = _snapshot_string_list(item.source_snapshot, "context_member_ids")
@@ -2039,6 +2071,10 @@ def _item_snapshot_is_current(
             or not _snapshot_matches_row(frozen.source_snapshot, current)
         ):
             return False
+    if item.source_snapshot.get("intake_parent_identity") != parent_identities.get(
+        item.user_file_id
+    ):
+        return False
     return advisory_hashes.get(
         item.regulatory_chunk_id, context_hash("")
     ) == item.source_snapshot.get("advisory_sha256")
@@ -2096,6 +2132,9 @@ def _apply_frozen_window_results(
     advisory_hashes = {
         chunk_id: context_hash(value) for chunk_id, value in advisories.items()
     }
+    from onyx.db.document_intake_review import parent_labeling_contexts
+
+    parent_identities = parent_labeling_contexts(session, [file_id])
     for item in items:
         outcome = outcomes.get(item.request_hash or "")
         if outcome is None:
@@ -2110,6 +2149,7 @@ def _apply_frozen_window_results(
             current_boundary_ids=current_boundary_ids,
             current_windows_complete=current_windows_complete,
             advisory_hashes=advisory_hashes,
+            parent_identities=parent_identities,
         ):
             item.status = "stale"
             item.error = "The canonical context changed before labels were applied"
@@ -2494,6 +2534,11 @@ def _revalidate_projection_sources(
     window_cache: dict[
         tuple[UUID, int, int], tuple[list[RegulatoryChunk], frozenset[str], bool]
     ] = {}
+    from onyx.db.document_intake_review import parent_labeling_contexts
+
+    parent_identities = parent_labeling_contexts(
+        session, list({item.user_file_id for item in completed})
+    )
     for item in completed:
         lower, upper = _snapshot_context_window(item.source_snapshot)
         key = (item.user_file_id, lower, upper)
@@ -2515,6 +2560,7 @@ def _revalidate_projection_sources(
             current_boundary_ids={item.user_file_id: boundaries},
             current_windows_complete={item.user_file_id: complete},
             advisory_hashes=advisory_hashes,
+            parent_identities=parent_identities,
         ):
             item.status = "stale"
             item.labels = []
@@ -2693,6 +2739,11 @@ def current_labeling_items_for_search(
         session, [item.regulatory_chunk_id for item in items]
     )
     hashes = {key: context_hash(value) for key, value in advisories.items()}
+    from onyx.db.document_intake_review import parent_labeling_contexts
+
+    parent_identities = parent_labeling_contexts(
+        session, list({file_id for file_id, _lower, _upper in groups})
+    )
     for (file_id, lower, upper), file_items in groups.items():
         if deadline is not None and monotonic() >= deadline:
             break
@@ -2744,6 +2795,7 @@ def current_labeling_items_for_search(
                     current_boundary_ids={file_id: boundaries},
                     current_windows_complete={file_id: complete},
                     advisory_hashes=hashes,
+                    parent_identities=parent_identities,
                 )
             ):
                 valid.add(item.regulatory_chunk_id)
