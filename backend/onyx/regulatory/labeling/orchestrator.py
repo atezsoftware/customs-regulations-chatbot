@@ -9,6 +9,10 @@ from typing import Protocol, runtime_checkable
 from uuid import UUID
 
 from onyx.db import regulatory_labeling as repository
+from onyx.db.document_intake_label_repair import (
+    IntakeLabelRepairSourceChangedError,
+    load_current_intake_label_repair_request,
+)
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.db.labeling_configuration import (
     LabelingProviderBinding,
@@ -31,12 +35,21 @@ from onyx.regulatory.indexing_jobs.vertex_batch import (
     vertex_jsonl_line_size,
 )
 from onyx.regulatory.labeling.domain import shard_by_count_and_bytes
+from onyx.regulatory.labeling.intake_quote_repair import (
+    QUOTE_ERRORS,
+    build_quote_repair,
+    parse_quote_repair_output,
+    quote_repair_audits,
+    validate_quote_repair,
+)
 from onyx.regulatory.labeling.provider import (
+    LabelingOutcome,
     TaxonomyDefinition,
     build_labeling_request,
     validate_labeling_response,
 )
 from onyx.utils.logger import setup_logger
+from shared_configs.contextvars import get_current_tenant_id
 
 logger = setup_logger()
 
@@ -800,6 +813,118 @@ def _result_pages(
         yield items
 
 
+class _IntakeQuoteRepairRejected(ValueError):
+    """A single repair was ineligible or did not satisfy its exact quote contract."""
+
+
+def _repair_intake_quotes(
+    lease: repository.RunLease,
+    shard_id: UUID,
+    item: RegulatoryLabelingItem,
+    gateway: VertexBatchGateway,
+    rejected_response: str,
+    taxonomy: TaxonomyDefinition,
+    heartbeat: Callable[[], None],
+) -> LabelingOutcome:
+    # Fresh source/lease checks also load fields deferred on result-page objects.
+    with get_session_with_current_tenant() as session:
+        base = load_current_intake_label_repair_request(
+            session, lease, shard_id, item.id
+        )
+    try:
+        repair = build_quote_repair(
+            base_request=base,
+            rejected_response=rejected_response,
+            text=item.text_snapshot,
+            chunk_id=item.regulatory_chunk_id,
+            source_hash=item.canonical_text_sha256 or "",
+            taxonomy=taxonomy,
+        )
+    except ValueError as error:
+        raise _IntakeQuoteRepairRejected(str(error)) from error
+    submission_key = vertex_batch_submission_key(
+        [repair.request],
+        tenant_id=get_current_tenant_id(),
+        job_id=lease.run_id,
+        output_prefix=f"regulatory-labeling/{lease.run_id}/quote-repair/{shard_id}/{item.id}",
+        submission_attempt=1,
+    ).replace("regulatory-context-", "regulatory-labeling-", 1)
+    with get_session_with_current_tenant() as session:
+        if (
+            load_current_intake_label_repair_request(session, lease, shard_id, item.id)
+            != base
+        ):
+            raise IntakeLabelRepairSourceChangedError(
+                "The source changed before quote repair submission"
+            )
+    logger.info(
+        "Intake quote repair run=%s chunk=%s original_request=%s rejected_response=%s repair_request=%s submission=%s",
+        lease.run_id,
+        item.regulatory_chunk_id,
+        base.request_hash,
+        repair.rejected_response_sha256,
+        repair.request.request_hash,
+        submission_key,
+    )
+    # Use the same durable gateway: acknowledged repair output survives redelivery.
+    # Transport/lease failures must reach the normal shard reconciliation path.
+    if isinstance(gateway, StreamingLabelingGateway):
+        state = gateway.submit_stream(
+            iter([repair.request]),
+            submission_key=submission_key,
+            max_jsonl_bytes=LABELING_SHARD_BYTES,
+            on_progress=heartbeat,
+        )
+    else:
+        state = gateway.submit(
+            [repair.request],
+            submission_key=submission_key,
+            max_jsonl_bytes=LABELING_SHARD_BYTES,
+        )
+    with get_session_with_current_tenant() as session:
+        current = load_current_intake_label_repair_request(
+            session, lease, shard_id, item.id
+        )
+        if current != base:
+            raise IntakeLabelRepairSourceChangedError(
+                "The frozen labeling source changed after quote repair"
+            )
+    if state.status is not VertexBatchJobStatus.SUCCEEDED or not state.output_uri:
+        raise _IntakeQuoteRepairRejected(
+            "Quote repair did not return a completed provider response"
+        )
+    logger.info(
+        "Intake quote repair acknowledged run=%s chunk=%s repair_request=%s submission=%s output=%s",
+        lease.run_id,
+        item.regulatory_chunk_id,
+        repair.request.request_hash,
+        submission_key,
+        state.output_uri,
+    )
+    try:
+        response = parse_quote_repair_output(
+            gateway.read_results(state.output_uri), repair=repair, on_progress=heartbeat
+        )
+        outcome = validate_quote_repair(
+            response, repair=repair, text=item.text_snapshot, taxonomy=taxonomy
+        )
+        audits = quote_repair_audits(response, repair=repair)
+    except ValueError as error:
+        raise _IntakeQuoteRepairRejected(str(error)) from error
+    logger.info(
+        "Repaired intake evidence run=%s chunk=%s original_request=%s rejected_response=%s repair_request=%s submission=%s output=%s audit=%s",
+        lease.run_id,
+        item.regulatory_chunk_id,
+        base.request_hash,
+        repair.rejected_response_sha256,
+        repair.request.request_hash,
+        submission_key,
+        state.output_uri,
+        audits,
+    )
+    return outcome
+
+
 def _read_and_apply_results(
     lease: repository.RunLease,
     shard_id: UUID,
@@ -839,6 +964,13 @@ def _read_and_apply_results(
                 request_hash = item.request_hash
                 if request_hash is None:
                     continue
+                if intake_quotes and item.status in {
+                    "completed",
+                    "failed",
+                    "stale",
+                    "cancelled",
+                }:
+                    continue
                 if batch_error is not None:
                     outcomes[request_hash] = batch_error
                     continue
@@ -872,8 +1004,25 @@ def _read_and_apply_results(
                             result.context, text=item.text_snapshot, taxonomy=taxonomy
                         )
                 except ValueError as error:
-                    outcomes[request_hash] = str(error)
-                    continue
+                    if not intake_quotes or str(error) not in QUOTE_ERRORS:
+                        outcomes[request_hash] = str(error)
+                        continue
+                    try:
+                        outcome = _repair_intake_quotes(
+                            lease,
+                            shard_id,
+                            item,
+                            gateway,
+                            result.context,
+                            taxonomy,
+                            heartbeat,
+                        )
+                    except (
+                        _IntakeQuoteRepairRejected,
+                        IntakeLabelRepairSourceChangedError,
+                    ) as repair_error:
+                        outcomes[request_hash] = str(repair_error)
+                        continue
                 if outcome.abstained:
                     outcomes[request_hash] = "Model abstained: insufficient evidence"
                     continue

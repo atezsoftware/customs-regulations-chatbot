@@ -473,7 +473,10 @@ test.each([
     const upload = creation[1]!.body as FormData;
     expect(upload.get("file")).toBe(file);
     expect(upload.get("idempotency_key")).toEqual(expect.any(String));
-    expect([...upload.keys()].sort()).toEqual(["file", "idempotency_key"]);
+    expect(Array.from(upload.keys()).sort()).toEqual([
+      "file",
+      "idempotency_key",
+    ]);
     expect(fetchMock).toHaveBeenCalledWith(
       `${sourceBase}/source-1?document_set_id=7`,
       undefined

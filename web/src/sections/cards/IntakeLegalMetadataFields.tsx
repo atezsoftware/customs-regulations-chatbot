@@ -56,11 +56,9 @@ export function IntakeMetadataOrigin({
     <div className="flex flex-col gap-1">
       <div className="flex flex-wrap gap-1">
         <Tag title={label} />
-        {!pendingManual &&
-          (review.stale === true ||
-            (audit.input_stale === true && source !== "manual")) && (
-            <Tag title="Source changed · review needed" />
-          )}
+        {!pendingManual && source === "llm" && review.stale === true && (
+          <Tag title="Source changed · review needed" />
+        )}
       </div>
       {rationale && (
         <Text font="secondary-body" color="text-03">
@@ -120,6 +118,24 @@ export default function IntakeLegalMetadataFields({
   }, [editing, edits, onEdits]);
   const audit = metadataRecord(metadata.intake_legal_metadata);
   const fields = metadataRecord(audit.fields);
+  const warnings = Array.from(
+    new Set(
+      Array.isArray(audit.warnings)
+        ? audit.warnings.filter(
+            (warning): warning is string => typeof warning === "string"
+          )
+        : []
+    )
+  );
+  if (
+    audit.input_stale === true &&
+    !warnings.some((warning) =>
+      warning.startsWith("Document context changed after metadata extraction")
+    )
+  )
+    warnings.push(
+      "Document context changed after metadata extraction. Review Gemini-derived metadata against the current source; saved manual values are retained."
+    );
   const visible = editing
     ? intakeLegalMetadataFields
     : intakeLegalMetadataFields.filter(
@@ -211,14 +227,11 @@ export default function IntakeLegalMetadataFields({
             </div>
           ))}
       </div>
-      {Array.isArray(audit.warnings) &&
-        audit.warnings
-          .filter((warning): warning is string => typeof warning === "string")
-          .map((warning, index) => (
-            <Text key={index} as="p" font="secondary-body" color="text-04">
-              {warning}
-            </Text>
-          ))}
+      {warnings.map((warning, index) => (
+        <Text key={index} as="p" font="secondary-body" color="text-04">
+          {warning}
+        </Text>
+      ))}
       {editing && edits.error && (
         <Text color="status-error-05">{edits.error}</Text>
       )}

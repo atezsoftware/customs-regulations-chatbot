@@ -120,7 +120,7 @@ Kaydetmeden önce düzenlenen metinler ve bunlardan yeniden oluşacak toplu chun
 
 Etiketleme başarısızlıklarının sayısı hem dosya kartında hem içe aktarımın üstünde gösterilir. İlgili chunk'ta **Labeling: failed** ve hata nedeni bulunur. Bunu yalnızca etiket atanmamış olmasıyla karıştırmayın; başarısız veya kanıtı yetersiz bir chunk varken toplu onay açılmaz.
 
-Metin, başlık yolu veya chunk türü değişirse o dosyaya ait önceki LLM kanıtları güncel değil olarak işaretlenir ve LLM'den türetilmiş tarihler temizlenir. Bu alanları güncel bağlama göre yeniden kontrol edin. Gerçekten elle düzelttiğiniz değerler korunur. Önceki ve düzeltilmiş chunk revizyonları saklanır.
+Metin, başlık yolu veya chunk türü değişirse o dosyaya ait önceki LLM kanıtları güncel değil olarak işaretlenir ve LLM'den türetilmiş tarihler temizlenir. Bu alanları güncel bağlama göre yeniden kontrol edin. Gerçekten elle düzelttiğiniz değerler korunur. Önceki ve düzeltilmiş chunk revizyonları saklanır. Dosya bağlamı uyarısı metadata bölümünde, eski LLM kanıtı uyarısı ilgili alanda gösterilir; bu, her boş veya yapısal alanın değiştiği anlamına gelmez. **Retry new documents**, manuel metin düzenlemesinden sonra metadata'yı LLM'den yeniden çıkarmaz; etiketlemeyi yeniden dener. Metadata değerlerini ve dayanaklarını onaydan önce güncel kaynakla karşılaştırın.
 
 Türetilmiş toplu chunk'ların okumada kullanılacağı tarih aralığı, bağlı oldukları bütün kaynak parçalarının geçerlilik aralıklarının kesişimiyle sınırlıdır. Bu sınırlandırma, kayıtlı kaynak metnini ve elle onayladığınız tarih değerlerini değiştirmez.
 
