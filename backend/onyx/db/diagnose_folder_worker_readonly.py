@@ -6,6 +6,7 @@ import subprocess
 
 from onyx.background.celery.versioned_apps.regulatory_annex import app
 from onyx.configs import app_configs
+from onyx.regulatory.amendments.annexes import config as annex_config
 from onyx.regulatory.amendments.annexes.config import source_queue_name
 
 OWNED_FILES = (
@@ -15,6 +16,21 @@ OWNED_FILES = (
 
 
 def main() -> None:
+    print("INTAKE_RECOVERY_GATE", json.dumps({
+        "enabled": annex_config.REGULATORY_ANNEX_WORKER_ENABLED,
+        "environment": annex_config.REGULATORY_ANNEX_ENVIRONMENT,
+        "database_identity": annex_config.ANNEX_DATABASE_IDENTITY,
+    }), flush=True)
+    control_tail = subprocess.run(
+        ["tail", "-n", "800", "/var/log/onyx/celery_worker_light.log"],
+        check=False, capture_output=True, text=True,
+    )
+    control_lines = [line for line in control_tail.stdout.splitlines() if "recover_document_intakes" in line]
+    print("INTAKE_RECOVERY_LIGHT_LOG_COUNTS", json.dumps({
+        "received": sum("received" in line.lower() for line in control_lines),
+        "succeeded": sum("succeeded" in line.lower() for line in control_lines),
+        "failed": sum("failed" in line.lower() or "scope mismatch" in line.lower() for line in control_lines),
+    }), flush=True)
     registered = app.control.inspect(timeout=5).registered() or {}
     print(
         "INTAKE_RECOVERY_REGISTERED",
