@@ -43,9 +43,22 @@ from onyx.regulatory.indexing_jobs.vertex_batch import (
 )
 from onyx.regulatory.labeling.vertex_direct import _Manifest, _StoredResult
 
-BATCH_ID = UUID("f8d84bb5-411a-4f7e-9105-bb7b11f45d34")
-MEMBER_ID = UUID("3ce3cc58-d96f-434f-95d7-31cb719479ff")
-FILE_ID = UUID("73fd455a-4e58-4966-bfc0-edec5f2d3ca7")
+BATCH_ID = UUID("de8ef131-ab8f-4222-ba09-55a3c43b7a30")
+SOURCE_PACKAGE_ID = UUID("0e8a9538-c59f-4451-a513-3c9ce71971a3")
+OWNED_FILES = (
+    (
+        "main",
+        UUID("d22bec9a-eea0-4006-972b-331abbafbbb1"),
+        UUID("9ce14012-ca20-4be4-b725-07dd4c5ba8bb"),
+        43,
+    ),
+    (
+        "annex",
+        UUID("66b369d5-3637-47ce-9d5b-6037fe94141e"),
+        UUID("7ed78b32-7ddd-44e8-9c86-adfe9e706c5e"),
+        179,
+    ),
+)
 BINDING = "9f04d6faad370b533f335376a2c300044cb51d75ee360b05914950b6b9bea9ea"
 DATABASE = "customs-regulations-dev"
 MAX_FAILURE_FACTS = 20
@@ -100,7 +113,15 @@ class _ReadResultsOnly:
 
 
 class CacheDiagnostic:
-    def __init__(self, session: Session, chunks: Sequence[MetadataChunk]) -> None:
+    def __init__(
+        self,
+        session: Session,
+        chunks: Sequence[MetadataChunk],
+        *,
+        member_id: UUID,
+        request_limit: int = MAX_REQUESTS,
+        failure_fact_limit: int = MAX_FAILURE_FACTS,
+    ) -> None:
         self.session = session
         self.chunks = chunks
         self.by_id = {chunk.chunk_id: chunk for chunk in chunks}
@@ -110,8 +131,10 @@ class CacheDiagnostic:
         }
         self.store = PostgresBackedFileStore()
         self.identity = (
-            f"metadata-v{METADATA_VERSION}:public:{BATCH_ID}:{MEMBER_ID}:{BINDING}"
+            f"metadata-v{METADATA_VERSION}:public:{BATCH_ID}:{member_id}:{BINDING}"
         )
+        self.request_limit = request_limit
+        self.failure_fact_limit = failure_fact_limit
         self.records: set[str] = set()
         self.windows: list[dict[str, Any]] = []
         self.bad_facts: list[dict[str, Any]] = []
@@ -278,7 +301,7 @@ class CacheDiagnostic:
                 if error is None:
                     continue
                 self.total_bad_facts += 1
-                if len(self.bad_facts) >= MAX_FAILURE_FACTS:
+                if len(self.bad_facts) >= self.failure_fact_limit:
                     continue
                 evidence = self.catalog.get(str(fact.get("evidence_id", "")))
                 reference = self.catalog.get(str(fact.get("reference_evidence_id", "")))
@@ -314,7 +337,7 @@ class CacheDiagnostic:
     def _inspect(
         self, request: VertexBatchRequest, targets: Sequence[str], phase: str
     ) -> tuple[str | None, bool | None, ValueError | None]:
-        if len(self.windows) >= MAX_REQUESTS:
+        if len(self.windows) >= self.request_limit:
             raise ValueError("Diagnostic reconstructed request budget exceeded")
         line, detail = self._load(request)
         detail.update({"phase": phase, "target_ids": list(targets)})
@@ -409,71 +432,87 @@ def main() -> None:
             raise RuntimeError("Read-only database fence unavailable")
         with Session(bind=connection, autoflush=False) as session:
             batch = session.get_one(RegulatoryDocumentIntake, BATCH_ID)
-            member = session.get_one(RegulatoryDocumentIntakeFile, MEMBER_ID)
-            file = session.get_one(UserFile, FILE_ID)
             if (
                 batch.document_set_id != 15
-                or member.intake_id != batch.id
-                or member.user_file_id != file.id
-                or file.user_id != batch.created_by
-                or file.status != UserFileStatus.CHUNKED
+                or batch.source_package_id != SOURCE_PACKAGE_ID
                 or batch.labeling_run_id is not None
                 or batch.stage != "metadata"
+                or batch.status != "failed"
             ):
                 raise RuntimeError("Allowlisted unpublished metadata scope changed")
-            rows = list(
-                session.scalars(
-                    select(RegulatoryChunk)
-                    .where(RegulatoryChunk.user_file_id == FILE_ID)
-                    .order_by(RegulatoryChunk.position, RegulatoryChunk.id)
+            requests_seen = facts_reported = 0
+            for role, member_id, file_id, expected_count in OWNED_FILES:
+                member = session.get_one(RegulatoryDocumentIntakeFile, member_id)
+                file = session.get_one(UserFile, file_id)
+                if (
+                    member.intake_id != batch.id
+                    or member.user_file_id != file.id
+                    or file.user_id != batch.created_by
+                    or file.status != UserFileStatus.CHUNKED
+                ):
+                    raise RuntimeError("Allowlisted unpublished member scope changed")
+                rows = list(
+                    session.scalars(
+                        select(RegulatoryChunk)
+                        .where(RegulatoryChunk.user_file_id == file_id)
+                        .order_by(RegulatoryChunk.position, RegulatoryChunk.id)
+                    )
                 )
-            )
-            if len(rows) != 239:
-                raise RuntimeError("Allowlisted canonical source count changed")
-            chunks = metadata_chunks(rows)
-            diagnostic = CacheDiagnostic(session, chunks)
-            for offset in range(0, len(chunks), TARGETS_PER_REQUEST):
-                diagnostic.inspect_targets(
-                    [
-                        chunk.chunk_id
-                        for chunk in chunks[offset : offset + TARGETS_PER_REQUEST]
-                    ],
-                    f"window{offset // TARGETS_PER_REQUEST}",
+                if len(rows) != expected_count:
+                    raise RuntimeError("Allowlisted canonical source count changed")
+                chunks = metadata_chunks(rows)
+                diagnostic = CacheDiagnostic(
+                    session,
+                    chunks,
+                    member_id=member_id,
+                    request_limit=MAX_REQUESTS - requests_seen,
+                    failure_fact_limit=MAX_FAILURE_FACTS - facts_reported,
                 )
-            report = {
-                "scope": "read_only_cached_metadata_no_submit_no_provider_no_configuration_reads",
-                "database": DATABASE,
-                "transaction_read_only": True,
-                "batch_id": str(BATCH_ID),
-                "document_id": str(MEMBER_ID),
-                "user_file_id": str(FILE_ID),
-                "batch_status": batch.status,
-                "stage": batch.stage,
-                "canonical_count": len(rows),
-                "metadata_target_count": len(chunks),
-                "metadata_version": METADATA_VERSION,
-                "input_sha256": metadata_input_hash(chunks),
-                "canonical_metadata_audit_count": sum(
-                    "intake_legal_metadata" in row.chunk_metadata for row in rows
-                ),
-                "verified_cache_manifest_count": sum(
-                    identifier.endswith("/manifest.json")
-                    for identifier in diagnostic.records
-                ),
-                "verified_cache_output_count": sum(
-                    not identifier.endswith("/manifest.json")
-                    for identifier in diagnostic.records
-                ),
-                "requests": diagnostic.windows,
-                "total_invalid_facts": diagnostic.total_bad_facts,
-                "reported_invalid_facts_limit": MAX_FAILURE_FACTS,
-                "invalid_facts": diagnostic.bad_facts,
-            }
-            print(
-                "METADATA_CACHE_DIAGNOSTIC",
-                json.dumps(report, ensure_ascii=False, separators=(",", ":")),
-                flush=True,
-            )
+                for offset in range(0, len(chunks), TARGETS_PER_REQUEST):
+                    diagnostic.inspect_targets(
+                        [
+                            chunk.chunk_id
+                            for chunk in chunks[offset : offset + TARGETS_PER_REQUEST]
+                        ],
+                        f"window{offset // TARGETS_PER_REQUEST}",
+                    )
+                requests_seen += len(diagnostic.windows)
+                facts_reported += len(diagnostic.bad_facts)
+                report = {
+                    "scope": "read_only_cached_metadata_no_submit_no_provider_no_configuration_reads",
+                    "database": DATABASE,
+                    "transaction_read_only": True,
+                    "batch_id": str(BATCH_ID),
+                    "document_id": str(member_id),
+                    "user_file_id": str(file_id),
+                    "role": role,
+                    "batch_status": batch.status,
+                    "stage": batch.stage,
+                    "canonical_count": len(rows),
+                    "metadata_target_count": len(chunks),
+                    "metadata_version": METADATA_VERSION,
+                    "input_sha256": metadata_input_hash(chunks),
+                    "canonical_metadata_audit_count": sum(
+                        "intake_legal_metadata" in row.chunk_metadata for row in rows
+                    ),
+                    "verified_cache_manifest_count": sum(
+                        identifier.endswith("/manifest.json")
+                        for identifier in diagnostic.records
+                    ),
+                    "verified_cache_output_count": sum(
+                        not identifier.endswith("/manifest.json")
+                        for identifier in diagnostic.records
+                    ),
+                    "requests": diagnostic.windows,
+                    "total_invalid_facts": diagnostic.total_bad_facts,
+                    "reported_invalid_facts_limit": diagnostic.failure_fact_limit,
+                    "invalid_facts": diagnostic.bad_facts,
+                }
+                print(
+                    "METADATA_CACHE_DIAGNOSTIC",
+                    json.dumps(report, ensure_ascii=False, separators=(",", ":")),
+                    flush=True,
+                )
             session.rollback()
     engine.dispose()
 
