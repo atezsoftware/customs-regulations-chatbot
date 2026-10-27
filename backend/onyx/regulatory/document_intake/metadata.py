@@ -389,6 +389,116 @@ def _check_metadata_request_budget(request: VertexBatchRequest) -> None:
         )
 
 
+def _unknown_evidence_feedback(
+    payload: dict[str, object], previous_response: str
+) -> dict[str, object] | None:
+    """Point at real source entries; never resolve, rewrite or accept an invalid ID."""
+    try:
+        result = _TransportResult.model_validate_json(previous_response)
+    except ValueError:
+        return None
+    raw_sources = payload.get("complete_document")
+    raw_catalog = payload.get("evidence_catalog")
+    target_ids = payload.get("target_chunk_ids")
+    if (
+        not isinstance(raw_sources, list)
+        or not isinstance(raw_catalog, list)
+        or not isinstance(target_ids, list)
+    ):
+        return None
+    sources = [MetadataChunk.model_validate(value) for value in raw_sources]
+    catalog = build_metadata_evidence_catalog(sources)
+    if raw_catalog != [entry.model_dump(mode="json") for entry in catalog]:
+        raise ValueError("Metadata repair catalog differs from its frozen sources")
+    by_id = {entry.evidence_id: entry for entry in catalog}
+    source_positions = {source.chunk_id: index for index, source in enumerate(sources)}
+    errors: list[dict[str, object]] = []
+    total = 0
+    for target in result.chunks:
+        if target.chunk_id not in target_ids or target.chunk_id not in source_positions:
+            continue
+        for fact in target.fields:
+            for slot, invalid_id in (
+                ("evidence_id", fact.evidence_id),
+                ("reference_evidence_id", fact.reference_evidence_id),
+            ):
+                if (
+                    slot == "reference_evidence_id" and not invalid_id
+                ) or invalid_id in by_id:
+                    continue
+                total += 1
+                if len(errors) >= 8:
+                    continue
+                position = source_positions[target.chunk_id]
+                nearby_ids = [target.chunk_id]
+                nearby_ids.extend(
+                    sources[index].chunk_id
+                    for index in (position - 1, position + 1)
+                    if 0 <= index < len(sources)
+                )
+                eligible = [
+                    entry
+                    for entry in catalog
+                    if entry.source_chunk_id in nearby_ids
+                    and (
+                        entry.scope == "body"
+                        or (
+                            slot == "evidence_id"
+                            and fact.field in HEADING_EVIDENCE_FIELDS
+                        )
+                    )
+                ]
+                # The nearest verified heading is useful for title-less continuations.
+                # The full source catalog remains available beyond this diagnostic subset.
+                eligible.sort(
+                    key=lambda entry: (
+                        nearby_ids.index(entry.source_chunk_id),
+                        0 if entry.scope == "heading" else 1,
+                        -(entry.heading_index or 0)
+                        if entry.scope == "heading"
+                        else entry.start,
+                        -(entry.end - entry.start),
+                        entry.evidence_id,
+                    )
+                )
+                item: dict[str, object] = {
+                    "target_chunk_id": target.chunk_id,
+                    "field": fact.field,
+                    "invalid_slot": slot,
+                    "error": "evidence_id_not_in_original_catalog",
+                    "available_evidence": [
+                        entry.model_dump(mode="json") for entry in eligible[:8]
+                    ],
+                }
+                if re.fullmatch(r"[0-9a-f]{64}", invalid_id):
+                    item["invalid_evidence_id"] = invalid_id
+                else:
+                    # Arbitrary model text is not repeated as an instruction.
+                    item["invalid_id_sha256"] = hashlib.sha256(
+                        invalid_id.encode()
+                    ).hexdigest()
+                    item["invalid_id_length"] = len(invalid_id)
+                errors.append(item)
+    if not errors:
+        return None
+    return {
+        "version": 1,
+        "invalid_evidence_total": total,
+        "reported_error_limit": 8,
+        "candidate_limit_per_error": 8,
+        "instruction": (
+            "The listed evidence IDs do not exist. Copy an actual evidence_id exactly "
+            "from the unchanged evidence_catalog; never create, edit or guess a hash. "
+            "The entries below are only a bounded diagnostic subset, not the complete "
+            "set of permitted evidence. Verified headings may support identity/locator "
+            "facts on body continuations. Dates and publication references require body "
+            "evidence. Re-extract every original target, using source-supported values "
+            "and IDs, or omit an unsupported fact. All original strict checks still apply."
+        ),
+        "errors": errors,
+    }
+
+
 def build_metadata_repair_request(
     request: VertexBatchRequest,
     previous_response: str,
@@ -420,6 +530,10 @@ def build_metadata_repair_request(
             "exactly once. Do not repeat the invalid response."
         ),
     }
+    if validation_category == "invalid_coverage_or_evidence":
+        catalog_feedback = _unknown_evidence_feedback(payload, previous_response)
+        if catalog_feedback is not None:
+            payload["validation_feedback"]["catalog_feedback"] = catalog_feedback
     repaired = VertexBatchRequest(
         prompt=json.dumps(
             payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True
