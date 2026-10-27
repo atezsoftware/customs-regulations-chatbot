@@ -278,6 +278,115 @@ def test_bulk_reuses_unchanged_file_and_rebuilds_derived_rows_once(
     )
 
 
+def test_552_reviewed_dates_create_one_run_and_reuse_the_unchanged_file(
+    intake_session: Session,
+    intake_owner: tuple[User, DocumentSet, ModelConfiguration],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    batch, members = _ready(intake_session, intake_owner, monkeypatch)
+    root, _first = _root_chunk(intake_session, members)
+    for position in range(2, 552):
+        intake_session.add(
+            RegulatoryChunk(
+                id=f"rc_reviewed_date_{uuid4().hex}",
+                user_file_id=root.user_file_id,
+                text=f"MADDE {position + 1} — İncelenmiş teknik koşul.",
+                position=position,
+                projection_ordinal=position,
+                heading_path=["root", f"MADDE {position + 1}"],
+                chunk_type="article",
+                chunk_metadata={},
+                source="indexed",
+                status="active",
+            )
+        )
+    intake_session.flush()
+    previous = intake_session.get_one(RegulatoryLabelingRun, batch.labeling_run_id)
+    frozen, _created = labeling.create_labeling_run(
+        intake_session,
+        document_set_id=batch.document_set_id,
+        taxonomy=previous.taxonomy,
+        model_configuration_id=intake_owner[2].id,
+        model=previous.model,
+        provider_binding=previous.provider_binding,
+        requested_by_id=batch.created_by,
+        idempotency_key=uuid4(),
+        target_file_ids=[member.user_file_id for member in members],
+    )
+    lease = labeling.claim_run(
+        intake_session, run_id=frozen.id, expected_generation=0, lease_seconds=300
+    )
+    assert lease is not None
+    while pending := labeling.prepare_next_item_page(intake_session, lease, limit=128):
+        for item in pending:
+            item.status, item.labels = "completed", ["Gümrük"]
+            assignment: dict[str, object] = {
+                "label": "Gümrük",
+                "evidence": item.text_snapshot,
+            }
+            item.assignments = [assignment]
+            item.request_hash = uuid4().hex * 2
+            request: dict[str, object] = {"custom_id": item.request_hash}
+            item.request_payload = request
+        intake_session.flush()
+    frozen.status, frozen.stage, frozen.completed_chunks = (
+        "completed",
+        "finished",
+        frozen.total_chunks,
+    )
+    frozen.lease_token, frozen.lease_expires_at = None, None
+    batch.labeling_run_id, batch.status, batch.stage = (
+        frozen.id,
+        "preparing",
+        "labeling",
+    )
+    intake_session.flush()
+    intake.refresh_intake(intake_session, batch)
+    receipt = batch.review_sha256
+    assert batch.status == "ready" and receipt
+    rows = list(
+        intake_session.scalars(
+            select(RegulatoryChunk).where(
+                RegulatoryChunk.user_file_id == root.user_file_id
+            )
+        )
+    )
+    assert len(rows) == 552
+    source_texts = {row.id: row.text for row in rows}
+    previous_outcomes = {
+        item.id: (item.status, item.labels, item.assignments, item.request_hash)
+        for item in _items(intake_session, frozen.id)
+    }
+    runs_before = set(intake_session.scalars(select(RegulatoryLabelingRun.id)))
+    start = datetime.date(2025, 5, 9)
+    run_id = editing.edit_intake_chunks(
+        intake_session,
+        batch,
+        expected_review_sha256=receipt,
+        edits=[
+            editing.IntakeChunkEdit(root.id, row.id, {"validity_start_date": start})
+            for row in rows
+        ],
+    )
+    assert run_id is not None
+    assert set(
+        intake_session.scalars(select(RegulatoryLabelingRun.id))
+    ) - runs_before == {run_id}
+    assert all(
+        row.validity_start_date == start and row.text == source_texts[row.id]
+        for row in rows
+    )
+    replacement = intake_session.get_one(RegulatoryLabelingRun, run_id)
+    items = _items(intake_session, run_id)
+    assert replacement.total_chunks == 553 and replacement.completed_chunks == 1
+    assert sum(item.status == "pending" for item in items) == 552
+    assert sum(item.status == "completed" for item in items) == 1
+    assert {
+        item.id: (item.status, item.labels, item.assignments, item.request_hash)
+        for item in _items(intake_session, frozen.id)
+    } == previous_outcomes
+
+
 def test_bulk_noop_keeps_receipt_run_and_audit_exact(
     intake_session: Session,
     intake_owner: tuple[User, DocumentSet, ModelConfiguration],
@@ -381,7 +490,7 @@ def test_bulk_invalid_or_stale_edit_rolls_back_the_whole_set(
     assert _snapshot(intake_session) == before
 
 
-@pytest.mark.parametrize("count", [0, 257])
+@pytest.mark.parametrize("count", [0, 2049])
 def test_bulk_collection_bounds_do_not_change_state(
     intake_session: Session,
     intake_owner: tuple[User, DocumentSet, ModelConfiguration],
@@ -392,7 +501,7 @@ def test_bulk_collection_bounds_do_not_change_state(
     root, _first = _root_chunk(intake_session, members)
     assert batch.review_sha256
     before = _snapshot(intake_session)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="Supply between 1 and 2048 chunk edits"):
         editing.edit_intake_chunks(
             intake_session,
             batch,
