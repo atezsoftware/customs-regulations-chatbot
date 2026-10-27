@@ -46,6 +46,31 @@ jobs:
           kubectl exec -i "$pod" -n customs-regulations-dev -c "$container" -- \
             sh -ec '. /vault/secrets/config; export PYTHONPATH=/app; exec python -' < \
             backend/onyx/db/diagnose_folder_intake_readonly.py
+      - name: Read only scoped worker activity
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          pods=json.loads(Path('/tmp/amendment-pods.json').read_text())['items']
+          ready=[]
+          for pod in pods:
+              if pod['status']['phase']!='Running' or pod['metadata'].get('deletionTimestamp') or 'background' not in pod['metadata']['name']:
+                  continue
+              statuses={item['name']:item for item in pod['status'].get('containerStatuses',[])}
+              for container in pod['spec']['containers']:
+                  if 'customs-regulations-backend-lite-dev:0301d7c430633f3d5949dc4e65258b8745110d8c' in container['image'] and statuses.get(container['name'],{}).get('ready'):
+                      ready.append((pod['metadata']['name'],container['name']))
+          if len(ready)!=1:
+              raise SystemExit('Expected exactly one Ready DEV background container')
+          pod,container=ready[0]
+          Path('/tmp/folder-worker-target').write_text(pod+'\t'+container+'\n')
+          PY
+          IFS=$'\t' read -r pod container < /tmp/folder-worker-target
+          kubectl exec -i "$pod" -n customs-regulations-dev -c "$container" -- \
+            sh -ec '. /vault/secrets/config; export PYTHONPATH=/app; exec python -' < \
+            backend/onyx/db/diagnose_folder_worker_readonly.py
       - name: Filter amendment approval worker errors
         if: inputs.operation == 'inspect'
         shell: bash
