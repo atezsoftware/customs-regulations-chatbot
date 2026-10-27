@@ -60,7 +60,7 @@ jobs:
                   continue
               statuses={item['name']:item for item in pod['status'].get('containerStatuses',[])}
               for container in pod['spec']['containers']:
-                  if 'customs-regulations-backend-lite-dev:0301d7c430633f3d5949dc4e65258b8745110d8c' in container['image'] and statuses.get(container['name'],{}).get('ready'):
+                  if 'customs-regulations-backend-lite-dev:' in container['image'] and statuses.get(container['name'],{}).get('ready'):
                       ready.append((pod['metadata']['name'],container['name']))
           if len(ready)!=1:
               raise SystemExit('Expected exactly one Ready DEV background container')
