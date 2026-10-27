@@ -18,6 +18,7 @@ from onyx.regulatory.document_intake.source_graph import (
     ZIP_INPUT_KIND,
     parse_intake_graph,
 )
+from onyx.regulatory.document_intake.versions import reprepare_target_versions
 
 
 def run_document_intake_reprepare(
@@ -85,6 +86,10 @@ def run_document_intake_reprepare(
                 for key, entry in request.documents.items()
                 if entry["status"] == "prepared"
             }
+            targets = {
+                key: reprepare_target_versions(entry)
+                for key, entry in request.documents.items()
+            }
             session.commit()
         for document_id, file_id, asset_id, _status, original_file_id in work:
             if str(document_id) in done:
@@ -114,6 +119,8 @@ def run_document_intake_reprepare(
                 tenant_id=tenant_id,
                 store=store,
                 original_file_id=original_file_id,
+                chunking_version=targets[str(document_id)][0],
+                formatter_version=targets[str(document_id)][1],
                 chunk_file=partial(
                     reprepare_owned_intake_file,
                     intake_id=intake_id,
@@ -130,6 +137,11 @@ def run_document_intake_reprepare(
             run_id = intake.start_intake_labeling(session, intake_id, token)
             session.commit()
         return run_id
+    except repository.IntakeReprepareLabelingBusy:
+        with get_session_with_current_tenant() as session:
+            repository.defer_busy_reprepare(session, intake_id, request_id, token)
+            session.commit()
+        return None
     except Exception as error:
         with get_session_with_current_tenant() as session:
             if prepared:

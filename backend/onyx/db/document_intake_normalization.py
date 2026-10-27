@@ -45,7 +45,7 @@ class NormalizationDerivation(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     version: Literal[1] = 1
-    formatter_version: Literal[2, 3] = 3
+    formatter_version: Literal[2, 3, 4] = 4
     source_context_sha256: str
     raw_sha256: str
     prepared_text_sha256: str
@@ -215,8 +215,19 @@ def derive_normalization(
     member: RegulatoryDocumentIntakeFile,
     original: OriginalIngestionReceipt,
     documents: LoadedUserFileDocuments,
+    *,
+    formatter_version: Literal[2, 3, 4] = 4,
 ) -> dict[str, Any]:
     context, arguments = _frozen_source(session, batch, member, original, lock=True)
+    from onyx.regulatory.document_intake.chunking_profile import (
+        documents_intake_chunking_version,
+        supported_intake_chunking_version,
+    )
+
+    arguments["formatter_version"] = formatter_version
+    version = documents_intake_chunking_version(documents)
+    if version is not None:
+        arguments["chunking_version"] = supported_intake_chunking_version(version)
     try:
         rebuilt = load_verified_intake_documents(**arguments)
     except FileRecordNotFoundError as error:
@@ -228,6 +239,7 @@ def derive_normalization(
             "Reprepared documents differ from the verified source formatter"
         )
     proof = NormalizationDerivation(
+        formatter_version=formatter_version,
         source_context_sha256=publication_digest(context),
         raw_sha256=original.raw_sha256,
         prepared_text_sha256=arguments["asset"].text_sha256,

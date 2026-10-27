@@ -65,7 +65,7 @@ def test_unversioned_source_documents_keep_legacy_profile() -> None:
     assert documents_intake_chunking_version([]) is None
 
 
-@pytest.mark.parametrize("version", ["1", "2"])
+@pytest.mark.parametrize("version", ["1", "2", "3"])
 def test_explicit_profile_requires_supported_complete_context_and_uniform_documents(
     version: str,
 ) -> None:
@@ -79,7 +79,7 @@ def test_explicit_profile_requires_supported_complete_context_and_uniform_docume
             [first, _document(version="2" if version == "1" else "1")]
         )
     with pytest.raises(ValueError):
-        intake_chunking_version(_document(version="3"))
+        intake_chunking_version(_document(version="4"))
     invalid = first.model_copy(
         update={
             "doc_metadata": {"regulatory_document_intake": {"chunking_version": "1"}}
@@ -319,16 +319,16 @@ def test_new_source_context_uses_current_version_and_unknown_hash_fails() -> Non
     fresh = IntakeSourceContext.model_validate(
         source.model_dump(exclude={"chunking_version"})
     )
-    assert fresh.chunking_version == INTAKE_CHUNKING_CODE_VERSION == "2"
+    assert fresh.chunking_version == INTAKE_CHUNKING_CODE_VERSION == "3"
     with pytest.raises(ValueError, match="not supported"):
         configuration.compute_regulatory_chunk_generation_hash(
             embedding_provider=None,
             embedding_model_name="embedding",
-            intake_chunking_version="3",
+            intake_chunking_version="4",
         )
 
 
-@pytest.mark.parametrize("version", ["1", "2"])
+@pytest.mark.parametrize("version", ["1", "2", "3"])
 def test_canonical_writer_passes_frozen_profile_to_intake_chunker(
     monkeypatch: pytest.MonkeyPatch, version: str
 ) -> None:

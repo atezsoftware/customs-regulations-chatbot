@@ -24,6 +24,7 @@ from onyx.regulatory.document_intake.metadata import (
     TARGETS_PER_REQUEST,
     LegalMetadataResult,
     MetadataChunk,
+    build_metadata_body_scope_repair_request,
     build_metadata_repair_request,
     build_metadata_request,
     metadata_input_hash,
@@ -121,13 +122,55 @@ def _extract_metadata_targets(
                     else "invalid_coverage_or_evidence"
                 ),
             )
-        context, exhausted = _run_metadata_request(
-            gateway=gateway,
-            request=repair,
-            identity_prefix=identity_prefix,
-            heartbeat=heartbeat,
-            stopped=stopped,
-        )
+            if str(error) in {
+                "Metadata field requires body evidence",
+                "Metadata publication reference must use body evidence only for relative dates",
+            }:
+                cached = _cached_metadata_request(
+                    gateway=gateway,
+                    request=repair,
+                    identity_prefix=identity_prefix,
+                    heartbeat=heartbeat,
+                    stopped=stopped,
+                )
+                if cached is None:
+                    scoped_repair = build_metadata_body_scope_repair_request(
+                        request, context
+                    )
+                    if scoped_repair is not None:
+                        repair = scoped_repair
+                else:
+                    cached_context, cached_exhausted = cached
+                    if cached_exhausted:
+                        exhausted = True
+                    else:
+                        assert cached_context is not None
+                        try:
+                            result = validate_metadata_transport_response(
+                                cached_context, chunks=chunks, target_ids=targets
+                            )
+                            return [(repair.request_hash, result)]
+                        except ValueError:
+                            scoped_repair = build_metadata_body_scope_repair_request(
+                                request,
+                                context,
+                                cached_repair_response=cached_context,
+                            )
+                            if scoped_repair is None:
+                                raise ValueError(
+                                    "New-document metadata failed strict validation after its single repair attempt"
+                                ) from None
+                            repair = scoped_repair
+        if exhausted:
+            context = None
+        else:
+            context, exhausted = _run_metadata_request(
+                gateway=gateway,
+                request=repair,
+                identity_prefix=identity_prefix,
+                heartbeat=heartbeat,
+                stopped=stopped,
+            )
         if not exhausted:
             assert context is not None
             try:
@@ -172,12 +215,7 @@ def _run_metadata_request(
         raise _MetadataWindowStopped(
             "New-document metadata stopped after another window failed"
         )
-    submission_key = (
-        "regulatory-labeling-"
-        + hashlib.sha256(
-            f"{identity_prefix}:{request.request_hash}".encode()
-        ).hexdigest()
-    )
+    submission_key = _metadata_submission_key(identity_prefix, request)
     heartbeat()
     state = gateway.submit(
         [request],
@@ -189,6 +227,40 @@ def _run_metadata_request(
     context, exhausted = _metadata_response(gateway, request, state.output_uri)
     heartbeat()
     return context, exhausted
+
+
+def _metadata_submission_key(identity_prefix: str, request: VertexBatchRequest) -> str:
+    return (
+        "regulatory-labeling-"
+        + hashlib.sha256(
+            f"{identity_prefix}:{request.request_hash}".encode()
+        ).hexdigest()
+    )
+
+
+def _cached_metadata_request(
+    *,
+    gateway: VertexBatchGateway,
+    request: VertexBatchRequest,
+    identity_prefix: str,
+    heartbeat: Callable[[], None],
+    stopped: Event,
+) -> tuple[str | None, bool] | None:
+    if stopped.is_set():
+        raise _MetadataWindowStopped(
+            "New-document metadata stopped after another window failed"
+        )
+    heartbeat()
+    state = gateway.reconcile_submission(
+        _metadata_submission_key(identity_prefix, request)
+    )
+    if state is None:
+        return None
+    if state.status != VertexBatchJobStatus.SUCCEEDED or not state.output_uri:
+        raise ValueError("New-document metadata cached repair did not complete")
+    result = _metadata_response(gateway, request, state.output_uri)
+    heartbeat()
+    return result
 
 
 def _extract_metadata_document(

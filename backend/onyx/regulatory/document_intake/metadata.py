@@ -545,6 +545,125 @@ def build_metadata_repair_request(
     return repaired
 
 
+def build_metadata_body_scope_repair_request(
+    request: VertexBatchRequest,
+    previous_response: str,
+    *,
+    cached_repair_response: str | None = None,
+) -> VertexBatchRequest | None:
+    """Explain rejected date scopes without changing or resolving catalog IDs."""
+    generic = build_metadata_repair_request(
+        request,
+        previous_response,
+        validation_category="invalid_coverage_or_evidence",
+    )
+    payload = json.loads(generic.prompt)
+    try:
+        result = _TransportResult.model_validate_json(
+            cached_repair_response
+            if cached_repair_response is not None
+            else previous_response
+        )
+    except ValueError:
+        return None
+    sources = [
+        MetadataChunk.model_validate(raw) for raw in payload["complete_document"]
+    ]
+    catalog = build_metadata_evidence_catalog(sources)
+    if payload["evidence_catalog"] != [
+        entry.model_dump(mode="json") for entry in catalog
+    ]:
+        raise ValueError("Metadata repair catalog differs from its frozen sources")
+    by_id = {entry.evidence_id: entry for entry in catalog}
+    target_ids = set(payload["target_chunk_ids"])
+    source_ids = {source.chunk_id for source in sources}
+    errors: list[dict[str, object]] = []
+    total = 0
+    for target in result.chunks:
+        if target.chunk_id not in target_ids or target.chunk_id not in source_ids:
+            continue
+        for fact in target.fields:
+            if fact.field not in DATE_FIELDS:
+                continue
+            for slot, evidence_id in (
+                ("evidence_id", fact.evidence_id),
+                ("reference_evidence_id", fact.reference_evidence_id),
+            ):
+                evidence = by_id.get(evidence_id)
+                if evidence is None or evidence.scope != "heading":
+                    continue
+                total += 1
+                if len(errors) >= 8:
+                    continue
+                body = [
+                    entry
+                    for entry in catalog
+                    if entry.scope == "body"
+                    and entry.source_chunk_id == evidence.source_chunk_id
+                    and evidence.text in entry.text
+                ]
+                body.sort(
+                    key=lambda entry: (
+                        entry.text != evidence.text,
+                        len(entry.text),
+                        entry.start,
+                        entry.evidence_id,
+                    )
+                )
+                errors.append(
+                    {
+                        "target_chunk_id": target.chunk_id,
+                        "field": fact.field,
+                        "invalid_slot": slot,
+                        "rejected_evidence_id": evidence.evidence_id,
+                        "rejected_text_sha256": hashlib.sha256(
+                            evidence.text.encode()
+                        ).hexdigest(),
+                        "rejected_scope": "heading",
+                        "required_scope": "body",
+                        "error": "date_or_publication_reference_requires_body_evidence",
+                        "available_evidence": [
+                            entry.model_dump(mode="json") for entry in body[:8]
+                        ],
+                    }
+                )
+    if not errors:
+        return None
+    feedback = payload["validation_feedback"]
+    feedback["body_scope_feedback"] = {
+        "version": 1,
+        "invalid_scope_total": total,
+        "reported_error_limit": 8,
+        "candidate_limit_per_error": 8,
+        "instruction": (
+            "These known IDs were rejected because their scope is heading. Dates "
+            "and publication references require BODY evidence, even when a heading "
+            "has identical words. The entries below are exact body spans from the "
+            "same cited source chunk, not automatic replacements. Select a valid "
+            "body evidence_id yourself and recheck the fact's date, legal target "
+            "and basis. A commencement clause's own start is distinct from dates "
+            "it assigns to other provisions. Use the unchanged full source/catalog "
+            "for every original target. Omit unsupported facts; all strict checks "
+            "still apply. No heading ID is accepted for a date."
+        ),
+        "errors": errors,
+    }
+    if cached_repair_response is not None:
+        feedback["cached_repair_request_hash"] = generic.request_hash
+        feedback["cached_repair_response_sha256"] = hashlib.sha256(
+            cached_repair_response.encode()
+        ).hexdigest()
+    repaired = VertexBatchRequest(
+        prompt=json.dumps(
+            payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        ),
+        system_instruction=request.system_instruction,
+        generation_config=request.generation_config,
+    )
+    _check_metadata_request_budget(repaired)
+    return repaired
+
+
 def _fold(text: str) -> str:
     return "".join(
         c

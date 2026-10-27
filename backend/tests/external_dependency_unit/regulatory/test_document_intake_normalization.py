@@ -169,7 +169,7 @@ def _prepared_transition(
     )
 
 
-@pytest.mark.parametrize("formatter_version", [2, 3])
+@pytest.mark.parametrize("formatter_version", [2, 3, 4])
 def test_changed_navigation_reprepare_seals_artifact_preserves_sources_and_survives_future_formatter(
     intake_session: Session,
     intake_owner: tuple[User, DocumentSet, ModelConfiguration],
@@ -178,12 +178,12 @@ def test_changed_navigation_reprepare_seals_artifact_preserves_sources_and_survi
     formatter_version: int,
 ) -> None:
     session = intake_session
-    if formatter_version == 2:
+    if formatter_version in {2, 3}:
         derive = normalization.derive_normalization
 
         def previous_witness(*args: Any, **kwargs: Any) -> dict[str, Any]:
             proof = derive(*args, **kwargs)
-            proof["formatter_version"] = 2
+            proof["formatter_version"] = formatter_version
             proof["witness_sha256"] = publication_digest(
                 {key: value for key, value in proof.items() if key != "witness_sha256"}
             )
@@ -474,6 +474,8 @@ def test_plaintext_failure_after_committed_reprepare_restores_exact_artifact_wit
         return original(file_id, tenant_id, documents, **kwargs)
 
     monkeypatch.setattr(writer_publication, "reprepare_owned_intake_file", remaining)
+    intake.retry_intake(session, batch)
+    session.commit()
     assert (
         reprepare_job.run_document_intake_reprepare(
             intake_id=batch.id, request_id=request.id, tenant_id="public"
