@@ -4,7 +4,7 @@ on:
     inputs:
       operation:
         type: choice
-        options: [inspect, approve_462, approve_465, approve_470]
+        options: [inspect]
         default: inspect
 permissions:
   contents: read
@@ -45,7 +45,7 @@ jobs:
           IFS=$'\t' read -r pod container < /tmp/amendment-target
           kubectl exec -i "$pod" -n customs-regulations-dev -c "$container" -- \
             sh -ec '. /vault/secrets/config; export PYTHONPATH=/app; exec python -' < \
-            backend/onyx/db/diagnose_amendment_batches_299_310.py
+            backend/onyx/db/diagnose_folder_intake_readonly.py
       - name: Filter amendment approval worker errors
         if: inputs.operation == 'inspect'
         shell: bash
@@ -58,7 +58,7 @@ jobs:
           from pathlib import Path
 
           pods = json.loads(Path('/tmp/amendment-pods.json').read_text())['items']
-          needles = re.compile(r'Amendment proposal (460|462|465|470) approval failed|amendment_(prepared|approved) proposal_id=(460|462|465|470)')
+          needles = re.compile(r'acquire_amendment_sources|regulatory_document_intake_prepare|Source package|source.package|regulatory_annex|lease expired|discarding revoked|ERROR|Traceback')
           for pod in pods:
               name = pod['metadata']['name']
               if pod['status']['phase'] != 'Running' or 'background' not in name:
@@ -66,7 +66,7 @@ jobs:
               for container in pod['spec']['containers']:
                   result = subprocess.run(
                       ['kubectl', 'logs', name, '-n', 'customs-regulations-dev',
-                       '-c', container['name'], '--since=36h', '--tail=30000'],
+                       '-c', container['name'], '--since=50m', '--tail=16000'],
                       capture_output=True, text=True, check=False,
                   )
                   if result.returncode:
@@ -74,26 +74,16 @@ jobs:
                       continue
                   lines = result.stdout.splitlines()
                   print('LOG_SCAN', name, container['name'], len(lines))
+                  matches = 0
                   for index, line in enumerate(lines):
                       if needles.search(line):
+                          matches += 1
+                          if matches > 100:
+                              break
                           print('LOG_MATCH', name, container['name'])
-                          for excerpt in lines[index:index + 45]:
-                              print(excerpt[:500])
+                          for excerpt in lines[index:index + 12]:
+                              if re.search(r'api.key|authorization|bearer|password|secret|token=', excerpt, re.I):
+                                  print('[credential-bearing line omitted]')
+                              else:
+                                  print(excerpt[:450])
           PY
-      - name: Resume one existing reviewed proposal
-        if: inputs.operation != 'inspect'
-        shell: bash
-        env:
-          OPERATION: ${{ inputs.operation }}
-        run: |
-          set -euo pipefail
-          case "$OPERATION" in
-            approve_462) proposal_id=462 ;;
-            approve_465) proposal_id=465 ;;
-            approve_470) proposal_id=470 ;;
-            *) exit 2 ;;
-          esac
-          IFS=$'\t' read -r pod container < /tmp/amendment-target
-          kubectl exec -i "$pod" -n customs-regulations-dev -c "$container" -- \
-            sh -ec '. /vault/secrets/config; export PYTHONPATH=/app; exec python - "$1"' sh "$proposal_id" < \
-            backend/onyx/db/resume_amendment_approvals_309_310.py
