@@ -174,17 +174,52 @@ class CacheDiagnostic:
         if result_bytes is None:
             return None, {**detail, "cache": "manifest_without_output"}
         stored = _StoredResult.model_validate_json(result_bytes)
-        if (
-            stored.binding_sha256 != BINDING
-            or stored.submission_key != submission_key
-            or stored.request_hash != request.request_hash
-            or _sha(stored.line) != stored.line_sha256
-            or len(stored.line.encode()) > MAX_METADATA_RESPONSE_BYTES
-            or stored.request_payload != request.model_dump(mode="json")
-            or VertexBatchRequest.model_validate(stored.request_payload).request_hash
-            != request.request_hash
-        ):
-            raise ValueError("Cached result does not match its reconstructed request")
+        # The direct gateway intentionally omits this Pydantic computed field.
+        expected_payload = request.model_dump(mode="json", exclude={"request_hash"})
+        rebuilt = VertexBatchRequest.model_validate(stored.request_payload)
+        checks = {
+            "binding_matches": stored.binding_sha256 == BINDING,
+            "submission_matches": stored.submission_key == submission_key,
+            "stored_request_hash_matches": stored.request_hash == request.request_hash,
+            "line_sha256_matches": _sha(stored.line) == stored.line_sha256,
+            "line_within_byte_limit": len(stored.line.encode())
+            <= MAX_METADATA_RESPONSE_BYTES,
+            "stored_payload_matches": stored.request_payload == expected_payload,
+            "rebuilt_request_hash_matches": rebuilt.request_hash
+            == request.request_hash,
+            "generate_content_payload_matches": rebuilt.to_generate_content_request()
+            == request.to_generate_content_request(),
+        }
+        if not all(checks.values()):
+            safe = {
+                "request_hash": request.request_hash,
+                "checks": checks,
+                "stored_payload_fields": sorted(stored.request_payload),
+                "expected_payload_fields": sorted(expected_payload),
+                "field_hashes": {
+                    field: {
+                        "stored_sha256": _sha(
+                            json.dumps(
+                                stored.request_payload.get(field),
+                                ensure_ascii=False,
+                                sort_keys=True,
+                            )
+                        ),
+                        "expected_sha256": _sha(
+                            json.dumps(
+                                expected_payload.get(field),
+                                ensure_ascii=False,
+                                sort_keys=True,
+                            )
+                        ),
+                    }
+                    for field in ("prompt", "system_instruction", "generation_config")
+                },
+            }
+            raise ValueError(
+                "Cached result reconstruction mismatch: "
+                + json.dumps(safe, sort_keys=True)
+            )
         detail.update(
             {"cache": "acknowledged_output", "line_sha256": stored.line_sha256}
         )
