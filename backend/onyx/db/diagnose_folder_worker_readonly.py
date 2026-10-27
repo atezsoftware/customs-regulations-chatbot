@@ -13,7 +13,25 @@ def main() -> None:
     for method in ("active", "reserved", "active_queues"):
         inspector = app.control.inspect(timeout=5)
         result = getattr(inspector, method)()
-        print("WORKER_" + method.upper(), json.dumps(result, default=str), flush=True)
+        bounded = {}
+        for worker, items in (result or {}).items():
+            if method == "active_queues":
+                bounded[worker] = [
+                    item.get("name")
+                    for item in items
+                    if str(item.get("name", "")).startswith("regulatory_annex_")
+                ]
+            else:
+                bounded[worker] = [
+                    {key: item.get(key) for key in ("id", "name", "time_start")}
+                    for item in items
+                    if item.get("name")
+                    in {
+                        "acquire_amendment_sources",
+                        "regulatory_document_intake_prepare",
+                    }
+                ]
+        print("WORKER_" + method.upper(), json.dumps(bounded, default=str), flush=True)
     result = subprocess.run(
         ["tail", "-n", "250", "/var/log/onyx/celery_worker_regulatory_annex.log"],
         capture_output=True,
