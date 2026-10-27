@@ -31,6 +31,11 @@ _ANNEX_NUMBER = re.compile(
     rf"\bEK\s*[-–—:_]?\s*({_ANNEX_NUMBER_VALUE})\b",
     re.IGNORECASE,
 )
+_WRAPPED_ANNEX_REFERENCE = re.compile(
+    r"(?m)^(?P<prose>[^\n|]*\S[ \t]+EK[ \t]*[-–—])[ \t]*"
+    r"(?P<line_break>\n[ \t]*)(?P<number>\d+(?:[/.]\d+)*[A-Z]?)\b",
+    re.IGNORECASE,
+)
 
 
 def _navigation_suffix(label: str) -> str | None:
@@ -337,6 +342,24 @@ def normalize_inline_articles(
     )
 
 
+def normalize_wrapped_annex_references(text: str) -> str:
+    """Keep a wrapped prose reference from becoming a numbered section heading."""
+    masked, _environment = _mask_code(text)
+    replacements = []
+    for match in _WRAPPED_ANNEX_REFERENCE.finditer(masked):
+        next_line_end = masked.find("\n", match.end())
+        if next_line_end < 0:
+            next_line_end = len(masked)
+        if (
+            match["prose"].lstrip().startswith("#")
+            or re.match(r"^(?: {4}| {0,3}\t)", match["prose"])
+            or "|" in masked[match.end() : next_line_end]
+        ):
+            continue
+        replacements.append((*match.span("line_break"), ""))
+    return _apply_replacements(text, replacements)
+
+
 def require_chunk_source_coverage(text: str) -> None:
     """Every source letter/digit must reach a chunk or one of its delivered headings."""
     chunked = RegulatoryChunker().chunk_text(text)
@@ -386,8 +409,10 @@ def prepare_intake_text(
         text = normalize_attachment_navigation(
             text, asset_sha256=asset_sha256, links=links, package_assets=package_assets
         )
-    normalized = normalize_inline_articles(
-        text, preserve_markdown_headings=preserve_markdown_headings
+    normalized = normalize_wrapped_annex_references(
+        normalize_inline_articles(
+            text, preserve_markdown_headings=preserve_markdown_headings
+        )
     )
     if "".join(text.split()) != "".join(normalized.split()):
         raise ValueError("New document normalization changed the source wording")

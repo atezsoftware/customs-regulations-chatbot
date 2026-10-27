@@ -45,7 +45,7 @@ class NormalizationDerivation(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     version: Literal[1] = 1
-    formatter_version: Literal[2] = 2
+    formatter_version: Literal[2, 3] = 3
     source_context_sha256: str
     raw_sha256: str
     prepared_text_sha256: str
