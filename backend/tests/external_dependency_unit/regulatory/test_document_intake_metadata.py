@@ -5,6 +5,7 @@ import json
 from collections.abc import Iterator
 from contextlib import contextmanager
 from copy import deepcopy
+from io import BytesIO
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import MagicMock
@@ -25,7 +26,9 @@ from onyx.db.models import (
     RegulatoryChunk,
     RegulatoryDocumentIntake,
     RegulatoryDocumentIntakeFile,
+    RegulatorySourceAsset,
     User,
+    UserFile,
 )
 from onyx.file_store.file_store import FileStore
 from onyx.regulatory.document_intake import metadata_job
@@ -158,6 +161,141 @@ def test_metadata_sets_scoped_dates_with_exact_cross_chunk_evidence_and_retry_re
     assert _existing_rows(intake_session, [members[1].user_file_id]) == annex_before
     _batch, work = metadata.load_metadata_work(intake_session, batch.id, token)
     assert [identifier for identifier, _chunks in work] == [members[1].id]
+
+
+def test_llm_title_names_only_new_owned_file_and_preserves_original_source(
+    intake_session: Session, intake_owner: tuple[User, DocumentSet, ModelConfiguration]
+) -> None:
+    batch, members, token, article, closing = _ready_metadata(
+        intake_session, intake_owner
+    )
+    title = "5000 sayılı Gümrük Kanunu"
+    article.text = f"{title}\n{article.text}"
+    asset = intake_session.get_one(RegulatorySourceAsset, members[0].source_asset_id)
+    source_before = (asset.display_name, asset.sha256, asset.file_id, asset.text_sha256)
+    annex_before = _existing_rows(intake_session, [members[1].user_file_id])
+    chunks = metadata.metadata_chunks([article, closing])
+    metadata.apply_metadata_results(
+        intake_session,
+        intake_id=batch.id,
+        lease_token=token,
+        document_id=members[0].id,
+        expected_input_sha256=metadata_input_hash(chunks),
+        results=[
+            (
+                "a" * 64,
+                LegalMetadataResult(
+                    chunks=[
+                        ChunkLegalMetadata(
+                            chunk_id=row.id,
+                            fields=[
+                                LegalMetadataFact(
+                                    field="document_title",
+                                    value=title,
+                                    source_chunk_id=article.id,
+                                    evidence_quote=title,
+                                )
+                            ],
+                        )
+                        for row in [article, closing]
+                    ]
+                ),
+            )
+        ],
+    )
+    assert intake_session.get_one(UserFile, members[0].user_file_id).name == title
+    assert (
+        asset.display_name,
+        asset.sha256,
+        asset.file_id,
+        asset.text_sha256,
+    ) == source_before
+    assert _existing_rows(intake_session, [members[1].user_file_id]) == annex_before
+    patch = metadata.manual_edit_metadata(
+        article, {"chunk_metadata": {"document_title": "Gümrük Uygulama Kanunu"}}
+    )
+    article.chunk_metadata = patch["chunk_metadata"]
+    metadata.refresh_intake_document_name(intake_session, batch, members[0].id)
+    assert (
+        intake_session.get_one(UserFile, members[0].user_file_id).name
+        == "Gümrük Uygulama Kanunu"
+    )
+
+
+def test_missing_title_is_explicit_instead_of_upload_filename(
+    intake_session: Session, intake_owner: tuple[User, DocumentSet, ModelConfiguration]
+) -> None:
+    batch, members, token, article, closing = _ready_metadata(
+        intake_session, intake_owner
+    )
+    _apply(intake_session, batch.id, token, members[0].id, [article, closing], closing)
+    assert (
+        intake_session.get_one(UserFile, members[0].user_file_id).name
+        == "Başlık belirlenemedi"
+    )
+
+
+def test_source_heading_omitted_from_chunk_body_still_names_annex(
+    intake_session: Session, intake_owner: tuple[User, DocumentSet, ModelConfiguration]
+) -> None:
+    batch, members, token, _article, _closing = _ready_metadata(
+        intake_session, intake_owner
+    )
+    annex = members[1]
+    row = intake_session.scalars(
+        select(RegulatoryChunk).where(
+            RegulatoryChunk.user_file_id == annex.user_file_id
+        )
+    ).one()
+    title = "EK-1 — İthalatta ibraz edilecek belgeler."
+    row.text, row.heading_path = "İbraz edilecek belgeler.", [title]
+    metadata.apply_metadata_results(
+        intake_session,
+        intake_id=batch.id,
+        lease_token=token,
+        document_id=annex.id,
+        expected_input_sha256=metadata_input_hash(metadata.metadata_chunks([row])),
+        results=[
+            (
+                "a" * 64,
+                LegalMetadataResult(
+                    chunks=[
+                        ChunkLegalMetadata(
+                            chunk_id=row.id,
+                            fields=[
+                                LegalMetadataFact(
+                                    field="annex_title",
+                                    value=title,
+                                    source_chunk_id=row.id,
+                                    evidence_quote=title,
+                                )
+                            ],
+                        )
+                    ]
+                ),
+            )
+        ],
+    )
+    assert intake_session.get_one(UserFile, annex.user_file_id).name == title
+
+
+def test_naming_rejects_changed_frozen_source_bytes(
+    intake_session: Session,
+    intake_owner: tuple[User, DocumentSet, ModelConfiguration],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    batch, members, _token, _article, _closing = _ready_metadata(
+        intake_session, intake_owner
+    )
+    file = intake_session.get_one(UserFile, members[0].user_file_id)
+    name = file.name
+    store = cast(
+        FileStore, SimpleNamespace(read_file=lambda *_args: BytesIO(b"changed"))
+    )
+    monkeypatch.setattr(metadata, "get_default_file_store", lambda: store)
+    with pytest.raises(intake.IntakeConflictError, match="integrity"):
+        metadata.refresh_intake_document_name(intake_session, batch, members[0].id)
+    assert file.name == name
 
 
 def test_manual_patch_preserves_provenance_and_text_edit_invalidates_cross_chunk_llm_dates(
@@ -635,9 +773,12 @@ def test_adaptive_split_keeps_file_unapplied_until_all_cached_leaves_resume(
     )
     for row in rows[:2]:
         assert row.chunk_metadata["document_title"] == "Yeni TEBLİĞ Kapsamı"
-        assert row.chunk_metadata[METADATA_AUDIT_KEY]["fields"]["document_title"][
-            "evidence_quote"
-        ] == article.text
+        assert (
+            row.chunk_metadata[METADATA_AUDIT_KEY]["fields"]["document_title"][
+                "evidence_quote"
+            ]
+            == article.text
+        )
     metadata_job.run_intake_metadata(
         intake_id=batch.id, lease_token=token, tenant_id="public"
     )

@@ -84,6 +84,41 @@ def _annex(
     ).one()
 
 
+def test_reviewed_title_edit_updates_only_the_same_new_document_name(
+    intake_session: Session,
+    intake_owner: tuple[User, DocumentSet, ModelConfiguration],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    batch, members = _ready(intake_session, intake_owner, monkeypatch)
+    root, chunk = _root_chunk(intake_session, members)
+    annex, _row = _annex(intake_session, members)
+    annex_file = intake_session.get_one(UserFile, annex.user_file_id)
+    annex_name = annex_file.name
+    assert batch.review_sha256
+    run_id = editing.edit_intake_chunks(
+        intake_session,
+        batch,
+        expected_review_sha256=batch.review_sha256,
+        edits=[
+            editing.IntakeChunkEdit(
+                root.id,
+                chunk.id,
+                {"chunk_metadata": {"document_title": "Gümrük Uygulama Kanunu"}},
+            )
+        ],
+    )
+    assert run_id
+    assert (
+        intake_session.get_one(UserFile, root.user_file_id).name
+        == "Gümrük Uygulama Kanunu"
+    )
+    assert annex_file.name == annex_name
+    assert chunk.chunk_metadata["intake_display_name"] == {
+        "version": 1,
+        "title": "Gümrük Uygulama Kanunu",
+    }
+
+
 @pytest.mark.parametrize("partial", [False, True])
 def test_bulk_changes_two_files_in_one_run_and_retains_original_outcomes(
     intake_session: Session,

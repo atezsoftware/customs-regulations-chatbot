@@ -751,3 +751,75 @@ def test_bulk_chunk_edit_requires_admin() -> None:
         },
     )
     assert response.status_code == 403
+
+
+@pytest.mark.parametrize("created", [True, False])
+def test_mixed_zip_upload_uses_fixed_intake_request_and_commits_before_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    created: bool,
+) -> None:
+    from onyx.background.celery.tasks.regulatory_amendments import sources
+    from onyx.server.features.regulatory.models import AmendmentSourcePackageSnapshot
+
+    package_id, request_id = uuid4(), uuid4()
+    package = SimpleNamespace(id=package_id)
+    events: list[str] = []
+    session = MagicMock(spec=Session)
+    session.commit.side_effect = lambda: events.append("commit")
+    create = MagicMock(return_value=(package, created))
+    monkeypatch.setattr(api, "create_zip_source_package", create)
+    snapshot = AmendmentSourcePackageSnapshot(
+        id=package_id,
+        document_set_id=8,
+        status="processing",
+        asset_count=0,
+        total_bytes=0,
+        issues=[],
+        manifest_sha256=None,
+        created_at=datetime.datetime.now(datetime.timezone.utc),
+        updated_at=datetime.datetime.now(datetime.timezone.utc),
+    )
+    monkeypatch.setattr(api, "markdown_source_snapshot", lambda *_args: snapshot)
+    dispatch = MagicMock(side_effect=lambda **_kwargs: events.append("dispatch"))
+    monkeypatch.setattr(sources, "enqueue_source_package", dispatch)
+    response = _client(session).post(
+        "/regulatory/document-intake/source-packages/zip",
+        data={"idempotency_key": str(request_id)},
+        files={"file": ("mixed.zip", b"PK-source", "application/zip")},
+    )
+    assert response.status_code == 202
+    assert response.json()["document_set_id"] == 8
+    assert create.call_args.kwargs["content"] == b"PK-source"
+    assert create.call_args.kwargs["idempotency_key"] == request_id
+    assert "document_set_id" not in create.call_args.kwargs
+    assert events == (["commit", "dispatch"] if created else ["commit"])
+    if created:
+        dispatch.assert_called_once_with(package_id=package_id, tenant_id="tenant")
+
+
+@pytest.mark.parametrize(
+    "name,content", [("source.md", b"# Main"), ("source.zip", b"")]
+)
+def test_mixed_zip_upload_rejects_wrong_extension_and_empty_input(
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    content: bytes,
+) -> None:
+    create = MagicMock()
+    monkeypatch.setattr(api, "create_zip_source_package", create)
+    response = _client(MagicMock(spec=Session)).post(
+        "/regulatory/document-intake/source-packages/zip",
+        data={"idempotency_key": str(uuid4())},
+        files={"file": (name, content)},
+    )
+    assert response.status_code == 400
+    create.assert_not_called()
+
+
+def test_mixed_zip_upload_requires_admin() -> None:
+    response = _client(MagicMock(spec=Session), admin=False).post(
+        "/regulatory/document-intake/source-packages/zip",
+        data={"idempotency_key": str(uuid4())},
+        files={"file": ("source.zip", b"PK-source")},
+    )
+    assert response.status_code == 403

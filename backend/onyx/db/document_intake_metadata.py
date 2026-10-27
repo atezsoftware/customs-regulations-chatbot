@@ -1,6 +1,7 @@
 """Metadata writes are limited to unpublished documents owned by one intake."""
 
 import datetime
+import hashlib
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from typing import Any
@@ -15,9 +16,16 @@ from onyx.db.models import (
     RegulatoryChunk,
     RegulatoryDocumentIntake,
     RegulatoryDocumentIntakeFile,
+    RegulatorySourceAsset,
     UserFile,
 )
 from onyx.db.regulatory_chunks import is_hierarchical_aggregate_chunk
+from onyx.file_store.file_store import get_default_file_store
+from onyx.file_store.postgres_file_store import PostgresBackedFileStore
+from onyx.regulatory.document_intake.document_names import (
+    UNKNOWN_DOCUMENT_TITLE,
+    intake_document_name,
+)
 from onyx.regulatory.document_intake.metadata import (
     DATE_FIELDS,
     INTEGER_FIELDS,
@@ -226,6 +234,52 @@ def load_metadata_work(
     return batch, work
 
 
+def refresh_intake_document_name(
+    session: Session, batch: RegulatoryDocumentIntake, document_id: UUID
+) -> None:
+    """Rename only the unpublished file owned by this intake; source assets stay immutable."""
+    rows = _load_rows(session, batch, document_id)
+    member = session.get_one(RegulatoryDocumentIntakeFile, document_id)
+    file = session.get_one(UserFile, member.user_file_id)
+    asset = session.get_one(RegulatorySourceAsset, member.source_asset_id)
+    if (
+        asset.package_id != batch.source_package_id
+        or not asset.text_file_id
+        or not asset.text_sha256
+    ):
+        raise intake.IntakeConflictError(
+            "The document title requires its frozen source"
+        )
+    store = get_default_file_store()
+    stream = (
+        store.read_file(asset.text_file_id, db_session=session)
+        if isinstance(store, PostgresBackedFileStore)
+        else store.read_file(asset.text_file_id)
+    )
+    with stream:
+        prepared = stream.read()
+    if hashlib.sha256(prepared).hexdigest() != asset.text_sha256:
+        raise intake.IntakeConflictError("The document title source integrity changed")
+    file.name = (
+        intake_document_name(
+            [
+                row.chunk_metadata
+                for row in rows
+                if not is_hierarchical_aggregate_chunk(row)
+            ],
+            source_text=prepared.decode("utf-8")
+            + "\n"
+            + "\n".join(row.text for row in rows),
+        )
+        or UNKNOWN_DOCUMENT_TITLE
+    )
+    first = next(row for row in rows if not is_hierarchical_aggregate_chunk(row))
+    first.chunk_metadata = {
+        **first.chunk_metadata,
+        "intake_display_name": {"version": 1, "title": file.name},
+    }
+
+
 def heartbeat_metadata(session: Session, intake_id: UUID, lease_token: UUID) -> None:
     batch, _package, _assets = intake.load_intake_job(session, intake_id, lease_token)
     batch.lease_expires_at = datetime.datetime.now(
@@ -303,5 +357,6 @@ def apply_metadata_results(
             )
             metadata[METADATA_AUDIT_KEY] = audit
             row.chunk_metadata = metadata
+    refresh_intake_document_name(session, batch, document_id)
     heartbeat_metadata(session, intake_id, lease_token)
     session.flush()

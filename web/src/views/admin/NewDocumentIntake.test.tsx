@@ -159,7 +159,8 @@ function mockApi(
       if (
         url === `${sourceBase}/upload` ||
         url === sourceBase ||
-        url === `${base}/source-packages/markdown`
+        url === `${base}/source-packages/markdown` ||
+        url === `${base}/source-packages/zip`
       )
         return options.prepareResponse ?? json(options.source ?? sourcePackage);
       if (url.startsWith(`${sourceBase}/source-1?`)) {
@@ -323,7 +324,7 @@ test("previews separate main and attachment documents and approves only the revi
   await screen.findByText(/will be added to PC Külliyatı/);
   expect(screen.getByLabelText("New document source file")).toHaveAttribute(
     "accept",
-    ".pdf,.docx,.html,.htm,.xlsx,.png,.jpg,.jpeg,.webp,.tif,.tiff"
+    ".zip,.pdf,.docx,.html,.htm,.xlsx,.png,.jpg,.jpeg,.webp,.tif,.tiff"
   );
   expect(
     screen.queryByLabelText("Markdown package file")
@@ -423,6 +424,83 @@ test("previews separate main and attachment documents and approves only the revi
   expect(
     fetchMock.mock.calls.some(([url]) =>
       String(url).includes("/amendments/analyze")
+    )
+  ).toBe(false);
+});
+
+test("uploads a mixed-format ZIP in File mode through the ZIP endpoint", async () => {
+  const fetchMock = mockApi();
+  const user = setupUser();
+  render(<NewDocumentIntake />);
+  const input = await screen.findByLabelText("New document source file");
+  expect(input).toHaveAttribute(
+    "accept",
+    ".zip,.pdf,.docx,.html,.htm,.xlsx,.png,.jpg,.jpeg,.webp,.tif,.tiff"
+  );
+  const file = new File(["mixed format archive"], "kaynaklar.ZIP", {
+    type: "application/zip",
+  });
+  await user.upload(input, file);
+  expect(
+    screen.queryByLabelText("Original document URL")
+  ).not.toBeInTheDocument();
+  await user.click(
+    screen.getByRole("button", { name: "Prepare source and attachments" })
+  );
+  await screen.findByText("Source package ready · 2 documents");
+  const creation = fetchMock.mock.calls.find(
+    ([url]) => url === `${base}/source-packages/zip`
+  )!;
+  expect(creation[1]?.method).toBe("POST");
+  const body = creation[1]!.body as FormData;
+  expect(body.get("file")).toBe(file);
+  expect(Array.from(body.keys()).sort()).toEqual(["file", "idempotency_key"]);
+  expect(
+    fetchMock.mock.calls.some(
+      ([url]) =>
+        url === `${sourceBase}/upload` ||
+        url === `${base}/source-packages/markdown`
+    )
+  ).toBe(false);
+});
+
+test("shows the missing ZIP attachment path and blocks document preparation", async () => {
+  const fetchMock = mockApi({
+    source: {
+      ...sourcePackage,
+      status: "blocked",
+      issues: [
+        {
+          code: "missing_local_zip_target",
+          locator: "ekler/yok.md",
+          retryable: false,
+        },
+      ],
+    },
+  });
+  const user = setupUser();
+  render(<NewDocumentIntake />);
+  await user.upload(
+    await screen.findByLabelText("New document source file"),
+    new File(["incomplete archive"], "eksik-ek.zip", {
+      type: "application/zip",
+    })
+  );
+  await user.click(
+    screen.getByRole("button", { name: "Prepare source and attachments" })
+  );
+  expect(
+    await screen.findByText(
+      "An attachment referenced in the source is missing from the ZIP. Add it at the exact linked path."
+    )
+  ).toBeVisible();
+  expect(screen.getByText(/ekler\/yok.md/)).toBeVisible();
+  expect(
+    screen.getByRole("button", { name: "Prepare new documents" })
+  ).toBeDisabled();
+  expect(
+    fetchMock.mock.calls.some(
+      ([url, init]) => url === `${base}/batches` && init?.method === "POST"
     )
   ).toBe(false);
 });

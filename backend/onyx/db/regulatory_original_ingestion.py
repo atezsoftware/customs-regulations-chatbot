@@ -49,13 +49,11 @@ def original_attachment_receipt(
         )
         if receipt is None:
             return None
-    elif (
-        isinstance(file.regulatory_chunk_generation_hash, str)
-        and file.regulatory_chunk_generation_hash != receipt.generation_hash
-    ):
+    else:
         from onyx.db.document_intake_reprepare import reprepared_original_receipt
 
         try:
+            # A verified formatter transition can retain the same canonical hash.
             receipt = reprepared_original_receipt(session, user_file_id, receipt)
         except ValueError:
             return None

@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+from functools import partial
 from uuid import UUID
 
 from onyx.db import document_intake as repository
@@ -13,6 +14,7 @@ from onyx.regulatory.document_intake.preparation import (
     clone_intake_original,
     prepare_intake_file,
 )
+from onyx.regulatory.document_intake.source_graph import parse_intake_graph
 from onyx.utils.logger import setup_logger
 
 logger = setup_logger()
@@ -47,7 +49,14 @@ def run_document_intake(*, intake_id: UUID, tenant_id: str) -> UUID | None:
                 manifest_bytes = stream.read(150 * 1024 * 1024 + 1)
             if hashlib.sha256(manifest_bytes).hexdigest() != package.manifest_sha256:
                 raise ValueError("Source manifest changed")
-            root_hash = json.loads(manifest_bytes)["assets"][0]["sha256"]
+            manifest = json.loads(manifest_bytes)
+            root_hash = manifest["assets"][0]["sha256"]
+            graph = parse_intake_graph(
+                manifest,
+                input_kind=package.input_spec.get("kind"),
+                asset_hashes=[asset.sha256 for asset in assets],
+                links=links,
+            )
             asset_views = [IntakeSourceAsset.model_validate(asset) for asset in assets]
             owned_file_ids = (
                 {
@@ -59,7 +68,14 @@ def run_document_intake(*, intake_id: UUID, tenant_id: str) -> UUID | None:
                 if not repository.intake_files(session, batch)
                 else None
             )
-            repository.admit_intake_assets(
+            admit = repository.admit_intake_assets
+            if graph is not None:
+                admit = partial(
+                    admit,
+                    intake_graph=graph,
+                    source_manifest_bytes=manifest_bytes,
+                )
+            admit(
                 session,
                 batch,
                 assets,
@@ -73,7 +89,13 @@ def run_document_intake(*, intake_id: UUID, tenant_id: str) -> UUID | None:
             session.commit()
         for document_id, file_id, asset_id, status, original_file_id in work:
             if status not in {"chunked", "labeling", "ready"}:
-                prepare_intake_file(
+                prepare = prepare_intake_file
+                if graph is not None:
+                    prepare = partial(
+                        prepare,
+                        parent_asset_hashes=graph.parents_for(by_id[asset_id].sha256),
+                    )
+                prepare(
                     package_id=package_id,
                     asset=by_id[asset_id],
                     user_file_id=file_id,

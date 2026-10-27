@@ -139,6 +139,11 @@ def _navigation_context(
             "Beyanname zorunludur. [EK-1](ekler/ek-1.md)",
         ),
         ("Ek için tıklayınız", "[EK-1](ekler/ek-1.md)"),
+        ("EK-1 için tıklayınız", "[EK-1](ekler/ek-1.md)"),
+        (
+            "[EK-1 için tıklayınız (PDF)](ekler/ek-1.md)",
+            "[EK-1](ekler/ek-1.md)",
+        ),
     ],
 )
 def test_navigation_prompts_become_concise_verified_annex_references(
@@ -165,6 +170,9 @@ def test_navigation_prompts_become_concise_verified_annex_references(
         "```md\n[Ekler için tıklayınız](ekler/ek-1.md)\n```",
         "    [Ekler için tıklayınız](ekler/ek-1.md)\n",
         "[Ekler için tıklayınız ibaresi mevzuatta açıklanır](ekler/ek-1.md)",
+        '"EK-1 için tıklayınız" ibaresinin kullanılması zorunludur.',
+        "EK-1 için tıklayınız ifadesi başvuru formunun zorunlu alanıdır.",
+        "Başvuru sırasında EK-1 ve EK-2 belgeleri sunulur.",
     ],
 )
 def test_operative_sentences_quoted_mentions_and_code_are_preserved(text: str) -> None:
@@ -237,3 +245,94 @@ def test_display_label_is_concise_without_rewriting_source_relationships() -> No
         update={"label": "Mevzuat kapsamındaki belge listesi"}
     )
     assert attachment_reference_label(citation, package_assets=assets) == citation.label
+
+
+@pytest.mark.parametrize("representation", ["inspection", "canonical", "html"])
+def test_actual_two_anchor_html_keeps_distinct_annex_labels_and_operative_text(
+    representation: str,
+) -> None:
+    from onyx.file_processing.html_utils import parse_html_page_basic
+    from onyx.regulatory.amendments.annexes.sources import inspect_source
+
+    parent, links, assets = _navigation_context("ek-b.pdf")
+    html = (
+        "<main><h1>Başvuru Tebliği</h1><h2>MADDE 1 — Başvuru usulü</h2>"
+        "<p>Başvuru sırasında EK-1 ve EK-2 belgeleri sunulur.</p>"
+        "<p><a href='ekler/ek-b.pdf'>Ekler için tıklayınız: EK-1</a></p>"
+        "<p><a href='ekler/a1.md'>EK-2 için tıklayınız</a></p>"
+        "<h2>Yürürlük</h2>"
+        "<p>MADDE 2 — Bu Tebliğ yayımı tarihinde yürürlüğe girer.</p></main>"
+    )
+    inspection = inspect_source(html.encode(), "text/html")
+    children = [assets[0].sha256, "c" * 64]
+    links = [
+        SourceLink(
+            parent_asset_hash=parent,
+            target_asset_hash=child,
+            original_url=discovered.target,
+            requested_url=discovered.target,
+            source_field=discovered.source_field,
+            label=discovered.label,
+            kind="url",
+        )
+        for discovered, child in zip(inspection.links, children, strict=True)
+    ]
+    assets.append(
+        assets[0].model_copy(
+            update={"id": uuid4(), "sha256": children[1], "display_name": "a1.md"}
+        )
+    )
+    frozen_links = [link.model_dump() for link in links]
+    frozen_assets = [asset.model_dump() for asset in assets]
+    source = {
+        "inspection": inspection.text,
+        "canonical": parse_html_page_basic(html),
+        "html": html,
+    }[representation]
+    normalized = normalize_attachment_navigation(
+        source, asset_sha256=parent, links=links, package_assets=assets
+    )
+    expected = source.replace(
+        "Ekler için tıklayınız: EK-1",
+        "EK-1" if representation == "html" else "[EK-1](ekler/ek-b.pdf)",
+    ).replace(
+        "EK-2 için tıklayınız",
+        "EK-2" if representation == "html" else "[EK-2](ekler/a1.md)",
+    )
+    assert normalized == expected
+    assert "tıklayınız" not in normalized
+    assert [
+        attachment_reference_label(link, package_assets=assets) for link in links
+    ] == [
+        "EK-1",
+        "EK-2",
+    ]
+    assert [link.model_dump() for link in links] == frozen_links
+    assert [asset.model_dump() for asset in assets] == frozen_assets
+    assert (
+        normalize_attachment_navigation(
+            "Ekler için tıklayınız",
+            asset_sha256=parent,
+            links=links,
+            package_assets=assets,
+        )
+        == "[EK-1](ekler/ek-b.pdf), [EK-2](ekler/a1.md)"
+    )
+
+
+def test_explicit_plain_annex_number_does_not_fall_back_to_unrelated_targets() -> None:
+    parent, links, assets = _navigation_context()
+    with pytest.raises(ValueError, match="does not match"):
+        normalize_attachment_navigation(
+            "Ekler için tıklayınız: EK-2",
+            asset_sha256=parent,
+            links=links,
+            package_assets=assets,
+        )
+
+
+def test_numbered_attachment_placeholder_requires_a_resolved_target() -> None:
+    with pytest.raises(ValueError, match="no attachment target was resolved"):
+        require_resolved_attachment_references(
+            "EK-2 için tıklayınız", asset_sha256="a" * 64, links=[]
+        )

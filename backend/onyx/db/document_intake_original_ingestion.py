@@ -122,7 +122,6 @@ def approved_intake_original_receipt(
         if (
             effective.file_id != original.file_id
             or effective.raw_sha256 != original.raw_sha256
-            or effective.plaintext_sha256 != original.plaintext_sha256
             or effective.generation_hash != file.regulatory_chunk_generation_hash
             or not has_initial_intake_canonical_state(
                 session, [item.user_file_id for item in members]

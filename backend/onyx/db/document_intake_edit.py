@@ -19,6 +19,7 @@ from onyx.db.document_intake_edit_budget import (
 from onyx.db.document_intake_metadata import (
     invalidate_metadata_file_context,
     manual_edit_metadata,
+    refresh_intake_document_name,
 )
 from onyx.db.enums import UserFileStatus
 from onyx.db.labeling_configuration import resolve_intake_labeling_provider_binding
@@ -453,6 +454,7 @@ def _edit_intake_chunks(
     for row in rows:
         rows_by_file.setdefault(row.user_file_id, []).append(row)
     prepared_by_file: dict[UUID, list[_PreparedChunkEdit]] = {}
+    rename_document_ids: dict[UUID, UUID] = {}
     assets_by_package: dict[UUID, list[IntakeSourceAsset]] = {}
     for edit in edits:
         member = member_by_id[edit.document_id]
@@ -499,6 +501,13 @@ def _edit_intake_chunks(
             prepared_by_file.setdefault(chunk.user_file_id, []).append(
                 _PreparedChunkEdit(chunk, changes)
             )
+            metadata_patch = edit.updates.get("chunk_metadata")
+            if isinstance(metadata_patch, dict) and any(
+                field in metadata_patch
+                and metadata_patch[field] != chunk.chunk_metadata.get(field)
+                for field in ("document_title", "annex_title")
+            ):
+                rename_document_ids[chunk.user_file_id] = member.id
     if not prepared_by_file:
         return None
     if previous is None or previous.status not in _TERMINAL_LABELING_STATUSES:
@@ -544,6 +553,8 @@ def _edit_intake_chunks(
         for replacement in rebuilt:
             if replacement is not by_id[replacement.id]:
                 by_id[replacement.id].text = replacement.text
+        if file_id in rename_document_ids:
+            refresh_intake_document_name(session, batch, rename_document_ids[file_id])
         session.flush()
         retain_canonical_revisions(session, capture_canonical_scope(session, file_id))
     run, _created = labeling.create_labeling_run(

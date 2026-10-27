@@ -11,6 +11,12 @@ const descriptions: Record<string, string> = {
   download_failed: "The attachment could not be downloaded.",
   depth_limit: "The attachment exceeds the supported link depth.",
   unsafe_url: "The attachment address cannot be fetched safely.",
+  missing_local_zip_target:
+    "An attachment referenced in the source is missing from the ZIP. Add it at the exact linked path.",
+  unsafe_local_link:
+    "An attachment link leaves the permitted ZIP paths. Correct the local link.",
+  invalid_zip_member:
+    "A ZIP member could not be read as a supported document. Check the file shown below.",
 };
 
 export default function IntakeSourceIssues({

@@ -1,7 +1,7 @@
 """Turn each acquired source into its own reviewable, unpublished canonical file."""
 
 import hashlib
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Sequence
 from io import BytesIO
 from uuid import UUID, uuid5
 
@@ -38,6 +38,7 @@ def build_intake_document(
     links: Sequence[SourceLink],
     package_assets: Sequence[IntakeSourceAsset] = (),
     original_file_id: str | None = None,
+    parent_asset_hashes: Collection[str] | None = None,
 ) -> Document:
     if asset.package_id != package_id:
         raise ValueError("Source asset belongs to another intake package")
@@ -59,7 +60,14 @@ def build_intake_document(
         if link.target_asset_hash == asset.sha256
         and link.parent_asset_hash != asset.sha256
     ]
-    parents = sorted({link.parent_asset_hash for link in incoming})
+    linked_parents = {link.parent_asset_hash for link in incoming}
+    if parent_asset_hashes is not None and not set(parent_asset_hashes).issubset(
+        linked_parents
+    ):
+        raise ValueError("Selected intake parents require actual source links")
+    parents = sorted(
+        linked_parents if parent_asset_hashes is None else set(parent_asset_hashes)
+    )
     by_hash = {item.sha256: item for item in package_assets}
     if any(item.package_id != package_id for item in package_assets):
         raise ValueError("Source context contains an asset from another package")
@@ -139,24 +147,18 @@ def _canonical_source_text(asset: IntakeSourceAsset, raw: bytes, prepared: str) 
     return parse_html_page_basic(str(root))
 
 
-def prepare_intake_file(
+def load_verified_intake_documents(
     *,
     package_id: UUID,
     asset: IntakeSourceAsset,
     user_file_id: UUID,
     links: Sequence[SourceLink],
-    tenant_id: str,
     package_assets: Sequence[IntakeSourceAsset] = (),
     store: FileStore | None = None,
-    chunk_file: ChunkFile | None = None,
-    store_plaintext: StorePlaintext | None = None,
     original_file_id: str | None = None,
-) -> IntakeFilePreparation:
-    """Prepare an already-admitted asset; never compare or publish search content.
-
-    The caller owns the verified ready-package gate and the durable per-file
-    checkpoint. Its original has independent storage from frozen source evidence.
-    """
+    parent_asset_hashes: Collection[str] | None = None,
+) -> LoadedUserFileDocuments:
+    """Rebuild canonical input exclusively from hash-verified retained sources."""
     if asset.package_id != package_id:
         raise ValueError("Source asset belongs to another intake package")
     if not asset.text_file_id or not asset.text_sha256:
@@ -180,9 +182,37 @@ def prepare_intake_file(
         links=links,
         package_assets=package_assets,
         original_file_id=owned_file_id,
+        parent_asset_hashes=parent_asset_hashes,
     )
-    documents = LoadedUserFileDocuments(
+    return LoadedUserFileDocuments(
         [document], file_id=owned_file_id, raw_sha256=asset.sha256
+    )
+
+
+def prepare_intake_file(
+    *,
+    package_id: UUID,
+    asset: IntakeSourceAsset,
+    user_file_id: UUID,
+    links: Sequence[SourceLink],
+    tenant_id: str,
+    package_assets: Sequence[IntakeSourceAsset] = (),
+    store: FileStore | None = None,
+    chunk_file: ChunkFile | None = None,
+    store_plaintext: StorePlaintext | None = None,
+    original_file_id: str | None = None,
+    parent_asset_hashes: Collection[str] | None = None,
+) -> IntakeFilePreparation:
+    """Prepare an admitted asset without comparing or publishing search content."""
+    documents = load_verified_intake_documents(
+        package_id=package_id,
+        asset=asset,
+        user_file_id=user_file_id,
+        links=links,
+        package_assets=package_assets,
+        store=store,
+        original_file_id=original_file_id,
+        parent_asset_hashes=parent_asset_hashes,
     )
     if chunk_file is None:
         from onyx.regulatory.writer_publication import chunk_owned_file

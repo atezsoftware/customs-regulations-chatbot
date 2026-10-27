@@ -12,6 +12,7 @@ from onyx.db import document_intake as repository
 from onyx.db import regulatory_labeling as labeling_repository
 from onyx.db.document_intake_sources import (
     create_markdown_source_package,
+    create_zip_source_package,
     markdown_source_snapshot,
 )
 from onyx.db.engine.sql_engine import get_session
@@ -266,6 +267,58 @@ def upload_markdown_intake_package(
             logger.exception(
                 "Markdown source dispatch failed for package=%s", package.id
             )
+            mark_source_package_failed(
+                db_session,
+                package_id=package.id,
+                environment=config.REGULATORY_ANNEX_ENVIRONMENT,
+            )
+    return markdown_source_snapshot(db_session, package)
+
+
+@router.post("/source-packages/zip", status_code=202)
+def upload_zip_intake_package(
+    file: UploadFile = File(...),
+    idempotency_key: UUID = Form(...),
+    user: User = Depends(_admin),
+    db_session: Session = Depends(get_session),
+    tenant_id: str = Depends(get_current_tenant_id),
+) -> AmendmentSourcePackageSnapshot:
+    from onyx.background.celery.tasks.regulatory_amendments.sources import (
+        enqueue_source_package,
+    )
+    from onyx.db.amendment_sources import mark_source_package_failed
+    from onyx.regulatory.document_intake.zip_package import MAX_ZIP_UPLOAD_BYTES
+
+    _require_enabled()
+    name = file.filename or ""
+    if len(name) > 255 or not name.lower().endswith(".zip"):
+        raise OnyxError(
+            OnyxErrorCode.INVALID_INPUT, "Upload a mixed document .zip package"
+        )
+    content = file.file.read(MAX_ZIP_UPLOAD_BYTES + 1)
+    if not content or len(content) > MAX_ZIP_UPLOAD_BYTES:
+        raise OnyxError(
+            OnyxErrorCode.INVALID_INPUT,
+            "ZIP upload must contain between 1 byte and 25 MiB",
+        )
+    try:
+        package, created = create_zip_source_package(
+            db_session,
+            user=user,
+            environment=config.REGULATORY_ANNEX_ENVIRONMENT,
+            idempotency_key=idempotency_key,
+            display_name=name,
+            content=content,
+        )
+        db_session.commit()
+    except (ValueError, repository.IntakeConflictError) as exc:
+        db_session.rollback()
+        raise OnyxError(OnyxErrorCode.INVALID_INPUT, str(exc)) from exc
+    if created:
+        try:
+            enqueue_source_package(package_id=package.id, tenant_id=tenant_id)
+        except Exception:
+            logger.exception("ZIP source dispatch failed for package=%s", package.id)
             mark_source_package_failed(
                 db_session,
                 package_id=package.id,
