@@ -206,6 +206,9 @@ def link_user_file_to_document_set(
     document_set_id: int,
     user_file: UserFile,
 ) -> bool:
+    from onyx.db.document_intake_review import require_publication_file
+
+    require_publication_file(db_session, user_file.id)
     existing_link = db_session.get(
         DocumentSet__UserFile,
         {"document_set_id": document_set_id, "user_file_id": user_file.id},

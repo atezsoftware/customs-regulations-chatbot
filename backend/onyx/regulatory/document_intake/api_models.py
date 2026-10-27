@@ -122,6 +122,8 @@ class DocumentLineageSnapshot(BaseModel):
     effective_date: datetime.date | None = None
     predecessors: list[DocumentLineageEdge] = Field(default_factory=list)
     successors: list[DocumentLineageEdge] = Field(default_factory=list)
+    existing_parents: list["IntakeExistingParent"] = Field(default_factory=list)
+    attachments: list["IntakeExistingParent"] = Field(default_factory=list)
 
 
 class IntakeSourceIssue(BaseModel):
@@ -137,10 +139,38 @@ class IntakeDocumentLink(BaseModel):
     target_document_id: UUID
 
 
+class IntakePublicationReviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_review_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    disposition: Literal["legislation", "source_evidence"]
+    duplicate_of_document_id: UUID | None = None
+    existing_parent_file_id: UUID | None = None
+    reason: str = Field(min_length=1, max_length=2000)
+
+
+class IntakeExistingParent(BaseModel):
+    user_file_id: UUID
+    display_name: str
+    source_url: str | None = None
+
+
+class IntakeExistingParentCandidate(IntakeExistingParent):
+    chunk_count: int = Field(ge=0)
+
+
+class IntakePublicationReview(BaseModel):
+    decision_id: UUID
+    reason: str
+    reviewed_at: datetime.datetime
+
+
 class IntakeDocumentSnapshot(BaseModel):
     id: UUID
     asset_id: UUID
     display_name: str
+    source_display_name: str | None = None
+    mime_type: str | None = None
     role: Literal["root", "annex"]
     parent_document_id: UUID | None = None
     source_url: str | None = None
@@ -152,6 +182,10 @@ class IntakeDocumentSnapshot(BaseModel):
     user_file_id: UUID | None = None
     document_links: list[IntakeDocumentLink] = Field(default_factory=list)
     lineage_review: IntakeLineageReview | None = None
+    publication_disposition: Literal["legislation", "source_evidence"] = "legislation"
+    duplicate_of_document_id: UUID | None = None
+    existing_parent: IntakeExistingParent | None = None
+    publication_review: IntakePublicationReview | None = None
 
 
 class IntakeBatchSnapshot(BaseModel):
@@ -165,6 +199,8 @@ class IntakeBatchSnapshot(BaseModel):
     target_document_set_name: str
     review_sha256: str | None = None
     edit_review_sha256: str | None = None
+    publication_review_sha256: str | None = None
+    active_document_count: int = Field(default=0, ge=0)
     error: str | None = None
     issues: list[IntakeSourceIssue] = Field(default_factory=list)
     documents: list[IntakeDocumentSnapshot] = Field(default_factory=list)

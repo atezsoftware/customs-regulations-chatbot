@@ -60,6 +60,10 @@ def current_intake_embedding_scope(
         if len(associations) != 1 or publication is None:
             return False
         batch, member, file, request = associations[0]
+        from onyx.db.document_intake_review import source_evidence_file_ids
+
+        if source_evidence_file_ids(session, [file.id]):
+            return False
         if (
             reservations.gate_closed
             or publication.epoch != 0

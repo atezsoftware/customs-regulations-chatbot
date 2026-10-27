@@ -102,7 +102,9 @@ def edit_review_digest(session: Session, batch: RegulatoryDocumentIntake) -> str
         )
     ):
         return None
-    members = intake.intake_files(session, batch)
+    from onyx.db.document_intake_review import effective_intake_files
+
+    members = effective_intake_files(session, batch)
     if (
         not members
         or set(run.file_ids) != {str(member.user_file_id) for member in members}
@@ -389,6 +391,8 @@ def _edit_intake_chunks(
     expected_review_sha256: str,
     edits: Sequence[IntakeChunkEdit],
 ) -> UUID | None:
+    from onyx.db.document_intake_review import effective_intake_files
+
     session.refresh(batch, with_for_update=True)
     intake.refresh_intake(session, batch)
     session.get_one(DocumentSet, batch.document_set_id, with_for_update=True)
@@ -421,6 +425,12 @@ def _edit_intake_chunks(
     )
     if {member.id for member in members} != document_ids:
         raise ValueError("Intake document not found")
+    from onyx.db.document_intake_review import source_evidence_file_ids
+
+    if source_evidence_file_ids(session, [member.user_file_id for member in members]):
+        raise intake.IntakeConflictError(
+            "Retained source evidence is read-only; reverse its publication decision before editing"
+        )
     member_by_id = {member.id: member for member in members}
     files = {
         member.user_file_id: session.get_one(
@@ -567,7 +577,7 @@ def _edit_intake_chunks(
         requested_by_id=batch.created_by,
         idempotency_key=uuid5(previous.id, intake.review_digest(session, batch)),
         target_file_ids=[
-            member.user_file_id for member in intake.intake_files(session, batch)
+            member.user_file_id for member in effective_intake_files(session, batch)
         ],
     )
     _copy_unchanged_label_results(
@@ -580,7 +590,7 @@ def _edit_intake_chunks(
     batch.labeling_run_id = run.id
     batch.status, batch.stage, batch.error = "preparing", "labeling", None
     batch.review_sha256, batch.lease_token, batch.lease_expires_at = None, None, None
-    for member in intake.intake_files(session, batch):
+    for member in effective_intake_files(session, batch):
         member.status, member.error = "labeling", None
     session.flush()
     return run.id

@@ -172,6 +172,12 @@ def _guard_batch(
         raise intake.IntakeConflictError(
             "Only an idle, unapproved ready, failed or incomplete intake can be prepared again"
         )
+    from onyx.db.document_intake_review import has_active_publication_decisions
+
+    if has_active_publication_decisions(session, batch):
+        raise intake.IntakeConflictError(
+            "Reverse publication and existing-parent review decisions before preparing this source again"
+        )
     members = intake.intake_files(session, batch)
     package = session.get_one(AmendmentSourcePackage, batch.source_package_id)
     if (

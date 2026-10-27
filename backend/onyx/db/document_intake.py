@@ -226,7 +226,9 @@ def pending_intake_file_ids(
     """Ordinary upload indexing must not bypass the Updates admission review."""
     if not file_ids:
         return set()
-    return set(
+    from onyx.db.document_intake_review import source_evidence_file_ids
+
+    return source_evidence_file_ids(session, file_ids) | set(
         session.scalars(
             select(RegulatoryDocumentIntakeFile.user_file_id)
             .join(
@@ -269,7 +271,15 @@ def review_digest(session: Session, batch: RegulatoryDocumentIntake) -> str:
             )
         )
     )
-    if not ids or membership != set(ids):
+    from onyx.db.document_intake_review import (
+        publication_decision_payload,
+        source_evidence_file_ids,
+    )
+
+    expected_membership = set(ids)
+    if batch.stage in {"indexing", "completed", "lineage"} and batch.review_sha256:
+        expected_membership -= source_evidence_file_ids(session, ids)
+    if not ids or membership != expected_membership:
         raise IntakeConflictError("The imported document membership changed")
     chunks = list(
         session.scalars(
@@ -319,6 +329,12 @@ def review_digest(session: Session, batch: RegulatoryDocumentIntake) -> str:
                 .order_by(UserFile.id)
             )
         ]
+    decisions = publication_decision_payload(session, batch)
+    if decisions:
+        from onyx.db.document_intake_review import validate_publication_review
+
+        validate_publication_review(session, batch, require_current_parent=False)
+        payload["publication_review"] = decisions
     lineage = lineage_review_payload(session, batch)
     if lineage:
         payload["document_lineage"] = lineage
@@ -326,6 +342,8 @@ def review_digest(session: Session, batch: RegulatoryDocumentIntake) -> str:
 
 
 def refresh_intake(session: Session, batch: RegulatoryDocumentIntake) -> None:
+    from onyx.db.document_intake_review import effective_intake_files
+
     # Polling must re-read the worker's lease under the same lock as transitions.
     session.refresh(batch, with_for_update=True)
     if batch.status == "preparing" and batch.stage in {
@@ -351,7 +369,10 @@ def refresh_intake(session: Session, batch: RegulatoryDocumentIntake) -> None:
         if run is None:
             batch.status, batch.error = "failed", "The labeling run is unavailable"
         elif run.status == "completed":
-            expected = {str(item.user_file_id) for item in intake_files(session, batch)}
+            expected = {
+                str(item.user_file_id)
+                for item in effective_intake_files(session, batch)
+            }
             if (
                 set(run.file_ids) != expected
                 or run.failed_chunks
@@ -365,7 +386,7 @@ def refresh_intake(session: Session, batch: RegulatoryDocumentIntake) -> None:
             else:
                 batch.status, batch.stage = "ready", "review"
                 batch.review_sha256 = review_digest(session, batch)
-                for item in intake_files(session, batch):
+                for item in effective_intake_files(session, batch):
                     item.status = "ready"
         elif run.status in {"failed", "completed_with_errors", "cancelled"}:
             batch.status, batch.error = (
@@ -373,7 +394,7 @@ def refresh_intake(session: Session, batch: RegulatoryDocumentIntake) -> None:
                 run.error or "Labeling has unresolved or failed chunks",
             )
     if batch.stage == "indexing" and batch.status in {"approving", "failed"}:
-        files = intake_files(session, batch)
+        files = effective_intake_files(session, batch)
         for item in files:
             file = session.get(UserFile, item.user_file_id)
             if file is None or file.status in {
@@ -420,9 +441,18 @@ def intake_snapshot(
     from onyx.regulatory.document_intake.text import attachment_reference_label
 
     refresh_intake(session, batch)
+    from onyx.db.document_intake_review import (
+        effective_intake_files,
+        effective_parent_document_ids,
+        latest_publication_decisions,
+        publication_review_digest,
+    )
+
     lineage_selections = intake_lineage_selections(session, batch)
+    decisions = latest_publication_decisions(session, batch.id)
     labels = _labels(session, batch)
     members = intake_files(session, batch)
+    publication_parents = effective_parent_document_ids(members, decisions)
     failed_counts = intake_labeling_failed_counts(session, batch)
     assets = {
         member.source_asset_id: session.get_one(
@@ -462,17 +492,42 @@ def intake_snapshot(
                     "target_document_id": str(target.id),
                 }
             )
+        decision = decisions.get(member.id)
         documents.append(
             {
                 "id": str(member.id),
                 "asset_id": str(asset.id),
                 "display_name": file.name if file else asset.display_name,
+                "source_display_name": asset.display_name,
+                "mime_type": asset.mime_type,
                 "role": member.role,
-                "parent_document_id": str(member.parent_document_id)
-                if member.parent_document_id
+                "parent_document_id": str(publication_parents.get(member.id))
+                if publication_parents.get(member.id)
                 else None,
                 "source_url": asset.final_url or asset.original_url,
-                "status": member.status if file else "deleted",
+                "status": (
+                    "source_evidence"
+                    if decision and decision.disposition == "source_evidence"
+                    else member.status
+                )
+                if file
+                else "deleted",
+                "publication_disposition": decision.disposition
+                if decision
+                else "legislation",
+                "duplicate_of_document_id": str(decision.duplicate_of_document_id)
+                if decision and decision.duplicate_of_document_id
+                else None,
+                "existing_parent": decision.existing_parent_snapshot
+                if decision and decision.existing_parent_file_id
+                else None,
+                "publication_review": {
+                    "decision_id": str(decision.id),
+                    "reason": decision.reason,
+                    "reviewed_at": decision.created_at,
+                }
+                if decision
+                else None,
                 "chunk_count": len(chunk_ids),
                 "labeling_failed_count": failed_counts.get(member.user_file_id, 0),
                 "labels": {
@@ -502,6 +557,8 @@ def intake_snapshot(
         "target_document_set_name": TARGET_DOCUMENT_SET_NAME,
         "review_sha256": batch.review_sha256,
         "edit_review_sha256": edit_review_digest(session, batch),
+        "publication_review_sha256": publication_review_digest(session, batch),
+        "active_document_count": len(effective_intake_files(session, batch)),
         "issues": list(package.issues),
         "error": batch.error,
         "documents": documents,
@@ -605,11 +662,17 @@ def approve_intake(
         raise IntakeConflictError(
             "The ready document review changed; reload before approving"
         )
+    from onyx.db.document_intake_review import (
+        detach_source_evidence_memberships,
+        effective_intake_files,
+        validate_publication_review,
+    )
     from onyx.db.document_lineage import freeze_intake_lineage
 
+    validate_publication_review(session, batch)
     freeze_intake_lineage(session, batch)
     deliveries = []
-    for member in intake_files(session, batch):
+    for member in effective_intake_files(session, batch):
         file = session.get_one(UserFile, member.user_file_id, with_for_update=True)
         if file.status != UserFileStatus.CHUNKED:
             raise IntakeConflictError(
@@ -622,6 +685,7 @@ def approve_intake(
             )
         member.approval_attempt_id, member.status = token, "indexing"
         deliveries.append((file.id, token))
+    detach_source_evidence_memberships(session, batch)
     batch.status, batch.stage, batch.error = "approving", "indexing", None
     session.flush()
     return deliveries
@@ -630,6 +694,11 @@ def approve_intake(
 def retry_intake(
     session: Session, batch: RegulatoryDocumentIntake
 ) -> list[tuple[UUID, UUID]]:
+    from onyx.db.document_intake_review import (
+        effective_intake_files,
+        has_active_publication_decisions,
+    )
+
     session.refresh(batch, with_for_update=True)
     if batch.status == "blocked" and batch.stage == "lineage":
         batch.status, batch.stage, batch.error = "completed", "completed", None
@@ -657,7 +726,7 @@ def retry_intake(
         retry_audits: list[tuple[dict[str, object], UUID]] = []
         with session.begin_nested():
             deliveries = []
-            for member in intake_files(session, batch):
+            for member in effective_intake_files(session, batch):
                 file = session.get_one(
                     UserFile, member.user_file_id, with_for_update=True
                 )
@@ -716,6 +785,11 @@ def retry_intake(
         for evidence, token in retry_audits:
             log_failed_intake_index_retry(evidence, token)
         return deliveries
+    if has_active_publication_decisions(session, batch):
+        from onyx.db.document_intake_review import _replace_labels
+
+        _replace_labels(session, batch, set())
+        return []
     batch.status, batch.stage, batch.error = "preparing", "chunking", None
     batch.lease_token, batch.lease_expires_at = None, None
     session.flush()
@@ -916,7 +990,9 @@ def start_intake_labeling(session: Session, intake_id: UUID, token: UUID) -> UUI
     from onyx.db import regulatory_labeling as labeling
 
     batch, _package, _assets = load_intake_job(session, intake_id, token)
-    files = intake_files(session, batch)
+    from onyx.db.document_intake_review import effective_intake_files
+
+    files = effective_intake_files(session, batch)
     if not files or any(item.status != "chunked" for item in files):
         raise IntakeConflictError("Every new document must be chunked before labeling")
     existing = (
@@ -932,7 +1008,11 @@ def start_intake_labeling(session: Session, intake_id: UUID, token: UUID) -> UUI
         if reprepare is not None and reprepare.previous_labeling_run_id
         else None
     )
-    if existing and existing.status in {"queued", "running", "completed"}:
+    if (
+        existing
+        and existing.status in {"queued", "running", "completed"}
+        and set(existing.file_ids) == {str(member.user_file_id) for member in files}
+    ):
         run = existing
     else:
         user = session.get_one(User, batch.created_by)

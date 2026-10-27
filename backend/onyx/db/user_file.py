@@ -32,6 +32,10 @@ def claim_user_file_projection_repair(
 ) -> UUID | None:
     """Create one durable repair attempt, replacing only a stale/terminal one."""
 
+    from onyx.db.document_intake_review import source_evidence_file_ids
+
+    if source_evidence_file_ids(db_session, [user_file_id]):
+        return None
     now = now or datetime.datetime.now(datetime.timezone.utc)
     user_file = db_session.scalar(
         select(UserFile).where(UserFile.id == user_file_id).with_for_update()
@@ -86,6 +90,10 @@ def start_user_file_projection_repair(
     user_file_id: UUID,
     attempt_id: UUID,
 ) -> bool:
+    from onyx.db.document_intake_review import source_evidence_file_ids
+
+    if source_evidence_file_ids(db_session, [user_file_id]):
+        return False
     repair = db_session.scalar(
         select(UserFileProjectionRepair)
         .where(UserFileProjectionRepair.user_file_id == user_file_id)
@@ -655,6 +663,10 @@ def recover_user_file_index_requests(
 def start_user_file_index_request(
     db_session: Session, user_file_id: UUID, attempt_id: UUID
 ) -> bool:
+    from onyx.db.document_intake_review import source_evidence_file_ids
+
+    if source_evidence_file_ids(db_session, [user_file_id]):
+        return False
     claimed = db_session.scalar(
         update(UserFileProjectionRepair)
         .where(
@@ -677,6 +689,9 @@ def validate_user_file_index_request(owner: FileOwnership, attempt_id: UUID) -> 
 
     with get_session_with_tenant(tenant_id=owner.scope.tenant_id) as session:
         PublicationStore(owner.scope).lock_owned_snapshot(session, owner)
+        from onyx.db.document_intake_review import require_publication_file
+
+        require_publication_file(session, owner.user_file_id)
         repair = session.get(UserFileProjectionRepair, owner.user_file_id)
         if (
             repair is None

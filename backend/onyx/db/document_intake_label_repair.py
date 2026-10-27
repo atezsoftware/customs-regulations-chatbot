@@ -149,6 +149,8 @@ def load_current_intake_label_repair_request(
         advisories = repository._latest_context_advisories(
             session, [item.regulatory_chunk_id]
         )
+        from onyx.db.document_intake_review import parent_labeling_contexts
+
         if not repository._item_snapshot_is_current(
             item,
             snapshot_items=snapshot_items,
@@ -156,6 +158,7 @@ def load_current_intake_label_repair_request(
             current_file_rows={item.user_file_id: rows},
             current_boundary_ids={item.user_file_id: boundaries},
             current_windows_complete={item.user_file_id: complete},
+            parent_identities=parent_labeling_contexts(session, [item.user_file_id]),
             advisory_hashes={
                 key: context_hash(value) for key, value in advisories.items()
             },

@@ -304,6 +304,10 @@ def set_predecessor_selection(
     if batch.status != "ready" or batch.stage != "review":
         raise ValueError("Önceki belge yalnızca onay öncesi incelemede seçilebilir")
     member = _member(session, batch, document_id)
+    from onyx.db.document_intake_review import source_evidence_file_ids
+
+    if source_evidence_file_ids(session, [member.user_file_id]):
+        raise ValueError("Retained source evidence cannot have a predecessor review")
     row = session.get(
         RegulatoryDocumentLineageReview, document_id, with_for_update=True
     )
@@ -432,13 +436,9 @@ def activate_intake_lineage(session: Session, batch: RegulatoryDocumentIntake) -
     rows = _rows(session, batch, lock=True)
     if not rows or all(row.status == "active" for row in rows):
         return
-    members = list(
-        session.scalars(
-            select(RegulatoryDocumentIntakeFile).where(
-                RegulatoryDocumentIntakeFile.intake_id == batch.id
-            )
-        )
-    )
+    from onyx.db.document_intake_review import effective_intake_files
+
+    members = effective_intake_files(session, batch)
     if not members or any(
         session.get_one(UserFile, member.user_file_id).status
         != UserFileStatus.COMPLETED
