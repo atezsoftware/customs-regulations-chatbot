@@ -206,6 +206,7 @@ def get_user_chat_sessions(
     include_failed_chats: bool = False,
     page_size: int = Query(default=50, ge=1, le=100),
     before: str | None = Query(default=None),
+    name_prefix: str | None = Query(default=None, min_length=1, max_length=256),
 ) -> ChatSessionsResponse:
     user_id = user.id
 
@@ -227,6 +228,7 @@ def get_user_chat_sessions(
             include_failed_chats=include_failed_chats,
             limit=page_size + 1,
             before=before_dt,
+            name_prefix=name_prefix,
         )
 
     except ValueError:
