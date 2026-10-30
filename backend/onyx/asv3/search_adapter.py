@@ -491,17 +491,20 @@ def build_search_adapter(
             if field in args:
                 tool_args[field] = args[field]
         embedding_scope = context.services.get("parallel_query_embeddings")
+        parallel_acquisition = context.services.get(
+            "asv3_fast_retrieval"
+        ) is True or parallel_execution_enabled(context)
         scoped_embeddings = (
             experimental_parallel_query_embeddings(
                 embedding_scope, check_active=context.check_research_active
             )
-            if parallel_execution_enabled(context)
+            if parallel_acquisition
             and isinstance(embedding_scope, ParallelQueryEmbeddingScope)
             else nullcontext()
         )
         scoped_retrieval = (
             experimental_parallel_retrieval(check_active=context.check_research_active)
-            if parallel_execution_enabled(context)
+            if parallel_acquisition
             else nullcontext()
         )
         with scoped_embeddings, scoped_retrieval:

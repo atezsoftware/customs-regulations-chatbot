@@ -43,6 +43,7 @@ from onyx.asv3.models import (
 from onyx.asv3.native_cache_projection import lossless_original_transport_enabled
 from onyx.asv3.outcome_map import OutcomeMap
 from onyx.asv3.parallel_execution import parallel_execution_enabled
+from onyx.asv3.performance import profile_fast_step
 from onyx.asv3.progress import ProgressReporter, action_narration, public_action_id
 from onyx.asv3.registry import CapabilityRegistry
 from onyx.asv3.research_state import EvidenceWorkingSet, ResearchState
@@ -507,6 +508,7 @@ class Harness:
                 )
             )
 
+    @profile_fast_step("asv3.checkpoint_save")
     def _save(self) -> None:
         if (
             self.checkpoint
@@ -516,6 +518,7 @@ class Harness:
             preparation = (
                 graph_step("asv3.checkpoint_preparation", {})
                 if parallel_execution_enabled(self.context)
+                or self.context.services.get("asv3_fast") is True
                 else nullcontext()
             )
             with preparation as checkpoint_step:
@@ -764,6 +767,7 @@ class Harness:
             call=call, outcome=outcome, elapsed_seconds=time.monotonic() - start
         )
 
+    @profile_fast_step("asv3.receipt_commit")
     def _commit_receipt(self, receipt: ToolReceipt) -> None:
         if receipt.call.call_id in self._committed_calls:
             return
