@@ -46,6 +46,19 @@ correct passage does not cure an earlier incompatible rule. Do this within the c
 answer decision, without an extra reviewer, rewrite or research pass for settled points.
 """
 
+FAST_TEK_SOURCE_ACTIONS = """SOURCE ACTION PRIORITIES
+Reuse supplied complete originals before rediscovering the same rule. For a known
+source_id and article, prefer read_provision; include the provision's continuations and
+material exceptions. A heading or metadata match alone is never the operative evidence.
+If the source identity is unresolved but its instrument and provision are known, prefer
+a focused full_text identifier lookup before another broad hybrid topic search. Keep
+the source qualifier in each query. Use hybrid when semantic discovery is actually needed.
+Request independent unresolved reads or searches together in one decision; keep dependent
+actions sequential. Do not run one broad search per question when existing anchors let
+you read the requested branches directly. There is no read quota or early completion rule:
+an unresolved material requirement still needs its source or an honest precise gap.
+"""
+
 FAST_TEK_ACTION_RESEARCH = """FAST TEK SOURCE-ACTION ROLE
 Choose routine source actions only; do not write a narrative candidate or summary.
 When you would propose an answer, partial answer or clarification, choose the standalone

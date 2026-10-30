@@ -46,3 +46,79 @@ def test_source_answer_selection_uses_visible_model_factory_and_caller_identity(
     assert selection.model_version == "claude-sonnet-5-5"
     assert selection.model_provider_id is None
     assert selection.temperature is None
+
+
+def test_fast_material_review_uses_authorized_sol_and_preflights_its_cost(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user, persona = MagicMock(spec=User), MagicMock(spec=Persona)
+    reviewer = MagicMock(spec=LLM)
+    reviewer.config = LLMConfig(
+        model_provider="openai",
+        model_name="gpt-6.1-sol",
+        temperature=1,
+        max_input_tokens=240000,
+        api_key="synthetic-provider-key",
+    )
+    factory = MagicMock(return_value=reviewer)
+    cost = MagicMock()
+    monkeypatch.setattr(answer_model, "default_asv3_persona", lambda: persona)
+    monkeypatch.setattr(answer_model, "get_llm_for_persona", factory)
+    monkeypatch.setattr(answer_model, "check_asv3_secondary_model_cost_limit", cost)
+    assert answer_model.fast_material_review_model(user) is reviewer
+    assert factory.call_args.args == (persona, user)
+    selection = factory.call_args.kwargs["llm_override"]
+    assert selection.model_provider_type == "openai"
+    assert selection.model_version == "gpt-6.1-sol"
+    assert selection.model_provider_id is None
+    cost.assert_called_once_with("synthetic-provider-key")
+
+
+@pytest.mark.parametrize("stage", ["access", "cost"])
+def test_fast_reviewer_access_and_cost_errors_propagate_without_fallback(
+    monkeypatch: pytest.MonkeyPatch, stage: str
+) -> None:
+    reviewer = MagicMock(spec=LLM)
+    reviewer.config = LLMConfig(
+        model_provider="openai",
+        model_name="gpt-6.1-sol",
+        temperature=1,
+        max_input_tokens=240000,
+    )
+    factory = MagicMock(return_value=reviewer)
+    cost = MagicMock()
+    error = PermissionError("Access or cost limit denied")
+    if stage == "access":
+        factory.side_effect = error
+    else:
+        cost.side_effect = error
+    monkeypatch.setattr(
+        answer_model, "default_asv3_persona", lambda: MagicMock(spec=Persona)
+    )
+    monkeypatch.setattr(answer_model, "get_llm_for_persona", factory)
+    monkeypatch.setattr(answer_model, "check_asv3_secondary_model_cost_limit", cost)
+    with pytest.raises(PermissionError) as raised:
+        answer_model.fast_material_review_model(MagicMock(spec=User))
+    assert raised.value is error
+    assert factory.call_count == 1 and cost.call_count == (stage == "cost")
+
+
+def test_secondary_model_cost_preflight_uses_tenant_scoped_db_helper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from onyx.db import asv3_models
+
+    session = MagicMock()
+    context = MagicMock()
+    context.__enter__.return_value = session
+    cost = MagicMock()
+    monkeypatch.setattr(asv3_models, "get_session_with_current_tenant", lambda: context)
+    monkeypatch.setattr(asv3_models, "get_current_tenant_id", lambda: "test-tenant")
+    monkeypatch.setattr(asv3_models, "check_llm_cost_limit_for_provider", cost)
+    asv3_models.check_asv3_secondary_model_cost_limit("synthetic-provider-key")
+    cost.assert_called_once_with(
+        db_session=session,
+        tenant_id="test-tenant",
+        llm_provider_api_key="synthetic-provider-key",
+    )
+    assert context.__exit__.call_count == 1

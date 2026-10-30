@@ -17,7 +17,11 @@ from uuid import UUID
 
 from pydantic import JsonValue
 
-from onyx.asv3.answer_model import source_answer_model, uses_source_answer_model
+from onyx.asv3.answer_model import (
+    fast_material_review_model,
+    source_answer_model,
+    uses_source_answer_model,
+)
 from onyx.asv3.article_bindings import ArticleBindings, bound_identity_ledger
 from onyx.asv3.authority import cited_lower_statute_gap, native_named_authority_gap
 from onyx.asv3.authority_requirements import AuthorityRequirements
@@ -178,6 +182,7 @@ from onyx.db.memory import UserMemoryContext
 from onyx.db.models import User
 from onyx.error_handling.error_codes import OnyxErrorCode
 from onyx.error_handling.exceptions import OnyxError
+from onyx.llm.factory import get_llm_token_counter
 from onyx.llm.interfaces import LLM, LLMUserIdentity
 from onyx.llm.models import ReasoningEffort
 from onyx.prompts.asv3.experimental import (
@@ -529,6 +534,21 @@ def run_asv3_loop(
     ):
         llm = llm.with_temperature(llm.config.temperature)
         context.services["explicit_research_temperature"] = True
+    material_review_llm = None
+    material_review_identity: dict[str, JsonValue] | None = None
+    material_review_token_counter = None
+    if checkpoint_workflow_variant == ASV3_FAST_VARIANT:
+        material_review_llm = fast_material_review_model(user)
+        material_review_identity = {
+            "provider": material_review_llm.config.model_provider,
+            "model": material_review_llm.config.model_name,
+        }
+        if (
+            previous is not None
+            and previous.get("fast_material_review_model") != material_review_identity
+        ):
+            raise ValueError("Fast ASv3 resume requires the same material review model")
+        material_review_token_counter = get_llm_token_counter(material_review_llm)
     context.language = profile.language
     context.services["research_profile"] = research_profile
     context.services["asv3_legacy_search_payload"] = workflow_variant in {
@@ -1416,6 +1436,10 @@ def run_asv3_loop(
                     )
                     # Child acceptance may occur after the caller captured its root snapshot.
                     snapshot["evidence"] = ledger.export()
+                if material_review_identity is not None:
+                    snapshot["fast_material_review_model"] = dict(
+                        material_review_identity
+                    )
                 augmentation_seconds = time.monotonic() - augmentation_started
                 submit_started = time.monotonic()
                 if checkpoint_writer is not None:
@@ -2109,24 +2133,25 @@ def run_asv3_loop(
     def assess_fast_materials(
         payload: dict[str, JsonValue],
     ) -> FastMaterialReviewResult:
+        assert material_review_llm is not None
         isolated = copy.copy(context)
         isolated.services = dict(context.services)
         isolated.services.pop("last_model_call_id", None)
         isolated.services["provider_max_attempts"] = 1
         isolated.services["provider_compatibility_attempts"] = 1
         verifier = ResearchModel(
-            research_llm or llm,
+            material_review_llm,
             isolated,
             user_identity=user_identity,
             reasoning_effort=reasoning_effort,
-            token_counter=token_counter,
+            token_counter=material_review_token_counter,
         )
         try:
             raw = verifier.invoke_text(
                 FAST_TEK_CONDITION_REVIEW,
                 json.dumps(payload, ensure_ascii=False),
                 LLMFlow.ASV3_VERIFICATION,
-                max_tokens=2400,
+                max_tokens=6000,
                 response_model_override=FastMaterialReviewResult,
             )
             report = FastMaterialReviewResult.model_validate_json(raw)

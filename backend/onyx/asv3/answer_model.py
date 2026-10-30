@@ -1,7 +1,10 @@
 """Authorized model selection for the isolated source-to-answer experiment."""
 
 from onyx.asv3.workflow_variant import ASV3_TUNED_VARIANT
-from onyx.db.asv3_models import default_asv3_persona
+from onyx.db.asv3_models import (
+    check_asv3_secondary_model_cost_limit,
+    default_asv3_persona,
+)
 from onyx.db.models import User
 from onyx.llm.factory import get_llm_for_persona
 from onyx.llm.interfaces import LLM
@@ -24,3 +27,15 @@ def source_answer_model(user: User) -> LLM:
             model_provider_type="anthropic", model_version="claude-sonnet-5-5"
         ),
     )
+
+
+def fast_material_review_model(user: User) -> LLM:
+    reviewer = get_llm_for_persona(
+        default_asv3_persona(),
+        user,
+        llm_override=LLMOverride(
+            model_provider_type="openai", model_version="gpt-6.1-sol"
+        ),
+    )
+    check_asv3_secondary_model_cost_limit(reviewer.config.api_key)
+    return reviewer

@@ -124,6 +124,7 @@ from onyx.prompts.asv3.fast import (
     FAST_TEK_ACTION_RESEARCH,
     FAST_TEK_CONDITION_REPAIR,
     FAST_TEK_MATERIAL_CONDITIONS,
+    FAST_TEK_SOURCE_ACTIONS,
 )
 
 if TYPE_CHECKING:
@@ -3254,6 +3255,7 @@ class ResearchModel:
             instruction += "\n\n" + FAST_MATERIAL_OUTCOMES
         if self._fast_action_coordinator:
             instruction += "\n\n" + FAST_TEK_MATERIAL_CONDITIONS
+            instruction += "\n\n" + FAST_TEK_SOURCE_ACTIONS
             if view.publication_gap and view.publication_gap.get(
                 "asv3_fast_material_review"
             ):
