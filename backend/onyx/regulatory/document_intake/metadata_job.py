@@ -25,6 +25,7 @@ from onyx.regulatory.document_intake.metadata import (
     LegalMetadataResult,
     MetadataChunk,
     build_metadata_body_scope_repair_request,
+    build_metadata_catalog_recovery_request,
     build_metadata_repair_request,
     build_metadata_request,
     metadata_input_hash,
@@ -104,6 +105,7 @@ def _extract_metadata_targets(
     )
     if not exhausted:
         assert context is not None
+        original_context = context
         try:
             result = validate_metadata_transport_response(
                 context, chunks=chunks, target_ids=targets
@@ -157,10 +159,56 @@ def _extract_metadata_targets(
                                 cached_repair_response=cached_context,
                             )
                             if scoped_repair is None:
+                                scoped_repair = build_metadata_catalog_recovery_request(
+                                    repair, cached_context
+                                )
+                            if scoped_repair is None:
                                 raise ValueError(
                                     "New-document metadata failed strict validation after its single repair attempt"
                                 ) from None
                             repair = scoped_repair
+        if not exhausted:
+            # Inspect durable ACKs before spending this invocation's one repair call.
+            cached = _cached_metadata_request(
+                gateway=gateway,
+                request=repair,
+                identity_prefix=identity_prefix,
+                heartbeat=heartbeat,
+                stopped=stopped,
+            )
+            if cached is not None:
+                cached_context, exhausted = cached
+                if not exhausted:
+                    assert cached_context is not None
+                    try:
+                        result = validate_metadata_transport_response(
+                            cached_context, chunks=chunks, target_ids=targets
+                        )
+                        return [(repair.request_hash, result)]
+                    except ValueError as error:
+                        recovery = build_metadata_catalog_recovery_request(
+                            repair, cached_context
+                        )
+                        if (
+                            recovery is None
+                            and str(error)
+                            in {
+                                "Metadata field requires body evidence",
+                                "Metadata publication reference must use body evidence only for relative dates",
+                            }
+                            and "catalog_recovery_version"
+                            not in json.loads(repair.prompt)["validation_feedback"]
+                        ):
+                            recovery = build_metadata_body_scope_repair_request(
+                                request,
+                                original_context,
+                                cached_repair_response=cached_context,
+                            )
+                        if recovery is None:
+                            raise ValueError(
+                                "New-document metadata failed strict validation after its single repair attempt"
+                            ) from None
+                        repair = recovery
         if exhausted:
             context = None
         else:
