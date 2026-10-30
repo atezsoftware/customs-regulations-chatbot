@@ -161,7 +161,9 @@ def resolve_program_value(
 
 
 def _continuous_compose_enabled(context: RunContext) -> bool:
-    return parallel_execution_enabled(context)
+    return context.services.get("asv3_fast") is True or parallel_execution_enabled(
+        context
+    )
 
 
 def _failed_dependency(result: ToolOutcome, context: RunContext) -> bool:

@@ -36,6 +36,8 @@ it.each(legacyPayloads)(
         ...baseParams,
         ...mode,
         asv3ExpCropped: false,
+        asv3Fast: false,
+        asv3FastCropped: false,
       })
     ).toBe(body);
   }

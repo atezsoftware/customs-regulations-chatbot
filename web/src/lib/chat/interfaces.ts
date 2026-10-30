@@ -3,6 +3,8 @@ export type WorkflowSelection =
   | "deep"
   | "experimental"
   | "asv3_exp_cropped"
+  | "asv3_fast"
+  | "asv3_fast_cropped"
   | "experimental_parallel"
   | "experimental_guardrails"
   | "experimental_guardrails_v2"

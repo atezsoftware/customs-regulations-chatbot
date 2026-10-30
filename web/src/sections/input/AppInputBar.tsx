@@ -94,6 +94,8 @@ export interface AppInputBarProps {
   legalReviewEnabled?: boolean;
   supersearchEnabled?: boolean;
   asv3ExpCroppedEnabled?: boolean;
+  asv3FastEnabled?: boolean;
+  asv3FastCroppedEnabled?: boolean;
   experimentalResearchEnabled?: boolean;
   experimentalParallelResearchEnabled?: boolean;
   experimentalGuardrailsEnabled?: boolean;
@@ -108,6 +110,8 @@ export interface AppInputBarProps {
   toggleLegalReview?: () => void;
   toggleSupersearch?: () => void;
   toggleAsv3ExpCropped?: () => void;
+  toggleAsv3Fast?: () => void;
+  toggleAsv3FastCropped?: () => void;
   toggleExperimentalResearch?: () => void;
   toggleExperimentalParallelResearch?: () => void;
   toggleExperimentalGuardrails?: () => void;
@@ -142,6 +146,8 @@ const AppInputBar = React.memo(
     legalReviewEnabled = false,
     supersearchEnabled = false,
     asv3ExpCroppedEnabled = false,
+    asv3FastEnabled = false,
+    asv3FastCroppedEnabled = false,
     experimentalResearchEnabled = false,
     experimentalParallelResearchEnabled = false,
     experimentalGuardrailsEnabled = false,
@@ -153,6 +159,8 @@ const AppInputBar = React.memo(
     toggleLegalReview,
     toggleSupersearch,
     toggleAsv3ExpCropped,
+    toggleAsv3Fast,
+    toggleAsv3FastCropped,
     toggleExperimentalResearch,
     toggleExperimentalParallelResearch,
     toggleExperimentalGuardrails,
@@ -885,6 +893,40 @@ const AppInputBar = React.memo(
                     }
                   >
                     exp cropped
+                  </SelectButton>
+                )}
+                {showAtezSearch && toggleAsv3Fast && (
+                  <SelectButton
+                    disabled={disabled || isMultiModelActive}
+                    variant="select-light"
+                    icon={SvgSparkle}
+                    onClick={toggleAsv3Fast}
+                    state={asv3FastEnabled ? "selected" : "empty"}
+                    foldable={false}
+                    tooltip={
+                      isMultiModelActive
+                        ? "Fast ASv3 Tek tek modelle çalışır. Ek modelleri kaldırın."
+                        : "Kaynak araştırmasını ve yanıt yazımını ayrı yürüten hızlandırılmış ASv3 akışı"
+                    }
+                  >
+                    Fast ASv3 Tek
+                  </SelectButton>
+                )}
+                {showAtezSearch && toggleAsv3FastCropped && (
+                  <SelectButton
+                    disabled={disabled || isMultiModelActive}
+                    variant="select-light"
+                    icon={SvgSparkle}
+                    onClick={toggleAsv3FastCropped}
+                    state={asv3FastCroppedEnabled ? "selected" : "empty"}
+                    foldable={false}
+                    tooltip={
+                      isMultiModelActive
+                        ? "Fast Exp Cropped tek modelle çalışır. Ek modelleri kaldırın."
+                        : "Kaynak araştırmasını ve yanıt yazımını ayrı yürüten hızlandırılmış ASv3 akışı"
+                    }
+                  >
+                    Fast Exp Cropped
                   </SelectButton>
                 )}
                 {showAtezSearch && toggleExperimentalParallelResearch && (

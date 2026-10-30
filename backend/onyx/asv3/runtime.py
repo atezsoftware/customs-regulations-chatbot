@@ -59,6 +59,11 @@ from onyx.asv3.cropped_worker_handoff import (
 )
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.external_tools import build_external_specs
+from onyx.asv3.fast_policy import (
+    FAST_HANDOFF,
+    finish_research_spec,
+    restore_fast_handoff,
+)
 from onyx.asv3.governing_acquisitions import (
     GoverningOriginalAcquisitions,
     governing_original_targets,
@@ -408,6 +413,17 @@ def run_asv3_loop(
         raise ValueError("ASv3 resume requires the same authorized scope and question")
     validate_asv3_variant_resume(workflow_variant, previous)
     checkpoint_workflow_variant = workflow_variant
+    from onyx.asv3.workflow_variant import ASV3_FAST_CROPPED_VARIANT, ASV3_FAST_VARIANT
+
+    if workflow_variant in {ASV3_FAST_VARIANT, ASV3_FAST_CROPPED_VARIANT}:
+        if research_profile != "normal" or parallel_research:
+            raise ValueError("Fast ASv3 requires the normal non-parallel profile")
+        context.services["asv3_fast"] = True
+        workflow_variant = (
+            ASV3_EXP_CROPPED_VARIANT
+            if workflow_variant == ASV3_FAST_CROPPED_VARIANT
+            else ASV3_STANDARD_VARIANT
+        )
     if workflow_variant == ASV3_EXP_CROPPED_VARIANT:
         if research_profile != "normal" or parallel_research:
             raise ValueError(
@@ -712,7 +728,13 @@ def run_asv3_loop(
     )
     notice_state: SourceNoticeState | None = None
     if (
-        checkpoint_workflow_variant in {ASV3_STANDARD_VARIANT, ASV3_EXP_CROPPED_VARIANT}
+        checkpoint_workflow_variant
+        in {
+            ASV3_STANDARD_VARIANT,
+            ASV3_EXP_CROPPED_VARIANT,
+            ASV3_FAST_VARIANT,
+            ASV3_FAST_CROPPED_VARIANT,
+        }
         and research_profile == "normal"
         and not parallel_research
     ):
@@ -1031,6 +1053,13 @@ def run_asv3_loop(
                 )
                 if source_reviews is not None:
                     snapshot["legal_source_reviews"] = source_reviews.export()
+                if (
+                    context.services.get("asv3_fast") is True
+                    and FAST_HANDOFF in context.services
+                ):
+                    snapshot[FAST_HANDOFF] = copy.deepcopy(
+                        context.services[FAST_HANDOFF]
+                    )
                 if notice_state is not None:
                     snapshot["source_notices"] = notice_state.export()
                 if authority_requirements is not None:
@@ -1265,6 +1294,13 @@ def run_asv3_loop(
                     snapshot["legal_source_reviews"] = source_reviews.export()
                 if authority_requirements is not None:
                     snapshot["authority_requirements"] = authority_requirements.export()
+                if (
+                    context.services.get("asv3_fast") is True
+                    and FAST_HANDOFF in context.services
+                ):
+                    snapshot[FAST_HANDOFF] = copy.deepcopy(
+                        context.services[FAST_HANDOFF]
+                    )
                 if governing_acquisitions is not None:
                     if article_bindings is not None:
                         snapshot["article_bindings"] = article_bindings.export()
@@ -2465,6 +2501,8 @@ def run_asv3_loop(
             consumes_tool_budget=False,
         )
     )
+    if context.services.get("asv3_fast") is True:
+        registry.register(finish_research_spec(ledger, context))
     root_focused_repair = (
         CroppedFocusedRepair(cropped_repair_state)
         if cropped_repair_state is not None
@@ -2692,6 +2730,7 @@ def run_asv3_loop(
             checkpoint_sequence = saved_sequence
             if parallel_answers is not None and question_research.answers:
                 question_research.assemble_retained_answers()
+        restore_fast_handoff(previous, ledger, context)
         if notice_state is not None:
             saved_notices = previous.get("source_notices") if previous else None
             if saved_notices is not None:

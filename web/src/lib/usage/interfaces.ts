@@ -18,7 +18,11 @@ export interface UsageExportTotals {
   average_queries_per_session: number;
 }
 
-export type WorkflowUsageKey = "asv3" | "asv3_exp_cropped";
+export type WorkflowUsageKey =
+  | "asv3"
+  | "asv3_exp_cropped"
+  | "asv3_fast"
+  | "asv3_fast_cropped";
 
 export interface WorkflowUsage {
   query_count: number;

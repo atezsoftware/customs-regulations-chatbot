@@ -160,6 +160,8 @@ class SendMessageRequest(BaseModel):
     asv3_guardrails_v2: bool = False
     asv3_guardrails_v3: bool = False
     asv3_exp_cropped: bool = False
+    asv3_fast: bool = False
+    asv3_fast_cropped: bool = False
     asv3_allow_external: bool = False
     asv3_resume_message_id: int | None = None
 
@@ -217,6 +219,8 @@ class SendMessageRequest(BaseModel):
                 self.asv3_guardrails_v2,
                 self.asv3_guardrails_v3,
                 self.asv3_exp_cropped,
+                self.asv3_fast,
+                self.asv3_fast_cropped,
                 self.asv3_resume_message_id is not None,
                 self.asv3_research_profile != "deep",
             )
@@ -249,6 +253,8 @@ class SendMessageRequest(BaseModel):
                 self.asv3_guardrails_v2,
                 self.asv3_guardrails_v3,
                 self.asv3_exp_cropped,
+                self.asv3_fast,
+                self.asv3_fast_cropped,
                 self.asv3_resume_message_id is not None,
                 self.asv3_research_profile != "deep",
             )
@@ -277,6 +283,8 @@ class SendMessageRequest(BaseModel):
                 self.atez_search_v3,
                 self.deep_research,
                 self.asv3_exp_cropped,
+                self.asv3_fast,
+                self.asv3_fast_cropped,
             )
         ):
             raise ValueError(
@@ -320,6 +328,12 @@ class SendMessageRequest(BaseModel):
             raise ValueError(
                 "Experimental Guardrails requires the normal non-parallel ASv3 profile"
             )
+        if (self.asv3_fast or self.asv3_fast_cropped) and not (
+            self.atez_search_v3
+            and self.asv3_research_profile == "normal"
+            and not self.asv3_parallel_research
+        ):
+            raise ValueError("Fast ASv3 requires the normal non-parallel ASv3 profile")
         if self.asv3_exp_cropped and not (
             self.atez_search_v3
             and self.asv3_research_profile == "normal"
@@ -335,6 +349,8 @@ class SendMessageRequest(BaseModel):
                     self.asv3_guardrails_v2,
                     self.asv3_guardrails_v3,
                     self.asv3_exp_cropped,
+                    self.asv3_fast,
+                    self.asv3_fast_cropped,
                 )
             )
             > 1

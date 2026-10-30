@@ -77,6 +77,8 @@ it("labels each visible workflow as the input bar does", () => {
   expect(workflowLabel("asv3")).toBe("ASv3 Tek Araştırma");
   expect(workflowLabel("legal_review")).toBe("Hukuki İnceleme (Flash)");
   expect(workflowLabel("asv3_exp_cropped")).toBe("exp cropped");
+  expect(workflowLabel("asv3_fast")).toBe("Fast ASv3 Tek");
+  expect(workflowLabel("asv3_fast_cropped")).toBe("Fast Exp Cropped");
 });
 
 it("omits the workflow when the answer predates it being recorded", () => {

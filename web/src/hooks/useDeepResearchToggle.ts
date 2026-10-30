@@ -35,6 +35,14 @@ export default function useDeepResearchToggle({
       current === "asv3_exp_cropped" ? null : "asv3_exp_cropped"
     );
   }, []);
+  const toggleAsv3Fast = useCallback(() => {
+    setMode((current) => (current === "asv3_fast" ? null : "asv3_fast"));
+  }, []);
+  const toggleAsv3FastCropped = useCallback(() => {
+    setMode((current) =>
+      current === "asv3_fast_cropped" ? null : "asv3_fast_cropped"
+    );
+  }, []);
   const toggleExperimentalResearch = useCallback(() => {
     setMode((current) => (current === "experimental" ? null : "experimental"));
   }, []);
@@ -90,6 +98,10 @@ export default function useDeepResearchToggle({
     toggleAtezSearchV3,
     asv3ExpCroppedEnabled: mode === "asv3_exp_cropped",
     toggleAsv3ExpCropped,
+    asv3FastEnabled: mode === "asv3_fast",
+    toggleAsv3Fast,
+    asv3FastCroppedEnabled: mode === "asv3_fast_cropped",
+    toggleAsv3FastCropped,
     experimentalResearchEnabled: mode === "experimental",
     toggleExperimentalResearch,
     experimentalParallelResearchEnabled: mode === "experimental_parallel",
