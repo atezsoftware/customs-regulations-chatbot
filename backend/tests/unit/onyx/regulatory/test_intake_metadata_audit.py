@@ -97,3 +97,4 @@ def test_applied_metadata_distinguishes_retained_current_and_manual_fact_sources
     assert chunk.chunk_metadata["document_title"] == "Elle incelenmiş başlık"
     assert audit["fields"]["document_title"] == manual_provenance
     assert audit["request_hash"] == recovery_hash
+    assert audit["composed_from_validated_facts"] is True

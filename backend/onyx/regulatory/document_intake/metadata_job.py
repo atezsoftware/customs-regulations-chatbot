@@ -29,6 +29,7 @@ from onyx.regulatory.document_intake.metadata import (
     build_metadata_repair_request,
     build_metadata_request,
     metadata_input_hash,
+    recover_metadata_response,
     retain_validated_metadata_facts,
     validate_metadata_transport_response,
 )
@@ -112,6 +113,22 @@ def _extract_metadata_targets(
             )
         return [(accepted_request.request_hash, result)]
 
+    def validate_attempt(response: str) -> LegalMetadataResult:
+        try:
+            return validate_metadata_transport_response(
+                response, chunks=chunks, target_ids=targets
+            )
+        except ValueError:
+            recovered = recover_metadata_response(
+                response,
+                previous_attempts=previous_attempts,
+                chunks=chunks,
+                target_ids=targets,
+            )
+            if recovered is None:
+                raise
+            return recovered
+
     context, exhausted = _run_metadata_request(
         gateway=gateway,
         request=request,
@@ -123,9 +140,7 @@ def _extract_metadata_targets(
         assert context is not None
         original_context = context
         try:
-            result = validate_metadata_transport_response(
-                context, chunks=chunks, target_ids=targets
-            )
+            result = validate_attempt(context)
             return accepted(request, result)
         except ValueError as error:
             previous_attempts.append((request.request_hash, context))
@@ -165,9 +180,7 @@ def _extract_metadata_targets(
                     else:
                         assert cached_context is not None
                         try:
-                            result = validate_metadata_transport_response(
-                                cached_context, chunks=chunks, target_ids=targets
-                            )
+                            result = validate_attempt(cached_context)
                             return accepted(repair, result)
                         except ValueError:
                             previous_attempts.append(
@@ -201,9 +214,7 @@ def _extract_metadata_targets(
                 if not exhausted:
                     assert cached_context is not None
                     try:
-                        result = validate_metadata_transport_response(
-                            cached_context, chunks=chunks, target_ids=targets
-                        )
+                        result = validate_attempt(cached_context)
                         return accepted(repair, result)
                     except ValueError as error:
                         previous_attempts.append((repair.request_hash, cached_context))
@@ -243,9 +254,7 @@ def _extract_metadata_targets(
         if not exhausted:
             assert context is not None
             try:
-                result = validate_metadata_transport_response(
-                    context, chunks=chunks, target_ids=targets
-                )
+                result = validate_attempt(context)
             except ValueError:
                 raise ValueError(
                     "New-document metadata failed strict validation after its single repair attempt"

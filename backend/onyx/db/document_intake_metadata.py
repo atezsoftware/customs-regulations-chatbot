@@ -361,6 +361,10 @@ def apply_metadata_results(
                     "input_stale": False,
                 }
             )
+            if any(fact.retained_request_hash for fact in target.fields):
+                audit["composed_from_validated_facts"] = True
+            else:
+                audit.pop("composed_from_validated_facts", None)
             metadata[METADATA_AUDIT_KEY] = audit
             row.chunk_metadata = metadata
     refresh_intake_document_name(session, batch, document_id)
