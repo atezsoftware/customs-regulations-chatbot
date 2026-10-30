@@ -9,7 +9,7 @@ from onyx.asv3.workflow_variant import (
     ASV3_FAST_VARIANT,
     validate_asv3_variant_resume,
 )
-from onyx.prompts.asv3.fast import FAST_MATERIAL_OUTCOMES
+from onyx.prompts.asv3.fast import FAST_MATERIAL_OUTCOMES, FAST_TEK_MATERIAL_CONDITIONS
 from tests.unit.onyx.asv3.test_native_model_adapter import adaptive_tool_view, model
 from tests.unit.onyx.asv3.test_shared_originals import full_record, original, recorded
 
@@ -44,7 +44,9 @@ def test_response_policy_preserves_originals_tools_and_output_capacity(
     restored_prompt = [
         message.model_copy(
             update={
-                "content": message.content.replace("\n\n" + FAST_MATERIAL_OUTCOMES, "")
+                "content": message.content.replace(
+                    "\n\n" + FAST_MATERIAL_OUTCOMES, ""
+                ).replace("\n\n" + FAST_TEK_MATERIAL_CONDITIONS, "")
             }
         )
         if isinstance(message.content, str)
@@ -63,6 +65,7 @@ def test_response_policy_preserves_originals_tools_and_output_capacity(
         (ASV3_FAST_CROPPED_VARIANT, "cropped-fast-handoff-v1"),
         (ASV3_FAST_VARIANT, "standard-fast-batched-io-v2"),
         (ASV3_FAST_CROPPED_VARIANT, "cropped-fast-batched-io-v2"),
+        (ASV3_FAST_VARIANT, "standard-fast-primary-material-outcomes-v3"),
     ],
 )
 def test_previous_fast_protocol_cannot_resume_as_material_outcomes_policy(
