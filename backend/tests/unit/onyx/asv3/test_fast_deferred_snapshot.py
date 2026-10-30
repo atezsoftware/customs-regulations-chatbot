@@ -20,6 +20,7 @@ from onyx.asv3.workflow_variant import (
 from onyx.db.asv3_corpus import CorpusChunk, CorpusSource
 from onyx.db.asv3_runs import decode_asv3_checkpoint, encode_asv3_checkpoint
 from onyx.llm.model_response import ModelResponse
+from onyx.prompts.asv3.fast import FAST_RESPONSE_POLICY, FAST_RESPONSE_POLICY_SERVICE
 from onyx.regulatory.source_notices import SourceNotice
 from onyx.tracing.framework.setup import get_trace_provider
 from tests.unit.onyx.asv3 import test_runtime
@@ -114,6 +115,8 @@ def _run(
 
     def create(**arguments: Any) -> Harness:
         active = Harness(**arguments)
+        # Isolate checkpoint mechanics from the separately tested Fast response policy.
+        active.context.services[FAST_RESPONSE_POLICY_SERVICE] = FAST_RESPONSE_POLICY
         roots.append(active)
         return active
 

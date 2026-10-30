@@ -21,6 +21,7 @@ from onyx.asv3.models import (
 )
 from onyx.asv3.workflow_variant import ASV3_TUNED_VARIANT
 from onyx.llm.models import ChatCompletionMessage
+from onyx.prompts.asv3.fast import FAST_RESPONSE_POLICY, FAST_RESPONSE_POLICY_SERVICE
 from tests.unit.onyx.asv3.test_native_model_adapter import adaptive_tool_view, model
 from tests.unit.onyx.asv3.test_shared_originals import full_record, original
 
@@ -100,6 +101,8 @@ def _adapter(
             "asv3_workflow_variant": ASV3_TUNED_VARIANT,
             "asv3_exp_cropped": True,
             "asv3_fast": fast,
+            # Compare navigation mechanics with the same response instruction.
+            FAST_RESPONSE_POLICY_SERVICE: FAST_RESPONSE_POLICY,
         },
     )
     ledger = EvidenceLedger()

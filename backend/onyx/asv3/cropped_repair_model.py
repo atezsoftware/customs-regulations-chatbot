@@ -12,6 +12,7 @@ from onyx.asv3.citation_numbers import extract_citation_numbers
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.llm_adapter import ResearchModel, _NativeOriginalCatalogue
 from onyx.asv3.models import Decision, HarnessView, RunStopped
+from onyx.asv3.performance import FAST_TIMING_SERVICE
 from onyx.asv3.retained_answer import resolve_retained_answer
 from onyx.llm.interfaces import LLM
 from onyx.llm.model_response import ModelResponse
@@ -44,6 +45,8 @@ _SERVICES = frozenset(
         "cropped_cost_phase",
         "research_state",
         "cropped_research_controller",
+        FAST_TIMING_SERVICE,
+        "asv3_fast_response_policy",
     }
 )
 _TERMINALS = frozenset({"submit_answer", "submit_partial_answer"})

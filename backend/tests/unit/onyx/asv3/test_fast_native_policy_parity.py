@@ -1,4 +1,4 @@
-"""Fast I/O must not alter the model-visible research or writing contract."""
+"""Fast response priorities preserve operative originals and canonical tools."""
 
 import pytest
 
@@ -9,6 +9,7 @@ from onyx.asv3.workflow_variant import (
     ASV3_FAST_VARIANT,
     validate_asv3_variant_resume,
 )
+from onyx.prompts.asv3.fast import FAST_MATERIAL_OUTCOMES
 from tests.unit.onyx.asv3.test_native_model_adapter import adaptive_tool_view, model
 from tests.unit.onyx.asv3.test_shared_originals import full_record, original, recorded
 
@@ -16,7 +17,7 @@ from tests.unit.onyx.asv3.test_shared_originals import full_record, original, re
 @pytest.mark.parametrize(
     "draft", [None, "Both conditions apply subject to exception [1]."]
 )
-def test_io_policy_preserves_exact_prompt_tools_and_output_capacity(
+def test_response_policy_preserves_originals_tools_and_output_capacity(
     draft: str | None,
 ) -> None:
     ledger = recorded(
@@ -39,7 +40,18 @@ def test_io_policy_preserves_exact_prompt_tools_and_output_capacity(
     context.services.update(asv3_fast=True, asv3_fast_retrieval=True)
     fast_adapter = ResearchModel(selected, context, lean_native_mode=True)
     after = fast_adapter._fit_native_decision(current)
-    assert after == before
+    prompt, tools, output = after
+    restored_prompt = [
+        message.model_copy(
+            update={
+                "content": message.content.replace("\n\n" + FAST_MATERIAL_OUTCOMES, "")
+            }
+        )
+        if isinstance(message.content, str)
+        else message
+        for message in prompt
+    ]
+    assert (restored_prompt, tools, output) == before
     assert ledger.get(1) is not None
     assert "finish_research" not in str(after[1])
 
@@ -49,9 +61,11 @@ def test_io_policy_preserves_exact_prompt_tools_and_output_capacity(
     [
         (ASV3_FAST_VARIANT, "standard-fast-handoff-v1"),
         (ASV3_FAST_CROPPED_VARIANT, "cropped-fast-handoff-v1"),
+        (ASV3_FAST_VARIANT, "standard-fast-batched-io-v2"),
+        (ASV3_FAST_CROPPED_VARIANT, "cropped-fast-batched-io-v2"),
     ],
 )
-def test_v1_handoff_checkpoint_cannot_resume_as_v2_io_policy(
+def test_previous_fast_protocol_cannot_resume_as_material_outcomes_policy(
     variant: str, policy: str
 ) -> None:
     with pytest.raises(ValueError, match="own checkpoint policy"):

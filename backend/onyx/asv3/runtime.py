@@ -99,7 +99,12 @@ from onyx.asv3.parallel_execution import (
     ParallelExecutionSlots,
     parallel_execution_enabled,
 )
-from onyx.asv3.performance import FastCancellationProbe
+from onyx.asv3.performance import (
+    FastCancellationProbe,
+    fast_timing_run,
+    fast_timing_step,
+    install_fast_timing,
+)
 from onyx.asv3.progress import (
     ProgressEvent,
     ProgressReporter,
@@ -267,7 +272,14 @@ def _trace_asv3(function: Callable[P, None]) -> Callable[P, None]:
                 model_name=llm.config.model_name,
             ).model_dump(),
         ):
-            function(*args, **kwargs)
+            if kwargs.get("workflow_variant") in {
+                ASV3_FAST_VARIANT,
+                ASV3_FAST_CROPPED_VARIANT,
+            }:
+                with fast_timing_run(True):
+                    function(*args, **kwargs)
+            else:
+                function(*args, **kwargs)
 
     return wrapped
 
@@ -424,6 +436,7 @@ def run_asv3_loop(
             raise ValueError("Fast ASv3 requires the normal non-parallel profile")
         context.services["asv3_fast"] = True
         context.services["asv3_fast_retrieval"] = True
+        install_fast_timing(context, cancellation_probe=cancellation_probe)
         workflow_variant = (
             ASV3_EXP_CROPPED_VARIANT
             if workflow_variant == ASV3_FAST_CROPPED_VARIANT
@@ -739,7 +752,8 @@ def run_asv3_loop(
         queries: list[str] | None, identifiers: list[str] | None
     ) -> list[SourceNotice]:
         capture = (
-            graph_step(
+            fast_timing_step(
+                context,
                 "asv3.source_notice_lookup",
                 {
                     "query_count": len(queries or []),
@@ -1237,9 +1251,10 @@ def run_asv3_loop(
         if checkpoint_writer is not None:
             checkpoint_writer.raise_if_failed()
         capture = (
-            graph_step("asv3.checkpoint_capture", {})
-            if (parallel_research and durable)
-            or context.services.get("asv3_fast") is True
+            fast_timing_step(context, "asv3.checkpoint_capture")
+            if context.services.get("asv3_fast") is True
+            else graph_step("asv3.checkpoint_capture", {})
+            if parallel_research and durable
             else nullcontext()
         )
         with capture as capture_step:
@@ -3009,23 +3024,16 @@ def run_asv3_loop(
     finally:
         primary_error = sys.exc_info()[0] is not None
         try:
-            try:
-                if workers:
-                    workers.close()
-            finally:
-                teardown_error = sys.exc_info()[0] is not None
-                if checkpoint_writer is not None:
-                    try:
-                        checkpoint_writer.close()
-                    except BaseException:
-                        if not primary_error and not teardown_error:
-                            raise
-                        logger.exception(
-                            "Parallel checkpoint persistence failed during teardown"
-                        )
+            if workers:
+                workers.close()
         finally:
-            if cancellation_probe is not None:
-                with graph_step(
-                    "asv3.cancellation_checks", cancellation_probe.snapshot()
-                ):
-                    pass
+            teardown_error = sys.exc_info()[0] is not None
+            if checkpoint_writer is not None:
+                try:
+                    checkpoint_writer.close()
+                except BaseException:
+                    if not primary_error and not teardown_error:
+                        raise
+                    logger.exception(
+                        "Parallel checkpoint persistence failed during teardown"
+                    )

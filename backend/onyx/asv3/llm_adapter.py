@@ -116,6 +116,11 @@ from onyx.asv3.terminal_wire_schema import (
     strict_terminal_tools,
 )
 from onyx.asv3.workflow_variant import ASV3_STANDARD_VARIANT, ASV3_TUNED_VARIANT
+from onyx.prompts.asv3.fast import (
+    FAST_MATERIAL_OUTCOMES,
+    FAST_RESPONSE_POLICY,
+    FAST_RESPONSE_POLICY_SERVICE,
+)
 
 if TYPE_CHECKING:
     from onyx.asv3.cropped_sections import CroppedSectionMaterialContext
@@ -847,9 +852,18 @@ class ResearchModel:
         self._writing_answer = False
         self._cropped_source_writer_started = False
         self._answer_researching = False
+        self._fast_primary_coordinator = (
+            (lean_native_mode or context.services.get("lean_native_mode") is True)
+            and context.depth == 0
+            and context.services.get("asv3_fast") is True
+            and context.services.get("asv3_exp_cropped") is not True
+        )
+        if context.services.get("asv3_fast") is True:
+            context.services[FAST_RESPONSE_POLICY_SERVICE] = FAST_RESPONSE_POLICY
         self.research_llm = (
             None
             if context.services.get("research_profile") == "experimental"
+            or self._fast_primary_coordinator
             else research_llm
         )
         self.context = context
@@ -914,6 +928,8 @@ class ResearchModel:
                 "research_model": config.model_name,
                 "research_temperature": config.temperature,
             }
+        if self._fast_primary_coordinator:
+            settings["fast_coordinator_routing"] = "selected-primary-v1"
         snapshot: dict[str, JsonValue] = {
             "settings": settings,
             "first_decision_started": self._native_first_decision_started,
@@ -3182,6 +3198,11 @@ class ResearchModel:
             == ASV3_STANDARD_VARIANT
         ):
             instruction += "\n\n" + DIRECT_ANSWER_OPENING
+        if (
+            self.context.services.get(FAST_RESPONSE_POLICY_SERVICE)
+            == FAST_RESPONSE_POLICY
+        ):
+            instruction += "\n\n" + FAST_MATERIAL_OUTCOMES
         question: dict[str, JsonValue] = {
             "request": view.request,
         }

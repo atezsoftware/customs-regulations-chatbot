@@ -13,6 +13,11 @@ from onyx.asv3.cropped_research_limit import CroppedResearchLimit
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.llm_adapter import ResearchModel
 from onyx.asv3.models import HarnessView, RunContext, RunStopped, SharedBudget
+from onyx.asv3.performance import (
+    FAST_TIMING_SERVICE,
+    fast_timing_step,
+    install_fast_timing,
+)
 from onyx.asv3.workflow_variant import ASV3_TUNED_VARIANT
 from onyx.llm.model_response import ModelResponse
 from onyx.llm.models import ChatCompletionMessage, TextContentPart, ToolMessage
@@ -135,6 +140,25 @@ def test_fresh_requires_cropped_and_rejects_cheap() -> None:
     adapter.context.services.update(asv3_exp_cropped=True, asv3_exp_cheap=True)
     with pytest.raises(ValueError, match="Cropped"):
         fresh_model(adapter)
+
+
+def test_fresh_shares_timing_and_response_policy_without_fast_flags() -> None:
+    adapter, _ledger, _selected = fixture()
+    adapter.context.services.update(
+        asv3_fast=True,
+        asv3_fast_retrieval=True,
+        asv3_fast_response_policy="material-outcomes-v1",
+    )
+    collector = install_fast_timing(adapter.context)
+    assert collector is not None
+    fresh = fresh_model(adapter)
+    assert fresh.context.services[FAST_TIMING_SERVICE] is collector
+    assert "asv3_fast" not in fresh.context.services
+    assert "asv3_fast_retrieval" not in fresh.context.services
+    assert fresh.context.services["asv3_fast_response_policy"] == "material-outcomes-v1"
+    with fast_timing_step(fresh.context, "asv3.model_request") as step:
+        assert step is not None
+    assert collector._totals["asv3.model_request"].count == 1
 
 
 class CheckResult(BaseModel):
