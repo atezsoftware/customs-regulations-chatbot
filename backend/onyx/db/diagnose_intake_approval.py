@@ -120,8 +120,15 @@ def inspect_cache(
         if len(rows) > 10000:
             raise RuntimeError("Target file exceeds diagnostic chunk bound")
         # Stored requests, rather than current metadata-enriched rows, are replay authority.
-        current[frozenset(row["id"] for row in rows)] = member
         audits = [row["chunk_metadata"].get("intake_legal_metadata") for row in rows]
+        applied = bool(rows) and all(
+            isinstance(audit, dict)
+            and audit.get("model") == "gemini-3.5-flash"
+            and not audit.get("input_stale")
+            for audit in audits
+        )
+        if not applied:
+            current[frozenset(row["id"] for row in rows)] = member
         emit(
             "INTAKE_FILE",
             {
@@ -138,7 +145,7 @@ def inspect_cache(
                         "id": row["id"],
                         "heading_path": row["heading_path"],
                         "text_sha256": digest(row["text"]),
-                        "text_excerpt": row["text"][:400],
+                        "text_excerpt": None if applied else row["text"][:400],
                         "metadata_keys": sorted(row["chunk_metadata"]),
                         "validity_start_date": row["validity_start_date"],
                         "validity_end_date": row["validity_end_date"],
