@@ -28,6 +28,8 @@ const workflowLabels: Record<string, string> = {
   experimental_asv3: "Experimental ASv3",
   experimental: "Experimental",
   asv3_exp_cropped: "exp cropped",
+  asv3_fast: "Fast ASv3 Tek",
+  asv3_fast_cropped: "Fast Exp Cropped",
   experimental_guardrails: "Experimental Guardrails",
   experimental_guardrails_v2: "Experimental Guardrails v2",
   experimental_guardrails_v3: "Experimental Guardrails v3",

@@ -13,7 +13,7 @@ from onyx.db.models import ChatMessage, ChatSession, User
 from onyx.db.response_usage import get_response_usage
 from onyx.db.user_usage import DELETED_USER_EXPORT_EMAIL
 
-USAGE_WORKFLOWS = ("asv3", "asv3_exp_cropped")
+USAGE_WORKFLOWS = ("asv3", "asv3_exp_cropped", "asv3_fast", "asv3_fast_cropped")
 _RESPONSE_BATCH_SIZE = 500
 
 

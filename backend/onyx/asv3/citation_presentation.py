@@ -7,6 +7,8 @@ from onyx.asv3.models import EvidenceItem
 from onyx.asv3.progress import official_corpus_source_name
 from onyx.asv3.workflow_variant import (
     ASV3_EXP_CROPPED_VARIANT,
+    ASV3_FAST_CROPPED_VARIANT,
+    ASV3_FAST_VARIANT,
     ASV3_STANDARD_VARIANT,
 )
 from onyx.regulatory.legistation_metadata import parse_legistation_metadata
@@ -42,7 +44,13 @@ def citation_presentation_enabled(
     workflow_variant: str, research_profile: str, parallel_research: bool
 ) -> bool:
     return (
-        workflow_variant in {ASV3_STANDARD_VARIANT, ASV3_EXP_CROPPED_VARIANT}
+        workflow_variant
+        in {
+            ASV3_STANDARD_VARIANT,
+            ASV3_EXP_CROPPED_VARIANT,
+            ASV3_FAST_VARIANT,
+            ASV3_FAST_CROPPED_VARIANT,
+        }
         and research_profile == "normal"
         and not parallel_research
     )

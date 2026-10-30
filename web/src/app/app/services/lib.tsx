@@ -170,6 +170,8 @@ export interface SendMessageParams {
   legalReview?: boolean;
   supersearch?: boolean;
   asv3ExpCropped?: boolean;
+  asv3Fast?: boolean;
+  asv3FastCropped?: boolean;
   experimentalResearch?: boolean;
   experimentalParallelResearch?: boolean;
   experimentalGuardrails?: boolean;
@@ -207,6 +209,8 @@ export async function* sendMessage({
   legalReview,
   supersearch,
   asv3ExpCropped = false,
+  asv3Fast = false,
+  asv3FastCropped = false,
   experimentalResearch,
   experimentalParallelResearch,
   experimentalGuardrails,
@@ -234,6 +238,8 @@ export async function* sendMessage({
       legalComposite ||
       supersearch ||
       asv3ExpCropped ||
+      asv3Fast ||
+      asv3FastCropped ||
       experimentalResearch ||
       experimentalParallelResearch ||
       experimentalGuardrails ||
@@ -268,6 +274,26 @@ export async function* sendMessage({
     throw new Error("exp cropped tek modelle çalışır.");
   }
 
+  if (
+    (asv3Fast || asv3FastCropped) &&
+    ((asv3Fast && asv3FastCropped) ||
+      asv3ExpCropped ||
+      deepResearch ||
+      legalComposite ||
+      legalReview ||
+      supersearch ||
+      experimentalResearch ||
+      experimentalParallelResearch ||
+      experimentalGuardrails ||
+      experimentalGuardrailsV2 ||
+      experimentalGuardrailsV3)
+  ) {
+    throw new Error("Fast ASv3 başka araştırma modlarıyla birleştirilemez.");
+  }
+  if ((asv3Fast || asv3FastCropped) && (llmOverrides?.length ?? 0) > 1) {
+    throw new Error("Fast ASv3 tek modelle çalışır.");
+  }
+
   // Build payload for new send-chat-message API
   const payload = {
     message: message,
@@ -284,6 +310,8 @@ export async function* sendMessage({
     atez_search_v3: Boolean(
       (atezSearchV3 ||
         asv3ExpCropped ||
+        asv3Fast ||
+        asv3FastCropped ||
         experimentalResearch ||
         experimentalParallelResearch ||
         experimentalGuardrails ||
@@ -295,7 +323,7 @@ export async function* sendMessage({
     asv3_research_profile:
       supersearch || deepResearch
         ? "deep"
-        : asv3ExpCropped
+        : asv3ExpCropped || asv3Fast || asv3FastCropped
           ? "normal"
           : experimentalResearch || experimentalParallelResearch
             ? "experimental"
@@ -305,6 +333,10 @@ export async function* sendMessage({
                 experimentalGuardrailsV3
               ? "normal"
               : "deep",
+    ...(asv3Fast ? { asv3_fast: true, asv3_parallel_research: false } : {}),
+    ...(asv3FastCropped
+      ? { asv3_fast_cropped: true, asv3_parallel_research: false }
+      : {}),
     ...(asv3ExpCropped && !deepResearch && !supersearch
       ? { asv3_exp_cropped: true, asv3_parallel_research: false }
       : experimentalParallelResearch && !deepResearch && !supersearch
@@ -324,6 +356,8 @@ export async function* sendMessage({
     asv3_allow_external: Boolean(
       (atezSearchV3 ||
         asv3ExpCropped ||
+        asv3Fast ||
+        asv3FastCropped ||
         experimentalResearch ||
         experimentalParallelResearch ||
         experimentalGuardrails ||

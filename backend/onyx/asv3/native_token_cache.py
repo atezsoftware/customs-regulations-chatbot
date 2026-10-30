@@ -9,6 +9,8 @@ TokenCounter = Callable[[str], int]
 
 
 def native_token_cache_enabled(services: Mapping[str, object]) -> bool:
+    if services.get("asv3_fast") is True:
+        return True
     if (
         services.get("asv3_exp_cropped") is True
         and services.get("asv3_exp_cheap") is not True

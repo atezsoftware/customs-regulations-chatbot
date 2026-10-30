@@ -43,6 +43,12 @@ from onyx.asv3.citation_numbers import extract_citation_numbers
 from onyx.asv3.cropped_article_bindings import cropped_identity_ledger
 from onyx.asv3.cropped_crossrefs import CroppedCrossReferencePolicy
 from onyx.asv3.evidence import EvidenceLedger
+from onyx.asv3.fast_policy import (
+    FAST_HANDOFF,
+    fast_research_decision_gap,
+    fast_research_phase,
+    fast_tool_definitions,
+)
 from onyx.asv3.judicial_sections import (
     judicial_disposition_gap,
     judicial_disposition_missing,
@@ -155,6 +161,7 @@ from onyx.prompts.asv3.experimental import (
     EXPERIMENTAL_RESEARCHER_PROMPT,
     parallel_metadata_instructions,
 )
+from onyx.prompts.asv3.fast import FAST_ANSWER_HANDOFF, FAST_RESEARCH_HANDOFF
 from onyx.prompts.asv3.research import (
     COORDINATOR_PROMPT,
     DEFAULT_RESPONSE_PREFERENCES,
@@ -1795,6 +1802,12 @@ class ResearchModel:
                                 and selected_llm.config.model_provider != "vertex_ai"
                             )
                             or (
+                                fast_research_phase(
+                                    self.context, writing=self._writing_answer
+                                )
+                                and selected_llm.config.model_provider != "vertex_ai"
+                            )
+                            or (
                                 not self.context.depth
                                 and self.context.services.get(
                                     "independent_question_mode"
@@ -3103,6 +3116,7 @@ class ResearchModel:
         candidate_reviews: list[JsonValue] | None = None,
         repair_observations: list[dict[str, JsonValue]] | None = None,
     ) -> tuple[list[ChatCompletionMessage], list[dict[str, JsonValue]], int]:
+        fast_research = fast_research_phase(self.context, writing=self._writing_answer)
         instruction = (
             TUNED_SOURCE_ANSWER_PROMPT
             + "\n\n"
@@ -3172,9 +3186,17 @@ class ResearchModel:
             == ASV3_STANDARD_VARIANT
         ):
             instruction += "\n\n" + DIRECT_ANSWER_OPENING
+        if self.context.services.get("asv3_fast") is True and not self.context.depth:
+            instruction += "\n\n" + (
+                FAST_RESEARCH_HANDOFF if fast_research else FAST_ANSWER_HANDOFF
+            )
         question: dict[str, JsonValue] = {
             "request": view.request,
         }
+        if FAST_HANDOFF in self.context.services:
+            question["fast_research_handoff"] = copy.deepcopy(
+                self.context.services[FAST_HANDOFF]
+            )
         if self.context.services.get("experimental_parallel") is True:
             scenario_request = self.context.services.get("scenario_request")
             if not isinstance(scenario_request, str) or not scenario_request:
@@ -3186,7 +3208,10 @@ class ResearchModel:
             question["conversation"] = self.history
         if len(view.questions) > 1:
             question["questions"] = list(view.questions)
-        if self.context.services.get("asv3_exp_cropped") is True:
+        if (
+            self.context.services.get("asv3_exp_cropped") is True
+            or self.context.services.get("asv3_fast") is True
+        ):
             question["question_bindings"] = [
                 {"question_id": f"q{index}", "question": text}
                 for index, text in enumerate(view.questions)
@@ -3355,6 +3380,20 @@ class ResearchModel:
         records = [*self._native_original_records(retained), *view.original_evidence]
         required = set(view.required_evidence_numbers)
         required.update(extract_citation_numbers(view.draft_to_repair or ""))
+        if self.context.services.get("asv3_fast") is True:
+            handoff = self.context.services.get(FAST_HANDOFF)
+            if isinstance(handoff, dict) and isinstance(
+                findings := handoff.get("findings"), list
+            ):
+                for finding in findings:
+                    if isinstance(finding, dict) and isinstance(
+                        numbers := finding.get("evidence_numbers"), list
+                    ):
+                        required.update(
+                            number
+                            for number in numbers
+                            if type(number) is int and number > 0
+                        )
         if self.context.services.get("research_profile") == "experimental":
             for source_review in candidate_reviews or []:
                 witnesses = (
@@ -3646,6 +3685,8 @@ class ResearchModel:
                     return True
             return False
 
+        if self.context.services.get("asv3_fast") is True and not self.context.depth:
+            selected = fast_tool_definitions(selected, research=fast_research)
         unbound_selected = (
             copy.deepcopy(selected)
             if parallel_execution_enabled(self.context)
@@ -4309,6 +4350,15 @@ class ResearchModel:
         else:
             self.context.check_research_active()
         if (
+            self.context.services.get("asv3_fast") is True
+            and self.context.services.get("asv3_exp_cropped") is True
+            and FAST_HANDOFF in self.context.services
+            and not self.context.depth
+            and not self._writing_answer
+            and view.publication_gap is None
+        ):
+            return self._decide_cropped_source_answer(view)
+        if (
             self.lean_native_mode
             and self.context.services.get("asv3_exp_cropped") is True
             and not self._writing_answer
@@ -4400,6 +4450,11 @@ class ResearchModel:
                 self.research_llm is not None
                 and not assembly_decision
                 and (self.context.depth > 0 or self._native_first_decision_completed)
+                and not (
+                    self.context.services.get("asv3_fast") is True
+                    and not self.context.depth
+                    and FAST_HANDOFF in self.context.services
+                )
             )
             from onyx.asv3.cropped_cost_budget import CroppedResearchBudgetReached
 
@@ -6124,6 +6179,10 @@ class ResearchModel:
                 decision = self._decision(
                     response, tools, argument_normalizer=argument_normalizer
                 )
+                if fast_research_phase(self.context, writing=self._writing_answer):
+                    gap = fast_research_decision_gap(decision)
+                    if gap is not None:
+                        raise NativeDecisionEnvelopeError(gap)
             except NativeDecisionEnvelopeError as error:
                 # No action from a structurally invalid batch may reach dispatch.
                 fingerprint = self._native_batch_fingerprint(response)

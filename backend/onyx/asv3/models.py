@@ -23,6 +23,8 @@ class ASv3WorkflowSelection(BaseModel):
         "asv3_tuned",
         "asv3_exp_cheap",
         "asv3_exp_cropped",
+        "asv3_fast",
+        "asv3_fast_cropped",
         "asv3_guarded_experimental",
         "asv3_guardrails_v2",
         "asv3_guardrails_v3",
@@ -34,6 +36,7 @@ class ASv3WorkflowSelection(BaseModel):
             "asv3_tuned",
             "asv3_exp_cheap",
             "asv3_exp_cropped",
+            "asv3_fast_cropped",
         }
 
     @property

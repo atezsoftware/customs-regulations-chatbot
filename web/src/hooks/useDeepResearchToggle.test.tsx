@@ -8,6 +8,8 @@ describe("research mode selection", () => {
     ["toggleAtezSearchV3", "atezSearchV3Enabled"],
     ["toggleDeepResearch", "deepResearchEnabled"],
     ["toggleAsv3ExpCropped", "asv3ExpCroppedEnabled"],
+    ["toggleAsv3Fast", "asv3FastEnabled"],
+    ["toggleAsv3FastCropped", "asv3FastCroppedEnabled"],
     ["toggleExperimentalResearch", "experimentalResearchEnabled"],
     [
       "toggleExperimentalParallelResearch",

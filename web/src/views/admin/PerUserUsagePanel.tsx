@@ -114,6 +114,8 @@ const METRIC_COLUMNS: {
 const WORKFLOWS: { key: WorkflowUsageKey; label: string }[] = [
   { key: "asv3", label: "Derin Mod · ASv3 Tek" },
   { key: "asv3_exp_cropped", label: "Hızlı Mod · ASv3 Exp Cropped" },
+  { key: "asv3_fast", label: "Fast ASv3 Tek" },
+  { key: "asv3_fast_cropped", label: "Fast Exp Cropped" },
 ];
 
 const WORKFLOW_COLUMNS: {

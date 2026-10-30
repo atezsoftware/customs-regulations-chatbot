@@ -13,6 +13,10 @@ ASV3_EXP_CHEAP_VARIANT = "asv3_exp_cheap"
 ASV3_EXP_CHEAP_POLICY = "tuned-copy-metadata-source-repair-v4"
 ASV3_EXP_CROPPED_VARIANT = "asv3_exp_cropped"
 ASV3_EXP_CROPPED_POLICY = "tuned-open-topic-packets-v18"
+ASV3_FAST_VARIANT = "asv3_fast"
+ASV3_FAST_POLICY = "standard-fast-handoff-v1"
+ASV3_FAST_CROPPED_VARIANT = "asv3_fast_cropped"
+ASV3_FAST_CROPPED_POLICY = "cropped-fast-handoff-v1"
 ASV3_GUARDED_EXPERIMENTAL_VARIANT = "asv3_guarded_experimental"
 ASV3_GUARDED_EXPERIMENTAL_POLICY = "guarded-normal-v1"
 ASV3_GUARDRAILS_V2_VARIANT = "asv3_guardrails_v2"
@@ -29,7 +33,34 @@ def resolve_asv3_workflow(
     guardrails_v3: bool = False,
     exp_cheap: bool = False,
     exp_cropped: bool = False,
+    fast: bool = False,
+    fast_cropped: bool = False,
 ) -> ASv3WorkflowSelection:
+    if fast or fast_cropped:
+        if (
+            sum(
+                (
+                    fast,
+                    fast_cropped,
+                    exp_cropped,
+                    exp_cheap,
+                    guarded_experimental,
+                    guardrails_v2,
+                    guardrails_v3,
+                )
+            )
+            > 1
+        ):
+            raise ValueError("Fast ASv3 cannot be combined with other ASv3 variants")
+        if research_profile != "normal" or parallel_research:
+            raise ValueError("Fast ASv3 requires the normal non-parallel profile")
+        return ASv3WorkflowSelection(
+            research_profile="normal",
+            parallel_research=False,
+            workflow_variant=ASV3_FAST_CROPPED_VARIANT
+            if fast_cropped
+            else ASV3_FAST_VARIANT,
+        )
     if exp_cropped:
         if exp_cheap or guarded_experimental or guardrails_v2 or guardrails_v3:
             raise ValueError("exp cropped cannot be combined with other ASv3 variants")
@@ -110,6 +141,8 @@ def validate_asv3_variant_resume(
         ASV3_TUNED_VARIANT,
         ASV3_EXP_CHEAP_VARIANT,
         ASV3_EXP_CROPPED_VARIANT,
+        ASV3_FAST_VARIANT,
+        ASV3_FAST_CROPPED_VARIANT,
         ASV3_GUARDED_EXPERIMENTAL_VARIANT,
         ASV3_GUARDRAILS_V2_VARIANT,
         ASV3_GUARDRAILS_V3_VARIANT,
@@ -122,6 +155,16 @@ def validate_asv3_variant_resume(
     saved_variant = previous.get("asv3_workflow_variant", ASV3_STANDARD_VARIANT)
     if saved_variant != workflow_variant:
         raise ValueError("ASv3 resume requires the same workflow variant")
+    fast_policy = {
+        ASV3_FAST_VARIANT: ASV3_FAST_POLICY,
+        ASV3_FAST_CROPPED_VARIANT: ASV3_FAST_CROPPED_POLICY,
+    }.get(workflow_variant)
+    if fast_policy is not None and (
+        previous.get("asv3_workflow_policy") != fast_policy
+        or previous.get("research_profile") != "normal"
+        or previous.get("parallel_research") is not False
+    ):
+        raise ValueError("Fast ASv3 resume requires its own checkpoint policy")
     if workflow_variant == ASV3_EXP_CHEAP_VARIANT and (
         previous.get("asv3_workflow_policy") != ASV3_EXP_CHEAP_POLICY
         or previous.get("research_profile") != "normal"
@@ -169,6 +212,15 @@ def validate_asv3_variant_resume(
 
 
 def checkpoint_variant_fields(workflow_variant: str) -> dict[str, JsonValue]:
+    fast_policy = {
+        ASV3_FAST_VARIANT: ASV3_FAST_POLICY,
+        ASV3_FAST_CROPPED_VARIANT: ASV3_FAST_CROPPED_POLICY,
+    }.get(workflow_variant)
+    if fast_policy is not None:
+        return {
+            "asv3_workflow_variant": workflow_variant,
+            "asv3_workflow_policy": fast_policy,
+        }
     if workflow_variant == ASV3_EXP_CROPPED_VARIANT:
         return {
             "asv3_workflow_variant": ASV3_EXP_CROPPED_VARIANT,

@@ -2,7 +2,11 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import ts from "typescript";
 
-it.each([["toggleAsv3ExpCropped", "asv3ExpCroppedEnabled", "exp cropped"]])(
+it.each([
+  ["toggleAsv3ExpCropped", "asv3ExpCroppedEnabled", "exp cropped"],
+  ["toggleAsv3Fast", "asv3FastEnabled", "Fast ASv3 Tek"],
+  ["toggleAsv3FastCropped", "asv3FastCroppedEnabled", "Fast Exp Cropped"],
+])(
   "shows %s as an independent single-model workflow selection",
   (toggle, enabled, label) => {
     const source = ts.createSourceFile(

@@ -845,7 +845,10 @@ class CorpusBroker:
                         originals.close()
                 step.output_value = {"verified_chunk_count": verified_count}
 
-        if context.services.get("asv3_exp_cropped") is True:
+        if (
+            context.services.get("asv3_exp_cropped") is True
+            or context.services.get("asv3_fast") is True
+        ):
             self._revalidate_canonical_batch(canonical, context)
         else:
             run_functions_tuples_in_parallel(
@@ -1030,7 +1033,10 @@ class CorpusBroker:
                     "Retrieved section has no canonical center identity."
                 )
             grouped.setdefault(doc.document_id, []).append(doc)
-        if context.services.get("asv3_exp_cropped") is True:
+        if (
+            context.services.get("asv3_exp_cropped") is True
+            or context.services.get("asv3_fast") is True
+        ):
             return self._hydrate_search_centers_batch(grouped, context)
 
         def hydrate_source(

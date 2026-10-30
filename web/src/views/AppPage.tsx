@@ -210,6 +210,8 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
         legalReview: legalReviewEnabledForCurrentWorkflow,
         supersearch: supersearchEnabledForCurrentWorkflow,
         asv3ExpCropped: asv3ExpCroppedEnabledForCurrentWorkflow,
+        asv3Fast: asv3FastEnabledForCurrentWorkflow,
+        asv3FastCropped: asv3FastCroppedEnabledForCurrentWorkflow,
         experimentalResearch: experimentalResearchEnabledForCurrentWorkflow,
         experimentalParallelResearch:
           experimentalParallelResearchEnabledForCurrentWorkflow,
@@ -251,7 +253,11 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
     supersearchEnabled,
     toggleSupersearch,
     asv3ExpCroppedEnabled,
+    asv3FastEnabled,
+    asv3FastCroppedEnabled,
     toggleAsv3ExpCropped,
+    toggleAsv3Fast,
+    toggleAsv3FastCropped,
     experimentalResearchEnabled,
     toggleExperimentalResearch,
     experimentalParallelResearchEnabled,
@@ -297,6 +303,14 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
     currentProjectId === null &&
     (selectedAgent ?? liveAgent)?.id === 0 &&
     asv3ExpCroppedEnabled;
+  const asv3FastEnabledForCurrentWorkflow =
+    currentProjectId === null &&
+    (selectedAgent ?? liveAgent)?.id === 0 &&
+    asv3FastEnabled;
+  const asv3FastCroppedEnabledForCurrentWorkflow =
+    currentProjectId === null &&
+    (selectedAgent ?? liveAgent)?.id === 0 &&
+    asv3FastCroppedEnabled;
   const experimentalResearchEnabledForCurrentWorkflow =
     currentProjectId === null &&
     (selectedAgent ?? liveAgent)?.id === 0 &&
@@ -663,6 +677,11 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
       asv3ExpCropped:
         asv3ExpCroppedEnabledForCurrentWorkflow &&
         !multiModel.isMultiModelActive,
+      asv3Fast:
+        asv3FastEnabledForCurrentWorkflow && !multiModel.isMultiModelActive,
+      asv3FastCropped:
+        asv3FastCroppedEnabledForCurrentWorkflow &&
+        !multiModel.isMultiModelActive,
       experimentalResearch:
         experimentalResearchEnabledForCurrentWorkflow &&
         !multiModel.isMultiModelActive,
@@ -692,6 +711,8 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
     legalReviewEnabledForCurrentWorkflow,
     supersearchEnabledForCurrentWorkflow,
     asv3ExpCroppedEnabledForCurrentWorkflow,
+    asv3FastEnabledForCurrentWorkflow,
+    asv3FastCroppedEnabledForCurrentWorkflow,
     experimentalResearchEnabledForCurrentWorkflow,
     experimentalParallelResearchEnabledForCurrentWorkflow,
     experimentalGuardrailsEnabledForCurrentWorkflow,
@@ -748,6 +769,11 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
         asv3ExpCropped:
           asv3ExpCroppedEnabledForCurrentWorkflow &&
           !multiModel.isMultiModelActive,
+        asv3Fast:
+          asv3FastEnabledForCurrentWorkflow && !multiModel.isMultiModelActive,
+        asv3FastCropped:
+          asv3FastCroppedEnabledForCurrentWorkflow &&
+          !multiModel.isMultiModelActive,
         experimentalResearch:
           experimentalResearchEnabledForCurrentWorkflow &&
           !multiModel.isMultiModelActive,
@@ -783,6 +809,8 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
       legalReviewEnabledForCurrentWorkflow,
       supersearchEnabledForCurrentWorkflow,
       asv3ExpCroppedEnabledForCurrentWorkflow,
+      asv3FastEnabledForCurrentWorkflow,
+      asv3FastCroppedEnabledForCurrentWorkflow,
       experimentalResearchEnabledForCurrentWorkflow,
       experimentalParallelResearchEnabledForCurrentWorkflow,
       experimentalGuardrailsEnabledForCurrentWorkflow,
@@ -864,6 +892,11 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
           asv3ExpCropped:
             asv3ExpCroppedEnabledForCurrentWorkflow &&
             !multiModel.isMultiModelActive,
+          asv3Fast:
+            asv3FastEnabledForCurrentWorkflow && !multiModel.isMultiModelActive,
+          asv3FastCropped:
+            asv3FastCroppedEnabledForCurrentWorkflow &&
+            !multiModel.isMultiModelActive,
           experimentalResearch:
             experimentalResearchEnabledForCurrentWorkflow &&
             !multiModel.isMultiModelActive,
@@ -910,6 +943,8 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
       legalReviewEnabledForCurrentWorkflow,
       supersearchEnabledForCurrentWorkflow,
       asv3ExpCroppedEnabledForCurrentWorkflow,
+      asv3FastEnabledForCurrentWorkflow,
+      asv3FastCroppedEnabledForCurrentWorkflow,
       experimentalResearchEnabledForCurrentWorkflow,
       experimentalParallelResearchEnabledForCurrentWorkflow,
       experimentalGuardrailsEnabledForCurrentWorkflow,
@@ -1125,6 +1160,10 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
                         }
                         asv3ExpCroppedEnabled={
                           asv3ExpCroppedEnabledForCurrentWorkflow
+                        }
+                        asv3FastEnabled={asv3FastEnabledForCurrentWorkflow}
+                        asv3FastCroppedEnabled={
+                          asv3FastCroppedEnabledForCurrentWorkflow
                         }
                         experimentalResearchEnabled={
                           experimentalResearchEnabledForCurrentWorkflow
@@ -1355,6 +1394,10 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
                         asv3ExpCroppedEnabled={
                           asv3ExpCroppedEnabledForCurrentWorkflow
                         }
+                        asv3FastEnabled={asv3FastEnabledForCurrentWorkflow}
+                        asv3FastCroppedEnabled={
+                          asv3FastCroppedEnabledForCurrentWorkflow
+                        }
                         experimentalResearchEnabled={
                           experimentalResearchEnabledForCurrentWorkflow
                         }
@@ -1376,6 +1419,8 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
                         toggleLegalComposite={toggleLegalComposite}
                         toggleSupersearch={toggleSupersearch}
                         toggleAsv3ExpCropped={toggleAsv3ExpCropped}
+                        toggleAsv3Fast={toggleAsv3Fast}
+                        toggleAsv3FastCropped={toggleAsv3FastCropped}
                         toggleExperimentalResearch={toggleExperimentalResearch}
                         toggleExperimentalParallelResearch={
                           toggleExperimentalParallelResearch

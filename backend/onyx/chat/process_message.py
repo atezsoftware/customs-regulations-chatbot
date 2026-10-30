@@ -73,7 +73,7 @@ from onyx.configs.constants import (
     MilestoneRecordType,
 )
 from onyx.context.search.models import BaseFilters, SearchDoc
-from onyx.db.asv3_runs import load_asv3_checkpoint
+from onyx.db.asv3_runs import load_asv3_checkpoint, retain_fast_response_workflow
 from onyx.db.chat import (
     create_new_chat_message,
     get_chat_session_by_id,
@@ -1799,9 +1799,13 @@ def _run_models(
                     guardrails_v2_resume = False
                     guardrails_v3_resume = False
                     cropped_resume = False
+                    fast_resume = False
+                    fast_cropped_resume = False
                     if setup.new_msg_req.asv3_resume_message_id is not None:
                         from onyx.asv3.workflow_variant import (
                             ASV3_EXP_CROPPED_VARIANT,
+                            ASV3_FAST_CROPPED_VARIANT,
+                            ASV3_FAST_VARIANT,
                             ASV3_GUARDED_EXPERIMENTAL_VARIANT,
                             ASV3_GUARDRAILS_V2_VARIANT,
                             ASV3_GUARDRAILS_V3_VARIANT,
@@ -1831,20 +1835,32 @@ def _run_models(
                             and resume_checkpoint.get("asv3_workflow_variant")
                             == ASV3_EXP_CROPPED_VARIANT
                         )
+                        fast_resume = (
+                            resume_checkpoint is not None
+                            and resume_checkpoint.get("asv3_workflow_variant")
+                            == ASV3_FAST_VARIANT
+                        )
+                        fast_cropped_resume = (
+                            resume_checkpoint is not None
+                            and resume_checkpoint.get("asv3_workflow_variant")
+                            == ASV3_FAST_CROPPED_VARIANT
+                        )
                     checkpoint_selects_variant = (
                         guarded_resume
                         or guardrails_v2_resume
                         or guardrails_v3_resume
                         or cropped_resume
+                        or fast_resume
+                        or fast_cropped_resume
                     )
                     workflow = resolve_asv3_workflow(
                         "normal"
-                        if cropped_resume
+                        if cropped_resume or fast_resume or fast_cropped_resume
                         else "deep"
                         if _uses_deep_asv3(setup)
                         else setup.new_msg_req.asv3_research_profile,
                         False
-                        if cropped_resume
+                        if cropped_resume or fast_resume or fast_cropped_resume
                         else setup.new_msg_req.asv3_parallel_research,
                         guarded_experimental=(
                             guarded_resume
@@ -1866,8 +1882,27 @@ def _run_models(
                             if checkpoint_selects_variant
                             else setup.new_msg_req.asv3_exp_cropped
                         ),
+                        fast=(
+                            fast_resume
+                            if checkpoint_selects_variant
+                            else setup.new_msg_req.asv3_fast
+                        ),
+                        fast_cropped=(
+                            fast_cropped_resume
+                            if checkpoint_selects_variant
+                            else setup.new_msg_req.asv3_fast_cropped
+                        ),
                     )
                     research_profile = workflow.research_profile
+                    if fast_resume or fast_cropped_resume:
+                        retain_fast_response_workflow(
+                            message_id=setup.reserved_messages[model_idx].id,
+                            user_id=user.id,
+                            workflow_variant=workflow.workflow_variant,
+                        )
+                        setup.reserved_messages[
+                            model_idx
+                        ].workflow = workflow.workflow_variant
                     research_llm = (
                         None
                         if research_profile == "experimental"

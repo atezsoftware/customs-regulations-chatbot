@@ -35,6 +35,8 @@ interface RegenerationResearchModeInput {
   legalReviewEnabled?: boolean;
   supersearchEnabled?: boolean;
   asv3ExpCroppedEnabled?: boolean;
+  asv3FastEnabled?: boolean;
+  asv3FastCroppedEnabled?: boolean;
   experimentalResearchEnabled: boolean;
   experimentalParallelResearchEnabled: boolean;
   experimentalGuardrailsEnabled: boolean;
@@ -51,6 +53,8 @@ export function getRegenerationResearchMode({
   legalReviewEnabled = false,
   supersearchEnabled = false,
   asv3ExpCroppedEnabled = false,
+  asv3FastEnabled = false,
+  asv3FastCroppedEnabled = false,
   experimentalResearchEnabled,
   experimentalParallelResearchEnabled,
   experimentalGuardrailsEnabled,
@@ -66,6 +70,10 @@ export function getRegenerationResearchMode({
     ...(!resumingAsv3 && legalReviewEnabled ? { legalReview: true } : {}),
     supersearch: !resumingAsv3 && supersearchEnabled,
     ...(asv3ExpCroppedEnabled && !resumingAsv3 ? { asv3ExpCropped: true } : {}),
+    ...(asv3FastEnabled && !resumingAsv3 ? { asv3Fast: true } : {}),
+    ...(asv3FastCroppedEnabled && !resumingAsv3
+      ? { asv3FastCropped: true }
+      : {}),
     experimentalResearch: resumingAsv3 ? false : experimentalResearchEnabled,
     experimentalParallelResearch: resumingAsv3
       ? false
@@ -102,6 +110,8 @@ export interface ChatUIProps {
     legalReview?: boolean;
     supersearch?: boolean;
     asv3ExpCropped?: boolean;
+    asv3Fast?: boolean;
+    asv3FastCropped?: boolean;
     experimentalResearch?: boolean;
     experimentalParallelResearch?: boolean;
     experimentalGuardrails?: boolean;
@@ -127,6 +137,8 @@ export interface ChatUIProps {
   legalReviewEnabled?: boolean;
   supersearchEnabled?: boolean;
   asv3ExpCroppedEnabled?: boolean;
+  asv3FastEnabled?: boolean;
+  asv3FastCroppedEnabled?: boolean;
   experimentalResearchEnabled?: boolean;
   experimentalParallelResearchEnabled?: boolean;
   experimentalGuardrailsEnabled?: boolean;
@@ -165,6 +177,8 @@ const ChatUI = React.memo(
     legalReviewEnabled = false,
     supersearchEnabled = false,
     asv3ExpCroppedEnabled = false,
+    asv3FastEnabled = false,
+    asv3FastCroppedEnabled = false,
     experimentalResearchEnabled = false,
     experimentalParallelResearchEnabled = false,
     experimentalGuardrailsEnabled = false,
@@ -204,6 +218,8 @@ const ChatUI = React.memo(
     const legalCompositeEnabledRef = useRef(legalCompositeEnabled);
     const supersearchEnabledRef = useRef(supersearchEnabled);
     const asv3ExpCroppedEnabledRef = useRef(asv3ExpCroppedEnabled);
+    const asv3FastEnabledRef = useRef(asv3FastEnabled);
+    const asv3FastCroppedEnabledRef = useRef(asv3FastCroppedEnabled);
     const experimentalResearchEnabledRef = useRef(experimentalResearchEnabled);
     const experimentalParallelResearchEnabledRef = useRef(
       experimentalParallelResearchEnabled
@@ -228,6 +244,8 @@ const ChatUI = React.memo(
     legalCompositeEnabledRef.current = legalCompositeEnabled;
     supersearchEnabledRef.current = supersearchEnabled;
     asv3ExpCroppedEnabledRef.current = asv3ExpCroppedEnabled;
+    asv3FastEnabledRef.current = asv3FastEnabled;
+    asv3FastCroppedEnabledRef.current = asv3FastCroppedEnabled;
     experimentalResearchEnabledRef.current = experimentalResearchEnabled;
     experimentalParallelResearchEnabledRef.current =
       experimentalParallelResearchEnabled;
@@ -256,6 +274,8 @@ const ChatUI = React.memo(
             legalReviewEnabled: legalReviewEnabledRef.current,
             supersearchEnabled: supersearchEnabledRef.current,
             asv3ExpCroppedEnabled: asv3ExpCroppedEnabledRef.current,
+            asv3FastEnabled: asv3FastEnabledRef.current,
+            asv3FastCroppedEnabled: asv3FastCroppedEnabledRef.current,
             experimentalResearchEnabled: experimentalResearchEnabledRef.current,
             experimentalParallelResearchEnabled:
               experimentalParallelResearchEnabledRef.current,
@@ -302,6 +322,11 @@ const ChatUI = React.memo(
           supersearch: supersearchEnabledRef.current,
           asv3ExpCropped:
             asv3ExpCroppedEnabledRef.current && !(models && models.length >= 2),
+          asv3Fast:
+            asv3FastEnabledRef.current && !(models && models.length >= 2),
+          asv3FastCropped:
+            asv3FastCroppedEnabledRef.current &&
+            !(models && models.length >= 2),
           experimentalResearch:
             experimentalResearchEnabledRef.current &&
             !(models && models.length >= 2),
