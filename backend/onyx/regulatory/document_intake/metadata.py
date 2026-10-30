@@ -366,6 +366,65 @@ def retain_validated_metadata_facts(
     return retained
 
 
+def recover_metadata_response(
+    response: str,
+    *,
+    previous_attempts: Sequence[tuple[str, str]],
+    chunks: Sequence[MetadataChunk],
+    target_ids: Sequence[str],
+) -> LegalMetadataResult | None:
+    """Repair rejected facts only with verified same-target fields from prior ACKs."""
+    if not previous_attempts or len(response.encode()) > 1024 * 1024:
+        return None
+    try:
+        current = _TransportResult.model_validate_json(response)
+    except ValueError:
+        return None
+    ids = [target.chunk_id for target in current.chunks]
+    if len(set(ids)) != len(ids) or set(ids) != set(target_ids):
+        return None
+    if any(
+        len({fact.field for fact in target.fields}) != len(target.fields)
+        for target in current.chunks
+    ):
+        return None
+    invalid: set[tuple[str, MetadataField]] = set()
+    hydrated: list[ChunkLegalMetadata] = []
+    for target in current.chunks:
+        fields = []
+        for fact in target.fields:
+            one_fact = _TransportResult(
+                chunks=[_TransportChunk(chunk_id=target.chunk_id, fields=[fact])]
+            )
+            try:
+                validated = validate_metadata_transport_response(
+                    one_fact.model_dump_json(),
+                    chunks=chunks,
+                    target_ids=[target.chunk_id],
+                )
+            except ValueError:
+                invalid.add((target.chunk_id, fact.field))
+            else:
+                fields.append(validated.chunks[0].fields[0])
+        hydrated.append(ChunkLegalMetadata(chunk_id=target.chunk_id, fields=fields))
+    result = LegalMetadataResult(chunks=hydrated, warnings=current.warnings)
+    for request_hash, previous_response in reversed(previous_attempts):
+        result = retain_validated_metadata_facts(
+            result, previous_response, request_hash, chunks, target_ids
+        )
+    present = {
+        (target.chunk_id, fact.field)
+        for target in result.chunks
+        for fact in target.fields
+    }
+    if invalid - present:
+        return None
+    validate_metadata_response(
+        result.model_dump_json(), chunks=chunks, target_ids=target_ids
+    )
+    return result
+
+
 def metadata_input_hash(chunks: Sequence[MetadataChunk]) -> str:
     return hashlib.sha256(
         json.dumps(
