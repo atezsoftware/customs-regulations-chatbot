@@ -72,6 +72,9 @@ class _Gateway:
         self.lines: dict[str, str] = {}
         self.lock = Lock()
 
+    def reconcile_submission(self, _submission_key: str) -> VertexBatchState | None:
+        return None
+
     def submit(
         self,
         requests: Sequence[VertexBatchRequest],

@@ -464,6 +464,48 @@ def test_legacy_valid_repair_reuses_exact_ack_invalid_repair_gets_only_one_new_c
     assert len(gateway.new_requests) == (0 if cached == "valid" else 1)
 
 
+@pytest.mark.parametrize("cached", ["valid", "invalid_scope"])
+def test_unknown_id_base_with_cached_heading_date_repair_gets_one_scoped_repair(
+    cached: str,
+) -> None:
+    sources = _sources()
+    base = _request(sources)
+    invalid_scope = _response(sources, valid=False)
+    unknown = json.loads(invalid_scope)
+    unknown["chunks"][0]["fields"][0]["evidence_id"] = "f" * 64
+    invalid_id = json.dumps(unknown, ensure_ascii=False)
+    with pytest.raises(ValueError, match="not in this document catalog"):
+        metadata.validate_metadata_transport_response(
+            invalid_id, chunks=sources, target_ids=[s.chunk_id for s in sources[1:]]
+        )
+    generic = metadata.build_metadata_repair_request(
+        base, invalid_id, validation_category="invalid_coverage_or_evidence"
+    )
+    valid = _response(sources, valid=True)
+    gateway = _CachedGateway(lambda request: _envelope(request, "STOP", valid))
+    gateway.seed(base, invalid_id)
+    gateway.seed(generic, valid if cached == "valid" else invalid_scope)
+    before = dict(gateway.lines)
+
+    results = _run(gateway, sources)
+
+    assert all(gateway.lines[key] == value for key, value in before.items())
+    assert len(gateway.new_requests) == (0 if cached == "valid" else 1)
+    if cached == "valid":
+        assert results[0][0] == generic.request_hash
+    else:
+        repaired = gateway.new_requests[0]
+        feedback = json.loads(repaired.prompt)["validation_feedback"]
+        assert "body_scope_feedback" in feedback
+        assert feedback["cached_repair_request_hash"] == generic.request_hash
+        assert results[0][0] == repaired.request_hash
+    assert results[0][1] == metadata.validate_metadata_transport_response(
+        valid, chunks=sources, target_ids=[s.chunk_id for s in sources[1:]]
+    )
+    assert _run(gateway, sources) == results
+    assert len(gateway.new_requests) == (0 if cached == "valid" else 1)
+
+
 def test_invalid_targeted_repair_is_terminal_and_raw_caches_remain() -> None:
     sources = _sources()
     base, invalid = _request(sources), _response(sources, valid=False)

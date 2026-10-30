@@ -664,6 +664,34 @@ def build_metadata_body_scope_repair_request(
     return repaired
 
 
+def build_metadata_catalog_recovery_request(
+    request: VertexBatchRequest, cached_repair_response: str
+) -> VertexBatchRequest | None:
+    """Recover a rejected repair ACK without replacing its evidence or cache."""
+    payload = json.loads(request.prompt)
+    feedback = payload.get("validation_feedback")
+    if not isinstance(feedback, dict) or "catalog_recovery_version" in feedback:
+        return None
+    catalog_feedback = _unknown_evidence_feedback(payload, cached_repair_response)
+    if catalog_feedback is None:
+        return None
+    feedback["catalog_feedback"] = catalog_feedback
+    feedback["catalog_recovery_version"] = 1
+    feedback["cached_repair_request_hash"] = request.request_hash
+    feedback["cached_repair_response_sha256"] = hashlib.sha256(
+        cached_repair_response.encode()
+    ).hexdigest()
+    repaired = VertexBatchRequest(
+        prompt=json.dumps(
+            payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        ),
+        system_instruction=request.system_instruction,
+        generation_config=request.generation_config,
+    )
+    _check_metadata_request_budget(repaired)
+    return repaired
+
+
 def _fold(text: str) -> str:
     return "".join(
         c
