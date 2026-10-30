@@ -255,7 +255,7 @@ def test_authoritative_max_tokens_without_visible_body_still_splits(
         "max-tokens-only-in-generated-text",
     ],
 )
-def test_invalid_bodies_get_one_repair_but_envelope_failures_never_retry(
+def test_structural_failures_split_after_repair_but_envelope_failures_never_retry(
     case: str,
 ) -> None:
     def respond(request: VertexBatchRequest) -> dict[str, Any]:
@@ -317,18 +317,25 @@ def test_invalid_bodies_get_one_repair_but_envelope_failures_never_retry(
     gateway = _Gateway(respond)
     with pytest.raises(ValueError):
         _run(gateway, _sources(8))
-    repairable = {
+    structural_failures = {
         "invalid-json",
         "missing-target",
         "duplicate-target",
         "unquoted-evidence",
         "max-tokens-only-in-generated-text",
     }
-    assert len(gateway.requests) == (2 if case in repairable else 1)
-    assert all(
-        len(json.loads(request.prompt)["target_chunk_ids"]) == 8
+    sizes = [
+        len(json.loads(request.prompt)["target_chunk_ids"])
         for request in gateway.requests
-    )
+    ]
+    assert sizes == ([8, 8, 4, 4, 2, 2, 1, 1] if case in structural_failures else [8])
+    original = json.loads(gateway.requests[0].prompt)
+    for request in gateway.requests:
+        payload = json.loads(request.prompt)
+        for key in ("complete_document", "evidence_catalog", "input_sha256"):
+            assert payload[key] == original[key]
+        assert request.system_instruction == gateway.requests[0].system_instruction
+        assert request.generation_config == gateway.requests[0].generation_config
 
 
 def test_unknown_catalog_id_repair_is_cached_with_valid_windows_and_own_leaf_hash(
