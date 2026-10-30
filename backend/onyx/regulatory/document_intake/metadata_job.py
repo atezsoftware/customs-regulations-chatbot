@@ -29,6 +29,7 @@ from onyx.regulatory.document_intake.metadata import (
     build_metadata_repair_request,
     build_metadata_request,
     metadata_input_hash,
+    retain_validated_metadata_facts,
     validate_metadata_transport_response,
 )
 from onyx.regulatory.indexing_jobs.vertex_batch import (
@@ -96,6 +97,21 @@ def _extract_metadata_targets(
     stopped: Event,
 ) -> MetadataResults:
     request = build_metadata_request(chunks, targets)
+    previous_attempts: list[tuple[str, str]] = []
+
+    def accepted(
+        accepted_request: VertexBatchRequest, result: LegalMetadataResult
+    ) -> MetadataResults:
+        for previous_hash, previous_response in reversed(previous_attempts):
+            result = retain_validated_metadata_facts(
+                result,
+                previous_response=previous_response,
+                previous_request_hash=previous_hash,
+                chunks=chunks,
+                target_ids=targets,
+            )
+        return [(accepted_request.request_hash, result)]
+
     context, exhausted = _run_metadata_request(
         gateway=gateway,
         request=request,
@@ -110,8 +126,9 @@ def _extract_metadata_targets(
             result = validate_metadata_transport_response(
                 context, chunks=chunks, target_ids=targets
             )
-            return [(request.request_hash, result)]
+            return accepted(request, result)
         except ValueError as error:
+            previous_attempts.append((request.request_hash, context))
             repair = build_metadata_repair_request(
                 request,
                 context,
@@ -151,8 +168,11 @@ def _extract_metadata_targets(
                             result = validate_metadata_transport_response(
                                 cached_context, chunks=chunks, target_ids=targets
                             )
-                            return [(repair.request_hash, result)]
+                            return accepted(repair, result)
                         except ValueError:
+                            previous_attempts.append(
+                                (repair.request_hash, cached_context)
+                            )
                             scoped_repair = build_metadata_body_scope_repair_request(
                                 request,
                                 context,
@@ -184,8 +204,9 @@ def _extract_metadata_targets(
                         result = validate_metadata_transport_response(
                             cached_context, chunks=chunks, target_ids=targets
                         )
-                        return [(repair.request_hash, result)]
+                        return accepted(repair, result)
                     except ValueError as error:
+                        previous_attempts.append((repair.request_hash, cached_context))
                         recovery = build_metadata_catalog_recovery_request(
                             repair, cached_context
                         )
@@ -229,7 +250,7 @@ def _extract_metadata_targets(
                 raise ValueError(
                     "New-document metadata failed strict validation after its single repair attempt"
                 ) from None
-            return [(repair.request_hash, result)]
+            return accepted(repair, result)
     if len(targets) == 1:
         raise ValueError(
             "New-document metadata exceeded the output token budget for one target"
