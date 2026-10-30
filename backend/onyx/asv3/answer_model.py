@@ -4,6 +4,7 @@ from onyx.asv3.workflow_variant import ASV3_TUNED_VARIANT
 from onyx.db.asv3_models import (
     check_asv3_secondary_model_cost_limit,
     default_asv3_persona,
+    resolve_asv3_model_provider_id,
 )
 from onyx.db.models import User
 from onyx.llm.factory import get_llm_for_persona
@@ -30,11 +31,14 @@ def source_answer_model(user: User) -> LLM:
 
 
 def fast_material_review_model(user: User) -> LLM:
+    provider_id = resolve_asv3_model_provider_id("openai", "gpt-6.1-sol")
     reviewer = get_llm_for_persona(
         default_asv3_persona(),
         user,
         llm_override=LLMOverride(
-            model_provider_type="openai", model_version="gpt-6.1-sol"
+            model_provider_id=provider_id,
+            model_provider_type="openai",
+            model_version="gpt-6.1-sol",
         ),
     )
     check_asv3_secondary_model_cost_limit(reviewer.config.api_key)
