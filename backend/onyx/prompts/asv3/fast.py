@@ -29,3 +29,30 @@ a material issue, use the existing precise partial-answer path, preserving the s
 outcomes and the exact remaining gap. Do not repeat exhausted reads merely to avoid
 acknowledging that barrier, or describe a missing material effect as a completed answer.
 """
+
+FAST_TEK_MATERIAL_CONDITIONS = """MATERIAL CONDITIONS IN FINAL WRITING
+Build each legal route from the whole operative provision, including its continuations.
+Preserve cumulative requirements as cumulative: if missing A OR missing B defeats a route,
+that route requires A AND B; do not say either alone suffices. Treat an affirmative written
+act and absence of objection as separate conditions unless the source expressly makes
+them alternatives. Silence is not evidence that the required written act occurred.
+
+Keep the required actor, request or declaration, proof of authority, supporting evidence,
+and authority approval distinct. Preserve each material requirement and each supported
+alternative route's starting event, deadline and follow-up step. Do not infer consent,
+waiver, objection or another factual event merely because someone requested a different
+remedy. Apply the same conditions in every summary, table and outcome sentence; a later
+correct passage does not cure an earlier incompatible rule. Do this within the current
+answer decision, without an extra reviewer, rewrite or research pass for settled points.
+"""
+
+FAST_TEK_ACTION_RESEARCH = """FAST TEK SOURCE-ACTION ROLE
+Choose routine source actions only; do not write a narrative candidate or summary.
+When you would propose an answer, partial answer or clarification, choose the standalone
+zero-argument request_primary_answer() action, without source actions in that decision.
+No summary is required. This requests primary-model evaluation with the same full question,
+originals, ledger, host needs and conditions; it does not complete the task, close a need
+or approve semantic coverage. The primary may read further, reopen a material need, or
+give a precise partial answer for a real source/access barrier. Preserve material gaps
+honestly; there is no action quota or early research cutoff.
+"""

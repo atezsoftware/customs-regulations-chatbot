@@ -120,6 +120,8 @@ from onyx.prompts.asv3.fast import (
     FAST_MATERIAL_OUTCOMES,
     FAST_RESPONSE_POLICY,
     FAST_RESPONSE_POLICY_SERVICE,
+    FAST_TEK_ACTION_RESEARCH,
+    FAST_TEK_MATERIAL_CONDITIONS,
 )
 
 if TYPE_CHECKING:
@@ -820,6 +822,18 @@ def _generation_resources(
 
 NATIVE_COORDINATOR_FIRST_SEED = 31
 NATIVE_COORDINATOR_CONTINUATION_SEED = 1424088823
+_FAST_PRIMARY_ANSWER = "request_primary_answer"
+_FAST_PRIMARY_ACTIONS = frozenset(
+    {
+        "submit_answer",
+        "submit_partial_answer",
+        "submit_retained_answer",
+        "submit_retained_partial_answer",
+        "ask_user",
+        "assemble_answers",
+        "repair_question_answer",
+    }
+)
 
 
 class ResearchModel:
@@ -852,20 +866,21 @@ class ResearchModel:
         self._writing_answer = False
         self._cropped_source_writer_started = False
         self._answer_researching = False
-        self._fast_primary_coordinator = (
+        self._fast_action_coordinator = (
             (lean_native_mode or context.services.get("lean_native_mode") is True)
             and context.depth == 0
             and context.services.get("asv3_fast") is True
             and context.services.get("asv3_exp_cropped") is not True
         )
+        self._fast_primary_answer_mode = False
         if context.services.get("asv3_fast") is True:
             context.services[FAST_RESPONSE_POLICY_SERVICE] = FAST_RESPONSE_POLICY
         self.research_llm = (
             None
             if context.services.get("research_profile") == "experimental"
-            or self._fast_primary_coordinator
             else research_llm
         )
+        self._fast_routine_research_llm = self.research_llm
         self.context = context
         self.user_identity = user_identity
         self.reasoning_effort = reasoning_effort
@@ -928,13 +943,15 @@ class ResearchModel:
                 "research_model": config.model_name,
                 "research_temperature": config.temperature,
             }
-        if self._fast_primary_coordinator:
-            settings["fast_coordinator_routing"] = "selected-primary-v1"
+        if self._fast_action_coordinator:
+            settings["fast_coordinator_routing"] = "action-research-primary-answer-v1"
         snapshot: dict[str, JsonValue] = {
             "settings": settings,
             "first_decision_started": self._native_first_decision_started,
             "first_decision_completed": self._native_first_decision_completed,
         }
+        if self._fast_action_coordinator:
+            snapshot["fast_primary_answer_mode"] = self._fast_primary_answer_mode
         if self.context.services.get("asv3_exp_cheap") is True:
             snapshot["cheap_repair"] = {
                 "version": 1,
@@ -959,6 +976,16 @@ class ResearchModel:
                 for key in ("first_decision_started", "first_decision_completed")
             ):
                 raise ValueError("Invalid ASv3 coordinator sampling checkpoint")
+            if self._fast_action_coordinator:
+                primary_mode = saved.get("fast_primary_answer_mode")
+                if type(primary_mode) is not bool or (
+                    primary_mode and saved["first_decision_completed"] is not True
+                ):
+                    raise ValueError("Invalid Fast primary answer routing checkpoint")
+                self._fast_primary_answer_mode = primary_mode
+                self.research_llm = (
+                    None if primary_mode else self._fast_routine_research_llm
+                )
             self._native_first_decision_started = (
                 saved["first_decision_started"] is True
             )
@@ -2436,6 +2463,23 @@ class ResearchModel:
             raise NativeDecisionEnvelopeError(
                 "Invalid tool-call count or duplicate identities"
             )
+        if any(call.function.name == _FAST_PRIMARY_ANSWER for call in native_calls):
+            if len(native_calls) != 1:
+                raise NativeDecisionEnvelopeError(
+                    "Primary answer routing requires one standalone action"
+                )
+            try:
+                marker_arguments = parse_json_object(
+                    native_calls[0].function.arguments or ""
+                )
+            except ValueError as error:
+                raise NativeDecisionEnvelopeError(
+                    "Primary answer routing requires an empty argument object"
+                ) from error
+            if marker_arguments:
+                raise NativeDecisionEnvelopeError(
+                    "Primary answer routing requires an empty argument object"
+                )
         calls = []
         for call in native_calls:
             assert call.function.name is not None
@@ -3203,6 +3247,8 @@ class ResearchModel:
             == FAST_RESPONSE_POLICY
         ):
             instruction += "\n\n" + FAST_MATERIAL_OUTCOMES
+        if self._fast_action_coordinator:
+            instruction += "\n\n" + FAST_TEK_MATERIAL_CONDITIONS
         question: dict[str, JsonValue] = {
             "request": view.request,
         }
@@ -3239,6 +3285,25 @@ class ResearchModel:
             "language": self.context.language,
             "request": view.request,
         }
+        if self._fast_action_coordinator:
+            from onyx.asv3.research_state import ResearchState
+
+            state = self.context.services.get("research_state")
+            research_state = copy.deepcopy(view.research_state)
+            if isinstance(state, ResearchState) and (
+                not research_state
+                or any(
+                    research_state.get(field, 0) != 0
+                    for field in (
+                        "needs_omitted",
+                        "findings_omitted",
+                        "source_conditions_omitted",
+                    )
+                )
+            ):
+                research_state = state.export()
+            if research_state:
+                context["research_state"] = research_state
         notices = source_notices_for_model(self.context)
         if notices:
             context["source_notices"] = notices
@@ -4357,6 +4422,38 @@ class ResearchModel:
             decision, self.context, fresh.draft_to_repair, request=fresh.request
         )
 
+    @staticmethod
+    def _fast_action_tools(
+        tools: list[dict[str, JsonValue]],
+    ) -> list[dict[str, JsonValue]]:
+        selected = [
+            tool
+            for tool in tools
+            if isinstance(function := tool.get("function"), dict)
+            and function.get("name") not in _FAST_PRIMARY_ACTIONS
+        ]
+        selected.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": _FAST_PRIMARY_ANSWER,
+                    "description": (
+                        "Ask the selected primary model to assess the complete current "
+                        "question and original evidence for an answer, partial answer or "
+                        "clarification. This is routing only, not completion or approval. "
+                        "The primary may research further. Call alone with empty arguments."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                        "required": [],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        )
+        return selected
+
     def decide(self, view: HarnessView) -> Decision:
         if (
             not self.context.depth
@@ -4458,13 +4555,35 @@ class ResearchModel:
                 and not assembly_decision
                 and (self.context.depth > 0 or self._native_first_decision_completed)
             )
+            fast_action_research = self._fast_action_coordinator and use_research_model
+            invocation_tools = (
+                self._fast_action_tools(tools) if fast_action_research else tools
+            )
+            if fast_action_research:
+                prompt = [
+                    prompt[0].model_copy(
+                        update={
+                            "content": str(prompt[0].content)
+                            + "\n\n"
+                            + FAST_TEK_ACTION_RESEARCH
+                        }
+                    ),
+                    *prompt[1:],
+                ]
+                ceiling, _ = self._limits(output)
+                if self._input_cost(prompt, invocation_tools) > ceiling:
+                    self._fast_primary_answer_mode = True
+                    self.research_llm = None
+                    fast_action_research = use_research_model = False
+                    prompt, tools, output = self._fit_native_decision(view)
+                    invocation_tools = tools
             from onyx.asv3.cropped_cost_budget import CroppedResearchBudgetReached
 
             try:
                 decision = self._invoke_decision(
                     view,
                     prompt,
-                    tools,
+                    invocation_tools,
                     output,
                     call_llm_override=self.research_llm if use_research_model else None,
                 )
@@ -4479,6 +4598,25 @@ class ResearchModel:
                         "absence_proven": False,
                     },
                 )
+            if fast_action_research and (
+                (
+                    len(decision.calls) == 1
+                    and decision.calls[0].name == _FAST_PRIMARY_ANSWER
+                    and decision.calls[0].argument_error is None
+                )
+                or (not decision.calls and bool((decision.answer or "").strip()))
+            ):
+                self.context.check_active()
+                if self.context.services.get("question_research_started") is True:
+                    self.context.budget.consume("decisions")
+                else:
+                    self.context.consume_research_decision()
+                self._fast_primary_answer_mode = True
+                self.research_llm = None
+                # Refit the full ordinary view; the routing response is not a draft.
+                prompt, tools, output = self._fit_native_decision(view)
+                decision = self._invoke_decision(view, prompt, tools, output)
+                use_research_model = False
             decision = resolve_retained_answer(
                 decision, self.context, view.draft_to_repair, request=view.request
             )
@@ -4514,7 +4652,11 @@ class ResearchModel:
                     return acquisition
                 return self._decide_source_answer(view, candidate_coverage=coverage)
             invocation_draft = view.draft_to_repair
-            if use_research_model and self._needs_answer_model(decision):
+            if (
+                use_research_model
+                and not self._fast_action_coordinator
+                and self._needs_answer_model(decision)
+            ):
                 candidate = decision.answer or next(
                     (
                         str(call.arguments.get("answer", ""))
