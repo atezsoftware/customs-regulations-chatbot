@@ -2,6 +2,8 @@
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from types import FunctionType
+from typing import Callable, cast
 from unittest.mock import MagicMock
 
 import pytest
@@ -56,6 +58,16 @@ def test_cancellation_probe_checks_every_time_including_errors(
         "maximum_seconds": 0.75,
         "elapsed_is_cumulative_not_wall": True,
         "cached_results": 0,
+        "locations": [
+            {
+                "module": "external",
+                "function": "external",
+                "root_thread": True,
+                "count": 3,
+                "cumulative_seconds": 1.5,
+                "maximum_seconds": 0.75,
+            }
+        ],
     }
 
 
@@ -65,3 +77,43 @@ def test_parallel_cancellation_checks_are_never_coalesced() -> None:
     with ThreadPoolExecutor(max_workers=4) as workers:
         assert list(workers.map(lambda _: probe(), range(100))) == [False] * 100
     assert check.call_count == probe.snapshot()["count"] == 100
+    assert probe.snapshot()["locations"] == [
+        {
+            "module": "external",
+            "function": "external",
+            "root_thread": False,
+            "count": 100,
+            "cumulative_seconds": probe.snapshot()["cumulative_seconds"],
+            "maximum_seconds": probe.snapshot()["maximum_seconds"],
+        }
+    ]
+
+
+def test_cancellation_location_skips_context_wrappers_without_inspecting_values() -> (
+    None
+):
+    def check_context(context: RunContext) -> None:
+        context.check_research_active()
+
+    call = cast(
+        Callable[[RunContext], None],
+        FunctionType(check_context.__code__, {"__name__": "onyx.asv3.example"}),
+    )
+    probe = FastCancellationProbe(lambda: False)
+    call(RunContext(cancelled=probe))
+    locations = probe.snapshot()["locations"]
+    assert isinstance(locations, list) and len(locations) == 1
+    location = locations[0]
+    assert isinstance(location, dict)
+    assert location["module"] == "onyx.asv3.example"
+    assert location["function"] == check_context.__qualname__
+    assert location["root_thread"] is True
+    assert location["count"] == 1
+    assert set(location) == {
+        "module",
+        "function",
+        "root_thread",
+        "count",
+        "cumulative_seconds",
+        "maximum_seconds",
+    }

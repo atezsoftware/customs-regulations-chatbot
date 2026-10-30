@@ -292,8 +292,12 @@ def encode_cheap_metadata(
     token_counter: Callable[[str], int],
     *,
     extra_fields: Sequence[str] = (),
+    validate_roots_once: bool = False,
 ) -> dict[str, JsonValue]:
-    """Keep a separate encoded payload only when its full text estimates smaller."""
+    """Keep a separate encoded payload only when its full text estimates smaller.
+
+    Root-only validation requires stable JSON values and a nonmutating tokenizer.
+    """
     if (
         isinstance(extra_fields, (str, bytes))
         or any(field not in _EXTRA_PAYLOAD_FIELDS for field in extra_fields)
@@ -301,7 +305,9 @@ def encode_cheap_metadata(
     ):
         raise ValueError("Metadata extra payload fields are invalid")
     if not extra_fields:
-        return _encode_cheap_metadata(payload, token_counter)
+        return _encode_cheap_metadata(
+            payload, token_counter, validate_roots_once=validate_roots_once
+        )
     if "original_metadata_codec" in payload:
         # A completed v2 encoding is stable; v1 can opt into the newer grammar.
         expand_cheap_payload(payload)
@@ -319,11 +325,25 @@ def encode_cheap_metadata(
         )
         payload = expand_cheap_payload(payload)
     if not any(field in payload for field in extra_fields):
-        return _encode_cheap_metadata(payload, token_counter, extra_fields=extra_fields)
+        return _encode_cheap_metadata(
+            payload,
+            token_counter,
+            extra_fields=extra_fields,
+            validate_roots_once=validate_roots_once,
+        )
     candidates = [
-        _encode_cheap_metadata(payload, token_counter, extra_fields=extra_fields),
         _encode_cheap_metadata(
-            payload, token_counter, extra_fields=extra_fields, identity_refs=True
+            payload,
+            token_counter,
+            extra_fields=extra_fields,
+            validate_roots_once=validate_roots_once,
+        ),
+        _encode_cheap_metadata(
+            payload,
+            token_counter,
+            extra_fields=extra_fields,
+            identity_refs=True,
+            validate_roots_once=validate_roots_once,
         ),
         _encode_cheap_metadata(
             payload,
@@ -331,6 +351,7 @@ def encode_cheap_metadata(
             extra_fields=extra_fields,
             identity_refs=True,
             small_containers=True,
+            validate_roots_once=validate_roots_once,
         ),
     ]
     return min(
@@ -349,6 +370,7 @@ def _encode_cheap_metadata(
     extra_fields: Sequence[str] = (),
     identity_refs: bool = False,
     small_containers: bool = False,
+    validate_roots_once: bool = False,
 ) -> dict[str, JsonValue]:
     canonical = expand_cheap_metadata(payload)
     if "original_metadata_codec" in payload:
@@ -361,6 +383,7 @@ def _encode_cheap_metadata(
             expand_cheap_payload(payload),
             token_counter,
             extra_fields=tuple(dict.fromkeys([*current_extra, *extra_fields])),
+            validate_roots_once=validate_roots_once,
         )
         return (
             upgraded
@@ -381,8 +404,10 @@ def _encode_cheap_metadata(
     literal_values: dict[str, JsonValue] = {}
     costs: dict[str, int] = {}
 
-    def scan(value: JsonValue) -> None:
-        _json_value(value)
+    def scan(value: JsonValue, *, validated: bool = False) -> None:
+        # The root validator already checks every descendant before tokenization.
+        if validate_roots_once is not True or not validated:
+            _json_value(value)
         if isinstance(value, (str, list, dict)):
             signature = _text(value, compact=True)
             if signature not in costs:
@@ -392,10 +417,10 @@ def _encode_cheap_metadata(
                 literal_values.setdefault(signature, value)
         if isinstance(value, dict):
             for child in value.values():
-                scan(child)
+                scan(child, validated=True)
         elif isinstance(value, list):
             for child in value:
-                scan(child)
+                scan(child, validated=True)
 
     for row in original_rows:
         assert isinstance(row, dict)
@@ -509,9 +534,15 @@ def serialize_cheap_payload(
     token_counter: Callable[[str], int],
     *,
     extra_fields: Sequence[str] = (),
+    validate_roots_once: bool = False,
 ) -> str:
     """Remove JSON separator whitespace only when the actual estimator improves."""
-    encoded = encode_cheap_metadata(payload, token_counter, extra_fields=extra_fields)
+    encoded = encode_cheap_metadata(
+        payload,
+        token_counter,
+        extra_fields=extra_fields,
+        validate_roots_once=validate_roots_once,
+    )
     ordinary = _text(encoded)
     compact = _text(encoded, compact=True)
     if json.loads(compact) != encoded:
