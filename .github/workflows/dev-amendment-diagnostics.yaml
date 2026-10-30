@@ -4,7 +4,7 @@ on:
     inputs:
       operation:
         type: choice
-        options: [inspect, approve_462, approve_465, approve_470]
+        options: [inspect, intake_inspect, approve_462, approve_465, approve_470]
         default: inspect
 permissions:
   contents: read
@@ -17,6 +17,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Read only batch inventory
+        if: inputs.operation != 'intake_inspect'
         shell: bash
         run: |
           set -euo pipefail
@@ -81,7 +82,7 @@ jobs:
                               print(excerpt[:500])
           PY
       - name: Resume one existing reviewed proposal
-        if: inputs.operation != 'inspect'
+        if: inputs.operation != 'inspect' && inputs.operation != 'intake_inspect'
         shell: bash
         env:
           OPERATION: ${{ inputs.operation }}
@@ -97,3 +98,52 @@ jobs:
           kubectl exec -i "$pod" -n customs-regulations-dev -c "$container" -- \
             sh -ec '. /vault/secrets/config; export PYTHONPATH=/app; exec python - "$1"' sh "$proposal_id" < \
             backend/onyx/db/resume_amendment_approvals_309_310.py
+      - name: Read only new-document intake diagnostics
+        if: inputs.operation == 'intake_inspect'
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws eks update-kubeconfig --name atez-dev-cluster --region eu-central-1
+          kubectl get pods -n customs-regulations-dev -o json > /tmp/intake-pods.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          pods = json.loads(Path('/tmp/intake-pods.json').read_text())['items']
+          ready = []
+          for pod in pods:
+              if pod['status']['phase'] != 'Running' or pod['metadata'].get('deletionTimestamp'):
+                  continue
+              statuses = {item['name']: item for item in pod['status'].get('containerStatuses', [])}
+              for container in pod['spec']['containers']:
+                  image = container['image']
+                  if 'customs-regulations-backend-lite-dev:5cba1da8' in image and statuses.get(container['name'], {}).get('ready'):
+                      ready.append((pod['metadata']['name'], container['name'], image))
+          if not ready:
+              raise SystemExit('No ready DEV backend at expected revision 5cba1da8')
+          pod, container, image = sorted(ready)[0]
+          print('INTAKE_TARGET', pod, container, image)
+          Path('/tmp/intake-target').write_text(pod + '\t' + container + '\n')
+          PY
+          IFS=$'\t' read -r pod container < /tmp/intake-target
+          kubectl exec -i "$pod" -n customs-regulations-dev -c "$container" -- \
+            sh -ec '. /vault/secrets/config; export PYTHONPATH=/app; exec python -' < \
+            backend/onyx/db/diagnose_intake_approval.py > /tmp/intake-diagnostic.raw
+          mkdir -p /tmp/intake-diagnostic
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          artifacts = []
+          for line in Path('/tmp/intake-diagnostic.raw').read_text().splitlines():
+              if line.startswith('INTAKE_CACHE_ARTIFACT '):
+                  artifacts.append(json.loads(line.removeprefix('INTAKE_CACHE_ARTIFACT ')))
+              else:
+                  print(line)
+          Path('/tmp/intake-diagnostic/cached-metadata.json').write_text(json.dumps(artifacts, ensure_ascii=False))
+          PY
+      - name: Upload bounded cached metadata diagnostic
+        if: inputs.operation == 'intake_inspect'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: intake-cached-metadata-diagnostic
+          path: /tmp/intake-diagnostic/cached-metadata.json
+          retention-days: 3
