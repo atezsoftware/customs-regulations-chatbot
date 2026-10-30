@@ -251,8 +251,17 @@ def _continuous_compose(
             remaining.remove(key)
         if active:
             done, _ = wait(active, timeout=0.05, return_when=FIRST_COMPLETED)
-            context.check_active()
+            fast = context.services.get("asv3_fast") is True
+            if fast:
+                # An empty wait cannot change dependency readiness or free capacity.
+                while not done:
+                    context.check_active()
+                    done, _ = wait(active, timeout=0.05, return_when=FIRST_COMPLETED)
+            else:
+                context.check_active()
             for future in done:
+                if fast:
+                    context.check_active()
                 results[active.pop(future)] = future.result()
     context.check_active()
     return {key: results[key] for key in steps}

@@ -6,7 +6,7 @@ import hashlib
 import json
 import re
 import time
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import nullcontext
 from typing import Callable, cast
 
@@ -43,7 +43,7 @@ from onyx.asv3.models import (
 from onyx.asv3.native_cache_projection import lossless_original_transport_enabled
 from onyx.asv3.outcome_map import OutcomeMap
 from onyx.asv3.parallel_execution import parallel_execution_enabled
-from onyx.asv3.performance import profile_fast_step
+from onyx.asv3.performance import fast_timing_step, profile_fast_step
 from onyx.asv3.progress import ProgressReporter, action_narration, public_action_id
 from onyx.asv3.registry import CapabilityRegistry
 from onyx.asv3.research_state import EvidenceWorkingSet, ResearchState
@@ -516,9 +516,10 @@ class Harness:
             and time.monotonic() < self.context.deadline
         ):
             preparation = (
-                graph_step("asv3.checkpoint_preparation", {})
+                fast_timing_step(self.context, "asv3.checkpoint_preparation")
+                if self.context.services.get("asv3_fast") is True
+                else graph_step("asv3.checkpoint_preparation", {})
                 if parallel_execution_enabled(self.context)
-                or self.context.services.get("asv3_fast") is True
                 else nullcontext()
             )
             with preparation as checkpoint_step:
@@ -1384,7 +1385,14 @@ class Harness:
                         )
                         self._commit_receipt(ready[call_id])
                     break
-                time.sleep(0.02)
+                if self.context.services.get("asv3_fast") is True:
+                    wait(
+                        [future for _, _, future in pending.values()],
+                        timeout=0.02,
+                        return_when=FIRST_COMPLETED,
+                    )
+                else:
+                    time.sleep(0.02)
             return [ready[call.call_id] for call in calls]
         finally:
             for _, child, future in futures:
