@@ -15,7 +15,7 @@ from onyx.asv3.llm_adapter import ResearchModel
 from onyx.asv3.models import RunContext
 from onyx.asv3.retained_answer import bind_retained_answer, resolve_retained_answer
 from onyx.asv3.workflow_variant import ASV3_FAST_VARIANT
-from onyx.llm.interfaces import LLM
+from onyx.llm.interfaces import LLM, LLMConfig
 from onyx.llm.model_response import ModelResponse
 from onyx.prompts.asv3.fast import FAST_TEK_CONDITION_REVIEW
 from onyx.regulatory.source_notices import SourceNotice
@@ -127,8 +127,24 @@ def test_runtime_material_reviewer_charges_shared_budget_and_isolates_writer_id(
         return []
 
     monkeypatch.setattr(broker, "source_notices", notices, raising=False)
+    primary.config = primary.config.model_copy(
+        update={"model_provider": "vertex_ai", "model_name": "gemini-3.8-flash"}
+    )
     secondary = MagicMock(spec=LLM)
-    secondary.config = primary.config.model_copy()
+    secondary.config = primary.config.model_copy(
+        update={"model_name": "gemini-3.5-flash-lite"}
+    )
+    reviewer = MagicMock(spec=LLM)
+    reviewer.config = LLMConfig(
+        model_provider="openai",
+        model_name="gpt-6.1-sol",
+        temperature=1,
+        max_input_tokens=240000,
+    )
+    resolver = MagicMock(return_value=reviewer)
+    counter = MagicMock(return_value=len)
+    monkeypatch.setattr(runtime, "fast_material_review_model", resolver)
+    monkeypatch.setattr(runtime, "get_llm_token_counter", counter)
     kwargs["research_llm"] = secondary
     adapters: list[ResearchModel] = []
     constructor = runtime.ResearchModel
@@ -160,10 +176,12 @@ def test_runtime_material_reviewer_charges_shared_budget_and_isolates_writer_id(
     primary.invoke.side_effect = primary_response
     captured: list[dict[str, Any]] = []
 
-    def secondary_response(**arguments: Any) -> ModelResponse:
+    secondary.invoke.return_value = response(calls=[("request_primary_answer", {})])
+
+    def reviewer_response(**arguments: Any) -> ModelResponse:
         prompt = arguments["prompt"]
-        if not str(prompt[0].content).startswith(FAST_TEK_CONDITION_REVIEW):
-            return response(calls=[("request_primary_answer", {})])
+        assert str(prompt[0].content).startswith(FAST_TEK_CONDITION_REVIEW)
+        assert arguments["max_tokens"] == 6000
         payload = user_payload(prompt[-1])
         root, checker = adapters[0], adapters[-1]
         assert root is not checker and root.context is not checker.context
@@ -198,7 +216,7 @@ def test_runtime_material_reviewer_charges_shared_budget_and_isolates_writer_id(
             )
         )
 
-    secondary.invoke.side_effect = secondary_response
+    reviewer.invoke.side_effect = reviewer_response
     record_delivery = EvidenceLedger.record_delivery
 
     def delivered(
@@ -246,3 +264,65 @@ def test_runtime_material_reviewer_charges_shared_budget_and_isolates_writer_id(
     if defect is None:
         assert checker.last_call_id != root.last_call_id
         assert ledger.completely_delivered(checker.last_call_id or "") == {1, 2}
+    resolver.assert_called_once_with(kwargs["user"])
+    counter.assert_called_once_with(reviewer)
+    assert checker.llm is reviewer and root.llm is primary
+    assert root.llm.config.model_name == "gemini-3.8-flash"
+    assert checker.llm.config.model_name == "gpt-6.1-sol"
+    assert reviewer.invoke.call_count == 1
+    assert all(
+        row["fast_material_review_model"]
+        == {"provider": "openai", "model": "gpt-6.1-sol"}
+        for row in checkpoints
+    )
+    if defect is None:
+        paid_calls = primary.invoke.call_count
+        for identity in [
+            None,
+            {"provider": "vertex_ai", "model": "gemini-3.5-flash-lite"},
+        ]:
+            previous = copy.deepcopy(checkpoints[-1])
+            previous["fast_material_review_model"] = identity
+            monkeypatch.setattr(
+                runtime, "load_asv3_checkpoint", lambda **_kwargs: previous
+            )
+            kwargs["resume_message_id"] = 42
+            with pytest.raises(ValueError, match="same material review model"):
+                runtime.run_asv3_loop(**kwargs)
+        assert primary.invoke.call_count == paid_calls
+
+
+@pytest.mark.parametrize(
+    "failure", [PermissionError("unavailable model"), RuntimeError("cost limit")]
+)
+def test_fast_reviewer_resolution_failure_occurs_before_paid_source_work(
+    monkeypatch: pytest.MonkeyPatch, failure: Exception
+) -> None:
+    kwargs, broker, primary, checkpoints, _queue = setup_run(monkeypatch)
+    kwargs.pop("test_language")
+    kwargs.update(research_profile="normal", workflow_variant=ASV3_FAST_VARIANT)
+    resolver = MagicMock(side_effect=failure)
+    monkeypatch.setattr(runtime, "fast_material_review_model", resolver)
+    with pytest.raises(type(failure)) as raised:
+        runtime.run_asv3_loop(**kwargs)
+    assert raised.value is failure
+    resolver.assert_called_once_with(kwargs["user"])
+    assert primary.invoke.call_count == 0 and not checkpoints and not broker.revalidated
+
+
+@pytest.mark.parametrize(
+    "variant", ["standard", "asv3_exp_cropped", "asv3_fast_cropped"]
+)
+def test_original_and_cropped_runtime_never_resolve_fast_tek_reviewer(
+    monkeypatch: pytest.MonkeyPatch, variant: str
+) -> None:
+    kwargs, _broker, primary, _checkpoints, _queue = setup_run(monkeypatch)
+    kwargs.pop("test_language")
+    kwargs.update(research_profile="normal", workflow_variant=variant)
+    resolver = MagicMock(side_effect=AssertionError("reviewer must stay Fast Tek only"))
+    monkeypatch.setattr(runtime, "fast_material_review_model", resolver)
+    constructor = MagicMock(side_effect=RuntimeError("model setup boundary"))
+    monkeypatch.setattr(runtime, "ResearchModel", constructor)
+    with pytest.raises(RuntimeError, match="model setup boundary"):
+        runtime.run_asv3_loop(**kwargs)
+    assert resolver.call_count == 0 and primary.invoke.call_count == 0
