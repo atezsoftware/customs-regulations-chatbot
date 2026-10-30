@@ -116,10 +116,10 @@ jobs:
               statuses = {item['name']: item for item in pod['status'].get('containerStatuses', [])}
               for container in pod['spec']['containers']:
                   image = container['image']
-                  if 'customs-regulations-backend-lite-dev:19b08458' in image and statuses.get(container['name'], {}).get('ready'):
+                  if 'customs-regulations-backend-lite-dev:73ded51f' in image and statuses.get(container['name'], {}).get('ready'):
                       ready.append((pod['metadata']['name'], container['name'], image))
           if not ready:
-              raise SystemExit('No ready DEV backend at expected revision 19b08458')
+              raise SystemExit('No ready DEV backend at expected revision 73ded51f')
           pod, container, image = sorted(ready)[0]
           print('INTAKE_TARGET', pod, container, image)
           Path('/tmp/intake-target').write_text(pod + '\t' + container + '\n')
