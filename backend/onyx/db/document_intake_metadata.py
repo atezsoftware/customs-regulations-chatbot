@@ -331,6 +331,12 @@ def apply_metadata_results(
                     metadata[fact.field] = fact.value
                 audit["fields"][fact.field] = {
                     "source": "llm",
+                    "request_hash": fact.retained_request_hash or request_hash,
+                    **(
+                        {"retained_from_validated_fact": True}
+                        if fact.retained_request_hash
+                        else {}
+                    ),
                     "basis": fact.basis,
                     "evidence_quote": fact.evidence_quote,
                     "source_chunk_id": fact.source_chunk_id,

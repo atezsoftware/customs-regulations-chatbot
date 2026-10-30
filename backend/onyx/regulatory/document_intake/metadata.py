@@ -106,6 +106,9 @@ class LegalMetadataFact(BaseModel):
     basis: Literal["explicit", "relative_publication"] = "explicit"
     reference_chunk_id: str | None = None
     reference_quote: str | None = Field(default=None, max_length=2000)
+    retained_request_hash: str | None = Field(
+        default=None, exclude=True, pattern=r"^[0-9a-f]{64}$"
+    )
 
 
 class ChunkLegalMetadata(BaseModel):
@@ -283,6 +286,84 @@ def validate_metadata_transport_response(
     return validate_metadata_response(
         canonical.model_dump_json(), chunks=chunks, target_ids=target_ids
     )
+
+
+def retain_validated_metadata_facts(
+    result: LegalMetadataResult,
+    previous_response: str,
+    previous_request_hash: str,
+    chunks: Sequence[MetadataChunk],
+    target_ids: Sequence[str],
+) -> LegalMetadataResult:
+    """Retain omitted facts only when their original transport evidence validates."""
+    if re.fullmatch(r"[0-9a-f]{64}", previous_request_hash) is None:
+        raise ValueError("Retained metadata requires its original request hash")
+    validate_metadata_response(
+        result.model_dump_json(), chunks=chunks, target_ids=target_ids
+    )
+    if len(previous_response.encode()) > 1024 * 1024:
+        return result
+    try:
+        previous = _TransportResult.model_validate_json(previous_response)
+    except ValueError:
+        return result
+    ids = [target.chunk_id for target in previous.chunks]
+    if len(set(ids)) != len(ids) or set(ids) != set(target_ids):
+        return result
+    if any(
+        len({fact.field for fact in target.fields}) != len(target.fields)
+        for target in previous.chunks
+    ):
+        return result
+    current = {target.chunk_id: target for target in result.chunks}
+    merged: dict[str, ChunkLegalMetadata] = {}
+    restored = False
+    for target in previous.chunks:
+        fields = list(current[target.chunk_id].fields)
+        present = {fact.field for fact in fields}
+        for fact in target.fields:
+            if fact.field in present:
+                continue
+            one_fact = _TransportResult(
+                chunks=[_TransportChunk(chunk_id=target.chunk_id, fields=[fact])]
+            )
+            try:
+                validated = validate_metadata_transport_response(
+                    one_fact.model_dump_json(),
+                    chunks=chunks,
+                    target_ids=[target.chunk_id],
+                )
+            except ValueError:
+                continue
+            fields.append(
+                validated.chunks[0]
+                .fields[0]
+                .model_copy(update={"retained_request_hash": previous_request_hash})
+            )
+            restored = True
+        merged[target.chunk_id] = ChunkLegalMetadata(
+            chunk_id=target.chunk_id, fields=fields
+        )
+    if not restored:
+        return result
+    warning_prefix = r"^Retained metadata from request [0-9a-f]{64}: "
+    warnings = list(result.warnings)
+    known_warnings = {re.sub(warning_prefix, "", value) for value in warnings}
+    for warning in previous.warnings:
+        message = re.sub(warning_prefix, "", warning)
+        if message not in known_warnings:
+            warnings.append(
+                f"Retained metadata from request {previous_request_hash}: {message}"
+            )
+            known_warnings.add(message)
+    retained = LegalMetadataResult(
+        chunks=[merged[target.chunk_id] for target in result.chunks],
+        warnings=warnings,
+    )
+    validate_metadata_response(
+        retained.model_dump_json(), chunks=chunks, target_ids=target_ids
+    )
+    return retained
 
 
 def metadata_input_hash(chunks: Sequence[MetadataChunk]) -> str:
