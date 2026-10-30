@@ -2,10 +2,11 @@
 
 import hashlib
 import json
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextvars import copy_context
 from threading import Event, Lock
+from typing import Literal, cast
 from uuid import UUID
 
 from pydantic import ValidationError
@@ -20,15 +21,19 @@ from onyx.db.models import User
 from onyx.regulatory.document_intake.metadata import (
     MAX_METADATA_REQUEST_BYTES,
     MAX_METADATA_RESPONSE_BYTES,
+    METADATA_OUTPUT_TOKENS,
     METADATA_VERSION,
     TARGETS_PER_REQUEST,
     LegalMetadataResult,
     MetadataChunk,
     build_metadata_body_scope_repair_request,
     build_metadata_catalog_recovery_request,
+    build_metadata_output_reserve_request,
     build_metadata_repair_request,
     build_metadata_request,
     metadata_input_hash,
+    metadata_response_needs_split,
+    project_metadata_attempts,
     recover_metadata_response,
     retain_validated_metadata_facts,
     validate_metadata_transport_response,
@@ -50,8 +55,45 @@ class _MetadataWindowStopped(ValueError):
     pass
 
 
+class _MetadataWindowNeedsSplit(Exception):
+    def __init__(self, reason: Literal["token_budget", "structured_output"]) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _metadata_output_pressure(
+    envelope: Mapping[str, object], request: VertexBatchRequest
+) -> bool:
+    limit = (request.generation_config or {}).get("maxOutputTokens")
+    response = envelope.get("response")
+    usage = (
+        cast(Mapping[str, object], response).get("usageMetadata")
+        if isinstance(response, dict)
+        else None
+    )
+    if (
+        type(limit) is not int
+        or limit != METADATA_OUTPUT_TOKENS
+        or not isinstance(usage, dict)
+    ):
+        return False
+    counters = cast(Mapping[str, object], usage)
+    thoughts = counters.get("thoughtsTokenCount")
+    visible = counters.get("candidatesTokenCount")
+    return (
+        type(thoughts) is int
+        and type(visible) is int
+        and thoughts >= limit * 3 // 4
+        and visible >= 0
+        and thoughts + visible <= limit
+    )
+
+
 def _metadata_response(
-    gateway: VertexBatchGateway, request: VertexBatchRequest, output_uri: str
+    gateway: VertexBatchGateway,
+    request: VertexBatchRequest,
+    output_uri: str,
+    output_pressure: dict[str, bool] | None = None,
 ) -> tuple[str | None, bool]:
     lines = [line for line in gateway.read_results(output_uri) if line.strip()]
     parsed = parse_vertex_jsonl_output(iter(lines), [request.request_hash])[
@@ -80,10 +122,18 @@ def _metadata_response(
         parsed.error in {None, VertexBatchResultError.EMPTY}
         or (parsed.error == VertexBatchResultError.MALFORMED and no_visible_body)
     ):
+        if output_pressure is not None:
+            output_pressure[request.request_hash] = _metadata_output_pressure(
+                envelope, request
+            )
         return None, True
     if finish != "STOP" or parsed.error is not None or parsed.context is None:
         raise ValueError(
             "New-document metadata extraction returned incomplete or invalid output"
+        )
+    if output_pressure is not None:
+        output_pressure[request.request_hash] = _metadata_output_pressure(
+            envelope, request
         )
     return parsed.context, False
 
@@ -96,9 +146,59 @@ def _extract_metadata_targets(
     identity_prefix: str,
     heartbeat: Callable[[], None],
     stopped: Event,
+    inherited_attempts: Sequence[tuple[str, str]] = (),
+) -> MetadataResults:
+    previous_attempts = list(inherited_attempts)
+    try:
+        return _extract_metadata_window(
+            gateway=gateway,
+            chunks=chunks,
+            targets=targets,
+            identity_prefix=identity_prefix,
+            heartbeat=heartbeat,
+            stopped=stopped,
+            previous_attempts=previous_attempts,
+        )
+    except _MetadataWindowNeedsSplit as failure:
+        if len(targets) == 1:
+            if failure.reason == "token_budget":
+                raise ValueError(
+                    "New-document metadata exceeded the output token budget for one target"
+                ) from None
+            raise ValueError(
+                "New-document metadata returned invalid structured output for one target"
+            ) from None
+    midpoint = len(targets) // 2
+    results: MetadataResults = []
+    for child in (targets[:midpoint], targets[midpoint:]):
+        results.extend(
+            _extract_metadata_targets(
+                gateway=gateway,
+                chunks=chunks,
+                targets=child,
+                identity_prefix=identity_prefix,
+                heartbeat=heartbeat,
+                stopped=stopped,
+                inherited_attempts=project_metadata_attempts(
+                    previous_attempts, parent_target_ids=targets, target_ids=child
+                ),
+            )
+        )
+    return results
+
+
+def _extract_metadata_window(
+    *,
+    gateway: VertexBatchGateway,
+    chunks: Sequence[MetadataChunk],
+    targets: Sequence[str],
+    identity_prefix: str,
+    heartbeat: Callable[[], None],
+    stopped: Event,
+    previous_attempts: list[tuple[str, str]],
 ) -> MetadataResults:
     request = build_metadata_request(chunks, targets)
-    previous_attempts: list[tuple[str, str]] = []
+    output_pressure: dict[str, bool] = {}
 
     def accepted(
         accepted_request: VertexBatchRequest, result: LegalMetadataResult
@@ -129,13 +229,63 @@ def _extract_metadata_targets(
                 raise
             return recovered
 
+    def failed_repair(
+        failed_request: VertexBatchRequest, response: str
+    ) -> MetadataResults:
+        if metadata_response_needs_split(response, target_ids=targets):
+            reserved = (
+                build_metadata_output_reserve_request(failed_request)
+                if output_pressure.get(failed_request.request_hash)
+                else None
+            )
+            if reserved is not None:
+                reserved_context, reserved_exhausted = _run_metadata_request(
+                    gateway=gateway,
+                    request=reserved,
+                    identity_prefix=identity_prefix,
+                    heartbeat=heartbeat,
+                    stopped=stopped,
+                    output_pressure=output_pressure,
+                )
+                if reserved_exhausted:
+                    raise _MetadataWindowNeedsSplit("token_budget")
+                assert reserved_context is not None
+                try:
+                    result = validate_attempt(reserved_context)
+                except ValueError:
+                    previous_attempts.append((reserved.request_hash, reserved_context))
+                    if metadata_response_needs_split(
+                        reserved_context, target_ids=targets
+                    ):
+                        raise _MetadataWindowNeedsSplit("structured_output") from None
+                else:
+                    return accepted(reserved, result)
+            else:
+                raise _MetadataWindowNeedsSplit("structured_output")
+        raise ValueError(
+            "New-document metadata failed strict validation after its single repair attempt"
+        ) from None
+
     context, exhausted = _run_metadata_request(
         gateway=gateway,
         request=request,
         identity_prefix=identity_prefix,
         heartbeat=heartbeat,
         stopped=stopped,
+        output_pressure=output_pressure,
     )
+    if exhausted and output_pressure.get(request.request_hash):
+        reserved = build_metadata_output_reserve_request(request)
+        if reserved is not None:
+            request = reserved
+            context, exhausted = _run_metadata_request(
+                gateway=gateway,
+                request=request,
+                identity_prefix=identity_prefix,
+                heartbeat=heartbeat,
+                stopped=stopped,
+                output_pressure=output_pressure,
+            )
     if not exhausted:
         assert context is not None
         original_context = context
@@ -166,6 +316,7 @@ def _extract_metadata_targets(
                     identity_prefix=identity_prefix,
                     heartbeat=heartbeat,
                     stopped=stopped,
+                    output_pressure=output_pressure,
                 )
                 if cached is None:
                     scoped_repair = build_metadata_body_scope_repair_request(
@@ -196,9 +347,7 @@ def _extract_metadata_targets(
                                     repair, cached_context
                                 )
                             if scoped_repair is None:
-                                raise ValueError(
-                                    "New-document metadata failed strict validation after its single repair attempt"
-                                ) from None
+                                return failed_repair(repair, cached_context)
                             repair = scoped_repair
         if not exhausted:
             # Inspect durable ACKs before spending this invocation's one repair call.
@@ -208,6 +357,7 @@ def _extract_metadata_targets(
                 identity_prefix=identity_prefix,
                 heartbeat=heartbeat,
                 stopped=stopped,
+                output_pressure=output_pressure,
             )
             if cached is not None:
                 cached_context, exhausted = cached
@@ -237,9 +387,7 @@ def _extract_metadata_targets(
                                 cached_repair_response=cached_context,
                             )
                         if recovery is None:
-                            raise ValueError(
-                                "New-document metadata failed strict validation after its single repair attempt"
-                            ) from None
+                            return failed_repair(repair, cached_context)
                         repair = recovery
         if exhausted:
             context = None
@@ -250,35 +398,17 @@ def _extract_metadata_targets(
                 identity_prefix=identity_prefix,
                 heartbeat=heartbeat,
                 stopped=stopped,
+                output_pressure=output_pressure,
             )
         if not exhausted:
             assert context is not None
             try:
                 result = validate_attempt(context)
             except ValueError:
-                raise ValueError(
-                    "New-document metadata failed strict validation after its single repair attempt"
-                ) from None
+                previous_attempts.append((repair.request_hash, context))
+                return failed_repair(repair, context)
             return accepted(repair, result)
-    if len(targets) == 1:
-        raise ValueError(
-            "New-document metadata exceeded the output token budget for one target"
-        )
-    midpoint = len(targets) // 2
-    results: MetadataResults = []
-    # Children stay sequential inside this window's concurrency slot.
-    for child in (targets[:midpoint], targets[midpoint:]):
-        results.extend(
-            _extract_metadata_targets(
-                gateway=gateway,
-                chunks=chunks,
-                targets=child,
-                identity_prefix=identity_prefix,
-                heartbeat=heartbeat,
-                stopped=stopped,
-            )
-        )
-    return results
+    raise _MetadataWindowNeedsSplit("token_budget")
 
 
 def _run_metadata_request(
@@ -288,6 +418,7 @@ def _run_metadata_request(
     identity_prefix: str,
     heartbeat: Callable[[], None],
     stopped: Event,
+    output_pressure: dict[str, bool] | None = None,
 ) -> tuple[str | None, bool]:
     if stopped.is_set():
         raise _MetadataWindowStopped(
@@ -302,7 +433,9 @@ def _run_metadata_request(
     )
     if state.status != VertexBatchJobStatus.SUCCEEDED or not state.output_uri:
         raise ValueError("New-document metadata extraction did not complete")
-    context, exhausted = _metadata_response(gateway, request, state.output_uri)
+    context, exhausted = _metadata_response(
+        gateway, request, state.output_uri, output_pressure
+    )
     heartbeat()
     return context, exhausted
 
@@ -323,6 +456,7 @@ def _cached_metadata_request(
     identity_prefix: str,
     heartbeat: Callable[[], None],
     stopped: Event,
+    output_pressure: dict[str, bool] | None = None,
 ) -> tuple[str | None, bool] | None:
     if stopped.is_set():
         raise _MetadataWindowStopped(
@@ -336,7 +470,7 @@ def _cached_metadata_request(
         return None
     if state.status != VertexBatchJobStatus.SUCCEEDED or not state.output_uri:
         raise ValueError("New-document metadata cached repair did not complete")
-    result = _metadata_response(gateway, request, state.output_uri)
+    result = _metadata_response(gateway, request, state.output_uri, output_pressure)
     heartbeat()
     return result
 
