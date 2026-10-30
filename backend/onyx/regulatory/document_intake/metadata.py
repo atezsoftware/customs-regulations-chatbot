@@ -796,8 +796,14 @@ def build_metadata_body_scope_repair_request(
     previous_response: str,
     *,
     cached_repair_response: str | None = None,
+    cached_repair_request_hash: str | None = None,
 ) -> VertexBatchRequest | None:
     """Explain rejected date scopes without changing or resolving catalog IDs."""
+    if (
+        cached_repair_request_hash is not None
+        and re.fullmatch(r"[0-9a-f]{64}", cached_repair_request_hash) is None
+    ):
+        raise ValueError("Metadata body-scope repair requires its actual request hash")
     generic = build_metadata_repair_request(
         request,
         previous_response,
@@ -895,7 +901,9 @@ def build_metadata_body_scope_repair_request(
         "errors": errors,
     }
     if cached_repair_response is not None:
-        feedback["cached_repair_request_hash"] = generic.request_hash
+        feedback["cached_repair_request_hash"] = (
+            cached_repair_request_hash or generic.request_hash
+        )
         feedback["cached_repair_response_sha256"] = hashlib.sha256(
             cached_repair_response.encode()
         ).hexdigest()

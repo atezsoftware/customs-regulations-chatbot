@@ -516,11 +516,11 @@ def test_invalid_targeted_repair_is_terminal_and_raw_caches_remain() -> None:
     gateway.seed(base, invalid)
     gateway.seed(generic, invalid)
     before = dict(gateway.lines)
-    with pytest.raises(ValueError, match="after its single repair"):
+    with pytest.raises(ValueError, match="after bounded repair"):
         _run(gateway, sources)
     assert len(gateway.new_requests) == 1
     assert all(gateway.lines[key] == value for key, value in before.items())
-    with pytest.raises(ValueError, match="after its single repair"):
+    with pytest.raises(ValueError, match="after bounded repair"):
         _run(gateway, sources)
     assert len(gateway.new_requests) == 1
 

@@ -247,12 +247,12 @@ def test_foreign_evidence_id_is_never_suggested_or_accepted() -> None:
         )
 
 
-def test_second_unknown_id_remains_hard_failure_after_one_repair_only() -> None:
+def test_unknown_ids_remain_hard_failure_after_one_narrow_feedback() -> None:
     source = _continuation()
     gateway = _Gateway(
         lambda request: _envelope(request, "STOP", _outcome([source.chunk_id]))
     )
-    with pytest.raises(ValueError, match="after its single repair"):
+    with pytest.raises(ValueError, match="after bounded repair"):
         metadata_job._extract_metadata_targets(
             gateway=cast(VertexBatchGateway, gateway),
             chunks=[source],
@@ -261,7 +261,10 @@ def test_second_unknown_id_remains_hard_failure_after_one_repair_only() -> None:
             heartbeat=lambda: None,
             stopped=Event(),
         )
-    assert len(gateway.requests) == 2
+    assert len(gateway.requests) == 3
+    feedback = json.loads(gateway.requests[-1].prompt)["validation_feedback"]
+    assert feedback["catalog_recovery_version"] == 1
+    assert feedback["cached_repair_request_hash"] == gateway.requests[1].request_hash
     with pytest.raises(ValueError, match="only one repair"):
         metadata.build_metadata_repair_request(
             gateway.requests[-1],

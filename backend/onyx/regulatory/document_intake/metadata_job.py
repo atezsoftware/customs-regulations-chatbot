@@ -203,6 +203,8 @@ def _extract_metadata_window(
 ) -> MetadataResults:
     request = build_metadata_request(chunks, targets)
     output_pressure: dict[str, bool] = {}
+    semantic_feedback_used = False
+    output_reserve_used = False
 
     def accepted(
         accepted_request: VertexBatchRequest, result: LegalMetadataResult
@@ -233,16 +235,74 @@ def _extract_metadata_window(
                 raise
             return recovered
 
+    def semantic_feedback_request(
+        failed_request: VertexBatchRequest, response: str, error: ValueError
+    ) -> VertexBatchRequest | None:
+        recovery = build_metadata_catalog_recovery_request(failed_request, response)
+        if recovery is not None:
+            return recovery
+        feedback = json.loads(failed_request.prompt).get("validation_feedback", {})
+        if str(error) not in {
+            "Metadata field requires body evidence",
+            "Metadata publication reference must use body evidence only for relative dates",
+        } or any(
+            marker in feedback
+            for marker in ("catalog_recovery_version", "body_scope_feedback")
+        ):
+            return None
+        recovery = build_metadata_body_scope_repair_request(
+            request,
+            original_context,
+            cached_repair_response=response,
+            cached_repair_request_hash=failed_request.request_hash,
+        )
+        if recovery is not None:
+            recovery = VertexBatchRequest(
+                prompt=recovery.prompt,
+                system_instruction=recovery.system_instruction,
+                generation_config=failed_request.generation_config,
+            )
+        legacy = build_metadata_body_scope_repair_request(
+            request, original_context, cached_repair_response=response
+        )
+        if (
+            legacy is not None
+            and recovery is not None
+            and legacy.request_hash != recovery.request_hash
+        ):
+            cached_legacy = _cached_metadata_request(
+                gateway=gateway,
+                request=legacy,
+                identity_prefix=identity_prefix,
+                heartbeat=heartbeat,
+                stopped=stopped,
+                output_pressure=output_pressure,
+            )
+            if cached_legacy is not None:
+                legacy_context, legacy_exhausted = cached_legacy
+                if not legacy_exhausted:
+                    assert legacy_context is not None
+                    try:
+                        validate_attempt(legacy_context)
+                    except ValueError:
+                        previous_attempts.append((legacy.request_hash, legacy_context))
+                    else:
+                        return legacy
+        return recovery
+
     def failed_repair(
-        failed_request: VertexBatchRequest, response: str
+        failed_request: VertexBatchRequest, response: str, error: ValueError
     ) -> MetadataResults:
+        nonlocal semantic_feedback_used, output_reserve_used
         if metadata_response_needs_split(response, target_ids=targets):
             reserved = (
                 build_metadata_output_reserve_request(failed_request)
-                if output_pressure.get(failed_request.request_hash)
+                if not output_reserve_used
+                and output_pressure.get(failed_request.request_hash)
                 else None
             )
             if reserved is not None:
+                output_reserve_used = True
                 reserved_context, reserved_exhausted = _run_metadata_request(
                     gateway=gateway,
                     request=reserved,
@@ -256,18 +316,50 @@ def _extract_metadata_window(
                 assert reserved_context is not None
                 try:
                     result = validate_attempt(reserved_context)
-                except ValueError:
+                except ValueError as reserved_error:
                     previous_attempts.append((reserved.request_hash, reserved_context))
                     if metadata_response_needs_split(
                         reserved_context, target_ids=targets
                     ):
                         raise _MetadataWindowNeedsSplit("structured_output") from None
+                    failed_request, response, error = (
+                        reserved,
+                        reserved_context,
+                        reserved_error,
+                    )
                 else:
                     return accepted(reserved, result)
             else:
                 raise _MetadataWindowNeedsSplit("structured_output")
+        recovery = (
+            semantic_feedback_request(failed_request, response, error)
+            if not semantic_feedback_used
+            else None
+        )
+        if (
+            recovery is not None
+            and recovery.request_hash != failed_request.request_hash
+        ):
+            semantic_feedback_used = True
+            recovered_context, recovered_exhausted = _run_metadata_request(
+                gateway=gateway,
+                request=recovery,
+                identity_prefix=identity_prefix,
+                heartbeat=heartbeat,
+                stopped=stopped,
+                output_pressure=output_pressure,
+            )
+            if recovered_exhausted:
+                raise _MetadataWindowNeedsSplit("token_budget")
+            assert recovered_context is not None
+            try:
+                result = validate_attempt(recovered_context)
+            except ValueError as recovered_error:
+                previous_attempts.append((recovery.request_hash, recovered_context))
+                return failed_repair(recovery, recovered_context, recovered_error)
+            return accepted(recovery, result)
         raise ValueError(
-            "New-document metadata failed strict validation after its single repair attempt"
+            "New-document metadata failed strict validation after bounded repair attempts"
         ) from None
 
     context, exhausted = _run_metadata_request(
@@ -281,6 +373,7 @@ def _extract_metadata_window(
     if exhausted and output_pressure.get(request.request_hash):
         reserved = build_metadata_output_reserve_request(request)
         if reserved is not None:
+            output_reserve_used = True
             request = reserved
             context, exhausted = _run_metadata_request(
                 gateway=gateway,
@@ -337,7 +430,7 @@ def _extract_metadata_window(
                         try:
                             result = validate_attempt(cached_context)
                             return accepted(repair, result)
-                        except ValueError:
+                        except ValueError as cached_error:
                             previous_attempts.append(
                                 (repair.request_hash, cached_context)
                             )
@@ -351,10 +444,12 @@ def _extract_metadata_window(
                                     repair, cached_context
                                 )
                             if scoped_repair is None:
-                                return failed_repair(repair, cached_context)
+                                return failed_repair(
+                                    repair, cached_context, cached_error
+                                )
                             repair = scoped_repair
         if not exhausted:
-            # Inspect durable ACKs before spending this invocation's one repair call.
+            # Inspect durable ACKs before making another provider request.
             cached = _cached_metadata_request(
                 gateway=gateway,
                 request=repair,
@@ -372,26 +467,11 @@ def _extract_metadata_window(
                         return accepted(repair, result)
                     except ValueError as error:
                         previous_attempts.append((repair.request_hash, cached_context))
-                        recovery = build_metadata_catalog_recovery_request(
-                            repair, cached_context
+                        recovery = semantic_feedback_request(
+                            repair, cached_context, error
                         )
-                        if (
-                            recovery is None
-                            and str(error)
-                            in {
-                                "Metadata field requires body evidence",
-                                "Metadata publication reference must use body evidence only for relative dates",
-                            }
-                            and "catalog_recovery_version"
-                            not in json.loads(repair.prompt)["validation_feedback"]
-                        ):
-                            recovery = build_metadata_body_scope_repair_request(
-                                request,
-                                original_context,
-                                cached_repair_response=cached_context,
-                            )
                         if recovery is None:
-                            return failed_repair(repair, cached_context)
+                            return failed_repair(repair, cached_context, error)
                         repair = recovery
         if exhausted:
             context = None
@@ -408,9 +488,9 @@ def _extract_metadata_window(
             assert context is not None
             try:
                 result = validate_attempt(context)
-            except ValueError:
+            except ValueError as repair_error:
                 previous_attempts.append((repair.request_hash, context))
-                return failed_repair(repair, context)
+                return failed_repair(repair, context, repair_error)
             return accepted(repair, result)
     raise _MetadataWindowNeedsSplit("token_budget")
 
