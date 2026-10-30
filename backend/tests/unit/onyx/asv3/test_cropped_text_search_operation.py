@@ -104,10 +104,11 @@ def test_full_scan_result_unchanged_with_two_fresh_authorizations(
 @pytest.mark.parametrize(
     "defect", ["acl", "identity", "publication", "cancel", "index"]
 )
+@pytest.mark.parametrize("fast", [False, True])
 def test_actual_text_search_returns_no_evidence_when_final_fence_fails(
-    monkeypatch: pytest.MonkeyPatch, defect: str
+    monkeypatch: pytest.MonkeyPatch, defect: str, fast: bool
 ) -> None:
-    context = RunContext(services={"asv3_exp_cropped": True})
+    context = RunContext(services={"asv3_exp_cropped": True, "asv3_fast": fast})
 
     def mutate(page: int) -> None:
         if page != 20:
