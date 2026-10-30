@@ -249,7 +249,7 @@ def test_cached_repairs_reuse_valid_ack_or_recover_unknown_id_once(
 
 @pytest.mark.parametrize("case", ["generic", "scoped"])
 @pytest.mark.parametrize("existing_repair", [False, True])
-def test_invalid_new_repair_is_terminal_and_retains_every_cached_response(
+def test_invalid_feedback_is_terminal_and_retains_every_cached_response(
     case: str, existing_repair: bool
 ) -> None:
     sources, base, invalid_base, repair, invalid_repair, _valid = _case(case)
@@ -259,19 +259,19 @@ def test_invalid_new_repair_is_terminal_and_retains_every_cached_response(
         gateway.seed(repair, invalid_repair)
     before = dict(gateway.lines)
 
-    with pytest.raises(ValueError, match="after its single repair"):
+    with pytest.raises(ValueError, match="after bounded repair"):
         _run(gateway, sources)
 
-    assert len(gateway.new_requests) == 1
+    expected_calls = 1 if existing_repair else 2
+    assert len(gateway.new_requests) == expected_calls
     assert all(gateway.lines[key] == value for key, value in before.items())
     with pytest.raises(ValueError):
         metadata.validate_metadata_transport_response(
             invalid_repair, chunks=sources, target_ids=[sources[0].chunk_id]
         )
-    if existing_repair:
-        with pytest.raises(ValueError, match="after its single repair"):
-            _run(gateway, sources)
-        assert len(gateway.new_requests) == 1
+    with pytest.raises(ValueError, match="after bounded repair"):
+        _run(gateway, sources)
+    assert len(gateway.new_requests) == expected_calls
 
 
 @pytest.mark.parametrize("case", ["generic", "scoped"])

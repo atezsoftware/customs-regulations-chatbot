@@ -302,7 +302,7 @@ def test_semantic_failures_never_trigger_output_reserve_or_target_splitting(
     )
     _seed(gateway, base, invalid)
     _seed(gateway, repair, response, _PRESSURE)
-    with pytest.raises(ValueError, match="after its single repair"):
+    with pytest.raises(ValueError, match="after bounded repair"):
         _run(gateway, sources)
     assert len(gateway.new_requests) <= 1
     assert all(
