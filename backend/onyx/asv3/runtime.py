@@ -59,6 +59,11 @@ from onyx.asv3.cropped_worker_handoff import (
 )
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.external_tools import build_external_specs
+from onyx.asv3.fast_material_review import (
+    FAST_MATERIAL_REVIEW_STOP_SERVICE,
+    FastMaterialReview,
+    FastMaterialReviewResult,
+)
 from onyx.asv3.governing_acquisitions import (
     GoverningOriginalAcquisitions,
     governing_original_targets,
@@ -179,6 +184,7 @@ from onyx.prompts.asv3.experimental import (
     EXPERIMENTAL_PARALLEL_PROMPT_VERSION,
     EXPERIMENTAL_PROMPT_VERSION,
 )
+from onyx.prompts.asv3.fast import FAST_TEK_CONDITION_REVIEW
 from onyx.prompts.asv3.research import (
     PROMPT_VERSION,
     VERIFICATION_PROMPT,
@@ -197,6 +203,7 @@ from onyx.server.query_and_chat.streaming_models import (
 from onyx.tools.interface import Tool
 from onyx.tools.tool_implementations.search.search_tool import SearchTool
 from onyx.tracing.answer_graph import graph_step
+from onyx.tracing.flows import LLMFlow
 from onyx.tracing.framework.create import ChatTraceMetadata, ensure_trace
 
 logger = logging.getLogger(__name__)
@@ -2099,6 +2106,60 @@ def run_asv3_loop(
         )
     )
 
+    def assess_fast_materials(
+        payload: dict[str, JsonValue],
+    ) -> FastMaterialReviewResult:
+        isolated = copy.copy(context)
+        isolated.services = dict(context.services)
+        isolated.services.pop("last_model_call_id", None)
+        isolated.services["provider_max_attempts"] = 1
+        isolated.services["provider_compatibility_attempts"] = 1
+        verifier = ResearchModel(
+            research_llm or llm,
+            isolated,
+            user_identity=user_identity,
+            reasoning_effort=reasoning_effort,
+            token_counter=token_counter,
+        )
+        try:
+            raw = verifier.invoke_text(
+                FAST_TEK_CONDITION_REVIEW,
+                json.dumps(payload, ensure_ascii=False),
+                LLMFlow.ASV3_VERIFICATION,
+                max_tokens=2400,
+                response_model_override=FastMaterialReviewResult,
+            )
+            report = FastMaterialReviewResult.model_validate_json(raw)
+        except RunStopped:
+            raise
+        except Exception:
+            logger.warning("Fast material-condition review is unavailable")
+            report = FastMaterialReviewResult.model_validate(
+                {
+                    "status": "uncertain",
+                    "candidate_sha256": payload["candidate_sha256"],
+                    "source_set_sha256": payload["source_set_sha256"],
+                    "examined_citations": [],
+                    "findings": [],
+                }
+            )
+        numbers = payload.get("required_evidence_numbers")
+        assert isinstance(numbers, list)
+        expected = {number for number in numbers if type(number) is int}
+        if (
+            verifier.last_response_truncated
+            or ledger.completely_delivered(verifier.last_call_id or "") != expected
+        ):
+            report = report.model_copy(update={"status": "uncertain"})
+        context.check_active()
+        return report
+
+    fast_material_review = (
+        FastMaterialReview(context, ledger, assess_fast_materials)
+        if checkpoint_workflow_variant == ASV3_FAST_VARIANT
+        else None
+    )
+
     def source_publication_gap(
         answer: str,
         model_call_id: str | None,
@@ -2259,6 +2320,24 @@ def run_asv3_loop(
             )
             if records:
                 combined.data["governing_original_acquisition_episodes"] = records
+        if (
+            combined is None
+            and fast_material_review is not None
+            and not active_context.depth
+        ):
+            material_gap = fast_material_review.publication_gap(
+                answer, model_call_id, question
+            )
+            if material_gap is not None:
+                detail = material_gap.data.get("asv3_fast_material_review")
+                if (
+                    not isinstance(detail, dict)
+                    or detail.get("status") != "material_findings"
+                ):
+                    reason = "Fast material-condition review is unverified; retained answer needs review"
+                    context.services[FAST_MATERIAL_REVIEW_STOP_SERVICE] = reason
+                    raise RunStopped(reason)
+            return material_gap
         return combined
 
     if cropped_repair_state is not None:
