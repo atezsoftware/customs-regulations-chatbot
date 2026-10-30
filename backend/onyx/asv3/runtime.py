@@ -59,11 +59,6 @@ from onyx.asv3.cropped_worker_handoff import (
 )
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.external_tools import build_external_specs
-from onyx.asv3.fast_policy import (
-    FAST_HANDOFF,
-    finish_research_spec,
-    restore_fast_handoff,
-)
 from onyx.asv3.governing_acquisitions import (
     GoverningOriginalAcquisitions,
     governing_original_targets,
@@ -104,6 +99,7 @@ from onyx.asv3.parallel_execution import (
     ParallelExecutionSlots,
     parallel_execution_enabled,
 )
+from onyx.asv3.performance import FastCancellationProbe
 from onyx.asv3.progress import (
     ProgressEvent,
     ProgressReporter,
@@ -141,6 +137,8 @@ from onyx.asv3.workers import WorkerPool
 from onyx.asv3.workflow_variant import (
     ASV3_EXP_CHEAP_VARIANT,
     ASV3_EXP_CROPPED_VARIANT,
+    ASV3_FAST_CROPPED_VARIANT,
+    ASV3_FAST_VARIANT,
     ASV3_GUARDED_EXPERIMENTAL_VARIANT,
     ASV3_GUARDRAILS_V2_VARIANT,
     ASV3_GUARDRAILS_V3_VARIANT,
@@ -181,6 +179,7 @@ from onyx.prompts.asv3.research import (
     VERIFICATION_PROMPT,
 )
 from onyx.prompts.asv3.tuned import TUNED_PROMPT_VERSION
+from onyx.regulatory.source_notices import SourceNotice
 from onyx.server.query_and_chat.placement import Placement
 from onyx.server.query_and_chat.streaming_models import (
     AgentResponseDelta,
@@ -356,6 +355,11 @@ def run_asv3_loop(
         ),
         "",
     )
+    cancellation_probe = (
+        FastCancellationProbe(lambda: not is_connected(chat_session_id, cache))
+        if workflow_variant in {ASV3_FAST_VARIANT, ASV3_FAST_CROPPED_VARIANT}
+        else None
+    )
     guarded_experimental = workflow_variant == ASV3_GUARDED_EXPERIMENTAL_VARIANT
     guardrails_v3 = workflow_variant == ASV3_GUARDRAILS_V3_VARIANT
     bounded_guardrails = guarded_experimental or guardrails_v3
@@ -370,7 +374,9 @@ def run_asv3_loop(
             if bounded_guardrails
             else SharedBudget(unlimited_execution=True)
         ),
-        cancelled=lambda: not is_connected(chat_session_id, cache),
+        cancelled=cancellation_probe
+        if cancellation_probe is not None
+        else lambda: not is_connected(chat_session_id, cache),
         services={
             "lean_native_mode": True,
             **(
@@ -413,12 +419,11 @@ def run_asv3_loop(
         raise ValueError("ASv3 resume requires the same authorized scope and question")
     validate_asv3_variant_resume(workflow_variant, previous)
     checkpoint_workflow_variant = workflow_variant
-    from onyx.asv3.workflow_variant import ASV3_FAST_CROPPED_VARIANT, ASV3_FAST_VARIANT
-
     if workflow_variant in {ASV3_FAST_VARIANT, ASV3_FAST_CROPPED_VARIANT}:
         if research_profile != "normal" or parallel_research:
             raise ValueError("Fast ASv3 requires the normal non-parallel profile")
         context.services["asv3_fast"] = True
+        context.services["asv3_fast_retrieval"] = True
         workflow_variant = (
             ASV3_EXP_CROPPED_VARIANT
             if workflow_variant == ASV3_FAST_CROPPED_VARIANT
@@ -525,6 +530,8 @@ def run_asv3_loop(
         context.services["parallel_execution_slots"] = ParallelExecutionSlots()
         context.services["parallel_query_embeddings"] = ParallelQueryEmbeddingScope()
         context.services["scenario_request"] = question
+    elif context.services.get("asv3_fast_retrieval") is True:
+        context.services["parallel_query_embeddings"] = ParallelQueryEmbeddingScope()
     context.corpus_only = not (allow_external and profile.external_requested)
     ledger = EvidenceLedger()
     context.services["evidence"] = ledger
@@ -727,6 +734,24 @@ def run_asv3_loop(
         ),
     )
     notice_state: SourceNoticeState | None = None
+
+    def notice_lookup(
+        queries: list[str] | None, identifiers: list[str] | None
+    ) -> list[SourceNotice]:
+        capture = (
+            graph_step(
+                "asv3.source_notice_lookup",
+                {
+                    "query_count": len(queries or []),
+                    "notice_count": len(identifiers or []),
+                },
+            )
+            if context.services.get("asv3_fast") is True
+            else nullcontext()
+        )
+        with capture:
+            return broker.source_notices(queries, identifiers, context)
+
     if (
         checkpoint_workflow_variant
         in {
@@ -740,9 +765,7 @@ def run_asv3_loop(
     ):
         notice_state = SourceNoticeState(
             context,
-            lambda queries, identifiers: broker.source_notices(
-                queries, identifiers, context
-            ),
+            notice_lookup,
         )
         context.services[SOURCE_NOTICE_STATE_SERVICE] = notice_state
     if parallel_research or workflow_variant == ASV3_TUNED_VARIANT:
@@ -1053,13 +1076,6 @@ def run_asv3_loop(
                 )
                 if source_reviews is not None:
                     snapshot["legal_source_reviews"] = source_reviews.export()
-                if (
-                    context.services.get("asv3_fast") is True
-                    and FAST_HANDOFF in context.services
-                ):
-                    snapshot[FAST_HANDOFF] = copy.deepcopy(
-                        context.services[FAST_HANDOFF]
-                    )
                 if notice_state is not None:
                     snapshot["source_notices"] = notice_state.export()
                 if authority_requirements is not None:
@@ -1294,13 +1310,6 @@ def run_asv3_loop(
                     snapshot["legal_source_reviews"] = source_reviews.export()
                 if authority_requirements is not None:
                     snapshot["authority_requirements"] = authority_requirements.export()
-                if (
-                    context.services.get("asv3_fast") is True
-                    and FAST_HANDOFF in context.services
-                ):
-                    snapshot[FAST_HANDOFF] = copy.deepcopy(
-                        context.services[FAST_HANDOFF]
-                    )
                 if governing_acquisitions is not None:
                     if article_bindings is not None:
                         snapshot["article_bindings"] = article_bindings.export()
@@ -2501,8 +2510,6 @@ def run_asv3_loop(
             consumes_tool_budget=False,
         )
     )
-    if context.services.get("asv3_fast") is True:
-        registry.register(finish_research_spec(ledger, context))
     root_focused_repair = (
         CroppedFocusedRepair(cropped_repair_state)
         if cropped_repair_state is not None
@@ -2516,7 +2523,13 @@ def run_asv3_loop(
         evidence=ledger,
         on_receipt=record,
         checkpoint=checkpoint,
-        checkpoint_snapshot=(lambda: {}) if parallel_research else None,
+        checkpoint_snapshot=(lambda: {})
+        if parallel_research
+        or (
+            context.services.get("asv3_fast") is True
+            and cropped_repair_state is not None
+        )
+        else None,
         progress=progress,
         draft_guard=publication_guard,
         partial_submission=lambda: clarification or partial,
@@ -2730,7 +2743,6 @@ def run_asv3_loop(
             checkpoint_sequence = saved_sequence
             if parallel_answers is not None and question_research.answers:
                 question_research.assemble_retained_answers()
-        restore_fast_handoff(previous, ledger, context)
         if notice_state is not None:
             saved_notices = previous.get("source_notices") if previous else None
             if saved_notices is not None:
@@ -2996,16 +3008,23 @@ def run_asv3_loop(
     finally:
         primary_error = sys.exc_info()[0] is not None
         try:
-            if workers:
-                workers.close()
+            try:
+                if workers:
+                    workers.close()
+            finally:
+                teardown_error = sys.exc_info()[0] is not None
+                if checkpoint_writer is not None:
+                    try:
+                        checkpoint_writer.close()
+                    except BaseException:
+                        if not primary_error and not teardown_error:
+                            raise
+                        logger.exception(
+                            "Parallel checkpoint persistence failed during teardown"
+                        )
         finally:
-            teardown_error = sys.exc_info()[0] is not None
-            if checkpoint_writer is not None:
-                try:
-                    checkpoint_writer.close()
-                except BaseException:
-                    if not primary_error and not teardown_error:
-                        raise
-                    logger.exception(
-                        "Parallel checkpoint persistence failed during teardown"
-                    )
+            if cancellation_probe is not None:
+                with graph_step(
+                    "asv3.cancellation_checks", cancellation_probe.snapshot()
+                ):
+                    pass
