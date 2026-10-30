@@ -7,9 +7,18 @@ import json
 import re
 import unicodedata
 from collections.abc import Sequence
+from copy import deepcopy
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, StrictInt, StrictStr
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    JsonValue,
+    StrictInt,
+    StrictStr,
+    ValidationError,
+)
 
 from onyx.regulatory.indexing_jobs.vertex_batch import VertexBatchRequest
 
@@ -20,6 +29,8 @@ MAX_METADATA_REQUEST_BYTES = 8 * 1024 * 1024
 MAX_METADATA_RESPONSE_BYTES = 16 * 1024 * 1024
 MAX_METADATA_CATALOG_ENTRIES = 50_000
 TARGETS_PER_REQUEST = 8
+METADATA_OUTPUT_TOKENS = 32768
+METADATA_OUTPUT_RESERVE_TOKENS = 65536
 LEGAL_METADATA_FIELDS = frozenset(
     {
         "document_title",
@@ -169,6 +180,69 @@ class _TransportResult(BaseModel):
     warnings: list[str] = Field(default_factory=list, max_length=32)
 
 
+def _exact_metadata_targets(
+    result: _TransportResult, target_ids: Sequence[str]
+) -> bool:
+    ids = [target.chunk_id for target in result.chunks]
+    return (
+        len(set(ids)) == len(ids)
+        and set(ids) == set(target_ids)
+        and all(
+            len({fact.field for fact in target.fields}) == len(target.fields)
+            for target in result.chunks
+        )
+    )
+
+
+def metadata_response_needs_split(response: str, target_ids: Sequence[str]) -> bool:
+    """Classify shape failures only; the caller must first verify the provider envelope."""
+    if len(response.encode()) > 1024 * 1024:
+        return False
+    try:
+        result = _TransportResult.model_validate_json(response)
+    except ValidationError:
+        return True
+    return not _exact_metadata_targets(result, target_ids)
+
+
+def project_metadata_attempts(
+    previous_attempts: Sequence[tuple[str, str]],
+    *,
+    parent_target_ids: Sequence[str],
+    target_ids: Sequence[str],
+) -> list[tuple[str, str]]:
+    """Project exact parent targets while retaining the original ACK's provenance."""
+    parents, children = set(parent_target_ids), set(target_ids)
+    if (
+        not 1 <= len(parents) <= TARGETS_PER_REQUEST
+        or len(parents) != len(parent_target_ids)
+        or not children
+        or len(children) != len(target_ids)
+        or not children < parents
+    ):
+        raise ValueError(
+            "Metadata child targets must be a distinct strict parent subset"
+        )
+    projected = []
+    for request_hash, response in previous_attempts:
+        if re.fullmatch(r"[0-9a-f]{64}", request_hash) is None:
+            raise ValueError("Projected metadata requires its original request hash")
+        if len(response.encode()) > 1024 * 1024:
+            continue
+        try:
+            result = _TransportResult.model_validate_json(response)
+        except ValidationError:
+            continue
+        if not _exact_metadata_targets(result, parent_target_ids):
+            continue
+        child = _TransportResult(
+            chunks=[target for target in result.chunks if target.chunk_id in children],
+            warnings=result.warnings,
+        )
+        projected.append((request_hash, child.model_dump_json()))
+    return projected
+
+
 def build_metadata_evidence_catalog(
     chunks: Sequence[MetadataChunk],
 ) -> list[MetadataEvidence]:
@@ -307,13 +381,7 @@ def retain_validated_metadata_facts(
         previous = _TransportResult.model_validate_json(previous_response)
     except ValueError:
         return result
-    ids = [target.chunk_id for target in previous.chunks]
-    if len(set(ids)) != len(ids) or set(ids) != set(target_ids):
-        return result
-    if any(
-        len({fact.field for fact in target.fields}) != len(target.fields)
-        for target in previous.chunks
-    ):
+    if not _exact_metadata_targets(previous, target_ids):
         return result
     current = {target.chunk_id: target for target in result.chunks}
     merged: dict[str, ChunkLegalMetadata] = {}
@@ -380,13 +448,7 @@ def recover_metadata_response(
         current = _TransportResult.model_validate_json(response)
     except ValueError:
         return None
-    ids = [target.chunk_id for target in current.chunks]
-    if len(set(ids)) != len(ids) or set(ids) != set(target_ids):
-        return None
-    if any(
-        len({fact.field for fact in target.fields}) != len(target.fields)
-        for target in current.chunks
-    ):
+    if not _exact_metadata_targets(current, target_ids):
         return None
     invalid: set[tuple[str, MetadataField]] = set()
     hydrated: list[ChunkLegalMetadata] = []
@@ -529,12 +591,34 @@ def build_metadata_request(
         generation_config={
             "responseMimeType": "application/json",
             "responseJsonSchema": _response_schema(),
-            "maxOutputTokens": 32768,
+            "maxOutputTokens": METADATA_OUTPUT_TOKENS,
             "thinkingConfig": {"thinkingLevel": "medium"},
         },
     )
     _check_metadata_request_budget(request)
     return request
+
+
+def build_metadata_output_reserve_request(
+    request: VertexBatchRequest,
+) -> VertexBatchRequest | None:
+    """Reserve visible output without changing the original reasoning configuration."""
+    config = request.generation_config
+    if (
+        config is None
+        or type(config.get("maxOutputTokens")) is not int
+        or config["maxOutputTokens"] != METADATA_OUTPUT_TOKENS
+    ):
+        return None
+    reserved_config = deepcopy(config)
+    reserved_config["maxOutputTokens"] = METADATA_OUTPUT_RESERVE_TOKENS
+    reserved = VertexBatchRequest(
+        prompt=request.prompt,
+        system_instruction=request.system_instruction,
+        generation_config=reserved_config,
+    )
+    _check_metadata_request_budget(reserved)
+    return reserved
 
 
 def _check_metadata_request_budget(request: VertexBatchRequest) -> None:
