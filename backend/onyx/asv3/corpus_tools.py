@@ -1983,6 +1983,11 @@ def build_corpus_specs(
         stream = broker.iter_chunks(
             str(args["source_id"]), context, start=int(cast(int, args.get("start", 0)))
         )
+        stream_checks_context = (
+            context.services.get("asv3_fast") is True
+            and type(stream) is ChunkScan
+            and stream.context is context
+        )
         selection = EvidenceSelection(stream.source)
         match_chunks = 0
         match_overflow = False
@@ -1992,7 +1997,9 @@ def build_corpus_specs(
 
             compiled = regex.compile(pattern, flags=regex.IGNORECASE)
         for chunk in stream:
-            context.check_active()
+            # ChunkScan checks this same context immediately before every yield.
+            if not stream_checks_context:
+                context.check_active()
             if mode == "regex" and compiled is not None:
                 try:
                     spans = [
@@ -2035,6 +2042,8 @@ def build_corpus_specs(
             if match_chunks >= 30:
                 match_overflow = True
                 break
+        if stream_checks_context:
+            context.check_active()
         evidence, clipped = selection.items, selection.clipped
         more = stream.truncated or match_overflow or len(matches) > 200
         return ToolOutcome(

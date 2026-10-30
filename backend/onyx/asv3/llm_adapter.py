@@ -47,7 +47,10 @@ from onyx.asv3.judicial_sections import (
     judicial_disposition_gap,
     judicial_disposition_missing,
 )
-from onyx.asv3.legal_source_navigation import derive_provision_navigation_anchor
+from onyx.asv3.legal_source_navigation import (
+    ProvisionNavigationAnchor,
+    derive_provision_navigation_anchor,
+)
 from onyx.asv3.legal_source_reviews import LegalSourceReviews, annotate_navigation
 from onyx.asv3.legistation_metadata_transport import (
     LEGISTATION_METADATA_USAGE_RULE,
@@ -3488,6 +3491,8 @@ class ResearchModel:
             acquire_navigation = self.context.services.get(
                 "legal_source_navigation_acquire"
             )
+            acquired_navigation: set[ProvisionNavigationAnchor] = set()
+            deduplicate_navigation = self.context.services.get("asv3_fast") is True
             for number in sorted({identity[0] for identity in verified}):
                 item = ledger.get(number)
                 if item is not None:
@@ -3499,13 +3504,33 @@ class ResearchModel:
                             anchor.qualifier,
                         )
                     if callable(acquire_navigation) and anchor is not None:
+                        if deduplicate_navigation and anchor in acquired_navigation:
+                            self.context.check_active()
+                            continue
                         acquire = cast(
                             Callable[
                                 [EvidenceItem, RunContext], dict[str, JsonValue] | None
                             ],
                             acquire_navigation,
                         )
-                        acquire(item, self.context)
+                        acquired = acquire(item, self.context)
+                        if (
+                            deduplicate_navigation
+                            and isinstance(acquired, dict)
+                            and acquired.get("status") == "available"
+                        ):
+                            expected: dict[str, JsonValue] = {
+                                "anchor_source_id": anchor.source_id,
+                                "instrument_name": anchor.instrument_name,
+                                "instrument_number": anchor.instrument_number,
+                                "article_no": anchor.article_no,
+                                "qualifier": anchor.qualifier,
+                            }
+                            if all(
+                                key in acquired and acquired[key] == value
+                                for key, value in expected.items()
+                            ):
+                                acquired_navigation.add(anchor)
         if not native_original_cache:
             retained = self._native_turns_with_original_references(
                 retained,
