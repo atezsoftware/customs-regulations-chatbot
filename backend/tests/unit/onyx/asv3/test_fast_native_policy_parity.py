@@ -53,7 +53,20 @@ def test_response_policy_preserves_originals_tools_and_output_capacity(
         else message
         for message in prompt
     ]
-    assert (restored_prompt, tools, output) == before
+    if draft is None:
+        assert (restored_prompt, tools, output) == before
+    else:
+        before_text = "\n".join(str(message.content) for message in before[0])
+        after_text = "\n".join(str(message.content) for message in prompt)
+        record = full_record(ledger, 1)
+        for field in ("text", "source_id", "chunk_id", "text_hash"):
+            value = record[field]
+            assert isinstance(value, str)
+            assert value in before_text and value in after_text
+        assert draft in after_text
+        assert "retained_answer" in after_text
+        assert "retained_answer_edits" in str(tools)
+        assert output == before[2]
     assert ledger.get(1) is not None
     assert "finish_research" not in str(after[1])
 
@@ -66,6 +79,7 @@ def test_response_policy_preserves_originals_tools_and_output_capacity(
         (ASV3_FAST_VARIANT, "standard-fast-batched-io-v2"),
         (ASV3_FAST_CROPPED_VARIANT, "cropped-fast-batched-io-v2"),
         (ASV3_FAST_VARIANT, "standard-fast-primary-material-outcomes-v3"),
+        (ASV3_FAST_VARIANT, "standard-fast-action-primary-material-outcomes-v4"),
     ],
 )
 def test_previous_fast_protocol_cannot_resume_as_material_outcomes_policy(

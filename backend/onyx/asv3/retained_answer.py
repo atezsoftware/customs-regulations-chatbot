@@ -45,6 +45,11 @@ def retained_answer_enabled(context: RunContext) -> bool:
     return (
         parallel_execution_enabled(context)
         or context.services.get("asv3_workflow_variant") == ASV3_TUNED_VARIANT
+        or (
+            context.services.get("asv3_fast") is True
+            and context.services.get("asv3_exp_cropped") is not True
+            and context.depth == 0
+        )
     )
 
 

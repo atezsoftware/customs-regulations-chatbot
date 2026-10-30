@@ -43,6 +43,7 @@ from onyx.asv3.citation_numbers import extract_citation_numbers
 from onyx.asv3.cropped_article_bindings import cropped_identity_ledger
 from onyx.asv3.cropped_crossrefs import CroppedCrossReferencePolicy
 from onyx.asv3.evidence import EvidenceLedger
+from onyx.asv3.fast_material_review import FAST_MATERIAL_REVIEW_STOP_SERVICE
 from onyx.asv3.judicial_sections import (
     judicial_disposition_gap,
     judicial_disposition_missing,
@@ -121,6 +122,7 @@ from onyx.prompts.asv3.fast import (
     FAST_RESPONSE_POLICY,
     FAST_RESPONSE_POLICY_SERVICE,
     FAST_TEK_ACTION_RESEARCH,
+    FAST_TEK_CONDITION_REPAIR,
     FAST_TEK_MATERIAL_CONDITIONS,
 )
 
@@ -1527,6 +1529,9 @@ class ResearchModel:
             raise ValueError("provider_max_attempts must be a positive integer")
         for attempt in range(configured_attempts):
             check()
+            stop_reason = self.context.services.get(FAST_MATERIAL_REVIEW_STOP_SERVICE)
+            if isinstance(stop_reason, str) and self._fast_action_coordinator:
+                raise RunStopped(stop_reason)
             try:
                 return self._invoke_once(
                     prompt,
@@ -3249,6 +3254,10 @@ class ResearchModel:
             instruction += "\n\n" + FAST_MATERIAL_OUTCOMES
         if self._fast_action_coordinator:
             instruction += "\n\n" + FAST_TEK_MATERIAL_CONDITIONS
+            if view.publication_gap and view.publication_gap.get(
+                "asv3_fast_material_review"
+            ):
+                instruction += "\n\n" + FAST_TEK_CONDITION_REPAIR
         question: dict[str, JsonValue] = {
             "request": view.request,
         }
