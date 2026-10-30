@@ -4,7 +4,7 @@ on:
     inputs:
       operation:
         type: choice
-        options: [inspect, intake_inspect, approve_462, approve_465, approve_470]
+        options: [inspect, intake_inspect, intake_progress, approve_462, approve_465, approve_470]
         default: inspect
 permissions:
   contents: read
@@ -17,7 +17,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Read only batch inventory
-        if: inputs.operation != 'intake_inspect'
+        if: inputs.operation != 'intake_inspect' && inputs.operation != 'intake_progress'
         shell: bash
         run: |
           set -euo pipefail
@@ -82,7 +82,7 @@ jobs:
                               print(excerpt[:500])
           PY
       - name: Resume one existing reviewed proposal
-        if: inputs.operation != 'inspect' && inputs.operation != 'intake_inspect'
+        if: inputs.operation != 'inspect' && inputs.operation != 'intake_inspect' && inputs.operation != 'intake_progress'
         shell: bash
         env:
           OPERATION: ${{ inputs.operation }}
@@ -99,8 +99,10 @@ jobs:
             sh -ec '. /vault/secrets/config; export PYTHONPATH=/app; exec python - "$1"' sh "$proposal_id" < \
             backend/onyx/db/resume_amendment_approvals_309_310.py
       - name: Read only new-document intake diagnostics
-        if: inputs.operation == 'intake_inspect'
+        if: inputs.operation == 'intake_inspect' || inputs.operation == 'intake_progress'
         shell: bash
+        env:
+          INTAKE_OPERATION: ${{ inputs.operation }}
         run: |
           set -euo pipefail
           aws eks update-kubeconfig --name atez-dev-cluster --region eu-central-1
@@ -125,9 +127,14 @@ jobs:
           Path('/tmp/intake-target').write_text(pod + '\t' + container + '\n')
           PY
           IFS=$'\t' read -r pod container < /tmp/intake-target
+          case "$INTAKE_OPERATION" in
+            intake_inspect) intake_script=backend/onyx/db/diagnose_intake_approval.py ;;
+            intake_progress) intake_script=backend/onyx/db/diagnose_intake_progress.py ;;
+            *) exit 2 ;;
+          esac
           kubectl exec -i "$pod" -n customs-regulations-dev -c "$container" -- \
             sh -ec '. /vault/secrets/config; export PYTHONPATH=/app; exec python -' < \
-            backend/onyx/db/diagnose_intake_approval.py > /tmp/intake-diagnostic.raw
+            "$intake_script" > /tmp/intake-diagnostic.raw
           mkdir -p /tmp/intake-diagnostic
           python - <<'PY'
           import json
