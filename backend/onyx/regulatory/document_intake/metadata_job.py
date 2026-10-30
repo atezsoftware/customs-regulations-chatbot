@@ -235,6 +235,58 @@ def _extract_metadata_window(
                 raise
             return recovered
 
+    def cached_children_preferred(reserved: VertexBatchRequest) -> bool:
+        if (
+            _cached_metadata_request(
+                gateway=gateway,
+                request=reserved,
+                identity_prefix=identity_prefix,
+                heartbeat=heartbeat,
+                stopped=stopped,
+                output_pressure=None,
+            )
+            is not None
+        ):
+            return False
+        if len(targets) > 1:
+            midpoint = len(targets) // 2
+            for child in (targets[:midpoint], targets[midpoint:]):
+                cached_child = _cached_metadata_request(
+                    gateway=gateway,
+                    request=build_metadata_request(chunks, child),
+                    identity_prefix=identity_prefix,
+                    heartbeat=heartbeat,
+                    stopped=stopped,
+                    output_pressure=None,
+                )
+                if cached_child is not None:
+                    return True
+        return False
+
+    def reserve_on_exhaustion(
+        attempted: VertexBatchRequest, context: str | None, exhausted: bool
+    ) -> tuple[VertexBatchRequest, str | None, bool]:
+        nonlocal output_reserve_used
+        reserved = (
+            build_metadata_output_reserve_request(attempted)
+            if exhausted
+            and not output_reserve_used
+            and output_pressure.get(attempted.request_hash)
+            else None
+        )
+        if reserved is None or cached_children_preferred(reserved):
+            return attempted, context, exhausted
+        output_reserve_used = True
+        context, exhausted = _run_metadata_request(
+            gateway=gateway,
+            request=reserved,
+            identity_prefix=identity_prefix,
+            heartbeat=heartbeat,
+            stopped=stopped,
+            output_pressure=output_pressure,
+        )
+        return reserved, context, exhausted
+
     def semantic_feedback_request(
         failed_request: VertexBatchRequest, response: str, error: ValueError
     ) -> VertexBatchRequest | None:
@@ -302,6 +354,8 @@ def _extract_metadata_window(
                 else None
             )
             if reserved is not None:
+                if cached_children_preferred(reserved):
+                    raise _MetadataWindowNeedsSplit("structured_output")
                 output_reserve_used = True
                 reserved_context, reserved_exhausted = _run_metadata_request(
                     gateway=gateway,
@@ -349,6 +403,9 @@ def _extract_metadata_window(
                 stopped=stopped,
                 output_pressure=output_pressure,
             )
+            recovery, recovered_context, recovered_exhausted = reserve_on_exhaustion(
+                recovery, recovered_context, recovered_exhausted
+            )
             if recovered_exhausted:
                 raise _MetadataWindowNeedsSplit("token_budget")
             assert recovered_context is not None
@@ -370,19 +427,7 @@ def _extract_metadata_window(
         stopped=stopped,
         output_pressure=output_pressure,
     )
-    if exhausted and output_pressure.get(request.request_hash):
-        reserved = build_metadata_output_reserve_request(request)
-        if reserved is not None:
-            output_reserve_used = True
-            request = reserved
-            context, exhausted = _run_metadata_request(
-                gateway=gateway,
-                request=request,
-                identity_prefix=identity_prefix,
-                heartbeat=heartbeat,
-                stopped=stopped,
-                output_pressure=output_pressure,
-            )
+    request, context, exhausted = reserve_on_exhaustion(request, context, exhausted)
     if not exhausted:
         assert context is not None
         original_context = context
@@ -423,6 +468,10 @@ def _extract_metadata_window(
                         repair = scoped_repair
                 else:
                     cached_context, cached_exhausted = cached
+                    cached_request = repair
+                    repair, cached_context, cached_exhausted = reserve_on_exhaustion(
+                        repair, cached_context, cached_exhausted
+                    )
                     if cached_exhausted:
                         exhausted = True
                     else:
@@ -434,6 +483,10 @@ def _extract_metadata_window(
                             previous_attempts.append(
                                 (repair.request_hash, cached_context)
                             )
+                            if repair.request_hash != cached_request.request_hash:
+                                return failed_repair(
+                                    repair, cached_context, cached_error
+                                )
                             scoped_repair = build_metadata_body_scope_repair_request(
                                 request,
                                 context,
@@ -460,6 +513,10 @@ def _extract_metadata_window(
             )
             if cached is not None:
                 cached_context, exhausted = cached
+                cached_request = repair
+                repair, cached_context, exhausted = reserve_on_exhaustion(
+                    repair, cached_context, exhausted
+                )
                 if not exhausted:
                     assert cached_context is not None
                     try:
@@ -467,6 +524,8 @@ def _extract_metadata_window(
                         return accepted(repair, result)
                     except ValueError as error:
                         previous_attempts.append((repair.request_hash, cached_context))
+                        if repair.request_hash != cached_request.request_hash:
+                            return failed_repair(repair, cached_context, error)
                         recovery = semantic_feedback_request(
                             repair, cached_context, error
                         )
@@ -483,6 +542,9 @@ def _extract_metadata_window(
                 heartbeat=heartbeat,
                 stopped=stopped,
                 output_pressure=output_pressure,
+            )
+            repair, context, exhausted = reserve_on_exhaustion(
+                repair, context, exhausted
             )
         if not exhausted:
             assert context is not None
