@@ -1274,7 +1274,11 @@ class ResearchModel:
             if self.context.services.get("asv3_exp_cropped") is True:
                 from onyx.asv3.cropped_transport import serialize_cropped_payload
 
-                data = serialize_cropped_payload(payload, self._tokens)
+                data = serialize_cropped_payload(
+                    payload,
+                    self._tokens,
+                    validate_roots_once=self.context.services.get("asv3_fast") is True,
+                )
             elif (
                 self.context.services.get("asv3_exp_cheap") is True
                 and "original_metadata_codec" in payload
@@ -4101,7 +4105,11 @@ class ResearchModel:
             if self.context.services.get("asv3_exp_cropped") is True:
                 from onyx.asv3.cropped_transport import serialize_cropped_payload
 
-                current_content = serialize_cropped_payload(current, self._tokens)
+                current_content = serialize_cropped_payload(
+                    current,
+                    self._tokens,
+                    validate_roots_once=self.context.services.get("asv3_fast") is True,
+                )
             elif self.context.services.get("asv3_exp_cheap") is True and current.get(
                 "original_metadata_catalogue"
             ):

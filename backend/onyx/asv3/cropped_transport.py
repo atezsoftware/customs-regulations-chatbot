@@ -36,7 +36,10 @@ class CroppedInputOverflow(RunStopped):
 
 
 def serialize_cropped_payload(
-    payload: dict[str, JsonValue], token_counter: Callable[[str], int]
+    payload: dict[str, JsonValue],
+    token_counter: Callable[[str], int],
+    *,
+    validate_roots_once: bool = False,
 ) -> str:
     """Reuse only the reversible same-message codec, without Cheap policies."""
     original = serialize_cheap_payload(
@@ -48,6 +51,7 @@ def serialize_cropped_payload(
             "cropped_completion",
             "session_research",
         ),
+        validate_roots_once=validate_roots_once,
     )
     canonical = canonical_cropped_handoff_payload(payload)
     alternatives = [encode_cropped_handoff_transport(payload)]
@@ -71,6 +75,7 @@ def serialize_cropped_payload(
                 "cropped_completion",
                 "session_research",
             ),
+            validate_roots_once=validate_roots_once,
         )
         restored = expand_cropped_handoff_transport(json.loads(candidate))
         if json.dumps(

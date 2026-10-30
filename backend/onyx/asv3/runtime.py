@@ -1238,7 +1238,8 @@ def run_asv3_loop(
             checkpoint_writer.raise_if_failed()
         capture = (
             graph_step("asv3.checkpoint_capture", {})
-            if parallel_research and durable
+            if (parallel_research and durable)
+            or context.services.get("asv3_fast") is True
             else nullcontext()
         )
         with capture as capture_step:
