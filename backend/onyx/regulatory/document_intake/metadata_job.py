@@ -18,6 +18,10 @@ from onyx.db.labeling_configuration import (
     resolve_labeling_gateway,
 )
 from onyx.db.models import User
+from onyx.regulatory.document_intake.capacity import (
+    MetadataCapacityStopped,
+    run_with_metadata_capacity_retry,
+)
 from onyx.regulatory.document_intake.metadata import (
     MAX_METADATA_REQUEST_BYTES,
     MAX_METADATA_RESPONSE_BYTES,
@@ -425,12 +429,21 @@ def _run_metadata_request(
             "New-document metadata stopped after another window failed"
         )
     submission_key = _metadata_submission_key(identity_prefix, request)
-    heartbeat()
-    state = gateway.submit(
-        [request],
-        submission_key=submission_key,
-        max_jsonl_bytes=MAX_METADATA_REQUEST_BYTES,
-    )
+    try:
+        state = run_with_metadata_capacity_retry(
+            lambda: gateway.submit(
+                [request],
+                submission_key=submission_key,
+                max_jsonl_bytes=MAX_METADATA_REQUEST_BYTES,
+            ),
+            request_hash=request.request_hash,
+            heartbeat=heartbeat,
+            stopped=stopped,
+        )
+    except MetadataCapacityStopped:
+        raise _MetadataWindowStopped(
+            "New-document metadata stopped after another window failed"
+        ) from None
     if state.status != VertexBatchJobStatus.SUCCEEDED or not state.output_uri:
         raise ValueError("New-document metadata extraction did not complete")
     context, exhausted = _metadata_response(
