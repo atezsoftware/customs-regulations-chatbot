@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import logging
 import os
@@ -87,6 +88,11 @@ from onyx.asv3.legal_source_reviews import (
 from onyx.asv3.llm_adapter import (
     LanguageProfile,
     ResearchModel,
+)
+from onyx.asv3.model_composition import (
+    MODEL_COMPOSITION_SERVICE,
+    ModelBinding,
+    ModelComposition,
 )
 from onyx.asv3.models import (
     CapabilityCall,
@@ -271,18 +277,34 @@ def _trace_asv3(function: Callable[P, None]) -> Callable[P, None]:
     def wrapped(*args: P.args, **kwargs: P.kwargs) -> None:
         llm = cast(LLM, kwargs["llm"])
         identity = cast(LLMUserIdentity | None, kwargs.get("user_identity"))
+        metadata = ChatTraceMetadata(
+            chat_session_id=str(kwargs["chat_session_id"]),
+            user_id=identity.user_id
+            if identity
+            else str(cast(User, kwargs["user"]).id),
+            user_message_id=cast(int, kwargs["user_message_id"]),
+            assistant_message_id=cast(int, kwargs["assistant_message_id"]),
+            model_name=llm.config.model_name,
+        ).model_dump()
+        composition = kwargs.get("model_composition")
+        if isinstance(composition, ModelComposition):
+            history = cast(list[ChatMessageSimple], kwargs["simple_chat_history"])
+            question = next(
+                (
+                    row.message
+                    for row in reversed(history)
+                    if row.message_type == MessageType.USER
+                ),
+                "",
+            )
+            metadata[MODEL_COMPOSITION_SERVICE] = composition.identity()
+            metadata["asv3_question_sha256"] = hashlib.sha256(
+                question.encode()
+            ).hexdigest()
         with ensure_trace(
             "run_asv3_loop",
             group_id=str(kwargs["chat_session_id"]),
-            metadata=ChatTraceMetadata(
-                chat_session_id=str(kwargs["chat_session_id"]),
-                user_id=identity.user_id
-                if identity
-                else str(cast(User, kwargs["user"]).id),
-                user_message_id=cast(int, kwargs["user_message_id"]),
-                assistant_message_id=cast(int, kwargs["assistant_message_id"]),
-                model_name=llm.config.model_name,
-            ).model_dump(),
+            metadata=metadata,
         ):
             if kwargs.get("workflow_variant") in {
                 ASV3_FAST_VARIANT,
@@ -363,6 +385,7 @@ def run_asv3_loop(
     workflow_variant: str = ASV3_STANDARD_VARIANT,
     research_llm: LLM | None = None,
     repair_llm: LLM | None = None,
+    model_composition: ModelComposition | None = None,
     resume_message_id: int | None = None,
     custom_agent_prompt: str | None = None,
     allow_external: bool = False,
@@ -371,6 +394,28 @@ def run_asv3_loop(
     inject_memories_in_prompt: bool = True,
 ) -> None:
     start = time.monotonic()
+    composition_identity: dict[str, JsonValue] | None = None
+    if model_composition is not None:
+        if reasoning_effort != ReasoningEffort.LOW:
+            raise ValueError("Model composition requires LOW reasoning effort")
+        if (
+            workflow_variant not in {ASV3_FAST_VARIANT, ASV3_FAST_CROPPED_VARIANT}
+            or research_profile != "normal"
+            or parallel_research
+        ):
+            raise ValueError(
+                "Model composition requires a normal non-parallel Fast workflow"
+            )
+        coordinator = model_composition.binding("coordinator")
+        if (
+            ModelBinding(llm, token_counter, coordinator.provider_id).descriptor()
+            != coordinator.descriptor()
+        ):
+            raise ValueError(
+                "The selected primary model must match the composition coordinator"
+            )
+        llm, token_counter = coordinator.llm, coordinator.token_counter
+        composition_identity = model_composition.identity()
     question = next(
         (
             m.message
@@ -389,7 +434,11 @@ def run_asv3_loop(
     bounded_guardrails = guarded_experimental or guardrails_v3
     context = RunContext(
         language="und",
-        timeout_seconds=1800 if bounded_guardrails else float("inf"),
+        timeout_seconds=480
+        if model_composition is not None
+        else 1800
+        if bounded_guardrails
+        else float("inf"),
         research_reserve_seconds=(
             120 if guardrails_v3 else 30 if guarded_experimental else 0
         ),
@@ -413,6 +462,8 @@ def run_asv3_loop(
             ),
         },
     )
+    if model_composition is not None:
+        context.services[MODEL_COMPOSITION_SERVICE] = model_composition
     if custom_agent_prompt:
         context.services["assistant_instructions"] = custom_agent_prompt
     scope = IndexFilters(
@@ -442,6 +493,11 @@ def run_asv3_loop(
     ):
         raise ValueError("ASv3 resume requires the same authorized scope and question")
     validate_asv3_variant_resume(workflow_variant, previous)
+    if (
+        previous is not None
+        and previous.get(MODEL_COMPOSITION_SERVICE) != composition_identity
+    ):
+        raise ValueError("ASv3 resume requires the same model composition")
     checkpoint_workflow_variant = workflow_variant
     if workflow_variant in {ASV3_FAST_VARIANT, ASV3_FAST_CROPPED_VARIANT}:
         if research_profile != "normal" or parallel_research:
@@ -520,14 +576,20 @@ def run_asv3_loop(
         raise ValueError("Saved parallel research uses a different session policy")
     if research_profile == "experimental" or workflow_variant == ASV3_TUNED_VARIANT:
         research_llm = None
+    if (
+        model_composition is not None
+        and checkpoint_workflow_variant == ASV3_FAST_VARIANT
+    ):
+        research_llm = model_composition.binding("routine").llm
     answer_llm = None
-    if uses_source_answer_model(workflow_variant, llm):
+    if model_composition is None and uses_source_answer_model(workflow_variant, llm):
         # Resolve visibility and user access before starting paid research.
         answer_llm = source_answer_model(user)
         llm = llm.with_temperature(0.1)
         context.services["explicit_research_temperature"] = True
     elif (
-        workflow_variant == ASV3_TUNED_VARIANT
+        model_composition is None
+        and workflow_variant == ASV3_TUNED_VARIANT
         and llm.config.model_provider == "vertex_ai"
         and llm.config.model_name.startswith("gemini-")
         and llm.config.temperature == 0.1
@@ -538,7 +600,11 @@ def run_asv3_loop(
     material_review_identity: dict[str, JsonValue] | None = None
     material_review_token_counter = None
     if checkpoint_workflow_variant == ASV3_FAST_VARIANT:
-        material_review_llm = fast_material_review_model(user)
+        material_review_llm = (
+            model_composition.binding("verifier").llm
+            if model_composition is not None
+            else fast_material_review_model(user)
+        )
         material_review_identity = {
             "provider": material_review_llm.config.model_provider,
             "model": material_review_llm.config.model_name,
@@ -548,7 +614,11 @@ def run_asv3_loop(
             and previous.get("fast_material_review_model") != material_review_identity
         ):
             raise ValueError("Fast ASv3 resume requires the same material review model")
-        material_review_token_counter = get_llm_token_counter(material_review_llm)
+        material_review_token_counter = (
+            model_composition.binding("verifier").token_counter
+            if model_composition is not None
+            else get_llm_token_counter(material_review_llm)
+        )
     context.language = profile.language
     context.services["research_profile"] = research_profile
     context.services["asv3_legacy_search_payload"] = workflow_variant in {
@@ -768,7 +838,9 @@ def run_asv3_loop(
     broker = CorpusBroker(
         user,
         scope,
-        vision_llm=research_llm or llm,
+        vision_llm=model_composition.binding("routine").llm
+        if model_composition is not None
+        else research_llm or llm,
         allow_numbered_title_fallback=(
             research_profile == "experimental" or workflow_variant == ASV3_TUNED_VARIANT
         ),
@@ -853,12 +925,17 @@ def run_asv3_loop(
         model.restore_native_sampling(previous)
     search = next((tool for tool in tools if isinstance(tool, SearchTool)), None)
     if search is not None and (
-        research_llm is not None
+        model_composition is not None
+        or research_llm is not None
         or research_profile == "experimental"
         or workflow_variant == ASV3_TUNED_VARIANT
     ):
         search = search.fork_for_independent_context()
-        search.llm = research_llm or llm
+        search.llm = (
+            model_composition.binding("search").llm
+            if model_composition is not None
+            else research_llm or llm
+        )
 
     def search_history(child: RunContext) -> list[ChatMessageSimple]:
         private = child.services.get("search_message_history")
@@ -1440,6 +1517,10 @@ def run_asv3_loop(
                     snapshot["fast_material_review_model"] = dict(
                         material_review_identity
                     )
+                if composition_identity is not None:
+                    snapshot[MODEL_COMPOSITION_SERVICE] = copy.deepcopy(
+                        composition_identity
+                    )
                 augmentation_seconds = time.monotonic() - augmentation_started
                 submit_started = time.monotonic()
                 if checkpoint_writer is not None:
@@ -1557,11 +1638,16 @@ def run_asv3_loop(
             " ".join(f"[{n}]" for n in numbers) if isinstance(numbers, list) else ""
         )
         verifier = ResearchModel(
-            research_llm or llm,
+            model_composition.binding("verifier").llm
+            if model_composition is not None
+            else research_llm or llm,
             child,
             user_identity=user_identity,
             reasoning_effort=reasoning_effort,
-            token_counter=token_counter,
+            token_counter=model_composition.binding("verifier").token_counter
+            if model_composition is not None
+            else token_counter,
+            composition_role="verifier" if model_composition is not None else None,
         )
         child.consume_research_decision()
         report = verifier.invoke_verification(
@@ -2145,6 +2231,7 @@ def run_asv3_loop(
             user_identity=user_identity,
             reasoning_effort=reasoning_effort,
             token_counter=material_review_token_counter,
+            composition_role="verifier" if model_composition is not None else None,
         )
         try:
             raw = verifier.invoke_text(
