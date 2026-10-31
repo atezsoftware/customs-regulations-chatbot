@@ -34,8 +34,9 @@ def request() -> SendMessageRequest:
 
 
 @pytest.mark.parametrize("variant", ["asv3_fast", "asv3_fast_cropped"])
+@pytest.mark.parametrize("api_normalized", [False, True])
 def test_composition_passes_actual_caller_persona_and_workflow_to_resolver(
-    monkeypatch: pytest.MonkeyPatch, variant: str
+    monkeypatch: pytest.MonkeyPatch, variant: str, api_normalized: bool
 ) -> None:
     user, persona = MagicMock(spec=User), MagicMock(spec=Persona)
     user.role = UserRole.ADMIN
@@ -57,8 +58,11 @@ def test_composition_passes_actual_caller_persona_and_workflow_to_resolver(
             "parallel_research": False,
         }
     )
+    selected_request = request()
+    if api_normalized:
+        selected_request.origin = MessageOrigin.API
     result = asv3_composition.resolve_chat_model_composition(
-        request(), user, persona, workflow, selected
+        selected_request, user, persona, workflow, selected
     )
     assert result is composition
     resolver.assert_called_once_with(
@@ -97,7 +101,7 @@ def test_composition_cannot_bypass_authorization_or_silently_replace_primary(
     selected_request = request()
     if defect == "origin":
         selected_request = selected_request.model_copy(
-            update={"origin": MessageOrigin.API}
+            update={"origin": MessageOrigin.WEBAPP}
         )
     workflow = ASv3WorkflowSelection.model_validate(
         {
@@ -133,7 +137,9 @@ def test_default_requests_never_resolve_composition_models(
     resolver.assert_not_called()
 
 
-@pytest.mark.parametrize("defect", ["unknown", "not_fast", "origin", "parallel"])
+@pytest.mark.parametrize(
+    "defect", ["unknown", "not_fast", "origin", "api_origin", "parallel"]
+)
 def test_request_schema_rejects_unregistered_or_wrong_scope_profiles(
     defect: str,
 ) -> None:
@@ -142,10 +148,40 @@ def test_request_schema_rejects_unregistered_or_wrong_scope_profiles(
         "unknown": {"asv3_model_profile": "arbitrary-model-routing"},
         "not_fast": {"asv3_fast": False},
         "origin": {"origin": "webapp"},
+        "api_origin": {"origin": "api"},
         "parallel": {"asv3_parallel_research": True},
     }
     with pytest.raises(ValidationError):
         SendMessageRequest.model_validate({**payload, **changes[defect]})
+
+
+@pytest.mark.parametrize(
+    "role", [UserRole.BASIC, UserRole.CURATOR, UserRole.GLOBAL_CURATOR]
+)
+@pytest.mark.parametrize("api_normalized", [False, True])
+def test_nonadmin_remains_rejected_before_resolution_for_both_internal_origins(
+    monkeypatch: pytest.MonkeyPatch, role: UserRole, api_normalized: bool
+) -> None:
+    selected_request = request()
+    if api_normalized:
+        selected_request.origin = MessageOrigin.API
+    user = MagicMock(spec=User)
+    user.role = role
+    resolver = MagicMock(side_effect=AssertionError("Unauthorized model resolution"))
+    monkeypatch.setattr(asv3_composition, "resolve_model_composition", resolver)
+    with pytest.raises(OnyxError, match="administrator"):
+        asv3_composition.resolve_chat_model_composition(
+            selected_request,
+            user,
+            MagicMock(spec=Persona),
+            ASv3WorkflowSelection(
+                research_profile="normal",
+                parallel_research=False,
+                workflow_variant="asv3_fast",
+            ),
+            MagicMock(spec=LLM),
+        )
+    resolver.assert_not_called()
 
 
 @pytest.mark.parametrize("cropped", [False, True])
