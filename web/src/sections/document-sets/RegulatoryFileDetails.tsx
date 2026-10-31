@@ -10,6 +10,7 @@ import { cn } from "@opal/utils";
 import InputDatePicker from "@/refresh-components/inputs/InputDatePicker";
 import InputTypeIn from "@/refresh-components/inputs/InputTypeIn";
 import { useFileChunks } from "@/lib/regulatory/hooks";
+import { chunkEditRestriction } from "@/lib/regulatory/chunkEditing";
 import type {
   RegulatoryChunk,
   RegulatoryChunkUpdate,
@@ -62,9 +63,15 @@ interface ChunkEditModalProps {
   chunk: RegulatoryChunk;
   onClose: () => void;
   onSaved: () => void;
+  indexed?: boolean;
 }
 
-function ChunkEditModal({ chunk, onClose, onSaved }: ChunkEditModalProps) {
+export function ChunkEditModal({
+  chunk,
+  onClose,
+  onSaved,
+  indexed = true,
+}: ChunkEditModalProps) {
   const [text, setText] = useState(chunk.text);
   const [metadataJson, setMetadataJson] = useState(
     JSON.stringify(chunk.chunk_metadata, null, 2)
@@ -111,6 +118,7 @@ function ChunkEditModal({ chunk, onClose, onSaved }: ChunkEditModalProps) {
     }
 
     const update: RegulatoryChunkUpdate = {
+      expected_updated_at: chunk.updated_at,
       text,
       chunk_metadata: metadata,
       heading_path: headingPath,
@@ -125,7 +133,11 @@ function ChunkEditModal({ chunk, onClose, onSaved }: ChunkEditModalProps) {
     setSaving(true);
     try {
       await patchChunk(chunk.id, update);
-      toast.success("Chunk updated and re-indexed.");
+      toast.success(
+        indexed
+          ? "Chunk updated and re-indexed."
+          : "Chunk kaydedildi. Aramaya açmak için dosyayı indeksleyin."
+      );
       onSaved();
       onClose();
     } catch (requestError) {
@@ -138,6 +150,7 @@ function ChunkEditModal({ chunk, onClose, onSaved }: ChunkEditModalProps) {
   }, [
     chunk,
     headingPathJson,
+    indexed,
     metadataJson,
     onClose,
     onSaved,
@@ -160,6 +173,7 @@ function ChunkEditModal({ chunk, onClose, onSaved }: ChunkEditModalProps) {
                 Text
               </Text>
               <InputTextArea
+                aria-label="Chunk metni"
                 value={text}
                 onChange={(event) => setText(event.target.value)}
                 rows={6}
@@ -227,7 +241,7 @@ function ChunkEditModal({ chunk, onClose, onSaved }: ChunkEditModalProps) {
             Cancel
           </Button>
           <Button onClick={() => void handleSave()} disabled={saving}>
-            {saving ? "Saving…" : "Save & Re-index"}
+            {saving ? "Saving…" : indexed ? "Save & Re-index" : "Kaydet"}
           </Button>
         </Modal.Footer>
       </Modal.Content>
@@ -236,10 +250,12 @@ function ChunkEditModal({ chunk, onClose, onSaved }: ChunkEditModalProps) {
 }
 
 interface RegulatoryFileDetailsProps {
-  file: ProjectFile;
+  file: Pick<ProjectFile, "id" | "name">;
   onFileRenamed: (name: string) => void;
   lineageEnabled?: boolean;
   onOpenRelatedFile?: (fileId: string) => void;
+  readOnly?: boolean;
+  indexed?: boolean;
 }
 
 interface EditingChunkState {
@@ -252,6 +268,8 @@ export default function RegulatoryFileDetails({
   onFileRenamed,
   lineageEnabled = false,
   onOpenRelatedFile,
+  readOnly = false,
+  indexed = true,
 }: RegulatoryFileDetailsProps) {
   const [chunkPage, setChunkPage] = useState({ fileId: file.id, offset: 0 });
   const chunkOffset = chunkPage.fileId === file.id ? chunkPage.offset : 0;
@@ -316,7 +334,7 @@ export default function RegulatoryFileDetails({
 
   return (
     <div className="flex flex-col gap-4">
-      <div className="flex items-center gap-2">
+      <div className="flex flex-wrap items-center gap-2">
         {renaming ? (
           <>
             <InputTypeIn
@@ -333,14 +351,17 @@ export default function RegulatoryFileDetails({
           </>
         ) : (
           <>
-            <Text font="heading-h3" color="text-05">
-              {file.name}
-            </Text>
+            <div className="min-w-0 flex-1 break-words [overflow-wrap:anywhere]">
+              <Text font="heading-h3" color="text-05">
+                {file.name}
+              </Text>
+            </div>
             <Button
               prominence="tertiary"
               icon={SvgEdit}
               size="sm"
               tooltip="Rename file"
+              disabled={readOnly}
               onClick={() => {
                 setNewFileName(file.name);
                 setRenaming(true);
@@ -395,7 +416,7 @@ export default function RegulatoryFileDetails({
                 : "border-border-02"
             )}
           >
-            <div className="flex items-center justify-between gap-2">
+            <div className="flex flex-wrap items-center justify-between gap-2">
               <Text font="secondary-body" color="text-03">
                 {`#${chunk.position} · ${chunk.chunk_type ?? "text"} · ${chunk.heading_path.join(" > ")}`}
               </Text>
@@ -422,12 +443,19 @@ export default function RegulatoryFileDetails({
                   prominence="tertiary"
                   icon={SvgEdit}
                   size="sm"
-                  tooltip="Edit chunk"
+                  tooltip={chunkEditRestriction(chunk) ?? "Edit chunk"}
+                  disabled={readOnly || chunkEditRestriction(chunk) !== null}
                   aria-label={`Edit chunk ${chunk.position}`}
                   onClick={() => setEditingChunk({ fileId: file.id, chunk })}
                 />
               </div>
             </div>
+
+            {chunkEditRestriction(chunk) && (
+              <Text font="secondary-body" color="text-03">
+                {chunkEditRestriction(chunk) ?? ""}
+              </Text>
+            )}
 
             <Text font="main-ui-body" color="text-05" as="p">
               {chunk.text}
@@ -475,6 +503,7 @@ export default function RegulatoryFileDetails({
       {currentEditingChunk && (
         <ChunkEditModal
           chunk={currentEditingChunk}
+          indexed={indexed}
           onClose={() => setEditingChunk(null)}
           onSaved={() => void refreshChunks()}
         />

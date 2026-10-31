@@ -86,6 +86,7 @@ class RegulatoryChunkUpdateRequest(BaseModel):
     """Partial chunk edit. Omitted fields stay unchanged; validity dates may
     be explicitly nulled to clear them."""
 
+    expected_updated_at: datetime.datetime | None = None
     text: str | None = None
     heading_path: list[str] | None = None
     chunk_metadata: dict[str, Any] | None = None

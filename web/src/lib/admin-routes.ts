@@ -86,6 +86,12 @@ export const ADMIN_ROUTES = {
     title: "Updates",
     sidebarLabel: "Updates",
   },
+  LEGISTATIONS: {
+    path: "/admin/legistations",
+    icon: SvgBookOpen,
+    title: "Legistations",
+    sidebarLabel: "Legistations",
+  },
   BENCHMARK: {
     path: "/admin/benchmark",
     icon: SvgBarChart,

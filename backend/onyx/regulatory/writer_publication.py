@@ -27,7 +27,7 @@ from onyx.utils.logger import setup_logger
 logger = setup_logger()
 
 if TYPE_CHECKING:
-    from datetime import date
+    from datetime import date, datetime
     from typing import Literal
     from uuid import UUID
 
@@ -427,6 +427,7 @@ def correct_owned_chunk(
     client: Elasticsearch,
     chunk_id: str,
     *,
+    expected_updated_at: "datetime | None" = None,
     text: str | None = None,
     heading_path: list[str] | None = None,
     chunk_metadata: dict[str, "JsonValue"] | None = None,
@@ -435,6 +436,7 @@ def correct_owned_chunk(
 ) -> FileOwnership:
     from datetime import date
 
+    from onyx.db.regulatory_chunk_edits import require_owned_chunk_revision
     from onyx.db.regulatory_chunks import update_chunk
     from onyx.db.regulatory_writer_publication import (
         apply_owned_deferred_edit,
@@ -446,6 +448,8 @@ def correct_owned_chunk(
 
     owner = recover_owned_writer_before_next(owner)
     with publication_heartbeat(owner) as lost:
+        if expected_updated_at is not None:
+            require_owned_chunk_revision(owner, chunk_id, expected_updated_at)
         inputs = load_owned_writer_inputs(owner)
         rows = canonical_snapshot_rows(inputs.canonical)
         target = next((row for row in rows if row.id == chunk_id), None)
