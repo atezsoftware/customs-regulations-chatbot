@@ -21,7 +21,11 @@ def resolve_chat_model_composition(
 ) -> ModelComposition | None:
     if request.asv3_model_profile is None:
         return None
-    if user.role != UserRole.ADMIN or request.origin != MessageOrigin.BENCHMARK:
+    # Authenticated API-key/PAT chat requests have their origin normalized by the endpoint.
+    if user.role != UserRole.ADMIN or request.origin not in {
+        MessageOrigin.BENCHMARK,
+        MessageOrigin.API,
+    }:
         raise OnyxError(
             OnyxErrorCode.INSUFFICIENT_PERMISSIONS,
             "Model composition benchmarks require an administrator.",
