@@ -37,12 +37,20 @@ export async function patchChunk(
   chunkId: string,
   update: RegulatoryChunkUpdate
 ): Promise<RegulatoryChunk> {
-  const response = await fetch(`/api/regulatory/chunks/${chunkId}`, {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(update),
-  });
+  const response = await fetch(
+    `/api/regulatory/chunks/${encodeURIComponent(chunkId)}`,
+    {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(update),
+    }
+  );
   if (!response.ok) {
+    if (response.status === 409) {
+      throw new Error(
+        "Chunk değişmiş veya başka bir işlem tarafından güncelleniyor. Taslağınızı kopyalayıp son sürümü yeniden açın."
+      );
+    }
     handleRequestError("Update chunk", response);
   }
   return response.json();

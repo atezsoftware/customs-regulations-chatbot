@@ -26,6 +26,7 @@ export interface RegulatoryChunkPage {
 }
 
 export interface RegulatoryChunkUpdate {
+  expected_updated_at?: string;
   text?: string;
   heading_path?: string[];
   chunk_metadata?: Record<string, unknown>;

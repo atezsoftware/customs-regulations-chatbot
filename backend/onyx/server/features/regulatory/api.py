@@ -417,6 +417,7 @@ def patch_chunk(
 
     from uuid import uuid4
 
+    from onyx.db.regulatory_chunk_edits import ChunkEditConflict
     from onyx.db.regulatory_publication import PublicationStore
     from onyx.document_index.elasticsearch.client import ElasticsearchClient
     from onyx.document_index.publication_models import PublicationScope
@@ -439,12 +440,15 @@ def patch_chunk(
                 owner,
                 transport.publication_client(),
                 chunk_id,
+                expected_updated_at=update_request.expected_updated_at,
                 text=update_request.text,
                 heading_path=update_request.heading_path,
                 chunk_metadata=update_request.chunk_metadata,
                 validity_start_date=validity_start,
                 validity_end_date=validity_end,
             )
+    except ChunkEditConflict as error:
+        raise OnyxError(OnyxErrorCode.CONFLICT, str(error)) from error
     finally:
         try:
             authority.release(owner)
