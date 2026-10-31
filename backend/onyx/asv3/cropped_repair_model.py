@@ -11,6 +11,11 @@ from pydantic import BaseModel, JsonValue
 from onyx.asv3.citation_numbers import extract_citation_numbers
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.llm_adapter import ResearchModel, _NativeOriginalCatalogue
+from onyx.asv3.model_composition.models import (
+    MODEL_COMPOSITION_SERVICE,
+    CompositionRole,
+    get_model_composition,
+)
 from onyx.asv3.models import Decision, HarnessView, RunStopped
 from onyx.asv3.performance import FAST_TIMING_SERVICE
 from onyx.asv3.retained_answer import resolve_retained_answer
@@ -47,6 +52,7 @@ _SERVICES = frozenset(
         "cropped_research_controller",
         FAST_TIMING_SERVICE,
         "asv3_fast_response_policy",
+        MODEL_COMPOSITION_SERVICE,
     }
 )
 _TERMINALS = frozenset({"submit_answer", "submit_partial_answer"})
@@ -94,7 +100,9 @@ class _FreshRepairModel(ResearchModel):
         )
 
 
-def fresh_model(model: ResearchModel) -> ResearchModel:
+def fresh_model(
+    model: ResearchModel, *, role: CompositionRole | None = None
+) -> ResearchModel:
     """Share source ownership and execution fences without sharing writer receipts."""
     if (
         model.context.services.get("asv3_exp_cropped") is not True
@@ -115,8 +123,10 @@ def fresh_model(model: ResearchModel) -> ResearchModel:
         reasoning_effort=model.reasoning_effort,
         token_counter=model.token_counter,
         lean_native_mode=model.lean_native_mode,
+        composition_role=role if get_model_composition(context) is not None else None,
     )
-    fresh._native_output_capacity = model._native_output_capacity
+    if get_model_composition(context) is None:
+        fresh._native_output_capacity = model._native_output_capacity
     return fresh
 
 
@@ -210,7 +220,11 @@ def integrate_repair(
             "Cropped integration requires an owned rejected draft and checks"
         )
     originals, required = _originals(model, view, records)
-    fresh = fresh_model(model)
+    fresh = (
+        fresh_model(model, role="repair")
+        if get_model_composition(model.context) is not None
+        else fresh_model(model)
+    )
     instructions = fresh.context.services.get("assistant_instructions")
     fresh.context.services["assistant_instructions"] = (
         instructions + "\n\n" if isinstance(instructions, str) and instructions else ""

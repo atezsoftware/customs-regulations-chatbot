@@ -26,6 +26,7 @@ from onyx.asv3.cropped_repair_state import (
     CroppedRepairTarget,
     extract_repair_targets,
 )
+from onyx.asv3.model_composition.models import get_model_composition
 from onyx.asv3.models import (
     CapabilityCall,
     Decision,
@@ -403,7 +404,11 @@ class CroppedFocusedRepair:
                 if (spec := harness.registry.get(name)) is not None
                 and not spec.external
             ]
-            planner = fresh_model(model)
+            planner = (
+                fresh_model(model, role="routine")
+                if get_model_composition(harness.context) is not None
+                else fresh_model(model)
+            )
             payload: dict[str, JsonValue] = {
                 "request": self.state.request,
                 "deficiency": target.model_dump(mode="json"),
@@ -495,7 +500,11 @@ class CroppedFocusedRepair:
                 include_witness_spans=True,
             )
         )
-        checker = fresh_model(model)
+        checker = (
+            fresh_model(model, role="verifier")
+            if get_model_composition(harness.context) is not None
+            else fresh_model(model)
+        )
         payload: dict[str, JsonValue] = {
             "request": self.state.request,
             "deficiency": {

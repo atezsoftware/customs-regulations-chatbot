@@ -210,6 +210,28 @@ def _span_contents(span: Span[Any]) -> tuple[Any, Any, Any, dict[str, Any], str]
             "image_count": data.image_count,
             "time_to_first_action_seconds": data.time_to_first_action_seconds,
         }
+        configuration = data.model_config or {}
+        profile = configuration.get("asv3_composition_profile")
+        role = configuration.get("asv3_composition_role")
+        version = configuration.get("asv3_composition_version")
+        provider_id = configuration.get("asv3_composition_provider_id")
+        if (
+            isinstance(profile, str)
+            and re.fullmatch(r"[a-z][a-z0-9_]{0,63}", profile)
+            and isinstance(role, str)
+            and role
+            in {"coordinator", "routine", "search", "author", "repair", "verifier"}
+            and isinstance(version, str)
+            and re.fullmatch(r"[1-9][0-9]{0,8}", version)
+            and isinstance(provider_id, str)
+            and re.fullmatch(r"[1-9][0-9]{0,8}", provider_id)
+        ):
+            attributes.update(
+                asv3_composition_profile=profile,
+                asv3_composition_role=role,
+                asv3_composition_version=int(version),
+                asv3_composition_provider_id=int(provider_id),
+            )
         operation = str(
             redact_graph_value(
                 str((data.model_config or {}).get("flow") or "generation")

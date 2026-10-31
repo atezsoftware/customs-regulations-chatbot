@@ -1790,6 +1790,9 @@ def _run_models(
                 elif setup.new_msg_req.atez_search_v3 or _uses_deep_asv3(setup):
                     from onyx.asv3.runtime import run_asv3_loop
                     from onyx.asv3.workflow_variant import resolve_asv3_workflow
+                    from onyx.chat.asv3_composition import (
+                        resolve_chat_model_composition,
+                    )
 
                     if setup.persona.id != DEFAULT_PERSONA_ID:
                         raise ValueError("ASv3 requires the default assistant")
@@ -1894,6 +1897,9 @@ def _run_models(
                         ),
                     )
                     research_profile = workflow.research_profile
+                    model_composition = resolve_chat_model_composition(
+                        setup.new_msg_req, user, setup.persona, workflow, model_llm
+                    )
                     if fast_resume or fast_cropped_resume:
                         retain_fast_response_workflow(
                             message_id=setup.reserved_messages[model_idx].id,
@@ -1904,7 +1910,9 @@ def _run_models(
                             model_idx
                         ].workflow = workflow.workflow_variant
                     research_llm = (
-                        None
+                        model_composition.binding("routine").llm
+                        if model_composition is not None
+                        else None
                         if research_profile == "experimental"
                         or workflow.selected_model_only
                         else model_llm.with_model(
@@ -1924,7 +1932,8 @@ def _run_models(
                         )
                     )
                     if (
-                        research_llm is not None
+                        model_composition is None
+                        and research_llm is not None
                         and research_llm.config.api_key != model_llm.config.api_key
                     ):
                         with get_session_with_current_tenant() as cost_db_session:
@@ -1978,6 +1987,7 @@ def _run_models(
                         llm=model_llm,
                         research_llm=research_llm,
                         repair_llm=repair_llm,
+                        model_composition=model_composition,
                         token_counter=get_llm_token_counter(model_llm),
                         user=user,
                         filters=_global_regulatory_search_filters(setup),

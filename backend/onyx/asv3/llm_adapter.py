@@ -57,6 +57,10 @@ from onyx.asv3.legistation_metadata_transport import (
     LEGISTATION_METADATA_USAGE_RULE,
     has_legistation_annotations,
 )
+from onyx.asv3.model_composition.models import (
+    CompositionRole,
+    get_model_composition,
+)
 from onyx.asv3.models import (
     CapabilityCall,
     Decision,
@@ -854,6 +858,7 @@ class ResearchModel:
         lean_native_mode: bool = False,
         research_llm: LLM | None = None,
         answer_llm: LLM | None = None,
+        composition_role: CompositionRole | None = None,
     ) -> None:
         if answer_llm is not None and (
             context.services.get("asv3_workflow_variant") != ASV3_TUNED_VARIANT
@@ -885,6 +890,18 @@ class ResearchModel:
         )
         self._fast_routine_research_llm = self.research_llm
         self.context = context
+        self._composition = get_model_composition(context)
+        self._composition_role: CompositionRole | None = composition_role
+        self._active_composition_role: CompositionRole | None = composition_role
+        if self._composition is not None:
+            if answer_llm is not None:
+                raise ValueError("Model composition cannot use the legacy answer model")
+            binding = self._composition.binding(composition_role or "coordinator")
+            self.llm = binding.llm
+            token_counter = binding.token_counter
+            self.research_llm = None
+        elif composition_role is not None:
+            raise ValueError("A composition role requires a resolved model composition")
         self.user_identity = user_identity
         self.reasoning_effort = reasoning_effort
         self.history = history
@@ -895,7 +912,11 @@ class ResearchModel:
         self.lean_native_mode = (
             lean_native_mode or context.services.get("lean_native_mode") is True
         )
-        if self.lean_native_mode and context.services.get("asv3_exp_cropped") is True:
+        if (
+            self._composition is None
+            and self.lean_native_mode
+            and context.services.get("asv3_exp_cropped") is True
+        ):
             from onyx.llm.multi_llm import LitellmLLM
 
             if (
@@ -919,6 +940,35 @@ class ResearchModel:
         self._cheap_repair_fingerprint: str | None = None
         self._cheap_repair_attempts = 0
         self._cheap_acquisition_fingerprint: str | None = None
+
+    @contextmanager
+    def _bind_composition_role(self, role: CompositionRole) -> Iterator[None]:
+        if self._composition is None:
+            yield
+            return
+        binding = self._composition.binding(role)
+        previous = (
+            self.llm,
+            self.token_counter,
+            self.research_llm,
+            self._native_output_capacity,
+            self._active_composition_role,
+        )
+        self.llm = binding.llm
+        self.token_counter = binding.token_counter
+        self.research_llm = None
+        self._native_output_capacity = None
+        self._active_composition_role = role
+        try:
+            yield
+        finally:
+            (
+                self.llm,
+                self.token_counter,
+                self.research_llm,
+                self._native_output_capacity,
+                self._active_composition_role,
+            ) = previous
 
     def native_sampling_snapshot(self) -> dict[str, JsonValue]:
         config = self.llm.config
@@ -953,7 +1003,7 @@ class ResearchModel:
             "first_decision_started": self._native_first_decision_started,
             "first_decision_completed": self._native_first_decision_completed,
         }
-        if self._fast_action_coordinator:
+        if self._fast_action_coordinator or self._composition is not None:
             snapshot["fast_primary_answer_mode"] = self._fast_primary_answer_mode
         if self.context.services.get("asv3_exp_cheap") is True:
             snapshot["cheap_repair"] = {
@@ -979,10 +1029,12 @@ class ResearchModel:
                 for key in ("first_decision_started", "first_decision_completed")
             ):
                 raise ValueError("Invalid ASv3 coordinator sampling checkpoint")
-            if self._fast_action_coordinator:
+            if self._fast_action_coordinator or self._composition is not None:
                 primary_mode = saved.get("fast_primary_answer_mode")
                 if type(primary_mode) is not bool or (
-                    primary_mode and saved["first_decision_completed"] is not True
+                    primary_mode
+                    and saved["first_decision_completed"] is not True
+                    and self._composition is None
                 ):
                     raise ValueError("Invalid Fast primary answer routing checkpoint")
                 self._fast_primary_answer_mode = primary_mode
@@ -1741,6 +1793,18 @@ class ResearchModel:
             wire_tools or None,
             research=research,
         ) as span:
+            if self._composition is not None and self._active_composition_role:
+                span.span_data.model_config = {
+                    **(span.span_data.model_config or {}),
+                    "asv3_composition_profile": self._composition.profile_id,
+                    "asv3_composition_version": str(self._composition.version),
+                    "asv3_composition_role": self._active_composition_role,
+                    "asv3_composition_provider_id": str(
+                        self._composition.binding(
+                            self._active_composition_role
+                        ).provider_id
+                    ),
+                }
             if cropped_input_budget is not None:
                 span.span_data.request_params = {
                     **(span.span_data.request_params or {}),
@@ -4466,6 +4530,52 @@ class ResearchModel:
         return selected
 
     def decide(self, view: HarnessView) -> Decision:
+        if self._composition is None:
+            return self._decide(view)
+        role: CompositionRole = self._composition_role or (
+            "repair"
+            if view.draft_to_repair
+            else "author"
+            if self._fast_primary_answer_mode
+            else "routine"
+            if self.context.depth or self._native_first_decision_completed
+            else "coordinator"
+        )
+        with self._bind_composition_role(role):
+            if (
+                role == "author"
+                and self.context.services.get("asv3_exp_cropped") is True
+            ):
+                return self._decide_cropped_source_answer(view)
+            return self._decide(view)
+
+    def _composed_author_decision(
+        self, view: HarnessView, *, consume_budget: bool = True
+    ) -> Decision:
+        self.context.check_active()
+        self._fast_primary_answer_mode = True
+        if self.context.services.get("asv3_exp_cropped") is True:
+            return self._decide_cropped_source_answer(view)
+        if consume_budget:
+            if self.context.services.get("question_research_started") is True:
+                self.context.budget.consume("decisions")
+            else:
+                self.context.consume_research_decision()
+        with self._bind_composition_role("author"):
+            prompt, tools, output = self._fit_native_decision(view)
+            decision = self._invoke_decision(view, prompt, tools, output)
+            decision = self._experimental_terminal_envelope(
+                decision,
+                tools,
+                publication_gap=view.publication_gap,
+                retained_draft=view.draft_to_repair,
+                request=view.request,
+            )
+            return resolve_retained_answer(
+                decision, self.context, view.draft_to_repair, request=view.request
+            )
+
+    def _decide(self, view: HarnessView) -> Decision:
         if (
             not self.context.depth
             and self.context.services.get("question_research_started") is True
@@ -4531,8 +4641,23 @@ class ResearchModel:
                 if parallel_execution_enabled(self.context)
                 else nullcontext()
             )
-            with preparation:
-                prompt, tools, output = self._fit_native_decision(view)
+            try:
+                with preparation:
+                    prompt, tools, output = self._fit_native_decision(view)
+            except RunStopped as error:
+                from onyx.asv3.cropped_transport import CroppedInputOverflow
+
+                if (
+                    self._composition is None
+                    or self._active_composition_role not in {"coordinator", "routine"}
+                    or not (
+                        isinstance(error, CroppedInputOverflow)
+                        or str(error)
+                        == "The complete question, required originals and native tools exceed the selected model context"
+                    )
+                ):
+                    raise
+                return self._composed_author_decision(view, consume_budget=False)
             if self.context.services.get("asv3_exp_cropped") is True:
                 from onyx.asv3.cropped_transport import CroppedInputOverflow
 
@@ -4566,7 +4691,13 @@ class ResearchModel:
                 and not assembly_decision
                 and (self.context.depth > 0 or self._native_first_decision_completed)
             )
-            fast_action_research = self._fast_action_coordinator and use_research_model
+            composed_action_research = (
+                self._composition is not None
+                and self._active_composition_role == "routine"
+            )
+            fast_action_research = (
+                self._fast_action_coordinator and use_research_model
+            ) or composed_action_research
             invocation_tools = (
                 self._fast_action_tools(tools) if fast_action_research else tools
             )
@@ -4583,6 +4714,10 @@ class ResearchModel:
                 ]
                 ceiling, _ = self._limits(output)
                 if self._input_cost(prompt, invocation_tools) > ceiling:
+                    if composed_action_research:
+                        return self._composed_author_decision(
+                            view, consume_budget=False
+                        )
                     self._fast_primary_answer_mode = True
                     self.research_llm = None
                     fast_action_research = use_research_model = False
@@ -4617,6 +4752,8 @@ class ResearchModel:
                 )
                 or (not decision.calls and bool((decision.answer or "").strip()))
             ):
+                if composed_action_research:
+                    return self._composed_author_decision(view)
                 self.context.check_active()
                 if self.context.services.get("question_research_started") is True:
                     self.context.budget.consume("decisions")
@@ -4631,6 +4768,18 @@ class ResearchModel:
             decision = resolve_retained_answer(
                 decision, self.context, view.draft_to_repair, request=view.request
             )
+            if (
+                self._composition is not None
+                and self._active_composition_role in {"coordinator", "routine"}
+                and (
+                    (not decision.calls and bool((decision.answer or "").strip()))
+                    or any(
+                        call.name in _FAST_PRIMARY_ACTIONS - {"ask_user"}
+                        for call in decision.calls
+                    )
+                )
+            ):
+                return self._composed_author_decision(view)
             if (
                 self.answer_llm is not None
                 and self._source_answer_ready(decision)
@@ -4747,6 +4896,24 @@ class ResearchModel:
         return self._decide_research(view)
 
     def _decide_cropped_source_answer(
+        self,
+        view: HarnessView,
+        *,
+        candidate: Decision | None = None,
+        finish_request: dict[str, JsonValue] | None = None,
+        allow_sections: bool = True,
+    ) -> Decision:
+        if self._composition is not None:
+            self._fast_primary_answer_mode = True
+        with self._bind_composition_role("author"):
+            return self._decide_cropped_source_answer_bound(
+                view,
+                candidate=candidate,
+                finish_request=finish_request,
+                allow_sections=allow_sections,
+            )
+
+    def _decide_cropped_source_answer_bound(
         self,
         view: HarnessView,
         *,
@@ -4902,6 +5069,10 @@ class ResearchModel:
             self._writing_answer = False
 
     def _decide_cropped_read_plan(self, view: HarnessView) -> Decision | None:
+        with self._bind_composition_role("routine"):
+            return self._decide_cropped_read_plan_bound(view)
+
+    def _decide_cropped_read_plan_bound(self, view: HarnessView) -> Decision | None:
         """Choose focused original reads before paying to write from the full packet."""
         from onyx.asv3.cropped_research_limit import CroppedResearchLimit
 
@@ -5094,7 +5265,11 @@ class ResearchModel:
         self.context.services["cropped_section_material_context"] = material_context
 
         def scoped_model(plan: CroppedSectionPlan | None = None) -> ResearchModel:
-            fresh = fresh_model(self)
+            fresh = (
+                fresh_model(self, role="author" if plan is not None else "verifier")
+                if self._composition is not None
+                else fresh_model(self)
+            )
             # Preserve execution reservations and owner fences while isolating receipts.
             fresh.context.services.update(self.context.services)
             fresh.context.services["cropped_cost_phase"] = "finalization"
@@ -6469,6 +6644,7 @@ class ResearchModel:
                 reasoning_effort=self.reasoning_effort,
                 token_counter=self.token_counter,
                 lean_native_mode=self.lean_native_mode,
+                composition_role=self._active_composition_role,
             )
             patcher._writing_answer = True
             prompt, tools, output = patcher._fit(

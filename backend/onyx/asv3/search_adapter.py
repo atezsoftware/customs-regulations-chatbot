@@ -15,6 +15,7 @@ from onyx.asv3.cropped_cost_budget import CroppedCostBudget, CroppedCostTicket
 from onyx.asv3.cropped_research_limit import CroppedResearchLimit
 from onyx.asv3.cropped_transport import enforce_cropped_input_budget
 from onyx.asv3.llm_adapter import ResearchModel, model_slot, provider_retry_delay
+from onyx.asv3.model_composition.models import get_model_composition
 from onyx.asv3.models import (
     CapabilityCall,
     EvidenceItem,
@@ -57,6 +58,8 @@ from onyx.tools.models import (
 )
 from onyx.tools.tool_implementations.search.search_tool import SearchTool
 from onyx.tools.tool_runner import run_tool_calls
+from onyx.tracing.framework.create import get_current_span
+from onyx.tracing.framework.span_data import GenerationSpanData
 
 _TUNED_RETRIEVAL_OVERRIDES = SearchToolRetrievalOverrides(
     per_lane_num_hits=256,
@@ -118,6 +121,33 @@ class ScopedSearchLLM(LLM):
     def config(self) -> LLMConfig:
         return self.selected.config
 
+    def _effective_reasoning_effort(
+        self, requested: ReasoningEffort
+    ) -> ReasoningEffort:
+        composition = get_model_composition(self.context)
+        if (
+            requested == ReasoningEffort.OFF
+            and composition is not None
+            and composition.effective_search_reasoning_effort() == "low"
+            and self.config.model_provider == "openai"
+            and self.config.model_name == "gpt-6.1-sol"
+        ):
+            return ReasoningEffort.LOW
+        return requested
+
+    def _record_reasoning_effort(
+        self, requested: ReasoningEffort, effective: ReasoningEffort
+    ) -> None:
+        if get_model_composition(self.context) is None:
+            return
+        span = get_current_span()
+        if span is not None and isinstance(span.span_data, GenerationSpanData):
+            span.span_data.request_params = {
+                **(span.span_data.request_params or {}),
+                "asv3_requested_search_reasoning_effort": requested.value,
+                "asv3_effective_search_reasoning_effort": effective.value,
+            }
+
     def timeout(self, requested: int | None) -> int | None:
         self.context.check_research_active()
         if self.context.research_deadline == float("inf"):
@@ -169,6 +199,9 @@ class ScopedSearchLLM(LLM):
             if callable(counter)
             else None,
             lean_native_mode=True,
+            composition_role="search"
+            if get_model_composition(self.context) is not None
+            else None,
         )
         incoming = model._input_cost(
             prompt if isinstance(prompt, list) else [prompt],
@@ -231,6 +264,7 @@ class ScopedSearchLLM(LLM):
         use_streaming: bool = True,
         provider_compatibility_attempts: int | None = None,
     ) -> ModelResponse:
+        effective_reasoning_effort = self._effective_reasoning_effort(reasoning_effort)
         max_attempts = self.provider_max_attempts()
         compatibility_attempts = self.provider_compatibility_attempts(
             provider_compatibility_attempts
@@ -264,7 +298,7 @@ class ScopedSearchLLM(LLM):
                         max_tokens=ticket.max_tokens
                         if ticket is not None and ticket.bounded
                         else max_tokens,
-                        reasoning_effort=reasoning_effort,
+                        reasoning_effort=effective_reasoning_effort,
                         user_identity=user_identity or self.user_identity,
                         use_streaming=use_streaming,
                         **compatibility_options,
@@ -279,6 +313,9 @@ class ScopedSearchLLM(LLM):
                     raise
                 self.wait_to_retry(error, attempt)
             finally:
+                self._record_reasoning_effort(
+                    reasoning_effort, effective_reasoning_effort
+                )
                 if budget is not None and ticket is not None:
                     budget.complete(
                         ticket,
@@ -300,6 +337,7 @@ class ScopedSearchLLM(LLM):
         reasoning_effort: ReasoningEffort = ReasoningEffort.AUTO,
         user_identity: LLMUserIdentity | None = None,
     ) -> Iterator[ModelResponseStream]:
+        effective_reasoning_effort = self._effective_reasoning_effort(reasoning_effort)
         max_attempts = self.provider_max_attempts()
         for attempt in range(max_attempts):
             emitted = False
@@ -326,7 +364,7 @@ class ScopedSearchLLM(LLM):
                         max_tokens=ticket.max_tokens
                         if ticket is not None and ticket.bounded
                         else max_tokens,
-                        reasoning_effort=reasoning_effort,
+                        reasoning_effort=effective_reasoning_effort,
                         user_identity=user_identity or self.user_identity,
                     ):
                         self.context.check_research_active()
@@ -346,6 +384,9 @@ class ScopedSearchLLM(LLM):
                     raise
                 self.wait_to_retry(error, attempt)
             finally:
+                self._record_reasoning_effort(
+                    reasoning_effort, effective_reasoning_effort
+                )
                 if budget is not None and ticket is not None:
                     budget.complete(
                         ticket, usage, failure, cache_write_partition_verified=False

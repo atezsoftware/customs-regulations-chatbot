@@ -5,6 +5,7 @@ from uuid import UUID
 
 from pydantic import AfterValidator, BaseModel, Field, field_validator, model_validator
 
+from onyx.asv3.model_composition.models import CompositionProfileId
 from onyx.configs.constants import DocumentSource, MessageType, SessionType
 from onyx.context.search.models import BaseFilters, SavedSearchDoc, SearchDoc, Tag
 from onyx.db.enums import ChatSessionSharedStatus
@@ -162,6 +163,7 @@ class SendMessageRequest(BaseModel):
     asv3_exp_cropped: bool = False
     asv3_fast: bool = False
     asv3_fast_cropped: bool = False
+    asv3_model_profile: CompositionProfileId | None = None
     asv3_allow_external: bool = False
     asv3_resume_message_id: int | None = None
 
@@ -334,6 +336,13 @@ class SendMessageRequest(BaseModel):
             and not self.asv3_parallel_research
         ):
             raise ValueError("Fast ASv3 requires the normal non-parallel ASv3 profile")
+        if self.asv3_model_profile is not None and not (
+            (self.asv3_fast or self.asv3_fast_cropped)
+            and self.origin == MessageOrigin.BENCHMARK
+        ):
+            raise ValueError(
+                "Model compositions require an explicit Fast ASv3 benchmark"
+            )
         if self.asv3_exp_cropped and not (
             self.atez_search_v3
             and self.asv3_research_profile == "normal"
