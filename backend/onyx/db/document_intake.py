@@ -341,6 +341,19 @@ def review_digest(session: Session, batch: RegulatoryDocumentIntake) -> str:
             for row in chunks
         ],
     }
+    if batch.labeling_run_id is not None:
+        from onyx.db.regulatory_labeling_review_authority import (
+            labeling_review_authority,
+        )
+
+        try:
+            authority = labeling_review_authority(session, batch.labeling_run_id)
+        except ValueError as error:
+            raise IntakeConflictError(
+                "Saved labeling evidence changed; review this import before approval"
+            ) from error
+        if authority is not None:
+            payload["labeling_review_authority"] = authority
     if batch.preparation_policy is not None:
         payload["preparation_policy"] = batch.preparation_policy
     if any("intake_display_name" in row.chunk_metadata for row in chunks):
@@ -476,6 +489,26 @@ def intake_snapshot(
     from onyx.regulatory.document_intake.text import attachment_reference_label
 
     refresh_intake(session, batch)
+    if batch.status == "ready" and batch.stage == "review":
+        v4_source = session.scalar(
+            select(RegulatoryChunk.id)
+            .join(
+                RegulatoryDocumentIntakeFile,
+                RegulatoryDocumentIntakeFile.user_file_id
+                == RegulatoryChunk.user_file_id,
+            )
+            .where(
+                RegulatoryDocumentIntakeFile.intake_id == batch.id,
+                RegulatoryChunk.chunk_metadata["intake_chunking_version"].astext == "4",
+            )
+            .limit(1)
+        )
+        if (batch.preparation_policy is not None or v4_source is not None) and (
+            review_digest(session, batch) != batch.review_sha256
+        ):
+            raise IntakeConflictError(
+                "The ready document review changed; reload before approving"
+            )
     from onyx.db.document_intake_review import (
         effective_intake_files,
         effective_parent_document_ids,
