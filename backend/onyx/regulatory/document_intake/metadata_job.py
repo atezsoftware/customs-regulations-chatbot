@@ -60,7 +60,10 @@ class _MetadataWindowStopped(ValueError):
 
 
 class _MetadataWindowNeedsSplit(Exception):
-    def __init__(self, reason: Literal["token_budget", "structured_output"]) -> None:
+    def __init__(
+        self,
+        reason: Literal["token_budget", "structured_output", "semantic_validation"],
+    ) -> None:
         super().__init__(reason)
         self.reason = reason
 
@@ -416,6 +419,8 @@ def _extract_metadata_window(
                 previous_attempts.append((recovery.request_hash, recovered_context))
                 return failed_repair(recovery, recovered_context, recovered_error)
             return accepted(recovery, result)
+        if len(targets) > 1:
+            raise _MetadataWindowNeedsSplit("semantic_validation") from None
         raise ValueError(
             "New-document metadata failed strict validation after bounded repair attempts"
         ) from None

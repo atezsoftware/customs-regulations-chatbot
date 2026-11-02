@@ -506,23 +506,38 @@ def test_unknown_id_base_with_cached_heading_date_repair_gets_one_scoped_repair(
     assert len(gateway.new_requests) == (0 if cached == "valid" else 1)
 
 
-def test_invalid_targeted_repair_is_terminal_and_raw_caches_remain() -> None:
+def test_invalid_targeted_repair_splits_then_leaf_is_terminal_and_raw_caches_remain() -> (
+    None
+):
     sources = _sources()
     base, invalid = _request(sources), _response(sources, valid=False)
     generic = metadata.build_metadata_repair_request(
         base, invalid, validation_category="invalid_coverage_or_evidence"
     )
-    gateway = _CachedGateway(lambda request: _envelope(request, "STOP", invalid))
+
+    def respond(request: VertexBatchRequest) -> dict[str, Any]:
+        target_ids = set(json.loads(request.prompt)["target_chunk_ids"])
+        projected = json.loads(invalid)
+        projected["chunks"] = [
+            chunk for chunk in projected["chunks"] if chunk["chunk_id"] in target_ids
+        ]
+        return _envelope(request, "STOP", json.dumps(projected))
+
+    gateway = _CachedGateway(respond)
     gateway.seed(base, invalid)
     gateway.seed(generic, invalid)
     before = dict(gateway.lines)
     with pytest.raises(ValueError, match="after bounded repair"):
         _run(gateway, sources)
-    assert len(gateway.new_requests) == 1
+    assert any(
+        len(json.loads(request.prompt)["target_chunk_ids"]) == 1
+        for request in gateway.new_requests
+    )
     assert all(gateway.lines[key] == value for key, value in before.items())
+    calls = len(gateway.new_requests)
     with pytest.raises(ValueError, match="after bounded repair"):
         _run(gateway, sources)
-    assert len(gateway.new_requests) == 1
+    assert len(gateway.new_requests) == calls
 
 
 def test_cached_repair_envelope_error_does_not_authorize_new_repair() -> None:
