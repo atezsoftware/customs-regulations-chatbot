@@ -293,6 +293,10 @@ def reprepare_snapshot(
                 canonical=[row.model_dump(mode="json") for row in snapshots],
             )
         )
+    selected_policy = intake.select_intake_preparation_policy(session)
+    target_policy = (
+        selected_policy.model_dump(mode="json") if selected_policy is not None else None
+    )
     digest = publication_digest(
         dict(
             intake_id=str(batch.id),
@@ -301,11 +305,24 @@ def reprepare_snapshot(
             if batch.labeling_run_id
             else None,
             documents=payload,
-            target_chunking_version="3",
+            target_chunking_version="4" if target_policy is not None else "3",
             target_formatter_version=4,
+            **(
+                {"target_preparation_policy": target_policy}
+                if target_policy is not None
+                else {}
+            ),
         )
     )
-    return {"expected_sha256": digest, "documents": payload}
+    return {
+        "expected_sha256": digest,
+        "documents": payload,
+        **(
+            {"target_preparation_policy": target_policy}
+            if target_policy is not None
+            else {}
+        ),
+    }
 
 
 def request_reprepare(
@@ -342,14 +359,20 @@ def request_reprepare(
             "The document snapshot changed; reload before reprepare"
         )
     audit = {}
+    target_policy = view.get("target_preparation_policy")
     for item in view["documents"]:
         revisions = retain_canonical_revisions(
             session, capture_canonical_scope(session, UUID(item["user_file_id"]))
         )
         audit[item["document_id"]] = {
             **item,
-            "target_chunking_version": "3",
+            "target_chunking_version": "4" if target_policy is not None else "3",
             "target_formatter_version": 4,
+            **(
+                {"target_preparation_policy": target_policy}
+                if target_policy is not None
+                else {}
+            ),
             "previous_review_sha256": batch.review_sha256,
             "before_revision_ids": [str(value) for value in revisions.values()],
             "status": "pending",
@@ -716,6 +739,15 @@ def prepared_reprepare_documents(
             entry.get("after_revision_ids", []),
         )
     _context, arguments = _frozen_source(session, batch, member, original)
+    from onyx.regulatory.document_intake.models import IntakePreparationPolicy
+    from onyx.regulatory.document_intake.versions import reprepare_target_versions
+
+    version, formatter = reprepare_target_versions(entry)
+    arguments.update(chunking_version=version, formatter_version=formatter)
+    if entry.get("target_preparation_policy") is not None:
+        arguments["preparation_policy"] = IntakePreparationPolicy.model_validate(
+            entry["target_preparation_policy"]
+        )
     documents = load_verified_intake_documents(**arguments)
     if (
         documents.original_extraction.plaintext_sha256 != original.plaintext_sha256

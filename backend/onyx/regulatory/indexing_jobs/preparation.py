@@ -4,6 +4,7 @@ import datetime
 import json
 from collections.abc import Sequence
 from hashlib import sha256
+from typing import TypedDict
 from uuid import UUID
 
 from sqlalchemy.orm import Session
@@ -24,7 +25,9 @@ from onyx.regulatory.amendments.annexes.staging import canonical_snapshot_rows
 from onyx.regulatory.document_intake.chunking_profile import (
     SUPPORTED_INTAKE_CHUNKING_VERSIONS,
     documents_intake_chunking_version,
+    documents_intake_preparation_policy,
 )
+from onyx.regulatory.document_intake.models import IntakePreparationPolicy
 from onyx.regulatory.indexing import (
     document_text_for_regulatory_indexing,
 )
@@ -39,6 +42,11 @@ from onyx.regulatory.indexing_jobs.models import (
     RegulatoryIndexingConfigSnapshot,
     RegulatoryInputHashVersion,
 )
+
+
+class _IntakeSnapshotArguments(TypedDict, total=False):
+    intake_chunking_version: str
+    intake_preparation_policy: IntakePreparationPolicy
 
 
 def regulatory_documents_content_hash(
@@ -212,15 +220,16 @@ def prepare_regulatory_indexing_job(
 
     input_hash_version = RegulatoryInputHashVersion.CANONICAL_V2
     content_hash = regulatory_documents_content_hash(documents, input_hash_version)
+    intake_arguments: _IntakeSnapshotArguments = {}
+    if (version := documents_intake_chunking_version(documents)) is not None:
+        intake_arguments["intake_chunking_version"] = version
+    if (policy := documents_intake_preparation_policy(documents)) is not None:
+        intake_arguments["intake_preparation_policy"] = policy
     snapshot = resolve_regulatory_indexing_snapshot(
         db_session,
         input_content_hash=content_hash,
         input_hash_version=input_hash_version,
-        **(
-            {"intake_chunking_version": version}
-            if (version := documents_intake_chunking_version(documents)) is not None
-            else {}
-        ),
+        **intake_arguments,
     )
     now = datetime.datetime.now(datetime.timezone.utc)
     job = _create_owned_regulatory_indexing_job(
@@ -286,6 +295,8 @@ def prepare_regulatory_indexing_job_from_chunks(
         raise ValueError("CHUNKED user file has no chunk-generation identity")
     if user_file.regulatory_chunk_generation_hash != snapshot.chunk_generation_hash:
         for version in sorted(SUPPORTED_INTAKE_CHUNKING_VERSIONS):
+            if version == "4":
+                continue  # The normal writer owns the scoped Google whole-table policy.
             intake_hash = compute_regulatory_chunk_generation_hash(
                 embedding_provider=snapshot.embedding_provider,
                 embedding_model_name=snapshot.embedding_model_name,

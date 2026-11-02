@@ -192,6 +192,8 @@ def _read_frozen_source(
         if graph is not None
         else None,
     )
+    if batch.preparation_policy is not None:
+        context["preparation_policy"] = batch.preparation_policy
     return context, arguments
 
 
@@ -225,6 +227,13 @@ def derive_normalization(
     )
 
     arguments["formatter_version"] = formatter_version
+    from onyx.regulatory.document_intake.chunking_profile import (
+        documents_intake_preparation_policy,
+    )
+
+    policy = documents_intake_preparation_policy(documents)
+    if policy is not None:
+        arguments["preparation_policy"] = policy
     version = documents_intake_chunking_version(documents)
     if version is not None:
         arguments["chunking_version"] = supported_intake_chunking_version(version)
