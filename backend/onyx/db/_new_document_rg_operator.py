@@ -17,6 +17,11 @@ from onyx.configs.app_configs import POSTGRES_DB
 from onyx.db import document_intake as repository
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.db.models import RegulatoryDocumentIntake
+from onyx.db.search_settings import get_current_search_settings
+from onyx.natural_language_processing.utils import get_tokenizer
+from onyx.regulatory.contextual import contextual_reserve_for_embedding_text
+from onyx.indexing.chunker import DEFAULT_CONTEXTUAL_RAG_RESERVED_TOKENS
+from shared_configs.configs import DOC_EMBEDDING_CONTEXT_SIZE
 from onyx.regulatory.amendments.annexes import config
 from shared_configs.contextvars import get_current_tenant_id
 
@@ -25,6 +30,9 @@ PACKAGE = "d75a8cb8-b268-4d24-a230-cfa9bf301189"
 OWNER = "9ea33f67-5578-4dc4-bbea-e32b16f3f1dc"
 MAIN_FILE = "6cb352ab-1331-445d-8dee-7d2c2fbe8a87"
 PDF_FILE = "8cbb0ca5-7e37-4880-aef6-72f816af7539"
+MAIN_DOCUMENT = "f8d4be65-ec82-4011-a4c9-da10c8998e2e"
+PDF_DOCUMENT = "fd1fefc8-1e2f-41f7-a09f-d36c3f6152e2"
+TARGET_ROW_SHA256 = "fe6b6725b8104825be247dc3fcdb8122659030f108e845dc0b8ae21b303b004a"
 MAIN_DIGEST = "f70e13400f34aec9878368a92a040d76b6a6d9363f70c7f06e6898b878f16ba3"
 ORIGINAL_ERROR = (
     "An intake table row exceeds the embedding content token limit; "
@@ -75,6 +83,7 @@ def verify_scope(session: Session, batch: RegulatoryDocumentIntake) -> list[dict
     require(package[0]["manifest_sha256"] == "a410f20b802e5e664e307915295f561a633954eed41a7fbaa4b66f25f8ce5fb9", "Frozen source manifest changed")
     assets = rows(session, """
         SELECT a.id,a.sha256,a.text_sha256,a.display_name,a.original_url,m.user_file_id,
+               m.id AS document_id,m.role,m.parent_document_id,m.relationships,
                m.status AS intake_file_status,m.error AS intake_file_error,
                u.status AS user_file_status,u.chunk_count,u.regulatory_chunk_generation_hash
         FROM regulatory_source_asset a
@@ -84,9 +93,84 @@ def verify_scope(session: Session, batch: RegulatoryDocumentIntake) -> list[dict
     """, batch=BATCH, package=PACKAGE)
     actual = {str(a["id"]): (a["sha256"], a["text_sha256"], str(a["user_file_id"])) for a in assets}
     require(actual == EXPECTED_ASSETS, "Frozen source assets or owned files changed")
+    by_file = {str(asset["user_file_id"]): asset for asset in assets}
+    require(str(by_file[MAIN_FILE]["document_id"]) == MAIN_DOCUMENT and by_file[MAIN_FILE]["role"] == "root" and by_file[MAIN_FILE]["parent_document_id"] is None, "Main source relationship changed")
+    require(str(by_file[PDF_FILE]["document_id"]) == PDF_DOCUMENT and by_file[PDF_FILE]["role"] == "annex" and str(by_file[PDF_FILE]["parent_document_id"]) == MAIN_DOCUMENT, "PDF attachment relationship changed")
     digest, count = main_identity(session)
     require(digest == MAIN_DIGEST and count == 365, "Existing main HTML chunk identity changed")
     return assets
+
+
+def pdf_chunk_verification(session: Session) -> dict[str, Any]:
+    settings = get_current_search_settings(session)
+    tokenizer = get_tokenizer(model_name=settings.model_name, provider_type=settings.provider_type)
+    report: dict[str, Any] = {
+        "search_settings_id": settings.id,
+        "model_name": settings.model_name,
+        "provider_type": settings.provider_type.value if settings.provider_type else None,
+        "tokenizer_class": type(tokenizer).__name__,
+        "embedding_token_limit": DOC_EMBEDDING_CONTEXT_SIZE,
+        "preferred_context_reserve": DEFAULT_CONTEXTUAL_RAG_RESERVED_TOKENS,
+        "contextual_enabled": settings.enable_contextual_rag,
+    }
+    chunks = rows(session, """
+        SELECT id,chunk_type,position,text,chunk_metadata
+        FROM regulatory_chunk WHERE user_file_id=:file ORDER BY position,id
+    """, file=PDF_FILE)
+    if not chunks:
+        report["state"] = "pdf_not_chunked_yet"
+        return report
+    require(DOC_EMBEDDING_CONTEXT_SIZE == 512 and DEFAULT_CONTEXTUAL_RAG_RESERVED_TOKENS == 200, "Production embedding/context budgets changed")
+    require(settings.enable_contextual_rag, "Production contextual enrichment is disabled")
+    atomic = [chunk for chunk in chunks if chunk["chunk_type"] != "hierarchical_aggregate" and chunk["chunk_metadata"].get("chunk_variant") != "hierarchical_aggregate"]
+    require(len(chunks) == 406 and len(atomic) == 395, "PDF chunk counts differ from the verified exact-source replay")
+    matches = [chunk for chunk in atomic if hashlib.sha256(chunk["text"].encode()).hexdigest() == TARGET_ROW_SHA256]
+    require(len(matches) == 1, "Exact tariff row is missing, split or duplicated")
+    target = matches[0]
+    tokens = len(tokenizer.encode(target["text"]))
+    reserve = contextual_reserve_for_embedding_text(target["text"], tokenizer=tokenizer, embedding_token_limit=DOC_EMBEDDING_CONTEXT_SIZE, requested_reserve=DEFAULT_CONTEXTUAL_RAG_RESERVED_TOKENS)
+    require(tokens == 314 and reserve == 198, "Actual production row token/reserve budget differs from the verified replay")
+    require(target["text"].startswith("| 8544 ila 8548 |"), "Verified tariff row prefix changed")
+    require(target["text"].count("|") == 4, "Tariff row no longer preserves its three cells")
+    content_token_counts = [len(tokenizer.encode(chunk["text"])) for chunk in chunks]
+    require(max(content_token_counts) <= DOC_EMBEDDING_CONTEXT_SIZE, "A persisted PDF chunk exceeds the actual embedding budget")
+    report.update({"state": "verified", "chunk_count": len(chunks), "canonical_chunk_count": len(atomic), "target_chunk_id": target["id"], "target_row_sha256": TARGET_ROW_SHA256, "target_content_tokens": tokens, "target_context_reserve": reserve, "maximum_content_tokens": max(content_token_counts), "target_three_cells_preserved": True})
+    return report
+
+
+def metadata_cache_progress(session: Session, batch: RegulatoryDocumentIntake) -> dict[str, Any]:
+    # Submission names encode the full intake/document identity and permit exact
+    # correlation without opening provider response blobs or invoking a model.
+    from onyx.regulatory.document_intake.metadata import METADATA_VERSION
+    inventory = rows(session, """
+        SELECT file_id,created_at,updated_at,file_metadata->>'binding_sha256' AS binding
+        FROM file_record
+        WHERE file_id LIKE 'regulatory-labeling-direct/%'
+          AND file_id NOT LIKE '%/manifest.json'
+          AND created_at>=:since
+        ORDER BY created_at DESC,file_id DESC LIMIT 1001
+    """, since=batch.created_at)
+    bounded = len(inventory) > 1000
+    inventory = inventory[:1000]
+    by_document: dict[str, list[dict[str, Any]]] = {MAIN_DOCUMENT: [], PDF_DOCUMENT: []}
+    for record in inventory:
+        match = re.fullmatch(r"regulatory-labeling-direct/([0-9a-f]{64})/([0-9a-f]{64})/([0-9a-f]{64})\.json", record["file_id"])
+        if match is None:
+            continue
+        binding, submission, request_hash = match.groups()
+        if record["binding"] != binding:
+            continue
+        for document in by_document:
+            identity = f"metadata-v{METADATA_VERSION}:public:{BATCH}:{document}:{binding}"
+            if hashlib.sha256(f"{identity}:{request_hash}".encode()).hexdigest() == submission:
+                by_document[document].append(record)
+                break
+    return {
+        "inventory_rows_scanned": len(inventory),
+        "inventory_limit_reached_counts_are_lower_bounds": bounded,
+        "source": "exact-correlated metadata response cache records; repairs/splits also count as requests",
+        "documents": [{"document_id": document, "correlated_cached_requests": len(records), "latest_cached_at": max((record["updated_at"] for record in records), default=None)} for document, records in by_document.items()],
+    }
 
 
 def snapshot(session: Session, batch: RegulatoryDocumentIntake) -> dict[str, Any]:
@@ -96,6 +180,8 @@ def snapshot(session: Session, batch: RegulatoryDocumentIntake) -> dict[str, Any
         "database": session.execute(text("SELECT current_database()")).scalar_one(),
         "batch": {key: getattr(batch, key) for key in ("id", "source_package_id", "document_set_id", "status", "stage", "error", "labeling_run_id", "review_sha256", "created_at", "updated_at")},
         "main_chunk_sha256": MAIN_DIGEST,
+        "pdf_chunk_verification": pdf_chunk_verification(session),
+        "metadata_cache_progress": metadata_cache_progress(session, batch),
         "assets": assets,
         "chunks": rows(session, """
             SELECT c.user_file_id,c.chunk_type,c.status,count(*) AS count,
