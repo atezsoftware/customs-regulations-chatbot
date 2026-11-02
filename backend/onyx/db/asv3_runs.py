@@ -31,6 +31,10 @@ from onyx.asv3.workflow_variant import (
     ASV3_KOMPOZIT_VARIANT,
 )
 from onyx.configs.constants import MessageType
+from onyx.db.cropped_checkpoint import (
+    compact_cropped_checkpoint,
+    restore_cropped_checkpoint,
+)
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.db.legal_review_checkpoint import (
     compact_legal_review_checkpoint,
@@ -67,6 +71,11 @@ def encode_asv3_checkpoint(snapshot: dict[str, JsonValue]) -> str:
         compact = compact_exp_cheap_checkpoint(
             versioned, max_packed_bytes=decoded_limit
         )
+    elif versioned.get("asv3_workflow_variant") in {
+        ASV3_EXP_CROPPED_VARIANT,
+        ASV3_FAST_CROPPED_VARIANT,
+    }:
+        compact = compact_cropped_checkpoint(versioned)
     else:
         compact = compact_parallel_checkpoint(
             compact_legal_review_checkpoint(versioned),
@@ -134,8 +143,10 @@ def decode_asv3_checkpoint(payload: str) -> dict[str, JsonValue]:
         if payload_size > MAX_CHECKPOINT_BYTES:
             raise ValueError("ASv3 checkpoint exceeds its durable payload budget")
         return restore_exp_cheap_checkpoint(data, max_packed_bytes=decoded_limit)
-    return restore_legal_review_checkpoint(
-        restore_parallel_checkpoint(data, max_unit_bytes=decoded_limit)
+    return restore_cropped_checkpoint(
+        restore_legal_review_checkpoint(
+            restore_parallel_checkpoint(data, max_unit_bytes=decoded_limit)
+        )
     )
 
 
