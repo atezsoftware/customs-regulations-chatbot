@@ -50,6 +50,7 @@ from onyx.regulatory.document_intake.embedding import (
     FrozenEmbeddingGroup,
     encode_intake_embedding_groups,
 )
+from onyx.regulatory.document_intake.encoder_budget import frozen_encoder_options
 from onyx.regulatory.document_intake.temporal_context import (
     intake_temporal_context_rows,
 )
@@ -99,6 +100,7 @@ def _intake_view_vectors(
             embedder.embedding_model,
             model_dim=model_dim,
             formatter=str(context.embedding_config["formatter"]),
+            **frozen_encoder_options(context.embedding_config),
         )
         if (
             texts != context.embedding_texts
@@ -106,13 +108,29 @@ def _intake_view_vectors(
         ):
             raise ValueError("writer encoder differs from complete frozen inputs")
         key = _embedding_group_key(context)
-        groups.setdefault(key, FrozenEmbeddingGroup(key=key, texts=tuple(texts)))
+        groups.setdefault(
+            key,
+            FrozenEmbeddingGroup(
+                key=key,
+                texts=tuple(texts),
+                max_seq_length=frozen_encoder_options(configuration).get(
+                    "max_seq_length"
+                ),
+            ),
+        )
     return encode_intake_embedding_groups(
         list(groups.values()),
         encode=lambda texts: embedder.embedding_model.encode(
             texts=texts,
             text_type=EmbedTextType.PASSAGE,
             tenant_id=tenant_id,
+        ),
+        encode_complete=lambda texts, limit: embedder.embedding_model.encode(
+            texts=texts,
+            text_type=EmbedTextType.PASSAGE,
+            tenant_id=tenant_id,
+            max_seq_length=limit,
+            strict_full_input=True,
         ),
         expected_dimension=vector_dimension,
         check_owner=check_owner,
@@ -468,6 +486,24 @@ def prepare_owned_correction(
                 ),
             )
             views.append(view)
+            for context in view.projections:
+                if frozen_encoder_options(context.embedding_config):
+                    complete_receipt = _encoder_receipt(
+                        context.embedding_config,
+                        resolution=context_hash(context.embedding_config),
+                    )
+                    if (
+                        complete_receipt.effective_authority()
+                        != receipt.effective_authority()
+                    ):
+                        raise ValueError(
+                            "Whole-table encoder authority differs from the physical index"
+                        )
+                    receipts[context_hash(context.embedding_config)] = complete_receipt
+            index = index.model_copy(
+                update={"encoder_receipts": tuple(receipts.values())}
+            )
+            indexes[-1] = index
             concurrent_vectors = (
                 _intake_view_vectors(
                     view.projections,
@@ -537,6 +573,7 @@ def prepare_owned_correction(
                             embedder.embedding_model,
                             model_dim=settings.model_dim,
                             formatter=str(context.embedding_config["formatter"]),
+                            **frozen_encoder_options(context.embedding_config),
                         )
                         if (
                             texts != context.embedding_texts
@@ -550,6 +587,7 @@ def prepare_owned_correction(
                                 texts=texts,
                                 text_type=EmbedTextType.PASSAGE,
                                 tenant_id=owner.scope.tenant_id,
+                                **frozen_encoder_options(context.embedding_config),
                             ),
                             expected_count=len(texts),
                             expected_dimension=index.vector_dimension,

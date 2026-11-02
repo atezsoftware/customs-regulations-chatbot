@@ -705,6 +705,7 @@ def chunk_owned_file(
     from onyx.regulatory.amendments.annexes.publication_execution import LEASE_TTL
     from onyx.regulatory.document_intake.chunking_profile import (
         documents_intake_chunking_version,
+        documents_intake_preparation_policy,
     )
     from onyx.regulatory.indexing_jobs.configuration import (
         compute_regulatory_chunk_generation_hash,
@@ -739,6 +740,7 @@ def chunk_owned_file(
             embedding_model_name=current.model_name,
             enable_contextual_rag=contextual,
             intake_chunking_version=documents_intake_chunking_version(documents),
+            intake_preparation_policy=documents_intake_preparation_policy(documents),
         )
         persist_owned_initial_chunks(
             owner,
@@ -776,6 +778,7 @@ def reprepare_owned_intake_file(
     from onyx.regulatory.amendments.annexes.publication_execution import LEASE_TTL
     from onyx.regulatory.document_intake.chunking_profile import (
         documents_intake_chunking_version,
+        documents_intake_preparation_policy,
     )
     from onyx.regulatory.indexing_jobs.configuration import (
         compute_regulatory_chunk_generation_hash,
@@ -814,6 +817,9 @@ def reprepare_owned_intake_file(
                     embedding_model_name=current.model_name,
                     enable_contextual_rag=contextual,
                     intake_chunking_version=version,
+                    intake_preparation_policy=documents_intake_preparation_policy(
+                        documents
+                    ),
                 ),
                 intake_id=intake_id,
                 request_id=request_id,

@@ -320,11 +320,16 @@ def _historical_plan(
         json.loads(verified.embedding_config_json) if verified else None
     ):
         if configuration.get("transport") != "openrouter_batch":
+            from onyx.regulatory.document_intake.encoder_budget import (
+                frozen_encoder_options,
+            )
+
             inputs, _ = freeze_encoder_inputs(
                 inputs,
                 embedding_model,
                 model_dim=index.vector_dimension,
                 formatter=str(encoder_config["formatter"]),
+                **frozen_encoder_options(encoder_config),
             )
     context = actual.binding.context.model_copy(
         update={
