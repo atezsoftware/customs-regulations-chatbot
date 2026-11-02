@@ -1196,6 +1196,54 @@ def _validate_article_evidence(
         raise ValueError("Metadata article locator contradicts its source evidence")
 
 
+def _local_paragraph_deadline(
+    fact: LegalMetadataFact, sources: dict[str, MetadataChunk], target_id: str
+) -> bool:
+    """Bind a bare temporal introduction to its operative article and paragraph."""
+    source, target = sources[fact.source_chunk_id], sources.get(target_id)
+    quote = fact.evidence_quote.strip()
+    marker = re.fullmatch(
+        r"\((\d+)\)\s+(?:\d{1,2}[./]\d{1,2}[./]\d{4}|\d{4}-\d{1,2}-\d{1,2})"
+        r"\s+tarihine\s+kadar\s*;",
+        _fold(quote),
+    )
+    article = _article_context(source)
+    if (
+        marker is None
+        or target is None
+        or article is None
+        or _article_context(target) != article
+        or fact.basis != "explicit"
+        or metadata_evidence_scope(fact, sources) != "body"
+    ):
+        return False
+    paragraph = marker.group(1)
+    for chunk in (source, target):
+        structural_paragraph = chunk.structural_metadata.get("paragraph_no")
+        if structural_paragraph is not None and structural_paragraph != paragraph:
+            return False
+        lines = chunk.text.strip().splitlines()
+        if _body_article_identity(chunk.text) is not None:
+            lines = lines[1:]
+        first_line = lines[0].strip() if lines else ""
+        body_paragraph = re.match(r"^\((\d+)\)\s", first_line)
+        if body_paragraph is not None and body_paragraph.group(1) != paragraph:
+            return False
+        if chunk is source and first_line != quote:
+            return False
+    if source.chunk_id == target_id:
+        return True
+    for index, heading in enumerate(source.heading_path):
+        if heading != quote:
+            continue
+        parent = source.heading_path[: index + 1]
+        if target.heading_path[: index + 1] == parent and any(
+            _article_locator_identity(value) == article for value in parent[:-1]
+        ):
+            return True
+    return False
+
+
 def validate_metadata_response(
     response: str, *, chunks: Sequence[MetadataChunk], target_ids: Sequence[str]
 ) -> LegalMetadataResult:
@@ -1272,6 +1320,7 @@ def validate_metadata_response(
                             _fold(fact.evidence_quote),
                         )
                     )
+                    or _local_paragraph_deadline(fact, sources, target.chunk_id)
                 ):
                     raise ValueError(
                         "A repeal of another law cannot end this new provision"
