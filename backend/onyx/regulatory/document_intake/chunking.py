@@ -32,6 +32,7 @@ from onyx.regulatory.document_intake.chunking_profile import (
 )
 from onyx.regulatory.document_intake.chunking_profile import (
     SUPPORTED_INTAKE_CHUNKING_VERSIONS,
+    is_multi_cell_table_row,
 )
 from onyx.regulatory.document_intake.document_profile import intake_document_profile
 from onyx.regulatory.document_intake.headings import promote_plain_article_titles
@@ -86,6 +87,7 @@ class IntakeRegulatoryChunker(RegulatoryChunker):
         max_chunk_chars: int = 2400,
         min_chunk_chars: int = 120,
         chunking_version: str = INTAKE_CHUNKING_CODE_VERSION,
+        whole_table_row_token_limit: int | None = None,
     ) -> None:
         if content_token_limit < 1:
             raise ValueError("Intake content token limit must be positive")
@@ -97,6 +99,9 @@ class IntakeRegulatoryChunker(RegulatoryChunker):
         self.tokenizer = tokenizer
         self.content_token_limit = content_token_limit
         self.chunking_version = chunking_version
+        self.whole_table_row_token_limit = max(
+            content_token_limit, whole_table_row_token_limit or content_token_limit
+        )
         self._source_text = ""
         self._source_starts: dict[SourceBlock, int] = {}
         self._table_row_fragments: dict[tuple[int, int], IntakeTableRow] = {}
@@ -511,6 +516,23 @@ class IntakeRegulatoryChunker(RegulatoryChunker):
                     start += 1
                 if start == len(block.text):
                     break
+                if block.kind == "table" and self.chunking_version == "3":
+                    row_end = block.text.find("\n", start)
+                    if row_end == -1:
+                        row_end = len(block.text)
+                    row = self._slice(block, start, row_end)
+                    if (
+                        not current
+                        and is_multi_cell_table_row(row.text)
+                        and self.content_token_limit
+                        < len(self.tokenizer.encode(row.text))
+                        <= self.whole_table_row_token_limit
+                    ):
+                        # A tariff code, description, and condition share one row.
+                        # Give only that intact row the adaptive contextual reserve.
+                        groups.append([row])
+                        start = row_end
+                        continue
                 fragment = self._table_row_fragments.get(
                     (block.block_id, self._source_start(block) + start)
                 )

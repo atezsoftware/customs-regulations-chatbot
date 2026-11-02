@@ -305,6 +305,14 @@ class RegulatoryIndexingChunker:
                         ),
                     ),
                     max_chunk_chars=max_chunk_chars,
+                    whole_table_row_token_limit=(
+                        self.chunk_token_limit
+                        - (
+                            MIN_CONTEXTUAL_RAG_RESERVED_TOKENS
+                            if self.enable_contextual_rag
+                            else 0
+                        )
+                    ),
                 )
             else:
                 structural_chunker = RegulatoryChunker(max_chunk_chars=max_chunk_chars)
