@@ -679,6 +679,9 @@ def approve_intake(
         raise IntakeConflictError(
             "The ready document review changed; reload before approving"
         )
+    from onyx.db.document_intake_metadata import validate_intake_metadata_receipts
+
+    validate_intake_metadata_receipts(session, batch)
     from onyx.db.document_intake_review import (
         detach_source_evidence_memberships,
         effective_intake_files,

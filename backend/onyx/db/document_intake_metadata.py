@@ -34,6 +34,8 @@ from onyx.regulatory.document_intake.metadata import (
     METADATA_MODEL,
     METADATA_VERSION,
     VALIDITY_FIELDS,
+    ChunkLegalMetadata,
+    LegalMetadataFact,
     LegalMetadataResult,
     MetadataChunk,
     metadata_evidence_scope,
@@ -213,25 +215,82 @@ def load_metadata_work(
     batch.lease_expires_at = datetime.datetime.now(
         datetime.timezone.utc
     ) + datetime.timedelta(minutes=10)
-    # Label retries and manually edited reviews never overwrite already reviewed metadata.
-    if batch.labeling_run_id is not None:
-        return batch, []
+    from onyx.db.document_intake_review import effective_intake_files
+
+    members = (
+        effective_intake_files(session, batch)
+        if batch.labeling_run_id is not None
+        else intake.intake_files(session, batch)
+    )
     work = []
-    for member in intake.intake_files(session, batch):
+    for member in members:
         rows = _load_rows(session, batch, member.id)
         chunks = metadata_chunks(rows)
         if not chunks:
             raise ValueError("Metadata requires at least one canonical source chunk")
         input_hash = metadata_input_hash(chunks)
-        if all(
+        complete = all(
             isinstance(row.chunk_metadata.get(METADATA_AUDIT_KEY), dict)
             and row.chunk_metadata[METADATA_AUDIT_KEY].get("input_sha256") == input_hash
             for row in rows
             if not is_hierarchical_aggregate_chunk(row)
-        ):
+        )
+        try:
+            validate_metadata_receipt_evidence(rows, chunks)
+        except ValueError as error:
+            if batch.labeling_run_id is not None:
+                raise intake.IntakeConflictError(
+                    "Saved article evidence changed its validation contract; review this import before labeling or approval"
+                ) from error
+            complete = False
+        # Label retries and manually edited reviews retain their reviewed metadata.
+        if batch.labeling_run_id is not None or complete:
             continue
         work.append((member.id, chunks))
     return batch, work
+
+
+def validate_metadata_receipt_evidence(
+    rows: Sequence[RegulatoryChunk], chunks: Sequence[MetadataChunk]
+) -> None:
+    for row in rows:
+        if is_hierarchical_aggregate_chunk(row):
+            continue
+        audit = row.chunk_metadata.get(METADATA_AUDIT_KEY)
+        fields = audit.get("fields") if isinstance(audit, dict) else None
+        entry = fields.get("article_no") if isinstance(fields, dict) else None
+        if not isinstance(entry, dict) or entry.get("source") != "llm":
+            continue
+        fact = LegalMetadataFact.model_validate(
+            {
+                "field": "article_no",
+                "value": row.chunk_metadata.get("article_no"),
+                "source_chunk_id": entry.get("source_chunk_id"),
+                "evidence_quote": entry.get("evidence_quote"),
+                "basis": entry.get("basis", "explicit"),
+            }
+        )
+        result = LegalMetadataResult(
+            chunks=[ChunkLegalMetadata(chunk_id=row.id, fields=[fact])]
+        )
+        validate_metadata_response(
+            result.model_dump_json(), chunks=chunks, target_ids=[row.id]
+        )
+
+
+def validate_intake_metadata_receipts(
+    session: Session, batch: RegulatoryDocumentIntake
+) -> None:
+    from onyx.db.document_intake_review import effective_intake_files
+
+    for member in effective_intake_files(session, batch):
+        rows = _load_rows(session, batch, member.id)
+        try:
+            validate_metadata_receipt_evidence(rows, metadata_chunks(rows))
+        except ValueError as error:
+            raise intake.IntakeConflictError(
+                "Saved article evidence failed source validation; retry or correct this import before approval"
+            ) from error
 
 
 def refresh_intake_document_name(
@@ -297,6 +356,12 @@ def apply_metadata_results(
     expected_input_sha256: str,
     results: Sequence[tuple[str, LegalMetadataResult]],
 ) -> None:
+    session.get_one(
+        RegulatoryDocumentIntake,
+        intake_id,
+        with_for_update=True,
+        populate_existing=True,
+    )
     batch, _package, _assets = intake.load_intake_job(session, intake_id, lease_token)
     rows = _load_rows(session, batch, document_id)
     chunks = metadata_chunks(rows)
