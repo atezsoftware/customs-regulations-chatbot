@@ -73,7 +73,11 @@ from onyx.configs.constants import (
     MilestoneRecordType,
 )
 from onyx.context.search.models import BaseFilters, SearchDoc
-from onyx.db.asv3_runs import load_asv3_checkpoint, retain_fast_response_workflow
+from onyx.db.asv3_runs import (
+    load_asv3_checkpoint,
+    retain_asv3_response_workflow,
+    retain_fast_response_workflow,
+)
 from onyx.db.chat import (
     create_new_chat_message,
     get_chat_session_by_id,
@@ -944,6 +948,11 @@ def build_chat_turn(
         from onyx.legal_review.provider import legal_review_override
 
         selected_overrides = [legal_review_override()]
+    from onyx.chat.asv3_composition import kompozit_llm_override
+
+    preset_override = kompozit_llm_override(new_msg_req, user)
+    if preset_override is not None:
+        selected_overrides = [preset_override]
     for override in selected_overrides:
         llm = get_llm_for_persona(
             persona=persona,
@@ -1318,7 +1327,9 @@ def build_chat_turn(
         reserved_messages=reserved_messages,
         processing_run_id=processing_run_id,
         reserved_token_count=reserved_token_count,
-        reasoning_effort=chat_session.reasoning_effort_override or ReasoningEffort.AUTO,
+        reasoning_effort=ReasoningEffort.LOW
+        if preset_override is not None
+        else chat_session.reasoning_effort_override or ReasoningEffort.AUTO,
         search_params=search_params,
         all_injected_file_metadata=all_injected_file_metadata,
         available_files=available_files,
@@ -1789,7 +1800,11 @@ def _run_models(
                     )
                 elif setup.new_msg_req.atez_search_v3 or _uses_deep_asv3(setup):
                     from onyx.asv3.runtime import run_asv3_loop
-                    from onyx.asv3.workflow_variant import resolve_asv3_workflow
+                    from onyx.asv3.workflow_variant import (
+                        ASV3_KOMPOZIT_CROPPED_VARIANT,
+                        ASV3_KOMPOZIT_VARIANT,
+                        resolve_asv3_workflow,
+                    )
                     from onyx.chat.asv3_composition import (
                         resolve_chat_model_composition,
                     )
@@ -1804,6 +1819,8 @@ def _run_models(
                     cropped_resume = False
                     fast_resume = False
                     fast_cropped_resume = False
+                    kompozit_resume = False
+                    kompozit_cropped_resume = False
                     if setup.new_msg_req.asv3_resume_message_id is not None:
                         from onyx.asv3.workflow_variant import (
                             ASV3_EXP_CROPPED_VARIANT,
@@ -1812,6 +1829,8 @@ def _run_models(
                             ASV3_GUARDED_EXPERIMENTAL_VARIANT,
                             ASV3_GUARDRAILS_V2_VARIANT,
                             ASV3_GUARDRAILS_V3_VARIANT,
+                            ASV3_KOMPOZIT_CROPPED_VARIANT,
+                            ASV3_KOMPOZIT_VARIANT,
                         )
 
                         resume_checkpoint = load_asv3_checkpoint(
@@ -1848,6 +1867,16 @@ def _run_models(
                             and resume_checkpoint.get("asv3_workflow_variant")
                             == ASV3_FAST_CROPPED_VARIANT
                         )
+                        kompozit_resume = (
+                            resume_checkpoint is not None
+                            and resume_checkpoint.get("asv3_workflow_variant")
+                            == ASV3_KOMPOZIT_VARIANT
+                        )
+                        kompozit_cropped_resume = (
+                            resume_checkpoint is not None
+                            and resume_checkpoint.get("asv3_workflow_variant")
+                            == ASV3_KOMPOZIT_CROPPED_VARIANT
+                        )
                     checkpoint_selects_variant = (
                         guarded_resume
                         or guardrails_v2_resume
@@ -1855,15 +1884,25 @@ def _run_models(
                         or cropped_resume
                         or fast_resume
                         or fast_cropped_resume
+                        or kompozit_resume
+                        or kompozit_cropped_resume
                     )
                     workflow = resolve_asv3_workflow(
                         "normal"
-                        if cropped_resume or fast_resume or fast_cropped_resume
+                        if cropped_resume
+                        or fast_resume
+                        or fast_cropped_resume
+                        or kompozit_resume
+                        or kompozit_cropped_resume
                         else "deep"
                         if _uses_deep_asv3(setup)
                         else setup.new_msg_req.asv3_research_profile,
                         False
-                        if cropped_resume or fast_resume or fast_cropped_resume
+                        if cropped_resume
+                        or fast_resume
+                        or fast_cropped_resume
+                        or kompozit_resume
+                        or kompozit_cropped_resume
                         else setup.new_msg_req.asv3_parallel_research,
                         guarded_experimental=(
                             guarded_resume
@@ -1895,11 +1934,32 @@ def _run_models(
                             if checkpoint_selects_variant
                             else setup.new_msg_req.asv3_fast_cropped
                         ),
+                        kompozit=kompozit_resume
+                        if checkpoint_selects_variant
+                        else setup.new_msg_req.asv3_kompozit,
+                        kompozit_cropped=kompozit_cropped_resume
+                        if checkpoint_selects_variant
+                        else setup.new_msg_req.asv3_kompozit_cropped,
                     )
                     research_profile = workflow.research_profile
                     model_composition = resolve_chat_model_composition(
                         setup.new_msg_req, user, setup.persona, workflow, model_llm
                     )
+                    if workflow.workflow_variant in {
+                        ASV3_KOMPOZIT_VARIANT,
+                        ASV3_KOMPOZIT_CROPPED_VARIANT,
+                    }:
+                        assert model_composition is not None
+                        model_llm = model_composition.binding("coordinator").llm
+                    if kompozit_resume or kompozit_cropped_resume:
+                        retain_asv3_response_workflow(
+                            message_id=setup.reserved_messages[model_idx].id,
+                            user_id=user.id,
+                            workflow_variant=workflow.workflow_variant,
+                        )
+                        setup.reserved_messages[
+                            model_idx
+                        ].workflow = workflow.workflow_variant
                     if fast_resume or fast_cropped_resume:
                         retain_fast_response_workflow(
                             message_id=setup.reserved_messages[model_idx].id,

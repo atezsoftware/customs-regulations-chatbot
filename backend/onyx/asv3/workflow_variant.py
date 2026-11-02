@@ -17,6 +17,10 @@ ASV3_FAST_VARIANT = "asv3_fast"
 ASV3_FAST_POLICY = "standard-fast-action-primary-sol-material-review-v6"
 ASV3_FAST_CROPPED_VARIANT = "asv3_fast_cropped"
 ASV3_FAST_CROPPED_POLICY = "cropped-fast-material-outcomes-v3"
+ASV3_KOMPOZIT_VARIANT = "asv3_kompozit"
+ASV3_KOMPOZIT_POLICY = "standard-composition-fna-v1"
+ASV3_KOMPOZIT_CROPPED_VARIANT = "asv3_kompozit_cropped"
+ASV3_KOMPOZIT_CROPPED_POLICY = "cropped-composition-fna-v1"
 ASV3_GUARDED_EXPERIMENTAL_VARIANT = "asv3_guarded_experimental"
 ASV3_GUARDED_EXPERIMENTAL_POLICY = "guarded-normal-v1"
 ASV3_GUARDRAILS_V2_VARIANT = "asv3_guardrails_v2"
@@ -35,7 +39,38 @@ def resolve_asv3_workflow(
     exp_cropped: bool = False,
     fast: bool = False,
     fast_cropped: bool = False,
+    kompozit: bool = False,
+    kompozit_cropped: bool = False,
 ) -> ASv3WorkflowSelection:
+    if kompozit or kompozit_cropped:
+        if (
+            sum(
+                (
+                    kompozit,
+                    kompozit_cropped,
+                    fast,
+                    fast_cropped,
+                    exp_cropped,
+                    exp_cheap,
+                    guarded_experimental,
+                    guardrails_v2,
+                    guardrails_v3,
+                )
+            )
+            > 1
+        ):
+            raise ValueError(
+                "Kompozit ASv3 cannot be combined with other ASv3 variants"
+            )
+        if research_profile != "normal" or parallel_research:
+            raise ValueError("Kompozit ASv3 requires the normal non-parallel profile")
+        return ASv3WorkflowSelection(
+            research_profile="normal",
+            parallel_research=False,
+            workflow_variant=ASV3_KOMPOZIT_CROPPED_VARIANT
+            if kompozit_cropped
+            else ASV3_KOMPOZIT_VARIANT,
+        )
     if fast or fast_cropped:
         if (
             sum(
@@ -143,6 +178,8 @@ def validate_asv3_variant_resume(
         ASV3_EXP_CROPPED_VARIANT,
         ASV3_FAST_VARIANT,
         ASV3_FAST_CROPPED_VARIANT,
+        ASV3_KOMPOZIT_VARIANT,
+        ASV3_KOMPOZIT_CROPPED_VARIANT,
         ASV3_GUARDED_EXPERIMENTAL_VARIANT,
         ASV3_GUARDRAILS_V2_VARIANT,
         ASV3_GUARDRAILS_V3_VARIANT,
@@ -165,6 +202,16 @@ def validate_asv3_variant_resume(
         or previous.get("parallel_research") is not False
     ):
         raise ValueError("Fast ASv3 resume requires its own checkpoint policy")
+    kompozit_policy = {
+        ASV3_KOMPOZIT_VARIANT: ASV3_KOMPOZIT_POLICY,
+        ASV3_KOMPOZIT_CROPPED_VARIANT: ASV3_KOMPOZIT_CROPPED_POLICY,
+    }.get(workflow_variant)
+    if kompozit_policy is not None and (
+        previous.get("asv3_workflow_policy") != kompozit_policy
+        or previous.get("research_profile") != "normal"
+        or previous.get("parallel_research") is not False
+    ):
+        raise ValueError("Kompozit ASv3 resume requires its own checkpoint policy")
     if workflow_variant == ASV3_EXP_CHEAP_VARIANT and (
         previous.get("asv3_workflow_policy") != ASV3_EXP_CHEAP_POLICY
         or previous.get("research_profile") != "normal"
@@ -212,6 +259,15 @@ def validate_asv3_variant_resume(
 
 
 def checkpoint_variant_fields(workflow_variant: str) -> dict[str, JsonValue]:
+    kompozit_policy = {
+        ASV3_KOMPOZIT_VARIANT: ASV3_KOMPOZIT_POLICY,
+        ASV3_KOMPOZIT_CROPPED_VARIANT: ASV3_KOMPOZIT_CROPPED_POLICY,
+    }.get(workflow_variant)
+    if kompozit_policy is not None:
+        return {
+            "asv3_workflow_variant": workflow_variant,
+            "asv3_workflow_policy": kompozit_policy,
+        }
     fast_policy = {
         ASV3_FAST_VARIANT: ASV3_FAST_POLICY,
         ASV3_FAST_CROPPED_VARIANT: ASV3_FAST_CROPPED_POLICY,

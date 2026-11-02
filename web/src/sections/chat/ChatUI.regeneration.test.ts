@@ -231,6 +231,8 @@ it("preserves exp cropped regeneration and defers resume variant to its checkpoi
 it.each([
   ["asv3FastEnabled", "asv3Fast"],
   ["asv3FastCroppedEnabled", "asv3FastCropped"],
+  ["asv3KompozitEnabled", "asv3Kompozit"],
+  ["asv3KompozitCroppedEnabled", "asv3KompozitCropped"],
 ] as const)(
   "retains %s for regeneration and leaves resumed identity to the checkpoint",
   (flag, wireFlag) => {
@@ -251,5 +253,7 @@ it.each([
     expect(resumed.atezSearchV3).toBe(true);
     expect(resumed).not.toHaveProperty("asv3Fast");
     expect(resumed).not.toHaveProperty("asv3FastCropped");
+    expect(resumed).not.toHaveProperty("asv3Kompozit");
+    expect(resumed).not.toHaveProperty("asv3KompozitCropped");
   }
 );

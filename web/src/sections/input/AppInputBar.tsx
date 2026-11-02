@@ -96,6 +96,8 @@ export interface AppInputBarProps {
   asv3ExpCroppedEnabled?: boolean;
   asv3FastEnabled?: boolean;
   asv3FastCroppedEnabled?: boolean;
+  asv3KompozitEnabled?: boolean;
+  asv3KompozitCroppedEnabled?: boolean;
   experimentalResearchEnabled?: boolean;
   experimentalParallelResearchEnabled?: boolean;
   experimentalGuardrailsEnabled?: boolean;
@@ -112,6 +114,8 @@ export interface AppInputBarProps {
   toggleAsv3ExpCropped?: () => void;
   toggleAsv3Fast?: () => void;
   toggleAsv3FastCropped?: () => void;
+  toggleAsv3Kompozit?: () => void;
+  toggleAsv3KompozitCropped?: () => void;
   toggleExperimentalResearch?: () => void;
   toggleExperimentalParallelResearch?: () => void;
   toggleExperimentalGuardrails?: () => void;
@@ -148,6 +152,8 @@ const AppInputBar = React.memo(
     asv3ExpCroppedEnabled = false,
     asv3FastEnabled = false,
     asv3FastCroppedEnabled = false,
+    asv3KompozitEnabled = false,
+    asv3KompozitCroppedEnabled = false,
     experimentalResearchEnabled = false,
     experimentalParallelResearchEnabled = false,
     experimentalGuardrailsEnabled = false,
@@ -161,6 +167,8 @@ const AppInputBar = React.memo(
     toggleAsv3ExpCropped,
     toggleAsv3Fast,
     toggleAsv3FastCropped,
+    toggleAsv3Kompozit,
+    toggleAsv3KompozitCropped,
     toggleExperimentalResearch,
     toggleExperimentalParallelResearch,
     toggleExperimentalGuardrails,
@@ -910,6 +918,40 @@ const AppInputBar = React.memo(
                     }
                   >
                     Fast ASv3 Tek
+                  </SelectButton>
+                )}
+                {showAtezSearch && toggleAsv3Kompozit && (
+                  <SelectButton
+                    disabled={disabled || isMultiModelActive}
+                    variant="select-light"
+                    icon={SvgSparkle}
+                    onClick={toggleAsv3Kompozit}
+                    state={asv3KompozitEnabled ? "selected" : "empty"}
+                    foldable={false}
+                    tooltip={
+                      isMultiModelActive
+                        ? "Kompozit sabit model bileşimi kullanır. Model karşılaştırmasını kapatın."
+                        : "ASv3 akışı; Flash araştırma, Sonnet yazım, Argon doğrulama, Lite arama ve Terra düzeltme; sabit LOW akıl yürütme"
+                    }
+                  >
+                    Kompozit
+                  </SelectButton>
+                )}
+                {showAtezSearch && toggleAsv3KompozitCropped && (
+                  <SelectButton
+                    disabled={disabled || isMultiModelActive}
+                    variant="select-light"
+                    icon={SvgSparkle}
+                    onClick={toggleAsv3KompozitCropped}
+                    state={asv3KompozitCroppedEnabled ? "selected" : "empty"}
+                    foldable={false}
+                    tooltip={
+                      isMultiModelActive
+                        ? "Kompozit Cropped sabit model bileşimi kullanır. Model karşılaştırmasını kapatın."
+                        : "Exp Cropped akışı; Flash araştırma, Sonnet yazım, Argon doğrulama, Lite arama ve Terra düzeltme; sabit LOW akıl yürütme"
+                    }
+                  >
+                    Kompozit Cropped
                   </SelectButton>
                 )}
                 {showAtezSearch && toggleAsv3FastCropped && (

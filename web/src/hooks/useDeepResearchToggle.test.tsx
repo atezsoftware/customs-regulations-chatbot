@@ -5,11 +5,38 @@ describe("research mode selection", () => {
   afterEach(cleanup);
 
   it.each([
+    ["toggleAsv3Kompozit", "asv3KompozitEnabled"],
+    ["toggleAsv3KompozitCropped", "asv3KompozitCroppedEnabled"],
+  ] as const)(
+    "preserves %s during chat creation and clears it on navigation",
+    (toggle, enabled) => {
+      const { result, rerender } = renderHook(
+        ({ chatSessionId, agentId }) =>
+          useDeepResearchToggle({ chatSessionId, agentId }),
+        { initialProps: { chatSessionId: null as string | null, agentId: 0 } }
+      );
+      act(() => result.current[toggle]());
+      rerender({ chatSessionId: "session-1", agentId: 0 });
+      expect(result.current[enabled]).toBe(true);
+      act(() => result.current[toggle]());
+      expect(result.current[enabled]).toBe(false);
+      act(() => result.current[toggle]());
+      rerender({ chatSessionId: "session-2", agentId: 0 });
+      expect(result.current[enabled]).toBe(false);
+      act(() => result.current[toggle]());
+      rerender({ chatSessionId: "session-2", agentId: 1 });
+      expect(result.current[enabled]).toBe(false);
+    }
+  );
+
+  it.each([
     ["toggleAtezSearchV3", "atezSearchV3Enabled"],
     ["toggleDeepResearch", "deepResearchEnabled"],
     ["toggleAsv3ExpCropped", "asv3ExpCroppedEnabled"],
     ["toggleAsv3Fast", "asv3FastEnabled"],
     ["toggleAsv3FastCropped", "asv3FastCroppedEnabled"],
+    ["toggleAsv3Kompozit", "asv3KompozitEnabled"],
+    ["toggleAsv3KompozitCropped", "asv3KompozitCroppedEnabled"],
     ["toggleExperimentalResearch", "experimentalResearchEnabled"],
     [
       "toggleExperimentalParallelResearch",

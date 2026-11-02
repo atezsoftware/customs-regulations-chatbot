@@ -28,6 +28,8 @@ from onyx.tracing.flows import LLMFlow
 _SERVICES = frozenset(
     {
         "asv3_exp_cropped",
+        "asv3_kompozit",
+        "asv3_kompozit_cropped",
         "asv3_workflow_variant",
         "research_profile",
         "lean_native_mode",

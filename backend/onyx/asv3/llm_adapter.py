@@ -59,6 +59,7 @@ from onyx.asv3.legistation_metadata_transport import (
 )
 from onyx.asv3.model_composition.models import (
     CompositionRole,
+    allows_cropped_composition_implicit_cache,
     get_model_composition,
 )
 from onyx.asv3.models import (
@@ -1879,12 +1880,8 @@ class ResearchModel:
                                 prompt,
                                 wire_tools,
                                 allow_fast_composition_flash=(
-                                    self.context.services.get("asv3_fast") is True
-                                    and self.context.services.get("asv3_exp_cropped")
-                                    is True
-                                    and self._composition is not None
-                                    and self._composition.profile_id.startswith(
-                                        "factorial_v1_"
+                                    allows_cropped_composition_implicit_cache(
+                                        self.context
                                     )
                                 ),
                             )
@@ -4704,6 +4701,7 @@ class ResearchModel:
             composed_action_research = (
                 self._composition is not None
                 and self._active_composition_role == "routine"
+                and self.context.services.get("asv3_fast") is True
             )
             fast_action_research = (
                 self._fast_action_coordinator and use_research_model

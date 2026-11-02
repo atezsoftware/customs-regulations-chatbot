@@ -10,6 +10,10 @@ from onyx.server.query_and_chat.models import SendMessageRequest
 
 def _asv3_workflow(request: SendMessageRequest) -> str:
     # Variant flags override the profile they run under, so they are checked first.
+    if request.asv3_kompozit:
+        return "asv3_kompozit"
+    if request.asv3_kompozit_cropped:
+        return "asv3_kompozit_cropped"
     if request.asv3_fast:
         return "asv3_fast"
     if request.asv3_fast_cropped:

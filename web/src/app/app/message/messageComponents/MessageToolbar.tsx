@@ -117,6 +117,7 @@ export interface MessageToolbarProps {
   onRegenerate?: RegenerationFactory;
   parentMessage?: Message | null;
   llmManager: LlmManager | null;
+  fixedModelPreset?: boolean;
   currentModelName?: string;
   modelDisplayName?: string;
   /** Provider slug for `currentModelName`, used to resolve the model icon in
@@ -143,6 +144,7 @@ export default function MessageToolbar({
   onRegenerate,
   parentMessage,
   llmManager,
+  fixedModelPreset = false,
   currentModelName,
   modelDisplayName,
   currentModelProvider,
@@ -329,31 +331,46 @@ export default function MessageToolbar({
               parentMessage &&
               llmManager && (
                 <div data-testid="AgentMessage/regenerate">
-                  <ModelSelector
-                    value={findModelConfigId(
-                      llmManager.llmProviders,
-                      llmManager.currentLlm.provider,
-                      currentModelName ?? llmManager.currentLlm.modelName
-                    )}
-                    renderTrigger={() => (
-                      <OpenButton icon={SvgRefreshCw} foldable>
-                        Regenerate
-                      </OpenButton>
-                    )}
-                    onChange={(opt) => {
-                      const regenerator = onRegenerate({
-                        messageId,
-                        parentMessage,
-                      });
-                      regenerator({
-                        name: opt.name,
-                        provider: opt.provider,
-                        modelName: opt.modelName,
-                      });
-                    }}
-                    temperatureManager={llmManager}
-                    reasoningManager={llmManager}
-                  />
+                  {fixedModelPreset ? (
+                    <OpenButton
+                      icon={SvgRefreshCw}
+                      foldable
+                      tooltip="Sabit model bileşimi ve LOW akıl yürütmeyle yeniden oluştur"
+                      onClick={() => {
+                        void onRegenerate({ messageId, parentMessage })(
+                          llmManager.currentLlm
+                        );
+                      }}
+                    >
+                      Regenerate
+                    </OpenButton>
+                  ) : (
+                    <ModelSelector
+                      value={findModelConfigId(
+                        llmManager.llmProviders,
+                        llmManager.currentLlm.provider,
+                        currentModelName ?? llmManager.currentLlm.modelName
+                      )}
+                      renderTrigger={() => (
+                        <OpenButton icon={SvgRefreshCw} foldable>
+                          Regenerate
+                        </OpenButton>
+                      )}
+                      onChange={(opt) => {
+                        const regenerator = onRegenerate({
+                          messageId,
+                          parentMessage,
+                        });
+                        regenerator({
+                          name: opt.name,
+                          provider: opt.provider,
+                          modelName: opt.modelName,
+                        });
+                      }}
+                      temperatureManager={llmManager}
+                      reasoningManager={llmManager}
+                    />
+                  )}
                 </div>
               )}
 

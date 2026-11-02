@@ -62,7 +62,7 @@ import OnboardingFlow from "@/sections/onboarding/OnboardingFlow";
 import { OnboardingStep } from "@/interfaces/onboarding";
 import { useShowOnboarding } from "@/hooks/useShowOnboarding";
 import { SvgChevronDown, SvgFileText } from "@opal/icons";
-import { Button, ShadowDiv, Spacer } from "@opal/components";
+import { Button, ShadowDiv, Spacer, Text } from "@opal/components";
 import {
   IllustrationContent,
   RootLayout,
@@ -81,6 +81,9 @@ import { paidTierGated } from "@/ce";
 import EESearchUI from "@/ee/sections/SearchUI";
 const SearchUI = paidTierGated(EESearchUI);
 import { motion, AnimatePresence } from "motion/react";
+
+const KOMPOZIT_MODEL_SUMMARY =
+  "Flash araştırma · Sonnet yazım · Argon doğrulama · Lite arama · Terra düzeltme · LOW (sabit)";
 
 interface FadeProps {
   show: boolean;
@@ -212,6 +215,8 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
         asv3ExpCropped: asv3ExpCroppedEnabledForCurrentWorkflow,
         asv3Fast: asv3FastEnabledForCurrentWorkflow,
         asv3FastCropped: asv3FastCroppedEnabledForCurrentWorkflow,
+        asv3Kompozit: asv3KompozitEnabledForCurrentWorkflow,
+        asv3KompozitCropped: asv3KompozitCroppedEnabledForCurrentWorkflow,
         experimentalResearch: experimentalResearchEnabledForCurrentWorkflow,
         experimentalParallelResearch:
           experimentalParallelResearchEnabledForCurrentWorkflow,
@@ -255,9 +260,13 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
     asv3ExpCroppedEnabled,
     asv3FastEnabled,
     asv3FastCroppedEnabled,
+    asv3KompozitEnabled,
+    asv3KompozitCroppedEnabled,
     toggleAsv3ExpCropped,
     toggleAsv3Fast,
     toggleAsv3FastCropped,
+    toggleAsv3Kompozit,
+    toggleAsv3KompozitCropped,
     experimentalResearchEnabled,
     toggleExperimentalResearch,
     experimentalParallelResearchEnabled,
@@ -311,6 +320,14 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
     currentProjectId === null &&
     (selectedAgent ?? liveAgent)?.id === 0 &&
     asv3FastCroppedEnabled;
+  const asv3KompozitEnabledForCurrentWorkflow =
+    currentProjectId === null &&
+    (selectedAgent ?? liveAgent)?.id === 0 &&
+    asv3KompozitEnabled;
+  const asv3KompozitCroppedEnabledForCurrentWorkflow =
+    currentProjectId === null &&
+    (selectedAgent ?? liveAgent)?.id === 0 &&
+    asv3KompozitCroppedEnabled;
   const experimentalResearchEnabledForCurrentWorkflow =
     currentProjectId === null &&
     (selectedAgent ?? liveAgent)?.id === 0 &&
@@ -682,6 +699,8 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
       asv3FastCropped:
         asv3FastCroppedEnabledForCurrentWorkflow &&
         !multiModel.isMultiModelActive,
+      asv3Kompozit: asv3KompozitEnabledForCurrentWorkflow,
+      asv3KompozitCropped: asv3KompozitCroppedEnabledForCurrentWorkflow,
       experimentalResearch:
         experimentalResearchEnabledForCurrentWorkflow &&
         !multiModel.isMultiModelActive,
@@ -713,6 +732,8 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
     asv3ExpCroppedEnabledForCurrentWorkflow,
     asv3FastEnabledForCurrentWorkflow,
     asv3FastCroppedEnabledForCurrentWorkflow,
+    asv3KompozitEnabledForCurrentWorkflow,
+    asv3KompozitCroppedEnabledForCurrentWorkflow,
     experimentalResearchEnabledForCurrentWorkflow,
     experimentalParallelResearchEnabledForCurrentWorkflow,
     experimentalGuardrailsEnabledForCurrentWorkflow,
@@ -774,6 +795,8 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
         asv3FastCropped:
           asv3FastCroppedEnabledForCurrentWorkflow &&
           !multiModel.isMultiModelActive,
+        asv3Kompozit: asv3KompozitEnabledForCurrentWorkflow,
+        asv3KompozitCropped: asv3KompozitCroppedEnabledForCurrentWorkflow,
         experimentalResearch:
           experimentalResearchEnabledForCurrentWorkflow &&
           !multiModel.isMultiModelActive,
@@ -811,6 +834,8 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
       asv3ExpCroppedEnabledForCurrentWorkflow,
       asv3FastEnabledForCurrentWorkflow,
       asv3FastCroppedEnabledForCurrentWorkflow,
+      asv3KompozitEnabledForCurrentWorkflow,
+      asv3KompozitCroppedEnabledForCurrentWorkflow,
       experimentalResearchEnabledForCurrentWorkflow,
       experimentalParallelResearchEnabledForCurrentWorkflow,
       experimentalGuardrailsEnabledForCurrentWorkflow,
@@ -897,6 +922,8 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
           asv3FastCropped:
             asv3FastCroppedEnabledForCurrentWorkflow &&
             !multiModel.isMultiModelActive,
+          asv3Kompozit: asv3KompozitEnabledForCurrentWorkflow,
+          asv3KompozitCropped: asv3KompozitCroppedEnabledForCurrentWorkflow,
           experimentalResearch:
             experimentalResearchEnabledForCurrentWorkflow &&
             !multiModel.isMultiModelActive,
@@ -945,6 +972,8 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
       asv3ExpCroppedEnabledForCurrentWorkflow,
       asv3FastEnabledForCurrentWorkflow,
       asv3FastCroppedEnabledForCurrentWorkflow,
+      asv3KompozitEnabledForCurrentWorkflow,
+      asv3KompozitCroppedEnabledForCurrentWorkflow,
       experimentalResearchEnabledForCurrentWorkflow,
       experimentalParallelResearchEnabledForCurrentWorkflow,
       experimentalGuardrailsEnabledForCurrentWorkflow,
@@ -1165,6 +1194,12 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
                         asv3FastCroppedEnabled={
                           asv3FastCroppedEnabledForCurrentWorkflow
                         }
+                        asv3KompozitEnabled={
+                          asv3KompozitEnabledForCurrentWorkflow
+                        }
+                        asv3KompozitCroppedEnabled={
+                          asv3KompozitCroppedEnabledForCurrentWorkflow
+                        }
                         experimentalResearchEnabled={
                           experimentalResearchEnabledForCurrentWorkflow
                         }
@@ -1263,7 +1298,13 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
                           state.phase === "idle" && state.appMode === "search"
                         ) &&
                         liveAgent &&
-                        llmManager.hasAnyProvider && (
+                        llmManager.hasAnyProvider &&
+                        (asv3KompozitEnabledForCurrentWorkflow ||
+                        asv3KompozitCroppedEnabledForCurrentWorkflow ? (
+                          <Text font="secondary-body" color="text-03">
+                            {KOMPOZIT_MODEL_SUMMARY}
+                          </Text>
+                        ) : (
                           <MultiModelSelector
                             selectedModels={multiModel.selectedModels}
                             onAdd={multiModel.addModel}
@@ -1278,7 +1319,7 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
                             temperatureManager={llmManager}
                             reasoningManager={llmManager}
                           />
-                        )}
+                        ))}
                     </Section>
                     <Spacer rem={1.5} />
                   </Fade>
@@ -1352,20 +1393,27 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
                       />
                       {appFocus.isChat() && liveAgent && (
                         <div className="pb-1">
-                          <MultiModelSelector
-                            selectedModels={multiModel.selectedModels}
-                            onAdd={multiModel.addModel}
-                            maxModels={
-                              supersearchEnabledForCurrentWorkflow ||
-                              legalReviewEnabledForCurrentWorkflow
-                                ? 1
-                                : undefined
-                            }
-                            onRemove={multiModel.removeModel}
-                            onReplace={multiModel.replaceModel}
-                            temperatureManager={llmManager}
-                            reasoningManager={llmManager}
-                          />
+                          {asv3KompozitEnabledForCurrentWorkflow ||
+                          asv3KompozitCroppedEnabledForCurrentWorkflow ? (
+                            <Text font="secondary-body" color="text-03">
+                              {KOMPOZIT_MODEL_SUMMARY}
+                            </Text>
+                          ) : (
+                            <MultiModelSelector
+                              selectedModels={multiModel.selectedModels}
+                              onAdd={multiModel.addModel}
+                              maxModels={
+                                supersearchEnabledForCurrentWorkflow ||
+                                legalReviewEnabledForCurrentWorkflow
+                                  ? 1
+                                  : undefined
+                              }
+                              onRemove={multiModel.removeModel}
+                              onReplace={multiModel.replaceModel}
+                              temperatureManager={llmManager}
+                              reasoningManager={llmManager}
+                            />
+                          )}
                         </div>
                       )}
                       <AppInputBar
@@ -1398,6 +1446,12 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
                         asv3FastCroppedEnabled={
                           asv3FastCroppedEnabledForCurrentWorkflow
                         }
+                        asv3KompozitEnabled={
+                          asv3KompozitEnabledForCurrentWorkflow
+                        }
+                        asv3KompozitCroppedEnabled={
+                          asv3KompozitCroppedEnabledForCurrentWorkflow
+                        }
                         experimentalResearchEnabled={
                           experimentalResearchEnabledForCurrentWorkflow
                         }
@@ -1421,6 +1475,8 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
                         toggleAsv3ExpCropped={toggleAsv3ExpCropped}
                         toggleAsv3Fast={toggleAsv3Fast}
                         toggleAsv3FastCropped={toggleAsv3FastCropped}
+                        toggleAsv3Kompozit={toggleAsv3Kompozit}
+                        toggleAsv3KompozitCropped={toggleAsv3KompozitCropped}
                         toggleExperimentalResearch={toggleExperimentalResearch}
                         toggleExperimentalParallelResearch={
                           toggleExperimentalParallelResearch

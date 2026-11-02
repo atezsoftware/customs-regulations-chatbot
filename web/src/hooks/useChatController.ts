@@ -98,6 +98,8 @@ export interface OnSubmitProps {
   asv3ExpCropped?: boolean;
   asv3Fast?: boolean;
   asv3FastCropped?: boolean;
+  asv3Kompozit?: boolean;
+  asv3KompozitCropped?: boolean;
   experimentalResearch?: boolean;
   experimentalParallelResearch?: boolean;
   experimentalGuardrails?: boolean;
@@ -400,6 +402,8 @@ export default function useChatController({
       asv3ExpCropped = false,
       asv3Fast = false,
       asv3FastCropped = false,
+      asv3Kompozit = false,
+      asv3KompozitCropped = false,
       experimentalResearch = false,
       experimentalParallelResearch = false,
       experimentalGuardrails = false,
@@ -421,6 +425,12 @@ export default function useChatController({
       if (legalReview && isMultiModel) {
         toast.error(
           "Hukuki İnceleme (Flash) tek modelle çalışır. Ek modelleri kaldırın."
+        );
+        return;
+      }
+      if ((asv3Kompozit || asv3KompozitCropped) && isMultiModel) {
+        toast.error(
+          "Kompozit sabit model bileşimi kullanır. Model karşılaştırmasını kapatın."
         );
         return;
       }
@@ -721,6 +731,8 @@ export default function useChatController({
           asv3ExpCropped ||
           asv3Fast ||
           asv3FastCropped ||
+          asv3Kompozit ||
+          asv3KompozitCropped ||
           experimentalResearch ||
           experimentalParallelResearch ||
           experimentalGuardrails ||
@@ -729,12 +741,19 @@ export default function useChatController({
           Boolean(deepResearch && liveAgent?.id === 0 && !projectId);
         // Freeze provenance on the answer itself; changing the input selector
         // later must not relabel historical assistant messages.
-        initialAgentNode.overridden_model = legalReview
-          ? "gemini-3.8-flash"
-          : finalLLM.modelName;
-        initialAgentNode.modelDisplayName = legalReview
-          ? "Gemini 3.8 Flash"
-          : finalLLM.modelName;
+        initialAgentNode.overridden_model =
+          asv3Kompozit || asv3KompozitCropped
+            ? undefined
+            : legalReview
+              ? "gemini-3.8-flash"
+              : finalLLM.modelName;
+        initialAgentNode.modelDisplayName = asv3KompozitCropped
+          ? "Kompozit Cropped"
+          : asv3Kompozit
+            ? "Kompozit"
+            : legalReview
+              ? "Gemini 3.8 Flash"
+              : finalLLM.modelName;
       }
 
       // make messages appear + clear input bar
@@ -1043,6 +1062,8 @@ export default function useChatController({
           asv3ExpCropped,
           asv3Fast,
           asv3FastCropped,
+          asv3Kompozit,
+          asv3KompozitCropped,
           experimentalResearch,
           experimentalParallelResearch,
           experimentalGuardrails,
@@ -1056,6 +1077,8 @@ export default function useChatController({
                 asv3ExpCropped ||
                 asv3Fast ||
                 asv3FastCropped ||
+                asv3Kompozit ||
+                asv3KompozitCropped ||
                 experimentalResearch ||
                 experimentalParallelResearch ||
                 experimentalGuardrails ||

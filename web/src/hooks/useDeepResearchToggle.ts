@@ -43,6 +43,16 @@ export default function useDeepResearchToggle({
       current === "asv3_fast_cropped" ? null : "asv3_fast_cropped"
     );
   }, []);
+  const toggleAsv3Kompozit = useCallback(() => {
+    setMode((current) =>
+      current === "asv3_kompozit" ? null : "asv3_kompozit"
+    );
+  }, []);
+  const toggleAsv3KompozitCropped = useCallback(() => {
+    setMode((current) =>
+      current === "asv3_kompozit_cropped" ? null : "asv3_kompozit_cropped"
+    );
+  }, []);
   const toggleExperimentalResearch = useCallback(() => {
     setMode((current) => (current === "experimental" ? null : "experimental"));
   }, []);
@@ -102,6 +112,10 @@ export default function useDeepResearchToggle({
     toggleAsv3Fast,
     asv3FastCroppedEnabled: mode === "asv3_fast_cropped",
     toggleAsv3FastCropped,
+    asv3KompozitEnabled: mode === "asv3_kompozit",
+    toggleAsv3Kompozit,
+    asv3KompozitCroppedEnabled: mode === "asv3_kompozit_cropped",
+    toggleAsv3KompozitCropped,
     experimentalResearchEnabled: mode === "experimental",
     toggleExperimentalResearch,
     experimentalParallelResearchEnabled: mode === "experimental_parallel",

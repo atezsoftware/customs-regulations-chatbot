@@ -163,6 +163,8 @@ class SendMessageRequest(BaseModel):
     asv3_exp_cropped: bool = False
     asv3_fast: bool = False
     asv3_fast_cropped: bool = False
+    asv3_kompozit: bool = False
+    asv3_kompozit_cropped: bool = False
     asv3_model_profile: CompositionProfileId | None = None
     asv3_allow_external: bool = False
     asv3_resume_message_id: int | None = None
@@ -223,6 +225,8 @@ class SendMessageRequest(BaseModel):
                 self.asv3_exp_cropped,
                 self.asv3_fast,
                 self.asv3_fast_cropped,
+                self.asv3_kompozit,
+                self.asv3_kompozit_cropped,
                 self.asv3_resume_message_id is not None,
                 self.asv3_research_profile != "deep",
             )
@@ -257,6 +261,8 @@ class SendMessageRequest(BaseModel):
                 self.asv3_exp_cropped,
                 self.asv3_fast,
                 self.asv3_fast_cropped,
+                self.asv3_kompozit,
+                self.asv3_kompozit_cropped,
                 self.asv3_resume_message_id is not None,
                 self.asv3_research_profile != "deep",
             )
@@ -287,6 +293,8 @@ class SendMessageRequest(BaseModel):
                 self.asv3_exp_cropped,
                 self.asv3_fast,
                 self.asv3_fast_cropped,
+                self.asv3_kompozit,
+                self.asv3_kompozit_cropped,
             )
         ):
             raise ValueError(
@@ -330,6 +338,12 @@ class SendMessageRequest(BaseModel):
             raise ValueError(
                 "Experimental Guardrails requires the normal non-parallel ASv3 profile"
             )
+        if (self.asv3_kompozit or self.asv3_kompozit_cropped) and not (
+            self.atez_search_v3
+            and self.asv3_research_profile == "normal"
+            and not self.asv3_parallel_research
+        ):
+            raise ValueError("Kompozit requires the normal non-parallel ASv3 profile")
         if (self.asv3_fast or self.asv3_fast_cropped) and not (
             self.atez_search_v3
             and self.asv3_research_profile == "normal"
@@ -360,6 +374,8 @@ class SendMessageRequest(BaseModel):
                     self.asv3_exp_cropped,
                     self.asv3_fast,
                     self.asv3_fast_cropped,
+                    self.asv3_kompozit,
+                    self.asv3_kompozit_cropped,
                 )
             )
             > 1

@@ -172,6 +172,8 @@ export interface SendMessageParams {
   asv3ExpCropped?: boolean;
   asv3Fast?: boolean;
   asv3FastCropped?: boolean;
+  asv3Kompozit?: boolean;
+  asv3KompozitCropped?: boolean;
   experimentalResearch?: boolean;
   experimentalParallelResearch?: boolean;
   experimentalGuardrails?: boolean;
@@ -211,6 +213,8 @@ export async function* sendMessage({
   asv3ExpCropped = false,
   asv3Fast = false,
   asv3FastCropped = false,
+  asv3Kompozit = false,
+  asv3KompozitCropped = false,
   experimentalResearch,
   experimentalParallelResearch,
   experimentalGuardrails,
@@ -228,6 +232,32 @@ export async function* sendMessage({
   origin,
   additionalContext,
 }: SendMessageParams): AsyncGenerator<PacketType, void, unknown> {
+  const kompozitEnabled = asv3Kompozit || asv3KompozitCropped;
+  if (
+    kompozitEnabled &&
+    ((asv3Kompozit && asv3KompozitCropped) ||
+      atezSearchV3 ||
+      deepResearch ||
+      legalComposite ||
+      legalReview ||
+      supersearch ||
+      asv3ExpCropped ||
+      asv3Fast ||
+      asv3FastCropped ||
+      experimentalResearch ||
+      experimentalParallelResearch ||
+      experimentalGuardrails ||
+      experimentalGuardrailsV2 ||
+      experimentalGuardrailsV3 ||
+      asv3ResumeMessageId != null)
+  ) {
+    throw new Error("Kompozit başka araştırma modlarıyla birleştirilemez.");
+  }
+  if (kompozitEnabled && (llmOverrides?.length ?? 0) > 1) {
+    throw new Error(
+      "Kompozit sabit model bileşimi kullanır. Model karşılaştırmasını kapatın."
+    );
+  }
   if (legalReview && (llmOverrides?.length ?? 0) > 1) {
     throw new Error("Hukuki İnceleme (Flash) tek modelle çalışır.");
   }
@@ -309,6 +339,7 @@ export async function* sendMessage({
     ...(supersearch ? { supersearch: true } : {}),
     atez_search_v3: Boolean(
       (atezSearchV3 ||
+        kompozitEnabled ||
         asv3ExpCropped ||
         asv3Fast ||
         asv3FastCropped ||
@@ -323,7 +354,7 @@ export async function* sendMessage({
     asv3_research_profile:
       supersearch || deepResearch
         ? "deep"
-        : asv3ExpCropped || asv3Fast || asv3FastCropped
+        : asv3ExpCropped || asv3Fast || asv3FastCropped || kompozitEnabled
           ? "normal"
           : experimentalResearch || experimentalParallelResearch
             ? "experimental"
@@ -334,6 +365,8 @@ export async function* sendMessage({
               ? "normal"
               : "deep",
     ...(asv3Fast ? { asv3_fast: true, asv3_parallel_research: false } : {}),
+    ...(asv3Kompozit ? { asv3_kompozit: true } : {}),
+    ...(asv3KompozitCropped ? { asv3_kompozit_cropped: true } : {}),
     ...(asv3FastCropped
       ? { asv3_fast_cropped: true, asv3_parallel_research: false }
       : {}),
@@ -355,6 +388,7 @@ export async function* sendMessage({
       supersearch || legalReview ? undefined : asv3ResumeMessageId,
     asv3_allow_external: Boolean(
       (atezSearchV3 ||
+        kompozitEnabled ||
         asv3ExpCropped ||
         asv3Fast ||
         asv3FastCropped ||
@@ -370,7 +404,7 @@ export async function* sendMessage({
     allowed_tool_ids: supersearch || legalReview ? [] : enabledToolIds,
     forced_tool_id: supersearch || legalReview ? null : (forcedToolId ?? null),
     llm_override:
-      !legalReview && (temperature || modelVersion)
+      !legalReview && !kompozitEnabled && (temperature || modelVersion)
         ? {
             temperature,
             model_provider: modelProvider,
@@ -379,7 +413,8 @@ export async function* sendMessage({
           }
         : null,
     // Multi-model: list of LLM overrides for parallel generation
-    llm_overrides: legalReview ? null : (llmOverrides ?? null),
+    llm_overrides:
+      legalReview || kompozitEnabled ? null : (llmOverrides ?? null),
     // Default to "unknown" for consistency with backend; callers should set explicitly
     origin: origin ?? "unknown",
     additional_context:

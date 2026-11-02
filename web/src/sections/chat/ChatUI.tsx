@@ -37,6 +37,8 @@ interface RegenerationResearchModeInput {
   asv3ExpCroppedEnabled?: boolean;
   asv3FastEnabled?: boolean;
   asv3FastCroppedEnabled?: boolean;
+  asv3KompozitEnabled?: boolean;
+  asv3KompozitCroppedEnabled?: boolean;
   experimentalResearchEnabled: boolean;
   experimentalParallelResearchEnabled: boolean;
   experimentalGuardrailsEnabled: boolean;
@@ -55,6 +57,8 @@ export function getRegenerationResearchMode({
   asv3ExpCroppedEnabled = false,
   asv3FastEnabled = false,
   asv3FastCroppedEnabled = false,
+  asv3KompozitEnabled = false,
+  asv3KompozitCroppedEnabled = false,
   experimentalResearchEnabled,
   experimentalParallelResearchEnabled,
   experimentalGuardrailsEnabled,
@@ -73,6 +77,10 @@ export function getRegenerationResearchMode({
     ...(asv3FastEnabled && !resumingAsv3 ? { asv3Fast: true } : {}),
     ...(asv3FastCroppedEnabled && !resumingAsv3
       ? { asv3FastCropped: true }
+      : {}),
+    ...(asv3KompozitEnabled && !resumingAsv3 ? { asv3Kompozit: true } : {}),
+    ...(asv3KompozitCroppedEnabled && !resumingAsv3
+      ? { asv3KompozitCropped: true }
       : {}),
     experimentalResearch: resumingAsv3 ? false : experimentalResearchEnabled,
     experimentalParallelResearch: resumingAsv3
@@ -112,6 +120,8 @@ export interface ChatUIProps {
     asv3ExpCropped?: boolean;
     asv3Fast?: boolean;
     asv3FastCropped?: boolean;
+    asv3Kompozit?: boolean;
+    asv3KompozitCropped?: boolean;
     experimentalResearch?: boolean;
     experimentalParallelResearch?: boolean;
     experimentalGuardrails?: boolean;
@@ -139,6 +149,8 @@ export interface ChatUIProps {
   asv3ExpCroppedEnabled?: boolean;
   asv3FastEnabled?: boolean;
   asv3FastCroppedEnabled?: boolean;
+  asv3KompozitEnabled?: boolean;
+  asv3KompozitCroppedEnabled?: boolean;
   experimentalResearchEnabled?: boolean;
   experimentalParallelResearchEnabled?: boolean;
   experimentalGuardrailsEnabled?: boolean;
@@ -179,6 +191,8 @@ const ChatUI = React.memo(
     asv3ExpCroppedEnabled = false,
     asv3FastEnabled = false,
     asv3FastCroppedEnabled = false,
+    asv3KompozitEnabled = false,
+    asv3KompozitCroppedEnabled = false,
     experimentalResearchEnabled = false,
     experimentalParallelResearchEnabled = false,
     experimentalGuardrailsEnabled = false,
@@ -220,6 +234,8 @@ const ChatUI = React.memo(
     const asv3ExpCroppedEnabledRef = useRef(asv3ExpCroppedEnabled);
     const asv3FastEnabledRef = useRef(asv3FastEnabled);
     const asv3FastCroppedEnabledRef = useRef(asv3FastCroppedEnabled);
+    const asv3KompozitEnabledRef = useRef(asv3KompozitEnabled);
+    const asv3KompozitCroppedEnabledRef = useRef(asv3KompozitCroppedEnabled);
     const experimentalResearchEnabledRef = useRef(experimentalResearchEnabled);
     const experimentalParallelResearchEnabledRef = useRef(
       experimentalParallelResearchEnabled
@@ -246,6 +262,8 @@ const ChatUI = React.memo(
     asv3ExpCroppedEnabledRef.current = asv3ExpCroppedEnabled;
     asv3FastEnabledRef.current = asv3FastEnabled;
     asv3FastCroppedEnabledRef.current = asv3FastCroppedEnabled;
+    asv3KompozitEnabledRef.current = asv3KompozitEnabled;
+    asv3KompozitCroppedEnabledRef.current = asv3KompozitCroppedEnabled;
     experimentalResearchEnabledRef.current = experimentalResearchEnabled;
     experimentalParallelResearchEnabledRef.current =
       experimentalParallelResearchEnabled;
@@ -276,6 +294,8 @@ const ChatUI = React.memo(
             asv3ExpCroppedEnabled: asv3ExpCroppedEnabledRef.current,
             asv3FastEnabled: asv3FastEnabledRef.current,
             asv3FastCroppedEnabled: asv3FastCroppedEnabledRef.current,
+            asv3KompozitEnabled: asv3KompozitEnabledRef.current,
+            asv3KompozitCroppedEnabled: asv3KompozitCroppedEnabledRef.current,
             experimentalResearchEnabled: experimentalResearchEnabledRef.current,
             experimentalParallelResearchEnabled:
               experimentalParallelResearchEnabledRef.current,
@@ -327,6 +347,8 @@ const ChatUI = React.memo(
           asv3FastCropped:
             asv3FastCroppedEnabledRef.current &&
             !(models && models.length >= 2),
+          asv3Kompozit: asv3KompozitEnabledRef.current,
+          asv3KompozitCropped: asv3KompozitCroppedEnabledRef.current,
           experimentalResearch:
             experimentalResearchEnabledRef.current &&
             !(models && models.length >= 2),
@@ -421,6 +443,9 @@ const ChatUI = React.memo(
                         overriddenModel: llmManager.currentLlm?.modelName,
                       }}
                       llmManager={llmManager}
+                      fixedModelPreset={
+                        asv3KompozitEnabled || asv3KompozitCroppedEnabled
+                      }
                       onRegenerate={createRegenerator}
                       parentMessage={message}
                       otherMessagesCanSwitchTo={
@@ -492,6 +517,9 @@ const ChatUI = React.memo(
                     messageId={message.messageId}
                     currentFeedback={message.currentFeedback}
                     llmManager={llmManager}
+                    fixedModelPreset={
+                      asv3KompozitEnabled || asv3KompozitCroppedEnabled
+                    }
                     otherMessagesCanSwitchTo={
                       parentMessage?.childrenNodeIds ?? emptyChildrenIds
                     }

@@ -1,8 +1,12 @@
-"""The fixed experiment matrix; model names never come from a role override."""
+"""Versioned role presets; model names never come from a request role override."""
 
 from dataclasses import dataclass
 
-from onyx.asv3.model_composition.models import CompositionProfileId, CompositionRole
+from onyx.asv3.model_composition.models import (
+    KOMPOZIT_PROFILE_ID,
+    CompositionProfileId,
+    CompositionRole,
+)
 
 COMPOSITION_VERSION = 1
 
@@ -115,6 +119,14 @@ COMPOSITION_PROFILES: dict[CompositionProfileId, dict[CompositionRole, str]] = {
         "verifier": "sol",
     },
     "factorial_v1_fna": {
+        "coordinator": "flash",
+        "routine": "flash",
+        "search": "lite",
+        "author": "sonnet",
+        "repair": "terra",
+        "verifier": "argon",
+    },
+    KOMPOZIT_PROFILE_ID: {
         "coordinator": "flash",
         "routine": "flash",
         "search": "lite",
