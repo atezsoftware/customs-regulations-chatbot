@@ -18,8 +18,10 @@ from onyx.regulatory.amendments.annexes.context_dependencies import (
 )
 from onyx.regulatory.amendments.annexes.publication_representations import _snapshot
 from onyx.regulatory.amendments.annexes.staging import canonical_snapshot_rows
+from onyx.regulatory.contextual import MIN_CONTEXTUAL_RAG_RESERVED_TOKENS
 from onyx.regulatory.document_intake.chunking_profile import (
     SUPPORTED_INTAKE_CHUNKING_VERSIONS,
+    is_multi_cell_table_row,
 )
 from onyx.regulatory.indexing_jobs.configuration import (
     compute_regulatory_chunk_generation_hash,
@@ -68,6 +70,7 @@ def validate_intake_edit_budgets(
         for version in (None, *sorted(SUPPORTED_INTAKE_CHUNKING_VERSIONS))
     }
     limits: dict[UUID, int] = {}
+    versions: dict[UUID, str | None] = {}
     for file_id, rows in prospective.items():
         file = files[file_id]
         generation = file.regulatory_chunk_generation_hash
@@ -76,6 +79,7 @@ def validate_intake_edit_budgets(
                 "The imported file generation no longer matches current indexing settings; reload or prepare it again"
             )
         version = generations[generation]
+        versions[file_id] = version
         if any(
             row.user_file_id != file_id
             or row.chunk_metadata.get("intake_chunking_version") not in (None, version)
@@ -89,8 +93,18 @@ def validate_intake_edit_budgets(
         limits[file_id] = max(1, DOC_EMBEDDING_CONTEXT_SIZE - reserve)
     tokenizer = _embedding_tokenizer(settings)
     for file_id, rows in prospective.items():
-        limit = limits[file_id]
         for row in rows:
+            limit = limits[file_id]
+            if (
+                versions[file_id] == "3"
+                and row.chunk_type == "table"
+                and row.chunk_metadata.get("chunk_variant") == "atomic"
+                and is_multi_cell_table_row(row.text)
+            ):
+                limit = max(
+                    limit,
+                    DOC_EMBEDDING_CONTEXT_SIZE - MIN_CONTEXTUAL_RAG_RESERVED_TOKENS,
+                )
             tokens = count_tokens(row.text, tokenizer)
             if tokens > limit:
                 raise ValueError(

@@ -13,6 +13,21 @@ INTAKE_CHUNKING_CODE_VERSION: IntakeChunkingVersion = "3"
 SUPPORTED_INTAKE_CHUNKING_VERSIONS = frozenset({"1", "2", "3"})
 
 
+def is_multi_cell_table_row(text: str) -> bool:
+    """Identify one complete source row without treating escaped pipes as columns."""
+
+    if len(text.splitlines()) != 1:
+        return False
+    row = text.strip()
+    pipes: list[int] = []
+    escaped = False
+    for index, character in enumerate(row):
+        if character == "|" and not escaped:
+            pipes.append(index)
+        escaped = not escaped if character == "\\" else False
+    return len(pipes) >= 3 and pipes[0] == 0 and pipes[-1] == len(row) - 1
+
+
 def supported_intake_chunking_version(version: str) -> IntakeChunkingVersion:
     if version not in SUPPORTED_INTAKE_CHUNKING_VERSIONS:
         raise ValueError("The intake chunking version is not supported")
