@@ -9026,6 +9026,9 @@ class RegulatoryDocumentIntake(Base):
     labeling_run_id: Mapped[UUID | None] = mapped_column(
         ForeignKey("regulatory_labeling_run.id"), nullable=True
     )
+    preparation_policy: Mapped[dict[str, Any] | None] = mapped_column(
+        PGJSONB(none_as_null=True), nullable=True
+    )
     status: Mapped[str] = mapped_column(Text, default="preparing")
     stage: Mapped[str] = mapped_column(Text, default="chunking")
     review_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)

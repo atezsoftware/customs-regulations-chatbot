@@ -1,4 +1,5 @@
 import json
+from collections.abc import Mapping
 from hashlib import sha256
 from typing import cast
 
@@ -29,6 +30,7 @@ from onyx.regulatory.contextual import MIN_CONTEXTUAL_RAG_RESERVED_TOKENS
 from onyx.regulatory.document_intake.chunking_profile import (
     supported_intake_chunking_version,
 )
+from onyx.regulatory.document_intake.models import IntakePreparationPolicy
 from onyx.regulatory.indexing import (
     REGULATORY_CONTEXTUAL_INITIAL_MAX_CHUNK_CHARS,
     REGULATORY_CONTEXTUAL_MIN_MAX_CHUNK_CHARS,
@@ -78,6 +80,9 @@ def compute_regulatory_chunk_generation_hash(
     embedding_model_name: str,
     enable_contextual_rag: bool = True,
     intake_chunking_version: str | None = None,
+    intake_preparation_policy: Mapping[str, object]
+    | IntakePreparationPolicy
+    | None = None,
 ) -> str:
     """Identify every deterministic input that affects canonical chunk output."""
 
@@ -108,6 +113,21 @@ def compute_regulatory_chunk_generation_hash(
         payload["intake_chunking_version"] = supported_intake_chunking_version(
             intake_chunking_version
         )
+    if intake_chunking_version == "4":
+        if not enable_contextual_rag:
+            raise ValueError("Whole-table preparation requires contextual retrieval")
+        policy = IntakePreparationPolicy.model_validate(intake_preparation_policy)
+        if (
+            embedding_provider is None
+            or embedding_provider.value != policy.provider
+            or embedding_model_name != policy.model_name
+        ):
+            raise ValueError(
+                "Whole-table generation encoder differs from its frozen policy"
+            )
+        payload["intake_preparation_policy"] = policy.model_dump(mode="json")
+    elif intake_preparation_policy is not None:
+        raise ValueError("Legacy generations cannot acquire a whole-table policy")
     return sha256(
         json.dumps(
             payload,
@@ -270,6 +290,7 @@ def resolve_regulatory_indexing_snapshot(
         RegulatoryInputHashVersion.CANONICAL_V2
     ),
     intake_chunking_version: str | None = None,
+    intake_preparation_policy: IntakePreparationPolicy | None = None,
 ) -> RegulatoryIndexingConfigSnapshot:
     search_settings = get_current_search_settings(db_session, for_update=True)
     _validate_embedding_contract(search_settings)
@@ -285,12 +306,14 @@ def resolve_regulatory_indexing_snapshot(
             embedding_model_name=search_settings.model_name,
             enable_contextual_rag=True,
             intake_chunking_version=intake_chunking_version,
+            intake_preparation_policy=intake_preparation_policy,
         ),
         intake_chunking_version=(
             supported_intake_chunking_version(intake_chunking_version)
             if intake_chunking_version is not None
             else None
         ),
+        intake_preparation_policy=intake_preparation_policy,
         search_settings_id=search_settings.id,
         embedding_provider=EmbeddingProvider.OPENROUTER,
         embedding_model_name=search_settings.model_name,
@@ -361,6 +384,7 @@ def validate_snapshot_for_stage(
         embedding_model_name=snapshot.embedding_model_name,
         enable_contextual_rag=True,
         intake_chunking_version=snapshot.intake_chunking_version,
+        intake_preparation_policy=snapshot.intake_preparation_policy,
     )
     unresolved_preparing_snapshot = (
         stage is RegulatoryIndexingStage.PREPARING
