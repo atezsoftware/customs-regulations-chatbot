@@ -278,7 +278,7 @@ def test_untrusted_provider_envelopes_never_authorize_reserve_or_splitting(
         ("document_title", "Invented title"),
     ],
 )
-def test_semantic_failures_never_trigger_output_reserve_or_target_splitting(
+def test_semantic_failures_split_without_borrowing_output_pressure(
     field: str, value: str
 ) -> None:
     sources, base, invalid, repair = _fixture()
@@ -297,16 +297,31 @@ def test_semantic_failures_never_trigger_output_reserve_or_target_splitting(
             )
         ]
     response = json.dumps(semantic)
-    gateway = _CachedGateway(
-        lambda request: _with_usage(_envelope(request, "STOP", response))
-    )
+
+    def respond(request: VertexBatchRequest) -> dict[str, Any]:
+        target_ids = set(json.loads(request.prompt)["target_chunk_ids"])
+        projected = {
+            **semantic,
+            "chunks": [
+                chunk for chunk in semantic["chunks"] if chunk["chunk_id"] in target_ids
+            ],
+        }
+        return _with_usage(_envelope(request, "STOP", json.dumps(projected)))
+
+    gateway = _CachedGateway(respond)
     _seed(gateway, base, invalid)
     _seed(gateway, repair, response, _PRESSURE)
     with pytest.raises(ValueError, match="after bounded repair"):
         _run(gateway, sources)
-    assert len(gateway.new_requests) <= 1
     assert all(
-        _config(request)["maxOutputTokens"] == 32768
-        and len(json.loads(request.prompt)["target_chunk_ids"]) == 8
+        _config(request)["maxOutputTokens"] == 32768 for request in gateway.new_requests
+    )
+    assert {1, 8}.issubset(
+        len(json.loads(request.prompt)["target_chunk_ids"])
         for request in gateway.new_requests
     )
+    before = dict(gateway.lines)
+    calls = len(gateway.new_requests)
+    with pytest.raises(ValueError, match="after bounded repair"):
+        _run(gateway, sources)
+    assert gateway.lines == before and len(gateway.new_requests) == calls
