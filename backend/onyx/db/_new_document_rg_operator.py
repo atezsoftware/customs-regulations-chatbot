@@ -8,7 +8,7 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid5
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -18,12 +18,12 @@ from onyx.db import document_intake as repository
 from onyx.db.engine.sql_engine import SqlEngine, get_session_with_current_tenant
 from onyx.db.models import RegulatoryDocumentIntake
 from onyx.db.search_settings import get_current_search_settings
-from onyx.natural_language_processing.utils import get_tokenizer
-from onyx.regulatory.contextual import contextual_reserve_for_embedding_text
 from onyx.indexing.chunker import DEFAULT_CONTEXTUAL_RAG_RESERVED_TOKENS
-from shared_configs.configs import DOC_EMBEDDING_CONTEXT_SIZE
+from onyx.natural_language_processing.utils import get_tokenizer
 from onyx.regulatory.amendments.annexes import config
+from onyx.regulatory.contextual import contextual_reserve_for_embedding_text
 from onyx.utils.variable_functionality import set_is_ee_based_on_env_variable
+from shared_configs.configs import DOC_EMBEDDING_CONTEXT_SIZE
 from shared_configs.contextvars import get_current_tenant_id
 
 BATCH = UUID("f32df3a9-4644-4fd3-be07-6aaa966d3107")
@@ -34,6 +34,7 @@ PDF_FILE = "8cbb0ca5-7e37-4880-aef6-72f816af7539"
 MAIN_DOCUMENT = "f8d4be65-ec82-4011-a4c9-da10c8998e2e"
 PDF_DOCUMENT = "fd1fefc8-1e2f-41f7-a09f-d36c3f6152e2"
 TARGET_ROW_SHA256 = "fe6b6725b8104825be247dc3fcdb8122659030f108e845dc0b8ae21b303b004a"
+REPREPARE_KEY = uuid5(BATCH, "explicit-whole-table-v4-reprepare-20261102")
 MAIN_DIGEST = "f70e13400f34aec9878368a92a040d76b6a6d9363f70c7f06e6898b878f16ba3"
 ORIGINAL_ERROR = (
     "An intake table row exceeds the embedding content token limit; "
@@ -83,7 +84,7 @@ def verify_scope(session: Session, batch: RegulatoryDocumentIntake) -> list[dict
     require(package[0]["status"] == "ready" and package[0]["issues"] == [], "Source package is not ready")
     require(package[0]["manifest_sha256"] == "a410f20b802e5e664e307915295f561a633954eed41a7fbaa4b66f25f8ce5fb9", "Frozen source manifest changed")
     assets = rows(session, """
-        SELECT a.id,a.sha256,a.text_sha256,a.display_name,a.original_url,m.user_file_id,
+        SELECT a.id,a.sha256,a.text_sha256,a.text_file_id,a.display_name,a.original_url,m.user_file_id,
                m.id AS document_id,m.role,m.parent_document_id,m.relationships,
                m.status AS intake_file_status,m.error AS intake_file_error,
                u.status AS user_file_status,u.chunk_count,u.regulatory_chunk_generation_hash
@@ -124,18 +125,30 @@ def pdf_chunk_verification(session: Session) -> dict[str, Any]:
     require(DOC_EMBEDDING_CONTEXT_SIZE == 512 and DEFAULT_CONTEXTUAL_RAG_RESERVED_TOKENS == 200, "Production embedding/context budgets changed")
     require(settings.enable_contextual_rag, "Production contextual enrichment is disabled")
     atomic = [chunk for chunk in chunks if chunk["chunk_type"] != "hierarchical_aggregate" and chunk["chunk_metadata"].get("chunk_variant") != "hierarchical_aggregate"]
-    require(len(chunks) == 406 and len(atomic) == 395, "PDF chunk counts differ from the verified exact-source replay")
-    matches = [chunk for chunk in atomic if hashlib.sha256(chunk["text"].encode()).hexdigest() == TARGET_ROW_SHA256]
+    profiles = {chunk["chunk_metadata"].get("intake_chunking_version") for chunk in chunks}
+    require(profiles in ({"3"}, {"4"}), "PDF chunk profiles are inconsistent")
+    profile = next(iter(profiles))
+    expected = (332, 320) if profile == "4" else (406, 395)
+    require((len(chunks), len(atomic)) == expected, "PDF chunk counts differ from the verified exact-source replay")
+    matches = [(chunk, line) for chunk in atomic for line in chunk["text"].splitlines() if hashlib.sha256(line.encode()).hexdigest() == TARGET_ROW_SHA256]
     require(len(matches) == 1, "Exact tariff row is missing, split or duplicated")
-    target = matches[0]
-    tokens = len(tokenizer.encode(target["text"]))
-    reserve = contextual_reserve_for_embedding_text(target["text"], tokenizer=tokenizer, embedding_token_limit=DOC_EMBEDDING_CONTEXT_SIZE, requested_reserve=DEFAULT_CONTEXTUAL_RAG_RESERVED_TOKENS)
-    require(tokens == 314 and reserve == 198, "Actual production row token/reserve budget differs from the verified replay")
-    require(target["text"].startswith("| 8544 ila 8548 |"), "Verified tariff row prefix changed")
-    require(target["text"].count("|") == 4, "Tariff row no longer preserves its three cells")
+    target, target_line = matches[0]
+    tokens = len(tokenizer.encode(target_line))
+    require(tokens == 314 and target_line.startswith("| 8544 ila 8548 |") and target_line.count("|") == 4, "Tariff row source or three-cell relationship changed")
+    if profile == "4":
+        from onyx.regulatory.document_intake.embedding_policy import (
+            embedding_token_limit_for_metadata,
+        )
+        limits = [embedding_token_limit_for_metadata(chunk["chunk_metadata"], chunk["chunk_type"], provider=settings.provider_type.value if settings.provider_type else None, model_name=settings.model_name) for chunk in chunks]
+        require(sum(chunk["chunk_type"] == "table" for chunk in atomic) == 68, "Whole-table source block count changed")
+    else:
+        limits = [DOC_EMBEDDING_CONTEXT_SIZE] * len(chunks)
+    target_limit = limits[chunks.index(target)]
+    reserve = contextual_reserve_for_embedding_text(target["text"], tokenizer=tokenizer, embedding_token_limit=target_limit, requested_reserve=DEFAULT_CONTEXTUAL_RAG_RESERVED_TOKENS)
+    require(reserve >= 198, "Target source lost its useful contextual capacity")
     content_token_counts = [len(tokenizer.encode(chunk["text"])) for chunk in chunks]
-    require(max(content_token_counts) <= DOC_EMBEDDING_CONTEXT_SIZE, "A persisted PDF chunk exceeds the actual embedding budget")
-    report.update({"state": "verified", "chunk_count": len(chunks), "canonical_chunk_count": len(atomic), "target_chunk_id": target["id"], "target_row_sha256": TARGET_ROW_SHA256, "target_content_tokens": tokens, "target_context_reserve": reserve, "maximum_content_tokens": max(content_token_counts), "target_three_cells_preserved": True})
+    require(all(count <= limit for count, limit in zip(content_token_counts, limits, strict=True)), "A persisted PDF chunk exceeds its frozen embedding budget")
+    report.update({"state": "verified", "chunking_version": profile, "chunk_count": len(chunks), "canonical_chunk_count": len(atomic), "target_chunk_id": target["id"], "target_row_sha256": TARGET_ROW_SHA256, "target_content_tokens": tokens, "target_chunk_content_tokens": len(tokenizer.encode(target["text"])), "target_final_input_limit": target_limit, "target_context_reserve": reserve, "maximum_content_tokens": max(content_token_counts), "target_three_cells_preserved": True})
     return report
 
 
@@ -208,6 +221,7 @@ def snapshot(session: Session, batch: RegulatoryDocumentIntake) -> dict[str, Any
 def embedding_canary() -> dict[str, Any]:
     """Exercise the configured encoder without publishing or indexing a document."""
     import math
+
     from onyx.indexing.embedder import DefaultIndexingEmbedder
     from onyx.regulatory.contextual import fit_context_fields_to_embedding_budget
     from shared_configs.enums import EmbedTextType
@@ -241,6 +255,7 @@ def embedding_canary() -> dict[str, Any]:
 def review_budget_canary() -> dict[str, Any]:
     """Validate the persisted review inputs without saving an edit."""
     from sqlalchemy import select
+
     from onyx.db.document_intake_edit_budget import validate_intake_edit_budgets
     from onyx.db.models import RegulatoryChunk, UserFile
 
@@ -249,10 +264,117 @@ def review_budget_canary() -> dict[str, Any]:
         identifiers = [UUID(MAIN_FILE), UUID(PDF_FILE)]
         files = {identifier: session.get_one(UserFile, identifier) for identifier in identifiers}
         prospective = {identifier: list(session.scalars(select(RegulatoryChunk).where(RegulatoryChunk.user_file_id == identifier).order_by(RegulatoryChunk.position))) for identifier in identifiers}
-        require([len(prospective[identifier]) for identifier in identifiers] == [365, 406], "Review scope changed")
+        counts = [len(prospective[identifier]) for identifier in identifiers]
+        require(counts in ([365, 406], [365, 332]), "Review scope changed")
         validate_intake_edit_budgets(session, files, prospective)
         session.rollback()
-    return {"success": True, "files": 2, "validated_chunks": 771, "document_or_index_writes": False}
+    return {"success": True, "files": 2, "validated_chunks": sum(counts), "document_or_index_writes": False}
+
+
+def request_v4_reprepare(session: Session, batch: RegulatoryDocumentIntake) -> tuple[dict[str, Any], UUID | None]:
+    """Use the normal reviewed request only for this idle, unpublished incident."""
+    from onyx.db.document_intake_reprepare import (
+        latest_reprepare,
+        reprepare_snapshot,
+        request_reprepare,
+    )
+    from onyx.regulatory.document_intake.models import IntakePreparationPolicy
+
+    previous = latest_reprepare(session, batch.id)
+    if previous is not None:
+        require(previous.idempotency_key == REPREPARE_KEY, "A different reprepare request exists")
+        require(previous.status in {"queued", "running", "prepared"}, "Existing reprepare needs the standard retry/reconciliation flow")
+        return {"operator_action": "existing_reprepare_inspected_only", "request_id": previous.id, "status": previous.status}, None
+    require(batch.status == "failed" and batch.stage == "metadata", "Only the original failed-metadata intake may be upgraded")
+    require(batch.error == "New-document metadata failed strict validation after bounded repair attempts", "The metadata failure signature changed")
+    require(batch.review_sha256 is None and batch.labeling_run_id is None, "A later review or labeling stage already exists")
+    require(pdf_chunk_verification(session)["chunking_version"] == "3", "The original v3 source revision is no longer current")
+    preview = reprepare_snapshot(session, batch)
+    policy = IntakePreparationPolicy().model_dump(mode="json")
+    require(preview.get("target_preparation_policy") == policy, "The reviewed request does not target the exact whole-table v4 policy")
+    require({entry["document_id"] for entry in preview["documents"]} == {MAIN_DOCUMENT, PDF_DOCUMENT}, "The reviewed document scope changed")
+    expected_sha = preview["expected_sha256"]
+    require(bool(re.fullmatch(r"[0-9a-f]{64}", expected_sha)), "The normal reprepare review SHA is missing")
+    request = request_reprepare(session, batch, expected_sha256=expected_sha, idempotency_key=REPREPARE_KEY)
+    require(request.status == "queued" and batch.stage == "reprepare", "The normal repository did not queue the expected reprepare")
+    require(all(entry.get("target_chunking_version") == "4" and entry.get("target_preparation_policy") == policy for entry in request.documents.values()), "The durable request differs from its reviewed v4 policy")
+    verify_scope(session, batch)
+    return {"operator_action": "normal_v4_reprepare_requested", "request_id": request.id, "idempotency_key": REPREPARE_KEY, "expected_review_sha256": expected_sha, "target_preparation_policy": policy, "document_ids": sorted(request.documents), "source_assets_unchanged": True, "publication_or_index_requested": False}, request.id
+
+
+def strict_v4_canary(input_path: Path, expected_sha: str) -> dict[str, Any]:
+    """Exercise the real normal freezer and strict encoder using detached fixture rows."""
+    import logging
+    import math
+
+    from sqlalchemy import select
+
+    from onyx.db.models import RegulatoryChunk, RegulatorySourceAsset, UserFile
+    from onyx.file_store.file_store import get_default_file_store
+    from onyx.file_store.postgres_file_store import PostgresBackedFileStore
+    from onyx.indexing.embedder import DefaultIndexingEmbedder
+    from onyx.regulatory.amendments.annexes.analysis import resolve_review_context_llm
+    from onyx.regulatory.document_intake.models import IntakePreparationPolicy
+    from onyx.regulatory.projection import prepare_normal_context_view
+    from onyx.regulatory.writer_projection import _intake_view_vectors
+    from shared_configs.enums import EmbeddingProvider
+
+    require(bool(re.fullmatch(r"[0-9a-f]{64}", expected_sha)), "Canary requires the exact fixture SHA")
+    wire = input_path.read_bytes()
+    require(0 < len(wire) <= 131072 and hashlib.sha256(wire).hexdigest() == expected_sha, "Fixture size or SHA changed")
+    prefix = "title: none | text: "
+    require(wire.decode().startswith(prefix), "Fixture is missing the established Google instruction wrapper")
+    source = wire.decode()[len(prefix):]
+    require(source.strip() == source and source.startswith("|"), "Fixture is not one exact source table")
+    with get_session_with_current_tenant() as session:
+        session.execute(text("SET TRANSACTION READ ONLY"))
+        asset = session.scalar(select(RegulatorySourceAsset).where(RegulatorySourceAsset.id == UUID("7743688a-0cdf-4b8a-8315-b292b21724ba")))
+        require(asset is not None and asset.text_sha256 == EXPECTED_ASSETS[str(asset.id)][1], "Retained source identity changed")
+        assert asset is not None and asset.text_file_id is not None
+        store = get_default_file_store()
+        stream = store.read_file(asset.text_file_id, db_session=session) if isinstance(store, PostgresBackedFileStore) else store.read_file(asset.text_file_id)
+        with stream:
+            prepared = stream.read(2_000_001)
+        require(len(prepared) <= 2_000_000 and hashlib.sha256(prepared).hexdigest() == asset.text_sha256 and source in prepared.decode("utf-8"), "Fixture is not an exact span of the retained source")
+        settings = get_current_search_settings(session)
+        require(settings.id == 11 and settings.provider_type == EmbeddingProvider.GOOGLE and settings.model_name == "gemini-embedding-2" and settings.enable_contextual_rag, "The configured strict canary model or contextual policy changed")
+        embedder = DefaultIndexingEmbedder.from_db_search_settings(settings)
+        llm = resolve_review_context_llm(settings, None)
+        dimension, model_dim = settings.final_embedding_dim, settings.model_dim
+        session.expunge(settings)
+        session.rollback()
+    file = UserFile(id=uuid5(BATCH, "detached-whole-table-canary"), name="Resmî Gazete whole-table canary")
+    row = RegulatoryChunk(id="detached-whole-table-canary", user_file_id=file.id, text=source, position=0, projection_ordinal=0, heading_path=["EK"], chunk_type="table", chunk_metadata={"chunk_variant": "atomic", "intake_chunking_version": "4", "intake_preparation_policy": IntakePreparationPolicy().model_dump(mode="json")}, source="indexed", status="active")
+    view = prepare_normal_context_view(rows=[row], user_file=file, search_settings=settings, embedder=embedder, llm=llm)
+    require(len(view.projections) == 1 and not view.calls, "A self-contained one-table canary must not call a contextual model")
+    projection = view.projections[0]
+    require(projection.embedding_texts[0] == source and projection.embedding_config.get("strict_full_input") is True and projection.embedding_config.get("max_sequence_length") == 2048, "The normal freezer changed the complete table or strict budget")
+    tokenizer = embedder.embedding_model.tokenizer
+    require(512 < len(tokenizer.encode(source)) <= 1848, "The fixture does not exercise the larger-table path")
+    native_counts: list[float] = []
+    class NativeCounts(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            if record.msg == "Whole-table embedding native_tokens=%s auto_truncate=false" and isinstance(record.args, tuple):
+                count = record.args[0]
+                if isinstance(count, (int, float)):
+                    native_counts.append(float(count))
+    from onyx.natural_language_processing.search_nlp_models import (
+        logger as encoder_logger,
+    )
+    handler = NativeCounts()
+    native_logger = encoder_logger.logger
+    old_level = native_logger.level
+    native_logger.addHandler(handler)
+    native_logger.setLevel(logging.INFO)
+    try:
+        vectors = _intake_view_vectors(view.projections, [], embedder, model_dim=model_dim, vector_dimension=dimension, tenant_id="public", check_owner=lambda: None)
+    finally:
+        native_logger.removeHandler(handler)
+        native_logger.setLevel(old_level)
+    result = next(iter(vectors.values()))
+    require(len(result) == len(projection.embedding_texts) and len(native_counts) == len(result), "Strict provider acknowledgements lack their native token evidence")
+    require(all(len(vector) == dimension and all(math.isfinite(value) for value in vector) for vector in result), "Strict provider returned invalid vectors")
+    return {"success": True, "fixture_wire_sha256": expected_sha, "source_table_sha256": hashlib.sha256(source.encode()).hexdigest(), "exact_source_span_verified": True, "normal_frozen_inputs_sha256": projection.embedding_input_sha256, "frozen_encoder_configuration": projection.embedding_config, "input_approximate_tokens": [len(tokenizer.encode(value)) for value in projection.embedding_texts], "native_processed_tokens_unordered": sorted(native_counts), "vector_dimensions": [len(vector) for vector in result], "complete_table_preserved": True, "requested_auto_truncate": False, "raw_truncated_field": "not inferred from SDK; native no-truncation request contract enforced", "contextual_provider_calls": 0, "document_or_index_writes": False}
 
 
 def worker_failures() -> list[dict[str, str]]:
@@ -283,8 +405,13 @@ def main() -> None:
     parser.add_argument("--retry", action="store_true")
     parser.add_argument("--embedding-canary", action="store_true")
     parser.add_argument("--review-canary", action="store_true")
+    parser.add_argument("--reprepare-v4", action="store_true")
+    parser.add_argument("--strict-v4-canary", action="store_true")
+    parser.add_argument("--input-path", type=Path)
+    parser.add_argument("--expected-input-sha")
     args = parser.parse_args()
-    require(sum((args.retry, args.embedding_canary, args.review_canary)) <= 1, "Retry and canaries must be separate operations")
+    require(sum((args.retry, args.embedding_canary, args.review_canary, args.reprepare_v4, args.strict_v4_canary)) <= 1, "Mutations and canaries must be separate operations")
+    require(not args.strict_v4_canary or (args.input_path is not None and args.expected_input_sha is not None), "Strict canary requires its exact fixture path and SHA")
     require(bool(re.fullmatch(r"[0-9a-f]{40}", args.expected_image_sha)), "Expected exact deployed commit SHA")
     require(args.observed_image_sha == args.expected_image_sha, "Selected DEV container image differs from expected SHA")
     require(POSTGRES_DB == "customs-regulations-dev", "Expected explicit DEV database configuration")
@@ -294,11 +421,12 @@ def main() -> None:
     set_is_ee_based_on_env_variable()
     SqlEngine.init_engine(pool_size=1, max_overflow=0)
     enqueue = False
+    reprepare_id: UUID | None = None
     with get_session_with_current_tenant() as session:
-        if not args.retry:
+        if not (args.retry or args.reprepare_v4):
             session.execute(text("SET TRANSACTION READ ONLY"))
         require(session.execute(text("SELECT current_database()")).scalar_one() == "customs-regulations-dev", "Connected database is not DEV")
-        batch = session.get(RegulatoryDocumentIntake, BATCH, with_for_update=args.retry, populate_existing=True)
+        batch = session.get(RegulatoryDocumentIntake, BATCH, with_for_update=args.retry or args.reprepare_v4, populate_existing=True)
         require(batch is not None, "Exact frozen intake is missing")
         assert batch is not None
         report = snapshot(session, batch)
@@ -318,17 +446,34 @@ def main() -> None:
                 session.commit()
                 enqueue = True
                 report["operator_action"] = "standard_retry_committed"
+        elif args.reprepare_v4:
+            action, reprepare_id = request_v4_reprepare(session, batch)
+            report.update(action)
+            if reprepare_id is None:
+                session.rollback()
+            else:
+                session.commit()
         else:
             report["operator_action"] = "inspected_read_only"
             session.rollback()
     if enqueue:
-        from onyx.background.celery.tasks.regulatory_amendments.document_intake import enqueue_intake_batch
+        from onyx.background.celery.tasks.regulatory_amendments.document_intake import (
+            enqueue_intake_batch,
+        )
         enqueue_intake_batch(batch_id=BATCH, tenant_id=tenant)
         report["delivery"] = "standard_enqueue_intake_batch_sent"
+    if reprepare_id is not None:
+        from onyx.background.celery.tasks.regulatory_amendments.document_intake import (
+            enqueue_intake_batch,
+        )
+        enqueue_intake_batch(batch_id=BATCH, tenant_id=tenant, reprepare_request_id=reprepare_id)
+        report["delivery"] = "standard_enqueue_intake_batch_with_frozen_reprepare_sent"
     if args.embedding_canary:
         report["embedding_canary"] = embedding_canary()
     if args.review_canary:
         report["review_budget_canary"] = review_budget_canary()
+    if args.strict_v4_canary:
+        report["strict_v4_canary"] = strict_v4_canary(args.input_path, args.expected_input_sha)
     report["expected_image_sha"] = args.expected_image_sha
     report["worker_failures"] = worker_failures()
     # Provider error strings can occasionally contain credentials; redact the entire value.
