@@ -248,7 +248,12 @@ def compare_context_views(
 
 
 def freeze_embedding_inputs(
-    chunk: "DocAwareChunk", model: "EmbeddingModel", *, model_dim: int
+    chunk: "DocAwareChunk",
+    model: "EmbeddingModel",
+    *,
+    model_dim: int,
+    max_seq_length: int | None = None,
+    strict_full_input: bool = False,
 ) -> tuple[list[str], dict[str, str | int | float | bool | None]]:
     """Mirror the actual formatter and encode normalization, including title/minis."""
     from onyx.document_index.chunk_content_enrichment import (
@@ -263,37 +268,72 @@ def freeze_embedding_inputs(
         raise ValueError("empty_embedding_input")
     texts = [main, *(chunk.mini_chunk_texts or []), *([title] if title else [])]
     return freeze_encoder_inputs(
-        texts, model, model_dim=model_dim, formatter="normal-v1"
+        texts,
+        model,
+        model_dim=model_dim,
+        formatter="normal-v1",
+        max_seq_length=max_seq_length,
+        strict_full_input=strict_full_input,
     )
 
 
 def freeze_encoder_inputs(
-    texts: list[str], model: "EmbeddingModel", *, model_dim: int, formatter: str
+    texts: list[str],
+    model: "EmbeddingModel",
+    *,
+    model_dim: int,
+    formatter: str,
+    max_seq_length: int | None = None,
+    strict_full_input: bool = False,
 ) -> tuple[list[str], dict[str, str | int | float | bool | None]]:
     """Freeze the text and configuration reaching the actual encoder transport."""
     from onyx.natural_language_processing.utils import tokenizer_trim_content
+    from onyx.regulatory.document_intake.embedding_policy import (
+        preparation_policy_for_model,
+    )
     from onyx.utils.text_processing import remove_invalid_unicode_chars
     from shared_configs.configs import DOC_EMBEDDING_CONTEXT_SIZE
 
     if not texts or not all(texts):
         raise ValueError("empty_embedding_input")
-    if model.retrim_content:
+    if max_seq_length is None:
+        max_seq_length = DOC_EMBEDDING_CONTEXT_SIZE
+    if strict_full_input:
+        policy = preparation_policy_for_model(
+            model.provider_type.value if model.provider_type else None, model.model_name
+        )
+        if policy is None or max_seq_length != policy.table_token_limit:
+            raise ValueError("The frozen whole-table encoder is unsupported")
+        if any(len(model.tokenizer.encode(text)) > max_seq_length for text in texts):
+            raise ValueError("Complete table input exceeds its frozen encoder budget")
+        if any(remove_invalid_unicode_chars(text) != text for text in texts):
+            raise ValueError("Complete table input contains invalid Unicode")
+    elif model.retrim_content:
         texts = [
             tokenizer_trim_content(
                 content=text,
-                desired_length=DOC_EMBEDDING_CONTEXT_SIZE,
+                desired_length=max_seq_length,
                 tokenizer=model.tokenizer,
             )
             for text in texts
         ]
     texts = [remove_invalid_unicode_chars(text) or "<>" for text in texts]
     return texts, encoder_model_fingerprint(
-        model, model_dim=model_dim, formatter=formatter
+        model,
+        model_dim=model_dim,
+        formatter=formatter,
+        max_seq_length=max_seq_length,
+        strict_full_input=strict_full_input,
     )
 
 
 def encoder_model_fingerprint(
-    model: "EmbeddingModel", *, model_dim: int, formatter: str
+    model: "EmbeddingModel",
+    *,
+    model_dim: int,
+    formatter: str,
+    max_seq_length: int | None = None,
+    strict_full_input: bool = False,
 ) -> dict[str, str | int | float | bool | None]:
     from shared_configs.configs import DOC_EMBEDDING_CONTEXT_SIZE
 
@@ -309,10 +349,14 @@ def encoder_model_fingerprint(
         "api_version": model.api_version,
         "deployment_name": model.deployment_name,
         "tokenizer": f"{type(model.tokenizer).__module__}.{type(model.tokenizer).__qualname__}",
-        "max_sequence_length": DOC_EMBEDDING_CONTEXT_SIZE,
+        "max_sequence_length": max_seq_length
+        if max_seq_length is not None
+        else DOC_EMBEDDING_CONTEXT_SIZE,
         "formatter": formatter,
         "text_type": "passage",
     }
+    if strict_full_input:
+        config["strict_full_input"] = True
     return config
 
 

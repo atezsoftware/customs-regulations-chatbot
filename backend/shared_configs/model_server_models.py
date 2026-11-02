@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from shared_configs.enums import EmbeddingProvider, EmbedTextType, RerankerProvider
 
@@ -11,6 +11,7 @@ class EmbedRequest(BaseModel):
     model_name: str | None = None
     deployment_name: str | None = None
     max_context_length: int
+    strict_full_input: bool = Field(default=False, exclude_if=lambda value: not value)
     normalize_embeddings: bool
     api_key: str | None = None
     provider_type: EmbeddingProvider | None = None

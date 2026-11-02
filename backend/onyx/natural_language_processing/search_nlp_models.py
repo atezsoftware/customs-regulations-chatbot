@@ -1,5 +1,6 @@
 import asyncio
 import json
+import math
 import os
 import re
 import threading
@@ -253,6 +254,7 @@ def is_authentication_error(error: Exception) -> bool:
 
 
 _GEMINI_EMBEDDING_2_MODEL_PREFIX = "gemini-embedding-2"
+_GEMINI_EMBEDDING_2_INPUT_TOKEN_LIMIT = 8192
 
 # Gemini embedding-2 ignores task_type entirely; instead the documented way
 # to differentiate query vs. document is to wrap the input in Google's task
@@ -444,6 +446,7 @@ class CloudEmbedding:
         model: str | None,
         embedding_type: str,
         reduced_dimension: int | None,
+        strict_full_input: bool = False,
     ) -> list[Embedding]:
         from google import genai
         from google.genai import types as genai_types
@@ -497,7 +500,7 @@ class CloudEmbedding:
         if _is_gemini_embedding_2_model(resolved_model):
             embed_config = genai_types.EmbedContentConfig(
                 output_dimensionality=reduced_dimension,
-                auto_truncate=True,
+                auto_truncate=not strict_full_input,
             )
         else:
             embed_config = genai_types.EmbedContentConfig(
@@ -532,6 +535,24 @@ class CloudEmbedding:
 
             embeddings: list[Embedding] = []
             for idx, embedding in enumerate(response.embeddings):
+                if strict_full_input:
+                    statistics = embedding.statistics
+                    if (
+                        statistics is None
+                        or statistics.token_count is None
+                        or not math.isfinite(statistics.token_count)
+                        or not 0
+                        < statistics.token_count
+                        <= _GEMINI_EMBEDDING_2_INPUT_TOKEN_LIMIT
+                        or statistics.truncated is True
+                    ):
+                        raise EmbeddingProviderResponseError(
+                            "Whole-table provider input completeness was not proven"
+                        )
+                    logger.info(
+                        "Whole-table embedding native_tokens=%s auto_truncate=false",
+                        statistics.token_count,
+                    )
                 if embedding.values is None:
                     raise RuntimeError(
                         f"Missing embedding values for input at index {idx}."
@@ -697,9 +718,17 @@ class CloudEmbedding:
         model_name: str | None = None,
         deployment_name: str | None = None,
         reduced_dimension: int | None = None,
+        strict_full_input: bool = False,
     ) -> list[Embedding]:
         import openai
 
+        if strict_full_input and (
+            self.provider != EmbeddingProvider.GOOGLE
+            or model_name != _GEMINI_EMBEDDING_2_MODEL_PREFIX
+        ):
+            raise ValueError(
+                "Complete-input embedding requires its frozen Google model"
+            )
         try:
             if self.provider == EmbeddingProvider.OPENAI:
                 return await self._embed_openai(texts, model_name, reduced_dimension)
@@ -720,7 +749,11 @@ class CloudEmbedding:
                 return await self._embed_voyage(texts, model_name, embedding_type)
             elif self.provider == EmbeddingProvider.GOOGLE:
                 return await self._embed_vertex(
-                    texts, model_name, embedding_type, reduced_dimension
+                    texts,
+                    model_name,
+                    embedding_type,
+                    reduced_dimension,
+                    **({"strict_full_input": True} if strict_full_input else {}),
                 )
             else:
                 raise ValueError(f"Unsupported provider: {self.provider}")
@@ -982,6 +1015,11 @@ class EmbeddingModel:
                 deployment_name=embed_request.deployment_name,
                 text_type=embed_request.text_type,
                 reduced_dimension=embed_request.reduced_dimension,
+                **(
+                    {"strict_full_input": True}
+                    if embed_request.strict_full_input
+                    else {}
+                ),
             )
 
         if any(embedding is None for embedding in embeddings):
@@ -1082,6 +1120,7 @@ class EmbeddingModel:
         num_threads: int = INDEXING_EMBEDDING_MODEL_NUM_THREADS,
         tenant_id: str | None = None,
         request_id: str | None = None,
+        strict_full_input: bool = False,
     ) -> list[Embedding]:
         text_batches = batch_list(texts, batch_size)
         num_of_batches = len(text_batches)
@@ -1110,6 +1149,7 @@ class EmbeddingModel:
                 api_version=self.api_version,
                 deployment_name=self.deployment_name,
                 max_context_length=max_seq_length,
+                strict_full_input=strict_full_input,
                 normalize_embeddings=self.normalize,
                 api_key=self.api_key,
                 provider_type=self.provider_type,
@@ -1286,6 +1326,7 @@ class EmbeddingModel:
         max_seq_length: int = DOC_EMBEDDING_CONTEXT_SIZE,
         tenant_id: str | None = None,
         request_id: str | None = None,
+        strict_full_input: bool = False,
     ) -> list[Embedding]:
         if not texts or not all(texts):
             raise ValueError(f"Empty or missing text for embedding: {texts}")
@@ -1299,7 +1340,24 @@ class EmbeddingModel:
         if large_chunks_present:
             max_seq_length *= LARGE_CHUNK_RATIO
 
-        if self.retrim_content:
+        if strict_full_input:
+            from onyx.regulatory.document_intake.embedding_policy import (
+                preparation_policy_for_model,
+            )
+
+            policy = preparation_policy_for_model(
+                self.provider_type.value if self.provider_type else None,
+                self.model_name,
+            )
+            if policy is None or max_seq_length != policy.table_token_limit:
+                raise ValueError("The requested whole-table encoder is unsupported")
+            if any(len(self.tokenizer.encode(text)) > max_seq_length for text in texts):
+                raise ValueError(
+                    "Complete table input exceeds its frozen encoder budget"
+                )
+            if any(remove_invalid_unicode_chars(text) != text for text in texts):
+                raise ValueError("Complete table input contains invalid Unicode")
+        elif self.retrim_content:
             # This is applied during indexing as a catchall for overly long titles (or other uncapped fields)
             # Note that this uses just the default tokenizer which may also lead to very minor miscountings
             # However this slight miscounting is very unlikely to have any material impact.
@@ -1329,6 +1387,7 @@ class EmbeddingModel:
             max_seq_length=max_seq_length,
             tenant_id=tenant_id,
             request_id=request_id,
+            **({"strict_full_input": True} if strict_full_input else {}),
         )
 
     @classmethod
