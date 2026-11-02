@@ -237,6 +237,24 @@ def embedding_canary() -> dict[str, Any]:
     return {"success": True, "model": model_name, "input_tokens": [len(tokenizer.encode(value)) for value in inputs], "vector_dimensions": [len(vector) for vector in vectors], "source_row_sha256": TARGET_ROW_SHA256, "enriched_input_sha256": hashlib.sha256(enriched.encode()).hexdigest(), "whole_source_row_preserved": True, "document_or_index_writes": False}
 
 
+
+def review_budget_canary() -> dict[str, Any]:
+    """Validate the persisted review inputs without saving an edit."""
+    from sqlalchemy import select
+    from onyx.db.document_intake_edit_budget import validate_intake_edit_budgets
+    from onyx.db.models import RegulatoryChunk, UserFile
+
+    with get_session_with_current_tenant() as session:
+        session.execute(text("SET TRANSACTION READ ONLY"))
+        identifiers = [UUID(MAIN_FILE), UUID(PDF_FILE)]
+        files = {identifier: session.get_one(UserFile, identifier) for identifier in identifiers}
+        prospective = {identifier: list(session.scalars(select(RegulatoryChunk).where(RegulatoryChunk.user_file_id == identifier).order_by(RegulatoryChunk.position))) for identifier in identifiers}
+        require([len(prospective[identifier]) for identifier in identifiers] == [365, 406], "Review scope changed")
+        validate_intake_edit_budgets(session, files, prospective)
+        session.rollback()
+    return {"success": True, "files": 2, "validated_chunks": 771, "document_or_index_writes": False}
+
+
 def worker_failures() -> list[dict[str, str]]:
     failures: list[dict[str, str]] = []
     for path in sorted(Path("/var/log/onyx").glob("*regulatory*.log")):
@@ -264,8 +282,9 @@ def main() -> None:
     parser.add_argument("--observed-image-sha", required=True)
     parser.add_argument("--retry", action="store_true")
     parser.add_argument("--embedding-canary", action="store_true")
+    parser.add_argument("--review-canary", action="store_true")
     args = parser.parse_args()
-    require(not (args.retry and args.embedding_canary), "Retry and embedding canary must be separate operations")
+    require(sum((args.retry, args.embedding_canary, args.review_canary)) <= 1, "Retry and canaries must be separate operations")
     require(bool(re.fullmatch(r"[0-9a-f]{40}", args.expected_image_sha)), "Expected exact deployed commit SHA")
     require(args.observed_image_sha == args.expected_image_sha, "Selected DEV container image differs from expected SHA")
     require(POSTGRES_DB == "customs-regulations-dev", "Expected explicit DEV database configuration")
@@ -308,6 +327,8 @@ def main() -> None:
         report["delivery"] = "standard_enqueue_intake_batch_sent"
     if args.embedding_canary:
         report["embedding_canary"] = embedding_canary()
+    if args.review_canary:
+        report["review_budget_canary"] = review_budget_canary()
     report["expected_image_sha"] = args.expected_image_sha
     report["worker_failures"] = worker_failures()
     # Provider error strings can occasionally contain credentials; redact the entire value.

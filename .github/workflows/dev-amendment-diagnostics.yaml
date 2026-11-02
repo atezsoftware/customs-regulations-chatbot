@@ -7,7 +7,7 @@ on:
         type: choice
         required: true
         default: inspect
-        options: [inspect, retry, embedding-canary]
+        options: [inspect, retry, embedding-canary, review-canary]
       expected_image_sha:
         type: string
         required: true
@@ -33,7 +33,7 @@ jobs:
         run: |
           set -euo pipefail
           [[ "$EXPECTED_IMAGE_SHA" =~ ^[0-9a-f]{40}$ ]]
-          [[ "$OPERATION" == inspect || "$OPERATION" == retry || "$OPERATION" == embedding-canary ]]
+          [[ "$OPERATION" == inspect || "$OPERATION" == retry || "$OPERATION" == embedding-canary || "$OPERATION" == review-canary ]]
           aws eks update-kubeconfig --name atez-dev-cluster --region eu-central-1
           kubectl get pods -n customs-regulations-dev -o json > /tmp/rg-pods.json
           python - <<'PY'
@@ -63,6 +63,7 @@ jobs:
           args=(--expected-image-sha "$EXPECTED_IMAGE_SHA" --observed-image-sha "$observed")
           if [[ "$OPERATION" == retry ]]; then args+=(--retry); fi
           if [[ "$OPERATION" == embedding-canary ]]; then args+=(--embedding-canary); fi
+          if [[ "$OPERATION" == review-canary ]]; then args+=(--review-canary); fi
           kubectl exec -i "$pod" -n customs-regulations-dev -c "$container" -- \
             sh -ec '. /vault/secrets/config; export PYTHONPATH=/app; exec python -c '\''import sys; exec(compile(sys.stdin.read(), "/app/onyx/db/_new_document_rg_operator.py", "exec"))'\'' "$@"' rg-operator "${args[@]}" \
             < backend/onyx/db/_new_document_rg_operator.py
