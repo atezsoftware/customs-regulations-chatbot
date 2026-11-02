@@ -36,6 +36,7 @@ PDF_DOCUMENT = "fd1fefc8-1e2f-41f7-a09f-d36c3f6152e2"
 TARGET_ROW_SHA256 = "fe6b6725b8104825be247dc3fcdb8122659030f108e845dc0b8ae21b303b004a"
 REPREPARE_KEY = uuid5(BATCH, "explicit-whole-table-v4-reprepare-20261102")
 REPREPARE_REQUEST = "a03a7101-f9a7-46cf-bbda-831d96e64865"
+REPREPARE_REVIEW_SHA = "1188de8875d91317e9f9cb9bc9cbf1057e9a4a47b40092de755bb8235b0b1462"
 MAIN_DIGEST = "f70e13400f34aec9878368a92a040d76b6a6d9363f70c7f06e6898b878f16ba3"
 ORIGINAL_ERROR = (
     "An intake table row exceeds the embedding content token limit; "
@@ -313,6 +314,33 @@ def request_v4_reprepare(session: Session, batch: RegulatoryDocumentIntake) -> t
     return {"operator_action": "normal_v4_reprepare_requested", "request_id": request.id, "idempotency_key": REPREPARE_KEY, "expected_review_sha256": expected_sha, "target_preparation_policy": policy, "document_ids": sorted(request.documents), "source_assets_unchanged": True, "publication_or_index_requested": False}, request.id
 
 
+def retry_frozen_reprepare(session: Session, batch: RegulatoryDocumentIntake) -> tuple[dict[str, Any], UUID | None]:
+    from onyx.db.document_intake_reprepare import latest_reprepare, reprepare_snapshot
+    from onyx.regulatory.document_intake.models import IntakePreparationPolicy
+
+    request = latest_reprepare(session, batch.id)
+    require(request is not None, "The frozen reprepare request is missing")
+    assert request is not None
+    require(str(request.id) == REPREPARE_REQUEST and request.intake_id == batch.id and request.idempotency_key == REPREPARE_KEY and request.expected_sha256 == REPREPARE_REVIEW_SHA, "The frozen reprepare request identity changed")
+    if batch.status == "preparing" and batch.stage == "reprepare":
+        return {"operator_action": "existing_reprepare_retry_inspected_only", "request_id": request.id, "status": request.status}, None
+    require(batch.status == "failed" and batch.stage == "reprepare" and request.status == "failed", "Only the failed original reprepare may be retried")
+    error = batch.error or ""
+    require(error.startswith("(psycopg2.errors.QueryCanceled) canceling statement due to user request") and "DELETE FROM regulatory_chunk" in error and MAIN_FILE in error and request.error == batch.error, "The guarded main-file cancellation signature changed")
+    require(batch.review_sha256 is None and batch.labeling_run_id is None and batch.lease_token is None and batch.lease_expires_at is None, "The cancelled reprepare has a later review or live owner")
+    policy = IntakePreparationPolicy().model_dump(mode="json")
+    require(set(request.documents) == {MAIN_DOCUMENT, PDF_DOCUMENT} and all(entry.get("status") == "pending" and entry.get("target_chunking_version") == "4" and entry.get("target_preparation_policy") == policy for entry in request.documents.values()), "The cancelled request checkpoints or target policy changed")
+    require(pdf_chunk_verification(session)["chunking_version"] == "3", "The cancelled PDF source revision changed")
+    preview = reprepare_snapshot(session, batch)
+    require(preview["expected_sha256"] == REPREPARE_REVIEW_SHA and preview.get("target_preparation_policy") == policy, "The complete original source snapshot changed after rollback")
+    audit = json.dumps(request.documents, sort_keys=True, default=str)
+    deliveries = repository.retry_intake(session, batch)
+    require(deliveries == [] and batch.status == "preparing" and batch.stage == "reprepare" and batch.error is None and batch.lease_token is None and batch.lease_expires_at is None, "The normal retry did not preserve the requested reprepare stage")
+    require(json.dumps(request.documents, sort_keys=True, default=str) == audit and request.expected_sha256 == REPREPARE_REVIEW_SHA, "The normal retry changed the frozen reprepare audit")
+    verify_scope(session, batch)
+    return {"operator_action": "normal_frozen_reprepare_retry_requested", "request_id": request.id, "expected_review_sha256": request.expected_sha256, "target_preparation_policy": policy, "source_snapshot_unchanged_after_rollback": True, "publication_or_index_requested": False}, request.id
+
+
 def strict_v4_canary(input_path: Path, expected_sha: str) -> dict[str, Any]:
     """Exercise the real normal freezer and strict encoder using detached fixture rows."""
     import logging
@@ -448,11 +476,12 @@ def main() -> None:
     parser.add_argument("--embedding-canary", action="store_true")
     parser.add_argument("--review-canary", action="store_true")
     parser.add_argument("--reprepare-v4", action="store_true")
+    parser.add_argument("--retry-reprepare-v4", action="store_true")
     parser.add_argument("--strict-v4-canary", action="store_true")
     parser.add_argument("--input-path", type=Path)
     parser.add_argument("--expected-input-sha")
     args = parser.parse_args()
-    require(sum((args.retry, args.embedding_canary, args.review_canary, args.reprepare_v4, args.strict_v4_canary)) <= 1, "Mutations and canaries must be separate operations")
+    require(sum((args.retry, args.embedding_canary, args.review_canary, args.reprepare_v4, args.retry_reprepare_v4, args.strict_v4_canary)) <= 1, "Mutations and canaries must be separate operations")
     require(not args.strict_v4_canary or (args.input_path is not None and args.expected_input_sha is not None), "Strict canary requires its exact fixture path and SHA")
     require(bool(re.fullmatch(r"[0-9a-f]{40}", args.expected_image_sha)), "Expected exact deployed commit SHA")
     require(args.observed_image_sha == args.expected_image_sha, "Selected DEV container image differs from expected SHA")
@@ -465,10 +494,10 @@ def main() -> None:
     enqueue = False
     reprepare_id: UUID | None = None
     with get_session_with_current_tenant() as session:
-        if not (args.retry or args.reprepare_v4):
+        if not (args.retry or args.reprepare_v4 or args.retry_reprepare_v4):
             session.execute(text("SET TRANSACTION READ ONLY"))
         require(session.execute(text("SELECT current_database()")).scalar_one() == "customs-regulations-dev", "Connected database is not DEV")
-        batch = session.get(RegulatoryDocumentIntake, BATCH, with_for_update=args.retry or args.reprepare_v4, populate_existing=True)
+        batch = session.get(RegulatoryDocumentIntake, BATCH, with_for_update=args.retry or args.reprepare_v4 or args.retry_reprepare_v4, populate_existing=True)
         require(batch is not None, "Exact frozen intake is missing")
         assert batch is not None
         report = snapshot(session, batch)
@@ -490,6 +519,13 @@ def main() -> None:
                 report["operator_action"] = "standard_retry_committed"
         elif args.reprepare_v4:
             action, reprepare_id = request_v4_reprepare(session, batch)
+            report.update(action)
+            if reprepare_id is None:
+                session.rollback()
+            else:
+                session.commit()
+        elif args.retry_reprepare_v4:
+            action, reprepare_id = retry_frozen_reprepare(session, batch)
             report.update(action)
             if reprepare_id is None:
                 session.rollback()
@@ -518,7 +554,7 @@ def main() -> None:
         report["strict_v4_canary"] = strict_v4_canary(args.input_path, args.expected_input_sha)
     report["expected_image_sha"] = args.expected_image_sha
     report["worker_failures"] = worker_failures()
-    if not (args.retry or args.reprepare_v4 or args.embedding_canary or args.review_canary or args.strict_v4_canary):
+    if not (args.retry or args.reprepare_v4 or args.retry_reprepare_v4 or args.embedding_canary or args.review_canary or args.strict_v4_canary):
         report["exact_worker_activity"] = exact_worker_activity()
     # Provider error strings can occasionally contain credentials; redact the entire value.
     def sanitized(value: Any) -> Any:

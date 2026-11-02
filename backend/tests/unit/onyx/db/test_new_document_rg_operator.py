@@ -168,7 +168,9 @@ def test_changed_review_snapshot_cannot_queue(
     else:
         preview["expected_sha256"] = "invalid"
     monkeypatch.setattr(repository, "latest_reprepare", MagicMock(return_value=None))
-    monkeypatch.setattr(repository, "reprepare_snapshot", MagicMock(return_value=preview))
+    monkeypatch.setattr(
+        repository, "reprepare_snapshot", MagicMock(return_value=preview)
+    )
     monkeypatch.setattr(
         operator, "pdf_chunk_verification", lambda _: {"chunking_version": "3"}
     )
@@ -212,3 +214,88 @@ def test_worker_inspection_reports_only_the_exact_intake(
     assert [task["task_id"] for task in report["exact_intake_tasks"]] == ["task1"]
     assert report["exact_intake_tasks"][0]["state"] == "active"
     app.send_task.assert_not_called()
+
+
+def test_normal_retry_preserves_the_original_frozen_request(
+    operator: ModuleType,
+    batch: RegulatoryDocumentIntake,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    batch.stage = "reprepare"
+    batch.error = (
+        "(psycopg2.errors.QueryCanceled) canceling statement due to user request\n"
+        f"DELETE FROM regulatory_chunk WHERE user_file_id='{operator.MAIN_FILE}'"
+    )
+    policy = IntakePreparationPolicy().model_dump(mode="json")
+    request = RegulatoryDocumentIntakeReprepare(
+        id=operator.UUID(operator.REPREPARE_REQUEST),
+        intake_id=batch.id,
+        idempotency_key=operator.REPREPARE_KEY,
+        expected_sha256=operator.REPREPARE_REVIEW_SHA,
+        status="failed",
+        error=batch.error,
+        documents={
+            value: {
+                "status": "pending",
+                "target_chunking_version": "4",
+                "target_preparation_policy": policy,
+            }
+            for value in [operator.MAIN_DOCUMENT, operator.PDF_DOCUMENT]
+        },
+    )
+    monkeypatch.setattr(repository, "latest_reprepare", MagicMock(return_value=request))
+    monkeypatch.setattr(
+        repository,
+        "reprepare_snapshot",
+        MagicMock(
+            return_value={
+                "expected_sha256": request.expected_sha256,
+                "target_preparation_policy": policy,
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        operator, "pdf_chunk_verification", lambda _: {"chunking_version": "3"}
+    )
+    monkeypatch.setattr(operator, "verify_scope", MagicMock())
+
+    def retry(*_args: object) -> list[object]:
+        batch.status, batch.error = "preparing", None
+        return []
+
+    retry_call = MagicMock(side_effect=retry)
+    monkeypatch.setattr(operator.repository, "retry_intake", retry_call)
+    session = MagicMock(spec=Session)
+    report, delivery = operator.retry_frozen_reprepare(session, batch)
+    retry_call.assert_called_once_with(session, batch)
+    assert delivery == request.id
+    assert request.status == "failed"
+    assert report["expected_review_sha256"] == operator.REPREPARE_REVIEW_SHA
+    assert report["publication_or_index_requested"] is False
+    session.commit.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "error", ["timeout", "canceling statement due to user request"]
+)
+def test_retry_does_not_accept_other_failure_signatures(
+    operator: ModuleType,
+    batch: RegulatoryDocumentIntake,
+    monkeypatch: pytest.MonkeyPatch,
+    error: str,
+) -> None:
+    batch.stage, batch.error = "reprepare", error
+    request = RegulatoryDocumentIntakeReprepare(
+        id=operator.UUID(operator.REPREPARE_REQUEST),
+        intake_id=batch.id,
+        idempotency_key=operator.REPREPARE_KEY,
+        expected_sha256=operator.REPREPARE_REVIEW_SHA,
+        status="failed",
+        error=error,
+    )
+    monkeypatch.setattr(repository, "latest_reprepare", MagicMock(return_value=request))
+    retry = MagicMock()
+    monkeypatch.setattr(operator.repository, "retry_intake", retry)
+    with pytest.raises(RuntimeError, match="cancellation signature changed"):
+        operator.retry_frozen_reprepare(MagicMock(spec=Session), batch)
+    retry.assert_not_called()
