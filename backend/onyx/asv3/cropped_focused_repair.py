@@ -26,6 +26,7 @@ from onyx.asv3.cropped_repair_state import (
     CroppedRepairTarget,
     extract_repair_targets,
 )
+from onyx.asv3.cropped_research_limit import CroppedResearchLimit
 from onyx.asv3.model_composition.models import get_model_composition
 from onyx.asv3.models import (
     CapabilityCall,
@@ -194,7 +195,7 @@ def unresolved_governing_projection(
     units = assertion_inventory(draft)
     known = {unit["unit_id"] for unit in units}
     by_key = {record.get("key"): record for record in records}
-    notices: dict[str, str] = {}
+    notices: dict[str, list[str]] = {}
     for target in targets:
         record = by_key.get(target.key)
         if (
@@ -210,9 +211,9 @@ def unresolved_governing_projection(
             return None
         notice = source_gap_sentence(target, str(record["status"]))
         for identifier in target.unit_ids:
-            if identifier in notices and notices[identifier] != notice:
-                return None
-            notices[identifier] = notice
+            unit_notices = notices.setdefault(identifier, [])
+            if notice not in unit_notices:
+                unit_notices.append(notice)
     if not notices or not any(
         unit["unit_id"] not in notices and unit["evidence_numbers"] for unit in units
     ):
@@ -220,12 +221,14 @@ def unresolved_governing_projection(
     emitted: set[str] = set()
     result: list[str] = []
     for unit in units:
-        notice = notices.get(unit["unit_id"])
-        if notice is None:
+        unit_notices = notices.get(unit["unit_id"])
+        if unit_notices is None:
             result.append(unit["text"])
-        elif notice not in emitted:
-            result.append(notice)
-            emitted.add(notice)
+        else:
+            for notice in unit_notices:
+                if notice not in emitted:
+                    result.append(notice)
+                    emitted.add(notice)
     return "\n\n".join(result)
 
 
@@ -440,7 +443,34 @@ class CroppedFocusedRepair:
             ]
         observations: list[dict[str, JsonValue]] = []
         if calls:
-            for receipt in harness.dispatch_repair_reads(calls):
+            controller = harness.context.services.get("cropped_research_controller")
+            records = self.state.records_for([target])
+            if (
+                governing
+                and len(calls) == 1
+                and calls[0].name
+                in {"read_provision", "read_named_provision", "read_chunk_context"}
+                and records
+                and records[0].get("status") == "in_progress"
+                and isinstance(controller, CroppedResearchLimit)
+            ):
+                from onyx.asv3.cropped_cost_budget import (
+                    CroppedCostBudget,
+                    CroppedRepairBudgetReached,
+                )
+
+                harness.context.check_research_active()
+                controller.check_context(harness.context)
+                budget = harness.context.services.get("cropped_cost_budget")
+                if isinstance(budget, CroppedCostBudget) and not budget.repair_allowed:
+                    raise CroppedRepairBudgetReached(
+                        "Cropped repair cost limit reached before its canonical read"
+                    )
+                with controller.focused_governing_read(calls[0], self.state, target):
+                    receipts = harness.dispatch_repair_reads(calls)
+            else:
+                receipts = harness.dispatch_repair_reads(calls)
+            for receipt in receipts:
                 numbers.update(receipt.evidence_ids)
                 observations.append(
                     {
@@ -494,7 +524,18 @@ class CroppedFocusedRepair:
             )
             self.state.finish(
                 target.key,
-                "failed" if failed else "not_found",
+                "failed"
+                if failed
+                else "incomplete"
+                if any(
+                    isinstance(result := row.get("result"), dict)
+                    and (
+                        result.get("not_read") is True
+                        or result.get("blocked_by_research_limit") is True
+                    )
+                    for row in observations
+                )
+                else "not_found",
                 [],
                 json.dumps(
                     {"absence_proven": False, "observations": observations},

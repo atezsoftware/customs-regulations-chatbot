@@ -2,19 +2,23 @@
 
 from __future__ import annotations
 
+import contextvars
 import copy
 import hashlib
 import json
 import re
 import threading
 import unicodedata
-from collections.abc import Iterable
-from typing import Literal
+from collections.abc import Generator, Iterable
+from contextlib import contextmanager
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.models import (
+    CapabilityCall,
     EvidenceItem,
     HarnessView,
     OutcomeStatus,
@@ -26,6 +30,9 @@ from onyx.regulatory.heading_path import (
     extract_single_regulatory_provision_reference,
 )
 from onyx.regulatory.source_identity import named_law_number
+
+if TYPE_CHECKING:
+    from onyx.asv3.cropped_repair_state import CroppedRepairState, CroppedRepairTarget
 
 _POLICY_ARTIFACT = "exp-cropped-rerank-audit-20261012/cohort/cohort-table.json"
 _POLICY_ARTIFACT_SHA256 = (
@@ -453,6 +460,19 @@ def _critical_operation(
         if isinstance(size, bool) or not isinstance(size, int) or not 1 <= size <= 100:
             return None
     return operation
+
+
+@dataclass(frozen=True)
+class _FocusedGoverningRead:
+    controller: CroppedResearchLimit
+    target_key: str
+    call_id: str
+    operation: dict[str, JsonValue]
+
+
+_FOCUSED_GOVERNING_READ: contextvars.ContextVar[_FocusedGoverningRead | None] = (
+    contextvars.ContextVar("cropped_focused_governing_read", default=None)
+)
 
 
 class CroppedResearchLimit:
@@ -911,6 +931,40 @@ class CroppedResearchLimit:
                 self._state.forced_finish_reason or reason
             )
 
+    @contextmanager
+    def focused_governing_read(
+        self,
+        call: CapabilityCall,
+        state: CroppedRepairState,
+        target: CroppedRepairTarget,
+    ) -> Generator[None, None, None]:
+        """Scope one reserved source repair without reopening broad discovery."""
+        self._fence()
+        records = state.records_for([target])
+        operation = _critical_operation(call.name, call.arguments)
+        if (
+            (state.run_id, state.scope_hash, state.request_hash)
+            != (self.run_id, self.scope_hash, self.request_hash)
+            or target.check_kind != "governing_original"
+            or not target.article
+            or not records
+            or records[0].get("status") != "in_progress"
+            or records[0].get("target") != target.checkpoint_value()
+            or call.name
+            not in {"read_provision", "read_named_provision", "read_chunk_context"}
+            or operation is None
+        ):
+            raise ValueError(
+                "Focused governing repair requires an exact canonical read"
+            )
+        token = _FOCUSED_GOVERNING_READ.set(
+            _FocusedGoverningRead(self, target.key, call.call_id, operation)
+        )
+        try:
+            yield
+        finally:
+            _FOCUSED_GOVERNING_READ.reset(token)
+
     def admit_tool(
         self,
         name: str,
@@ -918,6 +972,7 @@ class CroppedResearchLimit:
         *,
         critical_target_key: str | None = None,
         reserve: bool = True,
+        call_id: str | None = None,
     ) -> CroppedResearchAdmission:
         self._fence()
         with self._lock:
@@ -935,13 +990,22 @@ class CroppedResearchLimit:
                     else "retained_evidence_or_host_control",
                     long_tail=long_tail,
                 )
-            if not self.policy.enforce_observed_limits:
+            focused = _FOCUSED_GOVERNING_READ.get()
+            focused_read = (
+                focused is not None
+                and focused.controller is self
+                and focused.call_id == call_id
+                and focused.operation == _critical_operation(name, arguments)
+            )
+            if not self.policy.enforce_observed_limits and not focused_read:
                 return CroppedResearchAdmission(
                     allowed=False,
                     reason="host_finish_requires_available_evidence_only_unread_not_absent",
                     long_tail=long_tail,
                 )
             operation = _critical_operation(name, arguments)
+            if focused_read and focused is not None:
+                critical_target_key = focused.target_key
             if name == "resolve_source":
                 operation = self._source_resolution(arguments)
                 if operation is not None:

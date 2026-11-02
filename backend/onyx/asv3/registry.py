@@ -687,6 +687,7 @@ class CapabilityRegistry:
                     admission = controller.admit_tool(
                         call.name,
                         arguments,
+                        call_id=call.call_id,
                         critical_target_key=hashlib.sha256(
                             json.dumps(
                                 [call.name, arguments],
