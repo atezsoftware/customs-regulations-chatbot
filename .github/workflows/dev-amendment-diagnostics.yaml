@@ -1,99 +1,67 @@
-name: DEV amendment approval diagnostics
+name: DEV Resmi Gazete intake operator
+run-name: DEV Resmi Gazete ${{ inputs.operation }} ${{ inputs.expected_image_sha }}
 on:
   workflow_dispatch:
     inputs:
       operation:
         type: choice
-        options: [inspect, approve_462, approve_465, approve_470]
+        required: true
         default: inspect
+        options: [inspect, retry]
+      expected_image_sha:
+        type: string
+        required: true
+        description: Exact deployed DEV backend image commit SHA
 permissions:
   contents: read
+concurrency:
+  group: dev-resmigazete-f32df3a9-operator
+  cancel-in-progress: false
 jobs:
   inspect:
     runs-on: codebuild-customs-regulations-runner-${{ github.run_id }}-${{ github.run_attempt }}
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+      - uses: actions/checkout@v5
         with:
           persist-credentials: false
-      - name: Read only batch inventory
-        shell: bash
-        run: |
-          set -euo pipefail
-          aws eks update-kubeconfig --name atez-dev-cluster --region eu-central-1
-          kubectl get pods -n customs-regulations-dev -o json > /tmp/amendment-pods.json
-          python - <<'PY'
-          import json
-          from pathlib import Path
-          pods=json.loads(Path('/tmp/amendment-pods.json').read_text())['items']
-          ready=[]
-          for pod in pods:
-              if pod['status']['phase']!='Running' or pod['metadata'].get('deletionTimestamp'):
-                  continue
-              statuses={item['name']:item for item in pod['status'].get('containerStatuses',[])}
-              for container in pod['spec']['containers']:
-                  image=container['image']
-                  if 'customs-regulations-backend-lite-dev:' in image and statuses.get(container['name'],{}).get('ready'):
-                      ready.append((pod['metadata']['name'],container['name'],image))
-          if not ready:
-              raise SystemExit('No ready DEV backend container')
-          ready.sort()
-          pod,container,image=ready[0]
-          print('TARGET',pod,container,image)
-          Path('/tmp/amendment-target').write_text(pod+'\t'+container+'\n')
-          PY
-          IFS=$'\t' read -r pod container < /tmp/amendment-target
-          kubectl exec -i "$pod" -n customs-regulations-dev -c "$container" -- \
-            sh -ec '. /vault/secrets/config; export PYTHONPATH=/app; exec python -' < \
-            backend/onyx/db/diagnose_amendment_batches_299_310.py
-      - name: Filter amendment approval worker errors
-        if: inputs.operation == 'inspect'
-        shell: bash
-        run: |
-          set -euo pipefail
-          python - <<'PY'
-          import json
-          import re
-          import subprocess
-          from pathlib import Path
-
-          pods = json.loads(Path('/tmp/amendment-pods.json').read_text())['items']
-          needles = re.compile(r'Amendment proposal (460|462|465|470) approval failed|amendment_(prepared|approved) proposal_id=(460|462|465|470)')
-          for pod in pods:
-              name = pod['metadata']['name']
-              if pod['status']['phase'] != 'Running' or 'background' not in name:
-                  continue
-              for container in pod['spec']['containers']:
-                  result = subprocess.run(
-                      ['kubectl', 'logs', name, '-n', 'customs-regulations-dev',
-                       '-c', container['name'], '--since=36h', '--tail=30000'],
-                      capture_output=True, text=True, check=False,
-                  )
-                  if result.returncode:
-                      print('LOG_READ_FAILED', name, container['name'], result.returncode)
-                      continue
-                  lines = result.stdout.splitlines()
-                  print('LOG_SCAN', name, container['name'], len(lines))
-                  for index, line in enumerate(lines):
-                      if needles.search(line):
-                          print('LOG_MATCH', name, container['name'])
-                          for excerpt in lines[index:index + 45]:
-                              print(excerpt[:500])
-          PY
-      - name: Resume one existing reviewed proposal
-        if: inputs.operation != 'inspect'
+      - name: Inspect or retry the frozen DEV intake
         shell: bash
         env:
+          EXPECTED_IMAGE_SHA: ${{ inputs.expected_image_sha }}
           OPERATION: ${{ inputs.operation }}
         run: |
           set -euo pipefail
-          case "$OPERATION" in
-            approve_462) proposal_id=462 ;;
-            approve_465) proposal_id=465 ;;
-            approve_470) proposal_id=470 ;;
-            *) exit 2 ;;
-          esac
-          IFS=$'\t' read -r pod container < /tmp/amendment-target
+          [[ "$EXPECTED_IMAGE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$OPERATION" == inspect || "$OPERATION" == retry ]]
+          aws eks update-kubeconfig --name atez-dev-cluster --region eu-central-1
+          kubectl get pods -n customs-regulations-dev -o json > /tmp/rg-pods.json
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          expected = os.environ['EXPECTED_IMAGE_SHA']
+          pods = json.loads(Path('/tmp/rg-pods.json').read_text())['items']
+          ready = []
+          for pod in pods:
+              if pod['status']['phase'] != 'Running' or pod['metadata'].get('deletionTimestamp'):
+                  continue
+              if 'background' not in pod['metadata']['name']:
+                  continue
+              statuses = {item['name']:item for item in pod['status'].get('containerStatuses', [])}
+              for container in pod['spec']['containers']:
+                  image = container['image']
+                  if 'customs-regulations-backend-lite-dev:' in image and image.endswith(':' + expected) and statuses.get(container['name'], {}).get('ready'):
+                      ready.append((pod['metadata']['name'], container['name'], image.rsplit(':', 1)[1]))
+          if not ready:
+              raise SystemExit('No ready DEV background container at the exact expected image SHA')
+          ready.sort()
+          pod, container, observed = ready[0]
+          print(json.dumps({'target_pod':pod, 'container':container, 'observed_image_sha':observed}))
+          Path('/tmp/rg-target').write_text(pod + '\t' + container + '\t' + observed + '\n')
+          PY
+          IFS=$'\t' read -r pod container observed < /tmp/rg-target
+          args=(--expected-image-sha "$EXPECTED_IMAGE_SHA" --observed-image-sha "$observed")
+          if [[ "$OPERATION" == retry ]]; then args+=(--retry); fi
           kubectl exec -i "$pod" -n customs-regulations-dev -c "$container" -- \
-            sh -ec '. /vault/secrets/config; export PYTHONPATH=/app; exec python - "$1"' sh "$proposal_id" < \
-            backend/onyx/db/resume_amendment_approvals_309_310.py
+            sh -ec '. /vault/secrets/config; export PYTHONPATH=/app; exec python -c '\''import sys; exec(compile(sys.stdin.read(), "/app/onyx/db/_new_document_rg_operator.py", "exec"))'\'' "$@"' rg-operator "${args[@]}" \
+            < backend/onyx/db/_new_document_rg_operator.py
