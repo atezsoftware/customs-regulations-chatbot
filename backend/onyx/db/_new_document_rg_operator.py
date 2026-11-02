@@ -7,7 +7,7 @@ import json
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import IO, Any
 from uuid import UUID, uuid5
 
 from sqlalchemy import text
@@ -58,6 +58,16 @@ SECRET_LINE = re.compile(r"api[ _-]?key|password|secret|authorization|bearer|acc
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise RuntimeError(message)
+
+
+def retained_source_stream(file_id: str, session: Session) -> IO[bytes]:
+    from onyx.file_store.file_store import S3BackedFileStore, get_default_file_store
+    from onyx.file_store.postgres_file_store import PostgresBackedFileStore
+
+    store = get_default_file_store()
+    if isinstance(store, (PostgresBackedFileStore, S3BackedFileStore)):
+        return store.read_file(file_id, db_session=session)
+    return store.read_file(file_id)
 
 
 def rows(session: Session, query: str, **params: object) -> list[dict[str, Any]]:
@@ -310,8 +320,6 @@ def strict_v4_canary(input_path: Path, expected_sha: str) -> dict[str, Any]:
     from sqlalchemy import select
 
     from onyx.db.models import RegulatoryChunk, RegulatorySourceAsset, UserFile
-    from onyx.file_store.file_store import get_default_file_store
-    from onyx.file_store.postgres_file_store import PostgresBackedFileStore
     from onyx.indexing.embedder import DefaultIndexingEmbedder
     from onyx.regulatory.amendments.annexes.analysis import resolve_review_context_llm
     from onyx.regulatory.document_intake.models import IntakePreparationPolicy
@@ -331,8 +339,7 @@ def strict_v4_canary(input_path: Path, expected_sha: str) -> dict[str, Any]:
         asset = session.scalar(select(RegulatorySourceAsset).where(RegulatorySourceAsset.id == UUID("7743688a-0cdf-4b8a-8315-b292b21724ba")))
         require(asset is not None and asset.text_sha256 == EXPECTED_ASSETS[str(asset.id)][1], "Retained source identity changed")
         assert asset is not None and asset.text_file_id is not None
-        store = get_default_file_store()
-        stream = store.read_file(asset.text_file_id, db_session=session) if isinstance(store, PostgresBackedFileStore) else store.read_file(asset.text_file_id)
+        stream = retained_source_stream(asset.text_file_id, session)
         with stream:
             prepared = stream.read(2_000_001)
         require(len(prepared) <= 2_000_000 and hashlib.sha256(prepared).hexdigest() == asset.text_sha256 and source in prepared.decode("utf-8"), "Fixture is not an exact span of the retained source")

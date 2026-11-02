@@ -1,6 +1,7 @@
 """Incident operations must fail closed before a standard reprepare is requested."""
 
 import importlib.util
+from io import BytesIO
 from pathlib import Path
 from types import ModuleType
 from unittest.mock import MagicMock
@@ -11,6 +12,9 @@ from sqlalchemy.orm import Session
 
 from onyx.db import document_intake_reprepare as repository
 from onyx.db.models import RegulatoryDocumentIntake, RegulatoryDocumentIntakeReprepare
+from onyx.file_store import file_store
+from onyx.file_store.file_store import S3BackedFileStore
+from onyx.file_store.postgres_file_store import PostgresBackedFileStore
 from onyx.regulatory.document_intake.models import IntakePreparationPolicy
 
 
@@ -173,3 +177,19 @@ def test_changed_review_snapshot_cannot_queue(
     with pytest.raises(RuntimeError):
         operator.request_v4_reprepare(MagicMock(spec=Session), batch)
     queue.assert_not_called()
+
+
+@pytest.mark.parametrize("store_type", [S3BackedFileStore, PostgresBackedFileStore])
+def test_retained_source_reuses_read_only_session(
+    operator: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    store_type: type[S3BackedFileStore] | type[PostgresBackedFileStore],
+) -> None:
+    session = MagicMock(spec=Session)
+    store = object.__new__(store_type)
+    stream = BytesIO(b"retained source")
+    read = MagicMock(return_value=stream)
+    monkeypatch.setattr(store, "read_file", read)
+    monkeypatch.setattr(file_store, "get_default_file_store", lambda: store)
+    assert operator.retained_source_stream("retained-file", session) is stream
+    read.assert_called_once_with("retained-file", db_session=session)
