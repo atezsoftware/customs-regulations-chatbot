@@ -14,6 +14,7 @@ from onyx.db.models import (
     RegulatoryLabelingRun,
     RegulatoryLabelingShard,
 )
+from onyx.db.regulatory_labeling_readers import complete_frozen_sources
 from onyx.regulatory.amendments.annexes.context_dependencies import context_hash
 from onyx.regulatory.indexing_jobs.vertex_batch import VertexBatchRequest
 from onyx.regulatory.labeling.provider import (
@@ -130,6 +131,9 @@ def load_current_intake_label_repair_request(
                 .execution_options(populate_existing=True)
             )
         }
+        snapshot_items = complete_frozen_sources(
+            session, run.id, list(snapshot_items.values()), required_ids
+        )
         rows, boundaries, complete = repository._current_file_context_candidates(
             session,
             document_set_id=run.document_set_id,

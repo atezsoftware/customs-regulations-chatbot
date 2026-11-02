@@ -49,6 +49,14 @@ from onyx.db.models import (
     User,
     UserFile,
 )
+from onyx.db.regulatory_labeling_readers import (
+    STRUCTURAL_READER_KEY,
+    FrozenLabelingSource,
+    complete_frozen_sources,
+    reader_context_sources,
+    validate_requested_readers,
+    validated_reader_proof,
+)
 from onyx.regulatory.amendments.annexes.context_dependencies import (
     canonical_dependency_ids,
     context_hash,
@@ -62,9 +70,14 @@ from onyx.regulatory.contextual import (
     validity_window_contains,
     visible_regulatory_snapshot_for_target,
 )
+from onyx.regulatory.document_intake.structural_readers import NativeChapterReaderProof
 from onyx.regulatory.indexing_jobs.vertex_batch import (
     VertexBatchRequest,
     vertex_jsonl_line_size,
+)
+from onyx.regulatory.labeling.accepted_result import (
+    AcceptedIntakeRepair,
+    LabelingApplyOutcome,
 )
 from onyx.regulatory.labeling.api_models import (
     LabelingCounts,
@@ -78,6 +91,7 @@ from onyx.regulatory.labeling.domain import (
     bounded_document_context,
     labeling_submission_key_from_hashes,
 )
+from onyx.regulatory.labeling.intake_abstention_repair import ABSTENTION_REPAIR_KEY
 from onyx.regulatory.labeling.provider import LabelDefinition, TaxonomyDefinition
 
 _ACTIVE_RUN_STATUSES = ("queued", "running")
@@ -231,14 +245,14 @@ def _snapshot_date(snapshot: Mapping[str, object], key: str) -> datetime.date | 
 
 
 def _bounded_snapshot_context_items(
-    rows: Sequence[RegulatoryLabelingItem],
+    rows: Sequence[FrozenLabelingSource],
     target: RegulatoryLabelingItem,
-) -> list[RegulatoryLabelingItem]:
+) -> list[FrozenLabelingSource]:
     reference_date = context_reference_date(
         _snapshot_date(target.source_snapshot, "validity_start_date"),
         _snapshot_date(target.source_snapshot, "validity_end_date"),
     )
-    candidates_by_position: dict[int, list[RegulatoryLabelingItem]] = defaultdict(list)
+    candidates_by_position: dict[int, list[FrozenLabelingSource]] = defaultdict(list)
     for candidate in rows:
         if validity_window_contains(
             _snapshot_date(candidate.source_snapshot, "validity_start_date"),
@@ -250,7 +264,7 @@ def _bounded_snapshot_context_items(
             ].append(candidate)
 
     target_position = _snapshot_position(target.source_snapshot)
-    visible: list[RegulatoryLabelingItem] = []
+    visible: list[FrozenLabelingSource] = []
     for position in sorted(set(candidates_by_position) | {target_position}):
         candidates = candidates_by_position.get(position, [])
         if position == target_position:
@@ -702,6 +716,7 @@ def create_labeling_run(
     retry_of_id: UUID | None = None,
     uses_current_labels: bool = False,
     target_file_ids: Sequence[UUID] | None = None,
+    structural_readers: Mapping[str, NativeChapterReaderProof] | None = None,
 ) -> tuple[RegulatoryLabelingRun, bool]:
     document_set = session.scalar(
         select(DocumentSet).where(DocumentSet.id == document_set_id).with_for_update()
@@ -733,6 +748,18 @@ def create_labeling_run(
             raise LabelingStateConflictError(
                 "The idempotency key was already used with different parameters"
             )
+        if structural_readers is not None:
+            existing_readers = reader_context_sources(session, existing.id)
+            if {
+                item.regulatory_chunk_id: item.source_snapshot[STRUCTURAL_READER_KEY]
+                for item in existing_readers
+            } != {
+                key: value.model_dump(mode="json")
+                for key, value in structural_readers.items()
+            }:
+                raise LabelingStateConflictError(
+                    "The idempotency key has different structural readers"
+                )
         return existing, False
     if get_active_run_id(session, document_set_id) is not None:
         raise LabelingStateConflictError(
@@ -767,6 +794,18 @@ def create_labeling_run(
     ).all()
     atomic_ids = [row.id for row in frozen_rows if row.is_atomic]
     derived_ids = [row.id for row in frozen_rows if not row.is_atomic]
+    readers = (
+        validate_requested_readers(
+            session, structural_readers, file_ids=file_ids, atomic_ids=atomic_ids
+        )
+        if structural_readers
+        else {}
+    )
+    if readers:
+        atomic_ids = [
+            identifier for identifier in atomic_ids if identifier not in readers
+        ]
+        derived_ids = sorted([*derived_ids, *readers])
     if not atomic_ids:
         raise ValueError("This document set has no canonical chunks to label")
     snapshot_hash = context_hash(
@@ -777,6 +816,16 @@ def create_labeling_run(
             "file_ids": [str(file_id) for file_id in file_ids],
             "canonical_chunk_ids": atomic_ids,
             "derived_chunk_ids": derived_ids,
+            **(
+                {
+                    STRUCTURAL_READER_KEY: {
+                        key: proof.model_dump(mode="json")
+                        for key, proof in readers.items()
+                    }
+                }
+                if readers
+                else {}
+            ),
         }
     )
     run = RegulatoryLabelingRun(
@@ -881,6 +930,24 @@ def create_labeling_run(
             derived_source,
         )
     )
+    if readers:
+        for reader in session.scalars(
+            select(RegulatoryDerivedLabelProjection).where(
+                RegulatoryDerivedLabelProjection.run_id == run.id,
+                RegulatoryDerivedLabelProjection.regulatory_chunk_id.in_(readers),
+            )
+        ):
+            reader.source_snapshot = {
+                **reader.source_snapshot,
+                **(
+                    {"intake_parent_identity": parent_contexts[reader.user_file_id]}
+                    if reader.user_file_id in parent_contexts
+                    else {}
+                ),
+                STRUCTURAL_READER_KEY: readers[reader.regulatory_chunk_id].model_dump(
+                    mode="json"
+                ),
+            }
     # Store an exact content hash without requiring pgcrypto in the database.
     # The worker fills both hashes and bounded context in small pages.
     run.derived_chunks = (
@@ -1279,6 +1346,48 @@ def prepare_next_item_page(
                 ]
             }.values()
         )
+        if any(ABSTENTION_REPAIR_KEY in item.source_snapshot for item in file_items):
+            validated_sources = complete_frozen_sources(
+                session,
+                run.id,
+                file_items,
+                [item.regulatory_chunk_id for item in file_items],
+            )
+            if len(validated_sources) != len(file_items):
+                raise LabelingStateConflictError(
+                    "A frozen semantic repair context receipt changed"
+                )
+        readers = reader_context_sources(session, lease.run_id, file_id=file_id)
+        if readers:
+            combined: dict[str, FrozenLabelingSource] = {
+                item.regulatory_chunk_id: item for item in [*file_items, *readers]
+            }
+            ordered_sources = sorted(
+                combined.values(),
+                key=lambda item: (
+                    _snapshot_position(item.source_snapshot),
+                    item.regulatory_chunk_id,
+                ),
+            )
+            in_window = [
+                item
+                for item in ordered_sources
+                if lower <= _snapshot_position(item.source_snapshot) <= upper
+            ]
+            if len(in_window) > _CONTEXT_CANDIDATE_LIMIT:
+                for target in file_targets:
+                    target.status, target.error = (
+                        "failed",
+                        "The canonical context window is too ambiguous",
+                    )
+                run.failed_chunks += len(file_targets)
+                continue
+            file_items = list(
+                {
+                    item.regulatory_chunk_id: item
+                    for item in [ordered_sources[0], *in_window, ordered_sources[-1]]
+                }.values()
+            )
         for target in file_targets:
             selected = _bounded_snapshot_context_items(file_items, target)
             views = [
@@ -2028,7 +2137,7 @@ def _snapshot_matches_row(snapshot: Mapping[str, object], row: RegulatoryChunk) 
 def _item_snapshot_is_current(
     item: RegulatoryLabelingItem,
     *,
-    snapshot_items: Mapping[str, RegulatoryLabelingItem],
+    snapshot_items: Mapping[str, FrozenLabelingSource],
     current_rows: Mapping[str, RegulatoryChunk],
     current_file_rows: Mapping[UUID, Sequence[RegulatoryChunk]],
     current_boundary_ids: Mapping[UUID, frozenset[str]],
@@ -2088,7 +2197,7 @@ def _apply_frozen_window_results(
     file_id: UUID,
     lower: int,
     upper: int,
-    outcomes: Mapping[str, tuple[list[str], list[dict[str, object]]] | str],
+    outcomes: Mapping[str, LabelingApplyOutcome],
 ) -> None:
     required_ids = {
         member_id
@@ -2115,6 +2224,9 @@ def _apply_frozen_window_results(
             )
         ).all()
     }
+    snapshot_items = complete_frozen_sources(
+        session, run.id, list(snapshot_items.values()), list(required_ids)
+    )
     rows, boundaries, complete = _current_file_context_candidates(
         session,
         document_set_id=run.document_set_id,
@@ -2158,7 +2270,31 @@ def _apply_frozen_window_results(
             item.status = "failed"
             item.error = outcome[:4000]
             continue
-        labels, assignments = outcome
+        if isinstance(outcome, AcceptedIntakeRepair):
+            from onyx.db.regulatory_labeling_semantic_repair import (
+                validate_item_semantic_repair_audit,
+            )
+
+            labels = [assignment.label_id for assignment in outcome.outcome.labels]
+            assignments = [
+                assignment.model_dump(mode="json")
+                for assignment in outcome.outcome.labels
+            ]
+            audit = outcome.audit.model_dump(mode="json")
+            validate_item_semantic_repair_audit(
+                session,
+                item=item,
+                run=run,
+                audit=audit,
+                labels=labels,
+                assignments=assignments,
+            )
+            item.source_snapshot = {
+                **item.source_snapshot,
+                ABSTENTION_REPAIR_KEY: audit,
+            }
+        else:
+            labels, assignments = outcome
         item.labels = list(dict.fromkeys(labels))
         item.assignments = assignments
         item.status = "completed"
@@ -2171,7 +2307,7 @@ def apply_shard_result_page(
     *,
     shard_id: UUID,
     item_ids: Sequence[UUID],
-    outcomes: Mapping[str, tuple[list[str], list[dict[str, object]]] | str],
+    outcomes: Mapping[str, LabelingApplyOutcome],
 ) -> int:
     """Apply a validated output page; committed terminal items are replay-safe."""
     if not 1 <= len(item_ids) <= 128 or len(set(item_ids)) != len(item_ids):
@@ -2246,7 +2382,7 @@ def apply_shard_results(
     lease: RunLease,
     *,
     shard_id: UUID,
-    outcomes: Mapping[str, tuple[list[str], list[dict[str, object]]] | str],
+    outcomes: Mapping[str, LabelingApplyOutcome],
 ) -> None:
     after_id: UUID | None = None
     while items := load_shard_result_items(session, lease, shard_id, after_id=after_id):
@@ -2326,6 +2462,17 @@ def _projection_item_query() -> Select[tuple[RegulatoryLabelingItem]]:
 def _explicit_projection_dependencies(
     target: RegulatoryDerivedLabelProjection,
 ) -> list[str]:
+    if STRUCTURAL_READER_KEY in target.source_snapshot:
+        proof = NativeChapterReaderProof.model_validate(
+            target.source_snapshot[STRUCTURAL_READER_KEY]
+        )
+        if (
+            proof.heading_chunk_id != target.regulatory_chunk_id
+            or proof.user_file_id != target.user_file_id
+            or target.regulatory_chunk_id in proof.governed_chunk_ids
+        ):
+            raise ValueError("invalid_structural_reader_lineage")
+        return list(proof.governed_chunk_ids)
     raw_metadata = target.source_snapshot.get("chunk_metadata", {})
     if not isinstance(raw_metadata, dict):
         raise ValueError("invalid_explicit_lineage")
@@ -2363,10 +2510,16 @@ def _current_projection_target(
     if (
         row is None
         or row.user_file_id != target.user_file_id
-        or _is_atomic(row)
         or row.text != target.text_snapshot
         or not _snapshot_matches_row(target.source_snapshot, row)
     ):
+        return None
+    if STRUCTURAL_READER_KEY in target.source_snapshot:
+        try:
+            validated_reader_proof(session, target)
+        except ValueError:
+            return None
+    elif _is_atomic(row):
         return None
     return row
 
@@ -2525,6 +2678,9 @@ def _revalidate_projection_sources(
             )
         ).all()
     }
+    snapshot_items = complete_frozen_sources(
+        session, run.id, list(snapshot_items.values()), list(required_ids)
+    )
     advisories = _latest_context_advisories(
         session, [item.regulatory_chunk_id for item in completed]
     )
@@ -2567,6 +2723,30 @@ def _revalidate_projection_sources(
             item.assignments = []
             item.error = "The canonical source changed before label projection"
         already_revalidated.add(item.regulatory_chunk_id)
+
+
+def derived_label_provenance(
+    source_items: Sequence[RegulatoryLabelingItem],
+) -> tuple[list[str], dict[str, object]]:
+    """Use the exact canonical assignment provenance for every derived consumer."""
+    labels = sorted({label for item in source_items for label in item.labels})
+    provenance: dict[str, object] = {
+        label: [
+            {
+                "canonical_chunk_id": item.regulatory_chunk_id,
+                "canonical_text_sha256": item.canonical_text_sha256,
+                "assignments": [
+                    assignment
+                    for assignment in item.assignments
+                    if assignment.get("label_id") == label
+                ],
+            }
+            for item in source_items
+            if label in item.labels
+        ]
+        for label in labels
+    }
+    return labels, provenance
 
 
 def project_derived_labels(
@@ -2646,24 +2826,8 @@ def project_derived_labels(
             source_ids = ()
             resolution_kind = "unresolved"
             unresolved_reason = unresolved_reason or "source_label_result_unavailable"
-        labels = sorted({label for item in available for label in item.labels})
+        labels, provenance = derived_label_provenance(available)
         target.labels = labels
-        provenance: dict[str, object] = {
-            label: [
-                {
-                    "canonical_chunk_id": item.regulatory_chunk_id,
-                    "canonical_text_sha256": item.canonical_text_sha256,
-                    "assignments": [
-                        assignment
-                        for assignment in item.assignments
-                        if assignment.get("label_id") == label
-                    ],
-                }
-                for item in available
-                if label in item.labels
-            ]
-            for label in labels
-        }
         target.provenance = provenance
         target.resolution = resolution_kind
         target.unresolved_reason = unresolved_reason
@@ -2729,6 +2893,15 @@ def current_labeling_items_for_search(
     for item in items:
         if item.run_id != run.id or item.status != "completed":
             continue
+        if ABSTENTION_REPAIR_KEY in item.source_snapshot:
+            from onyx.db.regulatory_labeling_semantic_repair import (
+                validate_item_semantic_repair_audit,
+            )
+
+            try:
+                validate_item_semantic_repair_audit(session, item=item, run=run)
+            except ValueError:
+                continue
         try:
             lower, upper = _snapshot_context_window(item.source_snapshot)
         except ValueError:
@@ -2782,6 +2955,9 @@ def current_labeling_items_for_search(
                 )
             )
         }
+        frozen = complete_frozen_sources(
+            session, run.id, list(frozen.values()), list(required_ids)
+        )
         current = {row.id: row for row in rows}
         for item in file_items:
             if (
