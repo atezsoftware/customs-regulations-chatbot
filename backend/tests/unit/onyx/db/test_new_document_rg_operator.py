@@ -224,7 +224,7 @@ def test_normal_retry_preserves_the_original_frozen_request(
     batch.stage = "reprepare"
     batch.error = (
         "(psycopg2.errors.QueryCanceled) canceling statement due to user request\n"
-        f"DELETE FROM regulatory_chunk WHERE user_file_id='{operator.MAIN_FILE}'"
+        f"DELETE FROM regulatory_chunk WHERE user_file_id='{operator.PDF_FILE}'"
     )
     policy = IntakePreparationPolicy().model_dump(mode="json")
     request = RegulatoryDocumentIntakeReprepare(
@@ -236,7 +236,7 @@ def test_normal_retry_preserves_the_original_frozen_request(
         error=batch.error,
         documents={
             value: {
-                "status": "pending",
+                "status": "prepared" if value == operator.MAIN_DOCUMENT else "pending",
                 "target_chunking_version": "4",
                 "target_preparation_policy": policy,
             }
@@ -258,6 +258,11 @@ def test_normal_retry_preserves_the_original_frozen_request(
         operator, "pdf_chunk_verification", lambda _: {"chunking_version": "3"}
     )
     monkeypatch.setattr(operator, "verify_scope", MagicMock())
+    monkeypatch.setattr(
+        operator,
+        "validate_partial_checkpoint",
+        MagicMock(return_value={"verified": True}),
+    )
 
     def retry(*_args: object) -> list[object]:
         batch.status, batch.error = "preparing", None
@@ -299,3 +304,37 @@ def test_retry_does_not_accept_other_failure_signatures(
     with pytest.raises(RuntimeError, match="cancellation signature changed"):
         operator.retry_frozen_reprepare(MagicMock(spec=Session), batch)
     retry.assert_not_called()
+
+
+@pytest.mark.parametrize("drift", ["source", "checkpoint", "main_profile"])
+def test_partial_resume_rejects_changed_source_or_checkpoint_before_file_reads(
+    operator: ModuleType,
+    batch: RegulatoryDocumentIntake,
+    monkeypatch: pytest.MonkeyPatch,
+    drift: str,
+) -> None:
+    policy = IntakePreparationPolicy().model_dump(mode="json")
+    documents = {
+        operator.MAIN_DOCUMENT: {"status": "prepared", "canonical": []},
+        operator.PDF_DOCUMENT: {"status": "pending", "canonical": []},
+    }
+    live = [{"document_id": key, "canonical": []} for key in documents]
+    if drift == "source":
+        live[0]["source_sha256"] = "changed"
+    elif drift == "checkpoint":
+        documents[operator.MAIN_DOCUMENT]["status"] = "pending"
+    request = RegulatoryDocumentIntakeReprepare(documents=documents)
+    monkeypatch.setattr(
+        repository,
+        "reprepare_snapshot",
+        MagicMock(
+            return_value={"target_preparation_policy": policy, "documents": live}
+        ),
+    )
+    monkeypatch.setattr(
+        operator, "pdf_chunk_verification", lambda _: {"chunking_version": "3"}
+    )
+    session = MagicMock(spec=Session)
+    with pytest.raises(RuntimeError):
+        operator.validate_partial_checkpoint(session, batch, request)
+    session.get_one.assert_not_called()

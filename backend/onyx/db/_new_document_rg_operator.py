@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session
 from onyx.configs.app_configs import POSTGRES_DB
 from onyx.db import document_intake as repository
 from onyx.db.engine.sql_engine import SqlEngine, get_session_with_current_tenant
-from onyx.db.models import RegulatoryDocumentIntake
+from onyx.db.models import RegulatoryDocumentIntake, RegulatoryDocumentIntakeReprepare
 from onyx.db.search_settings import get_current_search_settings
 from onyx.indexing.chunker import DEFAULT_CONTEXTUAL_RAG_RESERVED_TOKENS
 from onyx.natural_language_processing.utils import get_tokenizer
@@ -37,6 +37,8 @@ TARGET_ROW_SHA256 = "fe6b6725b8104825be247dc3fcdb8122659030f108e845dc0b8ae21b303
 REPREPARE_KEY = uuid5(BATCH, "explicit-whole-table-v4-reprepare-20261102")
 REPREPARE_REQUEST = "a03a7101-f9a7-46cf-bbda-831d96e64865"
 REPREPARE_REVIEW_SHA = "1188de8875d91317e9f9cb9bc9cbf1057e9a4a47b40092de755bb8235b0b1462"
+MAIN_CANONICAL_SHA = "c987526ff76ea81f1cee005397a45282c7ecb718d34c836b8ecf7367773210f2"
+MAIN_METADATA_SHA = "21b05187e74424039e086570c512e55b0e20abce4c43afb06e383c86857b9ea0"
 MAIN_DIGEST = "f70e13400f34aec9878368a92a040d76b6a6d9363f70c7f06e6898b878f16ba3"
 ORIGINAL_ERROR = (
     "An intake table row exceeds the embedding content token limit; "
@@ -314,8 +316,62 @@ def request_v4_reprepare(session: Session, batch: RegulatoryDocumentIntake) -> t
     return {"operator_action": "normal_v4_reprepare_requested", "request_id": request.id, "idempotency_key": REPREPARE_KEY, "expected_review_sha256": expected_sha, "target_preparation_policy": policy, "document_ids": sorted(request.documents), "source_assets_unchanged": True, "publication_or_index_requested": False}, request.id
 
 
+def validate_partial_checkpoint(session: Session, batch: RegulatoryDocumentIntake, request: RegulatoryDocumentIntakeReprepare) -> dict[str, Any]:
+    from onyx.db.document_intake_normalization import (
+        _frozen_source,
+        validated_normalized_documents,
+    )
+    from onyx.db.document_intake_reprepare import reprepare_snapshot
+    from onyx.db.models import RegulatoryDocumentIntakeFile, UserFile
+    from onyx.db.regulatory_canonical_revisions import get_canonical_revisions
+    from onyx.db.regulatory_writer_publication import canonical_scope_digest
+    from onyx.document_index.publication_models import publication_digest
+    from onyx.file_processing.original_ingestion import OriginalIngestionReceipt
+    from onyx.regulatory.document_intake.models import IntakePreparationPolicy
+    from onyx.regulatory.document_intake.preparation import (
+        load_verified_intake_documents,
+    )
+
+    preview = reprepare_snapshot(session, batch)
+    policy = IntakePreparationPolicy().model_dump(mode="json")
+    current = {item["document_id"]: item for item in preview["documents"]}
+    require(set(current) == {MAIN_DOCUMENT, PDF_DOCUMENT} and preview.get("target_preparation_policy") == policy, "The current guarded source scope or policy changed")
+    for document_id in (MAIN_DOCUMENT, PDF_DOCUMENT):
+        original_entry, live_entry = request.documents[document_id], current[document_id]
+        require(all(original_entry.get(key) == live_entry.get(key) for key in ("user_file_id", "original_file_id", "source_asset_id", "source_sha256", "parent_document_id", "role", "relationships", "source_receipt")), "A retained original source or relationship changed")
+    require(request.documents[MAIN_DOCUMENT].get("status") == "prepared" and request.documents[PDF_DOCUMENT].get("status") == "pending", "Only the committed main and pending PDF checkpoint may resume")
+    require(current[PDF_DOCUMENT]["canonical"] == request.documents[PDF_DOCUMENT]["canonical"] and pdf_chunk_verification(session)["chunking_version"] == "3", "The cancelled PDF before-snapshot changed")
+    main = current[MAIN_DOCUMENT]["canonical"]
+    require(len(main) == 365 and all(row["metadata"].get("intake_chunking_version") == "4" and row["metadata"].get("intake_preparation_policy") == policy for row in main), "The committed main v4 profile changed")
+    canonical = [row for row in main if row["chunk_type"] != "hierarchical_aggregate" and row["metadata"].get("chunk_variant") != "hierarchical_aggregate"]
+    identity = [{key: row[key] for key in ("id", "chunk_type", "heading_path", "text")} for row in canonical]
+    metadata_input = [{"chunk_id": row["id"], "text": row["text"], "heading_path": row["heading_path"], "chunk_type": row["chunk_type"]} for row in canonical]
+    def digest(value: object) -> str:
+        return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    require(len(canonical) == 342 and digest(sorted(identity, key=lambda value: value["id"])) == MAIN_CANONICAL_SHA and digest(metadata_input) == MAIN_METADATA_SHA, "The 342 main canonical identities or actual metadata input changed")
+    entry = request.documents[MAIN_DOCUMENT]
+    original = OriginalIngestionReceipt.model_validate(entry["source_receipt"])
+    receipt = OriginalIngestionReceipt.model_validate(entry["after_receipt"])
+    member = session.get_one(RegulatoryDocumentIntakeFile, UUID(MAIN_DOCUMENT))
+    file = session.get_one(UserFile, UUID(MAIN_FILE))
+    require(receipt.file_id == original.file_id and receipt.raw_sha256 == original.raw_sha256 and receipt.generation_hash == file.regulatory_chunk_generation_hash and receipt.canonical_sha256 == canonical_scope_digest(session, member.user_file_id), "The prepared main receipt changed")
+    revision_ids = [UUID(value) for value in entry["after_revision_ids"]]
+    revisions = get_canonical_revisions(session, revision_ids)
+    snapshots = sorted((revision.snapshot for revision in revisions.values()), key=lambda row: (row.position, row.id))
+    require(len(revision_ids) == len(revisions) == 365 and [row.model_dump(mode="json") for row in snapshots] == main and publication_digest(main) == receipt.canonical_sha256, "The main after-revisions differ from its committed canonical receipt")
+    if entry.get("normalization_derivation") is not None:
+        documents = validated_normalized_documents(session, batch, member, original, receipt, entry["normalization_derivation"], entry["after_revision_ids"])
+    else:
+        _context, arguments = _frozen_source(session, batch, member, original)
+        arguments.update(chunking_version="4", formatter_version=4, preparation_policy=IntakePreparationPolicy.model_validate(policy))
+        documents = load_verified_intake_documents(**arguments)
+        require(documents.original_extraction.plaintext_sha256 == original.plaintext_sha256 == receipt.plaintext_sha256 and documents.original_extraction.documents_sha256 == receipt.documents_sha256, "The committed main plaintext/source context changed")
+    require(documents.original_extraction.raw_sha256 == original.raw_sha256, "The immutable main raw source changed")
+    return {"prepared_document_id": MAIN_DOCUMENT, "pending_document_id": PDF_DOCUMENT, "main_canonical_count": 342, "main_after_revision_count": len(revisions), "actual_main_metadata_input_sha256": MAIN_METADATA_SHA, "prepared_main_canonical_sha256": receipt.canonical_sha256, "current_review_sha256": preview["expected_sha256"], "original_sources_and_committed_checkpoint_verified": True}
+
+
 def retry_frozen_reprepare(session: Session, batch: RegulatoryDocumentIntake) -> tuple[dict[str, Any], UUID | None]:
-    from onyx.db.document_intake_reprepare import latest_reprepare, reprepare_snapshot
+    from onyx.db.document_intake_reprepare import latest_reprepare
     from onyx.regulatory.document_intake.models import IntakePreparationPolicy
 
     request = latest_reprepare(session, batch.id)
@@ -326,19 +382,17 @@ def retry_frozen_reprepare(session: Session, batch: RegulatoryDocumentIntake) ->
         return {"operator_action": "existing_reprepare_retry_inspected_only", "request_id": request.id, "status": request.status}, None
     require(batch.status == "failed" and batch.stage == "reprepare" and request.status == "failed", "Only the failed original reprepare may be retried")
     error = batch.error or ""
-    require(error.startswith("(psycopg2.errors.QueryCanceled) canceling statement due to user request") and "DELETE FROM regulatory_chunk" in error and MAIN_FILE in error and request.error == batch.error, "The guarded main-file cancellation signature changed")
+    require(error.startswith("(psycopg2.errors.QueryCanceled) canceling statement due to user request") and "DELETE FROM regulatory_chunk" in error and PDF_FILE in error and request.error == batch.error, "The guarded PDF cancellation signature changed")
     require(batch.review_sha256 is None and batch.labeling_run_id is None and batch.lease_token is None and batch.lease_expires_at is None, "The cancelled reprepare has a later review or live owner")
     policy = IntakePreparationPolicy().model_dump(mode="json")
-    require(set(request.documents) == {MAIN_DOCUMENT, PDF_DOCUMENT} and all(entry.get("status") == "pending" and entry.get("target_chunking_version") == "4" and entry.get("target_preparation_policy") == policy for entry in request.documents.values()), "The cancelled request checkpoints or target policy changed")
-    require(pdf_chunk_verification(session)["chunking_version"] == "3", "The cancelled PDF source revision changed")
-    preview = reprepare_snapshot(session, batch)
-    require(preview["expected_sha256"] == REPREPARE_REVIEW_SHA and preview.get("target_preparation_policy") == policy, "The complete original source snapshot changed after rollback")
+    require(set(request.documents) == {MAIN_DOCUMENT, PDF_DOCUMENT} and all(entry.get("target_chunking_version") == "4" and entry.get("target_preparation_policy") == policy for entry in request.documents.values()), "The cancelled request scope or target policy changed")
+    checkpoint = validate_partial_checkpoint(session, batch, request)
     audit = json.dumps(request.documents, sort_keys=True, default=str)
     deliveries = repository.retry_intake(session, batch)
     require(deliveries == [] and batch.status == "preparing" and batch.stage == "reprepare" and batch.error is None and batch.lease_token is None and batch.lease_expires_at is None, "The normal retry did not preserve the requested reprepare stage")
     require(json.dumps(request.documents, sort_keys=True, default=str) == audit and request.expected_sha256 == REPREPARE_REVIEW_SHA, "The normal retry changed the frozen reprepare audit")
     verify_scope(session, batch)
-    return {"operator_action": "normal_frozen_reprepare_retry_requested", "request_id": request.id, "expected_review_sha256": request.expected_sha256, "target_preparation_policy": policy, "source_snapshot_unchanged_after_rollback": True, "publication_or_index_requested": False}, request.id
+    return {"operator_action": "normal_frozen_reprepare_retry_requested", "request_id": request.id, "expected_review_sha256": request.expected_sha256, "target_preparation_policy": policy, "verified_partial_checkpoint": checkpoint, "publication_or_index_requested": False}, request.id
 
 
 def strict_v4_canary(input_path: Path, expected_sha: str) -> dict[str, Any]:
@@ -490,7 +544,7 @@ def main() -> None:
     tenant = get_current_tenant_id()
     require(tenant == "public", "Expected the original public tenant")
     set_is_ee_based_on_env_variable()
-    SqlEngine.init_engine(pool_size=1, max_overflow=0)
+    SqlEngine.init_engine(pool_size=2, max_overflow=0)
     enqueue = False
     reprepare_id: UUID | None = None
     with get_session_with_current_tenant() as session:
