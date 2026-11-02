@@ -1,7 +1,8 @@
 """Composition preflight uses configured identities without model or database calls."""
 
 import json
-from typing import cast
+from itertools import product
+from typing import cast, get_args
 from unittest.mock import MagicMock
 
 import pytest
@@ -21,6 +22,31 @@ from onyx.asv3.workflow_variant import ASV3_FAST_CROPPED_VARIANT, ASV3_FAST_VARI
 from onyx.db.models import Persona, User
 from onyx.llm.interfaces import LLM, LLMConfig
 from onyx.llm.override_models import LLMOverride
+
+
+def test_factorial_profiles_cover_exact_cartesian_product_with_fixed_roles() -> None:
+    factorial = {
+        profile_id: profile
+        for profile_id, profile in COMPOSITION_PROFILES.items()
+        if profile_id.startswith("factorial_v1_")
+    }
+    research = {"s": "sol", "f": "flash"}
+    authors = {"s": "sol", "n": "sonnet"}
+    verifiers = {"s": "sol", "a": "argon"}
+    expected = {
+        f"factorial_v1_{r}{a}{v}": {
+            "coordinator": research[r],
+            "routine": research[r],
+            "search": "lite",
+            "author": authors[a],
+            "repair": "terra",
+            "verifier": verifiers[v],
+        }
+        for r, a, v in product(research, authors, verifiers)
+    }
+    assert len(factorial) == 8
+    assert factorial == expected
+    assert set(get_args(CompositionProfileId)) == set(COMPOSITION_PROFILES)
 
 
 @pytest.mark.parametrize("profile_id", list(COMPOSITION_PROFILES))
