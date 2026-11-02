@@ -203,7 +203,7 @@ def _extract_metadata_window(
 ) -> MetadataResults:
     request = build_metadata_request(chunks, targets)
     output_pressure: dict[str, bool] = {}
-    semantic_feedback_used = False
+    semantic_feedback_used: set[Literal["catalog", "body_scope"]] = set()
     output_reserve_used = False
 
     def accepted(
@@ -290,16 +290,20 @@ def _extract_metadata_window(
     def semantic_feedback_request(
         failed_request: VertexBatchRequest, response: str, error: ValueError
     ) -> VertexBatchRequest | None:
-        recovery = build_metadata_catalog_recovery_request(failed_request, response)
-        if recovery is not None:
-            return recovery
+        if "catalog" not in semantic_feedback_used:
+            recovery = build_metadata_catalog_recovery_request(failed_request, response)
+            if recovery is not None:
+                semantic_feedback_used.add("catalog")
+                return recovery
         feedback = json.loads(failed_request.prompt).get("validation_feedback", {})
-        if str(error) not in {
-            "Metadata field requires body evidence",
-            "Metadata publication reference must use body evidence only for relative dates",
-        } or any(
-            marker in feedback
-            for marker in ("catalog_recovery_version", "body_scope_feedback")
+        if (
+            str(error)
+            not in {
+                "Metadata field requires body evidence",
+                "Metadata publication reference must use body evidence only for relative dates",
+            }
+            or "body_scope" in semantic_feedback_used
+            or "body_scope_feedback" in feedback
         ):
             return None
         recovery = build_metadata_body_scope_repair_request(
@@ -307,6 +311,7 @@ def _extract_metadata_window(
             original_context,
             cached_repair_response=response,
             cached_repair_request_hash=failed_request.request_hash,
+            prior_feedback=feedback,
         )
         if recovery is not None:
             recovery = VertexBatchRequest(
@@ -314,6 +319,7 @@ def _extract_metadata_window(
                 system_instruction=recovery.system_instruction,
                 generation_config=failed_request.generation_config,
             )
+            semantic_feedback_used.add("body_scope")
         legacy = build_metadata_body_scope_repair_request(
             request, original_context, cached_repair_response=response
         )
@@ -345,7 +351,7 @@ def _extract_metadata_window(
     def failed_repair(
         failed_request: VertexBatchRequest, response: str, error: ValueError
     ) -> MetadataResults:
-        nonlocal semantic_feedback_used, output_reserve_used
+        nonlocal output_reserve_used
         if metadata_response_needs_split(response, target_ids=targets):
             reserved = (
                 build_metadata_output_reserve_request(failed_request)
@@ -385,16 +391,11 @@ def _extract_metadata_window(
                     return accepted(reserved, result)
             else:
                 raise _MetadataWindowNeedsSplit("structured_output")
-        recovery = (
-            semantic_feedback_request(failed_request, response, error)
-            if not semantic_feedback_used
-            else None
-        )
+        recovery = semantic_feedback_request(failed_request, response, error)
         if (
             recovery is not None
             and recovery.request_hash != failed_request.request_hash
         ):
-            semantic_feedback_used = True
             recovered_context, recovered_exhausted = _run_metadata_request(
                 gateway=gateway,
                 request=recovery,

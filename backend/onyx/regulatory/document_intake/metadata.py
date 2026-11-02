@@ -6,7 +6,7 @@ import hashlib
 import json
 import re
 import unicodedata
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from typing import Literal
 
@@ -797,6 +797,7 @@ def build_metadata_body_scope_repair_request(
     *,
     cached_repair_response: str | None = None,
     cached_repair_request_hash: str | None = None,
+    prior_feedback: Mapping[str, object] | None = None,
 ) -> VertexBatchRequest | None:
     """Explain rejected date scopes without changing or resolving catalog IDs."""
     if (
@@ -881,7 +882,8 @@ def build_metadata_body_scope_repair_request(
                 )
     if not errors:
         return None
-    feedback = payload["validation_feedback"]
+    feedback = {**(prior_feedback or {}), **payload["validation_feedback"]}
+    payload["validation_feedback"] = feedback
     feedback["body_scope_feedback"] = {
         "version": 1,
         "invalid_scope_total": total,
