@@ -22,6 +22,7 @@ export interface MultiModelResponseViewProps {
   responses: MultiModelResponse[];
   chatState: FullChatState;
   llmManager: LlmManager | null;
+  fixedModelPreset?: boolean;
   onRegenerate?: RegenerationFactory;
   parentMessage?: Message | null;
   otherMessagesCanSwitchTo?: number[];
@@ -71,6 +72,7 @@ export default function MultiModelResponseView({
   responses,
   chatState,
   llmManager,
+  fixedModelPreset,
   onRegenerate,
   parentMessage,
   otherMessagesCanSwitchTo,
@@ -446,6 +448,7 @@ export default function MultiModelResponseView({
         otherMessagesCanSwitchTo,
         onMessageSelection,
         onRegenerate,
+        fixedModelPreset,
         parentMessage,
       },
       errorMessage: response.errorMessage,
@@ -467,6 +470,7 @@ export default function MultiModelResponseView({
       otherMessagesCanSwitchTo,
       onMessageSelection,
       onRegenerate,
+      fixedModelPreset,
       parentMessage,
       isGenerating,
     ]

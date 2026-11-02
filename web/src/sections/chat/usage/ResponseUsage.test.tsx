@@ -79,6 +79,8 @@ it("labels each visible workflow as the input bar does", () => {
   expect(workflowLabel("asv3_exp_cropped")).toBe("exp cropped");
   expect(workflowLabel("asv3_fast")).toBe("Fast ASv3 Tek");
   expect(workflowLabel("asv3_fast_cropped")).toBe("Fast Exp Cropped");
+  expect(workflowLabel("asv3_kompozit")).toBe("Kompozit");
+  expect(workflowLabel("asv3_kompozit_cropped")).toBe("Kompozit Cropped");
 });
 
 it("omits the workflow when the answer predates it being recorded", () => {

@@ -116,6 +116,8 @@ const WORKFLOWS: { key: WorkflowUsageKey; label: string }[] = [
   { key: "asv3_exp_cropped", label: "Hızlı Mod · ASv3 Exp Cropped" },
   { key: "asv3_fast", label: "Fast ASv3 Tek" },
   { key: "asv3_fast_cropped", label: "Fast Exp Cropped" },
+  { key: "asv3_kompozit", label: "Kompozit" },
+  { key: "asv3_kompozit_cropped", label: "Kompozit Cropped" },
 ];
 
 const WORKFLOW_COLUMNS: {

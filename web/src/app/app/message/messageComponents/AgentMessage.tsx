@@ -50,6 +50,7 @@ export interface AgentMessageProps {
   messageId?: number;
   currentFeedback?: FeedbackType | null;
   llmManager: LlmManager | null;
+  fixedModelPreset?: boolean;
   otherMessagesCanSwitchTo?: number[];
   onMessageSelection?: (nodeId: number) => void;
   // Stable regeneration callback - takes (parentMessage) and returns a function that takes (modelOverride)
@@ -97,6 +98,7 @@ function arePropsEqual(
     prev.parentMessage?.messageId === next.parentMessage?.messageId &&
     prev.llmManager?.isLoadingProviders ===
       next.llmManager?.isLoadingProviders &&
+    prev.fixedModelPreset === next.fixedModelPreset &&
     prev.processingDurationSeconds === next.processingDurationSeconds &&
     prev.usage === next.usage &&
     prev.hideFooter === next.hideFooter &&
@@ -116,6 +118,7 @@ const AgentMessage = React.memo(function AgentMessage({
   messageId,
   currentFeedback,
   llmManager,
+  fixedModelPreset,
   otherMessagesCanSwitchTo,
   onMessageSelection,
   onRegenerate,
@@ -461,6 +464,7 @@ const AgentMessage = React.memo(function AgentMessage({
           onRegenerate={onRegenerate}
           parentMessage={parentMessage}
           llmManager={llmManager}
+          fixedModelPreset={fixedModelPreset}
           currentModelName={chatState.overriddenModel}
           modelDisplayName={chatState.modelDisplayName}
           currentModelProvider={chatState.overriddenModelProvider}

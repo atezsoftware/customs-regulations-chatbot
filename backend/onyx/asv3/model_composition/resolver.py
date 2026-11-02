@@ -8,9 +8,15 @@ from onyx.asv3.model_composition.models import (
 from onyx.asv3.model_composition.profiles import (
     COMPOSITION_PROFILES,
     COMPOSITION_VERSION,
+    KOMPOZIT_PROFILE_ID,
     MODEL_SPECS,
 )
-from onyx.asv3.workflow_variant import ASV3_FAST_CROPPED_VARIANT, ASV3_FAST_VARIANT
+from onyx.asv3.workflow_variant import (
+    ASV3_FAST_CROPPED_VARIANT,
+    ASV3_FAST_VARIANT,
+    ASV3_KOMPOZIT_CROPPED_VARIANT,
+    ASV3_KOMPOZIT_VARIANT,
+)
 from onyx.db.asv3_models import (
     check_asv3_secondary_model_cost_limit,
     resolve_asv3_model_provider_id,
@@ -26,10 +32,22 @@ def resolve_model_composition(
     persona: Persona | None,
     workflow_variant: str,
 ) -> ModelComposition:
-    if workflow_variant not in {ASV3_FAST_VARIANT, ASV3_FAST_CROPPED_VARIANT}:
-        raise ValueError("Model composition requires an explicit Fast workflow")
+    if workflow_variant not in {
+        ASV3_FAST_VARIANT,
+        ASV3_FAST_CROPPED_VARIANT,
+        ASV3_KOMPOZIT_VARIANT,
+        ASV3_KOMPOZIT_CROPPED_VARIANT,
+    }:
+        raise ValueError(
+            "Model composition requires an explicit Fast or Kompozit workflow"
+        )
+    if (
+        workflow_variant in {ASV3_KOMPOZIT_VARIANT, ASV3_KOMPOZIT_CROPPED_VARIANT}
+        and profile_id != KOMPOZIT_PROFILE_ID
+    ):
+        raise ValueError("Kompozit workflows require their fixed model composition")
     if profile_id not in COMPOSITION_PROFILES:
-        raise ValueError("Unknown Fast model composition profile")
+        raise ValueError("Unknown model composition profile")
     profile = COMPOSITION_PROFILES[profile_id]
     resolved: dict[str, ModelBinding] = {}
     for alias in dict.fromkeys(profile.values()):

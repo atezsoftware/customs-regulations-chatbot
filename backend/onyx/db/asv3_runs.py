@@ -27,6 +27,8 @@ from onyx.asv3.workflow_variant import (
     ASV3_EXP_CROPPED_VARIANT,
     ASV3_FAST_CROPPED_VARIANT,
     ASV3_FAST_VARIANT,
+    ASV3_KOMPOZIT_CROPPED_VARIANT,
+    ASV3_KOMPOZIT_VARIANT,
 )
 from onyx.configs.constants import MessageType
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
@@ -52,6 +54,7 @@ def _checkpoint_limits(snapshot: dict[str, JsonValue]) -> tuple[int, int]:
     if snapshot.get("asv3_workflow_variant") in {
         ASV3_EXP_CROPPED_VARIANT,
         ASV3_FAST_CROPPED_VARIANT,
+        ASV3_KOMPOZIT_CROPPED_VARIANT,
     }:
         return MAX_CROPPED_CHECKPOINT_BYTES, MAX_CROPPED_DECODED_CHECKPOINT_BYTES
     return MAX_CHECKPOINT_BYTES, MAX_DECODED_CHECKPOINT_BYTES
@@ -119,7 +122,11 @@ def decode_asv3_checkpoint(payload: str) -> dict[str, JsonValue]:
     if (
         compressed
         and data.get("asv3_workflow_variant")
-        in {ASV3_EXP_CROPPED_VARIANT, ASV3_FAST_CROPPED_VARIANT}
+        in {
+            ASV3_EXP_CROPPED_VARIANT,
+            ASV3_FAST_CROPPED_VARIANT,
+            ASV3_KOMPOZIT_CROPPED_VARIANT,
+        }
         and payload_size > durable_limit
     ):
         raise ValueError("ASv3 checkpoint exceeds its durable payload budget")
@@ -160,7 +167,11 @@ def save_asv3_checkpoint(
     attempts = (
         len(_CHECKPOINT_RETRY_DELAYS) + 1
         if snapshot.get("asv3_workflow_variant")
-        in {ASV3_EXP_CROPPED_VARIANT, ASV3_FAST_CROPPED_VARIANT}
+        in {
+            ASV3_EXP_CROPPED_VARIANT,
+            ASV3_FAST_CROPPED_VARIANT,
+            ASV3_KOMPOZIT_CROPPED_VARIANT,
+        }
         else 1
     )
     for attempt in range(attempts):
@@ -193,6 +204,22 @@ def retain_fast_response_workflow(
     """Retain resumed checkpoint provenance on its newly reserved response."""
     if workflow_variant not in {ASV3_FAST_VARIANT, ASV3_FAST_CROPPED_VARIANT}:
         raise ValueError("Expected a Fast ASv3 checkpoint variant")
+    retain_asv3_response_workflow(
+        message_id=message_id, user_id=user_id, workflow_variant=workflow_variant
+    )
+
+
+def retain_asv3_response_workflow(
+    *, message_id: int, user_id: UUID | None, workflow_variant: str
+) -> None:
+    """Preserve an isolated checkpoint's public workflow on its owned response."""
+    if workflow_variant not in {
+        ASV3_FAST_VARIANT,
+        ASV3_FAST_CROPPED_VARIANT,
+        ASV3_KOMPOZIT_VARIANT,
+        ASV3_KOMPOZIT_CROPPED_VARIANT,
+    }:
+        raise ValueError("Expected an isolated ASv3 checkpoint variant")
     with get_session_with_current_tenant() as session:
         message = _require_owned_message(session, message_id, user_id)
         message.workflow = workflow_variant

@@ -1,4 +1,4 @@
-"""Resolved, run-local model roles for explicitly selected Fast profiles."""
+"""Resolved, run-local model roles for explicitly selected workflow profiles."""
 
 from __future__ import annotations
 
@@ -31,7 +31,9 @@ CompositionProfileId = Literal[
     "factorial_v1_fsa",
     "factorial_v1_fns",
     "factorial_v1_fna",
+    "kompozit_v1",
 ]
+KOMPOZIT_PROFILE_ID: CompositionProfileId = "kompozit_v1"
 COMPOSITION_ROLES: tuple[CompositionRole, ...] = (
     "coordinator",
     "routine",
@@ -111,3 +113,21 @@ def get_model_composition(context: RunContext) -> ModelComposition | None:
     if not isinstance(value, ModelComposition):
         raise ValueError("Invalid resolved model composition")
     return value
+
+
+def allows_cropped_composition_implicit_cache(context: RunContext) -> bool:
+    composition = get_model_composition(context)
+    return (
+        context.services.get("asv3_exp_cropped") is True
+        and composition is not None
+        and (
+            (
+                context.services.get("asv3_fast") is True
+                and composition.profile_id.startswith("factorial_v1_")
+            )
+            or (
+                context.services.get("asv3_kompozit_cropped") is True
+                and composition.profile_id == KOMPOZIT_PROFILE_ID
+            )
+        )
+    )

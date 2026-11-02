@@ -94,6 +94,7 @@ from onyx.asv3.model_composition import (
     ModelBinding,
     ModelComposition,
 )
+from onyx.asv3.model_composition.models import KOMPOZIT_PROFILE_ID
 from onyx.asv3.models import (
     CapabilityCall,
     Decision,
@@ -162,6 +163,8 @@ from onyx.asv3.workflow_variant import (
     ASV3_GUARDED_EXPERIMENTAL_VARIANT,
     ASV3_GUARDRAILS_V2_VARIANT,
     ASV3_GUARDRAILS_V3_VARIANT,
+    ASV3_KOMPOZIT_CROPPED_VARIANT,
+    ASV3_KOMPOZIT_VARIANT,
     ASV3_STANDARD_VARIANT,
     ASV3_TUNED_VARIANT,
     checkpoint_variant_fields,
@@ -395,17 +398,33 @@ def run_asv3_loop(
 ) -> None:
     start = time.monotonic()
     composition_identity: dict[str, JsonValue] | None = None
+    if (
+        workflow_variant in {ASV3_KOMPOZIT_VARIANT, ASV3_KOMPOZIT_CROPPED_VARIANT}
+        and model_composition is None
+    ):
+        raise ValueError("Kompozit requires its resolved model composition")
     if model_composition is not None:
         if reasoning_effort != ReasoningEffort.LOW:
             raise ValueError("Model composition requires LOW reasoning effort")
         if (
-            workflow_variant not in {ASV3_FAST_VARIANT, ASV3_FAST_CROPPED_VARIANT}
+            workflow_variant
+            not in {
+                ASV3_FAST_VARIANT,
+                ASV3_FAST_CROPPED_VARIANT,
+                ASV3_KOMPOZIT_VARIANT,
+                ASV3_KOMPOZIT_CROPPED_VARIANT,
+            }
             or research_profile != "normal"
             or parallel_research
         ):
             raise ValueError(
-                "Model composition requires a normal non-parallel Fast workflow"
+                "Model composition requires a normal non-parallel composed workflow"
             )
+        if (
+            workflow_variant in {ASV3_KOMPOZIT_VARIANT, ASV3_KOMPOZIT_CROPPED_VARIANT}
+            and model_composition.profile_id != KOMPOZIT_PROFILE_ID
+        ):
+            raise ValueError("Kompozit requires its fixed model composition")
         coordinator = model_composition.binding("coordinator")
         if (
             ModelBinding(llm, token_counter, coordinator.provider_id).descriptor()
@@ -436,6 +455,7 @@ def run_asv3_loop(
         language="und",
         timeout_seconds=480
         if model_composition is not None
+        and workflow_variant in {ASV3_FAST_VARIANT, ASV3_FAST_CROPPED_VARIANT}
         else 1800
         if bounded_guardrails
         else float("inf"),
@@ -499,6 +519,15 @@ def run_asv3_loop(
     ):
         raise ValueError("ASv3 resume requires the same model composition")
     checkpoint_workflow_variant = workflow_variant
+    if workflow_variant in {ASV3_KOMPOZIT_VARIANT, ASV3_KOMPOZIT_CROPPED_VARIANT}:
+        context.services["asv3_kompozit"] = True
+        if workflow_variant == ASV3_KOMPOZIT_CROPPED_VARIANT:
+            context.services["asv3_kompozit_cropped"] = True
+        workflow_variant = (
+            ASV3_EXP_CROPPED_VARIANT
+            if workflow_variant == ASV3_KOMPOZIT_CROPPED_VARIANT
+            else ASV3_STANDARD_VARIANT
+        )
     if workflow_variant in {ASV3_FAST_VARIANT, ASV3_FAST_CROPPED_VARIANT}:
         if research_profile != "normal" or parallel_research:
             raise ValueError("Fast ASv3 requires the normal non-parallel profile")
@@ -576,10 +605,10 @@ def run_asv3_loop(
         raise ValueError("Saved parallel research uses a different session policy")
     if research_profile == "experimental" or workflow_variant == ASV3_TUNED_VARIANT:
         research_llm = None
-    if (
-        model_composition is not None
-        and checkpoint_workflow_variant == ASV3_FAST_VARIANT
-    ):
+    if model_composition is not None and checkpoint_workflow_variant in {
+        ASV3_FAST_VARIANT,
+        ASV3_KOMPOZIT_VARIANT,
+    }:
         research_llm = model_composition.binding("routine").llm
     answer_llm = None
     if model_composition is None and uses_source_answer_model(workflow_variant, llm):
@@ -872,6 +901,8 @@ def run_asv3_loop(
             ASV3_EXP_CROPPED_VARIANT,
             ASV3_FAST_VARIANT,
             ASV3_FAST_CROPPED_VARIANT,
+            ASV3_KOMPOZIT_VARIANT,
+            ASV3_KOMPOZIT_CROPPED_VARIANT,
         }
         and research_profile == "normal"
         and not parallel_research

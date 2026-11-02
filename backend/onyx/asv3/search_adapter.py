@@ -15,7 +15,10 @@ from onyx.asv3.cropped_cost_budget import CroppedCostBudget, CroppedCostTicket
 from onyx.asv3.cropped_research_limit import CroppedResearchLimit
 from onyx.asv3.cropped_transport import enforce_cropped_input_budget
 from onyx.asv3.llm_adapter import ResearchModel, model_slot, provider_retry_delay
-from onyx.asv3.model_composition.models import get_model_composition
+from onyx.asv3.model_composition.models import (
+    allows_cropped_composition_implicit_cache,
+    get_model_composition,
+)
 from onyx.asv3.models import (
     CapabilityCall,
     EvidenceItem,
@@ -236,10 +239,7 @@ class ScopedSearchLLM(LLM):
                         prompt if isinstance(prompt, list) else [prompt],
                         tools or [],
                         allow_fast_composition_flash=(
-                            self.context.services.get("asv3_fast") is True
-                            and self.context.services.get("asv3_exp_cropped") is True
-                            and composition is not None
-                            and composition.profile_id.startswith("factorial_v1_")
+                            allows_cropped_composition_implicit_cache(self.context)
                         ),
                     )
                 )

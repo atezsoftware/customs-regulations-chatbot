@@ -53,6 +53,22 @@ def _request(**flags: Any) -> SendMessageRequest:
             {
                 "atez_search_v3": True,
                 "asv3_research_profile": "normal",
+                "asv3_kompozit": True,
+            },
+            "asv3_kompozit",
+        ),
+        (
+            {
+                "atez_search_v3": True,
+                "asv3_research_profile": "normal",
+                "asv3_kompozit_cropped": True,
+            },
+            "asv3_kompozit_cropped",
+        ),
+        (
+            {
+                "atez_search_v3": True,
+                "asv3_research_profile": "normal",
                 "asv3_guarded_experimental": True,
             },
             "experimental_guardrails",

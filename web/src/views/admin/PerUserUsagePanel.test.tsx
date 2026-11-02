@@ -60,6 +60,49 @@ function mockUsers(users: UsageExportUser[]) {
 }
 
 describe("PerUserUsagePanel", () => {
+  it("shows separate Kompozit and Kompozit Cropped usage", () => {
+    mockUsers([
+      {
+        ...alice,
+        workflow_usage: {
+          asv3_kompozit: deepUsage,
+          asv3_kompozit_cropped: {
+            ...deepUsage,
+            query_count: 7,
+            cost_cents: 30,
+            known_cost_cents: 30,
+            average_cost_cents_per_session: 15,
+            average_cost_cents_per_query: 30 / 7,
+          },
+        },
+      },
+    ]);
+    render(<PerUserUsagePanel timeRange={timeRange} />);
+    for (const label of ["Kompozit", "Kompozit Cropped"]) {
+      expect(
+        screen.getByRole("columnheader", { name: label })
+      ).toBeInTheDocument();
+      expect(
+        screen.getByRole("button", { name: `Sort ${label} Queries` })
+      ).toBeInTheDocument();
+    }
+    const cells = within(
+      screen.getByRole("row", { name: /alice@example.com/ })
+    ).getAllByRole("cell");
+    expect(cells.slice(33, 43).map((cell) => cell.textContent)).toEqual([
+      "2",
+      "$0.80",
+      "$0.4000",
+      "4",
+      "$0.2000",
+      "2",
+      "$0.30",
+      "$0.1500",
+      "7",
+      "$0.0429",
+    ]);
+  });
+
   it("preserves every existing metric and supports responses without workflow data", () => {
     mockUsers([alice]);
     render(<PerUserUsagePanel timeRange={timeRange} />);
