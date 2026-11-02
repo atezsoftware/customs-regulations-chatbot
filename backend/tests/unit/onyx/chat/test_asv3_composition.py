@@ -7,7 +7,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 from pydantic import ValidationError
 
-from onyx.asv3.model_composition.models import ModelComposition
+from onyx.asv3.model_composition.models import CompositionProfileId, ModelComposition
+from onyx.asv3.model_composition.profiles import COMPOSITION_PROFILES
 from onyx.asv3.models import ASv3WorkflowSelection
 from onyx.auth.schemas import UserRole
 from onyx.chat import asv3_composition, process_message
@@ -31,6 +32,22 @@ def request() -> SendMessageRequest:
             "origin": "benchmark",
         }
     )
+
+
+@pytest.mark.parametrize("profile_id", list(COMPOSITION_PROFILES))
+@pytest.mark.parametrize("cropped", [False, True])
+def test_request_schema_accepts_each_registered_profile_for_explicit_fast_workflow(
+    profile_id: CompositionProfileId, cropped: bool
+) -> None:
+    selected = SendMessageRequest.model_validate(
+        {
+            **request().model_dump(mode="json"),
+            "asv3_model_profile": profile_id,
+            "asv3_fast": not cropped,
+            "asv3_fast_cropped": cropped,
+        }
+    )
+    assert selected.asv3_model_profile == profile_id
 
 
 @pytest.mark.parametrize("variant", ["asv3_fast", "asv3_fast_cropped"])

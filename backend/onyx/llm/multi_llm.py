@@ -1405,13 +1405,22 @@ class LitellmLLM(LLM):
         self,
         prompt: Sequence[ChatCompletionMessage],
         tools: Sequence[Mapping[str, object]],
+        *,
+        allow_fast_composition_flash: bool = False,
     ) -> bool:
-        """Native Argon implicit writes need no extra billable cache-write partition."""
+        """Allowlisted native implicit writes are covered by ordinary input billing."""
         # Native implicit cache creation is billed at the ordinary input rate:
         # https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/context-cache/context-cache-overview
         if (
             self._model_provider not in {"vertex_ai", "gemini"}
-            or not is_gemini_4_argon_model(self._model_version)
+            or not (
+                is_gemini_4_argon_model(self._model_version)
+                or (
+                    allow_fast_composition_flash is True
+                    and self._model_version
+                    in {"gemini-3.8-flash", "gemini-3.5-flash-lite"}
+                )
+            )
             or self._api_base is not None
             or self._api_surface is not None
             or self._custom_llm_provider not in {None, self._model_provider}

@@ -1876,7 +1876,17 @@ class ResearchModel:
                         and (
                             selected_llm.cropped_native_cache_writes_disabled
                             or selected_llm.cropped_has_free_implicit_cache_writes(
-                                prompt, wire_tools
+                                prompt,
+                                wire_tools,
+                                allow_fast_composition_flash=(
+                                    self.context.services.get("asv3_fast") is True
+                                    and self.context.services.get("asv3_exp_cropped")
+                                    is True
+                                    and self._composition is not None
+                                    and self._composition.profile_id.startswith(
+                                        "factorial_v1_"
+                                    )
+                                ),
                             )
                         ),
                     )

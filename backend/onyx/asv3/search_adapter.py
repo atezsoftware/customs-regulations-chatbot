@@ -191,6 +191,7 @@ class ScopedSearchLLM(LLM):
     ) -> tuple[CroppedCostBudget | None, CroppedCostTicket | None]:
         if self.context.services.get("asv3_exp_cropped") is not True:
             return None, None
+        composition = get_model_composition(self.context)
         counter = self.context.services.get("cropped_token_counter")
         model = ResearchModel(
             self.selected,
@@ -199,9 +200,7 @@ class ScopedSearchLLM(LLM):
             if callable(counter)
             else None,
             lean_native_mode=True,
-            composition_role="search"
-            if get_model_composition(self.context) is not None
-            else None,
+            composition_role="search" if composition is not None else None,
         )
         incoming = model._input_cost(
             prompt if isinstance(prompt, list) else [prompt],
@@ -234,7 +233,14 @@ class ScopedSearchLLM(LLM):
                 and (
                     self.selected.cropped_native_cache_writes_disabled
                     or self.selected.cropped_has_free_implicit_cache_writes(
-                        prompt if isinstance(prompt, list) else [prompt], tools or []
+                        prompt if isinstance(prompt, list) else [prompt],
+                        tools or [],
+                        allow_fast_composition_flash=(
+                            self.context.services.get("asv3_fast") is True
+                            and self.context.services.get("asv3_exp_cropped") is True
+                            and composition is not None
+                            and composition.profile_id.startswith("factorial_v1_")
+                        ),
                     )
                 )
             ),

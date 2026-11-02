@@ -18,7 +18,19 @@ CompositionRole = Literal[
     "coordinator", "routine", "search", "author", "repair", "verifier"
 ]
 CompositionProfileId = Literal[
-    "sol_reference_v1", "flash_sol_v1", "terra_sol_v1", "argon_sonnet_v1", "luna_sol_v1"
+    "sol_reference_v1",
+    "flash_sol_v1",
+    "terra_sol_v1",
+    "argon_sonnet_v1",
+    "luna_sol_v1",
+    "factorial_v1_sss",
+    "factorial_v1_ssa",
+    "factorial_v1_sns",
+    "factorial_v1_sna",
+    "factorial_v1_fss",
+    "factorial_v1_fsa",
+    "factorial_v1_fns",
+    "factorial_v1_fna",
 ]
 COMPOSITION_ROLES: tuple[CompositionRole, ...] = (
     "coordinator",

@@ -21,6 +21,7 @@ from onyx.asv3.model_composition.models import (
     ModelBinding,
     ModelComposition,
 )
+from onyx.asv3.model_composition.profiles import COMPOSITION_PROFILES
 from onyx.asv3.models import HarnessView, RunContext, RunStopped, SharedBudget
 from onyx.asv3.workflow_variant import ASV3_TUNED_VARIANT
 from onyx.llm.interfaces import LLM, LLMConfig
@@ -108,16 +109,7 @@ def original_view(adapter: ResearchModel) -> HarnessView:
     )
 
 
-@pytest.mark.parametrize(
-    "profile",
-    [
-        "sol_reference_v1",
-        "flash_sol_v1",
-        "terra_sol_v1",
-        "argon_sonnet_v1",
-        "luna_sol_v1",
-    ],
-)
+@pytest.mark.parametrize("profile", list(COMPOSITION_PROFILES))
 @pytest.mark.parametrize("cropped", [False, True])
 def test_every_profile_uses_same_action_handoff_and_full_author_originals(
     monkeypatch: pytest.MonkeyPatch,
