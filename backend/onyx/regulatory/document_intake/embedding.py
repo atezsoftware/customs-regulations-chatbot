@@ -17,12 +17,14 @@ _REQUEST_ENVELOPE_RESERVE = 1024
 class FrozenEmbeddingGroup:
     key: str
     texts: tuple[str, ...]
+    max_seq_length: int | None = None
 
 
 def encode_intake_embedding_groups(
     groups: Sequence[FrozenEmbeddingGroup],
     *,
     encode: Callable[[list[str]], Sequence[object]],
+    encode_complete: Callable[[list[str], int], Sequence[object]] | None = None,
     expected_dimension: int,
     check_owner: Callable[[], None],
 ) -> dict[str, list[list[float]]]:
@@ -32,6 +34,10 @@ def encode_intake_embedding_groups(
     for group in groups:
         if not group.key or not group.texts:
             raise ValueError("Intake embedding groups require their complete inputs")
+        if group.max_seq_length is not None and encode_complete is None:
+            raise ValueError(
+                "A frozen whole-table request requires its complete encoder"
+            )
         for text in group.texts:
             if not isinstance(text, str) or not text:
                 raise ValueError("Intake embedding inputs cannot be empty")
@@ -45,7 +51,9 @@ def encode_intake_embedding_groups(
 
     def encode_group(group: FrozenEmbeddingGroup) -> list[list[float]]:
         return _validate_response_vectors(
-            encode(list(group.texts)),
+            encode_complete(list(group.texts), group.max_seq_length)
+            if encode_complete is not None and group.max_seq_length is not None
+            else encode(list(group.texts)),
             expected_count=len(group.texts),
             expected_dimension=expected_dimension,
         )

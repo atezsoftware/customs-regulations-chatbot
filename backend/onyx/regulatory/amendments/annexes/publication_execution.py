@@ -135,11 +135,16 @@ def execute_embeddings(
         dimension = checkpoint.request.configuration.get("dimension")
         if not isinstance(dimension, int) or isinstance(dimension, bool):
             raise ValueError("frozen encoder dimension missing")
+        from onyx.regulatory.document_intake.encoder_budget import (
+            frozen_encoder_options,
+        )
+
         actual_inputs, configuration = freeze_encoder_inputs(
             checkpoint.request.inputs,
             model,
             model_dim=dimension,
             formatter=str(checkpoint.request.configuration["formatter"]),
+            **frozen_encoder_options(checkpoint.request.configuration),
         )
         comparable = {
             key: value
@@ -154,6 +159,7 @@ def execute_embeddings(
             texts=actual_inputs,
             text_type=EmbedTextType.PASSAGE,
             tenant_id=delivery.tenant_id,
+            **frozen_encoder_options(checkpoint.request.configuration),
         )
         vectors = _validate_response_vectors(
             raw,

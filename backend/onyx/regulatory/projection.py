@@ -52,6 +52,7 @@ from onyx.regulatory.contextual import (
     fit_context_fields_to_embedding_budget,
     visible_regulatory_snapshot_for_target,
 )
+from onyx.regulatory.document_intake.encoder_budget import row_encoder_options
 from onyx.regulatory.document_intake.temporal_context import (
     intake_temporal_context_rows,
 )
@@ -194,6 +195,7 @@ def _contextualize_chunks(
     today = datetime.date.today()
     snapshot_documents: dict[tuple[str, ...], Document] = {}
     contextual_chunks: list[DocAwareChunk] = []
+    embedding_limits: dict[int, int] = {}
     skipped_for_budget = 0
 
     snapshot_rows = context_rows if context_rows is not None else rows
@@ -215,10 +217,14 @@ def _contextualize_chunks(
         embedding_text = (
             f"{chunk.title_prefix}{chunk.content}{chunk.metadata_suffix_semantic}"
         )
+        embedding_limit = row_encoder_options(row, embedder.embedding_model).get(
+            "max_seq_length", DOC_EMBEDDING_CONTEXT_SIZE
+        )
+        embedding_limits[id(chunk)] = embedding_limit
         reserve = contextual_reserve_for_embedding_text(
             embedding_text,
             tokenizer=embedder.embedding_model.tokenizer,
-            embedding_token_limit=DOC_EMBEDDING_CONTEXT_SIZE,
+            embedding_token_limit=embedding_limit,
             requested_reserve=DEFAULT_CONTEXTUAL_RAG_RESERVED_TOKENS,
         )
         if reserve == 0:
@@ -263,7 +269,17 @@ def _contextualize_chunks(
             chunks=contextual_chunks,
             llm=llm,
             tokenizer=llm_tokenizer,
-            chunk_token_limit=DOC_EMBEDDING_CONTEXT_SIZE * 2,
+            chunk_token_limit=max(
+                [
+                    DOC_EMBEDDING_CONTEXT_SIZE * 2,
+                    *[
+                        row_encoder_options(row, embedder.embedding_model).get(
+                            "max_seq_length", DOC_EMBEDDING_CONTEXT_SIZE
+                        )
+                        for row in rows
+                    ],
+                ]
+            ),
             raise_on_failure=True,
             **({"recorder": recorder} if recorder is not None else {}),
         )
@@ -276,7 +292,7 @@ def _contextualize_chunks(
                     doc_summary=chunk.doc_summary,
                     chunk_context=chunk.chunk_context,
                     tokenizer=embedder.embedding_model.tokenizer,
-                    embedding_token_limit=DOC_EMBEDDING_CONTEXT_SIZE,
+                    embedding_token_limit=embedding_limits[id(chunk)],
                 )
             )
 
@@ -448,7 +464,10 @@ def _freeze_normal_context_view(
         snapshot_hash = snapshot.sha256
         snapshots[snapshot_hash] = snapshot
         embedding_texts, embedding_config = freeze_embedding_inputs(
-            chunk, embedder.embedding_model, model_dim=search_settings.model_dim
+            chunk,
+            embedder.embedding_model,
+            model_dim=search_settings.model_dim,
+            **row_encoder_options(row, embedder.embedding_model),
         )
         projections.append(
             FrozenContextProjection(

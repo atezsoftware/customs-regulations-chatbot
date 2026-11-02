@@ -128,6 +128,13 @@ class DefaultIndexingEmbedder(IndexingEmbedder):
         flat_chunk_texts: list[str] = []
         large_chunks_present = False
         for chunk in chunks:
+            intake = (chunk.source_document.doc_metadata or {}).get(
+                "regulatory_document_intake"
+            )
+            if isinstance(intake, dict) and intake.get("chunking_version") == "4":
+                raise ValueError(
+                    "Whole-table intake requires the scoped regulatory writer"
+                )
             if chunk.large_chunk_reference_ids:
                 large_chunks_present = True
             chunk_text = (

@@ -374,6 +374,13 @@ class ContextualRequestFactory:
     )
 
     def __post_init__(self) -> None:
+        if any(
+            getattr(row, "chunk_metadata", {}).get("intake_chunking_version") == "4"
+            for row in self.rows
+        ):
+            raise ContextualMappingError(
+                "Whole-table intake requires the scoped normal writer"
+            )
         self._ordered_rows = tuple(
             _ordered_rows(intake_temporal_context_rows(list(self.rows)))
         )
