@@ -346,10 +346,10 @@ def strict_v4_canary(input_path: Path, expected_sha: str) -> dict[str, Any]:
         settings = get_current_search_settings(session)
         require(settings.id == 11 and settings.provider_type == EmbeddingProvider.GOOGLE and settings.model_name == "gemini-embedding-2" and settings.enable_contextual_rag, "The configured strict canary model or contextual policy changed")
         embedder = DefaultIndexingEmbedder.from_db_search_settings(settings)
-        llm = resolve_review_context_llm(settings, None)
         dimension, model_dim = settings.final_embedding_dim, settings.model_dim
         session.expunge(settings)
         session.rollback()
+    llm = resolve_review_context_llm(settings, None)
     file = UserFile(id=uuid5(BATCH, "detached-whole-table-canary"), name="Resmî Gazete whole-table canary")
     row = RegulatoryChunk(id="detached-whole-table-canary", user_file_id=file.id, text=source, position=0, projection_ordinal=0, heading_path=["EK"], chunk_type="table", chunk_metadata={"chunk_variant": "atomic", "intake_chunking_version": "4", "intake_preparation_policy": IntakePreparationPolicy().model_dump(mode="json")}, source="indexed", status="active")
     view = prepare_normal_context_view(rows=[row], user_file=file, search_settings=settings, embedder=embedder, llm=llm)
