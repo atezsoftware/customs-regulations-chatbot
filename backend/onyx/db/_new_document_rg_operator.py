@@ -16,7 +16,11 @@ from sqlalchemy.orm import Session
 from onyx.configs.app_configs import POSTGRES_DB
 from onyx.db import document_intake as repository
 from onyx.db.engine.sql_engine import SqlEngine, get_session_with_current_tenant
-from onyx.db.models import RegulatoryDocumentIntake, RegulatoryDocumentIntakeReprepare
+from onyx.db.models import (
+    RegulatoryDocumentIntake,
+    RegulatoryDocumentIntakeReprepare,
+    RegulatoryLabelingRun,
+)
 from onyx.db.search_settings import get_current_search_settings
 from onyx.indexing.chunker import DEFAULT_CONTEXTUAL_RAG_RESERVED_TOKENS
 from onyx.natural_language_processing.utils import get_tokenizer
@@ -39,6 +43,16 @@ REPREPARE_REQUEST = "a03a7101-f9a7-46cf-bbda-831d96e64865"
 REPREPARE_REVIEW_SHA = "1188de8875d91317e9f9cb9bc9cbf1057e9a4a47b40092de755bb8235b0b1462"
 MAIN_CANONICAL_SHA = "c987526ff76ea81f1cee005397a45282c7ecb718d34c836b8ecf7367773210f2"
 MAIN_METADATA_SHA = "21b05187e74424039e086570c512e55b0e20abce4c43afb06e383c86857b9ea0"
+REFRESH_IMAGE_SHA = "ff935c6d49088617d680e7d5d03763155fc04a99"
+LABELING_RUN = UUID("8620ccb4-c0c0-4a37-a403-5027d75d6f69")
+FK_INDEXES = {
+    "ix_regulatory_chunk_supersedes_chunk_id": ("regulatory_chunk", "supersedes_chunk_id"),
+    "ix_regulatory_chunk_superseded_by_chunk_id": ("regulatory_chunk", "superseded_by_chunk_id"),
+    "ix_user_file_batch_item_regulatory_chunk_id": ("user_file_batch_item", "regulatory_chunk_id"),
+    "ix_regulatory_indexing_item_regulatory_chunk_id": ("regulatory_indexing_item", "regulatory_chunk_id"),
+    "ix_amendment_proposal_applied_new_chunk_id": ("amendment_proposal", "applied_new_chunk_id"),
+    "ix_regulatory_annex_element_chunk_chunk_id": ("regulatory_annex_element_chunk", "chunk_id"),
+}
 MAIN_DIGEST = "f70e13400f34aec9878368a92a040d76b6a6d9363f70c7f06e6898b878f16ba3"
 ORIGINAL_ERROR = (
     "An intake table row exceeds the embedding content token limit; "
@@ -395,6 +409,132 @@ def retry_frozen_reprepare(session: Session, batch: RegulatoryDocumentIntake) ->
     return {"operator_action": "normal_frozen_reprepare_retry_requested", "request_id": request.id, "expected_review_sha256": request.expected_sha256, "target_preparation_policy": policy, "verified_partial_checkpoint": checkpoint, "publication_or_index_requested": False}, request.id
 
 
+def require_completed_labeling(run: RegulatoryLabelingRun) -> None:
+    require(run.id == LABELING_RUN and run.document_set_id == 15 and set(run.file_ids) == {MAIN_FILE, PDF_FILE}, "The completed labeling scope changed")
+    require(run.status == "completed" and run.stage == "finished" and run.total_chunks == run.completed_chunks == 662 and run.failed_chunks == run.stale_chunks == run.unresolved_derived_chunks == 0 and run.derived_chunks == 35 and not run.cancel_requested and run.error is None, "All canonical and derived labels must finish without failures before review")
+
+
+def unpublished_epoch_scope(session: Session) -> list[dict[str, Any]]:
+    publications = rows(session, """
+        SELECT user_file_id,epoch,gate_closed,writer_manifest,original_ingestion_receipt
+        FROM regulatory_file_publication WHERE user_file_id IN (:main,:pdf) ORDER BY user_file_id
+    """, main=MAIN_FILE, pdf=PDF_FILE)
+    require({str(item["user_file_id"]) for item in publications} == {MAIN_FILE, PDF_FILE} and all(item["epoch"] == 0 and not item["gate_closed"] and item["writer_manifest"] is None for item in publications), "The unpublished epoch-zero scope changed")
+    require(not rows(session, "SELECT id FROM regulatory_indexing_job WHERE user_file_id IN (:main,:pdf) LIMIT 1", main=MAIN_FILE, pdf=PDF_FILE), "An indexing request already exists")
+    return publications
+
+
+def review_receipt_proof(session: Session, batch: RegulatoryDocumentIntake, run: RegulatoryLabelingRun) -> dict[str, Any]:
+    from collections import Counter
+
+    from sqlalchemy import select
+
+    from onyx.db.document_intake_metadata import (
+        metadata_chunks,
+        validate_intake_metadata_receipts,
+    )
+    from onyx.db.document_intake_reprepare import latest_reprepare
+    from onyx.db.models import (
+        RegulatoryChunk,
+        RegulatoryDerivedLabelProjection,
+        RegulatoryLabelingItem,
+    )
+    from onyx.db.regulatory_labeling import (
+        current_derived_label_sources_for_search,
+        current_labeling_items_for_search,
+    )
+    from onyx.file_processing.original_ingestion import OriginalIngestionReceipt
+    from onyx.regulatory.document_intake.metadata import (
+        METADATA_AUDIT_KEY,
+        METADATA_MODEL,
+        METADATA_VERSION,
+        metadata_input_hash,
+    )
+    from onyx.regulatory.document_intake.models import IntakePreparationPolicy
+
+    assets = verify_scope(session, batch)
+    publications = unpublished_epoch_scope(session)
+    request = latest_reprepare(session, batch.id)
+    policy = IntakePreparationPolicy().model_dump(mode="json")
+    require(request is not None and str(request.id) == REPREPARE_REQUEST and request.expected_sha256 == REPREPARE_REVIEW_SHA and request.status == "prepared" and request.error is None, "The completed frozen reprepare changed")
+    assert request is not None
+    require(set(request.documents) == {MAIN_DOCUMENT, PDF_DOCUMENT} and all(item.get("status") == "prepared" and item.get("target_preparation_policy") == policy for item in request.documents.values()), "A source reprepare checkpoint is incomplete")
+    require(rows(session, "SELECT version_num FROM alembic_version") == [{"version_num": "576f0377f747"}], "The required FK-index migration head changed")
+    indexes = rows(session, """
+        SELECT idx.relname AS name,t.relname AS table_name,a.attname AS column_name,
+               i.indisvalid AND i.indisready AND NOT i.indisunique AND i.indnkeyatts=1
+               AND i.indnatts=1 AND i.indpred IS NULL AND i.indexprs IS NULL
+               AND am.amname='btree' AS valid_ready
+        FROM pg_index i JOIN pg_class idx ON idx.oid=i.indexrelid
+        JOIN pg_class t ON t.oid=i.indrelid JOIN pg_namespace n ON n.oid=t.relnamespace
+        JOIN pg_am am ON am.oid=idx.relam
+        JOIN pg_attribute a ON a.attrelid=t.oid AND a.attnum=i.indkey[0]
+        WHERE n.nspname=current_schema() AND idx.relname=ANY(:names) ORDER BY idx.relname
+    """, names=list(FK_INDEXES))
+    require({item["name"]: (item["table_name"], item["column_name"]) for item in indexes} == FK_INDEXES and all(item["valid_ready"] for item in indexes), "The six source-reference indexes are not valid and ready")
+    all_rows = list(session.scalars(select(RegulatoryChunk).where(RegulatoryChunk.user_file_id.in_([UUID(MAIN_FILE), UUID(PDF_FILE)])).order_by(RegulatoryChunk.user_file_id, RegulatoryChunk.position, RegulatoryChunk.id)))
+    require(len(all_rows) == 697 and all(item.source == "indexed" and item.status == "active" and item.chunk_metadata.get("intake_chunking_version") == "4" and item.chunk_metadata.get("intake_preparation_policy") == policy for item in all_rows), "The current v4 source scope changed")
+    canonical_ids: set[str] = set()
+    document_proofs: list[dict[str, Any]] = []
+    retained_text: dict[str, str] = {}
+    publication_by_file = {str(item["user_file_id"]): item for item in publications}
+    for asset in assets:
+        file_id = str(asset["user_file_id"])
+        receipt = OriginalIngestionReceipt.model_validate(publication_by_file[file_id]["original_ingestion_receipt"])
+        require(receipt.raw_sha256 == asset["sha256"], "An original raw source receipt changed")
+        with retained_source_stream(receipt.file_id, session) as stream:
+            raw = stream.read(10_000_001)
+        require(len(raw) <= 10_000_000 and hashlib.sha256(raw).hexdigest() == asset["sha256"], "An original raw source stream changed")
+        with retained_source_stream(asset["text_file_id"], session) as stream:
+            prepared = stream.read(2_000_001)
+        require(len(prepared) <= 2_000_000 and hashlib.sha256(prepared).hexdigest() == asset["text_sha256"], "A retained prepared source changed")
+        retained_text[file_id] = prepared.decode("utf-8")
+        file_rows = [item for item in all_rows if str(item.user_file_id) == file_id]
+        chunks = metadata_chunks(file_rows)
+        require((len(file_rows), len(chunks)) == ((365, 342) if file_id == MAIN_FILE else (332, 320)), "Canonical metadata coverage changed")
+        input_hash = metadata_input_hash(chunks)
+        if file_id == MAIN_FILE:
+            require(input_hash == MAIN_METADATA_SHA, "The actual main metadata input changed")
+        chunk_ids = {item.chunk_id for item in chunks}
+        canonical_ids.update(chunk_ids)
+        for item in file_rows:
+            if item.id not in chunk_ids:
+                continue
+            audit = item.chunk_metadata.get(METADATA_AUDIT_KEY, {})
+            require(audit.get("input_sha256") == input_hash and audit.get("input_stale") is False and audit.get("version") == METADATA_VERSION and audit.get("model") == METADATA_MODEL and isinstance(audit.get("request_hash"), str) and bool(re.fullmatch(r"[0-9a-f]{64}", audit["request_hash"])) and isinstance(audit.get("fields"), dict) and all(not field.get("stale") for field in audit["fields"].values()), "A canonical metadata receipt is incomplete or stale")
+        document_proofs.append({"user_file_id": file_id, "canonical_chunks": len(chunks), "all_chunks": len(file_rows), "metadata_input_sha256": input_hash, "raw_source_sha256": asset["sha256"], "prepared_source_sha256": asset["text_sha256"], "headingless_canonical_chunks": sum(not item.heading_path for item in chunks), "heading_samples": [item.heading_path[:4] for item in chunks[:3]]})
+    validate_intake_metadata_receipts(session, batch)
+    require(len(canonical_ids) == 662, "The complete metadata target count changed")
+    pdf_rows = [item for item in all_rows if str(item.user_file_id) == PDF_FILE and item.id in canonical_ids]
+    source_lines = [line.strip() for line in retained_text[PDF_FILE].splitlines() if line.strip().startswith("|")]
+    actual_lines = [line.strip() for item in pdf_rows for line in item.text.splitlines() if line.strip().startswith("|")]
+    require(len(source_lines) == 465 and not (Counter(source_lines) - Counter(actual_lines)) and sum(item.chunk_type == "table" for item in pdf_rows) == 68, "A source table line or whole-table block changed")
+    items = list(session.scalars(select(RegulatoryLabelingItem).where(RegulatoryLabelingItem.run_id == run.id)))
+    require(len(items) == 662 and {item.regulatory_chunk_id for item in items} == canonical_ids and all(item.status == "completed" and item.error is None for item in items), "Completed labeling items do not cover the canonical source")
+    require(current_labeling_items_for_search(session, run=run, items=items) == canonical_ids, "A completed labeling source or context receipt is stale")
+    derived = list(session.scalars(select(RegulatoryDerivedLabelProjection).where(RegulatoryDerivedLabelProjection.run_id == run.id)))
+    require(len(derived) == 35 and all(item.user_file_id in {UUID(MAIN_FILE), UUID(PDF_FILE)} and item.resolution == "lineage" and item.unresolved_reason is None and bool(current_derived_label_sources_for_search(session, run=run, target=item)) for item in derived), "A derived label lineage receipt is unresolved or stale")
+    return {"canonical_metadata_receipts": 662, "current_canonical_label_receipts": 662, "resolved_derived_label_receipts": 35, "source_table_lines_preserved": 465, "whole_table_blocks": 68, "fk_indexes_valid_ready": 6, "migration_head": "576f0377f747", "documents": document_proofs}
+
+
+def refresh_completed_review(session: Session, batch: RegulatoryDocumentIntake) -> dict[str, Any]:
+    require(batch.labeling_run_id == LABELING_RUN and batch.error is None and (batch.status, batch.stage) in {("preparing", "labeling"), ("ready", "review")}, "Only this completed intake labeling stage may refresh its review")
+    run = session.get_one(RegulatoryLabelingRun, LABELING_RUN, with_for_update=True)
+    require_completed_labeling(run)
+    proof = review_receipt_proof(session, batch, run)
+    before_digest = repository.review_digest(session, batch)
+    before_epochs = unpublished_epoch_scope(session)
+    result = repository.intake_snapshot(session, batch)
+    require(batch.status == "ready" and batch.stage == "review" and batch.error is None and batch.review_sha256 == before_digest == repository.review_digest(session, batch) and bool(re.fullmatch(r"[0-9a-f]{64}", batch.review_sha256 or "")), "The normal GET refresh did not produce the unchanged ready review")
+    require(result["status"] == "ready" and result["stage"] == "review" and result["labeling_failed_count"] == 0 and result["active_document_count"] == 2 and {item["user_file_id"] for item in result["documents"]} == {MAIN_FILE, PDF_FILE}, "The ready review snapshot scope is incomplete")
+    by_id = {item["id"]: item for item in result["documents"]}
+    require(by_id[MAIN_DOCUMENT]["role"] == "root" and by_id[PDF_DOCUMENT]["role"] == "annex" and by_id[PDF_DOCUMENT]["parent_document_id"] == MAIN_DOCUMENT and any(link["target_document_id"] == PDF_DOCUMENT for link in by_id[MAIN_DOCUMENT]["document_links"]), "The ready attachment navigation changed")
+    verify_scope(session, batch)
+    require(unpublished_epoch_scope(session) == before_epochs, "Review refresh changed publication/source authority")
+    diagnostics = [{key: item[key] for key in ("id", "user_file_id", "display_name", "source_display_name", "source_url", "role", "parent_document_id", "status", "chunk_count", "labeling_failed_count", "document_links")} for item in result["documents"]]
+    return {"operator_action": "normal_get_review_refreshed", "status": batch.status, "stage": batch.stage, "review_sha256": batch.review_sha256, "edit_review_sha256": result["edit_review_sha256"], "publication_review_sha256": result["publication_review_sha256"], "labeling_run_id": str(run.id), "source_and_receipt_proof": proof, "documents": diagnostics, "approval_or_publication_or_index_requested": False}
+
+
 def strict_v4_canary(input_path: Path, expected_sha: str) -> dict[str, Any]:
     """Exercise the real normal freezer and strict encoder using detached fixture rows."""
     import logging
@@ -531,14 +671,16 @@ def main() -> None:
     parser.add_argument("--review-canary", action="store_true")
     parser.add_argument("--reprepare-v4", action="store_true")
     parser.add_argument("--retry-reprepare-v4", action="store_true")
+    parser.add_argument("--refresh-review", action="store_true")
     parser.add_argument("--strict-v4-canary", action="store_true")
     parser.add_argument("--input-path", type=Path)
     parser.add_argument("--expected-input-sha")
     args = parser.parse_args()
-    require(sum((args.retry, args.embedding_canary, args.review_canary, args.reprepare_v4, args.retry_reprepare_v4, args.strict_v4_canary)) <= 1, "Mutations and canaries must be separate operations")
+    require(sum((args.retry, args.embedding_canary, args.review_canary, args.reprepare_v4, args.retry_reprepare_v4, args.refresh_review, args.strict_v4_canary)) <= 1, "Mutations and canaries must be separate operations")
     require(not args.strict_v4_canary or (args.input_path is not None and args.expected_input_sha is not None), "Strict canary requires its exact fixture path and SHA")
     require(bool(re.fullmatch(r"[0-9a-f]{40}", args.expected_image_sha)), "Expected exact deployed commit SHA")
     require(args.observed_image_sha == args.expected_image_sha, "Selected DEV container image differs from expected SHA")
+    require(not args.refresh_review or args.expected_image_sha == REFRESH_IMAGE_SHA, "Review refresh requires its exact approved deployed revision")
     require(POSTGRES_DB == "customs-regulations-dev", "Expected explicit DEV database configuration")
     require(config.REGULATORY_ANNEX_ENVIRONMENT == "dev", "Expected explicit DEV intake environment")
     tenant = get_current_tenant_id()
@@ -548,10 +690,10 @@ def main() -> None:
     enqueue = False
     reprepare_id: UUID | None = None
     with get_session_with_current_tenant() as session:
-        if not (args.retry or args.reprepare_v4 or args.retry_reprepare_v4):
+        if not (args.retry or args.reprepare_v4 or args.retry_reprepare_v4 or args.refresh_review):
             session.execute(text("SET TRANSACTION READ ONLY"))
         require(session.execute(text("SELECT current_database()")).scalar_one() == "customs-regulations-dev", "Connected database is not DEV")
-        batch = session.get(RegulatoryDocumentIntake, BATCH, with_for_update=args.retry or args.reprepare_v4 or args.retry_reprepare_v4, populate_existing=True)
+        batch = session.get(RegulatoryDocumentIntake, BATCH, with_for_update=args.retry or args.reprepare_v4 or args.retry_reprepare_v4 or args.refresh_review, populate_existing=True)
         require(batch is not None, "Exact frozen intake is missing")
         assert batch is not None
         report = snapshot(session, batch)
@@ -585,6 +727,9 @@ def main() -> None:
                 session.rollback()
             else:
                 session.commit()
+        elif args.refresh_review:
+            report.update(refresh_completed_review(session, batch))
+            session.commit()
         else:
             report["operator_action"] = "inspected_read_only"
             session.rollback()
@@ -608,7 +753,7 @@ def main() -> None:
         report["strict_v4_canary"] = strict_v4_canary(args.input_path, args.expected_input_sha)
     report["expected_image_sha"] = args.expected_image_sha
     report["worker_failures"] = worker_failures()
-    if not (args.retry or args.reprepare_v4 or args.retry_reprepare_v4 or args.embedding_canary or args.review_canary or args.strict_v4_canary):
+    if not (args.retry or args.reprepare_v4 or args.retry_reprepare_v4 or args.refresh_review or args.embedding_canary or args.review_canary or args.strict_v4_canary):
         report["exact_worker_activity"] = exact_worker_activity()
     # Provider error strings can occasionally contain credentials; redact the entire value.
     def sanitized(value: Any) -> Any:

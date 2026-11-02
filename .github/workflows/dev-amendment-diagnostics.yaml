@@ -7,7 +7,7 @@ on:
         type: choice
         required: true
         default: inspect
-        options: [inspect, retry, embedding-canary, review-canary, native-probe, strict-v4-canary, reprepare-v4, retry-reprepare-v4]
+        options: [inspect, retry, embedding-canary, review-canary, native-probe, strict-v4-canary, reprepare-v4, retry-reprepare-v4, refresh-review]
       expected_image_sha:
         type: string
         required: true
@@ -33,7 +33,7 @@ jobs:
         run: |
           set -euo pipefail
           [[ "$EXPECTED_IMAGE_SHA" =~ ^[0-9a-f]{40}$ ]]
-          [[ "$OPERATION" == inspect || "$OPERATION" == retry || "$OPERATION" == embedding-canary || "$OPERATION" == review-canary || "$OPERATION" == native-probe || "$OPERATION" == strict-v4-canary || "$OPERATION" == reprepare-v4 || "$OPERATION" == retry-reprepare-v4 ]]
+          [[ "$OPERATION" == inspect || "$OPERATION" == retry || "$OPERATION" == embedding-canary || "$OPERATION" == review-canary || "$OPERATION" == native-probe || "$OPERATION" == strict-v4-canary || "$OPERATION" == reprepare-v4 || "$OPERATION" == retry-reprepare-v4 || "$OPERATION" == refresh-review ]]
           aws eks update-kubeconfig --name atez-dev-cluster --region eu-central-1
           kubectl get pods -n customs-regulations-dev -o json > /tmp/rg-pods.json
           python - <<'PY'
@@ -75,6 +75,7 @@ jobs:
           if [[ "$OPERATION" == review-canary ]]; then args+=(--review-canary); fi
           if [[ "$OPERATION" == reprepare-v4 ]]; then args+=(--reprepare-v4); fi
           if [[ "$OPERATION" == retry-reprepare-v4 ]]; then args+=(--retry-reprepare-v4); fi
+          if [[ "$OPERATION" == refresh-review ]]; then args+=(--refresh-review); fi
           if [[ "$OPERATION" == strict-v4-canary ]]; then
             fixture=backend/tests/fixtures/regulatory/rg_largest_table_final_wire.txt
             kubectl exec -i "$pod" -n customs-regulations-dev -c "$container" -- sh -ec 'cat > /tmp/rg-largest-table-wire.txt' < "$fixture"

@@ -11,7 +11,11 @@ import pytest
 from sqlalchemy.orm import Session
 
 from onyx.db import document_intake_reprepare as repository
-from onyx.db.models import RegulatoryDocumentIntake, RegulatoryDocumentIntakeReprepare
+from onyx.db.models import (
+    RegulatoryDocumentIntake,
+    RegulatoryDocumentIntakeReprepare,
+    RegulatoryLabelingRun,
+)
 from onyx.file_store import file_store
 from onyx.file_store.file_store import S3BackedFileStore
 from onyx.file_store.postgres_file_store import PostgresBackedFileStore
@@ -338,3 +342,127 @@ def test_partial_resume_rejects_changed_source_or_checkpoint_before_file_reads(
     with pytest.raises(RuntimeError):
         operator.validate_partial_checkpoint(session, batch, request)
     session.get_one.assert_not_called()
+
+
+@pytest.fixture
+def completed_run(operator: ModuleType) -> RegulatoryLabelingRun:
+    return RegulatoryLabelingRun(
+        id=operator.LABELING_RUN,
+        document_set_id=15,
+        file_ids=[operator.MAIN_FILE, operator.PDF_FILE],
+        status="completed",
+        stage="finished",
+        total_chunks=662,
+        completed_chunks=662,
+        failed_chunks=0,
+        stale_chunks=0,
+        derived_chunks=35,
+        unresolved_derived_chunks=0,
+        cancel_requested=False,
+        error=None,
+    )
+
+
+def test_exact_completed_run_passes_refresh_guard(
+    operator: ModuleType, completed_run: RegulatoryLabelingRun
+) -> None:
+    operator.require_completed_labeling(completed_run)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("status", "running"),
+        ("completed_chunks", 661),
+        ("total_chunks", 663),
+        ("failed_chunks", 1),
+        ("stale_chunks", 1),
+        ("unresolved_derived_chunks", 1),
+        ("derived_chunks", 34),
+        ("document_set_id", 16),
+        ("cancel_requested", True),
+        ("error", "failure"),
+        ("file_ids", []),
+    ],
+)
+def test_incomplete_or_changed_labels_block_refresh(
+    operator: ModuleType,
+    completed_run: RegulatoryLabelingRun,
+    field: str,
+    value: object,
+) -> None:
+    setattr(completed_run, field, value)
+    with pytest.raises(RuntimeError):
+        operator.require_completed_labeling(completed_run)
+
+
+def test_review_refresh_calls_only_normal_snapshot_without_approval(
+    operator: ModuleType,
+    batch: RegulatoryDocumentIntake,
+    completed_run: RegulatoryLabelingRun,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    batch.status, batch.stage, batch.error = "preparing", "labeling", None
+    batch.labeling_run_id = operator.LABELING_RUN
+    session = MagicMock(spec=Session)
+    session.get_one.return_value = completed_run
+    proof = MagicMock(return_value={"canonical_metadata_receipts": 662})
+    monkeypatch.setattr(operator, "review_receipt_proof", proof)
+    monkeypatch.setattr(operator, "unpublished_epoch_scope", MagicMock(return_value=[]))
+    monkeypatch.setattr(operator, "verify_scope", MagicMock())
+    monkeypatch.setattr(
+        operator.repository, "review_digest", MagicMock(return_value="a" * 64)
+    )
+    approve = MagicMock()
+    monkeypatch.setattr(operator.repository, "approve_intake", approve)
+
+    def snapshot(*_args: object) -> dict[str, object]:
+        batch.status, batch.stage, batch.review_sha256 = "ready", "review", "a" * 64
+        return {
+            "status": "ready",
+            "stage": "review",
+            "labeling_failed_count": 0,
+            "active_document_count": 2,
+            "edit_review_sha256": "b" * 64,
+            "publication_review_sha256": "c" * 64,
+            "documents": [
+                {
+                    "id": document_id,
+                    "user_file_id": file_id,
+                    "display_name": "source title",
+                    "source_display_name": "source",
+                    "source_url": "https://www.resmigazete.gov.tr/source.htm",
+                    "role": role,
+                    "parent_document_id": parent,
+                    "status": "ready",
+                    "chunk_count": count,
+                    "labeling_failed_count": 0,
+                    "document_links": (
+                        [{"target_document_id": operator.PDF_DOCUMENT}]
+                        if role == "root"
+                        else []
+                    ),
+                }
+                for document_id, file_id, role, parent, count in [
+                    (operator.MAIN_DOCUMENT, operator.MAIN_FILE, "root", None, 365),
+                    (
+                        operator.PDF_DOCUMENT,
+                        operator.PDF_FILE,
+                        "annex",
+                        operator.MAIN_DOCUMENT,
+                        332,
+                    ),
+                ]
+            ],
+        }
+
+    normal_get = MagicMock(side_effect=snapshot)
+    monkeypatch.setattr(operator.repository, "intake_snapshot", normal_get)
+    report = operator.refresh_completed_review(session, batch)
+    proof.assert_called_once_with(session, batch, completed_run)
+    normal_get.assert_called_once_with(session, batch)
+    assert report["operator_action"] == "normal_get_review_refreshed"
+    assert report["approval_or_publication_or_index_requested"] is False
+    assert report["review_sha256"] == "a" * 64
+    approve.assert_not_called()
+    session.commit.assert_not_called()
