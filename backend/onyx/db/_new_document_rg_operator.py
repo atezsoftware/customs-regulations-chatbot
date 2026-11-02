@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 
 from onyx.configs.app_configs import POSTGRES_DB
 from onyx.db import document_intake as repository
-from onyx.db.engine.sql_engine import get_session_with_current_tenant
+from onyx.db.engine.sql_engine import SqlEngine, get_session_with_current_tenant
 from onyx.db.models import RegulatoryDocumentIntake
 from onyx.db.search_settings import get_current_search_settings
 from onyx.natural_language_processing.utils import get_tokenizer
@@ -271,6 +271,7 @@ def main() -> None:
     require(config.REGULATORY_ANNEX_ENVIRONMENT == "dev", "Expected explicit DEV intake environment")
     tenant = get_current_tenant_id()
     require(tenant == "public", "Expected the original public tenant")
+    SqlEngine.init_engine(pool_size=1, max_overflow=0)
     enqueue = False
     with get_session_with_current_tenant() as session:
         if not args.retry:
