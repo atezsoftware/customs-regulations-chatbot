@@ -20,6 +20,7 @@ from pydantic import (
     ValidationError,
 )
 
+from onyx.regulatory.heading_path import parse_regulatory_article_heading
 from onyx.regulatory.indexing_jobs.vertex_batch import VertexBatchRequest
 
 METADATA_VERSION = 2
@@ -1139,6 +1140,62 @@ def metadata_evidence_scope(
     raise ValueError("Metadata evidence is not an exact quote from this document")
 
 
+def _article_locator_identity(
+    value: str, *, locator_value: bool = False
+) -> tuple[str | None, str] | None:
+    normalized = _fold(" ".join(value.split()))
+    normalized = re.sub(r"\bmadde(?=\d)", "madde ", normalized)
+    if locator_value:
+        normalized = re.sub(r"^(ek|gecici|mukerrer)\s+(?=\d)", r"\1 madde ", normalized)
+        if re.match(r"^\d", normalized):
+            normalized = "madde " + normalized
+    parsed = parse_regulatory_article_heading(normalized)
+    return (parsed.qualifier, parsed.article_no) if parsed is not None else None
+
+
+def _body_article_identity(text: str) -> tuple[str | None, str] | None:
+    first_line = text.strip().splitlines()[0] if text.strip() else ""
+    normalized = re.sub(r"\bmadde(?=\d)", "madde ", _fold(first_line))
+    if re.match(
+        r"^(?:(?:ek|gecici|mukerrer)\s+)?(?:madde|article|art\.?)\s+"
+        r"\d+(?:/?[a-z])?(?:\s*[-–—:.]|\s*$)",
+        normalized,
+    ):
+        return _article_locator_identity(first_line)
+    return None
+
+
+def _article_context(source: MetadataChunk) -> tuple[str | None, str] | None:
+    # An operative body heading can correct a stale structural heading.
+    return _body_article_identity(source.text) or next(
+        (
+            identity
+            for heading in source.heading_path
+            if (identity := _article_locator_identity(heading)) is not None
+        ),
+        None,
+    )
+
+
+def _validate_article_evidence(
+    fact: LegalMetadataFact, sources: dict[str, MetadataChunk], target_id: str
+) -> None:
+    quoted = (
+        _article_locator_identity(fact.evidence_quote)
+        if metadata_evidence_scope(fact, sources) == "heading"
+        else _body_article_identity(fact.evidence_quote)
+    )
+    target = sources.get(target_id)
+    contexts = (
+        quoted,
+        _article_context(sources[fact.source_chunk_id]),
+        _article_context(target) if target is not None else None,
+    )
+    claimed = _article_locator_identity(str(fact.value), locator_value=True)
+    if any(identity != claimed for identity in contexts if identity is not None):
+        raise ValueError("Metadata article locator contradicts its source evidence")
+
+
 def validate_metadata_response(
     response: str, *, chunks: Sequence[MetadataChunk], target_ids: Sequence[str]
 ) -> LegalMetadataResult:
@@ -1156,6 +1213,8 @@ def validate_metadata_response(
         values: dict[str, datetime.date] = {}
         for fact in target.fields:
             metadata_evidence_scope(fact, sources)
+            if fact.field == "article_no":
+                _validate_article_evidence(fact, sources, target.chunk_id)
             if fact.field in INTEGER_FIELDS:
                 if type(fact.value) is not int or fact.value < 0:
                     raise ValueError("Table indexes must be nonnegative integers")
