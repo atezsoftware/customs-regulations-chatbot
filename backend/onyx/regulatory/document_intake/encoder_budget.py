@@ -23,9 +23,9 @@ class EncoderBudgetOptions(TypedDict, total=False):
 def row_encoder_options(
     row: "RegulatoryChunk", model: "EmbeddingModel"
 ) -> EncoderBudgetOptions:
-    if row.chunk_metadata.get("intake_chunking_version") == "4" and (
-        model.provider_type is None or model.model_name is None
-    ):
+    if row.chunk_metadata.get("intake_chunking_version") != "4":
+        return {}
+    if model.provider_type is None or model.model_name is None:
         raise ValueError("The frozen whole-table encoder is unavailable")
     limit = embedding_token_limit_for_metadata(
         row.chunk_metadata,

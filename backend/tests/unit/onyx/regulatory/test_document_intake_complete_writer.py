@@ -233,3 +233,11 @@ def test_context_generation_keeps_full_table_and_fits_generated_fields_to_2048()
     assert _table() in complete.embedding_texts[0]
     assert len(model.tokenizer.encode(complete.embedding_texts[0])) <= 2048
     assert complete.doc_summary.strip() or complete.chunk_context.strip()
+
+
+def test_legacy_rows_keep_the_configured_encoder_without_policy_inference() -> None:
+    from onyx.regulatory.document_intake import encoder_budget
+
+    row = canonical_row(uuid4(), 0, "Legacy source")
+    with patch.object(encoder_budget, "DOC_EMBEDDING_CONTEXT_SIZE", 256):
+        assert encoder_budget.row_encoder_options(row, _model()) == {}
