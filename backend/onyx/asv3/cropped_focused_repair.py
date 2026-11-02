@@ -362,7 +362,12 @@ class CroppedFocusedRepair:
         )
 
     def _acquire(
-        self, target: CroppedRepairTarget, harness: Harness, model: ResearchModel
+        self,
+        target: CroppedRepairTarget,
+        harness: Harness,
+        model: ResearchModel,
+        *,
+        read_incomplete_original: bool = False,
     ) -> tuple[list[int], list[dict[str, JsonValue]]]:
         ledger = harness.evidence
         numbers = set(target.evidence_numbers)
@@ -370,7 +375,10 @@ class CroppedFocusedRepair:
         governing = target.check_kind == "governing_original" and target.article
         if governing:
             numbers.update(self._governing_numbers(target, harness))
-        if governing and self._governing_gap(target, harness, sorted(numbers)):
+        if governing and (
+            read_incomplete_original
+            or self._governing_gap(target, harness, sorted(numbers))
+        ):
             source_name = self._source_name(target)
             source_ids = (
                 [target.source_id]
@@ -457,6 +465,8 @@ class CroppedFocusedRepair:
         model: ResearchModel,
         numbers: list[int],
         observations: list[dict[str, JsonValue]],
+        *,
+        acquire_incomplete_original: bool = True,
     ) -> None:
         ledger = harness.evidence
         usable = [
@@ -561,6 +571,27 @@ class CroppedFocusedRepair:
             response_validator=validate,
         )
         result = _EvidenceCheck.model_validate_json(text)
+        if (
+            acquire_incomplete_original
+            and result.status != "found"
+            and target.check_kind == "governing_original"
+            and target.article
+            and not observations
+        ):
+            # Article identity alone does not establish that its operative passage
+            # was retained. Complete originals still reuse the first check.
+            acquired, reads = self._acquire(
+                target, harness, model, read_incomplete_original=True
+            )
+            self._check(
+                target,
+                harness,
+                model,
+                acquired,
+                reads,
+                acquire_incomplete_original=False,
+            )
+            return
         witnessed = (
             sorted({w.citation for w in result.witnesses})
             if result.status == "found"
