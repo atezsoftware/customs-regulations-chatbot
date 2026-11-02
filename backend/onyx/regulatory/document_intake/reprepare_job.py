@@ -90,6 +90,16 @@ def run_document_intake_reprepare(
                 key: reprepare_target_versions(entry)
                 for key, entry in request.documents.items()
             }
+            from onyx.regulatory.document_intake.models import IntakePreparationPolicy
+
+            policies = {
+                key: IntakePreparationPolicy.model_validate(
+                    entry["target_preparation_policy"]
+                )
+                if entry.get("target_preparation_policy") is not None
+                else None
+                for key, entry in request.documents.items()
+            }
             session.commit()
         for document_id, file_id, asset_id, _status, original_file_id in work:
             if str(document_id) in done:
@@ -105,6 +115,10 @@ def run_document_intake_reprepare(
                     raise ValueError("Prepared intake plaintext could not be restored")
                 continue
             prepare = prepare_intake_file
+            if policies[str(document_id)] is not None:
+                prepare = partial(
+                    prepare, preparation_policy=policies[str(document_id)]
+                )
             if graph is not None:
                 prepare = partial(
                     prepare,

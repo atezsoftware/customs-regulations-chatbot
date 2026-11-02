@@ -9,7 +9,10 @@ from onyx.db import document_intake as repository
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.file_store.file_store import get_default_file_store
 from onyx.regulatory.amendments.annexes.evidence import read_source_graph
-from onyx.regulatory.document_intake.models import IntakeSourceAsset
+from onyx.regulatory.document_intake.models import (
+    IntakePreparationPolicy,
+    IntakeSourceAsset,
+)
 from onyx.regulatory.document_intake.preparation import (
     clone_intake_original,
     prepare_intake_file,
@@ -84,12 +87,21 @@ def run_document_intake(*, intake_id: UUID, tenant_id: str) -> UUID | None:
                 owned_file_ids=owned_file_ids,
             )
             package_id = package.id
+            policy = (
+                IntakePreparationPolicy.model_validate(batch.preparation_policy)
+                if batch.preparation_policy is not None
+                else None
+            )
             by_id = {asset.id: asset for asset in asset_views}
             work = repository.intake_preparation_work(session, batch)
             session.commit()
         for document_id, file_id, asset_id, status, original_file_id in work:
             if status not in {"chunked", "labeling", "ready"}:
                 prepare = prepare_intake_file
+                if policy is not None:
+                    prepare = partial(
+                        prepare, chunking_version="4", preparation_policy=policy
+                    )
                 if graph is not None:
                     prepare = partial(
                         prepare,

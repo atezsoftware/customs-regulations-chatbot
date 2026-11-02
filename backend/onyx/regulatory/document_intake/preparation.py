@@ -17,6 +17,7 @@ from onyx.regulatory.amendments.annexes.sources import MAX_ASSET_BYTES, MAX_TEXT
 from onyx.regulatory.document_intake.models import (
     IntakeChunkingVersion,
     IntakeFilePreparation,
+    IntakePreparationPolicy,
     IntakeSourceAsset,
     IntakeSourceContext,
 )
@@ -43,6 +44,7 @@ def build_intake_document(
     parent_asset_hashes: Collection[str] | None = None,
     formatter_version: IntakeFormatterVersion = 4,
     chunking_version: IntakeChunkingVersion = "3",
+    preparation_policy: IntakePreparationPolicy | None = None,
 ) -> Document:
     if asset.package_id != package_id:
         raise ValueError("Source asset belongs to another intake package")
@@ -78,6 +80,7 @@ def build_intake_document(
         raise ValueError("Source context contains an asset from another package")
     context = IntakeSourceContext(
         chunking_version=chunking_version,
+        preparation_policy=preparation_policy,
         package_id=package_id,
         asset_id=asset.id,
         asset_sha256=asset.sha256,
@@ -177,6 +180,7 @@ def load_verified_intake_documents(
     parent_asset_hashes: Collection[str] | None = None,
     formatter_version: IntakeFormatterVersion = 4,
     chunking_version: IntakeChunkingVersion = "3",
+    preparation_policy: IntakePreparationPolicy | None = None,
 ) -> LoadedUserFileDocuments:
     """Rebuild canonical input exclusively from hash-verified retained sources."""
     if asset.package_id != package_id:
@@ -207,6 +211,7 @@ def load_verified_intake_documents(
         parent_asset_hashes=parent_asset_hashes,
         formatter_version=formatter_version,
         chunking_version=chunking_version,
+        preparation_policy=preparation_policy,
     )
     return LoadedUserFileDocuments(
         [document], file_id=owned_file_id, raw_sha256=asset.sha256
@@ -228,6 +233,7 @@ def prepare_intake_file(
     parent_asset_hashes: Collection[str] | None = None,
     formatter_version: IntakeFormatterVersion = 4,
     chunking_version: IntakeChunkingVersion = "3",
+    preparation_policy: IntakePreparationPolicy | None = None,
 ) -> IntakeFilePreparation:
     """Prepare an admitted asset without comparing or publishing search content."""
     documents = load_verified_intake_documents(
@@ -241,6 +247,7 @@ def prepare_intake_file(
         parent_asset_hashes=parent_asset_hashes,
         formatter_version=formatter_version,
         chunking_version=chunking_version,
+        preparation_policy=preparation_policy,
     )
     if chunk_file is None:
         from onyx.regulatory.writer_publication import chunk_owned_file

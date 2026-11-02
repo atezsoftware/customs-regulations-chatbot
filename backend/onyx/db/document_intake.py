@@ -36,16 +36,33 @@ from onyx.db.models import (
     UserFile,
 )
 from onyx.db.regulatory_chunks import get_chunks_for_file_page_snapshot
+from onyx.db.search_settings import get_current_search_settings
 from onyx.db.user_file import (
     claim_user_file_projection_repair,
     get_user_file_projection_repair,
 )
 from onyx.document_index.publication_models import publication_digest
+from onyx.indexing.contextual_settings import effective_contextual_rag_enabled
 from onyx.regulatory.amendments.annexes.models import SourceLink
-from onyx.regulatory.document_intake.models import INTAKE_DELIVERY_SECONDS
+from onyx.regulatory.document_intake.embedding_policy import (
+    preparation_policy_for_model,
+)
+from onyx.regulatory.document_intake.models import (
+    INTAKE_DELIVERY_SECONDS,
+    IntakePreparationPolicy,
+)
 from onyx.regulatory.document_intake.source_graph import IntakeGraph
 
 TARGET_DOCUMENT_SET_NAME = "PC Külliyatı"
+
+
+def select_intake_preparation_policy(
+    session: Session,
+) -> IntakePreparationPolicy | None:
+    settings = get_current_search_settings(session)
+    if not effective_contextual_rag_enabled(settings):
+        return None
+    return preparation_policy_for_model(settings.provider_type, settings.model_name)
 
 
 class IntakeConflictError(RuntimeError):
@@ -145,12 +162,16 @@ def create_intake(
         resolve_intake_labeling_provider_binding(
             session, labeling_model_configuration_id, user=user
         )
+    policy = select_intake_preparation_policy(session)
     row = RegulatoryDocumentIntake(
         source_package_id=package.id,
         document_set_id=target.id,
         created_by=user.id,
         idempotency_key=idempotency_key,
         labeling_model_configuration_id=labeling_model_configuration_id,
+        preparation_policy=policy.model_dump(mode="json")
+        if policy is not None
+        else None,
         status="preparing",
         stage="chunking",
     )
@@ -289,7 +310,7 @@ def review_digest(session: Session, batch: RegulatoryDocumentIntake) -> str:
         )
     )
     labels = _labels(session, batch)
-    payload = {
+    payload: dict[str, Any] = {
         "source_package_id": str(batch.source_package_id),
         "files": [
             {
@@ -320,6 +341,8 @@ def review_digest(session: Session, batch: RegulatoryDocumentIntake) -> str:
             for row in chunks
         ],
     }
+    if batch.preparation_policy is not None:
+        payload["preparation_policy"] = batch.preparation_policy
     if any("intake_display_name" in row.chunk_metadata for row in chunks):
         payload["display_names"] = [
             {"id": str(file_id), "name": name}

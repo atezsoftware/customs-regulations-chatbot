@@ -23,6 +23,10 @@ from onyx.regulatory.document_intake.chunking_profile import (
     SUPPORTED_INTAKE_CHUNKING_VERSIONS,
     is_multi_cell_table_row,
 )
+from onyx.regulatory.document_intake.embedding_policy import (
+    embedding_token_limit_for_metadata,
+)
+from onyx.regulatory.document_intake.models import IntakePreparationPolicy
 from onyx.regulatory.indexing_jobs.configuration import (
     compute_regulatory_chunk_generation_hash,
 )
@@ -67,12 +71,36 @@ def validate_intake_edit_budgets(
             enable_contextual_rag=contextual if version is None else True,
             intake_chunking_version=version,
         ): version
-        for version in (None, *sorted(SUPPORTED_INTAKE_CHUNKING_VERSIONS))
+        for version in (None, *sorted(SUPPORTED_INTAKE_CHUNKING_VERSIONS - {"4"}))
     }
     limits: dict[UUID, int] = {}
     versions: dict[UUID, str | None] = {}
     for file_id, rows in prospective.items():
         file = files[file_id]
+        policies = {
+            IntakePreparationPolicy.model_validate(
+                row.chunk_metadata.get("intake_preparation_policy")
+            )
+            for row in rows
+            if row.chunk_metadata.get("intake_chunking_version") == "4"
+        }
+        if policies:
+            if len(policies) != 1 or any(
+                row.chunk_metadata.get("intake_chunking_version") != "4" for row in rows
+            ):
+                raise IntakeConflictError(
+                    "Canonical intake preparation policies are inconsistent"
+                )
+            policy = next(iter(policies))
+            generations[
+                compute_regulatory_chunk_generation_hash(
+                    embedding_provider=settings.provider_type,
+                    embedding_model_name=settings.model_name,
+                    enable_contextual_rag=True,
+                    intake_chunking_version="4",
+                    intake_preparation_policy=policy.model_dump(mode="json"),
+                )
+            ] = "4"
         generation = file.regulatory_chunk_generation_hash
         if generation is None or generation not in generations:
             raise IntakeConflictError(
@@ -95,6 +123,16 @@ def validate_intake_edit_budgets(
     for file_id, rows in prospective.items():
         for row in rows:
             limit = limits[file_id]
+            if versions[file_id] == "4":
+                limit = (
+                    embedding_token_limit_for_metadata(
+                        row.chunk_metadata,
+                        row.chunk_type,
+                        provider=settings.provider_type,
+                        model_name=settings.model_name,
+                    )
+                    - DEFAULT_CONTEXTUAL_RAG_RESERVED_TOKENS
+                )
             if (
                 versions[file_id] == "3"
                 and row.chunk_type == "table"
