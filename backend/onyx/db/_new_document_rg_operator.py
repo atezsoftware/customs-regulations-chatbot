@@ -23,6 +23,7 @@ from onyx.regulatory.contextual import contextual_reserve_for_embedding_text
 from onyx.indexing.chunker import DEFAULT_CONTEXTUAL_RAG_RESERVED_TOKENS
 from shared_configs.configs import DOC_EMBEDDING_CONTEXT_SIZE
 from onyx.regulatory.amendments.annexes import config
+from onyx.utils.variable_functionality import set_is_ee_based_on_env_variable
 from shared_configs.contextvars import get_current_tenant_id
 
 BATCH = UUID("f32df3a9-4644-4fd3-be07-6aaa966d3107")
@@ -271,6 +272,7 @@ def main() -> None:
     require(config.REGULATORY_ANNEX_ENVIRONMENT == "dev", "Expected explicit DEV intake environment")
     tenant = get_current_tenant_id()
     require(tenant == "public", "Expected the original public tenant")
+    set_is_ee_based_on_env_variable()
     SqlEngine.init_engine(pool_size=1, max_overflow=0)
     enqueue = False
     with get_session_with_current_tenant() as session:
