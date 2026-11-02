@@ -5937,10 +5937,14 @@ class RegulatoryChunk(Base):
     )
     projection_ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
     supersedes_chunk_id: Mapped[str | None] = mapped_column(
-        ForeignKey("regulatory_chunk.id", ondelete="SET NULL"), nullable=True
+        ForeignKey("regulatory_chunk.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
     )
     superseded_by_chunk_id: Mapped[str | None] = mapped_column(
-        ForeignKey("regulatory_chunk.id", ondelete="SET NULL"), nullable=True
+        ForeignKey("regulatory_chunk.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
     )
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
@@ -6719,6 +6723,7 @@ class RegulatoryIndexingItem(Base):
         Text,
         ForeignKey("regulatory_chunk.id", ondelete="CASCADE"),
         nullable=False,
+        index=True,
     )
     projection_id: Mapped[UUID | None] = mapped_column(
         PGUUID(as_uuid=True), nullable=True
@@ -6975,7 +6980,9 @@ class AmendmentProposal(Base):
         Text, nullable=False, default=AmendmentProposalStatus.PENDING.value
     )
     applied_new_chunk_id: Mapped[str | None] = mapped_column(
-        ForeignKey("regulatory_chunk.id", ondelete="SET NULL"), nullable=True
+        ForeignKey("regulatory_chunk.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
     )
     applied_new_chunk_ids: Mapped[list[str]] = mapped_column(
         PGJSONB, nullable=False, default=list, server_default=text("'[]'::jsonb")
@@ -9319,7 +9326,9 @@ class RegulatoryAnnexElementChunk(Base):
     revision_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True)
     element_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True)
     chunk_id: Mapped[str] = mapped_column(
-        ForeignKey("regulatory_chunk.id", ondelete="CASCADE"), primary_key=True
+        ForeignKey("regulatory_chunk.id", ondelete="CASCADE"),
+        primary_key=True,
+        index=True,
     )
     __table_args__ = (
         ForeignKeyConstraint(
