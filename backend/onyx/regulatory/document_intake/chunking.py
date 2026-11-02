@@ -88,6 +88,7 @@ class IntakeRegulatoryChunker(RegulatoryChunker):
         min_chunk_chars: int = 120,
         chunking_version: str = INTAKE_CHUNKING_CODE_VERSION,
         whole_table_row_token_limit: int | None = None,
+        table_content_token_limit: int | None = None,
     ) -> None:
         if content_token_limit < 1:
             raise ValueError("Intake content token limit must be positive")
@@ -99,6 +100,9 @@ class IntakeRegulatoryChunker(RegulatoryChunker):
         self.tokenizer = tokenizer
         self.content_token_limit = content_token_limit
         self.chunking_version = chunking_version
+        if chunking_version == "4" and table_content_token_limit is None:
+            raise ValueError("Intake v4 requires its frozen table content budget")
+        self.table_content_token_limit = table_content_token_limit
         self.whole_table_row_token_limit = max(
             content_token_limit, whole_table_row_token_limit or content_token_limit
         )
@@ -125,7 +129,7 @@ class IntakeRegulatoryChunker(RegulatoryChunker):
             source_path_override=source_path,
         )
         blocks = _markdown_to_blocks(self._source_text)
-        if self.chunking_version == "3":
+        if self.chunking_version in {"3", "4"}:
             blocks = promote_plain_article_titles(blocks, source_text=self._source_text)
         metadata, ignored = intake_document_profile(blocks=blocks, metadata=metadata)
         chunks, structure = self.chunk_blocks_with_structure(
@@ -142,9 +146,13 @@ class IntakeRegulatoryChunker(RegulatoryChunker):
         )
 
     def _fits(self, blocks: list[SourceBlock]) -> bool:
-        return (
-            len(self.tokenizer.encode(_blocks_text(blocks))) <= self.content_token_limit
-        )
+        limit = self.content_token_limit
+        if self.chunking_version == "4" and any(
+            block.kind == "table" for block in blocks
+        ):
+            assert self.table_content_token_limit is not None
+            limit = self.table_content_token_limit
+        return len(self.tokenizer.encode(_blocks_text(blocks))) <= limit
 
     def _source_start(self, block: SourceBlock) -> int:
         if block in self._source_starts:
@@ -184,7 +192,7 @@ class IntakeRegulatoryChunker(RegulatoryChunker):
                     break
                 end = match.end()
             if end == start:
-                if self.chunking_version == "3":
+                if self.chunking_version in {"3", "4"}:
                     return self._single_cell_row_prefix_end(block, start, prefix)
                 raise ValueError(
                     "An intake table row exceeds the embedding content token limit"
@@ -382,7 +390,7 @@ class IntakeRegulatoryChunker(RegulatoryChunker):
                 )
             else:
                 retained.append(draft)
-        if self.chunking_version in {"2", "3"}:
+        if self.chunking_version in {"2", "3", "4"}:
             retained = self._merge_adjacent_table_headings(retained, blocks=blocks)
         return retained, structure
 

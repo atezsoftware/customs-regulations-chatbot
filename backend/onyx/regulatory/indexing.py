@@ -38,7 +38,12 @@ from onyx.regulatory.contextual import (
 from onyx.regulatory.document_intake.chunking_profile import (
     documents_intake_chunking_version,
     intake_chunking_version,
+    intake_preparation_policy,
 )
+from onyx.regulatory.document_intake.embedding_policy import (
+    embedding_token_limit_for_metadata,
+)
+from onyx.regulatory.document_intake.models import IntakePreparationPolicy
 from onyx.utils.logger import setup_logger
 from shared_configs.configs import DOC_EMBEDDING_CONTEXT_SIZE
 
@@ -176,11 +181,13 @@ class RegulatoryIndexingChunker:
         text = document_text_for_regulatory_indexing(document)
         source_file = document.semantic_identifier or document.id
         intake_version = intake_chunking_version(document)
+        policy = intake_preparation_policy(document)
         chunked, contextual_rag_reserved_tokens = self._chunk_with_embedding_budget(
             text,
             source_path=str(user_file_id),
             source_file=source_file,
             intake_version=intake_version,
+            preparation_policy=policy,
         )
         for warning in chunked.warnings:
             logger.warning(
@@ -238,6 +245,11 @@ class RegulatoryIndexingChunker:
                 row.chunk_metadata = {
                     **row.chunk_metadata,
                     "intake_chunking_version": intake_version,
+                    **(
+                        {"intake_preparation_policy": policy.model_dump(mode="json")}
+                        if policy
+                        else {}
+                    ),
                 }
         # Assign ids before the session commits so the emitted DocAwareChunks
         # can reference them.
@@ -281,10 +293,13 @@ class RegulatoryIndexingChunker:
         source_path: str,
         source_file: str,
         intake_version: str | None = None,
+        preparation_policy: IntakePreparationPolicy | None = None,
     ) -> tuple[ChunkedDocument, list[int]]:
         """Keep legal text intact while reserving room for contextual summaries."""
 
         max_chunk_chars = self._regulatory_chunker.max_chunk_chars
+        if (intake_version == "4") != (preparation_policy is not None):
+            raise ValueError("Intake v4 requires its frozen preparation policy")
         while True:
             structural_chunker: RegulatoryChunker
             if intake_version is not None:
@@ -297,7 +312,11 @@ class RegulatoryIndexingChunker:
                     tokenizer=self.tokenizer,
                     content_token_limit=max(
                         1,
-                        self.chunk_token_limit
+                        (
+                            preparation_policy.body_token_limit
+                            if preparation_policy is not None
+                            else self.chunk_token_limit
+                        )
                         - (
                             DEFAULT_CONTEXTUAL_RAG_RESERVED_TOKENS
                             if self.enable_contextual_rag
@@ -305,6 +324,12 @@ class RegulatoryIndexingChunker:
                         ),
                     ),
                     max_chunk_chars=max_chunk_chars,
+                    table_content_token_limit=(
+                        preparation_policy.table_token_limit
+                        - DEFAULT_CONTEXTUAL_RAG_RESERVED_TOKENS
+                        if preparation_policy is not None
+                        else None
+                    ),
                     whole_table_row_token_limit=(
                         self.chunk_token_limit
                         - (
@@ -323,6 +348,25 @@ class RegulatoryIndexingChunker:
             )
             if not self.enable_contextual_rag or not chunked.chunks:
                 return chunked, [0] * len(chunked.chunks)
+
+            if preparation_policy is not None:
+                metadata = {
+                    "intake_chunking_version": "4",
+                    "intake_preparation_policy": preparation_policy.model_dump(
+                        mode="json"
+                    ),
+                }
+                return chunked, [
+                    contextual_reserve_for_embedding_text(
+                        item.text,
+                        tokenizer=self.tokenizer,
+                        embedding_token_limit=embedding_token_limit_for_metadata(
+                            metadata, item.metadata.chunk_type
+                        ),
+                        requested_reserve=DEFAULT_CONTEXTUAL_RAG_RESERVED_TOKENS,
+                    )
+                    for item in chunked.chunks
+                ]
 
             largest_chunk = max(
                 chunked.chunks,
