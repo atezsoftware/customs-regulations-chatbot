@@ -193,3 +193,22 @@ def test_retained_source_reuses_read_only_session(
     monkeypatch.setattr(file_store, "get_default_file_store", lambda: store)
     assert operator.retained_source_stream("retained-file", session) is stream
     read.assert_called_once_with("retained-file", db_session=session)
+
+
+def test_worker_inspection_reports_only_the_exact_intake(
+    operator: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from onyx.background.celery.versioned_apps import client
+
+    inspector = MagicMock()
+    target = {"id": "task1", "kwargs": {"batch_id": str(operator.BATCH)}}
+    other = {"id": "task2", "kwargs": {"batch_id": str(uuid4())}}
+    inspector.active.return_value = {"regulatory_annex@worker": [target, other]}
+    inspector.reserved.return_value = {}
+    app = MagicMock()
+    app.control.inspect.return_value = inspector
+    monkeypatch.setattr(client, "app", app)
+    report = operator.exact_worker_activity()
+    assert [task["task_id"] for task in report["exact_intake_tasks"]] == ["task1"]
+    assert report["exact_intake_tasks"][0]["state"] == "active"
+    app.send_task.assert_not_called()

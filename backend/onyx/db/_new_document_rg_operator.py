@@ -35,6 +35,7 @@ MAIN_DOCUMENT = "f8d4be65-ec82-4011-a4c9-da10c8998e2e"
 PDF_DOCUMENT = "fd1fefc8-1e2f-41f7-a09f-d36c3f6152e2"
 TARGET_ROW_SHA256 = "fe6b6725b8104825be247dc3fcdb8122659030f108e845dc0b8ae21b303b004a"
 REPREPARE_KEY = uuid5(BATCH, "explicit-whole-table-v4-reprepare-20261102")
+REPREPARE_REQUEST = "a03a7101-f9a7-46cf-bbda-831d96e64865"
 MAIN_DIGEST = "f70e13400f34aec9878368a92a040d76b6a6d9363f70c7f06e6898b878f16ba3"
 ORIGINAL_ERROR = (
     "An intake table row exceeds the embedding content token limit; "
@@ -405,6 +406,40 @@ def worker_failures() -> list[dict[str, str]]:
     return failures[-50:]
 
 
+def exact_worker_activity() -> dict[str, Any]:
+    """Query active/reserved tasks without consuming or resubmitting deliveries."""
+    from onyx.background.celery.versioned_apps.client import app
+
+    inspector = app.control.inspect(timeout=3.0)
+    matches: list[dict[str, Any]] = []
+    responders: set[str] = set()
+    for state in ("active", "reserved"):
+        response = getattr(inspector, state)() or {}
+        for worker, tasks in response.items():
+            if not worker.startswith("regulatory_annex@"):
+                continue
+            responders.add(worker)
+            for task in tasks:
+                kwargs = task.get("kwargs", {})
+                if isinstance(kwargs, str):
+                    continue
+                if kwargs.get("batch_id") != str(BATCH):
+                    continue
+                matches.append({"worker": worker, "state": state, "task_id": task.get("id"), "task_name": task.get("name"), "started_at_unix": task.get("time_start"), "acknowledged": task.get("acknowledged"), "worker_pid": task.get("worker_pid"), "kwargs": {key: kwargs.get(key) for key in ("batch_id", "tenant_id", "environment", "database_identity", "reprepare_request_id")}})
+    markers = [str(BATCH), REPREPARE_REQUEST, *[str(task["task_id"]) for task in matches if task["task_id"]]]
+    path = Path("/var/log/onyx/celery_worker_regulatory_annex.log")
+    log_matches: list[str] = []
+    if path.exists():
+        with path.open("rb") as stream:
+            stream.seek(0, 2)
+            stream.seek(max(0, stream.tell() - 2_000_000))
+            lines = stream.read().decode(errors="replace").splitlines()
+        for line in lines:
+            if any(marker in line for marker in markers) and not SECRET_LINE.search(line):
+                log_matches.append(line[:1200])
+    return {"regulatory_worker_responders": sorted(responders), "exact_intake_tasks": matches, "request_id": REPREPARE_REQUEST, "bounded_exact_log_matches": log_matches[-80:], "operation": "read_only_inspect_active_reserved_and_log_tail"}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--expected-image-sha", required=True)
@@ -483,6 +518,8 @@ def main() -> None:
         report["strict_v4_canary"] = strict_v4_canary(args.input_path, args.expected_input_sha)
     report["expected_image_sha"] = args.expected_image_sha
     report["worker_failures"] = worker_failures()
+    if not (args.retry or args.reprepare_v4 or args.embedding_canary or args.review_canary or args.strict_v4_canary):
+        report["exact_worker_activity"] = exact_worker_activity()
     # Provider error strings can occasionally contain credentials; redact the entire value.
     def sanitized(value: Any) -> Any:
         if isinstance(value, dict):
