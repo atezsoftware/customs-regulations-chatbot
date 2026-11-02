@@ -203,6 +203,39 @@ def snapshot(session: Session, batch: RegulatoryDocumentIntake) -> dict[str, Any
     return report
 
 
+
+def embedding_canary() -> dict[str, Any]:
+    """Exercise the configured encoder without publishing or indexing a document."""
+    import math
+    from onyx.indexing.embedder import DefaultIndexingEmbedder
+    from onyx.regulatory.contextual import fit_context_fields_to_embedding_budget
+    from shared_configs.enums import EmbedTextType
+
+    with get_session_with_current_tenant() as session:
+        session.execute(text("SET TRANSACTION READ ONLY"))
+        candidates = rows(session, "SELECT text FROM regulatory_chunk WHERE user_file_id=:file AND text LIKE :prefix", file=PDF_FILE, prefix="| 8544 ila 8548 |%")
+        require(len(candidates) == 1, "Expected one exact row for the embedding canary")
+        source = candidates[0]["text"]
+        require(hashlib.sha256(source.encode()).hexdigest() == TARGET_ROW_SHA256, "Canary source changed")
+        settings = get_current_search_settings(session)
+        embedder = DefaultIndexingEmbedder.from_db_search_settings(settings)
+        model_name, dimension = settings.model_name, settings.reduced_dimension
+        session.rollback()
+    tokenizer = embedder.embedding_model.tokenizer
+    summary, context = fit_context_fields_to_embedding_budget(
+        title_prefix="", content=source, metadata_suffix="", doc_summary="Ek II.",
+        chunk_context="8544 ila 8548 kod aralığı, ürün tanımları ve aynı satırdaki imalat koşulu. " * 80,
+        tokenizer=tokenizer, embedding_token_limit=512,
+    )
+    enriched = summary + source + context
+    require(source in enriched and len(tokenizer.encode(enriched)) <= 512, "Final canary input exceeded its budget or lost source text")
+    inputs = [source, enriched]
+    vectors = embedder.embedding_model.encode(inputs, text_type=EmbedTextType.PASSAGE, tenant_id="public", request_id="rg-f32df3a9-20261102-canary")
+    require(len(vectors) == 2 and all(vector and all(math.isfinite(value) for value in vector) for vector in vectors), "Embedding provider did not return two finite vectors")
+    require(dimension is None or all(len(vector) == dimension for vector in vectors), "Embedding dimensions changed")
+    return {"success": True, "model": model_name, "input_tokens": [len(tokenizer.encode(value)) for value in inputs], "vector_dimensions": [len(vector) for vector in vectors], "source_row_sha256": TARGET_ROW_SHA256, "enriched_input_sha256": hashlib.sha256(enriched.encode()).hexdigest(), "whole_source_row_preserved": True, "document_or_index_writes": False}
+
+
 def worker_failures() -> list[dict[str, str]]:
     failures: list[dict[str, str]] = []
     for path in sorted(Path("/var/log/onyx").glob("*regulatory*.log")):
@@ -229,7 +262,9 @@ def main() -> None:
     parser.add_argument("--expected-image-sha", required=True)
     parser.add_argument("--observed-image-sha", required=True)
     parser.add_argument("--retry", action="store_true")
+    parser.add_argument("--embedding-canary", action="store_true")
     args = parser.parse_args()
+    require(not (args.retry and args.embedding_canary), "Retry and embedding canary must be separate operations")
     require(bool(re.fullmatch(r"[0-9a-f]{40}", args.expected_image_sha)), "Expected exact deployed commit SHA")
     require(args.observed_image_sha == args.expected_image_sha, "Selected DEV container image differs from expected SHA")
     require(POSTGRES_DB == "customs-regulations-dev", "Expected explicit DEV database configuration")
@@ -268,6 +303,8 @@ def main() -> None:
         from onyx.background.celery.tasks.regulatory_amendments.document_intake import enqueue_intake_batch
         enqueue_intake_batch(batch_id=BATCH, tenant_id=tenant)
         report["delivery"] = "standard_enqueue_intake_batch_sent"
+    if args.embedding_canary:
+        report["embedding_canary"] = embedding_canary()
     report["expected_image_sha"] = args.expected_image_sha
     report["worker_failures"] = worker_failures()
     # Provider error strings can occasionally contain credentials; redact the entire value.
