@@ -3,7 +3,10 @@
 from collections.abc import Mapping
 from typing import Any, Literal
 
-from onyx.regulatory.document_intake.models import IntakeChunkingVersion
+from onyx.regulatory.document_intake.models import (
+    IntakeChunkingVersion,
+    IntakePreparationPolicy,
+)
 
 IntakeFormatterVersion = Literal[2, 3, 4]
 INTAKE_FORMATTER_VERSION: IntakeFormatterVersion = 4
@@ -21,6 +24,14 @@ def reprepare_target_versions(
         entry["target_chunking_version"],
         entry["target_formatter_version"],
     )
-    if chunking == "3" and type(formatter) is int and formatter == 4:
+    if chunking == "4" and type(formatter) is int and formatter == 4:
+        IntakePreparationPolicy.model_validate(entry.get("target_preparation_policy"))
+        return "4", 4
+    if (
+        chunking == "3"
+        and type(formatter) is int
+        and formatter == 4
+        and entry.get("target_preparation_policy") is None
+    ):
         return "3", 4
     raise ValueError("The frozen reprepare target versions are not supported")

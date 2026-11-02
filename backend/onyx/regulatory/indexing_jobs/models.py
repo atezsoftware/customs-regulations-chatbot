@@ -2,7 +2,10 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from onyx.regulatory.document_intake.models import IntakeChunkingVersion
+from onyx.regulatory.document_intake.models import (
+    IntakeChunkingVersion,
+    IntakePreparationPolicy,
+)
 from shared_configs.enums import EmbeddingProvider
 
 
@@ -149,6 +152,9 @@ class RegulatoryIndexingConfigSnapshot(BaseModel):
         min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
     )
     intake_chunking_version: IntakeChunkingVersion | None = None
+    intake_preparation_policy: IntakePreparationPolicy | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     search_settings_id: int = Field(gt=0)
     embedding_provider: EmbeddingProvider
     embedding_model_name: str = Field(min_length=1)
@@ -172,6 +178,17 @@ class RegulatoryIndexingConfigSnapshot(BaseModel):
 
     @model_validator(mode="after")
     def validate_derived_values(self) -> "RegulatoryIndexingConfigSnapshot":
+        if (self.intake_chunking_version == "4") != (
+            self.intake_preparation_policy is not None
+        ):
+            raise ValueError("Whole-table snapshots require their frozen intake policy")
+        if self.intake_preparation_policy is not None and (
+            self.embedding_provider.value != self.intake_preparation_policy.provider
+            or self.embedding_model_name != self.intake_preparation_policy.model_name
+        ):
+            raise ValueError(
+                "Whole-table snapshot encoder differs from its intake policy"
+            )
         expected_dimension = self.reduced_dimension or self.model_dimension
         if self.effective_dimension != expected_dimension:
             raise ValueError(

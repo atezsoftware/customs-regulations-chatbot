@@ -6,11 +6,12 @@ from typing import cast
 from onyx.connectors.models import Document
 from onyx.regulatory.document_intake.models import (
     IntakeChunkingVersion,
+    IntakePreparationPolicy,
     IntakeSourceContext,
 )
 
 INTAKE_CHUNKING_CODE_VERSION: IntakeChunkingVersion = "3"
-SUPPORTED_INTAKE_CHUNKING_VERSIONS = frozenset({"1", "2", "3"})
+SUPPORTED_INTAKE_CHUNKING_VERSIONS = frozenset({"1", "2", "3", "4"})
 
 
 def is_multi_cell_table_row(text: str) -> bool:
@@ -51,3 +52,26 @@ def documents_intake_chunking_version(documents: Sequence[Document]) -> str | No
     if len(versions) > 1:
         raise ValueError("Mixed intake chunking versions are not permitted")
     return next(iter(versions), None)
+
+
+def intake_preparation_policy(document: Document) -> IntakePreparationPolicy | None:
+    context = (document.doc_metadata or {}).get("regulatory_document_intake")
+    if context is None:
+        return None
+    if not isinstance(context, dict):
+        raise ValueError("Intake preparation requires a verified source context")
+    if (
+        context.get("chunking_version") != "4"
+        and context.get("preparation_policy") is None
+    ):
+        return None
+    return IntakeSourceContext.model_validate(context).preparation_policy
+
+
+def documents_intake_preparation_policy(
+    documents: Sequence[Document],
+) -> IntakePreparationPolicy | None:
+    policies = {intake_preparation_policy(document) for document in documents}
+    if len(policies) > 1:
+        raise ValueError("Mixed intake preparation policies are not permitted")
+    return next(iter(policies), None)
