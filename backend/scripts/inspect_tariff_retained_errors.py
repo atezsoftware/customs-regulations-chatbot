@@ -20,10 +20,14 @@ for pattern in ('onyx*.log*','api_server*.log*','celery_worker_user_file_process
   for line in raw.splitlines():
    stamp=re.search(r'(?:2026-11-03|11/03/2026)[ T][0-9:.]+',line)
    if stamp:timestamp=stamp[0]
+   try:
+    record=json.loads(line)
+    if isinstance(record,dict):line='\n'.join(value for key in ('message','log','exc_info','stack_trace','exception')if isinstance(value:=record.get(key),str))
+   except ValueError:pass
    found=[name for name,value in owned_ids.items()if value in line]
    if found:owned_context=found
-   frame=re.search(r'File "/app/(onyx/[A-Za-z0-9_/]+\.py)", line ([0-9]+), in ([A-Za-z0-9_]+)',line)
-   if frame:stack.append({'path':frame[1],'line':int(frame[2]),'function':frame[3]});stack=stack[-12:]
+   for frame in re.finditer(r'File "/app/(onyx/[A-Za-z0-9_/]+\.py)", line ([0-9]+), in ([A-Za-z0-9_]+)',line):
+    stack.append({'path':frame[1],'line':int(frame[2]),'function':frame[3]});stack=stack[-12:]
    for tag in ('writer_publication_finished','contextual enrichment','contextualize','Embedding','index_user_file_impl','parse_time_limit'):
     if tag in line:progress[tag]=progress.get(tag,0)+1
    marker=re.search(r'ASv3 capability ([a-z_]+) failed',line)

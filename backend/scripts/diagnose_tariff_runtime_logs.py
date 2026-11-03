@@ -1,6 +1,7 @@
 """Read-only DEV pod/log diagnostics; emits no log bodies, SQL or provider payloads."""
 import datetime as dt
 import json
+import os
 import re
 import subprocess
 
@@ -68,6 +69,7 @@ print(json.dumps({'safe_exception_findings':findings[:300],'read_only':True,'raw
 
 expected_revision='5a11809571cb930a5f90c2f20833986336ff6f32'
 for pod in pods.get('items',[]):
+    if os.environ.get('TARIFF_NATIVE_PDF_DIAGNOSTIC')!='1':break
     if pod['metadata'].get('deletionTimestamp')or pod['metadata'].get('labels',{}).get('app')!='dev-customs-regulations-background':continue
     statuses={item['name']:item for item in pod.get('status',{}).get('containerStatuses',[])}
     for container in pod['spec']['containers']:
