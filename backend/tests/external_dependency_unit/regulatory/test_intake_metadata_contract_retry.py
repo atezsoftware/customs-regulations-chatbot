@@ -158,7 +158,6 @@ def _legacy(
         capture=True,
     )
     store = PostgresBackedFileStore()
-    monkeypatch.setattr(repair, "get_default_file_store", lambda: store)
     for member in members:
         rows = repair._rows(session, member.user_file_id)
         chunks = metadata_db.metadata_chunks(rows)

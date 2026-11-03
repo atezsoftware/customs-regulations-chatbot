@@ -49,7 +49,11 @@ def setup_store(
     session.get.return_value = record
     store.read_file.side_effect = lambda _file_id: BytesIO(raw)
     monkeypatch.setattr(
-        evidence_db, "get_default_file_store", lambda: cast(FileStore, store)
+        evidence_db,
+        "read_direct_ack",
+        lambda _session, file_id, *, max_bytes: store.read_file(file_id).read(
+            max_bytes + 1
+        ),
     )
     return session, store, record, raw
 

@@ -30,6 +30,7 @@ from onyx.db.models import (
     UserFile,
     UserFileProjectionRepair,
 )
+from onyx.db.regulatory_direct_ack import read_direct_ack
 from onyx.db.regulatory_labeling_duplicate_evidence import (
     load_duplicate_ack,
     validate_duplicate_ack_header,
@@ -256,8 +257,7 @@ def _line_from_cache(
     submission = submission_key or _submission(session, source, run)
     file_id = f"regulatory-labeling-direct/{binding.fingerprint}/{submission.removeprefix('regulatory-labeling-')}/{request.request_hash}.json"
     try:
-        with get_default_file_store().read_file(file_id) as stream:
-            raw = stream.read(MAX_ACK_BYTES + 1)
+        raw = read_direct_ack(session, file_id, max_bytes=MAX_ACK_BYTES)
         if not 0 < len(raw) <= MAX_ACK_BYTES:
             raise ValueError("The base ACK exceeds its byte budget")
         value = json.loads(raw)

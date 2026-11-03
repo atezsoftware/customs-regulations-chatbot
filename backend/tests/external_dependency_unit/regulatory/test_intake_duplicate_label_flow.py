@@ -38,7 +38,6 @@ from onyx.db.regulatory_labeling_duplicate_repair import (
 from onyx.db.regulatory_labeling_readers import complete_frozen_sources
 from onyx.db.regulatory_labeling_review_authority import labeling_review_authority
 from onyx.document_index.publication_models import publication_digest
-from onyx.file_store.file_store import FileStore
 from onyx.regulatory.indexing_jobs.models import VertexAuthenticationMode
 from onyx.regulatory.indexing_jobs.vertex_batch import VertexBatchRequest
 from onyx.regulatory.labeling.accepted_result import AcceptedDuplicateLabelRepair
@@ -215,7 +214,11 @@ def seed(
     )
     store = LocalAckStore()
     monkeypatch.setattr(
-        evidence_db, "get_default_file_store", lambda: cast(FileStore, store)
+        evidence_db,
+        "read_direct_ack",
+        lambda _session, file_id, *, max_bytes: store.read_file(file_id).read(
+            max_bytes + 1
+        ),
     )
     session.flush()
     return Fixture(data, run, items, target, store, taxonomy, frozen, binding, asset_id)

@@ -13,7 +13,7 @@ from sqlalchemy.orm.exc import NoResultFound
 
 from onyx.configs.constants import FileOrigin
 from onyx.db.models import FileRecord
-from onyx.file_store.file_store import get_default_file_store
+from onyx.db.regulatory_direct_ack import read_direct_ack
 from onyx.regulatory.indexing_jobs.vertex_batch import VertexBatchRequest
 from onyx.regulatory.labeling.duplicate_ack_evidence import (
     MAX_ACK_BYTES,
@@ -76,8 +76,7 @@ def load_duplicate_ack(
     ):
         raise ValueError("The original duplicate-label ACK is unavailable")
     try:
-        with get_default_file_store().read_file(file_id) as stream:
-            raw = stream.read(MAX_ACK_BYTES + 1)
+        raw = read_direct_ack(session, file_id, max_bytes=MAX_ACK_BYTES)
     except (OSError, ClientError, GoogleAPICallError, NoResultFound) as error:
         raise ValueError(
             "The original duplicate-label ACK bytes are unavailable"

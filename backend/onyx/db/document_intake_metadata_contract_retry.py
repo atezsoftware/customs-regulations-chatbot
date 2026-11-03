@@ -37,9 +37,8 @@ from onyx.db.models import (
     UserFile,
     UserFileProjectionRepair,
 )
+from onyx.db.regulatory_direct_ack import read_direct_ack
 from onyx.file_processing.original_ingestion import OriginalIngestionReceipt
-from onyx.file_store.file_store import get_default_file_store
-from onyx.file_store.postgres_file_store import PostgresBackedFileStore
 from onyx.regulatory.document_intake.metadata import (
     METADATA_AUDIT_KEY,
     METADATA_MODEL,
@@ -449,14 +448,7 @@ def _read_ack(session: Session, cache_id: str) -> bytes:
     record = session.get(FileRecord, cache_id, populate_existing=True)
     if record is None or not isinstance(record.file_metadata, dict):
         raise intake.IntakeConflictError("The actual prior metadata ACK is unavailable")
-    store = get_default_file_store()
-    stream = (
-        store.read_file(cache_id, db_session=session)
-        if isinstance(store, PostgresBackedFileStore)
-        else store.read_file(cache_id)
-    )
-    with stream:
-        raw = stream.read(8 * 1024 * 1024 + 1)
+    raw = read_direct_ack(session, cache_id, max_bytes=8 * 1024 * 1024)
     stored_metadata = cast(dict[str, Any], record.file_metadata)
     if not 0 < len(raw) <= 8 * 1024 * 1024 or hashlib.sha256(
         raw

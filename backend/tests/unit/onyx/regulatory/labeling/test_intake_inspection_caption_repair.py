@@ -49,6 +49,33 @@ def test_actual_26_current_members_and_honest_missing_first_table_title() -> Non
     assert not _candidate(sources[0].chunk_id, sources)
 
 
+def test_actual_current25_keeps_all_operative_criteria_without_unrelated_ek1() -> None:
+    data = json.loads(
+        (
+            Path(__file__).parent / "fixtures/legacy_inspection_criteria_current25.json"
+        ).read_text()
+    )
+    sources = [DependentClauseRepairSource(**row) for row in data["sources"]]
+    before = deepcopy(sources)
+    assert len(sources) == data["actual_context_count"] == 25
+    assert data["canonical_annex_count"] == 26
+    assert {source.snapshot["position"] for source in sources} == set(range(26)) - {1}
+    assert _candidate(data["target_chunk_id"], sources)
+    assert sources == before
+
+
+@pytest.mark.parametrize("omitted_position", range(26))
+def test_shorter_delivered_window_can_omit_only_the_unrelated_report_heading(
+    omitted_position: int,
+) -> None:
+    chunk_id, sources = _case()
+    remaining = [s for s in sources if s.snapshot["position"] != omitted_position]
+    target = next((s for s in remaining if s.chunk_id == chunk_id), None)
+    if target is not None:
+        target.snapshot["context_member_ids"] = [s.chunk_id for s in remaining]
+    assert _candidate(chunk_id, remaining) is (omitted_position == 1)
+
+
 @pytest.mark.parametrize("index", range(26))
 @pytest.mark.parametrize("kind", ["text", "metadata"])
 def test_every_delivered_current_member_is_bound(index: int, kind: str) -> None:

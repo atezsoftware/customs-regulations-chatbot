@@ -47,14 +47,23 @@ from tests.external_dependency_unit.regulatory.test_labeling_jobs import (
 from tests.unit.onyx.regulatory.labeling.abstention_repair_test_helpers import line
 
 
-def _frozen() -> dict[str, Any]:
+def _frozen(context_size: int) -> dict[str, Any]:
     path = (
         Path(__file__).resolve().parents[2]
         / "unit/onyx/regulatory/labeling/fixtures/legacy_inspection_criteria_context.json"
     )
-    return json.loads(path.read_text())
+    frozen = json.loads(path.read_text())
+    if context_size == 25:
+        current = json.loads(
+            path.with_name("legacy_inspection_criteria_current25.json").read_text()
+        )
+        frozen.update(
+            {key: current[key] for key in ("sources", "base_request", "base_response")}
+        )
+    return frozen
 
 
+@pytest.mark.parametrize("context_size", [26, 25])
 @pytest.mark.parametrize(
     "mode",
     [
@@ -70,9 +79,9 @@ def _frozen() -> dict[str, Any]:
     ],
 )
 def test_current_inspection_context_and_durable_receipt_remain_strict(
-    labeling_data: LabelingData, mode: str
+    labeling_data: LabelingData, mode: str, context_size: int
 ) -> None:
-    data, frozen = labeling_data, _frozen()
+    data, frozen = labeling_data, _frozen(context_size)
     with data.database.engine.connect() as connection:
         transaction = connection.begin()
         try:
