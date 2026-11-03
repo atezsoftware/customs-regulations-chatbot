@@ -1414,6 +1414,30 @@ def bounded_evidence(
     return items, False
 
 
+def _with_source_identity_originals(
+    sources: list[CorpusSource], evidence: list[EvidenceItem]
+) -> tuple[list[EvidenceItem], bool]:
+    """Deliver already read identity originals within the shared response bound."""
+    items = list(evidence)
+    identities = {item.identity for item in items}
+    size = sum(len(item.text) for item in items)
+    for source in sources:
+        for chunk in source.identity_originals:
+            if chunk.source_id != source.id:
+                raise CorpusScopeUnavailable(
+                    "Identity original belongs to another source."
+                )
+            item = evidence_for_chunk(source, chunk)
+            if item.identity in identities:
+                continue
+            if size + len(item.text) > MAX_RESPONSE_CHARS:
+                return items, True
+            items.append(item)
+            identities.add(item.identity)
+            size += len(item.text)
+    return items, False
+
+
 def _ordered_source_read_data(
     evidence: list[EvidenceItem], context: RunContext
 ) -> dict[str, JsonValue]:
@@ -1610,10 +1634,12 @@ def build_corpus_specs(
         if len(notices) == 1 and not sources and not more:
             outcome = source_notice_outcome(notices[0])
             return outcome.model_copy(update={"data": {**outcome.data, **data}})
+        evidence, clipped = _with_source_identity_originals(sources, [])
         return ToolOutcome(
-            status=OutcomeStatus.PARTIAL if more else status,
+            status=OutcomeStatus.PARTIAL if more or clipped else status,
             summary="Authorized source candidates; choose an exact source_id before reading.",
-            data=data,
+            data={**data, **({"identity_evidence_truncated": True} if clipped else {})},
+            evidence=evidence,
         )
 
     def read_range(args: dict[str, JsonValue], context: RunContext) -> ToolOutcome:
@@ -1952,13 +1978,21 @@ def build_corpus_specs(
             if isinstance(shared, SharedReads)
             else acquire(context)
         )
+        evidence, clipped = (
+            _with_source_identity_originals([source], result.evidence)
+            if result.status in {OutcomeStatus.FOUND, OutcomeStatus.PARTIAL}
+            else (result.evidence, False)
+        )
         return result.model_copy(
             update={
+                "status": OutcomeStatus.PARTIAL if clipped else result.status,
+                "evidence": evidence,
                 "data": {
                     **result.data,
                     "source_id": str(source.id),
                     "source_name": source.name,
-                }
+                    **({"identity_evidence_truncated": True} if clipped else {}),
+                },
             }
         )
 
