@@ -302,7 +302,7 @@ jobs:
               local HELM_PLUGINS=/tmp/regulatory-runtime-values/helm-plugins
               export HELM_PLUGINS
               postrenderer=(--post-renderer dev-api-drain)
-              rollout_timeout=1020s
+              rollout_timeout=1920s
             fi
 
             if [[ -n "$memory_limit" ]]; then
@@ -601,7 +601,7 @@ jobs:
             release="${app_name}-${{ env.env_x }}"
             rollback_timeout=600s
             if [[ "$env_x" == "dev" && "$app_name" == "customs-regulations-api" ]]; then
-              rollback_timeout=1020s
+              rollback_timeout=1920s
             fi
             if history_json=$(helm history "$release" --namespace ${{ env.namespace }} -o json 2>/dev/null); then
               rollback_revision=$(jq -r '[.[] | select(.status == "deployed" or .status == "superseded")] | sort_by(.revision | tonumber) | last | .revision // empty' <<<"$history_json")

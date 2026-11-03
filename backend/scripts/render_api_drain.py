@@ -8,8 +8,8 @@ import yaml
 DEV_NAMESPACE = "customs-regulations-dev"
 DEV_API_DEPLOYMENT = "dev-customs-regulations-api-deployment"
 DEV_API_CONTAINER = "dev-customs-regulations-api-container"
-TERMINATION_GRACE_SECONDS = 900
-ROLLOUT_TIMEOUT_SECONDS = 1020
+TERMINATION_GRACE_SECONDS = 1800
+ROLLOUT_TIMEOUT_SECONDS = 1920
 
 
 def _mapping(value: object, path: str) -> dict[str, Any]:

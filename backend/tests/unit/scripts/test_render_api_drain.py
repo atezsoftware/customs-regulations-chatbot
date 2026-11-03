@@ -63,8 +63,8 @@ def test_multi_document_render_changes_only_expected_deployment_timeouts() -> No
     }
     documents: list[dict[str, Any]] = [service, background, api, hook]
     expected = copy.deepcopy(documents)
-    expected[2]["spec"]["progressDeadlineSeconds"] = 1020
-    expected[2]["spec"]["template"]["spec"]["terminationGracePeriodSeconds"] = 900
+    expected[2]["spec"]["progressDeadlineSeconds"] = 1920
+    expected[2]["spec"]["template"]["spec"]["terminationGracePeriodSeconds"] = 1800
     rendered = render_api_drain(yaml.safe_dump_all(documents))
     assert list(yaml.safe_load_all(rendered)) == expected
     assert render_api_drain(rendered) == rendered
@@ -72,8 +72,8 @@ def test_multi_document_render_changes_only_expected_deployment_timeouts() -> No
 
 def test_render_preserves_larger_existing_drain_limits() -> None:
     deployment = _deployment()
-    deployment["spec"]["progressDeadlineSeconds"] = 1800
-    deployment["spec"]["template"]["spec"]["terminationGracePeriodSeconds"] = 1200
+    deployment["spec"]["progressDeadlineSeconds"] = 3600
+    deployment["spec"]["template"]["spec"]["terminationGracePeriodSeconds"] = 2400
     assert yaml.safe_load(render_api_drain(yaml.safe_dump(deployment))) == deployment
 
 
@@ -95,7 +95,7 @@ def test_render_refuses_missing_ambiguous_or_out_of_scope_api(scope: str) -> Non
         render_api_drain(yaml.safe_dump_all(documents))
 
 
-@pytest.mark.parametrize("invalid", [None, True, "900", -1])
+@pytest.mark.parametrize("invalid", [None, True, "1800", -1])
 def test_render_refuses_invalid_existing_drain_limit(invalid: object) -> None:
     deployment = _deployment()
     deployment["spec"]["template"]["spec"]["terminationGracePeriodSeconds"] = invalid
@@ -195,7 +195,7 @@ if [[ "$1" == -r ]]; then printf '%s\\n' old; fi
     upgrade = next(call for call in calls if call.startswith("helm|upgrade"))
     rollout = next(call for call in calls if call.startswith("kubectl|rollout"))
     assert ("--post-renderer dev-api-drain" in upgrade) is protected
-    expected_timeout = "1020s" if protected else "600s"
+    expected_timeout = "1920s" if protected else "600s"
     assert f"--timeout {expected_timeout}" in upgrade
     assert f"--timeout={expected_timeout}" in rollout
     assert any("--grace-period=0 --force" in call for call in calls) is not protected

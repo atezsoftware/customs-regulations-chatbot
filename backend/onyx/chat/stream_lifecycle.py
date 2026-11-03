@@ -7,7 +7,7 @@ from collections.abc import Callable
 
 _writers: set[threading.Thread] = set()
 _writers_changed = threading.Condition()
-_SHUTDOWN_DRAIN_SECONDS = 14 * 60
+_SHUTDOWN_DRAIN_SECONDS = 29 * 60
 
 
 def start_chat_stream_writer(target: Callable[[], None]) -> None:
