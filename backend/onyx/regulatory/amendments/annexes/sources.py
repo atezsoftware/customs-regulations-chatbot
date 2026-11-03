@@ -14,7 +14,7 @@ from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, cast
 from urllib.parse import urldefrag, urljoin, urlsplit
 from xml.etree.ElementTree import Element
 
@@ -32,11 +32,31 @@ from onyx.regulatory.amendments.annexes.models import (
     SourceLink,
 )
 from onyx.regulatory.amendments.annexes.source_limits import SOURCE_ACQUISITION_SECONDS
-from onyx.regulatory.amendments.source_extraction import (
-    amendment_source_http_options,
-)
 from onyx.utils.url import ssrf_safe_get
-from onyx.utils.web_content import decode_html_bytes
+
+if TYPE_CHECKING:
+    from onyx.regulatory.amendments.source_extraction import (
+        AmendmentSourceHttpOptions,
+    )
+
+
+def amendment_source_http_options(url: str) -> "AmendmentSourceHttpOptions":
+    from onyx.regulatory.amendments.source_extraction import (
+        amendment_source_http_options as resolve,
+    )
+
+    return resolve(url)
+
+
+def decode_html_bytes(
+    content: bytes,
+    content_type: str | None = None,
+    fallback_encoding: str | None = None,
+) -> str:
+    from onyx.utils.web_content import decode_html_bytes as decode
+
+    return decode(content, content_type, fallback_encoding)
+
 
 MAX_ASSET_BYTES = 25 * 1024 * 1024
 MAX_PACKAGE_BYTES = 100 * 1024 * 1024
