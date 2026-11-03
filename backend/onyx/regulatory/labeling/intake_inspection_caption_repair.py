@@ -114,7 +114,7 @@ def legacy_inspection_caption_repair_candidate(
     """Admit one bounded model attempt; continued abstention stays failed."""
     by_id = {source.chunk_id: source for source in sources}
     target = by_id.get(chunk_id)
-    if target is None or len(sources) != 26 or len(by_id) != len(sources):
+    if target is None or len(sources) not in {25, 26} or len(by_id) != len(sources):
         return False
     members = target.snapshot.get("context_member_ids")
     if (
@@ -142,6 +142,9 @@ def legacy_inspection_caption_repair_candidate(
         ):
             return False
         positions[position] = source
+    # The shorter window may omit the unrelated EK1 report heading only.
+    if len(sources) == 25 and set(positions) != set(range(26)) - {1}:
+        return False
     if not _base(target) or not _caption(target, _CAPTION):
         return False
     position = target.snapshot["position"]

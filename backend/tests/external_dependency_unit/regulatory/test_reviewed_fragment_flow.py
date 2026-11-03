@@ -283,7 +283,18 @@ def seed(
         reviewed, "get_default_file_store", lambda: cast(FileStore, store)
     )
     monkeypatch.setattr(
-        evidence_db, "get_default_file_store", lambda: cast(FileStore, store)
+        evidence_db,
+        "read_direct_ack",
+        lambda _session, file_id, *, max_bytes: store.read_file(file_id).read(
+            max_bytes + 1
+        ),
+    )
+    monkeypatch.setattr(
+        reviewed,
+        "read_direct_ack",
+        lambda _session, file_id, *, max_bytes: store.read_file(file_id).read(
+            max_bytes + 1
+        ),
     )
     session.flush()
     fixture = Fixture(
@@ -398,9 +409,9 @@ def test_real_apply_read_search_review_api_and_reuse_preserve_all_sources(
             document_set_id=fixture.data.document_set_id,
             run_id=fixture.run.id,
             offset=0,
-            limit=20,
+            limit=len(fixture.items),
         )
-        assert page is not None
+        assert page is not None and page.total == len(fixture.items)
         view = next(i for i in page.items if i.chunk_id == target.regulatory_chunk_id)
         assert (
             view.classification_disposition == "source_only_reviewed_fragment"
