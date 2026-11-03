@@ -1135,6 +1135,13 @@ def _start_intake_labeling_for_batch(
         binding = resolve_intake_labeling_provider_binding(
             session, batch.labeling_model_configuration_id, user=user
         )
+        from onyx.db.document_intake_structural_readers import (
+            load_intake_structural_reader_proofs,
+        )
+
+        structural_readers = load_intake_structural_reader_proofs(
+            session, intake_id=batch.id
+        )
         run, _created = labeling.create_labeling_run(
             session,
             document_set_id=batch.document_set_id,
@@ -1161,6 +1168,7 @@ def _start_intake_labeling_for_batch(
             if prior_reprepare_run is not None
             else True,
             target_file_ids=[item.user_file_id for item in files],
+            structural_readers=structural_readers or None,
         )
         if existing is not None:
             from onyx.db.document_intake_edit import reuse_completed_intake_labels
