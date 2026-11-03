@@ -13,7 +13,12 @@ from onyx.db import document_intake_edit as editing
 from onyx.db import document_intake_review as review
 from onyx.db import regulatory_labeling as labeling
 from onyx.db.enums import UserFileStatus
-from onyx.db.models import RegulatoryDocumentIntake, RegulatoryLabelingRun, UserFile
+from onyx.db.models import (
+    RegulatoryChunk,
+    RegulatoryDocumentIntake,
+    RegulatoryLabelingRun,
+    UserFile,
+)
 
 
 @pytest.mark.parametrize(
@@ -28,6 +33,10 @@ from onyx.db.models import RegulatoryDocumentIntake, RegulatoryLabelingRun, User
         ("published_file", False),
         ("index_attempt", False),
         ("pending_shard", False),
+        ("receipt_chunking_frozen", True),
+        ("receipt_chunking_missing", False),
+        ("receipt_chunking_stale", False),
+        ("receipt_chunking_wrong_hash", False),
     ],
 )
 def test_failed_metadata_review_keeps_all_existing_ownership_fences(
@@ -84,10 +93,45 @@ def test_failed_metadata_review_keeps_all_existing_ownership_fences(
         member.approval_attempt_id = uuid4()
     elif change == "pending_shard":
         session.scalar.return_value = uuid4()
+    if change.startswith("receipt_chunking"):
+        from onyx.db.document_intake_metadata import metadata_chunks
+        from onyx.regulatory.document_intake.metadata import (
+            METADATA_AUDIT_KEY,
+            METADATA_MODEL,
+            METADATA_VERSION,
+            metadata_input_hash,
+        )
+
+        batch.stage = "chunking"
+        row = RegulatoryChunk(
+            id="source",
+            user_file_id=fid,
+            text="(1) Kaynak hüküm.",
+            heading_path=["MADDE 1"],
+            chunk_type="paragraph",
+            chunk_metadata={},
+        )
+        row.chunk_metadata = {
+            METADATA_AUDIT_KEY: {
+                "model": METADATA_MODEL,
+                "version": METADATA_VERSION,
+                "input_sha256": metadata_input_hash(metadata_chunks([row])),
+                "input_stale": change == "receipt_chunking_stale",
+                "request_hash": "a" * 64,
+            }
+        }
+        if change == "receipt_chunking_wrong_hash":
+            row.chunk_metadata[METADATA_AUDIT_KEY]["input_sha256"] = "b" * 64
+        session.scalars.side_effect = [
+            [] if change == "receipt_chunking_missing" else [row],
+            [],
+            [row],
+            [],
+        ]
     digest = editing.edit_review_digest(session, batch)
     assert bool(digest) is allowed
     if allowed:
         batch.error = "A different failure occurred"
         assert editing.edit_review_digest(session, batch) != digest
-        assert batch.status == "failed" and batch.stage == "metadata"
+        assert batch.status == "failed" and batch.stage in {"metadata", "chunking"}
         assert batch.labeling_run_id == run_id
