@@ -9,20 +9,37 @@ for path in Path('/app/onyx').rglob('*.py'):
   if isinstance(node,ast.Raise)and isinstance(node.exc,ast.Call)and node.exc.args and isinstance(node.exc.args[0],ast.Constant)and isinstance(node.exc.args[0].value,str):
    text=node.exc.args[0].value
    if 8<=len(text)<=400:literals.add(text)
-for pattern in ('api_server*.log*','celery_worker_user_file_processing*.log*','celery_worker_regulatory_annex*.log*'):
+owned_ids={'6001':'634d428a-1675-4812-a902-229e9f3e3987','6455':'d2d0756e-e996-46cf-991b-aec286ed4aab','history':'37e9c668-6ae3-404a-a8d9-5ae7154fa95a'}
+for pattern in ('onyx*.log*','api_server*.log*','celery_worker_user_file_processing*.log*','celery_worker_regulatory_annex*.log*'):
  for path in sorted(Path('/var/log/onyx').glob(pattern))[:8]:
   try:
    with path.open('rb')as stream:
     stream.seek(0,2);size=stream.tell();stream.seek(max(0,size-8_000_000));raw=stream.read().decode('utf-8',errors='replace')
   except OSError:continue
-  findings=[];timestamp=None;context=None
+  findings=[];timestamp=None;context=None;owned_context=[];stack=[];progress={}
   for line in raw.splitlines():
    stamp=re.search(r'(?:2026-11-03|11/03/2026)[ T][0-9:.]+',line)
    if stamp:timestamp=stamp[0]
+   found=[name for name,value in owned_ids.items()if value in line]
+   if found:owned_context=found
+   frame=re.search(r'File "/app/(onyx/[A-Za-z0-9_/]+\.py)", line ([0-9]+), in ([A-Za-z0-9_]+)',line)
+   if frame:stack.append({'path':frame[1],'line':int(frame[2]),'function':frame[3]});stack=stack[-12:]
+   for tag in ('writer_publication_finished','contextual enrichment','contextualize','Embedding','index_user_file_impl','parse_time_limit'):
+    if tag in line:progress[tag]=progress.get(tag,0)+1
    marker=re.search(r'ASv3 capability ([a-z_]+) failed',line)
    if marker:context=marker[1]
    classes=re.findall(r'\b([A-Z][A-Za-z0-9_]*(?:Error|Exception|Lost|Conflict))\s*:',line)
    messages=sorted(text for text in literals if text in line)
    if classes or messages:
-    findings.append({'timestamp':timestamp,'classes':classes,'capability_context':context,'safe_code_literals':messages[:4]})
-  print(json.dumps({'retained_log_file':path.name,'bytes_examined':len(raw.encode()),'safe_findings':findings[-100:],'raw_log_exported':False}))
+    findings.append({'timestamp':timestamp,'classes':classes,'capability_context':context,'owned_context_hint_only':owned_context,'code_stack':stack,'safe_code_literals':messages[:4]});stack=[]
+  print(json.dumps({'retained_log_file':path.name,'bytes_examined':len(raw.encode()),'progress_tag_counts':progress,'safe_findings':findings[-100:],'raw_log_exported':False}))
+try:
+ from onyx.background.celery.apps.user_file_processing import celery_app
+ active=celery_app.control.inspect(timeout=3).active()or{}
+ for worker,tasks in active.items():
+  for task in tasks:
+   args=str(task.get('args',''))+str(task.get('kwargs',''))
+   matches=[name for name,value in owned_ids.items()if value in args]
+   if matches:print(json.dumps({'active_owned_task':matches,'worker':worker,'id':task.get('id'),'task_name':task.get('name'),'time_start':task.get('time_start'),'acknowledged':task.get('acknowledged'),'arguments_exported':False}))
+ print(json.dumps({'active_worker_count':len(active),'active_task_count':sum(map(len,active.values())),'task_arguments_exported':False}))
+except Exception as exc:print(json.dumps({'inspect_exception_class':type(exc).__name__}))
