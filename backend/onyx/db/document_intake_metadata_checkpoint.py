@@ -233,16 +233,20 @@ def _source_snapshot(
         ):
             validate_metadata_receipt_evidence(rows, chunks)
             completed.add(str(member.id))
-        requests[str(member.id)] = [
-            build_metadata_request(
-                chunks,
-                [
-                    chunk.chunk_id
-                    for chunk in chunks[offset : offset + TARGETS_PER_REQUEST]
-                ],
-            ).request_hash
-            for offset in range(0, len(chunks), TARGETS_PER_REQUEST)
-        ]
+        requests[str(member.id)] = (
+            []
+            if str(member.id) in completed
+            else [
+                build_metadata_request(
+                    chunks,
+                    [
+                        chunk.chunk_id
+                        for chunk in chunks[offset : offset + TARGETS_PER_REQUEST]
+                    ],
+                ).request_hash
+                for offset in range(0, len(chunks), TARGETS_PER_REQUEST)
+            ]
+        )
         documents[str(member.id)] = {
             "user_file_id": str(file.id),
             "source_asset_id": str(asset.id),
