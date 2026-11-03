@@ -543,6 +543,7 @@ export default function NewDocumentIntake() {
   const {
     data: history,
     error: historyError,
+    isLoading: historyLoading,
     mutate: refreshHistory,
   } = useSWR(
     targetId ? "document-intake-history" : null,
@@ -1055,6 +1056,11 @@ export default function NewDocumentIntake() {
           </Button>
         </div>
       )}
+      {historyLoading && (
+        <div role="status">
+          <Text font="secondary-body">Loading previous imports…</Text>
+        </div>
+      )}
       {history && history.length > 0 && (
         <div className="flex flex-wrap gap-2">
           {history.map((item) => (
@@ -1064,6 +1070,11 @@ export default function NewDocumentIntake() {
               prominence={batch?.id === item.id ? "primary" : "secondary"}
               disabled={dirtyKeys.size > 0 || busy}
               onClick={() => {
+                if (dirtyKeys.size > 0 || busy) return;
+                if (initialBatch?.id === item.id) {
+                  void refreshBatch();
+                  return;
+                }
                 requestVersion.current += 1;
                 setInitialBatch(item);
                 setDirtyKeys(new Set());

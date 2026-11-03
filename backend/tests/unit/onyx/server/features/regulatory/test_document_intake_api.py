@@ -470,7 +470,9 @@ def test_chunk_edit_commits_before_scoped_relabel_dispatch(
     events: list[str] = []
     session.commit.side_effect = lambda: events.append("commit")
     monkeypatch.setattr(
-        api.repository, "get_intake", lambda *_args: SimpleNamespace(id=batch_id)
+        api.repository,
+        "get_intake",
+        lambda *_args: SimpleNamespace(id=batch_id, status="partial", stage="labeling"),
     )
     monkeypatch.setattr(
         api.repository, "intake_snapshot", lambda *_args: _snapshot(batch_id)
@@ -633,7 +635,9 @@ def test_bulk_chunk_edit_commits_all_edits_then_dispatches_one_run(
     events: list[str] = []
     session.commit.side_effect = lambda: events.append("commit")
     monkeypatch.setattr(
-        api.repository, "get_intake", lambda *_args: SimpleNamespace(id=batch_id)
+        api.repository,
+        "get_intake",
+        lambda *_args: SimpleNamespace(id=batch_id, status="partial", stage="labeling"),
     )
     snapshot = _snapshot(batch_id)
     snapshot["labeling_failed_count"] = 5

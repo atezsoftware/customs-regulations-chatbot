@@ -82,6 +82,16 @@ class _PreparedChunkEdit:
     updates: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class _LabelingReviewItem:
+    id: UUID
+    regulatory_chunk_id: str
+    user_file_id: UUID
+    status: str
+    error: str | None
+    request_hash: str | None
+
+
 def _has_frozen_metadata_receipts(session: Session, files: set[UUID]) -> bool:
     from onyx.db.document_intake_metadata import metadata_chunks
     from onyx.regulatory.document_intake.metadata import (
@@ -182,13 +192,21 @@ def edit_review_digest(session: Session, batch: RegulatoryDocumentIntake) -> str
         )
     ):
         return None
-    items = list(
-        session.scalars(
-            select(RegulatoryLabelingItem)
+    items = [
+        _LabelingReviewItem(*row)
+        for row in session.execute(
+            select(
+                RegulatoryLabelingItem.id,
+                RegulatoryLabelingItem.regulatory_chunk_id,
+                RegulatoryLabelingItem.user_file_id,
+                RegulatoryLabelingItem.status,
+                RegulatoryLabelingItem.error,
+                RegulatoryLabelingItem.request_hash,
+            )
             .where(RegulatoryLabelingItem.run_id == run.id)
             .order_by(RegulatoryLabelingItem.id)
-        )
-    )
+        ).tuples()
+    ]
     if any(item.status == "submitted" for item in items) or session.scalar(
         select(RegulatoryLabelingShard.id)
         .where(

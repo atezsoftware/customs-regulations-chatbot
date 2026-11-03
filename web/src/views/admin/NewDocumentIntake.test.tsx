@@ -1086,6 +1086,147 @@ test("keeps saved import status synchronized with completion polling", async () 
   }
 });
 
+test("refreshes the selected import and enables edits only after a fresh server receipt", async () => {
+  const stale: DocumentIntakeBatch = {
+    ...readyBatch,
+    status: "partial",
+    stage: "labeling",
+    review_sha256: null,
+    edit_review_sha256: null,
+  };
+  const refreshed = deferred<Response>();
+  const fetchMock = mockApi({ history: [stale] });
+  const original = fetchMock.getMockImplementation()!;
+  let batchReads = 0;
+  fetchMock.mockImplementation(async (input, init) => {
+    // GET the selected batch once from cache-era state, then await its live receipt.
+    if (String(input) === `${base}/batches/intake-1`) {
+      batchReads += 1;
+      if (batchReads > 1) return refreshed.promise;
+    }
+    return original(input, init);
+  });
+  const user = setupUser();
+  render(<NewDocumentIntake />);
+  const historyButton = await screen.findByRole("button", {
+    name: "Main regulation.html (partial)",
+  });
+  await user.click(historyButton);
+  const root = screen.getByRole("region", { name: "Main regulation.html" });
+  expect(await within(root).findByLabelText("After text")).toHaveAttribute(
+    "readonly"
+  );
+  await waitFor(() => expect(batchReads).toBe(1));
+
+  await user.click(historyButton);
+  await waitFor(() => expect(batchReads).toBe(2));
+  expect(within(root).getByLabelText("After text")).toHaveAttribute("readonly");
+  expect(
+    within(root).queryByRole("button", { name: "Save chunk changes" })
+  ).not.toBeInTheDocument();
+  await act(async () => {
+    refreshed.resolve(json({ ...stale, edit_review_sha256: "c".repeat(64) }));
+  });
+  await waitFor(() =>
+    expect(within(root).getByLabelText("After text")).not.toHaveAttribute(
+      "readonly"
+    )
+  );
+  expect(
+    screen.getByRole("button", { name: "Approve all new documents" })
+  ).toBeDisabled();
+  await user.type(within(root).getByLabelText("After text"), " Reviewed.");
+  expect(historyButton).toBeDisabled();
+  await user.click(historyButton);
+  expect(batchReads).toBe(2);
+  expect(within(root).getByLabelText("After text")).toHaveValue(
+    "Main document rule Reviewed."
+  );
+});
+
+test("switches history keys without refreshing the previous batch and blocks selection during a request", async () => {
+  const other: DocumentIntakeBatch = {
+    ...readyBatch,
+    id: "intake-other",
+    status: "partial",
+    stage: "labeling",
+    review_sha256: null,
+    edit_review_sha256: null,
+    documents: [
+      { ...readyBatch.documents[0]!, display_name: "Other regulation.pdf" },
+    ],
+  };
+  const retried = deferred<Response>();
+  const fetchMock = mockApi({ history: [readyBatch, other] });
+  const original = fetchMock.getMockImplementation()!;
+  fetchMock.mockImplementation(async (input, init) => {
+    const url = String(input);
+    // GET the second batch and hold its retry POST pending without any draft.
+    if (url === `${base}/batches/intake-other`) return json(other);
+    if (url === `${base}/batches/intake-other/retry`) return retried.promise;
+    if (url === `${base}/batches/intake-other/reprepare`)
+      return original(`${base}/batches/intake-1/reprepare`, init);
+    return original(input, init);
+  });
+  const user = setupUser();
+  render(<NewDocumentIntake />);
+  const first = await screen.findByRole("button", {
+    name: "Main regulation.html (ready)",
+  });
+  await user.click(first);
+  await screen.findByText("New documents: ready");
+  const second = screen.getByRole("button", {
+    name: "Other regulation.pdf (partial)",
+  });
+  await user.click(second);
+  await screen.findByText("New documents: partial");
+  await waitFor(() =>
+    expect(fetchMock).toHaveBeenCalledWith(
+      `${base}/batches/intake-other`,
+      undefined
+    )
+  );
+  const batchReadCounts = () =>
+    ["intake-1", "intake-other"].map(
+      (id) =>
+        fetchMock.mock.calls.filter(([url]) => url === `${base}/batches/${id}`)
+          .length
+    );
+  expect(batchReadCounts()).toEqual([1, 1]);
+  await user.click(screen.getByRole("button", { name: "Retry new documents" }));
+  expect(first).toBeDisabled();
+  expect(second).toBeDisabled();
+  await user.click(first);
+  await user.click(second);
+  expect(batchReadCounts()).toEqual([1, 1]);
+  await act(async () => {
+    retried.resolve(json(other));
+  });
+  await waitFor(() => expect(second).toBeEnabled());
+});
+
+test("shows a loading state while previous imports are pending", async () => {
+  const history = deferred<Response>();
+  const fetchMock = mockApi();
+  const original = fetchMock.getMockImplementation()!;
+  fetchMock.mockImplementation(async (input, init) =>
+    // GET intake history can outlast the capability and labeling setup requests.
+    String(input) === `${base}/batches`
+      ? history.promise
+      : original(input, init)
+  );
+  render(<NewDocumentIntake />);
+  expect(await screen.findByRole("status")).toHaveTextContent(
+    "Loading previous imports…"
+  );
+  await act(async () => {
+    history.resolve(json([]));
+  });
+  await waitFor(() =>
+    expect(screen.queryByRole("status")).not.toBeInTheDocument()
+  );
+});
+
 test("shows a missing attachment and keeps document preparation disabled", async () => {
   const fetchMock = mockApi({
     source: {

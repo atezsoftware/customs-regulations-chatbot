@@ -270,12 +270,13 @@ def _labels(session: Session, batch: RegulatoryDocumentIntake) -> dict[str, list
     if batch.labeling_run_id is None:
         return {}
     return {
-        item.regulatory_chunk_id: list(item.labels)
-        for item in session.scalars(
-            select(RegulatoryLabelingItem).where(
-                RegulatoryLabelingItem.run_id == batch.labeling_run_id
-            )
-        )
+        chunk_id: list(labels)
+        for chunk_id, labels in session.execute(
+            select(
+                RegulatoryLabelingItem.regulatory_chunk_id,
+                RegulatoryLabelingItem.labels,
+            ).where(RegulatoryLabelingItem.run_id == batch.labeling_run_id)
+        ).tuples()
     }
 
 
