@@ -6,7 +6,10 @@ from collections.abc import Mapping, Sequence
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from onyx.db.document_intake_source_binding import require_owned_v4_intake_source
+from onyx.db.document_intake_source_binding import (
+    require_owned_intake_source,
+    require_owned_v4_intake_source,
+)
 from onyx.db.models import (
     RegulatoryChunk,
     RegulatoryLabelingItem,
@@ -20,12 +23,15 @@ from onyx.regulatory.labeling.intake_abstention_repair import (
     AbstentionRepairAudit,
     validate_stored_abstention_repair_audit,
 )
+from onyx.regulatory.labeling.intake_structural_repair import (
+    legacy_structural_repair_candidate,
+)
 from onyx.regulatory.labeling.provider import TaxonomyDefinition, build_labeling_request
 
 SEMANTIC_REPAIR_KEY = ABSTENTION_REPAIR_KEY
 
 
-def require_current_v4_intake_repair_item(
+def require_current_intake_repair_item(
     session: Session, *, item: RegulatoryLabelingItem, run: RegulatoryLabelingRun
 ) -> None:
     """Check target identity; consumers also retain their full context-current guard."""
@@ -66,13 +72,24 @@ def require_current_v4_intake_repair_item(
         or item.canonical_text_sha256 != context_hash(row.text)
     ):
         raise ValueError("Semantic repair canonical source snapshot changed")
-    require_owned_v4_intake_source(
-        session,
-        user_file_id=item.user_file_id,
-        metadata=row.chunk_metadata,
-        chunk_type=row.chunk_type,
-        document_set_id=run.document_set_id,
-    )
+    if row.chunk_metadata.get("intake_chunking_version") in ("4", "5"):
+        require_owned_v4_intake_source(
+            session,
+            user_file_id=item.user_file_id,
+            metadata=row.chunk_metadata,
+            chunk_type=row.chunk_type,
+            document_set_id=run.document_set_id,
+        )
+    elif legacy_structural_repair_candidate(
+        chunk_id=row.id, text=row.text, source_snapshot=item.source_snapshot
+    ):
+        require_owned_intake_source(
+            session,
+            user_file_id=item.user_file_id,
+            document_set_id=run.document_set_id,
+        )
+    else:
+        raise ValueError("Legacy semantic repair requires a verified structural source")
 
 
 def validate_item_semantic_repair_audit(
@@ -103,7 +120,7 @@ def validate_item_semantic_repair_audit(
         and item.source_snapshot[SEMANTIC_REPAIR_KEY] != stored.model_dump(mode="json")
     ):
         raise ValueError("A semantic repair attempt has already been recorded")
-    require_current_v4_intake_repair_item(session, item=item, run=run)
+    require_current_intake_repair_item(session, item=item, run=run)
     taxonomy_row = session.get_one(
         RegulatoryLabelTaxonomy, run.taxonomy_id, populate_existing=True
     )

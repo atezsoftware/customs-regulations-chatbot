@@ -1,4 +1,4 @@
-"""Current owned source identity for v4 intake-only readers and semantic repair."""
+"""Current owned source identity for intake-only readers and semantic repair."""
 
 from collections.abc import Mapping
 from typing import Any
@@ -32,6 +32,17 @@ def require_owned_v4_intake_source(
     if metadata.get("intake_chunking_version") not in ("4", "5"):
         raise ValueError("Only frozen whole-table intake sources support this reader")
     embedding_token_limit_for_metadata(metadata, chunk_type)
+    return require_owned_intake_source(
+        session, user_file_id=user_file_id, document_set_id=document_set_id
+    )
+
+
+def require_owned_intake_source(
+    session: Session,
+    *,
+    user_file_id: UUID,
+    document_set_id: int | None = None,
+) -> RegulatorySourceAsset:
     member = session.scalar(
         select(RegulatoryDocumentIntakeFile)
         .where(RegulatoryDocumentIntakeFile.user_file_id == user_file_id)
