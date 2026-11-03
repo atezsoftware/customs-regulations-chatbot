@@ -83,7 +83,7 @@ _BOUND_REVERSE = re.compile(
     _BOUND_QUALIFIER
     + _BOUND_NUMBER
     + r"\s*(?:\.\s*|['’]?\s*(?:inci|nci|uncu|ıncı)\s+|\s+)"
-    + r"madd(?:e(?:de|den|nin|ye|yi)?|es[iı](?:nde|nden|nin|ne|ni)?|eleri(?:nin|ne)?)\b"
+    + r"madd(?:e(?:de|den|nin|ye|yi)?|es[iı](?:nde|nden|nin|ne|ni|yle)?|eleri(?:nin|ne)?)\b"
 )
 _BOUND_COMPACT = re.compile(
     r"\(?" + _BOUND_QUALIFIER + _BOUND_NUMBER + r"\)?\s*madd[a-z]*\b"
@@ -127,6 +127,22 @@ class _BoundLocator:
     qualifier: str | None
 
 
+def _locator_from_match(match: re.Match[str]) -> _BoundLocator:
+    groups = match.groupdict()
+    article = match["article"].upper()
+    if inserted := groups.get("inserted"):
+        article += "/" + inserted.upper()
+    qualifier = groups.get("qualifier")
+    return _BoundLocator(
+        match.start(),
+        match.end(),
+        article,
+        groups.get("paragraph"),
+        groups.get("clause"),
+        folded(qualifier) if qualifier else None,
+    )
+
+
 def _bound_locator(
     text: str, start: int, *, bare: bool = False
 ) -> _BoundLocator | None:
@@ -148,18 +164,7 @@ def _bound_locator(
     match = max(matches, key=lambda value: value.end())
     if bare and re.match(r"\s*(?:sayili|tarihli|yil[a-z]*)\b", text[match.end() :]):
         return None
-    article = match["article"].upper()
-    if inserted := match["inserted"]:
-        article += "/" + inserted.upper()
-    qualifier = match["qualifier"]
-    return _BoundLocator(
-        start,
-        match.end(),
-        article,
-        match["paragraph"],
-        match["clause"],
-        folded(qualifier) if qualifier else None,
-    )
+    return _locator_from_match(match)
 
 
 def _explicit_reverse_instrument(text: str, start: int) -> bool:
@@ -191,6 +196,14 @@ def _explicit_instrument_name(value: str) -> bool:
     return re.fullmatch(r".+\s+" + _OTHER_INSTRUMENT_END, value) is not None
 
 
+def _instrumental_statute_reference(text: str, start: int, end: int) -> bool:
+    """Instrumental wording leaves a following affected provision's owner open."""
+    return bool(
+        re.search(r"\bkanun(?:la|uyla|larla|lariyla)$", folded(text[start:end]))
+        or re.match(r"(?:\s+ile|\s*['’]\s*(?:la|le|yla|yle))\b", folded(text[end:]))
+    )
+
+
 def _bound_locators(text: str, start: int, end: int) -> list[_BoundLocator]:
     """Bind locators through explicit syntax, never through a later narrative clause."""
     found: list[_BoundLocator] = []
@@ -198,7 +211,11 @@ def _bound_locators(text: str, start: int, end: int) -> list[_BoundLocator]:
     prefix = _BOUND_PREFIX.match(tail)
     assert prefix is not None
     cursor = prefix.end()
-    locator = _bound_locator(tail, cursor)
+    locator = (
+        None
+        if _instrumental_statute_reference(text, start, end)
+        else _bound_locator(tail, cursor)
+    )
     while locator is not None:
         if _explicit_reverse_instrument(tail, locator.end):
             break
@@ -337,23 +354,27 @@ def statute_references(
                     ),
                 )
             continue
-        tail = _reference_tail(normalized[match.end() : match.end() + 180])
+        tail = (
+            ""
+            if _instrumental_statute_reference(normalized, match.start(), match.end())
+            else _reference_tail(normalized[match.end() : match.end() + 180])
+        )
         candidates: list[tuple[int, str, str | None, str | None, str | None]] = [
             (offset, reference.article_no, None, None, reference.qualifier)
             for offset, reference in extract_regulatory_provision_reference_occurrences(
                 tail
             )
         ]
-        for pattern in (_COMPACT_ARTICLE, _SHORTHAND_ARTICLE):
+        for pattern in (_COMPACT_ARTICLE, _SHORTHAND_ARTICLE, _BOUND_REVERSE):
             for subunit in pattern.finditer(tail):
-                qualifier = subunit.groupdict().get("qualifier")
+                locator = _locator_from_match(subunit)
                 candidates.append(
                     (
-                        subunit.start(),
-                        subunit["article"],
-                        subunit["paragraph"],
-                        subunit["clause"],
-                        folded(qualifier) if qualifier else None,
+                        locator.start,
+                        locator.article,
+                        locator.paragraph,
+                        locator.clause,
+                        locator.qualifier,
                     )
                 )
         article, paragraph, clause, qualifier = (
@@ -698,19 +719,25 @@ def _named_native_references(
                         )
                     )
                 continue
-            tail = _reference_tail(normalized[match.end() : match.end() + 180])
+            tail = (
+                ""
+                if _instrumental_statute_reference(
+                    normalized, match.start(), match.end()
+                )
+                else _reference_tail(normalized[match.end() : match.end() + 180])
+            )
             locators = extract_regulatory_provision_reference_occurrences(tail)
             article = locators[0][1].article_no if locators else None
             qualifier = locators[0][1].qualifier if locators else None
             subunits = [
-                part
-                for pattern in (_COMPACT_ARTICLE, _SHORTHAND_ARTICLE)
+                _locator_from_match(part)
+                for pattern in (_COMPACT_ARTICLE, _SHORTHAND_ARTICLE, _BOUND_REVERSE)
                 if (part := pattern.search(tail)) is not None
             ]
             if subunits:
-                first = min(subunits, key=lambda part: part.start())
-                article = first["article"]
-                qualifier = first.groupdict().get("qualifier") or qualifier
+                first = min(subunits, key=lambda part: part.start)
+                article = first.article
+                qualifier = first.qualifier or qualifier
             references.append(
                 (
                     StatuteReference(
