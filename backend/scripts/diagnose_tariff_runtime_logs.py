@@ -8,8 +8,8 @@ NAMESPACE='customs-regulations-dev'
 START='2026-11-03T14:00:00Z'
 END='2026-11-03T14:35:00Z'
 
-def command(args: list[str], input_text: str | None = None) -> str:
-    result=subprocess.run(args,input=input_text,capture_output=True,text=True,timeout=90,check=False)
+def command(args: list[str], input_text: str | None = None, timeout: int = 90) -> str:
+    result=subprocess.run(args,input=input_text,capture_output=True,text=True,timeout=timeout,check=False)
     if result.returncode:
         failure={'diagnostic_command_failed':args[:3],'exit_code':result.returncode};print(json.dumps(failure));return json.dumps(failure)
     return result.stdout
@@ -46,7 +46,7 @@ for pod in pods.get('items',[]):
         for record in retained.splitlines():
             try:
                 payload=json.loads(record)
-                if 'retained_log_file' in payload:print(json.dumps(payload))
+                if any(key in payload for key in ('retained_log_file','active_owned_task','active_worker_count','inspect_exception_class')):print(json.dumps(payload))
             except ValueError:pass
         if status.get('restartCount',0):findings.extend(safe_findings(command(args+['--previous']),pod['metadata']['name']+':previous'))
 events=json.loads(command(['kubectl','get','events','-n',NAMESPACE,'-o','json']))
@@ -65,6 +65,19 @@ for group in groups.get('logGroups',[]):
     print(json.dumps({'archive':name,'events_examined':len(data.get('events',[])),'has_next_page':bool(data.get('nextToken'))}))
     for event in data.get('events',[]):findings.extend(safe_findings(event.get('message',''),name))
 print(json.dumps({'safe_exception_findings':findings[:300],'read_only':True,'raw_log_bodies_exported':False}))
+
+expected_revision='5a11809571cb930a5f90c2f20833986336ff6f32'
+for pod in pods.get('items',[]):
+    if pod['metadata'].get('deletionTimestamp')or pod['metadata'].get('labels',{}).get('app')!='dev-customs-regulations-background':continue
+    statuses={item['name']:item for item in pod.get('status',{}).get('containerStatuses',[])}
+    for container in pod['spec']['containers']:
+        if not container['image'].endswith('customs-regulations-backend-lite-dev:'+expected_revision)or not statuses.get(container['name'],{}).get('ready'):continue
+        raw_probe=command(['kubectl','exec','-i',pod['metadata']['name'],'-n',NAMESPACE,'-c',container['name'],'--','python','-',expected_revision],Path('backend/scripts/inspect_tariff_native_pdf.py').read_text(),timeout=210)
+        for record in raw_probe.splitlines():
+            try:
+                payload=json.loads(record)
+                if 'elapsed'in payload:print(json.dumps({'native_pdf_diagnostic':payload}))
+            except ValueError:pass
 
 all_groups=json.loads(command(['aws','logs','describe-log-groups','--region','eu-central-1','--query','logGroups[].logGroupName','--output','json']))
 if isinstance(all_groups,list):print(json.dumps({'available_relevant_log_groups':[name for name in all_groups if any(k in name.lower() for k in ('customs','containerinsights','atez-dev'))][:100]}))
