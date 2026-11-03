@@ -22,7 +22,7 @@ from onyx.db.labeling_configuration import (
     resolve_intake_labeling_provider_binding,
     resolve_labeling_gateway,
 )
-from onyx.db.models import User
+from onyx.db.models import RegulatoryDocumentIntake, User
 from onyx.regulatory.document_intake import metadata as metadata_contract
 from onyx.regulatory.document_intake.capacity import (
     MetadataCapacityStopped,
@@ -165,6 +165,9 @@ def _extract_metadata_targets(
     heartbeat: Callable[[], None],
     stopped: Event,
     inherited_attempts: Sequence[tuple[str, str]] = (),
+    request_override: VertexBatchRequest | None = None,
+    on_accepted: Callable[[VertexBatchRequest, LegalMetadataResult], None]
+    | None = None,
 ) -> MetadataResults:
     previous_attempts = list(inherited_attempts)
     try:
@@ -176,6 +179,8 @@ def _extract_metadata_targets(
             heartbeat=heartbeat,
             stopped=stopped,
             previous_attempts=previous_attempts,
+            request_override=request_override,
+            on_accepted=on_accepted,
         )
     except _MetadataWindowNeedsSplit as failure:
         if len(targets) == 1:
@@ -214,8 +219,31 @@ def _extract_metadata_window(
     heartbeat: Callable[[], None],
     stopped: Event,
     previous_attempts: list[tuple[str, str]],
+    request_override: VertexBatchRequest | None = None,
+    on_accepted: Callable[[VertexBatchRequest, LegalMetadataResult], None]
+    | None = None,
 ) -> MetadataResults:
-    request = build_metadata_request(chunks, targets)
+    request = request_override or build_metadata_request(chunks, targets)
+    contract_retry = request_override is not None
+    if contract_retry:
+        from onyx.regulatory.document_intake.metadata_contract_retry import (
+            CONTRACT_RETRY_KEY,
+            require_contract_base_request,
+        )
+
+        payload = json.loads(request.prompt)
+        if (
+            len(targets) != 1
+            or payload.get("target_chunk_ids") != list(targets)
+            or payload.get("input_sha256") != metadata_input_hash(chunks)
+            or CONTRACT_RETRY_KEY not in payload
+        ):
+            raise ValueError(
+                "Contract metadata request changed its frozen single target"
+            )
+        require_contract_base_request(
+            request, chunks=list(chunks), target_id=targets[0]
+        )
     output_pressure: dict[str, bool] = {}
     semantic_feedback_used: set[Literal["catalog", "body_scope"]] = set()
     output_reserve_used = False
@@ -223,6 +251,20 @@ def _extract_metadata_window(
     def accepted(
         accepted_request: VertexBatchRequest, result: LegalMetadataResult
     ) -> MetadataResults:
+        if contract_retry:
+            from onyx.regulatory.document_intake.metadata_contract_retry import (
+                validate_contract_retry_result,
+            )
+
+            validate_contract_retry_result(
+                result, chunks=list(chunks), target_id=targets[0]
+            )
+            if on_accepted is None:
+                raise ValueError(
+                    "Contract metadata repair requires its actual request receipt"
+                )
+            on_accepted(accepted_request, result)
+            return [(accepted_request.request_hash, result)]
         for previous_hash, previous_response in reversed(previous_attempts):
             result = retain_validated_metadata_facts(
                 result,
@@ -234,6 +276,14 @@ def _extract_metadata_window(
         return [(accepted_request.request_hash, result)]
 
     def validate_attempt(response: str) -> LegalMetadataResult:
+        if contract_retry:
+            from onyx.regulatory.document_intake.metadata_contract_retry import (
+                validate_contract_retry_response,
+            )
+
+            return validate_contract_retry_response(
+                response, chunks=list(chunks), target_id=targets[0]
+            )
         try:
             return validate_metadata_transport_response(
                 response, chunks=chunks, target_ids=targets
@@ -721,9 +771,12 @@ def _extract_metadata_document(
 
 
 def metadata_recipe_sha256() -> str:
+    from onyx.regulatory.document_intake import metadata_contract_retry
+
     return metadata_recipe_fingerprint(
         {
             "contract": inspect.getsource(metadata_contract),
+            "contract_retry": inspect.getsource(metadata_contract_retry),
             **{
                 function.__name__: inspect.getsource(function)
                 for function in (
@@ -735,6 +788,7 @@ def metadata_recipe_sha256() -> str:
                     _metadata_submission_key,
                     _run_metadata_request,
                     _cached_metadata_request,
+                    _run_contract_metadata,
                 )
             },
         },
@@ -757,10 +811,15 @@ def run_intake_metadata(*, intake_id: UUID, lease_token: UUID, tenant_id: str) -
 def run_intake_metadata_locked(
     *, intake_id: UUID, lease_token: UUID, tenant_id: str
 ) -> None:
+    if _run_contract_metadata(
+        intake_id=intake_id, lease_token=lease_token, tenant_id=tenant_id
+    ):
+        return
     with get_session_with_current_tenant() as session:
         batch, work = repository.load_metadata_work(session, intake_id, lease_token)
         if not work:
             session.commit()
+
             return
         owner = session.get_one(User, batch.created_by)
         binding = resolve_intake_labeling_provider_binding(
@@ -819,3 +878,90 @@ def run_intake_metadata_locked(
                 results=results,
             )
             session.commit()
+
+
+def _run_contract_metadata(
+    *, intake_id: UUID, lease_token: UUID, tenant_id: str
+) -> bool:
+    from onyx.db import document_intake_metadata_contract_retry as repair
+    from onyx.db.document_intake_metadata_checkpoint import require_metadata_lease
+    from onyx.regulatory.document_intake.metadata_contract_retry import (
+        build_contract_retry_request,
+    )
+
+    with get_session_with_current_tenant() as session:
+        batch = session.get_one(
+            RegulatoryDocumentIntake, intake_id, populate_existing=True
+        )
+        if repair.contract_retry(batch) is None:
+            return False
+        from shared_configs.contextvars import get_current_tenant_id
+
+        if tenant_id != get_current_tenant_id():
+            raise ValueError("Contract metadata request belongs to another tenant")
+        batch = require_metadata_lease(session, intake_id, lease_token)
+        intent, pending = repair.require_current_contract(
+            session, batch, require_complete=False
+        )
+        owner = session.get_one(User, batch.created_by)
+        binding = resolve_intake_labeling_provider_binding(
+            session, batch.labeling_model_configuration_id, user=owner
+        )
+        gateway = resolve_labeling_gateway(
+            session,
+            batch.labeling_model_configuration_id,
+            user=owner,
+            expected_binding=binding,
+            direct_flow=LLMFlow.REGULATORY_INTAKE_METADATA,
+            direct_max_request_bytes=MAX_METADATA_REQUEST_BYTES,
+            direct_max_response_bytes=MAX_METADATA_RESPONSE_BYTES,
+            direct_request_timeout_seconds=240,
+        )
+        session.commit()
+    for document_id, target_id in pending:
+        document = intent.documents[str(document_id)]
+        request = build_contract_retry_request(intent.id, document.chunks, target_id)
+        accepted: list[tuple[VertexBatchRequest, LegalMetadataResult]] = []
+
+        def heartbeat() -> None:
+            with get_session_with_current_tenant() as session:
+                current = require_metadata_lease(session, intake_id, lease_token)
+                repair.require_current_contract(
+                    session, current, require_complete=False
+                )
+                repository.heartbeat_metadata_with_timeout(
+                    session, intake_id, lease_token
+                )
+                session.commit()
+
+        with maintain_metadata_lease(heartbeat) as owned_heartbeat:
+            _extract_metadata_targets(
+                gateway=gateway,
+                chunks=document.chunks,
+                targets=[target_id],
+                identity_prefix=f"metadata-v{METADATA_VERSION}:{tenant_id}:{intake_id}:{document_id}:{binding.fingerprint}",
+                heartbeat=owned_heartbeat,
+                stopped=Event(),
+                request_override=request,
+                on_accepted=lambda actual, result: accepted.append((actual, result)),
+            )
+        if len(accepted) != 1:
+            raise ValueError(
+                "Contract metadata repair has no single accepted request receipt"
+            )
+        with get_session_with_current_tenant() as session:
+            repair.apply_contract_result(
+                session,
+                intake_id=intake_id,
+                lease_token=lease_token,
+                document_id=document_id,
+                target_id=target_id,
+                request=accepted[0][0],
+                result=accepted[0][1],
+            )
+            session.commit()
+    with get_session_with_current_tenant() as session:
+        batch = require_metadata_lease(session, intake_id, lease_token)
+        repair.require_current_contract(session, batch, require_complete=True)
+        session.commit()
+    return True

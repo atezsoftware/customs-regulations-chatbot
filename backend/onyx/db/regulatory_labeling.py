@@ -76,9 +76,12 @@ from onyx.regulatory.indexing_jobs.vertex_batch import (
     vertex_jsonl_line_size,
 )
 from onyx.regulatory.labeling.accepted_result import (
+    AcceptedDuplicateLabelRepair,
     AcceptedIntakeRepair,
     LabelingApplyOutcome,
     SourceOnlyArticleLeadIn,
+    SourceOnlyChapterCaption,
+    SourceOnlyReviewedFragment,
     SourceOnlySelfRepeal,
 )
 from onyx.regulatory.labeling.api_models import (
@@ -89,13 +92,16 @@ from onyx.regulatory.labeling.api_models import (
     TaxonomySummary,
 )
 from onyx.regulatory.labeling.article_lead_in import ARTICLE_LEAD_IN_KEY
+from onyx.regulatory.labeling.chapter_caption import CHAPTER_CAPTION_KEY
 from onyx.regulatory.labeling.domain import (
     LabelingChunkView,
     bounded_document_context,
     labeling_submission_key_from_hashes,
 )
 from onyx.regulatory.labeling.intake_abstention_repair import ABSTENTION_REPAIR_KEY
+from onyx.regulatory.labeling.intake_duplicate_label_repair import DUPLICATE_REPAIR_KEY
 from onyx.regulatory.labeling.provider import LabelDefinition, TaxonomyDefinition
+from onyx.regulatory.labeling.reviewed_fragment import REVIEWED_FRAGMENT_KEY
 from onyx.regulatory.labeling.self_repeal import SOURCE_ONLY_KEY
 
 _ACTIVE_RUN_STATUSES = ("queued", "running")
@@ -1035,11 +1041,17 @@ def list_items(
                     if SOURCE_ONLY_KEY in row.source_snapshot
                     else "source_only_article_lead_in"
                     if ARTICLE_LEAD_IN_KEY in row.source_snapshot
+                    else "source_only_chapter_caption"
+                    if CHAPTER_CAPTION_KEY in row.source_snapshot
+                    else "source_only_reviewed_fragment"
+                    if REVIEWED_FRAGMENT_KEY in row.source_snapshot
                     else "provider"
                 ),
                 provider_abstained=True
                 if SOURCE_ONLY_KEY in row.source_snapshot
                 or ARTICLE_LEAD_IN_KEY in row.source_snapshot
+                or CHAPTER_CAPTION_KEY in row.source_snapshot
+                or REVIEWED_FRAGMENT_KEY in row.source_snapshot
                 else None,
                 labels=list(row.labels),
                 error=row.error,
@@ -1363,8 +1375,11 @@ def prepare_next_item_page(
         )
         if any(
             ABSTENTION_REPAIR_KEY in item.source_snapshot
+            or DUPLICATE_REPAIR_KEY in item.source_snapshot
             or SOURCE_ONLY_KEY in item.source_snapshot
             or ARTICLE_LEAD_IN_KEY in item.source_snapshot
+            or CHAPTER_CAPTION_KEY in item.source_snapshot
+            or REVIEWED_FRAGMENT_KEY in item.source_snapshot
             for item in file_items
         ):
             validated_sources = complete_frozen_sources(
@@ -2290,7 +2305,33 @@ def _apply_frozen_window_results(
             item.status = "failed"
             item.error = outcome[:4000]
             continue
-        if isinstance(outcome, SourceOnlyArticleLeadIn):
+        if isinstance(outcome, SourceOnlyReviewedFragment):
+            from onyx.db.regulatory_labeling_reviewed_fragment import (
+                validate_item_reviewed_fragment_receipt,
+            )
+
+            validate_item_reviewed_fragment_receipt(
+                session, item=item, run=run, receipt=outcome.receipt
+            )
+            item.source_snapshot = {
+                **item.source_snapshot,
+                REVIEWED_FRAGMENT_KEY: outcome.receipt.model_dump(mode="json"),
+            }
+            labels, assignments = [], []
+        elif isinstance(outcome, SourceOnlyChapterCaption):
+            from onyx.db.regulatory_labeling_chapter_caption import (
+                validate_item_chapter_caption_receipt,
+            )
+
+            validate_item_chapter_caption_receipt(
+                session, item=item, run=run, receipt=outcome.receipt
+            )
+            item.source_snapshot = {
+                **item.source_snapshot,
+                CHAPTER_CAPTION_KEY: outcome.receipt.model_dump(mode="json"),
+            }
+            labels, assignments = [], []
+        elif isinstance(outcome, SourceOnlyArticleLeadIn):
             from onyx.db.regulatory_labeling_article_lead_in import (
                 validate_item_article_lead_in_receipt,
             )
@@ -2316,6 +2357,28 @@ def _apply_frozen_window_results(
                 SOURCE_ONLY_KEY: outcome.receipt.model_dump(mode="json"),
             }
             labels, assignments = [], []
+        elif isinstance(outcome, AcceptedDuplicateLabelRepair):
+            from onyx.db.regulatory_labeling_duplicate_repair import (
+                validate_item_duplicate_repair_audit,
+            )
+
+            labels = [assignment.label_id for assignment in outcome.outcome.labels]
+            assignments = [
+                assignment.model_dump(mode="json")
+                for assignment in outcome.outcome.labels
+            ]
+            validate_item_duplicate_repair_audit(
+                session,
+                item=item,
+                run=run,
+                audit=outcome.audit,
+                labels=labels,
+                assignments=assignments,
+            )
+            item.source_snapshot = {
+                **item.source_snapshot,
+                DUPLICATE_REPAIR_KEY: outcome.audit.model_dump(mode="json"),
+            }
         elif isinstance(outcome, AcceptedIntakeRepair):
             from onyx.db.regulatory_labeling_semantic_repair import (
                 validate_item_semantic_repair_audit,
@@ -2939,6 +3002,24 @@ def current_labeling_items_for_search(
     for item in items:
         if item.run_id != run.id or item.status != "completed":
             continue
+        if REVIEWED_FRAGMENT_KEY in item.source_snapshot:
+            from onyx.db.regulatory_labeling_reviewed_fragment import (
+                validate_item_reviewed_fragment_receipt,
+            )
+
+            try:
+                validate_item_reviewed_fragment_receipt(session, item=item, run=run)
+            except ValueError:
+                continue
+        if CHAPTER_CAPTION_KEY in item.source_snapshot:
+            from onyx.db.regulatory_labeling_chapter_caption import (
+                validate_item_chapter_caption_receipt,
+            )
+
+            try:
+                validate_item_chapter_caption_receipt(session, item=item, run=run)
+            except ValueError:
+                continue
         if ARTICLE_LEAD_IN_KEY in item.source_snapshot:
             from onyx.db.regulatory_labeling_article_lead_in import (
                 validate_item_article_lead_in_receipt,
@@ -2955,6 +3036,15 @@ def current_labeling_items_for_search(
 
             try:
                 validate_item_source_only_receipt(session, item=item, run=run)
+            except ValueError:
+                continue
+        if DUPLICATE_REPAIR_KEY in item.source_snapshot:
+            from onyx.db.regulatory_labeling_duplicate_repair import (
+                validate_item_duplicate_repair_audit,
+            )
+
+            try:
+                validate_item_duplicate_repair_audit(session, item=item, run=run)
             except ValueError:
                 continue
         if ABSTENTION_REPAIR_KEY in item.source_snapshot:

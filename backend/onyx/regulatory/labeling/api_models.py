@@ -92,7 +92,11 @@ class LabelingRunSnapshot(BaseModel):
 
 class LabelingItemSnapshot(BaseModel):
     classification_disposition: Literal[
-        "provider", "source_only_self_repeal", "source_only_article_lead_in"
+        "provider",
+        "source_only_self_repeal",
+        "source_only_article_lead_in",
+        "source_only_chapter_caption",
+        "source_only_reviewed_fragment",
     ] = "provider"
     provider_abstained: bool | None = None
     chunk_id: str

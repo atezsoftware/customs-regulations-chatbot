@@ -18,6 +18,7 @@ from onyx.db.models import (
 )
 from onyx.regulatory.amendments.annexes.context_dependencies import context_hash
 from onyx.regulatory.indexing_jobs.vertex_batch import VertexBatchRequest
+from onyx.regulatory.labeling.chapter_caption import chapter_caption_candidate
 from onyx.regulatory.labeling.intake_abstention_repair import (
     ABSTENTION_REPAIR_KEY,
     AbstentionRepairAudit,
@@ -26,12 +27,109 @@ from onyx.regulatory.labeling.intake_abstention_repair import (
     legacy_annex_caption_shape,
     validate_stored_abstention_repair_audit,
 )
+from onyx.regulatory.labeling.intake_dependent_clause_repair import (
+    DependentClauseRepairSource,
+    legacy_dependent_clause_repair_candidate,
+    legacy_dependent_clause_shape,
+)
+from onyx.regulatory.labeling.intake_inspection_caption_repair import (
+    legacy_inspection_caption_repair_candidate,
+    legacy_inspection_caption_shape,
+)
+from onyx.regulatory.labeling.intake_logo_intro_repair import (
+    legacy_logo_intro_repair_candidate,
+    legacy_logo_intro_shape,
+)
 from onyx.regulatory.labeling.intake_structural_repair import (
     legacy_structural_repair_candidate,
 )
 from onyx.regulatory.labeling.provider import TaxonomyDefinition, build_labeling_request
 
 SEMANTIC_REPAIR_KEY = ABSTENTION_REPAIR_KEY
+
+
+def _legacy_list_sources(
+    session: Session, *, item: RegulatoryLabelingItem, run: RegulatoryLabelingRun
+) -> list[DependentClauseRepairSource]:
+    members = item.source_snapshot.get("context_member_ids")
+    if (
+        not isinstance(members, list)
+        or not 1 <= len(members) <= 40
+        or not all(isinstance(value, str) for value in members)
+        or len(set(members)) != len(members)
+    ):
+        return []
+    rows = session.execute(
+        select(RegulatoryChunk, RegulatoryLabelingItem)
+        .join(
+            RegulatoryLabelingItem,
+            (RegulatoryLabelingItem.regulatory_chunk_id == RegulatoryChunk.id)
+            & (RegulatoryLabelingItem.user_file_id == RegulatoryChunk.user_file_id),
+        )
+        .where(
+            RegulatoryLabelingItem.run_id == run.id,
+            RegulatoryChunk.user_file_id == item.user_file_id,
+            RegulatoryChunk.id.in_(members),
+        )
+        .execution_options(populate_existing=True)
+    ).all()
+    return [
+        DependentClauseRepairSource(
+            chunk_id=row.id,
+            file_id=str(row.user_file_id),
+            text=frozen.text_snapshot,
+            canonical_text_sha256=frozen.canonical_text_sha256 or "",
+            snapshot=frozen.source_snapshot,
+            current_text=row.text,
+            current_snapshot={
+                "position": row.position,
+                "heading_path": row.heading_path,
+                "chunk_type": row.chunk_type,
+                "chunk_metadata": row.chunk_metadata,
+                "validity_start_date": row.validity_start_date.isoformat()
+                if row.validity_start_date
+                else None,
+                "validity_end_date": row.validity_end_date.isoformat()
+                if row.validity_end_date
+                else None,
+            },
+            active=row.status == "active" and row.superseded_by_chunk_id is None,
+        )
+        for row, frozen in rows
+    ]
+
+
+def _legacy_dependent_clause_is_current(
+    session: Session, *, item: RegulatoryLabelingItem, run: RegulatoryLabelingRun
+) -> bool:
+    return legacy_dependent_clause_shape(
+        item.text_snapshot
+    ) and legacy_dependent_clause_repair_candidate(
+        chunk_id=item.regulatory_chunk_id,
+        sources=_legacy_list_sources(session, item=item, run=run),
+    )
+
+
+def _legacy_logo_intro_is_current(
+    session: Session, *, item: RegulatoryLabelingItem, run: RegulatoryLabelingRun
+) -> bool:
+    return legacy_logo_intro_shape(
+        item.text_snapshot
+    ) and legacy_logo_intro_repair_candidate(
+        chunk_id=item.regulatory_chunk_id,
+        sources=_legacy_list_sources(session, item=item, run=run),
+    )
+
+
+def _legacy_inspection_caption_is_current(
+    session: Session, *, item: RegulatoryLabelingItem, run: RegulatoryLabelingRun
+) -> bool:
+    return legacy_inspection_caption_shape(
+        item.text_snapshot
+    ) and legacy_inspection_caption_repair_candidate(
+        chunk_id=item.regulatory_chunk_id,
+        sources=_legacy_list_sources(session, item=item, run=run),
+    )
 
 
 def _legacy_annex_caption_is_current(
@@ -131,7 +229,13 @@ def require_current_intake_repair_item(
         or item.canonical_text_sha256 != context_hash(row.text)
     ):
         raise ValueError("Semantic repair canonical source snapshot changed")
-    if row.chunk_metadata.get("intake_chunking_version") in ("4", "5"):
+    if chapter_caption_candidate(row.text):
+        from onyx.db.regulatory_labeling_chapter_caption import (
+            require_current_chapter_caption,
+        )
+
+        require_current_chapter_caption(session, item=item, run=run)
+    elif row.chunk_metadata.get("intake_chunking_version") in ("4", "5"):
         require_owned_v4_intake_source(
             session,
             user_file_id=item.user_file_id,
@@ -139,9 +243,15 @@ def require_current_intake_repair_item(
             chunk_type=row.chunk_type,
             document_set_id=run.document_set_id,
         )
-    elif legacy_structural_repair_candidate(
-        chunk_id=row.id, text=row.text, source_snapshot=item.source_snapshot
-    ) or _legacy_annex_caption_is_current(session, item=item, run=run):
+    elif (
+        legacy_structural_repair_candidate(
+            chunk_id=row.id, text=row.text, source_snapshot=item.source_snapshot
+        )
+        or _legacy_annex_caption_is_current(session, item=item, run=run)
+        or _legacy_dependent_clause_is_current(session, item=item, run=run)
+        or _legacy_logo_intro_is_current(session, item=item, run=run)
+        or _legacy_inspection_caption_is_current(session, item=item, run=run)
+    ):
         require_owned_intake_source(
             session,
             user_file_id=item.user_file_id,

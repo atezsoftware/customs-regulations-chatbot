@@ -77,10 +77,16 @@ def _decode_result(data: bytes, *, request_hash: str) -> VertexBatchResult:
 
 
 class LabelingResultSpool:
-    def __init__(self, *, max_result_bytes: int = _MAX_RESULT_BYTES) -> None:
+    def __init__(
+        self,
+        *,
+        max_result_bytes: int = _MAX_RESULT_BYTES,
+        retain_raw_rows: bool = False,
+    ) -> None:
         if not 1 <= max_result_bytes <= _MAX_RESULT_BYTES:
             raise ValueError("Labeling result byte limit must be between 1 and 8 GiB")
         self._max_result_bytes = max_result_bytes
+        self._retain_raw_rows = retain_raw_rows
         self._directory: TemporaryDirectory[str] | None = None
         self._connection: sqlite3.Connection | None = None
         self._entered = False
@@ -109,7 +115,7 @@ class LabelingResultSpool:
                 connection.execute("PRAGMA synchronous=OFF")
                 connection.execute("PRAGMA temp_store=FILE")
                 connection.execute(
-                    "CREATE TABLE expected (request_hash TEXT PRIMARY KEY, result BLOB) "
+                    "CREATE TABLE expected (request_hash TEXT PRIMARY KEY, result BLOB, raw_line BLOB) "
                     "WITHOUT ROWID"
                 )
             return self
@@ -204,8 +210,14 @@ class LabelingResultSpool:
                             "Serialized labeling result exceeds its size limit"
                         )
                     connection.execute(
-                        "UPDATE expected SET result = ? WHERE request_hash = ?",
-                        (zlib.compress(serialized), key),
+                        "UPDATE expected SET result = ?, raw_line = ? WHERE request_hash = ?",
+                        (
+                            zlib.compress(serialized),
+                            zlib.compress(line.encode())
+                            if self._retain_raw_rows
+                            else None,
+                            key,
+                        ),
                     )
                 connection.commit()
             _close_iterator(iterator)
@@ -242,3 +254,32 @@ class LabelingResultSpool:
             for request_hash, result in rows
             if result is not None
         }
+
+    def get_raw_line(self, request_hash: str) -> str | None:
+        """Return the actual staged row only for explicitly opted-in intake jobs."""
+        if not self._validated:
+            raise ValueError("Labeling output has not been fully validated")
+        key = _validate_hash(request_hash)
+        with _database_errors():
+            row = (
+                self._active_connection()
+                .execute("SELECT raw_line FROM expected WHERE request_hash = ?", (key,))
+                .fetchone()
+            )
+        if row is None:
+            raise ValueError("Labeling raw result has an unexpected request hash")
+        if row[0] is None:
+            return None
+        decoder = zlib.decompressobj()
+        try:
+            raw = decoder.decompress(row[0], MAX_RESPONSE_BYTES + 1)
+        except (zlib.error, TypeError):
+            raise ValueError("Labeling raw result is invalid") from None
+        if (
+            len(raw) > MAX_RESPONSE_BYTES
+            or decoder.unconsumed_tail
+            or decoder.unused_data
+            or not decoder.eof
+        ):
+            raise ValueError("Labeling raw result exceeds its byte or frame budget")
+        return raw.decode("utf-8")

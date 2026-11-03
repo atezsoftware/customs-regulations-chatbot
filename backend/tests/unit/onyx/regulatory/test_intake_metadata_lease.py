@@ -23,7 +23,7 @@ from shared_configs.contextvars import (
 )
 from tests.unit.onyx.regulatory.test_intake_metadata import _sources
 
-_RECIPE = "240e5cab5a82314d9b6725f22ecb204d03dad60d797c200455decb7ddd112908"
+_RECIPE = "76dc0610dfc00e1f736440921bb30bc1cf0cd6fa1fc6ed8fd133d0ee43ddcb93"
 
 
 @pytest.mark.parametrize(
@@ -266,5 +266,5 @@ def test_db_timeout_cannot_authorize_a_metadata_write(
     session.commit.assert_not_called()
 
 
-def test_lease_keepalive_does_not_change_the_latest_semantic_recipe() -> None:
+def test_current_metadata_semantic_contract_recipe_is_frozen() -> None:
     assert metadata_job.metadata_recipe_sha256() == _RECIPE

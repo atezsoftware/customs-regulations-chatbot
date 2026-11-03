@@ -327,6 +327,24 @@ def _validated_checkpoint(
     capture: bool = False,
     rebase_recipe: bool = False,
 ) -> MetadataCheckpoint:
+    from onyx.db.document_intake_metadata_contract_retry import (
+        contract_retry,
+        require_current_contract,
+    )
+
+    if contract_retry(batch) is not None:
+        intent, _pending = require_current_contract(
+            session, batch, require_complete=False
+        )
+        saved = MetadataCheckpoint.model_validate(batch.metadata_checkpoint)
+        if (
+            saved.provider_binding != binding.model_dump(mode="json")
+            or intent.recipe_sha256 != recipe_sha256
+        ):
+            raise intake.IntakeConflictError(
+                "The contract metadata request or provider changed"
+            )
+        return saved
     try:
         source, requests, completed = _source_snapshot(session, batch)
         current = MetadataCheckpoint.build(

@@ -96,7 +96,13 @@ def _enqueue_batch(
     )
 
     try:
-        if batch.stage == "reprepare":
+        if batch.stage == "metadata":
+            from onyx.background.celery.tasks.regulatory_amendments.document_intake import (
+                enqueue_intake_metadata_recovery,
+            )
+
+            enqueue_intake_metadata_recovery(batch_id=batch.id, tenant_id=tenant_id)
+        elif batch.stage == "reprepare":
             from onyx.db.document_intake_reprepare import latest_reprepare
 
             request = latest_reprepare(session, batch.id)

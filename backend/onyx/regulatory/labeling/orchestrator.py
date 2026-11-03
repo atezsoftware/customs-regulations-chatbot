@@ -5,6 +5,7 @@ import time
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from enum import StrEnum
+from hashlib import sha256
 from typing import Protocol, cast, runtime_checkable
 from uuid import UUID
 
@@ -35,12 +36,16 @@ from onyx.regulatory.indexing_jobs.vertex_batch import (
     vertex_jsonl_line_size,
 )
 from onyx.regulatory.labeling.accepted_result import (
+    AcceptedDuplicateLabelRepair,
     AcceptedIntakeRepair,
     LabelingApplyOutcome,
     SourceOnlyArticleLeadIn,
+    SourceOnlyChapterCaption,
+    SourceOnlyReviewedFragment,
     SourceOnlySelfRepeal,
 )
 from onyx.regulatory.labeling.article_lead_in import article_lead_in_candidate
+from onyx.regulatory.labeling.chapter_caption import chapter_caption_candidate
 from onyx.regulatory.labeling.domain import shard_by_count_and_bytes
 from onyx.regulatory.labeling.intake_abstention_repair import (
     build_abstention_repair,
@@ -49,6 +54,19 @@ from onyx.regulatory.labeling.intake_abstention_repair import (
     parse_abstention_repair_output,
     validate_abstention_repair,
 )
+from onyx.regulatory.labeling.intake_dependent_clause_repair import (
+    legacy_dependent_clause_shape,
+)
+from onyx.regulatory.labeling.intake_duplicate_label_repair import (
+    build_duplicate_label_repair,
+    build_duplicate_repair_audit,
+    known_duplicate_shape,
+    parse_duplicate_output,
+)
+from onyx.regulatory.labeling.intake_inspection_caption_repair import (
+    legacy_inspection_caption_shape,
+)
+from onyx.regulatory.labeling.intake_logo_intro_repair import legacy_logo_intro_shape
 from onyx.regulatory.labeling.intake_quote_repair import (
     QUOTE_ERRORS,
     build_quote_repair,
@@ -64,6 +82,10 @@ from onyx.regulatory.labeling.provider import (
     TaxonomyDefinition,
     build_labeling_request,
     validate_labeling_response,
+)
+from onyx.regulatory.labeling.reviewed_fragment import (
+    reviewed_figure_fragment_candidate,
+    reviewed_fragment_candidate,
 )
 from onyx.utils.logger import setup_logger
 from shared_configs.contextvars import get_current_tenant_id
@@ -838,6 +860,149 @@ class _IntakeAbstentionRepairRejected(ValueError):
     """The sole semantic reconsideration did not produce a validated outcome."""
 
 
+class _IntakeDuplicateRepairRejected(ValueError):
+    """One duplicate-group selection failed its unchanged source/quote contract."""
+
+
+def _repair_intake_duplicates(
+    lease: repository.RunLease,
+    shard_id: UUID,
+    item: RegulatoryLabelingItem,
+    gateway: VertexBatchGateway,
+    rejected_response: str,
+    original_line: str,
+    taxonomy: TaxonomyDefinition,
+    heartbeat: Callable[[], None],
+) -> AcceptedDuplicateLabelRepair:
+    from onyx.db.regulatory_labeling_duplicate_evidence import (
+        load_duplicate_ack,
+        validate_duplicate_ack_header,
+    )
+    from onyx.db.regulatory_labeling_duplicate_repair import (
+        load_current_duplicate_repair_authority,
+    )
+
+    try:
+        with get_session_with_current_tenant() as session:
+            authority = load_current_duplicate_repair_authority(
+                session, lease=lease, shard_id=shard_id, item_id=item.id
+            )
+            base_ack = load_duplicate_ack(
+                session,
+                binding_fingerprint=authority.binding_fingerprint,
+                submission_key=authority.base_submission_key,
+                request=authority.base_request,
+                expected_line=original_line,
+            )
+        if base_ack.response_sha256 != sha256(rejected_response.encode()).hexdigest():
+            raise ValueError(
+                "The original duplicate-label response differs from its ACK"
+            )
+        repair = build_duplicate_label_repair(
+            base_request=authority.base_request,
+            rejected_response=rejected_response,
+            text=item.text_snapshot,
+            chunk_id=item.regulatory_chunk_id,
+            source_hash=item.canonical_text_sha256 or "",
+            taxonomy=taxonomy,
+            provider_binding=authority.provider_binding,
+        )
+        submission_key = vertex_batch_submission_key(
+            [repair.request],
+            tenant_id=get_current_tenant_id(),
+            job_id=lease.run_id,
+            output_prefix=f"regulatory-labeling/{lease.run_id}/duplicate-label-repair/{shard_id}/{item.id}",
+            submission_attempt=1,
+        ).replace("regulatory-context-", "regulatory-labeling-", 1)
+        with get_session_with_current_tenant() as session:
+            if (
+                load_current_duplicate_repair_authority(
+                    session, lease=lease, shard_id=shard_id, item_id=item.id
+                )
+                != authority
+            ):
+                raise IntakeLabelRepairSourceChangedError(
+                    "The duplicate-label source changed before submission"
+                )
+            validate_duplicate_ack_header(session, base_ack)
+    except ValueError as error:
+        raise _IntakeDuplicateRepairRejected(str(error)) from error
+    if isinstance(gateway, StreamingLabelingGateway):
+        state = gateway.submit_stream(
+            iter([repair.request]),
+            submission_key=submission_key,
+            max_jsonl_bytes=LABELING_SHARD_BYTES,
+            on_progress=heartbeat,
+        )
+    else:
+        state = gateway.submit(
+            [repair.request],
+            submission_key=submission_key,
+            max_jsonl_bytes=LABELING_SHARD_BYTES,
+        )
+    with get_session_with_current_tenant() as session:
+        if (
+            load_current_duplicate_repair_authority(
+                session, lease=lease, shard_id=shard_id, item_id=item.id
+            )
+            != authority
+        ):
+            raise IntakeLabelRepairSourceChangedError(
+                "The duplicate-label source changed after submission"
+            )
+        validate_duplicate_ack_header(session, base_ack)
+    if state.status is not VertexBatchJobStatus.SUCCEEDED or not state.output_uri:
+        raise _IntakeDuplicateRepairRejected(
+            "Duplicate-label selection returned no completed ACK"
+        )
+    try:
+        response, raw_line = parse_duplicate_output(
+            gateway.read_results(state.output_uri),
+            request=repair.request,
+            on_progress=heartbeat,
+        )
+        with get_session_with_current_tenant() as session:
+            if (
+                load_current_duplicate_repair_authority(
+                    session, lease=lease, shard_id=shard_id, item_id=item.id
+                )
+                != authority
+            ):
+                raise IntakeLabelRepairSourceChangedError(
+                    "The duplicate-label authority changed before acceptance"
+                )
+            validate_duplicate_ack_header(session, base_ack)
+            repair_ack = load_duplicate_ack(
+                session,
+                binding_fingerprint=authority.binding_fingerprint,
+                submission_key=submission_key,
+                request=repair.request,
+                expected_line=raw_line,
+            )
+        audit = build_duplicate_repair_audit(
+            repair=repair,
+            selection_response=response,
+            base_ack=base_ack,
+            repair_ack=repair_ack,
+            source_binding=authority.source_binding,
+            text=item.text_snapshot,
+            taxonomy=taxonomy,
+        )
+    except ValueError as error:
+        raise _IntakeDuplicateRepairRejected(str(error)) from error
+    logger.info(
+        "Intake duplicate-label selection run=%s chunk=%s base_request=%s rejected_response=%s repair_request=%s base_ack=%s repair_ack=%s",
+        lease.run_id,
+        item.regulatory_chunk_id,
+        repair.base_request.request_hash,
+        repair.rejected_response_sha256,
+        repair.request.request_hash,
+        base_ack.blob_sha256,
+        repair_ack.blob_sha256,
+    )
+    return AcceptedDuplicateLabelRepair(outcome=audit.outcome, audit=audit)
+
+
 def _repair_intake_abstention(
     lease: repository.RunLease,
     shard_id: UUID,
@@ -846,7 +1011,13 @@ def _repair_intake_abstention(
     rejected_response: str,
     taxonomy: TaxonomyDefinition,
     heartbeat: Callable[[], None],
-) -> AcceptedIntakeRepair | SourceOnlySelfRepeal | SourceOnlyArticleLeadIn:
+) -> (
+    AcceptedIntakeRepair
+    | SourceOnlySelfRepeal
+    | SourceOnlyArticleLeadIn
+    | SourceOnlyChapterCaption
+    | SourceOnlyReviewedFragment
+):
     from onyx.db.regulatory_labeling_semantic_repair import (
         require_current_intake_repair_item,
     )
@@ -963,6 +1134,32 @@ def _repair_intake_abstention(
                     RegulatoryLabelingItem, item.id, populate_existing=True
                 )
                 run = repository.load_claimed_run(session, lease)
+                if reviewed_figure_fragment_candidate(current_item.text_snapshot):
+                    from onyx.db.regulatory_labeling_reviewed_fragment import (
+                        build_source_only_reviewed_fragment_receipt,
+                    )
+
+                    return SourceOnlyReviewedFragment(
+                        receipt=build_source_only_reviewed_fragment_receipt(
+                            session,
+                            item=current_item,
+                            run=run,
+                            provider_abstention=audit,
+                        )
+                    )
+                if chapter_caption_candidate(current_item.text_snapshot):
+                    from onyx.db.regulatory_labeling_chapter_caption import (
+                        build_source_only_chapter_caption_receipt,
+                    )
+
+                    return SourceOnlyChapterCaption(
+                        receipt=build_source_only_chapter_caption_receipt(
+                            session,
+                            item=current_item,
+                            run=run,
+                            provider_abstention=audit,
+                        )
+                    )
                 if article_lead_in_candidate(current_item.text_snapshot):
                     from onyx.db.regulatory_labeling_article_lead_in import (
                         build_source_only_article_lead_in_receipt,
@@ -1116,7 +1313,7 @@ def _read_and_apply_results(
 
             intake_quotes = is_current_intake_labeling_run(session, run)
         session.commit()
-    with LabelingResultSpool() as spool:
+    with LabelingResultSpool(retain_raw_rows=intake_quotes) as spool:
         for items in _result_pages(lease, shard_id, heartbeat):
             spool.add_expected(
                 item.request_hash for item in items if item.request_hash is not None
@@ -1177,6 +1374,31 @@ def _read_and_apply_results(
                             result.context, text=item.text_snapshot, taxonomy=taxonomy
                         )
                 except ValueError as error:
+                    if intake_quotes and known_duplicate_shape(
+                        result.context, taxonomy
+                    ):
+                        try:
+                            original_line = spool.get_raw_line(request_hash)
+                            if original_line is None:
+                                raise _IntakeDuplicateRepairRejected(
+                                    "The actual duplicate-label ACK row is absent"
+                                )
+                            outcomes[request_hash] = _repair_intake_duplicates(
+                                lease,
+                                shard_id,
+                                item,
+                                gateway,
+                                result.context,
+                                original_line,
+                                taxonomy,
+                                heartbeat,
+                            )
+                        except (
+                            ValueError,
+                            IntakeLabelRepairSourceChangedError,
+                        ) as duplicate_error:
+                            outcomes[request_hash] = str(duplicate_error)
+                        continue
                     if not intake_quotes or str(error) not in QUOTE_ERRORS:
                         outcomes[request_hash] = str(error)
                         continue
@@ -1196,6 +1418,43 @@ def _read_and_apply_results(
                     ) as repair_error:
                         outcomes[request_hash] = str(repair_error)
                         continue
+                if (
+                    outcome.abstained
+                    and intake_quotes
+                    and reviewed_fragment_candidate(item.text_snapshot)
+                ):
+                    try:
+                        original_line = spool.get_raw_line(request_hash)
+                        if original_line is None:
+                            raise ValueError(
+                                "The actual reviewed-fragment base ACK row is absent"
+                            )
+                        with get_session_with_current_tenant() as session:
+                            from onyx.db.regulatory_labeling_reviewed_fragment import (
+                                build_source_only_reviewed_fragment_receipt,
+                            )
+
+                            load_current_intake_label_repair_request(
+                                session, lease, shard_id, item.id
+                            )
+                            current_item = session.get_one(
+                                RegulatoryLabelingItem, item.id, populate_existing=True
+                            )
+                            current_run = repository.load_claimed_run(session, lease)
+                            outcomes[request_hash] = SourceOnlyReviewedFragment(
+                                build_source_only_reviewed_fragment_receipt(
+                                    session,
+                                    item=current_item,
+                                    run=current_run,
+                                    original_line=original_line,
+                                )
+                            )
+                    except (
+                        ValueError,
+                        IntakeLabelRepairSourceChangedError,
+                    ) as reviewed_error:
+                        outcomes[request_hash] = str(reviewed_error)
+                    continue
                 if outcome.abstained:
                     metadata = item.source_snapshot.get("chunk_metadata")
                     if (
@@ -1212,6 +1471,10 @@ def _read_and_apply_results(
                                 source_snapshot=item.source_snapshot,
                             )
                             or legacy_annex_caption_shape(item.text_snapshot)
+                            or legacy_dependent_clause_shape(item.text_snapshot)
+                            or legacy_logo_intro_shape(item.text_snapshot)
+                            or legacy_inspection_caption_shape(item.text_snapshot)
+                            or chapter_caption_candidate(item.text_snapshot)
                         )
                     ):
                         try:

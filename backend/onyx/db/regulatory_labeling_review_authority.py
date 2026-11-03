@@ -12,6 +12,9 @@ from onyx.db.models import (
     RegulatoryLabelingRun,
     RegulatoryLabelTaxonomy,
 )
+from onyx.db.regulatory_labeling_duplicate_repair import (
+    validate_item_duplicate_repair_audit,
+)
 from onyx.db.regulatory_labeling_readers import (
     STRUCTURAL_READER_KEY,
     validated_reader_proof,
@@ -29,11 +32,20 @@ from onyx.regulatory.labeling.article_lead_in import (
     ARTICLE_LEAD_IN_KEY,
     SourceOnlyArticleLeadInReceipt,
 )
+from onyx.regulatory.labeling.chapter_caption import (
+    CHAPTER_CAPTION_KEY,
+    SourceOnlyChapterCaptionReceipt,
+)
 from onyx.regulatory.labeling.intake_abstention_repair import AbstentionRepairAudit
+from onyx.regulatory.labeling.intake_duplicate_label_repair import DUPLICATE_REPAIR_KEY
 from onyx.regulatory.labeling.provider import (
     TaxonomyDefinition,
     build_labeling_request,
     validate_labeling_response,
+)
+from onyx.regulatory.labeling.reviewed_fragment import (
+    REVIEWED_FRAGMENT_KEY,
+    SourceOnlyReviewedFragmentReceipt,
 )
 from onyx.regulatory.labeling.self_repeal import (
     SOURCE_ONLY_KEY,
@@ -67,6 +79,8 @@ def _validate_completed_leaf(
         item.status != "completed"
         or SOURCE_ONLY_KEY in item.source_snapshot
         or ARTICLE_LEAD_IN_KEY in item.source_snapshot
+        or CHAPTER_CAPTION_KEY in item.source_snapshot
+        or REVIEWED_FRAGMENT_KEY in item.source_snapshot
     ):
         return
     if (
@@ -105,8 +119,15 @@ def labeling_review_authority(
                 RegulatoryLabelingItem.run_id == run_id,
                 or_(
                     RegulatoryLabelingItem.source_snapshot.op("?")(SEMANTIC_REPAIR_KEY),
+                    RegulatoryLabelingItem.source_snapshot.op("?")(
+                        DUPLICATE_REPAIR_KEY
+                    ),
                     RegulatoryLabelingItem.source_snapshot.op("?")(SOURCE_ONLY_KEY),
                     RegulatoryLabelingItem.source_snapshot.op("?")(ARTICLE_LEAD_IN_KEY),
+                    RegulatoryLabelingItem.source_snapshot.op("?")(CHAPTER_CAPTION_KEY),
+                    RegulatoryLabelingItem.source_snapshot.op("?")(
+                        REVIEWED_FRAGMENT_KEY
+                    ),
                 ),
             )
             .order_by(RegulatoryLabelingItem.regulatory_chunk_id)
@@ -138,9 +159,59 @@ def labeling_review_authority(
     )
 
     semantic: list[dict[str, object]] = []
+    duplicate_selections: list[dict[str, object]] = []
     source_only: list[dict[str, object]] = []
     lead_ins: list[dict[str, object]] = []
+    chapter_captions: list[dict[str, object]] = []
+    reviewed_fragments: list[dict[str, object]] = []
     for item in repairs:
+        if DUPLICATE_REPAIR_KEY in item.source_snapshot:
+            duplicate = validate_item_duplicate_repair_audit(
+                session, item=item, run=run
+            )
+            if duplicate is None:
+                raise ValueError("The duplicate-label review receipt is absent")
+            duplicate_selections.append(
+                {
+                    "chunk_id": item.regulatory_chunk_id,
+                    "audit_sha256": duplicate.audit_sha256,
+                }
+            )
+            continue
+        if REVIEWED_FRAGMENT_KEY in item.source_snapshot:
+            from onyx.db.regulatory_labeling_reviewed_fragment import (
+                validate_item_reviewed_fragment_receipt,
+            )
+
+            validate_item_reviewed_fragment_receipt(session, item=item, run=run)
+            reviewed_fragments.append(
+                {
+                    "chunk_id": item.regulatory_chunk_id,
+                    "receipt_sha256": publication_digest(
+                        SourceOnlyReviewedFragmentReceipt.model_validate(
+                            item.source_snapshot[REVIEWED_FRAGMENT_KEY]
+                        ).model_dump(mode="json")
+                    ),
+                }
+            )
+            continue
+        if CHAPTER_CAPTION_KEY in item.source_snapshot:
+            from onyx.db.regulatory_labeling_chapter_caption import (
+                validate_item_chapter_caption_receipt,
+            )
+
+            validate_item_chapter_caption_receipt(session, item=item, run=run)
+            chapter_captions.append(
+                {
+                    "chunk_id": item.regulatory_chunk_id,
+                    "receipt_sha256": publication_digest(
+                        SourceOnlyChapterCaptionReceipt.model_validate(
+                            item.source_snapshot[CHAPTER_CAPTION_KEY]
+                        ).model_dump(mode="json")
+                    ),
+                }
+            )
+            continue
         if ARTICLE_LEAD_IN_KEY in item.source_snapshot:
             from onyx.db.regulatory_labeling_article_lead_in import (
                 validate_item_article_lead_in_receipt,
@@ -212,7 +283,20 @@ def labeling_review_authority(
         for leaf in leaves:
             _validate_completed_leaf(leaf, taxonomy)
             validate_item_semantic_repair_audit(session, item=leaf, run=run)
+            validate_item_duplicate_repair_audit(session, item=leaf, run=run)
             validate_item_source_only_receipt(session, item=leaf, run=run)
+            if REVIEWED_FRAGMENT_KEY in leaf.source_snapshot:
+                from onyx.db.regulatory_labeling_reviewed_fragment import (
+                    validate_item_reviewed_fragment_receipt,
+                )
+
+                validate_item_reviewed_fragment_receipt(session, item=leaf, run=run)
+            if CHAPTER_CAPTION_KEY in leaf.source_snapshot:
+                from onyx.db.regulatory_labeling_chapter_caption import (
+                    validate_item_chapter_caption_receipt,
+                )
+
+                validate_item_chapter_caption_receipt(session, item=leaf, run=run)
             if ARTICLE_LEAD_IN_KEY in leaf.source_snapshot:
                 from onyx.db.regulatory_labeling_article_lead_in import (
                     validate_item_article_lead_in_receipt,
@@ -267,7 +351,22 @@ def labeling_review_authority(
         "taxonomy_id": str(run.taxonomy_id),
         "model": run.model,
         "semantic_repairs": semantic,
+        **(
+            {"duplicate_label_selections": duplicate_selections}
+            if duplicate_selections
+            else {}
+        ),
         **({"source_only_dispositions": source_only} if source_only else {}),
         **({"article_lead_in_dispositions": lead_ins} if lead_ins else {}),
+        **(
+            {"chapter_caption_dispositions": chapter_captions}
+            if chapter_captions
+            else {}
+        ),
+        **(
+            {"reviewed_fragment_dispositions": reviewed_fragments}
+            if reviewed_fragments
+            else {}
+        ),
         "structural_readers": structural,
     }
