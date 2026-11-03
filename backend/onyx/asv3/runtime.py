@@ -650,6 +650,9 @@ def run_asv3_loop(
         )
     context.language = profile.language
     context.services["research_profile"] = research_profile
+    context.services["asv3_standard_normal"] = (
+        workflow_variant == ASV3_STANDARD_VARIANT and research_profile == "normal"
+    )
     context.services["asv3_legacy_search_payload"] = workflow_variant in {
         ASV3_STANDARD_VARIANT,
         ASV3_TUNED_VARIANT,
