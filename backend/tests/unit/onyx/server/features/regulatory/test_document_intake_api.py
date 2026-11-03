@@ -196,6 +196,38 @@ def test_approve_queues_only_durable_intake_file_requests(
     assert events == ["commit", "index", "commit"]
 
 
+@pytest.mark.parametrize("limit,expected_status", [(100, 200), (101, 422), (200, 422)])
+def test_chunk_page_limit_is_validated_before_the_bounded_reader(
+    monkeypatch: pytest.MonkeyPatch, limit: int, expected_status: int
+) -> None:
+    batch_id, document_id = uuid4(), uuid4()
+    batch = SimpleNamespace(id=batch_id)
+    session = MagicMock(spec=Session)
+    get_batch = MagicMock(return_value=batch)
+    monkeypatch.setattr(api.repository, "get_intake", get_batch)
+    page = MagicMock(return_value=([], 0))
+    monkeypatch.setattr(api.repository, "intake_chunk_page", page)
+    diagnostics = MagicMock(return_value={})
+    monkeypatch.setattr(
+        api.repository, "intake_chunk_labeling_diagnostics", diagnostics
+    )
+
+    response = _client(session).get(
+        f"/regulatory/document-intake/batches/{batch_id}/documents/{document_id}/chunks",
+        params={"limit": limit},
+    )
+
+    assert response.status_code == expected_status
+    if limit == 100:
+        page.assert_called_once_with(session, batch, document_id, offset=0, limit=100)
+        assert response.json() == {"items": [], "total": 0, "offset": 0, "limit": 100}
+    else:
+        assert response.json()["detail"][0]["loc"] == ["query", "limit"]
+        get_batch.assert_not_called()
+        page.assert_not_called()
+        diagnostics.assert_not_called()
+
+
 @pytest.mark.parametrize("assigned_labels", [[], ["subject:customs"]])
 def test_review_chunk_labels_overlay_does_not_mutate_canonical_metadata(
     monkeypatch: pytest.MonkeyPatch, assigned_labels: list[str]
