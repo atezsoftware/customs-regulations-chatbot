@@ -35,6 +35,11 @@ from onyx.asv3.models import (
     model_evidence_metadata,
 )
 from onyx.regulatory.heading_path import parse_regulatory_article_heading
+from onyx.regulatory.law_identity import (
+    LAW_DOCUMENT_TYPES,
+    exact_unnumbered_law_presentation,
+    unnumbered_own_law_masthead_number,
+)
 
 _FIELD = "cropped_ordered_source_read"
 _METHODS = {
@@ -44,6 +49,31 @@ _METHODS = {
     "read_chunk_context",
     "follow_reference",
 }
+
+
+def _identity_masthead_number(item: EvidenceItem, source_id: str) -> str | None:
+    metadata = model_evidence_metadata(item.metadata)
+    headings = metadata.get("heading_path")
+    title = str(metadata.get("title") or "")
+    if (
+        item.source_id != source_id
+        or not item.chunk_id
+        or hashlib.sha256(item.text.encode()).hexdigest() != item.text_hash
+        or item.search_doc is None
+        or item.search_doc.document_id != source_id
+        or item.search_doc.metadata.get("regulatory_chunk_id") != item.chunk_id
+        or str(metadata.get("document_type") or "").casefold() not in LAW_DOCUMENT_TYPES
+        or not isinstance(headings, list)
+        or not headings
+        or any(
+            metadata.get(key)
+            for key in ("derived", "external", "untrusted", "truncated")
+        )
+    ):
+        return None
+    return unnumbered_own_law_masthead_number(item.text, title, str(headings[0]))
+
+
 _PARAGRAPH = re.compile(r"^\s*(?:\((\d{1,3})\)|(\d{1,3})\.)\s+\S")
 _CONTINUING_PARAGRAPH = re.compile(r"^\s*\((\d{1,3})\)\s+\S")
 _UNNUMBERED_ARTICLE = re.compile(
@@ -509,14 +539,18 @@ class CroppedArticleBindings:
         if outcome.status not in {OutcomeStatus.FOUND, OutcomeStatus.PARTIAL}:
             return
         record = self._receipt_read(
-            ToolReceipt(call=call, outcome=outcome, evidence_ids=[], elapsed_seconds=0)
+            ToolReceipt(
+                call=call,
+                outcome=outcome,
+                evidence_ids=list(range(1, len(outcome.evidence) + 1)),
+                elapsed_seconds=0,
+            )
         )
         if record is None:
             return
-        provisional = record.model_copy(
-            update={"citations": list(range(1, len(outcome.evidence) + 1))}
+        self._validate_members(
+            record, [outcome.evidence[number - 1] for number in record.citations]
         )
-        self._validate_members(provisional, list(outcome.evidence))
         key = owner.task_id, owner.depth, owner.call_id
         with self._lock:
             pending = self._pending.setdefault(key, {})
@@ -860,11 +894,53 @@ class CroppedArticleBindings:
         if not isinstance(digest, str):
             raise ValueError("Ordered source witness has no digest")
         read = _Read.model_validate({k: v for k, v in raw.items() if k != "digest"})
+        citations = receipt.evidence_ids
+        if receipt.call.name == "read_named_provision" and len(
+            receipt.outcome.evidence
+        ) > len(read.members):
+            if len(citations) != len(receipt.outcome.evidence):
+                raise ValueError("Named source originals have incomplete receipt IDs")
+            expected = [(member.chunk_id, member.text_hash) for member in read.members]
+            expected_set = set(expected)
+            selected = []
+            actual = []
+            witnesses: set[str] = set()
+            selected_items: list[EvidenceItem] = []
+            for number, item in zip(citations, receipt.outcome.evidence, strict=True):
+                identity = item.chunk_id, item.text_hash
+                if identity in expected_set:
+                    selected.append(number)
+                    actual.append(identity)
+                    selected_items.append(item)
+                elif (
+                    own_number := _identity_masthead_number(item, read.source_id)
+                ) is not None:
+                    witnesses.add(own_number)
+                else:
+                    raise ValueError("Named read has an unrelated identity original")
+            if actual != expected or len(witnesses) != 1:
+                raise ValueError("Named source originals changed their ordered members")
+            own_number = next(iter(witnesses))
+            for item in selected_items:
+                metadata = model_evidence_metadata(item.metadata)
+                headings = metadata.get("heading_path")
+                title = str(metadata.get("title") or "")
+                if (
+                    not isinstance(headings, list)
+                    or not headings
+                    or not exact_unnumbered_law_presentation(
+                        title, str(headings[0]), title, own_number
+                    )
+                ):
+                    raise ValueError(
+                        "Named source original has a conflicting own title"
+                    )
+            citations = selected
         record = _RecordedRead(
             call_id=receipt.call.call_id,
             method=receipt.call.name,
             read=read,
-            citations=receipt.evidence_ids,
+            citations=citations,
             digest=digest,
         )
         actual_source = (
