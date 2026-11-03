@@ -16,6 +16,8 @@ from onyx.db import document_intake_review as review
 from onyx.db.models import RegulatoryChunk, RegulatoryDocumentIntake
 from onyx.regulatory.document_intake.metadata import (
     METADATA_AUDIT_KEY,
+    METADATA_MODEL,
+    METADATA_VERSION,
     metadata_input_hash,
 )
 
@@ -45,13 +47,17 @@ def _rows(
         row.chunk_metadata = {
             **row.chunk_metadata,
             METADATA_AUDIT_KEY: {
+                "model": METADATA_MODEL,
+                "version": METADATA_VERSION,
                 "input_sha256": input_hash,
+                "input_stale": False,
                 "fields": {},
             },
         }
     evidence = rows[1] if invalid else rows[0]
     rows[0].chunk_metadata[METADATA_AUDIT_KEY]["fields"][field] = {
         "source": source,
+        "stale": False,
         "basis": "explicit",
         "request_hash": "a" * 64,
         "source_chunk_id": evidence.id,
@@ -98,6 +104,7 @@ def test_receipt_hash_skip_revalidates_and_preserves_other_completed_files(
         RegulatoryDocumentIntake,
         SimpleNamespace(
             labeling_run_id=uuid4() if labeling else None,
+            metadata_checkpoint=None,
             status="preparing",
             stage="chunking",
             lease_token=lease,
