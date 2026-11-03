@@ -9,6 +9,12 @@ from onyx.regulatory.document_intake.structural_readers import (
 )
 
 _FOLIO = re.compile(r"Yönetmelik Adı – [1-9][0-9]{0,3}")
+_CAPTION = re.compile(
+    r"[A-ZÇĞİÖŞÜ][a-zçğıöşü]*(?: (?:ve|veya|ile|[A-ZÇĞİÖŞÜ][a-zçğıöşü]*))*"
+)
+_OPERATIVE_PREDICATE = re.compile(
+    r"(?:[dt][ıiuü]r|[ln][ıiuü]r|[ae]c[ae]k|m[ae]l[ıi]|gerekir|yükümlü|zorunda)\b", re.I
+)
 _OPERATIVE_PREFIX = re.compile(
     r"^(?:(?:GEÇİCİ\s+|EK\s+)?MADDE\b|EK\s*[-–]?\s*\d|"
     r"\(\d+\)|\d+[.)]|[a-zçğıöşü]\))",
@@ -54,6 +60,8 @@ def legacy_structural_repair_candidate(
     audit = metadata.get("intake_legal_metadata")
     if (
         not isinstance(headings, list)
+        or not _CAPTION.fullmatch(text)
+        or _OPERATIVE_PREDICATE.search(text)
         or len(headings) < 2
         or not all(isinstance(heading, str) for heading in headings)
         or not is_ordinal_chapter_heading(headings[-1])

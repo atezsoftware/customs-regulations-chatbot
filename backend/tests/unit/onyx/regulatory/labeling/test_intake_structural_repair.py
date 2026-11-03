@@ -110,6 +110,7 @@ def test_operative_or_table_locator_never_qualifies(field: str, text: str) -> No
     "change",
     [
         "short-body",
+        "operative-title",
         "extra-body",
         "table",
         "non-atomic",
@@ -132,7 +133,11 @@ def test_structure_requires_positive_whole_body_proof(change: str) -> None:
     metadata = snapshot["chunk_metadata"]
     field = metadata["intake_legal_metadata"]["fields"]["section_title"]
     if change == "short-body":
-        text = "Vergi uygulanır."
+        text = "Başvuru yapan kişiler ödeme yapmakla yükümlüdür."
+        metadata["section_title"] = field["evidence_quote"] = text
+    elif change == "operative-title":
+        text = "Başvuru Yapan Kişiler Ödeme Yapmakla Yükümlüdür"
+        metadata["section_title"] = field["evidence_quote"] = text
     elif change == "extra-body":
         text += "\n(1) Bu Yönetmelik uygulanır."
     elif change == "table":
