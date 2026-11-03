@@ -1,5 +1,6 @@
 """A recovered metadata result preserves the request that supplied each fact."""
 
+from datetime import datetime, timedelta, timezone
 from typing import cast
 from unittest.mock import MagicMock
 from uuid import uuid4
@@ -39,8 +40,17 @@ def test_applied_metadata_distinguishes_retained_current_and_manual_fact_sources
             },
         },
     )
-    batch = RegulatoryDocumentIntake(id=uuid4())
-    session = cast(Session, MagicMock(spec=Session))
+    token = uuid4()
+    batch = RegulatoryDocumentIntake(
+        id=uuid4(),
+        status="preparing",
+        stage="metadata",
+        lease_token=token,
+        lease_expires_at=datetime.now(timezone.utc) + timedelta(minutes=10),
+    )
+    session_mock = MagicMock(spec=Session)
+    session_mock.get_one.return_value = batch
+    session = cast(Session, session_mock)
     monkeypatch.setattr(
         intake, "load_intake_job", MagicMock(return_value=(batch, None, []))
     )
@@ -79,7 +89,7 @@ def test_applied_metadata_distinguishes_retained_current_and_manual_fact_sources
     repository.apply_metadata_results(
         session,
         intake_id=batch.id,
-        lease_token=uuid4(),
+        lease_token=token,
         document_id=uuid4(),
         expected_input_sha256=metadata_input_hash(repository.metadata_chunks([chunk])),
         results=[(recovery_hash, result)],

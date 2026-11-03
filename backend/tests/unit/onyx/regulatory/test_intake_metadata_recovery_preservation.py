@@ -165,7 +165,7 @@ def test_retention_fills_last_distinct_field_within_eighteen_fact_limit() -> Non
         metadata.MetadataChunk(
             chunk_id="section",
             text=(
-                "Sayı : 31529\nBu Yönetmelik 1/1/2021 tarihinde yürürlüğe girer.\n"
+                "(1) Sayı : 31529\nBu Yönetmelik 1/1/2021 tarihinde yürürlüğe girer.\n"
                 "Bu Yönetmelik 1/1/2022 tarihinde sona erer."
             ),
             heading_path=[],
@@ -184,6 +184,8 @@ def test_retention_fills_last_distinct_field_within_eighteen_fact_limit() -> Non
             if field == "validity_end_date"
             else "2021-01-01"
             if field in metadata.DATE_FIELDS
+            else "1"
+            if field == "paragraph_no"
             else "31529"
         )
         fields.append(_fact(field, value, evidence.evidence_id))

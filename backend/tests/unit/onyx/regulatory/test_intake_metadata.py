@@ -2,7 +2,7 @@
 
 import json
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import MagicMock
@@ -395,6 +395,14 @@ def test_metadata_job_uses_bounded_240_second_gateway_with_complete_context(
         yield session
 
     monkeypatch.setattr(metadata_job, "get_session_with_current_tenant", session_scope)
+    monkeypatch.setattr(
+        metadata_job, "metadata_execution_lock", lambda _id: nullcontext(True)
+    )
+    monkeypatch.setattr(
+        metadata_job,
+        "require_current_metadata_checkpoint",
+        lambda *_args, **_kwargs: SimpleNamespace(recipe_sha256="b" * 64),
+    )
     monkeypatch.setattr(
         metadata_job.repository,
         "load_metadata_work",

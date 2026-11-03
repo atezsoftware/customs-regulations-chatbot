@@ -1196,6 +1196,83 @@ def _validate_article_evidence(
         raise ValueError("Metadata article locator contradicts its source evidence")
 
 
+def _paragraph_markers(text: str, *, numbered: bool = False) -> set[str]:
+    body = _fold(text.strip())
+    if _body_article_identity(body) is not None:
+        body = re.sub(
+            r"^(?:(?:ek|gecici|mukerrer)\s+)?(?:madde|article|art\.?)\s*"
+            r"\d+(?:/?[a-z])?\s*[-–—:.]?\s*",
+            "",
+            body,
+            count=1,
+        )
+    marker = r"(\d+)[.)]" if numbered else r"\([ \t]*(\d+)[ \t]*\)"
+    return set(
+        re.findall(
+            r"(?m)^[ \t]*(?:#{1,6}[ \t]+)?(?:\*\*|__)?"
+            + marker
+            + r"(?:\*\*|__)?(?=[ \t]|$)",
+            body,
+        )
+    )
+
+
+def _paragraph_context(source: MetadataChunk) -> str | None:
+    markers = _paragraph_markers(source.text)
+    if markers:
+        return next(iter(markers)) if len(markers) == 1 else None
+    for heading in reversed(source.heading_path):
+        markers = _paragraph_markers(heading)
+        if markers:
+            return next(iter(markers)) if len(markers) == 1 else None
+    # Plain numbering can name a nested list, so never inherit it as a paragraph.
+    markers = _paragraph_markers(source.text, numbered=True)
+    return next(iter(markers)) if len(markers) == 1 else None
+
+
+def _quoted_paragraph_markers(
+    fact: LegalMetadataFact, sources: dict[str, MetadataChunk]
+) -> set[str]:
+    source = sources[fact.source_chunk_id]
+    heading = metadata_evidence_scope(fact, sources) == "heading"
+    text = "\n".join(source.heading_path) if heading else source.text
+    quote = fact.evidence_quote
+    for match in re.finditer(re.escape(quote), text):
+        prefix = text[text.rfind("\n", 0, match.start()) + 1 : match.start()]
+        if not prefix.strip() or re.fullmatch(
+            r"(?:(?:ek|gecici|mukerrer)\s+)?(?:madde|article|art\.?)\s*"
+            r"\d+(?:/?[a-z])?\s*[-–—:.]?\s*",
+            _fold(prefix),
+        ):
+            break
+    else:
+        # A quote starting mid-sentence cannot promote its citation to a locator.
+        quote = "_" + quote
+    markers = _paragraph_markers(quote)
+    return markers or (_paragraph_markers(quote, numbered=True) if heading else set())
+
+
+def _validate_paragraph_evidence(
+    fact: LegalMetadataFact, sources: dict[str, MetadataChunk], target_id: str
+) -> None:
+    raw = re.fullmatch(r"\s*(?:\(\s*(\d+)\s*\)|(\d+))\s*", str(fact.value))
+    claimed = (raw.group(1) or raw.group(2)) if raw is not None else None
+    quoted = _quoted_paragraph_markers(fact, sources)
+    selected = _paragraph_context(sources[fact.source_chunk_id])
+    target = sources.get(target_id)
+    if len(quoted) > 1:
+        raise ValueError("Metadata paragraph evidence contains ambiguous locators")
+    if not quoted and selected is None:
+        raise ValueError("Metadata paragraph locator requires explicit source context")
+    contexts = (
+        next(iter(quoted)) if quoted else None,
+        selected,
+        _paragraph_context(target) if target is not None else None,
+    )
+    if any(identity != claimed for identity in contexts if identity is not None):
+        raise ValueError("Metadata paragraph locator contradicts its source evidence")
+
+
 def _local_paragraph_deadline(
     fact: LegalMetadataFact, sources: dict[str, MetadataChunk], target_id: str
 ) -> bool:
@@ -1263,6 +1340,8 @@ def validate_metadata_response(
             metadata_evidence_scope(fact, sources)
             if fact.field == "article_no":
                 _validate_article_evidence(fact, sources, target.chunk_id)
+            if fact.field == "paragraph_no":
+                _validate_paragraph_evidence(fact, sources, target.chunk_id)
             if fact.field in INTEGER_FIELDS:
                 if type(fact.value) is not int or fact.value < 0:
                     raise ValueError("Table indexes must be nonnegative integers")
