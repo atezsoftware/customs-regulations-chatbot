@@ -35,6 +35,15 @@ export interface WorkflowUsage {
   average_cost_cents_per_session: number | null;
   cost_status: "complete" | "partial" | "unavailable" | "running";
   unpriced_call_count: number;
+  complete_query_count?: number;
+  complete_session_count?: number;
+  complete_query_cost_cents?: number;
+  complete_session_cost_cents?: number;
+  average_cost_cents_per_complete_query?: number | null;
+  average_cost_cents_per_complete_session?: number | null;
+  partial_query_count?: number;
+  running_query_count?: number;
+  unavailable_query_count?: number;
 }
 
 export interface UsageExportUser {

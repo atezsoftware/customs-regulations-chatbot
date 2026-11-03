@@ -316,9 +316,21 @@ class TestExportEndpoint:
         assert alice["totals"]["average_cost_cents_per_query"] == 2.0
         assert alice["totals"]["average_cost_cents_per_session"] == 3.0
         assert alice["totals"]["average_queries_per_session"] == 1.5
-        assert set(alice["workflow_usage"]) == {"asv3", "asv3_exp_cropped"}
+        assert set(alice["workflow_usage"]) == {
+            "asv3",
+            "asv3_exp_cropped",
+            "asv3_fast",
+            "asv3_fast_cropped",
+            "asv3_kompozit",
+            "asv3_kompozit_cropped",
+        }
         assert alice["workflow_usage"]["asv3"]["session_count"] == 0
         assert alice["workflow_usage"]["asv3"]["cost_cents"] == 0.0
+        cropped = alice["workflow_usage"]["asv3_exp_cropped"]
+        assert cropped["complete_query_count"] == 0
+        assert cropped["complete_session_count"] == 0
+        assert cropped["complete_query_cost_cents"] == 0.0
+        assert cropped["complete_session_cost_cents"] == 0.0
 
         bob = users["bob@example.com"]
         assert len(bob["records"]) == 1

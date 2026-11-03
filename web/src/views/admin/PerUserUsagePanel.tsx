@@ -112,12 +112,8 @@ const METRIC_COLUMNS: {
 ];
 
 const WORKFLOWS: { key: WorkflowUsageKey; label: string }[] = [
-  { key: "asv3", label: "Derin Mod · ASv3 Tek" },
-  { key: "asv3_exp_cropped", label: "Hızlı Mod · ASv3 Exp Cropped" },
-  { key: "asv3_fast", label: "Fast ASv3 Tek" },
-  { key: "asv3_fast_cropped", label: "Fast Exp Cropped" },
-  { key: "asv3_kompozit", label: "Kompozit" },
-  { key: "asv3_kompozit_cropped", label: "Kompozit Cropped" },
+  { key: "asv3", label: "Hızlı Mod · ASv3 Tek" },
+  { key: "asv3_exp_cropped", label: "Derin Mod · ASv3 Exp Cropped" },
 ];
 
 const WORKFLOW_COLUMNS: {
@@ -147,7 +143,40 @@ function workflowCostDescription(usage: WorkflowUsage): string | undefined {
     unavailable: "Research cost data was not captured for these queries.",
     running: "Some queries are still running; cost capture is incomplete.",
   }[usage.cost_status];
-  return `${reason} Captured cost: ${formatCost(usage.known_cost_cents)}. Averages are unavailable until all query costs are complete.`;
+  return `${reason} Captured cost: ${formatCost(usage.known_cost_cents)}. Averages use only queries or sessions with complete cost capture; the covered count is shown below each average.`;
+}
+
+function completeAverage(usage: WorkflowUsage, metric: WorkflowMetricKey) {
+  if (usage[metric] != null) return null;
+  const sample =
+    metric === "average_cost_cents_per_query"
+      ? {
+          value: usage.average_cost_cents_per_complete_query,
+          count: usage.complete_query_count,
+          total: usage.query_count,
+          unit: "sorgu",
+        }
+      : metric === "average_cost_cents_per_session"
+        ? {
+            value: usage.average_cost_cents_per_complete_session,
+            count: usage.complete_session_count,
+            total: usage.session_count,
+            unit: "oturum",
+          }
+        : null;
+  return sample?.value != null && sample.count != null && sample.count > 0
+    ? sample
+    : null;
+}
+
+function workflowMetricValue(
+  usage: WorkflowUsage,
+  metric: WorkflowMetricKey
+): number | null {
+  if (metric === "cost_cents" && usage.cost_status !== "unavailable") {
+    return usage.cost_cents ?? usage.known_cost_cents;
+  }
+  return usage[metric] ?? completeAverage(usage, metric)?.value ?? null;
 }
 
 function sortValue(
@@ -162,10 +191,7 @@ function sortValue(
   ];
   const usage = user.workflow_usage?.[workflowKey];
   if (!usage) return null;
-  if (metricKey === "cost_cents" && usage.cost_status !== "unavailable") {
-    return usage.cost_cents ?? usage.known_cost_cents;
-  }
-  return usage[metricKey];
+  return workflowMetricValue(usage, metricKey);
 }
 
 interface UsageRowProps {
@@ -226,7 +252,10 @@ function UsageRow({ user, onReset }: UsageRowProps) {
       {WORKFLOWS.map((workflow) => {
         const usage = user.workflow_usage?.[workflow.key];
         return WORKFLOW_COLUMNS.map((column, index) => {
-          const value = usage?.[column.sortKey];
+          const value = usage
+            ? workflowMetricValue(usage, column.sortKey)
+            : null;
+          const sample = usage ? completeAverage(usage, column.sortKey) : null;
           const incompleteCost =
             column.sortKey === "cost_cents" &&
             usage &&
@@ -248,6 +277,11 @@ function UsageRow({ user, onReset }: UsageRowProps) {
             >
               <div className="flex flex-col items-end gap-1">
                 <Text font="main-ui-body">{displayValue}</Text>
+                {sample && (
+                  <Text font="secondary-body" color="text-03">
+                    {`Maliyeti tam: ${sample.count}/${sample.total} ${sample.unit}`}
+                  </Text>
+                )}
                 {incompleteCost && (
                   <Text font="secondary-body" color="text-03">
                     {usage.cost_status === "running"
@@ -410,8 +444,9 @@ export default function PerUserUsagePanel({
           Workflow columns include only queries with a recorded workflow;
           sessions used in both modes appear in both groups. Costs are captured
           research estimates and can differ from existing usage totals. Partial
-          costs show a captured lower bound; — means complete cost data is
-          unavailable.
+          costs show a captured lower bound. Averages use only complete cost
+          records and show their query/session coverage; — means no complete
+          sample is available.
         </Text>
 
         <InputTypeIn
