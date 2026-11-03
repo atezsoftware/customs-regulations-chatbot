@@ -244,7 +244,7 @@ def load_metadata_work(
         except ValueError as error:
             if batch.labeling_run_id is not None:
                 raise intake.IntakeConflictError(
-                    "Saved article evidence changed its validation contract; review this import before labeling or approval"
+                    "Saved locator evidence changed its validation contract; review this import before labeling or approval"
                 ) from error
             complete = False
         # Label retries and manually edited reviews retain their reviewed metadata.
@@ -262,20 +262,28 @@ def validate_metadata_receipt_evidence(
             continue
         audit = row.chunk_metadata.get(METADATA_AUDIT_KEY)
         fields = audit.get("fields") if isinstance(audit, dict) else None
-        entry = fields.get("article_no") if isinstance(fields, dict) else None
-        if not isinstance(entry, dict) or entry.get("source") != "llm":
+        if not isinstance(fields, dict):
             continue
-        fact = LegalMetadataFact.model_validate(
-            {
-                "field": "article_no",
-                "value": row.chunk_metadata.get("article_no"),
-                "source_chunk_id": entry.get("source_chunk_id"),
-                "evidence_quote": entry.get("evidence_quote"),
-                "basis": entry.get("basis", "explicit"),
-            }
-        )
+        facts = []
+        for field in ("article_no", "paragraph_no"):
+            entry = fields.get(field)
+            if not isinstance(entry, dict) or entry.get("source") != "llm":
+                continue
+            facts.append(
+                LegalMetadataFact.model_validate(
+                    {
+                        "field": field,
+                        "value": row.chunk_metadata.get(field),
+                        "source_chunk_id": entry.get("source_chunk_id"),
+                        "evidence_quote": entry.get("evidence_quote"),
+                        "basis": entry.get("basis", "explicit"),
+                    }
+                )
+            )
+        if not facts:
+            continue
         result = LegalMetadataResult(
-            chunks=[ChunkLegalMetadata(chunk_id=row.id, fields=[fact])]
+            chunks=[ChunkLegalMetadata(chunk_id=row.id, fields=facts)]
         )
         validate_metadata_response(
             result.model_dump_json(), chunks=chunks, target_ids=[row.id]
@@ -293,7 +301,7 @@ def validate_intake_metadata_receipts(
             validate_metadata_receipt_evidence(rows, metadata_chunks(rows))
         except ValueError as error:
             raise intake.IntakeConflictError(
-                "Saved article evidence failed source validation; retry or correct this import before approval"
+                "Saved locator evidence failed source validation; retry or correct this import before approval"
             ) from error
 
 

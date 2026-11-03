@@ -1,6 +1,7 @@
 """Saved receipt validation cannot be bypassed by matching hashes or labeling."""
 
 from copy import deepcopy
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import MagicMock
@@ -19,7 +20,9 @@ from onyx.regulatory.document_intake.metadata import (
 )
 
 
-def _rows(*, invalid: bool, source: str = "llm") -> list[RegulatoryChunk]:
+def _rows(
+    *, invalid: bool, source: str = "llm", field: str = "article_no"
+) -> list[RegulatoryChunk]:
     file_id = uuid4()
     rows = [
         RegulatoryChunk(
@@ -27,7 +30,7 @@ def _rows(*, invalid: bool, source: str = "llm") -> list[RegulatoryChunk]:
             user_file_id=file_id,
             position=index,
             projection_ordinal=index,
-            text="(1) Kaynak hüküm.",
+            text=f"({1 if index == 0 else 4}) Kaynak hüküm.",
             heading_path=[f"MADDE {number} - Başlık"],
             chunk_type="paragraph",
             chunk_metadata={},
@@ -36,7 +39,7 @@ def _rows(*, invalid: bool, source: str = "llm") -> list[RegulatoryChunk]:
         )
         for index, number in enumerate((33, 49))
     ]
-    rows[0].chunk_metadata = {"article_no": "33"}
+    rows[0].chunk_metadata = {field: "33" if field == "article_no" else "(1)"}
     input_hash = metadata_input_hash(repository.metadata_chunks(rows))
     for row in rows:
         row.chunk_metadata = {
@@ -47,22 +50,27 @@ def _rows(*, invalid: bool, source: str = "llm") -> list[RegulatoryChunk]:
             },
         }
     evidence = rows[1] if invalid else rows[0]
-    rows[0].chunk_metadata[METADATA_AUDIT_KEY]["fields"]["article_no"] = {
+    rows[0].chunk_metadata[METADATA_AUDIT_KEY]["fields"][field] = {
         "source": source,
         "basis": "explicit",
         "request_hash": "a" * 64,
         "source_chunk_id": evidence.id,
-        "evidence_quote": evidence.heading_path[0],
+        "evidence_quote": evidence.heading_path[0]
+        if field == "article_no"
+        else evidence.text,
     }
     return rows
 
 
 @pytest.mark.parametrize("source", ["llm", "manual", "structural"])
-def test_saved_article_receipts_revalidate_only_model_evidence(source: str) -> None:
-    rows = _rows(invalid=True, source=source)
+@pytest.mark.parametrize("field", ["article_no", "paragraph_no"])
+def test_saved_locator_receipts_revalidate_only_model_evidence(
+    source: str, field: str
+) -> None:
+    rows = _rows(invalid=True, source=source, field=field)
     before = deepcopy([row.chunk_metadata for row in rows])
     if source == "llm":
-        with pytest.raises(ValueError, match="article locator contradicts"):
+        with pytest.raises(ValueError, match="locator contradicts"):
             repository.validate_metadata_receipt_evidence(
                 rows, repository.metadata_chunks(rows)
             )
@@ -76,16 +84,25 @@ def test_saved_article_receipts_revalidate_only_model_evidence(source: str) -> N
 @pytest.mark.parametrize(
     "labeling,effective_invalid", [(False, True), (True, True), (True, False)]
 )
+@pytest.mark.parametrize("field", ["article_no", "paragraph_no"])
 def test_receipt_hash_skip_revalidates_and_preserves_other_completed_files(
     monkeypatch: pytest.MonkeyPatch,
     labeling: bool,
     effective_invalid: bool,
+    field: str,
 ) -> None:
-    valid, invalid = _rows(invalid=False), _rows(invalid=True)
+    valid, invalid = _rows(invalid=False, field=field), _rows(invalid=True, field=field)
     before = deepcopy([row.chunk_metadata for row in valid])
+    lease = uuid4()
     batch = cast(
         RegulatoryDocumentIntake,
-        SimpleNamespace(labeling_run_id=uuid4() if labeling else None),
+        SimpleNamespace(
+            labeling_run_id=uuid4() if labeling else None,
+            status="preparing",
+            stage="chunking",
+            lease_token=lease,
+            lease_expires_at=datetime.now(timezone.utc) + timedelta(minutes=10),
+        ),
     )
     members = [SimpleNamespace(id=uuid4()), SimpleNamespace(id=uuid4())]
     monkeypatch.setattr(intake, "load_intake_job", lambda *_args: (batch, None, []))
@@ -99,13 +116,13 @@ def test_receipt_hash_skip_revalidates_and_preserves_other_completed_files(
     monkeypatch.setattr(
         repository, "_load_rows", lambda _session, _batch, member: by_member[member]
     )
+    session = MagicMock(spec=Session)
+    session.get_one.return_value = batch
     if labeling and effective_invalid:
-        with pytest.raises(intake.IntakeConflictError, match="Saved article evidence"):
-            repository.load_metadata_work(MagicMock(spec=Session), uuid4(), uuid4())
+        with pytest.raises(intake.IntakeConflictError, match="Saved locator evidence"):
+            repository.load_metadata_work(session, uuid4(), lease)
     else:
-        _batch, work = repository.load_metadata_work(
-            MagicMock(spec=Session), uuid4(), uuid4()
-        )
+        _batch, work = repository.load_metadata_work(session, uuid4(), lease)
         assert [member_id for member_id, _chunks in work] == (
             [] if labeling else [members[1].id]
         )
@@ -139,6 +156,12 @@ def test_metadata_apply_locks_and_refreshes_before_checking_lease(
 ) -> None:
     session = MagicMock(spec=Session)
     intake_id, lease, member = uuid4(), uuid4(), uuid4()
+    session.get_one.return_value = SimpleNamespace(
+        status="preparing",
+        stage="metadata",
+        lease_token=lease,
+        lease_expires_at=datetime.now(timezone.utc) + timedelta(minutes=10),
+    )
 
     def reject(*_args: object) -> None:
         session.get_one.assert_called_once_with(
@@ -183,7 +206,7 @@ def test_approval_validates_only_effective_publication_members(
 
     monkeypatch.setattr(repository, "_load_rows", rows)
     if invalid:
-        with pytest.raises(intake.IntakeConflictError, match="Saved article evidence"):
+        with pytest.raises(intake.IntakeConflictError, match="Saved locator evidence"):
             repository.validate_intake_metadata_receipts(MagicMock(spec=Session), batch)
     else:
         repository.validate_intake_metadata_receipts(MagicMock(spec=Session), batch)
