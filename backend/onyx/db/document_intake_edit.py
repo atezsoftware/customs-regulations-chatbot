@@ -5,7 +5,7 @@ import re
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypedDict
 from uuid import UUID, uuid4, uuid5
 
 from sqlalchemy import select
@@ -67,6 +67,25 @@ MAX_INTAKE_CHUNK_EDITS = 2048
 _TERMINAL_LABELING_STATUSES = frozenset(
     {"completed", "completed_with_errors", "failed", "cancelled"}
 )
+
+
+class IntakeEditReviewItem(TypedDict):
+    id: str
+    chunk_id: str
+    file_id: str
+    status: str
+    error: str | None
+    request_hash: str | None
+
+
+class IntakeEditReviewContext(TypedDict):
+    batch_status: str
+    batch_stage: str
+    batch_error: str | None
+    run_id: str
+    status: str
+    error: str | None
+    items: list[IntakeEditReviewItem]
 
 
 @dataclass(frozen=True)
@@ -140,6 +159,25 @@ def edit_review_digest(session: Session, batch: RegulatoryDocumentIntake) -> str
         )
 
         return prelabel_metadata_edit_digest(session, batch)
+    context = load_intake_edit_review_context(session, batch)
+    if context is None:
+        return None
+    try:
+        canonical_digest = intake.review_digest(session, batch)
+    except intake.IntakeConflictError:
+        return None
+    return compose_intake_edit_review_digest(
+        batch.status,
+        batch.review_sha256 if batch.status == "ready" else None,
+        context,
+        canonical_digest,
+    )
+
+
+def load_intake_edit_review_context(
+    session: Session, batch: RegulatoryDocumentIntake
+) -> IntakeEditReviewContext | None:
+    """Load eligible scalar edit inputs before current canonical validation."""
     metadata_review = batch.status == "failed" and batch.stage in {
         "metadata",
         "chunking",
@@ -218,33 +256,41 @@ def edit_review_digest(session: Session, batch: RegulatoryDocumentIntake) -> str
         .limit(1)
     ):
         return None
-    try:
-        canonical_digest = intake.review_digest(session, batch)
-    except intake.IntakeConflictError:
-        return None
-    if batch.status == "ready":
-        return batch.review_sha256 if batch.review_sha256 == canonical_digest else None
+    return {
+        "batch_status": batch.status,
+        "batch_stage": batch.stage,
+        "batch_error": batch.error,
+        "run_id": str(run.id),
+        "status": run.status,
+        "error": run.error,
+        "items": [
+            {
+                "id": str(item.id),
+                "chunk_id": item.regulatory_chunk_id,
+                "file_id": str(item.user_file_id),
+                "status": item.status,
+                "error": item.error,
+                "request_hash": item.request_hash,
+            }
+            for item in items
+        ],
+    }
+
+
+def compose_intake_edit_review_digest(
+    status: str,
+    review_sha256: str | None,
+    context: IntakeEditReviewContext,
+    canonical_digest: str,
+) -> str | None:
+    """Compose an edit receipt after full validation, without further reads."""
+    if status == "ready":
+        return review_sha256 if review_sha256 == canonical_digest else None
     return publication_digest(
         {
             "purpose": "unpublished_intake_edit",
-            "batch_status": batch.status,
-            "batch_stage": batch.stage,
-            "batch_error": batch.error,
             "canonical_review": canonical_digest,
-            "run_id": str(run.id),
-            "status": run.status,
-            "error": run.error,
-            "items": [
-                {
-                    "id": str(item.id),
-                    "chunk_id": item.regulatory_chunk_id,
-                    "file_id": str(item.user_file_id),
-                    "status": item.status,
-                    "error": item.error,
-                    "request_hash": item.request_hash,
-                }
-                for item in items
-            ],
+            **context,
         }
     )
 

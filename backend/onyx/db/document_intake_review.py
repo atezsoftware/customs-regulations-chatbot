@@ -405,11 +405,22 @@ def publication_review_digest(
     receipt = edit_review_digest(session, batch)
     if receipt is None:
         return None
+    return compose_intake_publication_review_digest(
+        receipt, publication_decision_payload(session, batch)
+    )
+
+
+def compose_intake_publication_review_digest(
+    receipt: str | None, decisions: list[dict[str, Any]]
+) -> str | None:
+    """Compose publication scope from a validated edit receipt and frozen inputs."""
+    if receipt is None:
+        return None
     return publication_digest(
         {
             "purpose": "intake_publication_review",
             "edit_review_sha256": receipt,
-            "decisions": publication_decision_payload(session, batch),
+            "decisions": decisions,
         }
     )
 
