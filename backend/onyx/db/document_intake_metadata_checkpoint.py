@@ -314,6 +314,7 @@ def _validated_checkpoint(
     recipe_sha256: str,
     *,
     capture: bool = False,
+    rebase_recipe: bool = False,
 ) -> MetadataCheckpoint:
     try:
         source, requests, completed = _source_snapshot(session, batch)
@@ -328,8 +329,7 @@ def _validated_checkpoint(
         saved = MetadataCheckpoint.model_validate(batch.metadata_checkpoint)
         saved.validate_checksum()
         if (
-            saved.recipe_sha256 != current.recipe_sha256
-            or saved.provider_binding != current.provider_binding
+            saved.provider_binding != current.provider_binding
             or saved.source_snapshot != current.source_snapshot
             or set(saved.request_hashes) != set(requests)
             or any(
@@ -341,9 +341,50 @@ def _validated_checkpoint(
             raise ValueError(
                 "The frozen metadata source, recipe or provider binding changed"
             )
+        if saved.recipe_sha256 != current.recipe_sha256:
+            if not rebase_recipe:
+                raise ValueError(
+                    "The frozen metadata source or request contract changed"
+                )
+            saved = MetadataCheckpoint.build(
+                recipe_sha256=current.recipe_sha256,
+                provider_binding=current.provider_binding,
+                source_snapshot=current.source_snapshot,
+                request_hashes=current.request_hashes,
+                predecessor=saved,
+            )
+            batch.metadata_checkpoint = saved.model_dump(mode="json")
     except (ValidationError, ValueError) as error:
         raise intake.IntakeConflictError(str(error)) from error
     return saved
+
+
+def rebase_metadata_checkpoint_for_retry(
+    session: Session, batch: RegulatoryDocumentIntake
+) -> None:
+    """An explicit idle Retry may adopt a validator with identical frozen requests."""
+    if batch.metadata_checkpoint is None or batch.labeling_run_id is not None:
+        return
+    if (
+        batch.status not in {"failed", "partial"}
+        or batch.stage != "metadata"
+        or batch.lease_token is not None
+        or batch.lease_expires_at is not None
+        or not try_reserve_metadata_execution(session, batch.id)
+    ):
+        raise intake.IntakeConflictError("Metadata execution is not idle for Retry")
+    from onyx.db.labeling_configuration import resolve_intake_labeling_provider_binding
+    from onyx.db.models import User
+    from onyx.regulatory.document_intake.metadata_job import metadata_recipe_sha256
+
+    binding = resolve_intake_labeling_provider_binding(
+        session,
+        batch.labeling_model_configuration_id,
+        user=session.get_one(User, batch.created_by),
+    )
+    _validated_checkpoint(
+        session, batch, binding, metadata_recipe_sha256(), rebase_recipe=True
+    )
 
 
 def require_current_metadata_checkpoint(

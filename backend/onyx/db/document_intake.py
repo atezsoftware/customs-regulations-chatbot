@@ -876,6 +876,12 @@ def retry_intake(
         for evidence, token in retry_audits:
             log_failed_intake_index_retry(evidence, token)
         return deliveries
+    if batch.stage == "metadata":
+        from onyx.db.document_intake_metadata_checkpoint import (
+            rebase_metadata_checkpoint_for_retry,
+        )
+
+        rebase_metadata_checkpoint_for_retry(session, batch)
     if has_active_publication_decisions(session, batch):
         from onyx.db.document_intake_review import _replace_labels
 
