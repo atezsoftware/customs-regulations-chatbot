@@ -491,6 +491,20 @@ def refresh_intake(session: Session, batch: RegulatoryDocumentIntake) -> None:
             activate_intake_lineage(session, batch)
         except ValueError as exc:
             batch.status, batch.stage, batch.error = "blocked", "lineage", str(exc)
+    if batch.status == "ready" and batch.stage == "review":
+        from onyx.db.document_intake_metadata import validate_intake_metadata_receipts
+
+        try:
+            validate_intake_metadata_receipts(
+                session, batch, verify_contract_ack_bytes=False
+            )
+        except IntakeConflictError:
+            batch.status, batch.stage, batch.error = (
+                "partial",
+                "labeling",
+                "Saved locator evidence failed source validation; use Retry to verify the affected metadata against its source",
+            )
+            batch.review_sha256 = None
     session.flush()
 
 
@@ -698,6 +712,16 @@ def intake_snapshot(
     snapshot["publication_review_sha256"] = compose_intake_publication_review_digest(
         edit_review, publication_decisions
     )
+    if batch.error and batch.error.startswith(
+        "Saved locator evidence failed source validation"
+    ):
+        snapshot["edit_review_sha256"] = None
+        snapshot["publication_review_sha256"] = None
+    from onyx.db.document_intake_metadata_contract_retry import contract_retry_snapshot
+
+    contract_proof = contract_retry_snapshot(session, batch)
+    if contract_proof is not None:
+        snapshot["metadata_contract_retry"] = contract_proof
     return snapshot
 
 
@@ -833,6 +857,15 @@ def retry_intake(
     )
 
     session.refresh(batch, with_for_update=True)
+    from onyx.db.document_intake_metadata_contract_retry import request_contract_retry
+
+    # A repeated owner Retry must reuse its frozen contract and genuine cache lineage.
+    if (
+        batch.status in {"failed", "partial", "preparing"}
+        and batch.stage in {"metadata", "labeling", "review"}
+        and request_contract_retry(session, batch)
+    ):
+        return []
     if batch.status == "blocked" and batch.stage == "lineage":
         batch.status, batch.stage, batch.error = "completed", "completed", None
         session.flush()
@@ -1179,6 +1212,20 @@ def _start_intake_labeling_for_batch(
     )
 
     reviewed = reviewed_metadata_edit(batch)
+    from onyx.db.document_intake_metadata_contract_retry import (
+        contract_retry,
+        require_current_contract,
+    )
+
+    contract = contract_retry(batch)
+    contract_refreshed = (
+        contract is not None
+        and batch.labeling_run_id == contract.previous_labeling_run_id
+    )
+    if contract is not None:
+        require_current_contract(
+            session, batch, require_complete=True, verify_ack_bytes=True
+        )
     refreshed = (
         reviewed is not None
         and reviewed.previous_labeling_run_id == batch.labeling_run_id
@@ -1196,6 +1243,7 @@ def _start_intake_labeling_for_batch(
     if (
         existing
         and not refreshed
+        and not contract_refreshed
         and existing.status in {"queued", "running", "completed"}
         and set(existing.file_ids) == {str(member.user_file_id) for member in files}
     ):
@@ -1232,7 +1280,10 @@ def _start_intake_labeling_for_batch(
             requested_by_id=batch.created_by,
             idempotency_key=uuid5(
                 batch.id,
-                "reviewed-edit:" + publication_digest(reviewed.model_dump(mode="json"))
+                "metadata-contract:" + contract.intent_sha256
+                if contract_refreshed and contract is not None
+                else "reviewed-edit:"
+                + publication_digest(reviewed.model_dump(mode="json"))
                 if refreshed and reviewed is not None
                 else str(existing.id)
                 if existing
@@ -1300,10 +1351,15 @@ def mark_intake_dispatch_failed(
     if (
         current is None
         or current.status != "preparing"
-        or current.stage not in {"chunking", "reprepare"}
+        or current.stage not in {"chunking", "reprepare", "metadata"}
         or current.lease_token is not None
     ):
         return
+    if current.stage == "metadata":
+        from onyx.db.document_intake_metadata_contract_retry import contract_retry
+
+        if contract_retry(current) is None:
+            return
     current.error = message[:1000]
     session.flush()
 

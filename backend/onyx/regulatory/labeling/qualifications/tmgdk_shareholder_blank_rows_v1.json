@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "profile_id": "tmgdk_shareholder_blank_rows_v1",
+  "profile_kind": "blank_form_rows",
+  "source_url": "https://www.resmigazete.gov.tr/eskiler/2022/06/20220618-7-1.pdf",
+  "source_sha256": "cfb3e3ef22b2852989371b19a888ad526a839efddd2ceb57db500eed9d8376d4",
+  "source_byte_count": 82928,
+  "source_mime_type": "application/pdf",
+  "canonical_entry_count": 9,
+  "transcription_sha256": "6b90d9961fc1a4c821d0d0f60bc1be28cf14d28c9382b605838d7ceadf8c65d1",
+  "reviewed_pages": [
+    {
+      "page": 1,
+      "render_sha256": "5539c37b3cf199ec7e6beccbad9c20f4f940e210204886309864b0f4f872bc17"
+    },
+    {
+      "page": 2,
+      "render_sha256": "a67120d8f83f096ea6c9473fd43514de59b72c7faf0e5e5588e0f0dff9d48467"
+    }
+  ],
+  "review_method": "Both complete public source pages were rendered and visually reviewed by agents. The shareholder grid has six columns and three input rows numbered1,2,3; its input cells are printed empty. This is a content-addressed reviewed-source qualification, not a general PDF/OCR blankness detector.",
+  "target_rows": "|---|---|---|---|---|---|\n| 1 | | | | | |\n| 2 | | | | | |\n| 3 | | | | | |",
+  "preceding_section": "| TMGD Hizmeti Verecek Pay Sahiplerine (Ortaklarına) İlişkin Bilgiler |\n|---|---|",
+  "preceding_columns": "| SIRA | T.C. Kimlik No | Adı Soyadı | İletişim Bilgileri | İstihdam Şekli, Süresi ve Yeri (Merkez-Şube) | Koordinatör TMGD/\nŞube Sorumlusu TMGD/\nTMGDK Ortak /\nTMGD (Merkez-Şube) |",
+  "following_section": "| TMGDK Bünyesinde İstihdam Edilen TMGD’lere İlişkin Bilgiler |\n|---|---|",
+  "appendix_label": "EK – 1",
+  "annex_title": "TEHLİKELİ MADDE GÜVENLİK DANIŞMANLIĞI KURULUŞU YETKİ BELGESİ BAŞVURU FORMU",
+  "signature_heading": "TMGDK temsile yetkilisi",
+  "qualification_scope": "Only the reviewed shareholder blank-row fragment upon a genuine provider abstention. Other completed model classifications and all source text/metadata remain unchanged."
+}

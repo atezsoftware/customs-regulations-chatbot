@@ -321,7 +321,7 @@ def validate_metadata_receipt_evidence(
         if not isinstance(fields, dict):
             continue
         facts = []
-        for field in ("article_no", "paragraph_no"):
+        for field in ("article_no", "paragraph_no", "clause_label"):
             entry = fields.get(field)
             if not isinstance(entry, dict) or entry.get("source") != "llm":
                 continue
@@ -344,11 +344,52 @@ def validate_metadata_receipt_evidence(
         validate_metadata_response(
             result.model_dump_json(), chunks=chunks, target_ids=[row.id]
         )
+        if isinstance(audit, dict) and "metadata_contract_retry" in audit:
+            from onyx.regulatory.document_intake.metadata_contract_retry import (
+                ContractAppliedClause,
+                validate_repaired_clause_fact,
+            )
+
+            stamp = ContractAppliedClause.model_validate(
+                audit["metadata_contract_retry"]
+            )
+            clause = next(
+                (fact for fact in facts if fact.field == "clause_label"), None
+            )
+            if stamp.omitted:
+                if clause is not None or "clause_label" in row.chunk_metadata:
+                    raise ValueError("An omitted contract clause was restored")
+            elif clause is None:
+                raise ValueError("The contract repaired clause receipt is missing")
+            else:
+                if fields["clause_label"].get("evidence_scope") != "body":
+                    raise ValueError(
+                        "Contract clause receipt requires actual BODY scope"
+                    )
+                validate_repaired_clause_fact(
+                    clause, source=next(c for c in chunks if c.chunk_id == row.id)
+                )
 
 
 def validate_intake_metadata_receipts(
-    session: Session, batch: RegulatoryDocumentIntake
+    session: Session,
+    batch: RegulatoryDocumentIntake,
+    *,
+    verify_contract_ack_bytes: bool = True,
 ) -> None:
+    from onyx.db.document_intake_metadata_contract_retry import (
+        contract_retry,
+        require_current_contract,
+    )
+
+    if contract_retry(batch) is not None:
+        require_current_contract(
+            session,
+            batch,
+            require_complete=True,
+            verify_ack_bytes=verify_contract_ack_bytes,
+            require_fresh_labeling=True,
+        )
     from onyx.db.document_intake_review import effective_intake_files
 
     for member in effective_intake_files(session, batch):

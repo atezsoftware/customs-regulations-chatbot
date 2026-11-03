@@ -29,15 +29,20 @@ from onyx.regulatory.amendments.annexes.models import AnnexCanonicalSnapshot
 from onyx.regulatory.amendments.annexes.sources import MAX_ASSET_BYTES
 from onyx.regulatory.indexing_jobs.vertex_batch import VertexBatchRequest
 from onyx.regulatory.labeling.article_lead_in import ARTICLE_LEAD_IN_KEY
+from onyx.regulatory.labeling.chapter_caption import CHAPTER_CAPTION_KEY
 from onyx.regulatory.labeling.intake_abstention_repair import (
     AbstentionRepairAudit,
     validate_stored_abstention_evidence,
 )
 from onyx.regulatory.labeling.provider import TaxonomyDefinition, build_labeling_request
+from onyx.regulatory.labeling.reviewed_fragment import REVIEWED_FRAGMENT_KEY
 from onyx.regulatory.labeling.self_repeal import SOURCE_ONLY_KEY, PriorFailedAbstention
 
 SourceOnlyReceiptKey = Literal[
-    "intake_source_only_self_repeal", "intake_source_only_article_lead_in"
+    "intake_source_only_self_repeal",
+    "intake_source_only_article_lead_in",
+    "intake_source_only_chapter_caption",
+    "intake_source_only_reviewed_fragment",
 ]
 
 CONTINUED_ABSTENTION = (
@@ -72,13 +77,22 @@ def require_single_source_only_kind(
     *,
     prospective_key: SourceOnlyReceiptKey | None = None,
 ) -> None:
-    supported = {SOURCE_ONLY_KEY, ARTICLE_LEAD_IN_KEY}
+    supported = {
+        SOURCE_ONLY_KEY,
+        ARTICLE_LEAD_IN_KEY,
+        CHAPTER_CAPTION_KEY,
+        REVIEWED_FRAGMENT_KEY,
+    }
     if prospective_key is not None and prospective_key not in supported:
         raise ValueError("Unknown source-only receipt kind")
     keys = supported.intersection(snapshot)
     if prospective_key is not None:
         keys.add(prospective_key)
-    if len(keys) > 1:
+    from onyx.regulatory.labeling.intake_duplicate_label_repair import (
+        DUPLICATE_REPAIR_KEY,
+    )
+
+    if len(keys) > 1 or (keys and DUPLICATE_REPAIR_KEY in snapshot):
         raise ValueError("A classification item cannot contain two source-only kinds")
 
 

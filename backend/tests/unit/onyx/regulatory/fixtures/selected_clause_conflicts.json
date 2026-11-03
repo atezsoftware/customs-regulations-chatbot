@@ -1,0 +1,1247 @@
+[
+  {
+    "target": {
+      "id": "rc_9e0e303cb60095f0d402a36f8e9f8a8ee71e80da",
+      "user_file_id": "f00cc0fc-6da2-405a-9f39-cda46153b8b3",
+      "text": "b) Bakanlığın gerekçeli talebine istinaden, bu Yönetmelik kapsamındaki ürünün uygunluğunun kanıtlanması\niçin gerekli tüm bilgi ve belgelerin kâğıt veya dijital formatta Bakanlığa sunulması.",
+      "position": 120,
+      "chunk_type": "clause",
+      "heading_path": [
+        "MAKİNE EMNİYETİ YÖNETMELİĞİ",
+        "ÜÇÜNCÜ BÖLÜM",
+        "MADDE 13",
+        "(2) Yetkili temsilci, imalatçıdan aldığı yetki çerçevesinde belirtilen görevleri yerine get...",
+        "b) Bakanlığın gerekçeli talebine istinaden, bu Yönetmelik kapsamındaki ürünün uygunluğunun..."
+      ],
+      "chunk_metadata": {
+        "article_no": "13",
+        "table_index": null,
+        "clause_label": "b",
+        "heading_path": [
+          "MAKİNE EMNİYETİ YÖNETMELİĞİ",
+          "ÜÇÜNCÜ BÖLÜM",
+          "MADDE 13",
+          "(2) Yetkili temsilci, imalatçıdan aldığı yetki çerçevesinde belirtilen görevleri yerine get...",
+          "b) Bakanlığın gerekçeli talebine istinaden, bu Yönetmelik kapsamındaki ürünün uygunluğunun..."
+        ],
+        "paragraph_no": "2",
+        "source_links": {
+          "0": "https://www.resmigazete.gov.tr/eskiler/2026/10/20261016-12.htm"
+        },
+        "article_title": null,
+        "chunk_variant": "atomic",
+        "document_date": null,
+        "document_type": "YÖNETMELİK",
+        "image_file_id": null,
+        "appendix_label": null,
+        "document_title": "MAKİNE EMNİYETİ YÖNETMELİĞİ",
+        "image_file_ids": [],
+        "document_number": null,
+        "subclause_label": null,
+        "table_row_index": null,
+        "publication_date": "2026-10-16",
+        "source_asset_ids": [],
+        "annex_element_ids": [],
+        "hierarchy_root_id": null,
+        "publication_number": "33402",
+        "hierarchy_root_path": [],
+        "source_chunk_orders": [],
+        "intake_legal_metadata": {
+          "model": "gemini-3.5-flash",
+          "fields": {
+            "article_no": {
+              "basis": "explicit",
+              "stale": false,
+              "source": "llm",
+              "request_hash": "b2dfef307d25ef2b57572172d5f7040d38561b7f755000cf031b9a8654d3bfe3",
+              "evidence_quote": "MADDE 13",
+              "evidence_scope": "body",
+              "reference_quote": null,
+              "source_chunk_id": "rc_d6c4a1408b9298dd49b462f5281d236777acca76",
+              "reference_chunk_id": null
+            },
+            "clause_label": {
+              "basis": "explicit",
+              "stale": false,
+              "source": "llm",
+              "request_hash": "b2dfef307d25ef2b57572172d5f7040d38561b7f755000cf031b9a8654d3bfe3",
+              "evidence_quote": "a) Makine veya ilgili ürünlerin teknik dosyası ve AB uygunluk beyanının veya kısmen tamaml...",
+              "evidence_scope": "heading",
+              "reference_quote": null,
+              "source_chunk_id": "rc_6e8869fa803f1cdb41a587b0145e17a767e4bc75",
+              "reference_chunk_id": null
+            },
+            "paragraph_no": {
+              "basis": "explicit",
+              "stale": false,
+              "source": "llm",
+              "request_hash": "b2dfef307d25ef2b57572172d5f7040d38561b7f755000cf031b9a8654d3bfe3",
+              "evidence_quote": "(2) Yetkili temsilci, imalatçıdan aldığı yetki çerçevesinde belirtilen görevleri yerine get...",
+              "evidence_scope": "heading",
+              "reference_quote": null,
+              "source_chunk_id": "rc_6e8869fa803f1cdb41a587b0145e17a767e4bc75",
+              "reference_chunk_id": null
+            },
+            "document_type": {
+              "basis": "explicit",
+              "stale": false,
+              "source": "llm",
+              "request_hash": "b2dfef307d25ef2b57572172d5f7040d38561b7f755000cf031b9a8654d3bfe3",
+              "evidence_quote": "YÖNETMELİK",
+              "evidence_scope": "body",
+              "reference_quote": null,
+              "source_chunk_id": "rc_690ee35d0ca900616b2d9ce0bd38e17a7583a8c8",
+              "reference_chunk_id": null
+            },
+            "document_title": {
+              "basis": "explicit",
+              "stale": false,
+              "source": "llm",
+              "request_hash": "b2dfef307d25ef2b57572172d5f7040d38561b7f755000cf031b9a8654d3bfe3",
+              "evidence_quote": "MAKİNE EMNİYETİ YÖNETMELİĞİ",
+              "evidence_scope": "body",
+              "reference_quote": null,
+              "source_chunk_id": "rc_690ee35d0ca900616b2d9ce0bd38e17a7583a8c8",
+              "reference_chunk_id": null
+            },
+            "publication_date": {
+              "basis": "explicit",
+              "stale": false,
+              "source": "llm",
+              "request_hash": "ab5a0405e5dae21f084e90b8b915f4f43ee1cb7342bfedd9391bd03d0043d947",
+              "evidence_quote": "16 Ekim 2026 CUMA Resmî Gazete Sayı : 33402",
+              "evidence_scope": "body",
+              "reference_quote": null,
+              "source_chunk_id": "rc_690ee35d0ca900616b2d9ce0bd38e17a7583a8c8",
+              "reference_chunk_id": null,
+              "retained_from_validated_fact": true
+            },
+            "publication_number": {
+              "basis": "explicit",
+              "stale": false,
+              "source": "llm",
+              "request_hash": "ab5a0405e5dae21f084e90b8b915f4f43ee1cb7342bfedd9391bd03d0043d947",
+              "evidence_quote": "16 Ekim 2026 CUMA Resmî Gazete Sayı : 33402",
+              "evidence_scope": "body",
+              "reference_quote": null,
+              "source_chunk_id": "rc_690ee35d0ca900616b2d9ce0bd38e17a7583a8c8",
+              "reference_chunk_id": null,
+              "retained_from_validated_fact": true
+            },
+            "validity_start_date": {
+              "basis": "explicit",
+              "stale": false,
+              "source": "llm",
+              "request_hash": "b2dfef307d25ef2b57572172d5f7040d38561b7f755000cf031b9a8654d3bfe3",
+              "evidence_quote": "b) Diğer hükümleri 20/1/2027 tarihinde,",
+              "evidence_scope": "body",
+              "reference_quote": null,
+              "source_chunk_id": "rc_a40912a33231c48e399e4166798c8d6a648abc88",
+              "reference_chunk_id": null
+            }
+          },
+          "version": 2,
+          "warnings": [],
+          "input_stale": false,
+          "input_sha256": "d2f32fe4fd68d2111ac6711040399049e01a6d5f8a5a6a25f1fb8c9a0ed218bc",
+          "request_hash": "b2dfef307d25ef2b57572172d5f7040d38561b7f755000cf031b9a8654d3bfe3",
+          "composed_from_validated_facts": true
+        },
+        "intake_chunking_version": "2",
+        "source_regulatory_chunk_ids": [],
+        "intake_normalization_witness": "7c17b2e475647dbb22e0ae9173c0d1b55e4ea1ff936c6c79c6bff98fa3befa17"
+      },
+      "validity_start_date": "2027-01-20",
+      "validity_end_date": null,
+      "status": "active",
+      "source": "indexed",
+      "supersedes_chunk_id": null,
+      "superseded_by_chunk_id": null,
+      "created_at": "2026-10-27T19:30:49.716523Z",
+      "updated_at": "2026-11-03T16:26:24.779920Z"
+    },
+    "source": {
+      "id": "rc_6e8869fa803f1cdb41a587b0145e17a767e4bc75",
+      "user_file_id": "f00cc0fc-6da2-405a-9f39-cda46153b8b3",
+      "text": "(2) Yetkili temsilci, imalatçıdan aldığı yetki çerçevesinde belirtilen görevleri yerine getirir. Bu yetkiler, yetkili\ntemsilcinin en az aşağıdakileri yerine getirmesine izin verir:\na) Makine veya ilgili ürünlerin teknik dosyası ve AB uygunluk beyanının veya kısmen tamamlanmış\nmakinenin AB bütünleştirme beyanının, ürünün piyasaya arz edilmesinden itibaren en az 10 yıl süreyle piyasa\ngözetimi ve denetimi kuruluşunun emrine hazır tutulması.",
+      "position": 119,
+      "chunk_type": "clause",
+      "heading_path": [
+        "MAKİNE EMNİYETİ YÖNETMELİĞİ",
+        "ÜÇÜNCÜ BÖLÜM",
+        "MADDE 13",
+        "(2) Yetkili temsilci, imalatçıdan aldığı yetki çerçevesinde belirtilen görevleri yerine get...",
+        "a) Makine veya ilgili ürünlerin teknik dosyası ve AB uygunluk beyanının veya kısmen tamaml..."
+      ],
+      "chunk_metadata": {
+        "article_no": "13",
+        "table_index": null,
+        "clause_label": "a",
+        "heading_path": [
+          "MAKİNE EMNİYETİ YÖNETMELİĞİ",
+          "ÜÇÜNCÜ BÖLÜM",
+          "MADDE 13",
+          "(2) Yetkili temsilci, imalatçıdan aldığı yetki çerçevesinde belirtilen görevleri yerine get...",
+          "a) Makine veya ilgili ürünlerin teknik dosyası ve AB uygunluk beyanının veya kısmen tamaml..."
+        ],
+        "paragraph_no": "2",
+        "source_links": {
+          "0": "https://www.resmigazete.gov.tr/eskiler/2026/10/20261016-12.htm"
+        },
+        "article_title": null,
+        "chunk_variant": "atomic",
+        "document_date": null,
+        "document_type": "yonetmelik",
+        "image_file_id": null,
+        "appendix_label": null,
+        "document_title": "MAKİNE EMNİYETİ YÖNETMELİĞİ",
+        "image_file_ids": [],
+        "document_number": null,
+        "subclause_label": null,
+        "table_row_index": null,
+        "publication_date": "2026-10-16",
+        "source_asset_ids": [],
+        "annex_element_ids": [],
+        "hierarchy_root_id": null,
+        "publication_number": "33402",
+        "hierarchy_root_path": [],
+        "source_chunk_orders": [],
+        "intake_legal_metadata": {
+          "model": "gemini-3.5-flash",
+          "fields": {
+            "article_no": {
+              "basis": "explicit",
+              "stale": false,
+              "source": "llm",
+              "request_hash": "475b3e3e1f9d2df1eba214afe9c3bddb5630df423a7d01712f854afefd3554de",
+              "evidence_quote": "MADDE 13-",
+              "evidence_scope": "body",
+              "reference_quote": null,
+              "source_chunk_id": "rc_d6c4a1408b9298dd49b462f5281d236777acca76",
+              "reference_chunk_id": null
+            },
+            "clause_label": {
+              "basis": "explicit",
+              "stale": false,
+              "source": "llm",
+              "request_hash": "475b3e3e1f9d2df1eba214afe9c3bddb5630df423a7d01712f854afefd3554de",
+              "evidence_quote": "a) Makine veya ilgili ürünlerin teknik dosyası ve AB uygunluk beyanının veya kısmen tamamlanmış",
+              "evidence_scope": "body",
+              "reference_quote": null,
+              "source_chunk_id": "rc_6e8869fa803f1cdb41a587b0145e17a767e4bc75",
+              "reference_chunk_id": null
+            },
+            "paragraph_no": {
+              "basis": "explicit",
+              "stale": false,
+              "source": "llm",
+              "request_hash": "475b3e3e1f9d2df1eba214afe9c3bddb5630df423a7d01712f854afefd3554de",
+              "evidence_quote": "(2) Yetkili temsilci, imalatçıdan aldığı yetki çerçevesinde belirtilen görevleri yerine getirir. Bu yetkiler, yetkili",
+              "evidence_scope": "body",
+              "reference_quote": null,
+              "source_chunk_id": "rc_6e8869fa803f1cdb41a587b0145e17a767e4bc75",
+              "reference_chunk_id": null
+            },
+            "document_type": {
+              "basis": "explicit",
+              "stale": false,
+              "source": "llm",
+              "request_hash": "5ed7de20e848e5615a8a39f97703e54b07addd3eb589bcdaa9ee7490a3a838ef",
+              "evidence_quote": "YÖNETMELİK",
+              "evidence_scope": "body",
+              "reference_quote": null,
+              "source_chunk_id": "rc_690ee35d0ca900616b2d9ce0bd38e17a7583a8c8",
+              "reference_chunk_id": null,
+              "retained_from_validated_fact": true
+            },
+            "document_title": {
+              "basis": "explicit",
+              "stale": false,
+              "source": "llm",
+              "request_hash": "475b3e3e1f9d2df1eba214afe9c3bddb5630df423a7d01712f854afefd3554de",
+              "evidence_quote": "MAKİNE EMNİYETİ YÖNETMELİĞİ",
+              "evidence_scope": "body",
+              "reference_quote": null,
+              "source_chunk_id": "rc_690ee35d0ca900616b2d9ce0bd38e17a7583a8c8",
+              "reference_chunk_id": null
+            },
+            "publication_date": {
+              "basis": "explicit",
+              "stale": false,
+              "source": "llm",
+              "request_hash": "5ed7de20e848e5615a8a39f97703e54b07addd3eb589bcdaa9ee7490a3a838ef",
+              "evidence_quote": "16 Ekim 2026 CUMA Resmî Gazete Sayı : 33402",
+              "evidence_scope": "body",
+              "reference_quote": null,
+              "source_chunk_id": "rc_690ee35d0ca900616b2d9ce0bd38e17a7583a8c8",
+              "reference_chunk_id": null,
+              "retained_from_validated_fact": true
+            },
+            "publication_number": {
+              "basis": "explicit",
+              "stale": false,
+              "source": "llm",
+              "request_hash": "5ed7de20e848e5615a8a39f97703e54b07addd3eb589bcdaa9ee7490a3a838ef",
+              "evidence_quote": "16 Ekim 2026 CUMA Resmî Gazete Sayı : 33402",
+              "evidence_scope": "body",
+              "reference_quote": null,
+              "source_chunk_id": "rc_690ee35d0ca900616b2d9ce0bd38e17a7583a8c8",
+              "reference_chunk_id": null,
+              "retained_from_validated_fact": true
+            },
+            "validity_start_date": {
+              "basis": "explicit",
+              "stale": false,
+              "source": "llm",
+              "request_hash": "475b3e3e1f9d2df1eba214afe9c3bddb5630df423a7d01712f854afefd3554de",
+              "evidence_quote": "b) Diğer hükümleri 20/1/2027 tarihinde,",
+              "evidence_scope": "body",
+              "reference_quote": null,
+              "source_chunk_id": "rc_a40912a33231c48e399e4166798c8d6a648abc88",
+              "reference_chunk_id": null
+            }
+          },
+          "version": 2,
+          "warnings": [],
+          "input_stale": false,
+          "input_sha256": "d2f32fe4fd68d2111ac6711040399049e01a6d5f8a5a6a25f1fb8c9a0ed218bc",
+          "request_hash": "475b3e3e1f9d2df1eba214afe9c3bddb5630df423a7d01712f854afefd3554de",
+          "composed_from_validated_facts": true
+        },
+        "intake_chunking_version": "2",
+        "source_regulatory_chunk_ids": [],
+        "intake_normalization_witness": "7c17b2e475647dbb22e0ae9173c0d1b55e4ea1ff936c6c79c6bff98fa3befa17"
+      },
+      "validity_start_date": "2027-01-20",
+      "validity_end_date": null,
+      "status": "active",
+      "source": "indexed",
+      "supersedes_chunk_id": null,
+      "superseded_by_chunk_id": null,
+      "created_at": "2026-10-27T19:30:49.716523Z",
+      "updated_at": "2026-11-03T16:26:24.779920Z"
+    },
+    "fact": {
+      "basis": "explicit",
+      "stale": false,
+      "source": "llm",
+      "request_hash": "b2dfef307d25ef2b57572172d5f7040d38561b7f755000cf031b9a8654d3bfe3",
+      "evidence_quote": "a) Makine veya ilgili ürünlerin teknik dosyası ve AB uygunluk beyanının veya kısmen tamaml...",
+      "evidence_scope": "heading",
+      "reference_quote": null,
+      "source_chunk_id": "rc_6e8869fa803f1cdb41a587b0145e17a767e4bc75",
+      "reference_chunk_id": null
+    },
+    "value": "b"
+  },
+  {
+    "target": {
+      "id": "rc_ba7703bcba38820a0199844ee0325388e38b7be3",
+      "user_file_id": "5797281f-246b-49cd-a350-fef757ef92c1",
+      "text": "Makine veya ilgili ürünün, her bir işlem arasında parçanın elle çıkarılmasıyla birkaç farklı işlem gerçekleştirmesinin amaçlandığı durumlarda (birleşik makine veya ilgili ürün), makine veya ilgili ürün, diğer unsurlar tehlikeye maruz kişiler için risk oluşturmaksızın her bir unsurun ayrı ayrı kullanılabilmesini sağlayacak şekilde tasarlanır ve imal edilir.\nBu amaçla, korunmayan her türlü unsuru ayrı ayrı çalıştırmak ve durdurmak mümkün olur.\n1.3.6. Çalışma koşullarındaki değişimlere bağlı riskler\nMakine veya ilgili ürünün farklı kullanım koşulları altında işlem yaptığı durumlarda, makine veya ilgili ürün bu koşulların seçimi ve ayarlanmasının güvenli ve güvenilir bir şekilde gerçekleştirilebileceği şekilde tasarlanır ve imal edilir.\n1.3.7. Hareketli parçalar ile ilgili riskler",
+      "position": 152,
+      "chunk_type": "clause",
+      "heading_path": [
+        "EK-1",
+        "EK 3",
+        "1. TEMEL SAĞLIK VE GÜVENLİK GEREKLİLİKLERİ",
+        "(b) Alet (istemli şekilde veya kazara) çalıştığında ve/veya durduğunda, besleme hareketi ve..."
+      ],
+      "chunk_metadata": {
+        "article_no": null,
+        "annex_title": "MAKİNE VEYA İLGİLİ ÜRÜNLERİN TASARIMI VE İMALİ İLE İLGİLİ TEMEL SAĞLIK VE GÜVENLİK GEREKLİLİKLERİ",
+        "table_index": null,
+        "clause_label": "b",
+        "heading_path": [
+          "EK-1",
+          "EK 3",
+          "1. TEMEL SAĞLIK VE GÜVENLİK GEREKLİLİKLERİ",
+          "(b) Alet (istemli şekilde veya kazara) çalıştığında ve/veya durduğunda, besleme hareketi ve..."
+        ],
+        "paragraph_no": "2",
+        "source_links": {
+          "0": "https://www.resmigazete.gov.tr/eskiler/2026/10/20261016-12-1.pdf"
+        },
+        "article_title": null,
+        "chunk_variant": "atomic",
+        "document_date": null,
+        "document_type": "unknown",
+        "image_file_id": null,
+        "appendix_label": "EK 3",
+        "image_file_ids": [],
+        "document_number": null,
+        "subclause_label": null,
+        "table_row_index": null,
+        "source_asset_ids": [],
+        "annex_element_ids": [],
+        "hierarchy_root_id": null,
+        "hierarchy_root_path": [],
+        "source_chunk_orders": [],
+        "intake_legal_metadata": {
+          "model": "gemini-3.5-flash",
+          "fields": {
+            "annex_title": {
+              "basis": "explicit",
+              "stale": false,
+              "source": "llm",
+              "request_hash": "3598ac66caa1454e0d22a696650ab9eb6a7d409835722df4a24d9ade1bb77fd3",
+              "evidence_quote": "MAKİNE VEYA İLGİLİ ÜRÜNLERİN TASARIMI VE İMALİ İLE İLGİLİ\nTEMEL SAĞLIK VE GÜVENLİK GEREKLİLİKLERİ\nKISIM A\nTanımlar\nBu EK'in amaçları doğrultusunda aşağıdaki tanımlar geçerlidir:",
+              "evidence_scope": "body",
+              "reference_quote": null,
+              "source_chunk_id": "rc_ed16ac4500e993d91e89760180a1dc1049c38d85",
+              "reference_chunk_id": null,
+              "retained_from_validated_fact": true
+            },
+            "clause_label": {
+              "basis": "explicit",
+              "stale": false,
+              "source": "llm",
+              "request_hash": "3598ac66caa1454e0d22a696650ab9eb6a7d409835722df4a24d9ade1bb77fd3",
+              "evidence_quote": "(d) Makine veya ilgili ürünün sensörleri üzerinde istemli veya istemsiz bir etki yoluyla te...",
+              "evidence_scope": "heading",
+              "reference_quote": null,
+              "source_chunk_id": "rc_d0a088e6d1d80639db17a5f9658218761af36afe",
+              "reference_chunk_id": null,
+              "retained_from_validated_fact": true
+            },
+            "paragraph_no": {
+              "basis": "explicit",
+              "stale": false,
+              "source": "llm",
+              "request_hash": "3598ac66caa1454e0d22a696650ab9eb6a7d409835722df4a24d9ade1bb77fd3",
+              "evidence_quote": "2. BELİRLİ MAKİNE VE İLGİLİ ÜRÜN KATEGORİLERİ İÇİN TAMAMLAYICI TEMEL SAĞLIK VE GÜVENLİK GE...",
+              "evidence_scope": "heading",
+              "reference_quote": null,
+              "source_chunk_id": "rc_1dcc4770596f5ae8b8b8e7dcfc9306b9a79261b2",
+              "reference_chunk_id": null,
+              "retained_from_validated_fact": true
+            },
+            "document_type": {
+              "basis": "chunker",
+              "stale": false,
+              "source": "structural",
+              "evidence_quote": null,
+              "source_chunk_id": "rc_ba7703bcba38820a0199844ee0325388e38b7be3"
+            },
+            "appendix_label": {
+              "basis": "explicit",
+              "stale": false,
+              "source": "llm",
+              "request_hash": "cfec005f14e058f17c471d0a3fad7b5dc61a4b0580f260fb45964e55e64188b3",
+              "evidence_quote": "EK 3",
+              "evidence_scope": "heading",
+              "reference_quote": null,
+              "source_chunk_id": "rc_ba7703bcba38820a0199844ee0325388e38b7be3",
+              "reference_chunk_id": null
+            }
+          },
+          "version": 2,
+          "warnings": [
+            "Retained metadata from request 3598ac66caa1454e0d22a696650ab9eb6a7d409835722df4a24d9ade1bb77fd3: No overall document title found in the text; extracted the annex title as annex_title."
+          ],
+          "input_stale": false,
+          "input_sha256": "03490b91b67bce9d923544d633fa1d975b846639bf4870205050cce743a54cdb",
+          "request_hash": "cfec005f14e058f17c471d0a3fad7b5dc61a4b0580f260fb45964e55e64188b3",
+          "composed_from_validated_facts": true
+        },
+        "intake_chunking_version": "2",
+        "source_regulatory_chunk_ids": []
+      },
+      "validity_start_date": null,
+      "validity_end_date": null,
+      "status": "active",
+      "source": "indexed",
+      "supersedes_chunk_id": null,
+      "superseded_by_chunk_id": null,
+      "created_at": "2026-10-27T19:42:43.065312Z",
+      "updated_at": "2026-11-03T18:42:42.894060Z"
+    },
+    "source": {
+      "id": "rc_d0a088e6d1d80639db17a5f9658218761af36afe",
+      "user_file_id": "5797281f-246b-49cd-a350-fef757ef92c1",
+      "text": "(d) Makine veya ilgili ürünün sensörleri üzerinde istemli veya istemsiz bir etki yoluyla tehlikeli fonksiyonların çalışmasını önler.\nBu dört koşul aynı anda yerine getirilemezse, kontrol veya çalışma modu seçici, güvenli bir müdahale bölgesi sağlamak için tasarlanmış ve imal edilmiş diğer koruyucu önlemleri etkinleştirir.\nBuna ek olarak, operatör üzerinde çalıştığı parçaların çalışmasını ayarlama noktasından kontrol edebilir.\n1.2.6. Güç kaynağının veya iletişim ağı bağlantısının arızalanması\nKesinti, kesintiden sonra yeniden enerjinin verilmesi veya makine veya ilgili ürünü ile olan güç kaynağı veya iletişim ağı bağlantısında her ne şekilde olursa olsun meydana gelen dalgalanma tehlikeli durumlara yol açmaz.\nAşağıdakilere özellikle dikkat edilir:",
+      "position": 141,
+      "chunk_type": "clause",
+      "heading_path": [
+        "EK-1",
+        "EK 3",
+        "1. TEMEL SAĞLIK VE GÜVENLİK GEREKLİLİKLERİ",
+        "(d) Makine veya ilgili ürünün sensörleri üzerinde istemli veya istemsiz bir etki yoluyla te..."
+      ],
+      "chunk_metadata": {
+        "article_no": null,
+        "annex_title": "MAKİNE VEYA İLGİLİ ÜRÜNLERİN TASARIMI VE İMALİ İLE İLGİLİ",
+        "table_index": null,
+        "clause_label": "d",
+        "heading_path": [
+          "EK-1",
+          "EK 3",
+          "1. TEMEL SAĞLIK VE GÜVENLİK GEREKLİLİKLERİ",
+          "(d) Makine veya ilgili ürünün sensörleri üzerinde istemli veya istemsiz bir etki yoluyla te..."
+        ],
+        "paragraph_no": null,
+        "source_links": {
+          "0": "https://www.resmigazete.gov.tr/eskiler/2026/10/20261016-12-1.pdf"
+        },
+        "article_title": null,
+        "chunk_variant": "atomic",
+        "document_date": null,
+        "document_type": "unknown",
+        "image_file_id": null,
+        "appendix_label": "EK 3",
+        "image_file_ids": [],
+        "document_number": null,
+        "subclause_label": null,
+        "table_row_index": null,
+        "source_asset_ids": [],
+        "annex_element_ids": [],
+        "hierarchy_root_id": null,
+        "hierarchy_root_path": [],
+        "source_chunk_orders": [],
+        "intake_legal_metadata": {
+          "model": "gemini-3.5-flash",
+          "fields": {
+            "annex_title": {
+              "basis": "explicit",
+              "stale": false,
+              "source": "llm",
+              "request_hash": "854a96acf6fa0d45ee023f010297f3072f0452aa8abc637105b69f3f45dd45cc",
+              "evidence_quote": "MAKİNE VEYA İLGİLİ ÜRÜNLERİN TASARIMI VE İMALİ İLE İLGİLİ",
+              "evidence_scope": "body",
+              "reference_quote": null,
+              "source_chunk_id": "rc_ed16ac4500e993d91e89760180a1dc1049c38d85",
+              "reference_chunk_id": null
+            },
+            "clause_label": {
+              "basis": "explicit",
+              "stale": false,
+              "source": "llm",
+              "request_hash": "854a96acf6fa0d45ee023f010297f3072f0452aa8abc637105b69f3f45dd45cc",
+              "evidence_quote": "(d) Makine veya ilgili ürünün sensörleri üzerinde istemli veya istemsiz bir etki yoluyla tehlikeli fonksiyonların çalışmasını önler.",
+              "evidence_scope": "body",
+              "reference_quote": null,
+              "source_chunk_id": "rc_d0a088e6d1d80639db17a5f9658218761af36afe",
+              "reference_chunk_id": null
+            },
+            "document_type": {
+              "basis": "chunker",
+              "stale": false,
+              "source": "structural",
+              "evidence_quote": null,
+              "source_chunk_id": "rc_d0a088e6d1d80639db17a5f9658218761af36afe"
+            },
+            "appendix_label": {
+              "basis": "explicit",
+              "stale": false,
+              "source": "llm",
+              "request_hash": "854a96acf6fa0d45ee023f010297f3072f0452aa8abc637105b69f3f45dd45cc",
+              "evidence_quote": "EK 3",
+              "evidence_scope": "heading",
+              "reference_quote": null,
+              "source_chunk_id": "rc_ed16ac4500e993d91e89760180a1dc1049c38d85",
+              "reference_chunk_id": null
+            }
+          },
+          "version": 2,
+          "warnings": [],
+          "input_stale": false,
+          "input_sha256": "03490b91b67bce9d923544d633fa1d975b846639bf4870205050cce743a54cdb",
+          "request_hash": "854a96acf6fa0d45ee023f010297f3072f0452aa8abc637105b69f3f45dd45cc"
+        },
+        "intake_chunking_version": "2",
+        "source_regulatory_chunk_ids": []
+      },
+      "validity_start_date": null,
+      "validity_end_date": null,
+      "status": "active",
+      "source": "indexed",
+      "supersedes_chunk_id": null,
+      "superseded_by_chunk_id": null,
+      "created_at": "2026-10-27T19:42:43.065312Z",
+      "updated_at": "2026-11-03T18:42:42.894060Z"
+    },
+    "fact": {
+      "basis": "explicit",
+      "stale": false,
+      "source": "llm",
+      "request_hash": "3598ac66caa1454e0d22a696650ab9eb6a7d409835722df4a24d9ade1bb77fd3",
+      "evidence_quote": "(d) Makine veya ilgili ürünün sensörleri üzerinde istemli veya istemsiz bir etki yoluyla te...",
+      "evidence_scope": "heading",
+      "reference_quote": null,
+      "source_chunk_id": "rc_d0a088e6d1d80639db17a5f9658218761af36afe",
+      "reference_chunk_id": null,
+      "retained_from_validated_fact": true
+    },
+    "value": "b"
+  },
+  {
+    "target": {
+      "id": "rc_bcfc9a4d4f573f745fe25e877442f82dda65e545",
+      "user_file_id": "5797281f-246b-49cd-a350-fef757ef92c1",
+      "text": "Makine veya ilgili ürünün hareketli parçaları, kazalara yol açabilecek temas risklerini önleyecek şekilde tasarlanır ve imal edilir ya da risklerin devam ettiği durumlarda mahfazalar veya koruyucu cihazlarla donatılır.\nHareketli parçaların yanlışlıkla bloke olmasını önlemek için gerekli tüm adımlar atılır. Alınan önlemlere rağmen bloke durumunun meydana gelmesinin muhtemel durumlarda, bloke olan ekipmanın güvenli bir şekilde serbest kalması için uygun olduğunda gerekli özel koruyucu cihazlar ve aletler temin edilir.\nKullanım talimatları ve mümkün olduğunda makine veya ilgili ürün üzerindeki bir işaret, bu özel koruyucu cihazları ve bunların nasıl kullanılacağını tanımlar.\nTehlike durumlarına yol açan temas risklerinin önlenmesi ve makine ile etkileşimin neden olabileceği psikolojik stres aşağıda belirtilenlere uyarlanır:",
+      "position": 153,
+      "chunk_type": "clause",
+      "heading_path": [
+        "EK-1",
+        "EK 3",
+        "1. TEMEL SAĞLIK VE GÜVENLİK GEREKLİLİKLERİ",
+        "(b) Alet (istemli şekilde veya kazara) çalıştığında ve/veya durduğunda, besleme hareketi ve..."
+      ],
+      "chunk_metadata": {
+        "article_no": null,
+        "annex_title": "MAKİNE VEYA İLGİLİ ÜRÜNLERİN TASARIMI VE İMALİ İLE İLGİLİ TEMEL SAĞLIK VE GÜVENLİK GEREKLİLİKLERİ",
+        "table_index": null,
+        "clause_label": "b",
+        "heading_path": [
+          "EK-1",
+          "EK 3",
+          "1. TEMEL SAĞLIK VE GÜVENLİK GEREKLİLİKLERİ",
+          "(b) Alet (istemli şekilde veya kazara) çalıştığında ve/veya durduğunda, besleme hareketi ve..."
+        ],
+        "paragraph_no": "2",
+        "source_links": {
+          "0": "https://www.resmigazete.gov.tr/eskiler/2026/10/20261016-12-1.pdf"
+        },
+        "article_title": null,
+        "chunk_variant": "atomic",
+        "document_date": null,
+        "document_type": "unknown",
+        "image_file_id": null,
+        "appendix_label": "EK 3",
+        "image_file_ids": [],
+        "document_number": null,
+        "subclause_label": null,
+        "table_row_index": null,
+        "source_asset_ids": [],
+        "annex_element_ids": [],
+        "hierarchy_root_id": null,
+        "hierarchy_root_path": [],
+        "source_chunk_orders": [],
+        "intake_legal_metadata": {
+          "model": "gemini-3.5-flash",
+          "fields": {
+            "annex_title": {
+              "basis": "explicit",
+              "stale": false,
+              "source": "llm",
+              "request_hash": "3598ac66caa1454e0d22a696650ab9eb6a7d409835722df4a24d9ade1bb77fd3",
+              "evidence_quote": "MAKİNE VEYA İLGİLİ ÜRÜNLERİN TASARIMI VE İMALİ İLE İLGİLİ\nTEMEL SAĞLIK VE GÜVENLİK GEREKLİLİKLERİ\nKISIM A\nTanımlar\nBu EK'in amaçları doğrultusunda aşağıdaki tanımlar geçerlidir:",
+              "evidence_scope": "body",
+              "reference_quote": null,
+              "source_chunk_id": "rc_ed16ac4500e993d91e89760180a1dc1049c38d85",
+              "reference_chunk_id": null,
+              "retained_from_validated_fact": true
+            },
+            "clause_label": {
+              "basis": "explicit",
+              "stale": false,
+              "source": "llm",
+              "request_hash": "3598ac66caa1454e0d22a696650ab9eb6a7d409835722df4a24d9ade1bb77fd3",
+              "evidence_quote": "(d) Makine veya ilgili ürünün sensörleri üzerinde istemli veya istemsiz bir etki yoluyla te...",
+              "evidence_scope": "heading",
+              "reference_quote": null,
+              "source_chunk_id": "rc_d0a088e6d1d80639db17a5f9658218761af36afe",
+              "reference_chunk_id": null,
+              "retained_from_validated_fact": true
+            },
+            "paragraph_no": {
+              "basis": "explicit",
+              "stale": false,
+              "source": "llm",
+              "request_hash": "3598ac66caa1454e0d22a696650ab9eb6a7d409835722df4a24d9ade1bb77fd3",
+              "evidence_quote": "2. BELİRLİ MAKİNE VE İLGİLİ ÜRÜN KATEGORİLERİ İÇİN TAMAMLAYICI TEMEL SAĞLIK VE GÜVENLİK GE...",
+              "evidence_scope": "heading",
+              "reference_quote": null,
+              "source_chunk_id": "rc_1dcc4770596f5ae8b8b8e7dcfc9306b9a79261b2",
+              "reference_chunk_id": null,
+              "retained_from_validated_fact": true
+            },
+            "document_type": {
+              "basis": "chunker",
+              "stale": false,
+              "source": "structural",
+              "evidence_quote": null,
+              "source_chunk_id": "rc_bcfc9a4d4f573f745fe25e877442f82dda65e545"
+            },
+            "appendix_label": {
+              "basis": "explicit",
+              "stale": false,
+              "source": "llm",
+              "request_hash": "cfec005f14e058f17c471d0a3fad7b5dc61a4b0580f260fb45964e55e64188b3",
+              "evidence_quote": "EK 3",
+              "evidence_scope": "heading",
+              "reference_quote": null,
+              "source_chunk_id": "rc_bcfc9a4d4f573f745fe25e877442f82dda65e545",
+              "reference_chunk_id": null
+            }
+          },
+          "version": 2,
+          "warnings": [
+            "Retained metadata from request 3598ac66caa1454e0d22a696650ab9eb6a7d409835722df4a24d9ade1bb77fd3: No overall document title found in the text; extracted the annex title as annex_title."
+          ],
+          "input_stale": false,
+          "input_sha256": "03490b91b67bce9d923544d633fa1d975b846639bf4870205050cce743a54cdb",
+          "request_hash": "cfec005f14e058f17c471d0a3fad7b5dc61a4b0580f260fb45964e55e64188b3",
+          "composed_from_validated_facts": true
+        },
+        "intake_chunking_version": "2",
+        "source_regulatory_chunk_ids": []
+      },
+      "validity_start_date": null,
+      "validity_end_date": null,
+      "status": "active",
+      "source": "indexed",
+      "supersedes_chunk_id": null,
+      "superseded_by_chunk_id": null,
+      "created_at": "2026-10-27T19:42:43.065312Z",
+      "updated_at": "2026-11-03T18:42:42.894060Z"
+    },
+    "source": {
+      "id": "rc_d0a088e6d1d80639db17a5f9658218761af36afe",
+      "user_file_id": "5797281f-246b-49cd-a350-fef757ef92c1",
+      "text": "(d) Makine veya ilgili ürünün sensörleri üzerinde istemli veya istemsiz bir etki yoluyla tehlikeli fonksiyonların çalışmasını önler.\nBu dört koşul aynı anda yerine getirilemezse, kontrol veya çalışma modu seçici, güvenli bir müdahale bölgesi sağlamak için tasarlanmış ve imal edilmiş diğer koruyucu önlemleri etkinleştirir.\nBuna ek olarak, operatör üzerinde çalıştığı parçaların çalışmasını ayarlama noktasından kontrol edebilir.\n1.2.6. Güç kaynağının veya iletişim ağı bağlantısının arızalanması\nKesinti, kesintiden sonra yeniden enerjinin verilmesi veya makine veya ilgili ürünü ile olan güç kaynağı veya iletişim ağı bağlantısında her ne şekilde olursa olsun meydana gelen dalgalanma tehlikeli durumlara yol açmaz.\nAşağıdakilere özellikle dikkat edilir:",
+      "position": 141,
+      "chunk_type": "clause",
+      "heading_path": [
+        "EK-1",
+        "EK 3",
+        "1. TEMEL SAĞLIK VE GÜVENLİK GEREKLİLİKLERİ",
+        "(d) Makine veya ilgili ürünün sensörleri üzerinde istemli veya istemsiz bir etki yoluyla te..."
+      ],
+      "chunk_metadata": {
+        "article_no": null,
+        "annex_title": "MAKİNE VEYA İLGİLİ ÜRÜNLERİN TASARIMI VE İMALİ İLE İLGİLİ",
+        "table_index": null,
+        "clause_label": "d",
+        "heading_path": [
+          "EK-1",
+          "EK 3",
+          "1. TEMEL SAĞLIK VE GÜVENLİK GEREKLİLİKLERİ",
+          "(d) Makine veya ilgili ürünün sensörleri üzerinde istemli veya istemsiz bir etki yoluyla te..."
+        ],
+        "paragraph_no": null,
+        "source_links": {
+          "0": "https://www.resmigazete.gov.tr/eskiler/2026/10/20261016-12-1.pdf"
+        },
+        "article_title": null,
+        "chunk_variant": "atomic",
+        "document_date": null,
+        "document_type": "unknown",
+        "image_file_id": null,
+        "appendix_label": "EK 3",
+        "image_file_ids": [],
+        "document_number": null,
+        "subclause_label": null,
+        "table_row_index": null,
+        "source_asset_ids": [],
+        "annex_element_ids": [],
+        "hierarchy_root_id": null,
+        "hierarchy_root_path": [],
+        "source_chunk_orders": [],
+        "intake_legal_metadata": {
+          "model": "gemini-3.5-flash",
+          "fields": {
+            "annex_title": {
+              "basis": "explicit",
+              "stale": false,
+              "source": "llm",
+              "request_hash": "854a96acf6fa0d45ee023f010297f3072f0452aa8abc637105b69f3f45dd45cc",
+              "evidence_quote": "MAKİNE VEYA İLGİLİ ÜRÜNLERİN TASARIMI VE İMALİ İLE İLGİLİ",
+              "evidence_scope": "body",
+              "reference_quote": null,
+              "source_chunk_id": "rc_ed16ac4500e993d91e89760180a1dc1049c38d85",
+              "reference_chunk_id": null
+            },
+            "clause_label": {
+              "basis": "explicit",
+              "stale": false,
+              "source": "llm",
+              "request_hash": "854a96acf6fa0d45ee023f010297f3072f0452aa8abc637105b69f3f45dd45cc",
+              "evidence_quote": "(d) Makine veya ilgili ürünün sensörleri üzerinde istemli veya istemsiz bir etki yoluyla tehlikeli fonksiyonların çalışmasını önler.",
+              "evidence_scope": "body",
+              "reference_quote": null,
+              "source_chunk_id": "rc_d0a088e6d1d80639db17a5f9658218761af36afe",
+              "reference_chunk_id": null
+            },
+            "document_type": {
+              "basis": "chunker",
+              "stale": false,
+              "source": "structural",
+              "evidence_quote": null,
+              "source_chunk_id": "rc_d0a088e6d1d80639db17a5f9658218761af36afe"
+            },
+            "appendix_label": {
+              "basis": "explicit",
+              "stale": false,
+              "source": "llm",
+              "request_hash": "854a96acf6fa0d45ee023f010297f3072f0452aa8abc637105b69f3f45dd45cc",
+              "evidence_quote": "EK 3",
+              "evidence_scope": "heading",
+              "reference_quote": null,
+              "source_chunk_id": "rc_ed16ac4500e993d91e89760180a1dc1049c38d85",
+              "reference_chunk_id": null
+            }
+          },
+          "version": 2,
+          "warnings": [],
+          "input_stale": false,
+          "input_sha256": "03490b91b67bce9d923544d633fa1d975b846639bf4870205050cce743a54cdb",
+          "request_hash": "854a96acf6fa0d45ee023f010297f3072f0452aa8abc637105b69f3f45dd45cc"
+        },
+        "intake_chunking_version": "2",
+        "source_regulatory_chunk_ids": []
+      },
+      "validity_start_date": null,
+      "validity_end_date": null,
+      "status": "active",
+      "source": "indexed",
+      "supersedes_chunk_id": null,
+      "superseded_by_chunk_id": null,
+      "created_at": "2026-10-27T19:42:43.065312Z",
+      "updated_at": "2026-11-03T18:42:42.894060Z"
+    },
+    "fact": {
+      "basis": "explicit",
+      "stale": false,
+      "source": "llm",
+      "request_hash": "3598ac66caa1454e0d22a696650ab9eb6a7d409835722df4a24d9ade1bb77fd3",
+      "evidence_quote": "(d) Makine veya ilgili ürünün sensörleri üzerinde istemli veya istemsiz bir etki yoluyla te...",
+      "evidence_scope": "heading",
+      "reference_quote": null,
+      "source_chunk_id": "rc_d0a088e6d1d80639db17a5f9658218761af36afe",
+      "reference_chunk_id": null,
+      "retained_from_validated_fact": true
+    },
+    "value": "b"
+  },
+  {
+    "target": {
+      "id": "rc_58559e0c8463d3441bc6777170245c6badff0cc5",
+      "user_file_id": "5797281f-246b-49cd-a350-fef757ef92c1",
+      "text": "(c) 7.3 maddesinde atıfta bulunulan şekilde son teknolojide herhangi bir değişiklik olmadığının teyidi ve,",
+      "position": 480,
+      "chunk_type": "clause",
+      "heading_path": [
+        "EK-1",
+        "EK 7",
+        "7. AB tip inceleme belgesinin gözden geçirilmesi",
+        "(c) 7.3 maddesinde atıfta bulunulan şekilde son teknolojide herhangi bir değişiklik olmadığ..."
+      ],
+      "chunk_metadata": {
+        "article_no": null,
+        "table_index": null,
+        "clause_label": "c",
+        "heading_path": [
+          "EK-1",
+          "EK 7",
+          "7. AB tip inceleme belgesinin gözden geçirilmesi",
+          "(c) 7.3 maddesinde atıfta bulunulan şekilde son teknolojide herhangi bir değişiklik olmadığ..."
+        ],
+        "paragraph_no": "7",
+        "source_links": {
+          "0": "https://www.resmigazete.gov.tr/eskiler/2026/10/20261016-12-1.pdf"
+        },
+        "article_title": null,
+        "chunk_variant": "atomic",
+        "document_date": null,
+        "document_type": "Yönetmelik",
+        "image_file_id": null,
+        "section_title": "7. AB tip inceleme belgesinin gözden geçirilmesi",
+        "appendix_label": "EK 7",
+        "image_file_ids": [],
+        "document_number": null,
+        "subclause_label": null,
+        "table_row_index": null,
+        "source_asset_ids": [],
+        "annex_element_ids": [],
+        "hierarchy_root_id": null,
+        "hierarchy_root_path": [],
+        "source_chunk_orders": [],
+        "intake_legal_metadata": {
+          "model": "gemini-3.5-flash",
+          "fields": {
+            "clause_label": {
+              "basis": "explicit",
+              "stale": false,
+              "source": "llm",
+              "request_hash": "a60d53e2f8f6a9f6b4d92ba446dcb6698581c004ef14e50e7c1152aa8c82d10e",
+              "evidence_quote": "(b) Zorlu iş duruşlarına veya hareketlerine ve operatörün kapasitesini aşan manuel kuvvet u...",
+              "evidence_scope": "heading",
+              "reference_quote": null,
+              "source_chunk_id": "rc_2d5705c1ae0426e35976c9066ae5937f9cb9e994",
+              "reference_chunk_id": null,
+              "retained_from_validated_fact": true
+            },
+            "paragraph_no": {
+              "basis": "explicit",
+              "stale": false,
+              "source": "llm",
+              "request_hash": "2c7c1f851c7945f7699236305f1a246b8950a76b686a264085a0ff17b5755c31",
+              "evidence_quote": "7. AB tip inceleme belgesinin gözden geçirilmesi",
+              "evidence_scope": "heading",
+              "reference_quote": null,
+              "source_chunk_id": "rc_58559e0c8463d3441bc6777170245c6badff0cc5",
+              "reference_chunk_id": null,
+              "retained_from_validated_fact": true
+            },
+            "document_type": {
+              "basis": "explicit",
+              "stale": false,
+              "source": "llm",
+              "request_hash": "a60d53e2f8f6a9f6b4d92ba446dcb6698581c004ef14e50e7c1152aa8c82d10e",
+              "evidence_quote": "1. AB tip incelemesi, onaylanmış bir kuruluşun makine veya bir ilgili ürünün teknik\ntasarımını incelediği ve makine veya ilgili ürünün teknik tasarımının bu Yönetmeliğin geçerli\ngerekliliklerini karşıladığını doğruladığı ve tasdik ettiği uygunluk değerlendirme prosedürünün\nbir parçasıdır.",
+              "evidence_scope": "body",
+              "reference_quote": null,
+              "source_chunk_id": "rc_1c16b5cabd8a0f3c15bdd31484b0cd5b130007ba",
+              "reference_chunk_id": null,
+              "retained_from_validated_fact": true
+            },
+            "section_title": {
+              "basis": "explicit",
+              "stale": false,
+              "source": "llm",
+              "request_hash": "afecc3db7c2987a8143020b7794cdca274f28acc34be6084053f2df2c760285c",
+              "evidence_quote": "7. AB tip inceleme belgesinin gözden geçirilmesi",
+              "evidence_scope": "heading",
+              "reference_quote": null,
+              "source_chunk_id": "rc_3a6453d065858da49536a7e687569d295cbfc410",
+              "reference_chunk_id": null
+            },
+            "appendix_label": {
+              "basis": "explicit",
+              "stale": false,
+              "source": "llm",
+              "request_hash": "afecc3db7c2987a8143020b7794cdca274f28acc34be6084053f2df2c760285c",
+              "evidence_quote": "EK 7",
+              "evidence_scope": "heading",
+              "reference_quote": null,
+              "source_chunk_id": "rc_35a40406318a1ff2a52917287f51fcc9558d9e72",
+              "reference_chunk_id": null
+            }
+          },
+          "version": 2,
+          "warnings": [
+            "Retained metadata from request a60d53e2f8f6a9f6b4d92ba446dcb6698581c004ef14e50e7c1152aa8c82d10e: No explicit document_title or document_date could be found in the evidence catalog."
+          ],
+          "input_stale": false,
+          "input_sha256": "03490b91b67bce9d923544d633fa1d975b846639bf4870205050cce743a54cdb",
+          "request_hash": "afecc3db7c2987a8143020b7794cdca274f28acc34be6084053f2df2c760285c",
+          "composed_from_validated_facts": true
+        },
+        "intake_chunking_version": "2",
+        "source_regulatory_chunk_ids": []
+      },
+      "validity_start_date": null,
+      "validity_end_date": null,
+      "status": "active",
+      "source": "indexed",
+      "supersedes_chunk_id": null,
+      "superseded_by_chunk_id": null,
+      "created_at": "2026-10-27T19:42:43.065312Z",
+      "updated_at": "2026-11-03T18:42:42.894060Z"
+    },
+    "source": {
+      "id": "rc_2d5705c1ae0426e35976c9066ae5937f9cb9e994",
+      "user_file_id": "5797281f-246b-49cd-a350-fef757ef92c1",
+      "text": "(b) Zorlu iş duruşlarına veya hareketlerine ve operatörün kapasitesini aşan manuel kuvvet uygulamalarına olan ihtiyacın önlenmesi,",
+      "position": 90,
+      "chunk_type": "clause",
+      "heading_path": [
+        "EK-1",
+        "EK 3",
+        "1. TEMEL SAĞLIK VE GÜVENLİK GEREKLİLİKLERİ",
+        "(b) Zorlu iş duruşlarına veya hareketlerine ve operatörün kapasitesini aşan manuel kuvvet u..."
+      ],
+      "chunk_metadata": {
+        "article_no": null,
+        "table_index": null,
+        "clause_label": "b",
+        "heading_path": [
+          "EK-1",
+          "EK 3",
+          "1. TEMEL SAĞLIK VE GÜVENLİK GEREKLİLİKLERİ",
+          "(b) Zorlu iş duruşlarına veya hareketlerine ve operatörün kapasitesini aşan manuel kuvvet u..."
+        ],
+        "paragraph_no": null,
+        "source_links": {
+          "0": "https://www.resmigazete.gov.tr/eskiler/2026/10/20261016-12-1.pdf"
+        },
+        "article_title": null,
+        "chunk_variant": "atomic",
+        "document_date": null,
+        "document_type": "unknown",
+        "image_file_id": null,
+        "appendix_label": "EK 3",
+        "image_file_ids": [],
+        "document_number": null,
+        "subclause_label": null,
+        "table_row_index": null,
+        "source_asset_ids": [],
+        "annex_element_ids": [],
+        "hierarchy_root_id": null,
+        "hierarchy_root_path": [],
+        "source_chunk_orders": [],
+        "intake_legal_metadata": {
+          "model": "gemini-3.5-flash",
+          "fields": {
+            "clause_label": {
+              "basis": "explicit",
+              "stale": false,
+              "source": "llm",
+              "request_hash": "f4b887d5256ccb66114955de9e4e8bad21fa3a84e66405fd8a697f1769cc91cc",
+              "evidence_quote": "(b) Zorlu iş duruşlarına veya hareketlerine ve operatörün kapasitesini aşan manuel kuvvet uygulamalarına olan ihtiyacın önlenmesi,",
+              "evidence_scope": "body",
+              "reference_quote": null,
+              "source_chunk_id": "rc_2d5705c1ae0426e35976c9066ae5937f9cb9e994",
+              "reference_chunk_id": null
+            },
+            "document_type": {
+              "basis": "chunker",
+              "stale": false,
+              "source": "structural",
+              "evidence_quote": null,
+              "source_chunk_id": "rc_2d5705c1ae0426e35976c9066ae5937f9cb9e994"
+            },
+            "appendix_label": {
+              "basis": "explicit",
+              "stale": false,
+              "source": "llm",
+              "request_hash": "f4b887d5256ccb66114955de9e4e8bad21fa3a84e66405fd8a697f1769cc91cc",
+              "evidence_quote": "EK 3",
+              "evidence_scope": "heading",
+              "reference_quote": null,
+              "source_chunk_id": "rc_2d5705c1ae0426e35976c9066ae5937f9cb9e994",
+              "reference_chunk_id": null
+            }
+          },
+          "version": 2,
+          "warnings": [
+            "No explicit document title, document date, or document number was found in the text; therefore, these fields are omitted."
+          ],
+          "input_stale": false,
+          "input_sha256": "03490b91b67bce9d923544d633fa1d975b846639bf4870205050cce743a54cdb",
+          "request_hash": "f4b887d5256ccb66114955de9e4e8bad21fa3a84e66405fd8a697f1769cc91cc"
+        },
+        "intake_chunking_version": "2",
+        "source_regulatory_chunk_ids": []
+      },
+      "validity_start_date": null,
+      "validity_end_date": null,
+      "status": "active",
+      "source": "indexed",
+      "supersedes_chunk_id": null,
+      "superseded_by_chunk_id": null,
+      "created_at": "2026-10-27T19:42:43.065312Z",
+      "updated_at": "2026-11-03T18:42:42.894060Z"
+    },
+    "fact": {
+      "basis": "explicit",
+      "stale": false,
+      "source": "llm",
+      "request_hash": "a60d53e2f8f6a9f6b4d92ba446dcb6698581c004ef14e50e7c1152aa8c82d10e",
+      "evidence_quote": "(b) Zorlu iş duruşlarına veya hareketlerine ve operatörün kapasitesini aşan manuel kuvvet u...",
+      "evidence_scope": "heading",
+      "reference_quote": null,
+      "source_chunk_id": "rc_2d5705c1ae0426e35976c9066ae5937f9cb9e994",
+      "reference_chunk_id": null,
+      "retained_from_validated_fact": true
+    },
+    "value": "c"
+  },
+  {
+    "target": {
+      "id": "rc_6a0875706bf7607315b2396fd83a282fa6da4114",
+      "user_file_id": "5797281f-246b-49cd-a350-fef757ef92c1",
+      "text": "(d) Normal çalışma koşullarında, işlevi bu şekilde çalışmasını gerektiren makine veya ilgili\nürünler dışında, yükü sadece sürtünme freni ile indirmek mümkün olmaz.",
+      "position": 352,
+      "chunk_type": "clause",
+      "heading_path": [
+        "EK-1",
+        "EK 3",
+        "1.2.4",
+        "(d) Normal çalışma koşullarında, işlevi bu şekilde çalışmasını gerektiren makine veya ilgili"
+      ],
+      "chunk_metadata": {
+        "article_no": null,
+        "table_index": null,
+        "clause_label": "b",
+        "heading_path": [
+          "EK-1",
+          "EK 3",
+          "1.2.4",
+          "(d) Normal çalışma koşullarında, işlevi bu şekilde çalışmasını gerektiren makine veya ilgili"
+        ],
+        "paragraph_no": null,
+        "source_links": {
+          "0": "https://www.resmigazete.gov.tr/eskiler/2026/10/20261016-12-1.pdf"
+        },
+        "article_title": null,
+        "chunk_variant": "atomic",
+        "document_date": null,
+        "document_type": "unknown",
+        "image_file_id": null,
+        "appendix_label": "EK 3",
+        "image_file_ids": [],
+        "document_number": null,
+        "subclause_label": null,
+        "table_row_index": null,
+        "source_asset_ids": [],
+        "annex_element_ids": [],
+        "hierarchy_root_id": null,
+        "hierarchy_root_path": [],
+        "source_chunk_orders": [],
+        "intake_legal_metadata": {
+          "model": "gemini-3.5-flash",
+          "fields": {
+            "clause_label": {
+              "basis": "explicit",
+              "stale": false,
+              "source": "llm",
+              "request_hash": "c66dc9a1d227c9da34d78fa5a70f267c61c00086860273f2d80abf51ba500d9e",
+              "evidence_quote": "(b) Dönen aletlerden kaynaklanan yaralanmalar.",
+              "evidence_scope": "heading",
+              "reference_quote": null,
+              "source_chunk_id": "rc_67e12a2e4c49a3b538f97ccc099de12ad1d4a6a5",
+              "reference_chunk_id": null
+            },
+            "document_type": {
+              "basis": "chunker",
+              "stale": false,
+              "source": "structural",
+              "evidence_quote": null,
+              "source_chunk_id": "rc_6a0875706bf7607315b2396fd83a282fa6da4114"
+            },
+            "appendix_label": {
+              "basis": "explicit",
+              "stale": false,
+              "source": "llm",
+              "request_hash": "c66dc9a1d227c9da34d78fa5a70f267c61c00086860273f2d80abf51ba500d9e",
+              "evidence_quote": "EK 3",
+              "evidence_scope": "heading",
+              "reference_quote": null,
+              "source_chunk_id": "rc_6a0875706bf7607315b2396fd83a282fa6da4114",
+              "reference_chunk_id": null
+            }
+          },
+          "version": 2,
+          "warnings": [],
+          "input_stale": false,
+          "input_sha256": "03490b91b67bce9d923544d633fa1d975b846639bf4870205050cce743a54cdb",
+          "request_hash": "c66dc9a1d227c9da34d78fa5a70f267c61c00086860273f2d80abf51ba500d9e"
+        },
+        "intake_chunking_version": "2",
+        "source_regulatory_chunk_ids": []
+      },
+      "validity_start_date": null,
+      "validity_end_date": null,
+      "status": "active",
+      "source": "indexed",
+      "supersedes_chunk_id": null,
+      "superseded_by_chunk_id": null,
+      "created_at": "2026-10-27T19:42:43.065312Z",
+      "updated_at": "2026-11-03T18:42:42.894060Z"
+    },
+    "source": {
+      "id": "rc_67e12a2e4c49a3b538f97ccc099de12ad1d4a6a5",
+      "user_file_id": "5797281f-246b-49cd-a350-fef757ef92c1",
+      "text": "3.4. MEKANİK RİSKLERE KARŞI KORUMA\n3.4.1. Kontrolsüz hareketler\nMakine veya ilgili ürünler, hareket ettirildiğinde ağırlık merkezinin kontrolsüz salınımlarının\ndengesini etkilememesini veya yapısına aşırı yük bindirmemesini sağlayacak şekilde tasarlanır,\nimal edilir ve uygun olduğunda hareketli bir destek üzerine yerleştirilir.\n3.4.2. Hareketli aktarım parçaları\n1.3.8.1'e istisna olarak, motorların söz konusu olduğu durumda, motor bölmesindeki hareketli\nparçalara erişimi engelleyen hareketli mahfazaların, bir alet veya anahtar kullanılarak veya\nyetkisiz erişimi önlemek üzere kilitli, tamamen kapalı bir kabin içinde bulunması kaydıyla sürüş\npozisyonunda bulunan bir kontrolle açılması gerekiyorsa, kilitleme tertibatına sahip olmaları\ngerekmez.\n3.4.3. Yuvarlanma ve devrilme",
+      "position": 301,
+      "chunk_type": "clause",
+      "heading_path": [
+        "EK-1",
+        "EK 3",
+        "1.2.4",
+        "(b) Dönen aletlerden kaynaklanan yaralanmalar."
+      ],
+      "chunk_metadata": {
+        "article_no": null,
+        "table_index": null,
+        "clause_label": "b",
+        "heading_path": [
+          "EK-1",
+          "EK 3",
+          "1.2.4",
+          "(b) Dönen aletlerden kaynaklanan yaralanmalar."
+        ],
+        "paragraph_no": null,
+        "source_links": {
+          "0": "https://www.resmigazete.gov.tr/eskiler/2026/10/20261016-12-1.pdf"
+        },
+        "article_title": null,
+        "chunk_variant": "atomic",
+        "document_date": null,
+        "document_type": "unknown",
+        "image_file_id": null,
+        "appendix_label": "EK 3",
+        "image_file_ids": [],
+        "document_number": null,
+        "subclause_label": null,
+        "table_row_index": null,
+        "source_asset_ids": [],
+        "annex_element_ids": [],
+        "hierarchy_root_id": null,
+        "hierarchy_root_path": [],
+        "source_chunk_orders": [],
+        "intake_legal_metadata": {
+          "model": "gemini-3.5-flash",
+          "fields": {
+            "clause_label": {
+              "basis": "chunker",
+              "stale": false,
+              "source": "structural",
+              "evidence_quote": null,
+              "source_chunk_id": "rc_67e12a2e4c49a3b538f97ccc099de12ad1d4a6a5"
+            },
+            "document_type": {
+              "basis": "chunker",
+              "stale": false,
+              "source": "structural",
+              "evidence_quote": null,
+              "source_chunk_id": "rc_67e12a2e4c49a3b538f97ccc099de12ad1d4a6a5"
+            },
+            "appendix_label": {
+              "basis": "explicit",
+              "stale": false,
+              "source": "llm",
+              "request_hash": "88a0fa01729c5994a48d47a520c49c7afad1d8eba80d2596b369c360ba4d65c6",
+              "evidence_quote": "EK 3",
+              "evidence_scope": "heading",
+              "reference_quote": null,
+              "source_chunk_id": "rc_67e12a2e4c49a3b538f97ccc099de12ad1d4a6a5",
+              "reference_chunk_id": null
+            }
+          },
+          "version": 2,
+          "warnings": [
+            "Could not extract clause_label and annex_title as they are not entirely covered by any single exact evidence entries."
+          ],
+          "input_stale": false,
+          "input_sha256": "03490b91b67bce9d923544d633fa1d975b846639bf4870205050cce743a54cdb",
+          "request_hash": "88a0fa01729c5994a48d47a520c49c7afad1d8eba80d2596b369c360ba4d65c6"
+        },
+        "intake_chunking_version": "2",
+        "source_regulatory_chunk_ids": []
+      },
+      "validity_start_date": null,
+      "validity_end_date": null,
+      "status": "active",
+      "source": "indexed",
+      "supersedes_chunk_id": null,
+      "superseded_by_chunk_id": null,
+      "created_at": "2026-10-27T19:42:43.065312Z",
+      "updated_at": "2026-11-03T18:42:42.894060Z"
+    },
+    "fact": {
+      "basis": "explicit",
+      "stale": false,
+      "source": "llm",
+      "request_hash": "c66dc9a1d227c9da34d78fa5a70f267c61c00086860273f2d80abf51ba500d9e",
+      "evidence_quote": "(b) Dönen aletlerden kaynaklanan yaralanmalar.",
+      "evidence_scope": "heading",
+      "reference_quote": null,
+      "source_chunk_id": "rc_67e12a2e4c49a3b538f97ccc099de12ad1d4a6a5",
+      "reference_chunk_id": null
+    },
+    "value": "b"
+  }
+]

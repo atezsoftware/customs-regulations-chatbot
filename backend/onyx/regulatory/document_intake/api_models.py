@@ -206,5 +206,8 @@ class IntakeBatchSnapshot(BaseModel):
     documents: list[IntakeDocumentSnapshot] = Field(default_factory=list)
     labeling_run_id: UUID | None = None
     labeling_failed_count: int = Field(default=0, ge=0)
+    metadata_contract_retry: dict[str, JsonValue] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     created_at: datetime.datetime | None = None
     updated_at: datetime.datetime | None = None

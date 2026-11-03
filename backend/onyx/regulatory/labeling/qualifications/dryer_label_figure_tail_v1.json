@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "profile_id": "dryer_label_figure_tail_v1",
+  "profile_kind": "figure_caption",
+  "source_url": "https://www.resmigazete.gov.tr/eskiler/2025/01/20250105-2-1.pdf",
+  "source_sha256": "a8024092aacabac79938653ff77cf9c3b215c89fe08cb5ec7fa4b011c63c4046",
+  "source_byte_count": 4526449,
+  "source_mime_type": "application/pdf",
+  "canonical_entry_count": 27,
+  "transcription_sha256": "7ff8bdaa61bc588a84fa74406739f3795730b760973f5a6cdb1ca257802055ac",
+  "reviewed_pages": [
+    {
+      "page": 5,
+      "printed_page": 24,
+      "render_sha256": "45519d3e29f91f2a300c2cb53df263c4815ff655cde0c4744874c6d54db944ab"
+    }
+  ],
+  "review_method": "The complete public source page was rendered and visually reviewed. The 48 mm datum belongs to the bottom of Figure2; Etiket: is the following caption. The next a) clause contains the operative size requirement and is preserved separately. This is a content-addressed source review, not a general PDF/OCR classification algorithm.",
+  "target_text": "48 mm\nEtiket:",
+  "preceding_diagram": "2. Yoğuşturuculu çamaşır kurutma makineleri için etiket tasarımı\nŞekil 2\n96 mm\n2\n21 mm 2 mm 14 mm 3 mm\n3 mm 3 mm\n14 mm ENERG 14 mm 3\n1\n2 mm\n4 8 mm TRADEMARK MODEL IDENTIFIER 5\n4 mm 7\n8.5 mm A 22 mm\n1.5 mm\n8.5 mm B B 12 mm 8\n1.5 mm\n8.5 mm C\n1.5 mm\n6 D 77 mm\n8.5 mm\n1.5 mm\n8.5 mm E\n1.5 mm\n8.5 mm F\n1.5 mm\n8.5 mm G\n4.5 mm 192 mm\n7\n14 mm XYZ kWh / 100 14 mm 20 mm\n9\n6 mm 7\n10 mm 15 mm 22 mm\nA A\nB B\n16 mm C XYdB 10\n10 D XY% D\n5 mm\n7 mm 14 mm\n14 mm 14 mm 10\n10\nXY,Z kg X:YZ 11\n7 mm 2023/2534\n6 mm\n3 mm 3 mm\n27 mm 38 mm 27 mm\n24 mm\n28 mm\n32 mm\n36 mm\n40 mm\n44 mm",
+  "following_clause": "a) Etiket en az 96 mm genişliğinde ve 192 mm yüksekliğinde olmalıdır. Etiketin daha büyük bir formatta basıldığı durumlarda, içeriği yine de Şekil 2'deki özelliklerle orantılı kalmalıdır.",
+  "section_title": "2. Yoğuşturuculu çamaşır kurutma makineleri için etiket tasarımı",
+  "appendix_label": "EK iii",
+  "annex_title": "Etiket",
+  "annex_title_witness_text": "Etiket\nA. Yoğuşturuculu (kondenserli) çamaşır kurutma makineleri için etiket",
+  "qualification_scope": "Only the exact reviewed figure-tail fragment after a genuine base abstention and the actual same-item single bounded semantic reconsideration also abstained. No labels are created and every operative neighbor remains unchanged."
+}

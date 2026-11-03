@@ -165,6 +165,8 @@ repos:
       - id: check-added-large-files
         name: Check for added large files
         args: ["--maxkb=1500"]
+        # Preserve the exact public PDF used by the reviewed-fragment byte proof.
+        exclude: ^backend/tests/unit/onyx/regulatory/labeling/fixtures/reviewed-figure-caption-source\.pdf$
       - id: check-yaml
         name: Check YAML
         # --unsafe relaxes check-yaml to syntax-only, so it accepts the

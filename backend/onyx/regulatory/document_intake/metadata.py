@@ -1310,6 +1310,106 @@ def _inline_heading_paragraph_evidence(
     return paragraph
 
 
+def _clause_value(value: str) -> str | None:
+    value = value.strip().strip("()")
+    normalized = value.replace("I", "ı").replace("İ", "i").lower()
+    if re.fullmatch(r"(?P<letter>[a-zçğıöşü])(?P=letter)?", normalized) is None:
+        return None
+    return normalized
+
+
+def clause_body_identity(text: str) -> str | None:
+    """Only a formal starting prefix with no competing body markers is unique."""
+    marker = re.compile(
+        r"^[ \t]*(?:\*\*|__)?\(?((?P<letter>[a-zçğıöşü])(?P=letter)?)\)",
+        re.I,
+    )
+    lines = text.strip().splitlines()
+    # Parenthesized Roman sublists are role-ambiguous before Turkish case folding.
+    if lines and re.match(r"^(?:\*\*|__)?\([IVXLCDMivxlcdm]{2,}\)", lines[0]):
+        return None
+    if not lines or marker.match(lines[0]) is None:
+        return None
+    markers = {
+        _clause_value(match.group(1))
+        for line in lines
+        if (match := marker.match(line)) is not None
+    }
+    return next(iter(markers)) if len(markers) == 1 else None
+
+
+def selected_clause_evidence_contradicts(
+    *, value: str, evidence_quote: str, source: MetadataChunk | None = None
+) -> bool:
+    """Reject opposing explicit prefixes; continuation/mixed scopes prove no identity."""
+    if (
+        source is not None
+        and evidence_quote in source.text
+        and re.match(r"^(?:\*\*|__)?\(?[IVXLCDMivxlcdm]+\)", evidence_quote.strip())
+        and _roman_sublist_quote(evidence_quote, source.text)
+    ):
+        return False
+    claimed, selected = _clause_value(value), clause_body_identity(evidence_quote)
+    return claimed is not None and selected is not None and claimed != selected
+
+
+def _roman_sublist_quote(quote: str, body: str) -> bool:
+    """Only the selected line in a consecutive parenthesized Roman run is ambiguous."""
+    marker = re.compile(r"^[ \t]*(?:\*\*|__)?\(?([IVXLCDMivxlcdm]+)\)")
+    values = {"I": 1, "V": 5, "X": 10, "L": 50, "C": 100, "D": 500, "M": 1000}
+    run: list[tuple[int, str]] = []
+    boundaries = [
+        line
+        for line in body.splitlines()
+        if re.match(r"^[ \t]*(?:\*\*|__)?\(?[a-zA-ZçğıöşüÇĞİÖŞÜ]+\)", line)
+    ]
+    for line in [*boundaries, ""]:
+        match = marker.match(line)
+        token = match[1].upper() if match else ""
+        valid = bool(
+            token
+            and re.fullmatch(
+                r"M{0,3}(CM|CD|D?C{0,3})(XC|XL|L?X{0,3})(IX|IV|V?I{0,3})", token
+            )
+        )
+        number = (
+            sum(
+                -values[c]
+                if i + 1 < len(token) and values[c] < values[token[i + 1]]
+                else values[c]
+                for i, c in enumerate(token)
+            )
+            if valid
+            else 0
+        )
+        if not number or (run and number != run[-1][0] + 1):
+            if len(run) >= 2 and any(
+                quote.strip().startswith(text.strip())
+                or text.strip().startswith(quote.strip())
+                for _n, text in run
+            ):
+                return True
+            run = []
+        if number:
+            run.append((number, line))
+    return False
+
+
+def target_clause_evidence_contradicts(*, value: str, target: MetadataChunk) -> bool:
+    """A direct leaf must identify its current body before overriding a locator hint."""
+    claimed, body = _clause_value(value), clause_body_identity(target.text)
+    leaf = target.heading_path[-1] if target.heading_path else ""
+    prefix = leaf[:-3] if leaf.endswith("...") else leaf.removesuffix("…")
+    return (
+        claimed is not None
+        and body is not None
+        and target.chunk_type == "clause"
+        and clause_body_identity(leaf) == body
+        and target.text.strip().startswith(prefix)
+        and claimed != body
+    )
+
+
 def _validate_paragraph_evidence(
     fact: LegalMetadataFact, sources: dict[str, MetadataChunk], target_id: str
 ) -> None:
@@ -1404,6 +1504,28 @@ def validate_metadata_response(
                 _validate_article_evidence(fact, sources, target.chunk_id)
             if fact.field == "paragraph_no":
                 _validate_paragraph_evidence(fact, sources, target.chunk_id)
+            if (
+                fact.field == "clause_label"
+                and isinstance(fact.value, str)
+                and selected_clause_evidence_contradicts(
+                    value=fact.value,
+                    evidence_quote=fact.evidence_quote,
+                    source=sources[fact.source_chunk_id],
+                )
+            ):
+                raise ValueError(
+                    "Metadata clause locator contradicts its selected source evidence"
+                )
+            if (
+                fact.field == "clause_label"
+                and isinstance(fact.value, str)
+                and target_clause_evidence_contradicts(
+                    value=fact.value, target=sources[target.chunk_id]
+                )
+            ):
+                raise ValueError(
+                    "Metadata clause locator contradicts its target source prefix"
+                )
             if fact.field in INTEGER_FIELDS:
                 if type(fact.value) is not int or fact.value < 0:
                     raise ValueError("Table indexes must be nonnegative integers")
