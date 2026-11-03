@@ -231,6 +231,7 @@ def existing_request(session: Session) -> RegulatoryDocumentIntakeReprepare | No
             and set(request.documents) == {scope.MAIN_DOCUMENT, scope.PDF_DOCUMENT}
             and all(
                 entry.get("target_chunking_version") == "5"
+                and entry.get("target_formatter_version") == 4
                 and entry.get("target_preparation_policy") == policy("5")
                 for entry in request.documents.values()
             ),
@@ -263,7 +264,13 @@ def reprepare_plan(session: Session, batch: RegulatoryDocumentIntake) -> dict[st
         and old.status == "prepared"
         and old.expected_sha256 == scope.REPREPARE_REVIEW_SHA
         and old.error is None
-        and all(entry.get("status") == "prepared" for entry in old.documents.values()),
+        and all(
+            entry.get("status") == "prepared"
+            and entry.get("target_chunking_version") == "4"
+            and entry.get("target_formatter_version") == 4
+            and entry.get("target_preparation_policy") == policy("4")
+            for entry in old.documents.values()
+        ),
         "The existing completed v4 preparation checkpoint changed",
     )
     assert old is not None

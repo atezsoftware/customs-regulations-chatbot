@@ -14,7 +14,11 @@ from uuid import uuid4
 import pytest
 from sqlalchemy.orm import Session
 
-from onyx.db.models import RegulatoryDocumentIntake, RegulatoryLabelingRun
+from onyx.db.models import (
+    RegulatoryDocumentIntake,
+    RegulatoryDocumentIntakeReprepare,
+    RegulatoryLabelingRun,
+)
 
 
 @pytest.fixture
@@ -171,6 +175,57 @@ def test_existing_request_never_retries_or_reenqueues(
     report, enqueue = operator.request_once(MagicMock(spec=Session), MagicMock())
     assert report["action"] == "existing_v5_request_inspected_only" and enqueue is None
     forbidden.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "changed", ["batch", "previous", "snapshot", "version", "formatter", "policy"]
+)
+def test_existing_key_is_bound_to_exact_incident_and_target_policy(
+    operator: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    changed: str,
+) -> None:
+    monkeypatch.setattr(operator, "APPROVED_PLAN_SHA", "a" * 64)
+    documents = {
+        key: {
+            "target_chunking_version": "5",
+            "target_formatter_version": 4,
+            "target_preparation_policy": operator.policy("5"),
+        }
+        for key in (operator.scope.MAIN_DOCUMENT, operator.scope.PDF_DOCUMENT)
+    }
+    request = RegulatoryDocumentIntakeReprepare(
+        id=uuid4(),
+        intake_id=operator.scope.BATCH,
+        previous_labeling_run_id=operator.OLD_RUN,
+        expected_sha256="a" * 64,
+        idempotency_key=operator.KEY,
+        documents=documents,
+    )
+    session = MagicMock(spec=Session)
+    session.scalar.return_value = request
+    assert operator.existing_request(session) is request
+    if changed in {"batch", "previous", "snapshot"}:
+        setattr(
+            request,
+            {
+                "batch": "intake_id",
+                "previous": "previous_labeling_run_id",
+                "snapshot": "expected_sha256",
+            }[changed],
+            "b" * 64 if changed == "snapshot" else uuid4(),
+        )
+    else:
+        entry = documents[operator.scope.PDF_DOCUMENT]
+        entry[
+            {
+                "version": "target_chunking_version",
+                "formatter": "target_formatter_version",
+                "policy": "target_preparation_policy",
+            }[changed]
+        ] = {"version": "4", "formatter": 5, "policy": operator.policy("4")}[changed]
+    with pytest.raises(RuntimeError, match="reviewed identity"):
+        operator.existing_request(session)
 
 
 @pytest.mark.parametrize(
