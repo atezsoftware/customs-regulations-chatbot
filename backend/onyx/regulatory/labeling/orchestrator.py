@@ -43,6 +43,7 @@ from onyx.regulatory.labeling.domain import shard_by_count_and_bytes
 from onyx.regulatory.labeling.intake_abstention_repair import (
     build_abstention_repair,
     build_abstention_repair_audit,
+    legacy_annex_caption_shape,
     parse_abstention_repair_output,
     validate_abstention_repair,
 )
@@ -1195,6 +1196,7 @@ def _read_and_apply_results(
                                 text=item.text_snapshot,
                                 source_snapshot=item.source_snapshot,
                             )
+                            or legacy_annex_caption_shape(item.text_snapshot)
                         )
                     ):
                         try:

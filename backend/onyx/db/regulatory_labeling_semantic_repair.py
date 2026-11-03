@@ -21,6 +21,9 @@ from onyx.regulatory.indexing_jobs.vertex_batch import VertexBatchRequest
 from onyx.regulatory.labeling.intake_abstention_repair import (
     ABSTENTION_REPAIR_KEY,
     AbstentionRepairAudit,
+    CaptionRepairSource,
+    legacy_annex_caption_repair_candidate,
+    legacy_annex_caption_shape,
     validate_stored_abstention_repair_audit,
 )
 from onyx.regulatory.labeling.intake_structural_repair import (
@@ -29,6 +32,62 @@ from onyx.regulatory.labeling.intake_structural_repair import (
 from onyx.regulatory.labeling.provider import TaxonomyDefinition, build_labeling_request
 
 SEMANTIC_REPAIR_KEY = ABSTENTION_REPAIR_KEY
+
+
+def _legacy_annex_caption_is_current(
+    session: Session, *, item: RegulatoryLabelingItem, run: RegulatoryLabelingRun
+) -> bool:
+    if not legacy_annex_caption_shape(item.text_snapshot):
+        return False
+    members = item.source_snapshot.get("context_member_ids")
+    if (
+        not isinstance(members, list)
+        or not 1 <= len(members) <= 40
+        or not all(isinstance(value, str) for value in members)
+        or len(set(members)) != len(members)
+    ):
+        return False
+    rows = session.execute(
+        select(RegulatoryChunk, RegulatoryLabelingItem)
+        .join(
+            RegulatoryLabelingItem,
+            (RegulatoryLabelingItem.regulatory_chunk_id == RegulatoryChunk.id)
+            & (RegulatoryLabelingItem.user_file_id == RegulatoryChunk.user_file_id),
+        )
+        .where(
+            RegulatoryLabelingItem.run_id == run.id,
+            RegulatoryChunk.user_file_id == item.user_file_id,
+            RegulatoryChunk.id.in_(members),
+        )
+        .execution_options(populate_existing=True)
+    ).all()
+    sources = [
+        CaptionRepairSource(
+            chunk_id=row.id,
+            file_id=str(row.user_file_id),
+            text=frozen.text_snapshot,
+            canonical_text_sha256=frozen.canonical_text_sha256 or "",
+            snapshot=frozen.source_snapshot,
+            current_text=row.text,
+            current_snapshot={
+                "position": row.position,
+                "heading_path": row.heading_path,
+                "chunk_type": row.chunk_type,
+                "chunk_metadata": row.chunk_metadata,
+                "validity_start_date": row.validity_start_date.isoformat()
+                if row.validity_start_date
+                else None,
+                "validity_end_date": row.validity_end_date.isoformat()
+                if row.validity_end_date
+                else None,
+            },
+            active=row.status == "active" and row.superseded_by_chunk_id is None,
+        )
+        for row, frozen in rows
+    ]
+    return legacy_annex_caption_repair_candidate(
+        chunk_id=item.regulatory_chunk_id, sources=sources
+    )
 
 
 def require_current_intake_repair_item(
@@ -82,7 +141,7 @@ def require_current_intake_repair_item(
         )
     elif legacy_structural_repair_candidate(
         chunk_id=row.id, text=row.text, source_snapshot=item.source_snapshot
-    ):
+    ) or _legacy_annex_caption_is_current(session, item=item, run=run):
         require_owned_intake_source(
             session,
             user_file_id=item.user_file_id,

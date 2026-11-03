@@ -1,10 +1,13 @@
 """One source-preserving reconsideration of a verified intake abstention."""
 
 import json
+import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from copy import deepcopy
+from dataclasses import dataclass
+from decimal import Decimal
 from hashlib import sha256
-from typing import Literal, cast
+from typing import Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
@@ -21,6 +24,258 @@ from onyx.regulatory.labeling.provider import (
 )
 
 ABSTENTION_REPAIR_KEY = "intake_abstention_repair"
+_NUMBERED_CAPTION = re.compile(
+    r"\((?P<number>[1-9]\d{0,2})\) Yedek parçaların bulunabilirliği:"
+)
+_DIMENSION_CAPTION = re.compile(
+    r"(?P<size>[1-9]\d{0,3}(?:[.,]\d{1,2})?) mm\n(?P<title>Etiket):"
+)
+_DIMENSION = re.compile(r"([1-9]\d{0,3}(?:[.,]\d{1,2})?) mm")
+_DESIGN_SECTION = re.compile(
+    r"(?P<number>[1-9]\d{0,2})\. (?:(?:Yoğuşturuculu|Yoğuşturucusuz) çamaşır "
+    r"kurutma makineleri|Çamaşır kurutma makineleri) için etiket tasarımı"
+)
+_DIAGRAM_TOKEN = (
+    r"(?:[0-9]{1,4}(?:[.,][0-9]{1,2})?|[0-9]{4}/[0-9]{1,5}|mm|kg|kWh|/|"
+    r"[A-G]|ENERG|ENERGY|TRADEMARK|MODEL|IDENTIFIER|XYZ|XYdB|XY%|XY,Z|X:YZ)"
+)
+_DIAGRAM_LINE = re.compile(rf"{_DIAGRAM_TOKEN}(?: {_DIAGRAM_TOKEN}){{0,15}}")
+_CAPTION_SNAPSHOT_FIELDS = (
+    "position",
+    "heading_path",
+    "chunk_type",
+    "chunk_metadata",
+    "validity_start_date",
+    "validity_end_date",
+)
+
+
+@dataclass(frozen=True)
+class CaptionRepairSource:
+    chunk_id: str
+    file_id: str
+    text: str
+    canonical_text_sha256: str
+    snapshot: dict[str, Any]
+    current_text: str
+    current_snapshot: dict[str, Any]
+    active: bool
+
+
+def legacy_annex_caption_shape(text: str) -> bool:
+    """A routing hint only; current source and neighboring witnesses are required."""
+    return len(text) <= 180 and bool(
+        _NUMBERED_CAPTION.fullmatch(text) or _DIMENSION_CAPTION.fullmatch(text)
+    )
+
+
+def _caption_metadata(source: CaptionRepairSource) -> Mapping[str, Any]:
+    metadata = source.snapshot.get("chunk_metadata")
+    return cast(Mapping[str, Any], metadata) if isinstance(metadata, Mapping) else {}
+
+
+def _caption_fact(
+    source: CaptionRepairSource, field: str, quote: str, scope: str
+) -> bool:
+    audit = _caption_metadata(source).get("intake_legal_metadata")
+    if not isinstance(audit, Mapping) or audit.get("input_stale") is not False:
+        return False
+    fields = audit.get("fields")
+    fact = fields.get(field) if isinstance(fields, Mapping) else None
+    return (
+        isinstance(fact, Mapping)
+        and fact.get("stale") is False
+        and all(
+            fact.get(key) == value
+            for key, value in {
+                "source": "llm",
+                "basis": "explicit",
+                "evidence_quote": quote,
+                "evidence_scope": scope,
+                "source_chunk_id": source.chunk_id,
+            }.items()
+        )
+    )
+
+
+def legacy_annex_caption_repair_candidate(
+    *, chunk_id: str, sources: Sequence[CaptionRepairSource]
+) -> bool:
+    """Recognize only witnessed annex captions; never classify their content.
+
+    Callers also verify the owned raw ingestion receipt and the complete current
+    labeling context before provider submission and durable result acceptance.
+    """
+    by_id = {source.chunk_id: source for source in sources}
+    target = by_id.get(chunk_id)
+    if (
+        target is None
+        or len(sources) != len(by_id)
+        or not 1 <= len(sources) <= 40
+        or not legacy_annex_caption_shape(target.text)
+    ):
+        return False
+    members = target.snapshot.get("context_member_ids")
+    if (
+        not isinstance(members, list)
+        or not all(isinstance(value, str) for value in members)
+        or len(members) != len(set(members))
+        or set(members) != set(by_id)
+    ):
+        return False
+    if any(
+        not source.active
+        or source.file_id != target.file_id
+        or source.text != source.current_text
+        or context_hash(source.current_text) != source.canonical_text_sha256
+        or any(
+            source.snapshot.get(key) != source.current_snapshot.get(key)
+            for key in _CAPTION_SNAPSHOT_FIELDS
+        )
+        for source in sources
+    ):
+        return False
+    metadata = _caption_metadata(target)
+    headings = target.snapshot.get("heading_path")
+    position = target.snapshot.get("position")
+    appendix, section = metadata.get("appendix_label"), metadata.get("section_title")
+    if (
+        target.snapshot.get("chunk_type") != "paragraph"
+        or metadata.get("intake_chunking_version") not in ("2", "3")
+        or metadata.get("chunk_variant") != "atomic"
+        or type(position) is not int
+        or position < 0
+        or not isinstance(headings, list)
+        or not all(isinstance(value, str) for value in headings)
+        or len(headings) < 3
+        or metadata.get("heading_path") != headings
+        or not isinstance(appendix, str)
+        or re.fullmatch(r"EK\s+(?:[ivxlcdm]+|[1-9]\d*)", appendix, re.I) is None
+        or headings.count(appendix) != 1
+        or headings[-2] != appendix
+        or headings[-1] != section
+        or any(
+            metadata.get(key) is not None
+            for key in (
+                "article_no",
+                "clause_label",
+                "subclause_label",
+                "table_index",
+                "table_row_index",
+            )
+        )
+    ):
+        return False
+    if any(type(source.snapshot.get("position")) is not int for source in sources):
+        return False
+    adjacent = {source.snapshot.get("position"): source for source in sources}
+    if len(adjacent) != len(sources):
+        return False
+    following = adjacent.get(position + 1)
+    if following is None:
+        return False
+    following_meta = _caption_metadata(following)
+    following_headings = following.snapshot.get("heading_path")
+    if (
+        following.snapshot.get("chunk_type") != "clause"
+        or following_meta.get("clause_label") != "a"
+        or following_meta.get("appendix_label") != appendix
+        or following_meta.get("paragraph_no") != metadata.get("paragraph_no")
+        or following_meta.get("section_title") != section
+        or following_meta.get("article_no") is not None
+        or following_meta.get("chunk_variant") != "atomic"
+        or following_meta.get("intake_chunking_version") not in ("2", "3")
+        or not isinstance(following_headings, list)
+        or len(following_headings) != len(headings) + 1
+        or following_headings[: len(headings)] != headings
+        or following_meta.get("heading_path") != following_headings
+        or not following.text.startswith("a) ")
+    ):
+        return False
+    child_heading = following_headings[-1]
+    if not isinstance(child_heading, str):
+        return False
+    child_prefix = (
+        child_heading[:-3]
+        if child_heading.endswith("...")
+        else child_heading.removesuffix("…")
+    )
+    if (
+        len(child_prefix) <= 3
+        or not child_prefix.startswith("a) ")
+        or not following.text.startswith(child_prefix)
+    ):
+        return False
+    clause_audit = following_meta.get("intake_legal_metadata")
+    fields = clause_audit.get("fields") if isinstance(clause_audit, Mapping) else None
+    clause_fact = fields.get("clause_label") if isinstance(fields, Mapping) else None
+    quote = (
+        clause_fact.get("evidence_quote") if isinstance(clause_fact, Mapping) else None
+    )
+    if (
+        not isinstance(quote, str)
+        or not quote.startswith("a) ")
+        or quote not in following.text
+        or not _caption_fact(following, "clause_label", quote, "body")
+    ):
+        return False
+    if match := _NUMBERED_CAPTION.fullmatch(target.text):
+        title = target.text.removesuffix(":")
+        return (
+            str(metadata.get("paragraph_no"))
+            in (match["number"], f"({match['number']})")
+            and section == title
+            and _caption_fact(target, "paragraph_no", target.text, "body")
+            and _caption_fact(target, "section_title", title, "body")
+        )
+    match = _DIMENSION_CAPTION.fullmatch(target.text)
+    previous = adjacent.get(position - 1)
+    if match is None or previous is None or not isinstance(section, str):
+        return False
+    previous_meta = _caption_metadata(previous)
+    section_match = _DESIGN_SECTION.fullmatch(section)
+    if section_match is None or str(metadata.get("paragraph_no")) not in (
+        section_match["number"],
+        f"({section_match['number']})",
+    ):
+        return False
+    lines = previous.text.splitlines()
+    if (
+        previous.snapshot.get("heading_path") != headings
+        or previous_meta.get("appendix_label") != appendix
+        or previous_meta.get("paragraph_no") != metadata.get("paragraph_no")
+        or previous_meta.get("section_title") != section
+        or len(lines) < 5
+        or lines[0] != section
+        or re.fullmatch(r"Şekil [1-9]\d{0,2}", lines[1]) is None
+        or any(_DIAGRAM_LINE.fullmatch(line) is None for line in lines[2:])
+        or previous_meta.get("article_no") is not None
+        or re.search(rf"\b{re.escape(match['title'])}\b", section, re.I) is None
+        or not _caption_fact(target, "paragraph_no", section, "heading")
+        or not _caption_fact(target, "section_title", section, "heading")
+        or not _caption_fact(previous, "paragraph_no", section, "body")
+        or not _caption_fact(previous, "section_title", section, "body")
+    ):
+        return False
+    tick_matches = [_DIMENSION.fullmatch(line) for line in lines[-3:]]
+    if any(tick is None for tick in tick_matches):
+        return False
+    ticks = [
+        Decimal(tick[1].replace(",", ".")) for tick in tick_matches if tick is not None
+    ]
+    size = Decimal(match["size"].replace(",", "."))
+    return (
+        ticks[1] - ticks[0] == ticks[2] - ticks[1] == size - ticks[2] > 0
+        and following.text.startswith(f"a) {match['title']} ")
+        and re.search(rf"\b{re.escape(lines[1])}\b", following.text) is not None
+        and isinstance(quote, str)
+        and quote.startswith(f"a) {match['title']} ")
+        and quote in following.text
+        and len(_DIMENSION.findall(quote)) >= 2
+        and _caption_fact(following, "clause_label", quote, "body")
+    )
+
+
 _REPAIR_VERSION = 1
 _SHA_PATTERN = r"^[0-9a-f]{64}$"
 _INSTRUCTION = """Reconsider this one earlier abstention using exactly the frozen target, taxonomy and interpretation context. The earlier abstention may remain correct; do not force a label or a successful result.
