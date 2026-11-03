@@ -3,6 +3,8 @@
 import re
 import unicodedata
 
+LAW_DOCUMENT_TYPES = frozenset({"kanun", "law", "act", "statute"})
+
 
 def _fold(value: str) -> str:
     return "".join(

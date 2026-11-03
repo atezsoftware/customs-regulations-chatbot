@@ -55,6 +55,7 @@ from onyx.db.regulatory_public_reads import (
 from onyx.document_index.publication_models import PublicationIndexSnapshot
 from onyx.regulatory.amendments.annexes.models import AnnexTemporalProjection
 from onyx.regulatory.law_identity import (
+    LAW_DOCUMENT_TYPES,
     canonical_law_number,
     compatible_own_law_title_fragment,
     own_law_filename_number,
@@ -1813,7 +1814,8 @@ def _source_has_own_law_number(
     for chunk in chunks:
         if (
             chunk.source_id != source.id
-            or str(chunk.metadata.get("document_type", "")).lower() != "kanun"
+            or str(chunk.metadata.get("document_type", "")).casefold()
+            not in LAW_DOCUMENT_TYPES
             or not chunk.heading_path
             or any(
                 chunk.metadata.get(flag)
@@ -1881,7 +1883,8 @@ def _source_has_numeric_filename_law_identity(
     for chunk in chunks:
         if (
             chunk.source_id != source.id
-            or str(chunk.metadata.get("document_type", "")).lower() != "kanun"
+            or str(chunk.metadata.get("document_type", "")).casefold()
+            not in LAW_DOCUMENT_TYPES
             or not chunk.heading_path
             or any(
                 chunk.metadata.get(flag)
@@ -1946,7 +1949,8 @@ def _source_has_numbered_law_identity(
     for chunk in chunks:
         if (
             chunk.source_id != source.id
-            or str(chunk.metadata.get("document_type", "")).lower() != "kanun"
+            or str(chunk.metadata.get("document_type", "")).casefold()
+            not in LAW_DOCUMENT_TYPES
             or not chunk.heading_path
             or any(
                 chunk.metadata.get(flag)

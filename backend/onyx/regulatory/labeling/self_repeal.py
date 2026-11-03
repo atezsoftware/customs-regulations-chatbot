@@ -19,6 +19,7 @@ from onyx.regulatory.document_intake.structural_readers import (
     is_ordinal_chapter_heading,
 )
 from onyx.regulatory.labeling.intake_abstention_repair import AbstentionRepairAudit
+from onyx.regulatory.law_identity import LAW_DOCUMENT_TYPES
 from onyx.utils.web_content import decode_html_bytes
 
 SOURCE_ONLY_KEY = "intake_source_only_self_repeal"
@@ -373,7 +374,8 @@ def build_self_repeal_source_proof(
         or row.chunk_type != "article"
         or row.metadata.get("chunk_variant") != "atomic"
         or str(row.metadata.get("article_no")) != full["article"]
-        or str(row.metadata.get("document_type", "")).casefold() != "kanun"
+        or str(row.metadata.get("document_type", "")).casefold()
+        not in LAW_DOCUMENT_TYPES
     ):
         raise ValueError(
             "The target is not one complete unconditional self-repeal article"

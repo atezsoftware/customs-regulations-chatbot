@@ -19,6 +19,7 @@ from onyx.regulatory.heading_path import (
     parse_regulatory_article_heading,
 )
 from onyx.regulatory.law_identity import (
+    LAW_DOCUMENT_TYPES,
     canonical_law_number,
     compatible_own_law_title_fragment,
     own_law_filename_number,
@@ -519,7 +520,7 @@ def unresolved_authority_gap(
     }
 
 
-_LAW_KINDS = {"kanun", "law", "act", "statute"}
+_LAW_KINDS = LAW_DOCUMENT_TYPES
 _UNCITED_ORIGINAL_GAP = re.compile(
     r"(?P<subject>[^.!?;,]+?)\s+(?:ozgun (?:metni|metin|metnin|hukum|hukmu)|"
     r"original (?:text|provision))\s+(?:henuz\s+)?"
