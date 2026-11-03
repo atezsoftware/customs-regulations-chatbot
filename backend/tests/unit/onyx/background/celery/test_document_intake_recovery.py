@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
 from types import ModuleType
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 from uuid import UUID, uuid4
 
 import pytest
@@ -30,6 +30,8 @@ class _Harness:
     reserve: MagicMock
     resume: MagicMock
     reconcile: MagicMock
+    metadata_reserve: MagicMock
+    metadata_send: MagicMock
     prepare_send: MagicMock
     label_send: MagicMock
     events: list[str]
@@ -64,6 +66,15 @@ def harness(monkeypatch: pytest.MonkeyPatch) -> _Harness:
         db_module, "resume_waiting_intake_labeling", resume, raising=False
     )
     monkeypatch.setitem(sys.modules, db_module.__name__, db_module)
+    metadata_reserve, metadata_send = MagicMock(return_value=[]), MagicMock()
+    metadata_module = ModuleType("onyx.db.document_intake_metadata_recovery")
+    monkeypatch.setattr(
+        metadata_module,
+        "reserve_intake_metadata_deliveries",
+        metadata_reserve,
+        raising=False,
+    )
+    monkeypatch.setitem(sys.modules, metadata_module.__name__, metadata_module)
     prepare_send, label_send = MagicMock(), MagicMock()
     for module_name, symbol, send in (
         (
@@ -79,9 +90,22 @@ def harness(monkeypatch: pytest.MonkeyPatch) -> _Harness:
     ):
         module = ModuleType(module_name)
         monkeypatch.setattr(module, symbol, send, raising=False)
+        if symbol == "enqueue_intake_batch":
+            monkeypatch.setattr(
+                module, "enqueue_intake_metadata_recovery", metadata_send, raising=False
+            )
         monkeypatch.setitem(sys.modules, module_name, module)
     return _Harness(
-        session, factory, reserve, resume, reconcile, prepare_send, label_send, events
+        session,
+        factory,
+        reserve,
+        resume,
+        reconcile,
+        metadata_reserve,
+        metadata_send,
+        prepare_send,
+        label_send,
+        events,
     )
 
 
@@ -309,3 +333,29 @@ def test_finished_labeling_reconciles_before_other_reservations_and_commit(
     assert harness.events == ["reconcile", "reserve", "resume", "commit"]
     harness.prepare_send.assert_not_called()
     harness.label_send.assert_not_called()
+
+
+def test_metadata_hint_commits_before_send_and_broker_failure_keeps_intent(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    identifiers = [uuid4(), uuid4()]
+    harness.metadata_reserve.return_value = identifiers
+
+    def send(**_kwargs: object) -> None:
+        assert harness.events == ["commit"]
+        raise RuntimeError("broker unavailable")
+
+    harness.metadata_send.side_effect = send
+    log = MagicMock()
+    monkeypatch.setattr(tasks, "logger", log)
+    _recover()
+    harness.metadata_reserve.assert_called_once_with(
+        harness.session, environment="dev", limit=10
+    )
+    assert harness.metadata_send.call_args_list == [
+        call(batch_id=identifier, tenant_id="public") for identifier in identifiers
+    ]
+    assert log.warning.call_count == 2
+    harness.session.rollback.assert_not_called()
+    harness.session.execute.assert_not_called()
+    harness.prepare_send.assert_not_called()

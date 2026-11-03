@@ -29,6 +29,9 @@ def recover_document_intakes(
     from onyx.db.document_intake_labeling_recovery import (
         reconcile_terminal_intake_labeling,
     )
+    from onyx.db.document_intake_metadata_recovery import (
+        reserve_intake_metadata_deliveries,
+    )
     from onyx.db.document_intake_queue import (
         reserve_intake_preparation_deliveries,
         resume_waiting_intake_labeling,
@@ -39,12 +42,30 @@ def recover_document_intakes(
         deliveries = reserve_intake_preparation_deliveries(
             session, environment=environment, limit=10
         )
+        metadata_ids = reserve_intake_metadata_deliveries(
+            session, environment=environment, limit=10
+        )
         run_ids = resume_waiting_intake_labeling(
             session, environment=environment, limit=10
         )
         session.commit()
 
     # The database intent survives a failed broker send; the next tick can retry.
+    if metadata_ids:
+        from onyx.background.celery.tasks.regulatory_amendments.document_intake import (
+            enqueue_intake_metadata_recovery,
+        )
+
+        for intake_id in metadata_ids:
+            try:
+                enqueue_intake_metadata_recovery(
+                    batch_id=intake_id, tenant_id=tenant_id
+                )
+            except Exception:
+                logger.warning(
+                    "Metadata-only redelivery failed; recovery will retry",
+                    extra={"batch_id": str(intake_id)},
+                )
     if deliveries:
         from onyx.background.celery.tasks.regulatory_amendments.document_intake import (
             enqueue_intake_batch,
