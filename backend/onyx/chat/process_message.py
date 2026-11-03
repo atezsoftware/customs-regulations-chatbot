@@ -1363,6 +1363,14 @@ class _PersistContext(Enum):
     POST_STEPS = "post-steps"
 
 
+class _PersistenceState(Enum):
+    PENDING = "pending"
+    SAVING = "saving"
+    SAVED = "saved"
+    FAILED = "failed"
+    INVALIDATED = "invalidated"
+
+
 # How often the drain loop polls for user-initiated cancellation (stop button).
 _CANCEL_POLL_INTERVAL_S: Final[float] = 0.05
 _STOP_PROBE_RETRY_INTERVAL_S: Final[float] = 1.0
@@ -1467,7 +1475,9 @@ def _run_models(
     # packet and the persisted message.
     model_error_info: list[LLMErrorInfo | None] = [None] * n_models
     persist_lock = threading.Lock()
-    persisted: list[bool] = [False] * n_models
+    persistence_states = [_PersistenceState.PENDING] * n_models
+    persistence_error_emitted = [False] * n_models
+    pending_stops: dict[int, Packet] = {}
     publication_invalidated: list[bool] = [False] * n_models
     publication_error_emitted: list[bool] = [False] * n_models
     post_steps_done = threading.Event()
@@ -1483,60 +1493,70 @@ def _run_models(
     # nobody will consume.
     reader_gone = threading.Event()
 
+    def _record_saved_outcome(model_idx: int) -> None:
+        try:
+            record_final_answer_message(setup.reserved_messages[model_idx].id)
+        except Exception:
+            logger.exception(
+                "Saved answer graph recording failed for model %d", model_idx
+            )
+
     def _persist_model_outcome(
         model_idx: int,
         context: _PersistContext,
         *,
         stop_button: bool = False,
-    ) -> None:
-        """Persist one model's outcome exactly once, from any thread.
+    ) -> _PersistenceState:
+        """Attempt one model's persistence once, without mistaking a claim for a save.
 
-        The LLM loops never observe the stop signal, so a worker that returns
-        non-errored always holds a complete answer. Partial content exists only
-        when the stop-button path snapshots a still-running model mid-loop —
-        that call forces a claim (``stop_button=True``) so the in-flight state
-        is saved with the stopped-by-user annotation and the worker's later
-        call becomes a no-op."""
+        Normal worker returns save complete answers. The stop-button path can
+        snapshot a still-running model with ``stop_button=True``, saving its
+        in-flight state with the stopped-by-user annotation. A worker's later
+        persistence attempt then becomes a no-op."""
         with persist_lock:
-            if persisted[model_idx]:
-                return
+            if persistence_states[model_idx] is not _PersistenceState.PENDING:
+                return persistence_states[model_idx]
             succeeded = model_succeeded[model_idx]
             errored = model_errored[model_idx]
             if not succeeded and not errored and not stop_button:
-                return
-            persisted[model_idx] = True
+                return _PersistenceState.PENDING
+            persistence_states[model_idx] = _PersistenceState.SAVING
 
         try:
             state_containers[model_idx].publication_reads.validate()
+            if errored:
+                saved = _save_errored_message(model_idx, context)
+                result = _PersistenceState.SAVED if saved else _PersistenceState.FAILED
+            else:
+                completed_normally = succeeded if stop_button else True
+
+                def _is_connected(value: bool = completed_normally) -> bool:
+                    return value
+
+                llm_loop_completion_handle(
+                    state_container=state_containers[model_idx],
+                    is_connected=_is_connected,
+                    assistant_message=setup.reserved_messages[model_idx],
+                    llm=setup.llms[model_idx],
+                    reserved_tokens=setup.reserved_token_count,
+                )
+                result = _PersistenceState.SAVED
         except PublicationReadChanged:
             _invalidate_publication_model(model_idx)
-            return
-
-        if errored:
-            _save_errored_message(model_idx, context)
-            return
-
-        completed_normally = succeeded if stop_button else True
-
-        def _is_connected(value: bool = completed_normally) -> bool:
-            return value
-
-        try:
-            llm_loop_completion_handle(
-                state_container=state_containers[model_idx],
-                is_connected=_is_connected,
-                assistant_message=setup.reserved_messages[model_idx],
-                llm=setup.llms[model_idx],
-                reserved_tokens=setup.reserved_token_count,
-            )
-            record_final_answer_message(setup.reserved_messages[model_idx].id)
+            result = _PersistenceState.INVALIDATED
         except Exception:
+            result = _PersistenceState.FAILED
             logger.exception(
                 "%s completion failed for model %d (%s)",
                 context.value,
                 model_idx,
                 setup.model_display_names[model_idx],
             )
+        with persist_lock:
+            persistence_states[model_idx] = result
+        if result is _PersistenceState.SAVED and not errored:
+            _record_saved_outcome(model_idx)
+        return result
 
     def _run_post_steps() -> None:
         with persist_lock:
@@ -2136,28 +2156,30 @@ def _run_models(
                 finally:
                     merged_queue.put((model_idx, _MODEL_DONE))
 
-    def _save_errored_message(model_idx: int, context: _PersistContext) -> None:
+    def _save_errored_message(model_idx: int, context: _PersistContext) -> bool:
         """Save an error message to a reserved ChatMessage that failed during execution."""
         try:
             with get_session_with_current_tenant() as save_db_session:
                 msg = save_db_session.get(
                     ChatMessage, setup.reserved_messages[model_idx].id
                 )
-                if msg is not None:
-                    info = model_error_info[model_idx]
-                    detail = (
-                        info.message
-                        if info is not None
-                        else "model encountered an error during generation."
+                if msg is None:
+                    raise RuntimeError(
+                        "Reserved assistant message missing during error save"
                     )
-                    error_text = "Error from %s: %s" % (
-                        setup.model_display_names[model_idx],
-                        detail,
-                    )
-                    msg.message = error_text
-                    msg.error = error_text
-                    save_db_session.commit()
-            record_final_answer_message(setup.reserved_messages[model_idx].id)
+                info = model_error_info[model_idx]
+                detail = (
+                    info.message
+                    if info is not None
+                    else "model encountered an error during generation."
+                )
+                error_text = "Error from %s: %s" % (
+                    setup.model_display_names[model_idx],
+                    detail,
+                )
+                msg.message = error_text
+                msg.error = error_text
+                save_db_session.commit()
         except Exception:
             logger.exception(
                 "%s error save failed for model %d (%s)",
@@ -2165,6 +2187,9 @@ def _run_models(
                 model_idx,
                 setup.model_display_names[model_idx],
             )
+            return False
+        _record_saved_outcome(model_idx)
+        return True
 
     def _invalidate_publication_model(model_idx: int) -> StreamingError:
         from onyx.db.chat import invalidate_publication_chat_message
@@ -2214,6 +2239,52 @@ def _run_models(
         # Non-blocking put: a slow reader can't stall the writer.
         if not reader_gone.is_set():
             tee.put(item)
+
+    def _publish_persistence_failure(model_idx: int) -> None:
+        if persistence_error_emitted[model_idx]:
+            return
+        persistence_error_emitted[model_idx] = True
+        _publish(
+            StreamingError(
+                error="The response could not be finalized. Reload the chat before retrying.",
+                error_code="PERSISTENCE_ERROR",
+                is_retryable=True,
+                details={"model_index": model_idx},
+            )
+        )
+
+    def _publish_persistence_result(model_idx: int) -> None:
+        result = persistence_states[model_idx]
+        if result is _PersistenceState.FAILED:
+            _publish_persistence_failure(model_idx)
+        elif result is _PersistenceState.INVALIDATED:
+            if not publication_error_emitted[model_idx]:
+                _publish(_invalidate_publication_model(model_idx))
+                publication_error_emitted[model_idx] = True
+
+    def _observe_worker_completion(model_idx: int) -> None:
+        try:
+            failure = model_futures[model_idx].exception()
+        except BaseException as error:
+            failure = error
+        if failure is None:
+            return
+        logger.error(
+            "Model worker failed during finalization",
+            exc_info=(type(failure), failure, failure.__traceback__),
+        )
+        if persistence_states[model_idx] is _PersistenceState.SAVING:
+            with persist_lock:
+                persistence_states[model_idx] = _PersistenceState.FAILED
+        elif persistence_states[model_idx] is _PersistenceState.PENDING:
+            _publish(
+                StreamingError(
+                    error="The model ended before its response could be finalized.",
+                    error_code="MODEL_ERROR",
+                    is_retryable=True,
+                    details={"model_index": model_idx},
+                )
+            )
 
     def _drain_to_completion() -> None:
         """Writer: consume worker output to the very end regardless of client state."""
@@ -2274,6 +2345,7 @@ def _run_models(
                             _persist_model_outcome(
                                 i, _PersistContext.STOP_BUTTON, stop_button=True
                             )
+                            _publish_persistence_result(i)
                         _publish(
                             Packet(
                                 placement=Placement(turn_index=0),
@@ -2288,8 +2360,12 @@ def _run_models(
                         return
                     continue
                 if item is _MODEL_DONE:
+                    # A worker's finally can enqueue its marker while an outer
+                    # context is still exiting; inspect the actual Future too.
+                    _observe_worker_completion(model_idx)
                     if (
-                        state_containers[model_idx].publication_reads.evidence()
+                        persistence_states[model_idx] is _PersistenceState.SAVED
+                        and state_containers[model_idx].publication_reads.evidence()
                         is not None
                     ):
                         from onyx.db.regulatory_chat_reads import (
@@ -2299,6 +2375,15 @@ def _run_models(
                         mark_message_publication_generated(
                             setup.reserved_messages[model_idx].id
                         )
+                    _publish_persistence_result(model_idx)
+                    stop = pending_stops.pop(model_idx, None)
+                    if (
+                        stop is not None
+                        and persistence_states[model_idx] is _PersistenceState.SAVED
+                        and model_succeeded[model_idx]
+                        and not model_errored[model_idx]
+                    ):
+                        _publish(stop)
                     models_remaining -= 1
                 elif isinstance(item, Exception):
                     # Publish a tagged error for this model but keep the other
@@ -2333,7 +2418,10 @@ def _run_models(
                     )
                 elif isinstance(item, Packet):
                     # model_index already embedded by the model's Emitter
-                    _publish(item)
+                    if isinstance(item.obj, OverallStop):
+                        pending_stops[model_idx] = item
+                    else:
+                        _publish(item)
 
             for i in range(n_models):
                 _persist_model_outcome(i, _PersistContext.NORMAL)
@@ -2351,11 +2439,26 @@ def _run_models(
                 )
             )
         finally:
-            # Mark done before _run_post_steps clears the fence so resume
-            # readers never see a fence-less, not-done buffer and drop the tail.
+            with persist_lock:
+                saving_on_cancel = [
+                    i
+                    for i, state in enumerate(persistence_states)
+                    if user_cancelled and state is _PersistenceState.SAVING
+                ]
+            if user_cancelled:
+                # A save may have settled between cancellation and this snapshot.
+                for i in range(n_models):
+                    _publish_persistence_result(i)
+            # Flush the terminal intent before releasing a cancelled turn's
+            # fence; an in-flight save still needs an open buffer for its result.
             if stream_buffer is not None:
                 try:
-                    stream_buffer.mark_done()
+                    if saving_on_cancel:
+                        # The explicit cancel is already outbound; its existing
+                        # save must still be able to report a failure afterward.
+                        stream_buffer.flush()
+                    else:
+                        stream_buffer.mark_done()
                 except Exception:
                     logger.exception(
                         "Failed to mark the source-dependent stream complete"
@@ -2366,17 +2469,28 @@ def _run_models(
                     # tracks native calls that cannot be interrupted immediately.
                     _run_post_steps()
             finally:
-                tee.put(_STREAM_DONE)
                 try:
-                    pending = set(model_futures)
-                    while pending:
-                        _, pending = wait(pending, timeout=_FENCE_REFRESH_INTERVAL_S)
-                        if pending and not user_cancelled:
-                            refresh_processing_fence()
+                    try:
+                        for i in saving_on_cancel:
+                            _observe_worker_completion(i)
+                            _publish_persistence_result(i)
+                        if saving_on_cancel and stream_buffer is not None:
+                            stream_buffer.mark_done()
+                    finally:
+                        tee.put(_STREAM_DONE)
                 finally:
-                    executor.shutdown(wait=True)
-                    if not user_cancelled:
-                        _run_post_steps()
+                    try:
+                        pending = set(model_futures)
+                        while pending:
+                            _, pending = wait(
+                                pending, timeout=_FENCE_REFRESH_INTERVAL_S
+                            )
+                            if pending and not user_cancelled:
+                                refresh_processing_fence()
+                    finally:
+                        executor.shutdown(wait=True)
+                        if not user_cancelled:
+                            _run_post_steps()
 
     # Each worker thread needs its own Context copy — a single Context object
     # cannot be entered concurrently by multiple threads (RuntimeError).
@@ -2782,6 +2896,8 @@ def llm_loop_completion_handle(
     llm: LLM,
     reserved_tokens: int,
 ) -> None:
+    from onyx.regulatory.publication_reads import PublicationReadChanged
+
     state_container.publication_reads.validate()
     # Snapshot all state under the container's lock before any DB write.
     # Worker threads may still be running (e.g. user-cancellation path), so
@@ -2844,23 +2960,35 @@ def llm_loop_completion_handle(
             publication_evidence=state_container.publication_reads.evidence(),
         )
 
-        updated_chat_history = create_chat_history_chain(
-            chat_session_id=chat_session_id,
-            db_session=db_session,
-        )
-        total_tokens = calculate_total_history_tokens(updated_chat_history)
+        # save_chat_turn commits the answer before history maintenance starts.
+        try:
+            updated_chat_history = create_chat_history_chain(
+                chat_session_id=chat_session_id,
+                db_session=db_session,
+            )
+            total_tokens = calculate_total_history_tokens(updated_chat_history)
+        except PublicationReadChanged:
+            raise
+        except Exception:
+            logger.exception("Saved answer history maintenance failed")
+            return
 
-    compression_params = get_compression_params(
-        max_input_tokens=llm.config.max_input_tokens,
-        current_history_tokens=total_tokens,
-        reserved_tokens=reserved_tokens,
-    )
-    if compression_params.should_compress:
-        compress_chat_history(
-            chat_history=updated_chat_history,
-            llm=llm,
-            compression_params=compression_params,
+    try:
+        compression_params = get_compression_params(
+            max_input_tokens=llm.config.max_input_tokens,
+            current_history_tokens=total_tokens,
+            reserved_tokens=reserved_tokens,
         )
+        if compression_params.should_compress:
+            compress_chat_history(
+                chat_history=updated_chat_history,
+                llm=llm,
+                compression_params=compression_params,
+            )
+    except PublicationReadChanged:
+        raise
+    except Exception:
+        logger.exception("Saved answer history maintenance failed")
 
 
 _CITATION_LINK_START_PATTERN = re.compile(r"\s*\[\[\d+\]\]\(")

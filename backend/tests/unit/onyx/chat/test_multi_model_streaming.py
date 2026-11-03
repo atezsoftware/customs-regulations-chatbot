@@ -8,6 +8,8 @@ calls, so we can trigger it with lightweight mocks.
 import threading
 import time
 from collections.abc import Generator
+from contextlib import nullcontext
+from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
@@ -297,6 +299,22 @@ class TestRunModels:
     All external dependencies (LLM, DB, tools) are patched out.  Worker threads
     still run but return immediately since run_llm_loop is mocked.
     """
+
+    @pytest.fixture(autouse=True)
+    def _mock_persistence_and_settings(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from onyx.chat import process_message
+
+        monkeypatch.setattr(
+            process_message,
+            "get_session_with_current_tenant",
+            lambda: nullcontext(MagicMock()),
+        )
+        monkeypatch.setattr(process_message, "record_final_answer_message", MagicMock())
+        monkeypatch.setattr(
+            process_message,
+            "load_settings",
+            lambda: SimpleNamespace(auto_detect_search_filters=False),
+        )
 
     def test_n1_overall_stop_from_llm_loop_passes_through(self) -> None:
         """OverallStop emitted by run_llm_loop is passed through the drain loop unchanged."""
