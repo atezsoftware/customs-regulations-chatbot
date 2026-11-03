@@ -779,6 +779,32 @@ def test_adaptive_split_keeps_file_unapplied_until_all_cached_leaves_resume(
         metadata_job, "resolve_labeling_gateway", lambda *_args, **_kwargs: gateway
     )
     monkeypatch.setattr(vertex_direct, "traced_llm_call", traced)
+    if invalid_evidence:
+        metadata_job.run_intake_metadata(
+            intake_id=batch.id, lease_token=token, tenant_id="public"
+        )
+        assert all(row.validity_start_date == datetime.date(2027, 1, 1) for row in rows)
+        for row in rows:
+            assert "document_title" not in row.chunk_metadata
+            fact = row.chunk_metadata[METADATA_AUDIT_KEY]["fields"][
+                "validity_start_date"
+            ]
+            assert fact["source_chunk_id"] == closing.id
+            assert fact["evidence_quote"] == closing.text
+        assert all(
+            set(payload["target_chunk_ids"]) <= {*parent_ids, annex.id}
+            for payload in payloads
+        )
+        calls = len(payloads)
+        assert calls <= 8
+        requests = [call.args[0][0] for call in submit.call_args_list]
+        assert len({request.request_hash for request in requests}) == calls
+        assert requests[0].request_hash == parent_hash
+        metadata_job.run_intake_metadata(
+            intake_id=batch.id, lease_token=token, tenant_id="public"
+        )
+        assert len(payloads) == calls
+        return
     with pytest.raises(
         ValueError if invalid_evidence else VertexBatchContractError,
         match="single repair" if invalid_evidence else None,
@@ -801,14 +827,6 @@ def test_adaptive_split_keeps_file_unapplied_until_all_cached_leaves_resume(
     )
     assert METADATA_AUDIT_KEY not in annex.chunk_metadata
     assert _existing_rows(intake_session, [members[1].user_file_id]) == annex_before
-    if invalid_evidence:
-        with pytest.raises(ValueError, match="single repair"):
-            metadata_job.run_intake_metadata(
-                intake_id=batch.id, lease_token=token, tenant_id="public"
-            )
-        assert len(payloads) == 3
-        assert all(METADATA_AUDIT_KEY not in row.chunk_metadata for row in rows)
-        return
     metadata_job.run_intake_metadata(
         intake_id=batch.id, lease_token=token, tenant_id="public"
     )
