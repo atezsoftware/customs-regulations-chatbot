@@ -1,6 +1,7 @@
 """Incident retry retains normal GET/retry semantics and never stages label runs."""
 
 import importlib.util
+import json
 import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -58,6 +59,35 @@ def test_current_operator_cannot_mutate_before_final_sha_is_pinned(
 ) -> None:
     operator.require_failed_run(run)
     assert operator.RETRY_IMAGE_SHA is None
+
+
+@pytest.mark.parametrize(
+    "reason,count,content",
+    [
+        ("STOP", 1, True),
+        ("MAX_TOKENS", 1, True),
+        (None, 1, True),
+        ("STOP", 2, True),
+        ("STOP", 0, True),
+        ("STOP", 1, False),
+    ],
+)
+def test_ack_eligibility_requires_one_complete_stop_candidate(
+    operator: ModuleType, reason: str | None, count: int, content: bool
+) -> None:
+    body = '{"labels":[],"abstained":true}'
+    candidate = {
+        "finishReason": reason,
+        "content": {"parts": [{"text": body if content else ""}]},
+    }
+    line = json.dumps(
+        {"key": "a" * 64, "response": {"candidates": [candidate] * count}}
+    )
+    if reason == "STOP" and count == 1 and content:
+        assert operator.complete_ack_context(line, "a" * 64) == body
+    else:
+        with pytest.raises(RuntimeError, match="complete STOP"):
+            operator.complete_ack_context(line, "a" * 64)
 
 
 @pytest.mark.parametrize(

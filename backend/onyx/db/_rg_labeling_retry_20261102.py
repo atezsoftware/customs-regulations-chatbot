@@ -41,14 +41,12 @@ from onyx.regulatory.amendments.annexes.context_dependencies import context_hash
 from onyx.regulatory.document_intake.structural_readers import (
     build_native_chapter_reader_proofs,
 )
-from onyx.regulatory.indexing_jobs.vertex_batch import (
-    VertexBatchRequest,
-    parse_vertex_jsonl_output,
-)
+from onyx.regulatory.indexing_jobs.vertex_batch import VertexBatchRequest
 from onyx.regulatory.labeling.intake_abstention_repair import build_abstention_repair
 from onyx.regulatory.labeling.provider import (
     TaxonomyDefinition,
     build_labeling_request,
+    parse_labeling_batch_output,
     validate_labeling_response,
 )
 from onyx.regulatory.labeling.vertex_direct import _StoredResult
@@ -68,6 +66,26 @@ def canonical_source_sha256(session: Session) -> str:
             for row in capture_canonical_scope(session, UUID(file_id))
         ]
     )
+
+
+def complete_ack_context(line: str, request_hash: str) -> str:
+    payload = json.loads(line)
+    response = payload.get("response") if isinstance(payload, dict) else None
+    candidates = response.get("candidates") if isinstance(response, dict) else None
+    scope.require(
+        isinstance(candidates, list)
+        and len(candidates) == 1
+        and isinstance(candidates[0], dict)
+        and candidates[0].get("finishReason") == "STOP",
+        "A retained failed ACK requires exactly one complete STOP candidate",
+    )
+    parsed = parse_labeling_batch_output(iter([line]), {request_hash})[request_hash]
+    scope.require(
+        parsed.error is None and parsed.context is not None,
+        "A retained failed ACK is not a complete STOP result",
+    )
+    assert parsed.context is not None
+    return parsed.context
 
 
 def require_failed_run(run: RegulatoryLabelingRun) -> None:
@@ -219,17 +237,10 @@ def pure_repair_plan(
             and line.get("request") == base.to_generate_content_request(),
             "A retained failed ACK lost exact request correlation",
         )
-        parsed = parse_vertex_jsonl_output(iter([ack.line]), [base.request_hash])[
-            base.request_hash
-        ]
-        scope.require(
-            parsed.error is None and parsed.context is not None,
-            "A retained failed ACK is not a complete STOP result",
-        )
-        assert parsed.context is not None
+        response_context = complete_ack_context(ack.line, base.request_hash)
         repair = build_abstention_repair(
             base_request=base,
-            rejected_response=parsed.context,
+            rejected_response=response_context,
             text=item.text_snapshot,
             chunk_id=identifier,
             source_hash=item.canonical_text_sha256 or "",
@@ -250,6 +261,7 @@ def pure_repair_plan(
                     ).encode()
                 ),
                 "eligible": True,
+                "verified_sole_candidate_finish_reason": "STOP",
             }
         )
     return {
