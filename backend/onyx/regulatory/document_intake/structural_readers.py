@@ -8,7 +8,8 @@ from uuid import UUID
 
 from bs4 import BeautifulSoup, NavigableString, Tag
 from pydantic import BaseModel, ConfigDict, Field
-from soupsieve import match
+from soupsieve import SelectorSyntaxError, match
+from soupsieve import compile as compile_selector
 
 from onyx.document_index.publication_models import publication_digest
 from onyx.regulatory.amendments.annexes.models import AnnexCanonicalSnapshot
@@ -191,11 +192,37 @@ class _NativeStyles:
             if re.search(r"@(import|media|supports|layer)\b", css, re.I):
                 raise ValueError("Native heading has conditional CSS")
             for selectors, body in re.findall(r"([^{}]+)\{([^{}]*)\}", css):
+                if selectors.lstrip().startswith("@"):
+                    if _declarations(body):
+                        raise ValueError("Native heading CSS rule is unsupported")
+                    continue
+                try:
+                    compile_selector(selectors)
+                except SelectorSyntaxError as error:
+                    invalid_simple = [
+                        selector.strip() for selector in selectors.split(",")
+                    ]
+                    if all(
+                        selector and _SELECTOR.fullmatch(selector)
+                        for selector in invalid_simple
+                    ) and any(
+                        re.search(r"[.#]-?[0-9]", selector)
+                        for selector in invalid_simple
+                    ):
+                        # A numeric-leading Word identifier invalidates its whole rule.
+                        continue
+                    raise ValueError(
+                        "Native heading CSS selector is unsupported"
+                    ) from error
+                except NotImplementedError as error:
+                    raise ValueError(
+                        "Native heading CSS selector is unsupported"
+                    ) from error
+                selector_list = [selector.strip() for selector in selectors.split(",")]
                 declarations = _declarations(body)
                 if not declarations:
                     continue
-                for selector in selectors.split(","):
-                    selector = selector.strip()
+                for selector in selector_list:
                     if not _SELECTOR.fullmatch(selector) or not selector:
                         raise ValueError("Native heading CSS selector is unsupported")
                     specificity = (
