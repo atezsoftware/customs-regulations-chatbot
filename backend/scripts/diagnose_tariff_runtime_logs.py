@@ -8,10 +8,10 @@ NAMESPACE='customs-regulations-dev'
 START='2026-11-03T14:00:00Z'
 END='2026-11-03T14:35:00Z'
 
-def command(args: list[str]) -> str:
-    result=subprocess.run(args,capture_output=True,text=True,timeout=90,check=False)
+def command(args: list[str], input_text: str | None = None) -> str:
+    result=subprocess.run(args,input=input_text,capture_output=True,text=True,timeout=90,check=False)
     if result.returncode:
-        return json.dumps({'diagnostic_command_failed':args[:3],'exit_code':result.returncode})
+        failure={'diagnostic_command_failed':args[:3],'exit_code':result.returncode};print(json.dumps(failure));return json.dumps(failure)
     return result.stdout
 
 def safe_findings(raw: str, origin: str)->list[dict[str,object]]:
@@ -41,6 +41,13 @@ for pod in pods.get('items',[]):
         if 'customs-regulations-backend-lite-dev:'not in container['image']:continue
         args=['kubectl','logs',pod['metadata']['name'],'-n',NAMESPACE,'-c',container['name'],'--since-time='+START,'--timestamps=true','--tail=20000']
         findings.extend(safe_findings(command(args),pod['metadata']['name']))
+        from pathlib import Path
+        retained=command(['kubectl','exec','-i',pod['metadata']['name'],'-n',NAMESPACE,'-c',container['name'],'--','python','-'],Path('backend/scripts/inspect_tariff_retained_errors.py').read_text())
+        for record in retained.splitlines():
+            try:
+                payload=json.loads(record)
+                if 'retained_log_file' in payload:print(json.dumps(payload))
+            except ValueError:pass
         if status.get('restartCount',0):findings.extend(safe_findings(command(args+['--previous']),pod['metadata']['name']+':previous'))
 events=json.loads(command(['kubectl','get','events','-n',NAMESPACE,'-o','json']))
 for event in events.get('items',[]):
@@ -58,3 +65,6 @@ for group in groups.get('logGroups',[]):
     print(json.dumps({'archive':name,'events_examined':len(data.get('events',[])),'has_next_page':bool(data.get('nextToken'))}))
     for event in data.get('events',[]):findings.extend(safe_findings(event.get('message',''),name))
 print(json.dumps({'safe_exception_findings':findings[:300],'read_only':True,'raw_log_bodies_exported':False}))
+
+all_groups=json.loads(command(['aws','logs','describe-log-groups','--region','eu-central-1','--query','logGroups[].logGroupName','--output','json']))
+if isinstance(all_groups,list):print(json.dumps({'available_relevant_log_groups':[name for name in all_groups if any(k in name.lower() for k in ('customs','containerinsights','atez-dev'))][:100]}))
