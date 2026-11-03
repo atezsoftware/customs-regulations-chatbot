@@ -5032,6 +5032,54 @@ class FileRecord(Base):
     )
 
 
+class RegulatoryRetainedPdfEvidence(Base):
+    """An original rendition retained separately from canonical publication."""
+
+    __tablename__ = "regulatory_retained_pdf_evidence"
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    document_set_id: Mapped[int] = mapped_column(
+        ForeignKey("document_set.id", ondelete="CASCADE")
+    )
+    user_file_id: Mapped[UUID] = mapped_column(
+        ForeignKey("user_file.id", ondelete="CASCADE"), index=True
+    )
+    raw_file_id: Mapped[str] = mapped_column(
+        ForeignKey("file_record.file_id"), unique=True
+    )
+    sha256: Mapped[str] = mapped_column(Text)
+    byte_count: Mapped[int] = mapped_column(BigInteger)
+    mime_type: Mapped[str] = mapped_column(Text)
+    original_filename: Mapped[str] = mapped_column(Text)
+    relation: Mapped[str] = mapped_column(Text)
+    reason: Mapped[str] = mapped_column(Text)
+    source_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    canonical_sha256: Mapped[str] = mapped_column(Text)
+    canonical_generation_hash: Mapped[str | None] = mapped_column(Text, nullable=True)
+    idempotency_key: Mapped[UUID] = mapped_column()
+    request_sha256: Mapped[str] = mapped_column(Text)
+    created_by: Mapped[UUID | None] = mapped_column(
+        ForeignKey("user.id", ondelete="SET NULL"), nullable=True
+    )
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    __table_args__ = (
+        UniqueConstraint("user_file_id", "sha256", name="uq_retained_pdf_target_hash"),
+        UniqueConstraint(
+            "user_file_id",
+            "created_by",
+            "idempotency_key",
+            name="uq_retained_pdf_request",
+        ),
+        CheckConstraint("byte_count BETWEEN 1 AND 26214400", name="retained_pdf_size"),
+        CheckConstraint("mime_type = 'application/pdf'", name="retained_pdf_mime"),
+        CheckConstraint(
+            "relation IN ('equivalent_rendition', 'historical_rendition')",
+            name="retained_pdf_relation",
+        ),
+    )
+
+
 class FileContent(Base):
     """Stores file content in PostgreSQL using Large Objects.
     Used when FILE_STORE_BACKEND=postgres to avoid needing S3/MinIO."""
