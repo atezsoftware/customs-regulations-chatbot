@@ -83,10 +83,15 @@ class _PreparedChunkEdit:
 
 def edit_review_digest(session: Session, batch: RegulatoryDocumentIntake) -> str | None:
     """An edit receipt never grants publication of an incomplete label review."""
+    metadata_review = batch.status == "failed" and batch.stage == "metadata"
     if (
         batch.labeling_run_id is None
-        or batch.status not in {"ready", "partial"}
+        or (batch.status not in {"ready", "partial"} and not metadata_review)
         or (batch.status == "partial" and batch.stage != "labeling")
+        or (
+            metadata_review
+            and (batch.lease_token is not None or batch.lease_expires_at is not None)
+        )
     ):
         return None
     run = session.get(RegulatoryLabelingRun, batch.labeling_run_id)
@@ -146,6 +151,9 @@ def edit_review_digest(session: Session, batch: RegulatoryDocumentIntake) -> str
     return publication_digest(
         {
             "purpose": "unpublished_intake_edit",
+            "batch_status": batch.status,
+            "batch_stage": batch.stage,
+            "batch_error": batch.error,
             "canonical_review": canonical_digest,
             "run_id": str(run.id),
             "status": run.status,
@@ -410,7 +418,7 @@ def _edit_intake_chunks(
         raise intake.IntakeConflictError(
             "The document edit review changed; reload before editing"
         )
-    partial_review = batch.status == "partial"
+    partial_review = batch.status in {"partial", "failed"}
     document_ids = {edit.document_id for edit in edits}
     members = list(
         session.scalars(

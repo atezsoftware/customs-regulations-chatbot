@@ -128,3 +128,16 @@ def test_nested_numbered_parent_is_not_a_conflicting_paragraph_identity() -> Non
     source = _chunk("source", "(1) Teklif bildirim şartlarına göre uygulanır.")
     target = _chunk("target", "b) Eşleşme gerçekleştirilir.", "3) Alış teklif miktarı.")
     assert _validate(source, target, source.text, "1")
+
+
+@pytest.mark.parametrize("prefix", ["2.", "(2)"])
+def test_alphabetic_no_space_numbered_paragraph_remains_explicit(prefix: str) -> None:
+    source = _chunk("source", prefix + "Tren makinist brövesi düzenlenir.")
+    assert _validate(source, source, source.text, "2")
+
+
+@pytest.mark.parametrize("prefix", ["2.3", "2.11.2025", "2.3.Muayene"])
+def test_nested_or_date_number_prefix_does_not_prove_a_paragraph(prefix: str) -> None:
+    source = _chunk("source", prefix + " Belge düzenlenir.")
+    with pytest.raises(ValueError, match="requires explicit source context"):
+        _validate(source, source, source.text, "2")
