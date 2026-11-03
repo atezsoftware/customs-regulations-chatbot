@@ -115,6 +115,9 @@ from onyx.server.features.regulatory.models import (
     RegulatoryFileValidityUpdateResponse,
     UserFileRenameRequest,
 )
+from onyx.server.features.regulatory.retained_pdf_evidence_api import (
+    router as retained_pdf_evidence_router,
+)
 from onyx.utils.logger import setup_logger
 from shared_configs.contextvars import get_current_tenant_id
 
@@ -1245,3 +1248,4 @@ def get_amendment_source_evidence(
 
 router.include_router(annex_router)
 router.include_router(document_intake_router)
+router.include_router(retained_pdf_evidence_router)
