@@ -250,9 +250,14 @@ def reuse_completed_intake_labels(
             continue
         _copy_completed_item(old, item)
         copied += 1
-    replacement.completed_chunks += copied
+    from onyx.db.regulatory_labeling_self_repeal import recover_failed_self_repeal_items
+
+    recovered = recover_failed_self_repeal_items(
+        session, previous=previous, replacement=replacement
+    )
+    replacement.completed_chunks += copied + recovered
     session.flush()
-    return copied
+    return copied + recovered
 
 
 def _validated_updates(

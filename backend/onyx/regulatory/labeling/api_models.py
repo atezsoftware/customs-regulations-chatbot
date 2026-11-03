@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime
+from typing import Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -90,6 +91,10 @@ class LabelingRunSnapshot(BaseModel):
 
 
 class LabelingItemSnapshot(BaseModel):
+    classification_disposition: Literal["provider", "source_only_self_repeal"] = (
+        "provider"
+    )
+    provider_abstained: bool | None = None
     chunk_id: str
     file_id: str
     status: str

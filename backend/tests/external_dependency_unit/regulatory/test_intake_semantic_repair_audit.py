@@ -44,7 +44,11 @@ from tests.external_dependency_unit.regulatory.test_labeling_jobs import (
 
 
 def seed_v4_owned_intake_source(
-    session: Session, data: LabelingData, *, raw_sha256: str = "a" * 64
+    session: Session,
+    data: LabelingData,
+    *,
+    raw_sha256: str = "a" * 64,
+    raw_byte_count: int = 1,
 ) -> UUID:
     """Minimal real owned source for provider-free semantic repair integration."""
     file = session.get_one(UserFile, data.file_id)
@@ -74,7 +78,7 @@ def seed_v4_owned_intake_source(
         file_id=file.file_id,
         mime_type=file.file_type,
         display_name=file.name,
-        byte_count=1,
+        byte_count=raw_byte_count,
     )
     session.add(asset)
     session.flush()
