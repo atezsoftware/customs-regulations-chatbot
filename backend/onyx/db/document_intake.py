@@ -497,12 +497,18 @@ def refresh_intake(session: Session, batch: RegulatoryDocumentIntake) -> None:
 def intake_snapshot(
     session: Session, batch: RegulatoryDocumentIntake
 ) -> dict[str, Any]:
-    from onyx.db.document_intake_edit import edit_review_digest
+    from onyx.db.document_intake_edit import (
+        compose_intake_edit_review_digest,
+        edit_review_digest,
+        load_intake_edit_review_context,
+    )
     from onyx.db.document_lineage import intake_lineage_selections
     from onyx.regulatory.document_intake.models import IntakeSourceAsset
     from onyx.regulatory.document_intake.text import attachment_reference_label
 
     refresh_intake(session, batch)
+    snapshot_transaction = session.get_transaction()
+    requires_current_review = False
     if batch.status == "ready" and batch.stage == "review":
         v4_source = session.scalar(
             select(RegulatoryChunk.id)
@@ -519,17 +525,15 @@ def intake_snapshot(
             )
             .limit(1)
         )
-        if (batch.preparation_policy is not None or v4_source is not None) and (
-            review_digest(session, batch) != batch.review_sha256
-        ):
-            raise IntakeConflictError(
-                "The ready document review changed; reload before approving"
-            )
+        requires_current_review = (
+            batch.preparation_policy is not None or v4_source is not None
+        )
     from onyx.db.document_intake_review import (
+        compose_intake_publication_review_digest,
         effective_intake_files,
         effective_parent_document_ids,
         latest_publication_decisions,
-        publication_review_digest,
+        publication_decision_payload,
     )
 
     lineage_selections = intake_lineage_selections(session, batch)
@@ -632,7 +636,14 @@ def intake_snapshot(
             }
         )
     package = session.get_one(AmendmentSourcePackage, batch.source_package_id)
-    return {
+    active_document_count = len(effective_intake_files(session, batch))
+    edit_context = load_intake_edit_review_context(session, batch)
+    publication_decisions = (
+        publication_decision_payload(session, batch)
+        if edit_context is not None or batch.labeling_run_id is None
+        else []
+    )
+    snapshot: dict[str, Any] = {
         "id": str(batch.id),
         "source_package_id": str(batch.source_package_id),
         "status": batch.status,
@@ -645,9 +656,9 @@ def intake_snapshot(
         "target_document_set_id": batch.document_set_id,
         "target_document_set_name": TARGET_DOCUMENT_SET_NAME,
         "review_sha256": batch.review_sha256,
-        "edit_review_sha256": edit_review_digest(session, batch),
-        "publication_review_sha256": publication_review_digest(session, batch),
-        "active_document_count": len(effective_intake_files(session, batch)),
+        "edit_review_sha256": None,
+        "publication_review_sha256": None,
+        "active_document_count": active_document_count,
         "issues": list(package.issues),
         "error": batch.error,
         "documents": documents,
@@ -658,6 +669,36 @@ def intake_snapshot(
         "created_at": batch.created_at,
         "updated_at": batch.updated_at,
     }
+    review_status, expected_review = batch.status, batch.review_sha256
+    prelabel_edit_review = (
+        edit_review_digest(session, batch) if batch.labeling_run_id is None else None
+    )
+    canonical_review = None
+    if requires_current_review or edit_context is not None:
+        try:
+            # Validate after every snapshot read; receipt composition below is pure.
+            canonical_review = review_digest(session, batch)
+        except IntakeConflictError:
+            if requires_current_review:
+                raise
+    if session.get_transaction() is not snapshot_transaction:
+        raise IntakeConflictError("The snapshot review transaction changed; reload")
+    if requires_current_review and canonical_review != snapshot["review_sha256"]:
+        raise IntakeConflictError(
+            "The ready document review changed; reload before approving"
+        )
+    edit_review = (
+        compose_intake_edit_review_digest(
+            review_status, expected_review, edit_context, canonical_review
+        )
+        if edit_context is not None and canonical_review is not None
+        else prelabel_edit_review
+    )
+    snapshot["edit_review_sha256"] = edit_review
+    snapshot["publication_review_sha256"] = compose_intake_publication_review_digest(
+        edit_review, publication_decisions
+    )
+    return snapshot
 
 
 def intake_chunk_page(
