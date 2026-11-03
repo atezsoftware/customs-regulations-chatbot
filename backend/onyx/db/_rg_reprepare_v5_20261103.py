@@ -68,10 +68,10 @@ FINAL_IMAGE_SHA: str | None = None
 APPROVED_PLAN_SHA: str | None = None
 REPREPARE_ENABLED = False
 # Fill only from the source replay made with both real incident assets/file IDs.
-V5_PDF_ALL: int | None = None
-V5_PDF_CANONICAL: int | None = None
-V5_PDF_METADATA_SHA: str | None = None
-V5_PDF_TABLES: int | None = None
+V5_PDF_ALL = 197
+V5_PDF_CANONICAL = 192
+V5_PDF_METADATA_SHA = "116fc65181ed9f62310f42312d28b80a45cae0481d54f18f99caed80a3ffb62a"
+V5_PDF_TABLES = 61
 
 
 def policy(version: str) -> dict[str, Any]:
@@ -521,8 +521,11 @@ def acceptance_proof(
     )
     scope.require(
         len(derived) == run.derived_chunks
+        and {target.regulatory_chunk_id for target in derived}
+        == {row.id for row in rows} - provider_ids
         and all(
             target.resolution == "lineage"
+            and str(target.user_file_id) in {scope.MAIN_FILE, scope.PDF_FILE}
             and target.unresolved_reason is None
             and current_derived_label_sources_for_search(
                 session, run=run, target=target
