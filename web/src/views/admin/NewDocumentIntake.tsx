@@ -62,6 +62,17 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : "The request failed.";
 }
 
+function canReviewChunks(batch: DocumentIntakeBatch): boolean {
+  const terminalReview =
+    ["ready", "partial"].includes(batch.status) ||
+    (batch.status === "failed" &&
+      ["metadata", "chunking"].includes(batch.stage));
+  const receipt =
+    batch.edit_review_sha256 ??
+    (batch.status === "ready" ? batch.review_sha256 : null);
+  return terminalReview && Boolean(receipt);
+}
+
 function labelText(value: unknown): string {
   if (Array.isArray(value))
     return value.map(labelText).filter(Boolean).join(", ");
@@ -387,10 +398,7 @@ function DocumentPreview({
                 documentName={document.display_name}
                 sourceUrl={document.source_url}
                 reviewSha256={editReceipt}
-                editable={
-                  ["ready", "partial"].includes(batch.status) &&
-                  Boolean(editReceipt)
-                }
+                editable={canReviewChunks(batch)}
                 disabled={
                   busy ||
                   Array.from(dirtyKeys).some(
@@ -1122,7 +1130,7 @@ export default function NewDocumentIntake() {
               <Text font="main-ui-action">{`${pendingChunkEdits.length} unsaved chunk changes`}</Text>
               <Text font="secondary-body" color="text-03">
                 Continue reviewing other chunks or pages. Save these changes
-                together to start one labeling run.
+                together before approval.
               </Text>
               {chunkSaveError && (
                 <Text color="status-error-05">{chunkSaveError}</Text>
@@ -1133,7 +1141,7 @@ export default function NewDocumentIntake() {
                     busy ||
                     Boolean(chunkSaveError) ||
                     lineageDirtyKeys.size > 0 ||
-                    !["ready", "partial"].includes(batch.status)
+                    !canReviewChunks(batch)
                   }
                   onClick={() => void saveAllChunkChanges()}
                 >
