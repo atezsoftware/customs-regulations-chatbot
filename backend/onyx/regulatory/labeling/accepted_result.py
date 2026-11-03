@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 from onyx.regulatory.labeling.intake_abstention_repair import AbstentionRepairAudit
 from onyx.regulatory.labeling.provider import LabelingOutcome
+from onyx.regulatory.labeling.self_repeal import SourceOnlySelfRepealReceipt
 
 
 @dataclass(frozen=True, slots=True)
@@ -12,6 +13,14 @@ class AcceptedIntakeRepair:
     audit: AbstentionRepairAudit
 
 
+@dataclass(frozen=True, slots=True)
+class SourceOnlySelfRepeal:
+    receipt: SourceOnlySelfRepealReceipt
+
+
 LabelingApplyOutcome = (
-    tuple[list[str], list[dict[str, object]]] | AcceptedIntakeRepair | str
+    tuple[list[str], list[dict[str, object]]]
+    | AcceptedIntakeRepair
+    | SourceOnlySelfRepeal
+    | str
 )

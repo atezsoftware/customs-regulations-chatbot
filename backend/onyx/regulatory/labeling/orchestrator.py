@@ -37,6 +37,7 @@ from onyx.regulatory.indexing_jobs.vertex_batch import (
 from onyx.regulatory.labeling.accepted_result import (
     AcceptedIntakeRepair,
     LabelingApplyOutcome,
+    SourceOnlySelfRepeal,
 )
 from onyx.regulatory.labeling.domain import shard_by_count_and_bytes
 from onyx.regulatory.labeling.intake_abstention_repair import (
@@ -842,7 +843,7 @@ def _repair_intake_abstention(
     rejected_response: str,
     taxonomy: TaxonomyDefinition,
     heartbeat: Callable[[], None],
-) -> AcceptedIntakeRepair:
+) -> AcceptedIntakeRepair | SourceOnlySelfRepeal:
     from onyx.db.regulatory_labeling_semantic_repair import (
         require_current_intake_repair_item,
     )
@@ -939,10 +940,6 @@ def _repair_intake_abstention(
         outcome = validate_abstention_repair(
             output.response, repair=repair, text=item.text_snapshot, taxonomy=taxonomy
         )
-        if outcome.abstained:
-            raise ValueError(
-                "Model abstained: insufficient evidence after bounded semantic reconsideration"
-            )
         audit = build_abstention_repair_audit(
             output=output,
             repair=repair,
@@ -952,6 +949,28 @@ def _repair_intake_abstention(
         )
     except ValueError as error:
         raise _IntakeAbstentionRepairRejected(str(error)) from error
+    if outcome.abstained:
+        from onyx.db.regulatory_labeling_self_repeal import (
+            build_source_only_self_repeal_receipt,
+        )
+
+        try:
+            with get_session_with_current_tenant() as session:
+                current_item = session.get_one(
+                    RegulatoryLabelingItem, item.id, populate_existing=True
+                )
+                run = repository.load_claimed_run(session, lease)
+                receipt = build_source_only_self_repeal_receipt(
+                    session,
+                    item=current_item,
+                    run=run,
+                    provider_abstention=audit,
+                )
+        except ValueError as error:
+            raise _IntakeAbstentionRepairRejected(
+                "Model abstained: insufficient evidence after bounded semantic reconsideration"
+            ) from error
+        return SourceOnlySelfRepeal(receipt=receipt)
     return AcceptedIntakeRepair(outcome=outcome, audit=audit)
 
 

@@ -302,7 +302,7 @@ def build_abstention_repair_audit(
     )
 
 
-def validate_stored_abstention_repair_audit(
+def validate_stored_abstention_evidence(
     audit: AbstentionRepairAudit | Mapping[str, object],
     *,
     base_request: VertexBatchRequest,
@@ -311,8 +311,6 @@ def validate_stored_abstention_repair_audit(
     source_hash: str,
     taxonomy: TaxonomyDefinition,
     provider_binding: Mapping[str, object],
-    labels: Sequence[str],
-    assignments: Sequence[Mapping[str, object]],
 ) -> AbstentionRepairAudit:
     stored = AbstentionRepairAudit.model_validate(audit)
     values = stored.model_dump(mode="json", exclude={"audit_sha256"})
@@ -344,6 +342,30 @@ def validate_stored_abstention_repair_audit(
         raise ValueError(
             "The stored semantic repair does not match current frozen data"
         )
+    return stored
+
+
+def validate_stored_abstention_repair_audit(
+    audit: AbstentionRepairAudit | Mapping[str, object],
+    *,
+    base_request: VertexBatchRequest,
+    text: str,
+    chunk_id: str,
+    source_hash: str,
+    taxonomy: TaxonomyDefinition,
+    provider_binding: Mapping[str, object],
+    labels: Sequence[str],
+    assignments: Sequence[Mapping[str, object]],
+) -> AbstentionRepairAudit:
+    stored = validate_stored_abstention_evidence(
+        audit,
+        base_request=base_request,
+        text=text,
+        chunk_id=chunk_id,
+        source_hash=source_hash,
+        taxonomy=taxonomy,
+        provider_binding=provider_binding,
+    )
     if (
         stored.outcome.abstained
         or [item.label_id for item in stored.outcome.labels] != list(labels)
