@@ -60,25 +60,25 @@ function mockUsers(users: UsageExportUser[]) {
 }
 
 describe("PerUserUsagePanel", () => {
-  it("shows separate Kompozit and Kompozit Cropped usage", () => {
+  it("shows only the two supported workflow groups even when the API returns others", () => {
     mockUsers([
       {
         ...alice,
         workflow_usage: {
+          asv3: deepUsage,
+          asv3_exp_cropped: deepUsage,
+          asv3_fast: deepUsage,
+          asv3_fast_cropped: deepUsage,
           asv3_kompozit: deepUsage,
-          asv3_kompozit_cropped: {
-            ...deepUsage,
-            query_count: 7,
-            cost_cents: 30,
-            known_cost_cents: 30,
-            average_cost_cents_per_session: 15,
-            average_cost_cents_per_query: 30 / 7,
-          },
+          asv3_kompozit_cropped: deepUsage,
         },
       },
     ]);
     render(<PerUserUsagePanel timeRange={timeRange} />);
-    for (const label of ["Kompozit", "Kompozit Cropped"]) {
+    for (const label of [
+      "Hızlı Mod · ASv3 Tek",
+      "Derin Mod · ASv3 Exp Cropped",
+    ]) {
       expect(
         screen.getByRole("columnheader", { name: label })
       ).toBeInTheDocument();
@@ -86,21 +86,20 @@ describe("PerUserUsagePanel", () => {
         screen.getByRole("button", { name: `Sort ${label} Queries` })
       ).toBeInTheDocument();
     }
+    for (const label of [
+      "Fast ASv3 Tek",
+      "Fast Exp Cropped",
+      "Kompozit",
+      "Kompozit Cropped",
+    ]) {
+      expect(
+        screen.queryByRole("columnheader", { name: label })
+      ).not.toBeInTheDocument();
+    }
     const cells = within(
       screen.getByRole("row", { name: /alice@example.com/ })
     ).getAllByRole("cell");
-    expect(cells.slice(33, 43).map((cell) => cell.textContent)).toEqual([
-      "2",
-      "$0.80",
-      "$0.4000",
-      "4",
-      "$0.2000",
-      "2",
-      "$0.30",
-      "$0.1500",
-      "7",
-      "$0.0429",
-    ]);
+    expect(cells).toHaveLength(24);
   });
 
   it("preserves every existing metric and supports responses without workflow data", () => {
@@ -173,10 +172,10 @@ describe("PerUserUsagePanel", () => {
     render(<PerUserUsagePanel timeRange={timeRange} />);
 
     expect(
-      screen.getByRole("columnheader", { name: "Derin Mod · ASv3 Tek" })
+      screen.getByRole("columnheader", { name: "Hızlı Mod · ASv3 Tek" })
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("columnheader", { name: "Hızlı Mod · ASv3 Exp Cropped" })
+      screen.getByRole("columnheader", { name: "Derin Mod · ASv3 Exp Cropped" })
     ).toBeInTheDocument();
     const row = screen.getByRole("row", { name: /alice@example.com/ });
     expect(
@@ -232,6 +231,97 @@ describe("PerUserUsagePanel", () => {
     expect(within(row).getAllByRole("cell")[17]).toHaveTextContent("—");
   });
 
+  it.each([
+    { status: "partial", queryAverage: 20, sessionAverage: 30 },
+    { status: "running", queryAverage: 20, sessionAverage: 30 },
+    { status: "partial", queryAverage: 0, sessionAverage: 0 },
+  ] as const)(
+    "shows complete-cost sample averages and coverage for $status ($queryAverage cents)",
+    ({ status, queryAverage, sessionAverage }) => {
+      mockUsers([
+        {
+          ...alice,
+          workflow_usage: {
+            asv3_exp_cropped: {
+              ...deepUsage,
+              cost_cents: null,
+              cost_status: status,
+              average_cost_cents_per_query: null,
+              average_cost_cents_per_session: null,
+              complete_query_count: 3,
+              complete_session_count: 1,
+              average_cost_cents_per_complete_query: queryAverage,
+              average_cost_cents_per_complete_session: sessionAverage,
+            },
+          },
+        },
+      ]);
+      render(<PerUserUsagePanel timeRange={timeRange} />);
+      const row = screen.getByRole("row", { name: /alice@example.com/ });
+      const cells = within(row).getAllByRole("cell");
+      expect(within(cells[19]!).getByText("≥$0.80")).toBeInTheDocument();
+      expect(
+        within(cells[20]!).getByText(`$${(sessionAverage / 100).toFixed(4)}`)
+      ).toBeInTheDocument();
+      expect(
+        within(cells[20]!).getByText("Maliyeti tam: 1/2 oturum")
+      ).toBeInTheDocument();
+      expect(
+        within(cells[22]!).getByText(`$${(queryAverage / 100).toFixed(4)}`)
+      ).toBeInTheDocument();
+      expect(
+        within(cells[22]!).getByText("Maliyeti tam: 3/4 sorgu")
+      ).toBeInTheDocument();
+    }
+  );
+
+  it("sorts incomplete workflows by the displayed complete-cost sample average", async () => {
+    const sampleUsage: WorkflowUsage = {
+      ...deepUsage,
+      cost_cents: null,
+      cost_status: "partial",
+      average_cost_cents_per_query: null,
+      average_cost_cents_per_session: null,
+      complete_query_count: 3,
+      average_cost_cents_per_complete_query: 20,
+    };
+    mockUsers([
+      { ...alice, email: "legacy@example.com" },
+      {
+        ...alice,
+        email: "bob@example.com",
+        workflow_usage: {
+          asv3_exp_cropped: {
+            ...sampleUsage,
+            average_cost_cents_per_complete_query: 5,
+          },
+        },
+      },
+      { ...alice, workflow_usage: { asv3_exp_cropped: sampleUsage } },
+    ]);
+    render(<PerUserUsagePanel timeRange={timeRange} />);
+    const user = setupUser();
+    const sort = screen.getByRole("button", {
+      name: "Sort Derin Mod · ASv3 Exp Cropped Cost / query",
+    });
+    const emails = () =>
+      screen
+        .getAllByRole("link")
+        .map((link) => link.getAttribute("aria-label"));
+    await user.click(sort);
+    expect(emails()).toEqual([
+      "Query history for alice@example.com",
+      "Query history for bob@example.com",
+      "Query history for legacy@example.com",
+    ]);
+    await user.click(sort);
+    expect(emails()).toEqual([
+      "Query history for bob@example.com",
+      "Query history for alice@example.com",
+      "Query history for legacy@example.com",
+    ]);
+  });
+
   it("sorts by workflow usage in both directions and keeps missing metrics last", async () => {
     mockUsers([
       { ...alice, email: "legacy@example.com" },
@@ -245,7 +335,7 @@ describe("PerUserUsagePanel", () => {
     render(<PerUserUsagePanel timeRange={timeRange} />);
     const user = setupUser();
     const sort = screen.getByRole("button", {
-      name: "Sort Derin Mod · ASv3 Tek Sessions",
+      name: "Sort Hızlı Mod · ASv3 Tek Sessions",
     });
     const emails = () =>
       screen

@@ -164,6 +164,11 @@ def test_workflow_usage_counts_prompts_once_and_all_nested_research_costs(
     assert deep.average_cost_cents_per_query == pytest.approx(50.0)
     assert deep.average_cost_cents_per_session == pytest.approx(50.0)
     assert deep.cost_status == "complete"
+    assert (deep.complete_query_count, deep.complete_session_count) == (2, 2)
+    assert deep.complete_query_cost_cents == pytest.approx(100.0)
+    assert deep.complete_session_cost_cents == pytest.approx(100.0)
+    assert deep.average_cost_cents_per_complete_query == pytest.approx(50.0)
+    assert deep.average_cost_cents_per_complete_session == pytest.approx(50.0)
     fast = usage["asv3_exp_cropped"]
     assert (fast.query_count, fast.session_count) == (1, 1)
     assert fast.cost_cents == pytest.approx(25.0)
@@ -225,6 +230,10 @@ def test_partial_and_running_costs_retain_known_cost_without_false_averages(
     assert usage.average_cost_cents_per_query is None
     assert usage.average_cost_cents_per_session is None
     assert usage.unpriced_call_count == int(unpriced)
+    assert usage.complete_query_count == 0
+    assert usage.complete_session_count == 0
+    assert usage.average_cost_cents_per_complete_query is None
+    assert usage.average_cost_cents_per_complete_session is None
 
 
 def test_missing_and_foreign_tenant_graphs_are_unavailable(db_session: Session) -> None:
@@ -242,6 +251,77 @@ def test_missing_and_foreign_tenant_graphs_are_unavailable(db_session: Session) 
         assert usage[workflow].cost_status == "unavailable"
         assert usage[workflow].known_cost_cents == 0.0
         assert usage[workflow].cost_cents is None
+        assert usage[workflow].unavailable_query_count == 1
+
+
+def test_cropped_complete_samples_keep_query_branches_and_sessions_together(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import onyx.db.workflow_usage as workflow_usage
+
+    monkeypatch.setattr(workflow_usage, "_RESPONSE_BATCH_SIZE", 1)
+    user, complete_session = _session(db_session)
+    _, mixed_session = _session(db_session, user)
+    _, running_session = _session(db_session, user)
+    _, missing_session = _session(db_session, user)
+
+    def answer(query: ChatMessage, cost: float, *, status: str = "COMPLETE") -> None:
+        response = _message(db_session, query.chat_session, query, "asv3_exp_cropped")
+        _generation(db_session, _run(db_session, query, response, status=status), cost)
+
+    first = _message(db_session, complete_session)
+    answer(first, 0.2)
+    # A failed answer still has a complete cost record and incurs its spend.
+    answer(first, 0.3, status="FAILED")
+    answer(_message(db_session, complete_session), 0.4)
+    answer(_message(db_session, mixed_session), 0.6)
+    partial = _message(db_session, mixed_session)
+    answer(partial, 0.7)
+    # One missing branch excludes the entire query from the complete sample.
+    _message(db_session, mixed_session, partial, "asv3_exp_cropped")
+    answer(_message(db_session, running_session), 0.8, status="RUNNING")
+    missing = _message(db_session, missing_session)
+    _message(db_session, missing_session, missing, "asv3_exp_cropped")
+
+    usage = get_workflow_usage_by_email(db_session, _START, _END)[user.email][
+        "asv3_exp_cropped"
+    ]
+
+    assert (usage.query_count, usage.session_count) == (6, 4)
+    assert usage.cost_status == "running"
+    assert usage.known_cost_cents == pytest.approx(300.0)
+    assert usage.cost_cents is None
+    assert usage.average_cost_cents_per_query is None
+    assert usage.average_cost_cents_per_session is None
+    assert usage.complete_query_count == 3
+    assert usage.complete_query_cost_cents == pytest.approx(150.0)
+    assert usage.average_cost_cents_per_complete_query == pytest.approx(50.0)
+    assert usage.complete_session_count == 1
+    assert usage.complete_session_cost_cents == pytest.approx(90.0)
+    assert usage.average_cost_cents_per_complete_session == pytest.approx(90.0)
+    assert (
+        usage.partial_query_count,
+        usage.running_query_count,
+        usage.unavailable_query_count,
+    ) == (1, 1, 1)
+
+
+def test_cropped_zero_cost_complete_sample_is_distinct_from_missing_data(
+    db_session: Session,
+) -> None:
+    user, chat_session = _session(db_session)
+    query = _message(db_session, chat_session)
+    response = _message(db_session, chat_session, query, "asv3_exp_cropped")
+    _generation(db_session, _run(db_session, query, response), 0.0)
+
+    usage = get_workflow_usage_by_email(db_session, _START, _END)[user.email][
+        "asv3_exp_cropped"
+    ]
+
+    assert (usage.complete_query_count, usage.complete_session_count) == (1, 1)
+    assert usage.average_cost_cents_per_complete_query == 0.0
+    assert usage.average_cost_cents_per_complete_session == 0.0
+    assert usage.unavailable_query_count == 0
 
 
 def test_workflow_activity_uses_prompt_time_excludes_benchmarks_and_unknown_modes(
