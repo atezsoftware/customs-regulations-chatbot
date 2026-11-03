@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
+import datetime as dt
 import hashlib
 import json
 import logging
@@ -69,6 +71,49 @@ def remote(expected: str) -> dict[str, Any]:
                     }
                     for priority in priorities
                 ]
+                queued = []
+                for priority in priorities:
+                    key = channel._q_for_pri(source_queue, priority)
+                    for raw in channel.client.lrange(key, 0, 9):
+                        if len(raw) > 16384:
+                            continue
+                        message = json.loads(raw)
+                        headers = message.get("headers", {})
+                        name = headers.get("task")
+                        if not isinstance(name, str) or not re.fullmatch(
+                            r"[A-Za-z0-9_.-]{1,200}", name
+                        ):
+                            continue
+                        owned = False
+                        if name == "acquire_amendment_sources":
+                            encoded = message.get("body", "")
+                            if isinstance(encoded, str) and len(encoded) <= 8192:
+                                body = json.loads(
+                                    base64.b64decode(encoded, validate=True)
+                                )
+                                if (
+                                    isinstance(body, list)
+                                    and len(body) >= 2
+                                    and isinstance(body[1], dict)
+                                ):
+                                    owned = body[1].get("package_id") == PACKAGE
+                        expires = headers.get("expires")
+                        expired = None
+                        if isinstance(expires, str):
+                            expiry = dt.datetime.fromisoformat(
+                                expires.replace("Z", "+00:00")
+                            )
+                            expired = expiry <= dt.datetime.now(dt.timezone.utc)
+                        queued.append(
+                            {
+                                "name": name,
+                                "owned_6455": owned,
+                                "expires": expires,
+                                "expired_at_observation": expired,
+                                "priority": priority,
+                            }
+                        )
+                report["queued_safe_headers"] = queued
     except Exception as error:
         report["queue_count_error_class"] = type(error).__name__
     inspect = app.control.inspect(timeout=3)
