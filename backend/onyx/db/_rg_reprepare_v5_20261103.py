@@ -66,7 +66,7 @@ OLD_PDF_METADATA_SHA = (
 )
 FINAL_IMAGE_SHA = "eb54c6215dc7dbb9f3ca9029afc11d09830ad77a"
 APPROVED_PLAN_SHA = "acca7ee08b6ec9c8e9e30730eb6218d12c201e8225c15f6e3b0dcbba80767d8f"
-REPREPARE_ENABLED = True
+REPREPARE_ENABLED = False
 # Fill only from the source replay made with both real incident assets/file IDs.
 V5_PDF_ALL = 197
 V5_PDF_CANONICAL = 192
