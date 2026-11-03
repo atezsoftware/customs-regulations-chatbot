@@ -124,6 +124,12 @@ def _has_frozen_metadata_receipts(session: Session, files: set[UUID]) -> bool:
 
 def edit_review_digest(session: Session, batch: RegulatoryDocumentIntake) -> str | None:
     """An edit receipt never grants publication of an incomplete label review."""
+    if batch.labeling_run_id is None:
+        from onyx.db.document_intake_metadata_review import (
+            prelabel_metadata_edit_digest,
+        )
+
+        return prelabel_metadata_edit_digest(session, batch)
     metadata_review = batch.status == "failed" and batch.stage in {
         "metadata",
         "chunking",
@@ -456,7 +462,15 @@ def _edit_intake_chunks(
     expected_review_sha256: str,
     edits: Sequence[IntakeChunkEdit],
 ) -> UUID | None:
+    from onyx.db.document_intake_metadata import metadata_chunks
+    from onyx.db.document_intake_metadata_review import (
+        canonical_metadata_source_digest,
+        capture_reviewed_metadata_checkpoint,
+        reviewed_metadata_edit,
+    )
     from onyx.db.document_intake_review import effective_intake_files
+    from onyx.regulatory.document_intake.metadata import metadata_input_hash
+    from onyx.regulatory.document_intake.metadata_review import ReviewedMetadataDocument
 
     session.refresh(batch, with_for_update=True)
     intake.refresh_intake(session, batch)
@@ -476,6 +490,13 @@ def _edit_intake_chunks(
             "The document edit review changed; reload before editing"
         )
     partial_review = batch.status in {"partial", "failed"}
+    prelabel = batch.labeling_run_id is None
+    pending = reviewed_metadata_edit(batch)
+    if (
+        pending is not None
+        and pending.previous_labeling_run_id != batch.labeling_run_id
+    ):
+        pending = None
     document_ids = {edit.document_id for edit in edits}
     members = list(
         session.scalars(
@@ -585,7 +606,9 @@ def _edit_intake_chunks(
                 rename_document_ids[chunk.user_file_id] = member.id
     if not prepared_by_file:
         return None
-    if previous is None or previous.status not in _TERMINAL_LABELING_STATUSES:
+    if (previous is None and not prelabel) or (
+        previous is not None and previous.status not in _TERMINAL_LABELING_STATUSES
+    ):
         raise intake.IntakeConflictError(
             "The completed labeling snapshot is unavailable"
         )
@@ -604,10 +627,13 @@ def _edit_intake_chunks(
     binding = resolve_intake_labeling_provider_binding(
         session, batch.labeling_model_configuration_id, user=user
     )
+    documents = dict(pending.documents) if pending else {}
+    context_changed = False
     # No canonical record changes until every submitted edit has been validated.
     for file_id in sorted(prepared_by_file):
         changes = prepared_by_file[file_id]
         file_rows = rows_by_file[file_id]
+        before_input = metadata_input_hash(metadata_chunks(file_rows))
         retain_canonical_revisions(session, capture_canonical_scope(session, file_id))
         for change in changes:
             for key, value in change.updates.items():
@@ -621,6 +647,7 @@ def _edit_intake_chunks(
             for change in changes
             for field in ("text", "heading_path", "chunk_type")
         ):
+            context_changed = True
             invalidate_metadata_file_context(file_rows)
         rebuilt = rebuild_context_aggregates(
             file_rows, changed_ids=[change.chunk.id for change in changes]
@@ -632,6 +659,52 @@ def _edit_intake_chunks(
             refresh_intake_document_name(session, batch, rename_document_ids[file_id])
         session.flush()
         retain_canonical_revisions(session, capture_canonical_scope(session, file_id))
+        member = next(member for member in members if member.user_file_id == file_id)
+        prior = documents.get(member.id)
+        revisions = dict(prior.revisions) if prior else {}
+        revisions.update(
+            {
+                change.chunk.id: UUID(
+                    change.chunk.chunk_metadata["intake_edit_revision"]
+                )
+                for change in changes
+            }
+        )
+        previous_input = (
+            prior.previous_input_sha256
+            if prior and prior.refresh_metadata
+            else before_input
+        )
+        current_input = metadata_input_hash(metadata_chunks(file_rows))
+        if previous_input == current_input and before_input != current_input:
+            previous_input = before_input
+        documents[member.id] = ReviewedMetadataDocument(
+            user_file_id=file_id,
+            previous_input_sha256=previous_input,
+            input_sha256=current_input,
+            canonical_source_sha256=canonical_metadata_source_digest(file_rows),
+            revisions=revisions,
+            refresh_metadata=previous_input != current_input,
+        )
+    if prelabel or context_changed or pending is not None:
+        batch.status, batch.stage, batch.error = "preparing", "chunking", None
+        batch.review_sha256, batch.lease_token, batch.lease_expires_at = (
+            None,
+            None,
+            None,
+        )
+        for member in effective_intake_files(session, batch):
+            member.status, member.error = "chunked", None
+        capture_reviewed_metadata_checkpoint(
+            session,
+            batch,
+            expected_review_sha256=expected_review_sha256,
+            documents=documents,
+            binding=binding,
+        )
+        session.flush()
+        return None
+    assert previous is not None
     run, _created = labeling.create_labeling_run(
         session,
         document_set_id=batch.document_set_id,

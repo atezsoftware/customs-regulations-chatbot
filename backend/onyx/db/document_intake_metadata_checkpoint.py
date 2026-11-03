@@ -110,9 +110,11 @@ def _source_snapshot(
     batch: RegulatoryDocumentIntake,
     *,
     reviewed: ReviewedMetadataEdit | None = None,
+    for_review: bool = False,
 ) -> tuple[dict[str, Any], dict[str, list[str]], set[str]]:
     from onyx.db.document_intake_metadata import (
         metadata_chunks,
+        metadata_receipts_current,
         validate_metadata_receipt_evidence,
     )
     from onyx.db.document_intake_metadata_review import (
@@ -122,9 +124,7 @@ def _source_snapshot(
         reviewed_metadata_edit,
     )
     from onyx.db.document_intake_reprepare import reprepared_original_receipt
-    from onyx.db.regulatory_chunks import is_hierarchical_aggregate_chunk
     from onyx.regulatory.document_intake.metadata import (
-        METADATA_AUDIT_KEY,
         TARGETS_PER_REQUEST,
         build_metadata_request,
         metadata_input_hash,
@@ -249,13 +249,9 @@ def _source_snapshot(
             raise intake.IntakeConflictError(
                 "Metadata requires canonical source targets"
             )
-        if all(
-            isinstance(row.chunk_metadata.get(METADATA_AUDIT_KEY), dict)
-            and row.chunk_metadata[METADATA_AUDIT_KEY].get("input_sha256") == input_hash
-            for row in rows
-            if not is_hierarchical_aggregate_chunk(row)
-        ):
-            validate_metadata_receipt_evidence(rows, chunks)
+        if metadata_receipts_current(rows, input_hash):
+            if not for_review:
+                validate_metadata_receipt_evidence(rows, chunks)
             completed.add(str(member.id))
         elif (
             reviewed is not None
@@ -270,7 +266,7 @@ def _source_snapshot(
             )
         requests[str(member.id)] = (
             []
-            if str(member.id) in completed
+            if for_review or str(member.id) in completed
             else [
                 build_metadata_request(
                     chunks,
@@ -378,8 +374,13 @@ def rebase_metadata_checkpoint_for_retry(
     session: Session, batch: RegulatoryDocumentIntake
 ) -> None:
     """An explicit idle Retry may adopt a validator with identical frozen requests."""
-    if batch.metadata_checkpoint is None or batch.labeling_run_id is not None:
+    if batch.metadata_checkpoint is None:
         return
+    if batch.labeling_run_id is not None:
+        from onyx.db.document_intake_metadata_review import reviewed_metadata_edit
+
+        if reviewed_metadata_edit(batch) is None:
+            return
     if (
         batch.status not in {"failed", "partial"}
         or batch.stage != "metadata"

@@ -29,6 +29,39 @@ from onyx.regulatory.document_intake.metadata_review import (
 )
 
 
+def prelabel_metadata_edit_digest(
+    session: Session, batch: RegulatoryDocumentIntake
+) -> str | None:
+    if (
+        batch.status != "failed"
+        or batch.stage not in {"metadata", "chunking"}
+        or batch.labeling_run_id is not None
+        or batch.lease_token is not None
+        or batch.lease_expires_at is not None
+        or labeling.get_active_run_id(session, batch.document_set_id) is not None
+    ):
+        return None
+    from onyx.db.document_intake_metadata_checkpoint import _source_snapshot
+
+    try:
+        source, _requests, _completed = _source_snapshot(
+            session, batch, for_review=True
+        )
+        canonical = intake.review_digest(session, batch)
+    except (ValueError, intake.IntakeConflictError):
+        return None
+    return metadata_digest(
+        {
+            "purpose": "unpublished_prelabel_metadata_edit",
+            "source": source,
+            "canonical_review": canonical,
+            "status": batch.status,
+            "stage": batch.stage,
+            "error": batch.error,
+        }
+    )
+
+
 def canonical_metadata_source_digest(rows: Sequence[RegulatoryChunk]) -> str:
     return metadata_digest(
         [
@@ -183,3 +216,25 @@ def capture_reviewed_metadata_checkpoint(
         predecessor=predecessor,
     )
     batch.metadata_checkpoint = checkpoint.model_dump(mode="json")
+
+
+def require_fresh_reviewed_metadata(
+    session: Session, batch: RegulatoryDocumentIntake
+) -> None:
+    from onyx.db.document_intake_metadata import (
+        _load_rows,
+        metadata_chunks,
+        metadata_receipts_current,
+        validate_metadata_receipt_evidence,
+    )
+    from onyx.db.document_intake_review import effective_intake_files
+
+    for member in effective_intake_files(session, batch):
+        rows = _load_rows(session, batch, member.id)
+        if not metadata_receipts_current(
+            rows, metadata_input_hash(metadata_chunks(rows))
+        ):
+            raise intake.IntakeConflictError(
+                "Reviewed metadata must be current before labeling"
+            )
+        validate_metadata_receipt_evidence(rows, metadata_chunks(rows))
