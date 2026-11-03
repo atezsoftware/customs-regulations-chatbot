@@ -11,6 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from onyx.db import document_intake as intake
+from onyx.db.document_intake_metadata_checkpoint import require_metadata_lease
 from onyx.db.enums import UserFileStatus
 from onyx.db.models import (
     RegulatoryChunk,
@@ -210,6 +211,9 @@ def _load_rows(
 def load_metadata_work(
     session: Session, intake_id: UUID, lease_token: UUID
 ) -> tuple[RegulatoryDocumentIntake, list[tuple[UUID, list[MetadataChunk]]]]:
+    require_metadata_lease(
+        session, intake_id, lease_token, allow_preparation_stage=True
+    )
     batch, _package, _assets = intake.load_intake_job(session, intake_id, lease_token)
     batch.stage = "metadata"
     batch.lease_expires_at = datetime.datetime.now(
@@ -340,7 +344,7 @@ def refresh_intake_document_name(
 
 
 def heartbeat_metadata(session: Session, intake_id: UUID, lease_token: UUID) -> None:
-    batch, _package, _assets = intake.load_intake_job(session, intake_id, lease_token)
+    batch = require_metadata_lease(session, intake_id, lease_token)
     batch.lease_expires_at = datetime.datetime.now(
         datetime.timezone.utc
     ) + datetime.timedelta(minutes=10)
@@ -356,12 +360,7 @@ def apply_metadata_results(
     expected_input_sha256: str,
     results: Sequence[tuple[str, LegalMetadataResult]],
 ) -> None:
-    session.get_one(
-        RegulatoryDocumentIntake,
-        intake_id,
-        with_for_update=True,
-        populate_existing=True,
-    )
+    require_metadata_lease(session, intake_id, lease_token)
     batch, _package, _assets = intake.load_intake_job(session, intake_id, lease_token)
     rows = _load_rows(session, batch, document_id)
     chunks = metadata_chunks(rows)

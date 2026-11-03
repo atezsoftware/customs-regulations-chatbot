@@ -1,6 +1,7 @@
 """Enrich only newly chunked intake files using cached direct Vertex requests."""
 
 import hashlib
+import inspect
 import json
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
@@ -12,12 +13,17 @@ from uuid import UUID
 from pydantic import ValidationError
 
 from onyx.db import document_intake_metadata as repository
+from onyx.db.document_intake_metadata_checkpoint import (
+    metadata_execution_lock,
+    require_current_metadata_checkpoint,
+)
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.db.labeling_configuration import (
     resolve_intake_labeling_provider_binding,
     resolve_labeling_gateway,
 )
 from onyx.db.models import User
+from onyx.regulatory.document_intake import metadata as metadata_contract
 from onyx.regulatory.document_intake.capacity import (
     MetadataCapacityStopped,
     run_with_metadata_capacity_retry,
@@ -41,6 +47,10 @@ from onyx.regulatory.document_intake.metadata import (
     recover_metadata_response,
     retain_validated_metadata_facts,
     validate_metadata_transport_response,
+)
+from onyx.regulatory.document_intake.metadata_checkpoint import (
+    MetadataLeaseLost,
+    metadata_recipe_fingerprint,
 )
 from onyx.regulatory.indexing_jobs.vertex_batch import (
     VertexBatchGateway,
@@ -709,7 +719,43 @@ def _extract_metadata_document(
     return [result for index in range(len(windows)) for result in results[index]]
 
 
+def metadata_recipe_sha256() -> str:
+    return metadata_recipe_fingerprint(
+        {
+            "contract": inspect.getsource(metadata_contract),
+            **{
+                function.__name__: inspect.getsource(function)
+                for function in (
+                    _extract_metadata_window,
+                    _extract_metadata_targets,
+                    _extract_metadata_document,
+                    _metadata_response,
+                    _metadata_output_pressure,
+                    _metadata_submission_key,
+                    _run_metadata_request,
+                    _cached_metadata_request,
+                )
+            },
+        },
+        {
+            "metadata_version": METADATA_VERSION,
+            "targets_per_request": TARGETS_PER_REQUEST,
+        },
+    )
+
+
 def run_intake_metadata(*, intake_id: UUID, lease_token: UUID, tenant_id: str) -> None:
+    with metadata_execution_lock(intake_id) as acquired:
+        if not acquired:
+            raise MetadataLeaseLost("Another worker still owns metadata execution")
+        run_intake_metadata_locked(
+            intake_id=intake_id, lease_token=lease_token, tenant_id=tenant_id
+        )
+
+
+def run_intake_metadata_locked(
+    *, intake_id: UUID, lease_token: UUID, tenant_id: str
+) -> None:
     with get_session_with_current_tenant() as session:
         batch, work = repository.load_metadata_work(session, intake_id, lease_token)
         if not work:
@@ -718,6 +764,14 @@ def run_intake_metadata(*, intake_id: UUID, lease_token: UUID, tenant_id: str) -
         owner = session.get_one(User, batch.created_by)
         binding = resolve_intake_labeling_provider_binding(
             session, batch.labeling_model_configuration_id, user=owner
+        )
+        checkpoint = require_current_metadata_checkpoint(
+            session,
+            intake_id,
+            lease_token,
+            provider_binding=binding,
+            recipe_sha256=metadata_recipe_sha256(),
+            capture=True,
         )
         gateway = resolve_labeling_gateway(
             session,
@@ -744,6 +798,14 @@ def run_intake_metadata(*, intake_id: UUID, lease_token: UUID, tenant_id: str) -
             heartbeat=heartbeat,
         )
         with get_session_with_current_tenant() as session:
+            require_current_metadata_checkpoint(
+                session,
+                intake_id,
+                lease_token,
+                provider_binding=binding,
+                recipe_sha256=checkpoint.recipe_sha256,
+                capture=False,
+            )
             repository.apply_metadata_results(
                 session,
                 intake_id=intake_id,
