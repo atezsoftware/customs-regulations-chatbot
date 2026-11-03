@@ -14,6 +14,7 @@ from onyx.regulatory.amendments.annexes import config
 from onyx.regulatory.document_intake.models import INTAKE_DELIVERY_SECONDS
 
 INTAKE_TASK_NAME = "regulatory_document_intake_prepare"
+METADATA_RECOVERY_TASK_NAME = "regulatory_document_intake_metadata_recover"
 
 
 def enqueue_intake_batch(
@@ -54,6 +55,59 @@ def enqueue_intake_indexes(deliveries: list[tuple[UUID, UUID]], tenant_id: str) 
             priority=OnyxCeleryPriority.HIGH,
             expires=CELERY_REGULATORY_INDEXING_TASK_EXPIRES,
         )
+
+
+def enqueue_intake_metadata_recovery(*, batch_id: UUID, tenant_id: str) -> None:
+    from onyx.background.celery.versioned_apps.client import app
+
+    app.send_task(
+        METADATA_RECOVERY_TASK_NAME,
+        kwargs={
+            "batch_id": str(batch_id),
+            "tenant_id": tenant_id,
+            "environment": config.REGULATORY_ANNEX_ENVIRONMENT,
+            "database_identity": config.ANNEX_DATABASE_IDENTITY,
+        },
+        queue=config.source_queue_name(),
+        expires=INTAKE_DELIVERY_SECONDS,
+    )
+
+
+@shared_task(name=METADATA_RECOVERY_TASK_NAME, ignore_result=True)
+def recover_document_intake_metadata(
+    *, batch_id: str, tenant_id: str, environment: str, database_identity: str
+) -> None:
+    from onyx.background.celery.tasks.regulatory_labeling.tasks import (
+        enqueue_labeling_run,
+    )
+    from onyx.regulatory.document_intake.metadata_resume_job import (
+        run_document_intake_metadata_recovery,
+    )
+    from shared_configs.configs import MULTI_TENANT, POSTGRES_DEFAULT_SCHEMA
+    from shared_configs.contextvars import get_current_tenant_id
+
+    if (
+        environment != config.REGULATORY_ANNEX_ENVIRONMENT
+        or database_identity != config.ANNEX_DATABASE_IDENTITY
+        or not tenant_id
+        or get_current_tenant_id() != tenant_id
+        or (not MULTI_TENANT and tenant_id != POSTGRES_DEFAULT_SCHEMA)
+    ):
+        raise ValueError("Metadata recovery belongs to another environment or database")
+    run_id = run_document_intake_metadata_recovery(
+        intake_id=UUID(batch_id), tenant_id=tenant_id
+    )
+    if run_id is not None:
+        try:
+            enqueue_labeling_run(run_id=run_id, tenant_id=tenant_id)
+        except Exception:
+            from onyx.db.document_intake import mark_intake_label_dispatch_failed
+            from onyx.db.engine.sql_engine import get_session_with_current_tenant
+
+            with get_session_with_current_tenant() as session:
+                mark_intake_label_dispatch_failed(session, UUID(batch_id))
+                session.commit()
+            raise
 
 
 @shared_task(name=INTAKE_TASK_NAME, ignore_result=True)
