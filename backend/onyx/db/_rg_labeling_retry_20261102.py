@@ -37,6 +37,10 @@ from onyx.db.regulatory_labeling_semantic_repair import (
     require_current_v4_intake_repair_item,
 )
 from onyx.document_index.publication_models import publication_digest
+from onyx.file_store.postgres_file_store import (
+    POSTGRES_BUCKET_SENTINEL,
+    PostgresBackedFileStore,
+)
 from onyx.regulatory.amendments.annexes.context_dependencies import context_hash
 from onyx.regulatory.document_intake.structural_readers import (
     build_native_chapter_reader_proofs,
@@ -86,6 +90,34 @@ def complete_ack_context(line: str, request_hash: str) -> str:
     )
     assert parsed.context is not None
     return parsed.context
+
+
+def retained_ack_bytes(session: Session, file_id: str, binding: str) -> bytes:
+    records = scope.rows(
+        session,
+        """
+        SELECT r.file_metadata,r.bucket_name,c.file_size
+        FROM file_record r JOIN file_content c ON c.file_id=r.file_id
+        WHERE r.file_id=:id
+    """,
+        id=file_id,
+    )
+    scope.require(
+        len(records) == 1
+        and records[0]["bucket_name"] == POSTGRES_BUCKET_SENTINEL
+        and 0 < records[0]["file_size"] <= 2_000_000
+        and records[0]["file_metadata"].get("binding_sha256") == binding,
+        "A retained direct ACK has no exact bounded PostgreSQL cache record",
+    )
+    with PostgresBackedFileStore().read_file(file_id, db_session=session) as stream:
+        raw = stream.read(2_000_001)
+    scope.require(
+        len(raw) == records[0]["file_size"]
+        and hashlib.sha256(raw).hexdigest()
+        == records[0]["file_metadata"].get("sha256"),
+        "A retained PostgreSQL ACK changed",
+    )
+    return raw
 
 
 def require_failed_run(run: RegulatoryLabelingRun) -> None:
@@ -205,24 +237,10 @@ def pure_repair_plan(
             "A retained ACK submission identity is malformed",
         )
         file_id = f"regulatory-labeling-direct/{binding.fingerprint}/{submission}/{base.request_hash}.json"
-        record = scope.rows(
-            session,
-            "SELECT file_metadata FROM file_record WHERE file_id=:id",
-            id=file_id,
-        )
-        scope.require(
-            len(record) == 1
-            and record[0]["file_metadata"].get("binding_sha256") == binding.fingerprint,
-            "A retained failed ACK has no exact provider binding",
-        )
-        with scope.retained_source_stream(file_id, session) as stream:
-            raw = stream.read(2_000_001)
+        raw = retained_ack_bytes(session, file_id, binding.fingerprint)
         total_bytes += len(raw)
         scope.require(
-            len(raw) <= 2_000_000
-            and total_bytes <= 16_000_000
-            and hashlib.sha256(raw).hexdigest()
-            == record[0]["file_metadata"].get("sha256"),
+            total_bytes <= 16_000_000,
             "A retained ACK changed or exceeded its bounded read budget",
         )
         ack = _StoredResult.model_validate_json(raw)

@@ -5,6 +5,8 @@ import json
 import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
+from hashlib import sha256
+from io import BytesIO
 from pathlib import Path
 from types import ModuleType
 from unittest.mock import MagicMock
@@ -88,6 +90,38 @@ def test_ack_eligibility_requires_one_complete_stop_candidate(
     else:
         with pytest.raises(RuntimeError, match="complete STOP"):
             operator.complete_ack_context(line, "a" * 64)
+
+
+@pytest.mark.parametrize("storage", ["postgres", "s3", "oversize"])
+def test_direct_ack_reads_use_postgres_even_with_an_s3_default_store(
+    operator: ModuleType, monkeypatch: pytest.MonkeyPatch, storage: str
+) -> None:
+    session = MagicMock(spec=Session)
+    raw = b"immutable cached ACK"
+    record = {
+        "bucket_name": "other-bucket" if storage == "s3" else "postgres",
+        "file_size": 2_000_001 if storage == "oversize" else len(raw),
+        "file_metadata": {
+            "binding_sha256": "b" * 64,
+            "sha256": sha256(raw).hexdigest(),
+        },
+    }
+    monkeypatch.setattr(operator.scope, "rows", lambda *_args, **_kwargs: [record])
+    default_read = MagicMock(
+        side_effect=AssertionError("Default S3 store cannot read direct ACKs")
+    )
+    monkeypatch.setattr(operator.scope, "retained_source_stream", default_read)
+    store = MagicMock()
+    store.read_file.return_value = BytesIO(raw)
+    monkeypatch.setattr(operator, "PostgresBackedFileStore", lambda: store)
+    if storage == "postgres":
+        assert operator.retained_ack_bytes(session, "exact-ack", "b" * 64) == raw
+        store.read_file.assert_called_once_with("exact-ack", db_session=session)
+    else:
+        with pytest.raises(RuntimeError, match="PostgreSQL cache"):
+            operator.retained_ack_bytes(session, "exact-ack", "b" * 64)
+        store.read_file.assert_not_called()
+    default_read.assert_not_called()
 
 
 @pytest.mark.parametrize(
