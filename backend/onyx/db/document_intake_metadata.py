@@ -7,7 +7,9 @@ from copy import deepcopy
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import select, text
+from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.orm import Session
 
 from onyx.db import document_intake as intake
@@ -43,6 +45,7 @@ from onyx.regulatory.document_intake.metadata import (
     metadata_input_hash,
     validate_metadata_response,
 )
+from onyx.regulatory.document_intake.metadata_checkpoint import MetadataLeaseLost
 
 
 def _audit(chunk: RegulatoryChunk) -> dict[str, Any]:
@@ -357,6 +360,20 @@ def heartbeat_metadata(session: Session, intake_id: UUID, lease_token: UUID) -> 
         datetime.timezone.utc
     ) + datetime.timedelta(minutes=10)
     session.flush()
+
+
+def heartbeat_metadata_with_timeout(
+    session: Session, intake_id: UUID, lease_token: UUID
+) -> None:
+    """Bound an isolated renewal transaction before checking its existing owner."""
+    try:
+        session.execute(text("SET LOCAL lock_timeout = '5s'"))
+        session.execute(text("SET LOCAL statement_timeout = '10s'"))
+        heartbeat_metadata(session, intake_id, lease_token)
+    except (OperationalError, SQLAlchemyTimeoutError) as error:
+        raise MetadataLeaseLost(
+            "Metadata heartbeat ownership could not be renewed"
+        ) from error
 
 
 def apply_metadata_results(

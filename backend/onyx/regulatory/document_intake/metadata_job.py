@@ -52,6 +52,7 @@ from onyx.regulatory.document_intake.metadata_checkpoint import (
     MetadataLeaseLost,
     metadata_recipe_fingerprint,
 )
+from onyx.regulatory.document_intake.metadata_lease import maintain_metadata_lease
 from onyx.regulatory.indexing_jobs.vertex_batch import (
     VertexBatchGateway,
     VertexBatchJobStatus,
@@ -788,15 +789,18 @@ def run_intake_metadata_locked(
 
         def heartbeat() -> None:
             with get_session_with_current_tenant() as session:
-                repository.heartbeat_metadata(session, intake_id, lease_token)
+                repository.heartbeat_metadata_with_timeout(
+                    session, intake_id, lease_token
+                )
                 session.commit()
 
-        results = _extract_metadata_document(
-            gateway=gateway,
-            chunks=chunks,
-            identity_prefix=f"metadata-v{METADATA_VERSION}:{tenant_id}:{intake_id}:{document_id}:{binding.fingerprint}",
-            heartbeat=heartbeat,
-        )
+        with maintain_metadata_lease(heartbeat) as owned_heartbeat:
+            results = _extract_metadata_document(
+                gateway=gateway,
+                chunks=chunks,
+                identity_prefix=f"metadata-v{METADATA_VERSION}:{tenant_id}:{intake_id}:{document_id}:{binding.fingerprint}",
+                heartbeat=owned_heartbeat,
+            )
         with get_session_with_current_tenant() as session:
             require_current_metadata_checkpoint(
                 session,
