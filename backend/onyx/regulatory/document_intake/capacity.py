@@ -1,11 +1,15 @@
-"""Lease-aware, bounded retries for explicit metadata provider capacity rejection."""
+"""Lease-aware, bounded retries of unchanged metadata transport requests."""
 
 import hashlib
 import re
 from collections.abc import Callable
 from threading import Event
 
-from onyx.regulatory.indexing_jobs.models import IndexingGatewayHTTPError
+from onyx.regulatory.indexing_jobs.models import (
+    IndexingGatewayConnectionError,
+    IndexingGatewayHTTPError,
+    IndexingGatewayTimeoutError,
+)
 
 _MAX_ATTEMPTS = 4
 _BASE_DELAY_SECONDS = 30.0
@@ -36,7 +40,7 @@ def run_with_metadata_capacity_retry[T](
     heartbeat: Callable[[], None],
     stopped: Event,
 ) -> T:
-    """Repeat only explicit HTTP 429 rejections using the unchanged operation."""
+    """Retry temporary provider faults; validated or invalid content is never replayed."""
     capacity_retry_delay_seconds(request_hash, 1)
 
     def check_stopped() -> None:
@@ -49,8 +53,15 @@ def run_with_metadata_capacity_retry[T](
         check_stopped()
         try:
             return operation()
-        except IndexingGatewayHTTPError as error:
-            if error.status_code != 429 or attempt == _MAX_ATTEMPTS - 1:
+        except (
+            IndexingGatewayHTTPError,
+            IndexingGatewayTimeoutError,
+            IndexingGatewayConnectionError,
+        ) as error:
+            if (
+                isinstance(error, IndexingGatewayHTTPError)
+                and error.status_code not in {408, 429, 500, 502, 503, 504}
+            ) or attempt == _MAX_ATTEMPTS - 1:
                 raise
             remaining = capacity_retry_delay_seconds(request_hash, attempt + 1)
             while remaining > 0:

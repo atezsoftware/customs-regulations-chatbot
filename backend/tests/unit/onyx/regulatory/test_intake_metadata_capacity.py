@@ -1,4 +1,4 @@
-"""Metadata capacity waits are bounded, cancellable and never broaden retries."""
+"""Temporary metadata faults preserve request identity and bounded lease-aware waits."""
 
 import json
 from collections.abc import Callable
@@ -17,6 +17,7 @@ from onyx.regulatory.document_intake.capacity import (
 from onyx.regulatory.indexing_jobs.models import (
     IndexingGatewayConnectionError,
     IndexingGatewayHTTPError,
+    IndexingGatewayIndeterminateSubmissionError,
     IndexingGatewayTimeoutError,
 )
 from onyx.regulatory.indexing_jobs.vertex_batch import VertexBatchGateway
@@ -42,13 +43,22 @@ def _fake_wait(
     return waits
 
 
-def test_capacity_rejection_then_ack_retries_exact_operation_with_heartbeats(
+@pytest.mark.parametrize(
+    "failure",
+    [
+        *(IndexingGatewayHTTPError(code) for code in (408, 429, 500, 502, 503, 504)),
+        IndexingGatewayConnectionError(),
+        IndexingGatewayTimeoutError(),
+    ],
+)
+def test_transient_fault_then_ack_retries_exact_operation_with_heartbeats(
     monkeypatch: pytest.MonkeyPatch,
+    failure: Exception,
 ) -> None:
     event = Event()
     waits = _fake_wait(monkeypatch, event)
     ack = object()
-    operation = Mock(side_effect=[IndexingGatewayHTTPError(429), ack])
+    operation = Mock(side_effect=[failure, ack])
     heartbeat = Mock()
     assert (
         run_with_metadata_capacity_retry(
@@ -62,14 +72,22 @@ def test_capacity_rejection_then_ack_retries_exact_operation_with_heartbeats(
     assert heartbeat.call_count == operation.call_count + len(waits)
 
 
-def test_four_capacity_attempts_exhaust_with_the_original_error(
+@pytest.mark.parametrize(
+    "error",
+    [
+        IndexingGatewayHTTPError(429),
+        IndexingGatewayHTTPError(503),
+        IndexingGatewayTimeoutError(),
+    ],
+)
+def test_four_transient_attempts_exhaust_with_the_original_error(
     monkeypatch: pytest.MonkeyPatch,
+    error: Exception,
 ) -> None:
     event = Event()
     waits = _fake_wait(monkeypatch, event)
-    error = IndexingGatewayHTTPError(429)
     operation = Mock(side_effect=error)
-    with pytest.raises(IndexingGatewayHTTPError) as caught:
+    with pytest.raises(type(error)) as caught:
         run_with_metadata_capacity_retry(
             operation, request_hash=_HASH, heartbeat=Mock(), stopped=event
         )
@@ -86,14 +104,13 @@ def test_four_capacity_attempts_exhaust_with_the_original_error(
         IndexingGatewayHTTPError(400),
         IndexingGatewayHTTPError(401),
         IndexingGatewayHTTPError(403),
-        IndexingGatewayHTTPError(408),
-        IndexingGatewayHTTPError(500),
-        IndexingGatewayConnectionError(),
-        IndexingGatewayTimeoutError(),
+        IndexingGatewayHTTPError(409),
+        IndexingGatewayHTTPError(501),
+        IndexingGatewayIndeterminateSubmissionError("unconfirmed-submission"),
         ValueError("Invalid metadata"),
     ],
 )
-def test_non_capacity_errors_fail_immediately_without_waiting(
+def test_permanent_or_indeterminate_errors_fail_immediately_without_waiting(
     monkeypatch: pytest.MonkeyPatch, error: Exception
 ) -> None:
     event = Event()
@@ -165,8 +182,16 @@ def test_jitter_is_deterministic_bounded_and_differs_between_requests() -> None:
 
 
 @pytest.mark.parametrize("semantic_error", [False, True])
+@pytest.mark.parametrize(
+    "failure",
+    [
+        IndexingGatewayHTTPError(429),
+        IndexingGatewayHTTPError(503),
+        IndexingGatewayTimeoutError(),
+    ],
+)
 def test_metadata_request_retries_same_cache_key_and_never_retries_semantic_validation(
-    monkeypatch: pytest.MonkeyPatch, semantic_error: bool
+    monkeypatch: pytest.MonkeyPatch, semantic_error: bool, failure: Exception
 ) -> None:
     sources = [
         metadata.MetadataChunk(
@@ -195,7 +220,7 @@ def test_metadata_request_retries_same_cache_key_and_never_retries_semantic_vali
     )
     provider = Mock(
         side_effect=[
-            IndexingGatewayHTTPError(429),
+            failure,
             _envelope(request, "STOP", response),
         ]
     )
