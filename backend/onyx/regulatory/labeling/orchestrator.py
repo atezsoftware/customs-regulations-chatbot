@@ -37,8 +37,10 @@ from onyx.regulatory.indexing_jobs.vertex_batch import (
 from onyx.regulatory.labeling.accepted_result import (
     AcceptedIntakeRepair,
     LabelingApplyOutcome,
+    SourceOnlyArticleLeadIn,
     SourceOnlySelfRepeal,
 )
+from onyx.regulatory.labeling.article_lead_in import article_lead_in_candidate
 from onyx.regulatory.labeling.domain import shard_by_count_and_bytes
 from onyx.regulatory.labeling.intake_abstention_repair import (
     build_abstention_repair,
@@ -844,7 +846,7 @@ def _repair_intake_abstention(
     rejected_response: str,
     taxonomy: TaxonomyDefinition,
     heartbeat: Callable[[], None],
-) -> AcceptedIntakeRepair | SourceOnlySelfRepeal:
+) -> AcceptedIntakeRepair | SourceOnlySelfRepeal | SourceOnlyArticleLeadIn:
     from onyx.db.regulatory_labeling_semantic_repair import (
         require_current_intake_repair_item,
     )
@@ -961,6 +963,19 @@ def _repair_intake_abstention(
                     RegulatoryLabelingItem, item.id, populate_existing=True
                 )
                 run = repository.load_claimed_run(session, lease)
+                if article_lead_in_candidate(current_item.text_snapshot):
+                    from onyx.db.regulatory_labeling_article_lead_in import (
+                        build_source_only_article_lead_in_receipt,
+                    )
+
+                    return SourceOnlyArticleLeadIn(
+                        receipt=build_source_only_article_lead_in_receipt(
+                            session,
+                            item=current_item,
+                            run=run,
+                            provider_abstention=audit,
+                        )
+                    )
                 receipt = build_source_only_self_repeal_receipt(
                     session,
                     item=current_item,

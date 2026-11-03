@@ -25,6 +25,10 @@ from onyx.document_index.publication_models import publication_digest
 from onyx.regulatory.amendments.annexes.context_dependencies import context_hash
 from onyx.regulatory.amendments.annexes.models import AnnexCanonicalSnapshot
 from onyx.regulatory.indexing_jobs.vertex_batch import VertexBatchRequest
+from onyx.regulatory.labeling.article_lead_in import (
+    ARTICLE_LEAD_IN_KEY,
+    SourceOnlyArticleLeadInReceipt,
+)
 from onyx.regulatory.labeling.intake_abstention_repair import AbstentionRepairAudit
 from onyx.regulatory.labeling.provider import (
     TaxonomyDefinition,
@@ -59,7 +63,11 @@ def _receipt_state(
 def _validate_completed_leaf(
     item: RegulatoryLabelingItem, taxonomy: TaxonomyDefinition
 ) -> None:
-    if item.status != "completed" or SOURCE_ONLY_KEY in item.source_snapshot:
+    if (
+        item.status != "completed"
+        or SOURCE_ONLY_KEY in item.source_snapshot
+        or ARTICLE_LEAD_IN_KEY in item.source_snapshot
+    ):
         return
     if (
         not item.request_payload
@@ -98,6 +106,7 @@ def labeling_review_authority(
                 or_(
                     RegulatoryLabelingItem.source_snapshot.op("?")(SEMANTIC_REPAIR_KEY),
                     RegulatoryLabelingItem.source_snapshot.op("?")(SOURCE_ONLY_KEY),
+                    RegulatoryLabelingItem.source_snapshot.op("?")(ARTICLE_LEAD_IN_KEY),
                 ),
             )
             .order_by(RegulatoryLabelingItem.regulatory_chunk_id)
@@ -130,7 +139,25 @@ def labeling_review_authority(
 
     semantic: list[dict[str, object]] = []
     source_only: list[dict[str, object]] = []
+    lead_ins: list[dict[str, object]] = []
     for item in repairs:
+        if ARTICLE_LEAD_IN_KEY in item.source_snapshot:
+            from onyx.db.regulatory_labeling_article_lead_in import (
+                validate_item_article_lead_in_receipt,
+            )
+
+            validate_item_article_lead_in_receipt(session, item=item, run=run)
+            lead_ins.append(
+                {
+                    "chunk_id": item.regulatory_chunk_id,
+                    "receipt_sha256": publication_digest(
+                        SourceOnlyArticleLeadInReceipt.model_validate(
+                            item.source_snapshot[ARTICLE_LEAD_IN_KEY]
+                        ).model_dump(mode="json")
+                    ),
+                }
+            )
+            continue
         if SOURCE_ONLY_KEY in item.source_snapshot:
             validate_item_source_only_receipt(session, item=item, run=run)
             source_only.append(
@@ -186,6 +213,12 @@ def labeling_review_authority(
             _validate_completed_leaf(leaf, taxonomy)
             validate_item_semantic_repair_audit(session, item=leaf, run=run)
             validate_item_source_only_receipt(session, item=leaf, run=run)
+            if ARTICLE_LEAD_IN_KEY in leaf.source_snapshot:
+                from onyx.db.regulatory_labeling_article_lead_in import (
+                    validate_item_article_lead_in_receipt,
+                )
+
+                validate_item_article_lead_in_receipt(session, item=leaf, run=run)
         current = current_labeling_items_for_search(session, run=run, items=leaves)
         lineage = current_derived_label_sources_for_search(
             session, run=run, target=target
@@ -235,5 +268,6 @@ def labeling_review_authority(
         "model": run.model,
         "semantic_repairs": semantic,
         **({"source_only_dispositions": source_only} if source_only else {}),
+        **({"article_lead_in_dispositions": lead_ins} if lead_ins else {}),
         "structural_readers": structural,
     }

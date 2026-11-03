@@ -78,6 +78,7 @@ from onyx.regulatory.indexing_jobs.vertex_batch import (
 from onyx.regulatory.labeling.accepted_result import (
     AcceptedIntakeRepair,
     LabelingApplyOutcome,
+    SourceOnlyArticleLeadIn,
     SourceOnlySelfRepeal,
 )
 from onyx.regulatory.labeling.api_models import (
@@ -87,6 +88,7 @@ from onyx.regulatory.labeling.api_models import (
     LabelingRunSnapshot,
     TaxonomySummary,
 )
+from onyx.regulatory.labeling.article_lead_in import ARTICLE_LEAD_IN_KEY
 from onyx.regulatory.labeling.domain import (
     LabelingChunkView,
     bounded_document_context,
@@ -1028,11 +1030,16 @@ def list_items(
                 chunk_id=row.regulatory_chunk_id,
                 file_id=str(row.user_file_id),
                 status=row.status,
-                classification_disposition="source_only_self_repeal"
-                if SOURCE_ONLY_KEY in row.source_snapshot
-                else "provider",
+                classification_disposition=(
+                    "source_only_self_repeal"
+                    if SOURCE_ONLY_KEY in row.source_snapshot
+                    else "source_only_article_lead_in"
+                    if ARTICLE_LEAD_IN_KEY in row.source_snapshot
+                    else "provider"
+                ),
                 provider_abstained=True
                 if SOURCE_ONLY_KEY in row.source_snapshot
+                or ARTICLE_LEAD_IN_KEY in row.source_snapshot
                 else None,
                 labels=list(row.labels),
                 error=row.error,
@@ -1357,6 +1364,7 @@ def prepare_next_item_page(
         if any(
             ABSTENTION_REPAIR_KEY in item.source_snapshot
             or SOURCE_ONLY_KEY in item.source_snapshot
+            or ARTICLE_LEAD_IN_KEY in item.source_snapshot
             for item in file_items
         ):
             validated_sources = complete_frozen_sources(
@@ -2282,7 +2290,20 @@ def _apply_frozen_window_results(
             item.status = "failed"
             item.error = outcome[:4000]
             continue
-        if isinstance(outcome, SourceOnlySelfRepeal):
+        if isinstance(outcome, SourceOnlyArticleLeadIn):
+            from onyx.db.regulatory_labeling_article_lead_in import (
+                validate_item_article_lead_in_receipt,
+            )
+
+            validate_item_article_lead_in_receipt(
+                session, item=item, run=run, receipt=outcome.receipt
+            )
+            item.source_snapshot = {
+                **item.source_snapshot,
+                ARTICLE_LEAD_IN_KEY: outcome.receipt.model_dump(mode="json"),
+            }
+            labels, assignments = [], []
+        elif isinstance(outcome, SourceOnlySelfRepeal):
             from onyx.db.regulatory_labeling_self_repeal import (
                 validate_item_source_only_receipt,
             )
@@ -2918,6 +2939,15 @@ def current_labeling_items_for_search(
     for item in items:
         if item.run_id != run.id or item.status != "completed":
             continue
+        if ARTICLE_LEAD_IN_KEY in item.source_snapshot:
+            from onyx.db.regulatory_labeling_article_lead_in import (
+                validate_item_article_lead_in_receipt,
+            )
+
+            try:
+                validate_item_article_lead_in_receipt(session, item=item, run=run)
+            except ValueError:
+                continue
         if SOURCE_ONLY_KEY in item.source_snapshot:
             from onyx.db.regulatory_labeling_self_repeal import (
                 validate_item_source_only_receipt,

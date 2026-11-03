@@ -91,9 +91,9 @@ class LabelingRunSnapshot(BaseModel):
 
 
 class LabelingItemSnapshot(BaseModel):
-    classification_disposition: Literal["provider", "source_only_self_repeal"] = (
-        "provider"
-    )
+    classification_disposition: Literal[
+        "provider", "source_only_self_repeal", "source_only_article_lead_in"
+    ] = "provider"
     provider_abstained: bool | None = None
     chunk_id: str
     file_id: str
