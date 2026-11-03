@@ -1,5 +1,6 @@
 """Metadata crash recovery binds immutable source and excludes stale workers."""
 
+from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
 
@@ -25,7 +26,13 @@ from onyx.db.models import (
     RegulatorySourceAsset,
     User,
 )
+from onyx.regulatory.document_intake import metadata as metadata_contract
 from onyx.regulatory.document_intake.metadata import (
+    METADATA_AUDIT_KEY,
+    ChunkLegalMetadata,
+    LegalMetadataFact,
+    LegalMetadataResult,
+    MetadataChunk,
     metadata_input_hash,
 )
 from onyx.regulatory.document_intake.metadata_checkpoint import (
@@ -35,6 +42,7 @@ from onyx.regulatory.document_intake.metadata_checkpoint import (
 )
 from onyx.regulatory.document_intake.metadata_job import metadata_recipe_sha256
 from onyx.regulatory.indexing_jobs.models import VertexAuthenticationMode
+from onyx.regulatory.indexing_jobs.vertex_batch import VertexBatchRequest
 from tests.external_dependency_unit.regulatory.test_document_intake_metadata import (
     _apply,
     _ready_metadata,
@@ -51,7 +59,10 @@ intake_session = _intake_session
 
 
 def ready_checkpoint(
-    session: Session, owner: tuple[User, DocumentSet, ModelConfiguration]
+    session: Session,
+    owner: tuple[User, DocumentSet, ModelConfiguration],
+    *,
+    title: str | None = None,
 ) -> tuple[
     RegulatoryDocumentIntake,
     list[RegulatoryDocumentIntakeFile],
@@ -59,6 +70,8 @@ def ready_checkpoint(
     LabelingProviderBinding,
 ]:
     batch, members, token, _article, _closing = _ready_metadata(session, owner)
+    if title is not None:
+        _article.text = title
     batch.stage = "metadata"
     model = owner[2]
     binding = LabelingProviderBinding(
@@ -304,3 +317,104 @@ def test_checkpoint_checksums_all_frozen_fields() -> None:
     )
     with pytest.raises(ValueError):
         checkpoint.model_copy(update={"request_hashes": {}}).validate_checksum()
+
+
+def test_completed_title_growth_never_rebuilds_requests_and_receipt_loss_fails_closed(
+    intake_session: Session,
+    intake_owner: tuple[User, DocumentSet, ModelConfiguration],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    title = ("İTHALATTA BELGELERİN İBRAZI HAKKINDA YÖNETMELİK " * 40).strip()
+    batch, members, token, binding = ready_checkpoint(
+        intake_session, intake_owner, title=title
+    )
+    rows = list(
+        intake_session.scalars(
+            select(RegulatoryChunk)
+            .where(RegulatoryChunk.user_file_id == members[0].user_file_id)
+            .order_by(RegulatoryChunk.position)
+        )
+    )
+    article = rows[0]
+    metadata.apply_metadata_results(
+        intake_session,
+        intake_id=batch.id,
+        lease_token=token,
+        document_id=members[0].id,
+        expected_input_sha256=metadata_input_hash(metadata.metadata_chunks(rows)),
+        results=[
+            (
+                "a" * 64,
+                LegalMetadataResult(
+                    chunks=[
+                        ChunkLegalMetadata(
+                            chunk_id=row.id,
+                            fields=[
+                                LegalMetadataFact(
+                                    field="document_title",
+                                    value=title,
+                                    source_chunk_id=article.id,
+                                    evidence_quote=title,
+                                )
+                            ],
+                        )
+                        for row in rows
+                    ]
+                ),
+            )
+        ],
+    )
+    assert article.chunk_metadata["intake_display_name"]["title"] == title
+    original_builder = metadata_contract.build_metadata_request
+    pending_calls: list[list[str]] = []
+
+    def pending_builder(
+        chunks: Sequence[MetadataChunk], target_ids: Sequence[str]
+    ) -> VertexBatchRequest:
+        assert article.id not in {chunk.chunk_id for chunk in chunks}, (
+            "completed requests must not be rebuilt"
+        )
+        pending_calls.append(list(target_ids))
+        return original_builder(chunks, target_ids)
+
+    monkeypatch.setattr(metadata_contract, "build_metadata_request", pending_builder)
+    require_current_metadata_checkpoint(
+        intake_session,
+        batch.id,
+        token,
+        provider_binding=binding,
+        recipe_sha256=metadata_recipe_sha256(),
+        capture=False,
+    )
+    assert len(pending_calls) == 1
+    # First capture can also begin after one file already has complete receipts.
+    batch.metadata_checkpoint = None
+    captured = require_current_metadata_checkpoint(
+        intake_session,
+        batch.id,
+        token,
+        provider_binding=binding,
+        recipe_sha256=metadata_recipe_sha256(),
+        capture=True,
+    )
+    assert captured.request_hashes[str(members[0].id)] == []
+    assert captured.request_hashes[str(members[1].id)]
+    monkeypatch.setattr(metadata_contract, "build_metadata_request", original_builder)
+    for row in rows:
+        row.chunk_metadata = {
+            key: value
+            for key, value in row.chunk_metadata.items()
+            if key != METADATA_AUDIT_KEY
+        }
+    with pytest.raises(
+        intake.IntakeConflictError,
+        match="request contract changed|source, recipe or provider",
+    ):
+        require_current_metadata_checkpoint(
+            intake_session,
+            batch.id,
+            token,
+            provider_binding=binding,
+            recipe_sha256=metadata_recipe_sha256(),
+            capture=False,
+        )
