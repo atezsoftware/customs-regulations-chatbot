@@ -34,6 +34,7 @@ from onyx.regulatory.document_intake.metadata_checkpoint import (
     MetadataLeaseLost,
     metadata_digest,
 )
+from onyx.regulatory.document_intake.metadata_review import ReviewedMetadataEdit
 from shared_configs.contextvars import get_current_tenant_id
 
 
@@ -105,16 +106,24 @@ def require_metadata_lease(
 
 
 def _source_snapshot(
-    session: Session, batch: RegulatoryDocumentIntake
+    session: Session,
+    batch: RegulatoryDocumentIntake,
+    *,
+    reviewed: ReviewedMetadataEdit | None = None,
 ) -> tuple[dict[str, Any], dict[str, list[str]], set[str]]:
     from onyx.db.document_intake_metadata import (
         metadata_chunks,
         validate_metadata_receipt_evidence,
     )
+    from onyx.db.document_intake_metadata_review import (
+        canonical_metadata_source_digest,
+        require_reviewed_document,
+        require_reviewed_metadata_owner,
+        reviewed_metadata_edit,
+    )
     from onyx.db.document_intake_reprepare import reprepared_original_receipt
     from onyx.db.regulatory_chunks import is_hierarchical_aggregate_chunk
     from onyx.regulatory.document_intake.metadata import (
-        LEGAL_METADATA_FIELDS,
         METADATA_AUDIT_KEY,
         TARGETS_PER_REQUEST,
         build_metadata_request,
@@ -132,6 +141,7 @@ def _source_snapshot(
             .execution_options(populate_existing=True)
         )
     )
+    reviewed = reviewed or reviewed_metadata_edit(batch)
     if (
         package.status != "ready"
         or package.issues
@@ -140,9 +150,21 @@ def _source_snapshot(
         or not package.manifest_sha256
         or not members
         or len(members) != package.asset_count
-        or batch.labeling_run_id is not None
+        or (batch.labeling_run_id is not None and reviewed is None)
     ):
         raise intake.IntakeConflictError("The frozen metadata source package changed")
+    if reviewed is not None:
+        if batch.labeling_run_id is not None:
+            from onyx.db.document_intake_review import effective_intake_files
+
+            members = effective_intake_files(session, batch)
+        if not set(reviewed.documents) <= {member.id for member in members}:
+            raise intake.IntakeConflictError(
+                "The reviewed metadata document scope changed"
+            )
+        require_reviewed_metadata_owner(
+            session, batch, reviewed, {str(member.user_file_id) for member in members}
+        )
     documents, requests, completed = {}, {}, set()
     for member in members:
         file = session.get_one(UserFile, member.user_file_id, populate_existing=True)
@@ -213,7 +235,7 @@ def _source_snapshot(
             or row.source != "indexed"
             or row.supersedes_chunk_id
             or row.superseded_by_chunk_id
-            or "intake_edit_revision" in row.chunk_metadata
+            or ("intake_edit_revision" in row.chunk_metadata and reviewed is None)
             for row in rows
         ):
             raise intake.IntakeConflictError(
@@ -221,6 +243,8 @@ def _source_snapshot(
             )
         chunks = metadata_chunks(rows)
         input_hash = metadata_input_hash(chunks)
+        if reviewed is not None and member.id in reviewed.documents:
+            require_reviewed_document(reviewed.documents[member.id], file.id, rows)
         if not chunks:
             raise intake.IntakeConflictError(
                 "Metadata requires canonical source targets"
@@ -233,6 +257,17 @@ def _source_snapshot(
         ):
             validate_metadata_receipt_evidence(rows, chunks)
             completed.add(str(member.id))
+        elif (
+            reviewed is not None
+            and batch.labeling_run_id is not None
+            and (
+                member.id not in reviewed.documents
+                or not reviewed.documents[member.id].refresh_metadata
+            )
+        ):
+            raise intake.IntakeConflictError(
+                "Unreviewed post-label metadata cannot be regenerated"
+            )
         requests[str(member.id)] = (
             []
             if str(member.id) in completed
@@ -267,28 +302,7 @@ def _source_snapshot(
             if member.parent_document_id
             else None,
             "relationships": member.relationships,
-            "canonical_source_sha256": metadata_digest(
-                [
-                    {
-                        "id": row.id,
-                        "text": row.text,
-                        "heading_path": row.heading_path,
-                        "chunk_type": row.chunk_type,
-                        "position": row.position,
-                        "source_metadata": {
-                            key: value
-                            for key, value in row.chunk_metadata.items()
-                            if key
-                            not in {
-                                *LEGAL_METADATA_FIELDS,
-                                METADATA_AUDIT_KEY,
-                                "intake_display_name",
-                            }
-                        },
-                    }
-                    for row in rows
-                ]
-            ),
+            "canonical_source_sha256": canonical_metadata_source_digest(rows),
         }
     return (
         {
@@ -301,6 +315,7 @@ def _source_snapshot(
             "manifest_sha256": package.manifest_sha256,
             "manifest_file_id": package.manifest_file_id,
             "documents": documents,
+            **({"reviewed_edit": reviewed.model_dump(mode="json")} if reviewed else {}),
         },
         requests,
         completed,
