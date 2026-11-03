@@ -64,7 +64,7 @@ OLD_SOURCE_SHA = "de0ffa6d4ee73b11499026af190690fe29760d77a51cfd8bf069601dfa96fd
 OLD_PDF_METADATA_SHA = (
     "360736824a7f7588a2ae032d4901238d5e3f9870f01cbe3c1246ed485927d5b1"
 )
-FINAL_IMAGE_SHA = "d4a9edb94a80b44d6c763fe2eea9dc0c408e0478"
+FINAL_IMAGE_SHA = "eb54c6215dc7dbb9f3ca9029afc11d09830ad77a"
 APPROVED_PLAN_SHA: str | None = None
 REPREPARE_ENABLED = False
 # Fill only from the source replay made with both real incident assets/file IDs.
