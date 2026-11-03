@@ -581,6 +581,8 @@ def strict_v4_canary(input_path: Path, expected_sha: str, *, chunking_version: s
         require(settings.id == 11 and settings.provider_type == EmbeddingProvider.GOOGLE and settings.model_name == "gemini-embedding-2" and settings.enable_contextual_rag, "The configured strict canary model or contextual policy changed")
         embedder = DefaultIndexingEmbedder.from_db_search_settings(settings)
         dimension, model_dim = settings.final_embedding_dim, settings.model_dim
+        if fixture is not None:
+            require(dimension == 1024, "The frozen v5 vector dimension changed")
         session.expunge(settings)
         session.rollback()
     llm = resolve_review_context_llm(settings, None)
@@ -593,6 +595,8 @@ def strict_v4_canary(input_path: Path, expected_sha: str, *, chunking_version: s
     require(projection.embedding_texts[0] == source and projection.embedding_config.get("strict_full_input") is True and projection.embedding_config.get("max_sequence_length") == 2048, "The normal freezer changed the complete table or strict budget")
     tokenizer = embedder.embedding_model.tokenizer
     require(512 < len(tokenizer.encode(source)) <= 1848, "The fixture does not exercise the larger-table path")
+    if fixture is not None:
+        require(len(tokenizer.encode(source)) == fixture["local_tokens"] == 1663, "The frozen logical matrix tokenizer changed")
     native_counts: list[float] = []
     class NativeCounts(logging.Handler):
         def emit(self, record: logging.LogRecord) -> None:
@@ -615,6 +619,7 @@ def strict_v4_canary(input_path: Path, expected_sha: str, *, chunking_version: s
         native_logger.setLevel(old_level)
     result = next(iter(vectors.values()))
     require(len(result) == len(projection.embedding_texts) and len(native_counts) == len(result), "Strict provider acknowledgements lack their native token evidence")
+    require(all(0 < count <= 8192 for count in native_counts), "Strict provider native token counts exceed the supported model input limit")
     require(all(len(vector) == dimension and all(math.isfinite(value) for value in vector) for vector in result), "Strict provider returned invalid vectors")
     return {"success": True, "fixture_wire_sha256": expected_sha, "source_table_sha256": hashlib.sha256(source.encode()).hexdigest(), "exact_source_span_verified": True, "normal_frozen_inputs_sha256": projection.embedding_input_sha256, "frozen_encoder_configuration": projection.embedding_config, "input_approximate_tokens": [len(tokenizer.encode(value)) for value in projection.embedding_texts], "native_processed_tokens_unordered": sorted(native_counts), "vector_dimensions": [len(vector) for vector in result], "complete_table_preserved": True, "requested_auto_truncate": False, "raw_truncated_field": "not inferred from SDK; native no-truncation request contract enforced", "contextual_provider_calls": 0, "document_or_index_writes": False}
 
