@@ -298,8 +298,17 @@ class RegulatoryIndexingChunker:
         """Keep legal text intact while reserving room for contextual summaries."""
 
         max_chunk_chars = self._regulatory_chunker.max_chunk_chars
-        if (intake_version == "4") != (preparation_policy is not None):
-            raise ValueError("Intake v4 requires its frozen preparation policy")
+        if (intake_version in {"4", "5"}) != (preparation_policy is not None):
+            raise ValueError(
+                "Whole-table intake requires its frozen preparation policy"
+            )
+        if (
+            preparation_policy is not None
+            and preparation_policy.chunking_version != intake_version
+        ):
+            raise ValueError(
+                "The intake chunking version differs from its frozen policy"
+            )
         while True:
             structural_chunker: RegulatoryChunker
             if intake_version is not None:
@@ -351,7 +360,7 @@ class RegulatoryIndexingChunker:
 
             if preparation_policy is not None:
                 metadata = {
-                    "intake_chunking_version": "4",
+                    "intake_chunking_version": preparation_policy.chunking_version,
                     "intake_preparation_policy": preparation_policy.model_dump(
                         mode="json"
                     ),

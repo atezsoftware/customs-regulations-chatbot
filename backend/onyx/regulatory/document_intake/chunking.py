@@ -36,6 +36,11 @@ from onyx.regulatory.document_intake.chunking_profile import (
 )
 from onyx.regulatory.document_intake.document_profile import intake_document_profile
 from onyx.regulatory.document_intake.headings import promote_plain_article_titles
+from onyx.regulatory.document_intake.logical_tables import (
+    LogicalTable,
+    LogicalTableEvidence,
+    logical_markdown_blocks,
+)
 from onyx.regulatory.heading_path import parse_regulatory_article_heading
 
 _SENTENCE_END = re.compile(r"[.!?;:](?:\s+|$)")
@@ -76,6 +81,17 @@ class IntakeChunkMetadata(ChunkMetadata):
         return metadata
 
 
+@dataclass(frozen=True)
+class LogicalIntakeChunkMetadata(IntakeChunkMetadata):
+    intake_logical_table: LogicalTableEvidence | None = None
+
+    def to_storage_dict(self) -> dict[str, Any]:
+        metadata = super().to_storage_dict()
+        if self.intake_logical_table is not None:
+            metadata["intake_logical_table"] = asdict(self.intake_logical_table)
+        return metadata
+
+
 class IntakeRegulatoryChunker(RegulatoryChunker):
     """Keep an article's heading with its first body slice within the real budget."""
 
@@ -100,13 +116,14 @@ class IntakeRegulatoryChunker(RegulatoryChunker):
         self.tokenizer = tokenizer
         self.content_token_limit = content_token_limit
         self.chunking_version = chunking_version
-        if chunking_version == "4" and table_content_token_limit is None:
+        if chunking_version in {"4", "5"} and table_content_token_limit is None:
             raise ValueError("Intake v4 requires its frozen table content budget")
         self.table_content_token_limit = table_content_token_limit
         self.whole_table_row_token_limit = max(
             content_token_limit, whole_table_row_token_limit or content_token_limit
         )
         self._source_text = ""
+        self._logical_tables: list[LogicalTable] = []
         self._source_starts: dict[SourceBlock, int] = {}
         self._table_row_fragments: dict[tuple[int, int], IntakeTableRow] = {}
 
@@ -128,8 +145,11 @@ class IntakeRegulatoryChunker(RegulatoryChunker):
             parser=parser,
             source_path_override=source_path,
         )
-        blocks = _markdown_to_blocks(self._source_text)
-        if self.chunking_version in {"3", "4"}:
+        if self.chunking_version == "5":
+            blocks, self._logical_tables = logical_markdown_blocks(self._source_text)
+        else:
+            blocks = _markdown_to_blocks(self._source_text)
+        if self.chunking_version in {"3", "4", "5"}:
             blocks = promote_plain_article_titles(blocks, source_text=self._source_text)
         metadata, ignored = intake_document_profile(blocks=blocks, metadata=metadata)
         chunks, structure = self.chunk_blocks_with_structure(
@@ -147,7 +167,7 @@ class IntakeRegulatoryChunker(RegulatoryChunker):
 
     def _fits(self, blocks: list[SourceBlock]) -> bool:
         limit = self.content_token_limit
-        if self.chunking_version == "4" and any(
+        if self.chunking_version in {"4", "5"} and any(
             block.kind == "table" for block in blocks
         ):
             assert self.table_content_token_limit is not None
@@ -180,6 +200,24 @@ class IntakeRegulatoryChunker(RegulatoryChunker):
         self, block: SourceBlock, start: int, prefix: list[SourceBlock]
     ) -> int:
         """Select a source boundary, measuring the final heading and body together."""
+        if block.kind == "table" and self.chunking_version == "5":
+            source_start = self._source_start(block)
+            rows = [
+                row
+                for table in self._logical_tables
+                for row in table.rows
+                if row.start_char >= source_start + start
+                and row.end_char <= source_start + len(block.text)
+            ]
+            end = start
+            for row in rows:
+                candidate = row.end_char - source_start
+                if not self._fits([*prefix, self._slice(block, start, candidate)]):
+                    break
+                end = candidate
+            if end == start:
+                return self._single_cell_row_prefix_end(block, start, prefix)
+            return end
         if block.kind == "table":
             end = start
             for match in _LINE_END.finditer(block.text, start):
@@ -192,7 +230,7 @@ class IntakeRegulatoryChunker(RegulatoryChunker):
                     break
                 end = match.end()
             if end == start:
-                if self.chunking_version in {"3", "4"}:
+                if self.chunking_version in {"3", "4", "5"}:
                     return self._single_cell_row_prefix_end(block, start, prefix)
                 raise ValueError(
                     "An intake table row exceeds the embedding content token limit"
@@ -390,9 +428,115 @@ class IntakeRegulatoryChunker(RegulatoryChunker):
                 )
             else:
                 retained.append(draft)
-        if self.chunking_version in {"2", "3", "4"}:
+        if self.chunking_version in {"2", "3", "4", "5"}:
             retained = self._merge_adjacent_table_headings(retained, blocks=blocks)
+        if self.chunking_version == "5":
+            retained, structure = self._bind_table_captions(
+                retained, structure, blocks, metadata
+            )
         return retained, structure
+
+    def _bind_table_captions(
+        self,
+        drafts: list[_ChunkDraft],
+        structure: list[StructureNode],
+        blocks: list[SourceBlock],
+        metadata: DocumentMetadata,
+    ) -> tuple[list[_ChunkDraft], list[StructureNode]]:
+        captions = [
+            block
+            for index, block in enumerate(blocks[:-1])
+            if re.match(r"^Tablo\s+\d+[A-Za-z]?\s*[:：]", block.text, re.I)
+            and blocks[index + 1].kind == "table"
+        ]
+        if not captions:
+            return drafts, structure
+        nodes = {node.node_id: node for node in structure}
+        anchors: dict[int, tuple[StructureNode, list[StructureNode]]] = {}
+        result: list[_ChunkDraft] = []
+        consumed: set[int] = set()
+        for draft in drafts:
+            if draft.chunk_type != "table":
+                result.append(draft)
+                continue
+            table_start = min(block.start_char for block in draft.blocks)
+            eligible = [
+                caption for caption in captions if caption.start_char < table_start
+            ]
+            if not eligible:
+                result.append(draft)
+                continue
+            caption = eligible[-1]
+            # A caption governs only tables in the same literal appendix/article.
+            if any(
+                _classify_block(block)["kind"] in {"appendix", "article", "section"}
+                for block in blocks
+                if caption.end_char < block.start_char < table_start
+            ):
+                result.append(draft)
+                continue
+            if caption.block_id not in anchors:
+                parents = [
+                    nodes[identifier]
+                    for identifier in draft.parent_ids
+                    if identifier in nodes
+                    and nodes[identifier].node_type
+                    in {"document", "appendix", "supplement", "section", "article"}
+                ]
+                parent = parents[-1] if parents else structure[0]
+                node = _make_structure_node(
+                    metadata=metadata,
+                    node_type="heading",
+                    label=caption.text,
+                    parent_id=parent.node_id,
+                    level=parent.level + 1,
+                    order=len(structure),
+                    source_block=caption.block_id,
+                )
+                structure.append(node)
+                anchors[caption.block_id] = node, parents
+            node, parents = anchors[caption.block_id]
+            hierarchy = [*parents, node]
+            parts = list(draft.blocks)
+            following = next(
+                (block for block in blocks if block.block_id == caption.block_id + 1),
+                None,
+            )
+            if following in draft.blocks:
+                consumed.add(caption.block_id)
+                table = next(block for block in draft.blocks if block.kind == "table")
+                source_end = max(block.end_char for block in draft.blocks)
+                parts = [
+                    replace(
+                        table,
+                        text=self._source_text[caption.start_char : source_end].strip(),
+                        start_char=caption.start_char,
+                        end_char=source_end,
+                    )
+                ]
+            result.append(
+                replace(
+                    draft,
+                    blocks=parts,
+                    parent_id=node.node_id,
+                    parent_ids=[item.node_id for item in hierarchy],
+                    parent_path=[item.label for item in hierarchy],
+                    heading_path=[item.label for item in hierarchy],
+                    paragraph_no=None,
+                    clause_label=None,
+                    subclause_label=None,
+                )
+            )
+        trimmed: list[_ChunkDraft] = []
+        for draft in result:
+            parts = (
+                [block for block in draft.blocks if block.block_id not in consumed]
+                if draft.chunk_type != "table"
+                else draft.blocks
+            )
+            if parts:
+                trimmed.append(replace(draft, blocks=parts))
+        return trimmed, structure
 
     def _merge_adjacent_table_headings(
         self, drafts: list[_ChunkDraft], *, blocks: list[SourceBlock]
@@ -515,6 +659,35 @@ class IntakeRegulatoryChunker(RegulatoryChunker):
     def _split_oversized_draft(self, draft: _ChunkDraft) -> list[_ChunkDraft]:
         if self._fits(draft.blocks):
             return [draft]
+        if self.chunking_version == "5" and draft.chunk_type == "table":
+            for table in self._logical_tables:
+                if not any(
+                    block.start_char <= table.start_char < block.end_char
+                    for block in draft.blocks
+                ):
+                    continue
+                multiline = any(
+                    "\n" in self._source_text[row.start_char : row.end_char]
+                    for row in table.rows
+                )
+                header = [
+                    self._source_text[cell.start_char : cell.end_char].strip()
+                    for cell in table.rows[0].cells
+                ]
+                widths = {len(row.cells) for row in table.rows}
+                footer = [
+                    self._source_text[cell.start_char : cell.end_char].strip()
+                    for cell in table.rows[-1].cells
+                ]
+                unresolved_footer = bool(footer) and all(
+                    not value or re.fullmatch(r"[A-Z]{2,6}", value) for value in footer
+                )
+                if multiline and (
+                    len(widths) != 1 or not all(header) or unresolved_footer
+                ):
+                    raise ValueError(
+                        "An oversized multiline table requires its complete source axes; ambiguous headers cannot be split"
+                    )
         groups: list[list[SourceBlock]] = []
         current: list[SourceBlock] = []
         for block in draft.blocks:
@@ -603,19 +776,83 @@ class IntakeRegulatoryChunker(RegulatoryChunker):
             )
             is not None
         ]
-        if not fragments:
+        fragment = None
+        if fragments:
+            if len(fragments) != 1 or draft.table_index is None:
+                raise ValueError(
+                    "An intake table continuation lost its source row identity"
+                )
+            fragment = replace(fragments[0], table_index=draft.table_index)
+        evidence = None
+        if self.chunking_version == "5" and draft.chunk_type == "table":
+            span = self._source_text[
+                chunk.metadata.source_start_char : chunk.metadata.source_end_char
+            ]
+            exact = span.find(chunk.text)
+            if exact >= 0:
+                source_start = chunk.metadata.source_start_char + exact
+                chunk = replace(
+                    chunk,
+                    metadata=replace(
+                        chunk.metadata,
+                        source_start_char=source_start,
+                        source_end_char=source_start + len(chunk.text),
+                    ),
+                )
+            matching = [
+                table
+                for table in self._logical_tables
+                if table.start_char < chunk.metadata.source_end_char
+                and table.end_char > chunk.metadata.source_start_char
+            ]
+            if len(matching) == 1:
+                table = matching[0]
+                rows = tuple(
+                    row
+                    for row in table.rows
+                    if row.start_char >= chunk.metadata.source_start_char
+                    and row.end_char <= chunk.metadata.source_end_char
+                )
+                if not rows and fragment is None:
+                    raise ValueError(
+                        "A logical intake table row lost its exact source span"
+                    )
+                evidence = LogicalTableEvidence(
+                    version=1,
+                    coordinate_system="retained_pipe_cells",
+                    table_start_char=table.start_char,
+                    table_end_char=table.end_char,
+                    table_sha256=hashlib.sha256(
+                        self._source_text[table.start_char : table.end_char].encode()
+                    ).hexdigest(),
+                    rows=rows,
+                    context_rows=tuple([*table.rows[:2], table.rows[-1]]),
+                )
+                if chunk.metadata.source_start_char > table.start_char:
+                    header = self._source_text[
+                        table.rows[0].start_char : table.rows[0].end_char
+                    ]
+                    chunk = replace(
+                        chunk,
+                        metadata=replace(
+                            chunk.metadata,
+                            heading_path=[*chunk.metadata.heading_path, header],
+                        ),
+                    )
+        if fragment is None and evidence is None:
             return chunk
-        if len(fragments) != 1 or draft.table_index is None:
-            raise ValueError(
-                "An intake table continuation lost its source row identity"
+        projected: IntakeChunkMetadata
+        if evidence is not None:
+            projected = LogicalIntakeChunkMetadata(
+                **asdict(chunk.metadata),
+                intake_table_row=fragment,
+                intake_logical_table=evidence,
             )
-        fragment = replace(fragments[0], table_index=draft.table_index)
-        return replace(
-            chunk,
-            metadata=IntakeChunkMetadata(
+        else:
+            projected = IntakeChunkMetadata(
                 **asdict(chunk.metadata), intake_table_row=fragment
-            ),
-        )
+            )
+        return replace(chunk, metadata=projected)
 
     def _build_hierarchical_aggregate_chunks(
         self,
@@ -640,7 +877,11 @@ class IntakeRegulatoryChunker(RegulatoryChunker):
             aggregate_metadata = replace(
                 chunk.metadata, chunk_order=len(atomic_chunks) + index
             )
-            if isinstance(aggregate_metadata, IntakeChunkMetadata):
+            if isinstance(aggregate_metadata, LogicalIntakeChunkMetadata):
+                aggregate_metadata = replace(
+                    aggregate_metadata, intake_table_row=None, intake_logical_table=None
+                )
+            elif isinstance(aggregate_metadata, IntakeChunkMetadata):
                 aggregate_metadata = replace(aggregate_metadata, intake_table_row=None)
             aggregates.append(replace(chunk, metadata=aggregate_metadata))
         return aggregates
