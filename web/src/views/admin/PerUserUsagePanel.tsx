@@ -439,7 +439,7 @@ export default function PerUserUsagePanel({
         <Text
           font="secondary-body"
           color="text-03"
-          title="Workflow estimates include nested research LLM calls, excluding embeddings, reranking, images, and voice. Cost / session and Cost / query divide the same captured cost by their counts."
+          title="Workflow estimates include nested research LLM calls, excluding embeddings, reranking, images, and voice. Each average uses only its own queries or sessions with complete cost capture; the displayed count identifies that sample."
         >
           Workflow columns include only queries with a recorded workflow;
           sessions used in both modes appear in both groups. Costs are captured
