@@ -6,7 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from onyx.regulatory.amendments.annexes.models import SourceLink
 
 INTAKE_DELIVERY_SECONDS = 15 * 60
-IntakeChunkingVersion = Literal["1", "2", "3", "4"]
+IntakeChunkingVersion = Literal["1", "2", "3", "4", "5"]
 
 
 class IntakePreparationPolicy(BaseModel):
@@ -15,7 +15,7 @@ class IntakePreparationPolicy(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     version: Literal[1] = 1
-    chunking_version: Literal["4"] = "4"
+    chunking_version: Literal["4", "5"] = "4"
     provider: Literal["google"] = "google"
     model_name: Literal["gemini-embedding-2"] = "gemini-embedding-2"
     body_token_limit: Literal[512] = 512
@@ -55,8 +55,19 @@ class IntakeSourceContext(BaseModel):
 
     @model_validator(mode="after")
     def require_matching_policy(self) -> "IntakeSourceContext":
-        if (self.chunking_version == "4") != (self.preparation_policy is not None):
-            raise ValueError("Intake v4 requires its frozen preparation policy")
+        if (self.chunking_version in {"4", "5"}) != (
+            self.preparation_policy is not None
+        ):
+            raise ValueError(
+                "Whole-table intake requires its frozen preparation policy"
+            )
+        if (
+            self.preparation_policy is not None
+            and self.preparation_policy.chunking_version != self.chunking_version
+        ):
+            raise ValueError(
+                "The frozen intake preparation version differs from its source"
+            )
         return self
 
 

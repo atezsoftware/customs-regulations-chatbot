@@ -375,7 +375,8 @@ class ContextualRequestFactory:
 
     def __post_init__(self) -> None:
         if any(
-            getattr(row, "chunk_metadata", {}).get("intake_chunking_version") == "4"
+            getattr(row, "chunk_metadata", {}).get("intake_chunking_version")
+            in ("4", "5")
             for row in self.rows
         ):
             raise ContextualMappingError(

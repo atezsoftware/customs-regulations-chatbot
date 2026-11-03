@@ -132,7 +132,9 @@ def synchronous_embedding_receipts(
     )
 
     dimension = job.config_snapshot["effective_dimension"]
-    if any(row.chunk_metadata.get("intake_chunking_version") == "4" for row in rows):
+    if any(
+        row.chunk_metadata.get("intake_chunking_version") in ("4", "5") for row in rows
+    ):
         raise ValueError("Whole-table intake requires the scoped normal writer")
     if not isinstance(dimension, int) or isinstance(dimension, bool):
         raise ValueError("durable embedding dimension is unresolved")

@@ -101,9 +101,21 @@ class _CachedGateway:
         return iter([_line(self.repair_request, self.repaired)])
 
 
-@pytest.mark.parametrize("mode", ["accepted", "continued", "legacy"])
+@pytest.mark.parametrize(
+    ("mode", "version"),
+    [
+        ("accepted", "4"),
+        ("continued", "4"),
+        ("legacy", "3"),
+        ("accepted", "5"),
+        ("continued", "5"),
+    ],
+)
 def test_one_semantic_repair_is_persisted_reused_and_source_checked(
-    labeling_data: LabelingData, monkeypatch: pytest.MonkeyPatch, mode: str
+    labeling_data: LabelingData,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    version: str,
 ) -> None:
     data = labeling_data
     with data.database.engine.connect() as connection:
@@ -114,6 +126,17 @@ def test_one_semantic_repair_is_persisted_reused_and_source_checked(
             ) as session:
                 seed_v4_owned_intake_source(session, data)
                 session.get_one(UserFile, data.file_id).status = UserFileStatus.CHUNKED
+                if version == "5":
+                    for identifier in (data.first_id, data.second_id):
+                        row = session.get_one(RegulatoryChunk, identifier)
+                        row.chunk_metadata = {
+                            **row.chunk_metadata,
+                            "intake_chunking_version": "5",
+                            "intake_preparation_policy": {
+                                **row.chunk_metadata["intake_preparation_policy"],
+                                "chunking_version": "5",
+                            },
+                        }
                 if mode == "legacy":
                     for identifier in (data.first_id, data.second_id):
                         row = session.get_one(RegulatoryChunk, identifier)
