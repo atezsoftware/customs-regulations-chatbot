@@ -215,6 +215,17 @@ def test_source_and_exact_delivery_tampering_cannot_pass_restore() -> None:
     records = cast(list[dict[str, JsonValue]], deliveries[0]["records"])
     records[0]["end_char"] = 3
     malformed = EvidenceLedger()
+    with pytest.raises(ValueError, match="Invalid complete evidence delivery"):
+        malformed.restore(ledger_snapshot, root)
+
+    records[0]["complete"] = False
+    malformed.restore(ledger_snapshot, root)
+    with pytest.raises(ValueError, match="complete original delivery"):
+        restored.restore(store.export(), root, REQUEST, malformed)
+
+    # Readable legacy receipts still require exact identity at the answer receipt.
+    records[0]["complete"] = True
+    del records[0]["passage_hash"]
     malformed.restore(ledger_snapshot, root)
     with pytest.raises(ValueError, match="delivery identity"):
         restored.restore(store.export(), root, REQUEST, malformed)
