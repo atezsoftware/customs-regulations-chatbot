@@ -382,6 +382,18 @@ def refresh_intake(session: Session, batch: RegulatoryDocumentIntake) -> None:
 
     # Polling must re-read the worker's lease under the same lock as transitions.
     session.refresh(batch, with_for_update=True)
+    checkpoint_owned_expiry = (
+        batch.stage == "metadata"
+        and batch.metadata_checkpoint is not None
+        and (
+            (batch.lease_token is not None and batch.lease_expires_at is not None)
+            or (
+                batch.lease_token is None
+                and batch.lease_expires_at is None
+                and 1 <= batch.metadata_recovery_count <= 3
+            )
+        )
+    )
     if (
         batch.status == "preparing"
         and batch.stage
@@ -395,6 +407,7 @@ def refresh_intake(session: Session, batch: RegulatoryDocumentIntake) -> None:
             and batch.lease_token is None
             and batch.lease_expires_at is None
         )
+        and not checkpoint_owned_expiry
     ):
         deadline = batch.lease_expires_at or (
             batch.updated_at + datetime.timedelta(seconds=INTAKE_DELIVERY_SECONDS)
@@ -1187,7 +1200,12 @@ def _start_intake_labeling_for_batch(
 def fail_intake(
     session: Session, intake_id: UUID, token: UUID | None, message: str
 ) -> None:
-    batch = session.get(RegulatoryDocumentIntake, intake_id, with_for_update=True)
+    batch = session.get(
+        RegulatoryDocumentIntake,
+        intake_id,
+        with_for_update=True,
+        populate_existing=True,
+    )
     if batch is None or (token is not None and batch.lease_token != token):
         return
     batch.status, batch.error = "failed", message[:1000]

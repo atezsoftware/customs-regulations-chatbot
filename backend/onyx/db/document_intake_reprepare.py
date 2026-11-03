@@ -397,6 +397,7 @@ def request_reprepare(
     session.add(request)
     batch.labeling_run_id = None
     batch.review_sha256 = None
+    batch.metadata_checkpoint = None
     batch.status, batch.stage, batch.error = "preparing", "reprepare", None
     batch.lease_token, batch.lease_expires_at = None, None
     session.flush()
