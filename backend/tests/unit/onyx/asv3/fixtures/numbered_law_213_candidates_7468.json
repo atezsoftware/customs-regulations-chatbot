@@ -1,0 +1,235 @@
+{
+  "case": "7468 read_named_provision 213/315 saw padded213 and substring3213 candidates",
+  "query": "213 sayılı Kanun",
+  "requested_article": "315",
+  "candidate_heads": [
+    {
+      "id": "d04fd7ab-d799-4b4b-acc6-a0826749e6da",
+      "name": "Diğer Kanunlar/3213_sayili_maden_kanunu.md",
+      "status": "COMPLETED",
+      "chunk_id": "rc_c8e8981160b9dfec35c8d1668ad7a5547caba91a",
+      "position": 0,
+      "projection_ordinal": 0,
+      "text": "```\nMADEN KANUNU\nAmaç:",
+      "heading_path": [
+        "MADEN KANUNU"
+      ],
+      "chunk_metadata": {
+        "article_no": null,
+        "table_index": null,
+        "clause_label": null,
+        "heading_path": [
+          "MADEN KANUNU"
+        ],
+        "paragraph_no": null,
+        "article_title": null,
+        "chunk_variant": "atomic",
+        "document_date": null,
+        "document_type": "kanun",
+        "appendix_label": null,
+        "document_number": null,
+        "subclause_label": null,
+        "table_row_index": null,
+        "hierarchy_root_id": null,
+        "hierarchy_root_path": [],
+        "source_chunk_orders": [],
+        "source_regulatory_chunk_ids": []
+      },
+      "validity_start_date": null,
+      "validity_end_date": null,
+      "chunk_status": "active"
+    },
+    {
+      "id": "d04fd7ab-d799-4b4b-acc6-a0826749e6da",
+      "name": "Diğer Kanunlar/3213_sayili_maden_kanunu.md",
+      "status": "COMPLETED",
+      "chunk_id": "rc_ceff5877c0841fc637bb6fecb6568009a294003e",
+      "position": 1,
+      "projection_ordinal": 1,
+      "text": "Madde 1 - Bu Kanun madenlerin milli menfaatlere uygun olarak aranması, işletilmesi, üzerinde hak sahibi  olunması ve terk edilmesi ile ilgili esas ve usulleri düzenler.\nMadenler:\n```\n**Madde 2.** -\nYer kabuğunda ve su kaynaklarında tabii olarak bulunan, ekonomik ve ticarî değeri olan petrol, doğal gaz, jeotermal ve su kaynakları dışında kalan her türlü madde bu Kanuna göre madendir.\nMadenler aşağıda sıralanan gruplara göre ruhsatlandırılır:",
+      "heading_path": [
+        "MADEN KANUNU",
+        "MADDE 1"
+      ],
+      "chunk_metadata": {
+        "article_no": "1",
+        "table_index": null,
+        "clause_label": null,
+        "heading_path": [
+          "MADEN KANUNU",
+          "MADDE 1"
+        ],
+        "paragraph_no": null,
+        "article_title": null,
+        "chunk_variant": "atomic",
+        "document_date": null,
+        "document_type": "kanun",
+        "appendix_label": null,
+        "document_number": null,
+        "subclause_label": null,
+        "table_row_index": null,
+        "hierarchy_root_id": null,
+        "hierarchy_root_path": [],
+        "source_chunk_orders": [],
+        "source_regulatory_chunk_ids": []
+      },
+      "validity_start_date": null,
+      "validity_end_date": null,
+      "chunk_status": "active"
+    },
+    {
+      "id": "d3c15591-f202-45e2-9f91-7fa5254adad2",
+      "name": "Diğer Kanunlar/0213_sayili_vergi_usul_kanunu.md",
+      "status": "COMPLETED",
+      "chunk_id": "rc_c9abce951cf01399dd0659223bd3884e2f592084",
+      "position": 0,
+      "projection_ordinal": 0,
+      "text": "```\nVERGİ USUL KANUNU\nKanun Numarası : 213  Kabul Tarihi : 4/1/1961\nYayımlandığı R. Gazete : Tarih: 10/1/1961 Sayı: 10703 - 10705\nVERGİ USUL KANUNU\nGİRİŞ\nKanunun Şümulü",
+      "heading_path": [
+        "VERGİ USUL KANUNU"
+      ],
+      "chunk_metadata": {
+        "article_no": null,
+        "table_index": null,
+        "clause_label": null,
+        "heading_path": [
+          "VERGİ USUL KANUNU"
+        ],
+        "paragraph_no": null,
+        "article_title": null,
+        "chunk_variant": "atomic",
+        "document_date": null,
+        "document_type": "kanun",
+        "appendix_label": null,
+        "document_number": "10703 - 10705",
+        "subclause_label": null,
+        "table_row_index": null,
+        "hierarchy_root_id": null,
+        "hierarchy_root_path": [],
+        "source_chunk_orders": [],
+        "source_regulatory_chunk_ids": []
+      },
+      "validity_start_date": null,
+      "validity_end_date": null,
+      "chunk_status": "active"
+    },
+    {
+      "id": "d3c15591-f202-45e2-9f91-7fa5254adad2",
+      "name": "Diğer Kanunlar/0213_sayili_vergi_usul_kanunu.md",
+      "status": "COMPLETED",
+      "chunk_id": "rc_6f53db300f9d8da8e1b922a8e46efe8da7e54b29",
+      "position": 1,
+      "projection_ordinal": 1,
+      "text": "Madde 1 - Bu kanun hükümleri ikinci maddede yazılı olanlar dışında, genel  bütçeye giren vergi, resim ve harçlar ile il özel idarelerine ve belediyelere ait vergi, resim ve harçlar hakkında uygulanır.\nYukarıda yazılı vergi, resim ve harçlara bağlı olan vergi, resim ve zamlar da bu kanuna tabidir.\nBu kanunun hükümleri kaldırılan vergi, resim ve harçlar hakkında da uygulanır.\nGümrük ve tekel vergileri:\n```",
+      "heading_path": [
+        "VERGİ USUL KANUNU",
+        "MADDE 1"
+      ],
+      "chunk_metadata": {
+        "article_no": "1",
+        "table_index": null,
+        "clause_label": null,
+        "heading_path": [
+          "VERGİ USUL KANUNU",
+          "MADDE 1"
+        ],
+        "paragraph_no": null,
+        "article_title": null,
+        "chunk_variant": "atomic",
+        "document_date": null,
+        "document_type": "kanun",
+        "appendix_label": null,
+        "document_number": "10703 - 10705",
+        "subclause_label": null,
+        "table_row_index": null,
+        "hierarchy_root_id": null,
+        "hierarchy_root_path": [],
+        "source_chunk_orders": [],
+        "source_regulatory_chunk_ids": []
+      },
+      "validity_start_date": null,
+      "validity_end_date": null,
+      "chunk_status": "active"
+    }
+  ],
+  "provision": [
+    {
+      "id": "rc_2fdd31b957658a6fec67fc57257b512b6e19ca92",
+      "position": 1087,
+      "projection_ordinal": 1087,
+      "text": "**Madde 315** -\nMükellefler amortismana tâbi iktisadî kıymetlerini, 320 nci maddenin dördüncü fıkrası saklı kalmak üzere, Maliye Bakanlığının tespit ve ilân edeceği oranlar üzerinden itfa ederler. İlân edilecek oranların tespitinde iktisadî kıymetlerin faydalı ömürleri dikkate alınır.\n```\nAzalan bakiyeler usulüyle amortisman:",
+      "heading_path": [
+        "VERGİ USUL KANUNU",
+        "Amortismanlar",
+        "BİRİNCİ BÖLÜM",
+        "MADDE 315"
+      ],
+      "chunk_metadata": {
+        "article_no": "315",
+        "table_index": null,
+        "clause_label": null,
+        "heading_path": [
+          "VERGİ USUL KANUNU",
+          "Amortismanlar",
+          "BİRİNCİ BÖLÜM",
+          "MADDE 315"
+        ],
+        "paragraph_no": null,
+        "article_title": null,
+        "chunk_variant": "atomic",
+        "document_date": null,
+        "document_type": "kanun",
+        "appendix_label": null,
+        "document_number": "10703 - 10705",
+        "subclause_label": null,
+        "table_row_index": null,
+        "hierarchy_root_id": null,
+        "hierarchy_root_path": [],
+        "source_chunk_orders": [],
+        "source_regulatory_chunk_ids": []
+      },
+      "validity_start_date": null,
+      "validity_end_date": null,
+      "status": "active"
+    },
+    {
+      "id": "rc_6ffa4a9897ed45824ae5993f957b206dae0e7a3a",
+      "position": 1088,
+      "projection_ordinal": 1088,
+      "text": "Mükerrer Madde 315 -\nBilanço esasına göre defter tutan mükelleflerden dileyenler, amortismana tabi iktisadi değerlerini, azalan bakıyeler üzerinden amortisman usulü ile yok edebilirler.\nBu usulün tatbikinde;",
+      "heading_path": [
+        "VERGİ USUL KANUNU",
+        "Amortismanlar",
+        "BİRİNCİ BÖLÜM",
+        "MÜKERRER MADDE 315"
+      ],
+      "chunk_metadata": {
+        "article_no": "MÜKERRER 315",
+        "table_index": null,
+        "clause_label": null,
+        "heading_path": [
+          "VERGİ USUL KANUNU",
+          "Amortismanlar",
+          "BİRİNCİ BÖLÜM",
+          "MÜKERRER MADDE 315"
+        ],
+        "paragraph_no": null,
+        "article_title": null,
+        "chunk_variant": "atomic",
+        "document_date": null,
+        "document_type": "kanun",
+        "appendix_label": null,
+        "document_number": "10703 - 10705",
+        "subclause_label": null,
+        "table_row_index": null,
+        "hierarchy_root_id": null,
+        "hierarchy_root_path": [],
+        "source_chunk_orders": [],
+        "source_regulatory_chunk_ids": []
+      },
+      "validity_start_date": null,
+      "validity_end_date": null,
+      "status": "active"
+    }
+  ]
+}

@@ -18,6 +18,12 @@ from onyx.regulatory.heading_path import (
     extract_regulatory_provision_reference_occurrences,
     parse_regulatory_article_heading,
 )
+from onyx.regulatory.law_identity import (
+    canonical_law_number,
+    compatible_own_law_title_fragment,
+    own_law_filename_number,
+    own_law_opening_numbers,
+)
 
 
 def folded(text: str) -> str:
@@ -56,7 +62,7 @@ _INSTRUMENT_DESIGNATOR = re.compile(
 )
 _OTHER_INSTRUMENT_END = (
     r"(?:yonetmeli[kg](?:i|in|inin)?|teblig(?:i|in|inin)?|genelge(?:si|nin)?"
-    r"|karar(?:i|in|inin)?|sozlesme(?:si|nin)?|anlasma(?:si|nin)?|konvansiyon(?:u|un|unun)?"
+    r"|karar(?:name(?:si|nin)?|i|in|inin)?|sozlesme(?:si|nin)?|anlasma(?:si|nin)?|konvansiyon(?:u|un|unun)?"
     r"|regulation|directive|decree|decision|circular|convention|treaty|agreement)"
 )
 _NUMBERED_OTHER_INSTRUMENT = re.compile(
@@ -83,7 +89,7 @@ _BOUND_REVERSE = re.compile(
     _BOUND_QUALIFIER
     + _BOUND_NUMBER
     + r"\s*(?:\.\s*|['’]?\s*(?:inci|nci|uncu|ıncı)\s+|\s+)"
-    + r"madd(?:e(?:de|den|nin|ye|yi)?|es[iı](?:nde|nden|nin|ne|ni)?|eleri(?:nin|ne)?)\b"
+    + r"madd(?:e(?:de|den|nin|ye|yi)?|es[iı](?:nde|nden|nin|ne|ni|yle)?|eleri(?:nin|ne)?)\b"
 )
 _BOUND_COMPACT = re.compile(
     r"\(?" + _BOUND_QUALIFIER + _BOUND_NUMBER + r"\)?\s*madd[a-z]*\b"
@@ -127,6 +133,22 @@ class _BoundLocator:
     qualifier: str | None
 
 
+def _locator_from_match(match: re.Match[str]) -> _BoundLocator:
+    groups = match.groupdict()
+    article = match["article"].upper()
+    if inserted := groups.get("inserted"):
+        article += "/" + inserted.upper()
+    qualifier = groups.get("qualifier")
+    return _BoundLocator(
+        match.start(),
+        match.end(),
+        article,
+        groups.get("paragraph"),
+        groups.get("clause"),
+        folded(qualifier) if qualifier else None,
+    )
+
+
 def _bound_locator(
     text: str, start: int, *, bare: bool = False
 ) -> _BoundLocator | None:
@@ -148,18 +170,7 @@ def _bound_locator(
     match = max(matches, key=lambda value: value.end())
     if bare and re.match(r"\s*(?:sayili|tarihli|yil[a-z]*)\b", text[match.end() :]):
         return None
-    article = match["article"].upper()
-    if inserted := match["inserted"]:
-        article += "/" + inserted.upper()
-    qualifier = match["qualifier"]
-    return _BoundLocator(
-        start,
-        match.end(),
-        article,
-        match["paragraph"],
-        match["clause"],
-        folded(qualifier) if qualifier else None,
-    )
+    return _locator_from_match(match)
 
 
 def _explicit_reverse_instrument(text: str, start: int) -> bool:
@@ -191,6 +202,14 @@ def _explicit_instrument_name(value: str) -> bool:
     return re.fullmatch(r".+\s+" + _OTHER_INSTRUMENT_END, value) is not None
 
 
+def _instrumental_statute_reference(text: str, start: int, end: int) -> bool:
+    """Instrumental wording leaves a following affected provision's owner open."""
+    return bool(
+        re.search(r"\bkanun(?:la|uyla|larla|lariyla)$", folded(text[start:end]))
+        or re.match(r"(?:\s+ile|\s*['’]\s*(?:la|le|yla|yle))\b", folded(text[end:]))
+    )
+
+
 def _bound_locators(text: str, start: int, end: int) -> list[_BoundLocator]:
     """Bind locators through explicit syntax, never through a later narrative clause."""
     found: list[_BoundLocator] = []
@@ -198,7 +217,11 @@ def _bound_locators(text: str, start: int, end: int) -> list[_BoundLocator]:
     prefix = _BOUND_PREFIX.match(tail)
     assert prefix is not None
     cursor = prefix.end()
-    locator = _bound_locator(tail, cursor)
+    locator = (
+        None
+        if _instrumental_statute_reference(text, start, end)
+        else _bound_locator(tail, cursor)
+    )
     while locator is not None:
         if _explicit_reverse_instrument(tail, locator.end):
             break
@@ -307,7 +330,8 @@ def statute_references(
             if not references:
                 references.append(None)
             for locator in references:
-                number = match["number"] or match["english_number"]
+                raw_number = match["number"] or match["english_number"]
+                number = canonical_law_number(raw_number) or raw_number
                 reference_start, reference_end = _reference_bounds(
                     normalized, match.start(), match.end(), locator
                 )
@@ -337,23 +361,27 @@ def statute_references(
                     ),
                 )
             continue
-        tail = _reference_tail(normalized[match.end() : match.end() + 180])
+        tail = (
+            ""
+            if _instrumental_statute_reference(normalized, match.start(), match.end())
+            else _reference_tail(normalized[match.end() : match.end() + 180])
+        )
         candidates: list[tuple[int, str, str | None, str | None, str | None]] = [
             (offset, reference.article_no, None, None, reference.qualifier)
             for offset, reference in extract_regulatory_provision_reference_occurrences(
                 tail
             )
         ]
-        for pattern in (_COMPACT_ARTICLE, _SHORTHAND_ARTICLE):
+        for pattern in (_COMPACT_ARTICLE, _SHORTHAND_ARTICLE, _BOUND_REVERSE):
             for subunit in pattern.finditer(tail):
-                qualifier = subunit.groupdict().get("qualifier")
+                locator = _locator_from_match(subunit)
                 candidates.append(
                     (
-                        subunit.start(),
-                        subunit["article"],
-                        subunit["paragraph"],
-                        subunit["clause"],
-                        folded(qualifier) if qualifier else None,
+                        locator.start,
+                        locator.article,
+                        locator.paragraph,
+                        locator.clause,
+                        locator.qualifier,
                     )
                 )
         article, paragraph, clause, qualifier = (
@@ -361,7 +389,8 @@ def statute_references(
             if candidates
             else (None, None, None, None)
         )
-        number = match["number"] or match["english_number"]
+        raw_number = match["number"] or match["english_number"]
+        number = canonical_law_number(raw_number) or raw_number
         original_reference = original[
             offsets[match.start()] : offsets[match.end() + len(tail)]
         ]
@@ -543,6 +572,7 @@ def _reference_name(reference: StatuteReference) -> str | None:
 
 def _native_original_rows(ledger: EvidenceLedger) -> list[dict[str, JsonValue]]:
     rows: list[dict[str, JsonValue]] = []
+    invalid_sources: set[str] = set()
     for row in ledger.authority_metadata():
         number = row["citation"]
         if not isinstance(number, int):
@@ -551,6 +581,7 @@ def _native_original_rows(ledger: EvidenceLedger) -> list[dict[str, JsonValue]]:
         if item is None:
             continue
         metadata = model_evidence_metadata(item.metadata)
+        canonical = item.metadata.get("canonical_metadata")
         doc = item.search_doc
         if (
             doc is None
@@ -559,6 +590,11 @@ def _native_original_rows(ledger: EvidenceLedger) -> list[dict[str, JsonValue]]:
             or doc.metadata.get("regulatory_chunk_id") != item.chunk_id
             or metadata.get("derived")
             or metadata.get("external")
+            or metadata.get("untrusted")
+            or metadata.get("truncated")
+            or item.metadata.get("truncated")
+            or isinstance(canonical, dict)
+            and canonical.get("truncated")
         ):
             continue
         headings = row.get("heading_path")
@@ -578,34 +614,79 @@ def _native_original_rows(ledger: EvidenceLedger) -> list[dict[str, JsonValue]]:
             kind or not any(_formal_law_name(value) for value in identities)
         ):
             continue
+        root_name, title_name = _formal_law_name(root), _formal_law_name(title)
+        if root_name and title_name and root_name != title_name:
+            continue
+        if (
+            root
+            and root_name is None
+            and title_name
+            and not compatible_own_law_title_fragment(root, title)
+        ):
+            continue
+        opening_root = title if root_name is None and title_name else root
+        identity_name = title_name or root_name
+        identity_references = [
+            ref for value in identities for ref in statute_references(value)
+        ]
+        if any(canonical_law_number(ref.number) is None for ref in identity_references):
+            invalid_sources.add(item.source_id)
+            continue
         numbers = {
-            ref.number for value in identities for ref in statute_references(value)
+            number
+            for ref in identity_references
+            if (number := canonical_law_number(ref.number)) is not None
         }
         if kind in _LAW_KINDS:
             numbers.update(
-                value.strip() for value in identities if value.strip().isdigit()
+                number
+                for value in identities
+                if (number := canonical_law_number(value.strip())) is not None
             )
-            if _formal_law_name(root):
-                basename = title.replace("\\", "/").rsplit("/", 1)[-1]
-                prefix = re.match(r"^(\d{2,7})[_-](?=[a-z])", folded(basename))
-                if prefix:
-                    numbers.add(prefix[1])
+            # Removing a numbered root here exposes, rather than hides, a
+            # conflicting structured filename number before the singleton check.
+            matching_root = root_name or opening_root
+            own_number = own_law_filename_number(title, matching_root)
+            basename = title.replace("\\", "/").rsplit("/", 1)[-1]
+            if (
+                re.match(r"^\d{2,7}[ _-]+.+\.(?:md|txt|pdf)$", folded(basename))
+                and own_number is None
+            ):
+                invalid_sources.add(item.source_id)
+                continue
+            try:
+                opening = own_law_opening_numbers(item.text, opening_root)
+            except ValueError:
+                invalid_sources.add(item.source_id)
+                continue
+            numbers.update(opening)
+            if own_number:
+                numbers.add(own_number)
+        if len(numbers) > 1:
+            invalid_sources.add(item.source_id)
+            continue
         rows.append(
             {
                 **row,
                 "instrument_numbers": sorted(numbers),
-                "formal_names": sorted(
-                    {name for value in identities if (name := _formal_law_name(value))}
-                ),
+                "formal_names": [identity_name] if identity_name else [],
             }
         )
-    return rows
+    return [
+        row
+        for row in rows
+        if isinstance(citation := row["citation"], int)
+        and (item := ledger.get(citation)) is not None
+        and item.source_id not in invalid_sources
+    ]
 
 
 def known_statute_source_ids(name: str, ledger: EvidenceLedger) -> list[str]:
     """Reuse canonical identity navigation; callers must authorize any new read."""
     formal = _formal_law_name(name)
     references = statute_references(name, strict_reference_boundaries=True)
+    if any(canonical_law_number(reference.number) is None for reference in references):
+        return []
     numbers = {reference.number for reference in references}
     if len(numbers) > 1 or (
         formal is None and not re.fullmatch(r"\d{2,7}\s+sayili\s+kanun", folded(name))
@@ -698,19 +779,25 @@ def _named_native_references(
                         )
                     )
                 continue
-            tail = _reference_tail(normalized[match.end() : match.end() + 180])
+            tail = (
+                ""
+                if _instrumental_statute_reference(
+                    normalized, match.start(), match.end()
+                )
+                else _reference_tail(normalized[match.end() : match.end() + 180])
+            )
             locators = extract_regulatory_provision_reference_occurrences(tail)
             article = locators[0][1].article_no if locators else None
             qualifier = locators[0][1].qualifier if locators else None
             subunits = [
-                part
-                for pattern in (_COMPACT_ARTICLE, _SHORTHAND_ARTICLE)
+                _locator_from_match(part)
+                for pattern in (_COMPACT_ARTICLE, _SHORTHAND_ARTICLE, _BOUND_REVERSE)
                 if (part := pattern.search(tail)) is not None
             ]
             if subunits:
-                first = min(subunits, key=lambda part: part.start())
-                article = first["article"]
-                qualifier = first.groupdict().get("qualifier") or qualifier
+                first = min(subunits, key=lambda part: part.start)
+                article = first.article
+                qualifier = first.qualifier or qualifier
             references.append(
                 (
                     StatuteReference(
@@ -825,6 +912,8 @@ def _matching_native_rows(
     *,
     clause_specific: bool = False,
 ) -> list[int]:
+    if reference.number and canonical_law_number(reference.number) is None:
+        return []
     matching: list[int] = []
     for row in rows:
         numbers, names = row["instrument_numbers"], row["formal_names"]

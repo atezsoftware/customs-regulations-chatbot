@@ -524,7 +524,7 @@ def get_intake_chunk_page(
     batch_id: UUID,
     document_id: UUID,
     offset: int = Query(default=0, ge=0),
-    limit: int = Query(default=50, ge=1, le=200),
+    limit: int = Query(default=50, ge=1, le=100),
     user: User = Depends(_admin),
     db_session: Session = Depends(get_session),
 ) -> IntakeChunkReviewPage:

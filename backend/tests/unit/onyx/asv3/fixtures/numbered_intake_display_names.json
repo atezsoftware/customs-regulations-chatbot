@@ -1,0 +1,764 @@
+{
+  "capture": "Task-owned 6001/5393 intake canonical GET snapshots; text unchanged; test projection ordinal follows captured position.",
+  "laws": [
+    {
+      "number": "6001",
+      "display_name": "6001 sayılı Karayolları Genel Müdürlüğünün Hizmetleri Hakkında Kanun",
+      "article": "30",
+      "source_id": "634d428a-1675-4812-a902-229e9f3e3987",
+      "candidate_heads": [
+        {
+          "id": "rc_9ad6b4a23f7186f06737299f16cf832f1421f7de",
+          "user_file_id": "634d428a-1675-4812-a902-229e9f3e3987",
+          "text": "Karayolları Genel Müdürlüğünün Hizmetleri\nHakkında Kanun [1]\nKanun Numarası                    : 6001\nKabul Tarihi                           : 25/6/2010\nYayımlandığı Resmî Gazete  : Tarih: 13/7/2010          Sayı: 27640\nYayımlandığı Düstur              : Tertip: 5                       Cilt: 49\nAmaç, Kapsam ve Tanımlar",
+          "position": 0,
+          "heading_path": [
+            "Hakkında Kanun [1]"
+          ],
+          "validity_start_date": null,
+          "validity_end_date": null,
+          "status": "active",
+          "chunk_metadata": {
+            "article_no": null,
+            "clause_label": null,
+            "paragraph_no": null,
+            "source_links": {
+              "0": "https://mevzuat.adalet.gov.tr/mevzuat/103465"
+            },
+            "chunk_variant": "atomic",
+            "document_type": "kanun",
+            "document_title": "Karayolları Genel Müdürlüğünün Hizmetleri Hakkında Kanun",
+            "document_number": "6001",
+            "subclause_label": null
+          },
+          "projection_ordinal": 0,
+          "text_sha256": "20840317972197454c7fec47f91c811ff5f52ae5382d9cb17babfb4c92cfbc7b"
+        },
+        {
+          "id": "rc_33b062ab0b91b76c1548150ffb600e2378e92abd",
+          "user_file_id": "634d428a-1675-4812-a902-229e9f3e3987",
+          "text": "MADDE 1-\n(Mülga: 2/7/2018-KHK-703/76 md.)",
+          "position": 1,
+          "heading_path": [
+            "Hakkında Kanun [1]",
+            "BİRİNCİ BÖLÜM",
+            "MADDE 1 - Amaç ve kapsam"
+          ],
+          "validity_start_date": "2010-07-13",
+          "validity_end_date": null,
+          "status": "active",
+          "chunk_metadata": {
+            "article_no": "1",
+            "clause_label": null,
+            "paragraph_no": null,
+            "source_links": {
+              "0": "https://mevzuat.adalet.gov.tr/mevzuat/103465"
+            },
+            "chunk_variant": "atomic",
+            "document_type": "kanun",
+            "document_title": "Karayolları Genel Müdürlüğünün Hizmetleri Hakkında Kanun",
+            "document_number": "6001",
+            "subclause_label": null
+          },
+          "projection_ordinal": 1,
+          "text_sha256": "46684fbc952e9d55a5908fa0bc474466a3e5cac75cb81ea5e4b73d9b6048a7af"
+        }
+      ],
+      "provision": [
+        {
+          "id": "rc_a0f8409f575a08d913153cc94f4fff6f9c6dde71",
+          "user_file_id": "634d428a-1675-4812-a902-229e9f3e3987",
+          "text": "MADDE 30-\n(1) Genel Müdürlük işletimindeki otoyollar ile erişme kontrolünün uygulandığı karayolları için belirlenen geçiş ücretlerini ödemeden geçiş yaptığı tespit edilen araç sahiplerine Genel Müdürlük tarafından, geçiş ücreti ödemeden giriş çıkış yaptığı mesafeye ait geçiş ücretinin dört katı tutarında idarî para cezası verilir. (Ek cümleler: 1/7/2022-7417/53 md.) Bu maddenin yedinci fıkrasına tabi olmak üzere, ödemesiz geçiş tarihini izleyen kırk beş gün içinde, idari para cezasının tebliğ edilip edilmediğine bakılmaksızın, geçiş ücreti ile birlikte geçiş ücretinin bir katının idari para cezası olarak ödenmesi halinde idari para cezası bir kat verilmiş sayılır ve bu ceza için ayrıca tebligat yapılmaz.",
+          "position": 103,
+          "heading_path": [
+            "Hakkında Kanun [1]",
+            "BEŞİNCİ BÖLÜM",
+            "MADDE 30 - Geçiş ücretini ödememe ve güvenliğin ihlali",
+            "(1) Genel Müdürlük işletimindeki otoyollar ile erişme kontrolünün uygulandığı karayolları i..."
+          ],
+          "validity_start_date": null,
+          "validity_end_date": null,
+          "status": "active",
+          "chunk_metadata": {
+            "article_no": "30",
+            "clause_label": null,
+            "paragraph_no": "1",
+            "source_links": {
+              "0": "https://mevzuat.adalet.gov.tr/mevzuat/103465"
+            },
+            "chunk_variant": "atomic",
+            "document_type": "kanun",
+            "document_number": "6001",
+            "subclause_label": null
+          },
+          "projection_ordinal": 103,
+          "text_sha256": "45cacb9d57af69a2bc4c1f74698d832fbac62b2f192bfc625e34a0bd852d9bd6"
+        },
+        {
+          "id": "rc_efa6c61588309eb0d7125bea8c94182997f1a27d",
+          "user_file_id": "634d428a-1675-4812-a902-229e9f3e3987",
+          "text": "Bu takdirde idari para cezasından 30/3/2005 tarihli ve 5326 sayılı Kabahatler Kanununun 17 nci maddesinin altıncı fıkrasında yer alan indirim hükmü uygulanmaz. [7] [8]",
+          "position": 104,
+          "heading_path": [
+            "Hakkında Kanun [1]",
+            "BEŞİNCİ BÖLÜM",
+            "MADDE 30 - Geçiş ücretini ödememe ve güvenliğin ihlali",
+            "(1) Genel Müdürlük işletimindeki otoyollar ile erişme kontrolünün uygulandığı karayolları i..."
+          ],
+          "validity_start_date": null,
+          "validity_end_date": null,
+          "status": "active",
+          "chunk_metadata": {
+            "article_no": "30",
+            "clause_label": null,
+            "paragraph_no": "1",
+            "source_links": {
+              "0": "https://mevzuat.adalet.gov.tr/mevzuat/103465"
+            },
+            "chunk_variant": "atomic",
+            "document_type": "kanun",
+            "document_title": "Karayolları Genel Müdürlüğünün Hizmetleri Hakkında Kanun",
+            "document_number": "6001",
+            "subclause_label": null
+          },
+          "projection_ordinal": 104,
+          "text_sha256": "aa0048962f6e8a498add47d9a29c90905f113b7c59e2574f066f0d89662b30d3"
+        },
+        {
+          "id": "rc_cc12ca0113c21bde8b2ae0e45a12310c9632e230",
+          "user_file_id": "634d428a-1675-4812-a902-229e9f3e3987",
+          "text": "(2) Erişme kontrolü uygulanan karayollarında kısıtlanan ve yasaklanan işler veya hareketleri yapanlar ve yaptıranlar ile koruma alanı içine giren hayvan sahiplerine Genel Müdürlükçe yetkilendirilen personel veya trafik polisi, trafik polisinin görev alanı dışında kalan yerlerde jandarma personeli tarafından beş yüz Türk Lirası idarî para cezası verilir. Bu Kanunun 18 inci maddesinin altıncı fıkrası uyarınca karayolları sınır çizgileri dâhilinde yasaklanan fiilleri işleyenler hakkında 9/8/1983 tarihli ve 2872 sayılı Çevre Kanunu hükümleri uygulanır. Şu kadar ki;",
+          "position": 105,
+          "heading_path": [
+            "Hakkında Kanun [1]",
+            "BEŞİNCİ BÖLÜM",
+            "MADDE 30 - Geçiş ücretini ödememe ve güvenliğin ihlali",
+            "(2) Erişme kontrolü uygulanan karayollarında kısıtlanan ve yasaklanan işler veya hareketler..."
+          ],
+          "validity_start_date": null,
+          "validity_end_date": null,
+          "status": "active",
+          "chunk_metadata": {
+            "article_no": "30",
+            "clause_label": null,
+            "paragraph_no": "2",
+            "source_links": {
+              "0": "https://mevzuat.adalet.gov.tr/mevzuat/103465"
+            },
+            "chunk_variant": "atomic",
+            "document_type": "kanun",
+            "document_title": "Karayolları Genel Müdürlüğünün Hizmetleri Hakkında Kanun",
+            "document_number": "6001",
+            "subclause_label": "2"
+          },
+          "projection_ordinal": 105,
+          "text_sha256": "edf89d8ffd0382af556f126559eac0b7914b5a90266b70a107d952fa1b7748a3"
+        },
+        {
+          "id": "rc_f0bad67e105f96362818b8dffa2ff96632f45af0",
+          "user_file_id": "634d428a-1675-4812-a902-229e9f3e3987",
+          "text": "2872 sayılı Kanunun 20 nci maddesinin (s) bendinde belirtilen fiillerin şehirlerarası yolcu ve yük taşımacılığı yapanlar tarafından karayolları sınır çizgileri dâhilinde işlenmesi halinde uygulanacak idarî para cezası beş yüz Türk Lirasından aşağı olamaz. Karayolları sınır çizgileri dâhilinde yasaklanan fiillerin denetimi ile 2872 sayılı Kanunda öngörülen yaptırımların uygulanmasında, Genel Müdürlük 2872 sayılı Kanunun 12 nci maddesi uyarınca yetkilendirilmiş kuruluşlardan sayılır.",
+          "position": 106,
+          "heading_path": [
+            "Hakkında Kanun [1]",
+            "BEŞİNCİ BÖLÜM",
+            "MADDE 30 - Geçiş ücretini ödememe ve güvenliğin ihlali",
+            "(2) Erişme kontrolü uygulanan karayollarında kısıtlanan ve yasaklanan işler veya hareketler..."
+          ],
+          "validity_start_date": null,
+          "validity_end_date": null,
+          "status": "active",
+          "chunk_metadata": {
+            "article_no": "30",
+            "clause_label": null,
+            "paragraph_no": "2",
+            "source_links": {
+              "0": "https://mevzuat.adalet.gov.tr/mevzuat/103465"
+            },
+            "chunk_variant": "atomic",
+            "document_type": "kanun",
+            "document_title": "Karayolları Genel Müdürlüğünün Hizmetleri Hakkında Kanun",
+            "document_number": "6001",
+            "subclause_label": null
+          },
+          "projection_ordinal": 106,
+          "text_sha256": "0c0fc752c4d313c30ca03d25747ff5bbb02a7fe3ad19e8d213a138c24cf3b441"
+        },
+        {
+          "id": "rc_1854778166cb7ffbb4f93a7a1c9769780543a551",
+          "user_file_id": "634d428a-1675-4812-a902-229e9f3e3987",
+          "text": "(3) Bu maddenin birinci fıkrasında belirtilen idarî para cezaları ile geçiş ücretleri ve ikinci fıkrasında yer alan idarî para cezaları tebliğ tarihinden itibaren bir ay içinde ödenir. Bu sürede ödenmeyen geçiş ücretleri ve idarî para cezaları 21/7/1953 tarihli ve 6183 sayılı Amme Alacaklarının Tahsil Usulü Hakkında Kanun hükümlerine göre ilgili vergi dairesi tarafından takip ve tahsil edilir. Vergi daireleri tarafından tahsil edilen geçiş ücretleri, tahsilâtın yapıldığı ayı takip eden ayın sonuna kadar Genel Müdürlük hesaplarına aktarılır.",
+          "position": 107,
+          "heading_path": [
+            "Hakkında Kanun [1]",
+            "BEŞİNCİ BÖLÜM",
+            "MADDE 30 - Geçiş ücretini ödememe ve güvenliğin ihlali",
+            "(3) Bu maddenin birinci fıkrasında belirtilen idarî para cezaları ile geçiş ücretleri ve ik..."
+          ],
+          "validity_start_date": null,
+          "validity_end_date": null,
+          "status": "active",
+          "chunk_metadata": {
+            "article_no": "30",
+            "clause_label": null,
+            "paragraph_no": "3",
+            "source_links": {
+              "0": "https://mevzuat.adalet.gov.tr/mevzuat/103465"
+            },
+            "chunk_variant": "atomic",
+            "document_type": "kanun",
+            "document_title": "Karayolları Genel Müdürlüğünün Hizmetleri Hakkında Kanun",
+            "document_number": "6001",
+            "subclause_label": null
+          },
+          "projection_ordinal": 107,
+          "text_sha256": "8914400bc534bded433fcc3858fccaf2623fa1b748c7c28414372a1a978af354"
+        },
+        {
+          "id": "rc_1d3dbfdfc56286a52a5e9e4b027dd280beaff822",
+          "user_file_id": "634d428a-1675-4812-a902-229e9f3e3987",
+          "text": "(4) Birinci fıkra uyarınca ödenmesi gereken idarî para cezaları ile geçiş ücretleri ödenmeden, kabahatin işlendiği araçların fennî muayeneleri ile satış ve devirleri yapılmaz.",
+          "position": 108,
+          "heading_path": [
+            "Hakkında Kanun [1]",
+            "BEŞİNCİ BÖLÜM",
+            "MADDE 30 - Geçiş ücretini ödememe ve güvenliğin ihlali",
+            "(4) Birinci fıkra uyarınca ödenmesi gereken idarî para cezaları ile geçiş ücretleri ödenmed..."
+          ],
+          "validity_start_date": null,
+          "validity_end_date": null,
+          "status": "active",
+          "chunk_metadata": {
+            "article_no": "30",
+            "clause_label": null,
+            "paragraph_no": "4",
+            "source_links": {
+              "0": "https://mevzuat.adalet.gov.tr/mevzuat/103465"
+            },
+            "chunk_variant": "atomic",
+            "document_type": "kanun",
+            "document_title": "Karayolları Genel Müdürlüğünün Hizmetleri Hakkında Kanun",
+            "document_number": "6001",
+            "subclause_label": null
+          },
+          "projection_ordinal": 108,
+          "text_sha256": "3c8b0328afbbf3ec278edac5fe2b25a187a28b3824fd1f29cde12f6962620e21"
+        },
+        {
+          "id": "rc_eddd6fcfb46ad1d8a450f6468bdd86e1038c6876",
+          "user_file_id": "634d428a-1675-4812-a902-229e9f3e3987",
+          "text": "(5) 4046, 3465 ve 3996 sayılı kanunlar çerçevesinde işletme hakkı verilen veya devredilen otoyollar veya erişme kontrolünün uygulandığı karayollarından geçiş ücretlerini ödemeden geçiş yapan araç sahiplerinden, işletici şirket tarafından geçiş ücreti ödemeden giriş çıkış yaptığı mesafeye ait geçiş ücreti ile birlikte, bu ücretin dört katı tutarında ceza, genel hükümlere göre tahsil edilir. (Mülga ikinci ve üçüncü cümle: 16/5/2018-7144/18 md.) (…) (Ek cümleler: 1/7/2022-7417/53 md.) Bununla birlikte, bu maddenin yedinci fıkrasına tabi olmak üzere ödemesiz geçiş tarihini izleyen kırk beş gün içinde yükümlü olduğu geçiş ücretini usulüne uygun olarak ödeyenlerden, ödemekle yükümlü oldukları geçiş ücreti ile birlikte bu ücretin bir katı ceza tahsil edilir.",
+          "position": 109,
+          "heading_path": [
+            "Hakkında Kanun [1]",
+            "BEŞİNCİ BÖLÜM",
+            "MADDE 30 - Geçiş ücretini ödememe ve güvenliğin ihlali",
+            "(5) 4046, 3465 ve 3996 sayılı kanunlar çerçevesinde işletme hakkı verilen veya devredilen o..."
+          ],
+          "validity_start_date": null,
+          "validity_end_date": null,
+          "status": "active",
+          "chunk_metadata": {
+            "article_no": "30",
+            "clause_label": null,
+            "paragraph_no": "5",
+            "source_links": {
+              "0": "https://mevzuat.adalet.gov.tr/mevzuat/103465"
+            },
+            "chunk_variant": "atomic",
+            "document_type": "kanun",
+            "document_title": "Karayolları Genel Müdürlüğünün Hizmetleri Hakkında Kanun",
+            "document_number": "6001",
+            "subclause_label": "5"
+          },
+          "projection_ordinal": 109,
+          "text_sha256": "d6b77d688f3fbe926bcafc84746180045384a549b9e57085aa4da0dc0b634bd5"
+        },
+        {
+          "id": "rc_ad31008353227ddc578d7c04370e01eef2530725",
+          "user_file_id": "634d428a-1675-4812-a902-229e9f3e3987",
+          "text": "Ödemesiz geçiş tarihini izleyen kırk beşinci günden sonra ise geçiş ücreti ödemeden giriş çıkış yaptığı mesafeye ait geçiş ücreti ile birlikte dört katı tutarında ceza, yabancı plakalı araçlar hariç olmak üzere, araç sahibine ücret toplama sistemlerinde tanımlı olan bilgiler doğrultusunda, en az on beş gün önceden kısa mesaj, e-posta, ihbarname, e-devlet bildirimi vb. yöntemlerinden en az biriyle bilgi verilir. Bu tutar genel hükümlere göre tahsil edilir. [9] [10] [11]",
+          "position": 110,
+          "heading_path": [
+            "Hakkında Kanun [1]",
+            "BEŞİNCİ BÖLÜM",
+            "MADDE 30 - Geçiş ücretini ödememe ve güvenliğin ihlali",
+            "(5) 4046, 3465 ve 3996 sayılı kanunlar çerçevesinde işletme hakkı verilen veya devredilen o..."
+          ],
+          "validity_start_date": null,
+          "validity_end_date": null,
+          "status": "active",
+          "chunk_metadata": {
+            "article_no": "30",
+            "clause_label": null,
+            "paragraph_no": "5",
+            "source_links": {
+              "0": "https://mevzuat.adalet.gov.tr/mevzuat/103465"
+            },
+            "chunk_variant": "atomic",
+            "document_type": "kanun",
+            "document_title": "Karayolları Genel Müdürlüğünün Hizmetleri Hakkında Kanun",
+            "document_number": "6001",
+            "subclause_label": null
+          },
+          "projection_ordinal": 110,
+          "text_sha256": "bbef4e5dab2be03a1c6c9ee86acf68a2114c5939183ba1e8675d6e3268cd93f9"
+        },
+        {
+          "id": "rc_02c87f395340581fabaffbc35e924d53de4b74ce",
+          "user_file_id": "634d428a-1675-4812-a902-229e9f3e3987",
+          "text": "(6) 4046, 3465 ve 3996 sayılı kanunlar çerçevesinde işletme hakkı verilen veya devredilen otoyollar veya erişme kontrolünün uygulandığı karayollarından ücretsiz geçiş yapan araçlar, işletici şirket tarafından bu maddenin yedinci fıkrasında öngörülen sürenin bitimini takip eden ilk iş gününde en yakın trafik kuruluşuna bildirilir.",
+          "position": 111,
+          "heading_path": [
+            "Hakkında Kanun [1]",
+            "BEŞİNCİ BÖLÜM",
+            "MADDE 30 - Geçiş ücretini ödememe ve güvenliğin ihlali",
+            "(6) 4046, 3465 ve 3996 sayılı kanunlar çerçevesinde işletme hakkı verilen veya devredilen o..."
+          ],
+          "validity_start_date": null,
+          "validity_end_date": null,
+          "status": "active",
+          "chunk_metadata": {
+            "article_no": "30",
+            "clause_label": null,
+            "paragraph_no": "6",
+            "source_links": {
+              "0": "https://mevzuat.adalet.gov.tr/mevzuat/103465"
+            },
+            "chunk_variant": "atomic",
+            "document_type": "kanun",
+            "document_title": "Karayolları Genel Müdürlüğünün Hizmetleri Hakkında Kanun",
+            "document_number": "6001",
+            "subclause_label": null
+          },
+          "projection_ordinal": 111,
+          "text_sha256": "3740bb43e76f5f14e5750ed1750cf285b70c84c0d33bdfe5f25687da0cb55703"
+        },
+        {
+          "id": "rc_79a49bb70e1cdfdc8bfba6d677cb543fc6fe8967",
+          "user_file_id": "634d428a-1675-4812-a902-229e9f3e3987",
+          "text": "(7) Geçiş ücretlerini ödemeden geçiş yapanlardan, ödemesiz geçiş tarihini izleyen on beş gün içinde yükümlü olduğu geçiş ücretini usulüne uygun olarak ödeyenlere, bu maddenin birinci fıkrası ile beşinci fıkrasında belirtilen cezalar uygulanmaz. (Ek cümle: 16/5/2018-7144/18 md.) Otoyollar ile erişme kontrolünün uygulandığı karayolları için belirlenen geçiş ücretlerini ödemeden geçiş yaptığı tespit edilen yabancı plakalı araçlara uygulanan (…) [12] para cezaları için bu fıkrada belirlenen on beş günlük süre beklenmez. (Ek cümle:23/7/2020-7252/9 md.) Ancak, ödemesiz geçiş tarihini izleyen on beş gün içinde geçiş ücretinin ödenmesi halinde (…) 12 para cezası tahsil edilmez. [13]",
+          "position": 112,
+          "heading_path": [
+            "Hakkında Kanun [1]",
+            "BEŞİNCİ BÖLÜM",
+            "MADDE 30 - Geçiş ücretini ödememe ve güvenliğin ihlali",
+            "(7) Geçiş ücretlerini ödemeden geçiş yapanlardan, ödemesiz geçiş tarihini izleyen on beş gü..."
+          ],
+          "validity_start_date": "2025-03-30",
+          "validity_end_date": null,
+          "status": "active",
+          "chunk_metadata": {
+            "article_no": "30",
+            "clause_label": null,
+            "paragraph_no": "7",
+            "source_links": {
+              "0": "https://mevzuat.adalet.gov.tr/mevzuat/103465"
+            },
+            "chunk_variant": "atomic",
+            "document_type": "kanun",
+            "document_title": "Karayolları Genel Müdürlüğünün Hizmetleri\nHakkında Kanun [1]",
+            "document_number": "6001",
+            "subclause_label": null
+          },
+          "projection_ordinal": 112,
+          "text_sha256": "333eee6274a926dd3ebb70247d31dcd1845df44e8007a9a4653c91c6bbf9b08f"
+        },
+        {
+          "id": "rc_ca85f2108b33fb2dddbe73369ea751f83b8113b8",
+          "user_file_id": "634d428a-1675-4812-a902-229e9f3e3987",
+          "text": "(8) (Ek:27/3/2015-6639/33 md.) Sürücüsünün Türk vatandaşı olup olmadığına bakılmaksızın yabancı plakalı araçlara uygulanacak olan bu maddenin birinci fıkrasında belirtilen idari para cezaları ile geçiş ücretleri ve ikinci fıkrasında yer alan idari para cezaları tebligat şartı aranmaksızın sürücüsü bilgilendirilmek suretiyle tahsil edilir. Tahsilat gerçekleşmeden yabancı plakalı aracın ülkeyi terk etmesine izin verilmez. Bu fıkra hükümlerinin uygulanmasına ilişkin usul ve esaslar Ticaret Bakanlığı, İçişleri Bakanlığı, Hazine ve Maliye Bakanlığı ile Ulaştırma ve Altyapı Bakanlığınca müştereken altı ay içinde belirlenir. Uluslararası sözleşme hükümleri saklıdır. [14]",
+          "position": 113,
+          "heading_path": [
+            "Hakkında Kanun [1]",
+            "BEŞİNCİ BÖLÜM",
+            "MADDE 30 - Geçiş ücretini ödememe ve güvenliğin ihlali",
+            "(8) (Ek:27/3/2015-6639/33 md.) Sürücüsünün Türk vatandaşı olup olmadığına bakılmaksızın yab..."
+          ],
+          "validity_start_date": "2015-04-15",
+          "validity_end_date": null,
+          "status": "active",
+          "chunk_metadata": {
+            "article_no": "30",
+            "clause_label": null,
+            "paragraph_no": "8",
+            "source_links": {
+              "0": "https://mevzuat.adalet.gov.tr/mevzuat/103465"
+            },
+            "chunk_variant": "atomic",
+            "document_type": "kanun",
+            "document_title": "Karayolları Genel Müdürlüğünün Hizmetleri\nHakkında Kanun [1]",
+            "document_number": "6001",
+            "subclause_label": null
+          },
+          "projection_ordinal": 113,
+          "text_sha256": "9a81e8b0ecdfb706c0ff8b58f81e26088f02f07841c8afbf0e1baac701565c74"
+        },
+        {
+          "id": "rc_68b80bddc669b9661ec152425bdba097179574bb",
+          "user_file_id": "634d428a-1675-4812-a902-229e9f3e3987",
+          "text": "(9) (Ek: 16/5/2018-7144/18 md.)  Bu maddenin birinci, ikinci, üçüncü, dördüncü, yedinci ve sekizinci fıkraları Bakanlık tarafından işletilen otoyolları ve erişme kontrolünün uygulandığı karayolları için; beşinci, altıncı ve yedinci fıkraları ise Bakanlık tarafından 3996 sayılı Kanun ve diğer ilgili kanunlar çerçevesinde işletme hakkı verilen veya devredilen otoyollar ile erişme kontrolünün uygulandığı karayolları için de uygulanır.",
+          "position": 114,
+          "heading_path": [
+            "Hakkında Kanun [1]",
+            "BEŞİNCİ BÖLÜM",
+            "MADDE 30 - Geçiş ücretini ödememe ve güvenliğin ihlali",
+            "(9) (Ek: 16/5/2018-7144/18 md.) Bu maddenin birinci, ikinci, üçüncü, dördüncü, yedinci ve s..."
+          ],
+          "validity_start_date": "2018-05-25",
+          "validity_end_date": null,
+          "status": "active",
+          "chunk_metadata": {
+            "article_no": "30",
+            "clause_label": null,
+            "paragraph_no": "9",
+            "source_links": {
+              "0": "https://mevzuat.adalet.gov.tr/mevzuat/103465"
+            },
+            "chunk_variant": "atomic",
+            "document_type": "kanun",
+            "document_title": "Karayolları Genel Müdürlüğünün Hizmetleri\nHakkında Kanun [1]",
+            "document_number": "6001",
+            "subclause_label": null
+          },
+          "projection_ordinal": 114,
+          "text_sha256": "67466db6faf8ad21e59194d86186a3d275d4ac25a49183464d129dab1abd5b67"
+        },
+        {
+          "id": "rc_b9d514b945c927a5b22f9cf71863bc15569ef977",
+          "user_file_id": "634d428a-1675-4812-a902-229e9f3e3987",
+          "text": "(10) (Ek:27/3/2025-7546/9 md.) Sürücüsünün Türk vatandaşı olup olmadığına bakılmaksızın yabancı plakalı araçlara ilişkin olarak bu maddenin beşinci fıkrası kapsamında tatbik edilen cezalar ile geçiş ücretleri ödenmeden bu araçların ülkeyi terk etmesine izin verilmez. Bu fıkra kapsamındaki alacaklar, tebligat şartı aranmaksızın sürücüsü bilgilendirilmek suretiyle gümrük kapılarında yetkili birimlerce de tahsil edilebilir. Tahsil edilen tutarların yüzde altmışı hizmet payı olarak genel bütçeye gelir kaydedilir, yüzde kırkı ise ilgili işleticiye aktarılmak üzere tahsilatı izleyen ayın sonuna kadar Genel Müdürlüğe aktarılır. Genel Müdürlük hesabına aktarılan tutar, takip eden yedi iş günü içinde ilgili işleticilerin hesabına aktarılır.",
+          "position": 115,
+          "heading_path": [
+            "Hakkında Kanun [1]",
+            "BEŞİNCİ BÖLÜM",
+            "MADDE 30 - Geçiş ücretini ödememe ve güvenliğin ihlali",
+            "(10) (Ek:27/3/2025-7546/9 md.) Sürücüsünün Türk vatandaşı olup olmadığına bakılmaksızın yaba..."
+          ],
+          "validity_start_date": "2025-03-30",
+          "validity_end_date": null,
+          "status": "active",
+          "chunk_metadata": {
+            "article_no": "30",
+            "clause_label": null,
+            "paragraph_no": "10",
+            "source_links": {
+              "0": "https://mevzuat.adalet.gov.tr/mevzuat/103465"
+            },
+            "chunk_variant": "atomic",
+            "document_type": "kanun",
+            "document_title": "Karayolları Genel Müdürlüğünün Hizmetleri\nHakkında Kanun [1]",
+            "document_number": "6001",
+            "subclause_label": "10"
+          },
+          "projection_ordinal": 115,
+          "text_sha256": "f9cc46931130e3aad3142ae1ec64100322a656c3538040ecd5c327b80bf1ede5"
+        },
+        {
+          "id": "rc_8241b2cfa8d8a891b93e296d1b309649b2560358",
+          "user_file_id": "634d428a-1675-4812-a902-229e9f3e3987",
+          "text": "Bu fıkra hükümlerinin uygulanmasına ilişkin usul ve esaslar Ticaret Bakanlığı, Hazine ve Maliye Bakanlığı ile Ulaştırma ve Altyapı Bakanlığınca müştereken belirlenir. Uluslararası sözleşme hükümleri saklıdır.",
+          "position": 116,
+          "heading_path": [
+            "Hakkında Kanun [1]",
+            "BEŞİNCİ BÖLÜM",
+            "MADDE 30 - Geçiş ücretini ödememe ve güvenliğin ihlali",
+            "(10) (Ek:27/3/2025-7546/9 md.) Sürücüsünün Türk vatandaşı olup olmadığına bakılmaksızın yaba..."
+          ],
+          "validity_start_date": "2025-03-30",
+          "validity_end_date": null,
+          "status": "active",
+          "chunk_metadata": {
+            "article_no": "30",
+            "clause_label": null,
+            "paragraph_no": "10",
+            "source_links": {
+              "0": "https://mevzuat.adalet.gov.tr/mevzuat/103465"
+            },
+            "chunk_variant": "atomic",
+            "document_type": "kanun",
+            "document_title": "Hakkında Kanun [1]",
+            "document_number": "6001",
+            "subclause_label": null
+          },
+          "projection_ordinal": 116,
+          "text_sha256": "62d4e7a066deacbc282e40a9fbf548794bbaf784d7c753fc9723f5006ab634ea"
+        }
+      ]
+    },
+    {
+      "number": "5393",
+      "display_name": "5393 sayılı Belediye Kanunu",
+      "article": "14",
+      "source_id": "6a6a7044-44fd-42d0-8a0d-99e3d04a5e3b",
+      "candidate_heads": [
+        {
+          "id": "rc_3f8e35227c24e3d3ed9e143a21ae32e9be5a9eba",
+          "user_file_id": "6a6a7044-44fd-42d0-8a0d-99e3d04a5e3b",
+          "text": "BELEDİYE KANUNU\nKanun Numarası                    : 5393\nKabul Tarihi                           : 3/7/2005\nYayımlandığı Resmî Gazete  : Tarih  : 13/7/2005        Sayı  : 25874\nYayımlandığı Düstur              : Tertip : 5                      Cilt   : 44\nGenel Hükümler\nAmaç, Kapsam ve Tanımlar",
+          "position": 0,
+          "heading_path": [
+            "BELEDİYE KANUNU"
+          ],
+          "validity_start_date": null,
+          "validity_end_date": null,
+          "status": "active",
+          "chunk_metadata": {
+            "article_no": null,
+            "clause_label": null,
+            "paragraph_no": null,
+            "source_links": {
+              "0": "https://mevzuat.adalet.gov.tr/mevzuat/102940"
+            },
+            "chunk_variant": "atomic",
+            "document_type": "kanun",
+            "document_number": "5393",
+            "subclause_label": null
+          },
+          "projection_ordinal": 0,
+          "text_sha256": "11820104bb44c1019cdbd15484fc9d42b43deee0db7149ee3960930fa7f86a76"
+        },
+        {
+          "id": "rc_882ff793e6d4c2303a1ec7c6c970cb3f804f1365",
+          "user_file_id": "6a6a7044-44fd-42d0-8a0d-99e3d04a5e3b",
+          "text": "Madde 1-\nBu Kanunun amacı, belediyenin kuruluşunu, organlarını, yönetimini, görev, yetki ve sorumlulukları ile çalışma usûl ve esaslarını düzenlemektir.",
+          "position": 1,
+          "heading_path": [
+            "BELEDİYE KANUNU",
+            "BİRİNCİ KISIM",
+            "BİRİNCİ BÖLÜM",
+            "MADDE 1 - Amaç"
+          ],
+          "validity_start_date": null,
+          "validity_end_date": null,
+          "status": "active",
+          "chunk_metadata": {
+            "article_no": "1",
+            "clause_label": null,
+            "paragraph_no": null,
+            "source_links": {
+              "0": "https://mevzuat.adalet.gov.tr/mevzuat/102940"
+            },
+            "chunk_variant": "atomic",
+            "document_type": "kanun",
+            "document_number": "5393",
+            "subclause_label": null
+          },
+          "projection_ordinal": 1,
+          "text_sha256": "99f578a3206ea3b183b5c8ec47ef4de6030fd5792164371d1b1193409ac0f92e"
+        }
+      ],
+      "provision": [
+        {
+          "id": "rc_e1277fe73d5e81589fb0f3330e527985adae16e0",
+          "user_file_id": "6a6a7044-44fd-42d0-8a0d-99e3d04a5e3b",
+          "text": "Madde 14-\nBelediye, mahallî müşterek nitelikte olmak şartıyla;",
+          "position": 37,
+          "heading_path": [
+            "BELEDİYE KANUNU",
+            "BİRİNCİ KISIM",
+            "ÜÇÜNCÜ BÖLÜM",
+            "MADDE 14 - Belediyenin görev ve sorumlulukları"
+          ],
+          "validity_start_date": null,
+          "validity_end_date": null,
+          "status": "active",
+          "chunk_metadata": {
+            "article_no": "14",
+            "clause_label": null,
+            "paragraph_no": null,
+            "source_links": {
+              "0": "https://mevzuat.adalet.gov.tr/mevzuat/102940"
+            },
+            "chunk_variant": "atomic",
+            "document_type": "kanun",
+            "document_number": "5393",
+            "subclause_label": null
+          },
+          "projection_ordinal": 37,
+          "text_sha256": "4df5e717218a7d5a32902d764ba9c20ba063ce4b5b37211878decbe9ae8942a0"
+        },
+        {
+          "id": "rc_0d176f752c951686f6aa9714a3cf3cbfd5327f36",
+          "user_file_id": "6a6a7044-44fd-42d0-8a0d-99e3d04a5e3b",
+          "text": "a) İmar, su ve kanalizasyon, ulaşım gibi kentsel alt yapı; coğrafî ve kent bilgi sistemleri; çevre ve çevre sağlığı, temizlik ve katı atık; zabıta, itfaiye, acil yardım, kurtarma ve ambulans; şehir içi trafik; defin ve mezarlıklar; ağaçlandırma, park ve yeşil alanlar; konut; kültür ve sanat, turizm ve tanıtım, gençlik ve spor orta ve yüksek öğrenim öğrenci yurtları (Bu Kanunun 75 inci maddesinin son fıkrası, belediyeler, il özel idareleri, bağlı kuruluşları ve bunların üyesi oldukları birlikler ile ortağı oldukları Sayıştay denetimine tabi şirketler tarafından, orta ve yüksek öğrenim öğrenci yurtları ile Devlete ait her derecedeki okul binalarının yapım, bakım ve onarımı ile tefrişinde uygulanmaz.); sosyal hizmet ve yardım, nikâh, meslek ve beceri kazandırma;",
+          "position": 38,
+          "heading_path": [
+            "BELEDİYE KANUNU",
+            "BİRİNCİ KISIM",
+            "ÜÇÜNCÜ BÖLÜM",
+            "MADDE 14 - Belediyenin görev ve sorumlulukları",
+            "a) İmar, su ve kanalizasyon, ulaşım gibi kentsel alt yapı"
+          ],
+          "validity_start_date": null,
+          "validity_end_date": null,
+          "status": "active",
+          "chunk_metadata": {
+            "article_no": "14",
+            "clause_label": "a",
+            "paragraph_no": null,
+            "source_links": {
+              "0": "https://mevzuat.adalet.gov.tr/mevzuat/102940"
+            },
+            "chunk_variant": "atomic",
+            "document_type": "kanun",
+            "document_number": "5393",
+            "subclause_label": null
+          },
+          "projection_ordinal": 38,
+          "text_sha256": "aac95e4f08c3defd365fd35fc34c6e4e57fe19bdf5117416376116310787515c"
+        },
+        {
+          "id": "rc_08c9d33931df7fc022d1c5d70725f9143a26ae53",
+          "user_file_id": "6a6a7044-44fd-42d0-8a0d-99e3d04a5e3b",
+          "text": "ekonomi ve ticaretin geliştirilmesi hizmetlerini yapar veya yaptırır . (Mülga son cümle: 12/11/2012-6360/17 md.) (…) (Ek cümleler: 12/11/2012-6360/17 md.) Büyükşehir belediyeleri ile nüfusu 100.000’in üzerindeki belediyeler, kadınlar ve çocuklar için konukevleri açmak zorundadır. Diğer belediyeler de mali durumları ve hizmet önceliklerini değerlendirerek kadınlar ve çocuklar için konukevleri açabilirler. [10] [11]",
+          "position": 39,
+          "heading_path": [
+            "BELEDİYE KANUNU",
+            "BİRİNCİ KISIM",
+            "ÜÇÜNCÜ BÖLÜM",
+            "MADDE 14 - Belediyenin görev ve sorumlulukları",
+            "a) İmar, su ve kanalizasyon, ulaşım gibi kentsel alt yapı"
+          ],
+          "validity_start_date": null,
+          "validity_end_date": null,
+          "status": "active",
+          "chunk_metadata": {
+            "article_no": "14",
+            "clause_label": "a",
+            "paragraph_no": null,
+            "source_links": {
+              "0": "https://mevzuat.adalet.gov.tr/mevzuat/102940"
+            },
+            "chunk_variant": "atomic",
+            "document_type": "kanun",
+            "document_number": "5393",
+            "subclause_label": null
+          },
+          "projection_ordinal": 39,
+          "text_sha256": "a7f95d83cff93f943b2b1c88b6ab9bdbb05fc0c5f7b6553431db1b3f1df21352"
+        },
+        {
+          "id": "rc_c3e07e6f58659edc34dca82a51555b3e5485f4ff",
+          "user_file_id": "6a6a7044-44fd-42d0-8a0d-99e3d04a5e3b",
+          "text": "b) (…) [12] Devlete ait her derecedeki okul binalarının inşaatı ile bakım ve onarımını yapabilir veya yaptırabilir, her türlü araç, gereç ve malzeme ihtiyaçlarını karşılayabilir; sağlıkla ilgili her türlü tesisi açabilir ve işletebilir; mabetlerin yapımı, bakımı, onarımını yapabilir; kültür ve tabiat varlıkları ile tarihî dokunun ve kent tarihi bakımından önem taşıyan mekânların ve işlevlerinin korunmasını sağlayabilir; bu amaçla bakım ve onarımını yapabilir, korunması mümkün olmayanları aslına uygun olarak yeniden inşa edebilir; cemevlerinin yapım, bakım ve onarımını yapabilir. (Değişik ikinci cümle:",
+          "position": 40,
+          "heading_path": [
+            "BELEDİYE KANUNU",
+            "BİRİNCİ KISIM",
+            "ÜÇÜNCÜ BÖLÜM",
+            "MADDE 14 - Belediyenin görev ve sorumlulukları",
+            "b) (…) [12] Devlete ait her derecedeki okul binalarının inşaatı ile bakım ve onarımını yap..."
+          ],
+          "validity_start_date": null,
+          "validity_end_date": null,
+          "status": "active",
+          "chunk_metadata": {
+            "article_no": "14",
+            "clause_label": "b",
+            "paragraph_no": null,
+            "source_links": {
+              "0": "https://mevzuat.adalet.gov.tr/mevzuat/102940"
+            },
+            "chunk_variant": "atomic",
+            "document_type": "kanun",
+            "document_number": "5393",
+            "subclause_label": null
+          },
+          "projection_ordinal": 40,
+          "text_sha256": "914c23caeec6278238b90115b6b4e4ca3671aa8132f3b6359e520211b869db74"
+        },
+        {
+          "id": "rc_99768dc99473b9e300e59121ad47ff42ed512abe",
+          "user_file_id": "6a6a7044-44fd-42d0-8a0d-99e3d04a5e3b",
+          "text": "12/11/2012-6360/17 md.) Gerektiğinde, sporu teşvik etmek amacıyla gençlere spor malzemesi verir, amatör spor kulüplerine ayni ve nakdî yardım yapar ve gerekli desteği sağlar, her türlü amatör spor karşılaşmaları düzenler, yurt içi ve yurt dışı müsabakalarda üstün başarı gösteren veya derece alan öğrencilere, sporculara, teknik yöneticilere ve antrenörlere belediye meclisi kararıyla ödül verebilir. Gıda bankacılığı yapabilir. [13] [14]",
+          "position": 41,
+          "heading_path": [
+            "BELEDİYE KANUNU",
+            "BİRİNCİ KISIM",
+            "ÜÇÜNCÜ BÖLÜM",
+            "MADDE 14 - Belediyenin görev ve sorumlulukları",
+            "b) (…) [12] Devlete ait her derecedeki okul binalarının inşaatı ile bakım ve onarımını yap..."
+          ],
+          "validity_start_date": null,
+          "validity_end_date": null,
+          "status": "active",
+          "chunk_metadata": {
+            "article_no": "14",
+            "clause_label": "b",
+            "paragraph_no": null,
+            "source_links": {
+              "0": "https://mevzuat.adalet.gov.tr/mevzuat/102940"
+            },
+            "chunk_variant": "atomic",
+            "document_type": "kanun",
+            "document_number": "5393",
+            "subclause_label": null
+          },
+          "projection_ordinal": 41,
+          "text_sha256": "6429ed4de7f4b56b5af6ef95e93b8486ac70868edce7cc06db30cbc0ce6bbdc5"
+        },
+        {
+          "id": "rc_b78b4527c480ea0a3243d6e2c362a59d8f2c3814",
+          "user_file_id": "6a6a7044-44fd-42d0-8a0d-99e3d04a5e3b",
+          "text": "(Ek fıkra: 12/11/2012-6360/17 md.; Değişik: 12/7/2013-6495/100 md.) Belediyelerin birinci fıkranın (b) bendi uyarınca, sporu teşvik etmek amacıyla yapacakları nakdi yardım, bir önceki yıl genel bütçe vergi gelirlerinden belediyeleri için tahakkuk eden miktarın; büyükşehir belediyeleri için binde yedisini, diğer belediyeler için binde on ikisini geçemez.\n(İptal fıkra: Anayasa Mahkemesinin 24/1/2007 tarihli ve E. 2005/95, K. 2007/5 sayılı Kararı ile. )\nHizmetlerin yerine getirilmesinde öncelik sırası, belediyenin malî durumu ve hizmetin ivediliği dikkate alınarak belirlenir.",
+          "position": 42,
+          "heading_path": [
+            "BELEDİYE KANUNU",
+            "BİRİNCİ KISIM",
+            "ÜÇÜNCÜ BÖLÜM",
+            "MADDE 14 - Belediyenin görev ve sorumlulukları",
+            "b) (…) [12] Devlete ait her derecedeki okul binalarının inşaatı ile bakım ve onarımını yap..."
+          ],
+          "validity_start_date": null,
+          "validity_end_date": null,
+          "status": "active",
+          "chunk_metadata": {
+            "article_no": "14",
+            "clause_label": "b",
+            "paragraph_no": null,
+            "source_links": {
+              "0": "https://mevzuat.adalet.gov.tr/mevzuat/102940"
+            },
+            "chunk_variant": "atomic",
+            "document_type": "kanun",
+            "document_number": "5393",
+            "subclause_label": null
+          },
+          "projection_ordinal": 42,
+          "text_sha256": "75579ca4cc3cd867334207f4a57d80cf4101fdb4b307865f9298b96cd1f16bb0"
+        },
+        {
+          "id": "rc_6cbd1a95e3bcf154f9aec3c3fbed7bd8404f8ed2",
+          "user_file_id": "6a6a7044-44fd-42d0-8a0d-99e3d04a5e3b",
+          "text": "Belediye hizmetleri, vatandaşlara en yakın yerlerde ve en uygun yöntemlerle sunulur. Hizmet sunumunda engelli, yaşlı, düşkün ve dar gelirlilerin durumuna uygun yöntemler uygulanır. [15]\nBelediyenin görev, sorumluluk ve yetki alanı belediye sınırlarını kapsar.\nBelediye meclisinin kararı ile mücavir alanlara da belediye hizmetleri götürülebilir.\n4562 sayılı Organize Sanayi Bölgeleri Kanunu hükümleri saklıdır.\n(Ek fıkra: 1/7/2006-5538/29 md.) Sivil hava ulaşımına açık havaalanları ile bu havaalanları bünyesinde yer alan tüm tesisler bu Kanunun kapsamı dışındadır.",
+          "position": 43,
+          "heading_path": [
+            "BELEDİYE KANUNU",
+            "BİRİNCİ KISIM",
+            "ÜÇÜNCÜ BÖLÜM",
+            "MADDE 14 - Belediyenin görev ve sorumlulukları",
+            "b) (…) [12] Devlete ait her derecedeki okul binalarının inşaatı ile bakım ve onarımını yap..."
+          ],
+          "validity_start_date": null,
+          "validity_end_date": null,
+          "status": "active",
+          "chunk_metadata": {
+            "article_no": "14",
+            "clause_label": "b",
+            "paragraph_no": null,
+            "source_links": {
+              "0": "https://mevzuat.adalet.gov.tr/mevzuat/102940"
+            },
+            "chunk_variant": "atomic",
+            "document_type": "kanun",
+            "document_number": "5393",
+            "subclause_label": null
+          },
+          "projection_ordinal": 43,
+          "text_sha256": "60bfab1669a336dadd9ad105a27bf3afefc6365e06c93a927f98daf374a634a1"
+        }
+      ]
+    }
+  ]
+}
