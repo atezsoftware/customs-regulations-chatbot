@@ -4,96 +4,90 @@ on:
     inputs:
       operation:
         type: choice
-        options: [inspect, approve_462, approve_465, approve_470]
+        options: [inspect]
+        required: true
         default: inspect
+      expected_backend_commit:
+        type: string
+        required: true
 permissions:
   contents: read
 jobs:
   inspect:
     runs-on: codebuild-customs-regulations-runner-${{ github.run_id }}-${{ github.run_attempt }}
-    timeout-minutes: 10
+    timeout-minutes: 8
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
-        with:
-          persist-credentials: false
-      - name: Read only batch inventory
-        shell: bash
-        run: |
-          set -euo pipefail
-          aws eks update-kubeconfig --name atez-dev-cluster --region eu-central-1
-          kubectl get pods -n customs-regulations-dev -o json > /tmp/amendment-pods.json
-          python - <<'PY'
-          import json
-          from pathlib import Path
-          pods=json.loads(Path('/tmp/amendment-pods.json').read_text())['items']
-          ready=[]
-          for pod in pods:
-              if pod['status']['phase']!='Running' or pod['metadata'].get('deletionTimestamp'):
-                  continue
-              statuses={item['name']:item for item in pod['status'].get('containerStatuses',[])}
-              for container in pod['spec']['containers']:
-                  image=container['image']
-                  if 'customs-regulations-backend-lite-dev:' in image and statuses.get(container['name'],{}).get('ready'):
-                      ready.append((pod['metadata']['name'],container['name'],image))
-          if not ready:
-              raise SystemExit('No ready DEV backend container')
-          ready.sort()
-          pod,container,image=ready[0]
-          print('TARGET',pod,container,image)
-          Path('/tmp/amendment-target').write_text(pod+'\t'+container+'\n')
-          PY
-          IFS=$'\t' read -r pod container < /tmp/amendment-target
-          kubectl exec -i "$pod" -n customs-regulations-dev -c "$container" -- \
-            sh -ec '. /vault/secrets/config; export PYTHONPATH=/app; exec python -' < \
-            backend/onyx/db/diagnose_amendment_batches_299_310.py
-      - name: Filter amendment approval worker errors
-        if: inputs.operation == 'inspect'
-        shell: bash
-        run: |
-          set -euo pipefail
-          python - <<'PY'
-          import json
-          import re
-          import subprocess
-          from pathlib import Path
-
-          pods = json.loads(Path('/tmp/amendment-pods.json').read_text())['items']
-          needles = re.compile(r'Amendment proposal (460|462|465|470) approval failed|amendment_(prepared|approved) proposal_id=(460|462|465|470)')
-          for pod in pods:
-              name = pod['metadata']['name']
-              if pod['status']['phase'] != 'Running' or 'background' not in name:
-                  continue
-              for container in pod['spec']['containers']:
-                  result = subprocess.run(
-                      ['kubectl', 'logs', name, '-n', 'customs-regulations-dev',
-                       '-c', container['name'], '--since=36h', '--tail=30000'],
-                      capture_output=True, text=True, check=False,
-                  )
-                  if result.returncode:
-                      print('LOG_READ_FAILED', name, container['name'], result.returncode)
-                      continue
-                  lines = result.stdout.splitlines()
-                  print('LOG_SCAN', name, container['name'], len(lines))
-                  for index, line in enumerate(lines):
-                      if needles.search(line):
-                          print('LOG_MATCH', name, container['name'])
-                          for excerpt in lines[index:index + 45]:
-                              print(excerpt[:500])
-          PY
-      - name: Resume one existing reviewed proposal
-        if: inputs.operation != 'inspect'
+      - name: Inspect bounded DEV API failures
         shell: bash
         env:
-          OPERATION: ${{ inputs.operation }}
+          EXPECTED_BACKEND_COMMIT: ${{ inputs.expected_backend_commit }}
         run: |
           set -euo pipefail
-          case "$OPERATION" in
-            approve_462) proposal_id=462 ;;
-            approve_465) proposal_id=465 ;;
-            approve_470) proposal_id=470 ;;
-            *) exit 2 ;;
-          esac
-          IFS=$'\t' read -r pod container < /tmp/amendment-target
-          kubectl exec -i "$pod" -n customs-regulations-dev -c "$container" -- \
-            sh -ec '. /vault/secrets/config; export PYTHONPATH=/app; exec python - "$1"' sh "$proposal_id" < \
-            backend/onyx/db/resume_amendment_approvals_309_310.py
+          [[ "$EXPECTED_BACKEND_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          aws eks update-kubeconfig --name atez-dev-cluster --region eu-central-1
+          python - <<'PYCODE'
+          import json, re, subprocess
+          def run(args):
+              return subprocess.run(args,capture_output=True,text=True,timeout=60)
+          ns='customs-regulations-dev'
+          deployment=run(['kubectl','get','deployment','dev-customs-regulations-api-deployment','-n',ns,'-o','json'])
+          if deployment.returncode==0:
+              dep=json.loads(deployment.stdout); spec=dep['spec']; podspec=spec['template']['spec']
+              print('DEPLOYMENT_CONFIG',json.dumps({'name':dep['metadata']['name'],'strategy':spec.get('strategy'),'replicas':spec.get('replicas'),'terminationGracePeriodSeconds':podspec.get('terminationGracePeriodSeconds'),'containers':[{k:c.get(k) for k in ('name','command','args','lifecycle','ports','readinessProbe','livenessProbe','startupProbe')} for c in podspec['containers'] if 'customs-regulations-backend-lite' in c['image']]}))
+          replicasets=run(['kubectl','get','replicasets','-n',ns,'-l','app=dev-customs-regulations-api','-o','json'])
+          if replicasets.returncode==0:
+              for rs in json.loads(replicasets.stdout)['items']:
+                  print('REPLICASET',json.dumps({'name':rs['metadata']['name'],'created':rs['metadata']['creationTimestamp'],'replicas':rs['spec'].get('replicas'),'status':rs.get('status')}))
+          result=run(['kubectl','get','pods','-n',ns,'-l','app=dev-customs-regulations-api','-o','json'])
+          if result.returncode: raise SystemExit('Cannot read DEV API pods')
+          pods=json.loads(result.stdout)['items']
+          for pod in pods:
+              print('POD_STATUS',json.dumps({'name':pod['metadata']['name'],'created':pod['metadata']['creationTimestamp'],'podIP':pod['status'].get('podIP'),'owners':pod['metadata'].get('ownerReferences'),'deletionTimestamp':pod['metadata'].get('deletionTimestamp'),'phase':pod['status']['phase'],'containers':[{k:s.get(k) for k in ('name','ready','restartCount','state','lastState')} for s in pod['status'].get('containerStatuses',[])],'resources':[{k:c.get(k) for k in ('name','image','resources')} for c in pod['spec']['containers']]}))
+              for container in pod['spec']['containers']:
+                  if 'customs-regulations-backend-lite' not in container['image']: continue
+                  for previous in (False,True):
+                      args=['kubectl','logs',pod['metadata']['name'],'-n',ns,'-c',container['name'],'--since=6h','--tail=30000']
+                      if previous: args.append('--previous')
+                      logs=run(args)
+                      if logs.returncode:
+                          print('LOG_UNAVAILABLE',previous,logs.returncode)
+                          continue
+                      lines=logs.stdout.splitlines()
+                      chosen=[]
+                      for line in lines:
+                          if re.search(r'api.?key|password|secret|authorization|bearer|access.?token',line,re.I): continue
+                          if re.search(r'Traceback|^\s*File "|^\w[\w.]*Error:|^\w[\w.]*Exception:|WORKER TIMEOUT|Worker exiting|Booting worker|SIGKILL|SIGTERM|out of memory|MemoryError|terminated|killed|worker died|Exception in|ASv3.*(failed|error)|candidate_audit_run_id|InvalidRequestError|context.*(large|exceed)|CRITICAL|Segmentation',line,re.I):
+                              chosen.append(line[:700])
+                      print('LOG_SCAN',pod['metadata']['name'],previous,'total',len(lines),'matches',len(chosen))
+                      for line in chosen[-150:]: print('API_LOG',line)
+                  script="""from pathlib import Path
+          import os
+          for p in Path('/proc').glob('[0-9]*/cmdline'):
+              try: args=p.read_bytes().replace(bytes([0]),b' ').decode(errors='replace')
+              except OSError: continue
+              if ('uvicorn' in args or 'gunicorn' in args) and not ('python -c' in args):
+                  print('API_PROCESS',p.parent.name,args[:1000])
+          import re,json
+          for root in ('/var/log/onyx','/app/log','/app/backend/log'):
+              for p in Path(root).glob('*'):
+                  if p.is_file(): print('LOGFILE',str(p),p.stat().st_size)
+          for p in Path('/var/log/onyx').glob('*log'):
+              if not p.is_file():continue
+              lines=p.read_text(errors='replace').splitlines()[-30000:]
+              selected=[]
+              for line in lines:
+                  if re.search(r'api.?key|password|secret|authorization|bearer|access.?token',line,re.I):continue
+                  if re.search(r'Traceback|^\s*File \"|^\w[\w.]*Error:|^\w[\w.]*Exception:|WORKER TIMEOUT|Worker exiting|SIGKILL|out of memory|MemoryError|terminated|killed|ASv3.*(failed|error)|candidate_audit_run_id|Segmentation|Started server|Finished server|Shutting down|Waiting for application|Application shutdown|Uvicorn running',line,re.I):selected.append(line[:700])
+              print('FILE_SCAN',str(p),'matches',len(selected))
+              for line in selected[-150:]:print('API_FILE_LOG',line)
+          """
+                  observed=run(['kubectl','exec',pod['metadata']['name'],'-n',ns,'-c',container['name'],'--','python','-c',script])
+                  if observed.returncode: print('FILE_SCAN_UNAVAILABLE',observed.returncode)
+                  else: print(observed.stdout)
+          events=run(['kubectl','get','events','-n',ns,'-o','json'])
+          if events.returncode==0:
+              for event in json.loads(events.stdout)['items']:
+                  obj=event.get('involvedObject',{})
+                  if 'customs-regulations-api' in obj.get('name',''):
+                      print('API_EVENT',json.dumps({k:event.get(k) for k in ('type','reason','message','firstTimestamp','lastTimestamp','count','involvedObject')}))
+          PYCODE
