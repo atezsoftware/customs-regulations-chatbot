@@ -14,26 +14,43 @@ from sqlalchemy.orm import Session
 
 from onyx.configs.app_configs import POSTGRES_DB
 from onyx.db import document_intake as intake
+from onyx.db import regulatory_labeling as labeling
 from onyx.db.document_intake_metadata import metadata_chunks
+from onyx.db.document_intake_review import parent_labeling_contexts
 from onyx.db.engine.sql_engine import SqlEngine, get_session_with_current_tenant
+from onyx.db.labeling_configuration import (
+    LabelingProviderBinding,
+    resolve_intake_labeling_provider_binding,
+)
 from onyx.db.models import (
     RegulatoryChunk,
     RegulatoryLabelingItem,
     RegulatoryLabelingRun,
+    RegulatoryLabelingShard,
     RegulatorySourceAsset,
+    User,
 )
 from onyx.db.regulatory_annex_changes import capture_canonical_scope
 from onyx.db.regulatory_labeling import current_labeling_items_for_search
+from onyx.db.regulatory_labeling_semantic_repair import (
+    require_current_v4_intake_repair_item,
+)
 from onyx.document_index.publication_models import publication_digest
+from onyx.regulatory.amendments.annexes.context_dependencies import context_hash
 from onyx.regulatory.document_intake.structural_readers import (
     build_native_chapter_reader_proofs,
 )
-from onyx.regulatory.indexing_jobs.vertex_batch import VertexBatchRequest
+from onyx.regulatory.indexing_jobs.vertex_batch import (
+    VertexBatchRequest,
+    parse_vertex_jsonl_output,
+)
+from onyx.regulatory.labeling.intake_abstention_repair import build_abstention_repair
 from onyx.regulatory.labeling.provider import (
     TaxonomyDefinition,
     build_labeling_request,
     validate_labeling_response,
 )
+from onyx.regulatory.labeling.vertex_direct import _StoredResult
 from onyx.utils.variable_functionality import set_is_ee_based_on_env_variable
 from shared_configs.contextvars import get_current_tenant_id
 
@@ -58,6 +75,183 @@ def require_failed_run(run: RegulatoryLabelingRun) -> None:
         and run.lease_expires_at is None,
         "The original terminal labeling receipt changed",
     )
+
+
+def failed_request_is_current(
+    session: Session,
+    *,
+    run: RegulatoryLabelingRun,
+    item: RegulatoryLabelingItem,
+    frozen: dict[str, RegulatoryLabelingItem],
+) -> None:
+    """Read the source predicate directly; never claim or synthesize a run lease."""
+    require_current_v4_intake_repair_item(session, item=item, run=run)
+    lower, upper = labeling._snapshot_context_window(item.source_snapshot)
+    rows, boundaries, complete = labeling._current_file_context_candidates(
+        session,
+        document_set_id=run.document_set_id,
+        user_file_id=item.user_file_id,
+        lower=lower,
+        upper=upper,
+    )
+    advisories = labeling._latest_context_advisories(
+        session, [item.regulatory_chunk_id]
+    )
+    scope.require(
+        labeling._item_snapshot_is_current(
+            item,
+            snapshot_items=frozen,
+            current_rows={row.id: row for row in rows},
+            current_file_rows={item.user_file_id: rows},
+            current_boundary_ids={item.user_file_id: boundaries},
+            current_windows_complete={item.user_file_id: complete},
+            parent_identities=parent_labeling_contexts(session, [item.user_file_id]),
+            advisory_hashes={
+                key: context_hash(value) for key, value in advisories.items()
+            },
+        ),
+        "A failed target's original frozen interpretation context changed",
+    )
+
+
+def pure_repair_plan(
+    session: Session,
+    *,
+    batch: scope.RegulatoryDocumentIntake,
+    run: RegulatoryLabelingRun,
+    items: list[RegulatoryLabelingItem],
+    pending_ids: set[str],
+    taxonomy: TaxonomyDefinition,
+) -> dict[str, Any]:
+    binding = LabelingProviderBinding.model_validate(run.provider_binding)
+    current = resolve_intake_labeling_provider_binding(
+        session,
+        batch.labeling_model_configuration_id,
+        user=session.get_one(User, batch.created_by),
+    )
+    scope.require(
+        binding.transport == "vertex_direct_v1"
+        and run.model == binding.model
+        and current.model_dump(mode="json") == run.provider_binding,
+        "The current direct provider/model binding differs from the original frozen run",
+    )
+    frozen = {item.regulatory_chunk_id: item for item in items}
+    shards = {
+        shard.id: shard
+        for shard in session.scalars(
+            select(RegulatoryLabelingShard).where(
+                RegulatoryLabelingShard.run_id == run.id
+            )
+        )
+    }
+    total_bytes = 0
+    records = []
+    for identifier in sorted(pending_ids):
+        item = frozen[identifier]
+        failed_request_is_current(session, run=run, item=item, frozen=frozen)
+        base = build_labeling_request(
+            chunk_id=identifier,
+            text=item.text_snapshot,
+            context=item.context_snapshot or "",
+            taxonomy=taxonomy,
+            source_hash=item.canonical_text_sha256 or "",
+        )
+        scope.require(
+            item.request_payload is not None
+            and VertexBatchRequest.model_validate(item.request_payload) == base
+            and item.request_hash == base.request_hash,
+            "A failed target's exact base request changed",
+        )
+        shard = shards.get(item.shard_id) if item.shard_id is not None else None
+        scope.require(
+            shard is not None
+            and str(item.id) in shard.item_ids
+            and shard.status == "succeeded",
+            "A failed target no longer has its complete provider shard",
+        )
+        assert shard is not None
+        submission = shard.submission_key.removeprefix("regulatory-labeling-")
+        scope.require(
+            bool(scope.re.fullmatch(r"[0-9a-f]{64}", submission)),
+            "A retained ACK submission identity is malformed",
+        )
+        file_id = f"regulatory-labeling-direct/{binding.fingerprint}/{submission}/{base.request_hash}.json"
+        record = scope.rows(
+            session,
+            "SELECT file_metadata FROM file_record WHERE file_id=:id",
+            id=file_id,
+        )
+        scope.require(
+            len(record) == 1
+            and record[0]["file_metadata"].get("binding_sha256") == binding.fingerprint,
+            "A retained failed ACK has no exact provider binding",
+        )
+        with scope.retained_source_stream(file_id, session) as stream:
+            raw = stream.read(2_000_001)
+        total_bytes += len(raw)
+        scope.require(
+            len(raw) <= 2_000_000
+            and total_bytes <= 16_000_000
+            and hashlib.sha256(raw).hexdigest()
+            == record[0]["file_metadata"].get("sha256"),
+            "A retained ACK changed or exceeded its bounded read budget",
+        )
+        ack = _StoredResult.model_validate_json(raw)
+        line = json.loads(ack.line)
+        scope.require(
+            ack.binding_sha256 == binding.fingerprint
+            and ack.submission_key == shard.submission_key
+            and ack.request_hash == base.request_hash
+            and VertexBatchRequest.model_validate(ack.request_payload) == base
+            and hashlib.sha256(ack.line.encode()).hexdigest() == ack.line_sha256
+            and line.get("key") == base.request_hash
+            and line.get("request") == base.to_generate_content_request(),
+            "A retained failed ACK lost exact request correlation",
+        )
+        parsed = parse_vertex_jsonl_output(iter([ack.line]), [base.request_hash])[
+            base.request_hash
+        ]
+        scope.require(
+            parsed.error is None and parsed.context is not None,
+            "A retained failed ACK is not a complete STOP result",
+        )
+        assert parsed.context is not None
+        repair = build_abstention_repair(
+            base_request=base,
+            rejected_response=parsed.context,
+            text=item.text_snapshot,
+            chunk_id=identifier,
+            source_hash=item.canonical_text_sha256 or "",
+            taxonomy=taxonomy,
+            provider_binding=run.provider_binding,
+        )
+        records.append(
+            {
+                "chunk_id": identifier,
+                "base_request_hash": base.request_hash,
+                "context_sha256": repair.context_text_sha256,
+                "rejected_response_sha256": repair.rejected_response_sha256,
+                "retained_ack_sha256": hashlib.sha256(raw).hexdigest(),
+                "repair_request_hash": repair.request.request_hash,
+                "repair_request_bytes": len(
+                    json.dumps(
+                        repair.request.to_generate_content_request(), ensure_ascii=False
+                    ).encode()
+                ),
+                "eligible": True,
+            }
+        )
+    return {
+        "eligible_failed_requests": len(records),
+        "provider_calls": 0,
+        "ack_bytes_read": total_bytes,
+        "binding_keys": sorted(run.provider_binding),
+        "provider_binding_fingerprint": binding.fingerprint,
+        "transport": binding.transport,
+        "model": run.model,
+        "current_binding_matches": True,
+        "requests": records,
+    }
 
 
 def retry_plan(
@@ -194,6 +388,14 @@ def retry_plan(
         all(set(proof.governed_chunk_ids) <= provider_ids for proof in proofs.values()),
         "A reader depends on a non-provider or cross-scope source",
     )
+    semantic_plan = pure_repair_plan(
+        session,
+        batch=batch,
+        run=run,
+        items=items,
+        pending_ids=pending,
+        taxonomy=taxonomy,
+    )
     return {
         "operator_action": "labeling_retry_plan_read_only",
         "old_run_id": str(run.id),
@@ -235,6 +437,7 @@ def retry_plan(
         "expected_derived_targets": 46,
         "expected_reused_receipts": 609,
         "expected_pending_targets": 42,
+        "pure_semantic_repair_plan": semantic_plan,
         "provider_ids_sha256": publication_digest(sorted(provider_ids)),
         "pending_ids_sha256": publication_digest(sorted(pending)),
         "approval_publication_index_or_provider_requested": False,
