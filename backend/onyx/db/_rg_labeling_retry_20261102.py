@@ -277,6 +277,25 @@ def retry_plan(
         and batch.lease_expires_at is None,
         "Only the original idle failed labeling stage may be retried",
     )
+    files = scope.rows(
+        session,
+        """
+        SELECT u.id,u.status,u.user_id,m.approval_attempt_id
+        FROM regulatory_document_intake_file m JOIN user_file u ON u.id=m.user_file_id
+        WHERE m.intake_id=:batch ORDER BY u.id
+    """,
+        batch=scope.BATCH,
+    )
+    scope.require(
+        {str(file["id"]) for file in files} == {scope.MAIN_FILE, scope.PDF_FILE}
+        and all(
+            file["status"] == "CHUNKED"
+            and str(file["user_id"]) == scope.OWNER
+            and file["approval_attempt_id"] is None
+            for file in files
+        ),
+        "Both owned files must remain chunked and never approved",
+    )
     run = session.get_one(
         RegulatoryLabelingRun, scope.LABELING_RUN, populate_existing=True
     )
