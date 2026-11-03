@@ -48,7 +48,7 @@ jobs:
                       chosen=[]
                       for line in lines:
                           if re.search(r'api.?key|password|secret|authorization|bearer|access.?token',line,re.I): continue
-                          if re.search(r'Traceback|^\s*File "|^\w[\w.]*Error:|^\w[\w.]*Exception:|WORKER TIMEOUT|Worker exiting|Booting worker|SIGKILL|SIGTERM|out of memory|MemoryError|terminated|killed|worker died|Exception in|ASv3.*(failed|error)|candidate_audit_run_id|InvalidRequestError|context.*(large|exceed)|[CRITICAL]|Segmentation',line,re.I):
+                          if re.search(r'Traceback|^\s*File "|^\w[\w.]*Error:|^\w[\w.]*Exception:|WORKER TIMEOUT|Worker exiting|Booting worker|SIGKILL|SIGTERM|out of memory|MemoryError|terminated|killed|worker died|Exception in|ASv3.*(failed|error)|candidate_audit_run_id|InvalidRequestError|context.*(large|exceed)|CRITICAL|Segmentation',line,re.I):
                               chosen.append(line[:700])
                       print('LOG_SCAN',pod['metadata']['name'],previous,'total',len(lines),'matches',len(chosen))
                       for line in chosen[-150:]: print('API_LOG',line)
