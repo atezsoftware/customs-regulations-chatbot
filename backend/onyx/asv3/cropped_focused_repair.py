@@ -20,6 +20,7 @@ from onyx.asv3.assertions import (
 from onyx.asv3.authority import known_statute_source_ids
 from onyx.asv3.cheap_authority import canonical_named_authority_gap
 from onyx.asv3.cropped_article_bindings import cropped_identity_ledger
+from onyx.asv3.cropped_citation_repair import citation_repair_plan
 from onyx.asv3.cropped_repair_model import fresh_model, integrate_repair
 from onyx.asv3.cropped_repair_state import (
     CroppedRepairState,
@@ -777,6 +778,25 @@ class CroppedFocusedRepair:
             finished = self._exhausted_decision(harness)
             if finished is not None:
                 return finished
+            records = self.state.records_for(targets)
+            plan = citation_repair_plan(
+                view.draft_to_repair, view.publication_gap, targets, records
+            )
+            if plan is not None and all(
+                self._governing_gap(
+                    target,
+                    harness,
+                    cast(list[int], record["evidence_numbers"]),
+                )
+                is None
+                for target, record in zip(targets, records, strict=True)
+            ):
+                citation_owner = "citation_correction:" + owner
+                if self.state.reserve_integration(targets, citation_owner):
+                    harness.save_repair_checkpoint()
+                    return integrate_repair(
+                        model, harness.view(), records, citation_plan=plan
+                    )
             raise RunStopped(
                 "This deficiency already received its focused attempt and answer integration; originals retained"
             )

@@ -9,6 +9,7 @@ from typing import cast
 from pydantic import BaseModel, JsonValue
 
 from onyx.asv3.citation_numbers import extract_citation_numbers
+from onyx.asv3.cropped_citation_repair import CitationRepairPlan
 from onyx.asv3.evidence import EvidenceLedger
 from onyx.asv3.llm_adapter import ResearchModel, _NativeOriginalCatalogue
 from onyx.asv3.model_composition.models import (
@@ -22,7 +23,10 @@ from onyx.asv3.retained_answer import resolve_retained_answer
 from onyx.llm.interfaces import LLM
 from onyx.llm.model_response import ModelResponse
 from onyx.llm.models import ChatCompletionMessage
-from onyx.prompts.asv3_cropped_repair import CROPPED_REPAIR_INTEGRATION
+from onyx.prompts.asv3_cropped_repair import (
+    CROPPED_CITATION_CORRECTION,
+    CROPPED_REPAIR_INTEGRATION,
+)
 from onyx.tracing.flows import LLMFlow
 
 _SERVICES = frozenset(
@@ -214,6 +218,8 @@ def integrate_repair(
     model: ResearchModel,
     view: HarnessView,
     records: list[dict[str, JsonValue]],
+    *,
+    citation_plan: CitationRepairPlan | None = None,
 ) -> Decision:
     """Make one owned-draft decision with fresh actual delivery of every retained original."""
     gap = view.publication_gap
@@ -228,15 +234,20 @@ def integrate_repair(
         else fresh_model(model)
     )
     instructions = fresh.context.services.get("assistant_instructions")
+    integration_instruction = (
+        CROPPED_CITATION_CORRECTION
+        if citation_plan is not None
+        else CROPPED_REPAIR_INTEGRATION
+    )
     fresh.context.services["assistant_instructions"] = (
         instructions + "\n\n" if isinstance(instructions, str) and instructions else ""
-    ) + CROPPED_REPAIR_INTEGRATION
+    ) + integration_instruction
     if (
         fresh.context.depth
         and fresh.context.services.get("independent_question") is not True
     ):
         assert isinstance(fresh, _FreshRepairModel)
-        fresh._integration_instruction = CROPPED_REPAIR_INTEGRATION
+        fresh._integration_instruction = integration_instruction
     prepared = view.model_copy(deep=True)
     prepared.turns = []
     prepared.receipts = []
@@ -246,13 +257,18 @@ def integrate_repair(
         tool
         for tool in prepared.tools
         if isinstance(function := tool.get("function"), dict)
-        and function.get("name") in _TERMINALS
+        and function.get("name")
+        in ({"submit_partial_answer"} if citation_plan is not None else _TERMINALS)
     ]
     prepared.publication_gap = {
         **gap,
         "cropped_evidence_checks": cast(JsonValue, copy.deepcopy(records)),
         "absence_proven": False,
     }
+    if citation_plan is not None:
+        prepared.publication_gap["citation_only_correction"] = citation_plan.metadata(
+            view.draft_to_repair
+        )
     user_context = fresh.context.services.get("cropped_user_context")
     if isinstance(user_context, str) and user_context:
         prepared.publication_gap["user_supplied_scenario_context"] = user_context
@@ -292,4 +308,11 @@ def integrate_repair(
         raise RunStopped(
             "Cropped integration requires one valid retained terminal action"
         )
+    if citation_plan is not None:
+        answer = expanded.calls[0].arguments.get("answer")
+        if expanded.calls[0].name != "submit_partial_answer" or not isinstance(
+            answer, str
+        ):
+            raise RunStopped("Citation correction requires a retained partial answer")
+        citation_plan.validate(view.draft_to_repair, answer)
     return expanded
