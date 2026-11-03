@@ -22,6 +22,7 @@ from onyx.regulatory.law_identity import (
     LAW_DOCUMENT_TYPES,
     canonical_law_number,
     compatible_own_law_title_fragment,
+    exact_unnumbered_law_presentation,
     own_law_filename_number,
     own_law_opening_numbers,
 )
@@ -673,13 +674,87 @@ def _native_original_rows(ledger: EvidenceLedger) -> list[dict[str, JsonValue]]:
                 "formal_names": [identity_name] if identity_name else [],
             }
         )
-    return [
+    retained = [
         row
         for row in rows
         if isinstance(citation := row["citation"], int)
         and (item := ledger.get(citation)) is not None
         and item.source_id not in invalid_sources
     ]
+    _bind_retained_own_law_mastheads(retained, ledger)
+    return retained
+
+
+def _bind_retained_own_law_mastheads(
+    rows: list[dict[str, JsonValue]], ledger: EvidenceLedger
+) -> None:
+    """A retained own masthead identifies only compatible originals of that source."""
+    grouped: dict[str, list[dict[str, JsonValue]]] = {}
+    for row in rows:
+        citation = row["citation"]
+        item = ledger.get(citation) if isinstance(citation, int) else None
+        if item is not None:
+            grouped.setdefault(item.source_id, []).append(row)
+    canonical: dict[str, set[int]] = {}
+    invalid_citations: set[int] = set()
+    for row in ledger.authority_metadata():
+        citation = row["citation"]
+        item = ledger.get(citation) if isinstance(citation, int) else None
+        if item is not None and _canonical_source(item) and isinstance(citation, int):
+            canonical.setdefault(item.source_id, set()).add(citation)
+    for source_id, originals in grouped.items():
+        if canonical.get(source_id) != {row["citation"] for row in originals}:
+            continue
+        witnessed: set[str] = set()
+        all_numbers: set[str] = set()
+        conflicted = False
+        for row in originals:
+            citation = row["citation"]
+            item = ledger.get(citation) if isinstance(citation, int) else None
+            if item is None:
+                continue
+            numbers = row.get("instrument_numbers")
+            if isinstance(numbers, list):
+                all_numbers.update(value for value in numbers if isinstance(value, str))
+            title = str(row.get("title") or "")
+            if re.match(r"\s*\d", title) or _formal_law_name(title) is None:
+                continue
+            try:
+                opening = own_law_opening_numbers(
+                    item.text, title, exact_formal_title=True
+                )
+                all_numbers.update(opening)
+                if row.get("original_completely_delivered") is True:
+                    witnessed.update(opening)
+            except ValueError:
+                conflicted = True
+        if conflicted or len(all_numbers) > 1:
+            invalid_citations.update(
+                citation
+                for row in originals
+                if isinstance(citation := row["citation"], int)
+            )
+            continue
+        if len(witnessed) != 1:
+            continue
+        number = next(iter(witnessed))
+        compatible = True
+        for row in originals:
+            headings = row.get("heading_path")
+            root = str(headings[0]) if isinstance(headings, list) and headings else ""
+            title = str(row.get("title") or "")
+            numbers = row["instrument_numbers"]
+            if (
+                not isinstance(numbers, list)
+                or any(value != number for value in numbers)
+                or not exact_unnumbered_law_presentation(title, root, title, number)
+            ):
+                compatible = False
+                break
+        if compatible:
+            for row in originals:
+                row["instrument_numbers"] = [number]
+    rows[:] = [row for row in rows if row["citation"] not in invalid_citations]
 
 
 def known_statute_source_ids(name: str, ledger: EvidenceLedger) -> list[str]:
