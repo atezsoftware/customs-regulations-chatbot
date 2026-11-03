@@ -102,7 +102,9 @@ def test_new_policy_is_persisted_and_idempotent_retry_does_not_reselect(
 ) -> None:
     batch = _create(intake_session, intake_owner)
     policy = deepcopy(batch.preparation_policy)
-    assert policy == IntakePreparationPolicy().model_dump(mode="json")
+    assert policy == IntakePreparationPolicy(chunking_version="5").model_dump(
+        mode="json"
+    )
     identity = batch.id, batch.source_package_id, batch.idempotency_key
     google_settings.model_name = "gemini-embedding-001"
     intake_session.flush()
@@ -205,9 +207,9 @@ def test_explicit_reprepare_can_upgrade_without_changing_legacy_batch_or_source(
         m.user_file_id: canonical_scope_digest(session, m.user_file_id) for m in members
     }
     preview = reprepare.reprepare_snapshot(session, batch)
-    assert preview["target_preparation_policy"] == IntakePreparationPolicy().model_dump(
-        mode="json"
-    )
+    assert preview["target_preparation_policy"] == IntakePreparationPolicy(
+        chunking_version="5"
+    ).model_dump(mode="json")
     google_settings.model_name = "gemini-embedding-001"
     session.flush()
     with pytest.raises(intake.IntakeConflictError, match="snapshot changed"):
@@ -226,7 +228,7 @@ def test_explicit_reprepare_can_upgrade_without_changing_legacy_batch_or_source(
         idempotency_key=uuid4(),
     )
     assert all(
-        reprepare_target_versions(entry) == ("4", 4)
+        reprepare_target_versions(entry) == ("5", 4)
         for entry in request.documents.values()
     )
     assert batch.preparation_policy is None
@@ -295,7 +297,7 @@ def test_verified_source_context_and_prospective_edit_use_frozen_policy(
         user_file_id=member.user_file_id,
         links=[SourceLink.model_validate(x) for x in member.relationships],
         store=store,
-        chunking_version="4",
+        chunking_version=policy.chunking_version,
         preparation_policy=policy,
     )
     assert documents.original_extraction.raw_sha256 == asset.sha256
@@ -312,7 +314,7 @@ def test_verified_source_context_and_prospective_edit_use_frozen_policy(
     row.text = "| 0101 | " + "menşeli " * 300 + "| Ortak %50 sınırı |"
     row.chunk_type = "table"
     row.chunk_metadata = {
-        "intake_chunking_version": "4",
+        "intake_chunking_version": policy.chunking_version,
         "intake_preparation_policy": policy.model_dump(mode="json"),
         "chunk_variant": "atomic",
     }
@@ -321,7 +323,7 @@ def test_verified_source_context_and_prospective_edit_use_frozen_policy(
         embedding_provider=EmbeddingProvider.GOOGLE,
         embedding_model_name=google_settings.model_name,
         enable_contextual_rag=True,
-        intake_chunking_version="4",
+        intake_chunking_version=policy.chunking_version,
         intake_preparation_policy=policy,
     )
     session.flush()

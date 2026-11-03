@@ -499,7 +499,9 @@ def intake_snapshot(
             )
             .where(
                 RegulatoryDocumentIntakeFile.intake_id == batch.id,
-                RegulatoryChunk.chunk_metadata["intake_chunking_version"].astext == "4",
+                RegulatoryChunk.chunk_metadata["intake_chunking_version"].astext.in_(
+                    ("4", "5")
+                ),
             )
             .limit(1)
         )

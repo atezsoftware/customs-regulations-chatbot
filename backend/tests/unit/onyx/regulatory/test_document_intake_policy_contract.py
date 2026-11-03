@@ -55,7 +55,26 @@ def test_policy_budget_requires_frozen_identity_and_matching_provider() -> None:
         )
     with pytest.raises(ValueError):
         embedding_token_limit_for_metadata({"intake_chunking_version": "4"}, "table")
-    assert (
-        preparation_policy_for_model("google", "gemini-embedding-2")
-        == IntakePreparationPolicy()
-    )
+    assert preparation_policy_for_model(
+        "google", "gemini-embedding-2"
+    ) == IntakePreparationPolicy(chunking_version="5")
+
+
+def test_v5_new_target_is_explicit_and_old_frozen_v4_target_stays_v4() -> None:
+    new = preparation_policy_for_model("google", "gemini-embedding-2")
+    assert new is not None and new.chunking_version == "5"
+    assert reprepare_target_versions(
+        {
+            "target_chunking_version": "5",
+            "target_formatter_version": 4,
+            "target_preparation_policy": new.model_dump(mode="json"),
+        }
+    ) == ("5", 4)
+    with pytest.raises(ValueError, match="differ"):
+        reprepare_target_versions(
+            {
+                "target_chunking_version": "4",
+                "target_formatter_version": 4,
+                "target_preparation_policy": new.model_dump(mode="json"),
+            }
+        )

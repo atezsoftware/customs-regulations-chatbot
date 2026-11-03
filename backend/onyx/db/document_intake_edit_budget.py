@@ -71,7 +71,7 @@ def validate_intake_edit_budgets(
             enable_contextual_rag=contextual if version is None else True,
             intake_chunking_version=version,
         ): version
-        for version in (None, *sorted(SUPPORTED_INTAKE_CHUNKING_VERSIONS - {"4"}))
+        for version in (None, *sorted(SUPPORTED_INTAKE_CHUNKING_VERSIONS - {"4", "5"}))
     }
     limits: dict[UUID, int] = {}
     versions: dict[UUID, str | None] = {}
@@ -82,11 +82,12 @@ def validate_intake_edit_budgets(
                 row.chunk_metadata.get("intake_preparation_policy")
             )
             for row in rows
-            if row.chunk_metadata.get("intake_chunking_version") == "4"
+            if row.chunk_metadata.get("intake_chunking_version") in {"4", "5"}
         }
         if policies:
             if len(policies) != 1 or any(
-                row.chunk_metadata.get("intake_chunking_version") != "4" for row in rows
+                row.chunk_metadata.get("intake_chunking_version") not in {"4", "5"}
+                for row in rows
             ):
                 raise IntakeConflictError(
                     "Canonical intake preparation policies are inconsistent"
@@ -97,10 +98,10 @@ def validate_intake_edit_budgets(
                     embedding_provider=settings.provider_type,
                     embedding_model_name=settings.model_name,
                     enable_contextual_rag=True,
-                    intake_chunking_version="4",
+                    intake_chunking_version=policy.chunking_version,
                     intake_preparation_policy=policy.model_dump(mode="json"),
                 )
-            ] = "4"
+            ] = policy.chunking_version
         generation = file.regulatory_chunk_generation_hash
         if generation is None or generation not in generations:
             raise IntakeConflictError(
@@ -123,7 +124,7 @@ def validate_intake_edit_budgets(
     for file_id, rows in prospective.items():
         for row in rows:
             limit = limits[file_id]
-            if versions[file_id] == "4":
+            if versions[file_id] in {"4", "5"}:
                 limit = (
                     embedding_token_limit_for_metadata(
                         row.chunk_metadata,

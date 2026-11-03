@@ -100,7 +100,9 @@ def run_document_intake(*, intake_id: UUID, tenant_id: str) -> UUID | None:
                 prepare = prepare_intake_file
                 if policy is not None:
                     prepare = partial(
-                        prepare, chunking_version="4", preparation_policy=policy
+                        prepare,
+                        chunking_version=policy.chunking_version,
+                        preparation_policy=policy,
                     )
                 if graph is not None:
                     prepare = partial(
