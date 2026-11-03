@@ -18,7 +18,9 @@ from onyx.asv3.models import Decision, OutcomeStatus, RunContext, ToolOutcome
 from onyx.asv3.registry import CapabilityRegistry
 
 _SUPPORTED = "Yönetmelikte sınır kapısında tahsil usulü düzenlenir [1]."
-_JOINT = "6001 sayılı Kanun m.30 ve 5326 sayılı Kanun m.17 uyarınca çıkışa izin verilir."
+_JOINT = (
+    "6001 sayılı Kanun m.30 ve 5326 sayılı Kanun m.17 uyarınca çıkışa izin verilir."
+)
 _REPEATED = "6001 sayılı Kanun m.30 uyarınca ayrıca indirim uygulanır."
 _DRAFT = "\n\n".join((_SUPPORTED, _JOINT, _REPEATED))
 
