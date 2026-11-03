@@ -4,7 +4,7 @@ on:
     inputs:
       operation:
         type: choice
-        options: [inspect, frozen_6455]
+        options: [inspect, frozen_6455, queue_6455]
         default: inspect
       expected_version:
         type: string
@@ -39,3 +39,12 @@ jobs:
           set -euo pipefail
           aws eks update-kubeconfig --name atez-dev-cluster --region eu-central-1
           python backend/onyx/db/diagnose_6455_frozen_source_20261103.py --expected-version "$EXPECTED_VERSION" --manifest-sha "$MANIFEST_SHA"
+      - name: Read safe 6455 queue and worker state
+        if: inputs.operation == 'queue_6455'
+        shell: bash
+        env:
+          EXPECTED_VERSION: ${{ inputs.expected_version }}
+        run: |
+          set -euo pipefail
+          aws eks update-kubeconfig --name atez-dev-cluster --region eu-central-1
+          python backend/onyx/db/diagnose_6455_queue_readonly_20261103.py --expected-version "$EXPECTED_VERSION"
