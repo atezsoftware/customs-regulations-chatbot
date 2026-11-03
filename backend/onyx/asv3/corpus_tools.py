@@ -848,6 +848,7 @@ class CorpusBroker:
         if (
             context.services.get("asv3_exp_cropped") is True
             or context.services.get("asv3_fast") is True
+            or context.services.get("asv3_standard_normal") is True
         ):
             self._revalidate_canonical_batch(canonical, context)
         else:
