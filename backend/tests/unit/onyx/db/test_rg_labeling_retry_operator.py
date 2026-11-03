@@ -16,12 +16,14 @@ from onyx.db.models import RegulatoryDocumentIntake, RegulatoryLabelingRun
 @pytest.fixture
 def operator(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
     root = Path(__file__).resolve().parents[4] / "onyx/db"
+    module: ModuleType | None = None
     for name in ("_new_document_rg_operator", "_rg_labeling_retry_20261102"):
         spec = importlib.util.spec_from_file_location(name, root / f"{name}.py")
         assert spec is not None and spec.loader is not None
         module = importlib.util.module_from_spec(spec)
         monkeypatch.setitem(sys.modules, name, module)
         spec.loader.exec_module(module)
+    assert module is not None
     return module
 
 
