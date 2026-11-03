@@ -3,7 +3,28 @@ import type {
   RegulatoryChunk,
   RegulatoryChunkPage,
   RegulatoryChunkUpdate,
+  RetainedPdfEvidencePage,
 } from "@/lib/regulatory/interfaces";
+
+export async function fetchRetainedPdfEvidence(
+  userFileId: string,
+  documentSetId: number
+): Promise<RetainedPdfEvidencePage | null> {
+  const response = await fetch(
+    `/api/regulatory/files/${encodeURIComponent(userFileId)}/retained-pdf-evidence?document_set_id=${documentSetId}`
+  );
+  if (response.status === 404) return null;
+  if (!response.ok) handleRequestError("Fetch source PDFs", response);
+  return response.json();
+}
+
+export function retainedPdfEvidenceUrl(
+  userFileId: string,
+  evidenceId: string,
+  documentSetId: number
+): string {
+  return `/api/regulatory/files/${encodeURIComponent(userFileId)}/retained-pdf-evidence/${encodeURIComponent(evidenceId)}/download?document_set_id=${documentSetId}`;
+}
 
 const handleRequestError = (action: string, response: Response): never => {
   throw new Error(`${action} failed (Status: ${response.status})`);
