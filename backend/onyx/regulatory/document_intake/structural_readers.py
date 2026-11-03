@@ -239,6 +239,9 @@ class _NativeStyles:
     def centered_bold(self, paragraph: Tag) -> bool:
         if self.computed(paragraph)["text-align"] != "center":
             return False
+        return self.visible_bold(paragraph)
+
+    def visible_bold(self, paragraph: Tag) -> bool:
         for node in paragraph.descendants:
             if not isinstance(node, NavigableString) or not node.strip():
                 continue
