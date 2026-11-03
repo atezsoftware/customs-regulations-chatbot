@@ -14,6 +14,7 @@ from onyx.db.regulatory_annex_changes import capture_canonical_scope
 from onyx.regulatory.amendments.annexes.models import AnnexCanonicalSnapshot
 from onyx.regulatory.document_intake.structural_readers import NativeChapterReaderProof
 from onyx.regulatory.labeling.intake_abstention_repair import ABSTENTION_REPAIR_KEY
+from onyx.regulatory.labeling.self_repeal import SOURCE_ONLY_KEY
 
 STRUCTURAL_READER_KEY = "intake_structural_reader"
 FrozenLabelingSource = RegulatoryLabelingItem | RegulatoryDerivedLabelProjection
@@ -151,6 +152,20 @@ def complete_frozen_sources(
     """Preserve source-only headings in unchanged canonical context receipts."""
     sources: dict[str, FrozenLabelingSource] = {}
     for item in items:
+        if SOURCE_ONLY_KEY in item.source_snapshot:
+            from onyx.db.models import RegulatoryLabelingRun
+            from onyx.db.regulatory_labeling_self_repeal import (
+                validate_item_source_only_receipt,
+            )
+
+            try:
+                validate_item_source_only_receipt(
+                    session,
+                    item=item,
+                    run=session.get_one(RegulatoryLabelingRun, run_id),
+                )
+            except ValueError:
+                continue
         if ABSTENTION_REPAIR_KEY in item.source_snapshot:
             from onyx.db.models import RegulatoryLabelingRun
             from onyx.db.regulatory_labeling_semantic_repair import (

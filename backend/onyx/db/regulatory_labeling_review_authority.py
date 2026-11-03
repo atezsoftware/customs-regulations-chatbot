@@ -3,7 +3,7 @@
 import json
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from onyx.db.models import (
@@ -16,6 +16,7 @@ from onyx.db.regulatory_labeling_readers import (
     STRUCTURAL_READER_KEY,
     validated_reader_proof,
 )
+from onyx.db.regulatory_labeling_self_repeal import validate_item_source_only_receipt
 from onyx.db.regulatory_labeling_semantic_repair import (
     SEMANTIC_REPAIR_KEY,
     validate_item_semantic_repair_audit,
@@ -29,6 +30,10 @@ from onyx.regulatory.labeling.provider import (
     TaxonomyDefinition,
     build_labeling_request,
     validate_labeling_response,
+)
+from onyx.regulatory.labeling.self_repeal import (
+    SOURCE_ONLY_KEY,
+    SourceOnlySelfRepealReceipt,
 )
 
 
@@ -54,7 +59,7 @@ def _receipt_state(
 def _validate_completed_leaf(
     item: RegulatoryLabelingItem, taxonomy: TaxonomyDefinition
 ) -> None:
-    if item.status != "completed":
+    if item.status != "completed" or SOURCE_ONLY_KEY in item.source_snapshot:
         return
     if (
         not item.request_payload
@@ -90,7 +95,10 @@ def labeling_review_authority(
             select(RegulatoryLabelingItem)
             .where(
                 RegulatoryLabelingItem.run_id == run_id,
-                RegulatoryLabelingItem.source_snapshot.op("?")(SEMANTIC_REPAIR_KEY),
+                or_(
+                    RegulatoryLabelingItem.source_snapshot.op("?")(SEMANTIC_REPAIR_KEY),
+                    RegulatoryLabelingItem.source_snapshot.op("?")(SOURCE_ONLY_KEY),
+                ),
             )
             .order_by(RegulatoryLabelingItem.regulatory_chunk_id)
             .execution_options(populate_existing=True)
@@ -121,7 +129,21 @@ def labeling_review_authority(
     )
 
     semantic: list[dict[str, object]] = []
+    source_only: list[dict[str, object]] = []
     for item in repairs:
+        if SOURCE_ONLY_KEY in item.source_snapshot:
+            validate_item_source_only_receipt(session, item=item, run=run)
+            source_only.append(
+                {
+                    "chunk_id": item.regulatory_chunk_id,
+                    "receipt_sha256": publication_digest(
+                        SourceOnlySelfRepealReceipt.model_validate(
+                            item.source_snapshot[SOURCE_ONLY_KEY]
+                        ).model_dump(mode="json")
+                    ),
+                }
+            )
+            continue
         validate_item_semantic_repair_audit(session, item=item, run=run)
         audit = AbstentionRepairAudit.model_validate(
             item.source_snapshot[SEMANTIC_REPAIR_KEY]
@@ -163,6 +185,7 @@ def labeling_review_authority(
         for leaf in leaves:
             _validate_completed_leaf(leaf, taxonomy)
             validate_item_semantic_repair_audit(session, item=leaf, run=run)
+            validate_item_source_only_receipt(session, item=leaf, run=run)
         current = current_labeling_items_for_search(session, run=run, items=leaves)
         lineage = current_derived_label_sources_for_search(
             session, run=run, target=target
@@ -211,5 +234,6 @@ def labeling_review_authority(
         "taxonomy_id": str(run.taxonomy_id),
         "model": run.model,
         "semantic_repairs": semantic,
+        **({"source_only_dispositions": source_only} if source_only else {}),
         "structural_readers": structural,
     }
