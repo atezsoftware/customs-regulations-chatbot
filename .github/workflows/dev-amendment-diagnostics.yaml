@@ -85,8 +85,9 @@ jobs:
               return json.loads(command(args))
 
           def public_version():
-              with urllib.request.urlopen(origin, timeout=20) as response:
-                  version = json.load(response).get('backend_version')
+              # Use the same curl transport as the existing DEV frontend checks.
+              response = command(['curl', '--fail', '--silent', '--show-error', '--max-time', '20', '--proto', '=https', origin])
+              version = json.loads(response).get('backend_version')
               if version != expected_sha:
                   raise RuntimeError('Public frontend API backend SHA differs')
               return version
