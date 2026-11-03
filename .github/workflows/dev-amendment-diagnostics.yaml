@@ -6,7 +6,7 @@ on:
       operation:
         description: Inspect only, or restart the exact fixed DEV API deployment after owned-stream verification
         type: choice
-        options: [inspect, restart_owned_streams]
+        options: [inspect, activity, restart_owned_streams]
         default: inspect
         required: true
       expected_backend_commit:
@@ -14,9 +14,9 @@ on:
         type: string
         required: true
       owned_message_ids:
-        description: One or two owned smoke assistant message IDs, verified running by the operator before dispatch
+        description: One or two owned smoke assistant message IDs for restart mode, verified running by the operator before dispatch
         type: string
-        required: true
+        required: false
 permissions:
   contents: read
 concurrency:
@@ -54,12 +54,12 @@ jobs:
           origin = 'https://dev-customs-regulations.singlewindow.io/api/version'
           operation = os.environ['OPERATION']
           expected_sha = os.environ['EXPECTED_BACKEND_COMMIT']
-          owned_ids = os.environ['OWNED_MESSAGE_IDS'].split(',')
-          if operation not in ('inspect', 'restart_owned_streams'):
+          owned_ids = os.environ['OWNED_MESSAGE_IDS'].split(',') if os.environ['OWNED_MESSAGE_IDS'] else []
+          if operation not in ('inspect', 'activity', 'restart_owned_streams'):
               raise SystemExit('Unsupported operation')
           if re.fullmatch(r'[0-9a-f]{40}', expected_sha) is None:
               raise SystemExit('A full lowercase expected backend SHA is required')
-          if not 1 <= len(owned_ids) <= 2 or len(set(owned_ids)) != len(owned_ids) or any(re.fullmatch(r'[1-9][0-9]*', value) is None for value in owned_ids):
+          if (operation == 'restart_owned_streams' and not 1 <= len(owned_ids) <= 2) or len(owned_ids) > 2 or len(set(owned_ids)) != len(owned_ids) or any(re.fullmatch(r'[1-9][0-9]*', value) is None for value in owned_ids):
               raise SystemExit('One or two distinct owned assistant message IDs are required')
           owned_ids = [int(value) for value in owned_ids]
           out = Path('drain-proof')
@@ -128,6 +128,28 @@ jobs:
               return {'observed_at': stamp(), 'operation': operation, 'expected_backend_sha': expected_sha, 'public_backend_sha': public_version(), 'owned_message_ids': owned_ids, 'ownership_and_running_state_verification_source': 'operator_frontend_API_checks_outside_workflow', 'ownership_and_running_state_independently_verified_by_workflow': False, 'deployment_generation': deployment['metadata']['generation'], 'deployment_termination_grace_seconds': grace, 'pods': [pod]}
 
           try:
+              if operation == 'activity':
+                  deployment = kubernetes('deployment', deployment_name)
+                  if deployment['metadata'].get('namespace') != namespace:
+                      raise RuntimeError('Unexpected activity deployment namespace')
+                  backend_container(deployment['spec']['template']['spec'])
+                  public_version()
+                  ready = [p for p in kubernetes('pods')['items'] if p['metadata'].get('deletionTimestamp') is None and p['status']['phase'] == 'Running' and any(c.get('type') == 'Ready' and c.get('status') == 'True' for c in p['status'].get('conditions', []))]
+                  if len(ready) != 1:
+                      raise RuntimeError('Expected one Ready exact-image DEV API pod for activity observation')
+                  backend_container(ready[0]['spec'])
+                  activity_code = "import contextlib, io, json\nfrom uuid import UUID\nquiet = io.StringIO()\nwith contextlib.redirect_stdout(quiet), contextlib.redirect_stderr(quiet):\n    from onyx.configs.app_configs import CACHE_BACKEND\n    from onyx.cache.interface import CacheBackendType\n    if CACHE_BACKEND != CacheBackendType.REDIS:\n        raise RuntimeError('Activity mode requires Redis and refuses SQL cache access')\n    from onyx.cache.factory import get_cache_backend\n    from onyx.chat.chat_processing_checker import get_processing_run_id, _get_fence_key\n    cache = get_cache_backend(tenant_id='public')\n    rows = []\n    for text in ('37e9c668-6ae3-404a-a8d9-5ae7154fa95a', '2cd5c69b-e61f-437b-a202-e4d00dfc09e4', 'f0d44c29-921e-4faf-8125-69f91a48bb3c'):\n        session = UUID(text)\n        rows.append({'session_id': text, 'current_run_id': get_processing_run_id(session, cache), 'ttl_seconds': cache.ttl(_get_fence_key(session))})\nprint(json.dumps(rows, sort_keys=True))\n"
+                  args = ['kubectl', 'exec', '-i', ready[0]['metadata']['name'], '-n', namespace, '-c', container_name, '--', 'sh', '-ec', '. /vault/secrets/config; export PYTHONPATH=/app; exec python -']
+                  result = subprocess.run(args, input=activity_code, capture_output=True, text=True, timeout=60)
+                  if result.returncode:
+                      raise RuntimeError('Read-only Redis activity inspection failed with status ' + str(result.returncode))
+                  observed = json.loads(result.stdout)
+                  if not isinstance(observed, list) or len(observed) != 3:
+                      raise RuntimeError('Unexpected activity observation shape')
+                  save('activity.json', {'observed_at': stamp(), 'expected_backend_sha': expected_sha, 'pod_name': ready[0]['metadata']['name'], 'sessions': observed, 'mutation_started': False})
+                  print('ACTIVITY_FENCES', json.dumps(observed, sort_keys=True))
+                  save('result.json', {'observed_at': stamp(), 'status': 'READ_ONLY_ACTIVITY_OBSERVED', 'mutation_started': False})
+                  raise SystemExit(0)
               before = preflight()
               old_names = [p['name'] for p in before['pods']]
               save('preflight.json', before)
