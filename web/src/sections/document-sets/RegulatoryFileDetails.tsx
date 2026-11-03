@@ -23,6 +23,7 @@ import {
 } from "@/lib/regulatory/svc";
 import type { ProjectFile } from "@/lib/projects/types";
 import LegislationLineageCard from "@/sections/cards/LegislationLineageCard";
+import RetainedPdfEvidenceCard from "@/sections/cards/RetainedPdfEvidenceCard";
 
 const CHUNKS_PER_PAGE = 25;
 
@@ -385,6 +386,8 @@ export default function RegulatoryFileDetails({
           Document PDF
         </Button>
       </div>
+
+      <RetainedPdfEvidenceCard fileId={file.id} />
 
       {lineageEnabled && (
         <LegislationLineageCard

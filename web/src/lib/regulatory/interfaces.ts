@@ -25,6 +25,26 @@ export interface RegulatoryChunkPage {
   limit: number;
 }
 
+export interface RetainedPdfEvidence {
+  id: string;
+  original_filename: string;
+  relation: "equivalent_rendition" | "historical_rendition";
+  reason: string;
+  source_url: string | null;
+  byte_count: number;
+  created_at: string;
+  canonical_sha256: string;
+  canonical_generation_hash: string | null;
+}
+
+export interface RetainedPdfEvidencePage {
+  document_set_id: number;
+  user_file_id: string;
+  canonical_sha256: string;
+  canonical_generation_hash: string | null;
+  items: RetainedPdfEvidence[];
+}
+
 export interface RegulatoryChunkUpdate {
   expected_updated_at?: string;
   text?: string;

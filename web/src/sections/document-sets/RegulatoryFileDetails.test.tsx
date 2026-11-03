@@ -4,6 +4,11 @@ import { UserFileStatus } from "@/lib/projects/types";
 
 const mockUseFileChunks = jest.fn();
 
+jest.mock("@/sections/cards/RetainedPdfEvidenceCard", () => ({
+  __esModule: true,
+  default: () => null,
+}));
+
 jest.mock("@/lib/regulatory/hooks", () => ({
   useFileChunks: (...args: unknown[]) => mockUseFileChunks(...args),
 }));
