@@ -9,6 +9,7 @@ from onyx.db import document_intake as repository
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.file_store.file_store import get_default_file_store
 from onyx.regulatory.amendments.annexes.evidence import read_source_graph
+from onyx.regulatory.document_intake.metadata_checkpoint import MetadataLeaseLost
 from onyx.regulatory.document_intake.models import (
     IntakePreparationPolicy,
     IntakeSourceAsset,
@@ -131,6 +132,8 @@ def run_document_intake(*, intake_id: UUID, tenant_id: str) -> UUID | None:
             run_id = repository.start_intake_labeling(session, intake_id, token)
             session.commit()
         return run_id
+    except MetadataLeaseLost:
+        return None
     except Exception as error:
         logger.exception("New document intake failed: %s", intake_id)
         with get_session_with_current_tenant() as session:

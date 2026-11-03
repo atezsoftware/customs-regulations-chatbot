@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session
 
 from onyx.db import document_intake as intake
 from onyx.db import document_intake_metadata as metadata
+from onyx.db.enums import IndexModelStatus
 from onyx.db.labeling_configuration import LabelingProviderBinding
 from onyx.db.models import (
     DocumentSet,
@@ -26,10 +27,13 @@ from onyx.db.models import (
     RegulatoryChunk,
     RegulatoryDocumentIntake,
     RegulatoryDocumentIntakeFile,
+    RegulatoryFilePublication,
     RegulatorySourceAsset,
+    SearchSettings,
     User,
     UserFile,
 )
+from onyx.file_processing.original_ingestion import OriginalIngestionReceipt
 from onyx.file_store.file_store import FileStore
 from onyx.regulatory.document_intake import metadata_job
 from onyx.regulatory.document_intake.metadata import (
@@ -73,11 +77,55 @@ def _ready_metadata(
     RegulatoryChunk,
 ]:
     user, target, model = owner
+    if (
+        session.scalar(
+            select(SearchSettings).where(
+                SearchSettings.status == IndexModelStatus.PRESENT
+            )
+        )
+        is None
+    ):
+        session.add(
+            SearchSettings(
+                model_name="metadata-fixture",
+                model_dim=3,
+                normalize=False,
+                status=IndexModelStatus.PRESENT,
+                index_name="metadata-fixture",
+                enable_contextual_rag=False,
+            )
+        )
+        session.flush()
     batch, members = _admitted(session, user, target, model)
     token = uuid4()
     batch.lease_token = token
+    batch.stage = "metadata"
+    batch.lease_expires_at = datetime.datetime.now(
+        datetime.timezone.utc
+    ) + datetime.timedelta(minutes=10)
     for member in members:
         member.status = "chunked"
+        file = session.get_one(UserFile, member.user_file_id)
+        asset = session.get_one(RegulatorySourceAsset, member.source_asset_id)
+        file.regulatory_chunk_generation_hash = "e" * 64
+        session.add(
+            RegulatoryFilePublication(
+                user_file_id=file.id,
+                scope_key="metadata-test",
+                owner_id=uuid4(),
+                fencing_token=1,
+                lease_expires_at=datetime.datetime.now(datetime.timezone.utc),
+                epoch=0,
+                original_ingestion_receipt=OriginalIngestionReceipt(
+                    file_id=file.file_id,
+                    raw_sha256=asset.sha256,
+                    documents_sha256="b" * 64,
+                    plaintext_sha256="c" * 64,
+                    canonical_sha256="d" * 64,
+                    generation_hash="e" * 64,
+                ).model_dump(mode="json"),
+            )
+        )
     chunks = list(
         session.scalars(
             select(RegulatoryChunk).where(
@@ -517,6 +565,10 @@ def test_real_cached_gateway_reuses_acknowledged_window_after_failure_and_applie
         )
     assert METADATA_AUDIT_KEY not in article.chunk_metadata
     assert calls == 2
+    # Worker takeover changes ownership while acknowledged request identities survive.
+    token = uuid4()
+    batch.lease_token = token
+    intake_session.commit()
     metadata_job.run_intake_metadata(
         intake_id=batch.id, lease_token=token, tenant_id="public"
     )

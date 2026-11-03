@@ -11,6 +11,7 @@ from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.file_processing.original_ingestion import extracted_plaintext
 from onyx.file_store.file_store import get_default_file_store
 from onyx.regulatory.amendments.annexes.evidence import read_source_graph
+from onyx.regulatory.document_intake.metadata_checkpoint import MetadataLeaseLost
 from onyx.regulatory.document_intake.metadata_job import run_intake_metadata
 from onyx.regulatory.document_intake.models import IntakeSourceAsset
 from onyx.regulatory.document_intake.preparation import prepare_intake_file
@@ -151,6 +152,8 @@ def run_document_intake_reprepare(
             run_id = intake.start_intake_labeling(session, intake_id, token)
             session.commit()
         return run_id
+    except MetadataLeaseLost:
+        return None
     except repository.IntakeReprepareLabelingBusy:
         with get_session_with_current_tenant() as session:
             repository.defer_busy_reprepare(session, intake_id, request_id, token)
