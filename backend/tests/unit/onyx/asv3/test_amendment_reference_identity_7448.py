@@ -12,6 +12,7 @@ from pydantic import JsonValue
 from onyx.asv3 import cropped_focused_repair
 from onyx.asv3.assertions import assertion_inventory
 from onyx.asv3.authority import (
+    _named_native_references,
     explicit_reference_leads,
     native_named_statute_references,
     statute_references,
@@ -99,6 +100,53 @@ def test_explicit_own_amending_provision_remains_its_own_reference(
     assert ("6455", "234") not in identities
     if "4458" in text:
         assert ("4458", "234") in identities
+
+
+@pytest.mark.parametrize("syntactic", [False, True])
+@pytest.mark.parametrize("named_alias", [False, True])
+@pytest.mark.parametrize(
+    ("locator", "article", "qualifier"),
+    [
+        ("11/A", "11/A", None),
+        ("ek 11/A", "11/A", "ek"),
+        ("geçici 11/A", "11/A", "gecici"),
+        ("geçici 11", "11", "gecici"),
+        ("mükerrer 11/A", "11/A", "mukerrer"),
+    ],
+)
+def test_amending_own_inserted_article_and_qualifier_survive_both_parse_paths(
+    syntactic: bool,
+    named_alias: bool,
+    locator: str,
+    article: str,
+    qualifier: str | None,
+) -> None:
+    identity = "Faaliyet Kanununun" if named_alias else "6455 sayılı Kanunun"
+    text = f"{identity} {locator} maddesiyle 4458 sayılı Kanunun 234 üncü maddesi değişmiştir."
+    options = {
+        "strict_reference_boundaries": True,
+        "syntactic_reference_binding": syntactic,
+        "unicode_ordinals": True,
+    }
+    references = (
+        [
+            reference
+            for reference, _name in _named_native_references(
+                text, {"faaliyet kanun": {"6455"}}, **options
+            )
+        ]
+        if named_alias
+        else statute_references(text, **options)
+    )
+    assert {
+        (reference.article, reference.qualifier)
+        for reference in references
+        if reference.number == "6455"
+    } == {(article, qualifier)}
+    assert ("4458", "234", None) in {
+        (reference.number, reference.article, reference.qualifier)
+        for reference in references
+    }
 
 
 def test_named_instrumental_alias_also_keeps_the_article_owner_open() -> None:

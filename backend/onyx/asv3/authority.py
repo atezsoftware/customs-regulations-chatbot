@@ -127,6 +127,22 @@ class _BoundLocator:
     qualifier: str | None
 
 
+def _locator_from_match(match: re.Match[str]) -> _BoundLocator:
+    groups = match.groupdict()
+    article = match["article"].upper()
+    if inserted := groups.get("inserted"):
+        article += "/" + inserted.upper()
+    qualifier = groups.get("qualifier")
+    return _BoundLocator(
+        match.start(),
+        match.end(),
+        article,
+        groups.get("paragraph"),
+        groups.get("clause"),
+        folded(qualifier) if qualifier else None,
+    )
+
+
 def _bound_locator(
     text: str, start: int, *, bare: bool = False
 ) -> _BoundLocator | None:
@@ -148,18 +164,7 @@ def _bound_locator(
     match = max(matches, key=lambda value: value.end())
     if bare and re.match(r"\s*(?:sayili|tarihli|yil[a-z]*)\b", text[match.end() :]):
         return None
-    article = match["article"].upper()
-    if inserted := match["inserted"]:
-        article += "/" + inserted.upper()
-    qualifier = match["qualifier"]
-    return _BoundLocator(
-        start,
-        match.end(),
-        article,
-        match["paragraph"],
-        match["clause"],
-        folded(qualifier) if qualifier else None,
-    )
+    return _locator_from_match(match)
 
 
 def _explicit_reverse_instrument(text: str, start: int) -> bool:
@@ -362,14 +367,14 @@ def statute_references(
         ]
         for pattern in (_COMPACT_ARTICLE, _SHORTHAND_ARTICLE, _BOUND_REVERSE):
             for subunit in pattern.finditer(tail):
-                qualifier = subunit.groupdict().get("qualifier")
+                locator = _locator_from_match(subunit)
                 candidates.append(
                     (
-                        subunit.start(),
-                        subunit["article"],
-                        subunit["paragraph"],
-                        subunit["clause"],
-                        folded(qualifier) if qualifier else None,
+                        locator.start,
+                        locator.article,
+                        locator.paragraph,
+                        locator.clause,
+                        locator.qualifier,
                     )
                 )
         article, paragraph, clause, qualifier = (
@@ -725,14 +730,14 @@ def _named_native_references(
             article = locators[0][1].article_no if locators else None
             qualifier = locators[0][1].qualifier if locators else None
             subunits = [
-                part
+                _locator_from_match(part)
                 for pattern in (_COMPACT_ARTICLE, _SHORTHAND_ARTICLE, _BOUND_REVERSE)
                 if (part := pattern.search(tail)) is not None
             ]
             if subunits:
-                first = min(subunits, key=lambda part: part.start())
-                article = first["article"]
-                qualifier = first.groupdict().get("qualifier") or qualifier
+                first = min(subunits, key=lambda part: part.start)
+                article = first.article
+                qualifier = first.qualifier or qualifier
             references.append(
                 (
                     StatuteReference(
