@@ -211,6 +211,7 @@ from onyx.server.query_and_chat.streaming_models import (
     AgentResponseStart,
     ASv3Progress,
     CitationInfo,
+    OverallStop,
     Packet,
     SectionEnd,
 )
@@ -3262,3 +3263,4 @@ def run_asv3_loop(
                     logger.exception(
                         "Parallel checkpoint persistence failed during teardown"
                     )
+    emitter.emit(Packet(placement=Placement(turn_index=0), obj=OverallStop()))
