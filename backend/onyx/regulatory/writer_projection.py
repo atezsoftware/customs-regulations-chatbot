@@ -189,6 +189,7 @@ def prepare_owned_correction(
     bindings: list[AnnexTemporalProjection] = []
     indexes: list[PublicationIndexSnapshot] = []
     views: list[PreparedContextView] = []
+    context_calls = {call.request_sha256: call for call in inputs.cached.calls}
     impacts: list[AmendmentImpactReport] = []
     revisions: dict[UUID, UUID] = {}
     for settings in sorted(
@@ -473,7 +474,9 @@ def prepare_owned_correction(
                 search_settings=settings,
                 embedder=embedder,
                 llm=llm,
-                cached=inputs.cached,
+                cached=inputs.cached.model_copy(
+                    update={"calls": list(context_calls.values())}
+                ),
                 as_of_date=when,
                 target_ids=(
                     {
@@ -486,6 +489,7 @@ def prepare_owned_correction(
                 ),
             )
             views.append(view)
+            context_calls.update((call.request_sha256, call) for call in view.calls)
             for context in view.projections:
                 if frozen_encoder_options(context.embedding_config):
                     complete_receipt = _encoder_receipt(
