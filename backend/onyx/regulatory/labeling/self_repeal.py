@@ -3,6 +3,7 @@
 import datetime
 import hashlib
 import re
+import unicodedata
 from collections.abc import Sequence
 from typing import Literal
 from uuid import UUID
@@ -13,7 +14,10 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from onyx.document_index.publication_models import publication_digest
 from onyx.regulatory.amendments.annexes.models import AnnexCanonicalSnapshot
 from onyx.regulatory.amendments.annexes.sources import MAX_ASSET_BYTES
-from onyx.regulatory.document_intake.structural_readers import _NativeStyles
+from onyx.regulatory.document_intake.structural_readers import (
+    _NativeStyles,
+    is_ordinal_chapter_heading,
+)
 from onyx.regulatory.labeling.intake_abstention_repair import AbstentionRepairAudit
 from onyx.utils.web_content import decode_html_bytes
 
@@ -33,12 +37,28 @@ def normalized_text(text: str) -> str:
 
 
 def _title(text: str) -> str:
-    return normalized_text(re.sub(r"\[\d+\]", "", text)).casefold()
+    text = unicodedata.normalize("NFC", text).translate(
+        str.maketrans({"I": "ı", "İ": "i"})
+    )
+    return unicodedata.normalize(
+        "NFC", normalized_text(re.sub(r"\[\d+\]", "", text)).casefold()
+    )
+
+
+def _own_article_path(row: AnnexCanonicalSnapshot) -> tuple[str, ...]:
+    matches = [
+        index
+        for index, heading in enumerate(row.heading_path)
+        if (match := _ARTICLE.match(normalized_text(heading)))
+        and match[1] == str(row.metadata.get("article_no"))
+    ]
+    if len(matches) != 1:
+        raise ValueError("The canonical own article heading is ambiguous")
+    return tuple(row.heading_path[: matches[0] + 1])
 
 
 def _caption(row: AnnexCanonicalSnapshot) -> str:
-    heading = row.heading_path[-1] if row.heading_path else ""
-    return _ARTICLE.sub("", heading).strip()
+    return _ARTICLE.sub("", _own_article_path(row)[-1]).strip()
 
 
 class SelfRepealSourceProof(BaseModel):
@@ -187,6 +207,102 @@ def _native_interval_text(start: Tag, end: Tag, styles: _NativeStyles) -> str:
     raise ValueError("The native own article DOM boundary is incomplete")
 
 
+def _next_section_transition(
+    *,
+    start: Tag,
+    end: Tag,
+    styles: _NativeStyles,
+    target: AnnexCanonicalSnapshot,
+    next_rows: Sequence[AnnexCanonicalSnapshot],
+    rows: Sequence[AnnexCanonicalSnapshot],
+) -> None:
+    """Account for a new canonical branch before the next own article."""
+    paths = {_own_article_path(row) for row in next_rows}
+    if len(paths) != 1:
+        raise ValueError("The next own article branch is ambiguous")
+    next_path = next(iter(paths))
+    current_path = _own_article_path(target)
+    common = 0
+    for left, right in zip(current_path[:-1], next_path[:-1]):
+        if left != right:
+            break
+        common += 1
+    markers = list(next_path[common:-1])
+    if (
+        not common
+        or not 1 <= len(markers) <= 4
+        or any(
+            not is_ordinal_chapter_heading(
+                marker.removesuffix(" KISIM") + " BÖLÜM"
+                if marker.endswith(" KISIM")
+                else marker
+            )
+            for marker in markers
+        )
+    ):
+        raise ValueError("The next branch has no exact canonical ordinal boundary")
+    next_position = min(row.position for row in next_rows)
+    transitions = sorted(
+        (row for row in rows if target.position < row.position < next_position),
+        key=lambda row: (row.position, row.id),
+    )
+    if len(transitions) > 8 or any(
+        row.status != "active"
+        or row.superseded_by_chunk_id is not None
+        or row.metadata.get("chunk_variant") != "atomic"
+        or row.chunk_type != "free_text"
+        or row.metadata.get("article_no") is not None
+        or not common < len(row.heading_path) < len(next_path)
+        or tuple(row.heading_path) != next_path[: len(row.heading_path)]
+        for row in transitions
+    ):
+        raise ValueError("The next section has no complete canonical caption scope")
+    captions = [
+        normalized_text(line)
+        for row in transitions
+        for line in row.text.splitlines()
+        if line.strip()
+    ]
+    if len(captions) > 16:
+        raise ValueError("The next canonical caption scope is too broad")
+    blocks: list[Tag] = []
+    for node in start.next_elements:
+        if node is end:
+            break
+        if start in node.parents:
+            continue
+        if (
+            isinstance(node, Tag)
+            and node.name in {"p", "h1", "h2", "h3", "h4", "h5", "h6"}
+            and normalized_text(node.get_text(" ", strip=True))
+        ):
+            blocks.append(node)
+    values = [normalized_text(block.get_text(" ", strip=True)) for block in blocks]
+    next_caption = _caption(next_rows[0])
+    if not values or values[0] != markers[0] or values[-1] != next_caption:
+        raise ValueError(
+            "The next canonical section boundary or own caption is missing"
+        )
+    marker_index = caption_index = 0
+    for block, value in zip(blocks[:-1], values[:-1]):
+        if not _visible_native(block, styles) or not styles.centered_bold(block):
+            raise ValueError("The next native section heading is hidden or ambiguous")
+        if marker_index < len(markers) and value == markers[marker_index]:
+            marker_index += 1
+        elif caption_index < len(captions) and value == captions[caption_index]:
+            caption_index += 1
+        else:
+            raise ValueError(
+                "The native section contains extra or noncanonical content"
+            )
+    if marker_index != len(markers) or caption_index != len(captions):
+        raise ValueError("The native next section is incomplete")
+    if not _visible_native(blocks[-1], styles) or not styles.visible_bold(blocks[-1]):
+        raise ValueError("The next native own article caption is hidden or ambiguous")
+    if _native_interval_text(start, end, styles) != normalized_text(" ".join(values)):
+        raise ValueError("The native next section contains unmodeled content")
+
+
 def _own_header(paragraph: Tag, styles: _NativeStyles) -> bool:
     first = next(
         (
@@ -200,7 +316,7 @@ def _own_header(paragraph: Tag, styles: _NativeStyles) -> bool:
         _visible_native(paragraph, styles)
         and first is not None
         and isinstance(first.parent, Tag)
-        and normalized_text(str(first)).startswith("MADDE")
+        and re.match(r"madde\b", normalized_text(str(first)), re.I) is not None
         and styles.computed(first.parent)["font-weight"]
         in {"bold", "700", "800", "900"}
     )
@@ -269,6 +385,10 @@ def build_self_repeal_source_proof(
     article = full["article"]
     number = str(row.metadata.get("document_number", ""))
     title = row.metadata.get("document_title")
+    if title is None and row.heading_path:
+        root = row.heading_path[0]
+        if re.fullmatch(r".+\s+kanunu?", _title(root)):
+            title = root
     if not number.isdecimal() or not isinstance(title, str) or not title.strip():
         raise ValueError("The self-repeal article has no verified own law identity")
     atomics = [r for r in rows if r.metadata.get("chunk_variant") == "atomic"]
@@ -343,18 +463,27 @@ def build_self_repeal_source_proof(
     ):
         raise ValueError("The native own article region is hidden or ambiguous")
     between = [text for text in texts[index + 1 : following[0]] if text]
-    if _native_interval_text(
-        paragraph, paragraphs[following[0]], styles
-    ) != normalized_text(" ".join(between)):
-        raise ValueError(
-            "The native whole article has unmodeled content outside paragraphs"
+    simple_caption = (
+        len(next_captions) == 1
+        and between == list(next_captions)
+        and bool(next(iter(next_captions)))
+    )
+    if simple_caption:
+        if _native_interval_text(
+            paragraph, paragraphs[following[0]], styles
+        ) != normalized_text(" ".join(between)):
+            raise ValueError(
+                "The native whole article has unmodeled content outside paragraphs"
+            )
+    else:
+        _next_section_transition(
+            start=paragraph,
+            end=paragraphs[following[0]],
+            styles=styles,
+            target=row,
+            next_rows=next_rows,
+            rows=rows,
         )
-    if (
-        len(next_captions) != 1
-        or between != list(next_captions)
-        or not next(iter(next_captions))
-    ):
-        raise ValueError("The native article contains extra or unbounded content")
     return SelfRepealSourceProof(
         user_file_id=user_file_id,
         source_asset_id=source_asset_id,
