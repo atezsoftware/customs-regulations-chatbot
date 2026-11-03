@@ -62,8 +62,7 @@ from onyx.chat.models import (
 from onyx.chat.prompt_utils import calculate_reserved_tokens
 from onyx.chat.response_workflow import response_workflow
 from onyx.chat.save_chat import save_chat_turn
-from onyx.chat.stop_signal_checker import is_connected as check_stop_signal
-from onyx.chat.stop_signal_checker import reset_cancel_status
+from onyx.chat.stop_signal_checker import TurnCancellationProbe, reset_cancel_status
 from onyx.chat.stream_buffer import StreamBufferWriter
 from onyx.configs.app_configs import DISABLE_VECTOR_DB, INTEGRATION_TESTS_MODE
 from onyx.configs.chat_configs import CHAT_HEARTBEAT_INTERVAL_S
@@ -1296,8 +1295,7 @@ def build_chat_turn(
     cache = get_cache_backend()
     reset_cancel_status(chat_session.id, cache)
 
-    def check_is_connected() -> bool:
-        return check_stop_signal(chat_session.id, cache)
+    check_is_connected = TurnCancellationProbe(chat_session.id, cache)
 
     set_processing_status(
         chat_session_id=chat_session.id,
@@ -2060,6 +2058,7 @@ def _run_models(
                         reasoning_effort=setup.reasoning_effort,
                         include_citations=setup.new_msg_req.include_citations,
                         cache=setup.cache,
+                        check_is_connected=setup.check_is_connected,
                         research_profile=research_profile,
                         parallel_research=workflow.parallel_research,
                         workflow_variant=workflow.workflow_variant,
