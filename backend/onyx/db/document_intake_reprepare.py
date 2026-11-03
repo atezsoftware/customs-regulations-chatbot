@@ -45,6 +45,7 @@ from onyx.file_processing.original_ingestion import (
 from onyx.natural_language_processing.utils import BaseTokenizer
 from onyx.regulatory.amendments.annexes.models import AnnexCanonicalSnapshot
 from onyx.regulatory.document_intake.metadata import METADATA_AUDIT_KEY
+from onyx.regulatory.document_intake.models import IntakePreparationPolicy
 
 
 class IntakeReprepareLabelingBusy(intake.IntakeConflictError):
@@ -305,7 +306,11 @@ def reprepare_snapshot(
             if batch.labeling_run_id
             else None,
             documents=payload,
-            target_chunking_version="4" if target_policy is not None else "3",
+            target_chunking_version=IntakePreparationPolicy.model_validate(
+                target_policy
+            ).chunking_version
+            if target_policy is not None
+            else "3",
             target_formatter_version=4,
             **(
                 {"target_preparation_policy": target_policy}
@@ -366,7 +371,11 @@ def request_reprepare(
         )
         audit[item["document_id"]] = {
             **item,
-            "target_chunking_version": "4" if target_policy is not None else "3",
+            "target_chunking_version": IntakePreparationPolicy.model_validate(
+                target_policy
+            ).chunking_version
+            if target_policy is not None
+            else "3",
             "target_formatter_version": 4,
             **(
                 {"target_preparation_policy": target_policy}

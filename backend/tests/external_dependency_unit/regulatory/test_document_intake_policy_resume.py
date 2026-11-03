@@ -173,6 +173,7 @@ def test_committed_file_reload_keeps_target_policy_after_process_interruption(
     assert token is not None
     member = members[0]
     file = session.get_one(UserFile, member.user_file_id)
+    target_policy = IntakePreparationPolicy(chunking_version="5")
     target = load_verified_intake_documents(
         package_id=package.id,
         asset=by_id[member.source_asset_id],
@@ -180,8 +181,8 @@ def test_committed_file_reload_keeps_target_policy_after_process_interruption(
         links=links,
         package_assets=views,
         store=store,
-        chunking_version="4",
-        preparation_policy=policy,
+        chunking_version="5",
+        preparation_policy=target_policy,
     )
     documents_to_regulatory_chunks(
         target, session, tokenizer, enable_contextual_rag=True
@@ -190,8 +191,8 @@ def test_committed_file_reload_keeps_target_policy_after_process_interruption(
         embedding_provider=EmbeddingProvider.GOOGLE,
         embedding_model_name=google_settings.model_name,
         enable_contextual_rag=True,
-        intake_chunking_version="4",
-        intake_preparation_policy=policy,
+        intake_chunking_version="5",
+        intake_preparation_policy=target_policy,
     )
     file.regulatory_chunk_generation_hash = generation
     canonical = canonical_scope_digest(session, file.id)
@@ -215,7 +216,7 @@ def test_committed_file_reload_keeps_target_policy_after_process_interruption(
     assert loaded[0].doc_metadata is not None
     assert loaded[0].doc_metadata["regulatory_document_intake"][
         "preparation_policy"
-    ] == policy.model_dump(mode="json")
+    ] == target_policy.model_dump(mode="json")
     assert canonical_scope_digest(session, file_id) == canonical
     assert (
         session.get_one(RegulatoryDocumentIntakeReprepare, request_id).documents

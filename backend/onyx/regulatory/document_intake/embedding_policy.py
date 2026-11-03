@@ -14,7 +14,7 @@ def preparation_policy_for_model(
     provider: str | None, model_name: str | None
 ) -> IntakePreparationPolicy | None:
     if provider == "google" and model_name == "gemini-embedding-2":
-        return IntakePreparationPolicy()
+        return IntakePreparationPolicy(chunking_version="5")
     return None
 
 
