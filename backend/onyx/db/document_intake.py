@@ -1131,6 +1131,18 @@ def _start_intake_labeling_for_batch(
         if batch.labeling_run_id
         else None
     )
+    from onyx.db.document_intake_metadata_review import (
+        require_fresh_reviewed_metadata,
+        reviewed_metadata_edit,
+    )
+
+    reviewed = reviewed_metadata_edit(batch)
+    refreshed = (
+        reviewed is not None
+        and reviewed.previous_labeling_run_id == batch.labeling_run_id
+    )
+    if refreshed:
+        require_fresh_reviewed_metadata(session, batch)
     from onyx.db.document_intake_reprepare import latest_reprepare
 
     reprepare = latest_reprepare(session, batch.id)
@@ -1141,6 +1153,7 @@ def _start_intake_labeling_for_batch(
     )
     if (
         existing
+        and not refreshed
         and existing.status in {"queued", "running", "completed"}
         and set(existing.file_ids) == {str(member.user_file_id) for member in files}
     ):
@@ -1177,7 +1190,9 @@ def _start_intake_labeling_for_batch(
             requested_by_id=batch.created_by,
             idempotency_key=uuid5(
                 batch.id,
-                str(existing.id)
+                "reviewed-edit:" + publication_digest(reviewed.model_dump(mode="json"))
+                if refreshed and reviewed is not None
+                else str(existing.id)
                 if existing
                 else "reprepare:" + str(reprepare.id)
                 if reprepare is not None

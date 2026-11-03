@@ -175,6 +175,38 @@ def invalidate_metadata_file_context(rows: Sequence[RegulatoryChunk]) -> None:
         row.chunk_metadata = metadata
 
 
+def _stale_model_fields(row: RegulatoryChunk) -> set[str]:
+    audit = row.chunk_metadata.get(METADATA_AUDIT_KEY)
+    fields = audit.get("fields", {}) if isinstance(audit, dict) else {}
+    if not isinstance(fields, dict):
+        return set()
+    return {
+        key
+        for key, entry in fields.items()
+        if isinstance(entry, dict)
+        and entry.get("source") == "llm"
+        and entry.get("stale") is True
+    }
+
+
+def metadata_receipts_current(rows: Sequence[RegulatoryChunk], input_hash: str) -> bool:
+    canonical = [row for row in rows if not is_hierarchical_aggregate_chunk(row)]
+    return bool(canonical) and all(
+        isinstance(audit := row.chunk_metadata.get(METADATA_AUDIT_KEY), dict)
+        and audit.get("model") == METADATA_MODEL
+        and audit.get("version") == METADATA_VERSION
+        and audit.get("input_sha256") == input_hash
+        and audit.get("input_stale") is False
+        and isinstance(audit.get("fields"), dict)
+        and all(
+            isinstance(entry, dict)
+            and (entry.get("source") != "llm" or entry.get("stale") is False)
+            for entry in audit["fields"].values()
+        )
+        for row in canonical
+    )
+
+
 def metadata_chunks(rows: Sequence[RegulatoryChunk]) -> list[MetadataChunk]:
     return [
         MetadataChunk(
@@ -185,7 +217,7 @@ def metadata_chunks(rows: Sequence[RegulatoryChunk]) -> list[MetadataChunk]:
             structural_metadata={
                 key: deepcopy(value)
                 for key, value in row.chunk_metadata.items()
-                if key in LEGAL_METADATA_FIELDS
+                if key in LEGAL_METADATA_FIELDS and key not in _stale_model_fields(row)
             },
         )
         for row in rows
@@ -222,7 +254,18 @@ def load_metadata_work(
     batch.lease_expires_at = datetime.datetime.now(
         datetime.timezone.utc
     ) + datetime.timedelta(minutes=10)
+    from onyx.db.document_intake_metadata_review import (
+        require_reviewed_document,
+        reviewed_metadata_edit,
+    )
     from onyx.db.document_intake_review import effective_intake_files
+
+    reviewed = reviewed_metadata_edit(batch)
+    if (
+        reviewed is not None
+        and reviewed.previous_labeling_run_id != batch.labeling_run_id
+    ):
+        reviewed = None
 
     members = (
         effective_intake_files(session, batch)
@@ -236,22 +279,32 @@ def load_metadata_work(
         if not chunks:
             raise ValueError("Metadata requires at least one canonical source chunk")
         input_hash = metadata_input_hash(chunks)
-        complete = all(
-            isinstance(row.chunk_metadata.get(METADATA_AUDIT_KEY), dict)
-            and row.chunk_metadata[METADATA_AUDIT_KEY].get("input_sha256") == input_hash
-            for row in rows
-            if not is_hierarchical_aggregate_chunk(row)
+        complete = metadata_receipts_current(rows, input_hash)
+        authorized = (
+            reviewed is not None
+            and member.id in reviewed.documents
+            and reviewed.documents[member.id].refresh_metadata
         )
-        try:
-            validate_metadata_receipt_evidence(rows, chunks)
-        except ValueError as error:
-            if batch.labeling_run_id is not None:
-                raise intake.IntakeConflictError(
-                    "Saved locator evidence changed its validation contract; review this import before labeling or approval"
-                ) from error
-            complete = False
+        if authorized and not complete:
+            assert reviewed is not None
+            require_reviewed_document(
+                reviewed.documents[member.id], member.user_file_id, rows
+            )
+        else:
+            try:
+                validate_metadata_receipt_evidence(rows, chunks)
+            except ValueError as error:
+                if batch.labeling_run_id is not None:
+                    raise intake.IntakeConflictError(
+                        "Saved locator evidence changed its validation contract; review this import before labeling or approval"
+                    ) from error
+                complete = False
+        if batch.labeling_run_id is not None and not complete and not authorized:
+            raise intake.IntakeConflictError(
+                "Unreviewed post-label metadata cannot be regenerated"
+            )
         # Label retries and manually edited reviews retain their reviewed metadata.
-        if batch.labeling_run_id is not None or complete:
+        if complete:
             continue
         work.append((member.id, chunks))
     return batch, work
@@ -409,6 +462,13 @@ def apply_metadata_results(
         for target in result.chunks:
             row = by_id[target.chunk_id]
             metadata, audit = deepcopy(row.chunk_metadata), _audit(row)
+            for field, entry in list(audit["fields"].items()):
+                if entry.get("source") == "llm" and entry.get("stale") is True:
+                    audit["fields"].pop(field)
+                    if field in VALIDITY_FIELDS:
+                        setattr(row, field, None)
+                    elif field in LEGAL_METADATA_FIELDS:
+                        metadata.pop(field, None)
             for fact in target.fields:
                 if audit["fields"].get(fact.field, {}).get("source") == "manual":
                     continue
