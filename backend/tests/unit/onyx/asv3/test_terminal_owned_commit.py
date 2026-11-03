@@ -143,6 +143,7 @@ def test_no_draft_and_plain_profiles_do_not_expose_owned_commit() -> None:
 
 @pytest.mark.parametrize("missing", [False, True])
 @pytest.mark.parametrize("patch", [False, True])
+@pytest.mark.usefixtures("synthetic_openai_terminal_host")
 def test_actual_hosted_commit_needs_current_invocation_originals(
     monkeypatch: pytest.MonkeyPatch, missing: bool, patch: bool
 ) -> None:

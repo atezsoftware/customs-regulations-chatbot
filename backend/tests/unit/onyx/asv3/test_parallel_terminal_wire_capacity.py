@@ -23,6 +23,7 @@ from tests.unit.onyx.asv3.test_terminal_wire_schema import context
         ("vertex_ai", "gpt-6-luna", False),
     ],
 )
+@pytest.mark.usefixtures("synthetic_openai_terminal_host")
 def test_input_accounting_uses_exact_wire_and_preserves_selected_host_schemas(
     provider: str, name: str, expanded: bool
 ) -> None:

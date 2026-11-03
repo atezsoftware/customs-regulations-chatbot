@@ -287,6 +287,7 @@ def test_hosted_checkpoint_captures_complete_restorable_session_once(
         ("originals", "İşleme uygulanacak özgün koşul okunmuştur [1]."),
     ],
 )
+@pytest.mark.usefixtures("synthetic_openai_terminal_host")
 def test_real_serial_and_owned_session_use_same_prompt_schemas_and_terminal_handlers(
     monkeypatch: pytest.MonkeyPatch, kind: Kind, body: str
 ) -> None:
