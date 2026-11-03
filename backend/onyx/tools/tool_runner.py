@@ -1,3 +1,4 @@
+import hashlib
 import threading
 import traceback
 from collections import defaultdict
@@ -62,6 +63,7 @@ GENERIC_TOOL_ERROR_MESSAGE = "Tool failed with error: {error}"
 DEFAULT_SEARCH_MAX_LLM_CHUNKS = MAX_CHUNKS_FED_TO_CHAT
 PARALLEL_SEARCH_TARGET_TOTAL_LLM_CHUNKS = 84
 PARALLEL_SEARCH_MIN_LLM_CHUNKS_PER_CALL = 8
+_CANDIDATE_AUDIT_RUN_ID_MAX_LENGTH = 128
 
 # 10 minute timeout for tool execution to prevent indefinite hangs
 TOOL_EXECUTION_TIMEOUT_SECONDS = 10 * 60
@@ -72,6 +74,13 @@ MERGEABLE_TOOL_FIELDS: dict[str, str] = {
     WebSearchTool.NAME: QUERIES_FIELD,
     OpenURLTool.NAME: URLS_FIELD,
 }
+
+
+def _candidate_audit_run_id(tool_call_id: str) -> str:
+    # Provider IDs can contain opaque thought signatures needed for native replay.
+    if len(tool_call_id) <= _CANDIDATE_AUDIT_RUN_ID_MAX_LENGTH:
+        return tool_call_id
+    return "tool_call_sha256:" + hashlib.sha256(tool_call_id.encode()).hexdigest()
 
 
 def _merge_tool_calls(tool_calls: list[ToolCallKickoff]) -> list[ToolCallKickoff]:
@@ -601,7 +610,7 @@ def run_tool_calls(
             )
             override_kwargs = SearchToolOverrideKwargs(
                 starting_citation_num=starting_citation_num,
-                candidate_audit_run_id=tool_call.tool_call_id,
+                candidate_audit_run_id=_candidate_audit_run_id(tool_call.tool_call_id),
                 original_query=search_original_query,
                 rerank_context=search_rerank_context,
                 message_history=search_message_history,

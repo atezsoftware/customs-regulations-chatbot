@@ -17,6 +17,7 @@ from onyx.tools.tool_runner import (
     DEFAULT_SEARCH_MAX_LLM_CHUNKS,
     PARALLEL_SEARCH_MIN_LLM_CHUNKS_PER_CALL,
     PARALLEL_SEARCH_TARGET_TOTAL_LLM_CHUNKS,
+    _candidate_audit_run_id,
     _has_completed_internal_search_in_current_turn,
     _max_llm_chunks_per_search_call,
     _merge_tool_calls,
@@ -748,3 +749,47 @@ def test_provision_and_internal_search_get_distinct_citation_slots() -> None:
     params = parallel.call_args.args[0]
     overrides = [args[2] for _, args in params]
     assert [item.starting_citation_num for item in overrides] == [1, 101]
+
+
+@pytest.mark.parametrize(
+    "tool_call_id",
+    ["call_1", "x" * 128, "call_788845__thought__" + "AY" * 4096],
+)
+def test_search_audit_accepts_provider_ids_without_changing_native_call(
+    tool_call_id: str,
+) -> None:
+    from onyx.tools.tool_implementations.search.search_tool import SearchTool
+
+    search = MagicMock(spec=SearchTool)
+    search.name = SearchTool.NAME
+    call = _make_tool_call(
+        search.name, {"queries": ["transit cancellation"]}, tool_call_id
+    )
+    with patch(
+        "onyx.tools.tool_runner.run_functions_tuples_in_parallel", return_value=[]
+    ) as parallel:
+        run_tool_calls(
+            tool_calls=[call],
+            tools=[search],
+            message_history=[_chat_message("Soruyu araştır", MessageType.USER)],
+            user_memory_context=None,
+            user_info=None,
+            citation_mapping={},
+            next_citation_num=1,
+        )
+
+    ((_, args),) = parallel.call_args.args[0]
+    native_call, overrides = args[1:]
+    assert native_call.tool_call_id == tool_call_id
+    assert call.tool_call_id == tool_call_id
+    assert 0 < len(overrides.candidate_audit_run_id) <= 128
+    assert overrides.candidate_audit_run_id == _candidate_audit_run_id(tool_call_id)
+    if len(tool_call_id) <= 128:
+        assert overrides.candidate_audit_run_id == tool_call_id
+
+
+def test_long_audit_ids_distinguish_calls_with_the_same_prefix() -> None:
+    prefix = "call_788845__thought__" + "AY" * 4096
+    assert _candidate_audit_run_id(prefix + "a") != _candidate_audit_run_id(
+        prefix + "b"
+    )
