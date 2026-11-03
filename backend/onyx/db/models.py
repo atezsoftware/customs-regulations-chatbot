@@ -9036,6 +9036,12 @@ class RegulatoryDocumentIntake(Base):
     preparation_policy: Mapped[dict[str, Any] | None] = mapped_column(
         PGJSONB(none_as_null=True), nullable=True
     )
+    metadata_checkpoint: Mapped[dict[str, Any] | None] = mapped_column(
+        PGJSONB(none_as_null=True), nullable=True
+    )
+    metadata_recovery_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
     status: Mapped[str] = mapped_column(Text, default="preparing")
     stage: Mapped[str] = mapped_column(Text, default="chunking")
     review_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
@@ -9049,6 +9055,13 @@ class RegulatoryDocumentIntake(Base):
     )
     updated_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "metadata_recovery_count BETWEEN 0 AND 3",
+            name="ck_regulatory_intake_metadata_recovery_count",
+        ),
     )
 
 
