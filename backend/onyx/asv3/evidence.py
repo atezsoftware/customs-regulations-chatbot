@@ -16,6 +16,48 @@ from onyx.asv3.models import (
 )
 from onyx.asv3.witnesses import original_witness_spans
 from onyx.context.search.models import SearchDoc
+from onyx.regulatory.law_identity import (
+    LAW_DOCUMENT_TYPES,
+    unnumbered_own_law_masthead_number,
+)
+
+
+def _own_law_masthead(item: EvidenceItem) -> bool:
+    metadata = model_evidence_metadata(item.metadata)
+    headings = metadata.get("heading_path")
+    return bool(
+        item.search_doc is not None
+        and item.chunk_id
+        and item.search_doc.document_id == item.source_id
+        and item.search_doc.metadata.get("regulatory_chunk_id") == item.chunk_id
+        and str(metadata.get("document_type") or "").casefold() in LAW_DOCUMENT_TYPES
+        and not any(
+            metadata.get(key)
+            for key in ("derived", "external", "untrusted", "truncated")
+        )
+        and isinstance(headings, list)
+        and headings
+        and unnumbered_own_law_masthead_number(
+            item.text, str(metadata.get("title") or ""), str(headings[0])
+        )
+    )
+
+
+def _complete_original_delivery(
+    record: dict[str, JsonValue], item: EvidenceItem
+) -> bool:
+    return (
+        record.get("complete") is True
+        and type(record.get("citation")) is int
+        and record.get("text_hash") == item.text_hash
+        and record.get("source_id") == item.source_id
+        and record.get("chunk_id") == item.chunk_id
+        and type(record.get("start_char")) is int
+        and record["start_char"] == 0
+        and type(record.get("end_char")) is int
+        and record["end_char"] == len(item.text)
+        and record.get("passage_hash") == item.text_hash
+    )
 
 
 class EvidenceLedger:
@@ -159,6 +201,16 @@ class EvidenceLedger:
         from onyx.regulatory.heading_path import parse_regulatory_article_heading
 
         with self._lock:
+            delivered = {
+                record.get("citation")
+                for delivery in self._deliveries
+                if isinstance(records := delivery.get("records"), list)
+                for record in records
+                if isinstance(record, dict)
+                and isinstance(number := record.get("citation"), int)
+                and (item := self._items.get(number)) is not None
+                and _complete_original_delivery(record, item)
+            }
             records: list[dict[str, JsonValue]] = []
             for number, item in self._items.items():
                 metadata = model_evidence_metadata(item.metadata)
@@ -198,6 +250,11 @@ class EvidenceLedger:
                         "heading_path": headings[:1]
                         if isinstance(headings, list)
                         else [],
+                        **(
+                            {"original_completely_delivered": True}
+                            if number in delivered
+                            else {}
+                        ),
                     }
                 )
             return records
@@ -313,6 +370,19 @@ class EvidenceLedger:
                 assert isinstance(number, int)
                 if record.get("text_hash") != items[number].text_hash:
                     raise ValueError("Changed delivered evidence identity")
+                complete_fields = {
+                    "source_id",
+                    "chunk_id",
+                    "start_char",
+                    "end_char",
+                    "passage_hash",
+                }
+                if (
+                    record.get("complete") is True
+                    and complete_fields <= record.keys()
+                    and not _complete_original_delivery(record, items[number])
+                ):
+                    raise ValueError("Invalid complete evidence delivery")
             deliveries.append(delivery)
         retained_calls = {
             call for row in deliveries if isinstance(call := row.get("call_id"), str)
@@ -370,6 +440,26 @@ class EvidenceLedger:
                     }
                 )
             if delivered:
+                pinned_complete = {
+                    record.get("citation")
+                    for delivery in self._deliveries
+                    if delivery.get("call_id") in self._pinned_delivery_calls
+                    if isinstance(records := delivery.get("records"), list)
+                    for record in records
+                    if isinstance(record, dict)
+                    and isinstance(number := record.get("citation"), int)
+                    and (item := self._items.get(number)) is not None
+                    and _complete_original_delivery(record, item)
+                }
+                if call_id and any(
+                    isinstance(record, dict)
+                    and record.get("complete") is True
+                    and isinstance(number := record.get("citation"), int)
+                    and number not in pinned_complete
+                    and _own_law_masthead(self._items[number])
+                    for record in delivered
+                ):
+                    self._pinned_delivery_calls.add(call_id)
                 self._deliveries.append(
                     {"call_id": call_id, "flow": flow, "records": delivered}
                 )
