@@ -33,13 +33,3 @@ for pattern in ('onyx*.log*','api_server*.log*','celery_worker_user_file_process
    if classes or messages:
     findings.append({'timestamp':timestamp,'classes':classes,'capability_context':context,'owned_context_hint_only':owned_context,'code_stack':stack,'safe_code_literals':messages[:4]});stack=[]
   print(json.dumps({'retained_log_file':path.name,'bytes_examined':len(raw.encode()),'progress_tag_counts':progress,'safe_findings':findings[-100:],'raw_log_exported':False}))
-try:
- from onyx.background.celery.apps.user_file_processing import celery_app
- active=celery_app.control.inspect(timeout=3).active()or{}
- for worker,tasks in active.items():
-  for task in tasks:
-   args=str(task.get('args',''))+str(task.get('kwargs',''))
-   matches=[name for name,value in owned_ids.items()if value in args]
-   if matches:print(json.dumps({'active_owned_task':matches,'worker':worker,'id':task.get('id'),'task_name':task.get('name'),'time_start':task.get('time_start'),'acknowledged':task.get('acknowledged'),'arguments_exported':False}))
- print(json.dumps({'active_worker_count':len(active),'active_task_count':sum(map(len,active.values())),'task_arguments_exported':False}))
-except Exception as exc:print(json.dumps({'inspect_exception_class':type(exc).__name__}))

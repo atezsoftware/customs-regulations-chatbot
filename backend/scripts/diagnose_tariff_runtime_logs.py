@@ -11,7 +11,7 @@ END='2026-11-03T14:35:00Z'
 def command(args: list[str], input_text: str | None = None, timeout: int = 90) -> str:
     result=subprocess.run(args,input=input_text,capture_output=True,text=True,timeout=timeout,check=False)
     if result.returncode:
-        failure={'diagnostic_command_failed':args[:3],'exit_code':result.returncode};print(json.dumps(failure));return json.dumps(failure)
+        failure={'diagnostic_command_failed':args[:3],'exit_code':result.returncode};print(json.dumps(failure));return result.stdout if input_text is not None else json.dumps(failure)
     return result.stdout
 
 def safe_findings(raw: str, origin: str)->list[dict[str,object]]:
