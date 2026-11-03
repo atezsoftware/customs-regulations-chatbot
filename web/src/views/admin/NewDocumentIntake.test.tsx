@@ -1723,71 +1723,87 @@ test("preserves full drafts across pages and files and atomically saves all chan
   );
 });
 
-test("allows manual repair with a terminal partial edit receipt while approval stays disabled", async () => {
-  const partial: DocumentIntakeBatch = {
-    ...readyBatch,
-    status: "partial",
-    stage: "labeling",
-    review_sha256: null,
-    edit_review_sha256: "c".repeat(64),
-    error: "One chunk needs labeling review.",
-  };
-  const fetchMock = mockApi({
-    history: [partial],
-    chunksByDocument: { root: "Original rule." },
-  });
-  const user = setupUser();
-  render(<NewDocumentIntake />);
-  await user.click(
-    await screen.findByRole("button", {
-      name: "Main regulation.html (partial)",
-    })
-  );
-  const root = screen.getByRole("region", { name: "Main regulation.html" });
-  const text = await within(root).findByLabelText("After text");
-  expect(text).not.toHaveAttribute("readonly");
-  expect(
-    screen.getByRole("button", { name: "Approve all new documents" })
-  ).toBeDisabled();
-  await user.type(text, " Reviewed.");
-  await user.type(
-    within(root).getByLabelText("After metadata article_no"),
-    "7"
-  );
-  await user.click(
-    within(root).getByRole("button", { name: "Save chunk changes" })
-  );
-  expect(await screen.findByText("New documents: preparing")).toBeVisible();
-  const request = fetchMock.mock.calls.find(
-    ([url, init]) =>
-      String(url).endsWith("/chunks/chunk-root") && init?.method === "PATCH"
-  )!;
-  expect(JSON.parse(String(request[1]!.body))).toEqual(
-    expect.objectContaining({
-      expected_review_sha256: "c".repeat(64),
-      text: "Original rule. Reviewed.",
-      chunk_metadata: { article_no: "7" },
-    })
-  );
-  expect(within(root).getByLabelText("After text")).toHaveAttribute("readonly");
-  expect(
-    screen.getByRole("button", { name: "Approve all new documents" })
-  ).toBeDisabled();
-  expect(
-    fetchMock.mock.calls.some(([url]) => String(url).endsWith("/approve"))
-  ).toBe(false);
-});
+test.each([
+  ["partial", "labeling"],
+  ["failed", "metadata"],
+  ["failed", "chunking"],
+] as const)(
+  "allows %s/%s manual repair with a terminal edit receipt while approval stays disabled",
+  async (status, stage) => {
+    const partial: DocumentIntakeBatch = {
+      ...readyBatch,
+      status,
+      stage,
+      review_sha256: null,
+      edit_review_sha256: "c".repeat(64),
+      error: "One chunk needs labeling review.",
+    };
+    const fetchMock = mockApi({
+      history: [partial],
+      chunksByDocument: { root: "Original rule." },
+    });
+    const user = setupUser();
+    render(<NewDocumentIntake />);
+    await user.click(
+      await screen.findByRole("button", {
+        name: `Main regulation.html (${status})`,
+      })
+    );
+    const root = screen.getByRole("region", { name: "Main regulation.html" });
+    const text = await within(root).findByLabelText("After text");
+    expect(text).not.toHaveAttribute("readonly");
+    expect(
+      screen.getByRole("button", { name: "Approve all new documents" })
+    ).toBeDisabled();
+    await user.type(text, " Reviewed.");
+    await user.type(
+      within(root).getByLabelText("After metadata article_no"),
+      "7"
+    );
+    expect(
+      screen.getByRole("button", { name: "Save all chunk changes" })
+    ).toBeEnabled();
+    await user.click(
+      within(root).getByRole("button", { name: "Save chunk changes" })
+    );
+    expect(await screen.findByText("New documents: preparing")).toBeVisible();
+    const request = fetchMock.mock.calls.find(
+      ([url, init]) =>
+        String(url).endsWith("/chunks/chunk-root") && init?.method === "PATCH"
+    )!;
+    expect(JSON.parse(String(request[1]!.body))).toEqual(
+      expect.objectContaining({
+        expected_review_sha256: "c".repeat(64),
+        text: "Original rule. Reviewed.",
+        chunk_metadata: { article_no: "7" },
+      })
+    );
+    expect(within(root).getByLabelText("After text")).toHaveAttribute(
+      "readonly"
+    );
+    expect(
+      screen.getByRole("button", { name: "Approve all new documents" })
+    ).toBeDisabled();
+    expect(
+      fetchMock.mock.calls.some(([url]) => String(url).endsWith("/approve"))
+    ).toBe(false);
+  }
+);
 
 test.each([
-  ["partial", null],
-  ["preparing", "c".repeat(64)],
+  ["partial", "labeling", null],
+  ["failed", "metadata", null],
+  ["failed", "chunking", null],
+  ["failed", "indexing", "c".repeat(64)],
+  ["preparing", "metadata", "c".repeat(64)],
+  ["preparing", "labeling", "c".repeat(64)],
 ] as const)(
-  "keeps %s read-only without a usable terminal edit review",
-  async (status, receipt) => {
+  "keeps %s/%s read-only without a usable terminal edit review",
+  async (status, stage, receipt) => {
     const batch: DocumentIntakeBatch = {
       ...readyBatch,
       status,
-      stage: "labeling",
+      stage,
       edit_review_sha256: receipt,
     };
     mockApi({
