@@ -14,6 +14,7 @@ import pytest
 
 from onyx.background.celery.tasks.regulatory_intake_recovery import tasks
 from onyx.configs.constants import OnyxCeleryPriority, OnyxCeleryQueues
+from onyx.db import document_intake_labeling_recovery
 
 
 @dataclass(frozen=True)
@@ -28,6 +29,7 @@ class _Harness:
     session_factory: MagicMock
     reserve: MagicMock
     resume: MagicMock
+    reconcile: MagicMock
     prepare_send: MagicMock
     label_send: MagicMock
     events: list[str]
@@ -48,6 +50,12 @@ def harness(monkeypatch: pytest.MonkeyPatch) -> _Harness:
     events: list[str] = []
     session.commit.side_effect = lambda: events.append("commit")
     reserve, resume = MagicMock(return_value=[]), MagicMock(return_value=[])
+    reconcile = MagicMock(return_value=[])
+    monkeypatch.setattr(
+        document_intake_labeling_recovery,
+        "reconcile_terminal_intake_labeling",
+        reconcile,
+    )
     db_module = ModuleType("onyx.db.document_intake_queue")
     monkeypatch.setattr(
         db_module, "reserve_intake_preparation_deliveries", reserve, raising=False
@@ -72,7 +80,9 @@ def harness(monkeypatch: pytest.MonkeyPatch) -> _Harness:
         module = ModuleType(module_name)
         monkeypatch.setattr(module, symbol, send, raising=False)
         monkeypatch.setitem(sys.modules, module_name, module)
-    return _Harness(session, factory, reserve, resume, prepare_send, label_send, events)
+    return _Harness(
+        session, factory, reserve, resume, reconcile, prepare_send, label_send, events
+    )
 
 
 def _recover(**updates: str) -> None:
@@ -278,3 +288,24 @@ def test_light_discovers_only_the_new_short_recovery_package() -> None:
     assert "onyx.background.celery.tasks.regulatory_intake_recovery" in strings
     assert "onyx.background.celery.tasks.regulatory_amendments" not in strings
     assert "onyx.background.celery.tasks.regulatory_labeling" not in strings
+
+
+def test_finished_labeling_reconciles_before_other_reservations_and_commit(
+    harness: _Harness,
+) -> None:
+    harness.reconcile.side_effect = lambda *_args, **_kwargs: harness.events.append(
+        "reconcile"
+    )
+    harness.reserve.side_effect = lambda *_args, **_kwargs: (
+        harness.events.append("reserve") or []
+    )
+    harness.resume.side_effect = lambda *_args, **_kwargs: (
+        harness.events.append("resume") or []
+    )
+    _recover()
+    harness.reconcile.assert_called_once_with(
+        harness.session, environment="dev", limit=10
+    )
+    assert harness.events == ["reconcile", "reserve", "resume", "commit"]
+    harness.prepare_send.assert_not_called()
+    harness.label_send.assert_not_called()

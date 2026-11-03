@@ -26,12 +26,16 @@ def recover_document_intakes(
     if not config.REGULATORY_ANNEX_WORKER_ENABLED:
         return
 
+    from onyx.db.document_intake_labeling_recovery import (
+        reconcile_terminal_intake_labeling,
+    )
     from onyx.db.document_intake_queue import (
         reserve_intake_preparation_deliveries,
         resume_waiting_intake_labeling,
     )
 
     with get_session_with_current_tenant() as session:
+        reconcile_terminal_intake_labeling(session, environment=environment, limit=10)
         deliveries = reserve_intake_preparation_deliveries(
             session, environment=environment, limit=10
         )
