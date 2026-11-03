@@ -377,6 +377,13 @@ def reuse_completed_intake_labels(
     recovered = recover_failed_self_repeal_items(
         session, previous=previous, replacement=replacement
     )
+    from onyx.db.regulatory_labeling_article_lead_in import (
+        recover_failed_article_lead_in_items,
+    )
+
+    recovered += recover_failed_article_lead_in_items(
+        session, previous=previous, replacement=replacement
+    )
     replacement.completed_chunks += copied + recovered
     session.flush()
     return copied + recovered
