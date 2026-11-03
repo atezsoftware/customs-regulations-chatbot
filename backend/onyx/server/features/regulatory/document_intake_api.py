@@ -558,6 +558,26 @@ def _enqueue_edited_labels(
     tenant_id: str,
 ) -> None:
     if run_id is None:
+        if batch.status != "preparing" or batch.stage != "chunking":
+            return
+        from onyx.db.document_intake_metadata_review import reviewed_metadata_edit
+
+        try:
+            reviewed = reviewed_metadata_edit(batch)
+            if reviewed is None:
+                return
+            if (
+                reviewed.intake_id != batch.id
+                or reviewed.package_id != batch.source_package_id
+                or reviewed.previous_labeling_run_id != batch.labeling_run_id
+            ):
+                raise ValueError("The reviewed metadata dispatch owner changed")
+        except ValueError as exc:
+            raise OnyxError(
+                OnyxErrorCode.CONFLICT,
+                "The reviewed document metadata changed; reload before processing",
+            ) from exc
+        _enqueue_batch(db_session, batch, tenant_id)
         return
     from onyx.background.celery.tasks.regulatory_labeling.tasks import (
         enqueue_labeling_run,
