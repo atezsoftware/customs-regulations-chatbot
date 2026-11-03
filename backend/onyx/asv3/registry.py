@@ -152,6 +152,15 @@ def _cropped_completion_enabled(context: RunContext) -> bool:
     )
 
 
+def _unassigned_cropped_child(context: RunContext) -> bool:
+    assigned = context.services.get("task_outcome_ids")
+    return (
+        _cropped_completion_enabled(context)
+        and context.depth > 0
+        and (not isinstance(assigned, list) or not assigned)
+    )
+
+
 class CapabilityRegistry:
     def __init__(self, specs: Iterable[ToolSpec] = ()) -> None:
         self._specs: dict[str, ToolSpec] = {}
@@ -174,7 +183,7 @@ class CapabilityRegistry:
     def definitions(self, context: RunContext) -> list[dict[str, JsonValue]]:
         definitions: list[dict[str, JsonValue]] = []
         task_outcome_ids = context.services.get("task_outcome_ids")
-        unbound_parallel_child = (
+        unbound_outcome_child = _unassigned_cropped_child(context) or (
             context.services.get("research_profile") == "experimental"
             and context.services.get("experimental_parallel") is True
             and context.depth > 0
@@ -184,7 +193,7 @@ class CapabilityRegistry:
             _outcome_metadata_properties()
             if context.services.get("lean_native_mode")
             and isinstance(context.services.get("outcome_map"), OutcomeMap)
-            and not unbound_parallel_child
+            and not unbound_outcome_child
             else None
         )
         research_bindings = native_research_bindings(context)
@@ -891,6 +900,10 @@ class CapabilityRegistry:
             ):
                 raise ValueError("Outcome metadata is unavailable in this context")
             update = self._outcome_update(call)
+            if _unassigned_cropped_child(context) and not (
+                update.outcomes or update.conditions or update.resolutions
+            ):
+                return None
             subset = context.services.get("task_outcome_ids")
             if context.depth:
                 if not isinstance(subset, list) or not subset:
