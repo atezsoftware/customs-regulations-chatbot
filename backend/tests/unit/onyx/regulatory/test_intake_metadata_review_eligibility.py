@@ -124,9 +124,7 @@ def test_failed_metadata_review_keeps_all_existing_ownership_fences(
             row.chunk_metadata[METADATA_AUDIT_KEY]["input_sha256"] = "b" * 64
         session.scalars.side_effect = [
             [] if change == "receipt_chunking_missing" else [row],
-            [],
             [row],
-            [],
         ]
     digest = editing.edit_review_digest(session, batch)
     assert bool(digest) is allowed
