@@ -59,7 +59,8 @@ from shared_configs.contextvars import get_current_tenant_id
 
 PDF_METADATA_SHA = "360736824a7f7588a2ae032d4901238d5e3f9870f01cbe3c1246ed485927d5b1"
 IBRAZ = "rc_9445ee9075213f582ea39b7124dc6275a32793c6"
-RETRY_IMAGE_SHA: str | None = None  # Pinned only after the final release is approved.
+RETRY_IMAGE_SHA = "2fc69ee1ad9ca619c4266a8b2c08a2ef44523fe3"
+RETRY_SOURCE_SHA256 = "de0ffa6d4ee73b11499026af190690fe29760d77a51cfd8bf069601dfa96fd89"
 
 
 def canonical_source_sha256(session: Session) -> str:
@@ -509,6 +510,10 @@ def request_retry(
     session: Session, batch: scope.RegulatoryDocumentIntake
 ) -> dict[str, Any]:
     proof = retry_plan(session, batch)
+    scope.require(
+        proof["all_canonical_source_sha256"] == RETRY_SOURCE_SHA256,
+        "The approved final source fingerprint changed",
+    )
     epochs = scope.unpublished_epoch_scope(session)
     result = intake.intake_snapshot(session, batch)
     scope.require(

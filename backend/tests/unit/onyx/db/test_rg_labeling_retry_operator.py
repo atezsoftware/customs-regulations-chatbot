@@ -56,11 +56,15 @@ def run(operator: ModuleType) -> RegulatoryLabelingRun:
     )
 
 
-def test_current_operator_cannot_mutate_before_final_sha_is_pinned(
+def test_current_operator_is_pinned_to_the_approved_final_release(
     operator: ModuleType, run: RegulatoryLabelingRun
 ) -> None:
     operator.require_failed_run(run)
-    assert operator.RETRY_IMAGE_SHA is None
+    assert operator.RETRY_IMAGE_SHA == "2fc69ee1ad9ca619c4266a8b2c08a2ef44523fe3"
+    assert (
+        operator.RETRY_SOURCE_SHA256
+        == "de0ffa6d4ee73b11499026af190690fe29760d77a51cfd8bf069601dfa96fd89"
+    )
 
 
 @pytest.mark.parametrize(
@@ -167,6 +171,7 @@ def test_retry_uses_normal_get_then_retry_and_keeps_publication_unchanged(
         "retry_plan",
         lambda *_: {"verified": True, "all_canonical_source_sha256": "s"},
     )
+    monkeypatch.setattr(operator, "RETRY_SOURCE_SHA256", "s")
     monkeypatch.setattr(
         operator,
         "canonical_source_sha256",
