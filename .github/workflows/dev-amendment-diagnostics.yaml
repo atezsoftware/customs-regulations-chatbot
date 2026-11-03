@@ -7,7 +7,7 @@ on:
         type: choice
         required: true
         default: inspect
-        options: [inspect, retry, embedding-canary, review-canary, native-probe, strict-v4-canary, reprepare-v4, retry-reprepare-v4, refresh-review, labeling-retry-plan, retry-labeling-v4, labeling-progress-v4, labeling-review-plan-v4, refresh-labeling-review-v4, labeling-failures-v4]
+        options: [inspect, retry, embedding-canary, review-canary, native-probe, strict-v4-canary, reprepare-v4, retry-reprepare-v4, refresh-review, labeling-retry-plan, retry-labeling-v4, labeling-progress-v4, labeling-review-plan-v4, refresh-labeling-review-v4, labeling-failures-v4, v5-status, reprepare-plan-v5, reprepare-v5, progress-v5, acceptance-v5, strict-v5-canary]
       expected_image_sha:
         type: string
         required: true
@@ -33,7 +33,7 @@ jobs:
         run: |
           set -euo pipefail
           [[ "$EXPECTED_IMAGE_SHA" =~ ^[0-9a-f]{40}$ ]]
-          [[ "$OPERATION" == inspect || "$OPERATION" == retry || "$OPERATION" == embedding-canary || "$OPERATION" == review-canary || "$OPERATION" == native-probe || "$OPERATION" == strict-v4-canary || "$OPERATION" == reprepare-v4 || "$OPERATION" == retry-reprepare-v4 || "$OPERATION" == refresh-review || "$OPERATION" == labeling-retry-plan || "$OPERATION" == retry-labeling-v4 || "$OPERATION" == labeling-progress-v4 || "$OPERATION" == labeling-review-plan-v4 || "$OPERATION" == refresh-labeling-review-v4 || "$OPERATION" == labeling-failures-v4 ]]
+          [[ "$OPERATION" == inspect || "$OPERATION" == retry || "$OPERATION" == embedding-canary || "$OPERATION" == review-canary || "$OPERATION" == native-probe || "$OPERATION" == strict-v4-canary || "$OPERATION" == reprepare-v4 || "$OPERATION" == retry-reprepare-v4 || "$OPERATION" == refresh-review || "$OPERATION" == labeling-retry-plan || "$OPERATION" == retry-labeling-v4 || "$OPERATION" == labeling-progress-v4 || "$OPERATION" == labeling-review-plan-v4 || "$OPERATION" == refresh-labeling-review-v4 || "$OPERATION" == labeling-failures-v4 || "$OPERATION" == v5-status || "$OPERATION" == reprepare-plan-v5 || "$OPERATION" == reprepare-v5 || "$OPERATION" == progress-v5 || "$OPERATION" == acceptance-v5 || "$OPERATION" == strict-v5-canary ]]
           aws eks update-kubeconfig --name atez-dev-cluster --region eu-central-1
           kubectl get pods -n customs-regulations-dev -o json > /tmp/rg-pods.json
           python - <<'PY'
@@ -61,6 +61,26 @@ jobs:
           PY
           IFS=$'\t' read -r pod container observed < /tmp/rg-target
           args=(--expected-image-sha "$EXPECTED_IMAGE_SHA" --observed-image-sha "$observed")
+          if [[ "$OPERATION" == v5-status || "$OPERATION" == reprepare-plan-v5 || "$OPERATION" == reprepare-v5 || "$OPERATION" == progress-v5 || "$OPERATION" == acceptance-v5 || "$OPERATION" == strict-v5-canary ]]; then
+            kubectl exec -i "$pod" -n customs-regulations-dev -c "$container" -- sh -ec 'cat > /tmp/_new_document_rg_operator.py' < backend/onyx/db/_new_document_rg_operator.py
+            kubectl exec -i "$pod" -n customs-regulations-dev -c "$container" -- sh -ec 'cat > /tmp/_rg_reprepare_v5_20261103.py' < backend/onyx/db/_rg_reprepare_v5_20261103.py
+            case "$OPERATION" in
+              v5-status) args+=(--operation status) ;;
+              reprepare-plan-v5) args+=(--operation plan) ;;
+              reprepare-v5) args+=(--operation request) ;;
+              progress-v5) args+=(--operation progress) ;;
+              acceptance-v5) args+=(--operation acceptance) ;;
+              strict-v5-canary)
+                fixture=backend/tests/fixtures/regulatory/rg_v5_largest_matrix_canary.json
+                kubectl exec -i "$pod" -n customs-regulations-dev -c "$container" -- sh -ec 'cat > /tmp/rg-v5-matrix-canary.json' < "$fixture"
+                input_sha=$(sha256sum "$fixture" | cut -d ' ' -f 1)
+                args+=(--operation canary --input-path /tmp/rg-v5-matrix-canary.json --expected-input-sha "$input_sha")
+                ;;
+            esac
+            kubectl exec -i "$pod" -n customs-regulations-dev -c "$container" -- \
+              sh -ec '. /vault/secrets/config; export PYTHONPATH=/app; exec python "$@"' rg-v5 /tmp/_rg_reprepare_v5_20261103.py "${args[@]}"
+            exit 0
+          fi
           if [[ "$OPERATION" == labeling-retry-plan || "$OPERATION" == retry-labeling-v4 || "$OPERATION" == labeling-progress-v4 || "$OPERATION" == labeling-review-plan-v4 || "$OPERATION" == refresh-labeling-review-v4 || "$OPERATION" == labeling-failures-v4 ]]; then
             kubectl exec -i "$pod" -n customs-regulations-dev -c "$container" -- sh -ec 'cat > /tmp/_new_document_rg_operator.py' < backend/onyx/db/_new_document_rg_operator.py
             kubectl exec -i "$pod" -n customs-regulations-dev -c "$container" -- sh -ec 'cat > /tmp/_rg_labeling_retry_20261102.py' < backend/onyx/db/_rg_labeling_retry_20261102.py

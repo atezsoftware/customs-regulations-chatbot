@@ -537,7 +537,7 @@ def refresh_completed_review(session: Session, batch: RegulatoryDocumentIntake) 
     return {"operator_action": "normal_get_review_refreshed", "status": batch.status, "stage": batch.stage, "review_sha256": batch.review_sha256, "edit_review_sha256": result["edit_review_sha256"], "publication_review_sha256": result["publication_review_sha256"], "labeling_run_id": str(run.id), "source_and_receipt_proof": proof, "documents": diagnostics, "approval_or_publication_or_index_requested": False}
 
 
-def strict_v4_canary(input_path: Path, expected_sha: str) -> dict[str, Any]:
+def strict_v4_canary(input_path: Path, expected_sha: str, *, chunking_version: str = "4") -> dict[str, Any]:
     """Exercise the real normal freezer and strict encoder using detached fixture rows."""
     import logging
     import math
@@ -555,10 +555,16 @@ def strict_v4_canary(input_path: Path, expected_sha: str) -> dict[str, Any]:
     require(bool(re.fullmatch(r"[0-9a-f]{64}", expected_sha)), "Canary requires the exact fixture SHA")
     wire = input_path.read_bytes()
     require(0 < len(wire) <= 131072 and hashlib.sha256(wire).hexdigest() == expected_sha, "Fixture size or SHA changed")
-    prefix = "title: none | text: "
-    require(wire.decode().startswith(prefix), "Fixture is missing the established Google instruction wrapper")
-    source = wire.decode()[len(prefix):]
-    require(source.strip() == source and source.startswith("|"), "Fixture is not one exact source table")
+    require(chunking_version in {"4", "5"}, "Unsupported strict intake canary version")
+    fixture = json.loads(wire) if chunking_version == "5" else None
+    if fixture is not None:
+        source = fixture["canonical_text"]
+        require(fixture["canonical_text_sha256"] == "e43bfc38eb661374d12c6c8dfad8f68f014b2cdc8c157d7b4d6396c98bd8d04a" and hashlib.sha256(source.encode()).hexdigest() == fixture["canonical_text_sha256"] and fixture["source_span_exact"] is True, "The exact logical matrix fixture changed")
+    else:
+        prefix = "title: none | text: "
+        require(wire.decode().startswith(prefix), "Fixture is missing the established Google instruction wrapper")
+        source = wire.decode()[len(prefix):]
+    require(source.strip() == source and "|" in source and (fixture is not None or source.startswith("|")), "Fixture is not one exact source table")
     with get_session_with_current_tenant() as session:
         session.execute(text("SET TRANSACTION READ ONLY"))
         asset = session.scalar(select(RegulatorySourceAsset).where(RegulatorySourceAsset.id == UUID("7743688a-0cdf-4b8a-8315-b292b21724ba")))
@@ -568,6 +574,9 @@ def strict_v4_canary(input_path: Path, expected_sha: str) -> dict[str, Any]:
         with stream:
             prepared = stream.read(2_000_001)
         require(len(prepared) <= 2_000_000 and hashlib.sha256(prepared).hexdigest() == asset.text_sha256 and source in prepared.decode("utf-8"), "Fixture is not an exact span of the retained source")
+        if fixture is not None:
+            require(fixture["source_retained_md_sha256"] == asset.text_sha256 and prepared.decode("utf-8")[fixture["metadata"]["source_start_char"]:fixture["metadata"]["source_end_char"]] == source, "The logical matrix source offsets changed")
+        file_title = session.get_one(UserFile, UUID(PDF_FILE)).name if fixture is not None else "Resmî Gazete whole-table canary"
         settings = get_current_search_settings(session)
         require(settings.id == 11 and settings.provider_type == EmbeddingProvider.GOOGLE and settings.model_name == "gemini-embedding-2" and settings.enable_contextual_rag, "The configured strict canary model or contextual policy changed")
         embedder = DefaultIndexingEmbedder.from_db_search_settings(settings)
@@ -575,8 +584,9 @@ def strict_v4_canary(input_path: Path, expected_sha: str) -> dict[str, Any]:
         session.expunge(settings)
         session.rollback()
     llm = resolve_review_context_llm(settings, None)
-    file = UserFile(id=uuid5(BATCH, "detached-whole-table-canary"), name="Resmî Gazete whole-table canary")
-    row = RegulatoryChunk(id="detached-whole-table-canary", user_file_id=file.id, text=source, position=0, projection_ordinal=0, heading_path=["EK"], chunk_type="table", chunk_metadata={"chunk_variant": "atomic", "intake_chunking_version": "4", "intake_preparation_policy": IntakePreparationPolicy().model_dump(mode="json")}, source="indexed", status="active")
+    file = UserFile(id=uuid5(BATCH, "detached-whole-table-canary"), name=file_title)
+    metadata = fixture["metadata"] if fixture is not None else {}
+    row = RegulatoryChunk(id="detached-whole-table-canary", user_file_id=file.id, text=source, position=0, projection_ordinal=0, heading_path=metadata.get("heading_path", ["EK"]), chunk_type="table", chunk_metadata={**metadata, "chunk_variant": "atomic", "intake_chunking_version": chunking_version, "intake_preparation_policy": IntakePreparationPolicy.model_validate({"chunking_version": chunking_version}).model_dump(mode="json")}, source="indexed", status="active")
     view = prepare_normal_context_view(rows=[row], user_file=file, search_settings=settings, embedder=embedder, llm=llm)
     require(len(view.projections) == 1 and not view.calls, "A self-contained one-table canary must not call a contextual model")
     projection = view.projections[0]
