@@ -175,7 +175,7 @@ from onyx.chat.chat_state import ChatStateContainer
 from onyx.chat.citation_processor import CitationMode, DynamicCitationProcessor
 from onyx.chat.emitter import Emitter
 from onyx.chat.models import ChatMessageSimple
-from onyx.chat.stop_signal_checker import is_connected
+from onyx.chat.stop_signal_checker import TurnCancellationProbe
 from onyx.configs.constants import MessageType
 from onyx.context.search.models import BaseFilters, IndexFilters, SearchDoc
 from onyx.context.search.retrieval.query_embedding_scope import (
@@ -384,6 +384,7 @@ def run_asv3_loop(
     reasoning_effort: ReasoningEffort,
     include_citations: bool,
     cache: CacheBackend,
+    check_is_connected: Callable[[], bool] | None = None,
     research_profile: str = "deep",
     parallel_research: bool = False,
     workflow_variant: str = ASV3_STANDARD_VARIANT,
@@ -444,8 +445,13 @@ def run_asv3_loop(
         ),
         "",
     )
+    turn_connected = (
+        check_is_connected
+        if check_is_connected is not None
+        else TurnCancellationProbe(chat_session_id, cache)
+    )
     cancellation_probe = (
-        FastCancellationProbe(lambda: not is_connected(chat_session_id, cache))
+        FastCancellationProbe(lambda: not turn_connected())
         if workflow_variant in {ASV3_FAST_VARIANT, ASV3_FAST_CROPPED_VARIANT}
         else None
     )
@@ -470,7 +476,7 @@ def run_asv3_loop(
         ),
         cancelled=cancellation_probe
         if cancellation_probe is not None
-        else lambda: not is_connected(chat_session_id, cache),
+        else lambda: not turn_connected(),
         services={
             "lean_native_mode": True,
             **(
