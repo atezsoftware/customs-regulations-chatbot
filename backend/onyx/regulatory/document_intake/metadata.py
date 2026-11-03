@@ -1252,6 +1252,64 @@ def _quoted_paragraph_markers(
     return markers or (_paragraph_markers(quote, numbered=True) if heading else set())
 
 
+def _inline_heading_paragraph_evidence(
+    fact: LegalMetadataFact, sources: dict[str, MetadataChunk], target_id: str
+) -> str | None:
+    """Bind a flattened formal section/article heading to its own continuation."""
+    source = sources[fact.source_chunk_id]
+    if fact.evidence_quote != source.text:
+        return None
+    body = " ".join(_fold(source.text).split())
+    article_pattern = (
+        r"(?:(?:ek|gecici|mukerrer)\s+)?(?:madde|article|art\.?)\s*"
+        r"\d+(?:/?[a-z])?\s*[-–—:]"
+    )
+    match = re.match(
+        r"^(?:[a-z]+(?:inci|nci|uncu)|[ivxlcdm]+)\s+"
+        r"(?:bolum|kisim|baslik)\s+"
+        r"(?P<title>[a-z\s’',/-]{1,240}?)\s+"
+        rf"(?P<article>{article_pattern})\s*\((?P<paragraph>\d+)\)"
+        r"(?=\s|[^\W\d_])",
+        body,
+    )
+    if match is None or re.search(
+        r"\b(?:madde|article|onceki|uyarinca|geregince|gore|numarali|anilan|"
+        r"belirtilen|fikra|uygulanir|aranir|zorundadir|gerekir|edilir|yapilir)\b",
+        match["title"],
+    ):
+        return None
+    article = _body_article_identity(match["article"])
+    paragraph = match["paragraph"]
+    if (
+        article is None
+        or re.findall(r"\(\s*(\d+)\s*\)", body) != [paragraph]
+        or re.search(article_pattern, body[match.end() :])
+        or re.match(
+            r"\s*(?:uyarinca|geregince|gore|numarali|fikrasi\w*|hukmu\w*|"
+            r"uygulanir|cercevesinde|kapsaminda)\b",
+            body[match.end() :],
+        )
+    ):
+        return None
+    ordered = list(sources.values())
+    source_index = next(i for i, row in enumerate(ordered) if row is source)
+    target_index = next(
+        (i for i, row in enumerate(ordered) if row.chunk_id == target_id), -1
+    )
+    if target_index < source_index:
+        return None
+    for row in ordered[source_index : target_index + 1]:
+        context = _article_context(row)
+        if context is not None and context != article:
+            return None
+        if row is not source and (
+            re.search(article_pattern, _fold(row.text))
+            or re.search(r"\(\s*\d+\s*\)", row.text)
+        ):
+            return None
+    return paragraph
+
+
 def _validate_paragraph_evidence(
     fact: LegalMetadataFact, sources: dict[str, MetadataChunk], target_id: str
 ) -> None:
@@ -1263,7 +1321,11 @@ def _validate_paragraph_evidence(
     if len(quoted) > 1:
         raise ValueError("Metadata paragraph evidence contains ambiguous locators")
     if not quoted and selected is None:
-        raise ValueError("Metadata paragraph locator requires explicit source context")
+        selected = _inline_heading_paragraph_evidence(fact, sources, target_id)
+        if selected is None:
+            raise ValueError(
+                "Metadata paragraph locator requires explicit source context"
+            )
     contexts = (
         next(iter(quoted)) if quoted else None,
         selected,
