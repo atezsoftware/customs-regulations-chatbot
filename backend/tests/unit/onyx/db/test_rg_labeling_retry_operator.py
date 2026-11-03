@@ -2,6 +2,8 @@
 
 import importlib.util
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from types import ModuleType
 from unittest.mock import MagicMock
@@ -10,7 +12,11 @@ from uuid import uuid4
 import pytest
 from sqlalchemy.orm import Session
 
-from onyx.db.models import RegulatoryDocumentIntake, RegulatoryLabelingRun
+from onyx.db.models import (
+    RegulatoryDocumentIntake,
+    RegulatoryLabelingItem,
+    RegulatoryLabelingRun,
+)
 
 
 @pytest.fixture
@@ -78,7 +84,9 @@ def test_failed_run_identity_counters_and_owner_are_exact(
         operator.require_failed_run(run)
 
 
-@pytest.mark.parametrize("failure", [None, "get", "deliveries", "publication"])
+@pytest.mark.parametrize(
+    "failure", [None, "get", "deliveries", "publication", "source"]
+)
 def test_retry_uses_normal_get_then_retry_and_keeps_publication_unchanged(
     operator: ModuleType, monkeypatch: pytest.MonkeyPatch, failure: str | None
 ) -> None:
@@ -90,7 +98,16 @@ def test_retry_uses_normal_get_then_retry_and_keeps_publication_unchanged(
         labeling_run_id=operator.scope.LABELING_RUN,
     )
     calls: list[str] = []
-    monkeypatch.setattr(operator, "retry_plan", lambda *_: {"verified": True})
+    monkeypatch.setattr(
+        operator,
+        "retry_plan",
+        lambda *_: {"verified": True, "all_canonical_source_sha256": "s"},
+    )
+    monkeypatch.setattr(
+        operator,
+        "canonical_source_sha256",
+        lambda *_: "changed" if failure == "source" else "s",
+    )
     epochs = MagicMock(
         side_effect=[[{"epoch": 0}], [{"epoch": 1 if failure == "publication" else 0}]]
     )
@@ -130,4 +147,76 @@ def test_retry_uses_normal_get_then_retry_and_keeps_publication_unchanged(
         )
         assert result["verified"] is True
         verify.assert_called_once_with(session, batch)
+    session.commit.assert_not_called()
+
+
+@pytest.mark.parametrize("failure", [None, "receipt", "late", "source"])
+def test_observation_reads_worker_created_plan_and_exact_copied_receipts(
+    operator: ModuleType,
+    run: RegulatoryLabelingRun,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str | None,
+) -> None:
+    binding: dict[str, object] = {"model": "frozen"}
+    run.provider_binding, run.taxonomy_id = binding, uuid4()
+    replacement = RegulatoryLabelingRun(
+        id=uuid4(),
+        total_chunks=651,
+        derived_chunks=46,
+        completed_chunks=609,
+        file_ids=run.file_ids,
+        provider_binding=run.provider_binding,
+        taxonomy_id=run.taxonomy_id,
+    )
+    batch = RegulatoryDocumentIntake(labeling_run_id=replacement.id)
+
+    def item(index: int, *, completed: bool) -> RegulatoryLabelingItem:
+        return RegulatoryLabelingItem(
+            regulatory_chunk_id=f"source-{index}",
+            status="completed" if completed else "pending",
+            source_snapshot={},
+            text_snapshot=str(index),
+            context_snapshot="same-context",
+            context_sha256="c" * 64,
+            canonical_text_sha256="d" * 64,
+            request_hash="a" * 64 if completed else None,
+            request_payload={"original": index} if completed else None,
+            labels=["supported"] if completed else [],
+            assignments=[],
+        )
+
+    old_items = [item(index, completed=index < 619) for index in range(662)]
+    for old in old_items[619:]:
+        old.status = "failed"
+    new_items = [item(index, completed=True) for index in range(609)] + [
+        item(index, completed=False) for index in range(619, 661)
+    ]
+    if failure == "receipt":
+        new_items[0].request_hash = "changed"
+    elif failure == "late":
+        new_items[-1].status = "submitted"
+    session = MagicMock(spec=Session)
+    session.get_one.side_effect = [batch, replacement, run]
+    session.scalars.side_effect = [new_items, old_items]
+
+    @contextmanager
+    def current_session() -> Iterator[Session]:
+        yield session
+
+    monkeypatch.setattr(operator, "get_session_with_current_tenant", current_session)
+    monkeypatch.setattr(
+        operator,
+        "canonical_source_sha256",
+        lambda *_: "changed" if failure == "source" else "s",
+    )
+    monkeypatch.setattr(operator.scope, "unpublished_epoch_scope", MagicMock())
+    if failure:
+        with pytest.raises(RuntimeError):
+            operator.observe_replacement("s")
+    else:
+        result = operator.observe_replacement("s")
+        assert result["observed_exact_reused_receipts"] == 609
+        assert result["observed_initial_pending_targets"] == 42
+        assert result["replacement_run_id"] == str(replacement.id)
+        assert result["provider_dispatched_by_operator"] is False
     session.commit.assert_not_called()

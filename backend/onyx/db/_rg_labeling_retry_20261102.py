@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import time
 from typing import Any
 from uuid import UUID
 
@@ -57,6 +58,16 @@ from shared_configs.contextvars import get_current_tenant_id
 PDF_METADATA_SHA = "360736824a7f7588a2ae032d4901238d5e3f9870f01cbe3c1246ed485927d5b1"
 IBRAZ = "rc_9445ee9075213f582ea39b7124dc6275a32793c6"
 RETRY_IMAGE_SHA: str | None = None  # Pinned only after the final release is approved.
+
+
+def canonical_source_sha256(session: Session) -> str:
+    return publication_digest(
+        [
+            row.model_dump(mode="json")
+            for file_id in sorted([scope.MAIN_FILE, scope.PDF_FILE])
+            for row in capture_canonical_scope(session, UUID(file_id))
+        ]
+    )
 
 
 def require_failed_run(run: RegulatoryLabelingRun) -> None:
@@ -422,6 +433,7 @@ def retry_plan(
         "canonical_scope_sha256": publication_digest(
             [row.model_dump(mode="json") for row in main_rows]
         ),
+        "all_canonical_source_sha256": canonical_source_sha256(session),
         "native_readers": [
             {
                 "chunk_id": identifier,
@@ -468,11 +480,119 @@ def request_retry(
         scope.unpublished_epoch_scope(session) == epochs,
         "The retry changed publication or indexing authority",
     )
+    scope.require(
+        canonical_source_sha256(session) == proof["all_canonical_source_sha256"],
+        "The normal retry changed canonical source data",
+    )
     scope.verify_scope(session, batch)
     proof["operator_action"] = "normal_labeling_retry_requested"
+    proof.pop("approval_publication_index_or_provider_requested", None)
+    proof["approval_publication_or_index_requested"] = False
+    proof["provider_requested_via_standard_intake_retry"] = True
     proof["normal_get_status"] = result["status"]
     proof["delivery"] = "standard_enqueue_intake_batch_without_reprepare_request"
     return proof
+
+
+def observe_replacement(expected_source_sha256: str) -> dict[str, Any]:
+    """Watch worker-created rows; never prepare a run or dispatch provider work."""
+    for _ in range(120):
+        with get_session_with_current_tenant() as session:
+            session.execute(text("SET TRANSACTION READ ONLY"))
+            batch = session.get_one(scope.RegulatoryDocumentIntake, scope.BATCH)
+            if batch.labeling_run_id != scope.LABELING_RUN:
+                run = session.get_one(RegulatoryLabelingRun, batch.labeling_run_id)
+                old = session.get_one(RegulatoryLabelingRun, scope.LABELING_RUN)
+                require_failed_run(old)
+                scope.require(
+                    (run.total_chunks, run.derived_chunks) == (651, 46)
+                    and run.file_ids == old.file_ids
+                    and run.provider_binding == old.provider_binding
+                    and run.taxonomy_id == old.taxonomy_id,
+                    "The worker-created replacement differs from the approved plan",
+                )
+                items = list(
+                    session.scalars(
+                        select(RegulatoryLabelingItem).where(
+                            RegulatoryLabelingItem.run_id == run.id
+                        )
+                    )
+                )
+                old_items = {
+                    item.regulatory_chunk_id: item
+                    for item in session.scalars(
+                        select(RegulatoryLabelingItem).where(
+                            RegulatoryLabelingItem.run_id == old.id
+                        )
+                    )
+                }
+                reused = [
+                    item
+                    for item in items
+                    if old_items[item.regulatory_chunk_id].status == "completed"
+                ]
+                pending = [
+                    item
+                    for item in items
+                    if old_items[item.regulatory_chunk_id].status == "failed"
+                ]
+                scope.require(
+                    len(items) == 651 and len(reused) == 609 and len(pending) == 42,
+                    "The worker changed the approved reuse/remaining source sets",
+                )
+                fields = (
+                    "source_snapshot",
+                    "text_snapshot",
+                    "context_snapshot",
+                    "context_sha256",
+                    "canonical_text_sha256",
+                    "request_hash",
+                    "request_payload",
+                    "labels",
+                    "assignments",
+                )
+                scope.require(
+                    all(
+                        item.status == "completed"
+                        and all(
+                            getattr(item, key)
+                            == getattr(old_items[item.regulatory_chunk_id], key)
+                            for key in fields
+                        )
+                        for item in reused
+                    ),
+                    "A compatible completed receipt was not copied immutably",
+                )
+                scope.require(
+                    all(
+                        item.status == "pending"
+                        and item.request_hash is None
+                        and item.request_payload is None
+                        for item in pending
+                    )
+                    and run.completed_chunks == 609,
+                    "The initial remaining42 pending state was not observed before labeling advanced",
+                )
+                scope.require(
+                    canonical_source_sha256(session) == expected_source_sha256,
+                    "The worker retry changed canonical source data",
+                )
+                scope.unpublished_epoch_scope(session)
+                return {
+                    "replacement_run_id": str(run.id),
+                    "provider_targets": 651,
+                    "derived_targets": 46,
+                    "observed_exact_reused_receipts": 609,
+                    "observed_initial_pending_targets": 42,
+                    "canonical_source_sha256": expected_source_sha256,
+                    "old_run_unchanged": True,
+                    "provider_dispatched_by_operator": False,
+                }
+            session.rollback()
+        time.sleep(0.5)
+    raise RuntimeError(
+        "The normal worker did not create the replacement within the bounded observation window; inspect without reenqueuing"
+    )
 
 
 def main() -> None:
@@ -523,6 +643,19 @@ def main() -> None:
         )
 
         enqueue_intake_batch(batch_id=scope.BATCH, tenant_id=get_current_tenant_id())
+        print(
+            json.dumps(
+                {
+                    "operator_event": "normal_retry_committed_and_standard_delivery_sent",
+                    "batch_id": str(scope.BATCH),
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+        report["observed_worker_replacement"] = observe_replacement(
+            report["all_canonical_source_sha256"]
+        )
     report["expected_image_sha"] = args.expected_image_sha
     print(json.dumps(report, ensure_ascii=False, default=str, indent=2))
 
