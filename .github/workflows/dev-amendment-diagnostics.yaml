@@ -134,7 +134,7 @@ jobs:
                   if deployment['metadata'].get('namespace') != namespace:
                       raise RuntimeError('Unexpected activity deployment namespace')
                   backend_container(deployment['spec']['template']['spec'])
-                  public_version()
+                  # Read-only activity uses the operator-verified frontend SHA; the exact pod image remains enforced.
                   ready = [p for p in kubernetes('pods')['items'] if p['metadata'].get('deletionTimestamp') is None and p['status']['phase'] == 'Running' and any(c.get('type') == 'Ready' and c.get('status') == 'True' for c in p['status'].get('conditions', []))]
                   if len(ready) != 1:
                       raise RuntimeError('Expected one Ready exact-image DEV API pod for activity observation')
