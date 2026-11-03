@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import re
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -384,6 +386,8 @@ def progress(
         "observed_at": datetime.now(timezone.utc).isoformat(),
         "request_id": str(request.id),
         "request_status": request.status,
+        "request_created_at": request.created_at,
+        "request_updated_at": getattr(request, "updated_at", None),
         "documents": {
             key: {
                 "status": entry.get("status"),
@@ -396,12 +400,26 @@ def progress(
         },
         "batch": {
             key: getattr(batch, key)
-            for key in ("status", "stage", "labeling_run_id", "review_sha256", "error")
+            for key in (
+                "status",
+                "stage",
+                "labeling_run_id",
+                "review_sha256",
+                "error",
+                "created_at",
+                "updated_at",
+                "lease_expires_at",
+            )
         },
+        "batch_lease_present": batch.lease_token is not None,
         "source_sha256": source_digest(session),
         "provider_calls": 0,
         "approval_or_index_requested": False,
         "metadata_cache": scope.metadata_cache_progress(session, batch),
+        "active_document_set_runs": scope.rows(
+            session,
+            "SELECT id,status,stage,total_chunks,completed_chunks,failed_chunks,lease_expires_at,updated_at FROM regulatory_labeling_run WHERE document_set_id=15 AND status IN ('queued','running') ORDER BY created_at LIMIT 8",
+        ),
     }
     if request.status == "prepared":
         report["metadata"] = metadata_proof(
@@ -463,6 +481,116 @@ def progress(
         not acceptance or "review" in report, "No autonomous complete review exists yet"
     )
     return report
+
+
+def broker_queue_progress(app: Any, queue: str) -> dict[str, Any]:
+    """Peek bounded metadata without consuming, acknowledging or publishing."""
+    result: dict[str, Any] = {"queue": queue}
+    try:
+        with app.connection_for_read() as connection:
+            result["driver"] = connection.transport.driver_type
+            if result["driver"] != "redis":
+                return result
+            channel = connection.channel()
+            try:
+                counts, exact = [], []
+                for priority in channel.priority_steps:
+                    key = channel._q_for_pri(queue, priority)
+                    counts.append(
+                        {"priority": priority, "messages": channel.client.llen(key)}
+                    )
+                    for raw in channel.client.lrange(key, 0, 7):
+                        if len(raw) > 200_000:
+                            continue
+                        try:
+                            message = json.loads(raw)
+                            headers = message.get("headers", {})
+                            if (
+                                headers.get("task")
+                                != "regulatory_document_intake_prepare"
+                            ):
+                                continue
+                            body = message.get("body", "")
+                            if (
+                                message.get("properties", {}).get("body_encoding")
+                                == "base64"
+                            ):
+                                body = base64.b64decode(body)
+                            payload = json.loads(body)
+                            kwargs = (
+                                payload[1]
+                                if isinstance(payload, list) and len(payload) > 1
+                                else {}
+                            )
+                            if (
+                                kwargs.get("batch_id") == str(scope.BATCH)
+                                and kwargs.get("reprepare_request_id")
+                                == "4a0ad9d5-674d-4bc3-ac98-d54e1ed5e0c5"
+                            ):
+                                exact.append(
+                                    {
+                                        "id": headers.get("id"),
+                                        "task": headers.get("task"),
+                                        "priority": priority,
+                                        "expires": headers.get("expires"),
+                                    }
+                                )
+                        except (TypeError, ValueError):
+                            continue
+                result.update(
+                    queue_counts=counts,
+                    exact_frozen_messages_in_bounded_peek=exact,
+                    peek_limit_per_priority=8,
+                )
+            finally:
+                channel.close()
+    except Exception as error:
+        result["read_error_type"] = type(error).__name__
+    return result
+
+
+def worker_progress() -> dict[str, Any]:
+    from onyx.background.celery.versioned_apps.client import app
+
+    inspector = app.control.inspect(timeout=3.0)
+    queues = inspector.active_queues() or {}
+    active = inspector.active() or {}
+    reserved = inspector.reserved() or {}
+    stats = inspector.stats() or {}
+    expected = scope.config.source_queue_name()
+    consumers = []
+    for worker, worker_queues in queues.items():
+        names = [item.get("name") for item in worker_queues]
+        if expected not in names and not worker.startswith("regulatory_annex@"):
+            continue
+
+        def tasks(values: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+            return [
+                {key: item.get(key) for key in ("id", "name", "time_start")}
+                for item in values[:12]
+            ]
+
+        consumers.append(
+            {
+                "worker": worker,
+                "queue_names": names,
+                "consumes_expected_queue": expected in names,
+                "pool_max_concurrency": stats.get(worker, {})
+                .get("pool", {})
+                .get("max-concurrency"),
+                "active_count": len(active.get(worker, [])),
+                "reserved_count": len(reserved.get(worker, [])),
+                "active": tasks(active.get(worker, [])),
+                "reserved": tasks(reserved.get(worker, [])),
+            }
+        )
+    return {
+        "observed_at": datetime.now(timezone.utc).isoformat(),
+        "expected_queue": expected,
+        "consumers": consumers,
+        "exact_activity": scope.exact_worker_activity(),
+        "broker_read_only": broker_queue_progress(app, expected),
+    }
 
 
 def acceptance_proof(
@@ -674,6 +802,8 @@ def main() -> None:
         enqueue_intake_batch(
             batch_id=scope.BATCH, tenant_id="public", reprepare_request_id=enqueue_id
         )
+    if args.operation == "progress" and report.get("request_status") == "queued":
+        report["worker_activity"] = worker_progress()
     for item in [report.get("batch", {}), report.get("run", {})]:
         if isinstance(item.get("error"), str) and scope.SECRET_LINE.search(
             item["error"]
