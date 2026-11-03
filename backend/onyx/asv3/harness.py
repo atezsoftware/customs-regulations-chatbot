@@ -1259,6 +1259,7 @@ class Harness:
                     admission = cropped_limit.admit_tool(
                         call.name,
                         call.arguments,
+                        call_id=call.call_id,
                         critical_target_key=hashlib.sha256(
                             self._read_signature(call).encode("utf-8")
                         ).hexdigest(),

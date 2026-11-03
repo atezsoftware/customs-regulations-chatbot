@@ -566,6 +566,12 @@ def _native_original_rows(ledger: EvidenceLedger) -> list[dict[str, JsonValue]]:
         title = str(row.get("title") or "")
         identities = [root, title]
         kind = folded(str(row.get("document_type") or ""))
+        # An explicit own instrument title outranks a legacy document-type hint.
+        if any(
+            _explicit_instrument_name(folded(value)) and _formal_law_name(value) is None
+            for value in identities
+        ):
+            continue
         # Missing kind can be recovered from an exact official statute heading,
         # never from a filename or a cross-reference in the passage's body.
         if kind not in _LAW_KINDS and (

@@ -269,6 +269,11 @@ _MESSAGES: dict[str, dict[str, tuple[str, str]]] = {
 }
 
 
+def is_host_cancellation_notice(text: str) -> bool:
+    """Recognize only standalone host status text, without source-dependent prose."""
+    return any(text == messages["cancelled"][1] for messages in _MESSAGES.values())
+
+
 def localized_notifications(language: str) -> dict[str, list[str]]:
     """Supply terminal UI text without a separate language-model invocation."""
     base = _MESSAGES.get(language.split("-")[0].lower(), {})

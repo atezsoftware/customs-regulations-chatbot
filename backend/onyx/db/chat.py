@@ -1122,6 +1122,11 @@ def translate_db_message_to_chat_message_detail(
 
     if not message_publication_available(chat_message):
         error = str(PublicationReadChanged())
+        if chat_message.message_type == MessageType.ASSISTANT:
+            from onyx.asv3.progress import is_host_cancellation_notice
+
+            if is_host_cancellation_notice(chat_message.message):
+                error = chat_message.message
         return chat_msg_detail.model_copy(
             update={
                 "message": error,

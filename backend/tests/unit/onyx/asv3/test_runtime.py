@@ -49,6 +49,7 @@ from onyx.llm.models import (
     UserMessage,
 )
 from onyx.prompts.asv3.research import COORDINATOR_PROMPT, RESEARCHER_PROMPT
+from onyx.regulatory.source_notices import SourceNotice
 from onyx.server.query_and_chat.streaming_models import (
     AgentResponseDelta,
     AgentResponseStart,
@@ -264,6 +265,15 @@ class CorpusBoundary:
         return None
 
     def related_source_navigation(self) -> list[dict[str, JsonValue]]:
+        return []
+
+    def source_notices(
+        self,
+        _queries: list[str] | None,
+        _notice_ids: list[str] | None,
+        context: RunContext,
+    ) -> list[SourceNotice]:
+        context.check_active()
         return []
 
     def shared_read_fence(self, source_id: str, context: RunContext) -> str:

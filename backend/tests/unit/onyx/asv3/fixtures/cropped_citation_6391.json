@@ -1,0 +1,567 @@
+{
+  "capture": "plans/tariff-api-incident-20261102/checkpoint-6391.json",
+  "assistant_message_id": 6391,
+  "failed_unit": "**Uyuşmazlık:** Çin menşeli beyan edilen eşyanın menşeini tevsik eden belgenin ibraz edilmemesi nedeniyle, ABD menşeli ürünlere yönelik ek mali yükümlülük ve bağlantılı vergi/ceza kararları alınmıştır. Dava, bunların **4458 sayılı Gümrük Kanunu’nun 211. maddesi kapsamında kaldırılması başvurusunun reddine** ilişkindir; doğrudan ve süresinde ek tahakkuka karşı açılmış bir dava değildir.[6][96]",
+  "preserved_condition": "Beyanname tarihi ve ilgili AD Tebliğinin numarası verilmediğinden, en yüksek tutar hükmünün bu ithalata uygulanacak tarihsel metnini ve ürün/ülke/firma bazlı önlemle etkileşimini kesinleştiremiyorum. Bu sınırlama, emsallerin dosyanıza doğrudan uygulanabilirliğini etkiler.",
+  "records": [
+    {
+      "captured_citation": 6,
+      "item": {
+        "source_id": "72048f85-f758-440a-a338-3a8b9956e164",
+        "text": "Davacı şirket adına tescilli …-… ile …-… tarih ve sayılı serbest dolaşıma giriş beyannamelerinde 33.04 tarife pozisyonunda ve Çin Halk Cumhuriyeti menşeli olarak beyan edilen eşyanın menşeini tevsik eden belgenin ibraz edilmediğinden bahisle, 11/06/2018 tarih ve 2018/11973 sayılı Bakanlar Kurulu Kararı ile 21/06/2018 tarihinden itibaren geçerli olmak üzere yürürlüğe konulan Amerika Birleşik Devletleri Menşeli Bazı Ürünlerin İthalatında Ek Mali Yükümlülük Uygulanmasına Dair Karar uyarınca ek mali yükümlülük ile özel tüketim ve katma değer vergisi ek olarak tahakkuk ettirilmiş ve bunlar üzerinden 4458 sayılı Gümrük Kanunu'nun 234. maddesinin 1. fıkrasının (a) bendi uyarınca para cezaları karara bağlanmıştır. Davacı tarafından bu kararlara karşı itiraz yoluna başvurulmadığı gibi dava da açılmamış, daha sonra 4458 sayılı Gümrük Kanunu'nun 211. maddesi uyarınca ek tahakkuk ve para cezası kararlarının kaldırılması istemiyle yapılan başvurunun reddine ilişkin karara vaki itirazın reddi yolundaki işlemin iptali istemiyle dava açılmıştır.",
+        "chunk_id": "rc_e6d54e0d824502e8f91d65c5392e779971ebec9a",
+        "search_doc": {
+          "document_id": "72048f85-f758-440a-a338-3a8b9956e164",
+          "chunk_ind": 8,
+          "semantic_identifier": "Kararname ve Mahkeme Kararları/danistay_7_daire_e_2022-476_k_2023-3694_abd_menseli_urunlerde_ek_mali_yukumluluge_ait_cezalar.md",
+          "link": null,
+          "blurb": "Davacı şirket adına tescilli …-… ile …-… tarih ve sayılı serbest dolaşıma giriş beyannamelerinde 33.04 tarife pozisyonunda ve Çin Halk Cumhuriyeti menşeli olarak beyan edilen eşyanın menşeini tevsik eden belgenin ibraz edilmediğinden bahisl",
+          "source_type": "file",
+          "boost": 0,
+          "hidden": false,
+          "metadata": {
+            "regulatory_chunk_id": "rc_e6d54e0d824502e8f91d65c5392e779971ebec9a",
+            "regulatory_heading_path": [
+              "D A N I Ş T A Y",
+              "MADDİ OLAY:"
+            ],
+            "regulatory_validity_start_date": "",
+            "regulatory_validity_end_date": ""
+          },
+          "score": null,
+          "is_relevant": null,
+          "relevance_explanation": null,
+          "match_highlights": [],
+          "updated_at": null,
+          "primary_owners": null,
+          "secondary_owners": null,
+          "is_internet": false,
+          "file_id": "dc6d2a16-1e71-415a-8a4e-0a01b7adaeb5"
+        },
+        "question_ids": [],
+        "metadata": {
+          "legistation_metadata": {
+            "official_title": "Danıştay - 7. Daire - K: 2023/3694, E: 2022/476",
+            "validity_status": "Uygulanmaz (Yargı Kararı)"
+          },
+          "position": 8,
+          "heading_path": [
+            "D A N I Ş T A Y",
+            "MADDİ OLAY:"
+          ],
+          "validity_start": null,
+          "validity_end": null,
+          "version_unknown": true,
+          "canonical_metadata": {
+            "document_id": "72048f85-f758-440a-a338-3a8b9956e164",
+            "chunk_index": 8,
+            "title": "Kararname ve Mahkeme Kararları/danistay_7_daire_e_2022-476_k_2023-3694_abd_menseli_urunlerde_ek_mali_yukumluluge_ait_cezalar.md",
+            "source_type": "user_file",
+            "semantic_identifier": "Kararname ve Mahkeme Kararları/danistay_7_daire_e_2022-476_k_2023-3694_abd_menseli_urunlerde_ek_mali_yukumluluge_ait_cezalar.md — D A N I Ş T A Y > MADDİ OLAY:",
+            "source_links": "{\"0\": \"\"}",
+            "document_sets": [
+              "PC Külliyatı"
+            ],
+            "regulatory_chunk_id": "rc_e6d54e0d824502e8f91d65c5392e779971ebec9a",
+            "heading_path": [
+              "D A N I Ş T A Y",
+              "MADDİ OLAY:"
+            ],
+            "decision_numbers": [
+              "2018/11973"
+            ],
+            "legal_dates": [
+              "2018-06-11",
+              "2018-06-21"
+            ],
+            "article_no": null,
+            "clause_label": null,
+            "paragraph_no": null,
+            "article_title": null,
+            "chunk_variant": "atomic",
+            "document_date": null,
+            "document_type": "unknown",
+            "source_regulatory_chunk_ids": [],
+            "read_as_of_date": "2026-10-29"
+          },
+          "read_as_of_date": "2026-10-29",
+          "retrieval_method": "established_search_exact_original",
+          "article_closure_complete": false,
+          "section_context": "not_inferred",
+          "additional_context": "harness_controlled",
+          "follow_context_tool": "read_provision",
+          "retrieved_projection_ordinal": 8,
+          "retrieved_center": true
+        },
+        "text_hash": "8f023dfd6d0e28144a11a0d2b2e038a9dcce4d1952f8b800d5934430db71712a"
+      }
+    },
+    {
+      "captured_citation": 96,
+      "item": {
+        "source_id": "72048f85-f758-440a-a338-3a8b9956e164",
+        "text": "Dava Konusu İstem: Davacı adına tescilli …-… ile …-… tarih ve sayılı serbest dolaşıma giriş beyannameleri muhteviyatı eşyaya ilişkin olarak 11/06/2018 tarih ve 2018/11973 sayılı Bakanlar Kurulu Kararı ile 21/06/2018 tarihinden itibaren geçerli olmak üzere yürürlüğe konulan Amerika Birleşik Devletleri Menşeli Bazı Ürünlerin İthalatında Ek Mali Yükümlülük Uygulanmasına Dair Karar uyarınca tahakkuk ettirilen ek mali yükümlülük, özel tüketim ve katma değer vergisi ile bunlar üzerinden 4458 sayılı Gümrük Kanunu'nun 234. maddesinin 1. fıkrasının (a) bendi uyarınca karara bağlanan para cezalarının anılan Kanun'un 211. maddesi uyarınca kaldırılması istemiyle yapılan başvurunun reddine ilişkin karara vaki itirazın reddi yolundaki işlemin iptali istemiyle dava açılmıştır.",
+        "chunk_id": "rc_5eac7835182ce5e9f473d9c5865274658dfa1b58",
+        "search_doc": {
+          "document_id": "72048f85-f758-440a-a338-3a8b9956e164",
+          "chunk_ind": 2,
+          "semantic_identifier": "Kararname ve Mahkeme Kararları/danistay_7_daire_e_2022-476_k_2023-3694_abd_menseli_urunlerde_ek_mali_yukumluluge_ait_cezalar.md",
+          "link": null,
+          "blurb": "Dava Konusu İstem: Davacı adına tescilli …-… ile …-… tarih ve sayılı serbest dolaşıma giriş beyannameleri muhteviyatı eşyaya ilişkin olarak 11/06/2018 tarih ve 2018/11973 sayılı Bakanlar Kurulu Kararı ile 21/06/2018 tarihinden itibaren geçe",
+          "source_type": "file",
+          "boost": 0,
+          "hidden": false,
+          "metadata": {
+            "regulatory_chunk_id": "rc_5eac7835182ce5e9f473d9c5865274658dfa1b58",
+            "regulatory_heading_path": [
+              "D A N I Ş T A Y",
+              "YARGILAMA SÜRECİ:"
+            ],
+            "regulatory_validity_start_date": "",
+            "regulatory_validity_end_date": ""
+          },
+          "score": null,
+          "is_relevant": null,
+          "relevance_explanation": null,
+          "match_highlights": [],
+          "updated_at": null,
+          "primary_owners": null,
+          "secondary_owners": null,
+          "is_internet": false,
+          "file_id": "dc6d2a16-1e71-415a-8a4e-0a01b7adaeb5"
+        },
+        "question_ids": [
+          "q0"
+        ],
+        "metadata": {
+          "legistation_metadata": {
+            "official_title": "Danıştay - 7. Daire - K: 2023/3694, E: 2022/476",
+            "validity_status": "Uygulanmaz (Yargı Kararı)"
+          },
+          "position": 2,
+          "heading_path": [
+            "D A N I Ş T A Y",
+            "YARGILAMA SÜRECİ:"
+          ],
+          "validity_start": null,
+          "validity_end": null,
+          "version_unknown": true,
+          "canonical_metadata": {
+            "document_id": "72048f85-f758-440a-a338-3a8b9956e164",
+            "chunk_index": 2,
+            "title": "Kararname ve Mahkeme Kararları/danistay_7_daire_e_2022-476_k_2023-3694_abd_menseli_urunlerde_ek_mali_yukumluluge_ait_cezalar.md",
+            "source_type": "user_file",
+            "semantic_identifier": "Kararname ve Mahkeme Kararları/danistay_7_daire_e_2022-476_k_2023-3694_abd_menseli_urunlerde_ek_mali_yukumluluge_ait_cezalar.md — D A N I Ş T A Y > YARGILAMA SÜRECİ:",
+            "source_links": "{\"0\": \"\"}",
+            "document_sets": [
+              "PC Külliyatı"
+            ],
+            "regulatory_chunk_id": "rc_5eac7835182ce5e9f473d9c5865274658dfa1b58",
+            "heading_path": [
+              "D A N I Ş T A Y",
+              "YARGILAMA SÜRECİ:"
+            ],
+            "decision_numbers": [
+              "2018/11973"
+            ],
+            "legal_dates": [
+              "2018-06-11",
+              "2018-06-21"
+            ],
+            "article_no": null,
+            "clause_label": null,
+            "paragraph_no": null,
+            "article_title": null,
+            "chunk_variant": "atomic",
+            "document_date": null,
+            "document_type": "unknown",
+            "source_regulatory_chunk_ids": [],
+            "read_as_of_date": "2026-10-29"
+          },
+          "read_as_of_date": "2026-10-29"
+        },
+        "text_hash": "9d86717b74c39f63f2f141f2ccc1af4c27cca480ac85e60566073799daad5301"
+      }
+    },
+    {
+      "captured_citation": 540,
+      "item": {
+        "source_id": "12328001-2f21-407e-b230-7d50a8dbf28f",
+        "text": "**MADDE 211- 1.** Kanunen ödenmemeleri gerektiği halde ödenmiş olduğu belirlenen gümrük vergileri geri verilir. Kanunen tahakkuk ettirilmemeleri gerektiği halde tahakkuk ettirilen gümrük vergileri kaldırılır.",
+        "chunk_id": "rc_daa85427ac2f4652a1dc3b8b3ef5f72025815a18",
+        "search_doc": {
+          "document_id": "12328001-2f21-407e-b230-7d50a8dbf28f",
+          "chunk_ind": 965,
+          "semantic_identifier": "İhracat Mevzuatı/Kanun, Kararname, Yönetmelik, Tebliğ, Genelge/gumruk_kanunu_.md",
+          "link": null,
+          "blurb": "**MADDE 211- 1.** Kanunen ödenmemeleri gerektiği halde ödenmiş olduğu belirlenen gümrük vergileri geri verilir. Kanunen tahakkuk ettirilmemeleri gerektiği halde tahakkuk ettirilen gümrük vergileri kaldırılır.",
+          "source_type": "file",
+          "boost": 0,
+          "hidden": false,
+          "metadata": {
+            "regulatory_chunk_id": "rc_daa85427ac2f4652a1dc3b8b3ef5f72025815a18",
+            "regulatory_heading_path": [
+              "4458 SAYILI GÜMRÜK KANUNU",
+              "Gümrük Yükümlülüğü",
+              "BEŞİNCİ BÖLÜM",
+              "MADDE 211",
+              "1. Kanunen ödenmemeleri gerektiği halde ödenmiş olduğu belirlenen gümrük vergileri geri ve..."
+            ],
+            "regulatory_validity_start_date": "",
+            "regulatory_validity_end_date": ""
+          },
+          "score": null,
+          "is_relevant": null,
+          "relevance_explanation": null,
+          "match_highlights": [],
+          "updated_at": null,
+          "primary_owners": null,
+          "secondary_owners": null,
+          "is_internet": false,
+          "file_id": "f3bf6768-cbe0-4cd2-926d-8958578530e6"
+        },
+        "question_ids": [],
+        "metadata": {
+          "legistation_metadata": {
+            "official_title": "4458 SAYILI GÜMRÜK KANUNU",
+            "validity_status": "Mülga",
+            "repeal_note": "2. (07.07.2009/27281 R.G. 5911 s.k. ile yürürlükten kaldırılmıştır.) [69] || 3. (07.07.2009/27281 R.G. 5911 s.k. ile yürürlükten kaldırılmıştır.) [187]  •  KISMİ: İkinci paragraf (07.07.2009/27281 R.G. 5911 s.k. ile yürürlükten kaldırılmıştır.) [17] || MADDE 42- (07.07.2009/27281 R.G. 5911 s.k. ile yürürlükten kaldırılmıştır.) [56] (+16 şerh daha)"
+          },
+          "position": 965,
+          "heading_path": [
+            "4458 SAYILI GÜMRÜK KANUNU",
+            "Gümrük Yükümlülüğü",
+            "BEŞİNCİ BÖLÜM",
+            "MADDE 211",
+            "1. Kanunen ödenmemeleri gerektiği halde ödenmiş olduğu belirlenen gümrük vergileri geri ve..."
+          ],
+          "validity_start": null,
+          "validity_end": null,
+          "version_unknown": true,
+          "canonical_metadata": {
+            "document_id": "12328001-2f21-407e-b230-7d50a8dbf28f",
+            "chunk_index": 965,
+            "title": "İhracat Mevzuatı/Kanun, Kararname, Yönetmelik, Tebliğ, Genelge/gumruk_kanunu_.md",
+            "source_type": "user_file",
+            "semantic_identifier": "İhracat Mevzuatı/Kanun, Kararname, Yönetmelik, Tebliğ, Genelge/gumruk_kanunu_.md — 4458 SAYILI GÜMRÜK KANUNU > Gümrük Yükümlülüğü > BEŞİNCİ BÖLÜM > MADDE 211 > 1. Kanunen ödenmemeleri gerektiği halde ödenmiş olduğu belirlenen gümrük vergileri geri ve...",
+            "source_links": "{\"0\": \"\"}",
+            "document_sets": [
+              "PC Külliyatı"
+            ],
+            "regulatory_chunk_id": "rc_daa85427ac2f4652a1dc3b8b3ef5f72025815a18",
+            "heading_path": [
+              "4458 SAYILI GÜMRÜK KANUNU",
+              "Gümrük Yükümlülüğü",
+              "BEŞİNCİ BÖLÜM",
+              "MADDE 211",
+              "1. Kanunen ödenmemeleri gerektiği halde ödenmiş olduğu belirlenen gümrük vergileri geri ve..."
+            ],
+            "provision_identifiers": [
+              "madde 211"
+            ],
+            "legal_dates": [
+              "1999-10-27",
+              "1999-11-04"
+            ],
+            "article_no": "211",
+            "clause_label": null,
+            "paragraph_no": "1",
+            "article_title": null,
+            "chunk_variant": "atomic",
+            "document_date": "1999-10-27",
+            "document_type": "kanun",
+            "source_regulatory_chunk_ids": [],
+            "read_as_of_date": "2026-10-29"
+          },
+          "read_as_of_date": "2026-10-29"
+        },
+        "text_hash": "28892a13d9be810f95ac42eebcbfa20c07501f6450ee654f4f091b2655a0ec1f"
+      }
+    },
+    {
+      "captured_citation": 541,
+      "item": {
+        "source_id": "12328001-2f21-407e-b230-7d50a8dbf28f",
+        "text": "Ancak, kanunen ödenmemesi veya tahakkuk ettirilmemesi gereken gümrük vergileri ilgili kişinin kasten yaptığı bir tahrifat veya ticaret politikası önlemlerine tabi eşyanın gümrük kıymetinin yükümlünün kendi beyanı ile artırılması sonucunda ödenmiş veya tahakkuk ettirilmişse, bu vergilerin geri verilmesine veya kaldırılmasına ilişkin talepler kabul edilmez.",
+        "chunk_id": "rc_96e8978c12a378ca8bd888af51f589f74dd8714f",
+        "search_doc": {
+          "document_id": "12328001-2f21-407e-b230-7d50a8dbf28f",
+          "chunk_ind": 966,
+          "semantic_identifier": "İhracat Mevzuatı/Kanun, Kararname, Yönetmelik, Tebliğ, Genelge/gumruk_kanunu_.md",
+          "link": null,
+          "blurb": "Ancak, kanunen ödenmemesi veya tahakkuk ettirilmemesi gereken gümrük vergileri ilgili kişinin kasten yaptığı bir tahrifat veya ticaret politikası önlemlerine tabi eşyanın gümrük kıymetinin yükümlünün kendi beyanı ile artırılması sonucunda ö",
+          "source_type": "file",
+          "boost": 0,
+          "hidden": false,
+          "metadata": {
+            "regulatory_chunk_id": "rc_96e8978c12a378ca8bd888af51f589f74dd8714f",
+            "regulatory_heading_path": [
+              "4458 SAYILI GÜMRÜK KANUNU",
+              "Gümrük Yükümlülüğü",
+              "BEŞİNCİ BÖLÜM",
+              "MADDE 211",
+              "1. Kanunen ödenmemeleri gerektiği halde ödenmiş olduğu belirlenen gümrük vergileri geri ve..."
+            ],
+            "regulatory_validity_start_date": "",
+            "regulatory_validity_end_date": ""
+          },
+          "score": null,
+          "is_relevant": null,
+          "relevance_explanation": null,
+          "match_highlights": [],
+          "updated_at": null,
+          "primary_owners": null,
+          "secondary_owners": null,
+          "is_internet": false,
+          "file_id": "f3bf6768-cbe0-4cd2-926d-8958578530e6"
+        },
+        "question_ids": [],
+        "metadata": {
+          "legistation_metadata": {
+            "official_title": "4458 SAYILI GÜMRÜK KANUNU",
+            "validity_status": "Mülga",
+            "repeal_note": "2. (07.07.2009/27281 R.G. 5911 s.k. ile yürürlükten kaldırılmıştır.) [69] || 3. (07.07.2009/27281 R.G. 5911 s.k. ile yürürlükten kaldırılmıştır.) [187]  •  KISMİ: İkinci paragraf (07.07.2009/27281 R.G. 5911 s.k. ile yürürlükten kaldırılmıştır.) [17] || MADDE 42- (07.07.2009/27281 R.G. 5911 s.k. ile yürürlükten kaldırılmıştır.) [56] (+16 şerh daha)"
+          },
+          "position": 966,
+          "heading_path": [
+            "4458 SAYILI GÜMRÜK KANUNU",
+            "Gümrük Yükümlülüğü",
+            "BEŞİNCİ BÖLÜM",
+            "MADDE 211",
+            "1. Kanunen ödenmemeleri gerektiği halde ödenmiş olduğu belirlenen gümrük vergileri geri ve..."
+          ],
+          "validity_start": null,
+          "validity_end": null,
+          "version_unknown": true,
+          "canonical_metadata": {
+            "document_id": "12328001-2f21-407e-b230-7d50a8dbf28f",
+            "chunk_index": 966,
+            "title": "İhracat Mevzuatı/Kanun, Kararname, Yönetmelik, Tebliğ, Genelge/gumruk_kanunu_.md",
+            "source_type": "user_file",
+            "semantic_identifier": "İhracat Mevzuatı/Kanun, Kararname, Yönetmelik, Tebliğ, Genelge/gumruk_kanunu_.md — 4458 SAYILI GÜMRÜK KANUNU > Gümrük Yükümlülüğü > BEŞİNCİ BÖLÜM > MADDE 211 > 1. Kanunen ödenmemeleri gerektiği halde ödenmiş olduğu belirlenen gümrük vergileri geri ve...",
+            "source_links": "{\"0\": \"\"}",
+            "document_sets": [
+              "PC Külliyatı"
+            ],
+            "regulatory_chunk_id": "rc_96e8978c12a378ca8bd888af51f589f74dd8714f",
+            "heading_path": [
+              "4458 SAYILI GÜMRÜK KANUNU",
+              "Gümrük Yükümlülüğü",
+              "BEŞİNCİ BÖLÜM",
+              "MADDE 211",
+              "1. Kanunen ödenmemeleri gerektiği halde ödenmiş olduğu belirlenen gümrük vergileri geri ve..."
+            ],
+            "provision_identifiers": [
+              "madde 211"
+            ],
+            "legal_dates": [
+              "1999-10-27",
+              "1999-11-04"
+            ],
+            "article_no": "211",
+            "clause_label": null,
+            "paragraph_no": "1",
+            "article_title": null,
+            "chunk_variant": "atomic",
+            "document_date": "1999-10-27",
+            "document_type": "kanun",
+            "source_regulatory_chunk_ids": [],
+            "read_as_of_date": "2026-10-29"
+          },
+          "read_as_of_date": "2026-10-29"
+        },
+        "text_hash": "9a6b910640f0d9749746a60de46a53508de91dc3a53658349d6e678761d2d0d8"
+      }
+    },
+    {
+      "captured_citation": 542,
+      "item": {
+        "source_id": "12328001-2f21-407e-b230-7d50a8dbf28f",
+        "text": "**2.** Kanunen ödenmemeleri gereken gümrük vergileri, söz konusu vergilerin yükümlüye tebliğ edilmesi ve ilgilinin üç yıl içinde gümrük idaresine müracaatı üzerine geri verilir veya kaldırılır.\nKontrol ve denetleme sonucunda, geri verme veya kaldırma hallerinden birinin tespiti durumunda, aynı süre içinde geri verme veya kaldırma işlemi doğrudan yapılır.\nBu süre mücbir sebep veya beklenmeyen hallerde uzatılabilir.",
+        "chunk_id": "rc_a0ed85d5b8ffab691ff204a5c389bdbe6080c052",
+        "search_doc": {
+          "document_id": "12328001-2f21-407e-b230-7d50a8dbf28f",
+          "chunk_ind": 967,
+          "semantic_identifier": "İhracat Mevzuatı/Kanun, Kararname, Yönetmelik, Tebliğ, Genelge/gumruk_kanunu_.md",
+          "link": null,
+          "blurb": "**2.** Kanunen ödenmemeleri gereken gümrük vergileri, söz konusu vergilerin yükümlüye tebliğ edilmesi ve ilgilinin üç yıl içinde gümrük idaresine müracaatı üzerine geri verilir veya kaldırılır.\nKontrol ve denetleme sonucunda, geri verme vey",
+          "source_type": "file",
+          "boost": 0,
+          "hidden": false,
+          "metadata": {
+            "regulatory_chunk_id": "rc_a0ed85d5b8ffab691ff204a5c389bdbe6080c052",
+            "regulatory_heading_path": [
+              "4458 SAYILI GÜMRÜK KANUNU",
+              "Gümrük Yükümlülüğü",
+              "BEŞİNCİ BÖLÜM",
+              "MADDE 211",
+              "2. Kanunen ödenmemeleri gereken gümrük vergileri, söz konusu vergilerin yükümlüye tebliğ e..."
+            ],
+            "regulatory_validity_start_date": "",
+            "regulatory_validity_end_date": ""
+          },
+          "score": null,
+          "is_relevant": null,
+          "relevance_explanation": null,
+          "match_highlights": [],
+          "updated_at": null,
+          "primary_owners": null,
+          "secondary_owners": null,
+          "is_internet": false,
+          "file_id": "f3bf6768-cbe0-4cd2-926d-8958578530e6"
+        },
+        "question_ids": [],
+        "metadata": {
+          "legistation_metadata": {
+            "official_title": "4458 SAYILI GÜMRÜK KANUNU",
+            "validity_status": "Mülga",
+            "repeal_note": "2. (07.07.2009/27281 R.G. 5911 s.k. ile yürürlükten kaldırılmıştır.) [69] || 3. (07.07.2009/27281 R.G. 5911 s.k. ile yürürlükten kaldırılmıştır.) [187]  •  KISMİ: İkinci paragraf (07.07.2009/27281 R.G. 5911 s.k. ile yürürlükten kaldırılmıştır.) [17] || MADDE 42- (07.07.2009/27281 R.G. 5911 s.k. ile yürürlükten kaldırılmıştır.) [56] (+16 şerh daha)"
+          },
+          "position": 967,
+          "heading_path": [
+            "4458 SAYILI GÜMRÜK KANUNU",
+            "Gümrük Yükümlülüğü",
+            "BEŞİNCİ BÖLÜM",
+            "MADDE 211",
+            "2. Kanunen ödenmemeleri gereken gümrük vergileri, söz konusu vergilerin yükümlüye tebliğ e..."
+          ],
+          "validity_start": null,
+          "validity_end": null,
+          "version_unknown": true,
+          "canonical_metadata": {
+            "document_id": "12328001-2f21-407e-b230-7d50a8dbf28f",
+            "chunk_index": 967,
+            "title": "İhracat Mevzuatı/Kanun, Kararname, Yönetmelik, Tebliğ, Genelge/gumruk_kanunu_.md",
+            "source_type": "user_file",
+            "semantic_identifier": "İhracat Mevzuatı/Kanun, Kararname, Yönetmelik, Tebliğ, Genelge/gumruk_kanunu_.md — 4458 SAYILI GÜMRÜK KANUNU > Gümrük Yükümlülüğü > BEŞİNCİ BÖLÜM > MADDE 211 > 2. Kanunen ödenmemeleri gereken gümrük vergileri, söz konusu vergilerin yükümlüye tebliğ e...",
+            "source_links": "{\"0\": \"\"}",
+            "document_sets": [
+              "PC Külliyatı"
+            ],
+            "regulatory_chunk_id": "rc_a0ed85d5b8ffab691ff204a5c389bdbe6080c052",
+            "heading_path": [
+              "4458 SAYILI GÜMRÜK KANUNU",
+              "Gümrük Yükümlülüğü",
+              "BEŞİNCİ BÖLÜM",
+              "MADDE 211",
+              "2. Kanunen ödenmemeleri gereken gümrük vergileri, söz konusu vergilerin yükümlüye tebliğ e..."
+            ],
+            "provision_identifiers": [
+              "madde 211"
+            ],
+            "legal_dates": [
+              "1999-10-27",
+              "1999-11-04"
+            ],
+            "article_no": "211",
+            "clause_label": null,
+            "paragraph_no": "2",
+            "article_title": null,
+            "chunk_variant": "atomic",
+            "document_date": "1999-10-27",
+            "document_type": "kanun",
+            "source_regulatory_chunk_ids": [],
+            "read_as_of_date": "2026-10-29"
+          },
+          "read_as_of_date": "2026-10-29"
+        },
+        "text_hash": "cfa0d40ae9dd6554f56c981ce1aaf4a9621f47a151468b11cad5708478ad1b75"
+      }
+    },
+    {
+      "captured_citation": 543,
+      "item": {
+        "source_id": "12328001-2f21-407e-b230-7d50a8dbf28f",
+        "text": "---------------------------------------------------------------------------------------------------------",
+        "chunk_id": "rc_5c57370eaf5d30a033be70b194b8cfa9a9b908bb",
+        "search_doc": {
+          "document_id": "12328001-2f21-407e-b230-7d50a8dbf28f",
+          "chunk_ind": 968,
+          "semantic_identifier": "İhracat Mevzuatı/Kanun, Kararname, Yönetmelik, Tebliğ, Genelge/gumruk_kanunu_.md",
+          "link": null,
+          "blurb": "---------------------------------------------------------------------------------------------------------",
+          "source_type": "file",
+          "boost": 0,
+          "hidden": false,
+          "metadata": {
+            "regulatory_chunk_id": "rc_5c57370eaf5d30a033be70b194b8cfa9a9b908bb",
+            "regulatory_heading_path": [
+              "4458 SAYILI GÜMRÜK KANUNU",
+              "Gümrük Yükümlülüğü",
+              "BEŞİNCİ BÖLÜM",
+              "MADDE 211",
+              "2. Kanunen ödenmemeleri gereken gümrük vergileri, söz konusu vergilerin yükümlüye tebliğ e..."
+            ],
+            "regulatory_validity_start_date": "",
+            "regulatory_validity_end_date": ""
+          },
+          "score": null,
+          "is_relevant": null,
+          "relevance_explanation": null,
+          "match_highlights": [],
+          "updated_at": null,
+          "primary_owners": null,
+          "secondary_owners": null,
+          "is_internet": false,
+          "file_id": "f3bf6768-cbe0-4cd2-926d-8958578530e6"
+        },
+        "question_ids": [],
+        "metadata": {
+          "legistation_metadata": {
+            "official_title": "4458 SAYILI GÜMRÜK KANUNU",
+            "validity_status": "Mülga",
+            "repeal_note": "2. (07.07.2009/27281 R.G. 5911 s.k. ile yürürlükten kaldırılmıştır.) [69] || 3. (07.07.2009/27281 R.G. 5911 s.k. ile yürürlükten kaldırılmıştır.) [187]  •  KISMİ: İkinci paragraf (07.07.2009/27281 R.G. 5911 s.k. ile yürürlükten kaldırılmıştır.) [17] || MADDE 42- (07.07.2009/27281 R.G. 5911 s.k. ile yürürlükten kaldırılmıştır.) [56] (+16 şerh daha)"
+          },
+          "position": 968,
+          "heading_path": [
+            "4458 SAYILI GÜMRÜK KANUNU",
+            "Gümrük Yükümlülüğü",
+            "BEŞİNCİ BÖLÜM",
+            "MADDE 211",
+            "2. Kanunen ödenmemeleri gereken gümrük vergileri, söz konusu vergilerin yükümlüye tebliğ e..."
+          ],
+          "validity_start": null,
+          "validity_end": null,
+          "version_unknown": true,
+          "canonical_metadata": {
+            "document_id": "12328001-2f21-407e-b230-7d50a8dbf28f",
+            "chunk_index": 968,
+            "title": "İhracat Mevzuatı/Kanun, Kararname, Yönetmelik, Tebliğ, Genelge/gumruk_kanunu_.md",
+            "source_type": "user_file",
+            "semantic_identifier": "İhracat Mevzuatı/Kanun, Kararname, Yönetmelik, Tebliğ, Genelge/gumruk_kanunu_.md — 4458 SAYILI GÜMRÜK KANUNU > Gümrük Yükümlülüğü > BEŞİNCİ BÖLÜM > MADDE 211 > 2. Kanunen ödenmemeleri gereken gümrük vergileri, söz konusu vergilerin yükümlüye tebliğ e...",
+            "source_links": "{\"0\": \"\"}",
+            "document_sets": [
+              "PC Külliyatı"
+            ],
+            "regulatory_chunk_id": "rc_5c57370eaf5d30a033be70b194b8cfa9a9b908bb",
+            "heading_path": [
+              "4458 SAYILI GÜMRÜK KANUNU",
+              "Gümrük Yükümlülüğü",
+              "BEŞİNCİ BÖLÜM",
+              "MADDE 211",
+              "2. Kanunen ödenmemeleri gereken gümrük vergileri, söz konusu vergilerin yükümlüye tebliğ e..."
+            ],
+            "provision_identifiers": [
+              "madde 211"
+            ],
+            "legal_dates": [
+              "1999-10-27",
+              "1999-11-04"
+            ],
+            "article_no": "211",
+            "clause_label": null,
+            "paragraph_no": "2",
+            "article_title": null,
+            "chunk_variant": "atomic",
+            "document_date": "1999-10-27",
+            "document_type": "kanun",
+            "source_regulatory_chunk_ids": [],
+            "read_as_of_date": "2026-10-29"
+          },
+          "read_as_of_date": "2026-10-29"
+        },
+        "text_hash": "39234dfc85efb520296d932a24a6b11592b48976c08524e8c044f8ade2b30236"
+      }
+    }
+  ]
+}

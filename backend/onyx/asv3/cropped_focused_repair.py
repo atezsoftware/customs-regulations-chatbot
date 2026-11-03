@@ -20,12 +20,14 @@ from onyx.asv3.assertions import (
 from onyx.asv3.authority import known_statute_source_ids
 from onyx.asv3.cheap_authority import canonical_named_authority_gap
 from onyx.asv3.cropped_article_bindings import cropped_identity_ledger
+from onyx.asv3.cropped_citation_repair import citation_repair_plan
 from onyx.asv3.cropped_repair_model import fresh_model, integrate_repair
 from onyx.asv3.cropped_repair_state import (
     CroppedRepairState,
     CroppedRepairTarget,
     extract_repair_targets,
 )
+from onyx.asv3.cropped_research_limit import CroppedResearchLimit
 from onyx.asv3.model_composition.models import get_model_composition
 from onyx.asv3.models import (
     CapabilityCall,
@@ -194,7 +196,7 @@ def unresolved_governing_projection(
     units = assertion_inventory(draft)
     known = {unit["unit_id"] for unit in units}
     by_key = {record.get("key"): record for record in records}
-    notices: dict[str, str] = {}
+    notices: dict[str, list[str]] = {}
     for target in targets:
         record = by_key.get(target.key)
         if (
@@ -210,9 +212,9 @@ def unresolved_governing_projection(
             return None
         notice = source_gap_sentence(target, str(record["status"]))
         for identifier in target.unit_ids:
-            if identifier in notices and notices[identifier] != notice:
-                return None
-            notices[identifier] = notice
+            unit_notices = notices.setdefault(identifier, [])
+            if notice not in unit_notices:
+                unit_notices.append(notice)
     if not notices or not any(
         unit["unit_id"] not in notices and unit["evidence_numbers"] for unit in units
     ):
@@ -220,12 +222,14 @@ def unresolved_governing_projection(
     emitted: set[str] = set()
     result: list[str] = []
     for unit in units:
-        notice = notices.get(unit["unit_id"])
-        if notice is None:
+        unit_notices = notices.get(unit["unit_id"])
+        if unit_notices is None:
             result.append(unit["text"])
-        elif notice not in emitted:
-            result.append(notice)
-            emitted.add(notice)
+        else:
+            for notice in unit_notices:
+                if notice not in emitted:
+                    result.append(notice)
+                    emitted.add(notice)
     return "\n\n".join(result)
 
 
@@ -362,7 +366,12 @@ class CroppedFocusedRepair:
         )
 
     def _acquire(
-        self, target: CroppedRepairTarget, harness: Harness, model: ResearchModel
+        self,
+        target: CroppedRepairTarget,
+        harness: Harness,
+        model: ResearchModel,
+        *,
+        read_incomplete_original: bool = False,
     ) -> tuple[list[int], list[dict[str, JsonValue]]]:
         ledger = harness.evidence
         numbers = set(target.evidence_numbers)
@@ -370,7 +379,10 @@ class CroppedFocusedRepair:
         governing = target.check_kind == "governing_original" and target.article
         if governing:
             numbers.update(self._governing_numbers(target, harness))
-        if governing and self._governing_gap(target, harness, sorted(numbers)):
+        if governing and (
+            read_incomplete_original
+            or self._governing_gap(target, harness, sorted(numbers))
+        ):
             source_name = self._source_name(target)
             source_ids = (
                 [target.source_id]
@@ -432,7 +444,34 @@ class CroppedFocusedRepair:
             ]
         observations: list[dict[str, JsonValue]] = []
         if calls:
-            for receipt in harness.dispatch_repair_reads(calls):
+            controller = harness.context.services.get("cropped_research_controller")
+            records = self.state.records_for([target])
+            if (
+                governing
+                and len(calls) == 1
+                and calls[0].name
+                in {"read_provision", "read_named_provision", "read_chunk_context"}
+                and records
+                and records[0].get("status") == "in_progress"
+                and isinstance(controller, CroppedResearchLimit)
+            ):
+                from onyx.asv3.cropped_cost_budget import (
+                    CroppedCostBudget,
+                    CroppedRepairBudgetReached,
+                )
+
+                harness.context.check_research_active()
+                controller.check_context(harness.context)
+                budget = harness.context.services.get("cropped_cost_budget")
+                if isinstance(budget, CroppedCostBudget) and not budget.repair_allowed:
+                    raise CroppedRepairBudgetReached(
+                        "Cropped repair cost limit reached before its canonical read"
+                    )
+                with controller.focused_governing_read(calls[0], self.state, target):
+                    receipts = harness.dispatch_repair_reads(calls)
+            else:
+                receipts = harness.dispatch_repair_reads(calls)
+            for receipt in receipts:
                 numbers.update(receipt.evidence_ids)
                 observations.append(
                     {
@@ -457,6 +496,8 @@ class CroppedFocusedRepair:
         model: ResearchModel,
         numbers: list[int],
         observations: list[dict[str, JsonValue]],
+        *,
+        acquire_incomplete_original: bool = True,
     ) -> None:
         ledger = harness.evidence
         usable = [
@@ -484,7 +525,18 @@ class CroppedFocusedRepair:
             )
             self.state.finish(
                 target.key,
-                "failed" if failed else "not_found",
+                "failed"
+                if failed
+                else "incomplete"
+                if any(
+                    isinstance(result := row.get("result"), dict)
+                    and (
+                        result.get("not_read") is True
+                        or result.get("blocked_by_research_limit") is True
+                    )
+                    for row in observations
+                )
+                else "not_found",
                 [],
                 json.dumps(
                     {"absence_proven": False, "observations": observations},
@@ -561,6 +613,27 @@ class CroppedFocusedRepair:
             response_validator=validate,
         )
         result = _EvidenceCheck.model_validate_json(text)
+        if (
+            acquire_incomplete_original
+            and result.status != "found"
+            and target.check_kind == "governing_original"
+            and target.article
+            and not observations
+        ):
+            # Article identity alone does not establish that its operative passage
+            # was retained. Complete originals still reuse the first check.
+            acquired, reads = self._acquire(
+                target, harness, model, read_incomplete_original=True
+            )
+            self._check(
+                target,
+                harness,
+                model,
+                acquired,
+                reads,
+                acquire_incomplete_original=False,
+            )
+            return
         witnessed = (
             sorted({w.citation for w in result.witnesses})
             if result.status == "found"
@@ -705,6 +778,25 @@ class CroppedFocusedRepair:
             finished = self._exhausted_decision(harness)
             if finished is not None:
                 return finished
+            records = self.state.records_for(targets)
+            plan = citation_repair_plan(
+                view.draft_to_repair, view.publication_gap, targets, records
+            )
+            if plan is not None and all(
+                self._governing_gap(
+                    target,
+                    harness,
+                    cast(list[int], record["evidence_numbers"]),
+                )
+                is None
+                for target, record in zip(targets, records, strict=True)
+            ):
+                citation_owner = "citation_correction:" + owner
+                if self.state.reserve_integration(targets, citation_owner):
+                    harness.save_repair_checkpoint()
+                    return integrate_repair(
+                        model, harness.view(), records, citation_plan=plan
+                    )
             raise RunStopped(
                 "This deficiency already received its focused attempt and answer integration; originals retained"
             )

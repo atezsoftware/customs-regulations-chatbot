@@ -41,3 +41,16 @@ claim that it was not read. Distinguish a remaining substantive conflict from a
 missing citation. Missing confirming case law alone creates no new uncertainty;
 retain a caveat only for a concrete unresolved material effect of the sources or
 scenario, and cite the provisions whose interaction is being qualified."""
+
+CROPPED_CITATION_CORRECTION = """This is the last citation-only correction of an
+otherwise retained answer. Every governing original in the supplied citation plan
+was obtained and verified. Add its actual supporting [n] marker inside each flagged
+owned unit. Select only from that unit's supplied original requirements, after reading
+the originals. Match its supplied exact unit_texts to the actual retained-answer units;
+use their exposed retained unit IDs for edits, not the diagnostic assertion IDs.
+Preserve all existing citation markers, words, conditions, exceptions,
+dates, conclusions, paragraphs, tables and unrelated units. Do not add a missing-source
+notice, change legal wording, perform research or infer that evidence acquisition
+approved an assertion. If a requirement cannot be supported without changing legal
+wording, do not fabricate a citation. Submit one retained partial answer. Host checks
+will reject changed assertions, unrelated citations or another unresolved source gap."""
