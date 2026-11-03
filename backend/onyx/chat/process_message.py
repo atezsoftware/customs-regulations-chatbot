@@ -13,7 +13,7 @@ import time
 import traceback
 import unicodedata
 from collections.abc import Callable, Generator
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from contextvars import Token
 from enum import Enum
 from typing import Final, cast
@@ -23,6 +23,7 @@ from sqlalchemy.orm import Session
 
 from onyx.auth.permissions import get_effective_permissions
 from onyx.cache.factory import get_cache_backend
+from onyx.cache.interface import CACHE_TRANSIENT_ERRORS
 from onyx.chat.chat_processing_checker import set_processing_status
 from onyx.chat.chat_state import AvailableFiles, ChatStateContainer, ChatTurnSetup
 from onyx.chat.chat_utils import (
@@ -1366,6 +1367,7 @@ class _PersistContext(Enum):
 
 # How often the drain loop polls for user-initiated cancellation (stop button).
 _CANCEL_POLL_INTERVAL_S: Final[float] = 0.05
+_STOP_PROBE_RETRY_INTERVAL_S: Final[float] = 1.0
 
 # How often the writer re-arms the processing fence (FENCE_TTL is 30 min).
 _FENCE_REFRESH_INTERVAL_S: Final[float] = 60.0
@@ -1419,14 +1421,14 @@ def _run_models(
             present, each outbound packet/error is serialized once and appended
             for replay while also being teed to the live reader.
 
-    Worker threads and the writer thread start before this function returns; the
-    returned reader generator only tails the stream and can be dropped freely.
+    The registered writer starts the model workers; the returned reader generator
+    only tails the stream and can be dropped freely.
 
     Returns:
         Reader generator yielding ``Packet`` objects as they arrive from worker threads —
         answer tokens, tool output, citations — followed by a terminal ``Packet``
         containing ``OverallStop`` once all models complete (or one containing
-        ``OverallStop(stop_reason="user_cancelled")`` if the connection drops).
+        ``OverallStop(stop_reason="user_cancelled")`` on an explicit stop).
     """
     from onyx.regulatory.publication_reads import (
         PublicationReadChanged,
@@ -1472,9 +1474,8 @@ def _run_models(
     publication_error_emitted: list[bool] = [False] * n_models
     post_steps_done = threading.Event()
 
-    # Set only on stop-button: workers can't be interrupted, so their remaining
-    # emits are discarded. Client disconnects do NOT set this — the writer keeps
-    # consuming and buffering to the very end.
+    # Explicit stops and writer failures discard further worker output.
+    # Client disconnects keep draining and buffering to the very end.
     drain_done = threading.Event()
 
     # Writer-thread → reader-generator hand-off. The writer is the run's
@@ -1548,9 +1549,7 @@ def _run_models(
         for i in range(n_models):
             _persist_model_outcome(i, _PersistContext.POST_STEPS)
 
-        # The writer thread is the run's authoritative end — it owns the fence
-        # reset so the session never sticks at (or prematurely leaves)
-        # "processing", whatever happened to the request generator.
+        # The producer owns this reset; a detached HTTP reader cannot end the turn.
         try:
             set_processing_status(
                 chat_session_id=setup.chat_session.id,
@@ -2221,31 +2220,55 @@ def _run_models(
         """Writer: consume worker output to the very end regardless of client state."""
         models_remaining = n_models
         last_fence_refresh = time.monotonic()
+        next_stop_probe = 0.0
+        stop_probe_failed = False
+        user_cancelled = False
+
+        def refresh_processing_fence() -> None:
+            nonlocal last_fence_refresh
+            # Native work can outlive both the HTTP reader and a failed writer.
+            now = time.monotonic()
+            if now - last_fence_refresh < _FENCE_REFRESH_INTERVAL_S:
+                return
+            last_fence_refresh = now
+            try:
+                set_processing_status(
+                    chat_session_id=setup.chat_session.id,
+                    cache=setup.cache,
+                    value=True,
+                    run_id=setup.processing_run_id,
+                )
+            except Exception:
+                logger.exception("processing fence refresh failed")
+
         try:
+            # Graceful shutdown must see the producer before any model can start.
+            for i, ctx in enumerate(worker_contexts):
+                model_futures.append(
+                    cast(Future[None], executor.submit(ctx.run, _run_model, i))
+                )
             while models_remaining > 0:
-                # Runs can outlive FENCE_TTL; a lapsed fence reads as a dead
-                # writer to resume readers and unblocks concurrent sends.
-                now = time.monotonic()
-                if now - last_fence_refresh >= _FENCE_REFRESH_INTERVAL_S:
-                    last_fence_refresh = now
-                    try:
-                        set_processing_status(
-                            chat_session_id=setup.chat_session.id,
-                            cache=setup.cache,
-                            value=True,
-                            run_id=setup.processing_run_id,
-                        )
-                    except Exception:
-                        # Worst case the fence lapses early; never kill the
-                        # run over a refresh.
-                        logger.exception("processing fence refresh failed")
+                refresh_processing_fence()
                 try:
                     model_idx, item = merged_queue.get(timeout=_CANCEL_POLL_INTERVAL_S)
                 except queue.Empty:
                     if stream_buffer is not None:
                         stream_buffer.flush()
-                    # Check for user-initiated cancellation every 50 ms.
-                    if not setup.check_is_connected():
+                    now = time.monotonic()
+                    if now < next_stop_probe:
+                        continue
+                    try:
+                        connected = setup.check_is_connected()
+                    except CACHE_TRANSIENT_ERRORS:
+                        if not stop_probe_failed:
+                            logger.exception("chat stop-signal lookup failed; retrying")
+                        stop_probe_failed = True
+                        next_stop_probe = now + _STOP_PROBE_RETRY_INTERVAL_S
+                        continue
+                    stop_probe_failed = False
+                    next_stop_probe = 0.0
+                    if not connected:
+                        user_cancelled = True
                         for i in range(n_models):
                             # Snapshot every model now: finished loops save
                             # complete, in-flight ones save partial + stopped.
@@ -2338,22 +2361,39 @@ def _run_models(
                     logger.exception(
                         "Failed to mark the source-dependent stream complete"
                     )
-            _run_post_steps()
-            tee.put(_STREAM_DONE)
-            executor.shutdown(wait=False)
+            try:
+                if user_cancelled:
+                    # Release the cancelled turn promptly, while shutdown still
+                    # tracks native calls that cannot be interrupted immediately.
+                    _run_post_steps()
+            finally:
+                tee.put(_STREAM_DONE)
+                try:
+                    pending = set(model_futures)
+                    while pending:
+                        _, pending = wait(pending, timeout=_FENCE_REFRESH_INTERVAL_S)
+                        if pending and not user_cancelled:
+                            refresh_processing_fence()
+                finally:
+                    executor.shutdown(wait=True)
+                    if not user_cancelled:
+                        _run_post_steps()
 
     # Each worker thread needs its own Context copy — a single Context object
     # cannot be entered concurrently by multiple threads (RuntimeError).
     executor = ThreadPoolExecutor(
         max_workers=n_models, thread_name_prefix="multi-model"
     )
-    for i in range(n_models):
-        ctx = contextvars.copy_context()
-        executor.submit(ctx.run, _run_model, i)
+    worker_contexts = [contextvars.copy_context() for _ in range(n_models)]
+    model_futures: list[Future[None]] = []
 
     from onyx.chat.stream_lifecycle import start_chat_stream_writer
 
-    start_chat_stream_writer(_drain_to_completion)
+    try:
+        start_chat_stream_writer(_drain_to_completion)
+    except BaseException:
+        executor.shutdown(wait=True)
+        raise
 
     def _read_stream() -> AnswerStream:
         # ── Reader: tail the tee while the client is attached ────────────────
