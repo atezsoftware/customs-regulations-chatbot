@@ -657,6 +657,7 @@ def test_english_heading_does_not_rewrite_the_model_question() -> None:
     assert result.endswith(question)
 
 
+@pytest.mark.usefixtures("synthetic_openai_terminal_host")
 def test_source_answer_body_transport_and_strict_wire_keep_exact_followup_rows() -> (
     None
 ):

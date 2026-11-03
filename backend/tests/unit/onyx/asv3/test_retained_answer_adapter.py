@@ -122,6 +122,7 @@ def test_rejected_native_body_rehydrates_shared_original_not_in_owner_ranges() -
 
 @pytest.mark.parametrize("edit_unit", [False, True])
 @pytest.mark.parametrize("nullable_wire", [False, True])
+@pytest.mark.usefixtures("synthetic_openai_terminal_host")
 def test_real_hosted_serial_reuses_rejected_body_with_fresh_original_delivery(
     monkeypatch: pytest.MonkeyPatch,
     edit_unit: bool,
