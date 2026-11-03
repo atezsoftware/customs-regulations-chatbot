@@ -54,6 +54,13 @@ from onyx.db.regulatory_public_reads import (
 )
 from onyx.document_index.publication_models import PublicationIndexSnapshot
 from onyx.regulatory.amendments.annexes.models import AnnexTemporalProjection
+from onyx.regulatory.law_identity import (
+    canonical_law_number,
+    compatible_own_law_title_fragment,
+    own_law_filename_number,
+    own_law_opening_numbers,
+    own_law_title_number,
+)
 from onyx.regulatory.legistation_metadata import (
     LegistationMetadata,
     parse_legistation_metadata,
@@ -1666,6 +1673,26 @@ def find_sources(
         offset=offset,
         limit=limit,
     )
+    bare_law = re.fullmatch(
+        r"\s*(\d{1,7})\s+sayili\s+kanun\s*",
+        query.translate(str.maketrans("ÇĞİÖŞÜçğıöşü", "CGIOSUcgiosu")).lower(),
+    )
+    if allow_canonical_filename_fallback and bare_law and source_ids is None:
+        number = canonical_law_number(bare_law[1])
+        if number is None:
+            return [], False
+        heads = _read_identity_heads_batch(
+            user=user,
+            filters=filters,
+            sources=sources,
+            check_active=check_active or (lambda: None),
+        )
+        verified = [
+            source
+            for source in sources
+            if _source_has_own_law_number(source, heads[source.id], number)
+        ]
+        return verified, more
     if (
         not (
             allow_numbered_title_fallback
@@ -1771,6 +1798,56 @@ def find_sources(
 class NumberedLawTitle:
     number: str
     title: str
+
+
+def _source_has_own_law_number(
+    source: CorpusSource, chunks: list[CorpusChunk], number: str
+) -> bool:
+    """Require one compatible own title and a complete canonical number witness."""
+    if not chunks:
+        return False
+    witnessed: set[str] = set()
+    opening: set[str] = set()
+    titles: set[str] = set()
+    needs_full_opening = False
+    for chunk in chunks:
+        if (
+            chunk.source_id != source.id
+            or str(chunk.metadata.get("document_type", "")).lower() != "kanun"
+            or not chunk.heading_path
+            or any(
+                chunk.metadata.get(flag)
+                for flag in ("derived", "external", "untrusted", "truncated")
+            )
+        ):
+            return False
+        root = chunk.heading_path[0]
+        title = root
+        if own_law_filename_number(source.name, title) != number:
+            full_title = chunk.metadata.get("document_title")
+            if (
+                not isinstance(full_title, str)
+                or not compatible_own_law_title_fragment(root, full_title)
+                or canonical_law_number(str(chunk.metadata.get("document_number", "")))
+                != number
+                or own_law_filename_number(source.name, full_title) != number
+            ):
+                return False
+            title = full_title
+            needs_full_opening = True
+        titles.add(" ".join(title.casefold().split()))
+        if root_number := own_law_title_number(root):
+            witnessed.add(root_number)
+        try:
+            opening.update(own_law_opening_numbers(chunk.text, title))
+        except ValueError:
+            return False
+    witnessed.update(opening)
+    return (
+        len(titles) == 1
+        and witnessed == {number}
+        and (not needs_full_opening or opening == {number})
+    )
 
 
 def _numeric_law_basename_pattern(number: str) -> str:
