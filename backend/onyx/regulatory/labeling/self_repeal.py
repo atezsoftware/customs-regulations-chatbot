@@ -341,6 +341,18 @@ def _closed_quotes(texts: Sequence[str]) -> bool:
     return not curly and not straight
 
 
+# Public source checks shared by independently serialized source-only receipts.
+NativeSourceStyles = _NativeStyles
+native_title = _title
+native_own_article_path = _own_article_path
+native_article_caption = _caption
+native_visible_content = _visible_native
+require_native_visibility = _require_unambiguous_visibility
+native_interval_text = _native_interval_text
+native_own_header = _own_header
+native_closed_quotes = _closed_quotes
+
+
 def self_repeal_candidate(text: str) -> bool:
     return _WHOLE.fullmatch(normalized_text(text)) is not None
 
