@@ -5,7 +5,7 @@ import re
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import date
 from typing import Any
 from typing import cast as typing_cast
@@ -58,6 +58,7 @@ from onyx.regulatory.law_identity import (
     LAW_DOCUMENT_TYPES,
     canonical_law_number,
     compatible_own_law_title_fragment,
+    exact_unnumbered_law_presentation,
     own_law_filename_number,
     own_law_opening_numbers,
     own_law_title_number,
@@ -157,6 +158,9 @@ class CorpusSource:
     name: str
     file_id: str
     legistation_metadata: LegistationMetadata | None = None
+    identity_originals: tuple["CorpusChunk", ...] = field(
+        default=(), compare=False, repr=False
+    )
 
 
 @dataclass
@@ -1530,6 +1534,7 @@ def _find_sources_with_title_queries(
     limit: int,
     basename_only: bool = False,
     exact_basename_pattern: str | None = None,
+    own_law_number: str | None = None,
 ) -> tuple[list[CorpusSource], bool]:
     if offset < 0 or not 1 <= limit <= 100:
         raise ValueError("Source pages require offset >= 0 and limit 1..100.")
@@ -1552,7 +1557,23 @@ def _find_sources_with_title_queries(
         _source_title_query(query, basename_only=basename_only) for query in queries
     ]
     if len(parsed) == 1:
-        statement = statement.where(*parsed[0][0])
+        if own_law_number is not None:
+            own_number = (
+                select(RegulatoryChunk.user_file_id)
+                .where(
+                    RegulatoryChunk.user_file_id == UserFile.id,
+                    func.lower(
+                        RegulatoryChunk.chunk_metadata["document_type"].astext
+                    ).in_(LAW_DOCUMENT_TYPES),
+                    RegulatoryChunk.chunk_metadata["document_number"].astext.op("~")(
+                        rf"^0*{re.escape(own_law_number)}$"
+                    ),
+                )
+                .exists()
+            )
+            statement = statement.where(or_(and_(*parsed[0][0]), own_number))
+        else:
+            statement = statement.where(*parsed[0][0])
     else:
         statement = statement.where(or_(*(and_(*parts) for parts, _ in parsed)))
     order = parsed[0][1]
@@ -1665,6 +1686,11 @@ def find_sources(
     check_active: Callable[[], None] | None = None,
 ) -> tuple[list[CorpusSource], bool]:
     """Resolve scoped titles; an opted-in formal fallback verifies canonical identity."""
+    bare_law = re.fullmatch(
+        r"\s*(\d{1,7})\s+sayili\s+kanun\s*",
+        query.translate(str.maketrans("ÇĞİÖŞÜçğıöşü", "CGIOSUcgiosu")).lower(),
+    )
+    own_number = canonical_law_number(bare_law[1]) if bare_law else None
     sources, more = _find_sources_with_title_queries(
         session,
         user=user,
@@ -1673,10 +1699,14 @@ def find_sources(
         source_ids=source_ids,
         offset=offset,
         limit=limit,
-    )
-    bare_law = re.fullmatch(
-        r"\s*(\d{1,7})\s+sayili\s+kanun\s*",
-        query.translate(str.maketrans("ÇĞİÖŞÜçğıöşü", "CGIOSUcgiosu")).lower(),
+        own_law_number=(
+            own_number
+            if allow_canonical_filename_fallback
+            and bare_law
+            and source_ids is None
+            and own_number is not None
+            else None
+        ),
     )
     if allow_canonical_filename_fallback and bare_law and source_ids is None:
         number = canonical_law_number(bare_law[1])
@@ -1688,11 +1718,21 @@ def find_sources(
             sources=sources,
             check_active=check_active or (lambda: None),
         )
-        verified = [
-            source
-            for source in sources
-            if _source_has_own_law_number(source, heads[source.id], number)
-        ]
+        verified = []
+        for source in sources:
+            if _source_has_own_law_number(source, heads[source.id], number):
+                verified.append(source)
+            elif _source_has_unnumbered_own_law_identity(
+                source, heads[source.id], number
+            ):
+                verified.append(
+                    replace(
+                        source,
+                        identity_originals=_own_law_masthead_originals(
+                            heads[source.id]
+                        ),
+                    )
+                )
         return verified, more
     if (
         not (
@@ -1747,9 +1787,8 @@ def find_sources(
         if allow_canonical_filename_fallback is True
         else None
     )
-    verified = [
-        source
-        for source in candidates
+    verified = []
+    for source in candidates:
         if _source_has_numbered_law_identity(
             session,
             user=user,
@@ -1757,8 +1796,17 @@ def find_sources(
             source=source,
             identity=identity,
             **({"originals": heads[source.id]} if heads is not None else {}),
-        )
-    ]
+        ):
+            verified.append(source)
+        elif heads is not None and _source_has_unnumbered_own_law_identity(
+            source, heads[source.id], identity.number, requested=identity
+        ):
+            verified.append(
+                replace(
+                    source,
+                    identity_originals=_own_law_masthead_originals(heads[source.id]),
+                )
+            )
     if verified or more or not allow_canonical_filename_fallback:
         return verified, more
     candidates, more = _find_sources_with_title_queries(
@@ -1799,6 +1847,67 @@ def find_sources(
 class NumberedLawTitle:
     number: str
     title: str
+
+
+def _own_law_masthead_originals(chunks: list[CorpusChunk]) -> tuple[CorpusChunk, ...]:
+    return tuple(
+        chunk
+        for chunk in chunks
+        if own_law_opening_numbers(
+            chunk.text,
+            str(chunk.metadata.get("document_title") or chunk.heading_path[0]),
+            exact_formal_title=True,
+        )
+    )
+
+
+def _source_has_unnumbered_own_law_identity(
+    source: CorpusSource,
+    chunks: list[CorpusChunk],
+    number: str,
+    *,
+    requested: NumberedLawTitle | None = None,
+) -> bool:
+    """Admit only an exact natural title with a complete current own masthead."""
+    if not chunks:
+        return False
+    opening: set[str] = set()
+    for chunk in chunks:
+        title = chunk.metadata.get("document_title")
+        if title is None and chunk.heading_path:
+            title = chunk.heading_path[0]
+        if (
+            chunk.source_id != source.id
+            or str(chunk.metadata.get("document_type", "")).casefold()
+            not in LAW_DOCUMENT_TYPES
+            or canonical_law_number(str(chunk.metadata.get("document_number", "")))
+            != number
+            or not isinstance(title, str)
+            or not chunk.heading_path
+            or any(
+                chunk.metadata.get(flag)
+                for flag in ("derived", "external", "untrusted", "truncated")
+            )
+            or not exact_unnumbered_law_presentation(
+                source.name, chunk.heading_path[0], title, number
+            )
+            or (
+                requested is not None
+                and (
+                    _numbered_law_title(title)
+                    or _numbered_law_title(f"{number} sayılı {title}")
+                )
+                != requested
+            )
+        ):
+            return False
+        try:
+            opening.update(
+                own_law_opening_numbers(chunk.text, title, exact_formal_title=True)
+            )
+        except ValueError:
+            return False
+    return opening == {number}
 
 
 def _source_has_own_law_number(

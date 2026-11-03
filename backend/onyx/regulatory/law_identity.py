@@ -71,6 +71,55 @@ def own_law_title_number(value: str) -> str | None:
     return canonical_law_number(match[1]) if match else None
 
 
+def _exact_formal_law_title(value: str) -> str | None:
+    title = (
+        unicodedata.normalize("NFC", value)
+        .translate(str.maketrans({"I": "ı", "İ": "i"}))
+        .casefold()
+    )
+    title = re.sub(r"(?:\s*\[\d+\])+$", "", " ".join(title.split())).strip()
+    numbered = re.match(r"^(\d+)\s+sayılı\s+", title)
+    if numbered:
+        if canonical_law_number(numbered[1]) is None:
+            return None
+        title = title[numbered.end() :]
+    if re.search(r"[/\\_`<>]", title) or title[:1] in {
+        "'",
+        '"',
+        "‘",
+        "’",
+        "“",
+        "”",
+        "#",
+        "~",
+    }:
+        return None
+    return title if re.fullmatch(r".+\s+kanunu?", title) else None
+
+
+def exact_unnumbered_law_presentation(
+    name: str, root: str, full_title: str, number: str
+) -> bool:
+    """A natural formal name needs a separately verified full own masthead."""
+    if re.match(r"\s*\d", name):
+        return False
+    title, own_root = _exact_formal_law_title(full_title), _exact_formal_law_title(root)
+    return (
+        title is not None
+        and _exact_formal_law_title(name) == title
+        and own_root is not None
+        and (
+            own_root == title
+            or len(own_root.split()) >= 2
+            and title.endswith(" " + own_root)
+        )
+        and all(
+            own_law_title_number(value) in {None, number}
+            for value in (root, full_title)
+        )
+    )
+
+
 def compatible_own_law_title_fragment(root: str, full_title: str) -> bool:
     """Only an exact suffix caption can use a separately proven full title."""
     fragment, title = _own_title(root), _own_title(full_title)
@@ -86,16 +135,21 @@ def compatible_own_law_title_fragment(root: str, full_title: str) -> bool:
     )
 
 
-def own_law_opening_numbers(text: str, root: str) -> frozenset[str]:
+def own_law_opening_numbers(
+    text: str, root: str, *, exact_formal_title: bool = False
+) -> frozenset[str]:
     """Read a complete singular own-number field beneath its contiguous own title.
 
     Ambiguous recognized mastheads are invalid, rather than an absent witness
     that could be overridden by a numbered canonical root.
     """
-    title = _own_title(root)
+    title_reader = _exact_formal_law_title if exact_formal_title else _own_title
+    title = title_reader(root)
     if title is None:
         return frozenset()
     lines = text.lstrip("\ufeff \t\r\n").splitlines()
+    if exact_formal_title and lines and lines[0].startswith(("```", "~~~")):
+        raise ValueError("A quoted code block is not a native own-law masthead")
     if lines and re.fullmatch(r"```[a-zA-Z0-9_+-]*\s*", lines[0]):
         lines = lines[1:]
     lines = [line.strip(" #*\t") for line in lines]
@@ -119,7 +173,7 @@ def own_law_opening_numbers(text: str, root: str) -> frozenset[str]:
         )
     index = fields[0]
     opening_title = " ".join(header[:index])
-    if _own_title(opening_title) != title:
+    if title_reader(opening_title) != title:
         raise ValueError(
             "The own law-number field does not immediately follow its own title"
         )
@@ -138,3 +192,18 @@ def own_law_opening_numbers(text: str, root: str) -> frozenset[str]:
     ):
         raise ValueError("The own law number is malformed or contradicts its title")
     return frozenset({number})
+
+
+def unnumbered_own_law_masthead_number(text: str, name: str, root: str) -> str | None:
+    """Read one complete own masthead beneath its exact natural presentation name."""
+    try:
+        numbers = own_law_opening_numbers(text, name, exact_formal_title=True)
+    except ValueError:
+        return None
+    number = next(iter(numbers)) if len(numbers) == 1 else None
+    return (
+        number
+        if number is not None
+        and exact_unnumbered_law_presentation(name, root, name, number)
+        else None
+    )
