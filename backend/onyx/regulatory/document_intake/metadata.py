@@ -1211,7 +1211,7 @@ def _paragraph_markers(text: str, *, numbered: bool = False) -> set[str]:
         re.findall(
             r"(?m)^[ \t]*(?:#{1,6}[ \t]+)?(?:\*\*|__)?"
             + marker
-            + r"(?:\*\*|__)?(?=[ \t]|$)",
+            + r"(?:\*\*|__)?(?=[^\W\d_]|[ \t]|$)",
             body,
         )
     )

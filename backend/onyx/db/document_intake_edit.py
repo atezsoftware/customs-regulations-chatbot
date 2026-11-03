@@ -1,6 +1,7 @@
 """Correct unpublished intake chunks and relabel only their changed file context."""
 
 import datetime
+import re
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
@@ -81,12 +82,60 @@ class _PreparedChunkEdit:
     updates: dict[str, Any]
 
 
+def _has_frozen_metadata_receipts(session: Session, files: set[UUID]) -> bool:
+    from onyx.db.document_intake_metadata import metadata_chunks
+    from onyx.regulatory.document_intake.metadata import (
+        METADATA_AUDIT_KEY,
+        METADATA_MODEL,
+        METADATA_VERSION,
+        metadata_input_hash,
+    )
+
+    rows = list(
+        session.scalars(
+            select(RegulatoryChunk)
+            .where(RegulatoryChunk.user_file_id.in_(files))
+            .order_by(RegulatoryChunk.position, RegulatoryChunk.id)
+        )
+    )
+    if {row.user_file_id for row in rows} != files:
+        return False
+    for file_id in files:
+        canonical = [
+            row
+            for row in rows
+            if row.user_file_id == file_id and not is_hierarchical_aggregate_chunk(row)
+        ]
+        input_hash = metadata_input_hash(metadata_chunks(canonical))
+        if not canonical:
+            return False
+        for row in canonical:
+            audit = row.chunk_metadata.get(METADATA_AUDIT_KEY)
+            if not isinstance(audit, dict) or not (
+                audit.get("model") == METADATA_MODEL
+                and audit.get("version") == METADATA_VERSION
+                and audit.get("input_sha256") == input_hash
+                and audit.get("input_stale") is False
+                and re.fullmatch(r"[0-9a-f]{64}", str(audit.get("request_hash", "")))
+            ):
+                return False
+    return True
+
+
 def edit_review_digest(session: Session, batch: RegulatoryDocumentIntake) -> str | None:
     """An edit receipt never grants publication of an incomplete label review."""
+    metadata_review = batch.status == "failed" and batch.stage in {
+        "metadata",
+        "chunking",
+    }
     if (
         batch.labeling_run_id is None
-        or batch.status not in {"ready", "partial"}
+        or (batch.status not in {"ready", "partial"} and not metadata_review)
         or (batch.status == "partial" and batch.stage != "labeling")
+        or (
+            metadata_review
+            and (batch.lease_token is not None or batch.lease_expires_at is not None)
+        )
     ):
         return None
     run = session.get(RegulatoryLabelingRun, batch.labeling_run_id)
@@ -119,6 +168,14 @@ def edit_review_digest(session: Session, batch: RegulatoryDocumentIntake) -> str
             or get_user_file_projection_repair(session, file.id)
         ):
             return None
+    if (
+        metadata_review
+        and batch.stage == "chunking"
+        and not _has_frozen_metadata_receipts(
+            session, {member.user_file_id for member in members}
+        )
+    ):
+        return None
     items = list(
         session.scalars(
             select(RegulatoryLabelingItem)
@@ -146,6 +203,9 @@ def edit_review_digest(session: Session, batch: RegulatoryDocumentIntake) -> str
     return publication_digest(
         {
             "purpose": "unpublished_intake_edit",
+            "batch_status": batch.status,
+            "batch_stage": batch.stage,
+            "batch_error": batch.error,
             "canonical_review": canonical_digest,
             "run_id": str(run.id),
             "status": run.status,
@@ -415,7 +475,7 @@ def _edit_intake_chunks(
         raise intake.IntakeConflictError(
             "The document edit review changed; reload before editing"
         )
-    partial_review = batch.status == "partial"
+    partial_review = batch.status in {"partial", "failed"}
     document_ids = {edit.document_id for edit in edits}
     members = list(
         session.scalars(

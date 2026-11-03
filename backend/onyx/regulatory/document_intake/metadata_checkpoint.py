@@ -28,6 +28,13 @@ def metadata_recipe_fingerprint(
     )
 
 
+class MetadataCheckpointPredecessor(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    version: Literal[1] = 1
+    checkpoint_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    recipe_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 class MetadataCheckpoint(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     version: Literal[1] = 1
@@ -36,6 +43,9 @@ class MetadataCheckpoint(BaseModel):
     source_snapshot: dict[str, Any]
     request_hashes: dict[str, list[str]]
     checkpoint_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    predecessor: MetadataCheckpointPredecessor | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
     @classmethod
     def build(
@@ -45,14 +55,21 @@ class MetadataCheckpoint(BaseModel):
         provider_binding: dict[str, Any],
         source_snapshot: dict[str, Any],
         request_hashes: dict[str, list[str]],
+        predecessor: "MetadataCheckpoint | None" = None,
     ) -> "MetadataCheckpoint":
-        payload = {
+        payload: dict[str, Any] = {
             "version": 1,
             "recipe_sha256": recipe_sha256,
             "provider_binding": provider_binding,
             "source_snapshot": source_snapshot,
             "request_hashes": request_hashes,
         }
+        if predecessor is not None:
+            payload["predecessor"] = {
+                "version": predecessor.version,
+                "checkpoint_sha256": predecessor.checkpoint_sha256,
+                "recipe_sha256": predecessor.recipe_sha256,
+            }
         return cls(**payload, checkpoint_sha256=metadata_digest(payload))
 
     def validate_checksum(self) -> None:
